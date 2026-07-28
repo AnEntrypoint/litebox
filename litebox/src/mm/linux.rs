@@ -273,7 +273,7 @@ pub(super) struct VmArea<Platform: PageManagementProvider<ALIGN>, const ALIGN: u
     is_file_backed: bool,
     /// For a `VM_SHARED` mapping backed by a real platform shared-memory object (see
     /// [`crate::platform::page_mgmt::PageManagementProvider::create_shared_memory`]): the handle
-    /// to re-map (not eagerly copy) during [`Vmem::duplicate`], so writes stay visible across
+    /// to re-map (not eagerly copy) during `Vmem::duplicate`, so writes stay visible across
     /// `fork()`. `None` for a private mapping. On a platform that doesn't support real shared
     /// memory, `create_shared_memory` fails when a `VM_SHARED` anonymous mapping is first
     /// created (see `create_pages`), so no `VmArea` on such a platform ever reaches this struct

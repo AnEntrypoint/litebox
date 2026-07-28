@@ -215,8 +215,8 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// This is the primitive that makes `MAP_SHARED` mappings genuinely shared across `fork()`:
     /// unlike [`Self::allocate_pages`] (whose memory belongs to exactly one virtual-address
     /// range, on this single-host-process design not visible to a fork()ed child at all without
-    /// an eager copy -- see [`crate::mm::linux::Vmem::duplicate`]), the SAME handle returned here
-    /// can be mapped into more than one address range (via [`Self::map_shared_memory`], including
+    /// an eager copy), the SAME handle returned here can be mapped into more than one address
+    /// range (via [`Self::map_shared_memory`], including
     /// after a fork, at a possibly different address per [`crate::mm::AddressRelocations`]) while
     /// all mappings observe the same underlying physical pages -- a write through one mapping is
     /// visible through the others.
