@@ -224,6 +224,16 @@ impl<Platform: ShimPlatform> Process<Platform> {
         self.inner.lock().exit_status
     }
 
+    /// Returns the exit code if all threads in this process have already exited, without
+    /// blocking. Used by `wait4(WNOHANG)`.
+    pub fn try_wait_for_exit(&self) -> Option<ExitStatus> {
+        if self.nr_threads.underlying_atomic().load(Ordering::Acquire) == 0 {
+            Some(self.inner.lock().exit_status)
+        } else {
+            None
+        }
+    }
+
     /// Attaches a new thread to this process, returning a new remote state for
     /// the thread.
     fn attach_thread(&self, tid: i32) -> Option<Arc<ThreadRemote<Platform>>> {
@@ -356,7 +366,16 @@ enum ThreadInitState {
     /// `fork()`/`vfork()`: the child resumes execution as if it were the parent returning from
     /// the same `clone()` syscall, with an identical register state except `rax` (the syscall
     /// return value), which is 0 in the child (vs. the child's pid in the parent).
-    ForkedChild(litebox_common_linux::PtRegs),
+    ///
+    /// Also carries the parent's `FsBase` (the platform's per-host-thread FS-segment-base
+    /// register, which backs the guest's TLS pointer): a `fork()`-created child runs on a
+    /// brand-new host thread, whose FS base starts unset, but the guest process's TLS block
+    /// (set up by libc at process startup, well before this `fork()` call) lives at a fixed
+    /// guest address that both parent and child must keep dereferencing identically -- without
+    /// explicitly propagating it here, the child's first guest instruction that touches `%fs`
+    /// (which libc's own post-`clone()` return path does immediately, e.g. to check TLS-stored
+    /// cancellation/errno state) dereferences FS base 0 and faults.
+    ForkedChild(litebox_common_linux::PtRegs, usize),
 }
 
 /// Credentials of a process
@@ -543,31 +562,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Handle syscall `wait4`.
     ///
-    /// Supports waiting for a specific child (`pid > 0`) or any child (`pid == -1`), always
-    /// blocking until the child exits (no `WNOHANG`/`WUNTRACED`/`WCONTINUED` support yet --
-    /// `options` is accepted but ignored). `rusage` is accepted but never populated.
-    ///
-    /// NOT YET WIRED to `SyscallRequest::Wait4` in `lib.rs` (routed to `ENOSYS` there instead):
-    /// an early version of this dispatch caused an intermittent crash under live testing whose
-    /// root cause was not isolated before this session's investigation ended. Kept implemented
-    /// (rather than deleted) since the logic itself is believed correct and this is real,
-    /// reviewable progress toward wiring it safely in a follow-up session -- see the
-    /// `shim-process-tree-pid-wait-sigchld` PRD row.
-    #[allow(dead_code, reason = "implemented but not yet wired -- see doc comment")]
+    /// Supports waiting for a specific child (`pid > 0`) or any child (`pid == -1`), either
+    /// blocking until the child exits or, with `WNOHANG` set, returning `0` immediately if no
+    /// child has exited yet (no `WUNTRACED`/`WCONTINUED` support yet -- only `WNOHANG` is
+    /// recognized in `options`). `rusage` is accepted but never populated.
     pub(crate) fn sys_wait4(
         &self,
         pid: i32,
         wstatus: Option<UserPtrMut<i32>>,
-        _options: i32,
+        options: i32,
         _rusage: Option<UserPtrMut<u8>>,
     ) -> Result<usize, Errno> {
+        const WNOHANG: i32 = 0x1;
+        let no_hang = options & WNOHANG != 0;
         let process = self.process();
 
-        // Find and remove the target child from our children list -- Linux does not let you
-        // wait for the same child twice, so removing it now (before blocking on its exit) is
-        // correct: no other waiter can also be given this same child.
+        // Unlike the blocking path, a `WNOHANG` poll must NOT remove the child from our children
+        // list unless it has actually already exited -- otherwise a later real wait for that
+        // same child would incorrectly see `ECHILD`.
         let (child_pid, child_process) = {
-            let mut children = process.children.lock();
+            let children = process.children.lock();
             let idx = if pid > 0 {
                 children.iter().position(|(p, _)| *p == pid)
             } else if pid == -1 {
@@ -581,10 +595,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let Some(idx) = idx else {
                 return Err(Errno::ECHILD);
             };
-            children.swap_remove(idx)
+            let (child_pid, child_process) = &children[idx];
+            (*child_pid, child_process.clone())
         };
 
-        let exit_status = child_process.wait_for_exit();
+        let exit_status = if no_hang {
+            let Some(exit_status) = child_process.try_wait_for_exit() else {
+                return Ok(0);
+            };
+            exit_status
+        } else {
+            child_process.wait_for_exit()
+        };
+
+        // The child has exited (or we were willing to block until it did) -- now it's safe to
+        // remove it from our children list. Linux does not let you wait for the same child
+        // twice, so this must happen exactly once, after confirming exit.
+        process.children.lock().retain(|(p, _)| *p != child_pid);
+
         let encoded = match exit_status {
             // Linux wait status encoding: normal exit is (exit_code & 0xff) << 8.
             ExitStatus::Exit(code) => (i32::from(code) & 0xff) << 8,
@@ -848,9 +876,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .lock()
                 .push((child_tid, thread.process.clone()));
 
+            // The child runs on a brand-new host thread, whose platform-level FS base (backing
+            // the guest's TLS pointer) starts unset -- explicitly propagate the parent's current
+            // value so the child's TLS accesses (which libc issues immediately after `clone()`
+            // returns) don't dereference FS base 0. See `ThreadInitState::ForkedChild`'s doc
+            // comment.
+            #[cfg(target_arch = "x86_64")]
+            let fs_base = self
+                .global
+                .platform
+                .get_arch_specific_register(&ArchSpecificRegister::FsBase)
+                .map_err(Errno::from)?;
+            #[cfg(not(target_arch = "x86_64"))]
+            let fs_base = 0;
+
             (
                 thread,
-                ThreadInitState::ForkedChild(child_ctx),
+                ThreadInitState::ForkedChild(child_ctx, fs_base),
                 child_tid,
                 self.pid,
             )
@@ -1803,10 +1845,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     let _ = child_tid_ptr.write_at_offset::<Platform>(0, self.tid);
                 }
             }
-            ThreadInitState::ForkedChild(mut parent_ctx) => {
+            #[cfg_attr(not(target_arch = "x86_64"), expect(unused_variables))]
+            ThreadInitState::ForkedChild(mut parent_ctx, fs_base) => {
                 #[cfg(target_arch = "x86_64")]
                 {
                     parent_ctx.rax = 0;
+                    self.sys_arch_prctl(ArchPrctlArg::SetFs(fs_base)).unwrap();
                 }
                 *ctx = parent_ctx;
             }

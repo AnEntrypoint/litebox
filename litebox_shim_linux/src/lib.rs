@@ -1182,16 +1182,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(old_mask.bits() as usize)
             }
             SyscallRequest::Wait4 {
-                pid: _,
-                wstatus: _,
-                options: _,
-                rusage: _,
-            } => {
-                // TODO(fork-followup): sys_wait4 caused a crash under investigation; routing to
-                // ENOSYS for now so fork()/exec() (which do not depend on the shell's own wait
-                // succeeding to at least run and produce output) keeps working.
-                Err(litebox_common_linux::errno::Errno::ENOSYS)
-            }
+                pid,
+                wstatus,
+                options,
+                rusage,
+            } => self.sys_wait4(pid, wstatus, options, rusage),
             SyscallRequest::Kill { pid, sig } => self.sys_kill(pid, sig),
             SyscallRequest::Tkill { tid, sig } => self.sys_tkill(tid, sig),
             SyscallRequest::Tgkill { tgid, tid, sig } => self.sys_tgkill(tgid, tid, sig),
