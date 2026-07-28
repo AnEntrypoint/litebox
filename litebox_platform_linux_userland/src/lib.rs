@@ -18,7 +18,7 @@ use std::unimplemented;
 use litebox::fs::OFlags;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::{
-    CowAllocationError, FixedAddressBehavior, MemoryRegionPermissions,
+    CowAllocationError, FixedAddressBehavior, MemoryRegionPermissions, SharedMemoryError,
 };
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer as _};
 use litebox::shim::ContinueOperation;
@@ -1460,6 +1460,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     #[cfg(target_arch = "x86_64")]
     const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
 
+    // A `memfd_create` file descriptor. Cast to/from `usize` at the trait boundary; the raw fd
+    // number is just an opaque per-process kernel-object identifier, safe to copy and pass
+    // across threads (the same fd number refers to the same open file description from any
+    // thread of this process).
+    type SharedMemoryHandle = usize;
+
     fn allocate_pages(
         &self,
         suggested_range: core::ops::Range<usize>,
@@ -1629,6 +1635,77 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             Ok(ptr) => Ok(UserMutPtr::from_usize(ptr)),
             Err(_) => Err(CowAllocationError::InternalFailure),
         }
+    }
+
+    fn create_shared_memory(
+        &self,
+        size: usize,
+    ) -> Result<Self::SharedMemoryHandle, SharedMemoryError> {
+        let name = c"litebox-shared-mem";
+        let fd =
+            unsafe { syscalls::syscall2(syscalls::Sysno::memfd_create, name.as_ptr() as usize, 0) }
+                .map_err(|_| SharedMemoryError::OutOfMemory)?;
+        if unsafe { syscalls::syscall2(syscalls::Sysno::ftruncate, fd, size) }.is_err() {
+            let _ = unsafe { syscalls::syscall1(syscalls::Sysno::close, fd) };
+            return Err(SharedMemoryError::OutOfMemory);
+        }
+        Ok(fd)
+    }
+
+    fn map_shared_memory(
+        &self,
+        handle: Self::SharedMemoryHandle,
+        suggested_range: core::ops::Range<usize>,
+        initial_permissions: MemoryRegionPermissions,
+        fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<Self::RawMutPointer<u8>, SharedMemoryError> {
+        let mut flags = MapFlags::MAP_SHARED;
+        match fixed_address_behavior {
+            FixedAddressBehavior::Hint => {}
+            FixedAddressBehavior::Replace => flags |= MapFlags::MAP_FIXED,
+            FixedAddressBehavior::NoReplace => flags |= MapFlags::MAP_FIXED_NOREPLACE,
+        }
+
+        let result = unsafe {
+            syscalls::syscall6(
+                {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        syscalls::Sysno::mmap
+                    }
+                },
+                suggested_range.start,
+                suggested_range.len(),
+                prot_flags(initial_permissions)
+                    .bits()
+                    .reinterpret_as_unsigned() as usize,
+                flags.bits().reinterpret_as_unsigned() as usize,
+                handle,
+                0,
+            )
+        };
+        match result {
+            Ok(ptr) => Ok(UserMutPtr::from_usize(ptr)),
+            Err(syscalls::Errno::EEXIST) => Err(SharedMemoryError::AddressInUse),
+            Err(_) => Err(SharedMemoryError::OutOfMemory),
+        }
+    }
+
+    unsafe fn unmap_shared_memory(
+        &self,
+        range: core::ops::Range<usize>,
+    ) -> Result<(), SharedMemoryError> {
+        unsafe { syscalls::syscall2(syscalls::Sysno::munmap, range.start, range.len()) }
+            .map_err(|_| SharedMemoryError::Unaligned)?;
+        Ok(())
+    }
+
+    fn close_shared_memory(
+        &self,
+        handle: Self::SharedMemoryHandle,
+    ) -> Result<(), SharedMemoryError> {
+        let _ = unsafe { syscalls::syscall1(syscalls::Sysno::close, handle) };
+        Ok(())
     }
 }
 

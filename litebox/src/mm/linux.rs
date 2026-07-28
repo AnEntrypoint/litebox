@@ -15,8 +15,10 @@ use crate::platform::PageManagementProvider;
 use crate::platform::RawConstPointer;
 use crate::platform::RawMutPointer;
 use crate::platform::page_mgmt::AllocationError;
+use crate::platform::page_mgmt::DeallocationError;
 use crate::platform::page_mgmt::FixedAddressBehavior;
 use crate::platform::page_mgmt::MemoryRegionPermissions;
+use crate::platform::page_mgmt::SharedMemoryError;
 
 /// Page size in bytes
 pub const PAGE_SIZE: usize = 4096;
@@ -263,15 +265,46 @@ impl<const ALIGN: usize> NonZeroAddress<ALIGN> {
 }
 
 /// Virtual memory area
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct VmArea {
+#[derive(Debug)]
+pub(super) struct VmArea<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> {
     /// Flags describing the properties of the memory region.
     flags: VmFlags,
     /// Whether this area is backed by a file
     is_file_backed: bool,
+    /// For a `VM_SHARED` mapping backed by a real platform shared-memory object (see
+    /// [`crate::platform::page_mgmt::PageManagementProvider::create_shared_memory`]): the handle
+    /// to re-map (not eagerly copy) during [`Vmem::duplicate`], so writes stay visible across
+    /// `fork()`. `None` for a private mapping. On a platform that doesn't support real shared
+    /// memory, `create_shared_memory` fails when a `VM_SHARED` anonymous mapping is first
+    /// created (see `create_pages`), so no `VmArea` on such a platform ever reaches this struct
+    /// with `VM_SHARED` set and this field `None` -- that combination cannot occur.
+    shared_handle: Option<Platform::SharedMemoryHandle>,
 }
 
-impl VmArea {
+// Manual impls since `#[derive(Clone, Copy)]` would incorrectly require `Platform: Clone`/`Copy`
+// (derive macros add bounds on every generic parameter, not just the ones actually stored by
+// value) -- only `Platform::SharedMemoryHandle` needs to be `Copy`, which the trait already
+// guarantees.
+impl<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> Clone
+    for VmArea<Platform, ALIGN>
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> Copy for VmArea<Platform, ALIGN> {}
+impl<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> PartialEq
+    for VmArea<Platform, ALIGN>
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.flags == other.flags
+            && self.is_file_backed == other.is_file_backed
+            && self.shared_handle == other.shared_handle
+    }
+}
+impl<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> Eq for VmArea<Platform, ALIGN> {}
+
+impl<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> VmArea<Platform, ALIGN> {
     /// Get the [flags](`VmFlags`) of this memory area.
     #[inline]
     pub(super) fn flags(self) -> VmFlags {
@@ -284,12 +317,28 @@ impl VmArea {
         self.is_file_backed
     }
 
-    /// Create a new [`VmArea`] with the given flags.
+    /// Create a new private (non-shared) [`VmArea`] with the given flags.
     #[inline]
     pub(super) fn new(flags: VmFlags, is_file_backed: bool) -> Self {
         Self {
             flags,
             is_file_backed,
+            shared_handle: None,
+        }
+    }
+
+    /// Create a new [`VmArea`] backed by a real platform shared-memory object -- see
+    /// [`Self::shared_handle`]'s field doc comment.
+    #[inline]
+    pub(super) fn new_shared(
+        flags: VmFlags,
+        is_file_backed: bool,
+        shared_handle: Platform::SharedMemoryHandle,
+    ) -> Self {
+        Self {
+            flags,
+            is_file_backed,
+            shared_handle: Some(shared_handle),
         }
     }
 }
@@ -304,7 +353,7 @@ pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const 
     /// Current program break address.
     pub(super) brk: usize,
     /// Virtual memory areas.
-    vmas: RangeMap<usize, VmArea>,
+    vmas: RangeMap<usize, VmArea<Platform, ALIGN>>,
 }
 
 impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem<Platform, ALIGN> {
@@ -375,6 +424,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     VmArea {
                         flags: VmFlags::empty(),
                         is_file_backed: false,
+                        shared_handle: None,
                     },
                 );
             }
@@ -384,7 +434,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
 
     /// Gets an iterator over all pairs of ([`Range<usize>`], [`VmArea`]),
     /// ordered by key range.
-    pub(super) fn iter(&self) -> impl Iterator<Item = (&Range<usize>, &VmArea)> {
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&Range<usize>, &VmArea<Platform, ALIGN>)> {
         self.vmas.iter()
     }
 
@@ -396,7 +446,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     pub(super) fn register_existing_mapping_overwrite(
         &mut self,
         range: PageRange<ALIGN>,
-        vma: VmArea,
+        vma: VmArea<Platform, ALIGN>,
     ) {
         self.vmas.insert(range.into(), vma);
     }
@@ -406,7 +456,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     pub(super) fn overlapping(
         &self,
         range: Range<usize>,
-    ) -> impl DoubleEndedIterator<Item = (&Range<usize>, &VmArea)> {
+    ) -> impl DoubleEndedIterator<Item = (&Range<usize>, &VmArea<Platform, ALIGN>)> {
         self.vmas.overlapping(range)
     }
 
@@ -422,12 +472,23 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         &mut self,
         range: PageRange<ALIGN>,
     ) -> Result<(), VmemUnmapError> {
+        let range: Range<usize> = range.into();
+        let is_shared = self
+            .vmas
+            .overlapping(range.clone())
+            .any(|(_, vma)| vma.shared_handle.is_some());
         unsafe {
-            self.platform
-                .deallocate_pages(range.into())
-                .map_err(VmemUnmapError::UnmapError)?;
+            if is_shared {
+                self.platform
+                    .unmap_shared_memory(range.clone())
+                    .map_err(|_| VmemUnmapError::UnmapError(DeallocationError::Unaligned))?;
+            } else {
+                self.platform
+                    .deallocate_pages(range.clone())
+                    .map_err(VmemUnmapError::UnmapError)?;
+            }
         }
-        self.vmas.remove(range.into());
+        self.vmas.remove(range);
         Ok(())
     }
 
@@ -457,7 +518,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // Any unmapped regions in the original range will result in this function returning `DeallocationError::AlreadyUnallocated`
         // while still resetting all of the existing vmas in the range.
         let unmapped_error = self.vmas.gaps(&range).next().is_some();
-        let overlapping_ranges: Vec<(Range<usize>, VmArea)> = self
+        let overlapping_ranges: Vec<(Range<usize>, VmArea<Platform, ALIGN>)> = self
             .overlapping(range.clone())
             .map(|(r, vma)| (r.clone(), *vma))
             .collect();
@@ -498,7 +559,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     pub(super) unsafe fn insert_mapping(
         &mut self,
         suggested_range: PageRange<ALIGN>,
-        vma: VmArea,
+        vma: VmArea<Platform, ALIGN>,
         populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
@@ -552,19 +613,63 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // The `max_permissions` is tracked by `VMem::protect_mapping` and thus doesn't need to be
         // passed to `allocate_pages`.
         let _ = max_permissions;
-        let ret = self
-            .platform
-            .allocate_pages(
-                suggested_range.into(),
-                MemoryRegionPermissions::from_bits(permissions).unwrap(),
-                vma.flags.contains(VmFlags::VM_GROWSDOWN),
-                populate_pages_immediately,
-                platform_fixed_address_behavior,
-            )
-            .map_err(|err| match err {
-                AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
-                other => other,
-            })?;
+        let ret = if let Some(shared_handle) = vma.shared_handle {
+            // Map the view with the WIDEST permissions the underlying shared-memory object could
+            // ever need, then narrow to `vma`'s real permissions via `update_permissions` below
+            // -- mirroring how the eager-copy path (below) inserts as READ|WRITE first and
+            // protects down after. This matters concretely on Windows: `MapViewOfFile3` fixes a
+            // view's MAXIMUM protection at map time (bounded by the section object's own
+            // protection ceiling from `create_shared_memory`'s `CreateFileMappingW` call, hence
+            // that also requests the widest protection up front), and a later `VirtualProtect`
+            // widening it beyond what was granted at map time fails outright -- valid and common
+            // for `MAP_SHARED` (e.g. a read-only mapping the guest later `mprotect`s writable, or
+            // adds `PROT_EXEC` to for a JIT).
+            let widest_permissions = MemoryRegionPermissions::READ
+                | MemoryRegionPermissions::WRITE
+                | MemoryRegionPermissions::EXEC;
+            let dest_ptr = self
+                .platform
+                .map_shared_memory(
+                    shared_handle,
+                    suggested_range.into(),
+                    widest_permissions,
+                    platform_fixed_address_behavior,
+                )
+                .map_err(|err| match err {
+                    SharedMemoryError::AddressInUse => AllocationError::AddressInUseByPlatform,
+                    SharedMemoryError::OutOfMemory => AllocationError::OutOfMemory,
+                    SharedMemoryError::Unaligned => AllocationError::Unaligned,
+                    SharedMemoryError::UnsupportedByPlatform => {
+                        // Unreachable in practice: a `shared_handle` only ever exists if
+                        // `create_shared_memory` (from the same platform) already succeeded.
+                        AllocationError::OutOfMemory
+                    }
+                })?;
+            let actual_permissions = MemoryRegionPermissions::from_bits(permissions).unwrap();
+            if actual_permissions != widest_permissions {
+                let mapped_range =
+                    dest_ptr.as_usize()..(dest_ptr.as_usize() + suggested_range.len());
+                unsafe {
+                    self.platform
+                        .update_permissions(mapped_range, actual_permissions)
+                }
+                .expect("failed to narrow newly-mapped shared memory permissions");
+            }
+            dest_ptr
+        } else {
+            self.platform
+                .allocate_pages(
+                    suggested_range.into(),
+                    MemoryRegionPermissions::from_bits(permissions).unwrap(),
+                    vma.flags.contains(VmFlags::VM_GROWSDOWN),
+                    populate_pages_immediately,
+                    platform_fixed_address_behavior,
+                )
+                .map_err(|err| match err {
+                    AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
+                    other => other,
+                })?
+        };
         let new_start = ret.as_usize();
         let new_end = new_start + suggested_range.len();
         self.vmas.insert(new_start..new_end, vma);
@@ -582,9 +687,13 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// independent copy of every byte currently readable in `self`; subsequent writes to either
     /// address space do not affect the other.
     ///
-    /// `VM_SHARED` mappings are not yet supported by this function and cause it to return
-    /// [`VmemDuplicateError::SharedMappingUnsupported`] rather than silently duplicating (and
-    /// thereby breaking the cross-process visibility) a shared mapping.
+    /// `VM_SHARED` mappings backed by a real platform shared-memory object (see
+    /// [`PageManagementProvider::create_shared_memory`]) are re-mapped at `dest` rather than
+    /// eagerly copied, so writes through either mapping stay visible to the other -- genuine
+    /// `fork()` + `MAP_SHARED` sharing. On a platform that doesn't support real shared memory,
+    /// no `VmArea` ever carries a shared handle in the first place (see
+    /// [`crate::platform::page_mgmt::PageManagementProvider::create_shared_memory`]'s default
+    /// body), so this path is simply never taken there.
     ///
     /// # Known deviation from real `fork()`: addresses are NOT preserved
     ///
@@ -621,7 +730,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         dest: &mut Vmem<DestPlatform, ALIGN>,
     ) -> Result<Vec<(Range<usize>, usize)>, VmemDuplicateError>
     where
-        DestPlatform: PageManagementProvider<ALIGN> + 'static,
+        DestPlatform: PageManagementProvider<ALIGN, SharedMemoryHandle = Platform::SharedMemoryHandle>
+            + 'static,
     {
         let mut relocations: Vec<(Range<usize>, usize)> = Vec::new();
         // Collect first: `insert_mapping` on `dest` only touches `dest.vmas`, but we still avoid
@@ -633,7 +743,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // readable) -- `dest` gets its own copy of those from its own construction, so skip them
         // here rather than trying to copy host-runtime memory that is none of the guest's
         // business.
-        let regions: Vec<(Range<usize>, VmArea)> = self
+        let regions: Vec<(Range<usize>, VmArea<Platform, ALIGN>)> = self
             .vmas
             .iter()
             .filter(|(_, vma)| !vma.flags.is_empty())
@@ -647,13 +757,41 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         let mut brk_relocation: Option<(Range<usize>, usize)> = None;
 
         for (range, vma) in regions {
-            if vma.flags.contains(VmFlags::VM_SHARED) {
-                return Err(VmemDuplicateError::SharedMappingUnsupported);
-            }
-
             let page_range = PageRange::<ALIGN>::new(range.start, range.end)
                 .ok_or(VmemDuplicateError::UnAligned)?;
             let (_, length) = page_range.start_and_length();
+
+            // Reconstruct for `DestPlatform` -- `vma` (from `self`, a `Vmem<Platform, ALIGN>`)
+            // can't be used directly on `dest` (a `Vmem<DestPlatform, ALIGN>`) even though the
+            // two platforms share the same `SharedMemoryHandle` type (the `where` bound above),
+            // since `VmArea<Platform, ALIGN>` and `VmArea<DestPlatform, ALIGN>` are distinct
+            // types to the compiler.
+            let dest_vma = match vma.shared_handle {
+                Some(handle) => VmArea::new_shared(vma.flags, vma.is_file_backed, handle),
+                None => VmArea::new(vma.flags, vma.is_file_backed),
+            };
+
+            if vma.shared_handle.is_some() {
+                // `VM_SHARED` backed by a real platform shared-memory object: re-map the SAME
+                // handle at a (possibly different) destination address instead of eagerly
+                // copying bytes, so writes through either mapping stay visible to the other --
+                // this is what makes `fork()` + `MAP_SHARED` genuinely share memory rather than
+                // just starting with identical initial contents.
+                let dest_ptr = unsafe {
+                    dest.insert_mapping(
+                        page_range,
+                        dest_vma,
+                        /* populate_pages_immediately */ false,
+                        FixedAddressBehavior::Hint,
+                    )
+                }
+                .map_err(VmemDuplicateError::Allocation)?;
+                if self.brk != 0 && range.contains(&self.brk) {
+                    brk_relocation = Some((range.clone(), dest_ptr.as_usize()));
+                }
+                relocations.push((range.clone(), dest_ptr.as_usize()));
+                continue;
+            }
 
             if vma.flags.intersection(VmFlags::VM_ACCESS_FLAGS).is_empty() {
                 // `PROT_NONE` region (e.g. a stack guard page): genuinely unreadable right now,
@@ -663,7 +801,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 let dest_ptr = unsafe {
                     dest.insert_mapping(
                         page_range,
-                        vma,
+                        dest_vma,
                         /* populate_pages_immediately */ false,
                         FixedAddressBehavior::Hint,
                     )
@@ -770,7 +908,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         &mut self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
         length: NonZeroPageSize<ALIGN>,
-        vma: VmArea,
+        vma: VmArea<Platform, ALIGN>,
         flags: CreatePagesFlags,
     ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
         let total_length = (length
@@ -1005,6 +1143,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 VmArea {
                     flags: new_flags,
                     is_file_backed: vma.is_file_backed,
+                    shared_handle: vma.shared_handle,
                 },
             );
             if !before.is_empty() {
@@ -1047,24 +1186,31 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
         let shared = flags.contains(CreatePagesFlags::SHARED);
         let file_backed = flags.contains(CreatePagesFlags::MAP_FILE);
-        unsafe {
-            self.create_mapping(
-                suggested_new_address,
-                length,
-                VmArea::new(
-                    VmFlags::from(perms)
-                        | VmFlags::may_flags_for_mapping(shared, file_backed)
-                        | if flags.contains(CreatePagesFlags::IS_STACK) {
-                            VmFlags::VM_GROWSDOWN
-                        } else {
-                            VmFlags::empty()
-                        },
-                    flags.contains(CreatePagesFlags::MAP_FILE),
-                ),
-                flags,
-            )
-        }
-        .map_err(MappingError::MapError)
+        let vm_flags = VmFlags::from(perms)
+            | VmFlags::may_flags_for_mapping(shared, file_backed)
+            | if flags.contains(CreatePagesFlags::IS_STACK) {
+                VmFlags::VM_GROWSDOWN
+            } else {
+                VmFlags::empty()
+            };
+        // Anonymous `MAP_SHARED`: back it with a real platform shared-memory object (see
+        // `PageManagementProvider::create_shared_memory`'s doc comment) so it survives `fork()`
+        // as genuinely shared memory (see `Vmem::duplicate`) rather than being eagerly copied.
+        // File-backed shared mappings are handled separately by the caller (currently rejected
+        // upfront for writable mappings -- see `litebox_shim_linux`'s `sys_mmap`) and don't need
+        // this, since re-opening/re-mmap'ing the same file in the child already gives the same
+        // sharing semantics without a platform-specific handle.
+        let vma = if shared && !file_backed {
+            let shared_handle = self
+                .platform
+                .create_shared_memory(length.as_usize())
+                .map_err(|_| MappingError::MapError(AllocationError::OutOfMemory))?;
+            VmArea::new_shared(vm_flags, file_backed, shared_handle)
+        } else {
+            VmArea::new(vm_flags, file_backed)
+        };
+        unsafe { self.create_mapping(suggested_new_address, length, vma, flags) }
+            .map_err(MappingError::MapError)
     }
 
     /// Get the memory permissions of a given address range.
@@ -1169,8 +1315,6 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
 pub enum VmemDuplicateError {
     #[error("arg is not aligned")]
     UnAligned,
-    #[error("VM_SHARED mappings are not yet supported by duplicate()")]
-    SharedMappingUnsupported,
     #[error("failed to read source mapping contents")]
     SourceUnreadable,
     #[error("failed to write duplicated contents into the destination mapping")]

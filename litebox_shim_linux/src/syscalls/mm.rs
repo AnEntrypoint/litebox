@@ -334,9 +334,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         // MAP_SHARED is partially supported:
-        // - Anonymous shared mappings are fully supported (no backing file concerns).
-        //   Note: since fork is not yet supported, shared anonymous mappings behave
-        //   identically to private ones (no cross-process sharing occurs).
+        // - Anonymous shared mappings are fully supported, including genuine cross-process
+        //   sharing across fork(): backed by a real platform shared-memory object (see
+        //   PageManagementProvider::create_shared_memory), re-mapped (not copied) into the
+        //   child by Vmem::duplicate, so writes through either mapping are visible to the
+        //   other -- on platforms that don't implement create_shared_memory, the underlying
+        //   mmap call itself fails rather than silently degrading to copy-on-fork.
         // - File-backed shared mappings are read-only: writable permission is rejected
         //   upfront and cannot be added later via mprotect, because writes cannot be
         //   propagated back to the underlying file.
@@ -1480,6 +1483,59 @@ mod tests {
         addr.write_slice_at_offset::<Platform>(0, &[0xcd; 0x10])
             .unwrap();
         assert_eq!(addr.read_at_offset::<Platform>(0).unwrap(), 0xcd_u8);
+
+        task.sys_munmap(addr, 0x1000).unwrap();
+    }
+
+    /// Real cross-process aliasing for `MAP_SHARED` anonymous memory: a write through the
+    /// "child"'s (duplicated `PageManager`'s) mapping must be visible through the original
+    /// "parent" mapping, proving the two are backed by the SAME underlying platform
+    /// shared-memory object rather than independent copies -- the actual guarantee
+    /// `mmap-map-shared-real-cross-process-semantics` exists to provide. `PageManager::duplicate`
+    /// is exercised directly (the same primitive `do_clone` uses for real `fork()`) rather than
+    /// through a full `clone()`/thread-spawn, since the cross-process visibility guarantee lives
+    /// entirely in `Vmem::duplicate`'s shared-mapping branch, not in thread/register plumbing.
+    #[test]
+    fn test_map_shared_survives_fork_duplicate() {
+        let task = init_platform(None);
+
+        let addr = task
+            .sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_ANON | MapFlags::MAP_SHARED,
+                -1,
+                0,
+            )
+            .unwrap();
+        addr.write_slice_at_offset::<Platform>(0, &[0x11; 0x10])
+            .unwrap();
+
+        // Simulate the address-space duplication `fork()` performs.
+        let (_child_pm, relocations) =
+            unsafe { task.process().pm.duplicate(&task.global.litebox) }.unwrap();
+        let child_addr: UserPtrMut<u8> =
+            UserPtrMut::from_usize(relocations.translate(addr.as_usize()).unwrap());
+
+        // The child's mapping starts with the parent's contents (proving it's the SAME memory,
+        // not merely identically-initialized independent memory would already be a weaker,
+        // insufficient guarantee here since the eager-copy path also does that).
+        assert_eq!(child_addr.read_at_offset::<Platform>(0).unwrap(), 0x11_u8);
+
+        // A write through the CHILD's mapping must be visible through the PARENT's mapping --
+        // this is the actual cross-process sharing guarantee, and cannot be explained by
+        // identical-initial-contents alone.
+        child_addr
+            .write_slice_at_offset::<Platform>(0, &[0x22; 0x10])
+            .unwrap();
+        assert_eq!(addr.read_at_offset::<Platform>(0).unwrap(), 0x22_u8);
+
+        // And the reverse direction: a write through the PARENT's mapping must be visible
+        // through the CHILD's.
+        addr.write_slice_at_offset::<Platform>(0, &[0x33; 0x10])
+            .unwrap();
+        assert_eq!(child_addr.read_at_offset::<Platform>(0).unwrap(), 0x33_u8);
 
         task.sys_munmap(addr, 0x1000).unwrap();
     }

@@ -976,6 +976,8 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
     const TASK_ADDR_MIN: usize = USER_ADDR_MIN;
     const TASK_ADDR_MAX: usize = USER_ADDR_MAX;
 
+    type SharedMemoryHandle = ();
+
     fn allocate_pages(
         &self,
         suggested_range: core::ops::Range<usize>,

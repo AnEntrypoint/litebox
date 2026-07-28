@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::{
-    AllocationError, FixedAddressBehavior, MemoryRegionPermissions,
+    AllocationError, FixedAddressBehavior, MemoryRegionPermissions, SharedMemoryError,
 };
 use litebox::shim::{ContinueOperation, Exception};
 use litebox::utils::TruncateExt as _;
@@ -32,7 +32,8 @@ use windows_sys::Win32::{
         EXCEPTION_POINTERS, EXCEPTION_RECORD,
     },
     System::Memory::{
-        self as Win32_Memory, PrefetchVirtualMemory, VirtualAlloc2, VirtualFree, VirtualProtect,
+        self as Win32_Memory, CreateFileMappingW, MapViewOfFile3, PrefetchVirtualMemory,
+        UnmapViewOfFileEx, VirtualAlloc2, VirtualFree, VirtualProtect,
     },
     System::SystemInformation::{self as Win32_SysInfo, GetSystemTimePreciseAsFileTime},
     System::Threading::{self as Win32_Threading, GetCurrentProcess},
@@ -1867,6 +1868,118 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
 
     fn reserved_pages(&self) -> impl Iterator<Item = &std::ops::Range<usize>> {
         self.reserved_pages.iter()
+    }
+
+    // A Windows file-mapping `HANDLE`, backed by the system paging file (no real file on disk)
+    // since litebox only uses this for anonymous `MAP_SHARED` memory. Cast to/from `usize` at
+    // the trait boundary since `HANDLE` (a `*mut c_void`-shaped type) is not `Send`/`Sync` by
+    // itself, but the raw value it wraps is just an opaque per-process kernel-object identifier
+    // that is safe to copy and pass across threads (the same handle value is valid from any
+    // thread of this process, per the Win32 handle model).
+    type SharedMemoryHandle = usize;
+
+    fn create_shared_memory(
+        &self,
+        size: usize,
+    ) -> Result<Self::SharedMemoryHandle, SharedMemoryError> {
+        let size_u64 = size as u64;
+        // Intentional truncation: `CreateFileMappingW` takes the 64-bit size split into
+        // high/low 32-bit halves, not a single 64-bit parameter.
+        #[expect(clippy::cast_possible_truncation)]
+        let handle = unsafe {
+            CreateFileMappingW(
+                Win32_Foundation::INVALID_HANDLE_VALUE,
+                core::ptr::null(),
+                Win32_Memory::PAGE_EXECUTE_READWRITE,
+                (size_u64 >> 32) as u32,
+                size_u64 as u32,
+                core::ptr::null(),
+            )
+        };
+        if handle.is_null() {
+            return Err(SharedMemoryError::OutOfMemory);
+        }
+        Ok(handle as usize)
+    }
+
+    fn map_shared_memory(
+        &self,
+        handle: Self::SharedMemoryHandle,
+        suggested_range: core::ops::Range<usize>,
+        initial_permissions: MemoryRegionPermissions,
+        fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<Self::RawMutPointer<u8>, SharedMemoryError> {
+        debug_assert_alignment!(suggested_range, ALIGN);
+        let try_map = |base_addr: *const c_void| unsafe {
+            MapViewOfFile3(
+                handle as *mut c_void,
+                GetCurrentProcess(),
+                base_addr,
+                0,
+                suggested_range.len(),
+                0,
+                prot_flags(initial_permissions),
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        let base_addr = if suggested_range.start == 0 {
+            core::ptr::null()
+        } else {
+            suggested_range.start as *const c_void
+        };
+        let mut view = try_map(base_addr);
+        // `Hint` means the platform may pick a different address if the hint isn't available
+        // (matching `allocate_pages`'s handling of the same case): retry with no address hint
+        // rather than surfacing an address collision as an error.
+        if view.Value.is_null()
+            && !base_addr.is_null()
+            && fixed_address_behavior == FixedAddressBehavior::Hint
+        {
+            view = try_map(core::ptr::null());
+        }
+        if view.Value.is_null() {
+            let err = unsafe { GetLastError() };
+            if fixed_address_behavior == FixedAddressBehavior::NoReplace
+                && err == Win32_Foundation::ERROR_INVALID_ADDRESS
+            {
+                return Err(SharedMemoryError::AddressInUse);
+            }
+            return Err(SharedMemoryError::OutOfMemory);
+        }
+        Ok(UserMutPtr::from_ptr(view.Value.cast::<u8>()))
+    }
+
+    unsafe fn unmap_shared_memory(
+        &self,
+        range: core::ops::Range<usize>,
+    ) -> Result<(), SharedMemoryError> {
+        debug_assert_alignment!(range, ALIGN);
+        let ok = unsafe {
+            UnmapViewOfFileEx(
+                Win32_Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: range.start as *mut c_void,
+                },
+                0,
+            )
+        } != 0;
+        if !ok {
+            return Err(SharedMemoryError::Unaligned);
+        }
+        Ok(())
+    }
+
+    fn close_shared_memory(
+        &self,
+        handle: Self::SharedMemoryHandle,
+    ) -> Result<(), SharedMemoryError> {
+        // Best-effort: a `CloseHandle` failure here would mean the handle was already invalid,
+        // which is not actionable by the caller (the shared memory is either already gone or was
+        // never valid) -- matching this file's existing style of not treating cleanup-path
+        // failures as fatal (see e.g. `VirtualFree` callers that only assert in truly
+        // unexpected cases).
+        let _ = unsafe { Win32_Foundation::CloseHandle(handle as *mut c_void) };
+        Ok(())
     }
 }
 

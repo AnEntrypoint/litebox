@@ -192,6 +192,114 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ) -> Result<Self::RawMutPointer<u8>, CowAllocationError> {
         Err(CowAllocationError::UnsupportedByPlatform)
     }
+
+    /// An opaque handle to a platform-level shared-memory object, e.g. a Windows file-mapping
+    /// `HANDLE` or a Linux `memfd_create` file descriptor. Cheap to copy (a raw handle/fd, not
+    /// the memory itself); [`Self::close_shared_memory`] releases the underlying object.
+    ///
+    /// Platforms that don't support real cross-process shared memory (e.g. bare-metal backends
+    /// with no host-OS shared-memory primitive to lean on) should set this to `()`: their
+    /// [`Self::create_shared_memory`] returns [`SharedMemoryError::UnsupportedByPlatform`]
+    /// unconditionally (the default body), so this type is never actually constructed.
+    ///
+    /// `Send + Sync` because it lives inside `Vmem`'s tracked mappings, which are shared,
+    /// cross-thread state (e.g. `litebox_shim_linux`'s per-process `PageManager`) -- a shared-
+    /// memory handle is fundamentally just an opaque OS-level identifier (a Windows `HANDLE` or
+    /// a Linux fd number) with no thread-affinity, so this is not an additional runtime
+    /// requirement on real implementations, only a bound the compiler needs stated explicitly.
+    type SharedMemoryHandle: Copy + Eq + Send + Sync + core::fmt::Debug;
+
+    /// Creates a new platform-level shared-memory object of `size` bytes (not yet mapped into
+    /// any address range) and returns a handle to it.
+    ///
+    /// This is the primitive that makes `MAP_SHARED` mappings genuinely shared across `fork()`:
+    /// unlike [`Self::allocate_pages`] (whose memory belongs to exactly one virtual-address
+    /// range, on this single-host-process design not visible to a fork()ed child at all without
+    /// an eager copy -- see [`crate::mm::linux::Vmem::duplicate`]), the SAME handle returned here
+    /// can be mapped into more than one address range (via [`Self::map_shared_memory`], including
+    /// after a fork, at a possibly different address per [`crate::mm::AddressRelocations`]) while
+    /// all mappings observe the same underlying physical pages -- a write through one mapping is
+    /// visible through the others.
+    ///
+    /// The default implementation returns [`SharedMemoryError::UnsupportedByPlatform`].
+    /// Platforms that DO support real OS-level shared memory (Windows via `CreateFileMappingW`,
+    /// Linux userland via `memfd_create`) should override this to unlock real `MAP_SHARED`
+    /// semantics; without it, `MAP_SHARED` mappings degrade to copy-on-fork (see
+    /// `mmap-map-shared-real-cross-process-semantics`'s original gap).
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn create_shared_memory(
+        &self,
+        size: usize,
+    ) -> Result<Self::SharedMemoryHandle, SharedMemoryError> {
+        Err(SharedMemoryError::UnsupportedByPlatform)
+    }
+
+    /// Maps `handle` (from [`Self::create_shared_memory`]) into the address space at
+    /// `suggested_range`, with the given semantics -- the same request shape as
+    /// [`Self::allocate_pages`], since from the caller's perspective this is just another way to
+    /// bring pages into the address space, only backed by a shared object instead of fresh
+    /// anonymous memory.
+    ///
+    /// The default implementation returns [`SharedMemoryError::UnsupportedByPlatform`]; see
+    /// [`Self::create_shared_memory`]'s doc comment.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn map_shared_memory(
+        &self,
+        handle: Self::SharedMemoryHandle,
+        suggested_range: Range<usize>,
+        initial_permissions: MemoryRegionPermissions,
+        fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<Self::RawMutPointer<u8>, SharedMemoryError> {
+        Err(SharedMemoryError::UnsupportedByPlatform)
+    }
+
+    /// Unmaps `range` (previously mapped via [`Self::map_shared_memory`]) from the address space,
+    /// WITHOUT releasing the underlying shared-memory object -- other mappings of the same handle
+    /// (e.g. in the parent, after a fork) remain valid and continue to observe the same memory.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that these pages are not in active use.
+    ///
+    /// The default implementation returns [`SharedMemoryError::UnsupportedByPlatform`]; see
+    /// [`Self::create_shared_memory`]'s doc comment.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    unsafe fn unmap_shared_memory(&self, range: Range<usize>) -> Result<(), SharedMemoryError> {
+        Err(SharedMemoryError::UnsupportedByPlatform)
+    }
+
+    /// Releases a shared-memory object entirely once no mapping of it remains in use anywhere.
+    /// Idempotent-adjacent: real platforms (`CreateFileMappingW` `HANDLE`s, `memfd_create` fds)
+    /// use OS-level refcounting, so this simply drops this holder's reference; the underlying
+    /// memory is only actually freed once every holder (every process/fork that ever mapped this
+    /// handle) has done so.
+    ///
+    /// The default implementation returns [`SharedMemoryError::UnsupportedByPlatform`]; see
+    /// [`Self::create_shared_memory`]'s doc comment.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn close_shared_memory(
+        &self,
+        handle: Self::SharedMemoryHandle,
+    ) -> Result<(), SharedMemoryError> {
+        Err(SharedMemoryError::UnsupportedByPlatform)
+    }
+}
+
+/// Possible errors for [`PageManagementProvider::create_shared_memory`],
+/// [`PageManagementProvider::map_shared_memory`],
+/// [`PageManagementProvider::unmap_shared_memory`], and
+/// [`PageManagementProvider::close_shared_memory`].
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum SharedMemoryError {
+    #[error("this platform does not support real cross-process shared memory")]
+    UnsupportedByPlatform,
+    #[error("provided range is not page-aligned")]
+    Unaligned,
+    #[error("out of memory")]
+    OutOfMemory,
+    #[error("provided fixed address range is in use")]
+    AddressInUse,
 }
 
 /// Behavior when allocating pages at a fixed address.

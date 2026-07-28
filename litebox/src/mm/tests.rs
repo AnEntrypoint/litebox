@@ -37,6 +37,8 @@ impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     const TASK_ADDR_MAX: usize = 0xFFFF_FFFF_F000; // 48-bit VA space
 
+    type SharedMemoryHandle = ();
+
     fn allocate_pages(
         &self,
         suggested_range: Range<usize>,
