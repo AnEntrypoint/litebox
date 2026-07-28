@@ -1147,6 +1147,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
             SyscallRequest::Getegid => Ok(self.sys_getegid() as usize),
+            SyscallRequest::Setuid { uid } => syscall!(sys_setuid(uid)),
+            SyscallRequest::Setgid { gid } => syscall!(sys_setgid(gid)),
             SyscallRequest::Sysinfo { buf } => {
                 let sysinfo = self.sys_sysinfo();
                 buf.write_at_offset::<Platform>(0, sysinfo)

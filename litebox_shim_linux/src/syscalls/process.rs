@@ -1473,6 +1473,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn sys_getegid(&self) -> u32 {
         self.credentials.egid
     }
+
+    /// Handle syscall `setuid`.
+    ///
+    /// LiteBox does not support real privilege separation (there is exactly one, fixed set of
+    /// credentials for the whole sandboxed guest), so this succeeds as a no-op when `uid`
+    /// matches the caller's current real/effective uid -- the common case of a program
+    /// idempotently dropping to the uid it is already running as -- and fails otherwise, rather
+    /// than silently pretending to change privileges.
+    pub(crate) fn sys_setuid(&self, uid: u32) -> Result<(), Errno> {
+        if uid == self.credentials.uid && uid == self.credentials.euid {
+            Ok(())
+        } else {
+            Err(Errno::EPERM)
+        }
+    }
+
+    /// Handle syscall `setgid`. See [`Self::sys_setuid`] for the same no-op-if-unchanged
+    /// rationale.
+    pub(crate) fn sys_setgid(&self, gid: u32) -> Result<(), Errno> {
+        if gid == self.credentials.gid && gid == self.credentials.egid {
+            Ok(())
+        } else {
+            Err(Errno::EPERM)
+        }
+    }
 }
 
 /// Number of CPUs
