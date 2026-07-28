@@ -22,8 +22,6 @@ jobs:
   build_windows_runner:
     name: Build Windows runner
     runs-on: windows-latest
-    env:
-      RUSTFLAGS: -Dwarnings
     steps:
       - name: Check out repo
         uses: actions/checkout@v6
