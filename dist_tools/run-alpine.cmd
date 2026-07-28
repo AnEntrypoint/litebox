@@ -1,4 +1,7 @@
 @echo off
+rem Copyright (c) Microsoft Corporation.
+rem Licensed under the MIT license.
+
 setlocal
 rem Runs the bundled Alpine (BusyBox) Linux rootfs on Windows via LiteBox.
 rem Usage: run-alpine.cmd [command] [args...]

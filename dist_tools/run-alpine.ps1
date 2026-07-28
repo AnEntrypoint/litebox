@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Runs the bundled Alpine (BusyBox) Linux rootfs on Windows via LiteBox.
 # Usage: .\run-alpine.ps1 [command] [args...]
 #   No args -> /bin/sh (interactive Alpine shell)
