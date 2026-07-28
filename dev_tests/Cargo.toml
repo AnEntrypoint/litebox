@@ -1,0 +1,15 @@
+[package]
+name = "dev_tests"
+version = "0.1.0"
+edition = "2024"
+
+# All dependencies here are dev dependencies, because this is just purely tests.
+[dev-dependencies]
+anyhow = "1.0.99"
+fs-err = "3.1.2"
+
+[lints]
+workspace = true
+
+[dependencies]
+ignore = "0.4.25"

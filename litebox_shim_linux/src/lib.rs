@@ -1,0 +1,1309 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+//! A shim that provides a Linux-compatible ABI via LiteBox.
+//!
+//! This shim is generic over the choice of [LiteBox platform](../litebox/platform/index.html).
+//! The concrete platform is threaded in by the runner via [`LinuxShimBuilder::new`].
+
+#![no_std]
+#![expect(
+    clippy::unused_self,
+    reason = "by convention, syscalls and related methods take &self even if unused"
+)]
+
+extern crate alloc;
+
+use alloc::borrow::Cow;
+use alloc::vec;
+use alloc::vec::Vec;
+
+use alloc::sync::Arc;
+use core::cell::{Cell, RefCell};
+use litebox::{
+    LiteBox,
+    fd::TypedFd,
+    mm::{PageManager, linux::PAGE_SIZE},
+    net::Network,
+    pipes::Pipes,
+    platform::TimeProvider,
+    shim::ContinueOperation,
+    sync::futex::FutexManager,
+    utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
+};
+use litebox_common_linux::{
+    SyscallRequest,
+    errno::Errno,
+    user_pointers::{UserPtr, UserPtrMut},
+};
+
+/// On debug builds, logs that the user attempted to use an unsupported feature.
+// DEVNOTE: this is before the `mod` declarations so that it can be used within them.
+macro_rules! log_unsupported {
+    ($($arg:tt)*) => {
+        $crate::log_unsupported_fmt(core::format_args!($($arg)*));
+    };
+}
+
+pub(crate) mod channel;
+pub mod loader;
+pub(crate) mod stdio;
+pub mod syscalls;
+pub mod transport;
+mod wait;
+
+use crate::syscalls::file::get_file_descriptor_flags;
+
+pub type DefaultFS<Platform> = LinuxFS<Platform>;
+
+pub(crate) type LinuxFS<Platform> = litebox::fs::layered::FileSystem<
+    Platform,
+    litebox::fs::in_mem::FileSystem<Platform>,
+    litebox::fs::layered::FileSystem<
+        Platform,
+        litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>,
+        litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>,
+    >,
+>;
+
+pub(crate) type FileFd<FS> = litebox::fd::TypedFd<FS>;
+
+/// A trait required for file systems to be used in the shim.
+pub trait ShimFS: litebox::fs::FileSystem + Send + Sync + 'static {}
+impl<T: litebox::fs::FileSystem + Send + Sync + 'static> ShimFS for T {}
+
+/// Aggregate bound capturing everything the shim requires of a platform.
+///
+/// This exists so that the (many) `impl` blocks throughout the shim can be written
+/// as `impl<Platform: ShimPlatform, ..>` rather than repeating a large `where` clause.
+pub trait ShimPlatform:
+    litebox::platform::RawPointerProvider
+    + litebox::platform::TimeProvider
+    + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
+    + litebox::mm::linux::VmemPageFaultHandler
+    + litebox::platform::RawMutexProvider
+    + litebox::sync::RawSyncPrimitivesProvider
+    + litebox::platform::CrngProvider
+    + litebox::platform::SystemInfoProvider
+    + litebox::platform::StdioProvider
+    + litebox::platform::ArchSpecificProvider
+    + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
+    + litebox::platform::TimerProvider<Signal = litebox_common_linux::signal::Signal>
+    + litebox::platform::SignalProvider<Signal = litebox_common_linux::signal::Signal>
+    + litebox::platform::IPInterfaceProvider
+    + 'static
+{
+}
+
+impl<T> ShimPlatform for T where
+    T: litebox::platform::RawPointerProvider
+        + litebox::platform::TimeProvider
+        + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
+        + litebox::mm::linux::VmemPageFaultHandler
+        + litebox::platform::RawMutexProvider
+        + litebox::sync::RawSyncPrimitivesProvider
+        + litebox::platform::CrngProvider
+        + litebox::platform::SystemInfoProvider
+        + litebox::platform::StdioProvider
+        + litebox::platform::ArchSpecificProvider
+        + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
+        + litebox::platform::TimerProvider<Signal = litebox_common_linux::signal::Signal>
+        + litebox::platform::SignalProvider<Signal = litebox_common_linux::signal::Signal>
+        + litebox::platform::IPInterfaceProvider
+        + 'static
+{
+}
+
+/// On debug builds, logs that the user attempted to use an unsupported feature.
+fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
+    if cfg!(debug_assertions) {
+        litebox_util_log::warn!(feature:% = args; "unsupported");
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
+fn preadv_pwritev_offset(pos_l: usize, _pos_h: usize) -> i64 {
+    pos_l.reinterpret_as_signed() as i64
+}
+
+#[cfg(target_pointer_width = "32")]
+fn preadv_pwritev_offset(pos_l: usize, pos_h: usize) -> i64 {
+    ((pos_h as u64) << 32 | pos_l as u64).reinterpret_as_signed()
+}
+
+pub struct LinuxShimEntrypoints<Platform: ShimPlatform, FS: ShimFS> {
+    task: Task<Platform, FS>,
+    // The task should not be moved once it's bound to a platform thread so that
+    // we preserve the ability to use TLS in the future.
+    _not_send: core::marker::PhantomData<*const ()>,
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
+    for LinuxShimEntrypoints<Platform, FS>
+{
+    type ExecutionContext = litebox_common_linux::PtRegs;
+
+    fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+        self.enter_shim(true, ctx, Task::handle_init_request)
+    }
+
+    fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+        self.enter_shim(false, ctx, Task::handle_syscall_request)
+    }
+
+    fn exception(
+        &self,
+        ctx: &mut Self::ExecutionContext,
+        info: &litebox::shim::ExceptionInfo,
+    ) -> ContinueOperation {
+        if info.kernel_mode && info.exception == litebox::shim::Exception::PAGE_FAULT {
+            if unsafe {
+                self.task
+                    .global
+                    .pm
+                    .handle_page_fault(info.cr2, info.error_code.into())
+            }
+            .is_ok()
+            {
+                return ContinueOperation::Resume;
+            } else {
+                return ContinueOperation::Terminate;
+            }
+        }
+        self.enter_shim(false, ctx, |task, _ctx| task.handle_exception_request(info))
+    }
+
+    fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+        self.enter_shim(false, ctx, |_, _| {})
+    }
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> LinuxShimEntrypoints<Platform, FS> {
+    fn enter_shim(
+        &self,
+        is_init: bool,
+        ctx: &mut litebox_common_linux::PtRegs,
+        f: impl FnOnce(&Task<Platform, FS>, &mut litebox_common_linux::PtRegs),
+    ) -> ContinueOperation {
+        if !is_init {
+            self.task.enter_from_guest();
+        }
+        f(&self.task, ctx);
+        if self.task.prepare_to_run_guest(ctx) {
+            ContinueOperation::Resume
+        } else {
+            ContinueOperation::Terminate
+        }
+    }
+}
+
+/// The shim entry point structure.
+pub struct LinuxShimBuilder<Platform: ShimPlatform> {
+    platform: &'static Platform,
+    litebox: LiteBox<Platform>,
+}
+
+impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
+    /// Returns a new shim builder using the given platform.
+    pub fn new(platform: &'static Platform) -> Self {
+        Self {
+            platform,
+            litebox: LiteBox::new(platform),
+        }
+    }
+
+    /// Returns the litebox object for the shim.
+    pub fn litebox(&self) -> &LiteBox<Platform> {
+        &self.litebox
+    }
+
+    /// Create a default layered file system with the given in-memory layer and tar data.
+    pub fn default_fs(
+        &self,
+        in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
+        tar_data: Cow<'static, [u8]>,
+    ) -> DefaultFS<Platform> {
+        default_fs(&self.litebox, in_mem_fs, tar_data)
+    }
+
+    /// Build the shim.
+    pub fn build<FS: ShimFS>(self) -> LinuxShim<Platform, FS> {
+        let mut net = Network::new(&self.litebox);
+        net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
+        let global = Arc::new(GlobalState {
+            platform: self.platform,
+            pm: PageManager::new(&self.litebox),
+            futex_manager: FutexManager::new(),
+            pipes: Pipes::new(&self.litebox),
+            net: litebox::sync::Mutex::new(net),
+            boot_time: self.platform.now(),
+            next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
+            litebox: self.litebox,
+            unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
+            elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+        });
+        LinuxShim(global)
+    }
+}
+
+pub struct LinuxShim<Platform: ShimPlatform, FS: ShimFS>(Arc<GlobalState<Platform, FS>>);
+impl<Platform: ShimPlatform, FS: ShimFS> Clone for LinuxShim<Platform, FS> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
+    /// Loads the program at `path` as the shim's initial task, returning the
+    /// initial register state.
+    pub fn load_program(
+        &self,
+        fs: alloc::sync::Arc<FS>,
+        task: litebox_common_linux::TaskParams,
+        path: &str,
+        argv: Vec<alloc::ffi::CString>,
+        envp: Vec<alloc::ffi::CString>,
+    ) -> Result<LoadedProgram<Platform, FS>, loader::elf::ElfLoaderError> {
+        let litebox_common_linux::TaskParams {
+            pid,
+            ppid,
+            uid,
+            euid,
+            gid,
+            egid,
+        } = task;
+
+        let files = syscalls::file::FilesState::new(fs);
+        files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR - 1);
+        let files = Arc::new(files);
+        files.initialize_stdio_in_shared_descriptors_table(&self.0);
+
+        let entrypoints = crate::LinuxShimEntrypoints {
+            _not_send: core::marker::PhantomData,
+            task: Task {
+                global: self.0.clone(),
+                thread: syscalls::process::ThreadState::new_process(pid),
+                wait_state: wait::WaitState::new(self.0.platform),
+                pid,
+                ppid,
+                tid: pid,
+                credentials: syscalls::process::Credentials {
+                    uid,
+                    euid,
+                    gid,
+                    egid,
+                }
+                .into(),
+                comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
+                fs: Arc::new(syscalls::file::FsState::new()).into(),
+                files: files.into(),
+                signals: syscalls::signal::SignalState::new_process(),
+            },
+        };
+
+        let (path, argv) = entrypoints
+            .task
+            .resolve_shebang(alloc::string::String::from(path), argv)
+            .map_err(loader::elf::ElfLoaderError::OpenError)?;
+
+        entrypoints.task.load_program(
+            loader::elf::ElfLoader::new(&entrypoints.task, &path)?,
+            argv,
+            envp,
+        )?;
+        let process = LinuxShimProcess(entrypoints.task.process().clone());
+        Ok(LoadedProgram {
+            entrypoints,
+            process,
+        })
+    }
+
+    /// Get the global page manager
+    pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
+        &self.0.pm
+    }
+
+    /// Perform queued network interactions with the outside world.
+    ///
+    /// This function should be invoked in a loop, based on the returned advice.
+    pub fn perform_network_interaction(
+        &self,
+    ) -> litebox::net::PlatformInteractionReinvocationAdvice {
+        self.0.net.lock().perform_platform_interaction()
+    }
+
+    /// Establish a TCP connection to the given address.
+    ///
+    /// Returns a [`transport::ShimTransport`] that can be used as a
+    /// byte-stream transport (e.g., for a 9P filesystem client).
+    pub fn tcp_connection(
+        &self,
+        addr: core::net::SocketAddr,
+    ) -> Result<transport::ShimTransport<Platform>, Errno> {
+        transport::ShimTransport::connect(self.0.clone(), addr)
+    }
+
+    pub fn litebox(&self) -> &LiteBox<Platform> {
+        &self.0.litebox
+    }
+
+    /// Returns the platform this shim was built with.
+    pub fn platform(&self) -> &'static Platform {
+        self.0.platform
+    }
+}
+
+pub struct LoadedProgram<Platform: ShimPlatform, FS: ShimFS> {
+    pub entrypoints: LinuxShimEntrypoints<Platform, FS>,
+    pub process: LinuxShimProcess<Platform>,
+}
+
+/// A handle to a process loaded via [`LinuxShim::load_program`].
+///
+/// This can be used to wait for the process to exit.
+pub struct LinuxShimProcess<Platform: ShimPlatform>(Arc<syscalls::process::Process<Platform>>);
+
+impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
+    /// Wait for the process to exit, returning its exit code.
+    pub fn wait(&self) -> i32 {
+        match self.0.wait_for_exit() {
+            syscalls::process::ExitStatus::Exit(v) => v.into(),
+            // TODO: return the enum instead of just a code?
+            syscalls::process::ExitStatus::Signal(signal) => signal.as_i32() + 256,
+        }
+    }
+}
+
+/// Create a default layered file system with the given in-memory layer and tar data.
+fn default_fs<Platform: ShimPlatform>(
+    litebox: &LiteBox<Platform>,
+    in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
+    tar_data: Cow<'static, [u8]>,
+) -> LinuxFS<Platform> {
+    let dev_stdio = litebox::fs::resolver::Resolver::new(
+        litebox,
+        litebox::fs::composer::Composer::builder()
+            .mount("/dev", |allocator| {
+                litebox::fs::devices::Devices::new(litebox, allocator)
+            })
+            .build()
+            .unwrap(),
+    );
+    let tar_ro = litebox::fs::resolver::Resolver::new(
+        litebox,
+        litebox::fs::composer::Composer::builder()
+            .mount("/", |allocator| {
+                litebox::fs::tar_ro::TarRo::new(tar_data, allocator)
+            })
+            .build()
+            .unwrap(),
+    );
+    litebox::fs::layered::FileSystem::new(
+        litebox,
+        in_mem_fs,
+        litebox::fs::layered::FileSystem::new(
+            litebox,
+            dev_stdio,
+            tar_ro,
+            litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
+        ),
+        litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
+    )
+}
+
+// Special override so that `GETFL` can return stdio-specific flags
+#[derive(Clone)]
+pub(crate) struct StdioStatusFlags(litebox::fs::OFlags);
+
+impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS> {
+    fn initialize_stdio_in_shared_descriptors_table(&self, global: &GlobalState<Platform, FS>) {
+        use litebox::fs::{Mode, OFlags};
+        let stdin = self
+            .fs
+            .open("/dev/stdin", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        let stdout = self
+            .fs
+            .open("/dev/stdout", OFlags::WRONLY, Mode::empty())
+            .unwrap();
+        let stderr = self
+            .fs
+            .open("/dev/stderr", OFlags::WRONLY, Mode::empty())
+            .unwrap();
+        let mut dt = global.litebox.descriptor_table_mut();
+        let mut rds = self.raw_descriptor_store.write();
+        for (raw_fd, fd, stream) in [
+            (0, stdin, litebox::platform::StdioStream::Stdin),
+            (1, stdout, litebox::platform::StdioStream::Stdout),
+            (2, stderr, litebox::platform::StdioStream::Stderr),
+        ] {
+            let status_flags = OFlags::APPEND | OFlags::RDWR;
+            debug_assert_eq!(OFlags::STATUS_FLAGS_MASK & status_flags, status_flags);
+            let old = dt.set_entry_metadata(&fd, StdioStatusFlags(status_flags));
+            assert!(old.is_none());
+            let old = dt.set_entry_metadata(&fd, stream);
+            assert!(old.is_none());
+            let success = rds.fd_into_specific_raw_integer(fd, raw_fd);
+            assert!(success);
+        }
+    }
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    fn close_on_exec(&self) {
+        let files = self.files.borrow();
+        let alive_fds: Vec<usize> = files.raw_descriptor_store.read().iter_alive().collect();
+        for raw_fd in alive_fds {
+            if let Ok(flags) = get_file_descriptor_flags(raw_fd, &self.global, &files)
+                && flags.contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC)
+            {
+                let _ = self.do_close(raw_fd);
+            }
+        }
+    }
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS> {
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn run_on_raw_fd<R>(
+        &self,
+        fd: usize,
+        fs: impl FnOnce(&TypedFd<FS>) -> R,
+        net: impl FnOnce(&TypedFd<Network<Platform>>) -> R,
+        pipes: impl FnOnce(&TypedFd<Pipes<Platform>>) -> R,
+        eventfd: impl FnOnce(&TypedFd<syscalls::eventfd::EventfdSubsystem<Platform>>) -> R,
+        epoll: impl FnOnce(&TypedFd<syscalls::epoll::EpollSubsystem<Platform, FS>>) -> R,
+        unix: impl FnOnce(&TypedFd<syscalls::unix::UnixSocketSubsystem<Platform, FS>>) -> R,
+    ) -> Result<R, Errno> {
+        let rds = self.raw_descriptor_store.read();
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(fs(&fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(net(&fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(pipes(&fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(eventfd(&fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(epoll(&fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(unix(&fd));
+        }
+        Err(Errno::EBADF)
+    }
+}
+
+// This places size limits on maximum read/write sizes that might occur; it exists primarily to
+// prevent OOM due to the user asking for a _massive_ read or such at once. Keeping this too small
+// has the downside of requiring too many syscalls, while having it be too large allows for massive
+// allocations to be triggered by the userland program. For now, this is set to a
+// hopefully-reasonable middle ground.
+const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
+
+trait ToSyscallResult {
+    fn to_syscall_result(self) -> Result<usize, Errno>;
+}
+impl ToSyscallResult for Result<(), Errno> {
+    fn to_syscall_result(self) -> Result<usize, Errno> {
+        self.map(|()| 0)
+    }
+}
+impl ToSyscallResult for Result<usize, Errno> {
+    fn to_syscall_result(self) -> Result<usize, Errno> {
+        self
+    }
+}
+impl ToSyscallResult for Result<u32, Errno> {
+    fn to_syscall_result(self) -> Result<usize, Errno> {
+        self.map(|v| v as usize)
+    }
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    /// A wrapper function around `sys_pread64` that copies data in chunks to avoid OOMing.
+    fn pread_with_user_buf(
+        &self,
+        fd: i32,
+        buf: UserPtrMut<u8>,
+        count: usize,
+        offset: i64,
+    ) -> Result<usize, Errno> {
+        let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
+        let mut read_total = 0;
+        while read_total < count {
+            let to_read = (count - read_total).min(kernel_buf.len());
+            match self.sys_pread64(
+                fd,
+                &mut kernel_buf[..to_read],
+                offset + (read_total.reinterpret_as_signed() as i64),
+            ) {
+                Ok(0) => break, // EOF
+                Ok(size) => {
+                    buf.copy_from_slice::<Platform>(read_total, &kernel_buf[..size])
+                        .ok_or(Errno::EFAULT)?;
+                    read_total += size;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        assert!(read_total <= count);
+        Ok(read_total)
+    }
+
+    /// Handle Linux syscalls and dispatch them to LiteBox implementations.
+    ///
+    /// # Panics
+    ///
+    /// Unsupported syscalls or arguments would trigger a panic for development purposes.
+    fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let return_value = match self.do_syscall(ctx) {
+            Ok(v) => v,
+            Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
+        };
+        #[cfg(target_arch = "x86_64")]
+        {
+            ctx.rax = return_value;
+        }
+    }
+
+    fn do_syscall(&self, ctx: &mut litebox_common_linux::PtRegs) -> Result<usize, Errno> {
+        // Helper macro to unify the return value from `sys_*`.
+        macro_rules! syscall {
+            ($func:ident($($args:expr),*)) => {
+                self.$func($($args),*).to_syscall_result()
+            };
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        let syscall_number = ctx.orig_rax;
+        let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
+
+        match request {
+            SyscallRequest::Exit { status } => {
+                self.sys_exit(status);
+                Ok(0)
+            }
+            SyscallRequest::ExitGroup { status } => {
+                self.sys_exit_group(status);
+                Ok(0)
+            }
+            SyscallRequest::Execve {
+                pathname,
+                argv,
+                envp,
+            } => self.sys_execve(pathname, argv, envp, ctx),
+            SyscallRequest::Read { fd, buf, count } => {
+                // Note some applications (e.g., `node`) seem to assume that getting fewer bytes than
+                // requested indicates EOF.
+                if count <= MAX_KERNEL_BUF_SIZE {
+                    let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
+                    self.sys_read(fd, &mut kernel_buf, None).and_then(|size| {
+                        buf.copy_from_slice::<Platform>(0, &kernel_buf[..size])
+                            .map(|()| size)
+                            .ok_or(Errno::EFAULT)
+                    })
+                } else {
+                    // If the read size is too large, we need to do some extra work to avoid OOMing.
+                    // We read data in chunks and update the file offset ourselves only if the read succeeds.
+                    self.sys_lseek(fd, 0, litebox::fs::SeekWhence::RelativeToCurrentOffset)
+                    .inspect_err(|e| {
+                        match *e {
+                            Errno::EBADF => (), // safe errors to return
+                            Errno::ESPIPE => {
+                                unimplemented!("read on non-seekable fds with large buffers");
+                            }
+                            Errno::EINVAL => {
+                                unreachable!("seekable file should not return EINVAL when getting current offset");
+                            }
+                            _ => {
+                                unimplemented!("unexpected error from lseek: {}", e);
+                            }
+                        }
+                    })
+                    .and_then(|cur_loc| {
+                        self.pread_with_user_buf(fd, buf, count, i64::try_from(cur_loc).unwrap())
+                            .inspect(|read_total| {
+                                // Update the file offset to reflect the read we just did.
+                                self.sys_lseek(
+                                    fd,
+                                    (cur_loc + read_total).reinterpret_as_signed(),
+                                    litebox::fs::SeekWhence::RelativeToBeginning,
+                                )
+                                // Given that previous lseek and pread succeeded, this lseek should also succeed.
+                                .expect("lseek failed");
+                            })
+                    })
+                }
+            }
+            SyscallRequest::Write { fd, buf, count } => match buf.to_owned_slice::<Platform>(count)
+            {
+                Some(buf) => self.sys_write(fd, &buf, None),
+                None => Err(Errno::EFAULT),
+            },
+            SyscallRequest::Close { fd } => syscall!(sys_close(fd)),
+            SyscallRequest::Lseek { fd, offset, whence } => {
+                use litebox::utils::TruncateExt as _;
+                syscalls::file::try_into_whence(whence.trunc())
+                    .map_err(|_| Errno::EINVAL)
+                    .and_then(|seekwhence| self.sys_lseek(fd, offset, seekwhence))
+            }
+            SyscallRequest::Mkdirat {
+                dirfd,
+                pathname,
+                mode,
+            } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |path| {
+                    syscall!(sys_mkdirat(dirfd, path, mode))
+                }),
+            SyscallRequest::Chdir { pathname } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EINVAL), |path| syscall!(sys_chdir(path))),
+            SyscallRequest::RtSigprocmask {
+                how,
+                set,
+                oldset,
+                sigsetsize,
+            } => self.sys_rt_sigprocmask(how, set, oldset, sigsetsize),
+            SyscallRequest::RtSigaction {
+                signum,
+                act,
+                oldact,
+                sigsetsize,
+            } => self.sys_rt_sigaction(signum, act, oldact, sigsetsize),
+            SyscallRequest::RtSigreturn => self.sys_rt_sigreturn(ctx),
+            SyscallRequest::Ioctl { fd, arg } => syscall!(sys_ioctl(fd, arg)),
+            SyscallRequest::Pread64 {
+                fd,
+                buf,
+                count,
+                offset,
+            } => self.pread_with_user_buf(fd, buf, count, offset),
+            SyscallRequest::Pwrite64 {
+                fd,
+                buf,
+                count,
+                offset,
+            } => match buf.to_owned_slice::<Platform>(count) {
+                Some(buf) => self.sys_pwrite64(fd, &buf, offset),
+                None => Err(Errno::EFAULT),
+            },
+            SyscallRequest::Sendfile {
+                out_fd,
+                in_fd,
+                offset,
+                count,
+            } => syscall!(sys_sendfile(out_fd, in_fd, offset, count)),
+            SyscallRequest::Mmap {
+                addr,
+                length,
+                prot,
+                flags,
+                fd,
+                offset,
+            } => self
+                .sys_mmap(addr, length, prot, flags, fd, offset)
+                .map(|ptr| ptr.as_usize()),
+            SyscallRequest::Mprotect { addr, length, prot } => {
+                syscall!(sys_mprotect(addr, length, prot))
+            }
+            SyscallRequest::Mremap {
+                old_addr,
+                old_size,
+                new_size,
+                flags,
+                new_addr,
+            } => self
+                .sys_mremap(old_addr, old_size, new_size, flags, new_addr)
+                .map(|ptr| ptr.as_usize()),
+            SyscallRequest::Munmap { addr, length } => syscall!(sys_munmap(addr, length)),
+            SyscallRequest::Brk { addr } => self.sys_brk(addr),
+            SyscallRequest::Readv { fd, iovec, iovcnt } => self.sys_readv(fd, iovec, iovcnt),
+            SyscallRequest::Writev { fd, iovec, iovcnt } => self.sys_writev(fd, iovec, iovcnt),
+            SyscallRequest::Preadv {
+                fd,
+                iovec,
+                iovcnt,
+                pos_l,
+                pos_h,
+            } => self.sys_preadv(fd, iovec, iovcnt, preadv_pwritev_offset(pos_l, pos_h)),
+            SyscallRequest::Pwritev {
+                fd,
+                iovec,
+                iovcnt,
+                pos_l,
+                pos_h,
+            } => self.sys_pwritev(fd, iovec, iovcnt, preadv_pwritev_offset(pos_l, pos_h)),
+            SyscallRequest::Faccessat {
+                dirfd,
+                pathname,
+                mode,
+                flags,
+            } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |path| {
+                    syscall!(sys_faccessat(dirfd, path, mode, flags))
+                }),
+            SyscallRequest::Madvise {
+                addr,
+                length,
+                behavior,
+            } => syscall!(sys_madvise(addr, length, behavior)),
+            SyscallRequest::Dup {
+                oldfd,
+                newfd,
+                flags,
+            } => syscall!(sys_dup(oldfd, newfd, flags)),
+            SyscallRequest::Socket {
+                domain,
+                type_and_flags,
+                protocol,
+            } => syscall!(sys_socket(domain, type_and_flags, protocol)),
+            SyscallRequest::Socketpair {
+                domain,
+                type_and_flags,
+                protocol,
+                sockvec,
+            } => syscall!(sys_socketpair(domain, type_and_flags, protocol, sockvec)),
+            SyscallRequest::Connect {
+                sockfd,
+                sockaddr,
+                addrlen,
+            } => syscall!(sys_connect(sockfd, sockaddr, addrlen)),
+            SyscallRequest::Accept {
+                sockfd,
+                addr,
+                addrlen,
+                flags,
+            } => syscall!(sys_accept(sockfd, addr, addrlen, flags)),
+            SyscallRequest::Sendto {
+                sockfd,
+                buf,
+                len,
+                flags,
+                addr,
+                addrlen,
+            } => self.sys_sendto(sockfd, buf, len, flags, addr, addrlen),
+            SyscallRequest::Sendmsg { sockfd, msg, flags } => self.sys_sendmsg(sockfd, msg, flags),
+            SyscallRequest::Sendmmsg {
+                sockfd,
+                msgvec,
+                vlen,
+                flags,
+            } => self.sys_sendmmsg(sockfd, msgvec, vlen, flags),
+            SyscallRequest::Recvfrom {
+                sockfd,
+                buf,
+                len,
+                flags,
+                addr,
+                addrlen,
+            } => self.sys_recvfrom(sockfd, buf, len, flags, addr, addrlen),
+            SyscallRequest::Recvmsg { sockfd, msg, flags } => self.sys_recvmsg(sockfd, msg, flags),
+            SyscallRequest::Recvmmsg {
+                sockfd,
+                msgvec,
+                vlen,
+                flags,
+                timeout,
+            } => self.sys_recvmmsg(sockfd, msgvec, vlen, flags, timeout),
+            SyscallRequest::Shutdown { sockfd, how } => syscall!(sys_shutdown(sockfd, how)),
+            SyscallRequest::Bind {
+                sockfd,
+                sockaddr,
+                addrlen,
+            } => syscall!(sys_bind(sockfd, sockaddr, addrlen)),
+            SyscallRequest::Listen { sockfd, backlog } => {
+                syscall!(sys_listen(sockfd, backlog))
+            }
+            SyscallRequest::Setsockopt {
+                sockfd,
+                level,
+                optname,
+                optval,
+                optlen,
+            } => syscall!(sys_setsockopt(sockfd, level, optname, optval, optlen)),
+            SyscallRequest::Getsockopt {
+                sockfd,
+                level,
+                optname,
+                optval,
+                optlen,
+            } => syscall!(sys_getsockopt(sockfd, level, optname, optval, optlen)),
+            SyscallRequest::Getsockname {
+                sockfd,
+                addr,
+                addrlen,
+            } => syscall!(sys_getsockname(sockfd, addr, addrlen)),
+            SyscallRequest::Getpeername {
+                sockfd,
+                addr,
+                addrlen,
+            } => syscall!(sys_getpeername(sockfd, addr, addrlen)),
+            SyscallRequest::Uname { buf } => syscall!(sys_uname(buf)),
+            SyscallRequest::Fcntl { fd, arg } => syscall!(sys_fcntl(fd, arg)),
+            SyscallRequest::Getcwd { buf, size: count } => {
+                let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
+                self.sys_getcwd(&mut kernel_buf).and_then(|size| {
+                    buf.copy_from_slice::<Platform>(0, &kernel_buf[..size])
+                        .map(|()| size)
+                        .ok_or(Errno::EFAULT)
+                })
+            }
+            SyscallRequest::EpollCtl {
+                epfd,
+                op,
+                fd,
+                event,
+            } => syscall!(sys_epoll_ctl(epfd, op, fd, event)),
+            SyscallRequest::EpollCreate { size, flags } => {
+                // the `size` argument is ignored, but must be greater than zero;
+                if size > 0 {
+                    syscall!(sys_epoll_create(flags))
+                } else {
+                    Err(Errno::EINVAL)
+                }
+            }
+            SyscallRequest::EpollPwait {
+                epfd,
+                events,
+                maxevents,
+                timeout,
+                sigmask,
+                sigsetsize,
+            } => self.sys_epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize),
+            SyscallRequest::Prctl { args } => self.sys_prctl(args),
+            SyscallRequest::ArchPrctl { arg } => syscall!(sys_arch_prctl(arg)),
+            SyscallRequest::Readlink {
+                pathname,
+                buf,
+                bufsiz,
+            } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |path| {
+                    let mut kernel_buf = vec![0u8; bufsiz.min(MAX_KERNEL_BUF_SIZE)];
+                    self.sys_readlink(path, &mut kernel_buf).and_then(|size| {
+                        buf.copy_from_slice::<Platform>(0, &kernel_buf[..size])
+                            .map(|()| size)
+                            .ok_or(Errno::EFAULT)
+                    })
+                }),
+            SyscallRequest::Ppoll {
+                fds,
+                nfds,
+                timeout,
+                sigmask,
+                sigsetsize,
+            } => self.sys_ppoll(fds, nfds, timeout, sigmask, sigsetsize),
+            SyscallRequest::Pselect {
+                nfds,
+                readfds,
+                writefds,
+                exceptfds,
+                timeout,
+                sigsetpack,
+            } => self.sys_pselect(nfds, readfds, writefds, exceptfds, timeout, sigsetpack),
+            SyscallRequest::Readlinkat {
+                dirfd,
+                pathname,
+                buf,
+                bufsiz,
+            } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |path| {
+                    let mut kernel_buf = vec![0u8; bufsiz.min(MAX_KERNEL_BUF_SIZE)];
+                    self.sys_readlinkat(dirfd, path, &mut kernel_buf)
+                        .and_then(|size| {
+                            buf.copy_from_slice::<Platform>(0, &kernel_buf[..size])
+                                .map(|()| size)
+                                .ok_or(Errno::EFAULT)
+                        })
+                }),
+            SyscallRequest::Gettimeofday { tv, tz } => syscall!(sys_gettimeofday(tv, tz)),
+            SyscallRequest::ClockGettime { clockid, tp } => {
+                litebox_common_linux::ClockId::try_from(clockid)
+                    .map_err(|_| {
+                        log_unsupported!("clock_gettime(clockid = {clockid})");
+                        Errno::EINVAL
+                    })
+                    .and_then(|clock_id| syscall!(sys_clock_gettime(clock_id, tp)))
+            }
+            SyscallRequest::ClockGetres { clockid, res } => {
+                litebox_common_linux::ClockId::try_from(clockid)
+                    .map_err(|_| {
+                        log_unsupported!("clock_getres(clockid = {clockid})");
+                        Errno::EINVAL
+                    })
+                    .and_then(|clock_id| syscall!(sys_clock_getres(clock_id, res)))
+            }
+            SyscallRequest::ClockNanosleep {
+                clockid,
+                flags,
+                request,
+                remain,
+            } => litebox_common_linux::ClockId::try_from(clockid)
+                .map_err(|_| {
+                    log_unsupported!("clock_nanosleep(clockid = {clockid})");
+                    Errno::EINVAL
+                })
+                .and_then(|clock_id| {
+                    syscall!(sys_clock_nanosleep(clock_id, flags, request, remain))
+                }),
+            SyscallRequest::Time { tloc } => self
+                .sys_time(tloc)
+                .and_then(|second| usize::try_from(second).or(Err(Errno::EOVERFLOW))),
+            SyscallRequest::Openat {
+                dirfd,
+                pathname,
+                flags,
+                mode,
+            } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |path| {
+                    syscall!(sys_openat(dirfd, path, flags, mode))
+                }),
+            SyscallRequest::Ftruncate { fd, length } => syscall!(sys_ftruncate(fd, length)),
+            SyscallRequest::Mknodat {
+                dirfd,
+                pathname,
+                mode_and_type,
+                dev,
+            } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |path| {
+                    syscall!(sys_mknodat(dirfd, path, mode_and_type, dev))
+                }),
+            SyscallRequest::Unlinkat {
+                dirfd,
+                pathname,
+                flags,
+            } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |path| {
+                    syscall!(sys_unlinkat(dirfd, path, flags))
+                }),
+            SyscallRequest::Stat { pathname, buf } => {
+                pathname
+                    .to_cstring::<Platform>()
+                    .map_or(Err(Errno::EFAULT), |path| {
+                        self.sys_stat(path).and_then(|stat| {
+                            buf.write_at_offset::<Platform>(0, stat)
+                                .ok_or(Errno::EFAULT)
+                                .map(|()| 0)
+                        })
+                    })
+            }
+            SyscallRequest::Lstat { pathname, buf } => {
+                pathname
+                    .to_cstring::<Platform>()
+                    .map_or(Err(Errno::EFAULT), |path| {
+                        self.sys_lstat(path).and_then(|stat| {
+                            buf.write_at_offset::<Platform>(0, stat)
+                                .ok_or(Errno::EFAULT)
+                                .map(|()| 0)
+                        })
+                    })
+            }
+            SyscallRequest::Fstat { fd, buf } => self.sys_fstat(fd).and_then(|stat| {
+                buf.write_at_offset::<Platform>(0, stat)
+                    .ok_or(Errno::EFAULT)
+                    .map(|()| 0)
+            }),
+            #[cfg(target_arch = "x86_64")]
+            SyscallRequest::Newfstatat {
+                dirfd,
+                pathname,
+                buf,
+                flags,
+            } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |path| {
+                    self.sys_newfstatat(dirfd, path, flags).and_then(|stat| {
+                        buf.write_at_offset::<Platform>(0, stat)
+                            .ok_or(Errno::EFAULT)
+                            .map(|()| 0)
+                    })
+                }),
+            SyscallRequest::Statx {
+                dirfd,
+                pathname,
+                flags,
+                mask,
+                statxbuf,
+            } => {
+                let (path, flags) = match pathname {
+                    // Linux 6.11+ treats a NULL statx path as a request to stat dirfd.
+                    None => (
+                        Ok(c"".into()),
+                        flags | litebox_common_linux::AtFlags::AT_EMPTY_PATH,
+                    ),
+                    Some(p) => (p.to_cstring::<Platform>().ok_or(Errno::EFAULT), flags),
+                };
+                path.and_then(|path| {
+                    self.sys_statx(dirfd, path, flags, mask).and_then(|sx| {
+                        statxbuf
+                            .write_at_offset::<Platform>(0, sx)
+                            .ok_or(Errno::EFAULT)
+                            .map(|()| 0)
+                    })
+                })
+            }
+            SyscallRequest::Eventfd2 { initval, flags } => {
+                syscall!(sys_eventfd2(initval, flags))
+            }
+            SyscallRequest::Pipe2 { pipefd, flags } => {
+                self.sys_pipe2(flags).and_then(|(read_fd, write_fd)| {
+                    pipefd
+                        .write_at_offset::<Platform>(0, read_fd)
+                        .ok_or(Errno::EFAULT)?;
+                    pipefd
+                        .write_at_offset::<Platform>(1, write_fd)
+                        .ok_or(Errno::EFAULT)?;
+                    Ok(0)
+                })
+            }
+            SyscallRequest::Clone { args } => self.sys_clone(ctx, &args),
+            SyscallRequest::Clone3 { args } => self.sys_clone3(ctx, args),
+            SyscallRequest::SetThreadArea { user_desc } => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let _ = user_desc;
+                    Err(Errno::ENOSYS) // x86_64 does not support set_thread_area
+                }
+            }
+            SyscallRequest::SetTidAddress { tidptr } => {
+                Ok(self.sys_set_tid_address(tidptr).reinterpret_as_unsigned() as usize)
+            }
+            SyscallRequest::Gettid => Ok(self.sys_gettid().reinterpret_as_unsigned() as usize),
+            SyscallRequest::Getrlimit { resource, rlim } => {
+                syscall!(sys_getrlimit(resource, rlim))
+            }
+            SyscallRequest::Setrlimit { resource, rlim } => {
+                syscall!(sys_setrlimit(resource, rlim))
+            }
+            SyscallRequest::Prlimit {
+                pid,
+                resource,
+                new_limit,
+                old_limit,
+            } => syscall!(sys_prlimit(pid, resource, new_limit, old_limit)),
+            SyscallRequest::SetRobustList { head } => {
+                self.sys_set_robust_list(head);
+                Ok(0)
+            }
+            SyscallRequest::GetRobustList { pid, head, len } => self
+                .sys_get_robust_list(pid, head)
+                .and_then(|()| {
+                    len.write_at_offset::<Platform>(
+                        0,
+                        size_of::<litebox_common_linux::RobustListHead>(),
+                    )
+                    .ok_or(Errno::EFAULT)
+                })
+                .map(|()| 0),
+            SyscallRequest::GetRandom { buf, count, flags } => {
+                self.sys_getrandom(buf, count, flags)
+            }
+            SyscallRequest::Getpid => Ok(self.sys_getpid().reinterpret_as_unsigned() as usize),
+            SyscallRequest::Getppid => Ok(self.sys_getppid().reinterpret_as_unsigned() as usize),
+            SyscallRequest::Getuid => Ok(self.sys_getuid() as usize),
+            SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
+            SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
+            SyscallRequest::Getegid => Ok(self.sys_getegid() as usize),
+            SyscallRequest::Sysinfo { buf } => {
+                let sysinfo = self.sys_sysinfo();
+                buf.write_at_offset::<Platform>(0, sysinfo)
+                    .ok_or(Errno::EFAULT)
+                    .map(|()| 0)
+            }
+            SyscallRequest::CapGet { header, data } => syscall!(sys_capget(header, data)),
+            SyscallRequest::GetDirent64 { fd, dirp, count } => {
+                self.sys_getdirent64(fd, dirp, count)
+            }
+            SyscallRequest::SchedGetAffinity { pid, len, mask } => {
+                const BITS_PER_BYTE: usize = 8;
+                let cpuset = self.sys_sched_getaffinity(pid);
+                if len * BITS_PER_BYTE < cpuset.len()
+                    || len & (core::mem::size_of::<usize>() - 1) != 0
+                {
+                    Err(Errno::EINVAL)
+                } else {
+                    let raw_bytes = cpuset.as_bytes();
+                    mask.copy_from_slice::<Platform>(0, raw_bytes)
+                        .map(|()| raw_bytes.len())
+                        .ok_or(Errno::EFAULT)
+                }
+            }
+            SyscallRequest::SchedYield => {
+                // Do nothing until we have more scheduler integration with the
+                // platform.
+                Ok(0)
+            }
+            SyscallRequest::Futex { args } => self.sys_futex(args),
+            SyscallRequest::Umask { mask } => {
+                let old_mask = self.sys_umask(mask);
+                Ok(old_mask.bits() as usize)
+            }
+            SyscallRequest::Kill { pid, sig } => self.sys_kill(pid, sig),
+            SyscallRequest::Tkill { tid, sig } => self.sys_tkill(tid, sig),
+            SyscallRequest::Tgkill { tgid, tid, sig } => self.sys_tgkill(tgid, tid, sig),
+            SyscallRequest::Sigaltstack { ss, old_ss } => self.sys_sigaltstack(ss, old_ss, ctx),
+            SyscallRequest::Alarm { seconds } => syscall!(sys_alarm(seconds)),
+            SyscallRequest::Pause => syscall!(sys_pause()),
+            SyscallRequest::GetITimer { which, curr_value } => {
+                syscall!(sys_getitimer(which, curr_value))
+            }
+            SyscallRequest::SetITimer {
+                which,
+                new_value,
+                old_value,
+            } => syscall!(sys_setitimer(which, new_value, old_value)),
+            _ => {
+                log_unsupported!("{request:?}");
+                Err(Errno::ENOSYS)
+            }
+        }
+    }
+}
+
+/// Global shim state, shared across all tasks.
+struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
+    /// The platform instance used throughout the shim.
+    platform: &'static Platform,
+    /// The LiteBox instance used throughout the shim.
+    litebox: litebox::LiteBox<Platform>,
+    /// The page manager for managing virtual memory.
+    pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
+    /// The futex manager for handling futex operations.
+    futex_manager: FutexManager<Platform>,
+    /// The anonymous pipe implementation.
+    pipes: Pipes<Platform>,
+    /// The network subsystem.
+    net: litebox::sync::Mutex<Platform, Network<Platform>>,
+    /// The time when the shim was started.
+    boot_time: <Platform as TimeProvider>::Instant,
+    /// Next thread ID to assign.
+    // TODO: better management of thread IDs
+    next_thread_id: core::sync::atomic::AtomicI32,
+    /// UNIX domain socket address table
+    unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<Platform, FS>>,
+    /// Per-process collection of ELF patching state for runtime syscall rewriting.
+    elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
+}
+
+struct Task<Platform: ShimPlatform, FS: ShimFS> {
+    global: Arc<GlobalState<Platform, FS>>,
+    wait_state: wait::WaitState<Platform>,
+    thread: syscalls::process::ThreadState<Platform>,
+    /// Process ID
+    pid: i32,
+    /// Parent Process ID
+    ppid: i32,
+    /// Thread ID
+    tid: i32,
+    /// Task credentials. These are set per task but are Arc'd to save space
+    /// since most tasks never change their credentials.
+    credentials: Arc<syscalls::process::Credentials>,
+    /// Command name (usually the executable name, excluding the path)
+    comm: Cell<[u8; litebox_common_linux::TASK_COMM_LEN]>,
+    /// Filesystem state. `RefCell` to support `unshare` in the future.
+    fs: RefCell<Arc<syscalls::file::FsState<Platform>>>,
+    /// File descriptors. `RefCell` to support `unshare` in the future.
+    files: RefCell<Arc<syscalls::file::FilesState<Platform, FS>>>,
+    /// Signal state
+    signals: syscalls::signal::SignalState<Platform>,
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> Drop for Task<Platform, FS> {
+    fn drop(&mut self) {
+        self.prepare_for_exit();
+    }
+}
+
+#[cfg(test)]
+mod test_utils {
+    extern crate std;
+    use super::*;
+
+    impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
+        /// Make a new task with default values for testing.
+        pub(crate) fn new_test_task(
+            self: Arc<Self>,
+            fs: alloc::sync::Arc<FS>,
+        ) -> Task<Platform, FS> {
+            let pid = self
+                .next_thread_id
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let files = Arc::new(syscalls::file::FilesState::new(fs));
+            files.initialize_stdio_in_shared_descriptors_table(&self);
+            Task {
+                wait_state: wait::WaitState::new(self.platform),
+                thread: syscalls::process::ThreadState::new_process(pid),
+                pid,
+                ppid: 0,
+                tid: pid,
+                credentials: Arc::new(syscalls::process::Credentials {
+                    uid: 0,
+                    euid: 0,
+                    gid: 0,
+                    egid: 0,
+                }),
+                comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
+                fs: Arc::new(syscalls::file::FsState::new()).into(),
+                files: files.into(),
+                signals: syscalls::signal::SignalState::new_process(),
+                global: self,
+            }
+        }
+    }
+
+    impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+        /// Returns a clone of this task with a new TID for testing.
+        pub(crate) fn clone_for_test(&self) -> Option<Self> {
+            let tid = self
+                .global
+                .next_thread_id
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let task = Task {
+                wait_state: wait::WaitState::new(self.global.platform),
+                global: self.global.clone(),
+                thread: self.thread.new_thread(tid)?,
+                pid: self.pid,
+                ppid: self.ppid,
+                tid,
+                credentials: self.credentials.clone(),
+                comm: self.comm.clone(),
+                fs: self.fs.clone(),
+                files: self.files.clone(),
+                signals: self.signals.clone_for_new_task(),
+            };
+            Some(task)
+        }
+
+        /// Spawns a thread that runs with a clone of this task and a new TID.
+        ///
+        /// # Panics
+        /// Panics if the test process is already terminating.
+        pub(crate) fn spawn_clone_for_test<R>(
+            &self,
+            f: impl 'static + Send + FnOnce(Task<Platform, FS>) -> R,
+        ) -> std::thread::JoinHandle<R>
+        where
+            R: 'static + Send,
+        {
+            let task = self.clone_for_test().unwrap();
+            std::thread::spawn(move || f(task))
+        }
+    }
+}

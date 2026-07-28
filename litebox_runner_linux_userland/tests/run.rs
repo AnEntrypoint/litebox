@@ -1,0 +1,642 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+mod cache;
+mod common;
+
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
+
+#[must_use]
+struct Runner {
+    command: std::process::Command,
+    dir_path: PathBuf,
+    tar_dir: PathBuf,
+    unique_name: String,
+    cmd_path: PathBuf,
+    cmd_args: Vec<OsString>,
+    has_run: bool,
+}
+
+impl Runner {
+    fn new(target: &Path, unique_name: &str) -> Self {
+        let dir_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+
+        // create tar file containing the rewritten executable and all dependencies
+        let tar_dir = dir_path.join(format!("tar_files_{unique_name}"));
+        let dirs_to_create = ["lib64", "lib/x86_64-linux-gnu", "lib32"];
+        for dir in dirs_to_create {
+            std::fs::create_dir_all(tar_dir.join(dir)).unwrap();
+        }
+        std::fs::create_dir_all(tar_dir.join("out")).unwrap();
+
+        let target_guest_path = std::path::absolute(target).unwrap();
+        let target_dest_path = tar_dir.join(target_guest_path.strip_prefix("/").unwrap());
+        let success = common::rewrite_with_cache(target, &target_dest_path, &[]);
+        assert!(success, "failed to run litebox_syscall_rewriter");
+
+        let libs = common::find_dependencies(target.to_str().unwrap());
+        for file in &libs {
+            let file_path = std::path::Path::new(file.as_str());
+            let dest_path = tar_dir.join(&file[1..]);
+            let success = common::rewrite_with_cache(file_path, &dest_path, &[]);
+            assert!(
+                success,
+                "failed to run litebox_syscall_rewriter for {}",
+                file_path.to_str().unwrap()
+            );
+        }
+
+        // Get the path to the litebox_runner_linux_userland binary
+        let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
+            .unwrap_or_else(|_| env!("CARGO_BIN_EXE_litebox_runner_linux_userland").to_string());
+
+        // run litebox_runner_linux_userland with the tar file and the compiled executable
+        let mut command = std::process::Command::new(binary_path);
+        command.args([
+            "--unstable",
+            // Tell ld where to find the libraries.
+            // See https://man7.org/linux/man-pages/man8/ld.so.8.html for how ld works.
+            // Alternatively, we could add a `/etc/ld.so.cache` file to the rootfs.
+            "--env",
+            "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
+            "--env",
+            "HOME=/",
+            "--program-from-tar",
+        ]);
+
+        Self {
+            command,
+            dir_path,
+            tar_dir,
+            cmd_path: target_guest_path,
+            cmd_args: Vec::new(),
+            has_run: false,
+            unique_name: unique_name.to_owned(),
+        }
+    }
+
+    fn env(&mut self, env: impl AsRef<std::ffi::OsStr>) -> &mut Self {
+        self.command.arg("--env").arg(env);
+        self
+    }
+
+    #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
+    fn envs(&mut self, envs: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -> &mut Self {
+        for env in envs {
+            self.env(env);
+        }
+        self
+    }
+
+    fn arg(&mut self, arg: impl AsRef<std::ffi::OsStr>) -> &mut Self {
+        self.cmd_args.push(arg.as_ref().to_os_string());
+        self
+    }
+
+    #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
+    fn args(&mut self, args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -> &mut Self {
+        for arg in args {
+            self.arg(arg);
+        }
+        self
+    }
+
+    fn tun_device_name(&mut self, tun_name: &str) -> &mut Self {
+        self.command.arg("--tun-device-name").arg(tun_name);
+        self
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn guest_program_path(&mut self, guest_path: &str) -> &mut Self {
+        self.cmd_path = PathBuf::from(guest_path);
+        self
+    }
+
+    #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
+    fn with_fs_path(&mut self, f: impl FnOnce(&Path)) -> &mut Self {
+        f(&self.tar_dir);
+        self
+    }
+
+    fn run(&mut self) {
+        self.run_inner(false);
+    }
+
+    #[must_use]
+    #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
+    fn output(&mut self) -> Vec<u8> {
+        self.run_inner(true)
+    }
+
+    fn prepare_command(&mut self) {
+        assert!(!self.has_run);
+        self.has_run = true;
+        // create tar file using `tar` command with caching
+        let tar_file = self
+            .dir_path
+            .join(format!("rootfs_{}.tar", self.unique_name));
+        let tar_success =
+            common::create_tar_with_cache(&self.tar_dir, &tar_file, &self.unique_name);
+        assert!(tar_success, "failed to create tar file");
+        println!("Tar file ready at: {}", tar_file.to_str().unwrap());
+
+        self.command
+            .arg("--initial-files")
+            .arg(tar_file)
+            .arg(&self.cmd_path)
+            .args(&self.cmd_args);
+    }
+
+    fn run_inner(&mut self, capture_stdout: bool) -> Vec<u8> {
+        self.prepare_command();
+        self.command.stderr(std::process::Stdio::inherit());
+        if !capture_stdout {
+            self.command.stdout(std::process::Stdio::inherit());
+        }
+        println!("Running `{:?}`", self.command);
+        let output = self
+            .command
+            .output()
+            .expect("Failed to run litebox_runner_linux_userland");
+        assert!(
+            output.status.success(),
+            "failed to run litebox_runner_linux_userland: {}",
+            output.status
+        );
+        output.stdout
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn spawn_with_stdio(
+        &mut self,
+        stdin: std::process::Stdio,
+        stdout: std::process::Stdio,
+        stderr: std::process::Stdio,
+    ) -> std::process::Child {
+        self.prepare_command();
+        self.command.stdin(stdin).stdout(stdout).stderr(stderr);
+        println!("Running `{:?}`", self.command);
+        self.command
+            .spawn()
+            .expect("Failed to spawn litebox_runner_linux_userland")
+    }
+}
+
+/// Find all C test files in a directory
+fn find_c_test_files(dir: &str) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if let Some("c") = path.extension().and_then(|e| e.to_str()) {
+            files.push(path);
+        }
+    }
+    files
+}
+
+#[test]
+fn test_dynamic_lib_with_rewriter() {
+    for path in find_c_test_files("./tests") {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("failed to get file stem");
+        let unique_name = format!("{stem}_rewriter");
+        let target = common::compile(path.to_str().unwrap(), &unique_name, false, false);
+        Runner::new(&target, &unique_name).run();
+    }
+}
+
+#[test]
+fn test_static_exec_with_rewriter() {
+    for path in find_c_test_files("./tests") {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("failed to get file stem");
+        let unique_name = format!("{stem}_exec_rewriter");
+        let target = common::compile(path.to_str().unwrap(), &unique_name, true, false);
+        Runner::new(&target, &unique_name).run();
+    }
+}
+
+#[test]
+fn test_host_program_with_rewrite_syscalls() {
+    let target = common::compile("./tests/hello.c", "host_program_rewriter", true, false);
+    let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_litebox_runner_linux_userland").to_string());
+
+    let output = std::process::Command::new(binary_path)
+        .args(["--unstable", "--rewrite-syscalls"])
+        .arg(target)
+        .output()
+        .expect("Failed to run litebox_runner_linux_userland");
+
+    assert!(
+        output.status.success(),
+        "failed to run litebox_runner_linux_userland: {}",
+        output.status
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    println!("{stdout}");
+    assert!(stdout.contains("argv[0] = "), "unexpected stdout: {stdout}");
+}
+
+/// Get the path of a program using `which`
+#[cfg(target_arch = "x86_64")]
+fn run_which(prog: &str) -> std::path::PathBuf {
+    let prog_path_str = std::process::Command::new("which")
+        .arg(prog)
+        .output()
+        .expect("Failed to find program binary")
+        .stdout;
+    let prog_path_str = String::from_utf8(prog_path_str).unwrap().trim().to_string();
+    let prog_path = std::path::PathBuf::from(prog_path_str);
+    assert!(prog_path.exists(), "Program binary not found");
+    prog_path
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_node_with_rewriter() {
+    const HELLO_WORLD_JS: &str = r"
+const fs = require('node:fs');
+
+const content = 'Hello World!';
+console.log(content);
+";
+
+    let node_path = run_which("node");
+    Runner::new(&node_path, "hello_node_rewriter")
+        .arg("/out/hello_world.js")
+        .with_fs_path(|out_dir| {
+            // write the test js file to the output directory
+            std::fs::write(out_dir.join("out/hello_world.js"), HELLO_WORLD_JS).unwrap();
+        })
+        .run();
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_runner_with_ls() {
+    let ls_path = run_which("ls");
+    let output = Runner::new(&ls_path, "ls_rewriter").arg("-a").output();
+
+    let output_str = String::from_utf8_lossy(&output);
+    let normalized = output_str.split_whitespace().collect::<Vec<_>>();
+    for each in [".", "..", "lib", "lib64"] {
+        assert!(
+            normalized.contains(&each),
+            "unexpected ls output:\n{output_str}\n{each} not found",
+        );
+    }
+
+    // test `ls` subdir
+    let output = Runner::new(&ls_path, "ls_lib_rewriter")
+        .args(["-a", "/lib/x86_64-linux-gnu"])
+        .output();
+
+    let output_str = String::from_utf8_lossy(&output);
+    let normalized = output_str.split_whitespace().collect::<Vec<_>>();
+    for each in [".", "..", "libc.so.6", "libpcre2-8.so.0", "libselinux.so.1"] {
+        assert!(
+            normalized.contains(&each),
+            "unexpected ls output:\n{output_str}\n{each} not found",
+        );
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn run_python(args: &[&str]) -> String {
+    let output = std::process::Command::new("python3")
+        .args(args)
+        .output()
+        .expect("Failed to run Python");
+    assert!(output.status.success(), "Python script failed");
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn python_runner(unique_name: &str) -> Runner {
+    let python_path = run_which("python3");
+    let python_guest_dir = python_path.parent().unwrap().to_str().unwrap().to_string();
+
+    let python_home = run_python(&["-c", "import sys; print(sys.prefix);"]);
+    println!("Detected PYTHONHOME: {python_home}");
+    let python_sys_path = run_python(&["-c", "import sys; print(':'.join(sys.path))"]);
+    println!("Detected PYTHONPATH: {python_sys_path}");
+    let python_home = python_home.trim().to_string();
+    let python_home_dir = PathBuf::from(&python_home);
+    let python_lib_paths = python_sys_path
+        .split(':')
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .filter(|path| path.starts_with(&python_home_dir))
+        .collect::<Vec<_>>();
+
+    let python_lib_paths_str = python_lib_paths
+        .iter()
+        .map(|path| path.to_str().unwrap())
+        .collect::<Vec<_>>()
+        .join(":");
+
+    let mut paths_to_stage = std::collections::BTreeSet::new();
+    paths_to_stage.extend(python_lib_paths.iter().cloned());
+
+    let mut runner = Runner::new(&python_path, unique_name);
+    runner
+        .envs([
+            &format!("PYTHONHOME={python_home}"),
+            &format!("PYTHONPATH={python_lib_paths_str}"),
+            // LiteBox does not provide /proc/self/exe yet; give glibc a fallback
+            // origin for DT_NEEDED entries like $ORIGIN/../lib/libpython*.so.
+            &format!("LD_ORIGIN_PATH={python_guest_dir}"),
+            // LiteBox does not support timestamp yet, so pre-compiled .pyc files are not usable.
+            // Avoid creating .pyc files as tar filesystem is read-only.
+            "PYTHONDONTWRITEBYTECODE=1",
+        ])
+        .with_fs_path(|out_dir| {
+            for source_path in &paths_to_stage {
+                if !source_path.exists() {
+                    continue;
+                }
+
+                if source_path.is_file() {
+                    let dest_path = out_dir.join(source_path.strip_prefix("/").unwrap());
+                    if !dest_path.exists() {
+                        if let Some(parent) = dest_path.parent() {
+                            std::fs::create_dir_all(parent).unwrap();
+                        }
+                        std::fs::copy(source_path, dest_path).unwrap();
+                    }
+                    continue;
+                }
+
+                if source_path.is_dir() {
+                    let python_lib_dst = out_dir.join(source_path.strip_prefix("/").unwrap());
+                    if !python_lib_dst.exists() {
+                        std::fs::create_dir_all(&python_lib_dst).unwrap();
+                        println!(
+                            "Copying python3 lib from {} to {}",
+                            source_path.display(),
+                            python_lib_dst.display()
+                        );
+                        let output = std::process::Command::new("cp")
+                            .args([
+                                "-rpL", // -r for recursive, -p to preserve attributes, -L to dereference symbolic links
+                                source_path.to_str().unwrap(),
+                                python_lib_dst.parent().unwrap().to_str().unwrap(),
+                            ])
+                            .output()
+                            .expect("Failed to copy python3 lib");
+                        // cp -rpL may report errors for broken symlinks (e.g.,
+                        // dangling man-page symlinks under /usr/share/npm) but
+                        // still copies the remaining files successfully. Log any
+                        // errors as warnings instead of failing the test.
+                        if !output.status.success() {
+                            let stderr =
+                                std::str::from_utf8(output.stderr.as_slice()).unwrap_or("");
+                            eprintln!("Warning: cp finished with errors (non-critical):\n{stderr}");
+                        }
+                    }
+
+                    // Rewrite shared objects (.so, .so.1, .so.1.2.3, etc.) under the python lib directory.
+                    for entry in walkdir::WalkDir::new(source_path)
+                        .into_iter()
+                        .filter_map(std::result::Result::ok)
+                        .filter(|e| e.file_type().is_file())
+                        .filter(|e| {
+                            e.path()
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .is_some_and(|name| name.contains(".so"))
+                        })
+                        // Skip non-ELF files (e.g., linker scripts like libcurses.so)
+                        .filter(|e| {
+                            let mut magic = [0u8; 4];
+                            std::fs::File::open(e.path())
+                                .and_then(|mut f| {
+                                    use std::io::Read;
+                                    f.read_exact(&mut magic)
+                                })
+                                .is_ok()
+                                && magic == *b"\x7fELF"
+                        })
+                    {
+                        let so_file = entry.path();
+                        let so_file_dest = out_dir.join(so_file.strip_prefix("/").unwrap());
+                        println!(
+                            "Rewrite {} to {}",
+                            so_file.display(),
+                            so_file_dest.display()
+                        );
+                        let success = common::rewrite_with_cache(so_file, &so_file_dest, &[]);
+                        assert!(success, "failed to rewrite {} file", so_file.display());
+                    }
+                }
+            }
+        });
+    runner
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn test_runner_with_python() {
+    const HELLO_WORLD_PY: &str = "print(\"Hello, World from litebox!\")";
+    python_runner("python_rewriter")
+        .args(["-c", HELLO_WORLD_PY])
+        .run();
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn test_runner_with_python_repl_pty() {
+    let mut runner = python_runner("python_repl_pty_rewriter");
+    let mut pty = common::pty::Pty::open();
+    let (stdin, stdout, stderr) = pty.slave_stdio();
+    let mut child = runner.spawn_with_stdio(stdin, stdout, stderr);
+    pty.close_slave();
+
+    let mut output = Vec::new();
+    pty.wait_for_output(&mut output, b">>> ");
+    pty.write_all(b"print(\"hi\")\nexit()\n");
+    let status = pty.wait_for_child_exit(&mut child, &mut output);
+    assert!(
+        status.success(),
+        "Python exited with {status}; output:\n{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let output = String::from_utf8_lossy(&output).replace("\r\n", "\n");
+    assert!(
+        output.lines().any(|line| line.trim() == "hi"),
+        "Python REPL did not print a standalone hi line; output:\n{output}"
+    );
+}
+
+#[test]
+fn test_tun_with_tcp_socket() {
+    let tcp_server_path = PathBuf::from("./tests/net/tcp_server.c");
+    let tcp_client_path = PathBuf::from("./tests/net/tcp_client.c");
+    let unique_name = "tcp_server_exec_rewriter";
+    let server_target =
+        common::compile(tcp_server_path.to_str().unwrap(), unique_name, true, false);
+    let client_target = common::compile(
+        tcp_client_path.to_str().unwrap(),
+        "tcp_client",
+        false,
+        false,
+    );
+
+    let child = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(2)); // wait for server to start
+        std::process::Command::new(client_target.to_str().unwrap())
+            .arg("10.0.0.2")
+            .arg("12345")
+            .status()
+            .expect("failed to execute client");
+    });
+    Runner::new(&server_target, unique_name)
+        .arg("10.0.0.2")
+        .arg("12345")
+        .tun_device_name("tun99")
+        .run();
+    child.join().unwrap();
+}
+
+/// Test network performance with iperf3
+///
+/// To run it with release build and see output, use:
+/// ```
+/// cargo test --package litebox_runner_linux_userland --test run --release -- test_tun_and_runner_with_iperf3 --exact --nocapture
+/// ```
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_tun_and_runner_with_iperf3() {
+    const NUM_CLIENTS: usize = 1;
+    let iperf3_path = run_which("iperf3");
+    let cloned_path = iperf3_path.clone();
+    let has_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let has_started_clone = has_started.clone();
+    std::thread::spawn(move || {
+        // Rewrite iperf3 and its dependencies may take some time, wait until it's done.
+        while !has_started_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        std::println!("Connecting iperf3 client...");
+        // Retry with a short connect-timeout instead of a fixed sleep, so we
+        // start the transfer as soon as the server is actually listening.
+        let mut connected = false;
+        for attempt in 1..=50 {
+            let status = std::process::Command::new(&cloned_path)
+                .args([
+                    "-c",
+                    "10.0.0.2",
+                    "-P",
+                    NUM_CLIENTS.to_string().leak(),
+                    "--connect-timeout",
+                    "50",
+                    "--time",
+                    "1",
+                ])
+                .status()
+                .expect("Failed to start iperf3 client");
+            if status.success() {
+                connected = true;
+                break;
+            }
+            std::eprintln!("iperf3 client attempt {attempt} failed, retrying");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            connected,
+            "iperf3 client failed to connect after 50 attempts"
+        );
+    });
+    let mut runner = Runner::new(&iperf3_path, "iperf3_server_rewriter");
+    runner
+        .args([
+            "-s", // run in server mode
+            "-1", // handle one client then exit
+            "-B", "10.0.0.2", // bind to this address
+        ])
+        .tun_device_name("tun99");
+    has_started.store(true, std::sync::atomic::Ordering::Relaxed);
+    runner.run();
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_tun_with_curl() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    const RESPONSE_BODY: &str = "#!/bin/bash\necho 'Hello from litebox!'\n";
+
+    // Bind to an OS-assigned port on all interfaces.
+    let listener = TcpListener::bind("0.0.0.0:0").expect("Failed to bind HTTP server");
+    let port = listener.local_addr().unwrap().port();
+
+    let server_thread = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("Failed to accept connection");
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).expect("Failed to read request");
+        let request = String::from_utf8_lossy(&buf[..n]);
+        println!("Received HTTP request:\n{request}");
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            RESPONSE_BODY.len(),
+            RESPONSE_BODY
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("Failed to send response");
+    });
+
+    let curl_path = run_which("curl");
+    let url = format!("http://10.0.0.1:{port}/something");
+    let output = Runner::new(&curl_path, "curl_rewriter")
+        .args(["-sS", &url])
+        .tun_device_name("tun99")
+        .output();
+
+    server_thread.join().expect("Server thread panicked");
+
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(output_str.contains(RESPONSE_BODY), "Unexpected curl output");
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_shebang() {
+    let bash_path = run_which("bash");
+
+    let output = Runner::new(&bash_path, "shebang_rewriter")
+        .with_fs_path(|out_dir| {
+            // Create a shebang script pointing to the staged bash.
+            std::fs::write(
+                out_dir.join("out/script.sh"),
+                format!("#!{}\necho shebang_test_passed\n", bash_path.display()),
+            )
+            .unwrap();
+        })
+        .guest_program_path("/out/script.sh")
+        .output();
+
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("shebang_test_passed"),
+        "shebang test failed, output: {output_str}"
+    );
+}
