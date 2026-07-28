@@ -285,6 +285,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 thread: syscalls::process::ThreadState::new_process(
                     pid,
                     PageManager::new(&self.0.litebox),
+                    false,
                 ),
                 wait_state: wait::WaitState::new(self.0.platform),
                 pid,
@@ -1294,6 +1295,7 @@ mod test_utils {
                 thread: syscalls::process::ThreadState::new_process(
                     pid,
                     PageManager::new(&self.litebox),
+                    false,
                 ),
                 pid,
                 ppid: 0,

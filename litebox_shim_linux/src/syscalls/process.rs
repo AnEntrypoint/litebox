@@ -54,11 +54,12 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
     pub fn new_process(
         pid: i32,
         pm: litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
+        vforked: bool,
     ) -> Self {
         let remote = Arc::new(ThreadRemote::new());
         Self {
             init_state: Cell::new(ThreadInitState::None),
-            process: Arc::new(Process::new(pid, remote.clone(), pm)),
+            process: Arc::new(Process::new(pid, remote.clone(), pm, vforked)),
             remote,
             attached_tid: Cell::new(Some(pid)),
             clear_child_tid: Cell::new(None),
@@ -138,6 +139,12 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     /// creating a new one). Consumed by `wait4`/`waitpid`. A `(pid, Process)` pair is removed
     /// once successfully waited-for (Linux does not let you wait for the same child twice).
     children: Mutex<Platform, alloc::vec::Vec<ChildEntry<Platform>>>,
+    /// `1` from process creation until this (vforked) process's initial thread either calls
+    /// `execve` successfully or exits, `0` otherwise. Only meaningful for a process created via
+    /// `vfork()`; a plain `fork()`ed process's `vfork_done` is set immediately and never blocks
+    /// anyone. `vfork()`'s POSIX contract requires the calling (parent) thread to be suspended
+    /// for exactly this window -- see `do_clone`'s use of this field.
+    vfork_done: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
 }
 
 pub(crate) struct Alarm<Platform: ShimPlatform> {
@@ -182,13 +189,23 @@ pub(crate) enum ExitStatus {
 
 impl<Platform: ShimPlatform> Process<Platform> {
     /// Creates a new process with the given initial thread and address space.
+    ///
+    /// `vforked` marks this process as created via `vfork()`: its `vfork_done` starts at `1`
+    /// (pending) and the creating parent (see `do_clone`) blocks on it until this process's
+    /// initial thread calls `execve` or exits. A plain `fork()`ed process passes `false` and its
+    /// `vfork_done` starts already-cleared, so no caller ever blocks on it.
     fn new(
         pid: i32,
         remote: Arc<ThreadRemote<Platform>>,
         pm: litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
+        vforked: bool,
     ) -> Self {
         let nr_threads = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
         nr_threads.underlying_atomic().store(1, Ordering::Relaxed);
+        let vfork_done = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
+        vfork_done
+            .underlying_atomic()
+            .store(u32::from(vforked), Ordering::Relaxed);
         Self {
             nr_threads,
             inner: Mutex::new(ProcessInner {
@@ -204,6 +221,35 @@ impl<Platform: ShimPlatform> Process<Platform> {
             }),
             pm,
             children: Mutex::new(alloc::vec::Vec::new()),
+            vfork_done,
+        }
+    }
+
+    /// Blocks the calling thread until this process's initial thread calls `execve` or exits.
+    /// Used by a `vfork()`-ing parent (see `do_clone`) to implement `vfork()`'s POSIX-mandated
+    /// parent suspension. Returns immediately (no-op) for a plain `fork()`ed process, whose
+    /// `vfork_done` starts already-cleared.
+    pub(crate) fn wait_for_vfork_done(&self) {
+        loop {
+            let v = self.vfork_done.underlying_atomic().load(Ordering::Acquire);
+            if v == 0 {
+                break;
+            }
+            let _ = self.vfork_done.block(v);
+        }
+    }
+
+    /// Marks this (vforked) process's initial thread as having called `execve` or exited,
+    /// waking any parent blocked in [`Self::wait_for_vfork_done`]. Idempotent -- safe to call
+    /// from both the `execve` and (if `execve` never happens) `exit`/`exit_group` paths.
+    fn signal_vfork_done(&self) {
+        if self
+            .vfork_done
+            .underlying_atomic()
+            .swap(0, Ordering::Release)
+            != 0
+        {
+            self.vfork_done.wake_all();
         }
     }
 
@@ -269,6 +315,10 @@ impl<Platform: ShimPlatform> Process<Platform> {
                 assert!(inner.threads.is_empty());
                 // The last thread exited. Prevent new threads.
                 inner.group_exit = true;
+                // Cover the case of a vfork()'d process exiting without ever calling execve --
+                // otherwise a parent blocked in `wait_for_vfork_done` would hang forever. A
+                // no-op if `signal_vfork_done` already ran from a successful `execve`.
+                self.signal_vfork_done();
             }
 
             // Notify waiters if this is the last thread of the process
@@ -844,7 +894,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     litebox_util_log::error!(err:% = err; "failed to duplicate address space for fork()");
                     Errno::ENOMEM
                 })?;
-            let thread = crate::syscalls::process::ThreadState::new_process(child_tid, dest_pm);
+            let vforked = flags.contains(CloneFlags::VFORK);
+            let thread =
+                crate::syscalls::process::ThreadState::new_process(child_tid, dest_pm, vforked);
 
             // The captured ctx's rsp/rbp point into the PARENT's address space; the child's
             // stack (and everything else) generally lives at a different host address (see
@@ -912,6 +964,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         thread.init_state.set(init_state);
         thread.clear_child_tid.set(clear_child_tid);
 
+        // Captured before `thread` moves into the spawned `Task` below -- only actually blocked
+        // on when this is a `vfork()`'d process (see `Process::wait_for_vfork_done`'s doc
+        // comment); `None` for a thread-clone or a plain `fork()`.
+        let vfork_child_process =
+            (is_process_clone && flags.contains(CloneFlags::VFORK)).then(|| thread.process.clone());
+
         let r = unsafe {
             self.global.platform.spawn_thread(
                 ctx,
@@ -938,6 +996,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // for conditions the user can control (such as "in-shim" rlimit
             // violations).
             return Err(Errno::ENOMEM);
+        }
+
+        // `vfork()`'s POSIX contract: the calling thread is suspended until the child calls
+        // `execve` or exits. Block AFTER the child's host thread has been successfully spawned
+        // (so the child is guaranteed to make progress -- there is no deadlock risk here, unlike
+        // blocking while still holding any lock the child might need).
+        if let Some(vfork_child_process) = vfork_child_process {
+            vfork_child_process.wait_for_vfork_done();
         }
 
         Ok(usize::try_from(child_tid).unwrap())
@@ -1776,6 +1842,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         self.load_program(loader, argv_vec, envp_vec)
             .expect("TODO: terminate the process cleanly");
+
+        // If this process was created via `vfork()`, this is the point its POSIX-mandated
+        // parent suspension ends (see `Process::wait_for_vfork_done`'s doc comment). A no-op for
+        // a plain `fork()`ed or never-vforked process.
+        self.process().signal_vfork_done();
 
         self.init_thread_context(ctx);
         Ok(0)
