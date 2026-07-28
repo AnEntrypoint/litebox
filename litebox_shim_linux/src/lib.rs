@@ -1220,17 +1220,6 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     platform: &'static Platform,
     /// The LiteBox instance used throughout the shim.
     litebox: litebox::LiteBox<Platform>,
-    /// The shim's very first (bootstrap) process, set once by the first `load_program` call.
-    /// Every process now owns its own [`litebox::mm::PageManager`] (see
-    /// [`syscalls::process::Process::pm`]) since real `fork()` gives each process an
-    /// independent address space -- this field exists ONLY so callers with no `Task` in scope
-    /// yet (e.g. `litebox_runner_snp`'s page-fault handler, which can fire while the initial
-    /// program is still being loaded, before any `Task`/`Process` handle is available to it)
-    /// have a way to reach a `PageManager` at all. It is never updated after the first
-    /// `load_program` call, so on a target that calls `load_program` more than once (or whose
-    /// initial process later `fork()`s) it does NOT track "the current process" -- it is
-    /// intentionally only correct for single-process kernel targets like SNP.
-    bootstrap_process: once_cell::race::OnceBox<Arc<syscalls::process::Process<Platform>>>,
     /// The futex manager for handling futex operations.
     futex_manager: FutexManager<Platform>,
     /// The anonymous pipe implementation.
@@ -1246,6 +1235,16 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<Platform, FS>>,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.
     elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
+    /// The first process created by [`LinuxShim::load_program`], set once and kept for the
+    /// lifetime of the shim.
+    ///
+    /// Since real `fork()` (see [`syscalls::process::Process`]) gives each process its own
+    /// [`litebox::mm::PageManager`], there is no longer a single shim-wide page manager -- code
+    /// with a [`Task`]/[`syscalls::process::Process`] in scope reaches its own via
+    /// `task.process().pm`. This field exists solely for the narrow single-process callers (e.g.
+    /// `litebox_runner_snp`'s kernel-context page-fault handler) that have no `Task` in scope and
+    /// only ever run a single bootstrap process, exposed via [`LinuxShim::page_manager`].
+    bootstrap_process: once_cell::race::OnceBox<Arc<syscalls::process::Process<Platform>>>,
 }
 
 struct Task<Platform: ShimPlatform, FS: ShimFS> {

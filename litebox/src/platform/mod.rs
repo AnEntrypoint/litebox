@@ -103,7 +103,13 @@ pub enum TimerCreationError {
 /// Timer support for proactive signal delivery.
 pub trait TimerProvider {
     /// The timer handle type.
-    type TimerHandle: TimerHandle;
+    ///
+    /// `Send + Sync` because a timer handle is stored inside a shared, cross-thread `Mutex`
+    /// (e.g. `litebox_shim_linux`'s per-process alarm timer) -- a timer handle is fundamentally
+    /// just an opaque OS-level identifier (e.g. a `timer_t`) with no thread-affinity, so this is
+    /// not an additional runtime requirement on real implementations, only a bound the compiler
+    /// needs stated explicitly on the trait to allow generic code to rely on it.
+    type TimerHandle: TimerHandle + Send + Sync;
     /// The signal type delivered by timers.
     type Signal;
 
