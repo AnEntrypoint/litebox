@@ -66,9 +66,31 @@ jobs:
           path: alpine-rootfs.tar
           if-no-files-found: error
 
+  smoke_test:
+    name: Smoke test runner exe against rootfs
+    needs: [build_windows_runner, build_alpine_rootfs]
+    runs-on: windows-latest
+    steps:
+      - name: Download runner exe
+        uses: actions/download-artifact@v6
+        with:
+          name: windows-runner-exe
+          path: smoke
+      - name: Download rootfs tar
+        uses: actions/download-artifact@v6
+        with:
+          name: alpine-rootfs-tar
+          path: smoke
+      - name: Run /bin/true against the rootfs
+        working-directory: smoke
+        run: .\litebox_runner_linux_on_windows_userland.exe --initial-files alpine-rootfs.tar /bin/true
+      - name: Run busybox echo against the rootfs
+        working-directory: smoke
+        run: .\litebox_runner_linux_on_windows_userland.exe --initial-files alpine-rootfs.tar /bin/busybox echo smoke-test-ok
+
   bundle:
     name: Bundle release zip
-    needs: [build_windows_runner, build_alpine_rootfs]
+    needs: [build_windows_runner, build_alpine_rootfs, smoke_test]
     runs-on: ubuntu-latest
     steps:
       - name: Check out repo

@@ -1905,7 +1905,7 @@ impl litebox::platform::StdioProvider for WindowsUserland {
 }
 
 #[global_allocator]
-static SLAB_ALLOC: litebox::mm::allocator::SafeZoneAllocator<'static, 28, WindowsUserland> =
+static SLAB_ALLOC: litebox::mm::allocator::SafeZoneAllocator<'static, 34, WindowsUserland> =
     litebox::mm::allocator::SafeZoneAllocator::new();
 
 impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
@@ -1933,8 +1933,15 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
         }
     }
 
-    unsafe fn free(_addr: usize) {
-        unimplemented!("Memory deallocation is not implemented for Windows yet.");
+    unsafe fn free(addr: usize) {
+        // `addr` is guaranteed by the `MemoryProvider` contract to be a base address
+        // previously returned by `alloc`, i.e. the base of a whole `VirtualAlloc2`
+        // RESERVE|COMMIT region. `MEM_RELEASE` requires exactly that: the original
+        // base address and a size of 0 (it always releases the entire region).
+        let ok = unsafe { VirtualFree(addr as *mut c_void, 0, Win32_Memory::MEM_RELEASE) } != 0;
+        assert!(ok, "VirtualFree(RELEASE) failed: {}", unsafe {
+            GetLastError()
+        });
     }
 }
 

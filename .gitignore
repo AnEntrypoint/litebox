@@ -197,3 +197,10 @@ dev_bench/unixbench/*.zip
 ### Direnv ###
 .direnv
 .envrc
+
+### Local tooling state ###
+.gm/
+.agentplug-kv/
+
+### Test-generated artifacts ###
+litebox_runner_linux_on_windows_userland/tests/test-bins/*.hooked
