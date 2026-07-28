@@ -90,7 +90,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Clone for FilesState<Platform, FS> {
     fn clone(&self) -> Self {
         Self {
             fs: self.fs.clone(),
-            raw_descriptor_store: litebox::sync::RwLock::new(self.raw_descriptor_store.read().clone()),
+            raw_descriptor_store: litebox::sync::RwLock::new(
+                self.raw_descriptor_store.read().clone(),
+            ),
             max_fd: AtomicUsize::new(self.max_fd.load(Ordering::Relaxed)),
         }
     }

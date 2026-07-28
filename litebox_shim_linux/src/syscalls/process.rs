@@ -655,7 +655,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// addresses -- see [`litebox::mm::linux::Vmem::duplicate`]'s doc comment on the resulting
     /// address-relocation limitation), its own thread group, and its own fd table (an
     /// independent copy sharing the same underlying open file descriptions).
-    #[expect(clippy::similar_names, reason = "pid/ppid is standard Unix terminology")]
+    #[expect(
+        clippy::similar_names,
+        reason = "pid/ppid is standard Unix terminology"
+    )]
     fn do_clone(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -832,7 +835,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // values before this context is ever resumed on a brand-new thread -- see
                 // PtRegs::sanitize_for_user_return's doc comment.
                 let sanitized = child_ctx.sanitize_for_user_return();
-                debug_assert!(sanitized, "forked child's rip/rsp left the user address range");
+                debug_assert!(
+                    sanitized,
+                    "forked child's rip/rsp left the user address range"
+                );
             }
 
             // Register the new process as a child of the caller's process so a later

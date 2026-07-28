@@ -100,8 +100,7 @@ where
         litebox: &LiteBox<Platform>,
     ) -> Result<(Self, AddressRelocations), VmemDuplicateError> {
         let source_vmem = self.vmem.read();
-        let source_ranges: Vec<Range<usize>> =
-            source_vmem.iter().map(|(r, _)| r.clone()).collect();
+        let source_ranges: Vec<Range<usize>> = source_vmem.iter().map(|(r, _)| r.clone()).collect();
         let mut dest_vmem =
             linux::Vmem::new_excluding(litebox.x.platform, source_ranges.into_iter());
         let relocations = unsafe { source_vmem.duplicate(&mut dest_vmem) }?;

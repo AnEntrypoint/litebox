@@ -651,8 +651,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 return Err(VmemDuplicateError::SharedMappingUnsupported);
             }
 
-            let page_range =
-                PageRange::<ALIGN>::new(range.start, range.end).ok_or(VmemDuplicateError::UnAligned)?;
+            let page_range = PageRange::<ALIGN>::new(range.start, range.end)
+                .ok_or(VmemDuplicateError::UnAligned)?;
             let (_, length) = page_range.start_and_length();
 
             if vma.flags.intersection(VmFlags::VM_ACCESS_FLAGS).is_empty() {
