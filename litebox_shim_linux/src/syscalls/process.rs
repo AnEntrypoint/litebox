@@ -652,7 +652,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// space, thread group, signal handlers, and fd table with the caller). Process-style clone
     /// (real `fork()`/`vfork()`) requires NONE of VM/THREAD/SIGHAND/FILES set: the child gets
     /// its own address space (an eager duplicate of the caller's, at possibly-different host
-    /// addresses -- see [`litebox::mm::linux::Vmem::duplicate`]'s doc comment on the resulting
+    /// addresses -- see [`litebox::mm::PageManager::duplicate`]'s doc comment on the resulting
     /// address-relocation limitation), its own thread group, and its own fd table (an
     /// independent copy sharing the same underlying open file descriptions).
     #[expect(

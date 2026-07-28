@@ -1164,7 +1164,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     }
 }
 
-/// Error for [`Vmem::duplicate`]
+/// Error for `Vmem::duplicate` (see [`crate::mm::PageManager::duplicate`], its public wrapper)
 #[derive(Error, Debug)]
 pub enum VmemDuplicateError {
     #[error("arg is not aligned")]

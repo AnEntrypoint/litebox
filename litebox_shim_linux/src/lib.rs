@@ -337,9 +337,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
     /// Panics if `load_program` has not been called yet.
     ///
     /// Only meaningful on single-process targets (e.g. `litebox_runner_snp`'s kernel-context
-    /// page-fault handler, which has no `Task` in scope): see
-    /// [`GlobalState::bootstrap_process`]'s doc comment for why this does not generalize to
-    /// targets with multiple processes (real `fork()`).
+    /// page-fault handler, which has no `Task` in scope): does not generalize to targets with
+    /// multiple processes (real `fork()`), which each have their own independent page manager
+    /// reachable only via a `Task`.
     pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
         &self
             .0

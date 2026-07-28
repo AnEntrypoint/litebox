@@ -79,17 +79,17 @@ where
     /// `PageManager` (or through `self`) after this call do not affect the other.
     ///
     /// Also returns a [`AddressRelocations`], since the destination generally CANNOT be given
-    /// the same addresses as the source (see [`linux::Vmem::duplicate`]'s doc comment) -- the
-    /// caller MUST use it to translate any address captured from the source's address space
-    /// (most importantly, CPU register state like `rsp`/`rbp` that will be resumed in the new
-    /// process) into the corresponding destination address before using it, or the child will
-    /// resume with dangling pointers into memory it does not own.
+    /// the same addresses as the source (the platform may already have the source's addresses
+    /// committed for its own use, e.g. on Windows) -- the caller MUST use it to translate any
+    /// address captured from the source's address space (most importantly, CPU register state
+    /// like `rsp`/`rbp` that will be resumed in the new process) into the corresponding
+    /// destination address before using it, or the child will resume with dangling pointers into
+    /// memory it does not own.
     ///
     /// # Errors
     ///
     /// Returns [`VmemDuplicateError`] if any tracked mapping cannot be duplicated -- in
-    /// particular, a `VM_SHARED` mapping currently always fails this way (see
-    /// [`linux::Vmem::duplicate`]).
+    /// particular, a `VM_SHARED` mapping currently always fails this way.
     ///
     /// # Safety
     ///
