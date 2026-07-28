@@ -1,0 +1,104 @@
+name: Release Windows Alpine Bundle
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build_windows_runner:
+    name: Build Windows runner
+    runs-on: windows-latest
+    env:
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v6
+      - name: Set up Rust
+        run: |
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --target x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-windows-runner
+      - name: Build litebox_runner_linux_on_windows_userland (release)
+        run: cargo build --locked --release -p litebox_runner_linux_on_windows_userland
+      - name: Upload runner exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-runner-exe
+          path: target/release/litebox_runner_linux_on_windows_userland.exe
+          if-no-files-found: error
+
+  build_alpine_rootfs:
+    name: Build Alpine rootfs tar
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v6
+      - name: Set up Rust
+        run: |
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --target x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-litebox-packager
+      - name: Build litebox_packager (release)
+        run: cargo build --locked --release -p litebox_packager
+      - name: Package Alpine (BusyBox) rootfs
+        run: |
+          ./target/release/litebox_packager --oci-image docker.io/library/alpine:latest -o alpine-rootfs.tar --verbose
+      - name: Upload rootfs tar
+        uses: actions/upload-artifact@v4
+        with:
+          name: alpine-rootfs-tar
+          path: alpine-rootfs.tar
+          if-no-files-found: error
+
+  bundle:
+    name: Bundle release zip
+    needs: [build_windows_runner, build_alpine_rootfs]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v6
+      - name: Download runner exe
+        uses: actions/download-artifact@v6
+        with:
+          name: windows-runner-exe
+          path: bundle
+      - name: Download rootfs tar
+        uses: actions/download-artifact@v6
+        with:
+          name: alpine-rootfs-tar
+          path: bundle
+      - name: Assemble bundle
+        run: |
+          cp dist_tools/run-alpine.cmd dist_tools/run-alpine.ps1 dist_tools/README.md bundle/
+          cd bundle
+          zip -r ../litebox-windows-alpine.zip .
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: litebox-windows-alpine
+          path: litebox-windows-alpine.zip
+          if-no-files-found: error
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: litebox-windows-alpine.zip
+          generate_release_notes: true
