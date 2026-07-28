@@ -2020,6 +2020,12 @@ pub enum SyscallRequest {
         sigsetsize: usize,
     },
     RtSigreturn,
+    Wait4 {
+        pid: i32,
+        wstatus: Option<UserPtrMut<i32>>,
+        options: i32,
+        rusage: Option<UserPtrMut<u8>>,
+    },
     Kill {
         pid: i32,
         sig: i32,
@@ -2549,6 +2555,12 @@ impl SyscallRequest {
                 sigsetsize,
             }),
             Sysno::rt_sigreturn => SyscallRequest::RtSigreturn,
+            Sysno::wait4 => sys_req!(Wait4 {
+                pid,
+                wstatus:*,
+                options,
+                rusage:*
+            }),
             Sysno::kill => sys_req!(Kill { pid, sig }),
             Sysno::tkill => sys_req!(Tkill { tid, sig }),
             Sysno::tgkill => sys_req!(Tgkill { tgid, tid, sig }),
@@ -2882,6 +2894,46 @@ impl SyscallRequest {
                     tls: ctx.sys_req_arg(if cfg!(target_arch = "x86_64") { 4 } else { 3 }),
                     pidfd: ctx.sys_req_arg(2), // aliases parent_tid
                     exit_signal: ctx.syscall_arg(0) as u64 & 0xff,
+                    stack_size: 0,
+                    set_tid: 0,
+                    set_tid_size: 0,
+                    cgroup: 0,
+                };
+                SyscallRequest::Clone { args }
+            }
+            Sysno::fork => {
+                // `fork()` takes no arguments; it is equivalent to
+                // `clone(SIGCHLD, 0, NULL, NULL, 0)` -- no flags set (separate address space,
+                // separate everything), exit_signal = SIGCHLD (17), stack = 0 (child gets a
+                // duplicate of the parent's own stack, not a caller-supplied one).
+                const SIGCHLD: u64 = 17;
+                let args = CloneArgs {
+                    flags: CloneFlags::empty(),
+                    stack: 0,
+                    parent_tid: 0,
+                    child_tid: 0,
+                    tls: 0,
+                    pidfd: 0,
+                    exit_signal: SIGCHLD,
+                    stack_size: 0,
+                    set_tid: 0,
+                    set_tid_size: 0,
+                    cgroup: 0,
+                };
+                SyscallRequest::Clone { args }
+            }
+            Sysno::vfork => {
+                // `vfork()` takes no arguments; equivalent to
+                // `clone(CLONE_VM | CLONE_VFORK | SIGCHLD, 0)`.
+                const SIGCHLD: u64 = 17;
+                let args = CloneArgs {
+                    flags: CloneFlags::VFORK,
+                    stack: 0,
+                    parent_tid: 0,
+                    child_tid: 0,
+                    tls: 0,
+                    pidfd: 0,
+                    exit_signal: SIGCHLD,
                     stack_size: 0,
                     set_tid: 0,
                     set_tid_size: 0,

@@ -279,7 +279,7 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfLoader<'a, Platform, FS> {
             None
         };
 
-        global.pm.set_initial_brk(info.brk);
+        self.main.file.task.process().pm.set_initial_brk(info.brk);
         aux.insert(AuxKey::AT_PAGESZ, PAGE_SIZE);
         aux.insert(AuxKey::AT_PHDR, info.phdrs_addr);
         aux.insert(AuxKey::AT_PHENT, info.phent_size());
@@ -295,7 +295,10 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfLoader<'a, Platform, FS> {
         let sp = unsafe {
             let length = litebox::mm::linux::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
                 .expect("DEFAULT_STACK_SIZE is not page-aligned");
-            global
+            self.main
+                .file
+                .task
+                .process()
                 .pm
                 .create_stack_pages(None, length, CreatePagesFlags::empty())
                 .map_err(ElfLoaderError::MappingError)?

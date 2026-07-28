@@ -82,6 +82,20 @@ pub(crate) struct FilesState<Platform: ShimPlatform, FS: ShimFS> {
     max_fd: AtomicUsize,
 }
 
+impl<Platform: ShimPlatform, FS: ShimFS> Clone for FilesState<Platform, FS> {
+    /// Duplicate the fd table for `fork()`: the new table starts as an independent copy of the
+    /// current fd-number-to-descriptor mapping (each entry shares the same underlying open file
+    /// description via `Arc`, matching POSIX `fork()` semantics), while `fs` (the filesystem
+    /// backend itself) remains shared, since fork does not create a second filesystem.
+    fn clone(&self) -> Self {
+        Self {
+            fs: self.fs.clone(),
+            raw_descriptor_store: litebox::sync::RwLock::new(self.raw_descriptor_store.read().clone()),
+            max_fd: AtomicUsize::new(self.max_fd.load(Ordering::Relaxed)),
+        }
+    }
+}
+
 impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
     pub(crate) fn new(fs: alloc::sync::Arc<FS>) -> Self {
         Self {

@@ -422,6 +422,14 @@ struct TlsState {
     /// Pointer to the `Waker` currently being waited on, or null if not
     /// waiting.
     waiting_waker: std::sync::atomic::AtomicPtr<litebox::event::wait::Waker<WindowsUserland>>,
+    /// Whether this host thread has ever entered guest mode before. `switch_to_guest`'s
+    /// `rcx == rip` fast path (`switch_to_guest_sysret`) relies on genuine `sysret`-style CPU
+    /// semantics that are only valid for a thread resuming guest mode after a PRIOR entry via
+    /// the `syscall` instruction on this exact thread; a brand-new host thread's very first
+    /// transition into guest mode (e.g. a `fork()`-created child resuming into a copy of the
+    /// parent's syscall-entry context, where `rcx == rip` holds by coincidence) must always use
+    /// the slower but universally-correct `NtContinue` path instead.
+    has_entered_guest: Cell<bool>,
 }
 
 impl TlsState {
@@ -437,6 +445,7 @@ impl TlsState {
             continue_context: Box::default(),
             pending_host_signals: AtomicU32::new(0),
             waiting_waker: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            has_entered_guest: false.into(),
         }
     }
 }
@@ -758,10 +767,18 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     //
     // This is much slower, but it is only used for things like signal handlers,
     // so it should not be on the critical path.
-    if ctx.rcx == ctx.rip {
+    //
+    // The fast path additionally requires this thread to have entered guest mode at least once
+    // before: `switch_to_guest_sysret` relies on genuine `sysret`-style CPU semantics that are
+    // only established by a PRIOR entry into kernel mode via the `syscall` instruction on this
+    // exact thread. A brand-new host thread's first-ever transition (e.g. a `fork()`-created
+    // child resuming into a copy of the parent's syscall-entry context, where `rcx == rip` holds
+    // only by coincidence) must always take the slower `NtContinue` path instead.
+    if ctx.rcx == ctx.rip && tls.has_entered_guest.get() {
         tls.is_in_guest.set(true);
         switch_to_guest_sysret(ctx)
     } else {
+        tls.has_entered_guest.set(true);
         switch_to_guest_ntcontinue(tls, ctx)
     }
 }

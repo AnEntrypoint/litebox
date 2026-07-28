@@ -570,11 +570,13 @@ pub(crate) enum CloseResult<Subsystem: FdEnabledSubsystem> {
 /// integers, with a reasonable amount of safety---this will not be able to check for "ABA" style
 /// issues, but will at least prevent using a descriptor for an unintended subsystem at the point of
 /// conversion.
+#[derive(Clone)]
 pub struct RawDescriptorStorage {
     /// Stored FDs are used to provide raw integer values in a safer way.
     stored_fds: Vec<Option<StoredFd>>,
 }
 
+#[derive(Clone)]
 struct StoredFd {
     x: Arc<OwnedFd>,
     subsystem_entry_type_id: core::any::TypeId,

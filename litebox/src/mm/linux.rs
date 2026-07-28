@@ -13,6 +13,7 @@ use thiserror::Error;
 
 use crate::platform::PageManagementProvider;
 use crate::platform::RawConstPointer;
+use crate::platform::RawMutPointer;
 use crate::platform::page_mgmt::AllocationError;
 use crate::platform::page_mgmt::FixedAddressBehavior;
 use crate::platform::page_mgmt::MemoryRegionPermissions;
@@ -311,6 +312,25 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
 
     /// Create a new [`Vmem`] instance with the given memory [backend](PageManagementProvider).
     pub(super) fn new(platform: &'static Platform) -> Self {
+        Self::new_excluding(platform, core::iter::empty())
+    }
+
+    /// Create a new [`Vmem`] instance, treating any of the platform's reported
+    /// [`PageManagementProvider::reserved_pages`] that overlap a range in `excluded` as NOT
+    /// reserved.
+    ///
+    /// This exists for `fork()` (see [`Self::duplicate`]): since the platform backend reports
+    /// `reserved_pages()` as a snapshot of the whole host process's committed/reserved memory
+    /// (there being only one host process backing every guest "process" in this architecture),
+    /// a plain [`Self::new`] for a to-be-forked-into child `Vmem` would incorrectly treat the
+    /// PARENT's own already-committed guest memory as pre-reserved host state -- even though the
+    /// child is meant to claim those exact same addresses as its own independent copy. Passing
+    /// the parent's currently-tracked guest ranges as `excluded` here lets the child `Vmem`
+    /// legitimately allocate over them.
+    pub(super) fn new_excluding(
+        platform: &'static Platform,
+        excluded: impl Iterator<Item = Range<usize>> + Clone,
+    ) -> Self {
         let mut vmem = Self {
             vmas: RangeMap::new(),
             brk: 0,
@@ -321,13 +341,43 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 each.start % ALIGN == 0 && each.end % ALIGN == 0,
                 "Vmem: reserved range is not aligned to {ALIGN} bytes"
             );
-            vmem.vmas.insert(
-                each.start..each.end,
-                VmArea {
-                    flags: VmFlags::empty(),
-                    is_file_backed: false,
-                },
-            );
+            // Subtract every excluded range from `each`, inserting whatever (possibly
+            // discontiguous) pieces remain as still-reserved.
+            let mut pieces = alloc::vec![each.clone()];
+            for excl in excluded.clone() {
+                pieces = pieces
+                    .into_iter()
+                    .flat_map(|p| {
+                        let mut out = Vec::new();
+                        let overlap_start = p.start.max(excl.start);
+                        let overlap_end = p.end.min(excl.end);
+                        if overlap_start >= overlap_end {
+                            // No overlap with this exclusion.
+                            out.push(p);
+                        } else {
+                            if p.start < overlap_start {
+                                out.push(p.start..overlap_start);
+                            }
+                            if overlap_end < p.end {
+                                out.push(overlap_end..p.end);
+                            }
+                        }
+                        out
+                    })
+                    .collect();
+            }
+            for piece in pieces {
+                if piece.start >= piece.end {
+                    continue;
+                }
+                vmem.vmas.insert(
+                    piece,
+                    VmArea {
+                        flags: VmFlags::empty(),
+                        is_file_backed: false,
+                    },
+                );
+            }
         }
         vmem
     }
@@ -521,6 +571,170 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         debug_assert!(new_start >= Platform::TASK_ADDR_MIN);
         debug_assert!(new_end <= Platform::TASK_ADDR_MAX);
         Ok(ret)
+    }
+
+    /// Duplicate every guest-tracked mapping (i.e. everything `insert_mapping` has recorded
+    /// since construction, excluding the platform's host-reserved ranges pre-populated by
+    /// [`Self::new`]) into `dest`, eagerly copying the contents of each region.
+    ///
+    /// This is the `fork()` address-space duplication primitive: `dest` must be a freshly
+    /// constructed, otherwise-empty [`Vmem`] for the same `Platform`. On success `dest` has an
+    /// independent copy of every byte currently readable in `self`; subsequent writes to either
+    /// address space do not affect the other.
+    ///
+    /// `VM_SHARED` mappings are not yet supported by this function and cause it to return
+    /// [`VmemDuplicateError::SharedMappingUnsupported`] rather than silently duplicating (and
+    /// thereby breaking the cross-process visibility) a shared mapping.
+    ///
+    /// # Known deviation from real `fork()`: addresses are NOT preserved
+    ///
+    /// Real Linux `fork()` gives the child a separate address space with the SAME virtual
+    /// addresses as the parent (via separate page tables), so any pointer valid in the parent
+    /// remains valid, unchanged, in the child. On a platform backend with only one real host
+    /// address space for the whole litebox process (true of `litebox_platform_windows_userland`:
+    /// there is no Windows primitive to give two logical "processes" the same VirtualAlloc2
+    /// addresses while both remain live in the same host process), that guarantee cannot be
+    /// upheld -- the host OS will refuse a second `VirtualAlloc2` at an address the parent
+    /// already committed. This function therefore lets the platform pick a fresh address for
+    /// each duplicated region ([`FixedAddressBehavior::Hint`]), meaning **any raw pointer value
+    /// stored in the copied memory that pointed into the OLD address space will be a dangling /
+    /// wrong address in the child**. This does not affect the dominant real-world usage pattern
+    /// (`fork()` immediately followed by `execve()`, e.g. every external command a shell runs),
+    /// since `execve()` discards the entire address space and loads a fresh one anyway. It DOES
+    /// mean a guest program that forks and then continues running in the child without exec,
+    /// relying on pointers computed before the fork, can misbehave. This is a genuine
+    /// architectural limitation of the single-host-address-space design, not a bug to silently
+    /// paper over -- see `fork-child-address-relocation-limitation` for further context.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure no other code is concurrently mutating the memory tracked by
+    /// `self` for the duration of this call (e.g. other threads of the same process must be
+    /// stopped), since the copy reads each region's live contents non-atomically.
+    ///
+    /// Returns the list of `(source_range, dest_base_address)` relocations that were actually
+    /// applied, in the order regions were processed, so the caller can translate any pointer
+    /// (e.g. captured CPU register state like `rsp`) that referenced the source address space
+    /// into the corresponding address in `dest`.
+    pub(super) unsafe fn duplicate<DestPlatform>(
+        &self,
+        dest: &mut Vmem<DestPlatform, ALIGN>,
+    ) -> Result<Vec<(Range<usize>, usize)>, VmemDuplicateError>
+    where
+        DestPlatform: PageManagementProvider<ALIGN> + 'static,
+    {
+        let mut relocations: Vec<(Range<usize>, usize)> = Vec::new();
+        // Collect first: `insert_mapping` on `dest` only touches `dest.vmas`, but we still avoid
+        // holding a borrow of `self.vmas` across it for clarity and to allow future parallel
+        // copying without restructuring this loop.
+        //
+        // Ranges with empty flags are the platform's host-reserved placeholders inserted by
+        // `Self::new`/`Self::new_excluding` (not real guest mappings, and not necessarily even
+        // readable) -- `dest` gets its own copy of those from its own construction, so skip them
+        // here rather than trying to copy host-runtime memory that is none of the guest's
+        // business.
+        let regions: Vec<(Range<usize>, VmArea)> = self
+            .vmas
+            .iter()
+            .filter(|(_, vma)| !vma.flags.is_empty())
+            .map(|(r, vma)| (r.clone(), *vma))
+            .collect();
+
+        // Tracks the relocation of whichever source region contains `self.brk`, if any, so the
+        // destination's brk can point at the corresponding relocated address rather than a
+        // stale one. `self.brk == 0` means brk was never initialized on the source; leave
+        // `dest.brk` as `0` in that case (its own default) rather than fabricating a value.
+        let mut brk_relocation: Option<(Range<usize>, usize)> = None;
+
+        for (range, vma) in regions {
+            if vma.flags.contains(VmFlags::VM_SHARED) {
+                return Err(VmemDuplicateError::SharedMappingUnsupported);
+            }
+
+            let page_range =
+                PageRange::<ALIGN>::new(range.start, range.end).ok_or(VmemDuplicateError::UnAligned)?;
+            let (_, length) = page_range.start_and_length();
+
+            if vma.flags.intersection(VmFlags::VM_ACCESS_FLAGS).is_empty() {
+                // `PROT_NONE` region (e.g. a stack guard page): genuinely unreadable right now,
+                // by design. There is no content to copy -- just create an equivalent
+                // inaccessible mapping at the destination's (possibly relocated) address so the
+                // child's guard page is preserved.
+                let dest_ptr = unsafe {
+                    dest.insert_mapping(
+                        page_range,
+                        vma,
+                        /* populate_pages_immediately */ false,
+                        FixedAddressBehavior::Hint,
+                    )
+                }
+                .map_err(VmemDuplicateError::Allocation)?;
+                if self.brk != 0 && range.contains(&self.brk) {
+                    brk_relocation = Some((range.clone(), dest_ptr.as_usize()));
+                }
+                relocations.push((range.clone(), dest_ptr.as_usize()));
+                continue;
+            }
+
+            // Read the full source region's live bytes up front so the write side can populate
+            // the destination pages via a single `op` callback (matching how `create_pages`
+            // wants its initializer).
+            let source_ptr = Platform::RawConstPointer::<u8>::from_usize(range.start);
+            let source_bytes = source_ptr
+                .to_owned_slice(length.as_usize())
+                .ok_or(VmemDuplicateError::SourceUnreadable)?;
+
+            // Insert as READ|WRITE first regardless of the source's real permissions: a
+            // read-only source region (e.g. an ELF text/rodata segment) would otherwise reject
+            // the write below before we ever get a chance to populate it. `create_pages`
+            // elsewhere in this module solves the identical problem via its `before_perms` /
+            // `after_perms` split; do the same here by protecting down to `vma`'s real flags
+            // only after the copy succeeds.
+            let writable_vma = VmArea::new(
+                (vma.flags & !VmFlags::VM_ACCESS_FLAGS) | VmFlags::VM_READ | VmFlags::VM_WRITE,
+                vma.is_file_backed,
+            );
+            // The destination platform cannot generally be asked for the SAME address as the
+            // source (that address is already committed in the one real host address space --
+            // see this function's doc comment on the address-relocation limitation), so let the
+            // platform place this region wherever it can and use the address it actually
+            // returns (`dest_ptr`), not `page_range`, for every subsequent operation on it.
+            let dest_ptr = unsafe {
+                dest.insert_mapping(
+                    page_range,
+                    writable_vma,
+                    /* populate_pages_immediately */ true,
+                    FixedAddressBehavior::Hint,
+                )
+            }
+            .map_err(VmemDuplicateError::Allocation)?;
+            dest_ptr
+                .write_slice_at_offset(0, &source_bytes)
+                .ok_or(VmemDuplicateError::DestUnwritable)?;
+
+            if self.brk != 0 && range.contains(&self.brk) {
+                brk_relocation = Some((range.clone(), dest_ptr.as_usize()));
+            }
+            relocations.push((range.clone(), dest_ptr.as_usize()));
+
+            if vma.flags.intersection(VmFlags::VM_ACCESS_FLAGS)
+                != writable_vma.flags().intersection(VmFlags::VM_ACCESS_FLAGS)
+            {
+                let dest_range = PageRange::<ALIGN>::new(
+                    dest_ptr.as_usize(),
+                    dest_ptr.as_usize() + length.as_usize(),
+                )
+                .ok_or(VmemDuplicateError::UnAligned)?;
+                unsafe { dest.protect_mapping(dest_range, vma.flags.into()) }
+                    .map_err(|_| VmemDuplicateError::DestUnwritable)?;
+            }
+        }
+
+        dest.brk = match brk_relocation {
+            Some((source_range, dest_start)) => dest_start + (self.brk - source_range.start),
+            None => self.brk,
+        };
+        Ok(relocations)
     }
 
     /// Create a new mapping in the virtual address space.
@@ -948,6 +1162,21 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
 
         None
     }
+}
+
+/// Error for [`Vmem::duplicate`]
+#[derive(Error, Debug)]
+pub enum VmemDuplicateError {
+    #[error("arg is not aligned")]
+    UnAligned,
+    #[error("VM_SHARED mappings are not yet supported by duplicate()")]
+    SharedMappingUnsupported,
+    #[error("failed to read source mapping contents")]
+    SourceUnreadable,
+    #[error("failed to write duplicated contents into the destination mapping")]
+    DestUnwritable,
+    #[error("failed to allocate destination mapping: {0}")]
+    Allocation(#[from] AllocationError),
 }
 
 /// Error for removing mappings

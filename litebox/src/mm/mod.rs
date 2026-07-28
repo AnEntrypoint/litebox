@@ -15,7 +15,7 @@ use core::ops::Range;
 use alloc::vec::Vec;
 use linux::{
     CreatePagesFlags, MappingError, PageFaultError, PageRange, VmArea, VmFlags, Vmem,
-    VmemPageFaultHandler, VmemProtectError, VmemUnmapError,
+    VmemDuplicateError, VmemPageFaultHandler, VmemProtectError, VmemUnmapError,
 };
 
 use crate::{
@@ -36,6 +36,31 @@ where
     vmem: RwLock<Platform, Vmem<Platform, ALIGN>>,
 }
 
+/// The address relocations produced by [`PageManager::duplicate`]: maps each duplicated
+/// source-address-space range to the (possibly different) base address it landed at in the
+/// destination.
+///
+/// Used to translate any address captured from the source's address space -- most importantly
+/// CPU register state that will be resumed in the new process -- into the corresponding
+/// destination address.
+pub struct AddressRelocations(Vec<(Range<usize>, usize)>);
+
+impl AddressRelocations {
+    /// Translate `addr` (assumed to be a valid address in the source address space at the time
+    /// of duplication) into the corresponding address in the destination address space.
+    ///
+    /// Returns `None` if `addr` does not fall within any duplicated range (e.g. it is 0, or it
+    /// points into a `VM_SHARED` mapping that duplication itself would have already rejected, or
+    /// it is simply not a pointer at all and happens to not fall in any tracked range).
+    #[must_use]
+    pub fn translate(&self, addr: usize) -> Option<usize> {
+        self.0
+            .iter()
+            .find(|(source_range, _)| source_range.contains(&addr))
+            .map(|(source_range, dest_base)| dest_base + (addr - source_range.start))
+    }
+}
+
 impl<Platform, const ALIGN: usize> PageManager<Platform, ALIGN>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
@@ -44,6 +69,48 @@ where
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
         let vmem = RwLock::new(linux::Vmem::new(litebox.x.platform));
         Self { vmem }
+    }
+
+    /// Create a new `PageManager` for the same `Platform`, whose guest-tracked address space is
+    /// an eager, independent copy of `self`'s current guest-tracked address space.
+    ///
+    /// This is the `fork()` primitive: intended to be called once, at the point a child process
+    /// is created, with the parent's `PageManager`. Writes made through the returned
+    /// `PageManager` (or through `self`) after this call do not affect the other.
+    ///
+    /// Also returns a [`AddressRelocations`], since the destination generally CANNOT be given
+    /// the same addresses as the source (see [`linux::Vmem::duplicate`]'s doc comment) -- the
+    /// caller MUST use it to translate any address captured from the source's address space
+    /// (most importantly, CPU register state like `rsp`/`rbp` that will be resumed in the new
+    /// process) into the corresponding destination address before using it, or the child will
+    /// resume with dangling pointers into memory it does not own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VmemDuplicateError`] if any tracked mapping cannot be duplicated -- in
+    /// particular, a `VM_SHARED` mapping currently always fails this way (see
+    /// [`linux::Vmem::duplicate`]).
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure no other code is concurrently mutating memory tracked by `self`
+    /// for the duration of this call (e.g. other threads of the same process must be stopped).
+    pub unsafe fn duplicate(
+        &self,
+        litebox: &LiteBox<Platform>,
+    ) -> Result<(Self, AddressRelocations), VmemDuplicateError> {
+        let source_vmem = self.vmem.read();
+        let source_ranges: Vec<Range<usize>> =
+            source_vmem.iter().map(|(r, _)| r.clone()).collect();
+        let mut dest_vmem =
+            linux::Vmem::new_excluding(litebox.x.platform, source_ranges.into_iter());
+        let relocations = unsafe { source_vmem.duplicate(&mut dest_vmem) }?;
+        Ok((
+            Self {
+                vmem: RwLock::new(dest_vmem),
+            },
+            AddressRelocations(relocations),
+        ))
     }
 
     /// Create a mapping with the given flags.

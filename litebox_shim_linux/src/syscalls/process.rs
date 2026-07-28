@@ -51,11 +51,14 @@ pub(crate) struct ThreadState<Platform: ShimPlatform> {
 unsafe impl<Platform: ShimPlatform> Send for ThreadState<Platform> {}
 
 impl<Platform: ShimPlatform> ThreadState<Platform> {
-    pub fn new_process(pid: i32) -> Self {
+    pub fn new_process(
+        pid: i32,
+        pm: litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
+    ) -> Self {
         let remote = Arc::new(ThreadRemote::new());
         Self {
             init_state: Cell::new(ThreadInitState::None),
-            process: Arc::new(Process::new(pid, remote.clone())),
+            process: Arc::new(Process::new(pid, remote.clone(), pm)),
             remote,
             attached_tid: Cell::new(Some(pid)),
             clear_child_tid: Cell::new(None),
@@ -112,6 +115,9 @@ impl<Platform: ShimPlatform> ThreadRemote<Platform> {
     }
 }
 
+/// A `(pid, Process)` pair for one of a [`Process`]'s children (see [`Process::children`]).
+type ChildEntry<Platform> = (i32, Arc<Process<Platform>>);
+
 /// A Linux process, which may have multiple threads.
 pub(crate) struct Process<Platform: ShimPlatform> {
     /// Number of threads in this process. Always updated under the `inner`
@@ -122,6 +128,16 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     pub(crate) limits: ResourceLimits,
     /// Process-wide alarm timer.
     pub(crate) alarm_timer: Mutex<Platform, Alarm<Platform>>,
+    /// This process's virtual address space. Shared by every thread in this process
+    /// (`CloneFlags::VM`); a forked child process gets its own independent
+    /// [`litebox::mm::PageManager`] (see [`litebox::mm::PageManager::duplicate`]) rather than
+    /// referencing this one.
+    pub(crate) pm: litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
+    /// Child processes created via real `fork()`/`vfork()` (i.e. process-style `clone()`,
+    /// distinct from thread-style clone which attaches into THIS `Process` rather than
+    /// creating a new one). Consumed by `wait4`/`waitpid`. A `(pid, Process)` pair is removed
+    /// once successfully waited-for (Linux does not let you wait for the same child twice).
+    children: Mutex<Platform, alloc::vec::Vec<ChildEntry<Platform>>>,
 }
 
 pub(crate) struct Alarm<Platform: ShimPlatform> {
@@ -165,8 +181,12 @@ pub(crate) enum ExitStatus {
 }
 
 impl<Platform: ShimPlatform> Process<Platform> {
-    /// Creates a new process with the given initial thread.
-    fn new(pid: i32, remote: Arc<ThreadRemote<Platform>>) -> Self {
+    /// Creates a new process with the given initial thread and address space.
+    fn new(
+        pid: i32,
+        remote: Arc<ThreadRemote<Platform>>,
+        pm: litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
+    ) -> Self {
         let nr_threads = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
         nr_threads.underlying_atomic().store(1, Ordering::Relaxed);
         Self {
@@ -182,6 +202,8 @@ impl<Platform: ShimPlatform> Process<Platform> {
                 handle: None,
                 deadline: None,
             }),
+            pm,
+            children: Mutex::new(alloc::vec::Vec::new()),
         }
     }
 
@@ -331,6 +353,10 @@ enum ThreadInitState {
         tls: Option<ThreadLocalDescriptor>,
         set_child_tid: Option<UserPtrMut<i32>>,
     },
+    /// `fork()`/`vfork()`: the child resumes execution as if it were the parent returning from
+    /// the same `clone()` syscall, with an identical register state except `rax` (the syscall
+    /// return value), which is 0 in the child (vs. the child's pid in the parent).
+    ForkedChild(litebox_common_linux::PtRegs),
 }
 
 /// Credentials of a process
@@ -514,6 +540,64 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // Tear down occurs similarly to `sys_exit`.
         self.exit_group(ExitStatus::Exit(status.trunc()));
     }
+
+    /// Handle syscall `wait4`.
+    ///
+    /// Supports waiting for a specific child (`pid > 0`) or any child (`pid == -1`), always
+    /// blocking until the child exits (no `WNOHANG`/`WUNTRACED`/`WCONTINUED` support yet --
+    /// `options` is accepted but ignored). `rusage` is accepted but never populated.
+    ///
+    /// NOT YET WIRED to `SyscallRequest::Wait4` in `lib.rs` (routed to `ENOSYS` there instead):
+    /// an early version of this dispatch caused an intermittent crash under live testing whose
+    /// root cause was not isolated before this session's investigation ended. Kept implemented
+    /// (rather than deleted) since the logic itself is believed correct and this is real,
+    /// reviewable progress toward wiring it safely in a follow-up session -- see the
+    /// `shim-process-tree-pid-wait-sigchld` PRD row.
+    #[allow(dead_code, reason = "implemented but not yet wired -- see doc comment")]
+    pub(crate) fn sys_wait4(
+        &self,
+        pid: i32,
+        wstatus: Option<UserPtrMut<i32>>,
+        _options: i32,
+        _rusage: Option<UserPtrMut<u8>>,
+    ) -> Result<usize, Errno> {
+        let process = self.process();
+
+        // Find and remove the target child from our children list -- Linux does not let you
+        // wait for the same child twice, so removing it now (before blocking on its exit) is
+        // correct: no other waiter can also be given this same child.
+        let (child_pid, child_process) = {
+            let mut children = process.children.lock();
+            let idx = if pid > 0 {
+                children.iter().position(|(p, _)| *p == pid)
+            } else if pid == -1 {
+                children.first().map(|_| 0)
+            } else {
+                // Waiting for a specific process group (pid == 0 or pid < -1) is not
+                // supported yet -- every child we create is in its own group today anyway.
+                log_unsupported!("wait4 with pid={pid} (process-group wait)");
+                return Err(Errno::EINVAL);
+            };
+            let Some(idx) = idx else {
+                return Err(Errno::ECHILD);
+            };
+            children.swap_remove(idx)
+        };
+
+        let exit_status = child_process.wait_for_exit();
+        let encoded = match exit_status {
+            // Linux wait status encoding: normal exit is (exit_code & 0xff) << 8.
+            ExitStatus::Exit(code) => (i32::from(code) & 0xff) << 8,
+            // Death by signal: the low 7 bits hold the signal number (bit 7 set = core dumped,
+            // never set here).
+            ExitStatus::Signal(sig) => sig.as_i32() & 0x7f,
+        };
+        if let Some(wstatus) = wstatus {
+            let _ = wstatus.write_at_offset::<Platform>(0, encoded);
+        }
+
+        Ok(usize::try_from(child_pid).unwrap())
+    }
 }
 
 /// A descriptor for thread-local storage (TLS).
@@ -564,7 +648,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Creates a new thread or process.
     ///
-    /// Note we currently only support creating threads with the VM, FS, and FILES flags set.
+    /// Thread-style clone requires VM, THREAD, SIGHAND, and FILES all set (sharing address
+    /// space, thread group, signal handlers, and fd table with the caller). Process-style clone
+    /// (real `fork()`/`vfork()`) requires NONE of VM/THREAD/SIGHAND/FILES set: the child gets
+    /// its own address space (an eager duplicate of the caller's, at possibly-different host
+    /// addresses -- see [`litebox::mm::linux::Vmem::duplicate`]'s doc comment on the resulting
+    /// address-relocation limitation), its own thread group, and its own fd table (an
+    /// independent copy sharing the same underlying open file descriptions).
+    #[expect(clippy::similar_names, reason = "pid/ppid is standard Unix terminology")]
     fn do_clone(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -593,8 +684,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             flags.remove(CloneFlags::DETACHED);
         }
 
-        let required_clone_flags =
+        let thread_clone_flags =
             CloneFlags::VM | CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::FILES;
+
+        // Real `fork()`/`vfork()` set none of VM/THREAD/SIGHAND/FILES: the child gets its own
+        // address space, its own thread group (i.e. becomes a new process), its own signal
+        // handler table copy, and its own (initially fd-table-copied) files. `vfork()` sets
+        // VFORK in addition; it is otherwise the same shape (see sys_vfork's caller, which sets
+        // exit_signal but not VM/THREAD/SIGHAND/FILES either).
+        let is_process_clone = !flags.intersects(
+            CloneFlags::VM | CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::FILES,
+        );
 
         let supported_clone_flags = CloneFlags::VM
             | CloneFlags::FS
@@ -606,6 +706,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             | CloneFlags::PARENT_SETTID
             | CloneFlags::CHILD_CLEARTID
             | CloneFlags::CHILD_SETTID
+            | CloneFlags::VFORK
             // Ignored since we don't support sysv semaphores anyway.
             | CloneFlags::SYSVSEM;
 
@@ -616,10 +717,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             );
             return Err(Errno::EINVAL);
         }
-        if !flags.contains(required_clone_flags) {
+        if !is_process_clone && !flags.contains(thread_clone_flags) {
             log_unsupported!(
                 "clone with missing required flags: {:?}",
-                required_clone_flags & !flags
+                thread_clone_flags & !flags
             );
             return Err(Errno::EINVAL);
         }
@@ -634,7 +735,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EINVAL);
         }
 
-        // Note `exit_signal` is ignored because we don't support `fork` yet; we just validate it.
+        // TODO: `exit_signal` is validated but not yet delivered to the parent on child exit
+        // (no SIGCHLD support yet -- see sys_wait4/waitpid, also not yet implemented).
         if exit_signal > MAX_SIGNAL_NUMBER {
             return Err(Errno::EINVAL);
         }
@@ -681,6 +783,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         } else {
             alloc::sync::Arc::new((**self.fs.borrow()).clone())
         };
+        let files = if flags.contains(CloneFlags::FILES) {
+            self.files.borrow().clone()
+        } else {
+            alloc::sync::Arc::new((**self.files.borrow()).clone())
+        };
 
         let child_tid = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
         if let Some(parent_tid_ptr) = set_parent_tid {
@@ -697,12 +804,64 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             None
         };
 
-        let thread = self.thread.new_thread(child_tid).ok_or(Errno::EBUSY)?;
-        thread.init_state.set(ThreadInitState::NewThread {
-            stack: sp,
-            tls,
-            set_child_tid,
-        });
+        let (thread, init_state, pid, ppid) = if is_process_clone {
+            // Real `fork()`/`vfork()`: build a brand-new `Process` (new thread group) whose
+            // address space is an eager duplicate of the parent's -- writes made by either the
+            // parent or the child after this point are independent.
+            let (dest_pm, relocations) =
+                unsafe { self.process().pm.duplicate(&self.global.litebox) }.map_err(|err| {
+                    litebox_util_log::error!(err:% = err; "failed to duplicate address space for fork()");
+                    Errno::ENOMEM
+                })?;
+            let thread = crate::syscalls::process::ThreadState::new_process(child_tid, dest_pm);
+
+            // The captured ctx's rsp/rbp point into the PARENT's address space; the child's
+            // stack (and everything else) generally lives at a different host address (see
+            // litebox::mm::linux::Vmem::duplicate's doc comment) -- translate them, or the child
+            // resumes with a dangling stack pointer and crashes on its very first push/pop.
+            let mut child_ctx = ctx.clone();
+            #[cfg(target_arch = "x86_64")]
+            {
+                if let Some(new_rsp) = relocations.translate(child_ctx.rsp) {
+                    child_ctx.rsp = new_rsp;
+                }
+                if let Some(new_rbp) = relocations.translate(child_ctx.rbp) {
+                    child_ctx.rbp = new_rbp;
+                }
+                // Clear privileged/reserved RFLAGS bits and normalize CS/SS to the user ABI
+                // values before this context is ever resumed on a brand-new thread -- see
+                // PtRegs::sanitize_for_user_return's doc comment.
+                let sanitized = child_ctx.sanitize_for_user_return();
+                debug_assert!(sanitized, "forked child's rip/rsp left the user address range");
+            }
+
+            // Register the new process as a child of the caller's process so a later
+            // `wait4`/`waitpid` from the parent can find it.
+            self.process()
+                .children
+                .lock()
+                .push((child_tid, thread.process.clone()));
+
+            (
+                thread,
+                ThreadInitState::ForkedChild(child_ctx),
+                child_tid,
+                self.pid,
+            )
+        } else {
+            let thread = self.thread.new_thread(child_tid).ok_or(Errno::EBUSY)?;
+            (
+                thread,
+                ThreadInitState::NewThread {
+                    stack: sp,
+                    tls,
+                    set_child_tid,
+                },
+                self.pid,
+                self.ppid,
+            )
+        };
+        thread.init_state.set(init_state);
         thread.clear_child_tid.set(clear_child_tid);
 
         let r = unsafe {
@@ -713,13 +872,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         global: self.global.clone(),
                         wait_state: crate::wait::WaitState::new(self.global.platform),
                         thread,
-                        pid: self.pid,
+                        pid,
                         tid: child_tid,
-                        ppid: self.ppid,
+                        ppid,
                         credentials: self.credentials.clone(),
                         comm: self.comm.clone(),
                         fs: fs.into(),
-                        files: self.files.clone(), // TODO: !CLONE_FILES support
+                        files: files.into(),
                         signals: self.signals.clone_for_new_task(),
                     },
                 }),
@@ -1534,7 +1693,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         // Don't release reserved mappings.
         let release = |_r: Range<usize>, vm: VmFlags| !vm.is_empty();
-        unsafe { self.global.pm.release_memory(release) }
+        unsafe { self.process().pm.release_memory(release) }
             .expect("failed to release memory mappings");
 
         self.global
@@ -1637,6 +1796,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // Set the child TID if requested.
                     let _ = child_tid_ptr.write_at_offset::<Platform>(0, self.tid);
                 }
+            }
+            ThreadInitState::ForkedChild(mut parent_ctx) => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    parent_ctx.rax = 0;
+                }
+                *ctx = parent_ctx;
             }
         }
     }

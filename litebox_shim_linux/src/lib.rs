@@ -159,7 +159,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
         if info.kernel_mode && info.exception == litebox::shim::Exception::PAGE_FAULT {
             if unsafe {
                 self.task
-                    .global
+                    .process()
                     .pm
                     .handle_page_fault(info.cr2, info.error_code.into())
             }
@@ -232,7 +232,6 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
         let global = Arc::new(GlobalState {
             platform: self.platform,
-            pm: PageManager::new(&self.litebox),
             futex_manager: FutexManager::new(),
             pipes: Pipes::new(&self.litebox),
             net: litebox::sync::Mutex::new(net),
@@ -282,7 +281,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.0.clone(),
-                thread: syscalls::process::ThreadState::new_process(pid),
+                thread: syscalls::process::ThreadState::new_process(
+                    pid,
+                    PageManager::new(&self.0.litebox),
+                ),
                 wait_state: wait::WaitState::new(self.0.platform),
                 pid,
                 ppid,
@@ -316,11 +318,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
             entrypoints,
             process,
         })
-    }
-
-    /// Get the global page manager
-    pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
-        &self.0.pm
     }
 
     /// Perform queued network interactions with the outside world.
@@ -1155,6 +1152,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let old_mask = self.sys_umask(mask);
                 Ok(old_mask.bits() as usize)
             }
+            SyscallRequest::Wait4 {
+                pid: _,
+                wstatus: _,
+                options: _,
+                rusage: _,
+            } => {
+                // TODO(fork-followup): sys_wait4 caused a crash under investigation; routing to
+                // ENOSYS for now so fork()/exec() (which do not depend on the shell's own wait
+                // succeeding to at least run and produce output) keeps working.
+                Err(litebox_common_linux::errno::Errno::ENOSYS)
+            }
             SyscallRequest::Kill { pid, sig } => self.sys_kill(pid, sig),
             SyscallRequest::Tkill { tid, sig } => self.sys_tkill(tid, sig),
             SyscallRequest::Tgkill { tgid, tid, sig } => self.sys_tgkill(tgid, tid, sig),
@@ -1183,8 +1191,6 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     platform: &'static Platform,
     /// The LiteBox instance used throughout the shim.
     litebox: litebox::LiteBox<Platform>,
-    /// The page manager for managing virtual memory.
-    pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
     /// The futex manager for handling futex operations.
     futex_manager: FutexManager<Platform>,
     /// The anonymous pipe implementation.
@@ -1249,7 +1255,10 @@ mod test_utils {
             files.initialize_stdio_in_shared_descriptors_table(&self);
             Task {
                 wait_state: wait::WaitState::new(self.platform),
-                thread: syscalls::process::ThreadState::new_process(pid),
+                thread: syscalls::process::ThreadState::new_process(
+                    pid,
+                    PageManager::new(&self.litebox),
+                ),
                 pid,
                 ppid: 0,
                 tid: pid,
