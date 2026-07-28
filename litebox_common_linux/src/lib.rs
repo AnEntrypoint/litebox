@@ -2901,6 +2901,7 @@ impl SyscallRequest {
                 };
                 SyscallRequest::Clone { args }
             }
+            #[cfg(target_arch = "x86_64")]
             Sysno::fork => {
                 // `fork()` takes no arguments; it is equivalent to
                 // `clone(SIGCHLD, 0, NULL, NULL, 0)` -- no flags set (separate address space,
@@ -2922,6 +2923,7 @@ impl SyscallRequest {
                 };
                 SyscallRequest::Clone { args }
             }
+            #[cfg(target_arch = "x86_64")]
             Sysno::vfork => {
                 // `vfork()` takes no arguments; equivalent to
                 // `clone(CLONE_VM | CLONE_VFORK | SIGCHLD, 0)`.

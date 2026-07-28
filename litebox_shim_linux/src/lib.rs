@@ -232,6 +232,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
         let global = Arc::new(GlobalState {
             platform: self.platform,
+            bootstrap_process: once_cell::race::OnceBox::new(),
             futex_manager: FutexManager::new(),
             pipes: Pipes::new(&self.litebox),
             net: litebox::sync::Mutex::new(net),
@@ -303,6 +304,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
             },
         };
 
+        // Make this process's page manager reachable via `LinuxShim::page_manager` for callers
+        // with no `Task` in scope (see `GlobalState::bootstrap_process`'s doc comment) BEFORE
+        // ELF loading below, since loading the program can itself trigger page faults.
+        let _ = self
+            .0
+            .bootstrap_process
+            .set(alloc::boxed::Box::new(entrypoints.task.process().clone()));
+
         let (path, argv) = entrypoints
             .task
             .resolve_shebang(alloc::string::String::from(path), argv)
@@ -318,6 +327,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
             entrypoints,
             process,
         })
+    }
+
+    /// Get the page manager for the shim's bootstrap process (the one created by the first
+    /// `load_program` call).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `load_program` has not been called yet.
+    ///
+    /// Only meaningful on single-process targets (e.g. `litebox_runner_snp`'s kernel-context
+    /// page-fault handler, which has no `Task` in scope): see
+    /// [`GlobalState::bootstrap_process`]'s doc comment for why this does not generalize to
+    /// targets with multiple processes (real `fork()`).
+    pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
+        &self
+            .0
+            .bootstrap_process
+            .get()
+            .expect("load_program has not been called yet")
+            .pm
     }
 
     /// Perform queued network interactions with the outside world.
@@ -1191,6 +1220,17 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     platform: &'static Platform,
     /// The LiteBox instance used throughout the shim.
     litebox: litebox::LiteBox<Platform>,
+    /// The shim's very first (bootstrap) process, set once by the first `load_program` call.
+    /// Every process now owns its own [`litebox::mm::PageManager`] (see
+    /// [`syscalls::process::Process::pm`]) since real `fork()` gives each process an
+    /// independent address space -- this field exists ONLY so callers with no `Task` in scope
+    /// yet (e.g. `litebox_runner_snp`'s page-fault handler, which can fire while the initial
+    /// program is still being loaded, before any `Task`/`Process` handle is available to it)
+    /// have a way to reach a `PageManager` at all. It is never updated after the first
+    /// `load_program` call, so on a target that calls `load_program` more than once (or whose
+    /// initial process later `fork()`s) it does NOT track "the current process" -- it is
+    /// intentionally only correct for single-process kernel targets like SNP.
+    bootstrap_process: once_cell::race::OnceBox<Arc<syscalls::process::Process<Platform>>>,
     /// The futex manager for handling futex operations.
     futex_manager: FutexManager<Platform>,
     /// The anonymous pipe implementation.
