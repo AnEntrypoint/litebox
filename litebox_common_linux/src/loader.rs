@@ -10,6 +10,7 @@
 
 use alloc::vec::Vec;
 use elf::file::FileHeader;
+use elf::parse::ParseAt as _;
 use litebox::{
     mm::linux::PAGE_SIZE,
     platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider},
@@ -484,6 +485,8 @@ impl ElfParsedFile {
             }
         }
 
+        self.apply_relocations::<M>(base_addr, mem)?;
+
         let mut info = MappingInfo {
             base_addr,
             brk,
@@ -502,6 +505,101 @@ impl ElfParsedFile {
         }
 
         Ok(info)
+    }
+
+    /// Apply `R_X86_64_RELATIVE` dynamic relocations, if this ELF has a `PT_DYNAMIC` segment
+    /// with a `.rela.dyn` table.
+    ///
+    /// A static-PIE binary (no `PT_INTERP`, so no dynamic linker ever runs, but still `ET_DYN`
+    /// with real GOT/data relocations baked in by the linker) relies on the KERNEL itself
+    /// applying these at load time -- unlike a dynamically-linked ELF, where `ld.so` does it.
+    /// Skipping this step leaves every GOT-style slot as whatever raw bytes the file contained
+    /// (typically zero, since the linker has nothing meaningful to put there before the real
+    /// runtime load address is known), so any code that indirects through such a slot
+    /// (`call *offset(%rip)` reading a relocated function pointer, a vtable, a `static` holding
+    /// a pointer to other static data, etc.) jumps through a wrong or null pointer at runtime.
+    /// Real Linux's `binfmt_elf.c` applies these identically for every `ET_DYN` load, whether or
+    /// not an interpreter is present; only `R_X86_64_RELATIVE` (a base-relative fixup requiring
+    /// no symbol lookup, i.e. no dynamic linker) is handled here, since that is the only
+    /// relocation type meaningful without a real symbol resolver -- a genuinely dynamically-linked
+    /// binary (with `PT_INTERP`) already exceeds what LiteBox's loader supports for other reasons.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "r_offset/r_addend truncation to usize is checked via checked_add below"
+    )]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "r_addend's `as usize` cast on a negative i64 is intentional two's-complement \
+                  reinterpretation, matching every real ELF loader's `base_addr + r_addend` \
+                  arithmetic (a negative addend is valid and common, e.g. relocating a pointer \
+                  that is computed as an offset BEFORE some other symbol)"
+    )]
+    fn apply_relocations<M: MapMemory>(
+        &self,
+        base_addr: usize,
+        mem: &mut impl AccessMemory,
+    ) -> Result<(), ElfLoadError<M::Error>> {
+        let Some(dynamic_ph) = self
+            .program_headers()
+            .find(|ph| ph.p_type == elf::abi::PT_DYNAMIC)
+        else {
+            return Ok(());
+        };
+
+        let dynamic_vaddr: usize = dynamic_ph.p_vaddr.trunc();
+        let dynamic_len: usize = dynamic_ph.p_memsz.trunc();
+        let mut dynamic_bytes = alloc::vec![0u8; dynamic_len];
+        mem.read(base_addr + dynamic_vaddr, &mut dynamic_bytes)?;
+        let dyn_table = elf::parse::ParsingIterator::<Endian, elf::dynamic::Dyn>::new(
+            self.header.endianness,
+            self.header.class,
+            &dynamic_bytes,
+        );
+
+        let mut rela_vaddr: Option<usize> = None;
+        let mut rela_size: Option<usize> = None;
+        let mut rela_ent: Option<usize> = None;
+        for entry in dyn_table {
+            match entry.d_tag {
+                elf::abi::DT_RELA => rela_vaddr = Some(entry.d_ptr().trunc()),
+                elf::abi::DT_RELASZ => rela_size = Some(entry.d_val().trunc()),
+                elf::abi::DT_RELAENT => rela_ent = Some(entry.d_val().trunc()),
+                _ => {}
+            }
+        }
+        let (Some(rela_vaddr), Some(rela_size)) = (rela_vaddr, rela_size) else {
+            // No DT_RELA table -- nothing to relocate (e.g. a non-PIE ET_EXEC, or a PIE with
+            // only symbol-requiring relocation types this loader does not support anyway).
+            return Ok(());
+        };
+        // `Rela`'s real on-disk size; `DT_RELAENT` merely confirms it if present.
+        let expected_ent: usize = elf::relocation::Rela::size_for(self.header.class);
+        if rela_ent.is_some_and(|ent| ent != expected_ent) {
+            return Err(ElfLoadError::InvalidProgramHeader);
+        }
+
+        let mut rela_bytes = alloc::vec![0u8; rela_size];
+        mem.read(base_addr + rela_vaddr, &mut rela_bytes)?;
+        let rela_table = elf::parse::ParsingIterator::<Endian, elf::relocation::Rela>::new(
+            self.header.endianness,
+            self.header.class,
+            &rela_bytes,
+        );
+        for rela in rela_table {
+            if rela.r_type != elf::abi::R_X86_64_RELATIVE {
+                // Every other x86-64 relocation type requires a symbol lookup (a real dynamic
+                // linker), which this loader does not implement -- see this function's doc
+                // comment. A binary needing one would already be unsupported (it would have a
+                // PT_INTERP this loader has no `ld.so` to satisfy), so this is not a new gap.
+                continue;
+            }
+            let target_addr = base_addr
+                .checked_add(rela.r_offset as usize)
+                .ok_or(ElfLoadError::InvalidProgramHeader)?;
+            let value = base_addr.wrapping_add(rela.r_addend as usize);
+            mem.write(target_addr, &value.to_le_bytes())?;
+        }
+        Ok(())
     }
 
     /// Load the LiteBox trampoline into memory.
