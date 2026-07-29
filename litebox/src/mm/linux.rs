@@ -750,6 +750,74 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .map(|(r, vma)| (r.clone(), *vma))
             .collect();
 
+        // Non-shared regions must be relocated in COHERENT GROUPS, not independently: real guest
+        // code (any dynamically-linked or PIE binary, which is the overwhelming majority) uses
+        // RIP-relative addressing across ELF segments -- e.g. a `call *offset(%rip)` in `.text`
+        // reading a function pointer out of `.got`, which are always mapped as SEPARATE regions
+        // (one per `PT_LOAD` segment / `mmap` call) but at a FIXED relative distance from each
+        // other, guaranteed by the original single coherent virtual address layout the linker
+        // computed. Relocating each region independently (as this function used to do, in the
+        // same style still used below for `PROT_NONE` guard pages and `VM_SHARED` regions, where
+        // no such cross-region relationship exists) would let two regions of the SAME loaded
+        // object land at DIFFERENT relative offsets in the child, silently corrupting every
+        // RIP-relative reference that crosses a region boundary -- observed as a NULL-pointer
+        // crash jumping through a GOT-style table whose entries read back wrong after `fork()`.
+        //
+        // The fix: partition regions into contiguity-based groups (adjacent-or-near regions,
+        // i.e. the segments of one loaded ELF image, separated by no more than
+        // `MAX_INTRA_GROUP_GAP`) rather than one single span covering the WHOLE address space --
+        // a single global span would also force the guest's stack (placed far from the ELF's own
+        // low-address segments, with no RIP-relative relationship to them at all) into the same
+        // reservation, requiring an absurdly large, likely-unsatisfiable allocation. Each group is
+        // reserved as ONE contiguous span at a single freshly-chosen base address, then every
+        // region within it is placed at `group_new_base + (region.start - group_min_start)` --
+        // preserving every pairwise relative offset within the group exactly, the same guarantee
+        // real Linux `fork()` gets for free by giving the child the SAME virtual addresses as the
+        // parent (see this function's "Known deviation" doc section on why that specific
+        // guarantee isn't available here). Regions in DIFFERENT groups (e.g. the stack vs. the
+        // main ELF image) have no such relationship and may land anywhere independently.
+        let max_intra_group_gap: usize = 16 * ALIGN;
+        let mut sorted_non_shared: Vec<Range<usize>> = regions
+            .iter()
+            .filter(|(_, vma)| vma.shared_handle.is_none())
+            .map(|(r, _)| r.clone())
+            .collect();
+        sorted_non_shared.sort_by_key(|r| r.start);
+        let mut groups: Vec<Range<usize>> = Vec::new();
+        for r in sorted_non_shared {
+            match groups.last_mut() {
+                Some(last) if r.start <= last.end.saturating_add(max_intra_group_gap) => {
+                    last.end = last.end.max(r.end);
+                }
+                _ => groups.push(r),
+            }
+        }
+        // For each source address, the `(group_source_base, group_dest_base)` of the group it
+        // falls in -- looked up per-region in the main loop below via a linear scan (`groups` is
+        // small: one entry per ELF image / stack / independent mmap cluster, not per region).
+        let mut group_bases: Vec<(Range<usize>, usize)> = Vec::with_capacity(groups.len());
+        for group in &groups {
+            let span_page_range = PageRange::<ALIGN>::new(group.start, group.end)
+                .ok_or(VmemDuplicateError::UnAligned)?;
+            // A pure address-space reservation: populate nothing yet (each region below performs
+            // its own real copy-and-populate into a `Replace`-mode sub-range of this group), and
+            // use empty flags since this placeholder `VmArea` is never queried directly -- only
+            // individual regions placed within it via `Replace` below are tracked in `dest.vmas`
+            // (each `insert_mapping` call replaces this placeholder's tracking for its own
+            // sub-range).
+            let placeholder_vma = VmArea::<DestPlatform, ALIGN>::new(VmFlags::empty(), false);
+            let base_ptr = unsafe {
+                dest.insert_mapping(
+                    span_page_range,
+                    placeholder_vma,
+                    /* populate_pages_immediately */ false,
+                    FixedAddressBehavior::Hint,
+                )
+            }
+            .map_err(VmemDuplicateError::Allocation)?;
+            group_bases.push((group.clone(), base_ptr.as_usize()));
+        }
+
         // Tracks the relocation of whichever source region contains `self.brk`, if any, so the
         // destination's brk can point at the corresponding relocated address rather than a
         // stale one. `self.brk == 0` means brk was never initialized on the source; leave
@@ -776,7 +844,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 // handle at a (possibly different) destination address instead of eagerly
                 // copying bytes, so writes through either mapping stay visible to the other --
                 // this is what makes `fork()` + `MAP_SHARED` genuinely share memory rather than
-                // just starting with identical initial contents.
+                // just starting with identical initial contents. Independently relocated (not
+                // placed within `non_shared_span`): a shared object's mapped address has no
+                // compile-time relationship to any other region's RIP-relative code, unlike the
+                // ELF-segment case `non_shared_span` exists for.
                 let dest_ptr = unsafe {
                     dest.insert_mapping(
                         page_range,
@@ -793,17 +864,32 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 continue;
             }
 
+            // Every non-shared region was already reserved as part of its group in `group_bases`
+            // above -- place it at its fixed position within that group's span (preserving the
+            // exact relative offset every other region in the same group has from it) rather than
+            // letting the platform pick a fresh, unrelated address per region.
+            let (group_source_base, group_dest_base) = group_bases
+                .iter()
+                .find(|(group, _)| group.start <= range.start && range.end <= group.end)
+                .map_or_else(
+                    || unreachable!("every non-shared region falls within a group by construction"),
+                    |(group, dest_base)| (group.start, *dest_base),
+                );
+            let forced_addr = group_dest_base + (range.start - group_source_base);
+            let forced_page_range =
+                PageRange::<ALIGN>::new(forced_addr, forced_addr + length.as_usize())
+                    .ok_or(VmemDuplicateError::UnAligned)?;
+
             if vma.flags.intersection(VmFlags::VM_ACCESS_FLAGS).is_empty() {
                 // `PROT_NONE` region (e.g. a stack guard page): genuinely unreadable right now,
                 // by design. There is no content to copy -- just create an equivalent
-                // inaccessible mapping at the destination's (possibly relocated) address so the
-                // child's guard page is preserved.
+                // inaccessible mapping at its fixed position within its group's span.
                 let dest_ptr = unsafe {
                     dest.insert_mapping(
-                        page_range,
+                        forced_page_range,
                         dest_vma,
                         /* populate_pages_immediately */ false,
-                        FixedAddressBehavior::Hint,
+                        FixedAddressBehavior::Replace,
                     )
                 }
                 .map_err(VmemDuplicateError::Allocation)?;
@@ -832,17 +918,15 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 (vma.flags & !VmFlags::VM_ACCESS_FLAGS) | VmFlags::VM_READ | VmFlags::VM_WRITE,
                 vma.is_file_backed,
             );
-            // The destination platform cannot generally be asked for the SAME address as the
-            // source (that address is already committed in the one real host address space --
-            // see this function's doc comment on the address-relocation limitation), so let the
-            // platform place this region wherever it can and use the address it actually
-            // returns (`dest_ptr`), not `page_range`, for every subsequent operation on it.
+            // Place at this region's fixed position within `non_shared_span` (reserved above),
+            // preserving its exact relative offset from every other non-shared region -- see
+            // `non_shared_span`'s doc comment for why this must NOT be independently relocated.
             let dest_ptr = unsafe {
                 dest.insert_mapping(
-                    page_range,
+                    forced_page_range,
                     writable_vma,
                     /* populate_pages_immediately */ true,
-                    FixedAddressBehavior::Hint,
+                    FixedAddressBehavior::Replace,
                 )
             }
             .map_err(VmemDuplicateError::Allocation)?;
