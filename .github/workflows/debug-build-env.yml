@@ -222,15 +222,19 @@ jobs:
       - name: Build BusyBox with debug symbols against musl
         run: |
           cd /tmp/busybox-1.37.0
-          make -j"$(nproc)" CC=musl-gcc CFLAGS="-g -O0"
+          sed -i 's/^CONFIG_STRIP=y/# CONFIG_STRIP is not set/' .config || true
+          make -j"$(nproc)" CC=musl-gcc EXTRA_CFLAGS="-g -O0" NOSTRIP=1
+          file busybox
+          nm busybox | wc -l
       - name: Reproduce the fork/&&-hang under gdb with real symbols
         run: |
           cd /tmp/busybox-1.37.0
+          ln -sf busybox sh
           cat > /tmp/gdb_repro.txt << 'EOF'
           set pagination off
-          run sh -c "/tmp/busybox-1.37.0/busybox echo child_out; echo AFTER_SEMICOLON"
+          run -c "/tmp/busybox-1.37.0/busybox echo child_out; echo AFTER_SEMICOLON"
           EOF
-          timeout 8 gdb -batch -x /tmp/gdb_repro.txt ./busybox > /tmp/native_repro.txt 2>&1 || true
+          timeout 8 gdb -batch -x /tmp/gdb_repro.txt ./sh > /tmp/native_repro.txt 2>&1 || true
           echo "--- native run (real Linux, real musl, should NOT hang) ---"
           cat /tmp/native_repro.txt
       - name: Package debug artifacts
