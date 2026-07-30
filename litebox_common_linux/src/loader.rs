@@ -542,6 +542,13 @@ impl ElfParsedFile {
         base_addr: usize,
         mem: &mut impl AccessMemory,
     ) -> Result<(), ElfLoadError<M::Error>> {
+        // Generic-ABI tags for the compressed relative-relocation format (`DT_RELR`/
+        // `DT_RELRSZ`/`DT_RELRENT`); not present in the `elf` crate's `abi` module, so
+        // named directly by their standard values.
+        const DT_RELR: i64 = 0x24;
+        const DT_RELRSZ: i64 = 0x23;
+        const DT_RELRENT: i64 = 0x25;
+
         let Some(dynamic_ph) = self
             .program_headers()
             .find(|ph| ph.p_type == elf::abi::PT_DYNAMIC)
@@ -559,27 +566,20 @@ impl ElfParsedFile {
             &dynamic_bytes,
         );
 
-        // Generic-ABI tags for the compressed relative-relocation format (`DT_RELR`/
-        // `DT_RELRSZ`/`DT_RELRENT`); not present in the `elf` crate's `abi` module, so
-        // named directly by their standard values.
-        const DT_RELR: i64 = 0x24;
-        const DT_RELRSZ: i64 = 0x23;
-        const DT_RELRENT: i64 = 0x25;
-
         let mut rela_vaddr: Option<usize> = None;
         let mut rela_size: Option<usize> = None;
         let mut rela_ent: Option<usize> = None;
-        let mut relr_vaddr: Option<usize> = None;
-        let mut relr_size: Option<usize> = None;
-        let mut relr_ent: Option<usize> = None;
+        let mut compressed_vaddr: Option<usize> = None;
+        let mut compressed_size: Option<usize> = None;
+        let mut compressed_ent: Option<usize> = None;
         for entry in dyn_table {
             match entry.d_tag {
                 elf::abi::DT_RELA => rela_vaddr = Some(entry.d_ptr().trunc()),
                 elf::abi::DT_RELASZ => rela_size = Some(entry.d_val().trunc()),
                 elf::abi::DT_RELAENT => rela_ent = Some(entry.d_val().trunc()),
-                DT_RELR => relr_vaddr = Some(entry.d_ptr().trunc()),
-                DT_RELRSZ => relr_size = Some(entry.d_val().trunc()),
-                DT_RELRENT => relr_ent = Some(entry.d_val().trunc()),
+                DT_RELR => compressed_vaddr = Some(entry.d_ptr().trunc()),
+                DT_RELRSZ => compressed_size = Some(entry.d_val().trunc()),
+                DT_RELRENT => compressed_ent = Some(entry.d_val().trunc()),
                 _ => {}
             }
         }
@@ -615,13 +615,13 @@ impl ElfParsedFile {
             }
         }
 
-        if let (Some(relr_vaddr), Some(relr_size)) = (relr_vaddr, relr_size) {
+        if let (Some(compressed_vaddr), Some(compressed_size)) = (compressed_vaddr, compressed_size) {
             // `DT_RELRENT` is always 8 (one `Elf64_Xword` per RELR entry); reject anything
             // else rather than silently misinterpreting the bitstream.
-            if relr_ent.is_some_and(|ent| ent != 8) {
+            if compressed_ent.is_some_and(|ent| ent != 8) {
                 return Err(ElfLoadError::InvalidProgramHeader);
             }
-            self.apply_relr_relocations::<M>(base_addr, mem, relr_vaddr, relr_size)?;
+            Self::apply_relr_relocations::<M>(base_addr, mem, compressed_vaddr, compressed_size)?;
         }
 
         Ok(())
@@ -645,7 +645,6 @@ impl ElfParsedFile {
                   in this file"
     )]
     fn apply_relr_relocations<M: MapMemory>(
-        &self,
         base_addr: usize,
         mem: &mut impl AccessMemory,
         relr_vaddr: usize,
@@ -667,7 +666,7 @@ impl ElfParsedFile {
                     .ok_or(ElfLoadError::InvalidProgramHeader)?;
                 let value = base_addr.wrapping_add(
                     usize::from_le_bytes(
-                        self.read_word_for_relr::<M>(mem, target_addr)?,
+                        Self::read_word_for_relr::<M>(mem, target_addr)?,
                     ),
                 );
                 mem.write(target_addr, &value.to_le_bytes())?;
@@ -683,7 +682,7 @@ impl ElfParsedFile {
                             .checked_add(current_addr + 8 * i)
                             .ok_or(ElfLoadError::InvalidProgramHeader)?;
                         let value = base_addr.wrapping_add(usize::from_le_bytes(
-                            self.read_word_for_relr::<M>(mem, target_addr)?,
+                            Self::read_word_for_relr::<M>(mem, target_addr)?,
                         ));
                         mem.write(target_addr, &value.to_le_bytes())?;
                     }
@@ -700,7 +699,6 @@ impl ElfParsedFile {
     /// relocates (RELR stores no explicit addend -- the pre-existing slot content, as written
     /// by the static linker, IS the addend, matching every real RELR decoder's behavior).
     fn read_word_for_relr<M: MapMemory>(
-        &self,
         mem: &mut impl AccessMemory,
         target_addr: usize,
     ) -> Result<[u8; 8], ElfLoadError<M::Error>> {
