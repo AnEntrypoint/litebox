@@ -1007,6 +1007,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 suggested_address,
                 total_length,
                 flags.contains(CreatePagesFlags::FIXED_ADDR),
+                vma.flags.contains(VmFlags::VM_GROWSDOWN),
             )
             .ok_or(AllocationError::OutOfMemory)?;
         // new_addr must be ALIGN aligned
@@ -1150,7 +1151,12 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             unimplemented!("file-backed mapping move is not supported yet");
         }
         let new_addr = self
-            .get_unmmaped_area(suggested_new_address, new_size, false)
+            .get_unmmaped_area(
+                suggested_new_address,
+                new_size,
+                false,
+                vma.flags.contains(VmFlags::VM_GROWSDOWN),
+            )
             .ok_or(VmemMoveError::OutOfMemory)?;
         let new_range = PageRange::<ALIGN>::new(new_addr, new_addr + new_size.as_usize()).unwrap();
         let new_addr = unsafe {
@@ -1332,6 +1338,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         suggested_address: Option<NonZeroAddress<ALIGN>>,
         length: NonZeroPageSize<ALIGN>,
         fixed_addr: bool,
+        is_growsdown: bool,
     ) -> Option<usize> {
         let size = length.as_usize();
         if size > Platform::TASK_ADDR_MAX {
@@ -1364,19 +1371,40 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         debug_assert_eq!(Platform::TASK_ADDR_MAX % ALIGN, 0);
         let last_end = self.vmas.last_range_value().map_or(low_limit, |r| r.0.end);
         if last_end <= high_limit {
-            return Some(high_limit);
+            // A growsdown (stack) region must keep a guard gap below whatever is already
+            // mapped above it -- gap #2 below already reserves this in the OTHER direction
+            // (a later placement avoiding landing too close above an EXISTING stack's
+            // downward growth), but that logic only runs once this fast path is skipped.
+            // Without this, a stack placed here can end up directly, contiguously adjacent
+            // to an already-mapped region (e.g. `ld.so`, itself placed top-down earlier) with
+            // zero separation, only guarded by luck of the arithmetic not aligning exactly.
+            if is_growsdown && last_end > low_limit {
+                let gapped_high_limit = high_limit.checked_sub(Self::STACK_GUARD_GAP)?;
+                if gapped_high_limit >= last_end {
+                    return Some(gapped_high_limit);
+                }
+            } else {
+                return Some(high_limit);
+            }
         }
 
         // 2. check gaps between ranges
         for (r, flags) in self.vmas.iter().rev() {
-            let start = r.start.checked_sub(
-                size + if flags.flags.contains(VmFlags::VM_GROWSDOWN) {
-                    // If it is a stack, we need to leave enough space for the stack to grow downwards.
-                    Self::STACK_GUARD_GAP << 1
-                } else {
-                    0
-                },
-            )?;
+            let gap_below_r = if flags.flags.contains(VmFlags::VM_GROWSDOWN) {
+                // If it is a stack, we need to leave enough space for the stack to grow downwards.
+                Self::STACK_GUARD_GAP << 1
+            } else {
+                0
+            };
+            // If the NEW region is itself a stack, it also needs a guard gap between its own
+            // top and `r` (whatever is already mapped directly above it) -- symmetric to the
+            // case above, and to the fast-path reservation a few lines up.
+            let gap_above_new = if is_growsdown {
+                Self::STACK_GUARD_GAP
+            } else {
+                0
+            };
+            let start = r.start.checked_sub(size + gap_below_r.max(gap_above_new))?;
             if start < low_limit {
                 return None;
             }
