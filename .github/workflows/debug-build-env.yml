@@ -1,0 +1,94 @@
+name: Debug Build Environment
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build_debug_artifacts:
+    name: Build debug-symboled musl and OpenSSL
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v6
+      - name: Use Node.js
+        uses: actions/setup-node@v6
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install general-purpose build toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential musl-tools musl-dev gdb binutils python3-pip python3-venv
+      - name: Fetch musl 1.2.6 source
+        run: |
+          curl -sL https://musl.libc.org/releases/musl-1.2.6.tar.gz -o /tmp/musl-1.2.6.tar.gz
+          tar -xf /tmp/musl-1.2.6.tar.gz -C /tmp
+      - name: Build musl 1.2.6 with debug symbols (Alpine-matched -Os -g)
+        run: |
+          cd /tmp/musl-1.2.6
+          CFLAGS='-Os -g' ./configure --prefix=/tmp/musl-install
+          make -j"$(nproc)"
+      - name: Fetch OpenSSL 3.5.7 source (exact version deployed in the Alpine rootfs)
+        run: |
+          curl -sL https://github.com/openssl/openssl/archive/refs/tags/openssl-3.5.7.tar.gz -o /tmp/openssl-3.5.7.tar.gz
+          tar -xf /tmp/openssl-3.5.7.tar.gz -C /tmp
+      - name: Cross-compile OpenSSL 3.5.7 against musl with debug symbols
+        run: |
+          cd /tmp/openssl-openssl-3.5.7
+          CC=musl-gcc ./Configure linux-x86_64 -g -O0 no-shared no-tests --prefix=/tmp/openssl-install
+          make -j"$(nproc)"
+      - name: Build a minimal EVP_MD_fetch reproduction against the debug OpenSSL
+        run: |
+          mkdir -p /tmp/repro
+          cat > /tmp/repro/evpfetch_repro.c << 'EOF'
+          #include <stdio.h>
+          #include <openssl/evp.h>
+          int main(void) {
+              printf("EVPFETCH-REPRO-START\n");
+              fflush(stdout);
+              EVP_MD *sha1 = EVP_MD_fetch(NULL, "sha1", NULL);
+              printf("sha1 fetch: %p\n", (void *)sha1);
+              fflush(stdout);
+              printf("EVPFETCH-REPRO-PASS\n");
+              return 0;
+          }
+          EOF
+          musl-gcc -g -O0 -static -I/tmp/openssl-openssl-3.5.7/include \
+            -o /tmp/repro/evpfetch_repro /tmp/repro/evpfetch_repro.c \
+            /tmp/openssl-openssl-3.5.7/libssl.a /tmp/openssl-openssl-3.5.7/libcrypto.a -ldl -lpthread
+      - name: Run the reproduction natively on Linux as a real-Linux control
+        run: |
+          /tmp/repro/evpfetch_repro
+          echo "exit code: $?"
+      - name: Run under gdb with full backtrace and thread-struct inspection as a reference trace
+        run: |
+          cat > /tmp/gdb_ci.txt << 'EOF'
+          run
+          bt full
+          info threads
+          quit
+          EOF
+          gdb -batch -x /tmp/gdb_ci.txt /tmp/repro/evpfetch_repro 2>&1 | tee /tmp/repro/gdb_reference_trace.txt
+      - name: Package debug artifacts
+        run: |
+          mkdir -p /tmp/artifacts
+          cp /tmp/musl-1.2.6/lib/libc.so /tmp/artifacts/musl-libc-debug.so
+          cp -r /tmp/musl-1.2.6/obj /tmp/artifacts/musl-obj-debug || true
+          cp /tmp/openssl-openssl-3.5.7/libssl.a /tmp/openssl-openssl-3.5.7/libcrypto.a /tmp/artifacts/ 2>/dev/null || true
+          cp /tmp/repro/evpfetch_repro /tmp/artifacts/
+          cp /tmp/repro/gdb_reference_trace.txt /tmp/artifacts/
+          objdump -d /tmp/repro/evpfetch_repro > /tmp/artifacts/evpfetch_repro_disasm.txt
+          nm /tmp/repro/evpfetch_repro > /tmp/artifacts/evpfetch_repro_symbols.txt
+      - name: Upload debug artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: musl-openssl-debug-artifacts
+          path: /tmp/artifacts/
