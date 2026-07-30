@@ -80,6 +80,10 @@ pub(crate) struct FilesState<Platform: ShimPlatform, FS: ShimFS> {
     pub(crate) raw_descriptor_store:
         litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>,
     max_fd: AtomicUsize,
+    /// Absolute path each open file fd was opened with, so `openat`/`fstatat`-family syscalls can
+    /// resolve a path given relative to that fd (`dirfd`-relative resolution). Only file fds
+    /// (as opposed to sockets/pipes/etc, which cannot serve as a `dirfd`) are ever inserted here.
+    fd_paths: litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<usize, CString>>,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Clone for FilesState<Platform, FS> {
@@ -94,6 +98,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Clone for FilesState<Platform, FS> {
                 self.raw_descriptor_store.read().clone(),
             ),
             max_fd: AtomicUsize::new(self.max_fd.load(Ordering::Relaxed)),
+            fd_paths: litebox::sync::RwLock::new(self.fd_paths.read().clone()),
         }
     }
 }
@@ -106,11 +111,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
                 litebox::fd::RawDescriptorStorage::new(),
             ),
             max_fd: AtomicUsize::new(usize::MAX),
+            fd_paths: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
         }
     }
 
     pub(crate) fn set_max_fd(&self, max_fd: usize) {
         self.max_fd.store(max_fd, Ordering::Relaxed);
+    }
+
+    /// Record the absolute path a raw file fd was opened with, so it can later serve as a
+    /// `dirfd` for `openat`/`fstatat`-family syscalls.
+    pub(crate) fn record_fd_path(&self, raw_fd: usize, path: CString) {
+        self.fd_paths.write().insert(raw_fd, path);
+    }
+
+    /// Look up the absolute path a raw file fd was opened with, if any.
+    pub(crate) fn lookup_fd_path(&self, raw_fd: usize) -> Option<CString> {
+        self.fd_paths.read().get(&raw_fd).cloned()
+    }
+
+    fn forget_fd_path(&self, raw_fd: usize) {
+        self.fd_paths.write().remove(&raw_fd);
     }
 
     // Returns Ok(raw_fd) if it fits within the max limits already set up; otherwise returns the
@@ -140,7 +161,6 @@ enum FsPath {
     /// Current working directory
     Cwd,
     /// Path is relative to a file descriptor
-    #[expect(dead_code, reason = "currently unused, might want to use later")]
     FdRelative { fd: u32, path: CString },
     /// Fd
     Fd(u32),
@@ -213,6 +233,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    /// Join a directory's absolute path with a path given relative to it, matching the semantics
+    /// `openat`/`fstatat`-family syscalls need for a `dirfd`-relative lookup.
+    fn join_dir_relative_path(dir_path: &CString, relative: &CString) -> Result<CString, Errno> {
+        let mut joined = dir_path
+            .to_str()
+            .map_err(|_| Errno::EINVAL)?
+            .to_string();
+        if !joined.ends_with('/') {
+            joined.push('/');
+        }
+        joined.push_str(relative.to_str().map_err(|_| Errno::EINVAL)?);
+        CString::new(joined).map_err(|_| Errno::EINVAL)
+    }
+
+    /// Resolve `dirfd` (as recorded by a prior successful `open`/`openat` of a directory) to its
+    /// absolute path, for `dirfd`-relative resolution.
+    fn resolve_dirfd_path(&self, fd: u32) -> Result<CString, Errno> {
+        self.files
+            .borrow()
+            .lookup_fd_path(fd as usize)
+            .ok_or(Errno::EBADF)
+    }
+
     /// Resolve a path relative to a dirfd.
     ///
     /// Note that an empty path is not valid for this function, and will be rejected with `ENOENT`.
@@ -222,9 +265,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         match fs_path {
             FsPath::Absolute { path } => Ok(path),
             FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
-            FsPath::FdRelative { fd: _, path: _ } => {
-                log_unsupported!("path resolution with FsPath::FdRelative");
-                Err(Errno::EINVAL)
+            FsPath::FdRelative { fd, path } => {
+                let dir_path = self.resolve_dirfd_path(fd)?;
+                Self::join_dir_relative_path(&dir_path, &path)
             }
         }
     }
@@ -254,7 +297,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.do_open(path, flags, mode)
     }
 
-    fn insert_raw_file_fd(&self, file: TypedFd<FS>, flags: OFlags) -> Result<u32, Errno> {
+    fn insert_raw_file_fd_with_path(
+        &self,
+        file: TypedFd<FS>,
+        flags: OFlags,
+        path: Option<CString>,
+    ) -> Result<u32, Errno> {
         if flags.contains(OFlags::CLOEXEC) {
             let None = self
                 .global
@@ -270,6 +318,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             files.fs.close(&file).unwrap();
             Errno::EMFILE
         })?;
+        if let Some(path) = path {
+            files.record_fd_path(raw_fd, path);
+        }
         Ok(u32::try_from(raw_fd).unwrap())
     }
 
@@ -287,8 +338,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `open`
     pub fn sys_open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
         let path = self.resolve_path(path)?;
-        let file = self.do_open(path, flags, mode)?;
-        self.insert_raw_file_fd(file, flags)
+        let file = self.do_open(path.clone(), flags, mode)?;
+        self.insert_raw_file_fd_with_path(file, flags, Some(path))
     }
 
     /// Handle syscall `openat`
@@ -299,8 +350,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         flags: OFlags,
         mode: Mode,
     ) -> Result<u32, Errno> {
-        let file = self.do_openat(dirfd, pathname, flags, mode)?;
-        self.insert_raw_file_fd(file, flags)
+        let path = self.resolve_path_at(dirfd, pathname)?;
+        let file = self.do_open(path.clone(), flags, mode)?;
+        self.insert_raw_file_fd_with_path(file, flags, Some(path))
     }
 
     /// Handle syscall `ftruncate`
@@ -823,6 +875,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             );
         }
         drop(rds);
+        files.forget_fd_path(raw_fd);
 
         match consumed {
             ConsumedFd::Fs(fd) => {
@@ -1424,9 +1477,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 descriptor_stat(fd as usize, self)
             }
             FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
-            FsPath::FdRelative { .. } => {
-                log_unsupported!("relative fstatat with AT_EMPTY_PATH unset is not supported yet");
-                Err(Errno::EINVAL)
+            FsPath::FdRelative { fd, path } => {
+                let dir_path = self.resolve_dirfd_path(fd)?;
+                let joined = Self::join_dir_relative_path(&dir_path, &path)?;
+                self.do_stat(joined, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))
             }
         }
     }
@@ -1438,7 +1492,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         pathname: impl path::Arg,
         flags: AtFlags,
     ) -> Result<FileStat, Errno> {
-        let current_support_flags = AtFlags::AT_EMPTY_PATH;
+        let current_support_flags = AtFlags::AT_EMPTY_PATH | AtFlags::AT_SYMLINK_NOFOLLOW;
         if flags.intersects(current_support_flags.complement()) {
             log_unsupported!("unsupported flags: {flags:?}");
             return Err(Errno::EINVAL);
@@ -2493,7 +2547,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             DupFdError::BadFd | DupFdError::TargetFdExceedsLimit => Errno::EBADF,
             DupFdError::TooManyFiles => Errno::EMFILE,
         })
-        .map(|new_fd| u32::try_from(new_fd).unwrap())
+        .map(|new_fd| {
+            let files = self.files.borrow();
+            if let Some(path) = files.lookup_fd_path(oldfd_usize) {
+                files.record_fd_path(new_fd, path);
+            }
+            u32::try_from(new_fd).unwrap()
+        })
     }
 }
 
