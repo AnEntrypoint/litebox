@@ -143,20 +143,30 @@ unsafe extern "system" fn vectored_exception_handler(
     {
         set_context_to_interrupt_callback(tls, context);
     } else {
-        // Push the exception record onto the host stack.
-        let exception_record_ptr = tls.host_sp.get().cast::<EXCEPTION_RECORD>().wrapping_sub(1);
+        // Write the exception record into scratch space BELOW `host_sp`, well clear of the
+        // `thread_ctx` pointer that `run_thread_arch`'s prologue pushed at `[host_sp]`/
+        // `[host_sp + 8]`. `exception_callback` (like `syscall_callback` and
+        // `interrupt_callback`) expects `[rsp] == thread_ctx`, so `Rsp` must land exactly on
+        // `host_sp`, unmodified -- it must NOT be repointed into the exception-record scratch
+        // area itself. Previously `Rsp` was set to the (16-byte-realigned) exception-record
+        // address instead of `host_sp`, so `exception_callback`'s `mov rcx, [rsp]` read raw
+        // bytes from within the just-written `EXCEPTION_RECORD` (misinterpreted as
+        // `&mut ThreadContext`) rather than the real `thread_ctx` pointer -- observed in
+        // practice as `ThreadContext` fields reading back as null/garbage.
+        let exception_record_ptr = tls
+            .host_sp
+            .get()
+            .cast::<EXCEPTION_RECORD>()
+            .wrapping_byte_sub(EXCEPTION_RECORD_RESERVE);
         assert!(exception_record_ptr.is_aligned());
         unsafe { exception_record_ptr.write(*exception_record) };
-
-        // Re-align the stack pointer.
-        let rsp = exception_record_ptr as usize & !15;
 
         // Ensure that `run_thread_arch` is linked in so that `exception_callback` is visible.
         let _ = run_thread_arch as *const () as usize;
 
         // Update the thread context to jump to the exception handler.
         context.Rip = exception_callback as *const () as usize as u64;
-        context.Rsp = rsp as u64;
+        context.Rsp = tls.host_sp.get() as u64;
         context.Rbp = tls.host_bp.get() as u64;
         context.Rdx = exception_record_ptr as u64;
     }
@@ -432,6 +442,16 @@ struct TlsState {
     /// the slower but universally-correct `NtContinue` path instead.
     has_entered_guest: Cell<bool>,
 }
+
+/// Scratch space (in bytes) reserved below `host_sp` for the `EXCEPTION_RECORD` that
+/// `vectored_exception_handler` writes when redirecting to `exception_callback`. Must be
+/// large enough to hold a full `EXCEPTION_RECORD` (152 bytes on x86_64) plus alignment slack,
+/// and must keep clear of `[host_sp]`/`[host_sp + 8]`, where `run_thread_arch`'s prologue
+/// pushes `thread_ctx` -- `exception_callback` (like `syscall_callback` and
+/// `interrupt_callback`) reads `thread_ctx` back via `[rsp]`, so `Rsp` is always set to
+/// `host_sp` itself, unmodified; the exception record lives in this separate reserve instead
+/// of overlapping the `Rsp` landing spot.
+const EXCEPTION_RECORD_RESERVE: usize = 4096;
 
 impl TlsState {
     /// Creates a new `TlsState` with all fields zeroed / defaulted.
