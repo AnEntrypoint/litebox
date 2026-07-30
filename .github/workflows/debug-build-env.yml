@@ -197,35 +197,16 @@ jobs:
         run: |
           curl -sL https://busybox.net/downloads/busybox-1.37.0.tar.bz2 -o /tmp/busybox-1.37.0.tar.bz2
           tar -xf /tmp/busybox-1.37.0.tar.bz2 -C /tmp
-      - name: Configure BusyBox minimally (ash + a few coreutils only -- avoids chasing every applet's kernel headers)
+      - name: Configure BusyBox from defconfig (real Alpine-like config with ash + job control), drop the applets that need unavailable kernel headers
         run: |
           cd /tmp/busybox-1.37.0
-          make allnoconfig
-          # Only what the fork/&&-hang repro actually needs; a minimal config sidesteps every
-          # applet that wants headers musl-gcc's sysroot doesn't carry (tc, nandwrite, etc).
-          # `yes "" | make oldconfig` accepts KCONFIG *defaults* for anything prompted after a
-          # dependency reset, silently dropping options appended by hand -- use
-          # KCONFIG_ALLCONFIG so every listed symbol is force-applied instead.
-          cat > /tmp/busybox_extra.config << 'EOF'
-          CONFIG_DEBUG=y
-          CONFIG_ASH=y
-          CONFIG_ASH_JOB_CONTROL=y
-          CONFIG_ASH_ALIAS=y
-          CONFIG_ASH_GETOPTS=y
-          CONFIG_ASH_BUILTIN_ECHO=y
-          CONFIG_ASH_BUILTIN_TEST=y
-          CONFIG_FEATURE_SH_IS_ASH=y
-          CONFIG_ECHO=y
-          CONFIG_LS=y
-          CONFIG_TRUE=y
-          CONFIG_FALSE=y
-          CONFIG_CAT=y
-          CONFIG_FEATURE_PREFER_APPLETS=y
-          CONFIG_BUSYBOX=y
-          CONFIG_FEATURE_INSTALLER=n
-          EOF
-          KCONFIG_ALLCONFIG=/tmp/busybox_extra.config make oldconfig CC=musl-gcc
-          grep -E "CONFIG_ASH=|CONFIG_ASH_JOB_CONTROL=|CONFIG_DEBUG=" .config
+          make defconfig
+          sed -i 's/^CONFIG_TC=y/# CONFIG_TC is not set/' .config
+          sed -i 's/^CONFIG_NANDWRITE=y/# CONFIG_NANDWRITE is not set/' .config
+          sed -i 's/^CONFIG_NANDDUMP=y/# CONFIG_NANDDUMP is not set/' .config
+          sed -i 's/^# CONFIG_DEBUG is not set/CONFIG_DEBUG=y/' .config
+          yes "" | make oldconfig CC=musl-gcc
+          grep -E "^CONFIG_ASH=|^CONFIG_ASH_JOB_CONTROL=|^CONFIG_DEBUG=|^CONFIG_TC=|^CONFIG_NANDWRITE=" .config
       - name: Build BusyBox with debug symbols against musl
         run: |
           cd /tmp/busybox-1.37.0
