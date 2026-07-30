@@ -325,12 +325,17 @@ jobs:
           }
           EOF
           musl-gcc -g -O0 -static -o /tmp/forkrepro/forkrepro /tmp/forkrepro/forkrepro.c
-      - name: Run the reproduction natively on Linux as a control (must NOT hang)
+          musl-gcc -g -O0 -o /tmp/forkrepro/forkrepro_dyn /tmp/forkrepro/forkrepro.c
+      - name: Run both reproductions natively on Linux as a control (must NOT hang)
         run: |
           timeout 5 /tmp/forkrepro/forkrepro
-          echo "native exit code: $?"
-      - name: Upload the reproduction binary
+          echo "static native exit code: $?"
+          timeout 5 /tmp/forkrepro/forkrepro_dyn
+          echo "dynamic native exit code: $?"
+      - name: Upload the reproduction binaries
         uses: actions/upload-artifact@v4
         with:
           name: forkrepro-artifacts
-          path: /tmp/forkrepro/forkrepro
+          path: |
+            /tmp/forkrepro/forkrepro
+            /tmp/forkrepro/forkrepro_dyn
