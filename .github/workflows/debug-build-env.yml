@@ -247,3 +247,90 @@ jobs:
         with:
           name: busybox-debug-artifacts
           path: /tmp/artifacts2/
+
+  build_fork_global_repro:
+    name: Build a minimal fork()+global-variable C reproduction (isolates the ash unwindfiles hang from busybox/ash entirely)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install musl-gcc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools gdb
+      - name: Build a minimal fork+global-static-pointer reproduction
+        run: |
+          mkdir -p /tmp/forkrepro
+          cat > /tmp/forkrepro/forkrepro.c << 'EOF'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <unistd.h>
+          #include <sys/wait.h>
+
+          struct node { struct node *prev; int tag; };
+          static struct node basenode = { 0, 0xBEEF };
+          static struct node *current = &basenode;
+
+          static void push(void) {
+              struct node *n = malloc(sizeof(*n));
+              n->prev = current;
+              n->tag = 0x1234;
+              current = n;
+          }
+
+          static void pop(void) {
+              if (current == &basenode) return;
+              struct node *old = current;
+              current = old->prev;
+              free(old);
+          }
+
+          static void unwind_to(struct node *stop) {
+              int iters = 0;
+              while (current != stop) {
+                  pop();
+                  if (++iters > 1000000) {
+                      fprintf(stderr, "FORKREPRO-HANG: current=%p stop=%p basenode=%p after %d iters\n",
+                              (void*)current, (void*)stop, (void*)&basenode, iters);
+                      _exit(1);
+                  }
+              }
+          }
+
+          int main(void) {
+              printf("FORKREPRO-START\n");
+              fflush(stdout);
+
+              push();
+              push();
+              struct node *saved_stop = current;
+
+              pid_t pid = fork();
+              if (pid == 0) {
+                  /* child: mimic ash's forked-external-command child -- do a little
+                   * work then exit, same shape as busybox echo/true. */
+                  printf("FORKREPRO-CHILD\n");
+                  fflush(stdout);
+                  _exit(0);
+              }
+
+              int status;
+              waitpid(pid, &status, 0);
+
+              /* parent: this is the exact call shape evalcommand's out: label uses --
+               * unwind back to the stop captured before the fork. */
+              unwind_to(saved_stop);
+
+              printf("FORKREPRO-PASS current=%p saved_stop=%p\n", (void*)current, (void*)saved_stop);
+              fflush(stdout);
+              return 0;
+          }
+          EOF
+          musl-gcc -g -O0 -static -o /tmp/forkrepro/forkrepro /tmp/forkrepro/forkrepro.c
+      - name: Run the reproduction natively on Linux as a control (must NOT hang)
+        run: |
+          timeout 5 /tmp/forkrepro/forkrepro
+          echo "native exit code: $?"
+      - name: Upload the reproduction binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: forkrepro-artifacts
+          path: /tmp/forkrepro/forkrepro
