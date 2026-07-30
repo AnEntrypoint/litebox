@@ -201,9 +201,11 @@ jobs:
         run: |
           cd /tmp/busybox-1.37.0
           make defconfig
-          sed -i 's/^CONFIG_TC=y/# CONFIG_TC is not set/' .config
-          sed -i 's/^CONFIG_NANDWRITE=y/# CONFIG_NANDWRITE is not set/' .config
-          sed -i 's/^CONFIG_NANDDUMP=y/# CONFIG_NANDDUMP is not set/' .config
+          # Disable every applet needing kernel headers musl-gcc's sysroot doesn't carry
+          # (qdisc, mtd/nand, ubi) -- irrelevant to the ash fork/&&-hang investigation.
+          for sym in TC NANDWRITE NANDDUMP UBIATTACH UBIDETACH UBIMKVOL UBIRMVOL UBIRSVOL UBIUPDATEVOL; do
+            sed -i "s/^CONFIG_${sym}=y/# CONFIG_${sym} is not set/" .config
+          done
           sed -i 's/^# CONFIG_DEBUG is not set/CONFIG_DEBUG=y/' .config
           yes "" | make oldconfig CC=musl-gcc
           grep -E "^CONFIG_ASH=|^CONFIG_ASH_JOB_CONTROL=|^CONFIG_DEBUG=|^CONFIG_TC=|^CONFIG_NANDWRITE=" .config
