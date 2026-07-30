@@ -898,27 +898,44 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let thread =
                 crate::syscalls::process::ThreadState::new_process(child_tid, dest_pm, vforked);
 
-            // The captured ctx's rip/rsp/rbp all point into the PARENT's address space; the
-            // child's code, stack, and everything else generally live at a different host
-            // address (see litebox::mm::linux::Vmem::duplicate's doc comment) -- translate all
-            // three, or the child resumes with a dangling stack pointer (crashing on its very
-            // first push/pop) or, worse, a stale `rip` that silently keeps executing the
-            // PARENT's still-live code/globals instead of the child's relocated copy: since
-            // `rip` remains within the broad guest address range either way,
-            // `sanitize_for_user_return`'s range check can't catch this, so the child runs with
-            // a corrupted hybrid state (child stack, parent globals) instead of crashing.
+            // The captured ctx's registers may hold addresses into the PARENT's address space --
+            // the child's code, stack, and everything else generally live at a different host
+            // address after `Vmem::duplicate` (see its doc comment). rip/rsp/rbp obviously need
+            // translation or the child crashes immediately; but the x86_64 SysV ABI also
+            // guarantees callee-saved registers (rbx, r12-r15) survive a `syscall` unchanged, so
+            // guest code routinely keeps a live pointer in one of them across `clone()` too --
+            // and the caller-clobbered registers can just as well hold a reloaded pointer value
+            // on return. Translate every register uniformly; `AddressRelocations::translate`
+            // already safely returns `None` (leaving the value untouched) for anything that
+            // isn't a relocated address, so this is a no-op for non-pointer register contents
+            // (small integers, flags, the post-fork `rax=0` return value, etc.).
             let mut child_ctx = ctx.clone();
             #[cfg(target_arch = "x86_64")]
             {
-                if let Some(new_rip) = relocations.translate(child_ctx.rip) {
-                    child_ctx.rip = new_rip;
+                macro_rules! translate_reg {
+                    ($reg:ident) => {
+                        if let Some(new_val) = relocations.translate(child_ctx.$reg) {
+                            child_ctx.$reg = new_val;
+                        }
+                    };
                 }
-                if let Some(new_rsp) = relocations.translate(child_ctx.rsp) {
-                    child_ctx.rsp = new_rsp;
-                }
-                if let Some(new_rbp) = relocations.translate(child_ctx.rbp) {
-                    child_ctx.rbp = new_rbp;
-                }
+                translate_reg!(rip);
+                translate_reg!(rsp);
+                translate_reg!(rbp);
+                translate_reg!(rbx);
+                translate_reg!(r12);
+                translate_reg!(r13);
+                translate_reg!(r14);
+                translate_reg!(r15);
+                translate_reg!(rax);
+                translate_reg!(rcx);
+                translate_reg!(rdx);
+                translate_reg!(rsi);
+                translate_reg!(rdi);
+                translate_reg!(r8);
+                translate_reg!(r9);
+                translate_reg!(r10);
+                translate_reg!(r11);
                 // Clear privileged/reserved RFLAGS bits and normalize CS/SS to the user ABI
                 // values before this context is ever resumed on a brand-new thread -- see
                 // PtRegs::sanitize_for_user_return's doc comment.
@@ -941,12 +958,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // value so the child's TLS accesses (which libc issues immediately after `clone()`
             // returns) don't dereference FS base 0. See `ThreadInitState::ForkedChild`'s doc
             // comment.
+            //
+            // Like `rip`/`rsp`/`rbp` above, this is a guest address (validated against
+            // `USER_ADDR_END` by `is_valid_user_fs_base`), not a host pointer -- and it points at
+            // musl's `struct pthread` TCB, which per musl's own `__init_tls.c` layout lives
+            // directly adjacent to the thread's stack, i.e. within the same relocation group
+            // `Vmem::duplicate` may move for the child. Without translation the child's `%fs`
+            // would point at the PARENT's original TCB address instead of its own relocated
+            // copy, and the child's first TLS access (which musl issues immediately on return
+            // from `clone()`) would dereference the wrong guest address.
             #[cfg(target_arch = "x86_64")]
-            let fs_base = self
-                .global
-                .platform
-                .get_arch_specific_register(&ArchSpecificRegister::FsBase)
-                .map_err(Errno::from)?;
+            let fs_base = {
+                let parent_fs_base = self
+                    .global
+                    .platform
+                    .get_arch_specific_register(&ArchSpecificRegister::FsBase)
+                    .map_err(Errno::from)?;
+                relocations
+                    .translate(parent_fs_base)
+                    .unwrap_or(parent_fs_base)
+            };
             #[cfg(not(target_arch = "x86_64"))]
             let fs_base = 0;
 
