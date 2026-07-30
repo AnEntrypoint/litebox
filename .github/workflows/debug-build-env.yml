@@ -116,6 +116,13 @@ jobs:
           musl-gcc -g -O0 -I/tmp/openssl-openssl-3.5.7/include \
             -o /tmp/repro/evpfetch_repro_dyn /tmp/repro/evpfetch_repro.c \
             -L/tmp/openssl-openssl-3.5.7 -lssl -lcrypto -Wl,-rpath,/tmp/openssl-openssl-3.5.7
+      - name: Install the instrumented musl ld.so over the system copy so the dynamic repro actually uses it
+        run: |
+          # musl-gcc links against the SYSTEM /lib/ld-musl-x86_64.so.1 by default;
+          # the freshly-built instrumented libc.so at /tmp/musl-1.2.6/lib/libc.so is
+          # a separate file until installed over that path.
+          ls -la /lib/ld-musl-x86_64.so.1
+          sudo cp /tmp/musl-1.2.6/lib/libc.so /lib/ld-musl-x86_64.so.1
       - name: Run the dynamically-linked reproduction natively on Linux as a real-Linux control (with TLS debug trace)
         run: |
           LD_LIBRARY_PATH=/tmp/openssl-openssl-3.5.7 /tmp/repro/evpfetch_repro_dyn 2>&1 | tee /tmp/repro/tls_debug_trace.txt
