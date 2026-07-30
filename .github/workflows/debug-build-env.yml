@@ -35,8 +35,16 @@ jobs:
           sudo ln -sf /usr/include/x86_64-linux-gnu/asm "$MUSL_INCLUDE/asm"
       - name: Fetch musl 1.2.6 source
         run: |
-          curl -sL https://musl.libc.org/releases/musl-1.2.6.tar.gz -o /tmp/musl-1.2.6.tar.gz
-          tar -xf /tmp/musl-1.2.6.tar.gz -C /tmp
+          # musl.libc.org has been intermittently unreachable from GitHub Actions
+          # runners this session; use the canonical git mirror on GitHub instead,
+          # which the CI runner reaches over the same network path as every other
+          # GitHub fetch in this job.
+          curl -fsSL --retry 5 --retry-delay 3 --connect-timeout 15 \
+            https://github.com/kraj/musl/archive/refs/tags/v1.2.6.tar.gz \
+            -o /tmp/musl-1.2.6.tar.gz
+          mkdir -p /tmp/musl-1.2.6
+          tar -xf /tmp/musl-1.2.6.tar.gz -C /tmp/musl-1.2.6 --strip-components=1
+          ls /tmp/musl-1.2.6
       - name: Instrument __copy_tls/static_init_tls/__init_tp with debug prints
         run: |
           cd /tmp/musl-1.2.6
@@ -116,7 +124,7 @@ jobs:
           make -j"$(nproc)"
       - name: Fetch OpenSSL 3.5.7 source (exact version deployed in the Alpine rootfs)
         run: |
-          curl -sL https://github.com/openssl/openssl/archive/refs/tags/openssl-3.5.7.tar.gz -o /tmp/openssl-3.5.7.tar.gz
+          curl -fsSL --retry 5 --retry-delay 3 --connect-timeout 15 https://github.com/openssl/openssl/archive/refs/tags/openssl-3.5.7.tar.gz -o /tmp/openssl-3.5.7.tar.gz
           tar -xf /tmp/openssl-3.5.7.tar.gz -C /tmp
       - name: Cross-compile OpenSSL 3.5.7 against musl with debug symbols
         run: |
