@@ -203,7 +203,10 @@ jobs:
           make allnoconfig
           # Only what the fork/&&-hang repro actually needs; a minimal config sidesteps every
           # applet that wants headers musl-gcc's sysroot doesn't carry (tc, nandwrite, etc).
-          cat >> .config << 'EOF'
+          # `yes "" | make oldconfig` accepts KCONFIG *defaults* for anything prompted after a
+          # dependency reset, silently dropping options appended by hand -- use
+          # KCONFIG_ALLCONFIG so every listed symbol is force-applied instead.
+          cat > /tmp/busybox_extra.config << 'EOF'
           CONFIG_DEBUG=y
           CONFIG_ASH=y
           CONFIG_ASH_JOB_CONTROL=y
@@ -217,8 +220,12 @@ jobs:
           CONFIG_TRUE=y
           CONFIG_FALSE=y
           CONFIG_CAT=y
+          CONFIG_FEATURE_PREFER_APPLETS=y
+          CONFIG_BUSYBOX=y
+          CONFIG_FEATURE_INSTALLER=n
           EOF
-          yes "" | make oldconfig CC=musl-gcc
+          KCONFIG_ALLCONFIG=/tmp/busybox_extra.config make oldconfig CC=musl-gcc
+          grep -E "CONFIG_ASH=|CONFIG_ASH_JOB_CONTROL=|CONFIG_DEBUG=" .config
       - name: Build BusyBox with debug symbols against musl
         run: |
           cd /tmp/busybox-1.37.0
@@ -232,9 +239,11 @@ jobs:
         run: |
           cd /tmp/busybox-1.37.0
           ln -sf busybox sh
+          ln -sf busybox echo
+          ln -sf busybox true
           cat > /tmp/gdb_repro.txt << 'EOF'
           set pagination off
-          run -c "/tmp/busybox-1.37.0/busybox echo child_out; echo AFTER_SEMICOLON"
+          run -c "/tmp/busybox-1.37.0/echo child_out; echo AFTER_SEMICOLON"
           EOF
           timeout 8 gdb -batch -x /tmp/gdb_repro.txt ./sh > /tmp/native_repro.txt 2>&1 || true
           echo "--- native run (real Linux, real musl, should NOT hang) ---"
@@ -246,6 +255,9 @@ jobs:
           cp /tmp/native_repro.txt /tmp/artifacts2/ 2>/dev/null || true
           objdump -d /tmp/busybox-1.37.0/busybox > /tmp/artifacts2/busybox_disasm.txt
           nm /tmp/busybox-1.37.0/busybox > /tmp/artifacts2/busybox_symbols.txt 2>/dev/null || true
+          cd /tmp/artifacts2
+          for applet in sh ash echo ls true false cat; do ln -sf busybox-debug "$applet"; done
+          tar -cf busybox-debug-with-symlinks.tar busybox-debug sh ash echo ls true false cat
       - name: Upload BusyBox debug artifacts
         uses: actions/upload-artifact@v4
         with:
