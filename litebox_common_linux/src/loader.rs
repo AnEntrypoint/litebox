@@ -615,7 +615,8 @@ impl ElfParsedFile {
             }
         }
 
-        if let (Some(compressed_vaddr), Some(compressed_size)) = (compressed_vaddr, compressed_size) {
+        if let (Some(compressed_vaddr), Some(compressed_size)) = (compressed_vaddr, compressed_size)
+        {
             // `DT_RELRENT` is always 8 (one `Elf64_Xword` per RELR entry); reject anything
             // else rather than silently misinterpreting the bitstream.
             if compressed_ent.is_some_and(|ent| ent != 8) {
@@ -664,11 +665,9 @@ impl ElfParsedFile {
                 let target_addr = base_addr
                     .checked_add(word as usize)
                     .ok_or(ElfLoadError::InvalidProgramHeader)?;
-                let value = base_addr.wrapping_add(
-                    usize::from_le_bytes(
-                        Self::read_word_for_relr::<M>(mem, target_addr)?,
-                    ),
-                );
+                let value = base_addr.wrapping_add(usize::from_le_bytes(
+                    Self::read_word_for_relr::<M>(mem, target_addr)?,
+                ));
                 mem.write(target_addr, &value.to_le_bytes())?;
                 current_addr = word as usize + 8;
             } else {
