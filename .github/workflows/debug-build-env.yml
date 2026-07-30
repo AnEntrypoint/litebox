@@ -174,3 +174,61 @@ jobs:
         with:
           name: musl-openssl-debug-artifacts
           path: /tmp/artifacts/
+
+  build_busybox_debug:
+    name: Build debug-symboled BusyBox ash (for the fork/&&-hang investigation)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Use Node.js
+        uses: actions/setup-node@v6
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install general-purpose build toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential musl-tools musl-dev linux-libc-dev gdb binutils python3-pip python3-venv bc
+          MUSL_INCLUDE=$(dirname "$(musl-gcc -print-file-name=include/stddef.h)")
+          sudo ln -sf /usr/include/linux "$MUSL_INCLUDE/linux"
+          sudo ln -sf /usr/include/asm-generic "$MUSL_INCLUDE/asm-generic"
+          sudo ln -sf /usr/include/x86_64-linux-gnu/asm "$MUSL_INCLUDE/asm"
+      - name: Fetch BusyBox 1.37.0 source (exact version deployed in the Alpine rootfs)
+        run: |
+          curl -sL https://busybox.net/downloads/busybox-1.37.0.tar.bz2 -o /tmp/busybox-1.37.0.tar.bz2
+          tar -xf /tmp/busybox-1.37.0.tar.bz2 -C /tmp
+      - name: Configure BusyBox with a defconfig close to Alpine's (ash + job control)
+        run: |
+          cd /tmp/busybox-1.37.0
+          make defconfig
+          # Match Alpine: static-ish musl build, ash as the shell, debug symbols on.
+          sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config || true
+          sed -i 's/^# CONFIG_DEBUG is not set/CONFIG_DEBUG=y/' .config
+          sed -i 's/^CONFIG_DEBUG_PESSIMIZE=.*/# CONFIG_DEBUG_PESSIMIZE is not set/' .config || true
+          yes "" | make oldconfig CC=musl-gcc
+      - name: Build BusyBox with debug symbols against musl
+        run: |
+          cd /tmp/busybox-1.37.0
+          make -j"$(nproc)" CC=musl-gcc CFLAGS="-g -O0"
+      - name: Reproduce the fork/&&-hang under gdb with real symbols
+        run: |
+          cd /tmp/busybox-1.37.0
+          cat > /tmp/gdb_repro.txt << 'EOF'
+          set pagination off
+          run sh -c "/tmp/busybox-1.37.0/busybox echo child_out; echo AFTER_SEMICOLON"
+          EOF
+          timeout 8 gdb -batch -x /tmp/gdb_repro.txt ./busybox > /tmp/native_repro.txt 2>&1 || true
+          echo "--- native run (real Linux, real musl, should NOT hang) ---"
+          cat /tmp/native_repro.txt
+      - name: Package debug artifacts
+        run: |
+          mkdir -p /tmp/artifacts2
+          cp /tmp/busybox-1.37.0/busybox /tmp/artifacts2/busybox-debug
+          cp /tmp/native_repro.txt /tmp/artifacts2/ 2>/dev/null || true
+          objdump -d /tmp/busybox-1.37.0/busybox > /tmp/artifacts2/busybox_disasm.txt
+          nm /tmp/busybox-1.37.0/busybox > /tmp/artifacts2/busybox_symbols.txt 2>/dev/null || true
+      - name: Upload BusyBox debug artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: busybox-debug-artifacts
+          path: /tmp/artifacts2/
