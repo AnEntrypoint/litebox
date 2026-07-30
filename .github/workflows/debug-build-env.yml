@@ -41,36 +41,57 @@ jobs:
         run: |
           cd /tmp/musl-1.2.6
           python3 - << 'PYEOF'
-          import re
           path = "src/env/__init_tls.c"
           src = open(path).read()
+          assert "if (libc.tls_size > sizeof builtin_tls) {" in src, "anchor 1 not found"
+          assert "if (__init_tp(__copy_tls(mem)) < 0)" in src, "anchor 2 not found"
 
-          # Print every field static_init_tls computes, right before the mmap/builtin_tls choice.
           src = src.replace(
-              "\tif (libc.tls_size > sizeof builtin_tls) {",
-              '\tfprintf(stderr, "TLS_DEBUG: tls_size=%zu builtin_tls_size=%zu tls_align=%zu main_tls.size=%zu main_tls.offset=%zu\\n", libc.tls_size, sizeof(builtin_tls), libc.tls_align, main_tls.size, main_tls.offset);\n'
-              "\tif (libc.tls_size > sizeof builtin_tls) {"
+              "if (libc.tls_size > sizeof builtin_tls) {",
+              'fprintf(stderr, "TLS_DEBUG: tls_size=%zu builtin_tls_size=%zu tls_align=%zu main_tls.size=%zu main_tls.offset=%zu\\n", libc.tls_size, sizeof(builtin_tls), libc.tls_align, main_tls.size, main_tls.offset);\n\tif (libc.tls_size > sizeof builtin_tls) {'
           )
           src = src.replace(
-              "\t/* Failure to initialize thread pointer is always fatal. */\n\tif (__init_tp(__copy_tls(mem)) < 0)",
-              '\tfprintf(stderr, "TLS_DEBUG: mem=%p\\n", mem);\n\tvoid *td_dbg = __copy_tls(mem);\n\tfprintf(stderr, "TLS_DEBUG: td=%p td->self=%p (should equal td)\\n", td_dbg, *(void**)td_dbg);\n\t/* Failure to initialize thread pointer is always fatal. */\n\tif (__init_tp(td_dbg) < 0)'
+              "if (__init_tp(__copy_tls(mem)) < 0)",
+              'fprintf(stderr, "TLS_DEBUG: mem=%p\\n", mem);\n\tif (__init_tp(__copy_tls(mem)) < 0)'
           )
           src = "#include <stdio.h>\n" + src
           open(path, "w").write(src)
 
           path = "src/env/__libc_start_main.c"
           src = open(path).read()
+          assert "__init_tls(aux);" in src, "anchor 3 not found"
           src = src.replace(
-              "\t__init_tls(aux);",
-              '\tfprintf(stderr, "TLS_DEBUG: AT_PAGESZ=%zu AT_PHDR=%zu AT_PHENT=%zu AT_PHNUM=%zu AT_RANDOM=%zu AT_SECURE=%zu AT_HWCAP=%zu\\n", aux[AT_PAGESZ], aux[AT_PHDR], aux[AT_PHENT], aux[AT_PHNUM], aux[AT_RANDOM], aux[AT_SECURE], aux[AT_HWCAP]);\n\t__init_tls(aux);'
+              "__init_tls(aux);",
+              'fprintf(stderr, "TLS_DEBUG: AT_PAGESZ=%zu AT_PHDR=%zu AT_PHENT=%zu AT_PHNUM=%zu AT_RANDOM=%zu AT_SECURE=%zu AT_HWCAP=%zu\\n", aux[AT_PAGESZ], aux[AT_PHDR], aux[AT_PHENT], aux[AT_PHNUM], aux[AT_RANDOM], aux[AT_SECURE], aux[AT_HWCAP]);\n\t__init_tls(aux);'
           )
           src = "#include <stdio.h>\n" + src
           open(path, "w").write(src)
-
-          path = "src/thread/pthread_create.c"
-          src = open(path).read()
-          print("pthread_create.c untouched (reference only)")
           PYEOF
+
+          # Also trace __init_tp itself (in __init_tls.c) since that's where td->next=td is set.
+          python3 - << 'PYEOF'
+          path = "src/env/__init_tls.c"
+          src = open(path).read()
+          src = src.replace(
+              "td->next = td->prev = td;",
+              'td->next = td->prev = td;\n\tfprintf(stderr, "TLS_DEBUG: __init_tp td=%p td->self=%p td->next=%p td->prev=%p\\n", (void*)td, (void*)td->self, (void*)td->next, (void*)td->prev);'
+          )
+          open(path, "w").write(src)
+          PYEOF
+
+          # Trace pthread_key_delete's thread-list walk, the exact site of the litebox crash.
+          python3 - << 'PYEOF'
+          path = "src/thread/pthread_key_create.c"
+          src = open(path).read()
+          assert 'do td->tsd[k] = 0;' in src, "anchor 5 not found"
+          src = src.replace(
+              "pthread_t self = __pthread_self(), td=self;",
+              'pthread_t self = __pthread_self(), td=self;\n\tfprintf(stderr, "TLS_DEBUG: pthread_key_delete self=%p self->next=%p self->self=%p\\n", (void*)self, (void*)self->next, (void*)self->self);'
+          )
+          src = "#include <stdio.h>\n" + src
+          open(path, "w").write(src)
+          PYEOF
+          grep -n "TLS_DEBUG" src/env/__init_tls.c src/env/__libc_start_main.c src/thread/pthread_key_create.c
       - name: Build instrumented musl 1.2.6 with debug symbols (Alpine-matched -Os -g)
         run: |
           cd /tmp/musl-1.2.6
