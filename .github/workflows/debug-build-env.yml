@@ -26,7 +26,13 @@ jobs:
       - name: Install general-purpose build toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential musl-tools musl-dev gdb binutils python3-pip python3-venv
+          sudo apt-get install -y build-essential musl-tools musl-dev linux-libc-dev gdb binutils python3-pip python3-venv
+          # musl-gcc's own sysroot lacks the Linux kernel UAPI headers (linux/mman.h etc);
+          # symlink the system ones in so musl-gcc can find them.
+          MUSL_INCLUDE=$(dirname "$(musl-gcc -print-file-name=include/stddef.h)")
+          sudo ln -sf /usr/include/linux "$MUSL_INCLUDE/linux"
+          sudo ln -sf /usr/include/asm-generic "$MUSL_INCLUDE/asm-generic"
+          sudo ln -sf /usr/include/x86_64-linux-gnu/asm "$MUSL_INCLUDE/asm"
       - name: Fetch musl 1.2.6 source
         run: |
           curl -sL https://musl.libc.org/releases/musl-1.2.6.tar.gz -o /tmp/musl-1.2.6.tar.gz
