@@ -37,7 +37,41 @@ jobs:
         run: |
           curl -sL https://musl.libc.org/releases/musl-1.2.6.tar.gz -o /tmp/musl-1.2.6.tar.gz
           tar -xf /tmp/musl-1.2.6.tar.gz -C /tmp
-      - name: Build musl 1.2.6 with debug symbols (Alpine-matched -Os -g)
+      - name: Instrument __copy_tls/static_init_tls/__init_tp with debug prints
+        run: |
+          cd /tmp/musl-1.2.6
+          python3 - << 'PYEOF'
+          import re
+          path = "src/env/__init_tls.c"
+          src = open(path).read()
+
+          # Print every field static_init_tls computes, right before the mmap/builtin_tls choice.
+          src = src.replace(
+              "\tif (libc.tls_size > sizeof builtin_tls) {",
+              '\tfprintf(stderr, "TLS_DEBUG: tls_size=%zu builtin_tls_size=%zu tls_align=%zu main_tls.size=%zu main_tls.offset=%zu\\n", libc.tls_size, sizeof(builtin_tls), libc.tls_align, main_tls.size, main_tls.offset);\n'
+              "\tif (libc.tls_size > sizeof builtin_tls) {"
+          )
+          src = src.replace(
+              "\t/* Failure to initialize thread pointer is always fatal. */\n\tif (__init_tp(__copy_tls(mem)) < 0)",
+              '\tfprintf(stderr, "TLS_DEBUG: mem=%p\\n", mem);\n\tvoid *td_dbg = __copy_tls(mem);\n\tfprintf(stderr, "TLS_DEBUG: td=%p td->self=%p (should equal td)\\n", td_dbg, *(void**)td_dbg);\n\t/* Failure to initialize thread pointer is always fatal. */\n\tif (__init_tp(td_dbg) < 0)'
+          )
+          src = "#include <stdio.h>\n" + src
+          open(path, "w").write(src)
+
+          path = "src/env/__libc_start_main.c"
+          src = open(path).read()
+          src = src.replace(
+              "\t__init_tls(aux);",
+              '\tfprintf(stderr, "TLS_DEBUG: AT_PAGESZ=%zu AT_PHDR=%zu AT_PHENT=%zu AT_PHNUM=%zu AT_RANDOM=%zu AT_SECURE=%zu AT_HWCAP=%zu\\n", aux[AT_PAGESZ], aux[AT_PHDR], aux[AT_PHENT], aux[AT_PHNUM], aux[AT_RANDOM], aux[AT_SECURE], aux[AT_HWCAP]);\n\t__init_tls(aux);'
+          )
+          src = "#include <stdio.h>\n" + src
+          open(path, "w").write(src)
+
+          path = "src/thread/pthread_create.c"
+          src = open(path).read()
+          print("pthread_create.c untouched (reference only)")
+          PYEOF
+      - name: Build instrumented musl 1.2.6 with debug symbols (Alpine-matched -Os -g)
         run: |
           cd /tmp/musl-1.2.6
           CFLAGS='-Os -g' ./configure --prefix=/tmp/musl-install
@@ -70,9 +104,21 @@ jobs:
           musl-gcc -g -O0 -static -I/tmp/openssl-openssl-3.5.7/include \
             -o /tmp/repro/evpfetch_repro /tmp/repro/evpfetch_repro.c \
             /tmp/openssl-openssl-3.5.7/libssl.a /tmp/openssl-openssl-3.5.7/libcrypto.a -ldl -lpthread
-      - name: Run the reproduction natively on Linux as a real-Linux control
+      - name: Build a DYNAMICALLY-linked reproduction (matches litebox/apk's real ld.so codepath)
         run: |
-          /tmp/repro/evpfetch_repro
+          # Rebuild OpenSSL itself as real shared objects against the instrumented musl,
+          # so the reproduction goes through ld.so's own static_init_tls at load time,
+          # exactly like apk/litebox does -- the earlier -static build bypasses ld.so entirely.
+          cd /tmp/openssl-openssl-3.5.7
+          make clean > /dev/null 2>&1 || true
+          CC=musl-gcc ./Configure linux-x86_64 -g -O0 shared no-tests --prefix=/tmp/openssl-install-shared
+          make -j"$(nproc)"
+          musl-gcc -g -O0 -I/tmp/openssl-openssl-3.5.7/include \
+            -o /tmp/repro/evpfetch_repro_dyn /tmp/repro/evpfetch_repro.c \
+            -L/tmp/openssl-openssl-3.5.7 -lssl -lcrypto -Wl,-rpath,/tmp/openssl-openssl-3.5.7
+      - name: Run the dynamically-linked reproduction natively on Linux as a real-Linux control (with TLS debug trace)
+        run: |
+          LD_LIBRARY_PATH=/tmp/openssl-openssl-3.5.7 /tmp/repro/evpfetch_repro_dyn 2>&1 | tee /tmp/repro/tls_debug_trace.txt
           echo "exit code: $?"
       - name: Run under gdb with full backtrace and thread-struct inspection as a reference trace
         run: |
@@ -90,6 +136,8 @@ jobs:
           cp -r /tmp/musl-1.2.6/obj /tmp/artifacts/musl-obj-debug || true
           cp /tmp/openssl-openssl-3.5.7/libssl.a /tmp/openssl-openssl-3.5.7/libcrypto.a /tmp/artifacts/ 2>/dev/null || true
           cp /tmp/repro/evpfetch_repro /tmp/artifacts/
+          cp /tmp/repro/evpfetch_repro_dyn /tmp/artifacts/ 2>/dev/null || true
+          cp /tmp/repro/tls_debug_trace.txt /tmp/artifacts/ 2>/dev/null || true
           cp /tmp/repro/gdb_reference_trace.txt /tmp/artifacts/
           objdump -d /tmp/repro/evpfetch_repro > /tmp/artifacts/evpfetch_repro_disasm.txt
           nm /tmp/repro/evpfetch_repro > /tmp/artifacts/evpfetch_repro_symbols.txt
