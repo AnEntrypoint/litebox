@@ -382,7 +382,29 @@ jobs:
                * unwind back to the stop captured before the fork. */
               unwind_to(saved_stop);
 
-              printf("FORKREPRO-PASS current=%p saved_stop=%p\n", (void*)current, (void*)saved_stop);
+              /* sh -c "cmd1; cmd2" always forks TWICE for two external commands (the
+               * first is never in tail position so ash can't exec-replace it; only a
+               * script's true final statement gets that optimization). Repeat the
+               * entire fork+wait+unwind sequence to match, in case a SECOND cycle
+               * specifically (not a lone one) triggers the corruption. */
+              push();
+              struct node *saved_stop2 = current;
+              sigprocmask(SIG_BLOCK, &block_set, &old_set);
+              pid_t pid2 = fork();
+              if (pid2 == 0) {
+                  setpgid(0, 0);
+                  sigprocmask(SIG_SETMASK, &old_set, NULL);
+                  printf("FORKREPRO-CHILD2\n");
+                  fflush(stdout);
+                  _exit(0);
+              }
+              setpgid(pid2, pid2);
+              waitpid(pid2, &status, 0);
+              sigprocmask(SIG_SETMASK, &old_set, NULL);
+              tcsetpgrp(STDIN_FILENO, getpgrp());
+              unwind_to(saved_stop2);
+
+              printf("FORKREPRO-PASS current=%p saved_stop=%p\n", (void*)current, (void*)saved_stop2);
               fflush(stdout);
               return 0;
           }
