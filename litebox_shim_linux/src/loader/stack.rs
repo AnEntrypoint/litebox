@@ -165,6 +165,7 @@ impl<Platform: ShimPlatform> UserStack<Platform> {
         argv: Vec<CString>,
         env: Vec<CString>,
         mut aux: BTreeMap<AuxKey, usize>,
+        platform: &impl litebox::platform::CrngProvider,
     ) -> Option<()> {
         // end markers
         self.pos = self.pos.checked_sub(size_of::<usize>())?;
@@ -174,11 +175,12 @@ impl<Platform: ShimPlatform> UserStack<Platform> {
         let envp = self.push_cstrings(&env)?;
         let argvp = self.push_cstrings(&argv)?;
 
-        // TODO: generate a random value
-        self.push_bytes(&[
-            0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD,
-            0xBE, 0xEF,
-        ])?;
+        // AT_RANDOM must point to 16 bytes of real randomness: the C library uses
+        // it to seed the stack-protector canary and (on some archs) pointer
+        // obfuscation, so a predictable value here weakens those defenses.
+        let mut random_bytes = [0u8; 16];
+        platform.fill_bytes_crng(&mut random_bytes);
+        self.push_bytes(&random_bytes)?;
         aux.insert(AuxKey::AT_RANDOM, self.stack_top.as_usize() + self.pos);
 
         let align_down = |pos: usize, alignment: usize| -> usize {
