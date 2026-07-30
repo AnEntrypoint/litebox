@@ -193,6 +193,7 @@ jobs:
           sudo ln -sf /usr/include/linux "$MUSL_INCLUDE/linux"
           sudo ln -sf /usr/include/asm-generic "$MUSL_INCLUDE/asm-generic"
           sudo ln -sf /usr/include/x86_64-linux-gnu/asm "$MUSL_INCLUDE/asm"
+          sudo ln -sf /usr/include/mtd "$MUSL_INCLUDE/mtd" 2>/dev/null || true
       - name: Fetch BusyBox 1.37.0 source (exact version deployed in the Alpine rootfs)
         run: |
           curl -sL https://busybox.net/downloads/busybox-1.37.0.tar.bz2 -o /tmp/busybox-1.37.0.tar.bz2
@@ -203,7 +204,7 @@ jobs:
           make defconfig
           # Disable every applet needing kernel headers musl-gcc's sysroot doesn't carry
           # (qdisc, mtd/nand, ubi) -- irrelevant to the ash fork/&&-hang investigation.
-          for sym in TC NANDWRITE NANDDUMP UBIATTACH UBIDETACH UBIMKVOL UBIRMVOL UBIRSVOL UBIUPDATEVOL; do
+          for sym in TC NANDWRITE NANDDUMP UBIATTACH UBIDETACH UBIMKVOL UBIRMVOL UBIRSVOL UBIUPDATEVOL UBIRENAME FEATURE_MTD_WRITEIMAGE FLASH_ERASEALL FLASH_LOCK FLASH_UNLOCK FLASHCP; do
             sed -i "s/^CONFIG_${sym}=y/# CONFIG_${sym} is not set/" .config
           done
           sed -i 's/^# CONFIG_DEBUG is not set/CONFIG_DEBUG=y/' .config
