@@ -205,6 +205,9 @@ jobs:
           sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config || true
           sed -i 's/^# CONFIG_DEBUG is not set/CONFIG_DEBUG=y/' .config
           sed -i 's/^CONFIG_DEBUG_PESSIMIZE=.*/# CONFIG_DEBUG_PESSIMIZE is not set/' .config || true
+          # tc needs newer kernel qdisc headers than musl-gcc's sysroot has; irrelevant to
+          # the ash fork/&&-hang investigation, so drop it rather than chase headers.
+          sed -i 's/^CONFIG_TC=y/# CONFIG_TC is not set/' .config || true
           yes "" | make oldconfig CC=musl-gcc
       - name: Build BusyBox with debug symbols against musl
         run: |
