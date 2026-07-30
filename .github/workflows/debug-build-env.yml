@@ -223,7 +223,9 @@ jobs:
         run: |
           cd /tmp/busybox-1.37.0
           sed -i 's/^CONFIG_STRIP=y/# CONFIG_STRIP is not set/' .config || true
-          make -j"$(nproc)" CC=musl-gcc EXTRA_CFLAGS="-g -O0" NOSTRIP=1
+          # busybox's own link step passes `-s` (strip) via LDFLAGS regardless of CONFIG_STRIP
+          # unless overridden; NOSTRIP=1 alone doesn't stop it, so force LDFLAGS empty too.
+          make -j"$(nproc)" CC=musl-gcc EXTRA_CFLAGS="-g -O0" LDFLAGS="" NOSTRIP=1 SKIP_STRIP=y
           file busybox
           nm busybox | wc -l
       - name: Reproduce the fork/&&-hang under gdb with real symbols
