@@ -197,17 +197,27 @@ jobs:
         run: |
           curl -sL https://busybox.net/downloads/busybox-1.37.0.tar.bz2 -o /tmp/busybox-1.37.0.tar.bz2
           tar -xf /tmp/busybox-1.37.0.tar.bz2 -C /tmp
-      - name: Configure BusyBox with a defconfig close to Alpine's (ash + job control)
+      - name: Configure BusyBox minimally (ash + a few coreutils only -- avoids chasing every applet's kernel headers)
         run: |
           cd /tmp/busybox-1.37.0
-          make defconfig
-          # Match Alpine: static-ish musl build, ash as the shell, debug symbols on.
-          sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config || true
-          sed -i 's/^# CONFIG_DEBUG is not set/CONFIG_DEBUG=y/' .config
-          sed -i 's/^CONFIG_DEBUG_PESSIMIZE=.*/# CONFIG_DEBUG_PESSIMIZE is not set/' .config || true
-          # tc needs newer kernel qdisc headers than musl-gcc's sysroot has; irrelevant to
-          # the ash fork/&&-hang investigation, so drop it rather than chase headers.
-          sed -i 's/^CONFIG_TC=y/# CONFIG_TC is not set/' .config || true
+          make allnoconfig
+          # Only what the fork/&&-hang repro actually needs; a minimal config sidesteps every
+          # applet that wants headers musl-gcc's sysroot doesn't carry (tc, nandwrite, etc).
+          cat >> .config << 'EOF'
+          CONFIG_DEBUG=y
+          CONFIG_ASH=y
+          CONFIG_ASH_JOB_CONTROL=y
+          CONFIG_ASH_ALIAS=y
+          CONFIG_ASH_GETOPTS=y
+          CONFIG_ASH_BUILTIN_ECHO=y
+          CONFIG_ASH_BUILTIN_TEST=y
+          CONFIG_FEATURE_SH_IS_ASH=y
+          CONFIG_ECHO=y
+          CONFIG_LS=y
+          CONFIG_TRUE=y
+          CONFIG_FALSE=y
+          CONFIG_CAT=y
+          EOF
           yes "" | make oldconfig CC=musl-gcc
       - name: Build BusyBox with debug symbols against musl
         run: |
