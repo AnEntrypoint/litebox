@@ -236,10 +236,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Join a directory's absolute path with a path given relative to it, matching the semantics
     /// `openat`/`fstatat`-family syscalls need for a `dirfd`-relative lookup.
     fn join_dir_relative_path(dir_path: &CString, relative: &CString) -> Result<CString, Errno> {
-        let mut joined = dir_path
-            .to_str()
-            .map_err(|_| Errno::EINVAL)?
-            .to_string();
+        let mut joined = dir_path.to_str().map_err(|_| Errno::EINVAL)?.to_string();
         if !joined.ends_with('/') {
             joined.push('/');
         }

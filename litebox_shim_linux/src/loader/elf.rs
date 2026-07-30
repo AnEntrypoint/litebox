@@ -235,9 +235,9 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
         } else {
             None
         };
-        let result =
-            self.parsed
-                .load(&mut self.file, &mut &*platform, reserve, apply_relocations);
+        let result = self
+            .parsed
+            .load(&mut self.file, &mut &*platform, reserve, apply_relocations);
         Ok(result?)
     }
 }
