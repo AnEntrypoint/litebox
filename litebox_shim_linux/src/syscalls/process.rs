@@ -898,13 +898,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let thread =
                 crate::syscalls::process::ThreadState::new_process(child_tid, dest_pm, vforked);
 
-            // The captured ctx's rsp/rbp point into the PARENT's address space; the child's
-            // stack (and everything else) generally lives at a different host address (see
-            // litebox::mm::linux::Vmem::duplicate's doc comment) -- translate them, or the child
-            // resumes with a dangling stack pointer and crashes on its very first push/pop.
+            // The captured ctx's rip/rsp/rbp all point into the PARENT's address space; the
+            // child's code, stack, and everything else generally live at a different host
+            // address (see litebox::mm::linux::Vmem::duplicate's doc comment) -- translate all
+            // three, or the child resumes with a dangling stack pointer (crashing on its very
+            // first push/pop) or, worse, a stale `rip` that silently keeps executing the
+            // PARENT's still-live code/globals instead of the child's relocated copy: since
+            // `rip` remains within the broad guest address range either way,
+            // `sanitize_for_user_return`'s range check can't catch this, so the child runs with
+            // a corrupted hybrid state (child stack, parent globals) instead of crashing.
             let mut child_ctx = ctx.clone();
             #[cfg(target_arch = "x86_64")]
             {
+                if let Some(new_rip) = relocations.translate(child_ctx.rip) {
+                    child_ctx.rip = new_rip;
+                }
                 if let Some(new_rsp) = relocations.translate(child_ctx.rsp) {
                     child_ctx.rsp = new_rsp;
                 }
