@@ -380,6 +380,7 @@ impl ElfParsedFile {
         mapper: &mut M,
         mem: &mut impl AccessMemory,
         reserve_trampoline: Option<usize>,
+        apply_relocations: bool,
     ) -> Result<MappingInfo, ElfLoadError<M::Error>> {
         let base_addr = if self.header.e_type == elf::abi::ET_DYN {
             // Find an aligned load address that will fit all PT_LOAD segments.
@@ -485,7 +486,9 @@ impl ElfParsedFile {
             }
         }
 
-        self.apply_relocations::<M>(base_addr, mem)?;
+        if apply_relocations {
+            self.apply_relocations::<M>(base_addr, mem)?;
+        }
 
         let mut info = MappingInfo {
             base_addr,
@@ -556,50 +559,154 @@ impl ElfParsedFile {
             &dynamic_bytes,
         );
 
+        // Generic-ABI tags for the compressed relative-relocation format (`DT_RELR`/
+        // `DT_RELRSZ`/`DT_RELRENT`); not present in the `elf` crate's `abi` module, so
+        // named directly by their standard values.
+        const DT_RELR: i64 = 0x24;
+        const DT_RELRSZ: i64 = 0x23;
+        const DT_RELRENT: i64 = 0x25;
+
         let mut rela_vaddr: Option<usize> = None;
         let mut rela_size: Option<usize> = None;
         let mut rela_ent: Option<usize> = None;
+        let mut relr_vaddr: Option<usize> = None;
+        let mut relr_size: Option<usize> = None;
+        let mut relr_ent: Option<usize> = None;
         for entry in dyn_table {
             match entry.d_tag {
                 elf::abi::DT_RELA => rela_vaddr = Some(entry.d_ptr().trunc()),
                 elf::abi::DT_RELASZ => rela_size = Some(entry.d_val().trunc()),
                 elf::abi::DT_RELAENT => rela_ent = Some(entry.d_val().trunc()),
+                DT_RELR => relr_vaddr = Some(entry.d_ptr().trunc()),
+                DT_RELRSZ => relr_size = Some(entry.d_val().trunc()),
+                DT_RELRENT => relr_ent = Some(entry.d_val().trunc()),
                 _ => {}
             }
         }
-        let (Some(rela_vaddr), Some(rela_size)) = (rela_vaddr, rela_size) else {
-            // No DT_RELA table -- nothing to relocate (e.g. a non-PIE ET_EXEC, or a PIE with
-            // only symbol-requiring relocation types this loader does not support anyway).
-            return Ok(());
-        };
-        // `Rela`'s real on-disk size; `DT_RELAENT` merely confirms it if present.
-        let expected_ent: usize = elf::relocation::Rela::size_for(self.header.class);
-        if rela_ent.is_some_and(|ent| ent != expected_ent) {
-            return Err(ElfLoadError::InvalidProgramHeader);
+
+        if let (Some(rela_vaddr), Some(rela_size)) = (rela_vaddr, rela_size) {
+            // `Rela`'s real on-disk size; `DT_RELAENT` merely confirms it if present.
+            let expected_ent: usize = elf::relocation::Rela::size_for(self.header.class);
+            if rela_ent.is_some_and(|ent| ent != expected_ent) {
+                return Err(ElfLoadError::InvalidProgramHeader);
+            }
+
+            let mut rela_bytes = alloc::vec![0u8; rela_size];
+            mem.read(base_addr + rela_vaddr, &mut rela_bytes)?;
+            let rela_table = elf::parse::ParsingIterator::<Endian, elf::relocation::Rela>::new(
+                self.header.endianness,
+                self.header.class,
+                &rela_bytes,
+            );
+            for rela in rela_table {
+                if rela.r_type != elf::abi::R_X86_64_RELATIVE {
+                    // Every other x86-64 relocation type requires a symbol lookup (a real
+                    // dynamic linker), which this loader does not implement -- see this
+                    // function's doc comment. A binary needing one would already be
+                    // unsupported (it would have a PT_INTERP this loader has no `ld.so` to
+                    // satisfy), so this is not a new gap.
+                    continue;
+                }
+                let target_addr = base_addr
+                    .checked_add(rela.r_offset as usize)
+                    .ok_or(ElfLoadError::InvalidProgramHeader)?;
+                let value = base_addr.wrapping_add(rela.r_addend as usize);
+                mem.write(target_addr, &value.to_le_bytes())?;
+            }
         }
 
-        let mut rela_bytes = alloc::vec![0u8; rela_size];
-        mem.read(base_addr + rela_vaddr, &mut rela_bytes)?;
-        let rela_table = elf::parse::ParsingIterator::<Endian, elf::relocation::Rela>::new(
-            self.header.endianness,
-            self.header.class,
-            &rela_bytes,
-        );
-        for rela in rela_table {
-            if rela.r_type != elf::abi::R_X86_64_RELATIVE {
-                // Every other x86-64 relocation type requires a symbol lookup (a real dynamic
-                // linker), which this loader does not implement -- see this function's doc
-                // comment. A binary needing one would already be unsupported (it would have a
-                // PT_INTERP this loader has no `ld.so` to satisfy), so this is not a new gap.
-                continue;
+        if let (Some(relr_vaddr), Some(relr_size)) = (relr_vaddr, relr_size) {
+            // `DT_RELRENT` is always 8 (one `Elf64_Xword` per RELR entry); reject anything
+            // else rather than silently misinterpreting the bitstream.
+            if relr_ent.is_some_and(|ent| ent != 8) {
+                return Err(ElfLoadError::InvalidProgramHeader);
             }
-            let target_addr = base_addr
-                .checked_add(rela.r_offset as usize)
-                .ok_or(ElfLoadError::InvalidProgramHeader)?;
-            let value = base_addr.wrapping_add(rela.r_addend as usize);
-            mem.write(target_addr, &value.to_le_bytes())?;
+            self.apply_relr_relocations::<M>(base_addr, mem, relr_vaddr, relr_size)?;
+        }
+
+        Ok(())
+    }
+
+    /// Apply `DT_RELR`-encoded relative relocations (the compressed, symbol-free "RELR"
+    /// format introduced as a generic-ABI extension for base-relative fixups).
+    ///
+    /// Each entry is a 64-bit word. If its low bit is 0, the word is itself the address of a
+    /// slot to relocate (value = `base_addr` at that slot), and the "current" address advances
+    /// to `word + 8` for the next entry. If the low bit is 1, the word is a *bitmap*: bit `i`
+    /// (for `i` in `1..64`) being set means the slot at `current + 8*i` (in 8-byte units, so
+    /// bit 1 covers `current`, bit 2 covers `current + 8`, etc.) also needs the same fixup, and
+    /// after processing every bitmap word the current address advances by `63 * 8` (one slot
+    /// per non-sign bit). This is the standard RELR encoding (see the generic-abi RELR
+    /// proposal / glibc's and musl's own decoders, e.g. musl's `reloc_relr` in `dynlink.c`).
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "RELR entries are read as u64 and truncated to usize for pointer arithmetic; \
+                  on a 64-bit target this is lossless, matching every other address computation \
+                  in this file"
+    )]
+    fn apply_relr_relocations<M: MapMemory>(
+        &self,
+        base_addr: usize,
+        mem: &mut impl AccessMemory,
+        relr_vaddr: usize,
+        relr_size: usize,
+    ) -> Result<(), ElfLoadError<M::Error>> {
+        if !relr_size.is_multiple_of(8) {
+            return Err(ElfLoadError::InvalidProgramHeader);
+        }
+        let mut relr_bytes = alloc::vec![0u8; relr_size];
+        mem.read(base_addr + relr_vaddr, &mut relr_bytes)?;
+
+        let mut current_addr: usize = 0;
+        for chunk in relr_bytes.chunks_exact(8) {
+            let word = u64::from_le_bytes(chunk.try_into().unwrap());
+            if word & 1 == 0 {
+                // An address entry: relocate the slot at this address, then advance.
+                let target_addr = base_addr
+                    .checked_add(word as usize)
+                    .ok_or(ElfLoadError::InvalidProgramHeader)?;
+                let value = base_addr.wrapping_add(
+                    usize::from_le_bytes(
+                        self.read_word_for_relr::<M>(mem, target_addr)?,
+                    ),
+                );
+                mem.write(target_addr, &value.to_le_bytes())?;
+                current_addr = word as usize + 8;
+            } else {
+                // A bitmap entry: bit i (1-indexed from the low end, skipping the tag bit)
+                // marks the slot at `current_addr + 8*(i-1)`.
+                let mut bitmap = word >> 1;
+                let mut i = 0usize;
+                while bitmap != 0 {
+                    if bitmap & 1 != 0 {
+                        let target_addr = base_addr
+                            .checked_add(current_addr + 8 * i)
+                            .ok_or(ElfLoadError::InvalidProgramHeader)?;
+                        let value = base_addr.wrapping_add(usize::from_le_bytes(
+                            self.read_word_for_relr::<M>(mem, target_addr)?,
+                        ));
+                        mem.write(target_addr, &value.to_le_bytes())?;
+                    }
+                    bitmap >>= 1;
+                    i += 1;
+                }
+                current_addr += 63 * 8;
+            }
         }
         Ok(())
+    }
+
+    /// Read the current 8-byte value at `target_addr`, used as the base offset a RELR entry
+    /// relocates (RELR stores no explicit addend -- the pre-existing slot content, as written
+    /// by the static linker, IS the addend, matching every real RELR decoder's behavior).
+    fn read_word_for_relr<M: MapMemory>(
+        &self,
+        mem: &mut impl AccessMemory,
+        target_addr: usize,
+    ) -> Result<[u8; 8], ElfLoadError<M::Error>> {
+        let mut buf = [0u8; 8];
+        mem.read(target_addr, &mut buf)?;
+        Ok(buf)
     }
 
     /// Load the LiteBox trampoline into memory.

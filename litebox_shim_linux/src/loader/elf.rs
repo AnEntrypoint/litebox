@@ -224,6 +224,7 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
     fn load_mapped(
         &mut self,
         platform: &(impl litebox::platform::RawPointerProvider + litebox::platform::SystemInfoProvider),
+        apply_relocations: bool,
     ) -> Result<litebox_common_linux::loader::MappingInfo, ElfLoaderError> {
         let syscall_entry_point = self.file.task.global.platform.get_syscall_entry_point();
         // When the platform requires syscall rewriting but the binary has no
@@ -234,7 +235,9 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
         } else {
             None
         };
-        let result = self.parsed.load(&mut self.file, &mut &*platform, reserve);
+        let result =
+            self.parsed
+                .load(&mut self.file, &mut &*platform, reserve, apply_relocations);
         Ok(result?)
     }
 }
@@ -270,11 +273,22 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfLoader<'a, Platform, FS> {
         let global = &self.main.file.task.global;
 
         // Load the main ELF file first so that it gets privileged addresses.
-        let info = self.main.load_mapped(global.platform)?;
+        //
+        // Only a true static-PIE main executable (no PT_INTERP) needs its
+        // relocations applied externally here, matching the real kernel's
+        // binfmt_elf.c. When an interpreter is present, ld.so relocates both
+        // itself and the main executable via its own internal machinery
+        // (e.g. musl's _dlstart_c self-relocation); applying relocations here
+        // too would double-relocate and corrupt the image.
+        let info = self
+            .main
+            .load_mapped(global.platform, self.interp.is_none())?;
 
-        // Load the interpreter ELF file, if any.
+        // Load the interpreter ELF file, if any. The interpreter always
+        // self-relocates itself before running any of its own library code,
+        // so it must never be relocated externally.
         let interp = if let Some(interp) = &mut self.interp {
-            Some(interp.load_mapped(global.platform)?)
+            Some(interp.load_mapped(global.platform, false)?)
         } else {
             None
         };
@@ -503,7 +517,7 @@ mod tests {
         let mut loader = ElfLoader::new(&task, "/main").expect("loader should parse test ELFs");
         let main = loader
             .main
-            .load_mapped(task.global.platform)
+            .load_mapped(task.global.platform, false)
             .expect("main should load");
         assert_eq!(main.base_addr, 0);
 
@@ -511,7 +525,7 @@ mod tests {
             .interp
             .as_mut()
             .expect("test main should have PT_INTERP")
-            .load_mapped(task.global.platform)
+            .load_mapped(task.global.platform, false)
             .expect("interpreter should load");
 
         // The interpreter must land high — via the top-down search — so the
