@@ -264,6 +264,7 @@ jobs:
           #include <stdlib.h>
           #include <unistd.h>
           #include <sys/wait.h>
+          #include <signal.h>
 
           struct node { struct node *prev; int tag; };
           static struct node basenode = { 0, 0xBEEF };
@@ -295,25 +296,62 @@ jobs:
               }
           }
 
+          /* Mimics ash's INT_OFF/INT_ON pattern (block/unblock SIGINT around
+           * critical sections) and its process-group / job-control setup around
+           * a forked external command, in addition to the bare fork+wait shape
+           * already tested clean by the sibling repro. */
           int main(void) {
               printf("FORKREPRO-START\n");
               fflush(stdout);
+
+              /* ash sets up its own pgrp and puts itself in the foreground when
+               * job control is active (setjobctl(1) -> setpgid + tcsetpgrp). */
+              setpgid(0, 0);
+              signal(SIGTTOU, SIG_IGN);
+              signal(SIGTTIN, SIG_IGN);
+              signal(SIGCHLD, SIG_DFL);
 
               push();
               push();
               struct node *saved_stop = current;
 
+              sigset_t block_set, old_set;
+              sigemptyset(&block_set);
+              sigaddset(&block_set, SIGCHLD);
+              sigaddset(&block_set, SIGINT);
+
+              /* INT_OFF-equivalent: block signals across the fork, same as ash's
+               * real forkshell()/makejob() do. */
+              sigprocmask(SIG_BLOCK, &block_set, &old_set);
+
               pid_t pid = fork();
               if (pid == 0) {
-                  /* child: mimic ash's forked-external-command child -- do a little
-                   * work then exit, same shape as busybox echo/true. */
+                  /* child: put itself in its own foreground process group, same
+                   * shape as ash's forked external-command child, then restore
+                   * default signal disposition and unblock before exec-equivalent
+                   * work. */
+                  setpgid(0, 0);
+                  sigprocmask(SIG_SETMASK, &old_set, NULL);
                   printf("FORKREPRO-CHILD\n");
                   fflush(stdout);
                   _exit(0);
               }
 
+              /* parent: also sets the child's pgid (both parent and child race to
+               * do this in real job-control shells; harmless if it loses the race
+               * because the child already exited). */
+              setpgid(pid, pid);
+
               int status;
               waitpid(pid, &status, 0);
+
+              /* INT_ON-equivalent: restore the signal mask after the fork+wait,
+               * same ordering as ash's real evalcommand -> waitforjob -> INT_ON. */
+              sigprocmask(SIG_SETMASK, &old_set, NULL);
+
+              /* Reclaim the foreground process group, same as waitforjob's real
+               * xtcsetpgrp(ttyfd, rootpid) call when job control is active. */
+              tcsetpgrp(STDIN_FILENO, getpgrp());
 
               /* parent: this is the exact call shape evalcommand's out: label uses --
                * unwind back to the stop captured before the fork. */
