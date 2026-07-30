@@ -91,7 +91,24 @@ jobs:
           src = "#include <stdio.h>\n" + src
           open(path, "w").write(src)
           PYEOF
-          grep -n "TLS_DEBUG" src/env/__init_tls.c src/env/__libc_start_main.c src/thread/pthread_key_create.c
+
+          # Trace each loaded module's individual TLS block size/offset/id as ld.so computes
+          # it (ldso/dynlink.c's load_library, right after p->tls.offset is finalized) -- to
+          # check whether some module's TLS block size/offset lines up with the 0x468-byte
+          # constant offset observed corrupting a thread struct's self->next under litebox.
+          python3 - << 'PYEOF'
+          path = "ldso/dynlink.c"
+          src = open(path).read()
+          assert "p->tls.offset = tls_offset + ( (p->tls.align-1) &" in src, "anchor 6 not found"
+          src = src.replace(
+              "p->tls.offset = tls_offset + ( (p->tls.align-1) &\n\t\t\t(-tls_offset + (uintptr_t)p->tls.image) );\n\t\ttls_offset = p->tls.offset + p->tls.size;",
+              'p->tls.offset = tls_offset + ( (p->tls.align-1) &\n\t\t\t(-tls_offset + (uintptr_t)p->tls.image) );\n\t\ttls_offset = p->tls.offset + p->tls.size;\n\t\tfprintf(stderr, "TLS_DEBUG: module=%s tls_id=%zu tls.size=%zu tls.align=%zu tls.offset=%zu running_tls_offset=%zu\\n", p->shortname ? p->shortname : p->name, p->tls_id, p->tls.size, p->tls.align, p->tls.offset, tls_offset);'
+          )
+          assert '#include <stdio.h>' not in src
+          src = "#include <stdio.h>\n" + src
+          open(path, "w").write(src)
+          PYEOF
+          grep -n "TLS_DEBUG" src/env/__init_tls.c src/env/__libc_start_main.c src/thread/pthread_key_create.c ldso/dynlink.c
       - name: Build instrumented musl 1.2.6 with debug symbols (Alpine-matched -Os -g)
         run: |
           cd /tmp/musl-1.2.6
