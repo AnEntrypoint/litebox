@@ -233,7 +233,7 @@ impl<'a> ElfLoader<'a> {
         let ldelf_info =
             self.main
                 .parsed
-                .load(&mut self.main.file, &mut &*global.platform, None)?;
+                .load(&mut self.main.file, &mut &*global.platform, None, true)?;
 
         let mut ta_stack = crate::loader::ta_stack::allocate_stack(task, None).ok_or(
             ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory),
