@@ -66,6 +66,24 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
         }
     }
 
+    /// Permanently change the fixed uid/gid used for all subsequent permission checks against
+    /// this file system (i.e. the "current user" of the single, fixed set of credentials the
+    /// whole sandboxed guest runs as -- see the `setuid` syscall handler's doc comment).
+    ///
+    /// [`FileSystem::new`] defaults this to an unprivileged uid/gid, but some guest rootfs
+    /// layouts (e.g. an OCI/container image such as Alpine, whose `/`, `/etc`, `/lib`, etc. are
+    /// root-owned at mode `0755` since a real container's initial process runs as root absent an
+    /// explicit `USER` directive) require the guest to actually run as root in order to write
+    /// into those directories, matching what a real container would allow.
+    ///
+    /// This is distinct from [`FileSystem::with_root_privileges`], which only grants root
+    /// privileges for the duration of a closure (intended for one-off internal setup); this
+    /// method changes the persistent identity used for every future operation until changed
+    /// again.
+    pub fn set_default_user(&mut self, user: u16, group: u16) {
+        self.current_user = UserInfo { user, group };
+    }
+
     /// Execute `f` with superuser/root privileges.
     ///
     /// This function primarily exists to initialize files. Most regular interaction with the file

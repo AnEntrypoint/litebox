@@ -77,6 +77,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
+        // The guest's persistent identity is root, matching `Platform::init_task`'s credentials
+        // below and matching how a real container's initial process runs (a fresh OCI rootfs's
+        // `/`, `/etc`, `/lib`, etc. are root-owned at mode 0755, not world-writable). Without
+        // this, `getuid()` would report root while the file system's own permission checks still
+        // enforced a mismatched non-root identity, breaking any program (e.g. `apk`) that needs
+        // to write into the rootfs's root-owned directories.
+        in_mem.set_default_user(0, 0);
         in_mem.with_root_privileges(|fs| {
             use litebox::fs::FileSystem as _;
             fs.mkdir(

@@ -375,14 +375,22 @@ impl WindowsUserland {
     pub fn init_task(&self) -> litebox_common_linux::TaskParams {
         // TODO: Currently we are using a static thread ID and credentials (faked).
         // This is a placeholder for future implementation to use passthrough.
+        //
+        // Credentials are root (uid/gid 0), matching a real container's initial process (a
+        // fresh OCI/container rootfs such as Alpine ships `/`, `/etc`, `/lib`, etc. root-owned
+        // at mode 0755, and its init process runs as root absent an explicit `USER` directive).
+        // Callers that build the guest's file system (e.g.
+        // `litebox_runner_linux_on_windows_userland`) must set the in-memory file system's
+        // persistent user to match via `litebox::fs::in_mem::FileSystem::set_default_user`, or
+        // `getuid()` will disagree with what the filesystem layer's permission checks enforce.
         litebox_common_linux::TaskParams {
             pid: 1000,
             // TODO: placeholder for actual PPID
             ppid: 0,
-            uid: 1000,
-            gid: 1000,
-            euid: 1000,
-            egid: 1000,
+            uid: 0,
+            gid: 0,
+            euid: 0,
+            egid: 0,
         }
     }
 }
