@@ -1245,8 +1245,8 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// reached from independent `open()` calls in different (e.g. `fork()`-created) processes, not
     /// just fds `dup()`-derived from a single `open()`. See [`syscalls::file::FlockFile`].
     flock_registry: litebox::sync::Mutex<Platform, syscalls::file::FlockRegistry<Platform>>,
-    /// Next id to hand out to a [`syscalls::file::FlockHolder`], identifying an open file
-    /// description to the `flock()` implementation. Shim-wide (rather than a function-local
+    /// Next id to hand out to a `flock()` holder, identifying an open file description to the
+    /// `flock()` implementation (see `syscalls::file`). Shim-wide (rather than a function-local
     /// `static`) so it composes with the crate's existing "no bare `static`s outside of the
     /// ratcheted set" discipline.
     next_flock_holder_id: core::sync::atomic::AtomicU64,
