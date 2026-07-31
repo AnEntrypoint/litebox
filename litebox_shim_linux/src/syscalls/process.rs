@@ -586,6 +586,48 @@ fn wake_robust_list<Platform: ShimPlatform>(
     Ok(())
 }
 
+/// Fixes up stale, untranslated pointers copied verbatim onto a `fork()` child's own (already
+/// correctly relocated) memory -- specifically, the small, bounded set of return addresses and
+/// spilled registers that libc's own post-`fork()`/`clone()` unwind (musl's `_Fork` -> `fork` ->
+/// the guest's caller) reads back out of stack slots written by `call` instructions *before* this
+/// `fork()` happened, plus TCB fields musl caches adjacent to the stack (per the ABI-mandated
+/// self-referential `%fs:0` fixup next to this call's caller, `struct pthread`'s other fields --
+/// e.g. its cached `stack`/`stack_size` -- live in that same region and are just as stale).
+///
+/// Scans every 8-byte-aligned slot across every one of `duplicate()`'s duplicated regions --
+/// `AddressRelocations::ranges()` tracks one `(source_range, dest_base)` entry per ORIGINAL VMA,
+/// not one per relocation group (`Vmem::duplicate` places several adjacent VMAs, e.g. a stack
+/// guard page + the growable stack + the TCB, at fixed offsets within one coherent group span,
+/// but each still gets its own entry here) -- so scanning only the single entry containing
+/// `rsp` is not enough: the TCB commonly lands in a sibling entry of the same group, and a
+/// `fork()`-time `rsp` can itself sit just below the lowest currently-tracked entry (in the
+/// stack's own unmapped-so-far guard gap) without matching any single entry at all. Scanning
+/// every region instead of guessing which one is "the stack's group" is still fully bounded --
+/// this is the total mapped size of one (typically small) guest process, walked once per
+/// `fork()` -- and overwrites any slot whose value is itself a translatable SOURCE-range address
+/// with its DESTINATION equivalent. Non-pointer contents (small integers, saved flags, ...) are
+/// left untouched: `AddressRelocations::translate` only ever matches genuine addresses that fell
+/// within one of the parent's pre-`fork()` mappings, which no ordinary integer or flag value
+/// does.
+#[cfg(target_arch = "x86_64")]
+fn fixup_stale_stack_pointers<Platform: ShimPlatform>(
+    relocations: &litebox::mm::AddressRelocations,
+) {
+    for (source_range, dest_base) in relocations.ranges() {
+        let dest_top = dest_base + source_range.len();
+        let mut addr = *dest_base;
+        while addr < dest_top {
+            let slot = UserPtrMut::<usize>::from_usize(addr);
+            if let Some(value) = slot.read_at_offset::<Platform>(0)
+                && let Some(translated) = relocations.translate(value)
+            {
+                let _ = slot.write_at_offset::<Platform>(0, translated);
+            }
+            addr += core::mem::size_of::<usize>();
+        }
+    }
+}
+
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Called when the task is exiting.
     pub(crate) fn prepare_for_exit(&mut self) {
@@ -955,6 +997,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     sanitized,
                     "forked child's rip/rsp left the user address range"
                 );
+
+                // Register translation above covers every GPR at the instant `fork()` returns,
+                // but the very next thing the child does -- before it ever reaches `execve()` --
+                // is unwind back up through libc's own `fork()`/`clone()` call chain (musl's
+                // `_Fork` -> `fork` -> the guest's caller, e.g. ash's `forkshell`), which
+                // necessarily `ret`s to, and reloads spilled registers from, a handful of stack
+                // and TCB slots that were written by `call` instructions (or cached by musl's TLS
+                // setup) BEFORE this `fork()` happened. Those slots hold verbatim-copied,
+                // untranslated pointers into the PARENT's address space -- the same "stale
+                // pointer" class documented on `fork_verify`, just fixed up proactively here
+                // instead of only reactively during single-step verification (which still covers
+                // whatever this proactive pass does not reach, e.g. a value copied into a
+                // register from here and then re-spilled by the child's own early code). Unlike
+                // an unbounded scan of arbitrary heap/global memory (tried and reverted earlier in
+                // this investigation -- see `fork_verify`'s module docs), this is a small,
+                // deterministic, always-present set of slots confined to `duplicate()`'s own
+                // duplicated regions: fix them up here, once, before the child ever executes an
+                // instruction, exactly the same way the FS-base self-pointer below is fixed up
+                // for the same reason.
+                fixup_stale_stack_pointers::<Platform>(&relocations);
             }
 
             // Register the new process as a child of the caller's process so a later

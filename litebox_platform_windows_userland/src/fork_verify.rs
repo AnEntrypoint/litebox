@@ -30,27 +30,43 @@
 //!
 //! # What this module does
 //!
-//! It does **not** try to repair stale pointers. Enumerating every place a stale pointer could
-//! surface (code pointers, data pointers, syscall arguments, ...) is unbounded, and guessing the
-//! "right" translation for a value that may not even be a pointer introduces corruption of its
-//! own.
+//! It does **not** try to repair *arbitrary* stale pointers. Enumerating every place a stale
+//! pointer could surface (code pointers, data pointers, syscall arguments, ...) is unbounded, and
+//! guessing the "right" translation for a value that may not even be a pointer introduces
+//! corruption of its own -- an earlier, more ambitious repair attempt that also tried to fix up
+//! syscall arguments confirmed this the hard way (see `.gm/prd.yml`): the child ultimately
+//! executed into invalid code anyway.
 //!
-//! Instead it *detects* the corruption in progress and stops it, reproducing what real hardware
-//! would have done: from the moment a `fork()` child resumes until it reaches `execve`/`exit`/
-//! `exit_group` (after which the parent's addresses are unreachable and the danger is over), the
-//! child runs with `EFLAGS.TF` set. On each single-step trap, before the next instruction runs:
+//! What it *does* repair is one narrow, fully-bounded case: `litebox_shim_linux`'s `fork()`
+//! handler already translates every CPU register at the instant `fork()` returns
+//! (`sys_clone`'s `translate_reg!`) and proactively rewrites the small, deterministic set of
+//! stale pointers libc's own post-`fork()` unwind reads back out of the child's stack/TCB before
+//! it ever resumes (`fixup_stale_stack_pointers`). This module is what catches the same class of
+//! value reached a different way (e.g. copied into a register from a location that proactive pass
+//! does not cover, then used or re-spilled by the child's own code) -- from the moment a `fork()`
+//! child resumes until it reaches `execve`/`exit`/`exit_group` (after which the parent's addresses
+//! are unreachable and the danger is over), the child runs with `EFLAGS.TF` set. On each
+//! single-step trap, before the next instruction runs:
 //!
 //! 1. **Code pointers.** If `rip` itself has landed inside one of the *source* (parent) ranges,
-//!    the child is about to execute the parent's code. Kill it.
+//!    the child is about to execute the parent's code -- almost always a `ret` to a return
+//!    address a `call` pushed before `fork()`. Since the source ranges are exactly what
+//!    `duplicate()` relocated, `rip` (and `rbp`, equally a live register at this exact trap) is
+//!    deterministically translatable the same way any other register is; translate and resume
+//!    at the destination address instead of killing.
 //! 2. **Data pointers.** Otherwise the instruction at `rip` is decoded (via `iced-x86`), and if
 //!    it writes memory, its effective address is computed from the operand plus the live register
-//!    values in the trapped context. If that address falls inside a source range, the child is
-//!    about to write through a stale pointer, into the parent's live state. Kill it -- *before*
-//!    the write lands.
+//!    values in the trapped context. If that address falls inside a source range, the register(s)
+//!    the instruction names as its memory base/index are themselves translated (never a blind
+//!    scan of unrelated registers or memory) and the *same* instruction is retried.
 //!
-//! "Kill" means synthesizing an access violation and letting it flow through the platform's
-//! ordinary exception path, so the shim raises a perfectly normal `SIGSEGV` on the child; the
-//! child's exit status is recorded and the parent's `wait4()` unblocks as usual.
+//! Either repair only ever substitutes a register value already proven translatable via the exact
+//! relocation map used for every other register at `fork()` time -- never a guess. If a stale
+//! `rip` or effective address is *not* translatable (falls in a source range `duplicate()` never
+//! recorded, which should not happen but is not assumed), the child is killed: synthesizing an
+//! access violation and letting it flow through the platform's ordinary exception path, so the
+//! shim raises a perfectly normal `SIGSEGV` on the child; the child's exit status is recorded and
+//! the parent's `wait4()` unblocks as usual.
 //!
 //! # Why this cannot produce false positives
 //!
@@ -155,9 +171,42 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
     #[allow(clippy::cast_possible_truncation)]
     let rip = context.Rip as usize;
 
-    // (1) Code pointer: `rip` itself landed in the parent's pre-`fork()` code. This is the `ret`
-    // to a stale return address, executing the parent's own instructions.
+    // (1) Code pointer: `rip` itself landed in the parent's pre-`fork()` code. This is almost
+    // always a `ret` to a return address a `call` pushed onto the stack *before* `fork()` was
+    // invoked -- e.g. musl's own post-`clone()` unwind back through its cancellation-point
+    // wrapper into libc/CRT frames that existed above `fork()` on the call stack, something every
+    // single `fork()` does, deterministically, before the child ever reaches `execve()`. Most of
+    // these are already fixed up proactively, once, at `fork()` setup time (see
+    // `fixup_stale_stack_pointers` in `litebox_shim_linux`), which handles the common case where
+    // the stale value already sits in scannable stack/TCB memory before the child resumes. This
+    // is the fallback for the same class of value reached a different way (e.g. copied into a
+    // register from a source location the proactive scan does not cover, then pushed by the
+    // child's own code after resuming) -- since the source ranges are exactly the ranges
+    // `duplicate()` relocated, `rip` is deterministically translatable the same way register
+    // state is (see `sys_clone`'s `translate_reg!`): resume at the translated destination rather
+    // than killing. This is narrower than the "repair stale pointers in place" approach ruled out
+    // earlier in this investigation (see module docs / `.gm/prd.yml`) -- that attempt tried to
+    // additionally repair arbitrary data pointers and syscall arguments, an unbounded problem
+    // that left the child executing invalid code. This handles only the one case that is fully
+    // bounded and safe: `rip` (and, since it is equally a live register at this exact trap and
+    // not a value read back out of arbitrary memory, `rbp`) translated via the exact same
+    // relocation map already proven correct for CPU registers, landing on byte-identical
+    // relocated code.
     if relocations.is_in_source(rip) {
+        if let Some(translated_rip) = relocations.translate(rip) {
+            litebox_util_log::warn!(
+                rip:? = rip, translated_rip:? = translated_rip;
+                "fork_verify: stale CODE pointer detected, translating and resuming"
+            );
+            context.Rip = translated_rip as u64;
+            #[allow(clippy::cast_possible_truncation)]
+            let rbp = context.Rbp as usize;
+            if let Some(translated_rbp) = relocations.translate(rbp) {
+                context.Rbp = translated_rbp as u64;
+            }
+            context.EFlags |= eflags_tf;
+            return StepOutcome::Continue;
+        }
         litebox_util_log::warn!(rip:? = rip; "fork_verify: stale CODE pointer detected");
         return StepOutcome::StalePointer {
             address: rip,
@@ -204,6 +253,25 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
     };
 
     if relocations.is_in_source(address) {
+        // As with the code-pointer case above: the stale value driving this write is not
+        // arbitrary guest data, it is the *base/index register* the instruction itself names
+        // (`memory_base`/`memory_index`), most likely reloaded from one of the same pre-`fork()`
+        // stack/TCB slots the proactive scan already covers for the common case, reached here a
+        // different way (see the code-pointer case's comment). If that exact register is itself a
+        // translatable source-range address, fixing the register (there is nowhere to write "the
+        // address" back to after the fact) and retrying the *same* instruction is exactly as
+        // sound as the register translation `sys_clone` already does for every GPR at fork-resume
+        // time. Only do this for a register-relative form we can name and rewrite; anything else
+        // still falls through to the kill below.
+        if translate_memory_operand_registers(&instruction, context, relocations) {
+            litebox_util_log::warn!(
+                rip:? = rip, address:? = address, mnemonic:? = instruction.mnemonic();
+                "fork_verify: stale DATA pointer detected, translating base/index register(s) and retrying"
+            );
+            // Do not advance rip: retry the same instruction now that its address-forming
+            // register(s) have been corrected.
+            return StepOutcome::Continue;
+        }
         litebox_util_log::warn!(
             rip:? = rip, address:? = address, mnemonic:? = instruction.mnemonic();
             "fork_verify: stale DATA pointer write detected"
@@ -215,6 +283,72 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
     }
 
     StepOutcome::Continue
+}
+
+/// If `instruction`'s memory operand's base and/or index register currently holds a value that
+/// falls in one of `relocations`'s SOURCE ranges, rewrites that register (in `context`) to the
+/// corresponding DESTINATION address and returns `true`. A no-op (returning `false`) if neither
+/// register is translatable, so the caller can fall back to killing the child.
+///
+/// This deliberately only ever touches the specific register(s) `instruction` itself names as a
+/// memory base/index -- never a blind scan of every register or of memory -- so it cannot "fix"
+/// an unrelated register that happens to coincidentally look like a source-range address.
+fn translate_memory_operand_registers(
+    instruction: &Instruction,
+    context: &mut CONTEXT,
+    relocations: &litebox::mm::AddressRelocations,
+) -> bool {
+    let mut translated_any = false;
+    for i in 0..instruction.op_count() {
+        if instruction.op_kind(i) != OpKind::Memory {
+            continue;
+        }
+        for reg in [instruction.memory_base(), instruction.memory_index()] {
+            if matches!(reg, Register::None | Register::RIP | Register::EIP) {
+                continue;
+            }
+            let Some(value) = register_value(reg, context) else {
+                continue;
+            };
+            let Some(translated) = relocations.translate(value) else {
+                continue;
+            };
+            write_register_value(reg, translated, context);
+            translated_any = true;
+        }
+    }
+    translated_any
+}
+
+/// Writes `value` into the 64-bit register (or enclosing 64-bit register, for narrower
+/// sub-registers) named by `register` in `context`.
+fn write_register_value(register: Register, value: usize, context: &mut CONTEXT) {
+    let full = register.full_register();
+    // This crate's only target is `x86_64`, so `usize` and `u64` are the same width; exact, never
+    // truncating.
+    #[allow(clippy::cast_possible_truncation)]
+    let value = value as u64;
+    match full {
+        Register::RAX => context.Rax = value,
+        Register::RBX => context.Rbx = value,
+        Register::RCX => context.Rcx = value,
+        Register::RDX => context.Rdx = value,
+        Register::RSI => context.Rsi = value,
+        Register::RDI => context.Rdi = value,
+        Register::RBP => context.Rbp = value,
+        Register::RSP => context.Rsp = value,
+        Register::R8 => context.R8 = value,
+        Register::R9 => context.R9 = value,
+        Register::R10 => context.R10 = value,
+        Register::R11 => context.R11 = value,
+        Register::R12 => context.R12 = value,
+        Register::R13 => context.R13 = value,
+        Register::R14 => context.R14 = value,
+        Register::R15 => context.R15 = value,
+        // `register_value` never returns `Some` for anything else, so `translate_memory_operand_
+        // registers` never calls this with any other register.
+        _ => {}
+    }
 }
 
 /// Reads up to `buf.len()` bytes of instruction encoding at `rip`, stopping at the first byte
