@@ -57,10 +57,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
         Self {
             litebox,
             root,
-            current_user: UserInfo {
-                user: 1000,
-                group: 1000,
-            },
+            // The whole sandboxed guest runs as a single, fixed set of credentials (see
+            // `with_root_privileges`'s doc comment and the `setuid` syscall handler). Real
+            // container/OCI rootfs images (such as the Alpine tar this layered FS is typically
+            // stacked under) are laid out assuming their initial process runs as root -- `/`,
+            // `/etc`, `/lib`, etc. are root-owned with mode 0755, not world-writable. Defaulting
+            // this to a non-root uid caused every write into a fresh rootfs's root-owned
+            // directories (e.g. `apk add`'s `/lib/apk/db/lock`) to fail permission checks that a
+            // real container's root-by-default init process would never hit.
+            current_user: UserInfo::ROOT,
             current_working_dir: "/".into(),
             unique_id_freshness: 1.into(), // the root dir gets unique ID of 0
         }
