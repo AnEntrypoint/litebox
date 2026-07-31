@@ -244,6 +244,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
             flock_registry: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+            next_flock_holder_id: core::sync::atomic::AtomicU64::new(1),
         });
         LinuxShim(global)
     }
@@ -1244,6 +1245,11 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// reached from independent `open()` calls in different (e.g. `fork()`-created) processes, not
     /// just fds `dup()`-derived from a single `open()`. See [`syscalls::file::FlockFile`].
     flock_registry: litebox::sync::Mutex<Platform, syscalls::file::FlockRegistry<Platform>>,
+    /// Next id to hand out to a [`syscalls::file::FlockHolder`], identifying an open file
+    /// description to the `flock()` implementation. Shim-wide (rather than a function-local
+    /// `static`) so it composes with the crate's existing "no bare `static`s outside of the
+    /// ratcheted set" discipline.
+    next_flock_holder_id: core::sync::atomic::AtomicU64,
     /// The first process created by [`LinuxShim::load_program`], set once and kept for the
     /// lifetime of the shim.
     ///

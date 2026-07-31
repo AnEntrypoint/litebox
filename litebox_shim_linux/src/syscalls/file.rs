@@ -192,12 +192,8 @@ struct FlockHolderInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> FlockHolderInner<Platform> {
-    fn new(file: alloc::sync::Arc<FlockFile<Platform>>) -> FlockHolder<Platform> {
-        static NEXT_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
-        alloc::sync::Arc::new(Self {
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-            file,
-        })
+    fn new(id: u64, file: alloc::sync::Arc<FlockFile<Platform>>) -> FlockHolder<Platform> {
+        alloc::sync::Arc::new(Self { id, file })
     }
 }
 
@@ -2010,7 +2006,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(h) => h,
             Err(MetadataError::ClosedFd) => return Err(Errno::EBADF),
             Err(MetadataError::NoSuchMetadata) => {
-                let h = FlockHolderInner::new(flock_file.clone());
+                let id = self
+                    .global
+                    .next_flock_holder_id
+                    .fetch_add(1, Ordering::Relaxed);
+                let h = FlockHolderInner::new(id, flock_file.clone());
                 dt.set_entry_metadata(fd, h.clone());
                 h
             }
