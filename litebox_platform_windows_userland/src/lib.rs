@@ -375,21 +375,14 @@ impl WindowsUserland {
     pub fn init_task(&self) -> litebox_common_linux::TaskParams {
         // TODO: Currently we are using a static thread ID and credentials (faked).
         // This is a placeholder for future implementation to use passthrough.
-        //
-        // Credentials are root (uid/gid 0), matching the fixed root credentials used by the
-        // in-memory file system's upper layer (see `litebox::fs::in_mem::FileSystem::new`) and
-        // matching how a real container/OCI rootfs's initial process actually runs (root-owned
-        // `/`, `/etc`, `/lib`, etc., absent an explicit `USER` directive). These two credential
-        // sources must stay consistent, or syscalls like `getuid` disagree with what the
-        // filesystem layer's permission checks actually enforce.
         litebox_common_linux::TaskParams {
             pid: 1000,
             // TODO: placeholder for actual PPID
             ppid: 0,
-            uid: 0,
-            gid: 0,
-            euid: 0,
-            egid: 0,
+            uid: 1000,
+            gid: 1000,
+            euid: 1000,
+            egid: 1000,
         }
     }
 }
