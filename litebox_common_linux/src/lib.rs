@@ -2210,6 +2210,10 @@ pub enum SyscallRequest {
         fd: i32,
         arg: FcntlArg,
     },
+    Flock {
+        fd: i32,
+        operation: i32,
+    },
     Getcwd {
         buf: UserPtrMut<u8>,
         size: usize,
@@ -2703,6 +2707,7 @@ impl SyscallRequest {
                     })?,
                 }
             }
+            Sysno::flock => sys_req!(Flock { fd, operation }),
             Sysno::gettimeofday => sys_req!(Gettimeofday { tv:*, tz:* }),
             Sysno::clock_gettime => {
                 sys_req!(ClockGettime { clockid, tp: { =*> TimeParam::timespec_old } })

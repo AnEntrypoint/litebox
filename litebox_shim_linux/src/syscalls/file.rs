@@ -14,7 +14,8 @@ use litebox::{
     fs::{Mode, OFlags, SeekWhence},
     mm::linux::PAGE_SIZE,
     path,
-    platform::StdioStream,
+    platform::{StdioStream, TimeProvider},
+    sync::RawSyncPrimitivesProvider,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
@@ -150,6 +151,182 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
             return Err(alloc::sync::Arc::into_inner(orig).unwrap());
         }
         Ok(raw_fd)
+    }
+}
+
+/// Registry of `flock(2)` advisory-lock state, keyed by the underlying file's `(dev, ino)`. See
+/// `GlobalState::flock_registry`'s doc comment for why this is shim-wide rather than per-process.
+pub(crate) type FlockRegistry<Platform> =
+    alloc::collections::BTreeMap<(usize, usize), alloc::sync::Arc<FlockFile<Platform>>>;
+
+/// `flock(2)` operation: request a shared lock.
+const LOCK_SH: i32 = 1;
+/// `flock(2)` operation: request an exclusive lock.
+const LOCK_EX: i32 = 2;
+/// `flock(2)` operation: release an existing lock.
+const LOCK_UN: i32 = 8;
+/// `flock(2)` operation flag: don't block if the lock can't be acquired immediately.
+const LOCK_NB: i32 = 4;
+
+/// Identifies a single open file description to a [`FlockFile`], so that `flock()` calls made
+/// through fds that are `dup()`-derived from the same `open()` (which share one `FlockHolder`, as
+/// entry-shared metadata -- the `Arc` clones `with_metadata`/`with_metadata_mut` produce are cheap
+/// aliases of the same underlying id, not new holders) are recognized as "the same locker" --
+/// matching real `flock()` semantics, where re-locking (including up/downgrading between
+/// `LOCK_SH`/`LOCK_EX`) or unlocking from the same open file description never contends with
+/// itself, while a *different* open file description (from an independent `open()`, or in a
+/// genuinely different process after `fork()`) on the same underlying file is a distinct,
+/// contending holder.
+///
+/// Also releases any lock this open file description holds when the *last* fd referencing it is
+/// closed (i.e. when the last `Arc<FlockHolderInner>` -- including the one held inside the
+/// `DescriptorEntry`'s metadata itself, not just transient clones taken by individual `flock()`
+/// calls -- is actually dropped), matching the kernel's "closing any fd referring to the open file
+/// description drops its flock" behavior, without needing a separate explicit close-time hook into
+/// every filesystem backend's `close()` implementation.
+type FlockHolder<Platform> = alloc::sync::Arc<FlockHolderInner<Platform>>;
+
+struct FlockHolderInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+    id: u64,
+    file: alloc::sync::Arc<FlockFile<Platform>>,
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> FlockHolderInner<Platform> {
+    fn new(file: alloc::sync::Arc<FlockFile<Platform>>) -> FlockHolder<Platform> {
+        static NEXT_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+        alloc::sync::Arc::new(Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            file,
+        })
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for FlockHolderInner<Platform> {
+    fn drop(&mut self) {
+        self.file.unlock(self.id);
+    }
+}
+
+/// Current lock state of a [`FlockFile`].
+enum FlockLockState {
+    Unlocked,
+    /// Held by one or more open file descriptions in shared mode.
+    Shared(alloc::collections::BTreeSet<u64>),
+    /// Held by exactly one open file description in exclusive mode.
+    Exclusive(u64),
+}
+
+/// Advisory-lock state for a single underlying file (identified by `(dev, ino)`), shared by every
+/// open file description of that file -- including ones from entirely independent `open()` calls,
+/// which is where real contention (as opposed to `dup()`-sharing, handled by [`FlockHolder`])
+/// happens. One instance lives in `GlobalState::flock_registry` per distinct locked file.
+pub(crate) struct FlockFile<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+    state: litebox::sync::Mutex<Platform, FlockLockState>,
+    /// Woken whenever the lock is released or downgraded, so blocked waiters can retry.
+    pollee: litebox::event::polling::Pollee<Platform>,
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> FlockFile<Platform> {
+    fn new() -> Self {
+        Self {
+            state: litebox::sync::Mutex::new(FlockLockState::Unlocked),
+            pollee: litebox::event::polling::Pollee::new(),
+        }
+    }
+
+    fn try_lock_shared(
+        &self,
+        holder: u64,
+    ) -> Result<(), litebox::event::polling::TryOpError<Errno>> {
+        let mut state = self.state.lock();
+        match &mut *state {
+            FlockLockState::Unlocked => {
+                let mut holders = alloc::collections::BTreeSet::new();
+                holders.insert(holder);
+                *state = FlockLockState::Shared(holders);
+                Ok(())
+            }
+            FlockLockState::Shared(holders) => {
+                holders.insert(holder);
+                Ok(())
+            }
+            FlockLockState::Exclusive(owner) if *owner == holder => {
+                // Downgrade: same open file description already holds the exclusive lock.
+                let mut holders = alloc::collections::BTreeSet::new();
+                holders.insert(holder);
+                *state = FlockLockState::Shared(holders);
+                Ok(())
+            }
+            FlockLockState::Exclusive(_) => Err(litebox::event::polling::TryOpError::TryAgain),
+        }
+    }
+
+    fn try_lock_exclusive(
+        &self,
+        holder: u64,
+    ) -> Result<(), litebox::event::polling::TryOpError<Errno>> {
+        let mut state = self.state.lock();
+        match &*state {
+            FlockLockState::Unlocked => {
+                *state = FlockLockState::Exclusive(holder);
+                Ok(())
+            }
+            FlockLockState::Exclusive(owner) if *owner == holder => Ok(()),
+            FlockLockState::Shared(holders) if holders.len() == 1 && holders.contains(&holder) => {
+                // Upgrade: same open file description is the sole shared-lock holder.
+                *state = FlockLockState::Exclusive(holder);
+                Ok(())
+            }
+            FlockLockState::Exclusive(_) | FlockLockState::Shared(_) => {
+                Err(litebox::event::polling::TryOpError::TryAgain)
+            }
+        }
+    }
+
+    fn lock_shared(
+        &self,
+        cx: &litebox::event::wait::WaitContext<'_, Platform>,
+        holder: u64,
+        nonblock: bool,
+    ) -> Result<u32, Errno> {
+        self.pollee
+            .wait(cx, nonblock, Events::IN, || self.try_lock_shared(holder))
+            .map(|()| 0)
+            .map_err(Errno::from)
+    }
+
+    fn lock_exclusive(
+        &self,
+        cx: &litebox::event::wait::WaitContext<'_, Platform>,
+        holder: u64,
+        nonblock: bool,
+    ) -> Result<u32, Errno> {
+        self.pollee
+            .wait(cx, nonblock, Events::IN, || self.try_lock_exclusive(holder))
+            .map(|()| 0)
+            .map_err(Errno::from)
+    }
+
+    fn unlock(&self, holder: u64) {
+        let mut state = self.state.lock();
+        let changed = match &mut *state {
+            FlockLockState::Exclusive(owner) if *owner == holder => {
+                *state = FlockLockState::Unlocked;
+                true
+            }
+            FlockLockState::Unlocked | FlockLockState::Exclusive(_) => false,
+            FlockLockState::Shared(holders) => {
+                let removed = holders.remove(&holder);
+                if holders.is_empty() {
+                    *state = FlockLockState::Unlocked;
+                }
+                removed
+            }
+        };
+        drop(state);
+        if changed {
+            self.pollee.notify_observers(Events::IN);
+        }
     }
 }
 
@@ -1751,6 +1928,103 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(new_file.try_into().unwrap())
             }
             _ => unimplemented!(),
+        }
+    }
+
+    /// Handle syscall `flock`.
+    ///
+    /// `flock(2)` locks are associated with the *open file description*, not the file descriptor
+    /// number: two fds obtained via `dup()`/`dup2()`/`dup3()` (or inherited across `fork()`) from
+    /// the same `open()` call share one lock and release/re-acquire it together, while two
+    /// independent `open()` calls on the same path get independent open file descriptions whose
+    /// locks nonetheless *contend* with each other (real kernel flock semantics: the lock is
+    /// conceptually attached to the open file description, but mutual exclusion is checked against
+    /// every other open file description of the same underlying file).
+    ///
+    /// This is implemented with two pieces of state:
+    ///   - [`FlockFile`]: one per underlying file (keyed by `(dev, ino)` in
+    ///     `GlobalState::flock_registry`), tracking who currently holds the lock and any waiters.
+    ///     This is the actual contention/mutual-exclusion point, shared across every open file
+    ///     description of that file, matching kernel semantics for independent `open()`s.
+    ///   - A holder id stored in this open file description's `DescriptorEntry`-scoped metadata
+    ///     (via `set_entry_metadata`/`with_metadata_mut`, which is exactly LiteBox's existing
+    ///     "shared across `dup()`'d fds of the same open, independent across separate `open()`s"
+    ///     mechanism -- see `litebox::fd::Descriptors::duplicate` -- already used for e.g. file
+    ///     offsets), identifying *which* open file description currently holds the lock so a
+    ///     `LOCK_UN`/re-`LOCK_EX` from the same open file description is idempotent/self-consistent
+    ///     rather than contending with itself.
+    pub(crate) fn sys_flock(&self, fd: i32, operation: i32) -> Result<u32, Errno> {
+        let Ok(desc) = u32::try_from(fd).and_then(usize::try_from) else {
+            return Err(Errno::EBADF);
+        };
+
+        let nonblock = operation & LOCK_NB != 0;
+        let op = operation & !LOCK_NB;
+        if !matches!(op, LOCK_SH | LOCK_EX | LOCK_UN) {
+            return Err(Errno::EINVAL);
+        }
+
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                desc,
+                |fd| self.do_flock(fd, op, nonblock),
+                // `flock()` on a non-regular-file fd (socket/pipe/eventfd/epoll/unix socket) is
+                // rejected with `EINVAL`, matching Linux (only regular files, directories, and a
+                // handful of special files support `flock()`; none of LiteBox's other fd kinds do).
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+            )
+            .flatten()
+    }
+
+    fn do_flock(&self, fd: &TypedFd<FS>, op: i32, nonblock: bool) -> Result<u32, Errno> {
+        let node_info = self
+            .files
+            .borrow()
+            .fs
+            .fd_file_status(fd)
+            .map_err(Errno::from)?
+            .node_info;
+        let key = (node_info.dev, node_info.ino);
+
+        let flock_file = {
+            let mut registry = self.global.flock_registry.lock();
+            registry
+                .entry(key)
+                .or_insert_with(|| alloc::sync::Arc::new(FlockFile::new()))
+                .clone()
+        };
+
+        // The holder id identifies this open file description (not this fd number) to the
+        // `FlockFile`. It is stored as entry-shared metadata so it is visible to (and shared by)
+        // every fd `dup()`-derived from this one, but independent of any other `open()` of the
+        // same path. `with_metadata_mut` takes the fd-table write lock for the duration of the
+        // closure, so the read-if-present/insert-if-absent below is atomic with respect to other
+        // `flock()` calls racing to lazily initialize the same entry's holder.
+        let mut dt = self.global.litebox.descriptor_table_mut();
+        let holder = match dt.with_metadata_mut(fd, |h: &mut FlockHolder<Platform>| h.clone()) {
+            Ok(h) => h,
+            Err(MetadataError::ClosedFd) => return Err(Errno::EBADF),
+            Err(MetadataError::NoSuchMetadata) => {
+                let h = FlockHolderInner::new(flock_file.clone());
+                dt.set_entry_metadata(fd, h.clone());
+                h
+            }
+        };
+        drop(dt);
+
+        match op {
+            LOCK_SH => flock_file.lock_shared(&self.wait_cx(), holder.id, nonblock),
+            LOCK_EX => flock_file.lock_exclusive(&self.wait_cx(), holder.id, nonblock),
+            LOCK_UN => {
+                flock_file.unlock(holder.id);
+                Ok(0)
+            }
+            _ => Err(Errno::EINVAL),
         }
     }
 

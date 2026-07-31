@@ -694,3 +694,144 @@ fn test_rwlock_readers_not_starved_after_writer_handoff() {
         join_with_timeout(reader_handle, join_timeout, "reader");
     }
 }
+
+mod flock_tests {
+    extern crate std;
+
+    use litebox::fs::{Mode, OFlags};
+    use litebox_common_linux::errno::Errno;
+
+    use super::init_platform;
+
+    const LOCK_SH: i32 = 1;
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    const LOCK_UN: i32 = 8;
+
+    fn open_rw(
+        task: &crate::Task<super::TestPlatform, crate::DefaultFS<super::TestPlatform>>,
+    ) -> i32 {
+        i32::try_from(
+            task.sys_open(
+                "/flock_test_file.txt",
+                OFlags::CREAT | OFlags::RDWR,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .expect("failed to open flock test file"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn exclusive_lock_excludes_other_open() {
+        let task = init_platform(None);
+        let fd1 = open_rw(&task);
+        let fd2 = open_rw(&task);
+
+        assert_eq!(task.sys_flock(fd1, LOCK_EX).unwrap(), 0);
+        // A different open file description on the same file cannot also get the exclusive
+        // lock, and (non-blockingly) fails with EWOULDBLOCK/EAGAIN.
+        assert_eq!(
+            task.sys_flock(fd2, LOCK_EX | LOCK_NB),
+            Err(Errno::EWOULDBLOCK)
+        );
+        assert_eq!(
+            task.sys_flock(fd2, LOCK_SH | LOCK_NB),
+            Err(Errno::EWOULDBLOCK)
+        );
+
+        assert_eq!(task.sys_flock(fd1, LOCK_UN).unwrap(), 0);
+        // Now that fd1 released it, fd2 can acquire it.
+        assert_eq!(task.sys_flock(fd2, LOCK_EX | LOCK_NB).unwrap(), 0);
+    }
+
+    #[test]
+    fn shared_locks_can_coexist_across_opens() {
+        let task = init_platform(None);
+        let fd1 = open_rw(&task);
+        let fd2 = open_rw(&task);
+
+        assert_eq!(task.sys_flock(fd1, LOCK_SH | LOCK_NB).unwrap(), 0);
+        assert_eq!(task.sys_flock(fd2, LOCK_SH | LOCK_NB).unwrap(), 0);
+
+        // But an exclusive lock still can't be granted while any shared lock is held.
+        assert_eq!(
+            task.sys_flock(fd1, LOCK_EX | LOCK_NB),
+            Err(Errno::EWOULDBLOCK)
+        );
+    }
+
+    #[test]
+    fn dup_shares_the_lock_with_the_original_fd() {
+        let task = init_platform(None);
+        let fd1 = open_rw(&task);
+        let fd2 = open_rw(&task);
+
+        assert_eq!(task.sys_flock(fd1, LOCK_EX).unwrap(), 0);
+        let fd1_dup = i32::try_from(task.sys_dup(fd1, None, None).unwrap()).unwrap();
+
+        // fd1_dup shares fd1's open file description/lock, so re-locking (even exclusively)
+        // through the dup'd fd does not contend with fd1's own held lock.
+        assert_eq!(task.sys_flock(fd1_dup, LOCK_EX | LOCK_NB).unwrap(), 0);
+        assert_eq!(task.sys_flock(fd1_dup, LOCK_SH | LOCK_NB).unwrap(), 0);
+
+        // A genuinely independent open file description still cannot acquire it.
+        assert_eq!(
+            task.sys_flock(fd2, LOCK_EX | LOCK_NB),
+            Err(Errno::EWOULDBLOCK)
+        );
+
+        // Unlocking via the dup'd fd releases the shared open file description's lock.
+        assert_eq!(task.sys_flock(fd1_dup, LOCK_UN).unwrap(), 0);
+        assert_eq!(task.sys_flock(fd2, LOCK_EX | LOCK_NB).unwrap(), 0);
+    }
+
+    #[test]
+    fn closing_the_last_fd_releases_the_lock() {
+        let task = init_platform(None);
+        let fd1 = open_rw(&task);
+        let fd2 = open_rw(&task);
+
+        assert_eq!(task.sys_flock(fd1, LOCK_EX).unwrap(), 0);
+        task.sys_close(fd1).unwrap();
+
+        // fd1's open file description is now fully closed, so its lock must have been
+        // released, allowing fd2 to acquire it.
+        assert_eq!(task.sys_flock(fd2, LOCK_EX | LOCK_NB).unwrap(), 0);
+    }
+
+    #[test]
+    fn unrecognized_operation_is_einval() {
+        let task = init_platform(None);
+        let fd = open_rw(&task);
+        assert_eq!(task.sys_flock(fd, 0).unwrap_err(), Errno::EINVAL);
+        assert_eq!(task.sys_flock(fd, 3).unwrap_err(), Errno::EINVAL);
+    }
+
+    #[test]
+    fn blocking_exclusive_lock_waits_then_succeeds_after_release() {
+        // `Task` is deliberately not `Send`/`Sync` (it represents one thread's execution
+        // context), so this test models two independent processes sharing the same underlying
+        // file the way a real `fork()` would: two separate `Task`s, each with their own fd
+        // table, both built from the same shared `GlobalState` (so they share `flock_registry`)
+        // and the same shared filesystem backend (so they resolve to the same `(dev, ino)`).
+        let task1 = init_platform(None);
+        let fd1 = open_rw(&task1);
+
+        assert_eq!(task1.sys_flock(fd1, LOCK_EX).unwrap(), 0);
+
+        let global2 = task1.global.clone();
+        let fs2 = task1.files.borrow().fs.clone();
+        let waiter = std::thread::spawn(move || {
+            let task2 = global2.new_test_task(fs2);
+            let fd2 = open_rw(&task2);
+            // Blocks until task1 unlocks.
+            task2.sys_flock(fd2, LOCK_EX).unwrap();
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(task1.sys_flock(fd1, LOCK_UN).unwrap(), 0);
+
+        waiter.join().expect("waiter thread panicked");
+    }
+}

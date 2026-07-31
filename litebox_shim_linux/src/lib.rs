@@ -243,6 +243,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+            flock_registry: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
         });
         LinuxShim(global)
     }
@@ -882,6 +883,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             } => syscall!(sys_getpeername(sockfd, addr, addrlen)),
             SyscallRequest::Uname { buf } => syscall!(sys_uname(buf)),
             SyscallRequest::Fcntl { fd, arg } => syscall!(sys_fcntl(fd, arg)),
+            SyscallRequest::Flock { fd, operation } => syscall!(sys_flock(fd, operation)),
             SyscallRequest::Getcwd { buf, size: count } => {
                 let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
                 self.sys_getcwd(&mut kernel_buf).and_then(|size| {
@@ -1235,6 +1237,13 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<Platform, FS>>,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.
     elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
+    /// Registry of `flock(2)` advisory-lock state, keyed by the underlying file's `(dev, ino)`.
+    ///
+    /// This is deliberately shim-wide (not per-`FilesState`/per-process): real `flock()` locks
+    /// must contend across *any* two open file descriptions of the same underlying file, even ones
+    /// reached from independent `open()` calls in different (e.g. `fork()`-created) processes, not
+    /// just fds `dup()`-derived from a single `open()`. See [`syscalls::file::FlockFile`].
+    flock_registry: litebox::sync::Mutex<Platform, syscalls::file::FlockRegistry<Platform>>,
     /// The first process created by [`LinuxShim::load_program`], set once and kept for the
     /// lifetime of the shim.
     ///
