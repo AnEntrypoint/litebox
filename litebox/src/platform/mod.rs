@@ -515,6 +515,43 @@ pub trait StdioProvider {
     fn is_a_tty(&self, stream: StdioStream) -> bool;
 }
 
+/// A provider that can verify a freshly-`fork()`ed child's execution against the address-space
+/// relocation its `fork()` performed.
+///
+/// `fork()` in LiteBox duplicates the parent's guest address space to *different* host addresses
+/// (see [`PageManager::duplicate`](crate::mm::PageManager::duplicate)) and translates the child's
+/// captured CPU registers accordingly -- but raw pointer values that were already sitting in
+/// *memory* (return addresses pushed on the stack by the parent's `call`s, pointers spilled into
+/// stack slots or globals, ...) are copied verbatim and are therefore stale in the child. Because
+/// `fork()` only ever *adds* mappings and never unmaps the parent's, such a stale pointer is
+/// still live, mapped host memory: dereferencing it silently reads or, far worse, *writes* the
+/// running parent's state instead of faulting the way it would on real Linux hardware.
+///
+/// A platform that can single-step the guest may implement this to detect that situation and
+/// convert it into what real hardware would have produced -- a fault in the child -- rather than
+/// letting it silently corrupt the parent.
+///
+/// The default implementations do nothing, which is always correct-but-unverified behavior.
+pub trait ForkChildVerificationProvider {
+    /// Begin verifying the current (freshly-`fork()`ed child) thread's guest execution against
+    /// `relocations`, which describe how this child's address space was relocated relative to
+    /// its parent's.
+    ///
+    /// Called on the child's own thread, immediately before it first resumes into guest code.
+    /// Verification ends automatically when the child reaches `execve`/`exit`/`exit_group` (at
+    /// which point the stale parent addresses are no longer reachable), or when
+    /// [`end_fork_child_verification`](Self::end_fork_child_verification) is called.
+    fn begin_fork_child_verification(
+        &self,
+        relocations: alloc::sync::Arc<crate::mm::AddressRelocations>,
+    ) {
+        let _ = relocations;
+    }
+
+    /// Stop verifying the current thread's guest execution, if it was being verified.
+    fn end_fork_child_verification(&self) {}
+}
+
 /// A provider for system information.
 pub trait SystemInfoProvider {
     /// Returns the address of the syscall entry point for the platform.

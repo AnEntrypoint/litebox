@@ -1097,6 +1097,8 @@ impl<Host: HostInterface> StdioProvider for LinuxKernel<Host> {
     }
 }
 
+impl<Host: HostInterface> litebox::platform::ForkChildVerificationProvider for LinuxKernel<Host> {}
+
 impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<Host> {
     fn get_syscall_entry_point(&self) -> usize {
         // Currently this is only used in ELF loader to fix trampoline code.

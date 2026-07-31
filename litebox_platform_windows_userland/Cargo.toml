@@ -5,8 +5,14 @@ edition = "2024"
 
 [target.'cfg(windows)'.dependencies]
 getrandom = "0.3.4"
+iced-x86 = { version = "1.21", default-features = false, features = [
+    "no_std",
+    "decoder",
+    "instr_info",
+] }
 litebox = { path = "../litebox/", version = "0.1.0" }
 litebox_common_linux = { path = "../litebox_common_linux", version = "0.1.0" }
+litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
 
 windows-sys = { version = "0.60.2", features = [
     "Win32_System_Console",

@@ -85,6 +85,7 @@ pub trait ShimPlatform:
     + litebox::sync::RawSyncPrimitivesProvider
     + litebox::platform::CrngProvider
     + litebox::platform::SystemInfoProvider
+    + litebox::platform::ForkChildVerificationProvider
     + litebox::platform::StdioProvider
     + litebox::platform::ArchSpecificProvider
     + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
@@ -104,6 +105,7 @@ impl<T> ShimPlatform for T where
         + litebox::sync::RawSyncPrimitivesProvider
         + litebox::platform::CrngProvider
         + litebox::platform::SystemInfoProvider
+        + litebox::platform::ForkChildVerificationProvider
         + litebox::platform::StdioProvider
         + litebox::platform::ArchSpecificProvider
         + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>

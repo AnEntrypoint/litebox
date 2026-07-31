@@ -59,6 +59,37 @@ impl AddressRelocations {
             .find(|(source_range, _)| source_range.contains(&addr))
             .map(|(source_range, dest_base)| dest_base + (addr - source_range.start))
     }
+
+    /// Returns whether `addr` falls within one of the SOURCE (pre-duplication, i.e. parent)
+    /// ranges.
+    ///
+    /// After `fork()`, the parent's original mappings are never unmapped, so any such address is
+    /// still live, mapped host memory in the child's process too -- which is exactly why a stale,
+    /// untranslated pointer copied verbatim into the child does not fault the way it would on
+    /// real hardware. This predicate is the basis for detecting such stale pointers.
+    #[must_use]
+    pub fn is_in_source(&self, addr: usize) -> bool {
+        self.0
+            .iter()
+            .any(|(source_range, _)| source_range.contains(&addr))
+    }
+
+    /// Returns whether `addr` falls within one of the DESTINATION (post-duplication, i.e. child)
+    /// ranges.
+    #[must_use]
+    pub fn is_in_destination(&self, addr: usize) -> bool {
+        self.0.iter().any(|(source_range, dest_base)| {
+            (*dest_base..dest_base + source_range.len()).contains(&addr)
+        })
+    }
+
+    /// Returns the `(source range, destination base)` pairs, for consumers (such as a platform's
+    /// post-`fork()` execution verifier) that need to hold onto a snapshot of the mapping
+    /// independently of this object.
+    #[must_use]
+    pub fn ranges(&self) -> &[(Range<usize>, usize)] {
+        &self.0
+    }
 }
 
 impl<Platform, const ALIGN: usize> PageManager<Platform, ALIGN>

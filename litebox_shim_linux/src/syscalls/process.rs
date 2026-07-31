@@ -425,7 +425,16 @@ enum ThreadInitState {
     /// explicitly propagating it here, the child's first guest instruction that touches `%fs`
     /// (which libc's own post-`clone()` return path does immediately, e.g. to check TLS-stored
     /// cancellation/errno state) dereferences FS base 0 and faults.
-    ForkedChild(litebox_common_linux::PtRegs, usize),
+    ///
+    /// Also carries the `fork()` address-space relocation map, so the platform can verify the
+    /// child's post-`fork()` execution against it (detecting stale, untranslated pointers into
+    /// the parent's address space before they silently corrupt the still-running parent). See
+    /// [`litebox::platform::ForkChildVerificationProvider`].
+    ForkedChild(
+        litebox_common_linux::PtRegs,
+        usize,
+        alloc::sync::Arc<litebox::mm::AddressRelocations>,
+    ),
 }
 
 /// Credentials of a process
@@ -602,11 +611,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn sys_exit(&self, status: i32) {
         // The `Task` will be dropped on the way out of the shim, which will
         // call `self.prepare_for_exit()`.
+        self.global.platform.end_fork_child_verification();
         self.exit_thread(status.trunc());
     }
 
     pub(crate) fn sys_exit_group(&self, status: i32) {
         // Tear down occurs similarly to `sys_exit`.
+        self.global.platform.end_fork_child_verification();
         self.exit_group(ExitStatus::Exit(status.trunc()));
     }
 
@@ -974,16 +985,39 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .platform
                     .get_arch_specific_register(&ArchSpecificRegister::FsBase)
                     .map_err(Errno::from)?;
-                relocations
+                let child_fs_base = relocations
                     .translate(parent_fs_base)
-                    .unwrap_or(parent_fs_base)
+                    .unwrap_or(parent_fs_base);
+
+                // The x86-64 TLS ABI requires the thread pointer to be *self-referential*: the
+                // word at `%fs:0` holds the thread pointer's own value, and that is how position-
+                // independent code materializes it at all (`mov reg, fs:[0]`, which musl's
+                // `__pthread_self()` -- and hence every `errno` access -- compiles to; the CPU
+                // cannot read `%fs.base` directly from user mode). That word lives in *memory*,
+                // so `Vmem::duplicate` copies it verbatim and it still holds the PARENT's TCB
+                // address in the child. Translating the FS base register alone therefore is not
+                // enough: the child's very first `errno` write would compute its address from
+                // the stale self-pointer and land in the parent's live TCB.
+                //
+                // Fix up that one ABI-mandated slot so the child's thread pointer is
+                // self-consistent, exactly as the register translation above intends.
+                if child_fs_base != parent_fs_base {
+                    let slot = UserPtrMut::<usize>::from_usize(child_fs_base);
+                    let _ = slot.write_at_offset::<Platform>(0, child_fs_base);
+                }
+
+                child_fs_base
             };
             #[cfg(not(target_arch = "x86_64"))]
             let fs_base = 0;
 
             (
                 thread,
-                ThreadInitState::ForkedChild(child_ctx, fs_base),
+                ThreadInitState::ForkedChild(
+                    child_ctx,
+                    fs_base,
+                    alloc::sync::Arc::new(relocations),
+                ),
                 child_tid,
                 self.pid,
             )
@@ -1827,6 +1861,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(out)
         }
 
+        // `execve` replaces the address space wholesale: any stale pointer into the parent's
+        // pre-`fork()` ranges is unreachable from here on, so post-`fork()` verification (if it
+        // was armed for this thread) has served its purpose and must stop.
+        self.global.platform.end_fork_child_verification();
+
         // Copy pathname
         let Some(path_cstr) = pathname.to_cstring::<Platform>() else {
             return Err(Errno::EFAULT);
@@ -1981,13 +2020,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
             }
             #[cfg_attr(not(target_arch = "x86_64"), expect(unused_variables))]
-            ThreadInitState::ForkedChild(mut parent_ctx, fs_base) => {
+            ThreadInitState::ForkedChild(mut parent_ctx, fs_base, relocations) => {
                 #[cfg(target_arch = "x86_64")]
                 {
                     parent_ctx.rax = 0;
                     self.sys_arch_prctl(ArchPrctlArg::SetFs(fs_base)).unwrap();
                 }
                 *ctx = parent_ctx;
+                // This runs on the child's own (brand-new) host thread, immediately before it
+                // first resumes into guest code -- ask the platform to verify that the child
+                // never executes at, nor writes through, a stale pointer into the parent's
+                // pre-`fork()` address space. See `ForkChildVerificationProvider`.
+                self.global
+                    .platform
+                    .begin_fork_child_verification(relocations);
             }
         }
     }

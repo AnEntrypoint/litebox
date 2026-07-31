@@ -7,6 +7,8 @@
 // Windows, but we _may_ allow for more in the future, if we find it useful to do so.
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
+mod fork_verify;
+
 use core::cell::Cell;
 use core::panic;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -126,7 +128,45 @@ unsafe extern "system" fn vectored_exception_handler(
             return EXCEPTION_CONTINUE_SEARCH;
         }
     }
+    // A single-step trap while in guest mode belongs to the post-`fork()` verification machinery
+    // (`EFLAGS.TF` is masked out of every guest-visible eflags value, so the guest can never arm
+    // it itself). Either it is a clean step -- in which case we re-arm TF and resume without ever
+    // leaving guest mode -- or it caught the child executing/writing through a stale pointer into
+    // the parent's address space, in which case we fall through to the normal exception path with
+    // a synthesized access violation so the child dies exactly as it would on real hardware.
+    let mut synthesized_record = None;
+    if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_SINGLE_STEP {
+        match fork_verify::on_single_step(tls, context) {
+            fork_verify::StepOutcome::Continue => return EXCEPTION_CONTINUE_EXECUTION,
+            fork_verify::StepOutcome::StalePointer { address, is_write } => {
+                // Report it as a page fault on the offending address so the shim raises the same
+                // `SIGSEGV` on the child that real hardware would have raised.
+                synthesized_record = Some(fork_verify::access_violation_record(
+                    exception_record,
+                    address,
+                    is_write,
+                ));
+            }
+        }
+    }
+    let exception_record: &EXCEPTION_RECORD =
+        synthesized_record.as_ref().unwrap_or(exception_record);
+
     tls.is_in_guest.set(false);
+
+    // From here on, `context` is being redirected into `exception_callback` or
+    // `interrupt_callback` (host code), and control never returns to `fork_verify::on_single_step`
+    // to re-arm or clear `TF` again. If `TF` were left set (a `fork()` child under verification
+    // hit a genuine exception -- our own synthesized one above, or an unrelated real one, e.g. a
+    // guest access violation that happens to occur mid-verification), the CPU would single-step
+    // through `exception_callback`'s/`interrupt_callback`'s own host instructions with
+    // `is_in_guest` now `false`, which the `!is_in_guest` branch above does not handle for
+    // `EXCEPTION_SINGLE_STEP` -- an unhandled `STATUS_SINGLE_STEP` (`0x80000004`) that kills the
+    // whole host process instead of just this child. Clear it unconditionally on every path that
+    // leaves guest mode here, not just the `StalePointer` one.
+    #[allow(clippy::cast_possible_truncation)]
+    let eflags_tf = fork_verify::EFLAGS_TF as u32;
+    context.EFlags &= !eflags_tf;
 
     let regs = unsafe { &mut *tls.guest_context_top.get().wrapping_sub(1) };
     save_guest_context(regs, context);
@@ -218,7 +258,13 @@ fn save_guest_context(
     *rdi = context.Rdi.trunc();
     *orig_rax = context.Rax.trunc();
     *rip = context.Rip.trunc();
-    *eflags = context.EFlags as usize;
+    // `EFLAGS.TF` is owned exclusively by the post-`fork()` verification machinery
+    // (`fork_verify`), which arms it on guest entry and re-arms it on every trap. It must never
+    // leak into guest-visible state: if it did, it would be restored on the next guest entry
+    // (via `pushfq`/`popfq` in the syscall path, or `EFlags` in `switch_to_guest_ntcontinue`)
+    // long after verification ended, producing single-step traps with nothing left to handle
+    // them.
+    *eflags = context.EFlags as usize & !fork_verify::EFLAGS_TF;
     *rsp = context.Rsp.trunc();
 }
 
@@ -441,6 +487,11 @@ struct TlsState {
     /// parent's syscall-entry context, where `rcx == rip` holds by coincidence) must always use
     /// the slower but universally-correct `NtContinue` path instead.
     has_entered_guest: Cell<bool>,
+    /// The post-`fork()` address-space relocation map this thread's guest execution is being
+    /// verified against, or `None` if this thread is not a `fork()` child under verification.
+    ///
+    /// See [`fork_verify`] and [`litebox::platform::ForkChildVerificationProvider`].
+    fork_verify: RefCell<Option<Arc<litebox::mm::AddressRelocations>>>,
 }
 
 /// Scratch space (in bytes) reserved below `host_sp` for the `EXCEPTION_RECORD` that
@@ -467,6 +518,7 @@ impl TlsState {
             pending_host_signals: AtomicU32::new(0),
             waiting_waker: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             has_entered_guest: false.into(),
+            fork_verify: RefCell::new(None),
         }
     }
 }
@@ -585,6 +637,20 @@ unsafe extern "C-unwind" fn run_thread_arch(thread_ctx: &mut ThreadContext, tls_
     // contain rflags if the syscall instruction had actually been issued).
     .globl  syscall_callback
 syscall_callback:
+    // Clear EFLAGS.TF in the live CPU flags before anything else runs. The guest reaches here
+    // via a call (the syscall rewriter's trampoline for every guest syscall instruction, not a
+    // real syscall), which is itself the next instruction a fork() child under fork_verify
+    // single-step verification was stepped through -- so if TF was armed, it is still live in
+    // the CPU's real flags register at this point, and every subsequent host instruction here
+    // (the register spills below, the call into the syscall handler, ...) would otherwise raise
+    // its own single-step trap while is_in_guest is about to be (or has just been) cleared, i.e.
+    // exactly the state vectored_exception_handler does not have a fork_verify handler for -- an
+    // unhandled EXCEPTION_SINGLE_STEP (STATUS_SINGLE_STEP, 0x80000004) that tears down the whole
+    // host process instead of just the child. pushfq/and/popfq on a scratch stack slot clears it
+    // without disturbing any register (rax/rcx/r11 are all still live guest state here).
+    pushfq
+    and     QWORD PTR [rsp], 0xfffffffffffffeff
+    popfq
     // Get the TLS state from the TLS slot and clear the in-guest flag.
     mov     r11d, DWORD PTR [rip + {TLS_INDEX}]
     mov     r11, QWORD PTR gs:[r11 * 8 + TEB_TLS_SLOTS_OFFSET]
@@ -738,7 +804,11 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         unsafe {
             win_ctx.write(CONTEXT {
                 ContextFlags: CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64,
-                EFlags: ctx.eflags.trunc(),
+                // `EFLAGS.TF` is never present in `ctx.eflags` (it is masked out of every
+                // guest-visible eflags value); it is added here, and only here, when this thread
+                // is a `fork()` child under verification -- arming the single-step trap that
+                // `fork_verify` uses to inspect each of the child's instructions.
+                EFlags: (ctx.eflags | fork_verify::entry_eflags_tf(tls)).trunc(),
                 Rax: ctx.rax as u64,
                 Rcx: ctx.rcx as u64,
                 Rdx: ctx.rdx as u64,
@@ -795,7 +865,11 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     // exact thread. A brand-new host thread's first-ever transition (e.g. a `fork()`-created
     // child resuming into a copy of the parent's syscall-entry context, where `rcx == rip` holds
     // only by coincidence) must always take the slower `NtContinue` path instead.
-    if ctx.rcx == ctx.rip && tls.has_entered_guest.get() {
+    //
+    // A `fork()` child under verification must likewise always take the `NtContinue` path: it is
+    // the only one that can set `EFLAGS.TF` (the fast path restores eflags from `ctx`, which
+    // never carries TF) to arm the single-step trap `fork_verify` depends on.
+    if ctx.rcx == ctx.rip && tls.has_entered_guest.get() && !fork_verify::is_verifying(tls) {
         tls.is_in_guest.set(true);
         switch_to_guest_sysret(ctx)
     } else {
@@ -2182,6 +2256,16 @@ impl ThreadContext<'_> {
             ContinueOperation::Resume => unsafe { switch_to_guest(self.ctx) },
             ContinueOperation::Terminate => {}
         }
+    }
+}
+
+impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
+    fn begin_fork_child_verification(&self, relocations: Arc<litebox::mm::AddressRelocations>) {
+        fork_verify::begin(relocations);
+    }
+
+    fn end_fork_child_verification(&self) {
+        fork_verify::end();
     }
 }
 

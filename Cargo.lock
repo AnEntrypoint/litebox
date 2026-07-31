@@ -1671,8 +1671,10 @@ name = "litebox_platform_windows_userland"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
+ "iced-x86",
  "litebox",
  "litebox_common_linux",
+ "litebox_util_log",
  "windows-sys 0.60.2",
  "zerocopy",
 ]

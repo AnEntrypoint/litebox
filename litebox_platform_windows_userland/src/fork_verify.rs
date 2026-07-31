@@ -1,0 +1,397 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+//! Post-`fork()` execution verification for `fork()`-created child threads.
+//!
+//! # The problem
+//!
+//! LiteBox's `fork()` duplicates the parent's guest address space into *fresh, different* host
+//! addresses (see [`litebox::mm::PageManager::duplicate`]) and translates the child's captured
+//! CPU registers into the new address space. Raw pointer values that were already sitting in
+//! *memory* at the moment of the `fork()`, however, are copied verbatim and are therefore stale
+//! in the child:
+//!
+//! * return addresses the parent's `call` instructions pushed onto the stack,
+//! * pointers spilled into stack slots, globals, or heap structures.
+//!
+//! On real Linux this is harmless: the child gets its own address space at the *same* virtual
+//! addresses, so a copied pointer is still correct. Under LiteBox it is not -- and, critically,
+//! it does not fault either, because `fork()` only ever *adds* mappings and never unmaps the
+//! parent's, so the stale address is still live, mapped, and (for code) executable memory
+//! belonging to the *still-running parent*. A child that `ret`s to a stale return address
+//! genuinely resumes executing the parent's copy of the code, and any store that code performs
+//! relative to that (unrelocated) `rip` -- or through any other stale pointer -- lands directly in
+//! the parent's live state, silently corrupting a process that is still running.
+//!
+//! This is exactly the case the `Vmem::duplicate` doc comment flags as unsupported, and it is
+//! reachable in practice: `ash`'s `fork()` -> `forkchild()` cleanup -> `execve()` sequence (i.e.
+//! any `sh -c "a; b"`) hits it every time, corrupting the parent's `g_parsefile` and hanging the
+//! shell forever.
+//!
+//! # What this module does
+//!
+//! It does **not** try to repair stale pointers. Enumerating every place a stale pointer could
+//! surface (code pointers, data pointers, syscall arguments, ...) is unbounded, and guessing the
+//! "right" translation for a value that may not even be a pointer introduces corruption of its
+//! own.
+//!
+//! Instead it *detects* the corruption in progress and stops it, reproducing what real hardware
+//! would have done: from the moment a `fork()` child resumes until it reaches `execve`/`exit`/
+//! `exit_group` (after which the parent's addresses are unreachable and the danger is over), the
+//! child runs with `EFLAGS.TF` set. On each single-step trap, before the next instruction runs:
+//!
+//! 1. **Code pointers.** If `rip` itself has landed inside one of the *source* (parent) ranges,
+//!    the child is about to execute the parent's code. Kill it.
+//! 2. **Data pointers.** Otherwise the instruction at `rip` is decoded (via `iced-x86`), and if
+//!    it writes memory, its effective address is computed from the operand plus the live register
+//!    values in the trapped context. If that address falls inside a source range, the child is
+//!    about to write through a stale pointer, into the parent's live state. Kill it -- *before*
+//!    the write lands.
+//!
+//! "Kill" means synthesizing an access violation and letting it flow through the platform's
+//! ordinary exception path, so the shim raises a perfectly normal `SIGSEGV` on the child; the
+//! child's exit status is recorded and the parent's `wait4()` unblocks as usual.
+//!
+//! # Why this cannot produce false positives
+//!
+//! The source ranges are the parent's *pre-`fork()`* mappings, and duplication allocates the
+//! child's copies specifically *excluding* them (`Vmem::new_excluding`), so source and destination
+//! ranges are disjoint by construction. Consequently:
+//!
+//! * writes to the child's own relocated stack, `.data`, or heap are in a *destination* range and
+//!   are never flagged;
+//! * writes to memory the child `mmap`s after the `fork()` are in neither range and are never
+//!   flagged;
+//! * `rip` inside LiteBox's own syscall trampoline (`call syscall_callback`, which the syscall
+//!   rewriter emits in place of every `syscall` instruction) is a *host* address, in neither
+//!   range, and is never flagged.
+//!
+//! The only thing that lands in a source range is an address that was never translated -- which
+//! is precisely the bug.
+//!
+//! # `EFLAGS.TF` lifecycle -- why it must be cleared on every path out of guest mode
+//!
+//! `TF` is armed only while resuming a verified child (`switch_to_guest`) and is otherwise the
+//! exclusive property of this module. Two places matter beyond the obvious single-step handling
+//! in [`on_single_step`], because a `#DB` raised while `TF` is live but the current thread is not
+//! `is_in_guest` is *unhandled* by [`crate::vectored_exception_handler`] and crashes the whole
+//! host process (`STATUS_SINGLE_STEP`, `0x80000004`), not just the child:
+//!
+//! * When [`vectored_exception_handler`](crate::vectored_exception_handler) redirects a trapped
+//!   context into `exception_callback`/`interrupt_callback` (whether for the access violation
+//!   this module synthesizes on detection, or for an unrelated genuine exception that happens to
+//!   occur mid-verification), `TF` must be cleared from that context first -- control never
+//!   returns to [`on_single_step`] to do it once host code starts running.
+//! * The syscall rewriter's trampoline reaches `syscall_callback` via an ordinary `call`
+//!   instruction executed *as* the guest's single-stepped next instruction, not via the
+//!   exception-handler redirect above -- so `TF` is still live in the CPU when `syscall_callback`
+//!   starts running, and it clears it itself, first thing, before any other host instruction.
+
+use iced_x86::{Decoder, DecoderOptions, Instruction, OpAccess, OpKind, Register};
+use windows_sys::Win32::Foundation as Win32_Foundation;
+use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, EXCEPTION_RECORD};
+
+use crate::TlsState;
+
+/// The x86 `EFLAGS.TF` (trap flag) bit: when set, the CPU raises `#DB` after every instruction.
+///
+/// This bit is owned exclusively by this module. It is masked out of every guest-visible eflags
+/// value (`litebox_common_linux::arch::SAFE_USER_EFLAGS` omits it, and `save_guest_context` clears
+/// it), so a guest can never observe or arm it, and it can never survive into a context resumed
+/// after verification has ended.
+pub(crate) const EFLAGS_TF: usize = 1 << 8;
+
+/// The maximum length of an x86-64 instruction, and hence how many bytes need to be readable at
+/// `rip` to decode one.
+const MAX_INSTRUCTION_LEN: usize = 15;
+
+/// Whether the current thread is a `fork()` child whose execution is being verified.
+pub(crate) fn is_verifying(tls: &TlsState) -> bool {
+    tls.fork_verify.borrow().is_some()
+}
+
+/// The `EFLAGS` bits to add when entering guest mode on this thread: `TF` if this thread is a
+/// `fork()` child under verification, nothing otherwise.
+pub(crate) fn entry_eflags_tf(tls: &TlsState) -> usize {
+    if is_verifying(tls) { EFLAGS_TF } else { 0 }
+}
+
+/// What [`on_single_step`] decided about the trapped instruction.
+pub(crate) enum StepOutcome {
+    /// Nothing suspicious; the child has been re-armed and should resume directly.
+    Continue,
+    /// The child is about to execute at, or write through, a stale pointer into its parent's
+    /// address space. It must be killed before the instruction runs.
+    StalePointer {
+        /// The offending address: `rip` for a code pointer, the write's effective address for a
+        /// data pointer.
+        address: usize,
+        /// Whether the offending access is a write (as opposed to an instruction fetch).
+        is_write: bool,
+    },
+}
+
+/// Inspect a single-step trap taken in guest mode on a `fork()` child under verification.
+///
+/// Returns [`StepOutcome::Continue`] after re-arming `TF` if the instruction about to execute is
+/// benign; see the module documentation for what "benign" means and why the check cannot produce
+/// false positives.
+pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutcome {
+    // `EFLAGS_TF` is a small, fixed bit-mask constant (`1 << 8`); the truncating cast to `u32`
+    // (the width of `CONTEXT::EFlags`) never actually loses any bits.
+    #[allow(clippy::cast_possible_truncation)]
+    let eflags_tf = EFLAGS_TF as u32;
+
+    let borrow = tls.fork_verify.borrow();
+    let Some(relocations) = borrow.as_ref() else {
+        // Not a thread under verification: TF must have leaked in from somewhere. Clear it and
+        // resume rather than trapping forever.
+        context.EFlags &= !eflags_tf;
+        return StepOutcome::Continue;
+    };
+
+    // This module only builds for `target_arch = "x86_64"` (see the crate's top-level `cfg`), so
+    // `usize` and `u64` are the same width here; the cast is exact, never truncating.
+    #[allow(clippy::cast_possible_truncation)]
+    let rip = context.Rip as usize;
+
+    // (1) Code pointer: `rip` itself landed in the parent's pre-`fork()` code. This is the `ret`
+    // to a stale return address, executing the parent's own instructions.
+    if relocations.is_in_source(rip) {
+        litebox_util_log::warn!(rip:? = rip; "fork_verify: stale CODE pointer detected");
+        return StepOutcome::StalePointer {
+            address: rip,
+            is_write: false,
+        };
+    }
+
+    // `rip` outside the child's own duplicated address space entirely is LiteBox's own host code:
+    // the syscall rewriter replaces every guest `syscall` instruction with a `call` to
+    // `syscall_callback`'s host address, so this happens on every single syscall the child makes.
+    // Single-stepping LiteBox's own code would be both pointless and fatal, so disarm here; the
+    // next `switch_to_guest` back into the child re-arms `TF` automatically.
+    if !relocations.is_in_destination(rip) {
+        context.EFlags &= !eflags_tf;
+        return StepOutcome::Continue;
+    }
+
+    // Keep stepping. Note this must happen even on the paths below that return `Continue` early
+    // (e.g. an instruction we cannot decode), or verification silently stops.
+    context.EFlags |= eflags_tf;
+
+    // (2) Data pointer: decode the instruction about to execute and check where it writes.
+    //
+    // `rip` here is guest code (or LiteBox's own trampoline, which is host code that is equally
+    // safe to read); reading `MAX_INSTRUCTION_LEN` bytes from it is safe in the same sense the
+    // CPU fetching it is, except that the instruction may sit at the very end of a mapping. Read
+    // it a byte at a time through a fault-tolerant read so a partial fetch simply yields a
+    // shorter (still decodable, or harmlessly undecodable) buffer instead of faulting inside the
+    // exception handler.
+    let mut code = [0u8; MAX_INSTRUCTION_LEN];
+    let len = read_code_bytes(rip, &mut code);
+    if len == 0 {
+        return StepOutcome::Continue;
+    }
+
+    let mut decoder = Decoder::with_ip(64, &code[..len], rip as u64, DecoderOptions::NONE);
+    let instruction = decoder.decode();
+    if instruction.is_invalid() {
+        return StepOutcome::Continue;
+    }
+
+    let Some(address) = memory_write_address(&instruction, context) else {
+        return StepOutcome::Continue;
+    };
+
+    if relocations.is_in_source(address) {
+        litebox_util_log::warn!(
+            rip:? = rip, address:? = address, mnemonic:? = instruction.mnemonic();
+            "fork_verify: stale DATA pointer write detected"
+        );
+        return StepOutcome::StalePointer {
+            address,
+            is_write: true,
+        };
+    }
+
+    StepOutcome::Continue
+}
+
+/// Reads up to `buf.len()` bytes of instruction encoding at `rip`, stopping at the first byte
+/// that cannot be read. Returns how many bytes were read.
+///
+/// Guards against the (rare, but real) case of an instruction sitting so close to the end of a
+/// mapping that a full 15-byte fetch would run off the end of it -- which would otherwise fault
+/// inside the vectored exception handler.
+fn read_code_bytes(rip: usize, buf: &mut [u8]) -> usize {
+    let page_size = 0x1000usize;
+    // The CPU already fetched the instruction at `rip`, so at minimum the bytes up to the end of
+    // `rip`'s own page are readable. Never read past that boundary unless the next page is
+    // demonstrably part of the same committed region.
+    let to_page_end = page_size - (rip & (page_size - 1));
+    let readable = if to_page_end >= buf.len() || is_readable(rip + to_page_end) {
+        buf.len()
+    } else {
+        to_page_end
+    };
+    // SAFETY: `rip` is the address the CPU just fetched an instruction from, so `readable` bytes
+    // starting there are mapped and readable per the check above.
+    unsafe {
+        core::ptr::copy_nonoverlapping(rip as *const u8, buf.as_mut_ptr(), readable);
+    }
+    readable
+}
+
+/// Whether `addr` is in a committed, readable region of the host address space.
+fn is_readable(addr: usize) -> bool {
+    use windows_sys::Win32::System::Memory as Win32_Memory;
+    const NO_ACCESS: u32 = Win32_Memory::PAGE_NOACCESS | Win32_Memory::PAGE_GUARD;
+
+    let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+    let ok = unsafe {
+        Win32_Memory::VirtualQuery(
+            addr as *const core::ffi::c_void,
+            &raw mut mbi,
+            core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+        ) != 0
+    };
+    if !ok || mbi.State != Win32_Memory::MEM_COMMIT {
+        return false;
+    }
+    mbi.Protect & NO_ACCESS == 0
+}
+
+/// If `instruction` writes to memory, computes the effective address it writes to from its
+/// operands plus the live register values in `context`.
+///
+/// Returns `None` for instructions that do not write memory at all, and for the handful of forms
+/// whose effective address cannot be resolved from the trapped register state alone.
+fn memory_write_address(instruction: &Instruction, context: &CONTEXT) -> Option<usize> {
+    // Does any operand write memory?
+    let mut info_factory = iced_x86::InstructionInfoFactory::new();
+    let info = info_factory.info(instruction);
+    let writes_memory = info.used_memory().iter().any(|m| {
+        matches!(
+            m.access(),
+            OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite
+        )
+    });
+    if !writes_memory {
+        return None;
+    }
+
+    // Push/pop-style implicit stack writes target `rsp`, which is always translated for the
+    // child, and are covered by the `rsp` value in the context anyway; the general path below
+    // handles them via `OpKind::Memory` when they have an explicit memory operand, and via the
+    // used-memory info otherwise. Compute the address from the explicit memory operand when there
+    // is one -- that is the case that can carry a stale pointer.
+    for i in 0..instruction.op_count() {
+        if instruction.op_kind(i) != OpKind::Memory {
+            continue;
+        }
+        // Exact on this crate's only target (`x86_64`): a 64-bit displacement fits `usize` as-is.
+        #[allow(clippy::cast_possible_truncation)]
+        let mut address = instruction.memory_displacement64() as usize;
+        match instruction.memory_base() {
+            // `None`: no base register to add. `RIP`/`EIP`: RIP-relative addressing, and
+            // `memory_displacement64` already folded in the instruction pointer -- both leave
+            // `address` unchanged, but are kept as distinct arms since they mean different things.
+            Register::None | Register::RIP | Register::EIP => {}
+            base => address = address.wrapping_add(register_value(base, context)?),
+        }
+        if instruction.memory_index() != Register::None {
+            let index = register_value(instruction.memory_index(), context)?;
+            // `memory_index_scale()` is one of 1/2/4/8; always fits `usize`.
+            #[allow(clippy::cast_possible_truncation)]
+            let scale = instruction.memory_index_scale() as usize;
+            address = address.wrapping_add(index.wrapping_mul(scale));
+        }
+        return Some(address);
+    }
+
+    // No explicit memory operand: an implicit stack access (`push`, `call`, ...). Those target
+    // `rsp`, which `fork()` translates, so they are not a stale-pointer vector -- and the
+    // `is_in_source` check below would harmlessly reject them anyway. Report the stack address so
+    // the check is still applied.
+    let used = info.used_memory().first()?;
+    if used.base() == Register::RSP || used.base() == Register::RBP {
+        // Exact on this crate's only target (`x86_64`): a 64-bit displacement fits `usize` as-is.
+        #[allow(clippy::cast_possible_truncation)]
+        let displacement = used.displacement() as usize;
+        return Some(register_value(used.base(), context)?.wrapping_add(displacement));
+    }
+    None
+}
+
+/// Reads the 64-bit value of `register` (or the enclosing 64-bit register, for narrower
+/// sub-registers) from the trapped context.
+fn register_value(register: Register, context: &CONTEXT) -> Option<usize> {
+    let full = register.full_register();
+    let value = match full {
+        Register::RAX => context.Rax,
+        Register::RBX => context.Rbx,
+        Register::RCX => context.Rcx,
+        Register::RDX => context.Rdx,
+        Register::RSI => context.Rsi,
+        Register::RDI => context.Rdi,
+        Register::RBP => context.Rbp,
+        Register::RSP => context.Rsp,
+        Register::R8 => context.R8,
+        Register::R9 => context.R9,
+        Register::R10 => context.R10,
+        Register::R11 => context.R11,
+        Register::R12 => context.R12,
+        Register::R13 => context.R13,
+        Register::R14 => context.R14,
+        Register::R15 => context.R15,
+        // Vector-index (`vsib`) registers, segment registers, and anything else cannot be
+        // resolved from the integer context; skip the instruction rather than guess.
+        _ => return None,
+    };
+    // A 32-bit base/index register is zero-extended to 64 bits, exactly as the CPU does. This
+    // crate's only target is `x86_64`, so `usize` is 64 bits and neither conversion below actually
+    // truncates: the first intentionally narrows to 32 bits before zero-extending back up, and the
+    // second is a same-width reinterpretation.
+    #[allow(clippy::cast_possible_truncation)]
+    if register.size() == 4 {
+        Some((value as u32) as usize)
+    } else {
+        Some(value as usize)
+    }
+}
+
+/// Builds a synthetic `EXCEPTION_ACCESS_VIOLATION` record describing an access to `address`, so a
+/// detected stale-pointer access flows through the platform's ordinary exception path and reaches
+/// the shim as an ordinary `SIGSEGV` -- exactly what real hardware would have delivered.
+pub(crate) fn access_violation_record(
+    template: &EXCEPTION_RECORD,
+    address: usize,
+    is_write: bool,
+) -> EXCEPTION_RECORD {
+    let mut record = *template;
+    record.ExceptionCode = Win32_Foundation::EXCEPTION_ACCESS_VIOLATION;
+    record.NumberParameters = 2;
+    record.ExceptionInformation[0] = usize::from(is_write);
+    record.ExceptionInformation[1] = address;
+    record
+}
+
+/// Per-thread arm/disarm entry points, called through
+/// [`litebox::platform::ForkChildVerificationProvider`].
+pub(crate) fn begin(relocations: alloc::sync::Arc<litebox::mm::AddressRelocations>) {
+    if let Some(tls) = crate::get_tls_ptr() {
+        // SAFETY: `get_tls_ptr` returns this thread's live `TlsState`.
+        let tls = unsafe { &*tls };
+        if std::env::var_os("LITEBOX_FORKVERIFY_OFF").is_none() {
+            *tls.fork_verify.borrow_mut() = Some(relocations);
+        }
+    }
+}
+
+pub(crate) fn end() {
+    if let Some(tls) = crate::get_tls_ptr() {
+        // SAFETY: as above.
+        let tls = unsafe { &*tls };
+        *tls.fork_verify.borrow_mut() = None;
+    }
+}

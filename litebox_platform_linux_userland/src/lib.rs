@@ -1838,6 +1838,8 @@ impl ThreadContext<'_> {
     }
 }
 
+impl litebox::platform::ForkChildVerificationProvider for LinuxUserland {}
+
 impl litebox::platform::SystemInfoProvider for LinuxUserland {
     fn get_syscall_entry_point(&self) -> usize {
         syscall_callback as *const () as usize
