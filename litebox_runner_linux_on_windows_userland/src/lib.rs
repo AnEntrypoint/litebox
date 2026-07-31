@@ -85,6 +85,20 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             )
             .unwrap();
             fs.chown("/tmp", Some(1000), Some(1000)).unwrap();
+
+            // Standard FHS directories that tools like `apk` expect to already exist
+            // (e.g. `apk` opens a log file under `/var/log`) but which don't survive
+            // as empty-directory entries when an OCI image's rootfs is scanned into a
+            // file-based tar (an empty directory has no file contents, so it produces
+            // no tar entry, and `TarRo`'s directory tree is inferred purely from file
+            // paths -- see litebox/src/fs/tar_ro.rs).
+            for dir in ["/run", "/var", "/var/log", "/var/cache", "/var/tmp"] {
+                fs.mkdir(
+                    dir,
+                    litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
+                )
+                .unwrap();
+            }
         });
 
         shim_builder.default_fs(in_mem, tar_data.into())

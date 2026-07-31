@@ -1633,11 +1633,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 files.run_on_raw_fd(
                     desc,
                     |fd| {
-                        setfl_in_metadata!(
-                            fd,
-                            crate::StdioStatusFlags,
-                            unimplemented!("SETFL on non-stdio")
-                        )
+                        // Most `fd`s dispatched here are plain regular files (not stdio), which
+                        // carry no `StdioStatusFlags` metadata at all. LiteBox's `FileSystem`
+                        // trait has no mechanism to store or honor per-fd status flags for
+                        // regular files (mirroring `GETFL`'s `fs` closure above, which likewise
+                        // falls back to `OFlags::empty()` when this metadata is absent). On real
+                        // Linux, `fcntl(F_SETFL, ...)` on a regular file is accepted but has no
+                        // effect on read/write blocking behavior, so treat a missing-metadata fd
+                        // here as a successful no-op rather than an error.
+                        match self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .with_metadata_mut(fd, |crate::StdioStatusFlags(f)| {
+                                let diff = (*f & setfl_mask) ^ flags;
+                                if diff
+                                    .intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME)
+                                {
+                                    log_unsupported!("unsupported flags");
+                                }
+                                f.toggle(diff);
+                            }) {
+                            Ok(()) | Err(MetadataError::NoSuchMetadata) => Ok(()),
+                            Err(MetadataError::ClosedFd) => Err(Errno::EBADF),
+                        }
                     },
                     |fd| {
                         setfl_in_metadata!(
