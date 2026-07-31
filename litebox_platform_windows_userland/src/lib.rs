@@ -8,6 +8,7 @@
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
 mod fork_verify;
+mod net;
 
 use core::cell::Cell;
 use core::panic;
@@ -1497,20 +1498,23 @@ impl litebox::platform::RawMutex for RawMutex {
 
 impl litebox::platform::IPInterfaceProvider for WindowsUserland {
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
-        unimplemented!(
-            "send_ip_packet is not implemented for Windows yet. packet length: {}",
-            packet.len()
-        );
+        net::send_ip_packet(packet)
     }
 
     fn receive_ip_packet(
         &self,
         packet: &mut [u8],
     ) -> Result<usize, litebox::platform::ReceiveError> {
-        unimplemented!(
-            "receive_ip_packet is not implemented for Windows yet. packet length: {}",
-            packet.len()
-        );
+        net::receive_ip_packet(packet)
+    }
+}
+
+impl WindowsUserland {
+    /// Wait until there is data available from the userspace NAT gateway (see [`net`]), or
+    /// `timeout` elapses. Mirrors `LinuxUserland::wait_on_tun`; used by a network-worker thread to
+    /// sleep efficiently between rounds of network interaction instead of busy-polling.
+    pub fn wait_on_tun(&self, timeout: Option<Duration>) {
+        net::wait_on_tun(timeout);
     }
 }
 

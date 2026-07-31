@@ -28,7 +28,8 @@ mod tests;
 
 use errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, ReadDirError,
-    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ReadError, ReadLinkError, RenameError, RmdirError, SeekError, SymlinkError, TruncateError,
+    UnlinkError, WriteError,
 };
 
 /// A private module, to help support writing sealed traits. This module should _itself_ never be
@@ -124,6 +125,32 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// Unlink a file
     fn unlink(&self, path: impl path::Arg) -> Result<(), UnlinkError>;
 
+    /// Rename (move) `from` to `to`, atomically replacing `to` if it already exists.
+    ///
+    /// Only regular-file renames are currently supported (directory rename returns
+    /// [`RenameError::IsADirectory`]) -- this covers the common "atomically replace a file with a
+    /// freshly-written temp file" pattern (e.g. package managers like `apk` installing a
+    /// downloaded package), which is the scenario this method exists to support. `from` and `to`
+    /// must resolve within the same filesystem/layer, matching Linux's `EXDEV` restriction on
+    /// cross-filesystem rename (implementations that can't support the general case return
+    /// [`RenameError::CrossDevice`] for a cross-layer attempt, e.g. renaming a file that currently
+    /// only exists in a read-only layer of a [`layered`] filesystem).
+    fn rename(&self, from: impl path::Arg, to: impl path::Arg) -> Result<(), RenameError>;
+
+    /// Create a symbolic link at `linkpath` pointing to `target`.
+    ///
+    /// `target` is stored verbatim (it is never itself resolved or validated at creation time,
+    /// matching Linux's `symlink(2)`, which happily creates dangling or relative-target
+    /// symlinks). This exists to support the common "package manager installs a shared-library
+    /// symlink" pattern (e.g. `apk` extracting `usr/lib/libfoo.so -> libfoo.so.1.2.3`).
+    fn symlink(&self, target: impl path::Arg, linkpath: impl path::Arg)
+    -> Result<(), SymlinkError>;
+
+    /// Read the target of the symbolic link at `path`.
+    ///
+    /// Returns [`ReadLinkError::NotASymlink`] if `path` does not name a symbolic link.
+    fn read_link(&self, path: impl path::Arg) -> Result<alloc::string::String, ReadLinkError>;
+
     /// Create a new directory
     fn mkdir(&self, path: impl path::Arg, mode: Mode) -> Result<(), MkdirError>;
 
@@ -202,6 +229,7 @@ pub enum FileType {
     RegularFile,
     Directory,
     CharacterDevice,
+    Symlink,
 }
 
 bitflags! {

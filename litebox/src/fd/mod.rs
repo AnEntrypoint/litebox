@@ -570,13 +570,14 @@ pub(crate) enum CloseResult<Subsystem: FdEnabledSubsystem> {
 /// integers, with a reasonable amount of safety---this will not be able to check for "ABA" style
 /// issues, but will at least prevent using a descriptor for an unintended subsystem at the point of
 /// conversion.
-#[derive(Clone)]
+/// Deliberately **not** `Clone`/`Copy`: see [`RawDescriptorStorage::fork_duplicate`] for why a
+/// naive derived `Clone` (which would `Arc::clone` every [`StoredFd::x`] token) is unsound for
+/// `fork()`'s per-process fd-table duplication.
 pub struct RawDescriptorStorage {
     /// Stored FDs are used to provide raw integer values in a safer way.
     stored_fds: Vec<Option<StoredFd>>,
 }
 
-#[derive(Clone)]
 struct StoredFd {
     x: Arc<OwnedFd>,
     subsystem_entry_type_id: core::any::TypeId,
@@ -599,6 +600,83 @@ impl RawDescriptorStorage {
     /// Create a new raw descriptor store.
     pub fn new() -> Self {
         Self { stored_fds: vec![] }
+    }
+
+    /// Produces an independent duplicate of this raw fd table, for `fork()`'s per-process
+    /// fd-table duplication.
+    ///
+    /// This is **not** a plain `Clone`: [`OwnedFd`] is explicitly documented as a non-clonable
+    /// ownership token (see its doc comment), and for good reason -- it is not merely a "closed"
+    /// flag, it is a claim on a specific slot in the *global* descriptor table
+    /// ([`crate::litebox::LiteBox::descriptor_table_mut`]). A naive derived `Clone` that
+    /// `Arc::clone`s each [`StoredFd::x`] would leave the parent and the fork()ed child sharing
+    /// the exact same `OwnedFd` (and hence the same global-table slot and the same `closed` flag)
+    /// for every raw fd number both processes have -- so closing/dup2-ing a raw fd in *either*
+    /// process (e.g. the parent tearing down a `>`-redirection's saved fd, or the child doing the
+    /// same) would remove the shared global-table slot (or mark the shared `OwnedFd` closed) out
+    /// from under the *other* process too. The other process would then see
+    /// `TypedFd::as_usize()`/`as_internal_fd()` fail (treated as EBADF) for a raw fd its own
+    /// table still lists as occupied -- exactly the symptom that motivated this method (a shell's
+    /// `fork()` + `dup2()`-based output-redirection sequence spinning forever on a spurious EBADF
+    /// once the parent or child closed its copy of a shared saved fd).
+    ///
+    /// Instead, every occupied slot's underlying entry is duplicated into a **genuinely new**
+    /// global-table slot -- exactly the same `Descriptors::duplicate` machinery `dup()`/`dup2()`
+    /// already use to give two raw fd numbers independent `OwnedFd` tokens over a shared open
+    /// file description -- so each process's fd *slot lifetime* is its own from the moment of
+    /// `fork()`, while the *open file description* itself remains correctly shared (matching
+    /// POSIX `fork()` semantics).
+    ///
+    /// One duplicator callback per supported subsystem is dispatched according to each occupied
+    /// slot's own subsystem (the same per-subsystem dispatch shape used elsewhere for raw-fd
+    /// operations, e.g. `litebox_shim_linux`'s `run_on_raw_fd`). Each callback is expected to call
+    /// [`Descriptors::duplicate`] on the caller's global descriptor table and hand back the new
+    /// `TypedFd`, or `None` if the fd could not be duplicated (e.g. already closed concurrently
+    /// on the global table), in which case the slot is dropped from the duplicate table.
+    #[must_use]
+    pub fn fork_duplicate<S1, S2, S3, S4, S5, S6>(
+        &self,
+        mut f1: impl FnMut(&TypedFd<S1>) -> Option<TypedFd<S1>>,
+        mut f2: impl FnMut(&TypedFd<S2>) -> Option<TypedFd<S2>>,
+        mut f3: impl FnMut(&TypedFd<S3>) -> Option<TypedFd<S3>>,
+        mut f4: impl FnMut(&TypedFd<S4>) -> Option<TypedFd<S4>>,
+        mut f5: impl FnMut(&TypedFd<S5>) -> Option<TypedFd<S5>>,
+        mut f6: impl FnMut(&TypedFd<S6>) -> Option<TypedFd<S6>>,
+    ) -> Self
+    where
+        S1: FdEnabledSubsystem,
+        S2: FdEnabledSubsystem,
+        S3: FdEnabledSubsystem,
+        S4: FdEnabledSubsystem,
+        S5: FdEnabledSubsystem,
+        S6: FdEnabledSubsystem,
+    {
+        let mut new = Self { stored_fds: vec![] };
+        for raw_fd in self.iter_alive() {
+            let new_fd = self
+                .invoke_matching_subsystem_6(
+                    raw_fd,
+                    |fd: Arc<TypedFd<S1>>| f1(&fd).map(StoredFd::new::<S1>),
+                    |fd: Arc<TypedFd<S2>>| f2(&fd).map(StoredFd::new::<S2>),
+                    |fd: Arc<TypedFd<S3>>| f3(&fd).map(StoredFd::new::<S3>),
+                    |fd: Arc<TypedFd<S4>>| f4(&fd).map(StoredFd::new::<S4>),
+                    |fd: Arc<TypedFd<S5>>| f5(&fd).map(StoredFd::new::<S5>),
+                    |fd: Arc<TypedFd<S6>>| f6(&fd).map(StoredFd::new::<S6>),
+                )
+                .ok()
+                .flatten();
+            let Some(new_fd) = new_fd else {
+                // The fd could not be duplicated (closed concurrently, or the global-table
+                // duplication failed) -- drop it from the fork()ed table, matching what would
+                // happen to a raw fd whose underlying open file description vanished mid-fork.
+                continue;
+            };
+            if raw_fd >= new.stored_fds.len() {
+                new.stored_fds.resize_with(raw_fd + 1, || None);
+            }
+            new.stored_fds[raw_fd] = Some(new_fd);
+        }
+        new
     }
 
     /// Get the corresponding integer value of the provided `fd`.
@@ -712,6 +790,8 @@ macro_rules! multi_subsystem_generic {
         /// Invoke the corresponding function that matches the subsystem.
         ///
         /// Equivalent versions of this function exist at differing number of subsystems.
+        // One callback per subsystem, generated per arity by this macro.
+        #[allow(clippy::too_many_arguments)]
         fn $ident_f<R, $($subsystem),+>(
             &self,
             fd: usize,
@@ -775,6 +855,7 @@ impl RawDescriptorStorage {
     multi_subsystem_generic! {invoke_matching_subsystem_2, typed_fd_at_raw_2, f1 S1, f2 S2}
     multi_subsystem_generic! {invoke_matching_subsystem_3, typed_fd_at_raw_3, f1 S1, f2 S2, f3 S3}
     multi_subsystem_generic! {invoke_matching_subsystem_4, typed_fd_at_raw_4, f1 S1, f2 S2, f3 S3, f4 S4}
+    multi_subsystem_generic! {invoke_matching_subsystem_6, typed_fd_at_raw_6, f1 S1, f2 S2, f3 S3, f4 S4, f5 S5, f6 S6}
 }
 
 /// A LiteBox subsystem that support having file descriptors.

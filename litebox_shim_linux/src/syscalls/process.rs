@@ -920,7 +920,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let files = if flags.contains(CloneFlags::FILES) {
             self.files.borrow().clone()
         } else {
-            alloc::sync::Arc::new((**self.files.borrow()).clone())
+            alloc::sync::Arc::new(self.files.borrow().fork_duplicate(&self.global.litebox))
         };
 
         let child_tid = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);

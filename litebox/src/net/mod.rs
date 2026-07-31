@@ -1173,9 +1173,17 @@ where
                     // unimplemented for now to trigger a panic.
                     unimplemented!()
                 }
+                // See the analogous comment in the `Protocol::Udp` arm below: an unspecified
+                // address must map to `addr: None` (wildcard), not `Some(0.0.0.0)`, or inbound
+                // SYNs addressed to the interface's real address will be rejected.
+                let bind_addr = if addr.ip().is_unspecified() {
+                    None
+                } else {
+                    Some(smoltcp::wire::IpAddress::Ipv4(*addr.ip()))
+                };
                 socket_handle.tcp_mut().server_socket = Some(TcpServerSpecific {
                     ip_listen_endpoint: smoltcp::wire::IpListenEndpoint {
-                        addr: Some(smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
+                        addr: bind_addr,
                         port: new_port,
                     },
                     backlog: None,
@@ -1187,8 +1195,20 @@ where
                     .local_port_allocator
                     .allocate_local_port(addr.port())
                     .map_err(|_| BindError::PortAlreadyInUse(addr.port()))?;
+                // An unspecified address (`0.0.0.0`) means "any local address" and must map to
+                // `addr: None` (smoltcp's true wildcard), not `Some(0.0.0.0)`. `UdpSocket::accepts`
+                // treats `Some(_)` as a literal address requiring an exact match against the
+                // packet's real destination address, so `Some(0.0.0.0)` would silently reject every
+                // inbound datagram whose destination is the interface's real address (e.g.
+                // `10.0.0.2`) instead of matching everything as intended -- this broke every
+                // reply to an auto-bound (unconnected `sendto()`) UDP socket, e.g. DNS queries.
+                let bind_addr = if addr.ip().is_unspecified() {
+                    None
+                } else {
+                    Some(smoltcp::wire::IpAddress::Ipv4(*addr.ip()))
+                };
                 let local_endpoint = smoltcp::wire::IpListenEndpoint {
-                    addr: Some(smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
+                    addr: bind_addr,
                     port: lp.port(),
                 };
                 let socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);

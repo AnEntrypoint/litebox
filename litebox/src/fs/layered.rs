@@ -16,7 +16,8 @@ use crate::sync;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ReadDirError, ReadError, ReadLinkError, RenameError, RmdirError, SeekError, SymlinkError,
+    TruncateError, UnlinkError, WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence};
 
@@ -133,7 +134,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                             | MkdirError::PathError(
                                 PathError::ComponentNotADirectory
                                 | PathError::InvalidPathname
-                                | PathError::NoSearchPerms { .. },
+                                | PathError::NoSearchPerms { .. }
+                                | PathError::TooManySymlinkHops,
                             ) => {
                                 return Err(e);
                             }
@@ -145,7 +147,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         },
                     }
                 }
-                Ok(FileType::RegularFile | FileType::CharacterDevice)
+                Ok(FileType::RegularFile | FileType::CharacterDevice | FileType::Symlink)
                 | Err(
                     FileStatusError::PathError(PathError::MissingComponent)
                     | FileStatusError::ClosedFd,
@@ -156,7 +158,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 Err(FileStatusError::PathError(PathError::InvalidPathname)) => {
                     unreachable!("we just confirmed valid path")
                 }
-                Err(FileStatusError::PathError(e @ PathError::NoSearchPerms { .. })) => {
+                Err(FileStatusError::PathError(
+                    e @ (PathError::NoSearchPerms { .. } | PathError::TooManySymlinkHops),
+                )) => {
                     Err(e)?;
                 }
                 Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)) => {
@@ -549,7 +553,8 @@ impl<
                 | OpenError::PathError(
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
-                    | PathError::NoSearchPerms { .. },
+                    | PathError::NoSearchPerms { .. }
+                    | PathError::TooManySymlinkHops,
                 ) => {
                     // None of these can be handled by lower level, just quit out early
                     return Err(e);
@@ -942,7 +947,8 @@ impl<
                 | ChmodError::PathError(
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
-                    | PathError::NoSearchPerms { .. },
+                    | PathError::NoSearchPerms { .. }
+                    | PathError::TooManySymlinkHops,
                 ) => {
                     return Err(e);
                 }
@@ -987,7 +993,8 @@ impl<
                 | ChownError::PathError(
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
-                    | PathError::NoSearchPerms { .. },
+                    | PathError::NoSearchPerms { .. }
+                    | PathError::TooManySymlinkHops,
                 ) => {
                     return Err(e);
                 }
@@ -1038,7 +1045,8 @@ impl<
                 | UnlinkError::PathError(
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
-                    | PathError::NoSearchPerms { .. },
+                    | PathError::NoSearchPerms { .. }
+                    | PathError::TooManySymlinkHops,
                 ) => {
                     return Err(e);
                 }
@@ -1052,7 +1060,7 @@ impl<
                         FileStatusError::PathError(p) => UnlinkError::PathError(p),
                         FileStatusError::ClosedFd => unreachable!(),
                     })? {
-                        FileType::RegularFile => {
+                        FileType::RegularFile | FileType::Symlink => {
                             // fallthrough
                         }
                         FileType::Directory => {
@@ -1070,6 +1078,90 @@ impl<
             .entries
             .insert(path, Arc::new(EntryX::Tombstone));
         Ok(())
+    }
+
+    fn rename(
+        &self,
+        from: impl crate::path::Arg,
+        to: impl crate::path::Arg,
+    ) -> Result<(), RenameError> {
+        let from = self.absolute_path(from)?;
+        let to = self.absolute_path(to)?;
+        // Scoped to the common case this method exists to support (a package manager-style
+        // atomic replace of a file it just wrote into the writable upper layer, e.g. `apk`
+        // installing a downloaded package, or atomically replacing its own on-disk database):
+        // `from` must already live purely in the upper (writable) layer -- renaming a source that
+        // only exists in the read-only lower layer would require migrating it up first, which is
+        // real Linux `EXDEV`-fallback territory (`RenameError::CrossDevice`), same as `rename`'s
+        // other implementations in this codebase.
+        //
+        // `to`, however, is allowed to shadow an existing lower-layer entry (this is exactly the
+        // `apk`-installed-database-file case: the database already shipped as part of the base
+        // image, so it exists in the lower/tar layer, and `apk` atomically replaces it by
+        // rename-over, same pattern as `unlink` already supports via a tombstone below).
+        if self.ensure_lower_contains(&from).is_ok() {
+            return Err(RenameError::CrossDevice);
+        }
+        self.upper.rename(&from, &to)?;
+        // If `to` shadows a lower-layer entry, place a tombstone over it -- otherwise a stale
+        // cached `EntryX::Lower` entry (from a previous open of `to` before this rename) would
+        // keep being returned by `open`, exactly as `unlink` guards against below.
+        if self.ensure_lower_contains(&to).is_ok() {
+            self.root
+                .write()
+                .entries
+                .insert(to, Arc::new(EntryX::Tombstone));
+        } else {
+            // No lower-layer shadowing, but there might still be a stale cached entry (e.g. an
+            // `EntryX::Upper` from a previous open of a *different* upper-layer file at the same
+            // path that was later unlinked and recreated) -- clear it so the next `open` re-reads
+            // fresh, mirroring the invalidation `unlink` performs by simply not caching anything
+            // for a path with no lower-layer shadow.
+            self.root.write().entries.remove(&to);
+        }
+        Ok(())
+    }
+
+    fn symlink(
+        &self,
+        target: impl crate::path::Arg,
+        linkpath: impl crate::path::Arg,
+    ) -> Result<(), SymlinkError> {
+        let linkpath = self.absolute_path(linkpath)?;
+        // Fail if anything already exists at `linkpath`, in either layer -- matches Linux
+        // `symlink(2)`'s `EEXIST`, and mirrors `open`'s `O_CREAT | O_EXCL` handling above.
+        if self.file_status(linkpath.as_str()).is_ok() {
+            return Err(SymlinkError::AlreadyExists);
+        }
+        // Symlink creation only ever targets the writable upper layer -- there is no
+        // "copy-on-write" concept for creating a brand new path, unlike writing to an existing
+        // lower-layer file.
+        self.upper.symlink(target, linkpath)
+    }
+
+    fn read_link(&self, path: impl crate::path::Arg) -> Result<String, ReadLinkError> {
+        let path = self.absolute_path(path)?;
+        match self.upper.read_link(path.as_str()) {
+            Ok(target) => Ok(target),
+            Err(e) => match e {
+                ReadLinkError::NotASymlink | ReadLinkError::Io => Err(e),
+                ReadLinkError::PathError(
+                    PathError::ComponentNotADirectory
+                    | PathError::InvalidPathname
+                    | PathError::NoSearchPerms { .. }
+                    | PathError::TooManySymlinkHops,
+                ) => {
+                    // None of these can be handled by lower level, just quit out early
+                    Err(e)
+                }
+                ReadLinkError::PathError(
+                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                ) => {
+                    // Not present (or not readable as a symlink) at the upper layer; check lower.
+                    self.lower.read_link(path)
+                }
+            },
+        }
     }
 
     fn mkdir(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), MkdirError> {
@@ -1092,7 +1184,8 @@ impl<
                 | MkdirError::PathError(
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
-                    | PathError::NoSearchPerms { .. },
+                    | PathError::NoSearchPerms { .. }
+                    | PathError::TooManySymlinkHops,
                 ) => {
                     return Err(e);
                 }
@@ -1171,7 +1264,9 @@ impl<
                 RmdirError::Busy
                 | RmdirError::NoWritePerms
                 | RmdirError::Io
-                | RmdirError::PathError(PathError::NoSearchPerms { .. }) => return Err(e),
+                | RmdirError::PathError(
+                    PathError::NoSearchPerms { .. } | PathError::TooManySymlinkHops,
+                ) => return Err(e),
             }
         }
 
@@ -1198,7 +1293,9 @@ impl<
                     RmdirError::Busy
                     | RmdirError::NoWritePerms
                     | RmdirError::Io
-                    | RmdirError::PathError(PathError::NoSearchPerms { .. }) => return Err(e),
+                    | RmdirError::PathError(
+                        PathError::NoSearchPerms { .. } | PathError::TooManySymlinkHops,
+                    ) => return Err(e),
                 }
             }
         }
@@ -1310,7 +1407,8 @@ impl<
                 FileStatusError::PathError(
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
-                    | PathError::NoSearchPerms { .. },
+                    | PathError::NoSearchPerms { .. }
+                    | PathError::TooManySymlinkHops,
                 ) => {
                     // None of these can be handled by lower level, just quit out early
                     return Err(e);

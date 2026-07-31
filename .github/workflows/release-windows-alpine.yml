@@ -87,6 +87,9 @@ jobs:
       - name: Run busybox echo against the rootfs
         working-directory: smoke
         run: .\litebox_runner_linux_on_windows_userland.exe --initial-files alpine-rootfs.tar /bin/busybox echo smoke-test-ok
+      - name: Run real DNS lookup against the rootfs (no Administrator privileges)
+        working-directory: smoke
+        run: .\litebox_runner_linux_on_windows_userland.exe --initial-files alpine-rootfs.tar /bin/busybox nslookup dl-cdn.alpinelinux.org 8.8.8.8
 
   bundle:
     name: Bundle release zip

@@ -619,6 +619,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         #[cfg(target_arch = "x86_64")]
         let syscall_number = ctx.orig_rax;
         let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
+        if matches!(
+            request,
+            SyscallRequest::Clone { .. }
+                | SyscallRequest::Clone3 { .. }
+                | SyscallRequest::Execve { .. }
+                | SyscallRequest::Wait4 { .. }
+                | SyscallRequest::Exit { .. }
+                | SyscallRequest::ExitGroup { .. }
+                | SyscallRequest::Openat { .. }
+                | SyscallRequest::Close { .. }
+                | SyscallRequest::Mkdirat { .. }
+                | SyscallRequest::Renameat { .. }
+                | SyscallRequest::Symlinkat { .. }
+                | SyscallRequest::Ftruncate { .. }
+                | SyscallRequest::Unlinkat { .. }
+                | SyscallRequest::Write { .. }
+                | SyscallRequest::Writev { .. }
+        ) {
+            litebox_util_log::trace!(request:? = request; "syscall");
+        }
 
         match request {
             SyscallRequest::Exit { status } => {
@@ -701,6 +721,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::Chdir { pathname } => pathname
                 .to_cstring::<Platform>()
                 .map_or(Err(Errno::EINVAL), |path| syscall!(sys_chdir(path))),
+            SyscallRequest::Fchdir { fd } => syscall!(sys_fchdir(fd)),
             SyscallRequest::RtSigprocmask {
                 how,
                 set,
@@ -1024,6 +1045,34 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .to_cstring::<Platform>()
                 .map_or(Err(Errno::EFAULT), |path| {
                     syscall!(sys_unlinkat(dirfd, path, flags))
+                }),
+            SyscallRequest::Renameat {
+                olddirfd,
+                oldpath,
+                newdirfd,
+                newpath,
+                flags,
+            } => oldpath
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |oldpath| {
+                    newpath
+                        .to_cstring::<Platform>()
+                        .map_or(Err(Errno::EFAULT), |newpath| {
+                            syscall!(sys_renameat(olddirfd, oldpath, newdirfd, newpath, flags))
+                        })
+                }),
+            SyscallRequest::Symlinkat {
+                target,
+                newdirfd,
+                linkpath,
+            } => target
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |target| {
+                    linkpath
+                        .to_cstring::<Platform>()
+                        .map_or(Err(Errno::EFAULT), |linkpath| {
+                            syscall!(sys_symlinkat(target, newdirfd, linkpath))
+                        })
                 }),
             SyscallRequest::Stat { pathname, buf } => {
                 pathname

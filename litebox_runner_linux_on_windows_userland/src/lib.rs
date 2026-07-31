@@ -106,6 +106,40 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 )
                 .unwrap();
             }
+
+            // A container's `/etc/resolv.conf` normally comes from the *host* runtime at
+            // container-start (e.g. Docker bind-mounts the host's own resolver config in), not
+            // from the image itself -- a plain OCI rootfs like this one has no such file. Without
+            // it, DNS-using tools (`apk`, `wget`, ...) have no configured nameserver at all and
+            // fail immediately rather than reaching the network. Point at a public resolver
+            // reachable through the platform's NAT gateway, mirroring what a real container
+            // runtime would inject.
+            //
+            // `/etc` itself isn't created here (it comes from the tar layer composed in later),
+            // so create it in this in-mem layer too, matching the `/tmp`, `/run`, etc. pattern
+            // above.
+            fs.mkdir(
+                "/etc",
+                litebox::fs::Mode::RWXU | litebox::fs::Mode::RGRP | litebox::fs::Mode::ROTH,
+            )
+            .unwrap();
+            let resolv_conf = fs
+                .open(
+                    "/etc/resolv.conf",
+                    litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
+                    litebox::fs::Mode::RUSR
+                        | litebox::fs::Mode::WUSR
+                        | litebox::fs::Mode::RGRP
+                        | litebox::fs::Mode::ROTH,
+                )
+                .unwrap();
+            fs.write(
+                &resolv_conf,
+                b"nameserver 8.8.8.8\nnameserver 1.1.1.1\n",
+                None,
+            )
+            .unwrap();
+            fs.close(&resolv_conf).unwrap();
         });
 
         shim_builder.default_fs(in_mem, tar_data.into())
@@ -113,6 +147,36 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let initial_file_system = std::sync::Arc::new(initial_file_system);
 
     let shim = shim_builder.build();
+
+    // Spawn a background worker that drives real network I/O (via the in-process userspace NAT
+    // gateway, see `litebox_platform_windows_userland::net`) so guest sockets can actually reach
+    // the outside world. No Administrator privileges or driver are required: the gateway proxies
+    // guest TCP/UDP flows to real, unprivileged Winsock sockets rather than creating a virtual
+    // network adapter.
+    let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
+    let net_shim = shim.clone();
+    let net_worker = std::thread::spawn(move || {
+        const DEFAULT_TIMEOUT: core::time::Duration = core::time::Duration::from_micros(100);
+        const MAX_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(1);
+        while !shutdown_clone.load(core::sync::atomic::Ordering::Relaxed) {
+            let timeout = loop {
+                match net_shim.perform_network_interaction() {
+                    litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately => {}
+                    litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction { timeout } => {
+                        break timeout;
+                    }
+                }
+            };
+            platform.wait_on_tun(Some(timeout.unwrap_or(DEFAULT_TIMEOUT).min(MAX_TIMEOUT)));
+        }
+        // Final flush
+        while net_shim
+            .perform_network_interaction()
+            .call_again_immediately()
+        {}
+    });
+
     let argv = cli_args
         .program_and_arguments
         .iter()
@@ -149,5 +213,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             &mut litebox_common_linux::PtRegs::default(),
         );
     }
-    std::process::exit(program.process.wait())
+    let exit_code = program.process.wait();
+
+    shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
+    // `wait_on_tun`'s timeout is always capped to `MAX_TIMEOUT` (1ms), so the worker re-checks
+    // `shutdown` frequently even while otherwise idle; the join below returns promptly.
+    let _ = net_worker.join();
+
+    std::process::exit(exit_code)
 }

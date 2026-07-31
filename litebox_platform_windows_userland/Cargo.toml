@@ -13,6 +13,21 @@ iced-x86 = { version = "1.21", default-features = false, features = [
 litebox = { path = "../litebox/", version = "0.1.0" }
 litebox_common_linux = { path = "../litebox_common_linux", version = "0.1.0" }
 litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
+# smoltcp powers a second, private in-process network stack used as a userspace NAT gateway (see
+# `src/net.rs`) so real TCP/UDP networking works without Administrator privileges (unlike a TUN
+# driver or WinDivert, both of which require elevation to install/attach on Windows).
+smoltcp = { version = "0.12.0", default-features = false, features = [
+    "log",
+    "proto-ipv4",
+    "medium-ip",
+    "socket",
+    "socket-tcp",
+    "socket-udp",
+    "std",
+] }
+# Portable nonblocking-connect / socket-option control for the NAT gateway's real outbound
+# sockets; ordinary unprivileged Winsock calls under the hood, same as any desktop application.
+socket2 = "0.6"
 
 windows-sys = { version = "0.60.2", features = [
     "Win32_System_Console",

@@ -119,6 +119,7 @@ impl From<litebox::fs::errors::PathError> for Errno {
             litebox::fs::errors::PathError::InvalidPathname => Errno::EINVAL,
             litebox::fs::errors::PathError::MissingComponent => Errno::ENOENT,
             litebox::fs::errors::PathError::ComponentNotADirectory => Errno::ENOTDIR,
+            litebox::fs::errors::PathError::TooManySymlinkHops => Errno::ELOOP,
         }
     }
 }
@@ -145,6 +146,45 @@ impl From<litebox::fs::errors::UnlinkError> for Errno {
             litebox::fs::errors::UnlinkError::ReadOnlyFileSystem => Errno::EROFS,
             litebox::fs::errors::UnlinkError::Io => Errno::EIO,
             litebox::fs::errors::UnlinkError::PathError(path_error) => path_error.into(),
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::fs::errors::RenameError> for Errno {
+    fn from(value: litebox::fs::errors::RenameError) -> Self {
+        match value {
+            litebox::fs::errors::RenameError::NoWritePerms => Errno::EACCES,
+            litebox::fs::errors::RenameError::IsADirectory => Errno::EISDIR,
+            litebox::fs::errors::RenameError::DestinationIsADirectory => Errno::EISDIR,
+            litebox::fs::errors::RenameError::CrossDevice => Errno::EXDEV,
+            litebox::fs::errors::RenameError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::RenameError::Io => Errno::EIO,
+            litebox::fs::errors::RenameError::PathError(path_error) => path_error.into(),
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::fs::errors::SymlinkError> for Errno {
+    fn from(value: litebox::fs::errors::SymlinkError) -> Self {
+        match value {
+            litebox::fs::errors::SymlinkError::NoWritePerms => Errno::EACCES,
+            litebox::fs::errors::SymlinkError::AlreadyExists => Errno::EEXIST,
+            litebox::fs::errors::SymlinkError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::SymlinkError::Io => Errno::EIO,
+            litebox::fs::errors::SymlinkError::PathError(path_error) => path_error.into(),
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::fs::errors::ReadLinkError> for Errno {
+    fn from(value: litebox::fs::errors::ReadLinkError) -> Self {
+        match value {
+            litebox::fs::errors::ReadLinkError::NotASymlink => Errno::EINVAL,
+            litebox::fs::errors::ReadLinkError::Io => Errno::EIO,
+            litebox::fs::errors::ReadLinkError::PathError(path_error) => path_error.into(),
             _ => unimplemented!(),
         }
     }
@@ -186,10 +226,11 @@ impl From<litebox::net::errors::CloseError> for Errno {
 impl From<litebox::fs::errors::ReadError> for Errno {
     fn from(value: litebox::fs::errors::ReadError) -> Self {
         match value {
+            litebox::fs::errors::ReadError::ClosedFd => Errno::EBADF,
             litebox::fs::errors::ReadError::NotAFile => Errno::EISDIR,
             litebox::fs::errors::ReadError::NotForReading => Errno::EBADF,
             litebox::fs::errors::ReadError::Io => Errno::EIO,
-            _ => unimplemented!(),
+            _ => Errno::EIO,
         }
     }
 }
@@ -197,10 +238,11 @@ impl From<litebox::fs::errors::ReadError> for Errno {
 impl From<litebox::fs::errors::WriteError> for Errno {
     fn from(value: litebox::fs::errors::WriteError) -> Self {
         match value {
+            litebox::fs::errors::WriteError::ClosedFd => Errno::EBADF,
             litebox::fs::errors::WriteError::NotAFile => Errno::EISDIR,
             litebox::fs::errors::WriteError::NotForWriting => Errno::EBADF,
             litebox::fs::errors::WriteError::Io => Errno::EIO,
-            _ => unimplemented!(),
+            _ => Errno::EIO,
         }
     }
 }
@@ -338,7 +380,9 @@ impl From<litebox::fs::errors::FileStatusError> for Errno {
     fn from(value: litebox::fs::errors::FileStatusError) -> Self {
         match value {
             litebox::fs::errors::FileStatusError::PathError(path_error) => path_error.into(),
-            _ => unimplemented!(),
+            litebox::fs::errors::FileStatusError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::FileStatusError::Io => Errno::EIO,
+            _ => Errno::EIO,
         }
     }
 }

@@ -19,7 +19,8 @@ use thiserror::Error;
 use crate::fs::OFlags;
 use crate::fs::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ReadError, ReadLinkError, RenameError, RmdirError, SeekError, SymlinkError, TruncateError,
+    UnlinkError, WriteError,
 };
 use crate::fs::nine_p::fcall::Rlerror;
 use crate::path::Arg;
@@ -44,6 +45,7 @@ const ENOTDIR: u32 = 20;
 const EISDIR: u32 = 21;
 const EINVAL: u32 = 22;
 const ESPIPE: u32 = 29;
+const EXDEV: u32 = 18;
 const ENAMETOOLONG: u32 = 36;
 const ENOSYS: u32 = 38;
 const ENOTEMPTY: u32 = 39;
@@ -151,6 +153,24 @@ impl From<Error> for UnlinkError {
                 _ => UnlinkError::Io,
             },
             Error::Io | Error::InvalidResponse => UnlinkError::Io,
+        }
+    }
+}
+
+impl From<Error> for RenameError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::InvalidPathname => RenameError::PathError(PathError::InvalidPathname),
+            Error::Remote(errno) => match errno {
+                ENOENT => RenameError::PathError(PathError::NoSuchFileOrDirectory),
+                EISDIR => RenameError::IsADirectory,
+                EPERM | EACCES => RenameError::NoWritePerms,
+                ENOTDIR => RenameError::PathError(PathError::ComponentNotADirectory),
+                ENAMETOOLONG => RenameError::PathError(PathError::InvalidPathname),
+                EXDEV => RenameError::CrossDevice,
+                _ => RenameError::Io,
+            },
+            Error::Io | Error::InvalidResponse => RenameError::Io,
         }
     }
 }
@@ -797,6 +817,49 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     fn unlink(&self, path: impl crate::path::Arg) -> Result<(), super::errors::UnlinkError> {
         self.remove_file_or_dir(path, true)
             .map_err(UnlinkError::from)
+    }
+
+    fn rename(
+        &self,
+        from: impl crate::path::Arg,
+        to: impl crate::path::Arg,
+    ) -> Result<(), RenameError> {
+        let from = self.absolute_path(from)?;
+        let to = self.absolute_path(to)?;
+
+        let from_fid = {
+            let components: Vec<&str> = from
+                .normalized_components()
+                .map_err(|_| RenameError::PathError(PathError::InvalidPathname))?
+                .collect();
+            let (_, fid) = self.client.walk(&self.root.1, &components)?;
+            fid
+        };
+        let (to_parent_fid, to_name) = self.walk_to_parent(&to)?;
+
+        let result = self.client.rename(&from_fid, &to_parent_fid, to_name);
+        self.client.clunk(from_fid);
+        self.client.clunk(to_parent_fid);
+
+        result.map_err(RenameError::from)
+    }
+
+    fn symlink(
+        &self,
+        target: impl crate::path::Arg,
+        linkpath: impl crate::path::Arg,
+    ) -> Result<(), SymlinkError> {
+        // The 9P client (`client.rs`) does not implement `Tsymlink`; wiring that up would mean
+        // implementing a new raw 9P protocol message from scratch, which is out of scope here.
+        // No current use of this filesystem needs to create symlinks over 9P.
+        let _ = (target, linkpath);
+        Err(SymlinkError::Io)
+    }
+
+    fn read_link(&self, path: impl crate::path::Arg) -> Result<String, ReadLinkError> {
+        // See `symlink` above -- `Treadlink` is not implemented by the 9P client either.
+        let _ = path;
+        Err(ReadLinkError::Io)
     }
 
     fn mkdir(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), MkdirError> {

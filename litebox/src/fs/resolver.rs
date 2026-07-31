@@ -13,8 +13,8 @@ use crate::{LiteBox, fd::TypedFd, sync};
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError,
-    WriteError,
+    ReadDirError, ReadError, ReadLinkError, RenameError, RmdirError, SeekError, SymlinkError,
+    TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::{
     FileType, Mode, OFlags,
@@ -666,6 +666,35 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             WalkError::PathError(error) => error.into(),
         })?;
         self.backend.unlink_at(parent, name)
+    }
+
+    fn rename(&self, from: impl Arg, to: impl Arg) -> Result<(), RenameError> {
+        // `Backend` (the `Composer`-based mount abstraction this `Resolver` sits on) has no
+        // `rename_at` operation: every current use of `Resolver<Composer>` in this codebase
+        // mounts either genuinely read-only backends (`tar_ro`, the OCI image's read-only rootfs
+        // layer) or device backends (`devices`, `/dev`) -- neither can meaningfully support
+        // rename, so reporting `ReadOnlyFileSystem` here is accurate rather than a stub. The
+        // writable rename path that matters (e.g. `apk` atomically replacing a downloaded temp
+        // file) goes through `in_mem::FileSystem::rename` instead, since the writable "upper"
+        // layer in this codebase's `layered::FileSystem` setup is always a plain `in_mem`
+        // filesystem, never a `Resolver<Composer>`.
+        let _ = (from, to);
+        Err(RenameError::ReadOnlyFileSystem)
+    }
+
+    fn symlink(&self, target: impl Arg, linkpath: impl Arg) -> Result<(), SymlinkError> {
+        // Same rationale as `rename` above: every current use of `Resolver<Composer>` mounts
+        // either a genuinely read-only backend (`tar_ro`) or a device backend (`devices`, `/dev`),
+        // neither of which can meaningfully support creating a new symlink.
+        let _ = (target, linkpath);
+        Err(SymlinkError::ReadOnlyFileSystem)
+    }
+
+    fn read_link(&self, path: impl Arg) -> Result<String, ReadLinkError> {
+        // `Backend` has no notion of symlinks at all (see `symlink` above); nothing mounted
+        // through this resolver can ever contain one, so any `path` is simply not a symlink.
+        let _ = path;
+        Err(ReadLinkError::NotASymlink)
     }
 
     fn mkdir(&self, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {

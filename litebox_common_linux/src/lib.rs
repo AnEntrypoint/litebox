@@ -1980,6 +1980,9 @@ pub enum SyscallRequest {
     Chdir {
         pathname: UserPtr<c_char>,
     },
+    Fchdir {
+        fd: u32,
+    },
     Mmap {
         addr: usize,
         length: usize,
@@ -2286,6 +2289,18 @@ pub enum SyscallRequest {
         pathname: UserPtr<c_char>,
         flags: AtFlags,
     },
+    Renameat {
+        olddirfd: i32,
+        oldpath: UserPtr<c_char>,
+        newdirfd: i32,
+        newpath: UserPtr<c_char>,
+        flags: u32,
+    },
+    Symlinkat {
+        target: UserPtr<c_char>,
+        newdirfd: i32,
+        linkpath: UserPtr<c_char>,
+    },
     Newfstatat {
         dirfd: i32,
         pathname: UserPtr<c_char>,
@@ -2540,6 +2555,7 @@ impl SyscallRequest {
             },
             Sysno::mkdirat => sys_req!(Mkdirat { dirfd, pathname:*, mode }),
             Sysno::chdir => sys_req!(Chdir { pathname:* }),
+            Sysno::fchdir => sys_req!(Fchdir { fd }),
             Sysno::mmap => sys_req!(Mmap {
                 addr,
                 length,
@@ -2865,6 +2881,44 @@ impl SyscallRequest {
                     dirfd: AT_FDCWD,
                     pathname: ctx.sys_req_ptr(0),
                     flags: AtFlags::AT_REMOVEDIR,
+                }
+            }
+            Sysno::renameat => {
+                // renameat has no flags argument (unlike renameat2); flags is always 0.
+                SyscallRequest::Renameat {
+                    olddirfd: ctx.sys_req_arg(0),
+                    oldpath: ctx.sys_req_ptr(1),
+                    newdirfd: ctx.sys_req_arg(2),
+                    newpath: ctx.sys_req_ptr(3),
+                    flags: 0,
+                }
+            }
+            Sysno::renameat2 => sys_req!(Renameat {
+                olddirfd,
+                oldpath:*,
+                newdirfd,
+                newpath:*,
+                flags
+            }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::rename => {
+                // rename is equivalent to renameat2 with olddirfd/newdirfd AT_FDCWD and flags 0
+                SyscallRequest::Renameat {
+                    olddirfd: AT_FDCWD,
+                    oldpath: ctx.sys_req_ptr(0),
+                    newdirfd: AT_FDCWD,
+                    newpath: ctx.sys_req_ptr(1),
+                    flags: 0,
+                }
+            }
+            Sysno::symlinkat => sys_req!(Symlinkat { target:*, newdirfd, linkpath:* }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::symlink => {
+                // symlink is equivalent to symlinkat with newdirfd AT_FDCWD
+                SyscallRequest::Symlinkat {
+                    target: ctx.sys_req_ptr(0),
+                    newdirfd: AT_FDCWD,
+                    linkpath: ctx.sys_req_ptr(1),
                 }
             }
             #[cfg(target_arch = "x86_64")]

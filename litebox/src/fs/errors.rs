@@ -148,6 +148,66 @@ pub enum UnlinkError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`FileSystem::rename`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum RenameError {
+    /// A parent directory (of either `from` or `to`) does not allow write permission.
+    #[error("a parent directory does not allow write permission")]
+    NoWritePerms,
+    /// `from` names a directory. Directory rename is not currently supported (see
+    /// [`FileSystem::rename`]'s docs).
+    #[error("directory rename is not supported")]
+    IsADirectory,
+    /// `to` exists and is a directory (regular-file-onto-directory rename is never valid).
+    #[error("destination is a directory")]
+    DestinationIsADirectory,
+    /// `from` and `to` are not both resolvable within the same filesystem/layer (e.g. `from`
+    /// only exists in a read-only lower layer). Matches Linux's `EXDEV` for cross-filesystem
+    /// rename; callers are expected to fall back to copy+unlink, same as on real Linux.
+    #[error("cross-device rename is not supported")]
+    CrossDevice,
+    /// The named file resides on a read-only filesystem.
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
+/// Possible errors from [`FileSystem::symlink`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum SymlinkError {
+    /// The parent directory does not allow write permission.
+    #[error("the parent directory does not allow write permission")]
+    NoWritePerms,
+    /// `linkpath` already exists.
+    #[error("file already exists")]
+    AlreadyExists,
+    /// The named file resides on a read-only filesystem.
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
+/// Possible errors from [`FileSystem::read_link`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum ReadLinkError {
+    /// `path` does not name a symbolic link.
+    #[error("not a symbolic link")]
+    NotASymlink,
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
 /// Possible errors from [`FileSystem::mkdir`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
@@ -238,6 +298,11 @@ pub enum PathError {
     MissingComponent,
     #[error("a component used as a directory in pathname is not, in fact, a directory")]
     ComponentNotADirectory,
+    /// Too many levels of symbolic links were encountered while resolving the final path
+    /// component (see [`FileSystem::open`]'s bounded symlink-following). Matches Linux's
+    /// `ELOOP`.
+    #[error("too many levels of symbolic links")]
+    TooManySymlinkHops,
 }
 
 impl From<crate::path::ConversionError> for PathError {

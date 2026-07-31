@@ -87,17 +87,44 @@ pub(crate) struct FilesState<Platform: ShimPlatform, FS: ShimFS> {
     fd_paths: litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<usize, CString>>,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Clone for FilesState<Platform, FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
     /// Duplicate the fd table for `fork()`: the new table starts as an independent copy of the
     /// current fd-number-to-descriptor mapping (each entry shares the same underlying open file
     /// description via `Arc`, matching POSIX `fork()` semantics), while `fs` (the filesystem
     /// backend itself) remains shared, since fork does not create a second filesystem.
-    fn clone(&self) -> Self {
+    ///
+    /// Deliberately **not** a `Clone` impl: uses
+    /// [`litebox::fd::RawDescriptorStorage::fork_duplicate`], which needs `litebox` (to allocate
+    /// each duplicated fd a genuinely new slot in the *global* descriptor table via
+    /// [`litebox::LiteBox::descriptor_table_mut`]) -- a naive `Clone` that merely `Arc::clone`d
+    /// the raw store's per-slot ownership tokens would leave the parent and child sharing the
+    /// same global-table slot (and hence the same close-tracking) for every fd both processes
+    /// have, so closing/dup2-ing a raw fd in *either* process would spuriously invalidate it in
+    /// the *other* (see `fork_duplicate`'s doc comment for the full failure mode this avoids --
+    /// this was the actual root cause of `dup2()` returning `EBADF` for shell output-redirection
+    /// fds surviving a `fork()`).
+    pub(crate) fn fork_duplicate(&self, litebox: &litebox::LiteBox<Platform>) -> Self {
+        let raw_descriptor_store = self.raw_descriptor_store.read().fork_duplicate(
+            |fd: &TypedFd<FS>| litebox.descriptor_table_mut().duplicate(fd),
+            |fd: &TypedFd<litebox::net::Network<Platform>>| {
+                litebox.descriptor_table_mut().duplicate(fd)
+            },
+            |fd: &TypedFd<litebox::pipes::Pipes<Platform>>| {
+                litebox.descriptor_table_mut().duplicate(fd)
+            },
+            |fd: &TypedFd<super::eventfd::EventfdSubsystem<Platform>>| {
+                litebox.descriptor_table_mut().duplicate(fd)
+            },
+            |fd: &TypedFd<super::epoll::EpollSubsystem<Platform, FS>>| {
+                litebox.descriptor_table_mut().duplicate(fd)
+            },
+            |fd: &TypedFd<super::unix::UnixSocketSubsystem<Platform, FS>>| {
+                litebox.descriptor_table_mut().duplicate(fd)
+            },
+        );
         Self {
             fs: self.fs.clone(),
-            raw_descriptor_store: litebox::sync::RwLock::new(
-                self.raw_descriptor_store.read().clone(),
-            ),
+            raw_descriptor_store: litebox::sync::RwLock::new(raw_descriptor_store),
             max_fd: AtomicUsize::new(self.max_fd.load(Ordering::Relaxed)),
             fd_paths: litebox::sync::RwLock::new(self.fd_paths.read().clone()),
         }
@@ -601,6 +628,46 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         } else {
             self.files.borrow().fs.unlink(path).map_err(Errno::from)
         }
+    }
+
+    /// Handle syscall `renameat`/`renameat2`
+    pub(crate) fn sys_renameat(
+        &self,
+        olddirfd: i32,
+        oldpath: impl path::Arg,
+        newdirfd: i32,
+        newpath: impl path::Arg,
+        flags: u32,
+    ) -> Result<(), Errno> {
+        // `FileSystem::rename` doesn't support any renameat2 flags (e.g. RENAME_NOREPLACE,
+        // RENAME_EXCHANGE, RENAME_WHITEOUT); reject rather than silently ignoring a semantic
+        // the caller explicitly asked for, matching `sys_unlinkat`'s handling of unsupported flags.
+        if flags != 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        let old_path = self.resolve_path_at(olddirfd, oldpath)?;
+        let new_path = self.resolve_path_at(newdirfd, newpath)?;
+        self.files
+            .borrow()
+            .fs
+            .rename(old_path, new_path)
+            .map_err(Errno::from)
+    }
+
+    /// Handle syscall `symlinkat`
+    pub(crate) fn sys_symlinkat(
+        &self,
+        target: impl path::Arg,
+        newdirfd: i32,
+        linkpath: impl path::Arg,
+    ) -> Result<(), Errno> {
+        let linkpath = self.resolve_path_at(newdirfd, linkpath)?;
+        self.files
+            .borrow()
+            .fs
+            .symlink(target, linkpath)
+            .map_err(Errno::from)
     }
 
     /// Handle syscall `read`
@@ -1437,8 +1504,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ///
     /// The caller must pass an absolute path.
     ///
-    /// Note that this function only handles the following cases that we hardcoded:
-    /// - `/proc/self/fd/<fd>`
+    /// Handles the hardcoded `/proc/self/fd/<fd>` case, then falls through to real symlinks
+    /// stored on the filesystem (e.g. shared-library symlinks like `libfoo.so -> libfoo.so.1`
+    /// extracted by a package manager).
     fn do_readlink(&self, fullpath: &str) -> Result<String, Errno> {
         if let Some(stripped) = fullpath.strip_prefix("/proc/self/fd/") {
             let fd = stripped.parse::<u32>().map_err(|_| Errno::EINVAL)?;
@@ -1450,8 +1518,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         }
 
-        // TODO: we do not support symbolic links other than stdio yet.
-        Err(Errno::ENOENT)
+        self.files
+            .borrow()
+            .fs
+            .read_link(fullpath)
+            .map_err(Errno::from)
     }
 
     /// Handle syscall `readlink`
@@ -2073,6 +2144,48 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         // Ensure the CWD ends with '/'.
+        let mut new_cwd = abs_path;
+        if !new_cwd.ends_with('/') {
+            new_cwd.push('/');
+        }
+
+        *self.fs.borrow().cwd.write() = new_cwd;
+        Ok(())
+    }
+
+    /// Handle syscall `fchdir`
+    pub fn sys_fchdir(&self, fd: u32) -> Result<(), Errno> {
+        use litebox::fs::FileType;
+        use litebox::fs::errors::{FileStatusError, PathError};
+        use litebox::path::Arg as _;
+
+        // `resolve_dirfd_path` already records the absolute path an fd was opened at (as used by
+        // `openat`/`*at`-family syscalls' dirfd resolution), which is exactly what `fchdir` needs
+        // to translate an already-open directory fd into the CWD path `chdir` itself works with.
+        let dir_path = self.resolve_dirfd_path(fd)?;
+        let abs_path = dir_path
+            .to_str()
+            .map_err(|_| Errno::EINVAL)?
+            .normalized()
+            .map_err(|_| Errno::EINVAL)?;
+
+        match self.files.borrow().fs.file_status(abs_path.as_str()) {
+            Ok(status) => {
+                if status.file_type != FileType::Directory {
+                    return Err(Errno::ENOTDIR);
+                }
+            }
+            Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)) => {
+                return Err(Errno::ENOENT);
+            }
+            Err(FileStatusError::PathError(_)) => {
+                return Err(Errno::EACCES);
+            }
+            Err(_) => {
+                return Err(Errno::ENOENT);
+            }
+        }
+
         let mut new_cwd = abs_path;
         if !new_cwd.ends_with('/') {
             new_cwd.push('/');

@@ -26,14 +26,17 @@ A bare command name (e.g. `busybox`) passed to the launcher scripts is
 resolved to `/bin/busybox` automatically; an already-absolute path is left
 unchanged.
 
-## Known limitation: no interactive shell yet
+Interactive shells and subprocesses (`/bin/sh`, `sh -c "cmd1; cmd2"`, etc.)
+work normally.
 
-`fork()`/`vfork()` are not implemented in LiteBox yet (see
-[issue #1](https://github.com/AnEntrypoint/litebox/issues/1)), so an
-interactive `/bin/sh` session that spawns subprocesses (e.g. typing `ls` at
-the prompt) will fail with `can't fork: Function not implemented`. Only
-single-applet invocation (no subshell, no subprocess) is supported today —
-e.g. `run-alpine.cmd busybox ls /` works because busybox recognizes the
-applet name and never forks.
+## Networking
+
+Real TCP/UDP networking (DNS, HTTP, HTTPS, `apk add <package>`, ...) works
+out of the box, with **no Administrator privileges and no driver
+installation required**. This is implemented as an in-process userspace NAT
+gateway: guest TCP/UDP flows are proxied to real, unprivileged Windows
+sockets rather than requiring a virtual network adapter (unlike a TUN driver
+or WinDivert, both of which need elevation on Windows). See
+`litebox_platform_windows_userland::net` in the source tree for details.
 
 All files must stay in the same directory.
