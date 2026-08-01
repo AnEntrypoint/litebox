@@ -571,7 +571,7 @@ pub(crate) enum CloseResult<Subsystem: FdEnabledSubsystem> {
 /// issues, but will at least prevent using a descriptor for an unintended subsystem at the point of
 /// conversion.
 /// Deliberately **not** `Clone`/`Copy`: see [`RawDescriptorStorage::fork_duplicate`] for why a
-/// naive derived `Clone` (which would `Arc::clone` every [`StoredFd::x`] token) is unsound for
+/// naive derived `Clone` (which would `Arc::clone` every stored ownership token) is unsound for
 /// `fork()`'s per-process fd-table duplication.
 pub struct RawDescriptorStorage {
     /// Stored FDs are used to provide raw integer values in a safer way.
@@ -605,11 +605,11 @@ impl RawDescriptorStorage {
     /// Produces an independent duplicate of this raw fd table, for `fork()`'s per-process
     /// fd-table duplication.
     ///
-    /// This is **not** a plain `Clone`: [`OwnedFd`] is explicitly documented as a non-clonable
-    /// ownership token (see its doc comment), and for good reason -- it is not merely a "closed"
-    /// flag, it is a claim on a specific slot in the *global* descriptor table
+    /// This is **not** a plain `Clone`: the internal `OwnedFd` ownership token is deliberately not
+    /// clonable (see its doc comment), and for good reason -- it is not merely a "closed" flag, it
+    /// is a claim on a specific slot in the *global* descriptor table
     /// ([`crate::litebox::LiteBox::descriptor_table_mut`]). A naive derived `Clone` that
-    /// `Arc::clone`s each [`StoredFd::x`] would leave the parent and the fork()ed child sharing
+    /// `Arc::clone`s each stored ownership token would leave the parent and the fork()ed child sharing
     /// the exact same `OwnedFd` (and hence the same global-table slot and the same `closed` flag)
     /// for every raw fd number both processes have -- so closing/dup2-ing a raw fd in *either*
     /// process (e.g. the parent tearing down a `>`-redirection's saved fd, or the child doing the

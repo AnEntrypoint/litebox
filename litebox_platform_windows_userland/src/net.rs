@@ -7,7 +7,7 @@
 //! LiteBox's own network stack (`litebox::net`, backed by `smoltcp` configured with
 //! `medium-ip`) sends and receives raw IP packets to/from the guest's virtual interface
 //! (`10.0.0.2/24`, gateway `10.0.0.1`) via [`litebox::platform::IPInterfaceProvider`]. On Linux,
-//! [`litebox_platform_linux_userland`] hands those packets to a real kernel TUN device
+//! `litebox_platform_linux_userland` hands those packets to a real kernel TUN device
 //! (`/dev/net/tun`), and relies on the *host* having IP forwarding and NAT (`MASQUERADE`)
 //! configured to actually reach the Internet.
 //!

@@ -59,7 +59,7 @@ pub struct WindowsUserland {
     reserved_pages: alloc::vec::Vec<core::ops::Range<usize>>,
     sys_info: std::sync::RwLock<Win32_SysInfo::SYSTEM_INFO>,
     /// The userspace NAT gateway backing [`IPInterfaceProvider`](litebox::platform::IPInterfaceProvider)
-    /// (see [`net`]), lazily initialized on first network use.
+    /// (see the private `net` module), lazily initialized on first network use.
     net_gateway: std::sync::OnceLock<net::NatGateway>,
 }
 
@@ -501,8 +501,8 @@ impl litebox::platform::SignalProvider for WindowsUserland {
 /// Ensures the module-wide TLS slot index ([`TLS_INDEX`]) has been allocated.
 ///
 /// This must be called before any code that reads `TLS_INDEX`. Both
-/// [`run_thread`] (guest threads) and [`run_test_thread`](WindowsUserland::run_test_thread)
-/// (test threads) go through here.
+/// [`run_thread`] (guest threads) and `WindowsUserland`'s `ThreadProvider::run_test_thread`
+/// (test threads, only present in `#[cfg(debug_assertions)]` builds) go through here.
 fn ensure_tls_index() {
     // Allocate a TLS slot for this module if not already done. This is used as
     // a place to store data across calls to the guest, since all the registers
@@ -1594,9 +1594,10 @@ impl litebox::platform::IPInterfaceProvider for WindowsUserland {
 }
 
 impl WindowsUserland {
-    /// Wait until there is data available from the userspace NAT gateway (see [`net`]), or
-    /// `timeout` elapses. Mirrors `LinuxUserland::wait_on_tun`; used by a network-worker thread to
-    /// sleep efficiently between rounds of network interaction instead of busy-polling.
+    /// Wait until there is data available from the userspace NAT gateway (see the private `net`
+    /// module), or `timeout` elapses. Mirrors `LinuxUserland::wait_on_tun`; used by a
+    /// network-worker thread to sleep efficiently between rounds of network interaction instead
+    /// of busy-polling.
     pub fn wait_on_tun(&self, timeout: Option<Duration>) {
         net::wait_on_tun(&self.net_gateway, timeout);
     }
