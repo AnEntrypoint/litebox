@@ -58,6 +58,9 @@ thread_local! {
 pub struct WindowsUserland {
     reserved_pages: alloc::vec::Vec<core::ops::Range<usize>>,
     sys_info: std::sync::RwLock<Win32_SysInfo::SYSTEM_INFO>,
+    /// The userspace NAT gateway backing [`IPInterfaceProvider`](litebox::platform::IPInterfaceProvider)
+    /// (see [`net`]), lazily initialized on first network use.
+    net_gateway: std::sync::OnceLock<net::NatGateway>,
 }
 
 impl core::fmt::Debug for WindowsUserland {
@@ -99,6 +102,13 @@ impl WindowsUserland {
     }
 }
 
+/// Diagnostic tracing gated by `LITEBOX_VEH_TRACE=1`, added to root-cause the intermittent
+/// hang/crash in the `apk add nodejs` repro. Temporary; remove once root-caused.
+pub(crate) fn veh_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("LITEBOX_VEH_TRACE").is_some())
+}
+
 unsafe extern "system" fn vectored_exception_handler(
     exception_info: *mut EXCEPTION_POINTERS,
 ) -> i32 {
@@ -112,6 +122,19 @@ unsafe extern "system" fn vectored_exception_handler(
         info = *exception_info;
         exception_record = &*info.ExceptionRecord;
         context = &mut *info.ContextRecord;
+    }
+
+    if veh_trace_enabled() {
+        eprintln!(
+            "[veh] tid={:?} code={:#x} rip={:#x} is_in_guest={} is_verifying={} rdfsbase={:#x} thread_fs_base={:#x}",
+            std::thread::current().id(),
+            exception_record.ExceptionCode,
+            context.Rip,
+            tls.is_in_guest.get(),
+            fork_verify::is_verifying(tls),
+            unsafe { litebox_common_linux::rdfsbase() },
+            WindowsUserland::get_thread_fs_base(),
+        );
     }
 
     if !tls.is_in_guest.get() {
@@ -129,6 +152,69 @@ unsafe extern "system" fn vectored_exception_handler(
             return EXCEPTION_CONTINUE_SEARCH;
         }
     }
+
+    // Windows clears this thread's FS_BASE MSR back to 0 on its own initiative, apparently as
+    // part of ordinary scheduling (observed to recur many times per second under load, e.g.
+    // during `apk add nodejs`'s guest dynamic-linking/TLS-heavy startup). A guest `mov %fs:...`
+    // hit while FS_BASE is 0 reads/writes through linear address `0 + offset` instead of the
+    // real TLS block, which is (almost always) unmapped and therefore an ordinary `#PF` here,
+    // reported as `EXCEPTION_ACCESS_VIOLATION` -- indistinguishable, without this check, from a
+    // genuine guest segfault.
+    //
+    // Detect and repair this *before* any other exception-code-specific handling (in particular
+    // before the `EXCEPTION_SINGLE_STEP` triage below, which hands off to
+    // `fork_verify::on_single_step` -- that function has no notion of FS_BASE at all, and running
+    // its source/destination-range and instruction-decode logic against a thread whose FS_BASE is
+    // transiently wrong would either misclassify the trap or simply waste the step; simplest and
+    // safest is to make sure FS_BASE is never wrong by the time exception-code-specific logic
+    // runs, for every exception code, not just the ones this repro happens to hit).
+    //
+    // Repair happens in place, without ever leaving guest mode: just `wrfsbase` the stored value
+    // back and retry the exact same faulting instruction via `EXCEPTION_CONTINUE_EXECUTION`. This
+    // used to instead route through `interrupt_callback` (`set_context_to_interrupt_callback`),
+    // which is far more expensive -- it leaves guest mode, saves the full guest context, and takes
+    // a `NtContinue` round-trip through host Rust code before `switch_to_guest` gets back around
+    // to restoring FS_BASE and re-entering the guest. Under the same scheduler pressure that
+    // causes FS_BASE to be cleared in the first place, that round-trip reliably took long enough
+    // for FS_BASE to be cleared *again* before the guest completed even one more instruction,
+    // producing an unbounded livelock: thousands of these access violations in a row, forward
+    // progress permanently stalled, observed in practice as the reported indefinite hang (see the
+    // `LITEBOX_VEH_TRACE=1` diagnostic traces this fix was root-caused from -- runs that hung
+    // showed exactly this pattern: repeated `EXCEPTION_ACCESS_VIOLATION` with `rdfsbase() == 0` at
+    // a different `rip` each time, `is_verifying == false`, never reaching a third occurrence of
+    // the same instruction because the guest one instruction at a time). Fixing FS_BASE directly
+    // in the handler removes every one of those host round-trip's kernel transitions from the
+    // recovery path, so recovery is a single MSR write plus a `CONTINUE_EXECUTION` return -- no
+    // syscalls, no context save, no scheduling-visible event of its own to compound the problem.
+    //
+    // This does forgo the old comment's stated rationale for going through `interrupt_callback`
+    // ("avoid missing a real interrupt that arrives while resuming the guest"): a pending
+    // interrupt is not inspected here before resuming. This is safe: interrupt/signal delivery to
+    // a running guest is already only ever "eventually", never guaranteed at a specific
+    // instruction boundary (the same is true on real hardware), and `ThreadHandle::interrupt`
+    // does not depend on this path at all -- it suspends the target thread directly and rewrites
+    // its context itself, which still works correctly regardless of whether this handler happens
+    // to run in between. A real interrupt is caught at the next point that already checks for one
+    // (the next syscall, or the next time this same thread is suspended-and-inspected by
+    // `ThreadHandle::interrupt`), exactly as it would be if this exact access violation had not
+    // happened to occur at all.
+    if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
+        && unsafe { litebox_common_linux::rdfsbase() } == 0
+    {
+        let saved = WindowsUserland::get_thread_fs_base();
+        if saved != 0 {
+            if veh_trace_enabled() {
+                eprintln!(
+                    "[veh] tid={:?} FS_BASE-reset in-place repair (rip={:#x})",
+                    std::thread::current().id(),
+                    context.Rip,
+                );
+            }
+            unsafe { litebox_common_linux::wrfsbase(saved) };
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+
     // A single-step trap while in guest mode belongs to the post-`fork()` verification machinery
     // (`EFLAGS.TF` is masked out of every guest-visible eflags value, so the guest can never arm
     // it itself). Either it is a clean step -- in which case we re-arm TF and resume without ever
@@ -172,45 +258,37 @@ unsafe extern "system" fn vectored_exception_handler(
     let regs = unsafe { &mut *tls.guest_context_top.get().wrapping_sub(1) };
     save_guest_context(regs, context);
 
-    // If it looks like fs base was cleared, then go through the interrupt path
-    // instead of the exception path to restore the fs base and try again.
+    // Note: an `EXCEPTION_ACCESS_VIOLATION` caused by a cleared FS_BASE is already handled above,
+    // before `is_in_guest` was cleared and before the single-step triage ran -- nothing between
+    // there and here writes FS_BASE, so by construction every remaining exception here is a
+    // genuine one and always goes to `exception_callback`.
     //
-    // This is done instead of just fixing up fsbase and returning here to avoid
-    // missing a real interrupt that arrives while resuming the guest. Go through
-    // the interrupt path to ensure that any pending interrupts are also handled.
-    if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
-        && unsafe { litebox_common_linux::rdfsbase() } == 0
-        && WindowsUserland::get_thread_fs_base() != 0
-    {
-        set_context_to_interrupt_callback(tls, context);
-    } else {
-        // Write the exception record into scratch space BELOW `host_sp`, well clear of the
-        // `thread_ctx` pointer that `run_thread_arch`'s prologue pushed at `[host_sp]`/
-        // `[host_sp + 8]`. `exception_callback` (like `syscall_callback` and
-        // `interrupt_callback`) expects `[rsp] == thread_ctx`, so `Rsp` must land exactly on
-        // `host_sp`, unmodified -- it must NOT be repointed into the exception-record scratch
-        // area itself. Previously `Rsp` was set to the (16-byte-realigned) exception-record
-        // address instead of `host_sp`, so `exception_callback`'s `mov rcx, [rsp]` read raw
-        // bytes from within the just-written `EXCEPTION_RECORD` (misinterpreted as
-        // `&mut ThreadContext`) rather than the real `thread_ctx` pointer -- observed in
-        // practice as `ThreadContext` fields reading back as null/garbage.
-        let exception_record_ptr = tls
-            .host_sp
-            .get()
-            .cast::<EXCEPTION_RECORD>()
-            .wrapping_byte_sub(EXCEPTION_RECORD_RESERVE);
-        assert!(exception_record_ptr.is_aligned());
-        unsafe { exception_record_ptr.write(*exception_record) };
+    // Write the exception record into scratch space BELOW `host_sp`, well clear of the
+    // `thread_ctx` pointer that `run_thread_arch`'s prologue pushed at `[host_sp]`/
+    // `[host_sp + 8]`. `exception_callback` (like `syscall_callback` and `interrupt_callback`)
+    // expects `[rsp] == thread_ctx`, so `Rsp` must land exactly on `host_sp`, unmodified -- it
+    // must NOT be repointed into the exception-record scratch area itself. Previously `Rsp` was
+    // set to the (16-byte-realigned) exception-record address instead of `host_sp`, so
+    // `exception_callback`'s `mov rcx, [rsp]` read raw bytes from within the just-written
+    // `EXCEPTION_RECORD` (misinterpreted as `&mut ThreadContext`) rather than the real
+    // `thread_ctx` pointer -- observed in practice as `ThreadContext` fields reading back as
+    // null/garbage.
+    let exception_record_ptr = tls
+        .host_sp
+        .get()
+        .cast::<EXCEPTION_RECORD>()
+        .wrapping_byte_sub(EXCEPTION_RECORD_RESERVE);
+    assert!(exception_record_ptr.is_aligned());
+    unsafe { exception_record_ptr.write(*exception_record) };
 
-        // Ensure that `run_thread_arch` is linked in so that `exception_callback` is visible.
-        let _ = run_thread_arch as *const () as usize;
+    // Ensure that `run_thread_arch` is linked in so that `exception_callback` is visible.
+    let _ = run_thread_arch as *const () as usize;
 
-        // Update the thread context to jump to the exception handler.
-        context.Rip = exception_callback as *const () as usize as u64;
-        context.Rsp = tls.host_sp.get() as u64;
-        context.Rbp = tls.host_bp.get() as u64;
-        context.Rdx = exception_record_ptr as u64;
-    }
+    // Update the thread context to jump to the exception handler.
+    context.Rip = exception_callback as *const () as usize as u64;
+    context.Rsp = tls.host_sp.get() as u64;
+    context.Rbp = tls.host_bp.get() as u64;
+    context.Rdx = exception_record_ptr as u64;
 
     EXCEPTION_CONTINUE_EXECUTION
 }
@@ -301,6 +379,7 @@ impl WindowsUserland {
         let platform = Self {
             reserved_pages,
             sys_info: std::sync::RwLock::new(sys_info),
+            net_gateway: std::sync::OnceLock::new(),
         };
 
         // Initialize it's own fs-base (for the main thread)
@@ -1498,14 +1577,14 @@ impl litebox::platform::RawMutex for RawMutex {
 
 impl litebox::platform::IPInterfaceProvider for WindowsUserland {
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
-        net::send_ip_packet(packet)
+        net::send_ip_packet(&self.net_gateway, packet)
     }
 
     fn receive_ip_packet(
         &self,
         packet: &mut [u8],
     ) -> Result<usize, litebox::platform::ReceiveError> {
-        net::receive_ip_packet(packet)
+        net::receive_ip_packet(&self.net_gateway, packet)
     }
 }
 
@@ -1514,7 +1593,7 @@ impl WindowsUserland {
     /// `timeout` elapses. Mirrors `LinuxUserland::wait_on_tun`; used by a network-worker thread to
     /// sleep efficiently between rounds of network interaction instead of busy-polling.
     pub fn wait_on_tun(&self, timeout: Option<Duration>) {
-        net::wait_on_tun(timeout);
+        net::wait_on_tun(&self.net_gateway, timeout);
     }
 }
 

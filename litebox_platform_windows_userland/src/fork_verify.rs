@@ -171,6 +171,16 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
     #[allow(clippy::cast_possible_truncation)]
     let rip = context.Rip as usize;
 
+    if crate::veh_trace_enabled() {
+        let fsbase = unsafe { litebox_common_linux::rdfsbase() };
+        if fsbase == 0 {
+            eprintln!(
+                "[fork_verify] tid={:?} on_single_step: rdfsbase()==0 at rip={rip:#x} (host thread FS_BASE state may be corrupted)",
+                std::thread::current().id(),
+            );
+        }
+    }
+
     // (1) Code pointer: `rip` itself landed in the parent's pre-`fork()` code. This is almost
     // always a `ret` to a return address a `call` pushed onto the stack *before* `fork()` was
     // invoked -- e.g. musl's own post-`clone()` unwind back through its cancellation-point
@@ -193,6 +203,12 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
     // relocation map already proven correct for CPU registers, landing on byte-identical
     // relocated code.
     if relocations.is_in_source(rip) {
+        if crate::veh_trace_enabled() {
+            eprintln!(
+                "[fork_verify] tid={:?} on_single_step: rip={rip:#x} is_in_source=true",
+                std::thread::current().id(),
+            );
+        }
         if let Some(translated_rip) = relocations.translate(rip) {
             litebox_util_log::warn!(
                 rip:? = rip, translated_rip:? = translated_rip;

@@ -619,7 +619,13 @@ fn new_listening_tcp_socket(sockets: &mut SocketSet<'static>, port: u16) -> Sock
 
 /// Shared handle to the gateway state plus the loopback queue used to exchange packets with the
 /// guest-facing `litebox::net::Network` (via [`send_ip_packet`]/[`receive_ip_packet`]).
-struct NatGateway {
+///
+/// Owned by [`crate::WindowsUserland`] as a lazily-initialized field (`OnceLock<NatGateway>`)
+/// rather than a module-level `static`: this codebase actively ratchets down new global mutable
+/// state (see `dev_tests/src/ratchet.rs`'s `ratchet_globals`), so a genuinely process-scoped
+/// singleton like this belongs on the one process-lifetime `WindowsUserland` instance instead of
+/// introducing another bare `static`.
+pub(crate) struct NatGateway {
     queue: Arc<Mutex<LoopbackQueue>>,
     /// Signaled whenever a new packet is pushed into `queue.to_guest`, so
     /// [`wait_on_tun`] can sleep without busy-polling.
@@ -662,12 +668,13 @@ impl NatGateway {
     }
 }
 
-/// Global (process-wide) NAT gateway, initialized lazily on first use so that non-networked
-/// invocations (e.g. `/bin/true`) never pay the cost of spinning up the gateway thread.
-static GATEWAY: OnceLock<NatGateway> = OnceLock::new();
-
-fn gateway() -> &'static NatGateway {
-    GATEWAY.get_or_init(NatGateway::new)
+/// Get (initializing on first use) the [`NatGateway`] behind `slot`.
+///
+/// Lazy so that non-networked invocations (e.g. `/bin/true`) never pay the cost of spinning up
+/// the gateway thread. `slot` is a field on [`crate::WindowsUserland`], not a module-level
+/// `static`; see [`NatGateway`]'s doc comment for why.
+fn gateway(slot: &OnceLock<NatGateway>) -> &NatGateway {
+    slot.get_or_init(NatGateway::new)
 }
 
 /// Send a raw IP packet from the guest into the NAT gateway.
@@ -679,8 +686,11 @@ fn gateway() -> &'static NatGateway {
     clippy::unnecessary_wraps,
     reason = "return type is fixed by the IPInterfaceProvider trait"
 )]
-pub(crate) fn send_ip_packet(packet: &[u8]) -> Result<(), litebox::platform::SendError> {
-    let gw = gateway();
+pub(crate) fn send_ip_packet(
+    slot: &OnceLock<NatGateway>,
+    packet: &[u8],
+) -> Result<(), litebox::platform::SendError> {
+    let gw = gateway(slot);
     gw.queue
         .lock()
         .unwrap()
@@ -692,9 +702,10 @@ pub(crate) fn send_ip_packet(packet: &[u8]) -> Result<(), litebox::platform::Sen
 /// Attempt to receive a raw IP packet (originating from the NAT gateway, e.g. a proxied TCP/UDP
 /// reply) without blocking.
 pub(crate) fn receive_ip_packet(
+    slot: &OnceLock<NatGateway>,
     packet: &mut [u8],
 ) -> Result<usize, litebox::platform::ReceiveError> {
-    let gw = gateway();
+    let gw = gateway(slot);
     let mut q = gw.queue.lock().unwrap();
     let Some(data) = q.to_guest.pop_front() else {
         return Err(litebox::platform::ReceiveError::WouldBlock);
@@ -706,8 +717,8 @@ pub(crate) fn receive_ip_packet(
 
 /// Block the calling thread until either a packet is available to read from the gateway, or
 /// `timeout` elapses. Mirrors `LinuxUserland::wait_on_tun`'s role for the network-worker thread.
-pub(crate) fn wait_on_tun(timeout: Option<core::time::Duration>) {
-    let gw = gateway();
+pub(crate) fn wait_on_tun(slot: &OnceLock<NatGateway>, timeout: Option<core::time::Duration>) {
+    let gw = gateway(slot);
     let has_packet = || !gw.queue.lock().unwrap().to_guest.is_empty();
     if has_packet() {
         return;
