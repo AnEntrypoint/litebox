@@ -104,9 +104,14 @@ impl WindowsUserland {
 
 /// Diagnostic tracing gated by `LITEBOX_VEH_TRACE=1`, added to root-cause the intermittent
 /// hang/crash in the `apk add nodejs` repro. Temporary; remove once root-caused.
+///
+/// Deliberately re-reads the environment on every call rather than caching the result behind a
+/// `static` (this crate's bare-static count is tracked by `dev_tests/src/ratchet.rs`'s
+/// `ratchet_globals`, which is actively trying to reduce, not grow, that count): this is only
+/// called on already-rare exception-handling paths, so the cost of an uncached env lookup is
+/// negligible relative to introducing another global.
 pub(crate) fn veh_trace_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("LITEBOX_VEH_TRACE").is_some())
+    std::env::var_os("LITEBOX_VEH_TRACE").is_some()
 }
 
 unsafe extern "system" fn vectored_exception_handler(

@@ -104,22 +104,49 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
     /// this was the actual root cause of `dup2()` returning `EBADF` for shell output-redirection
     /// fds surviving a `fork()`).
     pub(crate) fn fork_duplicate(&self, litebox: &litebox::LiteBox<Platform>) -> Self {
+        // `Descriptors::duplicate` (used per-subsystem below) is also `dup()`/`dup2()`'s own
+        // primitive, and by design does *not* propagate `FD_CLOEXEC` -- POSIX requires a
+        // duplicated fd to never inherit the original's close-on-exec flag. `fork()`, however, has
+        // the opposite requirement: `FD_CLOEXEC` must survive fork() unchanged and only take
+        // effect at the *child's* next `execve()`. Using `duplicate` unchanged here would
+        // therefore silently clear `FD_CLOEXEC` on every fd a forked child inherits, causing an
+        // fd the parent marked close-on-exec to leak into the child's own subsequent `execve()`
+        // (observed in practice: `apk`'s fork()+exec() of a trigger script's `#!/bin/sh`
+        // interpreter inheriting fds the parent never intended it to see). Re-read the source
+        // fd's `FD_CLOEXEC` metadata and re-apply it to the freshly duplicated fd to restore
+        // fork()'s actual semantics.
+        fn dup_preserving_cloexec<Platform: litebox::sync::RawSyncPrimitivesProvider, Subsystem>(
+            litebox: &litebox::LiteBox<Platform>,
+            fd: &TypedFd<Subsystem>,
+        ) -> Option<TypedFd<Subsystem>>
+        where
+            Subsystem: litebox::fd::FdEnabledSubsystem,
+        {
+            let mut dt = litebox.descriptor_table_mut();
+            let cloexec = dt
+                .with_metadata(fd, |flags: &FileDescriptorFlags| {
+                    flags.contains(FileDescriptorFlags::FD_CLOEXEC)
+                })
+                .unwrap_or(false);
+            let new_fd = dt.duplicate(fd)?;
+            if cloexec {
+                dt.set_fd_metadata(&new_fd, FileDescriptorFlags::FD_CLOEXEC);
+            }
+            Some(new_fd)
+        }
+
         let raw_descriptor_store = self.raw_descriptor_store.read().fork_duplicate(
-            |fd: &TypedFd<FS>| litebox.descriptor_table_mut().duplicate(fd),
-            |fd: &TypedFd<litebox::net::Network<Platform>>| {
-                litebox.descriptor_table_mut().duplicate(fd)
-            },
-            |fd: &TypedFd<litebox::pipes::Pipes<Platform>>| {
-                litebox.descriptor_table_mut().duplicate(fd)
-            },
+            |fd: &TypedFd<FS>| dup_preserving_cloexec(litebox, fd),
+            |fd: &TypedFd<litebox::net::Network<Platform>>| dup_preserving_cloexec(litebox, fd),
+            |fd: &TypedFd<litebox::pipes::Pipes<Platform>>| dup_preserving_cloexec(litebox, fd),
             |fd: &TypedFd<super::eventfd::EventfdSubsystem<Platform>>| {
-                litebox.descriptor_table_mut().duplicate(fd)
+                dup_preserving_cloexec(litebox, fd)
             },
             |fd: &TypedFd<super::epoll::EpollSubsystem<Platform, FS>>| {
-                litebox.descriptor_table_mut().duplicate(fd)
+                dup_preserving_cloexec(litebox, fd)
             },
             |fd: &TypedFd<super::unix::UnixSocketSubsystem<Platform, FS>>| {
-                litebox.descriptor_table_mut().duplicate(fd)
+                dup_preserving_cloexec(litebox, fd)
             },
         );
         Self {
