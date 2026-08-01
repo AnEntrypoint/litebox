@@ -204,3 +204,7 @@ dev_bench/unixbench/*.zip
 
 ### Test-generated artifacts ###
 litebox_runner_linux_on_windows_userland/tests/test-bins/*.hooked
+
+### Local repro/debug scratch (packaged rootfs tarballs, gdb investigation sessions) ###
+/alpine-rootfs.tar
+/.wfgy/

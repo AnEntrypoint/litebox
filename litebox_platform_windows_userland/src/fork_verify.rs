@@ -174,8 +174,17 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
     if crate::veh_trace_enabled() {
         let fsbase = unsafe { litebox_common_linux::rdfsbase() };
         if fsbase == 0 {
+            // `vectored_exception_handler` repairs a zeroed FS_BASE for every `EXCEPTION_SINGLE_
+            // STEP` unconditionally, immediately before calling this function (see its comment on
+            // why this matters far more here than on the non-single-stepped path) -- so this should
+            // now be unreachable in the common case where `WindowsUserland::get_thread_fs_base()`
+            // holds a real saved value. Seeing this fire means either the repair's `saved != 0`
+            // guard rejected a not-yet-initialized FS_BASE (benign, early in thread startup) or the
+            // repair genuinely did not stick, which would be a new, distinct bug worth
+            // investigating rather than the already-understood reset-under-scheduling-pressure
+            // case this used to log routinely.
             eprintln!(
-                "[fork_verify] tid={:?} on_single_step: rdfsbase()==0 at rip={rip:#x} (host thread FS_BASE state may be corrupted)",
+                "[fork_verify] tid={:?} on_single_step: rdfsbase()==0 at rip={rip:#x} (unexpected: FS_BASE repair should have already run)",
                 std::thread::current().id(),
             );
         }

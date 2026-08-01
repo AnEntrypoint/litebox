@@ -130,11 +130,23 @@ unsafe extern "system" fn vectored_exception_handler(
     }
 
     if veh_trace_enabled() {
+        unsafe extern "C" {
+            safe static __ImageBase: c_void;
+        }
+        let image_base = (&raw const __ImageBase).addr();
         eprintln!(
-            "[veh] tid={:?} code={:#x} rip={:#x} is_in_guest={} is_verifying={} rdfsbase={:#x} thread_fs_base={:#x}",
+            "[veh] tid={:?} code={:#x} rip={:#x} rva={:#x} addr={:#x} is_in_guest={} is_verifying={} rdfsbase={:#x} thread_fs_base={:#x}",
             std::thread::current().id(),
             exception_record.ExceptionCode,
             context.Rip,
+            {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "diagnostic-only; this platform is x86_64-only, rip fits in usize"
+                )]
+                (context.Rip as usize).wrapping_sub(image_base)
+            },
+            exception_record.ExceptionInformation[1],
             tls.is_in_guest.get(),
             fork_verify::is_verifying(tls),
             unsafe { litebox_common_linux::rdfsbase() },
@@ -143,6 +155,58 @@ unsafe extern "system" fn vectored_exception_handler(
     }
 
     if !tls.is_in_guest.get() {
+        // Same FS_BASE-reset repair as the guest-mode case below, but for *host* Rust code: live
+        // tracing (`LITEBOX_VEH_TRACE=1`) while investigating an `apk add nodejs` trigger-script
+        // hang showed `EXCEPTION_ACCESS_VIOLATION`s with `is_in_guest == false` and
+        // `rdfsbase() == 0` -- the same signature as the guest-mode case, just reached while
+        // running host code between guest instructions instead of guest code. Repairing it here
+        // too, before the exception-table lookup below, is a real, verified improvement (confirmed
+        // firing correctly in that trace).
+        //
+        // A second, now more precisely characterized, and still separate issue remains open past
+        // this fix (and past the `EXCEPTION_SINGLE_STEP`-path FS_BASE repair below, which fixes
+        // the quadratic single-step/FS_BASE-reset slowdown this comment originally attributed the
+        // whole hang to): `apk add --no-cache nodejs` deterministically stalls forever partway
+        // through -- specifically while `ash` runs the `icu-data-en` package's `.post-install`
+        // trigger script, right at the point that script's `fork()`ed child completes its
+        // `execve()` (the last traced activity is always the fork_verify single-step window's
+        // final few guest instructions immediately before the call into `switch_to_guest`/the
+        // syscall trampoline for `execve`; nothing more is ever traced afterward on any thread).
+        // `gdb`-attaching to a stalled process shows every OS thread cleanly parked in
+        // `WaitOnAddress`/`recvfrom`/threadpool-wait -- no thread spinning, no thread executing
+        // guest code, no panic message on stderr -- consistent with the parent's `wait4()` (via
+        // `Process::wait_for_exit`'s `nr_threads.block(n)` loop) never being woken because
+        // `Process::detach_thread`'s "last thread exited" bookkeeping and wake never ran for the
+        // execve'd child, rather than any FS_BASE or FS_BASE-adjacent problem (`rdfsbase()` reads
+        // back correct at every point observed near the stall). Notably, attaching `gdb` (whose
+        // `attach` implicitly suspends every thread in the process, the same primitive
+        // `ThreadHandle::interrupt` uses via `SuspendThread`/`SetThreadContext`/`ResumeThread`)
+        // was observed to occasionally produce one more increment of forward progress before the
+        // process re-stalled identically -- suggestive of a race in the interrupt/thread-exit
+        // signaling path (`litebox/src/event/wait.rs`, `Process::detach_thread`) rather than a
+        // true unconditional infinite loop, but not yet root-caused to a specific line. This is a
+        // distinct bug from the FS_BASE/single-step quadratic slowdown fixed in this commit and
+        // deserves its own dedicated investigation (ideally starting from a debug build under
+        // `gdb` with breakpoints on `Process::detach_thread`/`ThreadHandle::interrupt`, reproduced
+        // via `apk add --no-cache nodejs` against a freshly packaged `alpine-rootfs.tar`) rather
+        // than being folded into this fix.
+        if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
+            && unsafe { litebox_common_linux::rdfsbase() } == 0
+        {
+            let saved = WindowsUserland::get_thread_fs_base();
+            if saved != 0 {
+                if veh_trace_enabled() {
+                    eprintln!(
+                        "[veh] tid={:?} host-mode FS_BASE-reset in-place repair (rip={:#x})",
+                        std::thread::current().id(),
+                        context.Rip,
+                    );
+                }
+                unsafe { litebox_common_linux::wrfsbase(saved) };
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+
         // This might be a faulting guest memory access in LiteBox code. Try to
         // recover.
         if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
@@ -226,6 +290,36 @@ unsafe extern "system" fn vectored_exception_handler(
     // leaving guest mode -- or it caught the child executing/writing through a stale pointer into
     // the parent's address space, in which case we fall through to the normal exception path with
     // a synthesized access violation so the child dies exactly as it would on real hardware.
+    //
+    // FS_BASE-reset repair applies here too, and matters *far* more here than on the plain
+    // (non-single-stepped) guest-execution path above: single-stepping means every guest
+    // instruction is its own kernel round-trip through this handler, which is exactly the kind of
+    // scheduling-visible event the FS_BASE-reset behavior above is already keyed off of ("observed
+    // to recur many times per second under load") -- so a `fork()` child under verification hits
+    // the reset on very nearly every single instruction (confirmed via `LITEBOX_VEH_TRACE=1`:
+    // >99% of `on_single_step` calls during a real `apk add nodejs` run observed `rdfsbase() ==
+    // 0`), not merely "many times per second". Before this fix, this path had no FS_BASE repair of
+    // its own: `on_single_step` only *logged* the corruption and proceeded with its rip/instruction
+    // classification regardless (which is safe -- it never reads `%fs:`-relative memory itself,
+    // only CPU registers and instruction bytes at `rip`), then re-armed `TF` and resumed the
+    // *original* guest instruction with FS_BASE still zero. If that instruction touched `%fs:`, it
+    // then took a *second* trap -- `EXCEPTION_ACCESS_VIOLATION` this time -- which the repair above
+    // fixes and retries via `CONTINUE_EXECUTION`, but with `TF` still armed the whole time, so the
+    // very next instruction immediately single-steps again, and if FS_BASE has already been reset
+    // yet again by then (observed to be the common case), the two traps alternate in an extremely
+    // tight loop -- thousands of round trips to make a handful of instructions of real forward
+    // progress, exactly the "quadratic-ish" slowdown reported as an apparent hang. Repairing FS_BASE
+    // in place here, before `on_single_step` runs, means the guest instruction that resumes after
+    // this step always sees correct FS_BASE the first time, so it never needs that second
+    // access-violation-and-retry round trip at all: one MSR rewrite replaces two full VEH
+    // dispatches.
+    if unsafe { litebox_common_linux::rdfsbase() } == 0 {
+        let saved = WindowsUserland::get_thread_fs_base();
+        if saved != 0 {
+            unsafe { litebox_common_linux::wrfsbase(saved) };
+        }
+    }
+
     let mut synthesized_record = None;
     if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_SINGLE_STEP {
         match fork_verify::on_single_step(tls, context) {
