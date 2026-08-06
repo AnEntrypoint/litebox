@@ -493,54 +493,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         }
     }
-
-    /// Closes every fd this process's (now-exiting) fd table still holds open.
-    ///
-    /// Real Linux implicitly closes every fd a process holds when its last thread exits (the
-    /// kernel drops the process's fd table, releasing each open file description's reference).
-    /// This shim's fd bookkeeping does not get that for free: `raw_descriptor_store`'s entries
-    /// are plain `OwnedFd` tokens indexing into the single process-wide `descriptor_table()`
-    /// (see `litebox::fd::Descriptors`), and `OwnedFd`'s own `Drop` impl deliberately does *not*
-    /// close its slot -- it only asserts the fd was already closed via a real `close()`/`dup2()`
-    /// operation (see its doc comment / `panic_on_unclosed_fd_drop`). Before this fix, nothing
-    /// ever called that real close path on process exit: `Task::prepare_for_exit` handled thread
-    /// detachment, orphan reparenting, `clear_child_tid`, and `robust_list`, but never iterated
-    /// and closed the process's own fds, so every fd a process held leaked forever in the global
-    /// descriptor table once the process exited without individually `close()`-ing each one
-    /// itself (which real programs routinely never bother to do before `_exit()`/`exit_group()`,
-    /// relying on the kernel to do it for them, exactly as this fix now does too).
-    ///
-    /// This is a real, reproduced hang, not a theoretical gap: a pipe's read end only observes
-    /// EOF once every writer-side open file description is gone (`ReadEnd::is_peer_shutdown`,
-    /// which checks whether the peer `WriteEnd`'s `Arc` strong count has reached zero via
-    /// `Weak::upgrade` -- see `litebox/src/pipes.rs`). `sh -c "timeout 5 tar -tzf
-    /// <2-gzip-member.tar.gz>"` deterministically hangs because `tar`'s internal gzip
-    /// decompression forks a helper that pipes decompressed bytes back to the parent; once that
-    /// helper finishes and calls `exit_group()`, its copy of the pipe's write end was never
-    /// closed by this shim, so the `Arc<WriteEnd>` never drops, `is_peer_shutdown()` never
-    /// becomes true, and the parent's blocking `read()` on the pipe waits for an EOF that can now
-    /// never arrive -- even though the actual Linux kernel semantics this shim is emulating
-    /// guarantee that EOF the instant the last writer process exits, without that process ever
-    /// calling `close()` itself. The same leak applies to every other fd-backed resource this
-    /// shim has (regular files, sockets, eventfds, epoll instances, unix sockets): none of them
-    /// were ever released on ordinary process exit.
-    ///
-    /// Only called once, from `Task::prepare_for_exit`, and only when `process_exited` is `true`
-    /// (this was the process's last thread) -- other threads of a still-live multi-threaded
-    /// process share this same fd table (`CLONE_FILES`), so closing fds when just one of several
-    /// threads exits would incorrectly yank descriptors out from under sibling threads that are
-    /// still running.
-    fn close_all_fds_on_process_exit(&self) {
-        let files = self.files.borrow();
-        let alive_fds: Vec<usize> = files.raw_descriptor_store.read().iter_alive().collect();
-        litebox_util_log::warn!(
-            pid:? = self.pid, tid:? = self.tid, alive_fds:? = alive_fds;
-            "DIAG close_all_fds_on_process_exit"
-        );
-        for raw_fd in alive_fds {
-            let _ = self.do_close(raw_fd);
-        }
-    }
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS> {

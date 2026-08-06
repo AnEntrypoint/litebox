@@ -740,16 +740,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn prepare_for_exit(&mut self) {
         let process_exited = self.thread.detach_from_process();
         if process_exited {
-            // Real Linux implicitly closes every fd a process holds when its last thread exits,
-            // releasing each open file description's reference so peers (e.g. a pipe's reader,
-            // waiting for EOF once the last writer goes away) are correctly notified. This
-            // shim's fd bookkeeping does not do that automatically -- see
-            // `close_all_fds_on_process_exit`'s doc comment for the real, reproduced hang this
-            // fixes (a pipe reader blocking forever because a writer's fd was never released on
-            // the writer's ordinary process exit). Must happen before reparenting orphans below,
-            // though the ordering is not itself load-bearing -- fd closure and child reparenting
-            // are independent cleanup steps.
-            self.close_all_fds_on_process_exit();
             let orphans = self.process().take_children();
             if !orphans.is_empty() {
                 let target = self
