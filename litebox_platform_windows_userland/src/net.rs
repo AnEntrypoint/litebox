@@ -73,6 +73,24 @@ const SOCKET_BUFFER_SIZE: usize = 65536 * 4;
 /// [`GatewayState::ensure_listening`], just with one extra poll round-trip on first use.
 const WELL_KNOWN_PORTS: &[u16] = &[53, 80, 443];
 
+/// How long a UDP NAT flow (`GatewayState::udp_flows`) may sit with no traffic in either
+/// direction before `pump_udp` reaps it.
+///
+/// UDP is connectionless, so unlike TCP there is no FIN/close handshake that tells the gateway
+/// "the guest is done with this flow" -- the only removal trigger before this timeout existed was
+/// a hard error from the real socket's `recv_from` (e.g. `ECONNRESET`), which a normal, successful
+/// one-shot exchange (the overwhelmingly common case: a single DNS query/response on port 53)
+/// never produces. Every such exchange therefore left its `UdpFlow` (and the real, ephemeral-port
+/// `UdpSocket` bound in `pump_udp`'s `or_insert_with`) permanently resident in `udp_flows` for the
+/// rest of the process's lifetime -- confirmed in practice: after enough real DNS lookups within
+/// one `litebox_runner_linux_on_windows_userland.exe` invocation (e.g. partway through `apk add
+/// nodejs`'s per-package mirror lookups), fresh outbound connections started stalling
+/// indefinitely, and the same symptom was independently reproducible via repeated `wget` calls
+/// against unrelated hosts in the same process -- consistent with cumulative ephemeral-port/socket
+/// exhaustion rather than a per-request bug. A 30s idle timeout is generous for DNS (whose
+/// exchanges complete in milliseconds) while still bounding the leak.
+const UDP_FLOW_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Max number of concurrently backlogged listening sockets per port (allows a handful of
 /// simultaneous new connections to the same port without dropping SYNs).
 const LISTEN_BACKLOG_PER_PORT: usize = 4;
@@ -186,6 +204,10 @@ enum TcpFlowState {
 /// how a NAT UDP "connection" tracks the most recent 5-tuple).
 struct UdpFlow {
     real: std::net::UdpSocket,
+    /// Last time a datagram was sent or received on this flow. Used by `pump_udp` to reap flows
+    /// idle longer than [`UDP_FLOW_IDLE_TIMEOUT`] -- see that constant's doc comment for why this
+    /// is necessary (UDP has no close signal to remove a flow otherwise).
+    last_active: std::time::Instant,
 }
 
 /// The gateway-side networking state: the private `smoltcp` interface/socket-set, plus the NAT
@@ -539,8 +561,12 @@ impl GatewayState {
                         let real = std::net::UdpSocket::bind("0.0.0.0:0")
                             .expect("failed to bind ephemeral UDP socket");
                         let _ = real.set_nonblocking(true);
-                        UdpFlow { real }
+                        UdpFlow {
+                            real,
+                            last_active: std::time::Instant::now(),
+                        }
                     });
+                flow.last_active = std::time::Instant::now();
                 let _ = flow.real.send_to(data, SocketAddr::V4(dest_addr));
             }
         }
@@ -556,6 +582,7 @@ impl GatewayState {
             loop {
                 match flow.real.recv_from(&mut buf) {
                     Ok((n, SocketAddr::V4(from))) => {
+                        flow.last_active = std::time::Instant::now();
                         if !socket.can_send() {
                             break;
                         }
@@ -570,7 +597,12 @@ impl GatewayState {
                         let _ = socket.send_slice(&buf[..n], meta);
                     }
                     Ok((_, SocketAddr::V6(_))) => {}
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        if flow.last_active.elapsed() >= UDP_FLOW_IDLE_TIMEOUT {
+                            dead_flows.push((dest_port, guest_port));
+                        }
+                        break;
+                    }
                     Err(_) => {
                         dead_flows.push((dest_port, guest_port));
                         break;

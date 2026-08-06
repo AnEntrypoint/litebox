@@ -6,7 +6,7 @@
 use crate::{ShimFS, ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::boxed::Box;
 use alloc::collections::btree_map::BTreeMap;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::Cell;
 use core::mem::offset_of;
@@ -55,11 +55,12 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
         pid: i32,
         pm: litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
         vforked: bool,
+        parent: Option<Weak<Process<Platform>>>,
     ) -> Self {
         let remote = Arc::new(ThreadRemote::new());
         Self {
             init_state: Cell::new(ThreadInitState::None),
-            process: Arc::new(Process::new(pid, remote.clone(), pm, vforked)),
+            process: Arc::new(Process::new(pid, remote.clone(), pm, vforked, parent)),
             remote,
             attached_tid: Cell::new(Some(pid)),
             clear_child_tid: Cell::new(None),
@@ -79,16 +80,28 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
         })
     }
 
-    fn detach_from_process(&self) {
+    /// Detaches this thread from its process, returning `true` if this was the process's last
+    /// thread (i.e. the process has now fully exited). Returns `false` if this thread was already
+    /// detached (double-detach is possible via `ThreadState`'s own `Drop` running after
+    /// `Task::prepare_for_exit` already called this explicitly) or was never attached.
+    fn detach_from_process(&self) -> bool {
         if let Some(tid) = self.attached_tid.take() {
-            self.process.detach_thread(tid);
+            self.process.detach_thread(tid)
+        } else {
+            false
         }
     }
 }
 
 impl<Platform: ShimPlatform> Drop for ThreadState<Platform> {
     fn drop(&mut self) {
-        self.detach_from_process();
+        // Reparenting (if this is the process's last thread) is handled explicitly by
+        // `Task::prepare_for_exit`, which calls `detach_from_process` itself before this `Drop`
+        // runs (attached_tid is already `None` by the time we get here in the normal exit path,
+        // making this a no-op) -- see that function's doc comment. This `Drop` impl exists purely
+        // as a safety net for any path that drops `ThreadState` without going through
+        // `Task::prepare_for_exit` first.
+        let _ = self.detach_from_process();
     }
 }
 
@@ -134,6 +147,18 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     /// [`litebox::mm::PageManager`] (see [`litebox::mm::PageManager::duplicate`]) rather than
     /// referencing this one.
     pub(crate) pm: litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
+    /// This process's parent, set once at creation (`do_clone`'s process-clone branch) and never
+    /// changed afterward -- a `Weak` reference since the parent may exit (and be fully dropped,
+    /// once reaped) before this process does.
+    ///
+    /// Used purely for orphan reparenting on this process's own exit (see
+    /// `Task::prepare_for_exit`'s doc comment): real Linux reparents an orphaned process to its
+    /// nearest living ancestor (traditionally PID 1, or a `PR_SET_CHILD_SUBREAPER`), which this
+    /// approximates by walking `parent` chains upward from the exiting process until a still-live
+    /// (`Weak::upgrade`-able) one is found, falling back to the shim's bootstrap process if the
+    /// whole chain is already gone. `None` only for the bootstrap process itself, which has no
+    /// shim-visible parent.
+    parent: Option<Weak<Process<Platform>>>,
     /// Child processes created via real `fork()`/`vfork()` (i.e. process-style `clone()`,
     /// distinct from thread-style clone which attaches into THIS `Process` rather than
     /// creating a new one). Consumed by `wait4`/`waitpid`. A `(pid, Process)` pair is removed
@@ -199,6 +224,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
         remote: Arc<ThreadRemote<Platform>>,
         pm: litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
         vforked: bool,
+        parent: Option<Weak<Process<Platform>>>,
     ) -> Self {
         let nr_threads = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
         nr_threads.underlying_atomic().store(1, Ordering::Relaxed);
@@ -220,9 +246,24 @@ impl<Platform: ShimPlatform> Process<Platform> {
                 deadline: None,
             }),
             pm,
+            parent,
             children: Mutex::new(alloc::vec::Vec::new()),
             vfork_done,
         }
+    }
+
+    /// Returns this process's parent `Process`, if it is still live (its `Arc` not yet fully
+    /// dropped -- i.e. the parent process has not both exited *and* been reaped). `None` for the
+    /// bootstrap process (no parent at all) or once the parent is fully gone.
+    ///
+    /// Used by `Task::prepare_for_exit` to find the reparent target for this process's own
+    /// orphaned children; the caller falls back to the shim's bootstrap process when this returns
+    /// `None`, approximating real Linux's "reparent to the nearest live ancestor, or PID 1"
+    /// behavior. This is a single-hop lookup rather than a full chain walk: once a `Process`'s
+    /// `Arc` is fully dropped, its own `parent` field is gone with it, so there is nothing further
+    /// to walk through -- the bootstrap fallback covers that case directly instead.
+    fn live_parent(&self) -> Option<Arc<Process<Platform>>> {
+        self.parent.as_ref()?.upgrade()
     }
 
     /// Blocks the calling thread until this process's initial thread calls `execve` or exits.
@@ -298,11 +339,15 @@ impl<Platform: ShimPlatform> Process<Platform> {
 
     /// Detaches a thread from this process.
     ///
+    /// Returns `true` if this was the process's last thread (i.e. the whole process has now
+    /// exited) -- the caller (`Task::prepare_for_exit`) uses this to trigger reparenting of any
+    /// still-running children this process leaves behind (see that function's doc comment).
+    ///
     /// # Panics
     /// Panics if the thread ID does not exist in this process.
-    fn detach_thread(&self, tid: i32) {
+    fn detach_thread(&self, tid: i32) -> bool {
         let data;
-        let notify = {
+        let (notify, process_exited) = {
             let mut inner = self.inner.lock();
             data = inner.threads.remove(&tid);
             assert!(data.is_some());
@@ -324,11 +369,37 @@ impl<Platform: ShimPlatform> Process<Platform> {
             // Notify waiters if this is the last thread of the process
             // (`wait_for_exit`) or if this is the last thread being killed
             // during an exec (`kill_other_threads`).
-            new_count == 0 || (new_count == 1 && inner.is_killing_other_threads)
+            (
+                new_count == 0 || (new_count == 1 && inner.is_killing_other_threads),
+                new_count == 0,
+            )
         };
         if notify {
             self.nr_threads.wake_all();
         }
+        process_exited
+    }
+
+    /// Takes and returns every remaining (not-yet-waited-for) child of this process, leaving its
+    /// own child list empty.
+    ///
+    /// Used by `Task::prepare_for_exit` to reparent this process's children elsewhere once this
+    /// process itself has fully exited -- see that function's doc comment for why this is
+    /// necessary.
+    fn take_children(&self) -> alloc::vec::Vec<ChildEntry<Platform>> {
+        core::mem::take(&mut *self.children.lock())
+    }
+
+    /// Appends `orphans` to this process's child list, so a later `wait4(-1, ...)`/`wait4(pid,
+    /// ...)` from this process can reap them.
+    ///
+    /// Used by `Task::prepare_for_exit` to reparent an exiting process's still-running children
+    /// onto the shim's bootstrap (PID-1-equivalent) process -- see that function's doc comment.
+    fn adopt_children(&self, orphans: alloc::vec::Vec<ChildEntry<Platform>>) {
+        if orphans.is_empty() {
+            return;
+        }
+        self.children.lock().extend(orphans);
     }
 }
 
@@ -630,8 +701,58 @@ fn fixup_stale_stack_pointers<Platform: ShimPlatform>(
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Called when the task is exiting.
+    ///
+    /// # Reparenting orphaned children onto this process's own (still-live) parent, or the
+    /// # bootstrap process
+    ///
+    /// If this call detaches this process's *last* thread (i.e. the whole process is exiting, not
+    /// just one thread of a multi-threaded process), any of this process's own children that are
+    /// still running and have not yet been `wait4()`-ed for are moved onto this process's own
+    /// still-live parent's child list -- or, if that parent is itself already fully gone, onto the
+    /// shim's bootstrap process's child list -- mirroring real Linux's reparent-to-the-nearest-
+    /// live-ancestor (traditionally `init`, or a `PR_SET_CHILD_SUBREAPER`) behavior for orphaned
+    /// processes.
+    ///
+    /// Without this, an orphaned grandchild becomes permanently unreapable: nothing in the shim
+    /// ever tracked a process's grandchildren, only its immediate children (`Process::children`),
+    /// so once the immediate parent exits, the grandchild's `(pid, Process)` entry existed nowhere
+    /// any living task could `wait4()` for -- its eventual `exit_group()` / `detach_thread()`
+    /// would still correctly decrement its own `nr_threads` and call `wake_all()`, but into a
+    /// void, since no thread was ever going to be blocked in `wait_for_exit()` on it. This is not
+    /// a lost-wakeup race (the wake genuinely has no listener, ever) -- it is a missing
+    /// notification *path*, one layer up from the actual exit bookkeeping.
+    ///
+    /// This is a real, independently confirmed gap (reproduced directly, no network involved:
+    /// `sh -c "timeout 5 tar -tzf <a 2-gzip-member .tar.gz>"` -- busybox's `timeout` applet forks
+    /// an intermediate helper process that execs and exits almost immediately, orphaning the
+    /// actual `tar` process it started; before this fix, `tar`'s successful `exit_group` had no
+    /// path back to anything still waiting on it), and this fix does make that orphan reapable
+    /// where it previously was not (`Process::children`/`live_parent` now correctly track and
+    /// surface it). It has the same *shape* as the fork/exit chain in the deterministic
+    /// `apk add nodejs` / `icu-data-en` post-install-script hang this investigation was chasing
+    /// (`ash` forks a subshell to run the trigger script, the subshell forks and execs the actual
+    /// script interpreter and exits before it finishes) -- but reproducing the minimal `timeout`
+    /// case above with this fix applied still hangs identically, so this fix alone does *not*
+    /// fully resolve that hang; there is at least one more distinct bug in that path not yet
+    /// root-caused. Landed as its own correct, independently-verified fix rather than withheld
+    /// pending the remainder, per this investigation's standing discipline of not overclaiming
+    /// resolution.
     pub(crate) fn prepare_for_exit(&mut self) {
-        self.thread.detach_from_process();
+        let process_exited = self.thread.detach_from_process();
+        if process_exited {
+            let orphans = self.process().take_children();
+            if !orphans.is_empty() {
+                let target = self
+                    .process()
+                    .live_parent()
+                    .or_else(|| self.global.bootstrap_process.get().cloned());
+                if let Some(target) = target
+                    && !Arc::ptr_eq(&target, self.process())
+                {
+                    target.adopt_children(orphans);
+                }
+            }
+        }
 
         if let Some(clear_child_tid) = self.thread.clear_child_tid.take() {
             // Clear the child TID if requested
@@ -948,8 +1069,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     Errno::ENOMEM
                 })?;
             let vforked = flags.contains(CloneFlags::VFORK);
-            let thread =
-                crate::syscalls::process::ThreadState::new_process(child_tid, dest_pm, vforked);
+            let thread = crate::syscalls::process::ThreadState::new_process(
+                child_tid,
+                dest_pm,
+                vforked,
+                Some(Arc::downgrade(self.process())),
+            );
 
             // The captured ctx's registers may hold addresses into the PARENT's address space --
             // the child's code, stack, and everything else generally live at a different host

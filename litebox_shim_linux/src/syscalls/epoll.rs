@@ -596,16 +596,38 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
     }
 
     /// Waits for any of the fds in the poll set to become ready.
+    ///
+    /// # Correctness: no unregistered pre-check
+    ///
+    /// This used to run one `scan_once(..., None)` (i.e. with no observer registration) before
+    /// ever entering `wait_until`, as a fast path to skip the wait entirely if already ready.
+    /// That pre-check is a genuine lost-wakeup hazard: it observes "not ready yet" but leaves no
+    /// observer registered, so if the awaited condition (e.g. a pipe's peer closing, delivered via
+    /// `Pollee::notify_observers`) becomes true and fires its notification in the window between
+    /// that pre-check and the first *registered* check inside `wait_until`, the notification finds
+    /// no observer to deliver to and is silently dropped -- there is no other mechanism to re-scan
+    /// afterward, so the caller blocks forever. Directly observed via tracing during this
+    /// investigation: `WriteEnd::drop` firing `notify_observers(HUP)` with a live peer, but with
+    /// `Subject::notify_observers`'s own `nums == 0` fast path bailing out because no observer was
+    /// registered yet at that exact instant, so no corresponding `on_events` ever reached the
+    /// waiting `PollEntryObserver`. This is a real, confirmed bug on its own, and this fix removes
+    /// it correctly -- but it is not the sole cause of the deterministic `apk add nodejs` /
+    /// `icu-data-en` post-install-script stall this investigation was chasing: reproducing that
+    /// stall's minimal fork/exit shape (see `Task::prepare_for_exit`'s doc comment) with this fix
+    /// applied still hangs, so at least one further distinct bug remains in that path.
+    ///
+    /// `WaitContext::wait_until`'s own contract already covers the "already ready" fast path
+    /// correctly and race-free: `start_wait()` marks the thread as waiting *before* `ready()` (the
+    /// closure here) runs, and `ready()`'s first invocation performs the very same
+    /// `scan_once`-with-registration this pre-check tried to shortcut -- so removing the redundant
+    /// unregistered pre-check costs one extra (cheap, in-process) scan in the always-ready case, in
+    /// exchange for closing the missed-wakeup window entirely.
     pub fn wait<FS: ShimFS>(
         &mut self,
         global: &GlobalState<Platform, FS>,
         cx: &WaitContext<'_, Platform>,
         files: &FilesState<Platform, FS>,
     ) -> Result<(), WaitError> {
-        if self.scan_once(global, files, None) {
-            return Ok(());
-        }
-
         let mut register = true;
         cx.wait_until(|| {
             if self.scan_once(global, files, register.then_some(cx.waker())) {
