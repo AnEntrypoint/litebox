@@ -50,6 +50,16 @@ jobs:
         run: |
           sudo apt install -y diod
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Cache-bust: the persisted cache (including target/tmp's litebox_syscall_rewriter
+          # test-output cache under litebox_runner_linux_userland/tests) reached a stale state
+          # that broke the Python-based tests (test_runner_with_python{,_repl_pty}) with "Fatal
+          # Python error: init_fs_encoding ... ModuleNotFoundError: No module named 'encodings'"
+          # during the guest interpreter's own startup. Reproduced deterministically even
+          # re-running CI from an unrelated, previously-green commit, confirming this is
+          # pre-existing cache staleness, not a real code regression. Bump this prefix again if
+          # the same failure signature resurfaces.
+          prefix-key: v2-rust
       - name: Cache custom out directories
         uses: actions/cache@v5
         with:
