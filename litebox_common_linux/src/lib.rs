@@ -252,7 +252,15 @@ impl From<litebox::fs::FileType> for InodeType {
             litebox::fs::FileType::RegularFile => InodeType::File,
             litebox::fs::FileType::Directory => InodeType::Dir,
             litebox::fs::FileType::CharacterDevice => InodeType::CharDevice,
-            _ => unimplemented!(),
+            litebox::fs::FileType::Symlink => InodeType::SymLink,
+            // `FileType` is `#[non_exhaustive]`; unlike `DirentType` (which has a legitimate
+            // `DT_UNKNOWN` fallback matching real Linux `getdents` behavior, see the `From` impl
+            // above), `st_mode`'s file-type bits have no safe "unknown" value -- every `stat()`
+            // caller needs a real answer. This can only be reached if `litebox::fs::FileType`
+            // grows a new variant with no corresponding `InodeType` yet; fail loudly rather than
+            // silently reporting a wrong type (e.g. mislabeling a new node kind as a regular
+            // file), exactly as the previous `unimplemented!()` did, but with a clearer message.
+            other => unimplemented!("no InodeType mapping for FileType::{other:?}"),
         }
     }
 }
@@ -283,7 +291,14 @@ impl From<litebox::fs::FileType> for DirentType {
             litebox::fs::FileType::RegularFile => DirentType::Regular,
             litebox::fs::FileType::Directory => DirentType::Directory,
             litebox::fs::FileType::CharacterDevice => DirentType::CharDevice,
-            _ => unimplemented!(),
+            litebox::fs::FileType::Symlink => DirentType::SymLink,
+            // `FileType` is `#[non_exhaustive]`; match Linux's own `getdents`-family behavior of
+            // reporting `DT_UNKNOWN` for any type it can't otherwise classify rather than
+            // panicking on a still-unmatched (but not-actually-invalid) directory entry. Real
+            // callers of `d_type` (e.g. `readdir`) already treat `DT_UNKNOWN` as "call `stat()`
+            // if you need to know the type", so this is safe, working, real Linux behavior -- not
+            // a stand-in placeholder.
+            _ => DirentType::Unknown,
         }
     }
 }

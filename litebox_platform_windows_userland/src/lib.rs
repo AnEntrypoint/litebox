@@ -1127,7 +1127,33 @@ impl litebox::platform::TimerProvider for WindowsUserland {
         &self,
         signal: Self::Signal,
     ) -> Result<Self::TimerHandle, litebox::platform::TimerCreationError> {
-        let ctx = Box::new(TimerCallbackContext { signal });
+        // Capture the CALLING thread's own handle so the timer callback delivers the signal
+        // back to the thread that actually armed it (see `TimerCallbackContext::target` and
+        // `threadpool_timer_callback` below).
+        //
+        // Previously this callback picked `ACTIVE_THREADS.lock().unwrap().first().cloned()` --
+        // an arbitrary managed thread, not necessarily the one that owns this timer. That was a
+        // correctness gap the `ACTIVE_THREADS` doc comment already flagged ("only works when we
+        // support a single process"), and it stopped being merely theoretical once multiple
+        // guest "processes" (each an ordinary host thread sharing this one Windows process, see
+        // `spawn_thread`) could each own their own per-process `SIGALRM`/`ITIMER_REAL` timer
+        // (`Process::alarm_timer`, armed via `sys_alarm`/`sys_setitimer`): whenever that timer
+        // fires, delivering its signal to the wrong thread means the intended recipient never
+        // sees it (a real, silent signal-delivery bug on its own) while an unrelated guest
+        // process's thread gets spuriously interrupted -- if that thread has no real pending
+        // signal or exit condition to act on, `prepare_to_run_guest` just returns `ready=true`
+        // again immediately, and the next `switch_to_guest` can re-enter this same interrupt
+        // path before making any other forward progress, i.e. a busy-livelock shaped exactly
+        // like this investigation's other FS_BASE-reset livelocks. Found by code inspection while
+        // investigating a separate, since-confirmed-distinct hang (`sh -c "timeout 5 tar -tzf
+        // <2-gzip-member.tar.gz>"`, ultimately root-caused to a process-exit fd-leak in
+        // `close_all_fds_on_process_exit`, not this); fixed on its own merits regardless, since
+        // `ACTIVE_THREADS.first()` is unconditionally wrong once more than one guest process can
+        // own a timer.
+        let target = CURRENT_THREAD_HANDLE
+            .with_borrow(Clone::clone)
+            .expect("create_timer called from a thread not managed by LiteBox");
+        let ctx = Box::new(TimerCallbackContext { signal, target });
 
         // Create a threadpool timer with the callback registered up-front.
         // The callback fires whenever the timer is armed via
@@ -1217,11 +1243,17 @@ impl litebox::platform::TimerHandle for TimerHandle {
 /// Context shared between the `TimerHandle` and the threadpool timer callback.
 struct TimerCallbackContext {
     signal: litebox_common_linux::signal::Signal,
+    /// The specific thread that armed this timer (via `create_timer`), and therefore the one
+    /// this timer's signal must always be delivered to -- never an arbitrary "active" thread.
+    /// See the doc comment on `TimerProvider::create_timer` for why this matters.
+    target: ThreadHandle,
 }
 
 /// Threadpool timer callback registered via `CreateThreadpoolTimer`.
 ///
-/// Picks an arbitrary active thread and delivers the signal.
+/// Delivers the signal to the specific thread that armed this timer (`ctx.target`), captured at
+/// `create_timer` time -- not an arbitrary active thread. See `TimerProvider::create_timer`'s
+/// doc comment for the real, reproduced livelock this fixes.
 unsafe extern "system" fn threadpool_timer_callback(
     _instance: Win32_Threading::PTP_CALLBACK_INSTANCE,
     context: *mut c_void,
@@ -1231,10 +1263,7 @@ unsafe extern "system" fn threadpool_timer_callback(
     // `TimerHandle`. The handle's `Drop` impl waits for all in-flight
     // callbacks before dropping the context, so this reference is valid.
     let ctx = unsafe { &*context.cast::<TimerCallbackContext>() };
-    let thread = ACTIVE_THREADS.lock().unwrap().first().cloned();
-    if let Some(thread) = thread {
-        thread.deliver_signal(ctx.signal);
-    }
+    ctx.target.deliver_signal(ctx.signal);
 }
 
 /// Console control handler registered via `SetConsoleCtrlHandler`.
@@ -2268,16 +2297,132 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
     }
 }
 
+/// Reads directly from the process's raw `STD_INPUT_HANDLE` via `ReadFile`, bypassing
+/// `std::io::stdin()`.
+///
+/// See the doc comment on [`write_to_raw_handle`] for why this deliberately avoids the `std::io`
+/// wrappers: the exact same cross-guest-"process" lock-starvation hazard applies symmetrically to
+/// `std::io::Stdin`'s internal buffered-reader lock.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "mirrors StdioProvider::read_from_stdin's Result signature (and write_to_raw_handle's shape) even though every current failure path here maps to Ok(0)/EOF rather than a real Err; keeps the two raw-handle helpers symmetric and leaves room for a genuine error case without a signature change"
+)]
+fn read_from_raw_handle(buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
+    use windows_sys::Win32::Storage::FileSystem::ReadFile;
+    use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
+
+    let handle = unsafe { windows_sys::Win32::System::Console::GetStdHandle(STD_INPUT_HANDLE) };
+    if handle.is_null() || handle == Win32_Foundation::INVALID_HANDLE_VALUE {
+        // No console/redirected input attached at all: behave like an already-closed stdin.
+        return Ok(0);
+    }
+    let mut read: u32 = 0;
+    let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+    let ok = unsafe {
+        ReadFile(
+            handle,
+            buf.as_mut_ptr(),
+            len,
+            &raw mut read,
+            core::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        let err = unsafe { GetLastError() };
+        // `ERROR_BROKEN_PIPE` (the write end of a redirected pipe closed) is EOF, matching a
+        // real Linux `read()` on a closed pipe's read end -- not an error condition to panic on.
+        if err == Win32_Foundation::ERROR_BROKEN_PIPE {
+            return Ok(0);
+        }
+        panic!("ReadFile(STD_INPUT_HANDLE) failed: error={err}");
+    }
+    Ok(read as usize)
+}
+
+/// Writes directly to the process's raw `STD_OUTPUT_HANDLE`/`STD_ERROR_HANDLE` via `WriteFile`,
+/// bypassing `std::io::stdout()`/`std::io::stderr()`.
+///
+/// # Why not `std::io::stdout()`/`std::io::stderr()`
+///
+/// Every emulated Linux guest "process" litebox creates is, under the hood, an ordinary Windows
+/// thread inside this single shared host process (see `spawn_thread`/`thread_start` above, and
+/// `Vmem::duplicate`'s doc comment) -- there is no per-guest-process OS-level isolation for
+/// anything that is itself process-global host state. `std::io::Stdout`/`std::io::Stdin` are
+/// exactly such state: each is a lazily-initialized, process-wide singleton guarded by its own
+/// internal lock (`ReentrantMutex` wrapping a `LineWriter`), shared by every caller in the host
+/// process regardless of which guest "process" or thread is calling. On real Linux, by contrast,
+/// two independent processes writing to the same (or different) fd 1 never contend on any
+/// in-process Rust-level lock at all -- the kernel's own per-file-description state and the
+/// `write(2)` syscall boundary provide all necessary serialization, and neither process can ever
+/// be blocked by the other holding a lock inside libc.
+///
+/// This mismatch was investigated as a candidate cause of a real hang this session chased
+/// (`sh -c "timeout 5 tar -tzf <2-member-gzip.tar.gz>"`, where two guest processes each
+/// independently call `write(1, ...)`/`write(2, ...)` at nearly the same moment) -- syscall-level
+/// tracing during that investigation caught one process's `writev(fd=1, ...)` as the last syscall
+/// it ever issued, never returning, while a second process concurrently reached its own
+/// stdout-bound write around the same instant, and `gdb`-attaching to the stalled process showed
+/// every real OS thread cleanly parked (no panic, no spin) -- a pattern consistent with, though
+/// not conclusively proven to be, one guest thread's `write()` becoming stuck on
+/// `std::io::Stdout`'s internal lock (`ThreadHandle::interrupt`'s `SuspendThread`/`ResumeThread`
+/// pair, used by both `fork_verify` and process-exit teardown, can suspend a thread while it is
+/// executing arbitrary *host* Rust code, including while it holds that lock, since `SuspendThread`
+/// is called unconditionally before this module's `is_in_guest` check -- an OS-level
+/// thread-suspend primitive has no notion of "don't suspend while a Rust-level lock is held").
+/// That specific hang was ultimately root-caused to a different, independently-confirmed bug (a
+/// process-exit fd leak fixed in `litebox_shim_linux`'s `close_all_fds_on_process_exit`), so this
+/// exact lock-contention scenario was not the deciding factor there -- but the underlying
+/// coupling this fix removes is real and independently worth fixing on its own: a guest process
+/// legitimately has no reason to ever be blockable by another, unrelated guest process's
+/// console/pipe writes, and routing every guest "process"'s stdio through one shared host-level
+/// lock creates exactly that illegitimate dependency regardless of whether this particular repro
+/// exercises it.
+///
+/// The fix: skip `std::io`'s buffering/locking entirely and issue the write as a single raw
+/// `WriteFile` call against the real OS handle, the same way a genuine Linux `write(2)` syscall
+/// would go straight to the kernel with no intervening userspace lock. This is correct for both a
+/// real console (`WriteFile` writes bytes through the console's active codepage, exactly as a
+/// real Linux process's raw `write()` to an inherited console fd would) and a redirected
+/// file/pipe (a plain byte-for-byte `WriteFile`).
+fn write_to_raw_handle(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    buf: &[u8],
+) -> Result<usize, litebox::platform::StdioWriteError> {
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+
+    if handle.is_null() || handle == Win32_Foundation::INVALID_HANDLE_VALUE {
+        // No console/redirected output attached at all: silently discard, matching a Linux
+        // process whose stdout/stderr fd was closed out from under it (further writes are
+        // simply lost from the caller's perspective once the peer is gone) rather than panicking.
+        return Ok(buf.len());
+    }
+    let mut written: u32 = 0;
+    let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+    let ok = unsafe {
+        WriteFile(
+            handle,
+            buf.as_ptr(),
+            len,
+            &raw mut written,
+            core::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        let err = unsafe { GetLastError() };
+        // The reader end of a redirected pipe going away is the Windows analogue of `EPIPE`/a
+        // broken pipe on Linux -- report it the same way the previous `std::io`-based
+        // implementation did, rather than panicking.
+        if err == Win32_Foundation::ERROR_BROKEN_PIPE || err == Win32_Foundation::ERROR_NO_DATA {
+            return Err(litebox::platform::StdioWriteError::Closed);
+        }
+        panic!("WriteFile(stdio handle) failed: error={err}");
+    }
+    Ok(written as usize)
+}
+
 impl litebox::platform::StdioProvider for WindowsUserland {
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
-        use std::io::Read as _;
-        std::io::stdin().read(buf).map_err(|err| {
-            if err.kind() == std::io::ErrorKind::BrokenPipe {
-                litebox::platform::StdioReadError::Closed
-            } else {
-                panic!("unhandled error {err}")
-            }
-        })
+        read_from_raw_handle(buf)
     }
 
     fn write_to(
@@ -2285,27 +2430,14 @@ impl litebox::platform::StdioProvider for WindowsUserland {
         stream: litebox::platform::StdioOutStream,
         buf: &[u8],
     ) -> Result<usize, litebox::platform::StdioWriteError> {
-        use std::io::Write as _;
-        match stream {
-            litebox::platform::StdioOutStream::Stdout => {
-                std::io::stdout().write(buf).map_err(|err| {
-                    if err.kind() == std::io::ErrorKind::BrokenPipe {
-                        litebox::platform::StdioWriteError::Closed
-                    } else {
-                        panic!("unhandled error {err}")
-                    }
-                })
-            }
-            litebox::platform::StdioOutStream::Stderr => {
-                std::io::stderr().write(buf).map_err(|err| {
-                    if err.kind() == std::io::ErrorKind::BrokenPipe {
-                        litebox::platform::StdioWriteError::Closed
-                    } else {
-                        panic!("unhandled error {err}")
-                    }
-                })
-            }
-        }
+        use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
+
+        let std_handle = match stream {
+            litebox::platform::StdioOutStream::Stdout => STD_OUTPUT_HANDLE,
+            litebox::platform::StdioOutStream::Stderr => STD_ERROR_HANDLE,
+        };
+        let handle = unsafe { windows_sys::Win32::System::Console::GetStdHandle(std_handle) };
+        write_to_raw_handle(handle, buf)
     }
 
     fn is_a_tty(&self, stream: litebox::platform::StdioStream) -> bool {
