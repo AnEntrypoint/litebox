@@ -533,6 +533,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn close_all_fds_on_process_exit(&self) {
         let files = self.files.borrow();
         let alive_fds: Vec<usize> = files.raw_descriptor_store.read().iter_alive().collect();
+        litebox_util_log::warn!(
+            pid:? = self.pid, tid:? = self.tid, alive_fds:? = alive_fds;
+            "DIAG close_all_fds_on_process_exit"
+        );
         for raw_fd in alive_fds {
             let _ = self.do_close(raw_fd);
         }
