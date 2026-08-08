@@ -3,7 +3,7 @@
 
 //! The path-management/permissions/... layer, that sits above [`super::backend`].
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -138,6 +138,11 @@ impl Default for Context {
     }
 }
 
+/// Maximum number of intermediate-symlink hops a single walk will follow before giving up with
+/// `PathError::TooManySymlinkHops` (`ELOOP`). Matches
+/// [`super::in_mem::FileSystem`]'s own `MAX_SYMLINK_HOPS` for its (upper/writable) layer.
+const MAX_SYMLINK_HOPS: u32 = 8;
+
 /// Absolute normalized path, must only be created from [`Context::resolve`].
 struct ResolvedPath {
     components: Vec<String>,
@@ -203,25 +208,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             return Ok(from);
         }
 
-        let outcome =
-            self.backend
-                .walk_directories(from, components)
-                .map_err(|error| match error {
-                    WalkError::PathError(PathError::NoSuchFileOrDirectory) => {
-                        PathError::MissingComponent.into()
-                    }
-                    error => error,
-                })?;
-        Self::check_walk_permissions(
+        let (outcome, walked) = self.walk_path_following_symlinks(
             context,
+            from,
+            components,
             #[cfg(debug_assertions)]
             absolute_components,
-            &outcome,
         )?;
 
         match outcome.stop_reason {
             WalkStopReason::CompleteDirectory => {
-                assert_eq!(outcome.components.len(), components.len());
+                assert_eq!(walked, components.len());
                 Ok(outcome.last)
             }
             WalkStopReason::StoppedAtNonDirectory => {
@@ -243,32 +240,117 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         #[cfg(debug_assertions)] absolute_components: &[&str],
     ) -> Result<(WalkOutcome<WalkingDirHandle<'a>>, usize), WalkError> {
         assert!(!components.is_empty());
-        let outcome = self.backend.walk_directories(from, components)?;
-        Self::check_walk_permissions(
+        self.walk_path_following_symlinks(
             context,
+            from,
+            components,
             #[cfg(debug_assertions)]
             absolute_components,
-            &outcome,
-        )?;
+        )
+    }
 
-        let walked = outcome.components.len();
-        match outcome.stop_reason {
-            WalkStopReason::CompleteDirectory => {
-                assert_eq!(walked, components.len());
-                Ok((outcome, walked))
+    /// Walk `components` from `from`, transparently following a symlink encountered in an
+    /// *intermediate* (non-final) position -- e.g. Alpine's usrmerge `/lib -> usr/lib` -- up to
+    /// [`MAX_SYMLINK_HOPS`] times, matching the same hop-limit idiom
+    /// [`super::in_mem::FileSystem::resolve_final_symlinks`] uses for the writable upper layer.
+    ///
+    /// A symlink encountered at the requested *final* component is deliberately left unresolved
+    /// here: callers that need the final component followed too (e.g. `open()` without
+    /// `O_NOFOLLOW`) do so themselves once they have the resolved parent + leaf name, exactly as
+    /// before this change. Only intermediate components -- which can never legitimately be
+    /// anything but "a directory, or a symlink to one" -- are resolved inline, since a walk cannot
+    /// otherwise continue through them.
+    ///
+    /// Returns the same shape `walk_directories` would: the final [`WalkOutcome`] plus how many of
+    /// the *originally requested* `components` were consumed (which, after following any
+    /// intermediate symlinks, no longer 1:1 corresponds to `outcome.components.len()`, hence
+    /// returned separately).
+    fn walk_path_following_symlinks<'a>(
+        &'a self,
+        context: &Context,
+        // Every hop restarts the walk from the backend root (all current call sites already pass
+        // `self.backend.root()` here, and a symlink target can point anywhere in the tree), since
+        // `WalkingDirHandle` cannot cheaply be "rewound" to an intermediate point once a backend
+        // has walked past it. The parameter is retained (rather than dropped in favor of an
+        // internal `self.backend.root()` call) so this function's signature keeps documenting that
+        // the walk is root-relative, matching `walk_to_directory`/`walk_path`'s existing contract.
+        _from: WalkingDirHandle<'a>,
+        components: &[&str],
+        #[cfg(debug_assertions)] absolute_components: &[&str],
+    ) -> Result<(WalkOutcome<WalkingDirHandle<'a>>, usize), WalkError> {
+        // Owned, mutable working copy of the remaining path, so a symlink target can be spliced
+        // in.
+        let mut remaining: Vec<String> = components.iter().map(|c| (*c).to_string()).collect();
+        let original_len = components.len();
+
+        for _ in 0..MAX_SYMLINK_HOPS {
+            let current: Vec<&str> = remaining.iter().map(String::as_str).collect();
+            let outcome = self
+                .backend
+                .walk_directories(self.backend.root(), &current)?;
+            Self::check_walk_permissions(
+                context,
+                #[cfg(debug_assertions)]
+                absolute_components,
+                &outcome,
+            )?;
+
+            let walked = outcome.components.len();
+            let is_final_component_stop = outcome.stop_reason
+                == WalkStopReason::StoppedAtNonDirectory
+                && walked + 1 == current.len();
+            if outcome.stop_reason == WalkStopReason::CompleteDirectory || is_final_component_stop {
+                // Either fully walked, or stopped exactly at the requested final component (which
+                // is allowed to be a non-directory, e.g. a file or a symlink the caller will
+                // resolve itself) -- nothing left for us to do. `walked` here is relative to
+                // `current`, not the original `components`; report it in original-request terms by
+                // adding back however many components were already consumed by prior symlink hops.
+                let consumed_before_this_hop = original_len - current.len();
+                return Ok((outcome, walked + consumed_before_this_hop));
             }
-            WalkStopReason::StoppedAtNonDirectory if walked + 1 == components.len() => {
-                Ok((outcome, walked))
-            }
-            WalkStopReason::StoppedAtNonDirectory => {
-                Err(WalkError::PathError(PathError::ComponentNotADirectory))
-            }
-            WalkStopReason::Continue => {
-                // TODO(jayb): Continue walking from `outcome.last` once partial backend walks are
-                // supported by the resolver.
-                unimplemented!("partial backend walks are not supported yet")
-            }
+
+            // Stopped at a genuinely intermediate (non-final) component. If it names a symlink,
+            // follow it transparently and retry; otherwise this is a real `ComponentNotADirectory`,
+            // reported the same way `walk_to_directory`/`walk_path` always have. (`read_link_at`
+            // consumes `outcome.last`, so we must have already decided we no longer need
+            // `outcome` itself before calling it.)
+            let symlink_component = current[walked];
+            let Some(target) = self
+                .backend
+                .read_link_at(outcome.last, symlink_component)
+                .ok()
+                .flatten()
+            else {
+                return Err(WalkError::PathError(PathError::ComponentNotADirectory));
+            };
+
+            let mut new_remaining: Vec<String> = if let Some(target) = target.strip_prefix('/') {
+                target
+                    .split('/')
+                    .filter(|c| !c.is_empty() && *c != ".")
+                    .map(String::from)
+                    .collect()
+            } else {
+                // Relative target: resolve against the directory containing the symlink, i.e. the
+                // already-walked prefix (`current[..walked]`).
+                let mut v: Vec<String> =
+                    current[..walked].iter().map(|c| (*c).to_string()).collect();
+                for component in target.split('/') {
+                    match component {
+                        "" | "." => {}
+                        ".." => {
+                            v.pop();
+                        }
+                        c => v.push(c.to_string()),
+                    }
+                }
+                v
+            };
+            // Append whatever of the original request came after the symlink component itself.
+            new_remaining.extend(current[walked + 1..].iter().map(|c| (*c).to_string()));
+            remaining = new_remaining;
         }
+        Err(WalkError::PathError(PathError::TooManySymlinkHops))
     }
 
     fn check_walk_permissions(
@@ -716,10 +798,36 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     fn read_link(&self, path: impl Arg) -> Result<String, ReadLinkError> {
-        // `Backend` has no notion of symlinks at all (see `symlink` above); nothing mounted
-        // through this resolver can ever contain one, so any `path` is simply not a symlink.
-        let _ = path;
-        Err(ReadLinkError::NotASymlink)
+        // Backends can carry real symlinks now (see `Backend::read_link_at`, needed so
+        // intermediate-component symlinks like Alpine's usrmerge `/lib -> usr/lib` can be followed
+        // during a walk) even though `symlink()`/`rename()` above remain unsupported for
+        // *creating* new entries -- every current mount through this resolver is still read-only
+        // (`tar_ro`) or a device backend (`devices`) with nothing to write.
+        let context = default_context_pre_context_management_changes();
+        let path = context.resolve(path)?;
+        let Some((parent, name)) =
+            self.parent_dir_and_name(&context, &path)
+                .map_err(|error| match error {
+                    WalkError::Io => ReadLinkError::Io,
+                    WalkError::PathError(error) => error.into(),
+                })?
+        else {
+            // The root itself was requested; it is always a directory, never a symlink.
+            return Err(ReadLinkError::NotASymlink);
+        };
+        match self.backend.read_link_at(parent, name) {
+            Ok(Some(target)) => Ok(target),
+            Ok(None) => Err(ReadLinkError::NotASymlink),
+            Err(OpenError::PathError(error)) => Err(error.into()),
+            Err(
+                OpenError::Io
+                | OpenError::AccessNotAllowed
+                | OpenError::NoWritePerms
+                | OpenError::ReadOnlyFileSystem
+                | OpenError::AlreadyExists
+                | OpenError::TruncateError(_),
+            ) => Err(ReadLinkError::Io),
+        }
     }
 
     fn mkdir(&self, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {

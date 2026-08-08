@@ -4,6 +4,7 @@
 //! [`Backend`] for filesystems supported by [`super::resolver`]
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::any::{Any, TypeId};
 use core::marker::PhantomData;
@@ -88,6 +89,26 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
 
     /// Read directory entries at `dir`.
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError>;
+
+    /// If `name` at `dir` names a symlink, return its (unresolved) target string.
+    ///
+    /// Returns `Ok(None)` if `name` exists but is not a symlink. Returns
+    /// `Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))` if `name` does not exist at
+    /// `dir`. This exists so [`super::resolver::Resolver`] can transparently follow a symlink
+    /// appearing in an intermediate (non-final) path component during a walk -- e.g. Alpine's
+    /// usrmerge `/lib -> usr/lib` -- the same way [`super::in_mem`] already does for its own
+    /// (upper/writable) layer.
+    ///
+    /// Backends with no symlink concept (e.g. [`super::devices::Devices`]) can rely on the default
+    /// body, which always reports "not a symlink" for anything walkable.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn read_link_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        name: &str,
+    ) -> Result<Option<String>, OpenError> {
+        Ok(None)
+    }
 
     /// Read at `offset` into `buf`, returning the number of bytes read.
     ///

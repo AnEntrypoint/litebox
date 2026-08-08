@@ -622,6 +622,31 @@ impl Backend for Composer {
         }
     }
 
+    fn read_link_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        name: &str,
+    ) -> Result<Option<String>, OpenError> {
+        let dir = dir.into_typed::<Self>();
+        match dir.inner {
+            // A virtual directory is a pure mount-point placeholder with no real backend entries
+            // of its own; nothing there can be a symlink.
+            ComposerWalkingDirHandleInner::Virtual { .. } => Ok(None),
+            ComposerWalkingDirHandleInner::Mounted {
+                path,
+                mount_index,
+                handle,
+            } => {
+                self.checked_child_path(
+                    path,
+                    name,
+                    OpenError::PathError(PathError::NoSuchFileOrDirectory),
+                )?;
+                self.mounts[mount_index].backend.read_link_at(handle, name)
+            }
+        }
+    }
+
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
         let handle = handle.into_typed::<Self>();
         match handle.inner {

@@ -1091,6 +1091,86 @@ mod tar_ro {
             Err(crate::fs::errors::ReadDirError::NotADirectory)
         ));
     }
+
+    /// A fixture with a real symlink tar entry: `lib -> usr/lib`, an intermediate directory
+    /// component the same way Alpine's usrmerge `/lib -> usr/lib` compat symlink does, plus a file
+    /// (`usr/lib/libfoo.so.1`) only reachable by walking through it.
+    ///
+    /// Regression coverage for the bug where `tar_no_std::TarArchiveRef::entries()` silently
+    /// dropped every non-regular-file tar entry (including symlinks) during indexing, and where
+    /// the resolver's directory walk had no path to follow a symlink appearing in a non-final path
+    /// component -- together causing `apk`'s package-extraction writes through a symlinked
+    /// directory (e.g. `/lib/libbrotlicommon.so.1`) to fail with `ENOENT`.
+    const SYMLINK_TEST_TAR_FILE: &[u8] = include_bytes!("./symlink_test.tar");
+
+    #[test]
+    fn read_link_reports_symlink_target() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let fs = super::tar_ro_fs(&litebox, SYMLINK_TEST_TAR_FILE.into());
+        let target = fs.read_link("lib").expect("Failed to read symlink target");
+        assert_eq!(target, "usr/lib");
+    }
+
+    #[test]
+    fn read_link_on_non_symlink_fails() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let fs = super::tar_ro_fs(&litebox, SYMLINK_TEST_TAR_FILE.into());
+        assert!(matches!(
+            fs.read_link("usr/lib/libfoo.so.1"),
+            Err(crate::fs::errors::ReadLinkError::NotASymlink)
+        ));
+        assert!(matches!(
+            fs.read_link("usr"),
+            Err(crate::fs::errors::ReadLinkError::NotASymlink)
+        ));
+    }
+
+    #[test]
+    fn open_through_intermediate_symlink_directory() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let fs = super::tar_ro_fs(&litebox, SYMLINK_TEST_TAR_FILE.into());
+
+        // The real (non-symlinked) path works as a baseline.
+        let fd = fs
+            .open("usr/lib/libfoo.so.1", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open file via its real path");
+        let mut buffer = vec![0; 1024];
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from file");
+        assert_eq!(&buffer[..bytes_read], b"libdata\n");
+        fs.close(&fd).expect("Failed to close file");
+
+        // The same file, reached by walking through the `lib -> usr/lib` intermediate symlink,
+        // must resolve to the exact same content -- this is the actual bug: previously this failed
+        // with `NoSuchFileOrDirectory` because symlinks were both unindexed and unfollowed.
+        let fd = fs
+            .open("lib/libfoo.so.1", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open file via intermediate symlink");
+        let mut buffer = vec![0; 1024];
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from file");
+        assert_eq!(&buffer[..bytes_read], b"libdata\n");
+        fs.close(&fd).expect("Failed to close file");
+    }
+
+    #[test]
+    fn list_dir_reports_symlink_file_type() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let fs = super::tar_ro_fs(&litebox, SYMLINK_TEST_TAR_FILE.into());
+        let fd = fs
+            .open("/", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open root directory");
+        let entries = fs.read_dir(&fd).expect("Failed to read root directory");
+        fs.close(&fd).expect("Failed to close root directory");
+
+        let lib_entry = entries
+            .iter()
+            .find(|e| e.name == "lib")
+            .expect("lib entry should be present");
+        assert_eq!(lib_entry.file_type, crate::fs::FileType::Symlink);
+    }
 }
 
 mod layered {
