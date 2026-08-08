@@ -25,7 +25,9 @@ use litebox_common_linux::{
 };
 use thiserror::Error;
 
-use crate::{GlobalState, ShimFS, ShimPlatform, Task, UserPtr, UserPtrMut, syscalls::signal};
+use crate::{
+    GlobalState, ShimFS, ShimPlatform, Task, TermiosState, UserPtr, UserPtrMut, syscalls::signal,
+};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Clone, Copy)]
@@ -2372,25 +2374,37 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(raw_fd.try_into().unwrap())
     }
 
-    fn stdio_ioctl(&self, arg: &IoctlArg) -> Result<u32, Errno> {
+    /// Handle a `TCGETS`/`TCSETS`/`TCSETSW`/`TCSETSF`/`TIOCGWINSZ` ioctl on a stdio fd.
+    ///
+    /// `litebox` has no real POSIX termios/tty layer underneath on every platform, so this
+    /// tracks the guest-requested `termios` state per fd (mirroring `flock`'s
+    /// `FlockHolder`/`with_metadata_mut` idiom) and accepts every `TCSETS*` variant as success --
+    /// `TCGETS` then reflects back whatever was last set, so a `tcgetattr`/`tcsetattr`/`tcgetattr`
+    /// round-trip (exactly what libuv's `uv__tty_make_raw` performs to save/restore terminal
+    /// state around raw mode) observes consistent, self-coherent state instead of always reading
+    /// back zeroed flags regardless of what was set.
+    fn stdio_ioctl(&self, fd: &TypedFd<FS>, arg: &IoctlArg) -> Result<u32, Errno> {
         match arg {
-            IoctlArg::TCGETS(termios) => {
-                termios
-                    .write_at_offset::<Platform>(
-                        0,
-                        litebox_common_linux::Termios {
-                            c_iflag: 0,
-                            c_oflag: 0,
-                            c_cflag: 0,
-                            c_lflag: 0,
-                            c_line: 0,
-                            c_cc: [0; 19],
-                        },
-                    )
+            IoctlArg::TCGETS(termios_ptr) => {
+                let dt = self.global.litebox.descriptor_table();
+                let termios = dt
+                    .with_metadata(fd, |t: &TermiosState| t.0.clone())
+                    .unwrap_or_else(|_| TermiosState::default().0);
+                termios_ptr
+                    .write_at_offset::<Platform>(0, termios)
                     .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
-            IoctlArg::TCSETS(_) => Ok(0), // TODO: implement
+            IoctlArg::TCSETS(termios_ptr)
+            | IoctlArg::TCSETSW(termios_ptr)
+            | IoctlArg::TCSETSF(termios_ptr) => {
+                let termios = termios_ptr
+                    .read_at_offset::<Platform>(0)
+                    .ok_or(Errno::EFAULT)?;
+                let mut dt = self.global.litebox.descriptor_table_mut();
+                dt.set_entry_metadata(fd, TermiosState(termios));
+                Ok(0)
+            }
             IoctlArg::TIOCGWINSZ(ws) => {
                 ws.write_at_offset::<Platform>(
                     0,
@@ -2546,6 +2560,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             )?,
             IoctlArg::TCGETS(..)
             | IoctlArg::TCSETS(..)
+            | IoctlArg::TCSETSW(..)
+            | IoctlArg::TCSETSF(..)
             | IoctlArg::TIOCGPTN(..)
             | IoctlArg::TIOCGWINSZ(..) => files.run_on_raw_fd(
                 desc,
@@ -2567,7 +2583,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                 Errno::ENOTTY
                             })?;
                         if self.global.platform.is_a_tty(stream) {
-                            self.stdio_ioctl(&arg)
+                            self.stdio_ioctl(fd, &arg)
                         } else {
                             Err(Errno::ENOTTY)
                         }
@@ -3616,5 +3632,104 @@ mod tests {
             task.sys_stat("/cwd_test/subdir").unwrap_err(),
             Errno::ENOENT
         );
+    }
+
+    #[test]
+    fn tcsetsw_and_tcsetsf_round_trip_through_tcgets() {
+        // Regression test for the ENOTTY node.js `setRawMode` crash: libuv's
+        // `uv__tty_make_raw` calls `tcsetattr(fd, TCSAFLUSH, ...)`, i.e. ioctl command
+        // `TCSETSF`, never plain `TCSETS`. Exercise `stdio_ioctl` directly (bypassing
+        // `is_a_tty`, which the mock platform always reports `false` for) to verify the
+        // real per-fd `TermiosState` storage/round-trip logic added to close that gap.
+        let task = crate::syscalls::tests::init_platform(None);
+        let files = task.files.borrow();
+        let raw_fd_lookup = files.raw_descriptor_store.read().fd_from_raw_integer(0);
+        assert!(
+            raw_fd_lookup.is_ok(),
+            "test harness invariant: fd 0 must be the stdio-initialized stdin fd"
+        );
+        let Ok(stdin_fd) = raw_fd_lookup else {
+            return;
+        };
+
+        // Before any TCSETS*, TCGETS must succeed with the documented all-zero default
+        // rather than erroring (there is no real termios layer underneath).
+        let mut got = litebox_common_linux::Termios {
+            c_iflag: 0xFFFF_FFFF,
+            c_oflag: 0xFFFF_FFFF,
+            c_cflag: 0xFFFF_FFFF,
+            c_lflag: 0xFFFF_FFFF,
+            c_line: 0xFF,
+            c_cc: [0xFF; 19],
+        };
+        let got_ptr = UserPtrMut::from_usize((&raw mut got).expose_provenance());
+        assert_eq!(
+            task.stdio_ioctl(&stdin_fd, &IoctlArg::TCGETS(got_ptr)),
+            Ok(0)
+        );
+        assert_eq!(got.c_lflag, 0);
+
+        // TCSETSF (what libuv actually issues for raw mode) must be accepted, not rejected
+        // as an unrecognized/`Raw` ioctl command.
+        let mut raw_termios = litebox_common_linux::Termios {
+            c_iflag: 0,
+            c_oflag: 0,
+            c_cflag: 0,
+            // ICANON/ECHO cleared is what raw mode disables; use a recognizable nonzero
+            // value here purely to prove round-trip fidelity through storage.
+            c_lflag: 0x1234,
+            c_line: 0,
+            c_cc: [0; 19],
+        };
+        let set_ptr = UserPtr::from_usize((&raw mut raw_termios).expose_provenance());
+        assert_eq!(
+            task.stdio_ioctl(&stdin_fd, &IoctlArg::TCSETSF(set_ptr)),
+            Ok(0)
+        );
+
+        // TCGETS afterwards must reflect exactly what TCSETSF stored.
+        let mut after_flush = litebox_common_linux::Termios {
+            c_iflag: 0,
+            c_oflag: 0,
+            c_cflag: 0,
+            c_lflag: 0,
+            c_line: 0,
+            c_cc: [0; 19],
+        };
+        let after_flush_ptr = UserPtrMut::from_usize((&raw mut after_flush).expose_provenance());
+        assert_eq!(
+            task.stdio_ioctl(&stdin_fd, &IoctlArg::TCGETS(after_flush_ptr)),
+            Ok(0)
+        );
+        assert_eq!(after_flush.c_lflag, 0x1234);
+
+        // TCSETSW (TCSADRAIN) must also be accepted and likewise observable via TCGETS.
+        let mut drain_termios = litebox_common_linux::Termios {
+            c_iflag: 0,
+            c_oflag: 0,
+            c_cflag: 0,
+            c_lflag: 0x5678,
+            c_line: 0,
+            c_cc: [0; 19],
+        };
+        let drain_ptr = UserPtr::from_usize((&raw mut drain_termios).expose_provenance());
+        assert_eq!(
+            task.stdio_ioctl(&stdin_fd, &IoctlArg::TCSETSW(drain_ptr)),
+            Ok(0)
+        );
+        let mut after_drain = litebox_common_linux::Termios {
+            c_iflag: 0,
+            c_oflag: 0,
+            c_cflag: 0,
+            c_lflag: 0,
+            c_line: 0,
+            c_cc: [0; 19],
+        };
+        let after_drain_ptr = UserPtrMut::from_usize((&raw mut after_drain).expose_provenance());
+        assert_eq!(
+            task.stdio_ioctl(&stdin_fd, &IoctlArg::TCGETS(after_drain_ptr)),
+            Ok(0)
+        );
+        assert_eq!(after_drain.c_lflag, 0x5678);
     }
 }

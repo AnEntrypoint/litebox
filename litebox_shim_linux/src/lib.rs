@@ -447,6 +447,29 @@ fn default_fs<Platform: ShimPlatform>(
 #[derive(Clone)]
 pub(crate) struct StdioStatusFlags(litebox::fs::OFlags);
 
+/// Per-fd `termios` state, as last set by `ioctl(TCSETS|TCSETSW|TCSETSF)`.
+///
+/// LiteBox has no real POSIX termios layer underneath on every platform, so a stdio fd's
+/// raw/cooked mode is tracked purely as in-memory state: `TCSETS*` stores the guest-requested
+/// flags here, and `TCGETS` reads them back, so a `tcgetattr`/`tcsetattr`/`tcgetattr` round-trip
+/// (as performed by libuv's `uv__tty_make_raw` to save and later restore terminal state around
+/// raw mode) observes self-consistent state.
+#[derive(Clone)]
+pub(crate) struct TermiosState(pub(crate) litebox_common_linux::Termios);
+
+impl Default for TermiosState {
+    fn default() -> Self {
+        Self(litebox_common_linux::Termios {
+            c_iflag: 0,
+            c_oflag: 0,
+            c_cflag: 0,
+            c_lflag: 0,
+            c_line: 0,
+            c_cc: [0; 19],
+        })
+    }
+}
+
 impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS> {
     fn initialize_stdio_in_shared_descriptors_table(&self, global: &GlobalState<Platform, FS>) {
         use litebox::fs::{Mode, OFlags};

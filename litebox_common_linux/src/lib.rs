@@ -743,6 +743,8 @@ pub struct Winsize {
 
 pub const TCGETS: u32 = 0x5401;
 pub const TCSETS: u32 = 0x5402;
+pub const TCSETSW: u32 = 0x5403;
+pub const TCSETSF: u32 = 0x5404;
 pub const TIOCGWINSZ: u32 = 0x5413;
 pub const FIONBIO: u32 = 0x5421;
 pub const FIOCLEX: u32 = 0x5451;
@@ -754,8 +756,15 @@ pub const TIOCGPTN: u32 = 0x80045430;
 pub enum IoctlArg {
     /// Get the current serial port settings.
     TCGETS(UserPtrMut<Termios>),
-    /// Set the current serial port settings.
+    /// Set the current serial port settings immediately (`TCSANOW`).
     TCSETS(UserPtr<Termios>),
+    /// Set the current serial port settings after draining output (`TCSADRAIN`).
+    TCSETSW(UserPtr<Termios>),
+    /// Set the current serial port settings after flushing input/output (`TCSAFLUSH`).
+    ///
+    /// This is the command libuv's `uv__tty_make_raw` (and therefore Node's
+    /// `tty.ReadStream.setRawMode`) actually issues.
+    TCSETSF(UserPtr<Termios>),
     /// Get window size.
     TIOCGWINSZ(UserPtrMut<Winsize>),
     /// Obtain device unit number, which can be used to generate
@@ -2642,6 +2651,8 @@ impl SyscallRequest {
                     match cmd {
                         TCGETS => IoctlArg::TCGETS(ctx.sys_req_ptr(2)),
                         TCSETS => IoctlArg::TCSETS(ctx.sys_req_ptr(2)),
+                        TCSETSW => IoctlArg::TCSETSW(ctx.sys_req_ptr(2)),
+                        TCSETSF => IoctlArg::TCSETSF(ctx.sys_req_ptr(2)),
                         TIOCGWINSZ => IoctlArg::TIOCGWINSZ(ctx.sys_req_ptr(2)),
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
