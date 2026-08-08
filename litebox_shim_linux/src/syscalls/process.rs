@@ -91,6 +91,17 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
             false
         }
     }
+
+    /// Returns the cell that holds this thread's [`litebox::event::wait::ThreadHandle`], used by
+    /// [`Task::handle_init_request`] (the real per-guest-thread startup path) and, in tests only,
+    /// by `Task::set_thread_handle_for_test` to publish a `ThreadHandle` for a thread spawned via
+    /// `spawn_clone_for_test`, which does not go through the real guest-thread-startup path.
+    #[cfg(test)]
+    pub(crate) fn remote_handle_cell(
+        &self,
+    ) -> &once_cell::race::OnceBox<litebox::event::wait::ThreadHandle<Platform>> {
+        &self.remote.handle
+    }
 }
 
 impl<Platform: ShimPlatform> Drop for ThreadState<Platform> {
@@ -417,15 +428,40 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Updates the process exit status for a group exit and signals all threads
     /// to exit.
     pub(crate) fn exit_group(&self, status: ExitStatus) {
-        let mut inner = self.thread.process.inner.lock();
-        if self.is_exiting() {
-            return;
-        }
-        assert!(!inner.group_exit);
-        inner.exit_status = status;
-        inner.group_exit = true;
-        for thread in inner.threads.values() {
-            thread.is_exiting.store(true, Ordering::Relaxed);
+        // Mark every thread as exiting, and collect their remotes, while holding `inner` --
+        // but do NOT call `interrupt()` (below) while still holding it.
+        //
+        // `ThreadRemote::interrupt`/`ThreadHandle::interrupt` can call the platform's
+        // `SuspendThread` (Windows) directly on another live thread (see
+        // `litebox::event::wait::ThreadHandle::interrupt` and its platform-level
+        // `interrupt_thread`/VEH counterpart) -- an OS-level thread-suspend primitive that has
+        // no notion of "don't suspend while a Rust-level lock is held" by the *target* thread.
+        // If any other thread in this process is concurrently trying to acquire this same
+        // `inner` lock (e.g. another thread racing through its own `exit_thread`/`detach_thread`,
+        // or `attach_thread` for a just-`clone()`d sibling), holding `inner` across the whole
+        // interrupt loop serializes that thread's progress behind this loop for no reason, and
+        // -- worse -- widens the window in which a suspended thread can be frozen while it
+        // legitimately needs this exact lock to make forward progress once resumed, needlessly
+        // extending how long shutdown can appear stalled. This mirrors the exact class of bug
+        // fixed in `write_to_raw_handle`'s doc comment (`litebox_platform_windows_userland`):
+        // never hold a Rust-level lock across a call that can suspend another thread. Collecting
+        // the remotes first and interrupting after dropping the lock removes that coupling
+        // entirely, matching how a real kernel's `do_group_exit` never needs to hold a
+        // process-wide lock while signaling sibling threads.
+        let remotes: alloc::vec::Vec<_> = {
+            let mut inner = self.thread.process.inner.lock();
+            if self.is_exiting() {
+                return;
+            }
+            assert!(!inner.group_exit);
+            inner.exit_status = status;
+            inner.group_exit = true;
+            for thread in inner.threads.values() {
+                thread.is_exiting.store(true, Ordering::Relaxed);
+            }
+            inner.threads.values().cloned().collect()
+        };
+        for thread in remotes {
             thread.interrupt();
         }
     }
@@ -435,20 +471,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Returns false if this thread is already exiting.
     #[must_use]
     fn kill_other_threads(&self) -> bool {
-        {
+        // See `exit_group`'s doc comment on why `interrupt()` must never be called while
+        // holding `inner`: collect the other threads' remotes first, mark
+        // `is_killing_other_threads` and release the lock, then interrupt them afterward.
+        let remotes: alloc::vec::Vec<_> = {
             let mut inner = self.thread.process.inner.lock();
             if self.is_exiting() {
                 return false;
             }
-            for (&tid, thread) in &inner.threads {
-                if tid == self.tid {
-                    continue;
-                }
+            let remotes = inner
+                .threads
+                .iter()
+                .filter(|&(&tid, _)| tid != self.tid)
+                .map(|(_, thread)| thread.clone())
+                .collect::<alloc::vec::Vec<_>>();
+            for thread in &remotes {
                 thread.is_exiting.store(true, Ordering::Relaxed);
-                thread.interrupt();
             }
             assert!(!inner.is_killing_other_threads);
             inner.is_killing_other_threads = true;
+            remotes
+        };
+        for thread in &remotes {
+            thread.interrupt();
         }
         // Wait for other threads to exit.
         loop {
@@ -2659,6 +2704,108 @@ mod tests {
             // Clean up the timer.
             handle.delete_timer();
         });
+    }
+
+    /// Regression test for a multi-threaded `exit_group` deadlock: a background thread genuinely
+    /// blocked in `FUTEX_WAIT` must actually be woken and get a chance to detach from the process
+    /// once another thread calls `exit_group` -- mirroring the real hang this test was written to
+    /// catch (`node -e "console.log(1)"` never terminating: several `CLONE_THREAD` background
+    /// threads block in real waits, and the whole process only terminates once every one of them
+    /// has detached, tracked by `Process::wait_for_exit`'s `nr_threads` count reaching zero).
+    ///
+    /// Also exercises the specific fix in `exit_group`/`kill_other_threads`: `ThreadRemote::interrupt`
+    /// (`litebox::event::wait::ThreadHandle::interrupt`) can suspend another live OS thread
+    /// directly (`SuspendThread` on Windows) -- an operation with no notion of "don't suspend while
+    /// a Rust-level lock is held" by the *caller*. Before the fix, `exit_group` called `interrupt()`
+    /// on every other thread while still holding `Process::inner`'s lock, needlessly widening the
+    /// window during which any other thread contending for that same lock (e.g. another thread
+    /// racing through its own exit, or a concurrent `clone()`) is blocked behind the whole
+    /// interrupt loop. The fix collects the thread list and releases the lock before calling
+    /// `interrupt()` on each. This test does not by itself reproduce that specific contention (it
+    /// would require a precise race), but it does exercise the exact interrupt-and-wait-for-exit
+    /// path end-to-end, with a bounded watchdog so a real regression fails the test instead of
+    /// hanging CI forever.
+    #[test]
+    fn test_exit_group_wakes_thread_blocked_in_futex_wait() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let process = task.process().clone();
+        <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+            // A futex word that will never reach any value other than 0 -- the background
+            // thread's `FUTEX_WAIT` only returns if genuinely woken (by an explicit `FUTEX_WAKE`,
+            // which nothing here issues, or by `exit_group`'s interrupt).
+            let mut futex_word: u32 = 0;
+            let futex_addr = (&raw mut futex_word) as usize;
+
+            let bg = task.spawn_clone_for_test(move |bg_task| {
+                // Register this OS thread's `ThreadHandle` with the background `Task`, exactly as
+                // the platform does via `EnterShim::init`/`Task::handle_init_request` before a
+                // real guest thread ever runs guest code -- without this, `ThreadRemote::interrupt`
+                // (which reads `ThreadRemote::handle`, only ever populated by
+                // `handle_init_request`) is a guaranteed no-op for this thread, since nothing else
+                // ever populates it. `run_test_thread` sets up this OS thread's TLS/`ThreadHandle`
+                // machinery at the platform level; `bg_task.set_thread_handle_for_test()` then
+                // publishes it into `ThreadRemote::handle` the same way `handle_init_request` does.
+                <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+                    bg_task.set_thread_handle_for_test();
+
+                    let futex_ptr = UserPtrMut::from_usize(futex_addr);
+                    let result = bg_task.sys_futex(litebox_common_linux::FutexArgs::Wait {
+                        addr: futex_ptr,
+                        flags: litebox_common_linux::FutexFlags::PRIVATE,
+                        val: 0,
+                        timeout: litebox_common_linux::TimeParam::None,
+                    });
+                    // Interrupted by `exit_group`'s `is_exiting`-driven wake, not a real
+                    // wake/timeout.
+                    assert_eq!(
+                        result,
+                        Err(litebox_common_linux::errno::Errno::EINTR),
+                        "background thread's FUTEX_WAIT should be interrupted by exit_group"
+                    );
+                    // Dropping `bg_task` here (falling off the end of this closure) runs
+                    // `Task::prepare_for_exit` via `Drop for Task`, exactly as a real guest
+                    // thread's `Task` drops once its syscall loop observes `is_exiting()` and
+                    // returns `ContinueOperation::Terminate` -- decrementing `nr_threads`.
+                });
+            });
+
+            // Give the background thread a real chance to enter the blocking wait before this
+            // thread calls `exit_group` -- otherwise the test would trivially pass even with the
+            // pre-fix code, since `is_exiting()`'s pre-block check in `commit_wait` would already
+            // catch it before it ever blocks.
+            std::thread::sleep(core::time::Duration::from_millis(50));
+
+            task.exit_group(super::ExitStatus::Exit(0));
+
+            bg.join().expect("background thread panicked");
+
+            // Drop this (the calling) thread's own `Task`, matching a real `exit_group` caller,
+            // which unwinds back out of the shim and drops its own `Task` immediately afterward
+            // (see `Task::sys_exit_group`'s doc comment) -- `Process::wait_for_exit` waits for
+            // EVERY thread, including this one, to detach, not just the background thread.
+            drop(task);
+        });
+
+        // `Process::wait_for_exit` blocks until every thread in the process (both the background
+        // thread above and the caller of `exit_group` itself) has detached. If `exit_group`'s
+        // interrupt delivery regresses -- e.g. the background thread's `FUTEX_WAIT` is never
+        // actually woken -- this hangs forever, so it must run on a watchdog-timed thread rather
+        // than the test thread itself, to fail cleanly instead of hanging the whole test binary.
+        let waiter = std::thread::spawn(move || {
+            process.wait_for_exit();
+        });
+
+        let start = std::time::Instant::now();
+        let timeout = core::time::Duration::from_secs(10);
+        while !waiter.is_finished() {
+            assert!(
+                start.elapsed() < timeout,
+                "Process::wait_for_exit did not return within {timeout:?} -- \
+                 exit_group failed to wake the background thread blocked in FUTEX_WAIT"
+            );
+            std::thread::sleep(core::time::Duration::from_millis(10));
+        }
+        waiter.join().expect("wait_for_exit thread panicked");
     }
 
     #[test]

@@ -1508,5 +1508,25 @@ mod test_utils {
             let task = self.clone_for_test().unwrap();
             std::thread::spawn(move || f(task))
         }
+
+        /// Publishes this task's [`ThreadHandle`](litebox::event::wait::ThreadHandle) into
+        /// `syscalls::process::ThreadRemote::handle`, exactly as `Task::handle_init_request` does
+        /// for a real guest thread before it first runs guest code.
+        ///
+        /// Must be called once, on the OS thread that will run this task, after that thread has
+        /// registered its own platform-level `ThreadHandle`
+        /// (e.g. via [`ThreadProvider::run_test_thread`](litebox::platform::ThreadProvider::run_test_thread)),
+        /// and before performing any interruptible wait on this task -- otherwise
+        /// `ThreadRemote::interrupt`/`exit_group` cannot reach this thread at all, since nothing
+        /// else ever populates `ThreadRemote::handle` outside the real
+        /// [`litebox::shim::EnterShim::init`] entrypoint that production guest-thread startup
+        /// always goes through, which `spawn_clone_for_test` deliberately bypasses (it does not
+        /// run any guest code).
+        pub(crate) fn set_thread_handle_for_test(&self) {
+            self.thread
+                .remote_handle_cell()
+                .set(alloc::boxed::Box::new(self.wait_state.thread_handle()))
+                .ok();
+        }
     }
 }
