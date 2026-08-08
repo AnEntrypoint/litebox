@@ -51,26 +51,28 @@ jobs:
           sudo apt install -y diod
       - uses: Swatinem/rust-cache@v2
         with:
-          # Cache-bust: the persisted cache (including target/tmp's litebox_syscall_rewriter
-          # test-output cache under litebox_runner_linux_userland/tests) reached a stale state
-          # that broke the Python-based tests (test_runner_with_python{,_repl_pty}) with "Fatal
-          # Python error: init_fs_encoding ... ModuleNotFoundError: No module named 'encodings'"
-          # during the guest interpreter's own startup. Reproduced deterministically even
-          # re-running CI from an unrelated, previously-green commit, confirming this is
-          # pre-existing cache staleness, not a real code regression. The v2-rust and v3-rust
-          # prefix bumps didn't stick either (same failure signature resurfaced yet again on a
-          # later, also-unrelated commit) -- bumped a third time to v4-rust, and likewise the
-          # sibling "Cache custom out directories" step below (which independently caches
-          # target/tmp's rewriter output, keyed only off Cargo.lock/rewriter-source hashes rather
-          # than commit) is bumped again too, since it's an equally plausible carrier of the same
-          # stale litebox_syscall_rewriter output. Bump both again if this signature resurfaces.
-          prefix-key: v4-rust
+          # Root cause found and fixed (see litebox_runner_linux_userland/tests/run.rs,
+          # python_runner()): staging the host's Python stdlib directory into the test rootfs
+          # used `python_lib_dst.exists()` as its "already copied" signal. `target/` (including
+          # CARGO_TARGET_TMPDIR, where that staging directory lives) is persisted across CI runs
+          # by this very rust-cache step, so a directory left behind incomplete by an interrupted
+          # prior run (job cancellation, OOM-kill mid-`cp`, etc.) would report "exists" forever
+          # after, permanently skipping re-population and silently omitting files like
+          # `encodings/` -- producing "Fatal Python error: init_fs_encoding ...
+          # ModuleNotFoundError: No module named 'encodings'" in test_runner_with_python{,_repl_pty}
+          # on every run until the cache was reset. Fixed by writing a completion marker only
+          # after `cp` finishes and wiping+redoing the copy whenever that marker is absent, so a
+          # partial copy can never be silently reused. No cache-prefix bump needed for this fix to
+          # take effect, but the key is kept unique from the pre-fix caches below anyway so a
+          # cache produced by a run pinned to an older commit can't get restored on top of a
+          # newer, already-fixed one and mask a regression.
+          prefix-key: v5-rust
       - name: Cache custom out directories
         uses: actions/cache@v5
         with:
           path: |
             target/*/build/litebox_runner_linux_userland-*/out
-          key: custom-out-v3-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/litebox_syscall_rewriter/**/*.rs') }}
+          key: custom-out-v4-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/litebox_syscall_rewriter/**/*.rs') }}
       - run: ./.github/tools/github_actions_run_cargo fmt
       - run: |
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp
