@@ -539,6 +539,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 unreachable!()
             };
         }
+        // A freshly-opened `/dev/stdin`/`/dev/stdout`/`/dev/stderr` gets its own new fd distinct
+        // from fds 0/1/2, but ioctl's TCGETS/TCSETS*/TIOCGWINSZ handling in `sys_ioctl` requires
+        // `StdioStream` metadata to route the request correctly (see `is_a_tty`'s dispatch). Node's
+        // libuv (`uv__tty_make_raw`, backing `process.stdin.setRawMode`) reopens `/dev/stdin` to
+        // get a private fd for termios operations rather than reusing fd 0 directly -- without this,
+        // that reopened fd passes `is_stdio`'s character-device/rdev check (it has the same
+        // STDIO_NODE_INFO as the original) but has no `StdioStream` tag, so the ioctl handler bails
+        // with ENOTTY before ever reaching TCSETSF, surfacing as `setRawMode ENOTTY`.
+        if let Some(path) = &path
+            && let Some(stream) = stdio_stream_for_path(path)
+        {
+            let _ = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .set_entry_metadata(&file, stream);
+        }
         let files = self.files.borrow();
         let raw_fd = files.insert_raw_fd(file).map_err(|file| {
             files.fs.close(&file).unwrap();
@@ -992,6 +1009,22 @@ fn espipe_for_non_seekable_offset(offset: Option<usize>) -> Result<(), Errno> {
         Err(Errno::ESPIPE)
     } else {
         Ok(())
+    }
+}
+
+/// Maps an absolute path to the [`StdioStream`] it should be tagged with, if it refers to one of
+/// the process's standard streams.
+///
+/// Used to attach `StdioStream` metadata to a *freshly re-opened* `/dev/stdin`/`/dev/stdout`/
+/// `/dev/stderr` fd, not just the original bootstrap fds 0/1/2 -- see the call site in
+/// `insert_raw_file_fd_with_path` for why this matters (libuv reopens `/dev/stdin` to get a
+/// private fd for `tcsetattr`/raw-mode operations).
+fn stdio_stream_for_path(path: &CString) -> Option<StdioStream> {
+    match path.to_str().ok()? {
+        "/dev/stdin" => Some(StdioStream::Stdin),
+        "/dev/stdout" => Some(StdioStream::Stdout),
+        "/dev/stderr" => Some(StdioStream::Stderr),
+        _ => None,
     }
 }
 
@@ -2573,10 +2606,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             .descriptor_table()
                             .with_metadata(fd, |stream: &StdioStream| *stream)
                             .map_err(|_| {
-                                // TODO: Handle missing `StdioStream` metadata (could happen if
-                                // `/dev/stdin`, `/dev/stdout`, or `/dev/stderr` was reopened).
-                                // XXX(jayb): likely we might want to have some backend-specific
-                                // metadata layer in our file system?
+                                // A character device in the tty major-number range without
+                                // `StdioStream` metadata: shouldn't happen now that
+                                // `insert_raw_file_fd_with_path` tags a freshly (re)opened
+                                // `/dev/stdin`/`/dev/stdout`/`/dev/stderr`, but keep this as a
+                                // defensive fallback for any other path into a stdio-shaped fd.
                                 litebox_util_log::error!(
                                     "standard stream is missing StdioStream metadata"
                                 );
@@ -3731,5 +3765,72 @@ mod tests {
             Ok(0)
         );
         assert_eq!(after_drain.c_lflag, 0x5678);
+    }
+
+    #[test]
+    fn reopened_dev_stdin_gets_stdio_stream_metadata() {
+        // Regression test for the real ENOTTY node.js `setRawMode` crash reproduced live via a
+        // genuinely console-attached process: node's libuv (`uv__tty_make_raw`) doesn't issue
+        // TCGETS/TCSETSF on fd 0 directly -- it reopens `/dev/stdin` to get a private fd first.
+        // That fresh fd passes `is_stdio`'s character-device/rdev-major check (same
+        // STDIO_NODE_INFO as the original), but before this fix it had no `StdioStream` metadata
+        // attached (that was only ever set once at process bootstrap for fds 0/1/2 in
+        // `initialize_stdio_in_shared_descriptors_table`), so `sys_ioctl`'s TCGETS/TCSETS*
+        // handling unconditionally bailed with ENOTTY before even reaching `is_a_tty` --
+        // independent of, and not fixed by, the earlier TCSETSW/TCSETSF-command-mapping fix
+        // alone. `sys_ioctl`'s end-to-end behavior additionally depends on the platform's
+        // `is_a_tty` (which the mock platform always reports `false` for, orthogonal to this fix
+        // -- see `tcsetsw_and_tcsetsf_round_trip_through_tcgets` above), so this test verifies the
+        // metadata-attachment half directly rather than through the full ioctl dispatch.
+        let task = crate::syscalls::tests::init_platform(None);
+
+        let raw_fd = task
+            .sys_open("/dev/stdin", OFlags::RDONLY, Mode::empty())
+            .expect("reopening /dev/stdin must succeed");
+
+        let files = task.files.borrow();
+        let fd = files
+            .raw_descriptor_store
+            .read()
+            .fd_from_raw_integer::<crate::DefaultFS<crate::syscalls::tests::TestPlatform>>(
+                usize::try_from(raw_fd).unwrap(),
+            )
+            .expect("freshly opened /dev/stdin must resolve to a filesystem-backed fd");
+        let stream = task
+            .global
+            .litebox
+            .descriptor_table()
+            .with_metadata(&fd, |stream: &StdioStream| *stream)
+            .expect("reopened /dev/stdin must carry StdioStream::Stdin metadata");
+        assert_eq!(stream, StdioStream::Stdin);
+    }
+
+    #[test]
+    fn reopened_dev_stdout_and_stderr_get_stdio_stream_metadata() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let files = task.files.borrow();
+
+        for (path, expected) in [
+            ("/dev/stdout", StdioStream::Stdout),
+            ("/dev/stderr", StdioStream::Stderr),
+        ] {
+            let raw_fd = task
+                .sys_open(path, OFlags::WRONLY, Mode::empty())
+                .unwrap_or_else(|e| panic!("reopening {path} must succeed: {e:?}"));
+            let fd = files
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<crate::DefaultFS<crate::syscalls::tests::TestPlatform>>(
+                    usize::try_from(raw_fd).unwrap(),
+                )
+                .unwrap();
+            let stream = task
+                .global
+                .litebox
+                .descriptor_table()
+                .with_metadata(&fd, |stream: &StdioStream| *stream)
+                .unwrap_or_else(|_| panic!("reopened {path} must carry StdioStream metadata"));
+            assert_eq!(stream, expected);
+        }
     }
 }
