@@ -1148,7 +1148,33 @@ impl<
         if self.ensure_lower_contains(&from).is_ok() {
             return Err(RenameError::CrossDevice);
         }
-        self.upper.rename(&from, &to)?;
+        // `to`'s parent directory may only exist in the read-only lower layer so far (e.g. a
+        // package extractor's typical write-to-temp-then-atomic-`rename()`-into-place idiom,
+        // renaming into a directory that came from the read-only initial rootfs and has not yet
+        // been touched on the upper layer) -- mirror `open`'s `O_CREAT` handling and `symlink`'s
+        // equivalent fallback above: on a missing-component error, check whether the lower layer
+        // has the parent directory, migrate the ancestor chain up to the upper layer if so, and
+        // retry.
+        match self.upper.rename(&from, &to) {
+            Ok(()) => {}
+            Err(RenameError::PathError(PathError::MissingComponent)) => {
+                let dirname = to.rsplit_once('/').unwrap().0;
+                if let Ok(FileType::Directory) = self.ensure_lower_contains(dirname) {
+                    self.mkdir_migrating_ancestor_dirs(&to)
+                        .map_err(|e| match e {
+                            MkdirError::NoWritePerms => RenameError::NoWritePerms,
+                            MkdirError::ReadOnlyFileSystem => RenameError::ReadOnlyFileSystem,
+                            MkdirError::Io => RenameError::Io,
+                            MkdirError::AlreadyExists => unreachable!(),
+                            MkdirError::PathError(e) => RenameError::PathError(e),
+                        })?;
+                    self.upper.rename(&from, &to)?;
+                } else {
+                    return Err(RenameError::PathError(PathError::MissingComponent));
+                }
+            }
+            Err(e) => return Err(e),
+        }
         // If `to` shadows a lower-layer entry, place a tombstone over it -- otherwise a stale
         // cached `EntryX::Lower` entry (from a previous open of `to` before this rename) would
         // keep being returned by `open`, exactly as `unlink` guards against below.
@@ -1181,8 +1207,32 @@ impl<
         }
         // Symlink creation only ever targets the writable upper layer -- there is no
         // "copy-on-write" concept for creating a brand new path, unlike writing to an existing
-        // lower-layer file.
-        self.upper.symlink(target, linkpath)
+        // lower-layer file. However, `linkpath`'s *parent* directory may only exist in the
+        // read-only lower layer so far (e.g. a package extractor creating a brand new symlink
+        // inside a directory that came from the read-only initial rootfs and has not yet been
+        // touched on the upper layer) -- mirror `open`'s `O_CREAT` handling and `mkdir`'s
+        // fallback: on a missing-component error, check whether the lower layer has the parent
+        // directory, migrate the ancestor chain up to the upper layer if so, and retry.
+        match self.upper.symlink(&target, linkpath.as_str()) {
+            Ok(()) => Ok(()),
+            Err(SymlinkError::PathError(PathError::MissingComponent)) => {
+                let dirname = linkpath.rsplit_once('/').unwrap().0;
+                if let Ok(FileType::Directory) = self.ensure_lower_contains(dirname) {
+                    self.mkdir_migrating_ancestor_dirs(&linkpath)
+                        .map_err(|e| match e {
+                            MkdirError::NoWritePerms => SymlinkError::NoWritePerms,
+                            MkdirError::ReadOnlyFileSystem => SymlinkError::ReadOnlyFileSystem,
+                            MkdirError::Io => SymlinkError::Io,
+                            MkdirError::AlreadyExists => unreachable!(),
+                            MkdirError::PathError(e) => SymlinkError::PathError(e),
+                        })?;
+                    self.upper.symlink(target, linkpath)
+                } else {
+                    Err(SymlinkError::PathError(PathError::MissingComponent))
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn read_link(&self, path: impl crate::path::Arg) -> Result<String, ReadLinkError> {

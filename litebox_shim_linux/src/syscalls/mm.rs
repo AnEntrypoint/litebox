@@ -948,7 +948,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         };
 
-        // Make the trampoline RW for writing stubs.
+        // Make the trampoline RW for writing stubs. A failure here (e.g. transient memory
+        // pressure, or the trampoline region having been unmapped/reprotected out from under us)
+        // is not fatal to the guest: fall back to trap-based syscall interception for this
+        // segment instead, matching every other recoverable failure path in this function (e.g.
+        // the trampoline-allocation failure above).
         if state.trampoline_mapped_len > 0
             && self
                 .sys_mprotect_raw(
@@ -958,7 +962,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 )
                 .is_err()
         {
-            panic!("fatal: failed to mprotect trampoline to RW");
+            litebox_util_log::warn!(
+                "failed to mprotect trampoline to RW, falling back to trap patching"
+            );
+            self.apply_trap_fallback(mapped_addr, len, false);
+            return true;
         }
         if self
             .sys_mprotect_raw(
@@ -968,19 +976,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             )
             .is_err()
         {
+            litebox_util_log::warn!(
+                "failed to mprotect code segment to RW for patching, falling back to trap patching"
+            );
             restore_trampoline_rx(self, state);
-            panic!("fatal: failed to mprotect code segment to RW for patching");
+            self.apply_trap_fallback(mapped_addr, len, false);
+            return true;
         }
 
         // Read the mapped code into a buffer, patch it, write back.
         let Some(code_owned) = mapped_addr.to_owned_slice::<Platform>(len) else {
-            let _ = self.sys_mprotect_raw(
-                mapped_addr,
-                len,
-                ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+            litebox_util_log::warn!(
+                "failed to read code segment for patching, falling back to trap patching"
             );
+            let rw_ok = self
+                .sys_mprotect_raw(
+                    mapped_addr,
+                    len,
+                    ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+                )
+                .is_ok();
             restore_trampoline_rx(self, state);
-            panic!("fatal: failed to read code segment for patching");
+            if rw_ok {
+                self.apply_trap_fallback(mapped_addr, len, false);
+            }
+            return true;
         };
         let mut code_buf = code_owned.into_vec();
         let original_code = code_buf.clone();

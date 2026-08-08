@@ -2083,6 +2083,91 @@ mod layered {
         rx.recv_timeout(Duration::from_secs(2))
             .expect("migrate_file_up deadlocked");
     }
+
+    /// Regression coverage for the bug where creating a brand new symlink inside a directory that
+    /// only exists in the read-only lower layer (and has not yet been migrated up to the writable
+    /// upper layer) failed with `MissingComponent`/`ENOENT`, even though the exact same scenario
+    /// for a brand new *file* (`open` with `O_CREAT`) already worked via
+    /// `mkdir_migrating_ancestor_dirs`. This is the real root cause of Alpine's `apk` failing to
+    /// extract SONAME symlinks (e.g. `usr/lib/libbrotlicommon.so.1 -> libbrotlicommon.so.1.2.0`)
+    /// into a freshly-installed package's directory the first time that directory is touched.
+    #[test]
+    fn symlink_creation_migrates_lower_only_parent_directory() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        let fs = layered::FileSystem::new(
+            &litebox,
+            in_mem::FileSystem::new(&litebox),
+            super::tar_ro_fs(&litebox, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+
+        // `bar` exists only in the lower (read-only tar) layer and has never been touched on the
+        // upper layer -- confirm that up front.
+        let stat = fs.file_status("bar").expect("Failed to stat bar");
+        assert_eq!(stat.file_type, FileType::Directory);
+
+        // Creating a new symlink inside it must succeed, migrating `bar` up to the writable upper
+        // layer along the way, exactly as `open(..., O_CREAT, ...)` already does.
+        fs.symlink("baz", "bar/newlink")
+            .expect("Failed to create symlink inside lower-only directory");
+
+        let target = fs
+            .read_link("bar/newlink")
+            .expect("Failed to read back newly created symlink");
+        assert_eq!(target, "baz");
+
+        // The pre-existing lower-layer file in the same directory must still be reachable.
+        let fd = fs
+            .open("bar/baz", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open pre-existing lower-layer file after sibling symlink creation");
+        fs.close(&fd).expect("Failed to close file");
+    }
+
+    /// Same root cause as [`symlink_creation_migrates_lower_only_parent_directory`], but for the
+    /// write-to-temp-then-atomic-`rename()`-into-place idiom package managers commonly use instead
+    /// of a direct `open(O_CREAT)`.
+    #[test]
+    fn rename_into_lower_only_parent_directory() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        let mut in_mem_fs = in_mem::FileSystem::new(&litebox);
+        in_mem_fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+
+        let fs = layered::FileSystem::new(
+            &litebox,
+            in_mem_fs,
+            super::tar_ro_fs(&litebox, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+
+        // Write the "new" file to a scratch location on the upper layer first (matching how a
+        // package manager stages a download before an atomic rename into place).
+        let fd = fs
+            .open("/tmpfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to create scratch file");
+        fs.write(&fd, b"newcontent", None)
+            .expect("Failed to write scratch file");
+        fs.close(&fd).expect("Failed to close scratch file");
+
+        // `bar` exists only in the lower layer and has not yet been migrated up -- renaming into
+        // it must still succeed, migrating the directory up first.
+        fs.rename("/tmpfile", "bar/installed")
+            .expect("Failed to rename into lower-only directory");
+
+        let fd = fs
+            .open("bar/installed", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open renamed-into-place file");
+        let mut buffer = vec![0; 1024];
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read renamed-into-place file");
+        assert_eq!(&buffer[..bytes_read], b"newcontent");
+        fs.close(&fd).expect("Failed to close file");
+    }
 }
 
 mod stdio {

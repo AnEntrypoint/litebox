@@ -302,11 +302,27 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             if outcome.stop_reason == WalkStopReason::CompleteDirectory || is_final_component_stop {
                 // Either fully walked, or stopped exactly at the requested final component (which
                 // is allowed to be a non-directory, e.g. a file or a symlink the caller will
-                // resolve itself) -- nothing left for us to do. `walked` here is relative to
-                // `current`, not the original `components`; report it in original-request terms by
-                // adding back however many components were already consumed by prior symlink hops.
-                let consumed_before_this_hop = original_len - current.len();
-                return Ok((outcome, walked + consumed_before_this_hop));
+                // resolve itself) -- nothing left for us to do. The returned count must be
+                // expressed as an index/length into the *original* `components` the caller passed
+                // in (callers like `open`'s `components[walked]` index the original array with
+                // it), not into `current`: a symlink hop only ever rewrites a *non-final* prefix of
+                // the path (the final component, per this function's contract, is deliberately
+                // left unresolved here), so the final element of `current` is always identical to
+                // the final element of the original `components` regardless of how many hops
+                // happened, and the count is simply `original_len` (fully walked) or
+                // `original_len - 1` (stopped exactly at the original final component). This is
+                // NOT derived from `current`'s length -- `current` is a rewritten working copy
+                // whose total length is not monotonic across hops (a symlink target can expand to
+                // more or fewer components than the single component it replaced), so comparing
+                // `current.len()` against `original_len` could both underflow (a previous bug here)
+                // and, even saturating, return a value that does not correspond to a valid index
+                // into the caller's original array.
+                let consumed = if is_final_component_stop {
+                    original_len - 1
+                } else {
+                    original_len
+                };
+                return Ok((outcome, consumed));
             }
 
             // Stopped at a genuinely intermediate (non-final) component. If it names a symlink,
