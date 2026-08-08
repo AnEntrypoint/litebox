@@ -367,6 +367,12 @@ impl<Platform: ShimPlatform> Process<Platform> {
             let n = nr_threads.load(Ordering::Relaxed);
             let new_count = n.checked_sub(1).expect("decrementing from zero threads");
             nr_threads.store(new_count, Ordering::Release);
+            litebox_util_log::debug!(
+                tid:% = tid,
+                new_count:% = new_count,
+                is_killing_other_threads:% = inner.is_killing_other_threads;
+                "detach_thread: decremented nr_threads"
+            );
             if new_count == 0 {
                 assert!(inner.threads.is_empty());
                 // The last thread exited. Prevent new threads.
@@ -385,6 +391,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
                 new_count == 0,
             )
         };
+        litebox_util_log::debug!(tid:% = tid, notify:% = notify, process_exited:% = process_exited; "detach_thread: notify decision");
         if notify {
             self.nr_threads.wake_all();
         }
@@ -417,17 +424,21 @@ impl<Platform: ShimPlatform> Process<Platform> {
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Updates the process exit status for a thread exit.
     fn exit_thread(&self, code: i8) {
+        litebox_util_log::debug!(tid:% = self.tid, code:% = code; "sys_exit: exit_thread entry");
         let mut inner = self.thread.process.inner.lock();
         if self.is_exiting() {
+            litebox_util_log::debug!(tid:% = self.tid; "sys_exit: already exiting, no-op");
             return;
         }
         inner.exit_status = ExitStatus::Exit(code);
         self.thread.remote.is_exiting.store(true, Ordering::Relaxed);
+        litebox_util_log::debug!(tid:% = self.tid; "sys_exit: is_exiting set, thread will unwind to prepare_for_exit");
     }
 
     /// Updates the process exit status for a group exit and signals all threads
     /// to exit.
     pub(crate) fn exit_group(&self, status: ExitStatus) {
+        litebox_util_log::debug!(tid:% = self.tid, status:? = status; "sys_exit_group: entry");
         // Mark every thread as exiting, and collect their remotes, while holding `inner` --
         // but do NOT call `interrupt()` (below) while still holding it.
         //
@@ -461,9 +472,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             inner.threads.values().cloned().collect()
         };
+        litebox_util_log::debug!(
+            tid:% = self.tid,
+            n_remotes:% = remotes.len();
+            "sys_exit_group: interrupting sibling threads"
+        );
         for thread in remotes {
             thread.interrupt();
         }
+        litebox_util_log::debug!(tid:% = self.tid; "sys_exit_group: done interrupting siblings");
     }
 
     /// Kills all other threads in the process, waiting for them to exit.
@@ -492,6 +509,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             inner.is_killing_other_threads = true;
             remotes
         };
+        litebox_util_log::debug!(
+            tid:% = self.tid,
+            n_remotes:% = remotes.len();
+            "kill_other_threads: interrupting siblings"
+        );
         for thread in &remotes {
             thread.interrupt();
         }
@@ -503,12 +525,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .nr_threads
                 .underlying_atomic()
                 .load(Ordering::Acquire);
+            litebox_util_log::debug!(tid:% = self.tid, n:% = n; "kill_other_threads: nr_threads check");
             if n == 1 {
                 break;
             }
             let _ = self.thread.process.nr_threads.block(n);
         }
         self.thread.process.inner.lock().is_killing_other_threads = false;
+        litebox_util_log::debug!(tid:% = self.tid; "kill_other_threads: done");
         true
     }
 
@@ -783,7 +807,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// pending the remainder, per this investigation's standing discipline of not overclaiming
     /// resolution.
     pub(crate) fn prepare_for_exit(&mut self) {
+        litebox_util_log::debug!(tid:% = self.tid; "prepare_for_exit: entry (Task dropping)");
         let process_exited = self.thread.detach_from_process();
+        litebox_util_log::debug!(tid:% = self.tid, process_exited:% = process_exited; "prepare_for_exit: detach_from_process done");
         if process_exited {
             // Real Linux implicitly closes every fd a process holds when its last thread exits,
             // releasing each open file description's reference so peers (e.g. a pipe's reader,
@@ -1312,6 +1338,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // violations).
             return Err(Errno::ENOMEM);
         }
+        litebox_util_log::debug!(
+            parent_tid:% = self.tid,
+            child_tid:% = child_tid,
+            flags:? = flags,
+            is_process_clone:% = is_process_clone;
+            "clone: spawned new task"
+        );
 
         // `vfork()`'s POSIX contract: the calling thread is suspended until the child calls
         // `execve` or exits. Block AFTER the child's host thread has been successfully spawned
@@ -1927,9 +1960,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let Some(count) = core::num::NonZeroU32::new(count) else {
                     return Ok(0);
                 };
-                self.global
-                    .futex_manager
-                    .wake(addr.to_platform_ptr::<Platform>(), count, None)? as usize
+                let woken = self.global.futex_manager.wake(
+                    addr.to_platform_ptr::<Platform>(),
+                    count,
+                    None,
+                )? as usize;
+                litebox_util_log::trace!(
+                    tid:% = self.tid,
+                    addr:% = addr.as_usize(),
+                    requested:% = count.get(),
+                    woken:% = woken;
+                    "futex: WAKE"
+                );
+                woken
             }
             FutexArgs::Wait {
                 addr,
@@ -1939,12 +1982,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             } => {
                 warn_shared_futex!(flags);
                 let timeout = timeout.read::<Platform>()?;
-                self.global.futex_manager.wait(
+                litebox_util_log::trace!(
+                    tid:% = self.tid,
+                    addr:% = addr.as_usize(),
+                    val:% = val,
+                    timeout:? = timeout;
+                    "futex: WAIT enter"
+                );
+                let res = self.global.futex_manager.wait(
                     &self.wait_cx().with_timeout(timeout),
                     addr.to_platform_ptr::<Platform>(),
                     val,
                     None,
-                )?;
+                );
+                litebox_util_log::trace!(
+                    tid:% = self.tid,
+                    addr:% = addr.as_usize(),
+                    res:? = res;
+                    "futex: WAIT return"
+                );
+                res?;
                 0
             }
             litebox_common_linux::FutexArgs::WaitBitset {

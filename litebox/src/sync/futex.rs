@@ -160,7 +160,15 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         // Wake the waiters outside the `extract_if` closure to minimize the list's lock hold
         // time.
         for entry in entries {
-            entry.done.store(true, Ordering::Relaxed);
+            // `Release` here is required to actually pair with `wait`'s `Acquire` load below --
+            // a `Relaxed` store paired with an `Acquire` load establishes no happens-before edge
+            // at all (the "acquire" side would have nothing to synchronize with), so the waiter
+            // waking up from `Waker::wake()`'s OS-level notification would not be guaranteed to
+            // observe this write. In practice this was likely masked on x86's strong memory model
+            // and by `Waker::wake()`'s own internal `Release` fetch_update ordering the store
+            // before it in this thread's program order, but relying on that is fragile and not
+            // guaranteed by the abstract memory model this code is written against.
+            entry.done.store(true, Ordering::Release);
             entry.waker.wake();
         }
         Ok(woken)
