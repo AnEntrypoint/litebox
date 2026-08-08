@@ -2095,9 +2095,15 @@ mod layered {
     fn symlink_creation_migrates_lower_only_parent_directory() {
         let litebox = LiteBox::new(MockPlatform::new());
 
+        let mut in_mem_fs = in_mem::FileSystem::new(&litebox);
+        in_mem_fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+
         let fs = layered::FileSystem::new(
             &litebox,
-            in_mem::FileSystem::new(&litebox),
+            in_mem_fs,
             super::tar_ro_fs(&litebox, TEST_TAR_FILE.into()),
             layered::LayeringSemantics::LowerLayerReadOnly,
         );
