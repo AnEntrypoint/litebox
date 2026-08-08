@@ -740,6 +740,38 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .run_on_raw_fd(
                 fd as usize,
                 |fd| {
+                    // Stdin is the one raw-fd device backed by a platform call
+                    // (`StdioProvider::read_from_stdin`) that can genuinely block indefinitely
+                    // with no way for litebox to cancel it mid-call (see that trait's and
+                    // `stdin_ready`'s doc comments) -- unlike a regular file's `read`, which
+                    // always completes immediately regardless of `O_NONBLOCK`. When the guest
+                    // has set `O_NONBLOCK` on stdin (via `fcntl(F_SETFL, ...)`, tracked in
+                    // `StdioStatusFlags`), honor it the same way a real Linux `read(2)` on a
+                    // non-blocking fd with no pending input would: consult the platform's
+                    // non-blocking readiness probe first and return `EAGAIN` instead of
+                    // descending into the blocking call. This is what actually closes the
+                    // `node -e` hang: libuv puts its `uv_tty_t` stdin fd into non-blocking mode
+                    // and expects `EAGAIN` on an empty read, not an indefinite block -- the
+                    // epoll-readiness fix on its own only helps a caller that reliably re-polls
+                    // before every read, which libuv's persistent read-arm loop does not
+                    // guarantee.
+                    let is_nonblocking_stdin = matches!(
+                        self.global
+                            .litebox
+                            .descriptor_table()
+                            .with_metadata(fd, |stream: &StdioStream| *stream),
+                        Ok(StdioStream::Stdin)
+                    ) && matches!(
+                        self.global
+                            .litebox
+                            .descriptor_table()
+                            .with_metadata(fd, |crate::StdioStatusFlags(flags)| flags
+                                .contains(OFlags::NONBLOCK)),
+                        Ok(true)
+                    );
+                    if is_nonblocking_stdin && !self.global.platform.stdin_ready() {
+                        return Err(Errno::EAGAIN);
+                    }
                     files
                         .fs
                         .read(fd, &mut buf.borrow_mut(), offset)
@@ -2483,11 +2515,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .borrow()
                     .run_on_raw_fd(
                         desc,
-                        |_file_fd| {
-                            // TODO: stdio NONBLOCK?
-                            #[cfg(debug_assertions)]
-                            litebox_util_log::debug!("set non-blocking on raw fd unimplemented");
-                            Ok(())
+                        |file_fd| {
+                            // Mirrors `FcntlArg::SETFL`'s raw-fd branch: most fds dispatched here
+                            // are plain regular files carrying no `StdioStatusFlags` metadata at
+                            // all (real Linux accepts `ioctl(FIONBIO)` on a regular file as a
+                            // no-op too), so a missing-metadata result is success, not an error.
+                            // For stdio fds this is what makes `do_read`'s non-blocking-stdin
+                            // check observe the flag `FIONBIO` set, not just `fcntl(F_SETFL)`.
+                            match self
+                                .global
+                                .litebox
+                                .descriptor_table_mut()
+                                .with_metadata_mut(file_fd, |crate::StdioStatusFlags(flags)| {
+                                    flags.set(OFlags::NONBLOCK, val != 0);
+                                }) {
+                                Ok(()) | Err(MetadataError::NoSuchMetadata) => Ok(()),
+                                Err(MetadataError::ClosedFd) => Err(Errno::EBADF),
+                            }
                         },
                         |socket_fd| {
                             if let Err(e) = self

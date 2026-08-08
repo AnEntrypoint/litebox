@@ -135,13 +135,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
             }
             EpollDescriptor::Epoll(_file) => unimplemented!(),
             EpollDescriptor::File(file) => {
-                // TODO: File polling returns dummy events for now, but distinguish stdio enough for REPLs.
+                // Stdout/stderr are always immediately writable from the guest's perspective (the
+                // platform's `write_to` is a plain, always-completing `WriteFile`/`write(2)`), so
+                // those still report a fixed `Events::OUT`. Stdin, however, must consult the
+                // platform's genuinely non-blocking `stdin_ready` probe rather than hardcoding
+                // `Events::IN`: a hardcoded "always readable" answer here is exactly what let
+                // libuv observe stdin as ready, issue a `read()` that lands in the platform's
+                // blocking read call, and hang forever on a real console with no pending input --
+                // see `StdioProvider::stdin_ready`'s doc comment for the full story.
                 let events = match global
                     .litebox
                     .descriptor_table()
                     .with_metadata(file, |stream: &litebox::platform::StdioStream| *stream)
                 {
-                    Ok(litebox::platform::StdioStream::Stdin) => Events::IN,
+                    Ok(litebox::platform::StdioStream::Stdin) => {
+                        if global.platform.stdin_ready() {
+                            Events::IN
+                        } else {
+                            Events::empty()
+                        }
+                    }
                     Ok(
                         litebox::platform::StdioStream::Stdout
                         | litebox::platform::StdioStream::Stderr,

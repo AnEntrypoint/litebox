@@ -1755,6 +1755,39 @@ impl litebox::platform::StdioProvider for LinuxUserland {
     fn is_a_tty(&self, stream: litebox::platform::StdioStream) -> bool {
         self.stdio_is_tty[stream as usize]
     }
+
+    fn stdin_ready(&self) -> bool {
+        // A real `poll(2)` on the actual inherited stdin fd with a zero timeout: this is the
+        // same readiness query the guest-visible `poll`/`select`/`epoll_wait` syscalls need to
+        // answer, and on native Linux the host kernel already implements it directly against the
+        // real fd -- no emulation required, unlike the Windows console platform where this
+        // probe has to be built from scratch (see that platform's `stdin_ready` doc comment).
+        #[repr(C)]
+        struct PollFd {
+            fd: i32,
+            events: i16,
+            revents: i16,
+        }
+        const POLLIN: i16 = 0x0001;
+
+        let mut pfd = PollFd {
+            fd: litebox_common_linux::STDIN_FILENO,
+            events: POLLIN,
+            revents: 0,
+        };
+        let ret = unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::poll,
+                core::ptr::from_mut(&mut pfd) as usize,
+                1,
+                0,
+            )
+        };
+        match ret {
+            Ok(n) => n > 0,
+            Err(_) => true,
+        }
+    }
 }
 
 unsafe extern "C" {

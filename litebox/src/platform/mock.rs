@@ -318,6 +318,12 @@ impl StdioProvider for MockPlatform {
     fn is_a_tty(&self, _stream: StdioStream) -> bool {
         false
     }
+
+    fn stdin_ready(&self) -> bool {
+        // The mock's stdin is an in-memory queue that `read_from_stdin` never blocks on (it
+        // either pops a queued chunk or immediately reports `Closed`), so it is always ready.
+        true
+    }
 }
 
 impl CrngProvider for MockPlatform {

@@ -348,6 +348,14 @@ impl<Host: HostInterface> litebox::platform::StdioProvider for LinuxKernel<Host>
     fn is_a_tty(&self, _stream: litebox::platform::StdioStream) -> bool {
         false
     }
+
+    fn stdin_ready(&self) -> bool {
+        // This platform has no interactive-console concept (see `is_a_tty` above, always
+        // `false`) and no other caller of this trait treats it as one; `read_from_stdin` here is
+        // a host-provided call that this platform does not itself claim ever blocks
+        // indefinitely, so there is nothing for a readiness probe to usefully distinguish.
+        true
+    }
 }
 
 /// Platform-Host Interface

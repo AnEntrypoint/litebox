@@ -513,6 +513,19 @@ pub trait StdioProvider {
 
     /// Check if a stream is connected to a TTY.
     fn is_a_tty(&self, stream: StdioStream) -> bool;
+
+    /// Non-blocking readiness probe for standard input: returns `true` if a subsequent
+    /// [`StdioProvider::read_from_stdin`] call is expected to return immediately (either with
+    /// data or at EOF/closed), without actually consuming or blocking on any input.
+    ///
+    /// This exists because [`StdioProvider::read_from_stdin`] itself is permitted to be a plain
+    /// blocking read (matching a real Linux `read(2)` on an inherited stdin fd): the guest-visible
+    /// `poll`/`select`/`epoll_wait` syscalls need a way to answer "is stdin readable right now"
+    /// *without* performing that blocking read, exactly as the real kernel does by tracking
+    /// pending input independently of the read path. A platform whose readiness and read
+    /// operations are both trivially non-blocking (e.g. a native Linux fd, where the host kernel
+    /// already provides real `poll(2)` semantics) may simply return `true` unconditionally here.
+    fn stdin_ready(&self) -> bool;
 }
 
 /// A provider that can verify a freshly-`fork()`ed child's execution against the address-space

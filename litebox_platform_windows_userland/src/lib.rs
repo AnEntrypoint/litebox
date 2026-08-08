@@ -2339,6 +2339,110 @@ fn read_from_raw_handle(buf: &mut [u8]) -> Result<usize, litebox::platform::Stdi
     Ok(read as usize)
 }
 
+/// Non-blocking readiness probe for [`read_from_raw_handle`]'s `STD_INPUT_HANDLE`: answers
+/// "would a `read_from_raw_handle` call right now return immediately" without itself blocking or
+/// consuming any input, mirroring what a real kernel's `poll(2)`/`select(2)` does for an
+/// inherited stdin fd independently of the read path.
+///
+/// This exists because [`read_from_raw_handle`] is a single unconditional blocking `ReadFile`
+/// (see its doc comment): unlike a real Linux fd, Windows gives no portable way to make a console
+/// handle's `ReadFile` itself non-blocking or cancellable mid-call from another thread, so the
+/// guest-visible `poll`/`select`/`epoll_wait` syscalls (see
+/// `litebox_shim_linux::syscalls::epoll::EpollDescriptor::poll`'s `File` arm) must be answered by
+/// a *separate*, genuinely non-blocking readiness check instead of by the read call itself. Before
+/// this existed, that `poll` arm hardcoded stdin as always-readable, which is exactly wrong for a
+/// real interactive console with no pending keystrokes: libuv (Node's stdio backend) polls stdin
+/// as part of its startup/`uv_tty_init` path, saw the hardcoded "readable", issued a `read()`
+/// that landed in the blocking `ReadFile` above, and hung forever with a genuinely-attached
+/// console that had no pending input -- the process-never-exits bug this function fixes.
+///
+/// Dispatches on the handle's real type:
+/// - **Console** (`FILE_TYPE_CHAR`): `GetNumberOfConsoleInputEvents` reports the queued input
+///   record count without consuming any of them; each queued record is checked via
+///   `PeekConsoleInput` (also non-consuming) so that pure window/focus/menu bookkeeping events
+///   (which `ReadFile` on a console silently skips past without unblocking the caller) don't
+///   falsely report readiness -- only a real key-down event counts.
+/// - **Pipe** (`FILE_TYPE_PIPE`, e.g. a redirected/piped stdin): `PeekNamedPipe` reports the
+///   number of bytes currently available to read without consuming them.
+/// - Anything else (regular file, `FILE_TYPE_UNKNOWN`, invalid/null handle): these are always
+///   immediately readable (a disk file's `ReadFile` never blocks waiting for data to arrive, and
+///   an absent handle behaves like already-closed/EOF stdin, matching [`read_from_raw_handle`]'s
+///   own `Ok(0)` treatment of that case) -- report ready so the guest's `read()` promptly
+///   observes the real outcome instead of appearing to hang on a readiness check.
+fn stdin_ready_raw_handle() -> bool {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_CHAR, FILE_TYPE_PIPE, GetFileType};
+    use windows_sys::Win32::System::Console::{
+        GetNumberOfConsoleInputEvents, INPUT_RECORD, KEY_EVENT, PeekConsoleInputW, STD_INPUT_HANDLE,
+    };
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    // How many queued console input records to inspect per `PeekConsoleInputW` call when
+    // filtering out non-key events (see the `FILE_TYPE_CHAR` arm below).
+    const RECORD_CAP: u32 = 32;
+    // `KEY_EVENT` is defined as a wider integer type than `INPUT_RECORD::EventType` (`u16`); the
+    // real Win32 constant is always in `u16` range, so this narrowing is exact, not lossy.
+    let key_event_u16 = u16::try_from(KEY_EVENT).expect("KEY_EVENT constant fits in u16");
+
+    let handle = unsafe { windows_sys::Win32::System::Console::GetStdHandle(STD_INPUT_HANDLE) };
+    if handle.is_null() || handle == Win32_Foundation::INVALID_HANDLE_VALUE {
+        // No input attached at all: behaves like already-closed/EOF stdin (see
+        // `read_from_raw_handle`'s identical handling), which is always "ready" to read (the
+        // read immediately returns `Ok(0)`).
+        return true;
+    }
+
+    match unsafe { GetFileType(handle) } {
+        FILE_TYPE_CHAR => {
+            // Real console: peek the queued input-record count, then inspect each queued record
+            // so that non-key events (window-buffer-size, focus, menu) don't count as "ready" --
+            // `ReadFile` on a console consumes and discards those internally without returning,
+            // so reporting ready on their account alone would reintroduce the same hang for a
+            // console that has e.g. only a focus-change event queued and no real keystroke.
+            let mut queued: u32 = 0;
+            if unsafe { GetNumberOfConsoleInputEvents(handle, &raw mut queued) } == 0 || queued == 0
+            {
+                return false;
+            }
+            let mut records: [INPUT_RECORD; RECORD_CAP as usize] = unsafe { core::mem::zeroed() };
+            let mut peeked: u32 = 0;
+            let cap = queued.min(RECORD_CAP);
+            if unsafe { PeekConsoleInputW(handle, records.as_mut_ptr(), cap, &raw mut peeked) } == 0
+            {
+                // Peek failed for some reason (e.g. handle isn't actually an input-record
+                // console handle despite `FILE_TYPE_CHAR`): fall back to reporting ready rather
+                // than risking a permanently-stuck "never ready" readiness answer.
+                return true;
+            }
+            records[..peeked as usize]
+                .iter()
+                .any(|r| r.EventType == key_event_u16 && unsafe { r.Event.KeyEvent }.bKeyDown != 0)
+        }
+        FILE_TYPE_PIPE => {
+            let mut available: u32 = 0;
+            let ok = unsafe {
+                PeekNamedPipe(
+                    handle,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    &raw mut available,
+                    core::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                // A broken/closed pipe reads as EOF (see `read_from_raw_handle`'s
+                // `ERROR_BROKEN_PIPE` handling) -- that is also "ready" (the read returns `Ok(0)`
+                // immediately rather than blocking).
+                return true;
+            }
+            available > 0
+        }
+        // Regular disk file, `FILE_TYPE_UNKNOWN`, or anything else: `ReadFile` never blocks
+        // waiting for data on these, so they are always immediately ready.
+        _ => true,
+    }
+}
+
 /// Writes directly to the process's raw `STD_OUTPUT_HANDLE`/`STD_ERROR_HANDLE` via `WriteFile`,
 /// bypassing `std::io::stdout()`/`std::io::stderr()`.
 ///
@@ -2448,6 +2552,10 @@ impl litebox::platform::StdioProvider for WindowsUserland {
             StdioStream::Stdout => std::io::stdout().is_terminal(),
             StdioStream::Stderr => std::io::stderr().is_terminal(),
         }
+    }
+
+    fn stdin_ready(&self) -> bool {
+        stdin_ready_raw_handle()
     }
 }
 
@@ -2782,5 +2890,90 @@ mod tests {
         .unwrap()
         .as_usize();
         assert_ne!(addr3, addr + 0x4000);
+    }
+
+    /// Regression coverage for the `node -e "..."` hang: [`super::stdin_ready_raw_handle`] must
+    /// give a genuine non-blocking readiness answer instead of the old hardcoded
+    /// `EpollDescriptor::File`'s-caller-side "stdin is always readable" assumption that let
+    /// libuv's poll-then-read pattern land in [`super::read_from_raw_handle`]'s blocking
+    /// `ReadFile` with nothing queued. This drives `STD_INPUT_HANDLE` through both non-console
+    /// backings the function distinguishes (`FILE_TYPE_PIPE`/`FILE_TYPE_UNKNOWN`) via real OS
+    /// handles, since a genuinely console-backed `STD_INPUT_HANDLE` is not available in this
+    /// test-runner's (non-interactive) process.
+    #[test]
+    fn test_stdin_ready_pipe_and_regular_file() {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::Storage::FileSystem::WriteFile;
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE, SetStdHandle};
+        use windows_sys::Win32::System::Pipes::CreatePipe;
+
+        // Swap `STD_INPUT_HANDLE` for the lifetime of this test and always restore it, so this
+        // doesn't corrupt any other test's view of the process's real stdin.
+        struct RestoreStdin(HANDLE);
+        impl Drop for RestoreStdin {
+            fn drop(&mut self) {
+                unsafe {
+                    SetStdHandle(STD_INPUT_HANDLE, self.0);
+                }
+            }
+        }
+        let _restore = RestoreStdin(unsafe { GetStdHandle(STD_INPUT_HANDLE) });
+
+        // An empty anonymous pipe (`FILE_TYPE_PIPE`) with nothing written yet: must report
+        // not-ready, since a `ReadFile` on it would block until a writer sends data -- this is
+        // the exact "poll says ready, read blocks forever" hazard this function exists to avoid.
+        let (mut read_handle, mut write_handle): (HANDLE, HANDLE) =
+            (core::ptr::null_mut(), core::ptr::null_mut());
+        let ok = unsafe {
+            CreatePipe(
+                &raw mut read_handle,
+                &raw mut write_handle,
+                core::ptr::null(),
+                0,
+            )
+        };
+        assert_ne!(ok, 0, "CreatePipe failed: {}", unsafe {
+            windows_sys::Win32::Foundation::GetLastError()
+        });
+        unsafe {
+            SetStdHandle(STD_INPUT_HANDLE, read_handle);
+        }
+        assert!(
+            !super::stdin_ready_raw_handle(),
+            "an empty pipe with no writer output yet must not report ready"
+        );
+
+        // Write a byte into the pipe: now a `ReadFile` would return immediately, so readiness
+        // must flip to `true`.
+        let mut written: u32 = 0;
+        let ok = unsafe {
+            WriteFile(
+                write_handle,
+                [7u8].as_ptr(),
+                1,
+                &raw mut written,
+                core::ptr::null_mut(),
+            )
+        };
+        assert_ne!(ok, 0);
+        assert!(
+            super::stdin_ready_raw_handle(),
+            "a pipe with data already written must report ready"
+        );
+
+        unsafe {
+            CloseHandle(read_handle);
+            CloseHandle(write_handle);
+        }
+
+        // A null/invalid handle (no stdin attached at all) must report ready: `read_from_stdin`
+        // treats this as already-closed/EOF, which is an immediate (non-blocking) outcome.
+        unsafe {
+            SetStdHandle(STD_INPUT_HANDLE, core::ptr::null_mut());
+        }
+        assert!(
+            super::stdin_ready_raw_handle(),
+            "no stdin handle attached at all must report ready (matches EOF semantics)"
+        );
     }
 }

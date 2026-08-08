@@ -1095,6 +1095,10 @@ impl<Host: HostInterface> StdioProvider for LinuxKernel<Host> {
     fn is_a_tty(&self, _stream: litebox::platform::StdioStream) -> bool {
         unimplemented!()
     }
+
+    fn stdin_ready(&self) -> bool {
+        unimplemented!()
+    }
 }
 
 impl<Host: HostInterface> litebox::platform::ForkChildVerificationProvider for LinuxKernel<Host> {}
