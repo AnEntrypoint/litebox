@@ -28,8 +28,8 @@ mod tests;
 
 use errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, ReadDirError,
-    ReadError, ReadLinkError, RenameError, RmdirError, SeekError, SymlinkError, TruncateError,
-    UnlinkError, WriteError,
+    ReadError, ReadLinkError, RenameError, RmdirError, SeekError, SetTimesError, SymlinkError,
+    TruncateError, UnlinkError, WriteError,
 };
 
 /// A private module, to help support writing sealed traits. This module should _itself_ never be
@@ -121,6 +121,19 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError>;
+
+    /// Change the last-access and/or last-modification time of a file, matching the semantics of
+    /// `utimensat(2)`.
+    ///
+    /// `atime`/`mtime` of `None` leaves that timestamp unchanged (i.e. `UTIME_OMIT`); resolving
+    /// `UTIME_NOW` to an actual current-time value is the caller's responsibility (this trait has
+    /// no clock of its own), so `Some(ts)` here always means "set to exactly `ts`".
+    fn set_times(
+        &self,
+        path: impl path::Arg,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), SetTimesError>;
 
     /// Unlink a file
     fn unlink(&self, path: impl path::Arg) -> Result<(), UnlinkError>;
@@ -349,6 +362,25 @@ pub struct FileStatus {
     pub node_info: NodeInfo,
     /// Block size for file system I/O
     pub blksize: usize,
+    /// Last access time
+    pub atime: Timestamp,
+    /// Last modification time
+    pub mtime: Timestamp,
+}
+
+/// A timestamp, expressed as a duration since the Unix epoch (1970-01-01T00:00:00Z).
+///
+/// This is a minimal, storage-only timestamp type: [`FileSystem`] implementations that support
+/// [`FileSystem::set_times`] store whatever value is set here and hand it back verbatim from
+/// [`FileSystem::file_status`]/[`FileSystem::fd_file_status`]; there is no implied relationship
+/// with any wall clock. Callers (e.g. syscall shims) are responsible for resolving "current time"
+/// before constructing a `Timestamp`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Timestamp {
+    /// Whole seconds since the Unix epoch.
+    pub sec: i64,
+    /// Nanosecond remainder, in `[0, 1_000_000_000)`.
+    pub nsec: u32,
 }
 
 /// User information

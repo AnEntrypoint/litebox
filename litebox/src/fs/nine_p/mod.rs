@@ -17,10 +17,11 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 use crate::fs::OFlags;
+use crate::fs::Timestamp;
 use crate::fs::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, ReadLinkError, RenameError, RmdirError, SeekError, SymlinkError, TruncateError,
-    UnlinkError, WriteError,
+    ReadError, ReadLinkError, RenameError, RmdirError, SeekError, SetTimesError, SymlinkError,
+    TruncateError, UnlinkError, WriteError,
 };
 use crate::fs::nine_p::fcall::Rlerror;
 use crate::path::Arg;
@@ -271,6 +272,21 @@ impl From<Error> for ChownError {
     }
 }
 
+impl From<Error> for SetTimesError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::InvalidPathname => SetTimesError::PathError(PathError::InvalidPathname),
+            Error::Remote(errno) => match errno {
+                ENOENT => SetTimesError::PathError(PathError::NoSuchFileOrDirectory),
+                ENOTDIR => SetTimesError::PathError(PathError::ComponentNotADirectory),
+                EPERM | EACCES => SetTimesError::NotPermitted,
+                _ => SetTimesError::Io,
+            },
+            Error::Io | Error::InvalidResponse => SetTimesError::Io,
+        }
+    }
+}
+
 impl From<Rlerror> for Error {
     fn from(err: Rlerror) -> Self {
         Error::Remote(err.ecode)
@@ -445,6 +461,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         lflags
     }
 
+    /// Convert a 9P wire `Time` (seconds + nanoseconds since the Unix epoch, both unsigned) into
+    /// a [`Timestamp`], saturating rather than erroring on values that don't fit (a raw wire
+    /// timestamp is untrusted input from the server; saturating is preferable to failing an
+    /// entire `stat`/`getattr` call over a single out-of-range timestamp field).
+    fn time_to_timestamp(time: fcall::Time) -> Timestamp {
+        Timestamp {
+            sec: i64::try_from(time.sec).unwrap_or(i64::MAX),
+            nsec: u32::try_from(time.nsec).unwrap_or(u32::MAX),
+        }
+    }
+
     /// Convert a Qid type to our FileType
     fn qid_type_to_file_type(qid_type: fcall::QidType) -> super::FileType {
         if qid_type.contains(fcall::QidType::DIR) {
@@ -475,6 +502,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                     ),
                 },
                 blksize: usize::try_from(attr.stat.blksize).map_err(|_| Error::InvalidResponse)?,
+                atime: Self::time_to_timestamp(attr.stat.atime),
+                mtime: Self::time_to_timestamp(attr.stat.mtime),
             })
         } else {
             Ok(super::FileStatus {
@@ -516,6 +545,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                     usize::try_from(attr.stat.blksize).map_err(|_| Error::InvalidResponse)?
                 } else {
                     0
+                },
+                atime: if attr.valid.contains(fcall::GetattrMask::ATIME) {
+                    Self::time_to_timestamp(attr.stat.atime)
+                } else {
+                    Timestamp::default()
+                },
+                mtime: if attr.valid.contains(fcall::GetattrMask::MTIME) {
+                    Self::time_to_timestamp(attr.stat.mtime)
+                } else {
+                    Timestamp::default()
                 },
             })
         }
@@ -812,6 +851,57 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         self.client.clunk(fid);
 
         result.map_err(ChownError::from)
+    }
+
+    #[allow(
+        clippy::similar_names,
+        reason = "wire_atime/wire_mtime deliberately mirror atime/mtime, the wire-format encoding of the same values"
+    )]
+    fn set_times(
+        &self,
+        path: impl crate::path::Arg,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), SetTimesError> {
+        let path = self.absolute_path(path)?;
+        let fid = self.walk_to(&path)?;
+
+        // `*_SET` additionally tells the server "use the explicit value below", vs. just `*_TIME`
+        // alone which (per 9P2000.L) means "set to the server's current time" -- this trait's
+        // `set_times` contract only ever receives already-resolved explicit values (see its doc
+        // comment: `UTIME_NOW` resolution is the caller's responsibility), so both bits are
+        // always set together here.
+        let mut valid = fcall::SetattrMask::empty();
+        let wire_atime = match atime {
+            Some(ts) => {
+                valid |= fcall::SetattrMask::ATIME | fcall::SetattrMask::ATIME_SET;
+                fcall::Time {
+                    sec: u64::try_from(ts.sec).unwrap_or(0),
+                    nsec: u64::from(ts.nsec),
+                }
+            }
+            None => fcall::Time::default(),
+        };
+        let wire_mtime = match mtime {
+            Some(ts) => {
+                valid |= fcall::SetattrMask::MTIME | fcall::SetattrMask::MTIME_SET;
+                fcall::Time {
+                    sec: u64::try_from(ts.sec).unwrap_or(0),
+                    nsec: u64::from(ts.nsec),
+                }
+            }
+            None => fcall::Time::default(),
+        };
+        let stat = fcall::SetAttr {
+            atime: wire_atime,
+            mtime: wire_mtime,
+            ..Default::default()
+        };
+
+        let result = self.client.setattr(&fid, valid, stat);
+        self.client.clunk(fid);
+
+        result.map_err(SetTimesError::from)
     }
 
     fn unlink(&self, path: impl crate::path::Arg) -> Result<(), super::errors::UnlinkError> {

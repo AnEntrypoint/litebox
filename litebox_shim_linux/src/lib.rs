@@ -1161,6 +1161,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             .map(|()| 0)
                     })
                 }),
+            SyscallRequest::Utimensat {
+                dirfd,
+                pathname,
+                times,
+                flags,
+            } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |path| {
+                    let times = if times.is_null() {
+                        None
+                    } else {
+                        let Some(atime) = times.read_at_offset::<Platform>(0) else {
+                            return Err(Errno::EFAULT);
+                        };
+                        let Some(mtime) = times.read_at_offset::<Platform>(1) else {
+                            return Err(Errno::EFAULT);
+                        };
+                        Some((atime, mtime))
+                    };
+                    syscall!(sys_utimensat(dirfd, path, times, flags))
+                }),
             SyscallRequest::Statx {
                 dirfd,
                 pathname,

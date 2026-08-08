@@ -205,6 +205,18 @@ impl From<litebox::fs::errors::RmdirError> for Errno {
     }
 }
 
+impl From<litebox::fs::errors::SetTimesError> for Errno {
+    fn from(value: litebox::fs::errors::SetTimesError) -> Self {
+        match value {
+            litebox::fs::errors::SetTimesError::NotPermitted => Errno::EPERM,
+            litebox::fs::errors::SetTimesError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::SetTimesError::Io => Errno::EIO,
+            litebox::fs::errors::SetTimesError::PathError(path_error) => path_error.into(),
+            _ => Errno::EIO,
+        }
+    }
+}
+
 impl From<litebox::fs::errors::CloseError> for Errno {
     fn from(value: litebox::fs::errors::CloseError) -> Self {
         #[expect(clippy::match_single_binding)]

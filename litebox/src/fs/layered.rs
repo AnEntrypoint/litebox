@@ -16,8 +16,8 @@ use crate::sync;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, ReadLinkError, RenameError, RmdirError, SeekError, SymlinkError,
-    TruncateError, UnlinkError, WriteError,
+    ReadDirError, ReadError, ReadLinkError, RenameError, RmdirError, SeekError, SetTimesError,
+    SymlinkError, TruncateError, UnlinkError, WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence};
 
@@ -1023,6 +1023,52 @@ impl<
         self.chown(path, user, group)
     }
 
+    fn set_times(
+        &self,
+        path: impl crate::path::Arg,
+        atime: Option<super::Timestamp>,
+        mtime: Option<super::Timestamp>,
+    ) -> Result<(), SetTimesError> {
+        let path = self.absolute_path(path)?;
+        match self.upper.set_times(path.as_str(), atime, mtime) {
+            Ok(()) => return Ok(()),
+            Err(e) => match e {
+                SetTimesError::NotPermitted
+                | SetTimesError::Io
+                | SetTimesError::ReadOnlyFileSystem
+                | SetTimesError::PathError(
+                    PathError::ComponentNotADirectory
+                    | PathError::InvalidPathname
+                    | PathError::NoSearchPerms { .. }
+                    | PathError::TooManySymlinkHops,
+                ) => {
+                    return Err(e);
+                }
+                SetTimesError::PathError(
+                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                ) => {
+                    // fallthrough
+                }
+            },
+        }
+        match self.ensure_lower_contains(&path) {
+            Ok(_) => {}
+            Err(FileStatusError::Io) => return Err(SetTimesError::Io),
+            Err(FileStatusError::PathError(e)) => return Err(SetTimesError::PathError(e)),
+            Err(FileStatusError::ClosedFd) => unreachable!(),
+        }
+        match self.migrate_file_up(&path, true) {
+            Ok(()) => {}
+            Err(MigrationError::NoReadPerms) => unimplemented!(),
+            Err(MigrationError::NotAFile) => unimplemented!(),
+            Err(MigrationError::Io) => return Err(SetTimesError::Io),
+            Err(MigrationError::PathError(_e)) => unreachable!(),
+        }
+        // Since it has been migrated, we can just re-trigger, causing it to apply to the
+        // upper layer
+        self.set_times(path, atime, mtime)
+    }
+
     fn unlink(&self, path: impl crate::path::Arg) -> Result<(), UnlinkError> {
         let path = self.absolute_path(path)?;
         match self.upper.unlink(path.as_str()) {
@@ -1368,6 +1414,8 @@ impl<
                 owner,
                 node_info,
                 blksize,
+                atime,
+                mtime,
             } = match entry.as_ref() {
                 EntryX::Upper { fd } => self.upper.fd_file_status(fd)?,
                 EntryX::Lower { fd } => self.lower.fd_file_status(fd)?,
@@ -1382,6 +1430,8 @@ impl<
                 owner,
                 node_info: self.get_layered_nodeinfo(node_info),
                 blksize,
+                atime,
+                mtime,
             });
         }
         // The file is not open, we must look at the levels themselves.
@@ -1393,6 +1443,8 @@ impl<
                 owner,
                 node_info,
                 blksize,
+                atime,
+                mtime,
             }) => {
                 return Ok(FileStatus {
                     file_type,
@@ -1401,6 +1453,8 @@ impl<
                     owner,
                     node_info: self.get_layered_nodeinfo(node_info),
                     blksize,
+                    atime,
+                    mtime,
                 });
             }
             Err(e) => match e {
@@ -1429,6 +1483,8 @@ impl<
             owner,
             node_info,
             blksize,
+            atime,
+            mtime,
         } = self.lower.file_status(path)?;
         Ok(FileStatus {
             file_type,
@@ -1437,6 +1493,8 @@ impl<
             owner,
             node_info: self.get_layered_nodeinfo(node_info),
             blksize,
+            atime,
+            mtime,
         })
     }
 
@@ -1456,6 +1514,8 @@ impl<
             owner,
             node_info,
             blksize,
+            atime,
+            mtime,
         } = match entry.as_ref() {
             EntryX::Upper { fd } => self.upper.fd_file_status(fd)?,
             EntryX::Lower { fd } => self.lower.fd_file_status(fd)?,
@@ -1470,6 +1530,8 @@ impl<
             owner,
             node_info: self.get_layered_nodeinfo(node_info),
             blksize,
+            atime,
+            mtime,
         })
     }
 

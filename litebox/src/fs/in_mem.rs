@@ -15,8 +15,8 @@ use crate::sync;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, ReadLinkError, RenameError, RmdirError, SeekError, SymlinkError,
-    TruncateError, UnlinkError, WriteError,
+    ReadDirError, ReadError, ReadLinkError, RenameError, RmdirError, SeekError, SetTimesError,
+    SymlinkError, TruncateError, UnlinkError, WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, SeekWhence, UserInfo};
 
@@ -231,6 +231,30 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     }
 }
 
+/// Apply an optional new atime/mtime to `perms`, matching Linux's `utimensat` permission rule:
+/// the caller needs either ownership (or root) or write permission on the file to change its
+/// timestamps.
+fn apply_times(
+    perms: &mut Permissions,
+    current_user: UserInfo,
+    atime: Option<super::Timestamp>,
+    mtime: Option<super::Timestamp>,
+) -> Result<(), SetTimesError> {
+    if !(current_user.user == 0
+        || current_user.user == perms.userinfo.user
+        || current_user.can_write(perms))
+    {
+        return Err(SetTimesError::NotPermitted);
+    }
+    if let Some(atime) = atime {
+        perms.atime = atime;
+    }
+    if let Some(mtime) = mtime {
+        perms.mtime = mtime;
+    }
+    Ok(())
+}
+
 impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem<Platform> {
     fn open(
         &self,
@@ -296,6 +320,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     perms: Permissions {
                         mode,
                         userinfo: self.current_user,
+                        atime: super::Timestamp::default(),
+                        mtime: super::Timestamp::default(),
                     },
                     data: Vec::new().into(),
                     unique_id: self.fresh_id(),
@@ -637,6 +663,29 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
     }
 
+    fn set_times(
+        &self,
+        path: impl crate::path::Arg,
+        atime: Option<super::Timestamp>,
+        mtime: Option<super::Timestamp>,
+    ) -> Result<(), SetTimesError> {
+        let path = self.absolute_path(path)?;
+        let root = self.root.read();
+        let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let Some(entry) = entry else {
+            return Err(PathError::NoSuchFileOrDirectory)?;
+        };
+        match entry {
+            Entry::File(file) => {
+                apply_times(&mut file.write().perms, self.current_user, atime, mtime)
+            }
+            Entry::Dir(dir) => apply_times(&mut dir.write().perms, self.current_user, atime, mtime),
+            Entry::Symlink(symlink) => {
+                apply_times(&mut symlink.write().perms, self.current_user, atime, mtime)
+            }
+        }
+    }
+
     fn unlink(&self, path: impl crate::path::Arg) -> Result<(), UnlinkError> {
         let path = self.absolute_path(path)?;
         let mut root = self.root.write();
@@ -786,6 +835,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 perms: Permissions {
                     mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
                     userinfo: self.current_user,
+                    atime: super::Timestamp::default(),
+                    mtime: super::Timestamp::default(),
                 },
                 target,
                 unique_id: self.fresh_id(),
@@ -834,6 +885,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 perms: Permissions {
                     mode,
                     userinfo: self.current_user,
+                    atime: super::Timestamp::default(),
+                    mtime: super::Timestamp::default(),
                 },
                 children: HashMap::default(),
                 unique_id: self.fresh_id(),
@@ -997,6 +1050,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 rdev: None,
             },
             blksize: BLOCK_SIZE,
+            atime: perms.atime,
+            mtime: perms.mtime,
         })
     }
 
@@ -1038,6 +1093,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 rdev: None,
             },
             blksize: BLOCK_SIZE,
+            atime: perms.atime,
+            mtime: perms.mtime,
         })
     }
 
@@ -1077,6 +1134,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
                     perms: Permissions {
                         mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
                         userinfo: UserInfo { user: 0, group: 0 },
+                        atime: super::Timestamp::default(),
+                        mtime: super::Timestamp::default(),
                     },
                     children: HashMap::default(),
                     unique_id: 0,
@@ -1185,6 +1244,8 @@ pub(crate) struct SymlinkX {
 struct Permissions {
     mode: Mode,
     userinfo: UserInfo,
+    atime: super::Timestamp,
+    mtime: super::Timestamp,
 }
 
 impl UserInfo {

@@ -13,7 +13,7 @@ use litebox::{
     fd::{FdEnabledSubsystem, MetadataError, TypedFd},
     fs::{Mode, OFlags, SeekWhence},
     mm::linux::PAGE_SIZE,
-    path,
+    path::{self, Arg as _},
     platform::{StdioStream, TimeProvider},
     sync::RawSyncPrimitivesProvider,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
@@ -1801,6 +1801,105 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // report the actual filled set via `Statx::stx_mask`. Matches Linux's
         // documented behavior of returning more than what was asked.
         self.do_fstatat(dirfd, pathname, flags)
+    }
+
+    /// Resolve a `(atime_spec, mtime_spec)` pair of raw `struct timespec` values (as read from
+    /// the guest's `times[2]` array, or synthesized for `times == NULL`) into the
+    /// `Option<litebox::fs::Timestamp>` pair `FileSystem::set_times` expects: `UTIME_NOW`
+    /// resolves against the shim's current wall-clock time, `UTIME_OMIT` becomes `None` (leave
+    /// unchanged), and any other value is taken as an explicit timestamp.
+    fn resolve_utimes_pair(
+        &self,
+        atime: litebox_common_linux::Timespec,
+        mtime: litebox_common_linux::Timespec,
+    ) -> Result<
+        (
+            Option<litebox::fs::Timestamp>,
+            Option<litebox::fs::Timestamp>,
+        ),
+        Errno,
+    > {
+        let resolve_one =
+            |ts: litebox_common_linux::Timespec| -> Result<Option<litebox::fs::Timestamp>, Errno> {
+                #[allow(clippy::cast_possible_wrap)]
+                let tv_nsec = ts.tv_nsec as i64;
+                if tv_nsec == litebox_common_linux::UTIME_OMIT {
+                    return Ok(None);
+                }
+                if tv_nsec == litebox_common_linux::UTIME_NOW {
+                    let now = self.real_time_as_duration_since_epoch();
+                    return Ok(Some(litebox::fs::Timestamp {
+                        sec: now.as_secs().reinterpret_as_signed(),
+                        nsec: now.subsec_nanos(),
+                    }));
+                }
+                if !(0..1_000_000_000).contains(&tv_nsec) {
+                    return Err(Errno::EINVAL);
+                }
+                Ok(Some(litebox::fs::Timestamp {
+                    sec: ts.tv_sec,
+                    nsec: ts.tv_nsec.trunc(),
+                }))
+            };
+        Ok((resolve_one(atime)?, resolve_one(mtime)?))
+    }
+
+    /// Handle syscall `utimensat`.
+    ///
+    /// Also covers `futimens`/`futimesat`/`utimes`/`utime`, which on this shim's target (musl
+    /// libc, e.g. Alpine) are all implemented purely as userspace wrappers around this syscall
+    /// (`futimens(fd, times)` in particular compiles down to `utimensat(fd, NULL, times, 0)`),
+    /// so no separate handling of those syscall numbers is needed.
+    pub(crate) fn sys_utimensat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        times: Option<(
+            litebox_common_linux::Timespec,
+            litebox_common_linux::Timespec,
+        )>,
+        flags: AtFlags,
+    ) -> Result<(), Errno> {
+        let allowed = AtFlags::AT_EMPTY_PATH | AtFlags::AT_SYMLINK_NOFOLLOW;
+        if flags.intersects(allowed.complement()) {
+            log_unsupported!("unsupported utimensat flags: {flags:?}");
+            return Err(Errno::EINVAL);
+        }
+
+        let now = || {
+            let now = self.real_time_as_duration_since_epoch();
+            litebox::fs::Timestamp {
+                sec: now.as_secs().reinterpret_as_signed(),
+                nsec: now.subsec_nanos(),
+            }
+        };
+        let (atime, mtime) = match times {
+            None => (Some(now()), Some(now())),
+            Some((a, m)) => self.resolve_utimes_pair(a, m)?,
+        };
+
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
+        let path = match fs_path {
+            FsPath::Absolute { path } => path,
+            FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
+                get_cwd().as_str().to_c_str()?.into_owned()
+            }
+            FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
+                self.resolve_dirfd_path(fd)?
+            }
+            FsPath::Cwd | FsPath::Fd(_) => return Err(Errno::ENOENT),
+            FsPath::FdRelative { fd, path } => {
+                let dir_path = self.resolve_dirfd_path(fd)?;
+                Self::join_dir_relative_path(&dir_path, &path)?
+            }
+        };
+
+        self.files
+            .borrow()
+            .fs
+            .set_times(path, atime, mtime)
+            .map_err(Errno::from)
     }
 
     pub(crate) fn sys_fcntl(&self, fd: i32, arg: FcntlArg) -> Result<u32, Errno> {

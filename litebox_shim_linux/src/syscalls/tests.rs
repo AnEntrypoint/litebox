@@ -835,3 +835,222 @@ mod flock_tests {
         waiter.join().expect("waiter thread panicked");
     }
 }
+
+#[allow(
+    clippy::similar_names,
+    reason = "st_atime/st_atime_nsec/st_mtime/st_mtime_nsec mirror struct-stat field names"
+)]
+mod utimensat_tests {
+    use super::init_platform;
+    use litebox_common_linux::{AtFlags, Timespec, UTIME_NOW, UTIME_OMIT, errno::Errno};
+
+    fn create_file(
+        task: &crate::Task<super::TestPlatform, crate::DefaultFS<super::TestPlatform>>,
+        path: &str,
+    ) {
+        let fd = task
+            .sys_open(
+                path,
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .expect("failed to create test file");
+        task.sys_close(i32::try_from(fd).unwrap())
+            .expect("failed to close test file");
+    }
+
+    use litebox::fs::{Mode, OFlags};
+
+    #[test]
+    fn sets_explicit_atime_and_mtime() {
+        let task = init_platform(None);
+        create_file(&task, "/utimensat_explicit.txt");
+
+        let atime = Timespec {
+            tv_sec: 1_000_000,
+            tv_nsec: 123_000_000,
+        };
+        let mtime = Timespec {
+            tv_sec: 2_000_000,
+            tv_nsec: 456_000_000,
+        };
+        task.sys_utimensat(
+            libc_at_fdcwd(),
+            "/utimensat_explicit.txt",
+            Some((atime, mtime)),
+            AtFlags::empty(),
+        )
+        .expect("utimensat should succeed on a regular file");
+
+        let stat = task.sys_stat("/utimensat_explicit.txt").unwrap();
+        let (st_atime, st_atime_nsec, st_mtime, st_mtime_nsec) = (
+            stat.st_atime,
+            stat.st_atime_nsec,
+            stat.st_mtime,
+            stat.st_mtime_nsec,
+        );
+        assert_eq!(st_atime, 1_000_000);
+        assert_eq!(st_atime_nsec, 123_000_000);
+        assert_eq!(st_mtime, 2_000_000);
+        assert_eq!(st_mtime_nsec, 456_000_000);
+    }
+
+    #[test]
+    fn null_times_sets_both_to_now() {
+        let task = init_platform(None);
+        create_file(&task, "/utimensat_now.txt");
+
+        task.sys_utimensat(
+            libc_at_fdcwd(),
+            "/utimensat_now.txt",
+            None,
+            AtFlags::empty(),
+        )
+        .expect("utimensat with times=NULL should succeed");
+
+        let stat = task.sys_stat("/utimensat_now.txt").unwrap();
+        let (st_atime, st_mtime) = (stat.st_atime, stat.st_mtime);
+        // We can't assert an exact value, but a freshly-set "now" timestamp should be
+        // (comfortably) nonzero -- this is the direct fix for the "mtime preserved as zero"
+        // symptom this feature exists to address.
+        assert!(st_atime > 0);
+        assert!(st_mtime > 0);
+    }
+
+    #[test]
+    fn utime_now_sentinel_sets_to_current_time() {
+        let task = init_platform(None);
+        create_file(&task, "/utimensat_sentinel_now.txt");
+
+        let now_ts = Timespec {
+            tv_sec: 0,
+            tv_nsec: u64::try_from(UTIME_NOW).unwrap(),
+        };
+        let omit_ts = Timespec {
+            tv_sec: 0,
+            tv_nsec: u64::try_from(UTIME_OMIT).unwrap(),
+        };
+        task.sys_utimensat(
+            libc_at_fdcwd(),
+            "/utimensat_sentinel_now.txt",
+            Some((now_ts, omit_ts)),
+            AtFlags::empty(),
+        )
+        .expect("UTIME_NOW/UTIME_OMIT should be accepted");
+
+        let stat = task.sys_stat("/utimensat_sentinel_now.txt").unwrap();
+        let (st_atime, st_mtime) = (stat.st_atime, stat.st_mtime);
+        assert!(st_atime > 0, "UTIME_NOW should resolve to a nonzero time");
+        assert_eq!(st_mtime, 0, "UTIME_OMIT should leave mtime untouched");
+    }
+
+    #[test]
+    fn utime_omit_leaves_both_unchanged() {
+        let task = init_platform(None);
+        create_file(&task, "/utimensat_omit.txt");
+
+        // First set explicit values.
+        let atime = Timespec {
+            tv_sec: 111,
+            tv_nsec: 0,
+        };
+        let mtime = Timespec {
+            tv_sec: 222,
+            tv_nsec: 0,
+        };
+        task.sys_utimensat(
+            libc_at_fdcwd(),
+            "/utimensat_omit.txt",
+            Some((atime, mtime)),
+            AtFlags::empty(),
+        )
+        .unwrap();
+
+        // Then omit both -- nothing should change.
+        let omit_ts = Timespec {
+            tv_sec: 0,
+            tv_nsec: u64::try_from(UTIME_OMIT).unwrap(),
+        };
+        task.sys_utimensat(
+            libc_at_fdcwd(),
+            "/utimensat_omit.txt",
+            Some((omit_ts, omit_ts)),
+            AtFlags::empty(),
+        )
+        .unwrap();
+
+        let stat = task.sys_stat("/utimensat_omit.txt").unwrap();
+        let (st_atime, st_mtime) = (stat.st_atime, stat.st_mtime);
+        assert_eq!(st_atime, 111);
+        assert_eq!(st_mtime, 222);
+    }
+
+    #[test]
+    fn nonexistent_path_returns_enoent() {
+        let task = init_platform(None);
+        assert_eq!(
+            task.sys_utimensat(
+                libc_at_fdcwd(),
+                "/does_not_exist.txt",
+                None,
+                AtFlags::empty(),
+            )
+            .unwrap_err(),
+            Errno::ENOENT
+        );
+    }
+
+    #[test]
+    fn futimens_via_empty_path_and_dirfd() {
+        // `futimens(fd, times)` compiles down to `utimensat(fd, NULL, times, AT_EMPTY_PATH)` in
+        // musl; exercise that exact shape directly against an open fd.
+        let task = init_platform(None);
+        create_file(&task, "/utimensat_futimens.txt");
+        let fd = task
+            .sys_open("/utimensat_futimens.txt", OFlags::RDONLY, Mode::empty())
+            .expect("failed to open test file");
+
+        let mtime = Timespec {
+            tv_sec: 42,
+            tv_nsec: 0,
+        };
+        task.sys_utimensat(
+            i32::try_from(fd).unwrap(),
+            "",
+            Some((mtime, mtime)),
+            AtFlags::AT_EMPTY_PATH,
+        )
+        .expect("futimens-style utimensat should succeed");
+
+        let stat = task.sys_stat("/utimensat_futimens.txt").unwrap();
+        let st_mtime = stat.st_mtime;
+        assert_eq!(st_mtime, 42);
+
+        task.sys_close(i32::try_from(fd).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn invalid_nsec_is_einval() {
+        let task = init_platform(None);
+        create_file(&task, "/utimensat_invalid.txt");
+
+        let bad = Timespec {
+            tv_sec: 0,
+            tv_nsec: 2_000_000_000, // not a valid nanosecond value, and not a sentinel either
+        };
+        assert_eq!(
+            task.sys_utimensat(
+                libc_at_fdcwd(),
+                "/utimensat_invalid.txt",
+                Some((bad, bad)),
+                AtFlags::empty(),
+            )
+            .unwrap_err(),
+            Errno::EINVAL
+        );
+    }
+
+    fn libc_at_fdcwd() -> i32 {
+        litebox_common_linux::AT_FDCWD
+    }
+}

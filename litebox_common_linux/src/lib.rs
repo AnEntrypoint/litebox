@@ -56,6 +56,13 @@ pub const CLOCK_MONOTONIC_COARSE: i32 = 6;
 /// the current working directory.
 pub const AT_FDCWD: i32 = -100;
 
+/// Sentinel `tv_nsec` value for `utimensat(2)`/`futimens(3)`'s `times` argument meaning "set to
+/// the current time", per `<linux/stat.h>`.
+pub const UTIME_NOW: i64 = 0x3fff_ffff;
+/// Sentinel `tv_nsec` value for `utimensat(2)`/`futimens(3)`'s `times` argument meaning "leave
+/// this timestamp unchanged", per `<linux/stat.h>`.
+pub const UTIME_OMIT: i64 = 0x3fff_fffe;
+
 /// Encoding for ioctl commands.
 pub mod ioctl {
     /// The number of bits allocated for the ioctl command number field.
@@ -389,8 +396,12 @@ impl From<litebox::fs::FileStatus> for FileStat {
             owner: litebox::fs::UserInfo { user, group },
             node_info: litebox::fs::NodeInfo { dev, ino, rdev },
             blksize,
+            atime,
+            mtime,
             ..
         } = value;
+        let atime_nsec = i64::from(atime.nsec);
+        let mtime_nsec = i64::from(mtime.nsec);
         Self {
             st_dev: <_>::try_from(dev).unwrap(),
             st_ino: <_>::try_from(ino).unwrap(),
@@ -413,6 +424,16 @@ impl From<litebox::fs::FileStatus> for FileStat {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             st_blksize: blksize as i32,
             st_blocks: 0,
+            st_atime: atime.sec,
+            st_atime_nsec: atime_nsec,
+            // LiteBox doesn't track a separate change-time (`ctime`); mirroring `mtime` (as
+            // several minimal/embedded filesystems do) is closer to reality than the previous
+            // hardcoded-zero epoch, and is what most callers actually care about (e.g. `apk`'s
+            // post-install `utimensat` only inspects `mtime`).
+            st_ctime: mtime.sec,
+            st_ctime_nsec: mtime_nsec,
+            st_mtime: mtime.sec,
+            st_mtime_nsec: mtime_nsec,
             ..Default::default()
         }
     }
@@ -2322,6 +2343,14 @@ pub enum SyscallRequest {
         buf: UserPtrMut<FileStat>,
         flags: AtFlags,
     },
+    Utimensat {
+        dirfd: i32,
+        pathname: UserPtr<c_char>,
+        /// Pointer to a `struct timespec[2]` (`[atime, mtime]`); null means "set both to now",
+        /// matching `utimensat(2)`'s `times == NULL` semantics.
+        times: UserPtr<Timespec>,
+        flags: AtFlags,
+    },
     Eventfd2 {
         initval: u32,
         flags: EfdFlags,
@@ -2953,6 +2982,7 @@ impl SyscallRequest {
             Sysno::newfstatat => sys_req!(Newfstatat { dirfd,pathname:*,buf:*,flags }),
             #[cfg(target_arch = "aarch64")]
             Sysno::fstatat => sys_req!(Newfstatat { dirfd,pathname:*,buf:*,flags }),
+            Sysno::utimensat => sys_req!(Utimensat { dirfd,pathname:*,times:*,flags }),
             #[cfg(target_arch = "x86_64")]
             Sysno::eventfd => SyscallRequest::Eventfd2 {
                 initval: ctx.sys_req_arg(0),

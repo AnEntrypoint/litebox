@@ -32,11 +32,11 @@ use hashbrown::HashMap;
 use crate::fs::{DirEntry, FileType};
 
 use super::{
-    Mode, NodeInfo, OFlags, UserInfo,
+    Mode, NodeInfo, OFlags, Timestamp, UserInfo,
     backend::{DirHandle, FileHandle, WalkingDirHandle},
     errors::{
         ChmodError, ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError,
-        RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+        RmdirError, SetTimesError, TruncateError, UnlinkError, WalkError, WriteError,
     },
     inode_allocator::InodeAllocator,
 };
@@ -237,6 +237,8 @@ impl super::backend::Backend for TarRo {
             owner: file.owner,
             node_info: file.node_info.clone(),
             blksize: BLOCK_SIZE,
+            atime: Timestamp::default(),
+            mtime: Timestamp::default(),
         })
     }
 
@@ -252,6 +254,8 @@ impl super::backend::Backend for TarRo {
             owner: dir.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
             node_info: dir.node_info.clone(),
             blksize: BLOCK_SIZE,
+            atime: Timestamp::default(),
+            mtime: Timestamp::default(),
         })
     }
 
@@ -305,6 +309,21 @@ impl super::backend::Backend for TarRo {
         let dir = dir.into_typed::<Self>();
         if self.tar_index.dirs[dir.idx].children.contains_key(name) {
             Err(ChownError::ReadOnlyFileSystem)
+        } else {
+            Err(PathError::NoSuchFileOrDirectory.into())
+        }
+    }
+
+    fn set_times_at(
+        &self,
+        dir: DirHandle,
+        name: &str,
+        _atime: Option<Timestamp>,
+        _mtime: Option<Timestamp>,
+    ) -> Result<(), SetTimesError> {
+        let dir = dir.into_typed::<Self>();
+        if self.tar_index.dirs[dir.idx].children.contains_key(name) {
+            Err(SetTimesError::ReadOnlyFileSystem)
         } else {
             Err(PathError::NoSuchFileOrDirectory.into())
         }

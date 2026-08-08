@@ -12,9 +12,9 @@ use crate::utilities::anymap::AnyCloneSendSync;
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError, ReadError,
-    RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+    RmdirError, SetTimesError, TruncateError, UnlinkError, WalkError, WriteError,
 };
-use super::{DirEntry, FileStatus, Mode, OFlags, UserInfo};
+use super::{DirEntry, FileStatus, Mode, OFlags, Timestamp, UserInfo};
 
 /// How a backend file handle participates in seek.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,6 +161,16 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError>;
+
+    /// Update the access/modification time for the file/dir `name` at `parent`. `None` for either
+    /// timestamp leaves it unchanged.
+    fn set_times_at(
+        &self,
+        dir: DirHandle,
+        name: &str,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), SetTimesError>;
 }
 
 /// Concrete handle types used by a backend.

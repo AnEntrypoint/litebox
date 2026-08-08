@@ -132,6 +132,23 @@ pub enum ChownError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`FileSystem::set_times`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum SetTimesError {
+    #[error(
+        "the effective UID does not match the owner of the file, \
+         and the process is not privileged, and no write permission is held"
+    )]
+    NotPermitted,
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
 /// Possible errors from [`FileSystem::unlink`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
