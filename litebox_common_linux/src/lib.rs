@@ -2048,6 +2048,15 @@ pub enum SyscallRequest {
         pathname: UserPtr<c_char>,
         mode: u32,
     },
+    Fchmodat {
+        dirfd: i32,
+        pathname: UserPtr<c_char>,
+        mode: u32,
+    },
+    Fchmod {
+        fd: u32,
+        mode: u32,
+    },
     Chdir {
         pathname: UserPtr<c_char>,
     },
@@ -2633,6 +2642,19 @@ impl SyscallRequest {
                 mode: ctx.sys_req_arg(1),
             },
             Sysno::mkdirat => sys_req!(Mkdirat { dirfd, pathname:*, mode }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::chmod => SyscallRequest::Fchmodat {
+                dirfd: AT_FDCWD,
+                pathname: ctx.sys_req_ptr(0),
+                mode: ctx.sys_req_arg(1),
+            },
+            Sysno::fchmodat => sys_req!(Fchmodat { dirfd, pathname:*, mode }),
+            Sysno::fchmodat2 => SyscallRequest::Fchmodat {
+                dirfd: ctx.sys_req_arg(0),
+                pathname: ctx.sys_req_ptr(1),
+                mode: ctx.sys_req_arg(2),
+            },
+            Sysno::fchmod => sys_req!(Fchmod { fd, mode }),
             Sysno::chdir => sys_req!(Chdir { pathname:* }),
             Sysno::fchdir => sys_req!(Fchdir { fd }),
             Sysno::mmap => sys_req!(Mmap {

@@ -1136,6 +1136,42 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.do_mkdir(pathname, Mode::from_bits_retain(mode))
     }
 
+    /// Handle syscall `chmod`/`fchmodat`/`fchmodat2`.
+    ///
+    /// `chmod(path, mode)` is dispatched as `fchmodat(AT_FDCWD, path, mode)` (see the
+    /// `Sysno::chmod` mapping), matching the `mkdir`/`mkdirat` pattern already used above.
+    /// `fchmodat2`'s extra `flags` argument is not currently forwarded here (only `flags == 0`,
+    /// i.e. no `AT_SYMLINK_NOFOLLOW`, is meaningful on Linux for `chmod` anyway, since POSIX
+    /// requires symlink permission bits to be ignored/not-followable in the first place).
+    pub(crate) fn sys_fchmodat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        mode: u32,
+    ) -> Result<(), Errno> {
+        let pathname = self.resolve_path_at(dirfd, pathname)?;
+        self.files
+            .borrow()
+            .fs
+            .chmod(pathname, Mode::from_bits_retain(mode))
+            .map_err(Errno::from)
+    }
+
+    /// Handle syscall `fchmod`.
+    ///
+    /// Resolves the already-open file descriptor back to the absolute path it was opened at
+    /// (recorded by `do_open`, the same mechanism `fchdir`/`*at`-family dirfd resolution uses)
+    /// and applies the mode change through the same path-based `FileSystem::chmod` the fs layer
+    /// already implements.
+    pub(crate) fn sys_fchmod(&self, fd: u32, mode: u32) -> Result<(), Errno> {
+        let pathname = self.resolve_dirfd_path(fd)?;
+        self.files
+            .borrow()
+            .fs
+            .chmod(pathname, Mode::from_bits_retain(mode))
+            .map_err(Errno::from)
+    }
+
     pub(crate) fn do_close(&self, raw_fd: usize) -> Result<(), Errno> {
         self.do_close_and_replace::<FS>(raw_fd, None)
     }

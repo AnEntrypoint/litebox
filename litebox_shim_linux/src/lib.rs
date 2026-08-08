@@ -786,6 +786,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .map_or(Err(Errno::EFAULT), |path| {
                     syscall!(sys_mkdirat(dirfd, path, mode))
                 }),
+            SyscallRequest::Fchmodat {
+                dirfd,
+                pathname,
+                mode,
+            } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |path| {
+                    syscall!(sys_fchmodat(dirfd, path, mode))
+                }),
+            SyscallRequest::Fchmod { fd, mode } => syscall!(sys_fchmod(fd, mode)),
             SyscallRequest::Chdir { pathname } => pathname
                 .to_cstring::<Platform>()
                 .map_or(Err(Errno::EINVAL), |path| syscall!(sys_chdir(path))),

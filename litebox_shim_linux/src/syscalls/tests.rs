@@ -1054,3 +1054,92 @@ mod utimensat_tests {
         litebox_common_linux::AT_FDCWD
     }
 }
+
+mod chmod_tests {
+    use super::init_platform;
+    use litebox::fs::{Mode, OFlags};
+    use litebox_common_linux::errno::Errno;
+
+    fn create_file(
+        task: &crate::Task<super::TestPlatform, crate::DefaultFS<super::TestPlatform>>,
+        path: &str,
+    ) {
+        let fd = task
+            .sys_open(
+                path,
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .expect("failed to create test file");
+        task.sys_close(i32::try_from(fd).unwrap())
+            .expect("failed to close test file");
+    }
+
+    fn libc_at_fdcwd() -> i32 {
+        litebox_common_linux::AT_FDCWD
+    }
+
+    #[test]
+    fn chmod_changes_mode_of_regular_file() {
+        let task = init_platform(None);
+        create_file(&task, "/chmod_regular.txt");
+
+        task.sys_fchmodat(libc_at_fdcwd(), "/chmod_regular.txt", 0o600)
+            .expect("chmod on a regular file should succeed");
+
+        let stat = task.sys_stat("/chmod_regular.txt").unwrap();
+        assert_eq!(stat.st_mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn fchmod_via_open_fd_changes_mode() {
+        let task = init_platform(None);
+        create_file(&task, "/fchmod_target.txt");
+
+        let fd = task
+            .sys_open("/fchmod_target.txt", OFlags::RDONLY, Mode::empty())
+            .expect("failed to open test file");
+
+        task.sys_fchmod(fd, 0o640)
+            .expect("fchmod via an open fd should succeed");
+
+        let stat = task.sys_fstat(i32::try_from(fd).unwrap()).unwrap();
+        assert_eq!(stat.st_mode & 0o777, 0o640);
+
+        task.sys_close(i32::try_from(fd).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn fchmodat_with_dirfd_changes_mode() {
+        let task = init_platform(None);
+        task.sys_mkdirat(libc_at_fdcwd(), "/fchmodat_dir", 0o755)
+            .expect("failed to create test directory");
+        create_file(&task, "/fchmodat_dir/file.txt");
+
+        let dirfd = task
+            .sys_open(
+                "/fchmodat_dir",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .expect("failed to open test directory");
+
+        task.sys_fchmodat(i32::try_from(dirfd).unwrap(), "file.txt", 0o444)
+            .expect("fchmodat with a dirfd should succeed");
+
+        let stat = task.sys_stat("/fchmodat_dir/file.txt").unwrap();
+        assert_eq!(stat.st_mode & 0o777, 0o444);
+
+        task.sys_close(i32::try_from(dirfd).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn chmod_nonexistent_path_returns_enoent() {
+        let task = init_platform(None);
+        assert_eq!(
+            task.sys_fchmodat(libc_at_fdcwd(), "/chmod_does_not_exist.txt", 0o600)
+                .unwrap_err(),
+            Errno::ENOENT
+        );
+    }
+}
