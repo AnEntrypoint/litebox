@@ -182,7 +182,7 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
     /// `pthread_cond_broadcast`/`pthread_cond_signal` avoid a thundering herd when moving a
     /// condition variable's waiters onto its associated mutex).
     ///
-    /// This implementation cannot perform that move: each waiter's [`FutexEntry`] is pinned on
+    /// This implementation cannot perform that move: each waiter's `FutexEntry` is pinned on
     /// the waiting thread's own stack (owned by that thread's call to [`Self::wait`]), not owned
     /// by `FutexManager`, so there is no entry for this call to transplant into a different
     /// bucket. Instead, every waiter that real Linux would have requeued is woken directly here
