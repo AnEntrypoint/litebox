@@ -57,20 +57,20 @@ jobs:
           # Python error: init_fs_encoding ... ModuleNotFoundError: No module named 'encodings'"
           # during the guest interpreter's own startup. Reproduced deterministically even
           # re-running CI from an unrelated, previously-green commit, confirming this is
-          # pre-existing cache staleness, not a real code regression. The v2-rust prefix bump
-          # alone didn't stick (same failure signature resurfaced on a later, also-unrelated
-          # commit) -- bumped again to v3-rust, and the sibling "Cache custom out directories"
-          # step below (which independently caches target/tmp's rewriter output, keyed only off
-          # Cargo.lock/rewriter-source hashes rather than commit) is now also cache-busted, since
-          # it's an equally plausible carrier of the same stale litebox_syscall_rewriter output.
-          # Bump both again if this signature resurfaces a third time.
-          prefix-key: v3-rust
+          # pre-existing cache staleness, not a real code regression. The v2-rust and v3-rust
+          # prefix bumps didn't stick either (same failure signature resurfaced yet again on a
+          # later, also-unrelated commit) -- bumped a third time to v4-rust, and likewise the
+          # sibling "Cache custom out directories" step below (which independently caches
+          # target/tmp's rewriter output, keyed only off Cargo.lock/rewriter-source hashes rather
+          # than commit) is bumped again too, since it's an equally plausible carrier of the same
+          # stale litebox_syscall_rewriter output. Bump both again if this signature resurfaces.
+          prefix-key: v4-rust
       - name: Cache custom out directories
         uses: actions/cache@v5
         with:
           path: |
             target/*/build/litebox_runner_linux_userland-*/out
-          key: custom-out-v2-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/litebox_syscall_rewriter/**/*.rs') }}
+          key: custom-out-v3-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/litebox_syscall_rewriter/**/*.rs') }}
       - run: ./.github/tools/github_actions_run_cargo fmt
       - run: |
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp
