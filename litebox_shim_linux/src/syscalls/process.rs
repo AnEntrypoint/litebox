@@ -667,16 +667,75 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
 const ROBUST_LIST_LIMIT: isize = 2048;
 
-/*
- * Process a futex-list entry, check whether it's owned by the
- * dying task, and do notification if so:
- */
-fn handle_futex_death(futex_addr: UserPtr<u32>, _pi: bool, _pending_op: bool) -> Result<(), Errno> {
-    if !futex_addr.as_usize().is_multiple_of(4) {
-        return Err(Errno::EINVAL);
-    }
+/// Bit set in a robust futex word's low bits by the kernel (here, the shim) when the thread
+/// that held the lock dies without releasing it, so the next owner can detect the previous
+/// holder died mid-critical-section. Matches Linux's `FUTEX_OWNER_DIED`.
+const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+/// Bit set in a robust futex word's low bits when at least one thread is (or might be) sleeping
+/// in `FUTEX_WAIT` on it, so the unlocker knows to `FUTEX_WAKE`. Matches Linux's `FUTEX_WAITERS`.
+const FUTEX_WAITERS: u32 = 0x8000_0000;
+/// Mask isolating the TID stored in a robust futex word's low bits. Matches Linux's
+/// `FUTEX_TID_MASK`.
+const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
 
-    todo!("handle_futex_death is not implemented yet");
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    /// Process a single robust-futex-list entry belonging to a dying thread: if the futex word
+    /// still records this thread as the owner, mark it as dead (setting [`FUTEX_OWNER_DIED`] and
+    /// clearing the TID) and, if any waiters may be present, wake one -- mirroring Linux's
+    /// `handle_futex_death` (`kernel/futex/core.c`), which exists so a thread that dies while
+    /// holding a robust `pthread_mutex_t` doesn't leave every future waiter blocked forever on a
+    /// lock whose owner will never call `FUTEX_WAKE` again.
+    ///
+    /// Previously this was an unconditional `todo!()`: any thread whose robust list contained
+    /// even one entry at exit (e.g. a libuv/V8 worker thread that happened to hold, or was
+    /// mid-way through locking/unlocking, a robust mutex when it exited) would panic partway
+    /// through `prepare_for_exit`'s teardown -- after `detach_from_process` had already run and
+    /// decremented `nr_threads`, but before this dying thread ever issued the `FUTEX_WAKE` a
+    /// sibling thread blocked on that same lock (e.g. the main thread, in `FUTEX_WAIT` with the
+    /// glibc/musl "locked, has waiters" futex-word value `2`) was relying on -- permanently
+    /// stranding that waiter (this is the real, reproduced `node -e "console.log(1)"`
+    /// intermittent-hang root cause this fixes, not a hypothetical).
+    fn handle_futex_death(&self, futex_addr: UserPtr<u32>, _pending_op: bool) -> Result<(), Errno> {
+        if !futex_addr.as_usize().is_multiple_of(4) {
+            return Err(Errno::EINVAL);
+        }
+        let futex_addr = UserPtrMut::from_usize(futex_addr.as_usize());
+
+        let Some(word) = futex_addr.read_at_offset::<Platform>(0) else {
+            return Err(Errno::EFAULT);
+        };
+
+        // Only touch the word if it's still (nominally) owned by this dying thread -- a lock
+        // that was already unlocked and re-acquired by someone else, or never actually locked by
+        // us despite being linked into our robust list (see `list_op_pending`'s doc comment),
+        // must be left alone.
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "tid is always non-negative; only ever compared against another tid read \
+                      back from a futex word, never used arithmetically"
+        )]
+        if (word & FUTEX_TID_MASK) != self.tid as u32 {
+            return Ok(());
+        }
+
+        let had_waiters = word & FUTEX_WAITERS != 0;
+        let new_word = (word & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
+        if futex_addr
+            .write_at_offset::<Platform>(0, new_word)
+            .is_none()
+        {
+            return Err(Errno::EFAULT);
+        }
+
+        if had_waiters {
+            let _ = self.sys_futex(FutexArgs::Wake {
+                addr: futex_addr,
+                flags: litebox_common_linux::FutexFlags::PRIVATE,
+                count: 1,
+            });
+        }
+        Ok(())
+    }
 }
 
 fn fetch_robust_entry(
@@ -686,44 +745,42 @@ fn fetch_robust_entry(
     (UserPtr::from_usize(next & !1), next & 1 != 0)
 }
 
-fn wake_robust_list<Platform: ShimPlatform>(
-    head: UserPtr<litebox_common_linux::RobustListHead>,
-) -> Result<(), Errno> {
-    let mut limit = ROBUST_LIST_LIMIT;
-    let head_ptr = head.as_usize();
-    let head = head.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-    let (mut entry, mut pi) = fetch_robust_entry(UserPtr::from_usize(head.list.next));
-    let (pending, ppi) = fetch_robust_entry(UserPtr::from_usize(head.list_op_pending));
-    let futex_offset = head.futex_offset;
-    let entry_head = head_ptr + offset_of!(litebox_common_linux::RobustListHead, list);
-    while entry.as_usize() != entry_head && limit > 0 {
-        let nxt = entry
-            .read_at_offset::<Platform>(0)
-            .map(|e| fetch_robust_entry(UserPtr::from_usize(e.next)));
-        if entry.as_usize() != pending.as_usize() {
-            handle_futex_death(
-                UserPtr::from_usize(entry.as_usize() + futex_offset),
-                pi,
-                false,
-            )?;
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    fn wake_robust_list(
+        &self,
+        head: UserPtr<litebox_common_linux::RobustListHead>,
+    ) -> Result<(), Errno> {
+        let mut limit = ROBUST_LIST_LIMIT;
+        let head_ptr = head.as_usize();
+        let head = head.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        let (mut entry, _pi) = fetch_robust_entry(UserPtr::from_usize(head.list.next));
+        let (pending, _ppi) = fetch_robust_entry(UserPtr::from_usize(head.list_op_pending));
+        let futex_offset = head.futex_offset;
+        let entry_head = head_ptr + offset_of!(litebox_common_linux::RobustListHead, list);
+        while entry.as_usize() != entry_head && limit > 0 {
+            let nxt = entry
+                .read_at_offset::<Platform>(0)
+                .map(|e| fetch_robust_entry(UserPtr::from_usize(e.next)));
+            if entry.as_usize() != pending.as_usize() {
+                self.handle_futex_death(
+                    UserPtr::from_usize(entry.as_usize() + futex_offset),
+                    false,
+                )?;
+            }
+            let Some((next_entry, _next_pi)) = nxt else {
+                return Err(Errno::EFAULT);
+            };
+
+            entry = next_entry;
+            limit -= 1;
         }
-        let Some((next_entry, next_pi)) = nxt else {
-            return Err(Errno::EFAULT);
-        };
 
-        entry = next_entry;
-        pi = next_pi;
-        limit -= 1;
+        if pending.as_usize() != 0 {
+            let _ = self
+                .handle_futex_death(UserPtr::from_usize(pending.as_usize() + futex_offset), true);
+        }
+        Ok(())
     }
-
-    if pending.as_usize() != 0 {
-        let _ = handle_futex_death(
-            UserPtr::from_usize(pending.as_usize() + futex_offset),
-            ppi,
-            true,
-        );
-    }
-    Ok(())
 }
 
 /// Fixes up stale, untranslated pointers copied verbatim onto a `fork()` child's own (already
@@ -848,7 +905,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             });
         }
         if let Some(robust_list) = self.thread.robust_list.take() {
-            let _ = wake_robust_list::<Platform>(robust_list);
+            let _ = self.wake_robust_list(robust_list);
         }
     }
 
@@ -2031,6 +2088,59 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 )?;
                 0
             }
+            litebox_common_linux::FutexArgs::Requeue {
+                addr,
+                flags,
+                wake_count,
+                requeue_count,
+                addr2,
+            } => {
+                warn_shared_futex!(flags);
+                let woken = self.global.futex_manager.requeue(
+                    addr.to_platform_ptr::<Platform>(),
+                    wake_count,
+                    requeue_count,
+                    addr2.to_platform_ptr::<Platform>(),
+                    None,
+                )? as usize;
+                litebox_util_log::trace!(
+                    tid:% = self.tid,
+                    addr:% = addr.as_usize(),
+                    addr2:% = addr2.as_usize(),
+                    wake_count:% = wake_count,
+                    requeue_count:% = requeue_count,
+                    woken:% = woken;
+                    "futex: REQUEUE"
+                );
+                woken
+            }
+            litebox_common_linux::FutexArgs::CmpRequeue {
+                addr,
+                flags,
+                wake_count,
+                requeue_count,
+                addr2,
+                expected_value,
+            } => {
+                warn_shared_futex!(flags);
+                let woken = self.global.futex_manager.requeue(
+                    addr.to_platform_ptr::<Platform>(),
+                    wake_count,
+                    requeue_count,
+                    addr2.to_platform_ptr::<Platform>(),
+                    Some(expected_value),
+                )? as usize;
+                litebox_util_log::trace!(
+                    tid:% = self.tid,
+                    addr:% = addr.as_usize(),
+                    addr2:% = addr2.as_usize(),
+                    wake_count:% = wake_count,
+                    requeue_count:% = requeue_count,
+                    woken:% = woken;
+                    "futex: CMP_REQUEUE"
+                );
+                woken
+            }
             _ => unimplemented!("Unsupported futex operation"),
         };
         Ok(res)
@@ -2201,7 +2311,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         // unmmap all memory mappings and reset brk
         if let Some(robust_list) = self.thread.robust_list.take() {
-            let _ = wake_robust_list::<Platform>(robust_list);
+            let _ = self.wake_robust_list(robust_list);
         }
         self.thread.clear_child_tid.set(None);
 
@@ -2863,6 +2973,90 @@ mod tests {
             std::thread::sleep(core::time::Duration::from_millis(10));
         }
         waiter.join().expect("wait_for_exit thread panicked");
+    }
+
+    /// Regression test for the real, reproduced `node -e "console.log(1)"` intermittent hang:
+    /// a thread that dies while still recorded as the owner of a robust futex must have that
+    /// futex's word updated (`FUTEX_OWNER_DIED`) and any waiter woken -- mirroring Linux's
+    /// `exit_robust_list`/`handle_futex_death` (`kernel/futex/core.c`). Before this fix,
+    /// `handle_futex_death` was `todo!()`, so processing any non-empty robust list at thread exit
+    /// panicked instead of notifying waiters, permanently stranding a sibling thread blocked in
+    /// `FUTEX_WAIT` on that lock (observed live via `LITEBOX_LOG=litebox_shim_linux=trace`: the
+    /// main thread's `FUTEX_WAIT` on a glibc/musl "locked, has waiters" futex word (value `2`)
+    /// with no matching `FUTEX_WAKE` ever logged again).
+    ///
+    /// This drives `Task::handle_futex_death` directly (rather than round-tripping through a
+    /// hand-built `RobustListHead`/`RobustList` guest-memory layout, which is real guest-ABI
+    /// plumbing already covered by `wake_robust_list`'s straightforward list-walking logic) to
+    /// isolate exactly the piece that was unimplemented: does processing one owned, waited-on
+    /// futex entry correctly mark it dead and wake the waiter, without panicking.
+    #[test]
+    fn test_handle_futex_death_wakes_waiter_and_sets_owner_died() {
+        use core::sync::atomic::{AtomicU32, Ordering};
+
+        let task = crate::syscalls::tests::init_platform(None);
+        <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+            let futex_word = alloc::boxed::Box::new(AtomicU32::new(0));
+            let futex_addr = alloc::boxed::Box::into_raw(futex_word) as usize;
+
+            let bg = task.spawn_clone_for_test(move |bg_task| {
+                <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+                    bg_task.set_thread_handle_for_test();
+
+                    // Simulate this thread having locked a robust mutex: the futex word records
+                    // this thread as owner, with the waiters bit set since the main thread is
+                    // about to block on it.
+                    #[expect(clippy::cast_sign_loss, reason = "tid is always non-negative")]
+                    let owner_word = (bg_task.tid as u32) | super::FUTEX_WAITERS;
+                    let futex_atomic = unsafe { &*(futex_addr as *const AtomicU32) };
+                    futex_atomic.store(owner_word, Ordering::SeqCst);
+
+                    // Wait for the main thread to actually be parked in FUTEX_WAIT before
+                    // "dying" -- otherwise this would trivially pass even with the pre-fix
+                    // `todo!()` never running (there'd be nothing parked to prove got woken).
+                    std::thread::sleep(core::time::Duration::from_millis(50));
+
+                    // The background thread now processes its (simulated) robust-list death
+                    // notification directly, exactly as `prepare_for_exit`/`wake_robust_list`
+                    // would for a real dying thread with this futex linked into its robust list
+                    // -- without ever unlocking the futex itself.
+                    bg_task
+                        .handle_futex_death(UserPtr::from_usize(futex_addr), false)
+                        .expect("handle_futex_death should not error for a well-formed entry");
+                });
+            });
+
+            let futex_ptr = UserPtrMut::from_usize(futex_addr);
+            let owner_word = {
+                let futex_atomic = unsafe { &*(futex_addr as *const AtomicU32) };
+                futex_atomic.load(Ordering::SeqCst)
+            };
+            let result = task.sys_futex(litebox_common_linux::FutexArgs::Wait {
+                addr: futex_ptr,
+                flags: litebox_common_linux::FutexFlags::PRIVATE,
+                val: owner_word,
+                timeout: litebox_common_linux::TimeParam::None,
+            });
+            assert_eq!(
+                result,
+                Ok(0),
+                "main thread's FUTEX_WAIT on the robust futex should be woken once \
+                 handle_futex_death runs for its dying owner, not hang forever"
+            );
+
+            let final_word = {
+                let futex_atomic = unsafe { &*(futex_addr as *const AtomicU32) };
+                futex_atomic.load(Ordering::SeqCst)
+            };
+            assert_eq!(
+                final_word & super::FUTEX_OWNER_DIED,
+                super::FUTEX_OWNER_DIED,
+                "the futex word should have FUTEX_OWNER_DIED set once its owner dies without \
+                 unlocking"
+            );
+
+            bg.join().expect("background thread panicked");
+        });
     }
 
     #[test]

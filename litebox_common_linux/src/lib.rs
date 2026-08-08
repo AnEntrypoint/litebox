@@ -45,6 +45,7 @@ pub const STDERR_FILENO: i32 = 2;
 pub const FUTEX_WAIT: i32 = 0;
 pub const FUTEX_WAKE: i32 = 1;
 pub const FUTEX_REQUEUE: i32 = 3;
+pub const FUTEX_CMP_REQUEUE: i32 = 4;
 
 // linux/time.h
 pub const CLOCK_REALTIME: i32 = 0;
@@ -1708,6 +1709,8 @@ bitflags::bitflags! {
 pub enum FutexOperation {
     Wait = 0,
     Wake = 1,
+    Requeue = 3,
+    CmpRequeue = 4,
     WaitBitset = 9,
 }
 
@@ -1746,6 +1749,29 @@ pub enum FutexArgs {
         addr: UserPtrMut<u32>,
         flags: FutexFlags,
         count: u32,
+    },
+    /// `FUTEX_REQUEUE`: wake up to `wake_count` waiters on `addr`, then move up to
+    /// `requeue_count` of the remaining waiters on `addr` onto `addr2`'s wait queue (without
+    /// waking them) so a later wake on `addr2` can reach them. Used by musl's
+    /// `pthread_cond_broadcast`/`pthread_cond_signal` to move a condition variable's waiters onto
+    /// its associated mutex's futex word without a thundering herd.
+    Requeue {
+        addr: UserPtrMut<u32>,
+        flags: FutexFlags,
+        wake_count: u32,
+        requeue_count: u32,
+        addr2: UserPtrMut<u32>,
+    },
+    /// `FUTEX_CMP_REQUEUE`: identical to `Requeue`, but first atomically checks that the word at
+    /// `addr` still equals `expected_value`, failing with `EAGAIN` otherwise (closes the race
+    /// where the value changed between userspace's check and this syscall).
+    CmpRequeue {
+        addr: UserPtrMut<u32>,
+        flags: FutexFlags,
+        wake_count: u32,
+        requeue_count: u32,
+        addr2: UserPtrMut<u32>,
+        expected_value: u32,
     },
 }
 
@@ -3145,25 +3171,49 @@ impl SyscallRequest {
         let flags = FutexFlags::from_bits(flags)
             .ok_or_else(|| unsupported_einval(format_args!("futex(flags = {flags})")))?;
         let val = ctx.sys_req_arg(2);
-        let timeout = time_param(ctx.sys_req_ptr(3));
         let args = match cmd {
-            FutexOperation::Wait => FutexArgs::Wait {
-                addr,
-                flags,
-                val,
-                timeout,
-            },
-            FutexOperation::WaitBitset => FutexArgs::WaitBitset {
-                addr,
-                flags,
-                val,
-                timeout,
-                bitmask: ctx.sys_req_arg(5),
-            },
+            FutexOperation::Wait => {
+                let timeout = time_param(ctx.sys_req_ptr(3));
+                FutexArgs::Wait {
+                    addr,
+                    flags,
+                    val,
+                    timeout,
+                }
+            }
+            FutexOperation::WaitBitset => {
+                let timeout = time_param(ctx.sys_req_ptr(3));
+                FutexArgs::WaitBitset {
+                    addr,
+                    flags,
+                    val,
+                    timeout,
+                    bitmask: ctx.sys_req_arg(5),
+                }
+            }
             FutexOperation::Wake => FutexArgs::Wake {
                 addr,
                 flags,
                 count: val,
+            },
+            // Note: for FUTEX_REQUEUE/FUTEX_CMP_REQUEUE, the 4th syscall argument (normally a
+            // `struct timespec *timeout` for FUTEX_WAIT) is instead a plain integer -- the
+            // requeue count -- per futex(2)'s documented reuse of that argument slot. It must NOT
+            // be read as a timeout pointer here.
+            FutexOperation::Requeue => FutexArgs::Requeue {
+                addr,
+                flags,
+                wake_count: val,
+                requeue_count: ctx.sys_req_arg(3),
+                addr2: ctx.sys_req_ptr(4),
+            },
+            FutexOperation::CmpRequeue => FutexArgs::CmpRequeue {
+                addr,
+                flags,
+                wake_count: val,
+                requeue_count: ctx.sys_req_arg(3),
+                addr2: ctx.sys_req_ptr(4),
+                expected_value: ctx.sys_req_arg(5),
             },
         };
         Ok(SyscallRequest::Futex { args })
