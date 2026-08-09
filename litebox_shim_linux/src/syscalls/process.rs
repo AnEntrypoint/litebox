@@ -881,6 +881,83 @@ fn fixup_stale_stack_pointers<Platform: ShimPlatform>(
     }
 }
 
+/// Translate every stale, untranslated SOURCE-space pointer stored in the `fork()` child's copy of
+/// each loaded ELF image's *writable data segment* (`.data`/`.got`/`.data.rel.ro`/`.bss`) into its
+/// DESTINATION equivalent.
+///
+/// # The bug this fixes
+///
+/// Real Linux `fork()` gives the child the parent's exact virtual addresses, so absolute pointers
+/// the parent stored in memory stay valid verbatim. LiteBox cannot: parent and child share one
+/// host process, so the child's memory must be relocated (see `PageManager::duplicate`'s "Known
+/// deviation" section). RIP-relative references survive that relocation -- `duplicate` moves each
+/// ELF image's segments as one coherent group, preserving their relative offsets exactly --
+/// but every *absolute* pointer stored in guest memory is left pointing at the parent.
+///
+/// A loaded ELF's writable data segment is where those absolute pointers live: every
+/// `R_X86_64_RELATIVE`/`RELR` slot the loader filled in with `load_base + addend`, plus every
+/// global pointer variable the program assigns at runtime. Left stale, they do not fault (the
+/// parent's mappings are still mapped in the same host process) -- they silently read the
+/// *parent's* copy of the object, or get mistaken for something else entirely.
+///
+/// Confirmed live as the cause of this investigation's long-standing `STATUS_PRIVILEGED_
+/// INSTRUCTION` crash (`.gm/prd.yml`'s `residual-second-fork-verify-corruption-bug`): busybox
+/// `ash` keeps its file-stack head in `.data`, initialized by a `RELR` relocation to the address
+/// of a static sentinel node in `.bss`. Its pop loop reads that head and compares it against
+/// `leaq sentinel(%rip)`:
+///
+/// ```text
+///   leaq  0x84431(%rip), %rax   ; -> the CHILD's sentinel address (RIP-relative: correct)
+///   movq  0x83e40(%rip), %rbx   ; -> the head slot: still the PARENT's sentinel address (stale)
+///   cmpq  %rax, %rbx
+///   je    <done>                ; never taken in the child
+///   ...
+///   movq  %rbx, %rdi
+///   callq *free@GOT             ; the static sentinel gets handed to free()
+/// ```
+///
+/// so the loop ran past its terminator and passed a `.bss` object to `free()`. musl's mallocng
+/// correctly rejected the misaligned non-heap pointer with its deliberate `hlt` alignment assert,
+/// which surfaces on Windows as `0xC0000096`. Translating the head slot here makes the comparison
+/// match, exactly as it does on Linux.
+///
+/// # Why scanning these ranges is precise, not the heuristic scan that was reverted before
+///
+/// Sweeping memory for "values that fall in a parent range" is only sound where ordinary program
+/// data cannot live: `AddressRelocations::translate` cannot tell a genuine stale pointer from a
+/// string or integer that coincidentally lands in the parent's address range. An earlier
+/// whole-heap sweep did exactly that and corrupted a shell's stack-string arena (see
+/// `fixup_stale_stack_pointers`'s doc comment and `AddressRelocations::heap_range`).
+///
+/// `AddressRelocations::private_data_ranges` avoids that by construction rather than by guess: a
+/// range qualifies only if it is simultaneously private (excluding any `MAP_SHARED` mapping,
+/// which duplication itself already rejects), writable, non-executable, and not the stack (which
+/// is where all bulk program data lives -- covered separately, and only within a bounded window,
+/// by `fixup_stale_stack_pointers`). A loaded ELF's `PF_W` `PT_LOAD` segment and the `brk` heap
+/// both satisfy this and both are swept: an image's globals are pointers, counters and flags,
+/// never buffers, and the heap here is mallocng's own bookkeeping (free-chunk/group metadata),
+/// which genuinely holds pointers that must be relocated -- unlike the *heuristic* whole-heap scan
+/// this pass replaces, this one is admitted by the same non-executable/non-shared/non-stack
+/// conjunction, not by pattern-matching byte contents for "looks like a pointer".
+#[cfg(target_arch = "x86_64")]
+fn fixup_stale_elf_data_pointers<Platform: ShimPlatform>(
+    relocations: &litebox::mm::AddressRelocations,
+) {
+    for (source_range, dest_base) in relocations.private_data_ranges() {
+        let mut addr = dest_base;
+        let dest_top = dest_base + source_range.len();
+        while addr < dest_top {
+            let slot = UserPtrMut::<usize>::from_usize(addr);
+            if let Some(value) = slot.read_at_offset::<Platform>(0)
+                && let Some(translated) = relocations.translate(value)
+            {
+                let _ = slot.write_at_offset::<Platform>(0, translated);
+            }
+            addr += core::mem::size_of::<usize>();
+        }
+    }
+}
+
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Called when the task is exiting.
     ///
@@ -1336,6 +1413,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // instruction, exactly the same way the FS-base self-pointer below is fixed up
                 // for the same reason.
                 fixup_stale_stack_pointers::<Platform>(&relocations, child_ctx.rsp);
+                fixup_stale_elf_data_pointers::<Platform>(&relocations);
             }
 
             // Register the new process as a child of the caller's process so a later

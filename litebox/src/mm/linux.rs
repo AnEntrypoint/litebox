@@ -343,6 +343,42 @@ impl<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> VmArea<Platfor
     }
 }
 
+/// Whether `vma` (covering `range`) is a *private writable data region* of the guest: memory the
+/// guest owns exclusively and can legitimately store pointers in, as opposed to code, read-only
+/// data, shared mappings, or the stack.
+///
+/// Recorded per-range by [`Vmem::duplicate`] and surfaced as
+/// [`super::AddressRelocations::private_data_ranges`], whose doc comment explains what a consumer
+/// uses it for and why the conjunction below -- not any inspection of the contents -- is what
+/// makes the classification safe:
+///
+/// - **writable and not executable**: excludes `.text` and `.rodata`, i.e. every range whose
+///   contents are an instruction stream or immutable constants. Rewriting a byte there would
+///   corrupt decoded instructions.
+/// - **not shared**: a `MAP_SHARED` region is re-mapped rather than copied by [`Vmem::duplicate`],
+///   so its contents *are* the parent's live memory; rewriting a pointer there would corrupt a
+///   process that is still running.
+/// - **not the stack** (`VM_GROWSDOWN`): the stack is deep, dominated by in-progress program data
+///   (partially-built strings, locals, arena bytes), and is already covered -- deliberately only
+///   within a bounded window above `rsp` -- by the shim's separate stack fixup pass, for reasons
+///   that pass documents at length.
+///
+/// The `brk` heap is deliberately *not* excluded, unlike in the stack pass: the guest allocator's
+/// own bookkeeping lives there and genuinely holds pointers that must be relocated. See
+/// [`super::AddressRelocations::private_data_ranges`].
+/// `(source range, destination base address, was executable in source, is a private data region)`
+/// for one relocated range -- see [`Vmem::duplicate`].
+type DuplicatedRangeInfo = (Range<usize>, usize, bool, bool);
+
+fn is_private_data_range<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize>(
+    vma: &VmArea<Platform, ALIGN>,
+) -> bool {
+    vma.shared_handle.is_none()
+        && !vma.flags().contains(VmFlags::VM_GROWSDOWN)
+        && vma.flags().contains(VmFlags::VM_WRITE)
+        && !vma.flags().contains(VmFlags::VM_EXEC)
+}
+
 /// Virtual Memory Manager
 ///
 /// This struct mantains the virtual memory ranges backed by a memory [backend](PageManagementProvider).
@@ -728,7 +764,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     pub(super) unsafe fn duplicate<DestPlatform>(
         &self,
         dest: &mut Vmem<DestPlatform, ALIGN>,
-    ) -> Result<Vec<(Range<usize>, usize, bool)>, VmemDuplicateError>
+    ) -> Result<Vec<DuplicatedRangeInfo>, VmemDuplicateError>
     where
         DestPlatform: PageManagementProvider<ALIGN, SharedMemoryHandle = Platform::SharedMemoryHandle>
             + 'static,
@@ -736,8 +772,9 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // Each entry's third field: whether the range was executable (`VM_EXEC`) in `self` (the
         // source). Threaded through to `AddressRelocations::is_executable_range` so a consumer
         // that must scan destination memory for stale pointers can exclude code pages -- see that
-        // method's doc comment.
-        let mut relocations: Vec<(Range<usize>, usize, bool)> = Vec::new();
+        // method's doc comment. The fourth: whether it is a private writable data region (see
+        // `is_private_data_range` and `AddressRelocations::private_data_ranges`).
+        let mut relocations: Vec<DuplicatedRangeInfo> = Vec::new();
         // Collect first: `insert_mapping` on `dest` only touches `dest.vmas`, but we still avoid
         // holding a borrow of `self.vmas` across it for clarity and to allow future parallel
         // copying without restructuring this loop.
@@ -868,6 +905,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     range.clone(),
                     dest_ptr.as_usize(),
                     vma.flags.contains(VmFlags::VM_EXEC),
+                    is_private_data_range(&vma),
                 ));
                 continue;
             }
@@ -908,6 +946,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     range.clone(),
                     dest_ptr.as_usize(),
                     vma.flags.contains(VmFlags::VM_EXEC),
+                    is_private_data_range(&vma),
                 ));
                 continue;
             }
@@ -955,6 +994,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 // The SOURCE's real flags (`vma.flags`), not `writable_vma`'s temporary
                 // READ|WRITE-forced flags used only to populate this mapping above.
                 vma.flags.contains(VmFlags::VM_EXEC),
+                is_private_data_range(&vma),
             ));
 
             if vma.flags.intersection(VmFlags::VM_ACCESS_FLAGS)

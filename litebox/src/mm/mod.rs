@@ -56,6 +56,9 @@ pub struct AddressRelocations {
     /// individual bytes of a decoded instruction stream into a privileged or otherwise undefined
     /// opcode.
     executable: Vec<bool>,
+    /// Parallel to `ranges`: whether the corresponding range is a *private writable data region*
+    /// of the guest -- see [`Self::private_data_ranges`], which this exists to back.
+    private_data: Vec<bool>,
     /// The source (parent) process's program break at the moment of duplication, i.e. the current
     /// upper bound of its heap (`brk`-allocated) region -- `0` if `set_initial_brk` was never
     /// called (no heap exists yet). By construction (`PageManager::brk`'s `create_pages` call),
@@ -166,6 +169,26 @@ impl AddressRelocations {
             .find(|(source_range, _)| source_range.end == self.heap_top)
             .cloned()
     }
+
+    /// Returns the `(source range, destination base)` pairs of every tracked range classified as
+    /// a *private writable data region* of the guest at the moment of duplication: private
+    /// (non-`MAP_SHARED`), writable, non-executable, and not the stack -- i.e. a loaded ELF
+    /// image's `.data`/`.got`/`.bss`-style segment or an anonymous private mapping, never code,
+    /// read-only data, a shared mapping, or the stack. That conjunction (not any inspection of
+    /// contents) is what makes it precise enough to scan and rewrite unconditionally, unlike a
+    /// heuristic whole-region sweep.
+    ///
+    /// Used by a fork-time fixup pass that must translate stale, untranslated SOURCE-space
+    /// pointers a loaded ELF image's `.data`/`.got`/`.bss` segment stored before duplication (e.g.
+    /// an `R_X86_64_RELATIVE`/`RELR`-initialized global pointing at another symbol in the same
+    /// image) into their DESTINATION equivalents.
+    pub fn private_data_ranges(&self) -> impl Iterator<Item = (Range<usize>, usize)> + '_ {
+        self.ranges
+            .iter()
+            .zip(&self.private_data)
+            .filter(|(_, is_private)| **is_private)
+            .map(|((source_range, dest_base), _)| (source_range.clone(), *dest_base))
+    }
 }
 
 impl<Platform, const ALIGN: usize> PageManager<Platform, ALIGN>
@@ -212,10 +235,14 @@ where
         let mut dest_vmem =
             linux::Vmem::new_excluding(litebox.x.platform, source_ranges.into_iter());
         let relocations = unsafe { source_vmem.duplicate(&mut dest_vmem) }?;
-        let (ranges, executable) = relocations
-            .into_iter()
-            .map(|(range, dest_base, executable)| ((range, dest_base), executable))
-            .unzip();
+        let mut ranges = Vec::with_capacity(relocations.len());
+        let mut executable = Vec::with_capacity(relocations.len());
+        let mut private_data = Vec::with_capacity(relocations.len());
+        for (range, dest_base, is_executable, is_private_data) in relocations {
+            ranges.push((range, dest_base));
+            executable.push(is_executable);
+            private_data.push(is_private_data);
+        }
         Ok((
             Self {
                 vmem: RwLock::new(dest_vmem),
@@ -223,6 +250,7 @@ where
             AddressRelocations {
                 ranges,
                 executable,
+                private_data,
                 heap_top,
             },
         ))
@@ -940,6 +968,7 @@ mod address_relocations_tests {
                 (0x8000_0000..0x8000_2000, 0xa000_0000),
             ],
             executable: alloc::vec![false, false, false],
+            private_data: alloc::vec![false, true, false],
             heap_top: 0x1010_0000,
         };
 
@@ -960,6 +989,7 @@ mod address_relocations_tests {
         let relocations = AddressRelocations {
             ranges: alloc::vec![(0x7000_0000..0x7080_0000, 0x9000_0000)],
             executable: alloc::vec![false],
+            private_data: alloc::vec![false],
             heap_top: 0,
         };
 
@@ -975,9 +1005,40 @@ mod address_relocations_tests {
         let relocations = AddressRelocations {
             ranges: alloc::vec![(0x7000_0000..0x7080_0000, 0x9000_0000)],
             executable: alloc::vec![false],
+            private_data: alloc::vec![false],
             heap_top: 0x1234_5678,
         };
 
         assert_eq!(relocations.heap_range(), None);
+    }
+
+    /// `private_data_ranges` must return exactly the ranges flagged `true` in the parallel
+    /// `private_data` vec (source range and destination base preserved verbatim), in original
+    /// order, skipping every non-private-data range (e.g. code, stack, or a shared mapping) --
+    /// this is the primitive `fixup_stale_elf_data_pointers` (in `litebox_shim_linux`) relies on
+    /// to scan precisely, so a wrong filter here would either miss a genuine stale pointer or
+    /// rewrite a range it must not touch.
+    #[test]
+    fn private_data_ranges_returns_only_flagged_ranges_in_order() {
+        let relocations = AddressRelocations {
+            ranges: alloc::vec![
+                (0x1000_0000..0x1000_1000, 0x2000_0000), // code: excluded
+                (0x1000_1000..0x1000_2000, 0x2000_1000), // .data: included
+                (0x7000_0000..0x7080_0000, 0x9000_0000), // stack: excluded
+                (0x1000_2000..0x1000_3000, 0x2000_2000), // heap: included
+            ],
+            executable: alloc::vec![true, false, false, false],
+            private_data: alloc::vec![false, true, false, true],
+            heap_top: 0x1000_3000,
+        };
+
+        let got: alloc::vec::Vec<_> = relocations.private_data_ranges().collect();
+        assert_eq!(
+            got,
+            alloc::vec![
+                (0x1000_1000..0x1000_2000, 0x2000_1000),
+                (0x1000_2000..0x1000_3000, 0x2000_2000),
+            ]
+        );
     }
 }
