@@ -1901,10 +1901,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .now()
                     .duration_since(&self.global.boot_time)
             }
-            litebox_common_linux::ClockId::MonotonicCoarse => {
-                // CLOCK_MONOTONIC_COARSE - provides faster but less precise monotonic time
-                // For simplicity, we can reuse the same monotonic time as CLOCK_MONOTONIC
-                // In a real implementation, this would typically have lower resolution
+            litebox_common_linux::ClockId::MonotonicCoarse
+            | litebox_common_linux::ClockId::MonotonicRaw
+            | litebox_common_linux::ClockId::Boottime => {
+                // CLOCK_MONOTONIC_COARSE / CLOCK_MONOTONIC_RAW / CLOCK_BOOTTIME - all
+                // approximated by reusing CLOCK_MONOTONIC's source. litebox does not
+                // distinguish NTP-adjustment or suspend time from plain monotonic time.
+                self.global
+                    .platform
+                    .now()
+                    .duration_since(&self.global.boot_time)
+            }
+            litebox_common_linux::ClockId::RealTimeCoarse => {
+                // CLOCK_REALTIME_COARSE - approximated by reusing CLOCK_REALTIME's source.
+                self.real_time_as_duration_since_epoch()
+            }
+            litebox_common_linux::ClockId::ProcessCputimeId
+            | litebox_common_linux::ClockId::ThreadCputimeId => {
+                // CLOCK_PROCESS_CPUTIME_ID / CLOCK_THREAD_CPUTIME_ID - litebox does not
+                // track genuine per-process/per-thread CPU-time-consumed accounting.
+                // Approximate with monotonic wall-clock time: callers (e.g. V8/abseil)
+                // generally require a valid, monotonically-increasing, non-EINVAL value
+                // for coarse profiling/scheduling decisions rather than exact CPU
+                // accounting.
                 self.global
                     .platform
                     .now()
@@ -1931,7 +1950,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<Option<<Platform as TimeProvider>::Instant>, Errno> {
         match clock_id {
             litebox_common_linux::ClockId::Monotonic
-            | litebox_common_linux::ClockId::MonotonicCoarse => {
+            | litebox_common_linux::ClockId::MonotonicCoarse
+            | litebox_common_linux::ClockId::MonotonicRaw
+            | litebox_common_linux::ClockId::Boottime => {
                 // No need to compute the current time since the offset from the
                 // request to `Instant` is known.
                 Ok(self.global.boot_time.checked_add(duration))
@@ -1957,16 +1978,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<(), Errno> {
         // Return the resolution of the clock
         let resolution = match clockid {
-            litebox_common_linux::ClockId::MonotonicCoarse => {
+            litebox_common_linux::ClockId::MonotonicCoarse
+            | litebox_common_linux::ClockId::RealTimeCoarse => {
                 // Coarse clocks typically have lower resolution (e.g., 4 millisecond)
                 Duration::from_millis(4)
             }
-            litebox_common_linux::ClockId::RealTime | litebox_common_linux::ClockId::Monotonic => {
+            litebox_common_linux::ClockId::RealTime
+            | litebox_common_linux::ClockId::Monotonic
+            | litebox_common_linux::ClockId::MonotonicRaw
+            | litebox_common_linux::ClockId::Boottime
+            | litebox_common_linux::ClockId::ProcessCputimeId
+            | litebox_common_linux::ClockId::ThreadCputimeId => {
                 // For most modern systems, the resolution is typically 1 nanosecond
                 // This is a reasonable default for high-resolution timers
                 Duration::from_nanos(1)
             }
-            _ => unimplemented!(),
+            _ => {
+                log_unsupported!("getres for {clockid:?}");
+                return Err(Errno::EINVAL);
+            }
         };
 
         res.write::<Platform>(resolution)
@@ -2824,6 +2854,66 @@ mod tests {
         let ptr: UserPtrMut<u8> = UserPtrMut::from_usize(old_fs_base);
         task.sys_arch_prctl(ArchPrctlArg::SetFs(ptr.as_usize()))
             .expect("Failed to restore FS base");
+    }
+
+    #[test]
+    fn test_gettime_process_cputime_id_succeeds() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let duration = task
+            .gettime_as_duration(litebox_common_linux::ClockId::ProcessCputimeId)
+            .expect("CLOCK_PROCESS_CPUTIME_ID must be supported");
+        assert!(duration.as_nanos() < u128::MAX);
+    }
+
+    #[test]
+    fn test_gettime_thread_cputime_id_succeeds() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let duration = task
+            .gettime_as_duration(litebox_common_linux::ClockId::ThreadCputimeId)
+            .expect("CLOCK_THREAD_CPUTIME_ID must be supported");
+        assert!(duration.as_nanos() < u128::MAX);
+    }
+
+    #[test]
+    fn test_gettime_monotonic_raw_succeeds() {
+        let task = crate::syscalls::tests::init_platform(None);
+        task.gettime_as_duration(litebox_common_linux::ClockId::MonotonicRaw)
+            .expect("CLOCK_MONOTONIC_RAW must be supported");
+    }
+
+    #[test]
+    fn test_gettime_realtime_coarse_succeeds() {
+        let task = crate::syscalls::tests::init_platform(None);
+        task.gettime_as_duration(litebox_common_linux::ClockId::RealTimeCoarse)
+            .expect("CLOCK_REALTIME_COARSE must be supported");
+    }
+
+    #[test]
+    fn test_gettime_boottime_succeeds() {
+        let task = crate::syscalls::tests::init_platform(None);
+        task.gettime_as_duration(litebox_common_linux::ClockId::Boottime)
+            .expect("CLOCK_BOOTTIME must be supported");
+    }
+
+    #[test]
+    fn test_clock_id_invalid_value_rejected() {
+        use litebox_common_linux::ClockId;
+        use std::convert::TryFrom;
+
+        assert!(ClockId::try_from(99i32).is_err());
+    }
+
+    #[test]
+    fn test_clock_getres_process_cputime_id_succeeds() {
+        use litebox_common_linux::Timespec;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let mut res = Timespec::default();
+        task.sys_clock_getres(
+            litebox_common_linux::ClockId::ProcessCputimeId,
+            litebox_common_linux::TimeParam::Timespec64(UserPtrMut::from_ptr(&raw mut res)),
+        )
+        .expect("clock_getres on CLOCK_PROCESS_CPUTIME_ID must be supported");
     }
 
     #[test]

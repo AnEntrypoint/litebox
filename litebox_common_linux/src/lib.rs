@@ -1700,7 +1700,12 @@ pub struct LinuxDirent64 {
 pub enum ClockId {
     RealTime = 0,
     Monotonic = 1,
+    ProcessCputimeId = 2,
+    ThreadCputimeId = 3,
+    MonotonicRaw = 4,
+    RealTimeCoarse = 5,
     MonotonicCoarse = 6,
+    Boottime = 7,
 }
 
 bitflags::bitflags! {
