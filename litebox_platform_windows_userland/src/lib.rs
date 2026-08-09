@@ -61,6 +61,14 @@ pub struct WindowsUserland {
     /// The userspace NAT gateway backing [`IPInterfaceProvider`](litebox::platform::IPInterfaceProvider)
     /// (see the private `net` module), lazily initialized on first network use.
     net_gateway: std::sync::OnceLock<net::NatGateway>,
+    /// Backing state for [`read_from_raw_handle`]/[`stdin_ready_raw_handle`]'s console
+    /// (`FILE_TYPE_CHAR`) case, lazily initialized (spawning its background reader thread) on
+    /// first stdin access. See [`ConsoleStdinReader`]'s doc comment for why this exists. A field
+    /// on this per-instance struct rather than a bare `static`, matching `net_gateway` above --
+    /// `WindowsUserland::new` always hands back a `&'static Self` in practice, so this is no less
+    /// process-lifetime than a bare static would be, without adding to the crate's ratcheted
+    /// bare-static count.
+    console_stdin_reader: std::sync::OnceLock<ConsoleStdinReader>,
 }
 
 impl core::fmt::Debug for WindowsUserland {
@@ -479,6 +487,7 @@ impl WindowsUserland {
             reserved_pages,
             sys_info: std::sync::RwLock::new(sys_info),
             net_gateway: std::sync::OnceLock::new(),
+            console_stdin_reader: std::sync::OnceLock::new(),
         };
 
         // Initialize it's own fs-base (for the main thread)
@@ -499,6 +508,25 @@ impl WindowsUserland {
         }
 
         Box::leak(Box::new(platform))
+    }
+
+    /// Reinterprets `&self` as `&'static Self`.
+    ///
+    /// # Why this is sound
+    ///
+    /// [`Self::new`] always returns its result from `Box::leak`, and this crate creates exactly
+    /// one `WindowsUserland` per process (there is no `Drop` impl, no way to reclaim the leaked
+    /// allocation, and every entry point that could construct a second instance is either test-only
+    /// or documented as such) -- so any `&self` reachable from an instance method is, in practice,
+    /// already borrowed from that single `'static` allocation. This exists specifically for
+    /// [`ConsoleStdinReader::get`], whose background reader thread must outlive the calling stack
+    /// frame (see its doc comment); every other instance method continues to take a plain `&self`
+    /// with its natural (shorter, borrow-checked) lifetime, so this cast is used only where a
+    /// `'static` bound is genuinely required, not as a blanket escape hatch.
+    fn as_static(&self) -> &'static Self {
+        // Safety: see the doc comment above -- `self` is always ultimately derived from a
+        // `Box::leak`'d allocation with no legitimate way to outlive the process.
+        unsafe { &*core::ptr::from_ref(self) }
     }
 
     fn read_memory_maps() -> alloc::vec::Vec<core::ops::Range<usize>> {
@@ -2330,41 +2358,44 @@ struct ConsoleStdinReader {
 }
 
 impl ConsoleStdinReader {
-    fn get() -> &'static Self {
-        static READER: OnceLock<ConsoleStdinReader> = OnceLock::new();
-        READER.get_or_init(|| {
+    /// Returns `platform`'s lazily-initialized [`ConsoleStdinReader`], spawning its background
+    /// reader thread the first time this is called for a given `WindowsUserland` instance.
+    ///
+    /// Takes `&'static WindowsUserland` (not just `&WindowsUserland`) because the spawned reader
+    /// thread's closure must outlive the calling stack frame -- `WindowsUserland::new` always
+    /// hands back a `&'static Self` in practice (there is exactly one platform instance per
+    /// process, leaked for its lifetime), so every real caller already has one.
+    fn get(platform: &'static WindowsUserland) -> &'static Self {
+        platform.console_stdin_reader.get_or_init(|| {
             let reader = ConsoleStdinReader {
                 buffer: std::sync::Mutex::new(std::collections::VecDeque::new()),
                 ready: std::sync::Condvar::new(),
                 eof: core::sync::atomic::AtomicBool::new(false),
             };
-            // Safety: the spawned thread only ever touches `'static` state (this `OnceLock`'s
-            // contents, reached back through `ConsoleStdinReader::get()`) and the process's real
-            // `STD_INPUT_HANDLE`, so it has no lifetime dependency on its caller.
             std::thread::Builder::new()
                 .name("litebox-console-stdin-reader".to_owned())
-                .spawn(Self::reader_thread_body)
+                .spawn(move || Self::reader_thread_body(platform))
                 .expect("failed to spawn console stdin reader thread");
             reader
         })
     }
 
-    /// Runs on a dedicated background thread for the lifetime of the process: repeatedly issues a
-    /// single genuinely blocking `ReadFile` against `STD_INPUT_HANDLE` and appends whatever comes
-    /// back to `buffer`, waking any waiter. This is the only thread that ever calls `ReadFile` on
-    /// the console handle, so its blocking is invisible to every guest thread -- they only ever
-    /// observe this struct's already-buffered results.
     /// Chunk size for each background `ReadFile` call. Sized to comfortably hold a typical typed
     /// line; larger than this just means a following `ConsoleStdinReader::read` call drains it
     /// across more than one guest `read()` invocation, matching how a real Linux pipe/tty already
     /// behaves for an over-long line.
     const CHUNK_LEN: u32 = 4096;
 
-    fn reader_thread_body() {
+    /// Runs on a dedicated background thread for the lifetime of the process: repeatedly issues a
+    /// single genuinely blocking `ReadFile` against `STD_INPUT_HANDLE` and appends whatever comes
+    /// back to `buffer`, waking any waiter. This is the only thread that ever calls `ReadFile` on
+    /// the console handle, so its blocking is invisible to every guest thread -- they only ever
+    /// observe this struct's already-buffered results.
+    fn reader_thread_body(platform: &'static WindowsUserland) {
         use windows_sys::Win32::Storage::FileSystem::ReadFile;
         use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
 
-        let this = Self::get();
+        let this = Self::get(platform);
         loop {
             let handle =
                 unsafe { windows_sys::Win32::System::Console::GetStdHandle(STD_INPUT_HANDLE) };
@@ -2455,7 +2486,10 @@ impl ConsoleStdinReader {
     clippy::unnecessary_wraps,
     reason = "mirrors StdioProvider::read_from_stdin's Result signature (and write_to_raw_handle's shape) even though every current failure path here maps to Ok(0)/EOF rather than a real Err; keeps the two raw-handle helpers symmetric and leaves room for a genuine error case without a signature change"
 )]
-fn read_from_raw_handle(buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
+fn read_from_raw_handle(
+    platform: &'static WindowsUserland,
+    buf: &mut [u8],
+) -> Result<usize, litebox::platform::StdioReadError> {
     use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_CHAR, GetFileType, ReadFile};
     use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
 
@@ -2465,7 +2499,7 @@ fn read_from_raw_handle(buf: &mut [u8]) -> Result<usize, litebox::platform::Stdi
         return Ok(0);
     }
     if unsafe { GetFileType(handle) } == FILE_TYPE_CHAR {
-        return Ok(ConsoleStdinReader::get().read(buf));
+        return Ok(ConsoleStdinReader::get(platform).read(buf));
     }
     let mut read: u32 = 0;
     let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
@@ -2520,7 +2554,7 @@ fn read_from_raw_handle(buf: &mut [u8]) -> Result<usize, litebox::platform::Stdi
 ///   an absent handle behaves like already-closed/EOF stdin, matching [`read_from_raw_handle`]'s
 ///   own `Ok(0)` treatment of that case) -- report ready so the guest's `read()` promptly
 ///   observes the real outcome instead of appearing to hang on a readiness check.
-fn stdin_ready_raw_handle() -> bool {
+fn stdin_ready_raw_handle(platform: &'static WindowsUserland) -> bool {
     use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_CHAR, FILE_TYPE_PIPE, GetFileType};
     use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
     use windows_sys::Win32::System::Pipes::PeekNamedPipe;
@@ -2534,7 +2568,7 @@ fn stdin_ready_raw_handle() -> bool {
     }
 
     match unsafe { GetFileType(handle) } {
-        FILE_TYPE_CHAR => ConsoleStdinReader::get().is_ready(),
+        FILE_TYPE_CHAR => ConsoleStdinReader::get(platform).is_ready(),
         FILE_TYPE_PIPE => {
             let mut available: u32 = 0;
             let ok = unsafe {
@@ -2644,7 +2678,7 @@ fn write_to_raw_handle(
 
 impl litebox::platform::StdioProvider for WindowsUserland {
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
-        read_from_raw_handle(buf)
+        read_from_raw_handle(self.as_static(), buf)
     }
 
     fn write_to(
@@ -2673,7 +2707,7 @@ impl litebox::platform::StdioProvider for WindowsUserland {
     }
 
     fn stdin_ready(&self) -> bool {
-        stdin_ready_raw_handle()
+        stdin_ready_raw_handle(self.as_static())
     }
 }
 
@@ -3037,6 +3071,12 @@ mod tests {
         }
         let _restore = RestoreStdin(unsafe { GetStdHandle(STD_INPUT_HANDLE) });
 
+        // `stdin_ready_raw_handle` only needs a live `WindowsUserland` instance for its
+        // `FILE_TYPE_CHAR` (real console) branch, which this test deliberately does not exercise
+        // (see this test's doc comment) -- but the parameter is required regardless, so get a real
+        // instance the same way any other caller would.
+        let platform = WindowsUserland::new();
+
         // An empty anonymous pipe (`FILE_TYPE_PIPE`) with nothing written yet: must report
         // not-ready, since a `ReadFile` on it would block until a writer sends data -- this is
         // the exact "poll says ready, read blocks forever" hazard this function exists to avoid.
@@ -3057,7 +3097,7 @@ mod tests {
             SetStdHandle(STD_INPUT_HANDLE, read_handle);
         }
         assert!(
-            !super::stdin_ready_raw_handle(),
+            !super::stdin_ready_raw_handle(platform),
             "an empty pipe with no writer output yet must not report ready"
         );
 
@@ -3075,7 +3115,7 @@ mod tests {
         };
         assert_ne!(ok, 0);
         assert!(
-            super::stdin_ready_raw_handle(),
+            super::stdin_ready_raw_handle(platform),
             "a pipe with data already written must report ready"
         );
 
@@ -3090,7 +3130,7 @@ mod tests {
             SetStdHandle(STD_INPUT_HANDLE, core::ptr::null_mut());
         }
         assert!(
-            super::stdin_ready_raw_handle(),
+            super::stdin_ready_raw_handle(platform),
             "no stdin handle attached at all must report ready (matches EOF semantics)"
         );
     }
