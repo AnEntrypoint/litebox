@@ -2758,9 +2758,43 @@ fn stdin_ready_raw_handle(platform: &'static WindowsUserland) -> bool {
 /// real console (`WriteFile` writes bytes through the console's active codepage, exactly as a
 /// real Linux process's raw `write()` to an inherited console fd would) and a redirected
 /// file/pipe (a plain byte-for-byte `WriteFile`).
+///
+/// One gap this leaves: real Linux `write(2)` to a TTY (or a pipe/regular file, up to
+/// implementation-defined size limits -- `PIPE_BUF`-ish for pipes) is atomic with respect to other
+/// concurrent writers to the *same* file description -- the kernel serializes byte ranges so one
+/// writer's bytes are never torn/interleaved mid-flight with another's. A single guest "process"
+/// can itself be multi-threaded (every guest thread is an ordinary Windows thread in this shared
+/// host process, same as the guest-process note above), and Win32's `WriteFile` on a console
+/// handle provides no equivalent atomicity guarantee across concurrent callers -- two threads
+/// calling `WriteFile` on the same `STD_OUTPUT_HANDLE`/`STD_ERROR_HANDLE` at once can have their
+/// bytes genuinely interleaved by the console subsystem, which a real Linux kernel would never
+/// allow. This was the confirmed mechanism behind a reported live keystroke/output corruption bug
+/// in a heavily-multithreaded guest (Node.js's REPL, whose main JS thread, libuv threadpool, and
+/// V8 GC/compiler threads can all independently reach `write(1, ...)`/`write(2, ...)`): one
+/// thread's diagnostic stderr write landed spliced into the middle of another thread's stdout
+/// bytes.
+///
+/// Fixed with a pair of raw mutexes (`STDOUT_WRITE_LOCK`/`STDERR_WRITE_LOCK`, one per stream so a
+/// stalled stdout writer never blocks a concurrent stderr writer or vice versa), held only for the
+/// duration of the `WriteFile` call itself -- never across anything that can block indefinitely.
+/// This is safe with respect to `ThreadHandle::interrupt`'s `SuspendThread`/`ResumeThread` pair
+/// (the documented hazard above, where a thread suspended while holding a lock can wedge every
+/// other thread waiting on it forever): `interrupt` always pairs its `SuspendThread` with a
+/// `defer`-guaranteed `ResumeThread` before `interrupt` itself returns, so the suspend window is
+/// bounded by that one function call, never indefinite -- a thread blocked on this lock waits out,
+/// at worst, one `interrupt` call's short suspend/resume window, never forever. This differs from
+/// the `std::io::Stdout` case in scope, not just mechanism: that lock was one process-wide
+/// singleton shared by *every* guest process for *every* stdio stream, coupling unrelated guest
+/// processes' liveness together; these locks are per-stream only, so unrelated guest
+/// processes/threads writing to different streams never contend at all, and even same-stream
+/// writers only ever wait for one bounded `WriteFile` call to finish.
+static STDOUT_WRITE_LOCK: Mutex<()> = Mutex::new(());
+static STDERR_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
 fn write_to_raw_handle(
     handle: windows_sys::Win32::Foundation::HANDLE,
     buf: &[u8],
+    lock: &Mutex<()>,
 ) -> Result<usize, litebox::platform::StdioWriteError> {
     use windows_sys::Win32::Storage::FileSystem::WriteFile;
 
@@ -2772,6 +2806,12 @@ fn write_to_raw_handle(
     }
     let mut written: u32 = 0;
     let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+    // Serialize this write against any other concurrent writer to the same stream (see the doc
+    // comment above); held only across the `WriteFile` call itself, never across anything that can
+    // block for an unbounded time.
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let ok = unsafe {
         WriteFile(
             handle,
@@ -2806,12 +2846,12 @@ impl litebox::platform::StdioProvider for WindowsUserland {
     ) -> Result<usize, litebox::platform::StdioWriteError> {
         use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
 
-        let std_handle = match stream {
-            litebox::platform::StdioOutStream::Stdout => STD_OUTPUT_HANDLE,
-            litebox::platform::StdioOutStream::Stderr => STD_ERROR_HANDLE,
+        let (std_handle, lock) = match stream {
+            litebox::platform::StdioOutStream::Stdout => (STD_OUTPUT_HANDLE, &STDOUT_WRITE_LOCK),
+            litebox::platform::StdioOutStream::Stderr => (STD_ERROR_HANDLE, &STDERR_WRITE_LOCK),
         };
         let handle = unsafe { windows_sys::Win32::System::Console::GetStdHandle(std_handle) };
-        write_to_raw_handle(handle, buf)
+        write_to_raw_handle(handle, buf, lock)
     }
 
     fn is_a_tty(&self, stream: litebox::platform::StdioStream) -> bool {
