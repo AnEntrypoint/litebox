@@ -2297,24 +2297,175 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
     }
 }
 
-/// Reads directly from the process's raw `STD_INPUT_HANDLE` via `ReadFile`, bypassing
-/// `std::io::stdin()`.
+/// Background state backing [`read_from_raw_handle`]/[`stdin_ready_raw_handle`] for a real console
+/// (`FILE_TYPE_CHAR`) `STD_INPUT_HANDLE`.
+///
+/// # Why a background reader thread, not `PeekConsoleInputW`
+///
+/// An earlier version of this readiness probe used `GetNumberOfConsoleInputEvents`/
+/// `PeekConsoleInputW` to inspect the console's raw `INPUT_RECORD` queue directly, on the
+/// assumption that "a queued key-down record" and "`ReadFile` would return immediately" were the
+/// same fact. They are not, once `ENABLE_LINE_INPUT` (the default console mode, and the mode a
+/// real interactive shell like `ash` runs under) is in play: conhost's cooked-read line editor
+/// consumes `KEY_EVENT_RECORD`s out of the raw queue as they arrive (to echo them and perform
+/// line editing), and only stages the finished line -- terminated by Enter -- in its own private,
+/// unqueryable buffer. `ReadFile`/`ReadConsole`, however small the requested byte count, drain
+/// that private cooked-read buffer directly, not the raw `INPUT_RECORD` queue. Confirmed live via
+/// the ConPTY test harness (see this fix's commit message) and independently corroborated by
+/// Microsoft Terminal maintainers (`microsoft/terminal#12143`): once a full line has been typed
+/// and Enter pressed, a single small `ReadFile` call correctly drains the first few bytes, but the
+/// *remaining* buffered bytes of that already-committed line are invisible to
+/// `PeekConsoleInputW`/`GetNumberOfConsoleInputEvents` (they undercount to 0 or a stale
+/// non-key-down remnant), even though `ReadFile` would still return them immediately with no
+/// blocking. There is no supported Win32 API to peek cooked-read readiness -- the community-
+/// converged workaround (also used by libraries like `system-terminal`) is what this does: run a
+/// background thread doing nothing but blocking `ReadFile` calls, and treat *that thread's*
+/// buffered results, not the raw input queue, as the readiness signal.
+struct ConsoleStdinReader {
+    /// Bytes already read from the console but not yet consumed by a guest `read()` call.
+    buffer: std::sync::Mutex<std::collections::VecDeque<u8>>,
+    /// Signaled whenever `buffer` transitions from empty to non-empty, or `eof` becomes true.
+    ready: std::sync::Condvar,
+    eof: core::sync::atomic::AtomicBool,
+}
+
+impl ConsoleStdinReader {
+    fn get() -> &'static Self {
+        static READER: OnceLock<ConsoleStdinReader> = OnceLock::new();
+        READER.get_or_init(|| {
+            let reader = ConsoleStdinReader {
+                buffer: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                ready: std::sync::Condvar::new(),
+                eof: core::sync::atomic::AtomicBool::new(false),
+            };
+            // Safety: the spawned thread only ever touches `'static` state (this `OnceLock`'s
+            // contents, reached back through `ConsoleStdinReader::get()`) and the process's real
+            // `STD_INPUT_HANDLE`, so it has no lifetime dependency on its caller.
+            std::thread::Builder::new()
+                .name("litebox-console-stdin-reader".to_owned())
+                .spawn(Self::reader_thread_body)
+                .expect("failed to spawn console stdin reader thread");
+            reader
+        })
+    }
+
+    /// Runs on a dedicated background thread for the lifetime of the process: repeatedly issues a
+    /// single genuinely blocking `ReadFile` against `STD_INPUT_HANDLE` and appends whatever comes
+    /// back to `buffer`, waking any waiter. This is the only thread that ever calls `ReadFile` on
+    /// the console handle, so its blocking is invisible to every guest thread -- they only ever
+    /// observe this struct's already-buffered results.
+    /// Chunk size for each background `ReadFile` call. Sized to comfortably hold a typical typed
+    /// line; larger than this just means a following `ConsoleStdinReader::read` call drains it
+    /// across more than one guest `read()` invocation, matching how a real Linux pipe/tty already
+    /// behaves for an over-long line.
+    const CHUNK_LEN: u32 = 4096;
+
+    fn reader_thread_body() {
+        use windows_sys::Win32::Storage::FileSystem::ReadFile;
+        use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
+
+        let this = Self::get();
+        loop {
+            let handle =
+                unsafe { windows_sys::Win32::System::Console::GetStdHandle(STD_INPUT_HANDLE) };
+            if handle.is_null() || handle == Win32_Foundation::INVALID_HANDLE_VALUE {
+                this.eof.store(true, Ordering::SeqCst);
+                this.ready.notify_all();
+                return;
+            }
+            let mut chunk = [0u8; Self::CHUNK_LEN as usize];
+            let mut read: u32 = 0;
+            let ok = unsafe {
+                ReadFile(
+                    handle,
+                    chunk.as_mut_ptr(),
+                    Self::CHUNK_LEN,
+                    &raw mut read,
+                    core::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                let err = unsafe { GetLastError() };
+                // `ERROR_BROKEN_PIPE` (the write end of a redirected pipe closed) is EOF, matching
+                // a real Linux `read()` on a closed pipe's read end.
+                if err == Win32_Foundation::ERROR_BROKEN_PIPE {
+                    this.eof.store(true, Ordering::SeqCst);
+                    this.ready.notify_all();
+                    return;
+                }
+                panic!("ReadFile(STD_INPUT_HANDLE) failed: error={err}");
+            }
+            if read == 0 {
+                // A successful zero-byte read is EOF (matches `read_from_raw_handle`'s previous
+                // direct-call contract).
+                this.eof.store(true, Ordering::SeqCst);
+                this.ready.notify_all();
+                return;
+            }
+            // `read <= CHUNK_LEN` (4096), which fits in `usize` on every supported target.
+            let read = usize::try_from(read).unwrap_or(chunk.len());
+            let mut buffer = this.buffer.lock().unwrap();
+            let was_empty = buffer.is_empty();
+            buffer.extend(&chunk[..read]);
+            drop(buffer);
+            if was_empty {
+                this.ready.notify_all();
+            }
+        }
+    }
+
+    /// Copies already-buffered bytes into `buf` (up to `buf.len()`), blocking until at least one
+    /// byte is available or EOF is reached. Never itself calls `ReadFile`.
+    fn read(&self, buf: &mut [u8]) -> usize {
+        let mut buffer = self.buffer.lock().unwrap();
+        loop {
+            if !buffer.is_empty() {
+                let len = buffer.len().min(buf.len());
+                for slot in &mut buf[..len] {
+                    *slot = buffer.pop_front().unwrap();
+                }
+                return len;
+            }
+            if self.eof.load(Ordering::SeqCst) {
+                return 0;
+            }
+            buffer = self.ready.wait(buffer).unwrap();
+        }
+    }
+
+    /// Non-blocking: `true` if a [`Self::read`] call right now would return immediately (either
+    /// real buffered bytes, or EOF).
+    fn is_ready(&self) -> bool {
+        !self.buffer.lock().unwrap().is_empty() || self.eof.load(Ordering::SeqCst)
+    }
+}
+
+/// Reads directly from the process's raw `STD_INPUT_HANDLE`, bypassing `std::io::stdin()`.
 ///
 /// See the doc comment on [`write_to_raw_handle`] for why this deliberately avoids the `std::io`
 /// wrappers: the exact same cross-guest-"process" lock-starvation hazard applies symmetrically to
 /// `std::io::Stdin`'s internal buffered-reader lock.
+///
+/// For a real console (`FILE_TYPE_CHAR`), this drains [`ConsoleStdinReader`]'s buffer (see its doc
+/// comment for why a background reader thread is required, not a direct `ReadFile` here) rather
+/// than calling `ReadFile` itself. For a pipe/regular file, `ReadFile` remains safe to call
+/// directly (no cooked-read desync applies to non-console handles), so this still issues it inline
+/// for those, preserving the original direct-call behavior and error handling.
 #[expect(
     clippy::unnecessary_wraps,
     reason = "mirrors StdioProvider::read_from_stdin's Result signature (and write_to_raw_handle's shape) even though every current failure path here maps to Ok(0)/EOF rather than a real Err; keeps the two raw-handle helpers symmetric and leaves room for a genuine error case without a signature change"
 )]
 fn read_from_raw_handle(buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
-    use windows_sys::Win32::Storage::FileSystem::ReadFile;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_CHAR, GetFileType, ReadFile};
     use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
 
     let handle = unsafe { windows_sys::Win32::System::Console::GetStdHandle(STD_INPUT_HANDLE) };
     if handle.is_null() || handle == Win32_Foundation::INVALID_HANDLE_VALUE {
         // No console/redirected input attached at all: behave like an already-closed stdin.
         return Ok(0);
+    }
+    if unsafe { GetFileType(handle) } == FILE_TYPE_CHAR {
+        return Ok(ConsoleStdinReader::get().read(buf));
     }
     let mut read: u32 = 0;
     let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
@@ -2344,8 +2495,8 @@ fn read_from_raw_handle(buf: &mut [u8]) -> Result<usize, litebox::platform::Stdi
 /// consuming any input, mirroring what a real kernel's `poll(2)`/`select(2)` does for an
 /// inherited stdin fd independently of the read path.
 ///
-/// This exists because [`read_from_raw_handle`] is a single unconditional blocking `ReadFile`
-/// (see its doc comment): unlike a real Linux fd, Windows gives no portable way to make a console
+/// This exists because [`read_from_raw_handle`] can genuinely block indefinitely on a pipe/regular
+/// file's direct `ReadFile` call: unlike a real Linux fd, Windows gives no portable way to make a
 /// handle's `ReadFile` itself non-blocking or cancellable mid-call from another thread, so the
 /// guest-visible `poll`/`select`/`epoll_wait` syscalls (see
 /// `litebox_shim_linux::syscalls::epoll::EpollDescriptor::poll`'s `File` arm) must be answered by
@@ -2357,13 +2508,13 @@ fn read_from_raw_handle(buf: &mut [u8]) -> Result<usize, litebox::platform::Stdi
 /// console that had no pending input -- the process-never-exits bug this function fixes.
 ///
 /// Dispatches on the handle's real type:
-/// - **Console** (`FILE_TYPE_CHAR`): `GetNumberOfConsoleInputEvents` reports the queued input
-///   record count without consuming any of them; each queued record is checked via
-///   `PeekConsoleInput` (also non-consuming) so that pure window/focus/menu bookkeeping events
-///   (which `ReadFile` on a console silently skips past without unblocking the caller) don't
-///   falsely report readiness -- only a real key-down event counts.
+/// - **Console** (`FILE_TYPE_CHAR`): defers to [`ConsoleStdinReader::is_ready`] -- see its doc
+///   comment for why the raw `INPUT_RECORD` queue (`GetNumberOfConsoleInputEvents`/
+///   `PeekConsoleInputW`) cannot reliably answer this once `ENABLE_LINE_INPUT`'s cooked-read line
+///   editor is involved, which a real interactive console always has enabled by default.
 /// - **Pipe** (`FILE_TYPE_PIPE`, e.g. a redirected/piped stdin): `PeekNamedPipe` reports the
-///   number of bytes currently available to read without consuming them.
+///   number of bytes currently available to read without consuming them (no cooked-read layer
+///   applies to a pipe, so this remains a direct, reliable non-consuming probe).
 /// - Anything else (regular file, `FILE_TYPE_UNKNOWN`, invalid/null handle): these are always
 ///   immediately readable (a disk file's `ReadFile` never blocks waiting for data to arrive, and
 ///   an absent handle behaves like already-closed/EOF stdin, matching [`read_from_raw_handle`]'s
@@ -2371,17 +2522,8 @@ fn read_from_raw_handle(buf: &mut [u8]) -> Result<usize, litebox::platform::Stdi
 ///   observes the real outcome instead of appearing to hang on a readiness check.
 fn stdin_ready_raw_handle() -> bool {
     use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_CHAR, FILE_TYPE_PIPE, GetFileType};
-    use windows_sys::Win32::System::Console::{
-        GetNumberOfConsoleInputEvents, INPUT_RECORD, KEY_EVENT, PeekConsoleInputW, STD_INPUT_HANDLE,
-    };
+    use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
     use windows_sys::Win32::System::Pipes::PeekNamedPipe;
-
-    // How many queued console input records to inspect per `PeekConsoleInputW` call when
-    // filtering out non-key events (see the `FILE_TYPE_CHAR` arm below).
-    const RECORD_CAP: u32 = 32;
-    // `KEY_EVENT` is defined as a wider integer type than `INPUT_RECORD::EventType` (`u16`); the
-    // real Win32 constant is always in `u16` range, so this narrowing is exact, not lossy.
-    let key_event_u16 = u16::try_from(KEY_EVENT).expect("KEY_EVENT constant fits in u16");
 
     let handle = unsafe { windows_sys::Win32::System::Console::GetStdHandle(STD_INPUT_HANDLE) };
     if handle.is_null() || handle == Win32_Foundation::INVALID_HANDLE_VALUE {
@@ -2392,31 +2534,7 @@ fn stdin_ready_raw_handle() -> bool {
     }
 
     match unsafe { GetFileType(handle) } {
-        FILE_TYPE_CHAR => {
-            // Real console: peek the queued input-record count, then inspect each queued record
-            // so that non-key events (window-buffer-size, focus, menu) don't count as "ready" --
-            // `ReadFile` on a console consumes and discards those internally without returning,
-            // so reporting ready on their account alone would reintroduce the same hang for a
-            // console that has e.g. only a focus-change event queued and no real keystroke.
-            let mut queued: u32 = 0;
-            if unsafe { GetNumberOfConsoleInputEvents(handle, &raw mut queued) } == 0 || queued == 0
-            {
-                return false;
-            }
-            let mut records: [INPUT_RECORD; RECORD_CAP as usize] = unsafe { core::mem::zeroed() };
-            let mut peeked: u32 = 0;
-            let cap = queued.min(RECORD_CAP);
-            if unsafe { PeekConsoleInputW(handle, records.as_mut_ptr(), cap, &raw mut peeked) } == 0
-            {
-                // Peek failed for some reason (e.g. handle isn't actually an input-record
-                // console handle despite `FILE_TYPE_CHAR`): fall back to reporting ready rather
-                // than risking a permanently-stuck "never ready" readiness answer.
-                return true;
-            }
-            records[..peeked as usize]
-                .iter()
-                .any(|r| r.EventType == key_event_u16 && unsafe { r.Event.KeyEvent }.bKeyDown != 0)
-        }
+        FILE_TYPE_CHAR => ConsoleStdinReader::get().is_ready(),
         FILE_TYPE_PIPE => {
             let mut available: u32 = 0;
             let ok = unsafe {

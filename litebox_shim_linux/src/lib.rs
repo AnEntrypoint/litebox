@@ -704,6 +704,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 | SyscallRequest::Unlinkat { .. }
                 | SyscallRequest::Write { .. }
                 | SyscallRequest::Writev { .. }
+                | SyscallRequest::Read { .. }
+                | SyscallRequest::Readv { .. }
+                | SyscallRequest::Ioctl { .. }
+                | SyscallRequest::Ppoll { .. }
         ) {
             litebox_util_log::trace!(request:? = request; "syscall");
         }

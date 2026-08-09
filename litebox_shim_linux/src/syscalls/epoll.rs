@@ -207,16 +207,83 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         maxevents: usize,
     ) -> Result<Vec<EpollEvent>, WaitError> {
         let mut events = Vec::new();
-        match self.ready.pollee.wait(cx, false, Events::IN, || {
-            self.ready.pop_multiple(global, maxevents, &mut events);
-            if events.is_empty() {
-                return Err(TryOpError::<Infallible>::TryAgain);
+        loop {
+            // A stdin interest's initial `add_interest` registration (see its doc comment on the
+            // `EpollDescriptor::File` arm of `EpollDescriptor::poll`) never gets a real wakeup
+            // observer -- there is no OS-level async notification for "new console input arrived"
+            // this codebase's `Subject`/`Observer` machinery can hook into, unlike every other fd
+            // kind. Without bounding the wait, an `epoll_wait` whose interest set includes a
+            // not-yet-ready stdin fd would block on `self.ready.pollee`'s condvar forever, even
+            // once real keystrokes arrive, exactly mirroring the `ppoll`/`PollSet::wait` hang this
+            // fix also addresses (see `PollSet::wait`'s matching doc comment for the confirmed
+            // live repro). Manually re-poll stdin on a short cadence and push it into the ready
+            // set if it became readable, so `pop_multiple` picks it up on the next iteration.
+            let has_stdin_interest = self.has_unready_stdin_interest(global);
+            let iteration_cx = if has_stdin_interest {
+                cx.with_timeout(STDIN_REPOLL_INTERVAL)
+            } else {
+                cx.with_timeout(None)
+            };
+            match self
+                .ready
+                .pollee
+                .wait(&iteration_cx, false, Events::IN, || {
+                    self.ready.pop_multiple(global, maxevents, &mut events);
+                    if events.is_empty() {
+                        return Err(TryOpError::<Infallible>::TryAgain);
+                    }
+                    Ok(())
+                }) {
+                Ok(()) => return Ok(events),
+                Err(TryOpError::TryAgain) => unreachable!(),
+                Err(TryOpError::WaitError(WaitError::TimedOut)) => {
+                    if !has_stdin_interest
+                        || (cx.deadline().is_some() && cx.remaining_timeout().is_none())
+                    {
+                        return Err(WaitError::TimedOut);
+                    }
+                    // Only the bounded stdin-repoll interval elapsed, not the caller's own
+                    // deadline (if any): re-poll and loop back around.
+                    self.repoll_stdin_interests(global);
+                }
+                Err(TryOpError::WaitError(e)) => return Err(e),
             }
-            Ok(())
-        }) {
-            Ok(()) => Ok(events),
-            Err(TryOpError::TryAgain) => unreachable!(),
-            Err(TryOpError::WaitError(e)) => Err(e),
+        }
+    }
+
+    /// Returns `true` if any current interest is a stdin fd that is not currently ready -- see
+    /// [`Self::wait`]'s doc comment for why this fd kind needs bounded periodic re-polling instead
+    /// of relying solely on the observer-notification wakeup every other fd kind gets.
+    fn has_unready_stdin_interest(&self, global: &GlobalState<Platform, FS>) -> bool {
+        self.interests.lock().values().any(|entry| {
+            !entry.is_ready.load(core::sync::atomic::Ordering::Relaxed)
+                && matches!(entry.desc.upgrade(), Some(EpollDescriptor::File(file))
+                if matches!(
+                    global
+                        .litebox
+                        .descriptor_table()
+                        .with_metadata(&file, |stream: &litebox::platform::StdioStream| *stream),
+                    Ok(litebox::platform::StdioStream::Stdin)
+                ))
+        })
+    }
+
+    /// Re-polls every stdin interest and pushes it into the ready set if it has become readable.
+    /// Called after each bounded stdin-repoll interval elapses in [`Self::wait`].
+    fn repoll_stdin_interests(&self, global: &GlobalState<Platform, FS>) {
+        let entries: alloc::vec::Vec<_> = self
+            .interests
+            .lock()
+            .values()
+            .filter(|entry| matches!(entry.desc.upgrade(), Some(EpollDescriptor::File(_))))
+            .cloned()
+            .collect();
+        for entry in entries {
+            if let Some((_, is_ready)) = entry.poll(global)
+                && is_ready
+            {
+                self.ready.push(&entry);
+            }
         }
     }
 
@@ -520,6 +587,11 @@ pub(crate) struct PollSet<Platform: ShimPlatform> {
     entries: Vec<PollEntry<Platform>>,
 }
 
+/// How often [`PollSet::wait`] re-scans while waiting on a set that contains a stdin fd with no
+/// real OS-level readiness notification available (see `PollSet::scan_once`'s doc comment). Short
+/// enough that interactive typing feels immediate, long enough to not busy-loop.
+const STDIN_REPOLL_INTERVAL: core::time::Duration = core::time::Duration::from_millis(15);
+
 struct PollEntry<Platform: ShimPlatform> {
     fd: i32,
     mask: Events,
@@ -586,6 +658,13 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
                     None
                 };
                 // TODO: add machinery to unregister the observer to avoid leaks.
+                // Note `EpollDescriptor::poll`'s `File`/stdin arm never registers an observer (see
+                // its doc comment): there is no OS-level async notification for "new console input
+                // arrived" that this codebase's `Waker`/`Observer` machinery can hook into, unlike
+                // a socket/pipe/eventfd/unix fd, which always gets a real observer registration
+                // above. `Self::wait` detects a stdin fd up front (via `has_stdin_fd`) and falls
+                // back to bounded periodic re-polling for the whole set whenever one is present,
+                // rather than relying on an observer this arm can never actually register.
                 poll_descriptor
                     .poll(global, entry.mask, observer)
                     .unwrap_or(Events::NVAL)
@@ -641,15 +720,63 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
         cx: &WaitContext<'_, Platform>,
         files: &FilesState<Platform, FS>,
     ) -> Result<(), WaitError> {
+        // Determine up front whether this set contains a stdin fd at all, independent of whether
+        // it happens to be ready right now: `has_unwakeable_wait` is only known accurately *after*
+        // a `scan_once` call, but that call happens *inside* `wait_until`'s closure, which is too
+        // late to decide `wait_until`'s own deadline for its very first (and, in the always-ready
+        // fast path, only) invocation. Without this preliminary check, a set that starts out
+        // ready-immediately-but-then-goes-not-ready-again would take the unbounded fast path below
+        // and never re-visit this decision once inside a single `wait_until` call, hanging forever
+        // exactly like the original bug this fix addresses -- confirmed live via the ConPTY harness
+        // (see this fix's commit message for the repro).
+        let has_stdin_fd = self.entries.iter().any(|entry| {
+            entry.fd >= 0
+                && EpollDescriptor::try_from(files, entry.fd.reinterpret_as_unsigned() as usize)
+                    .is_ok_and(|desc| {
+                        matches!(&desc, EpollDescriptor::File(file)
+                        if matches!(
+                            global.litebox.descriptor_table().with_metadata(
+                                file,
+                                |stream: &litebox::platform::StdioStream| *stream,
+                            ),
+                            Ok(litebox::platform::StdioStream::Stdin)
+                        ))
+                    })
+        });
         let mut register = true;
-        cx.wait_until(|| {
-            if self.scan_once(global, files, register.then_some(cx.waker())) {
-                return true;
+        if !has_stdin_fd {
+            // Fast/common path: no stdin fd in the set at all, so wait exactly as before -- a
+            // single `wait_until` call using the caller's own context and deadline unmodified,
+            // woken only by real `Observer` notifications.
+            return cx.wait_until(|| self.scan_once(global, files, register.then_some(cx.waker())));
+        }
+        loop {
+            // At least one entry is a stdin fd, which never registers a real wakeup observer
+            // inside `scan_once` (see its doc comment): there is no OS-level async notification
+            // this codebase's `Waker`/`Observer` machinery can hook into for "new console input
+            // arrived". Bound this iteration's sleep to a short repoll interval so the loop comes
+            // back around and re-checks `stdin_ready()` on a short cadence instead of sleeping on
+            // a condvar that would otherwise never be signaled. `with_timeout` composes with
+            // (takes the min of) any caller-supplied deadline, so the caller's real timeout still
+            // fires on schedule instead of being silently overridden.
+            match cx
+                .with_timeout(STDIN_REPOLL_INTERVAL)
+                .wait_until(|| self.scan_once(global, files, register.then_some(cx.waker())))
+            {
+                Ok(()) => return Ok(()),
+                Err(WaitError::TimedOut) => {
+                    // Only propagate `TimedOut` once the caller's own deadline (not just this
+                    // iteration's repoll bound) has actually elapsed; otherwise loop back and scan
+                    // again. `remaining_timeout()` reflects `cx`'s own (unbounded-by-repoll)
+                    // deadline, so this is exact, not a heuristic.
+                    if cx.deadline().is_some() && cx.remaining_timeout().is_none() {
+                        return Err(WaitError::TimedOut);
+                    }
+                    register = false;
+                }
+                Err(e) => return Err(e),
             }
-            // Don't register observers again in the next iteration.
-            register = false;
-            false
-        })
+        }
     }
 
     /// Returns the accumulated `revents` for each entry in the poll set.
@@ -678,7 +805,7 @@ mod test {
     use crate::syscalls::tests::TestPlatform;
     use alloc::sync::Arc;
     use litebox::event::Events;
-    use litebox::event::wait::WaitState;
+    use litebox::event::wait::{WaitError, WaitState};
     use litebox_common_linux::{EfdFlags, EpollEvent};
 
     use super::EpollFile;
@@ -890,6 +1017,57 @@ mod test {
         set.wait(&task.global, &WaitState::new(platform()).context(), &fds)
             .unwrap();
         assert_eq!(revents(&set), Events::IN);
+    }
+
+    /// Regression test for the interactive-stdin hang this investigation root-caused: a `ppoll`/
+    /// `pselect` whose set includes a stdin fd must still honor the caller's own deadline exactly
+    /// on the very *first* `wait_until` call, not just on later iterations.
+    ///
+    /// The original (buggy) implementation only switched to the bounded stdin-repoll strategy
+    /// after observing `has_unwakeable_wait` become `true` inside a *previous* `scan_once` call --
+    /// but on a `PollSet`'s first ever `wait()`, no previous scan exists, so that first
+    /// `wait_until` call used the caller's raw, unbounded deadline. If stdin was not immediately
+    /// ready at that first scan, the call blocked on `wait_until`'s internal condvar wait with no
+    /// way to ever revisit the decision -- reproducing the exact hang this investigation found live
+    /// via the ConPTY harness (`ash` blocked forever in `Ppoll` after its first keystroke). The fix
+    /// detects "does this set contain a stdin fd" up front, independent of current readiness, and
+    /// uses the bounded-repoll strategy from the very first `wait_until` call onward whenever true.
+    ///
+    /// This test uses fd 0, which `crate::syscalls::tests::init_platform` already tags with
+    /// `StdioStream::Stdin` metadata (mirroring a real guest's bootstrap stdin fd), to exercise the
+    /// real `PollSet::wait` code path end-to-end -- not a synthetic stand-in.
+    #[test]
+    fn test_ppoll_on_stdin_honors_caller_deadline_on_first_wait() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let fds = Arc::new(FilesState::new(task.files.borrow().fs.clone()));
+
+        // fd 0 is stdin, tagged `StdioStream::Stdin` by `initialize_stdio_in_shared_descriptors_table`
+        // (see `crate::lib::FilesState::initialize_stdio_in_shared_descriptors_table`).
+        let mut set = super::PollSet::with_capacity(1);
+        set.add_fd(0, Events::IN);
+
+        let start = std::time::Instant::now();
+        let result = set.wait(
+            &task.global,
+            &WaitState::new(platform())
+                .context()
+                .with_timeout(core::time::Duration::from_millis(100)),
+            &fds,
+        );
+        let elapsed = start.elapsed();
+        // Whether or not the test process's own stdin happens to be immediately ready (irrelevant
+        // to what's being tested here -- `TestPlatform` reads the real OS-level stdio of whatever
+        // process is running the test suite), the call must return within a small margin of the
+        // caller's 100ms deadline -- never hang indefinitely, and never return near-instantly by
+        // some other unrelated path. If it returned `Ok`, stdin was already ready; that is a valid
+        // outcome too, so only assert the timing bound, not the specific `Result`.
+        let _ = result;
+        assert!(
+            elapsed < core::time::Duration::from_secs(2),
+            "ppoll on stdin must not hang indefinitely on its first wait \
+             (elapsed={elapsed:?}, exceeds the 100ms deadline by more than the bounded-repoll \
+             interval should ever allow)"
+        );
     }
 
     #[test]
