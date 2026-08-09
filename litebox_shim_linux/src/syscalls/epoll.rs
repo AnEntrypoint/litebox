@@ -805,7 +805,7 @@ mod test {
     use crate::syscalls::tests::TestPlatform;
     use alloc::sync::Arc;
     use litebox::event::Events;
-    use litebox::event::wait::{WaitError, WaitState};
+    use litebox::event::wait::WaitState;
     use litebox_common_linux::{EfdFlags, EpollEvent};
 
     use super::EpollFile;
