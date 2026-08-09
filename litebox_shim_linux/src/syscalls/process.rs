@@ -866,8 +866,50 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 /// scan at all (it reproduces identically whether this scan's margin is 64KB or 4KB) but something
 /// else entirely in the `fork()`/`execve()` path -- possibly in how the guest's own allocator
 /// (mallocng) or stack-arena bookkeeping interacts with litebox's `brk`/mmap emulation, rather than
-/// a memory-scanning false positive. Do not assume this comment's narrower margin is sufficient
-/// mitigation without re-verifying against a live repro first.
+/// a memory-scanning false positive.
+///
+/// # Root cause found and fixed: an executable-range filter on the healed VALUE, not just the scan window
+///
+/// The "38/40" residual from the margin-narrowing round above was root-caused in a later round via
+/// a deterministic repro: in a fresh interactive shell, whether `ls /`'s `argv` gets corrupted
+/// depends ENTIRELY on the exact character length of the immediately preceding command (`echo
+/// <payload>`) -- clean for total command length 6-12 and 29+, corrupt 100% of the time for total
+/// length 13-28 (payload 8-23 chars), reproduced 16/16 lengths and confirmed 10/10 repeatable at
+/// several lengths within the corrupt band. This is exactly the false-positive hazard the sections
+/// above already predicted, just pinned to its precise trigger: ash's `stalloc`-arena bookkeeping
+/// (nested argv/offset pointers, genuinely stack-address-shaped as ordinary DATA) shifts in a
+/// length-dependent way as the shell parses/expands the next command line, so for some lengths a
+/// live arena slot that merely *numerically* falls in the parent's stack range -- but is not a
+/// pointer at all, let alone a return address -- lands inside the `STACK_SCAN_MARGIN` window and
+/// gets misidentified and blindly overwritten by `AddressRelocations::translate`'s exact-range-
+/// membership check, which (as this whole investigation has repeatedly rediscovered for the heap
+/// and `.data` cases) cannot by itself distinguish a genuine stale pointer from ordinary data that
+/// coincidentally shares its address range.
+///
+/// The fix: in addition to falling in the scan window and range-translating, a slot is only healed
+/// if the TRANSLATED value also lands in a DESTINATION range that was executable in the source
+/// address space (`AddressRelocations::is_in_destination_executable_range`, already used
+/// elsewhere in this module for exactly this kind of structural, not-heuristic-guessing check). A
+/// genuine `call`-instruction return address always points into code; ash's arena bookkeeping never
+/// does. This is precise for the return-address class this pass exists to fix (per its top-level
+/// doc comment, "a handful of frames, well under a dozen call/ret pairs") and, unlike a value-shape
+/// heuristic, cannot misfire on data that happens to look pointer-shaped -- only a value that is
+/// BOTH an exact address-range match AND lands in code passes. It deliberately narrows coverage
+/// versus the pre-fix pass in one respect: a spilled callee-saved register value that points at
+/// non-code memory (e.g. a stack slot literally holding a heap or `.data` pointer, not a return
+/// address) is no longer healed here -- believed acceptable because every currently-known live
+/// register at the fork() boundary is already translated directly from `child_ctx` before this pass
+/// ever runs (see this function's caller), and no repro of a stack-RESIDENT non-code stale pointer
+/// (as opposed to a return address) has ever been observed across this investigation's many rounds.
+///
+/// Verified: the full length-sweep repro (payload 1-40, one run each) is 40/40 clean after this
+/// fix (was 17 corrupt lengths, spanning payload 8-23 plus an unrelated one-off at 40, before it);
+/// 10/10 repeat runs clean at payload lengths 10/15/20/23 (all four squarely inside the former
+/// corrupt band); the pre-existing `sh -c "ls /; ls /usr; ls /tmp; ls /bin | head -3"`
+/// `STATUS_PRIVILEGED_INSTRUCTION` crash-regression repro remained 20/20 clean (no reopening of the
+/// `residual-second-fork-verify-corruption-bug`/`fixup_stale_elf_data_pointers` fix above, which
+/// this change does not touch). Do not treat this as license to re-litigate the executable-range
+/// filter's soundness for the register class it does not cover without a live repro in hand first.
 #[cfg(target_arch = "x86_64")]
 fn fixup_stale_stack_pointers<Platform: ShimPlatform>(
     relocations: &litebox::mm::AddressRelocations,
@@ -902,6 +944,12 @@ fn fixup_stale_stack_pointers<Platform: ShimPlatform>(
             let slot = UserPtrMut::<usize>::from_usize(addr);
             if let Some(value) = slot.read_at_offset::<Platform>(0)
                 && let Some(translated) = relocations.translate(value)
+                // A genuine `call`-instruction return address always points into executable
+                // memory (specifically, just past a `call` site) -- see "Length-dependent
+                // false positives" below for why this extra check, not just range membership,
+                // is required. Ordinary shell-arena data that merely looks stack-address-shaped
+                // never satisfies this, since it does not point into code.
+                && relocations.is_in_destination_executable_range(translated)
             {
                 let _ = slot.write_at_offset::<Platform>(0, translated);
             }
