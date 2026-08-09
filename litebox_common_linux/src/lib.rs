@@ -750,6 +750,8 @@ pub const TIOCGWINSZ: u32 = 0x5413;
 pub const FIONBIO: u32 = 0x5421;
 pub const FIOCLEX: u32 = 0x5451;
 pub const TIOCGPTN: u32 = 0x80045430;
+pub const TIOCGPGRP: u32 = 0x540F;
+pub const TIOCSPGRP: u32 = 0x5410;
 
 /// Commands for use with `ioctl`.
 #[non_exhaustive]
@@ -771,6 +773,13 @@ pub enum IoctlArg {
     /// Obtain device unit number, which can be used to generate
     /// the filename of the pseudo-terminal slave device.
     TIOCGPTN(UserPtrMut<u32>),
+    /// Get the terminal's foreground process group ID (`tcgetpgrp`).
+    TIOCGPGRP(UserPtrMut<i32>),
+    /// Set the terminal's foreground process group ID (`tcsetpgrp`). A shell's job-control
+    /// setup calls this to make itself the foreground process group; failure here is exactly
+    /// what makes busybox `ash` print "can't access tty; job control turned off" and fall back
+    /// to a job-control-disabled mode.
+    TIOCSPGRP(UserPtr<i32>),
     /// Enables or disables non-blocking mode
     FIONBIO(UserPtr<i32>),
     /// Set close on exec
@@ -2473,6 +2482,13 @@ pub enum SyscallRequest {
     },
     Getpid,
     Getppid,
+    Getpgid {
+        pid: i32,
+    },
+    Setpgid {
+        pid: i32,
+        pgid: i32,
+    },
     Getuid,
     Geteuid,
     Getgid,
@@ -2501,6 +2517,22 @@ pub enum SyscallRequest {
         mask: UserPtrMut<u8>,
     },
     SchedYield,
+    SchedGetParam {
+        pid: Option<i32>,
+        param: UserPtrMut<i32>,
+    },
+    SchedSetParam {
+        pid: Option<i32>,
+        param: UserPtr<i32>,
+    },
+    SchedGetScheduler {
+        pid: Option<i32>,
+    },
+    SchedSetScheduler {
+        pid: Option<i32>,
+        policy: i32,
+        param: UserPtr<i32>,
+    },
     Futex {
         args: FutexArgs,
     },
@@ -2703,6 +2735,8 @@ impl SyscallRequest {
                         TCSETSF => IoctlArg::TCSETSF(ctx.sys_req_ptr(2)),
                         TIOCGWINSZ => IoctlArg::TIOCGWINSZ(ctx.sys_req_ptr(2)),
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),
+                        TIOCGPGRP => IoctlArg::TIOCGPGRP(ctx.sys_req_ptr(2)),
+                        TIOCSPGRP => IoctlArg::TIOCSPGRP(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
                         FIOCLEX => IoctlArg::FIOCLEX,
                         _ => IoctlArg::Raw {
@@ -2859,6 +2893,8 @@ impl SyscallRequest {
             Sysno::prlimit64 => sys_req!(Prlimit { pid, resource:?, new_limit:*, old_limit:* }),
             Sysno::getpid => SyscallRequest::Getpid,
             Sysno::getppid => SyscallRequest::Getppid,
+            Sysno::getpgid => sys_req!(Getpgid { pid }),
+            Sysno::setpgid => sys_req!(Setpgid { pid, pgid }),
             Sysno::getuid => SyscallRequest::Getuid,
             Sysno::getgid => SyscallRequest::Getgid,
             Sysno::geteuid => SyscallRequest::Geteuid,
@@ -3151,6 +3187,34 @@ impl SyscallRequest {
                 }
             }
             Sysno::sched_yield => SyscallRequest::SchedYield,
+            Sysno::sched_getparam => {
+                let pid = ctx.sys_req_arg(0);
+                SyscallRequest::SchedGetParam {
+                    pid: if pid == 0 { None } else { Some(pid) },
+                    param: ctx.sys_req_ptr(1),
+                }
+            }
+            Sysno::sched_setparam => {
+                let pid = ctx.sys_req_arg(0);
+                SyscallRequest::SchedSetParam {
+                    pid: if pid == 0 { None } else { Some(pid) },
+                    param: ctx.sys_req_ptr(1),
+                }
+            }
+            Sysno::sched_getscheduler => {
+                let pid = ctx.sys_req_arg(0);
+                SyscallRequest::SchedGetScheduler {
+                    pid: if pid == 0 { None } else { Some(pid) },
+                }
+            }
+            Sysno::sched_setscheduler => {
+                let pid = ctx.sys_req_arg(0);
+                SyscallRequest::SchedSetScheduler {
+                    pid: if pid == 0 { None } else { Some(pid) },
+                    policy: ctx.sys_req_arg::<i32>(1),
+                    param: ctx.sys_req_ptr(2),
+                }
+            }
             Sysno::futex => Self::parse_futex(ctx, TimeParam::timespec_old, unsupported_einval)?,
             Sysno::execve => sys_req!(Execve { pathname:*, argv:*, envp:* }),
             Sysno::umask => sys_req!(Umask { mask }),

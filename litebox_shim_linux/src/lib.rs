@@ -470,6 +470,18 @@ impl Default for TermiosState {
     }
 }
 
+/// A tty fd's foreground process group ID, as last set by `ioctl(TIOCSPGRP)` (`tcsetpgrp`).
+///
+/// LiteBox has no real POSIX tty-driver layer underneath, so -- mirroring [`TermiosState`] --
+/// this tracks the guest-requested foreground pgid purely as in-memory per-fd state:
+/// `TIOCSPGRP` stores it here and `TIOCGPGRP` reads it back. There is no entry in the
+/// descriptor table until the first `TIOCSPGRP`/explicit initialization, so callers reading
+/// before any write fall back to the calling process's own pgid, matching real Linux's
+/// default (a freshly opened controlling terminal's foreground group is the opening process's
+/// own group).
+#[derive(Clone, Copy)]
+pub(crate) struct ForegroundPgid(pub(crate) i32);
+
 impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS> {
     fn initialize_stdio_in_shared_descriptors_table(&self, global: &GlobalState<Platform, FS>) {
         use litebox::fs::{Mode, OFlags};
@@ -1301,6 +1313,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             SyscallRequest::Getpid => Ok(self.sys_getpid().reinterpret_as_unsigned() as usize),
             SyscallRequest::Getppid => Ok(self.sys_getppid().reinterpret_as_unsigned() as usize),
+            SyscallRequest::Getpgid { pid } => {
+                Ok(self.sys_getpgid(pid)?.reinterpret_as_unsigned() as usize)
+            }
+            SyscallRequest::Setpgid { pid, pgid } => {
+                self.sys_setpgid(pid, pgid)?;
+                Ok(0)
+            }
             SyscallRequest::Getuid => Ok(self.sys_getuid() as usize),
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
@@ -1334,6 +1353,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::SchedYield => {
                 // Do nothing until we have more scheduler integration with the
                 // platform.
+                Ok(0)
+            }
+            SyscallRequest::SchedGetParam { pid, param } => {
+                let sched_priority = self.sys_sched_getparam(pid);
+                param
+                    .write_at_offset::<Platform>(0, sched_priority)
+                    .ok_or(Errno::EFAULT)
+                    .map(|()| 0)
+            }
+            SyscallRequest::SchedSetParam { pid, param } => {
+                let sched_priority = param.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                self.sys_sched_setparam(pid, sched_priority);
+                Ok(0)
+            }
+            SyscallRequest::SchedGetScheduler { pid } => {
+                Ok(self.sys_sched_getscheduler(pid).reinterpret_as_unsigned() as usize)
+            }
+            SyscallRequest::SchedSetScheduler { pid, policy, param } => {
+                let sched_priority = param.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                self.sys_sched_setscheduler(pid, policy, sched_priority);
                 Ok(0)
             }
             SyscallRequest::Futex { args } => self.sys_futex(args),

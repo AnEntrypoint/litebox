@@ -45,6 +45,11 @@ pub(crate) struct ThreadState<Platform: ShimPlatform> {
     /// of the futex has died. This notification consists of two pieces: the FUTEX_OWNER_DIED bit is set in the futex word,
     /// and the kernel performs a futex(2) FUTEX_WAKE operation on one of the threads waiting on the futex.
     robust_list: Cell<Option<UserPtr<litebox_common_linux::RobustListHead>>>,
+    /// `(sched_policy, sched_priority)` as last set via `sched_setscheduler`/`sched_setparam`,
+    /// defaulting to `(SCHED_OTHER, 0)`. We don't implement real OS-level scheduling-policy
+    /// semantics -- this is accept-and-remember state (matching the `TCGETS`/`TCSETS` termios
+    /// pattern) purely so `sched_getscheduler`/`sched_getparam` reflect whatever was last set.
+    sched_policy_priority: Cell<(i32, i32)>,
 }
 
 // TODO: remove once we figure out how to handle Send/Sync for raw pointers.
@@ -65,6 +70,7 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
             attached_tid: Cell::new(Some(pid)),
             clear_child_tid: Cell::new(None),
             robust_list: Cell::new(None),
+            sched_policy_priority: Cell::new((SCHED_OTHER, 0)),
         }
     }
 
@@ -77,6 +83,7 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
             attached_tid: Cell::new(Some(tid)),
             clear_child_tid: Cell::new(None),
             robust_list: Cell::new(None),
+            sched_policy_priority: Cell::new((SCHED_OTHER, 0)),
         })
     }
 
@@ -181,6 +188,13 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     /// anyone. `vfork()`'s POSIX contract requires the calling (parent) thread to be suspended
     /// for exactly this window -- see `do_clone`'s use of this field.
     vfork_done: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
+    /// This process's process group ID, as last set via `setpgid()`. Defaults to the process's
+    /// own pid at creation, matching real Linux's default (a freshly created process is the
+    /// leader of its own, freshly created group). We have no global pid registry (see
+    /// `do_kill`'s doc comment on remote pid/tid being unsupported), so `setpgid`/`getpgid` only
+    /// ever target the calling process itself -- there is nowhere to look up another process by
+    /// pid to move it into a different group.
+    pgid: core::sync::atomic::AtomicI32,
 }
 
 pub(crate) struct Alarm<Platform: ShimPlatform> {
@@ -260,6 +274,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
             parent,
             children: Mutex::new(alloc::vec::Vec::new()),
             vfork_done,
+            pgid: core::sync::atomic::AtomicI32::new(pid),
         }
     }
 
@@ -2162,6 +2177,37 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.ppid
     }
 
+    /// Handle syscall `getpgid`.
+    ///
+    /// We have no global pid registry (see `do_kill`'s doc comment), so `pid` may only name the
+    /// calling process itself (`0`, or the caller's own pid) -- matching real Linux's `ESRCH` for
+    /// any other pid, since there is nowhere to look one up.
+    pub(crate) fn sys_getpgid(&self, pid: i32) -> Result<i32, Errno> {
+        if pid == 0 || pid == self.pid {
+            Ok(self.process().pgid.load(Ordering::Relaxed))
+        } else {
+            Err(Errno::ESRCH)
+        }
+    }
+
+    /// Handle syscall `setpgid`.
+    ///
+    /// Real Linux additionally restricts `setpgid` to processes within the same session and
+    /// forbids changing the pgid of a process that has already called `execve` (`EACCES`); we
+    /// don't model sessions at all, so those checks are not enforced -- only the pid-target
+    /// restriction (see [`Self::sys_getpgid`]) and `EINVAL` for a negative `pgid` are.
+    pub(crate) fn sys_setpgid(&self, pid: i32, pgid: i32) -> Result<(), Errno> {
+        if pgid < 0 {
+            return Err(Errno::EINVAL);
+        }
+        if pid != 0 && pid != self.pid {
+            return Err(Errno::ESRCH);
+        }
+        let target_pgid = if pgid == 0 { self.pid } else { pgid };
+        self.process().pgid.store(target_pgid, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Handle syscall `getuid`.
     pub(crate) fn sys_getuid(&self) -> u32 {
         self.credentials.uid
@@ -2232,6 +2278,49 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let mut cpuset = bitvec::bitvec![u8, bitvec::order::Lsb0; 0; NR_CPUS];
         cpuset.iter_mut().for_each(|mut b| *b = true);
         CpuSet { bits: cpuset }
+    }
+}
+
+/// `SCHED_OTHER` (aka `SCHED_NORMAL`), Linux's default scheduling policy. Under this policy
+/// `sched_priority` is always `0` -- static priority is only meaningful for the real-time
+/// policies (`SCHED_FIFO`/`SCHED_RR`), which litebox does not actually implement.
+pub(crate) const SCHED_OTHER: i32 = 0;
+
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    /// Handle syscall `sched_getparam`.
+    ///
+    /// We don't implement real OS-level scheduling; this returns whatever `sched_priority` was
+    /// last recorded via `sched_setparam`/`sched_setscheduler` for this thread (`0` under the
+    /// default `SCHED_OTHER` policy, matching real Linux).
+    pub(crate) fn sys_sched_getparam(&self, _pid: Option<i32>) -> i32 {
+        self.thread.sched_policy_priority.get().1
+    }
+
+    /// Handle syscall `sched_setparam`. Accept-and-remember: records `sched_priority` without
+    /// implementing real scheduling semantics.
+    pub(crate) fn sys_sched_setparam(&self, _pid: Option<i32>, sched_priority: i32) {
+        let (policy, _) = self.thread.sched_policy_priority.get();
+        self.thread
+            .sched_policy_priority
+            .set((policy, sched_priority));
+    }
+
+    /// Handle syscall `sched_getscheduler`. See [`Self::sys_sched_getparam`].
+    pub(crate) fn sys_sched_getscheduler(&self, _pid: Option<i32>) -> i32 {
+        self.thread.sched_policy_priority.get().0
+    }
+
+    /// Handle syscall `sched_setscheduler`. Accept-and-remember: records the policy and priority
+    /// without implementing real scheduling semantics. See [`Self::sys_sched_getparam`].
+    pub(crate) fn sys_sched_setscheduler(
+        &self,
+        _pid: Option<i32>,
+        policy: i32,
+        sched_priority: i32,
+    ) {
+        self.thread
+            .sched_policy_priority
+            .set((policy, sched_priority));
     }
 }
 
@@ -2745,6 +2834,85 @@ mod tests {
             .map(|b| b.count_ones() as usize)
             .sum();
         assert_eq!(ones, super::NR_CPUS);
+    }
+
+    #[test]
+    fn test_sched_getparam_default_is_zero() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        assert_eq!(task.sys_sched_getparam(None), 0);
+        assert_eq!(task.sys_sched_getparam(Some(0)), 0);
+    }
+
+    #[test]
+    fn test_sched_getscheduler_default_is_sched_other() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        assert_eq!(task.sys_sched_getscheduler(None), super::SCHED_OTHER);
+    }
+
+    #[test]
+    fn test_sched_setparam_then_getparam_roundtrip() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        task.sys_sched_setparam(None, 5);
+        assert_eq!(task.sys_sched_getparam(None), 5);
+    }
+
+    #[test]
+    fn test_sched_setscheduler_then_getscheduler_roundtrip() {
+        const SCHED_FIFO: i32 = 1;
+        let task = crate::syscalls::tests::init_platform(None);
+
+        task.sys_sched_setscheduler(None, SCHED_FIFO, 10);
+        assert_eq!(task.sys_sched_getscheduler(None), SCHED_FIFO);
+        assert_eq!(task.sys_sched_getparam(None), 10);
+    }
+
+    #[test]
+    fn test_getpgid_default_is_own_pid() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        let pid = task.sys_getpid();
+        assert_eq!(task.sys_getpgid(0), Ok(pid));
+        assert_eq!(task.sys_getpgid(pid), Ok(pid));
+    }
+
+    #[test]
+    fn test_setpgid_then_getpgid_roundtrip() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let pid = task.sys_getpid();
+
+        assert_eq!(task.sys_setpgid(0, 4242), Ok(()));
+        assert_eq!(task.sys_getpgid(0), Ok(4242));
+        assert_eq!(task.sys_getpgid(pid), Ok(4242));
+    }
+
+    #[test]
+    fn test_setpgid_zero_pgid_defaults_to_own_pid() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let pid = task.sys_getpid();
+
+        assert_eq!(task.sys_setpgid(0, 4242), Ok(()));
+        assert_eq!(task.sys_setpgid(0, 0), Ok(()));
+        assert_eq!(task.sys_getpgid(0), Ok(pid));
+    }
+
+    #[test]
+    fn test_setpgid_rejects_negative_pgid() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        assert_eq!(task.sys_setpgid(0, -1), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn test_getpgid_setpgid_reject_remote_pid() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let pid = task.sys_getpid();
+        let other_pid = pid.wrapping_add(1000);
+
+        assert_eq!(task.sys_getpgid(other_pid), Err(Errno::ESRCH));
+        assert_eq!(task.sys_setpgid(other_pid, 4242), Err(Errno::ESRCH));
     }
 
     #[test]
