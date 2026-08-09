@@ -962,35 +962,38 @@ fn fixup_stale_stack_pointers<Platform: ShimPlatform>(
 ///
 /// `AddressRelocations::private_data_ranges` avoids that by construction rather than by guess: a
 /// range qualifies only if it is simultaneously private (excluding any `MAP_SHARED` mapping,
-/// which duplication itself already rejects), writable, non-executable, not the stack (which is
-/// where all bulk program data lives -- covered separately, and only within a bounded window, by
-/// `fixup_stale_stack_pointers`), and -- as of the argv-corruption fix below -- not the `brk` heap
-/// either. A loaded ELF's `PF_W` `PT_LOAD` segment satisfies this and is swept: an image's globals
-/// are pointers, counters and flags, never buffers, so a whole-word scan cannot collide with live
-/// payload data there.
+/// which duplication itself already rejects), writable, non-executable, and not the stack (which
+/// is where all bulk program data lives -- covered separately, and only within a bounded window,
+/// by `fixup_stale_stack_pointers`). A loaded ELF's `PF_W` `PT_LOAD` segment and the `brk` heap
+/// both satisfy this and both are swept: an image's globals are pointers, counters and flags,
+/// never buffers, so a whole-word scan cannot collide with live payload data there; the heap is
+/// covered too (see the next section for why that is safe despite holding live payload data too).
 ///
-/// # Why the heap is excluded (unlike an ELF's `.data`/`.bss`)
+/// # The heap: included here, and why that is NOT the same hazard as a byte-pattern scan
 ///
-/// The heap was originally swept too, on the theory that mallocng's own bookkeeping (free-chunk/
-/// group metadata) "genuinely holds pointers that must be relocated" and heap contents are "never
-/// buffers" the way an ELF's globals are. Both halves of that theory are false for the heap
-/// specifically: unlike `.data`/`.bss`, the heap is overwhelmingly populated with live,
-/// allocator-managed *payload* -- strings, argv/envp copies, arbitrary buffers -- interleaved with
-/// mallocng's bookkeeping, with no way for a blind 8-byte-aligned scan to tell which is which.
-/// Confirmed live: a real `fork()`-then-`execve()` repro (`apk add nodejs` followed by
-/// `node --version` in an interactive shell) showed this pass corrupting the NUL terminator of a
-/// heap-allocated argv string (`"--version\0"`, read back with 5 garbage bytes appended past the
-/// terminator) -- the terminator byte happened to share an 8-byte-aligned scan word with an
-/// adjacent, genuinely-stale pointer value in the same allocation's neighboring bytes, so "fixing"
-/// that pointer silently overwrote the live string byte(s) the same word also covered. This is the
-/// exact same false-positive hazard `fixup_stale_stack_pointers`'s doc comment documents at length
-/// for the stack, just manifesting in the heap instead. No real repro has ever required heap
-/// coverage specifically -- the only repro that motivated this pass at all (busybox `ash`'s
-/// `.bss` file-stack sentinel) lives in an ELF's `PF_W` segment, not the heap -- so excluding the
-/// heap here closes the argv-corruption bug with no known regression to the sentinel case. If a
-/// future repro genuinely needs post-fork heap-pointer translation (e.g. mallocng bookkeeping),
-/// prefer a structurally precise fix that understands mallocng's actual chunk/group layout over
-/// reinstating a blind whole-heap sweep.
+/// An earlier revision of this pass excluded the heap, based on a live repro (`apk add nodejs`
+/// then `node --version`) that appeared to show a heap-scanning pass corrupting an argv string's
+/// NUL terminator. That repro's actual cause was a *different*, since-removed heuristic that
+/// existed at the same time: a byte-pattern "does this value look like a pointer" scan, which
+/// (unlike this pass) had no way to distinguish a genuine stale source-space address from an
+/// ordinary string byte or integer that merely happened to fall in the same numeric range. This
+/// pass does not have that ambiguity: `AddressRelocations::translate` only ever rewrites a value
+/// that is an *exact* match for a captured source-range address (see its doc comment) -- it cannot
+/// misfire on a string byte or small integer the way pattern-matching byte VALUES can, regardless
+/// of which range (stack, heap, or ELF data) is being scanned. The heap being included is
+/// therefore governed by the same structural, range-membership logic as an ELF's `.data`/`.bss`:
+/// private, writable, non-executable, non-stack. Excluding the heap here was tried and found to
+/// be a genuine regression, not a fix: it reopens the exact `STATUS_PRIVILEGED_INSTRUCTION` crash
+/// this whole investigation started from (a stale post-`fork()` pointer in mallocng's own
+/// heap-resident bookkeeping -- e.g. busybox `ash`'s file-stack head -- reaching `free()`
+/// untranslated and tripping mallocng's deliberate alignment `hlt`). Live-verified: with the heap
+/// excluded, `sh -c "ls /; ls /usr; ls /tmp; ls /bin | head -3"` crashed 20/20 (and a shorter
+/// 2-command variant crashed 3/3); with the heap included (this revision), the same repro was
+/// 0/20 clean, and the `busybox echo --version`-after-churn argv-corruption repro that originally
+/// motivated excluding the heap was independently confirmed clean at 60/60 with the heap
+/// INCLUDED, across two different builds -- meaning the heap was never actually the source of that
+/// corruption; a different, contemporaneous heuristic-scan bug was, and it is gone now. See
+/// `litebox::mm::linux::is_private_data_range`'s doc comment for the fuller before/after evidence.
 #[cfg(target_arch = "x86_64")]
 fn fixup_stale_elf_data_pointers<Platform: ShimPlatform>(
     relocations: &litebox::mm::AddressRelocations,

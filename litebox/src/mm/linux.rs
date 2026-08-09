@@ -387,24 +387,41 @@ impl<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> VmArea<Platfor
 /// for one relocated range -- see [`Vmem::duplicate`].
 type DuplicatedRangeInfo = (Range<usize>, usize, bool, bool);
 
-/// Whether `range` is the `brk`-allocated heap VMA, i.e. the same identification
-/// [`super::AddressRelocations::heap_range`] uses: the (unique, by construction) tracked range
-/// whose end equals the current program break. `heap_top == 0` means no heap VMA exists yet (`brk`
-/// was never initialized), so nothing can match.
-pub(super) fn is_heap_range(range: &Range<usize>, heap_top: usize) -> bool {
-    heap_top != 0 && range.end == heap_top
-}
-
+/// Whether `range` qualifies for `fork()`-time stale-pointer translation as a loaded ELF's
+/// writable data segment or the `brk` heap.
+///
+/// # Why the heap is included here, unlike a blind whole-heap byte-pattern scan
+///
+/// An earlier revision of this predicate excluded the heap after a live repro (`apk add nodejs`
+/// then `node --version`) showed a heap-scanning pass corrupting an argv string's NUL terminator.
+/// That repro's actual cause was a *different*, since-removed heuristic that also existed at the
+/// time: a byte-pattern "does this look like a pointer" scan across the WHOLE heap (matching any
+/// address-shaped value, live payload or not) rather than a precise translation limited to values
+/// that are *provably* stale source-space addresses (`AddressRelocations::translate` only ever
+/// rewrites a value that is exactly a captured source-range address -- see its doc comment -- so it
+/// cannot mistake an ordinary string byte or small integer for a pointer the way pattern-matching
+/// byte VALUES can). Once mis-attributed to "the heap" categorically, the heap was excluded here
+/// too -- but that reopened the exact `STATUS_PRIVILEGED_INSTRUCTION` crash this pass exists to
+/// fix (a stale post-`fork()` pointer in mallocng's own heap-resident bookkeeping, e.g. busybox
+/// `ash`'s file-stack head, reaching `free()` untranslated and tripping mallocng's deliberate
+/// alignment `hlt`): live-verified 20/20 (and separately 3/3) crashes on
+/// `sh -c "ls /; ls /usr; ls /tmp; ls /bin | head -3"` with the heap excluded, 0/20 with it
+/// included, on an otherwise-identical build. The heap is re-admitted here on the same structural,
+/// range-membership basis as an ELF's `.data`/`.bss` (private, writable, non-executable,
+/// non-stack) -- not a heuristic scan, since `translate`'s exact-match semantics make sweeping it
+/// safe regardless of what live payload data shares the scanned range. Note this is deliberately
+/// asymmetric with [`super::AddressRelocations::is_in_destination_heap_range`], which still
+/// EXCLUDES the heap for a genuinely different, heuristic-shaped consumer (`fork_verify`'s
+/// single-step register/write healing, which reasons from live register VALUES during
+/// single-stepping rather than `translate`'s exact source-range membership check) -- that
+/// exclusion remains correct and is untouched by this change.
 pub(super) fn is_private_data_range<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize>(
     vma: &VmArea<Platform, ALIGN>,
-    range: &Range<usize>,
-    heap_top: usize,
 ) -> bool {
     vma.shared_handle.is_none()
         && !vma.flags().contains(VmFlags::VM_GROWSDOWN)
         && vma.flags().contains(VmFlags::VM_WRITE)
         && !vma.flags().contains(VmFlags::VM_EXEC)
-        && !is_heap_range(range, heap_top)
 }
 
 /// Virtual Memory Manager
@@ -933,7 +950,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     range.clone(),
                     dest_ptr.as_usize(),
                     vma.flags.contains(VmFlags::VM_EXEC),
-                    is_private_data_range(&vma, &range, self.brk),
+                    is_private_data_range(&vma),
                 ));
                 continue;
             }
@@ -974,7 +991,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     range.clone(),
                     dest_ptr.as_usize(),
                     vma.flags.contains(VmFlags::VM_EXEC),
-                    is_private_data_range(&vma, &range, self.brk),
+                    is_private_data_range(&vma),
                 ));
                 continue;
             }
@@ -1022,7 +1039,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 // The SOURCE's real flags (`vma.flags`), not `writable_vma`'s temporary
                 // READ|WRITE-forced flags used only to populate this mapping above.
                 vma.flags.contains(VmFlags::VM_EXEC),
-                is_private_data_range(&vma, &range, self.brk),
+                is_private_data_range(&vma),
             ));
 
             if vma.flags.intersection(VmFlags::VM_ACCESS_FLAGS)
