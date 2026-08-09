@@ -787,49 +787,59 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 /// correctly relocated) memory -- specifically, the small, bounded set of return addresses and
 /// spilled registers that libc's own post-`fork()`/`clone()` unwind (musl's `_Fork` -> `fork` ->
 /// the guest's caller) reads back out of stack slots written by `call` instructions *before* this
-/// `fork()` happened, plus TCB fields musl caches adjacent to the stack (per the ABI-mandated
-/// self-referential `%fs:0` fixup next to this call's caller, `struct pthread`'s other fields --
-/// e.g. its cached `stack`/`stack_size` -- live in that same region and are just as stale).
+/// `fork()` happened.
 ///
-/// Scans every 8-byte-aligned slot across every one of `duplicate()`'s duplicated regions --
-/// `AddressRelocations::ranges()` tracks one `(source_range, dest_base)` entry per ORIGINAL VMA,
-/// not one per relocation group (`Vmem::duplicate` places several adjacent VMAs, e.g. a stack
-/// guard page + the growable stack + the TCB, at fixed offsets within one coherent group span,
-/// but each still gets its own entry here) -- so scanning only the single entry containing
-/// `rsp` is not enough: the TCB commonly lands in a sibling entry of the same group, and a
-/// `fork()`-time `rsp` can itself sit just below the lowest currently-tracked entry (in the
-/// stack's own unmapped-so-far guard gap) without matching any single entry at all. Scanning
-/// every region instead of guessing which one is "the stack's group" is still fully bounded --
-/// this is the total mapped size of one (typically small) guest process, walked once per
-/// `fork()` -- and overwrites any slot whose value is itself a translatable SOURCE-range address
-/// with its DESTINATION equivalent.
+/// Scans 8-byte-aligned slots across ONLY the bounded window near `rsp` of the child's own stack
+/// region -- no other tracked region, including a sibling entry that may hold the TCB (see
+/// "Excluding everything but the stack" below for why not).
 ///
-/// # Excluding the heap
+/// # Excluding everything but the stack
 ///
-/// The heap (`brk`-allocated region) is deliberately skipped entirely, via
-/// [`litebox::mm::AddressRelocations::heap_range`] -- a `call`-instruction return address, a
-/// spilled callee-saved register, or a TCB field can never legitimately live there, so it is
-/// never a source of genuine stale pointers this pass needs to fix.
+/// A `call`-instruction return address or a spilled callee-saved register can never legitimately
+/// live in the heap, the guest's loaded code, `.data`/`.bss`/GOT, a TCB placed in its own separate
+/// mapping, or any other region besides the stack itself -- so those were never a source of
+/// genuine stale pointers this pass needs to fix, only a false-positive hazard: any 8-byte-aligned
+/// value there that numerically happens to fall inside some other mapping's address range gets
+/// misidentified as a stale pointer and silently corrupted. This is far more dangerous than it
+/// sounds for two of those regions specifically -- a genuine function pointer stored in
+/// `.data`/GOT/a TCB field, later called or jumped through, corrupts control flow the moment it
+/// resolves to a wrong-but-plausible-looking address; a byte inside loaded code corrupts a decoded
+/// instruction directly, which can decode as an undefined or even privileged opcode. Both were
+/// directly observed and root-caused via this pass's own diagnostic tracing: with the heap
+/// excluded but every other region still scanned in full (this pass's original scope), a
+/// 4-`ls`-in-one-shell repro (`sh -c "ls /; ls /usr; ls /tmp; ls /bin | head -3"`) reliably (100%
+/// of runs) crashed the child on a `STATUS_PRIVILEGED_INSTRUCTION` (`0xC0000096`) Win32 exception a
+/// few instructions into its very first post-`fork()` syscall, well before `execve()`; excluding
+/// only executable ranges from the broader scan still reproduced the same crash 100% of the time
+/// (leaving `.data`/`.bss`/GOT scanned in full still corrupted a function pointer that later got
+/// jumped through, landing execution on unrelated, non-instruction bytes), and a follow-up attempt
+/// to keep scanning small, proximate "sibling" regions of the stack (to preserve TCB coverage)
+/// still reproduced the crash too, empirically confirmed by the same repro -- so this pass now
+/// scans the stack's own region alone. A prior version of this pass additionally scanned every
+/// sibling entry to reach `struct pthread`'s TCB fields (its self-referential `%fs:0` word, its
+/// cached `stack`/`stack_size`, ...) placed adjacent to the stack by `Vmem::duplicate`'s grouping;
+/// the ABI-mandated self-referential `%fs:0` pointer specifically is already independently and
+/// exactly corrected by `sys_clone`'s own `fs_base` translation (see this function's caller), so
+/// narrowing this pass to the stack alone does not reopen that one case, though any *other* stale
+/// TCB field this pass previously happened to also fix up is no longer covered -- no live repro of
+/// that narrower gap is known; if one surfaces, prefer fixing the specific TCB field(s) musl's
+/// unwind actually reads rather than reopening a broad scan of the whole sibling region.
 ///
 /// # Bounding the stack scan to a window above `rsp`
 ///
-/// Even excluding the heap, a guest's *stack* can easily be hundreds of kilobytes deep by the
-/// time it reaches a `fork()` call several frames down a shell's command-parsing/expansion code
-/// (confirmed live: a guest shell's `stalloc`-style stack-string arena used to build up a
-/// command's `argv`/pathname text one byte at a time lives *on the stack*, not the heap, roughly
-/// 150KB below `rsp` at `fork()` time in one observed repro) -- scanning the *entire* stack range
-/// hits exactly the same false-positive hazard the heap exclusion above addresses: ordinary
-/// in-progress program data (partially-built strings, local variables) that happens to
-/// numerically fall within the parent's address range gets misidentified as a stale pointer and
-/// silently corrupted. But unlike the heap, the stack genuinely does contain the real stale
-/// pointers this pass exists to fix -- they are, by construction, always *shallow* (within the
-/// handful of frames libc's own `fork()`/`clone()` unwind touches immediately after `fork()`
-/// returns, before the child has executed a single guest instruction of its own). So for
-/// whichever tracked region contains `child_rsp` (the child's already-translated stack pointer),
-/// only the bounded window `[child_rsp - STACK_SCAN_MARGIN, region_top)` is scanned instead of
-/// the whole region; every *other* tracked region (the TCB, guard pages, ...) is still scanned in
-/// full, since those are not live guest call-stack data and the same "TCB commonly lands in a
-/// sibling entry" concern above still applies to them.
+/// A guest's *stack* can easily be hundreds of kilobytes deep by the time it reaches a `fork()`
+/// call several frames down a shell's command-parsing/expansion code (confirmed live: a guest
+/// shell's `stalloc`-style stack-string arena used to build up a command's `argv`/pathname text
+/// one byte at a time lives *on the stack*, not the heap, roughly 150KB below `rsp` at `fork()`
+/// time in one observed repro) -- scanning the *entire* stack range hits the same false-positive
+/// hazard described above: ordinary in-progress program data (partially-built strings, local
+/// variables) that happens to numerically fall within the parent's address range gets
+/// misidentified as a stale pointer and silently corrupted. But unlike the rest of the stack, the
+/// portion right above `rsp` genuinely does contain the real stale pointers this pass exists to
+/// fix -- they are, by construction, always *shallow* (within the handful of frames libc's own
+/// `fork()`/`clone()` unwind touches immediately after `fork()` returns, before the child has
+/// executed a single guest instruction of its own). So only the bounded window
+/// `[child_rsp - STACK_SCAN_MARGIN, region_top)` is scanned, never the whole region.
 #[cfg(target_arch = "x86_64")]
 fn fixup_stale_stack_pointers<Platform: ShimPlatform>(
     relocations: &litebox::mm::AddressRelocations,
@@ -841,22 +851,21 @@ fn fixup_stale_stack_pointers<Platform: ShimPlatform>(
     // still excluding guest call-stack data dozens of KB or more below rsp (observed corruption
     // was ~150KB below rsp; this margin is well short of that).
     const STACK_SCAN_MARGIN: usize = 64 * 1024;
-    let heap_range = relocations.heap_range();
     for (source_range, dest_base) in relocations.ranges() {
-        if heap_range.as_ref().is_some_and(|(heap_source, heap_dest)| {
-            heap_source == source_range && heap_dest == dest_base
-        }) {
+        let dest_base = *dest_base;
+        let dest_top = dest_base + source_range.len();
+        // Only the single tracked region that contains `child_rsp` -- the child's own stack -- is
+        // ever scanned, and only the bounded window near `rsp` within it. See this function's
+        // top-level doc comment for why every other region (a sibling TCB/guard-page entry
+        // included) is excluded even though `duplicate()` may place the real TCB in a sibling
+        // entry of the same relocation group: the self-referential `%fs:0` TCB pointer this pass
+        // would otherwise also fix up there is already independently corrected by `sys_clone`'s
+        // own `fs_base` translation (see this function's caller), which is exact rather than
+        // heuristic, so this pass narrowing to the stack alone does not reopen that case.
+        if !(dest_base..dest_top).contains(&child_rsp) {
             continue;
         }
-        let dest_top = dest_base + source_range.len();
-        // If this region contains `child_rsp`, only scan the bounded window starting
-        // `STACK_SCAN_MARGIN` bytes below it (clamped to the region's own start) -- see this
-        // function's doc comment for why. Every other region is scanned in full, as before.
-        let scan_start = if (*dest_base..dest_top).contains(&child_rsp) {
-            child_rsp.saturating_sub(STACK_SCAN_MARGIN).max(*dest_base)
-        } else {
-            *dest_base
-        };
+        let scan_start = child_rsp.saturating_sub(STACK_SCAN_MARGIN).max(dest_base);
         let mut addr = scan_start;
         while addr < dest_top {
             let slot = UserPtrMut::<usize>::from_usize(addr);
@@ -867,6 +876,8 @@ fn fixup_stale_stack_pointers<Platform: ShimPlatform>(
             }
             addr += core::mem::size_of::<usize>();
         }
+        // Exactly one tracked region can contain `child_rsp`.
+        break;
     }
 }
 
@@ -2308,6 +2319,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 if total > MAX_TOTAL_BYTES {
                     return Err(Errno::E2BIG);
                 }
+                litebox_util_log::trace!(
+                    which = _which,
+                    idx:% = out.len(),
+                    ptr:% = p.as_usize(),
+                    len:% = cs.as_bytes().len(),
+                    bytes:? = cs.as_bytes();
+                    "execve: copied argv/envp entry"
+                );
                 out.push(cs);
                 // advance to next pointer
                 base = UserPtr::from_usize(base.as_usize() + core::mem::size_of::<usize>());

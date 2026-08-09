@@ -728,12 +728,16 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     pub(super) unsafe fn duplicate<DestPlatform>(
         &self,
         dest: &mut Vmem<DestPlatform, ALIGN>,
-    ) -> Result<Vec<(Range<usize>, usize)>, VmemDuplicateError>
+    ) -> Result<Vec<(Range<usize>, usize, bool)>, VmemDuplicateError>
     where
         DestPlatform: PageManagementProvider<ALIGN, SharedMemoryHandle = Platform::SharedMemoryHandle>
             + 'static,
     {
-        let mut relocations: Vec<(Range<usize>, usize)> = Vec::new();
+        // Each entry's third field: whether the range was executable (`VM_EXEC`) in `self` (the
+        // source). Threaded through to `AddressRelocations::is_executable_range` so a consumer
+        // that must scan destination memory for stale pointers can exclude code pages -- see that
+        // method's doc comment.
+        let mut relocations: Vec<(Range<usize>, usize, bool)> = Vec::new();
         // Collect first: `insert_mapping` on `dest` only touches `dest.vmas`, but we still avoid
         // holding a borrow of `self.vmas` across it for clarity and to allow future parallel
         // copying without restructuring this loop.
@@ -860,7 +864,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 if self.brk != 0 && range.contains(&self.brk) {
                     brk_relocation = Some((range.clone(), dest_ptr.as_usize()));
                 }
-                relocations.push((range.clone(), dest_ptr.as_usize()));
+                relocations.push((
+                    range.clone(),
+                    dest_ptr.as_usize(),
+                    vma.flags.contains(VmFlags::VM_EXEC),
+                ));
                 continue;
             }
 
@@ -896,7 +904,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 if self.brk != 0 && range.contains(&self.brk) {
                     brk_relocation = Some((range.clone(), dest_ptr.as_usize()));
                 }
-                relocations.push((range.clone(), dest_ptr.as_usize()));
+                relocations.push((
+                    range.clone(),
+                    dest_ptr.as_usize(),
+                    vma.flags.contains(VmFlags::VM_EXEC),
+                ));
                 continue;
             }
 
@@ -937,7 +949,13 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             if self.brk != 0 && range.contains(&self.brk) {
                 brk_relocation = Some((range.clone(), dest_ptr.as_usize()));
             }
-            relocations.push((range.clone(), dest_ptr.as_usize()));
+            relocations.push((
+                range.clone(),
+                dest_ptr.as_usize(),
+                // The SOURCE's real flags (`vma.flags`), not `writable_vma`'s temporary
+                // READ|WRITE-forced flags used only to populate this mapping above.
+                vma.flags.contains(VmFlags::VM_EXEC),
+            ));
 
             if vma.flags.intersection(VmFlags::VM_ACCESS_FLAGS)
                 != writable_vma.flags().intersection(VmFlags::VM_ACCESS_FLAGS)

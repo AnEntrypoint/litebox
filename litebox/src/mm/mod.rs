@@ -45,6 +45,17 @@ where
 /// destination address.
 pub struct AddressRelocations {
     ranges: Vec<(Range<usize>, usize)>,
+    /// Parallel to `ranges`: whether the corresponding range was executable (`VM_EXEC`) in the
+    /// SOURCE address space at the moment of duplication. Populated alongside `ranges` in
+    /// [`PageManager::duplicate`]; queried via [`Self::is_executable_range`] so a consumer that
+    /// must scan destination memory for stale pointers (e.g. a fork-time proactive stack-slot
+    /// fixup pass) can exclude code pages the same way it can exclude the heap -- see that
+    /// consumer's own doc comment for why blindly scanning-and-rewriting ordinary program data
+    /// (as opposed to the narrow, deliberately-bounded set of slots that pass exists to fix) is a
+    /// false-positive hazard, which applies with even more severity to a scan that can rewrite
+    /// individual bytes of a decoded instruction stream into a privileged or otherwise undefined
+    /// opcode.
+    executable: Vec<bool>,
     /// The source (parent) process's program break at the moment of duplication, i.e. the current
     /// upper bound of its heap (`brk`-allocated) region -- `0` if `set_initial_brk` was never
     /// called (no heap exists yet). By construction (`PageManager::brk`'s `create_pages` call),
@@ -97,6 +108,16 @@ impl AddressRelocations {
     #[must_use]
     pub fn ranges(&self) -> &[(Range<usize>, usize)] {
         &self.ranges
+    }
+
+    /// Returns whether the range at `ranges()[index]` was executable (`VM_EXEC`) in the source
+    /// address space at the moment of duplication.
+    ///
+    /// Panics if `index` is out of bounds for `ranges()` -- the two slices are always the same
+    /// length by construction (`PageManager::duplicate` pushes to both in lockstep).
+    #[must_use]
+    pub fn is_executable_range(&self, index: usize) -> bool {
+        self.executable[index]
     }
 
     /// Returns the destination-space range of the source process's heap (`brk`-allocated region)
@@ -168,12 +189,17 @@ where
         let mut dest_vmem =
             linux::Vmem::new_excluding(litebox.x.platform, source_ranges.into_iter());
         let relocations = unsafe { source_vmem.duplicate(&mut dest_vmem) }?;
+        let (ranges, executable) = relocations
+            .into_iter()
+            .map(|(range, dest_base, executable)| ((range, dest_base), executable))
+            .unzip();
         Ok((
             Self {
                 vmem: RwLock::new(dest_vmem),
             },
             AddressRelocations {
-                ranges: relocations,
+                ranges,
+                executable,
                 heap_top,
             },
         ))
@@ -890,6 +916,7 @@ mod address_relocations_tests {
                 // A small TCB-like range, also not ending at heap_top.
                 (0x8000_0000..0x8000_2000, 0xa000_0000),
             ],
+            executable: alloc::vec![false, false, false],
             heap_top: 0x1010_0000,
         };
 
@@ -909,6 +936,7 @@ mod address_relocations_tests {
     fn heap_range_is_none_when_no_heap_exists_yet() {
         let relocations = AddressRelocations {
             ranges: alloc::vec![(0x7000_0000..0x7080_0000, 0x9000_0000)],
+            executable: alloc::vec![false],
             heap_top: 0,
         };
 
@@ -923,6 +951,7 @@ mod address_relocations_tests {
     fn heap_range_is_none_when_no_range_matches_heap_top() {
         let relocations = AddressRelocations {
             ranges: alloc::vec![(0x7000_0000..0x7080_0000, 0x9000_0000)],
+            executable: alloc::vec![false],
             heap_top: 0x1234_5678,
         };
 

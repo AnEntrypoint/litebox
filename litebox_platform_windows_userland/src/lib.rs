@@ -160,6 +160,20 @@ unsafe extern "system" fn vectored_exception_handler(
             unsafe { litebox_common_linux::rdfsbase() },
             WindowsUserland::get_thread_fs_base(),
         );
+        if exception_record.ExceptionCode == 0xC000_0096_u32.cast_signed() {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "diagnostic-only; this platform is x86_64-only, rip fits in usize"
+            )]
+            let rip = context.Rip as usize;
+            let mut buf = [0u8; 16];
+            let n = fork_verify::read_code_bytes_for_diagnostics(rip, &mut buf);
+            eprintln!("[veh] rip bytes ({n}): {:02x?}", &buf[..n]);
+            let mut before = [0u8; 8];
+            let before_start = rip.wrapping_sub(8);
+            let nb = fork_verify::read_code_bytes_for_diagnostics(before_start, &mut before);
+            eprintln!("[veh] rip-8 bytes ({nb}): {:02x?}", &before[..nb]);
+        }
     }
 
     if !tls.is_in_guest.get() {

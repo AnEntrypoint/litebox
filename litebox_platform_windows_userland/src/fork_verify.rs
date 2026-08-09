@@ -229,6 +229,34 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
             if let Some(translated_rbp) = relocations.translate(rbp) {
                 context.Rbp = translated_rbp as u64;
             }
+            // This trap fires *after* the CPU has already fetched (and, for a `ret`, already
+            // popped) the stale value into `rip` -- fixing only the live register here repairs
+            // this one execution but leaves the stack slot the value was read from still holding
+            // the untranslated original. If the same call site executes again later (any
+            // `call`/`ret` pair through the same code path, e.g. a loop or a shared helper called
+            // more than once, which is the common case, not the exception), the next `ret` pops
+            // that same never-healed slot and this exact trap fires again on the identical stale
+            // value -- observed directly via `LITEBOX_VEH_TRACE=1`: the same stale source-range
+            // `rip` recurring verbatim across many single-step traps in one run, each time patched
+            // only in-register. Left unaddressed, this repeated stale round-trip can desynchronize
+            // other state and the child eventually executes into corrupted-looking code (observed
+            // downstream as a `STATUS_PRIVILEGED_INSTRUCTION` fault). The overwhelmingly common
+            // way this trap fires is a `ret`, which has already incremented `rsp` past the popped
+            // slot by the time this handler runs -- so the slot, if it still holds the stale value
+            // verbatim, is at `rsp - 8`; patch it in place (a destination-range stack slot the
+            // child legitimately owns, so this is exactly as safe as `fixup_stale_stack_pointers`
+            // patching the same class of slot proactively). A no-op for any other way this trap
+            // could fire (e.g. an indirect `jmp` through a register that never touched the stack):
+            // the slot below `rsp` simply won't hold the stale value, so the guarded write below
+            // never fires.
+            #[allow(clippy::cast_possible_truncation)]
+            let rsp = context.Rsp as usize;
+            if let Some(ret_addr_slot) = rsp.checked_sub(core::mem::size_of::<usize>())
+                && relocations.is_in_destination(ret_addr_slot)
+                && read_usize_fault_tolerant(ret_addr_slot) == Some(rip)
+            {
+                write_usize_fault_tolerant(ret_addr_slot, translated_rip);
+            }
             context.EFlags |= eflags_tf;
             return StepOutcome::Continue;
         }
@@ -307,6 +335,41 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
         };
     }
 
+    // (3) Indirect control transfer through a stale GOT/function-pointer-style memory slot:
+    // `call [mem]` / `jmp [mem]` reads (never writes) the target address from memory, so case (2)
+    // above -- which only inspects operands `iced-x86` classifies as writes -- never sees it. If
+    // that read's effective address is itself in a DESTINATION range (i.e. it is the child's own,
+    // legitimately-owned copy of some `.got`/`.data`/vtable-style slot -- never the parent's, since
+    // a stale *address of the slot itself* would already have been caught as an ordinary data-read
+    // fault or handled by `fixup_stale_stack_pointers`'s proactive pass) and the *value* stored
+    // there is a stale, untranslated SOURCE-range pointer, the very next instruction will load that
+    // stale value into `rip` and this same trap will re-fire on it via case (1) above -- but only
+    // for *that one* execution of this call site. Any later call through the *same* slot (a `call
+    // [rip+offset]` PLT/GOT stub is by far the most common shape, and gets executed repeatedly, not
+    // just once) hits the identical untranslated value again, since case (1) only ever patches the
+    // live `rip`/`rbp` registers, never the memory the value was read from. Observed in practice:
+    // the same stale source-range `rip` recurring verbatim across many single-step traps, each time
+    // patched only in-register, until the repeated stale round-trips desynchronize some other piece
+    // of state and the child eventually executes into corrupted-looking code (eventually hitting
+    // `STATUS_PRIVILEGED_INSTRUCTION`). Patching the SLOT itself here -- once -- means every
+    // subsequent call through it reads the already-correct destination pointer directly, matching
+    // how `fixup_stale_stack_pointers` permanently heals the stack/TCB slots it can reach, for the
+    // one narrow additional case (a code pointer loaded through an explicit memory operand) that
+    // proactive pass cannot: it never has TCB-adjacent GOT slots reliably identified up front.
+    if (instruction.is_call_near_indirect() || instruction.is_jmp_near_indirect())
+        && let Some(load_address) = explicit_memory_operand_address(&instruction, context)
+        && relocations.is_in_destination(load_address)
+        && let Some(stale_value) = read_usize_fault_tolerant(load_address)
+        && let Some(translated) = relocations.translate(stale_value)
+    {
+        litebox_util_log::warn!(
+            rip:? = rip, load_address:? = load_address, stale_value:? = stale_value,
+            translated:? = translated, mnemonic:? = instruction.mnemonic();
+            "fork_verify: stale CODE pointer in indirect call/jmp target slot detected, patching slot in place"
+        );
+        write_usize_fault_tolerant(load_address, translated);
+    }
+
     StepOutcome::Continue
 }
 
@@ -382,6 +445,12 @@ fn write_register_value(register: Register, value: usize, context: &mut CONTEXT)
 /// Guards against the (rare, but real) case of an instruction sitting so close to the end of a
 /// mapping that a full 15-byte fetch would run off the end of it -- which would otherwise fault
 /// inside the vectored exception handler.
+///
+/// Exposed under a `pub(crate)` alias below for diagnostic use from [`crate::vectored_exception_handler`].
+pub(crate) fn read_code_bytes_for_diagnostics(rip: usize, buf: &mut [u8]) -> usize {
+    read_code_bytes(rip, buf)
+}
+
 fn read_code_bytes(rip: usize, buf: &mut [u8]) -> usize {
     let page_size = 0x1000usize;
     // The CPU already fetched the instruction at `rip`, so at minimum the bytes up to the end of
@@ -420,6 +489,28 @@ fn is_readable(addr: usize) -> bool {
     mbi.Protect & NO_ACCESS == 0
 }
 
+/// Whether `addr` is in a committed, writable region of the host address space.
+fn is_writable(addr: usize) -> bool {
+    use windows_sys::Win32::System::Memory as Win32_Memory;
+    const WRITABLE: u32 = Win32_Memory::PAGE_READWRITE
+        | Win32_Memory::PAGE_WRITECOPY
+        | Win32_Memory::PAGE_EXECUTE_READWRITE
+        | Win32_Memory::PAGE_EXECUTE_WRITECOPY;
+
+    let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+    let ok = unsafe {
+        Win32_Memory::VirtualQuery(
+            addr as *const core::ffi::c_void,
+            &raw mut mbi,
+            core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+        ) != 0
+    };
+    if !ok || mbi.State != Win32_Memory::MEM_COMMIT {
+        return false;
+    }
+    mbi.Protect & WRITABLE != 0
+}
+
 /// If `instruction` writes to memory, computes the effective address it writes to from its
 /// operands plus the live register values in `context`.
 ///
@@ -444,6 +535,30 @@ fn memory_write_address(instruction: &Instruction, context: &CONTEXT) -> Option<
     // handles them via `OpKind::Memory` when they have an explicit memory operand, and via the
     // used-memory info otherwise. Compute the address from the explicit memory operand when there
     // is one -- that is the case that can carry a stale pointer.
+    if let Some(address) = explicit_memory_operand_address(instruction, context) {
+        return Some(address);
+    }
+
+    // No explicit memory operand: an implicit stack access (`push`, `call`, ...). Those target
+    // `rsp`, which `fork()` translates, so they are not a stale-pointer vector -- and the
+    // `is_in_source` check below would harmlessly reject them anyway. Report the stack address so
+    // the check is still applied.
+    let used = info.used_memory().first()?;
+    if used.base() == Register::RSP || used.base() == Register::RBP {
+        // Exact on this crate's only target (`x86_64`): a 64-bit displacement fits `usize` as-is.
+        #[allow(clippy::cast_possible_truncation)]
+        let displacement = used.displacement() as usize;
+        return Some(register_value(used.base(), context)?.wrapping_add(displacement));
+    }
+    None
+}
+
+/// Computes the effective address of `instruction`'s explicit memory operand (if it has one) from
+/// the live register values in `context`, regardless of whether that operand is read or written.
+///
+/// Returns `None` if `instruction` has no explicit `OpKind::Memory` operand, or its address cannot
+/// be resolved from the trapped register state alone.
+fn explicit_memory_operand_address(instruction: &Instruction, context: &CONTEXT) -> Option<usize> {
     for i in 0..instruction.op_count() {
         if instruction.op_kind(i) != OpKind::Memory {
             continue;
@@ -467,19 +582,31 @@ fn memory_write_address(instruction: &Instruction, context: &CONTEXT) -> Option<
         }
         return Some(address);
     }
-
-    // No explicit memory operand: an implicit stack access (`push`, `call`, ...). Those target
-    // `rsp`, which `fork()` translates, so they are not a stale-pointer vector -- and the
-    // `is_in_source` check below would harmlessly reject them anyway. Report the stack address so
-    // the check is still applied.
-    let used = info.used_memory().first()?;
-    if used.base() == Register::RSP || used.base() == Register::RBP {
-        // Exact on this crate's only target (`x86_64`): a 64-bit displacement fits `usize` as-is.
-        #[allow(clippy::cast_possible_truncation)]
-        let displacement = used.displacement() as usize;
-        return Some(register_value(used.base(), context)?.wrapping_add(displacement));
-    }
     None
+}
+
+/// Reads a `usize` from `addr` via a fault-tolerant access, returning `None` if `addr` is not in a
+/// committed, readable region.
+fn read_usize_fault_tolerant(addr: usize) -> Option<usize> {
+    if !is_readable(addr) {
+        return None;
+    }
+    // SAFETY: `is_readable` confirmed `addr` is in a committed, readable region of at least one
+    // page; callers of this function only ever pass addresses inside a tracked destination range,
+    // which -- by construction of `Vmem::duplicate` -- are always mapped with room for a full
+    // `usize` (never split mid-word across mapping boundaries with different protection).
+    Some(unsafe { core::ptr::read_unaligned(addr as *const usize) })
+}
+
+/// Writes `value` as a `usize` to `addr` via a fault-tolerant access, doing nothing if `addr` is
+/// not in a committed, writable region.
+fn write_usize_fault_tolerant(addr: usize, value: usize) {
+    if !is_writable(addr) {
+        return;
+    }
+    // SAFETY: `is_writable` confirmed `addr` is in a committed, writable region; see
+    // `read_usize_fault_tolerant`'s comment on why a full `usize` is always in-bounds here.
+    unsafe { core::ptr::write_unaligned(addr as *mut usize, value) };
 }
 
 /// Reads the 64-bit value of `register` (or the enclosing 64-bit register, for narrower
