@@ -267,6 +267,12 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
                 && relocations.is_in_destination(ret_addr_slot)
                 && read_usize_fault_tolerant(ret_addr_slot) == Some(rip)
             {
+                if crate::veh_trace_enabled() {
+                    eprintln!(
+                        "[fork_verify] HEAL case=1 ret_addr_slot={ret_addr_slot:#x} in_exec_range={} old={rip:#x} new={translated_rip:#x}",
+                        relocations.is_in_destination_executable_range(ret_addr_slot),
+                    );
+                }
                 write_usize_fault_tolerant(ret_addr_slot, translated_rip);
             }
             context.EFlags |= eflags_tf;
@@ -387,6 +393,12 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
         && let Some(stale_value) = read_usize_fault_tolerant(load_address)
         && let Some(translated) = relocations.translate(stale_value)
     {
+        if crate::veh_trace_enabled() {
+            eprintln!(
+                "[fork_verify] HEAL case=3 load_address={load_address:#x} in_exec_range={} old={stale_value:#x} new={translated:#x} rip={rip:#x}",
+                relocations.is_in_destination_executable_range(load_address),
+            );
+        }
         litebox_util_log::warn!(
             rip:? = rip, load_address:? = load_address, stale_value:? = stale_value,
             translated:? = translated, mnemonic:? = instruction.mnemonic();
@@ -428,6 +440,12 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
         && relocations.is_in_source(target_value)
         && let Some(translated) = relocations.translate(target_value)
     {
+        if crate::veh_trace_enabled() {
+            eprintln!(
+                "[fork_verify] HEAL case=4 load_address={load_address:#x} in_exec_range={} old={target_value:#x} new={translated:#x} rip={rip:#x}",
+                relocations.is_in_destination_executable_range(load_address),
+            );
+        }
         litebox_util_log::warn!(
             rip:? = rip, load_address:? = load_address, stale_value:? = target_value,
             translated:? = translated, mnemonic:? = instruction.mnemonic();
