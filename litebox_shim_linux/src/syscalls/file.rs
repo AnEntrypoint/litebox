@@ -2520,6 +2520,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(0)
             }
             IoctlArg::TIOCGPTN(_) => Err(Errno::ENOTTY),
+            IoctlArg::TIOCGPGRP(pgrp_ptr) => {
+                let dt = self.global.litebox.descriptor_table();
+                let pgid = dt
+                    .with_metadata(fd, |p: &crate::ForegroundPgid| p.0)
+                    .unwrap_or(self.pid);
+                pgrp_ptr
+                    .write_at_offset::<Platform>(0, pgid)
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TIOCSPGRP(pgrp_ptr) => {
+                let pgid = pgrp_ptr
+                    .read_at_offset::<Platform>(0)
+                    .ok_or(Errno::EFAULT)?;
+                if pgid <= 0 {
+                    return Err(Errno::EINVAL);
+                }
+                let mut dt = self.global.litebox.descriptor_table_mut();
+                dt.set_entry_metadata(fd, crate::ForegroundPgid(pgid));
+                Ok(0)
+            }
             _ => todo!(),
         }
     }
@@ -2676,7 +2697,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             | IoctlArg::TCSETSW(..)
             | IoctlArg::TCSETSF(..)
             | IoctlArg::TIOCGPTN(..)
-            | IoctlArg::TIOCGWINSZ(..) => files.run_on_raw_fd(
+            | IoctlArg::TIOCGWINSZ(..)
+            | IoctlArg::TIOCGPGRP(..)
+            | IoctlArg::TIOCSPGRP(..) => files.run_on_raw_fd(
                 desc,
                 |fd| {
                     if self.is_stdio(&files.fs, fd)? {
@@ -3845,6 +3868,76 @@ mod tests {
             Ok(0)
         );
         assert_eq!(after_drain.c_lflag, 0x5678);
+    }
+
+    #[test]
+    fn tiocgpgrp_defaults_to_process_pid() {
+        // Before any TIOCSPGRP, TIOCGPGRP must reflect the calling process's own pgid (which
+        // defaults to its own pid), matching real Linux's default for a freshly opened
+        // controlling terminal.
+        let task = crate::syscalls::tests::init_platform(None);
+        let files = task.files.borrow();
+        let Ok(stdin_fd) = files.raw_descriptor_store.read().fd_from_raw_integer(0) else {
+            panic!("test harness invariant: fd 0 must be the stdio-initialized stdin fd");
+        };
+        drop(files);
+
+        let mut pgrp: i32 = -1;
+        let pgrp_ptr = UserPtrMut::from_usize((&raw mut pgrp).expose_provenance());
+        assert_eq!(
+            task.stdio_ioctl(&stdin_fd, &IoctlArg::TIOCGPGRP(pgrp_ptr)),
+            Ok(0)
+        );
+        assert_eq!(pgrp, task.sys_getpid());
+    }
+
+    #[test]
+    fn tiocspgrp_then_tiocgpgrp_round_trip() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let files = task.files.borrow();
+        let Ok(stdin_fd) = files.raw_descriptor_store.read().fd_from_raw_integer(0) else {
+            panic!("test harness invariant: fd 0 must be the stdio-initialized stdin fd");
+        };
+        drop(files);
+
+        let set_val: i32 = 4242;
+        let set_ptr = UserPtr::from_usize((&raw const set_val).expose_provenance());
+        assert_eq!(
+            task.stdio_ioctl(&stdin_fd, &IoctlArg::TIOCSPGRP(set_ptr)),
+            Ok(0)
+        );
+
+        let mut got: i32 = -1;
+        let got_ptr = UserPtrMut::from_usize((&raw mut got).expose_provenance());
+        assert_eq!(
+            task.stdio_ioctl(&stdin_fd, &IoctlArg::TIOCGPGRP(got_ptr)),
+            Ok(0)
+        );
+        assert_eq!(got, 4242);
+    }
+
+    #[test]
+    fn tiocspgrp_rejects_nonpositive_pgid() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let files = task.files.borrow();
+        let Ok(stdin_fd) = files.raw_descriptor_store.read().fd_from_raw_integer(0) else {
+            panic!("test harness invariant: fd 0 must be the stdio-initialized stdin fd");
+        };
+        drop(files);
+
+        let bad_val: i32 = 0;
+        let bad_ptr = UserPtr::from_usize((&raw const bad_val).expose_provenance());
+        assert_eq!(
+            task.stdio_ioctl(&stdin_fd, &IoctlArg::TIOCSPGRP(bad_ptr)),
+            Err(Errno::EINVAL)
+        );
+
+        let negative_val: i32 = -1;
+        let negative_ptr = UserPtr::from_usize((&raw const negative_val).expose_provenance());
+        assert_eq!(
+            task.stdio_ioctl(&stdin_fd, &IoctlArg::TIOCSPGRP(negative_ptr)),
+            Err(Errno::EINVAL)
+        );
     }
 
     #[test]
