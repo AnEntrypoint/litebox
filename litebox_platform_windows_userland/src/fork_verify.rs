@@ -59,14 +59,26 @@
 //!    values in the trapped context. If that address falls inside a source range, the register(s)
 //!    the instruction names as its memory base/index are themselves translated (never a blind
 //!    scan of unrelated registers or memory) and the *same* instruction is retried.
+//! 3. **Stale pointers reachable through a memory read.** Any instruction with an explicit memory
+//!    operand -- not only a `call [mem]`/`jmp [mem]` -- whose effective address is in a
+//!    destination range (a slot the child legitimately owns) and whose *stored value* is itself a
+//!    stale, untranslated source-range pointer gets that slot healed in place, unconditionally. A
+//!    plain load (`mov reg, [slot]`) that stashes the stale value in a register for a *later*
+//!    `call reg` is exactly as much of a stale-pointer vector as a direct `call [slot]` -- case (1)
+//!    above still eventually catches the resulting stale `rip`, but has no memory operand at that
+//!    later instruction to trace back to the slot it came from, so the slot itself never gets
+//!    healed and every subsequent read/call through it re-triggers the identical trap. Healing at
+//!    the read closes that gap: once the slot holds the correct destination pointer, every later
+//!    read through it (a `dtv`/TCB-style field or GOT/PLT entry reread on every call, the common
+//!    case, not the exception) is already correct.
 //!
-//! Either repair only ever substitutes a register value already proven translatable via the exact
-//! relocation map used for every other register at `fork()` time -- never a guess. If a stale
-//! `rip` or effective address is *not* translatable (falls in a source range `duplicate()` never
-//! recorded, which should not happen but is not assumed), the child is killed: synthesizing an
-//! access violation and letting it flow through the platform's ordinary exception path, so the
-//! shim raises a perfectly normal `SIGSEGV` on the child; the child's exit status is recorded and
-//! the parent's `wait4()` unblocks as usual.
+//! Every repair only ever substitutes a value already proven translatable via the exact relocation
+//! map used for every other register at `fork()` time -- never a guess. If a stale `rip` or
+//! effective address is *not* translatable (falls in a source range `duplicate()` never recorded,
+//! which should not happen but is not assumed), the child is killed: synthesizing an access
+//! violation and letting it flow through the platform's ordinary exception path, so the shim
+//! raises a perfectly normal `SIGSEGV` on the child; the child's exit status is recorded and the
+//! parent's `wait4()` unblocks as usual.
 //!
 //! # Why this cannot produce false positives
 //!
@@ -305,6 +317,14 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
         return StepOutcome::Continue;
     };
 
+    if crate::veh_trace_enabled() && relocations.is_in_destination_executable_range(address) {
+        eprintln!(
+            "[fork_verify] tid={:?} on_single_step: WRITE INTO DESTINATION-EXECUTABLE range rip={rip:#x} address={address:#x} mnemonic={:?}",
+            std::thread::current().id(),
+            instruction.mnemonic(),
+        );
+    }
+
     if relocations.is_in_source(address) {
         // As with the code-pointer case above: the stale value driving this write is not
         // arbitrary guest data, it is the *base/index register* the instruction itself names
@@ -342,20 +362,25 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
     // legitimately-owned copy of some `.got`/`.data`/vtable-style slot -- never the parent's, since
     // a stale *address of the slot itself* would already have been caught as an ordinary data-read
     // fault or handled by `fixup_stale_stack_pointers`'s proactive pass) and the *value* stored
-    // there is a stale, untranslated SOURCE-range pointer, the very next instruction will load that
-    // stale value into `rip` and this same trap will re-fire on it via case (1) above -- but only
-    // for *that one* execution of this call site. Any later call through the *same* slot (a `call
-    // [rip+offset]` PLT/GOT stub is by far the most common shape, and gets executed repeatedly, not
-    // just once) hits the identical untranslated value again, since case (1) only ever patches the
-    // live `rip`/`rbp` registers, never the memory the value was read from. Observed in practice:
-    // the same stale source-range `rip` recurring verbatim across many single-step traps, each time
-    // patched only in-register, until the repeated stale round-trips desynchronize some other piece
-    // of state and the child eventually executes into corrupted-looking code (eventually hitting
-    // `STATUS_PRIVILEGED_INSTRUCTION`). Patching the SLOT itself here -- once -- means every
-    // subsequent call through it reads the already-correct destination pointer directly, matching
-    // how `fixup_stale_stack_pointers` permanently heals the stack/TCB slots it can reach, for the
-    // one narrow additional case (a code pointer loaded through an explicit memory operand) that
-    // proactive pass cannot: it never has TCB-adjacent GOT slots reliably identified up front.
+    // there is a stale, untranslated SOURCE-range pointer, heal the slot in place immediately, so
+    // every subsequent call through the same slot (a `call [rip+offset]` PLT/GOT stub is by far the
+    // most common shape, and gets executed repeatedly, not just once) reads the already-correct
+    // destination pointer directly.
+    //
+    // Restricted deliberately to instructions `iced-x86` classifies as an indirect call/jmp
+    // (rather than firing on every memory read whose loaded value happens to fall in a source
+    // range): an earlier version of this fix generalized to any explicit-memory-operand read,
+    // reasoning that a plain `mov reg, [slot]` feeding a *later* `call reg` was an equally valid
+    // stale-pointer vector case (1) alone could not trace back to its origin slot. That
+    // generalization introduced a real false-positive hazard this narrower form avoids: ordinary
+    // small-integer program data can coincidentally fall inside a tracked source range (source
+    // ranges can include low addresses, e.g. a small `brk`-adjacent value) with no relation to a
+    // pointer at all, and "translating" it is not a no-op -- it corrupts a legitimate data slot by
+    // overwriting it with an unrelated destination address. Observed directly: a slot healed with
+    // `stale_value=286028520` (not a plausible 64-bit pointer) got overwritten with a `translated`
+    // value that then desynchronized later execution instead of fixing anything. Restricting back
+    // to call/jmp targets keeps the same soundness argument as case (1) and case (2): the read is
+    // only ever treated as a pointer when the instruction itself is about to use it as one.
     if (instruction.is_call_near_indirect() || instruction.is_jmp_near_indirect())
         && let Some(load_address) = explicit_memory_operand_address(&instruction, context)
         && relocations.is_in_destination(load_address)
@@ -369,6 +394,56 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
         );
         write_usize_fault_tolerant(load_address, translated);
     }
+
+    // (4) Register-indirect control transfer (`call reg` / `jmp reg`) through a value that was
+    // itself loaded from a stale GOT/TCB-style memory slot one or more instructions earlier. Case
+    // (3) above only sees the read when it is the *explicit memory operand of the call/jmp itself*
+    // (`call [mem]`); it cannot see a `mov reg, [slot]` followed later by `call reg`, since that
+    // call's only operand is a register, with no memory operand to trace back to a slot at all.
+    // Case (1) still catches the resulting stale `rip` once the transfer actually happens (a stale
+    // `rip` is a stale `rip` regardless of how it got there) and heals the live register -- but
+    // with no slot to patch, the same call site reads the identical stale value out of the same
+    // slot again next time, and this trap re-fires on the exact same `rip` forever. This is
+    // precisely the shape `.gm/prd.yml`'s `residual-second-fork-verify-corruption-bug` row
+    // documents: the same stale source-range `rip` recurring verbatim across many single-step
+    // traps even with case (1)'s `[rsp-8]` slot healing active.
+    //
+    // Closing this safely (without reintroducing case (3)'s false-positive hazard above) requires
+    // knowing, with certainty, that the *specific* value about to be used as a call/jmp target was
+    // itself just read from a *specific* memory slot -- not merely that some earlier instruction
+    // read some source-range-shaped value from memory. `last_memory_load` (updated unconditionally
+    // below at the end of every step, independent of whether this step turned out to be
+    // suspicious) tracks exactly that: the `(address, value)` of the most recent explicit-memory-
+    // operand read, from any instruction, from the previous single-step. If this step is a
+    // register-indirect call/jmp whose target register's value matches that recorded value
+    // exactly, the slot it came from is safe to heal -- the same soundness argument as case (3),
+    // just with one more established fact (the value truly is about to be used as a control-
+    // transfer target, not merely data that resembles a pointer).
+    if (instruction.is_call_near_indirect() || instruction.is_jmp_near_indirect())
+        && explicit_memory_operand_address(&instruction, context).is_none()
+        && instruction.op0_kind() == OpKind::Register
+        && let Some(target_value) = register_value(instruction.op0_register(), context)
+        && let Some((load_address, loaded_value)) = tls.fork_verify_last_load.get()
+        && loaded_value == target_value
+        && relocations.is_in_source(target_value)
+        && let Some(translated) = relocations.translate(target_value)
+    {
+        litebox_util_log::warn!(
+            rip:? = rip, load_address:? = load_address, stale_value:? = target_value,
+            translated:? = translated, mnemonic:? = instruction.mnemonic();
+            "fork_verify: stale CODE pointer previously loaded from memory slot into register, patching slot in place"
+        );
+        write_usize_fault_tolerant(load_address, translated);
+    }
+
+    // Record this step's memory read (if any) for case (4) on the *next* step, regardless of
+    // whether this step was itself flagged -- the read that matters is whichever one happened
+    // most recently right before a register-indirect call/jmp, which may be several ordinary
+    // (non-suspicious) steps earlier if intervening instructions don't also read memory.
+    tls.fork_verify_last_load.set(
+        explicit_memory_operand_address(&instruction, context)
+            .and_then(|addr| read_usize_fault_tolerant(addr).map(|v| (addr, v))),
+    );
 
     StepOutcome::Continue
 }
@@ -599,14 +674,61 @@ fn read_usize_fault_tolerant(addr: usize) -> Option<usize> {
 }
 
 /// Writes `value` as a `usize` to `addr` via a fault-tolerant access, doing nothing if `addr` is
-/// not in a committed, writable region.
+/// not in a committed region at all.
+///
+/// If `addr` is committed but currently read-only (e.g. a `.got`/`.data.rel.ro`-style slot RELRO
+/// or the dynamic linker has already marked read-only post-relocation -- exactly the shape of a
+/// GOT/PLT entry, one of the most common slots this module ever needs to heal), the region's
+/// protection is temporarily switched to writable, the write performed, and the *original*
+/// protection restored immediately after -- never left more permissive than it started. Without
+/// this, healing a read-only slot silently no-ops (as a plain `is_writable` gate would), which is
+/// exactly the residual this function's callers exist to close: a GOT/PLT-style slot healed once
+/// by [`on_single_step`]'s memory-read case appeared to patch successfully (the call site logs
+/// unconditionally) but the value silently never changed, so the identical stale pointer kept
+/// being read back out on every subsequent call through the same slot.
 fn write_usize_fault_tolerant(addr: usize, value: usize) {
-    if !is_writable(addr) {
+    use windows_sys::Win32::System::Memory as Win32_Memory;
+
+    if is_writable(addr) {
+        // SAFETY: `is_writable` confirmed `addr` is in a committed, writable region; see
+        // `read_usize_fault_tolerant`'s comment on why a full `usize` is always in-bounds here.
+        unsafe { core::ptr::write_unaligned(addr as *mut usize, value) };
         return;
     }
-    // SAFETY: `is_writable` confirmed `addr` is in a committed, writable region; see
-    // `read_usize_fault_tolerant`'s comment on why a full `usize` is always in-bounds here.
+    if !is_readable(addr) {
+        // Not committed/accessible at all: nothing to patch.
+        return;
+    }
+
+    // Committed and readable but not currently writable: temporarily flip to
+    // `PAGE_EXECUTE_READWRITE` (a superset of every other protection this slot could legitimately
+    // have -- read-only data, read-only+exec code, or already read-write, so widening to it and
+    // back is always a strict round trip), write, then restore exactly what `VirtualProtect`
+    // reports as the prior protection.
+    let mut old_protect = 0u32;
+    let ok = unsafe {
+        Win32_Memory::VirtualProtect(
+            addr as *mut core::ffi::c_void,
+            core::mem::size_of::<usize>(),
+            Win32_Memory::PAGE_EXECUTE_READWRITE,
+            &raw mut old_protect,
+        ) != 0
+    };
+    if !ok {
+        return;
+    }
+    // SAFETY: the `VirtualProtect` call above just made this region writable, and
+    // `read_usize_fault_tolerant`'s comment covers why a full `usize` is always in-bounds here.
     unsafe { core::ptr::write_unaligned(addr as *mut usize, value) };
+    let mut restored = 0u32;
+    unsafe {
+        Win32_Memory::VirtualProtect(
+            addr as *mut core::ffi::c_void,
+            core::mem::size_of::<usize>(),
+            old_protect,
+            &raw mut restored,
+        );
+    }
 }
 
 /// Reads the 64-bit value of `register` (or the enclosing 64-bit register, for narrower
@@ -665,6 +787,13 @@ pub(crate) fn access_violation_record(
 /// Per-thread arm/disarm entry points, called through
 /// [`litebox::platform::ForkChildVerificationProvider`].
 pub(crate) fn begin(relocations: alloc::sync::Arc<litebox::mm::AddressRelocations>) {
+    if crate::veh_trace_enabled() {
+        eprintln!(
+            "[fork_verify] tid={:?} begin: ranges={:?}",
+            std::thread::current().id(),
+            relocations.ranges(),
+        );
+    }
     if let Some(tls) = crate::get_tls_ptr() {
         // SAFETY: `get_tls_ptr` returns this thread's live `TlsState`.
         let tls = unsafe { &*tls };
@@ -675,6 +804,9 @@ pub(crate) fn begin(relocations: alloc::sync::Arc<litebox::mm::AddressRelocation
 }
 
 pub(crate) fn end() {
+    if crate::veh_trace_enabled() {
+        eprintln!("[fork_verify] tid={:?} end", std::thread::current().id());
+    }
     if let Some(tls) = crate::get_tls_ptr() {
         // SAFETY: as above.
         let tls = unsafe { &*tls };

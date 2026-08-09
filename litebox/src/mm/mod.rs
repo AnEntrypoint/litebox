@@ -120,6 +120,29 @@ impl AddressRelocations {
         self.executable[index]
     }
 
+    /// Returns whether `addr` falls within a DESTINATION range that was executable (`VM_EXEC`) in
+    /// the SOURCE address space at the moment of duplication -- i.e. `addr` is inside the child's
+    /// own relocated copy of guest code.
+    ///
+    /// A write landing here is never legitimate guest behavior: ordinary program code does not
+    /// self-modify, so any write an instruction's *own* operand computes into this range is itself
+    /// evidence of a stale/corrupted address-forming register, exactly the class of bug this
+    /// module exists to catch -- distinct from [`Self::is_in_source`], which only catches a write
+    /// through an address that is *still untranslated* (literally in a source range); a
+    /// corrupted-but-already-"valid"-looking destination address (e.g. off by a small amount from
+    /// a genuinely translated one) would slip past that check while still being exactly as
+    /// dangerous, since it corrupts the child's own instruction stream instead of the parent's
+    /// live state.
+    #[must_use]
+    pub fn is_in_destination_executable_range(&self, addr: usize) -> bool {
+        self.ranges
+            .iter()
+            .enumerate()
+            .any(|(i, (source_range, dest_base))| {
+                self.executable[i] && (*dest_base..dest_base + source_range.len()).contains(&addr)
+            })
+    }
+
     /// Returns the destination-space range of the source process's heap (`brk`-allocated region)
     /// at the moment of duplication, if it has one (`set_initial_brk` was called and at least one
     /// successful `brk()` growth has happened, so a heap VMA actually exists and was duplicated).

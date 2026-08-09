@@ -721,6 +721,20 @@ struct TlsState {
     ///
     /// See [`fork_verify`] and [`litebox::platform::ForkChildVerificationProvider`].
     fork_verify: RefCell<Option<Arc<litebox::mm::AddressRelocations>>>,
+    /// The `(effective address, loaded value)` of the most recent explicit-memory-operand read
+    /// `fork_verify::on_single_step` observed, from the immediately preceding single-step trap on
+    /// this thread -- `None` if the preceding step had no explicit memory operand, or was not
+    /// itself observed under verification.
+    ///
+    /// Lets [`fork_verify::on_single_step`] recognize a register-indirect `call reg`/`jmp reg`
+    /// whose target was loaded from a stale memory slot one instruction earlier (`mov reg,
+    /// [slot]` then `call reg`), so that slot can be healed even though the call/jmp instruction
+    /// itself has no memory operand to read the slot address from directly. See that function's
+    /// case (4) for the full reasoning, including why this is restricted to the *immediately
+    /// preceding* step's read rather than an unbounded history (a false match against a stale,
+    /// unrelated earlier read would risk the same false-positive hazard case (3)'s doc comment
+    /// describes).
+    fork_verify_last_load: Cell<Option<(usize, usize)>>,
 }
 
 /// Scratch space (in bytes) reserved below `host_sp` for the `EXCEPTION_RECORD` that
@@ -748,6 +762,7 @@ impl TlsState {
             waiting_waker: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             has_entered_guest: false.into(),
             fork_verify: RefCell::new(None),
+            fork_verify_last_load: Cell::new(None),
         }
     }
 }
