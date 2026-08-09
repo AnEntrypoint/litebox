@@ -2297,7 +2297,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<usize, Errno> {
         fn copy_vector<Platform: ShimPlatform>(
             mut base: UserPtr<UserPtr<i8>>,
-            _which: &str,
+            which: &str,
         ) -> Result<alloc::vec::Vec<alloc::ffi::CString>, Errno> {
             let mut out = alloc::vec::Vec::new();
             let mut total = 0usize;
@@ -2320,7 +2320,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     return Err(Errno::E2BIG);
                 }
                 litebox_util_log::trace!(
-                    which = _which,
+                    which = which,
                     idx:% = out.len(),
                     ptr:% = p.as_usize(),
                     len:% = cs.as_bytes().len(),
