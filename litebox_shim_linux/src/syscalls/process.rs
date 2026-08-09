@@ -2196,14 +2196,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// forbids changing the pgid of a process that has already called `execve` (`EACCES`); we
     /// don't model sessions at all, so those checks are not enforced -- only the pid-target
     /// restriction (see [`Self::sys_getpgid`]) and `EINVAL` for a negative `pgid` are.
-    pub(crate) fn sys_setpgid(&self, pid: i32, pgid: i32) -> Result<(), Errno> {
-        if pgid < 0 {
+    pub(crate) fn sys_setpgid(&self, pid: i32, requested_group: i32) -> Result<(), Errno> {
+        if requested_group < 0 {
             return Err(Errno::EINVAL);
         }
         if pid != 0 && pid != self.pid {
             return Err(Errno::ESRCH);
         }
-        let target_pgid = if pgid == 0 { self.pid } else { pgid };
+        let target_pgid = if requested_group == 0 {
+            self.pid
+        } else {
+            requested_group
+        };
         self.process().pgid.store(target_pgid, Ordering::Relaxed);
         Ok(())
     }
@@ -2785,6 +2789,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 #[cfg(test)]
 mod tests {
     use crate::{UserPtr, UserPtrMut};
+    use litebox_common_linux::errno::Errno;
 
     extern crate std;
 
