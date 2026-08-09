@@ -2386,6 +2386,63 @@ impl ConsoleStdinReader {
     /// behaves for an over-long line.
     const CHUNK_LEN: u32 = 4096;
 
+    /// Clears `ENABLE_LINE_INPUT` on `STD_INPUT_HANDLE`, once, before the reader thread's first
+    /// `ReadFile` call.
+    ///
+    /// # Why this is required for correctness, not just a latency optimization
+    ///
+    /// With the console's default `ENABLE_LINE_INPUT` ("cooked mode") active, `ReadFile` does not
+    /// release ANY buffered bytes to the caller until a full line (terminated by Enter) is
+    /// available -- confirmed via a minimal, litebox-free repro: writing `ESC[6n` (a cursor-
+    /// position-report query, which busybox ash's line editor issues via `ask_terminal()` when
+    /// drawing a prompt) causes conhost to genuinely inject the `ESC[row;colR` reply into the
+    /// console's raw input queue near-instantly (visible via `PeekConsoleInputW`), but a
+    /// concurrently-blocked `ReadFile` call does NOT return with those bytes -- it stays blocked
+    /// indefinitely, because the reply has no trailing Enter and cooked-mode line buffering will
+    /// not release a partial line. The reply only becomes readable once concatenated with
+    /// whatever the user types *next*, which corrupts ash's own escape-sequence/line-buffer
+    /// state (`libbb/read_key.c`'s CPR-scanning loop and lineedit.c's stateful `read_key_buffer`)
+    /// -- observed live as `ls /` corrupted into `ls: /<3 garbage bytes>: Invalid argument`,
+    /// reproducible on the *second* interactive command in a session (the first has no pending,
+    /// still-unread CPR reply from an earlier prompt draw to collide with).
+    ///
+    /// Since the guest (`ash`) already performs its own line editing character-by-character via
+    /// its own `read(2)` loop (confirmed via syscall tracing: every guest read requests exactly 1
+    /// byte), there is no reason for the *Windows* console to also cook/line-buffer input on top
+    /// -- doing so is actively harmful here, not merely redundant. Clearing `ENABLE_LINE_INPUT`
+    /// makes `ReadFile` release each byte (or escape-sequence reply) as soon as it is queued,
+    /// exactly matching a real Linux tty's raw-mode delivery semantics and closing this race.
+    /// `ENABLE_ECHO_INPUT`/`ENABLE_PROCESSED_INPUT` are deliberately left untouched: local
+    /// character echo and Ctrl+C/Ctrl+Z signal generation continue to work exactly as before --
+    /// this is not a full raw-mode switch, only the minimum change needed to stop the console
+    /// from withholding already-arrived bytes behind an unrelated future line terminator.
+    ///
+    /// Best-effort: `SetConsoleMode` can return a nonzero-`GetLastError` "failure" on some
+    /// ConPTY-backed handles even though the mode change visibly takes effect (confirmed via the
+    /// same repro: `GetConsoleMode` read back afterward reflects the change, and the CPR-reply
+    /// race closes, despite `GetLastError() == ERROR_INVALID_PARAMETER`) -- so this does not
+    /// panic or retry on failure, only attempts the change once.
+    fn disable_line_input_mode() {
+        use windows_sys::Win32::System::Console::{
+            ENABLE_LINE_INPUT, GetConsoleMode, STD_INPUT_HANDLE, SetConsoleMode,
+        };
+
+        let handle = unsafe { windows_sys::Win32::System::Console::GetStdHandle(STD_INPUT_HANDLE) };
+        if handle.is_null() || handle == Win32_Foundation::INVALID_HANDLE_VALUE {
+            // No real console attached (e.g. redirected pipe/file stdin): nothing to do, and
+            // `read_from_raw_handle`'s non-`FILE_TYPE_CHAR` path never routes through this reader
+            // anyway.
+            return;
+        }
+        let mut mode: u32 = 0;
+        if unsafe { GetConsoleMode(handle, &raw mut mode) } == 0 {
+            // Not actually a console handle (e.g. a redirected pipe reports `FILE_TYPE_CHAR` in
+            // some edge cases) -- nothing to change.
+            return;
+        }
+        let _ = unsafe { SetConsoleMode(handle, mode & !ENABLE_LINE_INPUT) };
+    }
+
     /// Runs on a dedicated background thread for the lifetime of the process: repeatedly issues a
     /// single genuinely blocking `ReadFile` against `STD_INPUT_HANDLE` and appends whatever comes
     /// back to `buffer`, waking any waiter. This is the only thread that ever calls `ReadFile` on
@@ -2396,6 +2453,7 @@ impl ConsoleStdinReader {
         use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
 
         let this = Self::get(platform);
+        Self::disable_line_input_mode();
         loop {
             let handle =
                 unsafe { windows_sys::Win32::System::Console::GetStdHandle(STD_INPUT_HANDLE) };
