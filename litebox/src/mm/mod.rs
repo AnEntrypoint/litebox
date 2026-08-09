@@ -124,72 +124,6 @@ impl AddressRelocations {
     }
 }
 
-#[cfg(test)]
-mod address_relocations_tests {
-    use super::AddressRelocations;
-
-    /// Regression coverage for the builtin-then-`execve` argv corruption this investigation
-    /// root-caused: `fixup_stale_stack_pointers` (in `litebox_shim_linux`) must be able to
-    /// identify and skip the heap range so its broad "does this 8-byte slot look like a
-    /// translatable pointer" scan never touches live guest heap data (e.g. a shell's
-    /// `stalloc`-style stack-string arena, confirmed live to live there in one investigated
-    /// case) -- `heap_range` is the primitive that makes that possible, so its own
-    /// identify-by-construction logic (matching on the tracked range whose end equals the
-    /// captured `heap_top`) needs to be correct independent of the full `PageManager::duplicate`
-    /// machinery (which cannot be exercised in a plain unit test without a real platform).
-    #[test]
-    fn heap_range_identifies_the_range_ending_at_heap_top() {
-        let relocations = AddressRelocations {
-            ranges: alloc::vec![
-                // A stack-like range, much larger than the heap, whose end does NOT match
-                // heap_top -- must never be mistaken for the heap.
-                (0x7000_0000..0x7080_0000, 0x9000_0000),
-                // The heap: ends exactly at heap_top, by construction of how PageManager::brk
-                // creates it.
-                (0x1000_0000..0x1010_0000, 0x2000_0000),
-                // A small TCB-like range, also not ending at heap_top.
-                (0x8000_0000..0x8000_2000, 0xa000_0000),
-            ],
-            heap_top: 0x1010_0000,
-        };
-
-        assert_eq!(
-            relocations.heap_range(),
-            Some((0x1000_0000..0x1010_0000, 0x2000_0000)),
-            "must identify the range whose end matches heap_top, not any other range"
-        );
-    }
-
-    /// `heap_top == 0` means `set_initial_brk` was never called for this process (no heap VMA
-    /// exists at all yet) -- `heap_range` must report "no heap" rather than spuriously matching
-    /// some unrelated range that happens to end at address 0 (which cannot happen for a real
-    /// range, but the explicit early-return must still be exercised, not relied upon by
-    /// coincidence).
-    #[test]
-    fn heap_range_is_none_when_no_heap_exists_yet() {
-        let relocations = AddressRelocations {
-            ranges: alloc::vec![(0x7000_0000..0x7080_0000, 0x9000_0000)],
-            heap_top: 0,
-        };
-
-        assert_eq!(relocations.heap_range(), None);
-    }
-
-    /// If no tracked range's end happens to match `heap_top` (should not occur in practice, since
-    /// `PageManager::brk` always creates the heap range to end there -- but `heap_range` must
-    /// degrade gracefully rather than panicking or matching the wrong range if it ever does, e.g.
-    /// a future refactor changing how the heap range is created).
-    #[test]
-    fn heap_range_is_none_when_no_range_matches_heap_top() {
-        let relocations = AddressRelocations {
-            ranges: alloc::vec![(0x7000_0000..0x7080_0000, 0x9000_0000)],
-            heap_top: 0x1234_5678,
-        };
-
-        assert_eq!(relocations.heap_range(), None);
-    }
-}
-
 impl<Platform, const ALIGN: usize> PageManager<Platform, ALIGN>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
@@ -927,5 +861,71 @@ where
             vmem.platform
                 .handle_page_fault(fault_addr, vma.flags(), error_code)
         }
+    }
+}
+
+#[cfg(test)]
+mod address_relocations_tests {
+    use super::AddressRelocations;
+
+    /// Regression coverage for the builtin-then-`execve` argv corruption this investigation
+    /// root-caused: `fixup_stale_stack_pointers` (in `litebox_shim_linux`) must be able to
+    /// identify and skip the heap range so its broad "does this 8-byte slot look like a
+    /// translatable pointer" scan never touches live guest heap data (e.g. a shell's
+    /// `stalloc`-style stack-string arena, confirmed live to live there in one investigated
+    /// case) -- `heap_range` is the primitive that makes that possible, so its own
+    /// identify-by-construction logic (matching on the tracked range whose end equals the
+    /// captured `heap_top`) needs to be correct independent of the full `PageManager::duplicate`
+    /// machinery (which cannot be exercised in a plain unit test without a real platform).
+    #[test]
+    fn heap_range_identifies_the_range_ending_at_heap_top() {
+        let relocations = AddressRelocations {
+            ranges: alloc::vec![
+                // A stack-like range, much larger than the heap, whose end does NOT match
+                // heap_top -- must never be mistaken for the heap.
+                (0x7000_0000..0x7080_0000, 0x9000_0000),
+                // The heap: ends exactly at heap_top, by construction of how PageManager::brk
+                // creates it.
+                (0x1000_0000..0x1010_0000, 0x2000_0000),
+                // A small TCB-like range, also not ending at heap_top.
+                (0x8000_0000..0x8000_2000, 0xa000_0000),
+            ],
+            heap_top: 0x1010_0000,
+        };
+
+        assert_eq!(
+            relocations.heap_range(),
+            Some((0x1000_0000..0x1010_0000, 0x2000_0000)),
+            "must identify the range whose end matches heap_top, not any other range"
+        );
+    }
+
+    /// `heap_top == 0` means `set_initial_brk` was never called for this process (no heap VMA
+    /// exists at all yet) -- `heap_range` must report "no heap" rather than spuriously matching
+    /// some unrelated range that happens to end at address 0 (which cannot happen for a real
+    /// range, but the explicit early-return must still be exercised, not relied upon by
+    /// coincidence).
+    #[test]
+    fn heap_range_is_none_when_no_heap_exists_yet() {
+        let relocations = AddressRelocations {
+            ranges: alloc::vec![(0x7000_0000..0x7080_0000, 0x9000_0000)],
+            heap_top: 0,
+        };
+
+        assert_eq!(relocations.heap_range(), None);
+    }
+
+    /// If no tracked range's end happens to match `heap_top` (should not occur in practice, since
+    /// `PageManager::brk` always creates the heap range to end there -- but `heap_range` must
+    /// degrade gracefully rather than panicking or matching the wrong range if it ever does, e.g.
+    /// a future refactor changing how the heap range is created).
+    #[test]
+    fn heap_range_is_none_when_no_range_matches_heap_top() {
+        let relocations = AddressRelocations {
+            ranges: alloc::vec![(0x7000_0000..0x7080_0000, 0x9000_0000)],
+            heap_top: 0x1234_5678,
+        };
+
+        assert_eq!(relocations.heap_range(), None);
     }
 }
