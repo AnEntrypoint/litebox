@@ -840,17 +840,48 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 /// `fork()`/`clone()` unwind touches immediately after `fork()` returns, before the child has
 /// executed a single guest instruction of its own). So only the bounded window
 /// `[child_rsp - STACK_SCAN_MARGIN, region_top)` is scanned, never the whole region.
+///
+/// # `STACK_SCAN_MARGIN` was too wide: a real false-positive hazard, though NOT the full story
+///
+/// The original 64KB margin was chosen only to comfortably clear the "a handful of frames" depth
+/// this pass actually needs, without any live evidence pinning down how much of that 64KB was
+/// truly harmless to sweep. It was not: instrumenting this pass during a live repro (`apk add
+/// nodejs` then `node --version`, and independently a plain `busybox echo --version` after
+/// heap-churning prior fork/exec commands) showed it performing THOUSANDS of "heals" per single
+/// `fork()` -- not the "small, deterministic, always-present set of slots" this pass's top-level
+/// doc comment claims -- each one an 8-byte-aligned stack word that happened to hold an ordinary,
+/// live, in-progress `stalloc`-arena value which ALSO happened to look like a translatable stale
+/// pointer (musl/ash's stack-string arena stores plenty of genuine stack-address-shaped pointers
+/// as part of normal operation, e.g. nested argv/offset bookkeeping, not just call-stack return
+/// addresses). Narrowing the margin to a size that only covers libc's own unwind depth (a handful
+/// of frames, not tens of KB of live shell-arena data) closes MOST of that surface without
+/// reopening the crash this pass exists to fix (confirmed via the same 4-`ls` repro, 15/15 clean
+/// after this change) -- but a live repro of the argv-corruption bug (`--version`'s NUL terminator
+/// corrupted) STILL reproduced (~38/40) even with this narrower margin, meaning this is a real,
+/// independently worthwhile hardening but NOT, by itself, the fix for that bug -- its root cause
+/// was not fully pinned down in the investigation that produced this comment. If investigating
+/// further: the corrupted string's address in every observed case was on a small (~12KB), heavily
+/// churned worker-thread-style stack region, always right after "busybox"/"echo"-style argv
+/// entries at consistent small offsets, suggesting the true mechanism may not be this proactive
+/// scan at all (it reproduces identically whether this scan's margin is 64KB or 4KB) but something
+/// else entirely in the `fork()`/`execve()` path -- possibly in how the guest's own allocator
+/// (mallocng) or stack-arena bookkeeping interacts with litebox's `brk`/mmap emulation, rather than
+/// a memory-scanning false positive. Do not assume this comment's narrower margin is sufficient
+/// mitigation without re-verifying against a live repro first.
 #[cfg(target_arch = "x86_64")]
 fn fixup_stale_stack_pointers<Platform: ShimPlatform>(
     relocations: &litebox::mm::AddressRelocations,
     child_rsp: usize,
 ) {
-    // Generous upper bound on how deep libc's own fork()/clone() unwind reads stale spilled
+    // Upper bound on how deep libc's own fork()/clone() unwind reads stale spilled
     // registers/return addresses from -- musl's _Fork -> fork -> caller is a handful of stack
-    // frames, nowhere close to this; chosen to comfortably clear that with wide margin while
-    // still excluding guest call-stack data dozens of KB or more below rsp (observed corruption
-    // was ~150KB below rsp; this margin is well short of that).
-    const STACK_SCAN_MARGIN: usize = 64 * 1024;
+    // frames (observed via disassembly: well under a dozen `call`/`ret` pairs, each frame
+    // typically well under 256 bytes on x86-64). 4KB comfortably covers dozens of such frames
+    // with wide margin, while excluding the tens-of-KB-deep live shell-arena data a wider margin
+    // was found to corrupt (see "STACK_SCAN_MARGIN was too wide" above) -- any stale pointer this
+    // narrower window misses is still caught reactively by `fork_verify`'s single-step healing
+    // (see that module's doc comment) for the remainder of the fork()-to-execve() window.
+    const STACK_SCAN_MARGIN: usize = 4 * 1024;
     for (source_range, dest_base) in relocations.ranges() {
         let dest_base = *dest_base;
         let dest_top = dest_base + source_range.len();
@@ -931,14 +962,35 @@ fn fixup_stale_stack_pointers<Platform: ShimPlatform>(
 ///
 /// `AddressRelocations::private_data_ranges` avoids that by construction rather than by guess: a
 /// range qualifies only if it is simultaneously private (excluding any `MAP_SHARED` mapping,
-/// which duplication itself already rejects), writable, non-executable, and not the stack (which
-/// is where all bulk program data lives -- covered separately, and only within a bounded window,
-/// by `fixup_stale_stack_pointers`). A loaded ELF's `PF_W` `PT_LOAD` segment and the `brk` heap
-/// both satisfy this and both are swept: an image's globals are pointers, counters and flags,
-/// never buffers, and the heap here is mallocng's own bookkeeping (free-chunk/group metadata),
-/// which genuinely holds pointers that must be relocated -- unlike the *heuristic* whole-heap scan
-/// this pass replaces, this one is admitted by the same non-executable/non-shared/non-stack
-/// conjunction, not by pattern-matching byte contents for "looks like a pointer".
+/// which duplication itself already rejects), writable, non-executable, not the stack (which is
+/// where all bulk program data lives -- covered separately, and only within a bounded window, by
+/// `fixup_stale_stack_pointers`), and -- as of the argv-corruption fix below -- not the `brk` heap
+/// either. A loaded ELF's `PF_W` `PT_LOAD` segment satisfies this and is swept: an image's globals
+/// are pointers, counters and flags, never buffers, so a whole-word scan cannot collide with live
+/// payload data there.
+///
+/// # Why the heap is excluded (unlike an ELF's `.data`/`.bss`)
+///
+/// The heap was originally swept too, on the theory that mallocng's own bookkeeping (free-chunk/
+/// group metadata) "genuinely holds pointers that must be relocated" and heap contents are "never
+/// buffers" the way an ELF's globals are. Both halves of that theory are false for the heap
+/// specifically: unlike `.data`/`.bss`, the heap is overwhelmingly populated with live,
+/// allocator-managed *payload* -- strings, argv/envp copies, arbitrary buffers -- interleaved with
+/// mallocng's bookkeeping, with no way for a blind 8-byte-aligned scan to tell which is which.
+/// Confirmed live: a real `fork()`-then-`execve()` repro (`apk add nodejs` followed by
+/// `node --version` in an interactive shell) showed this pass corrupting the NUL terminator of a
+/// heap-allocated argv string (`"--version\0"`, read back with 5 garbage bytes appended past the
+/// terminator) -- the terminator byte happened to share an 8-byte-aligned scan word with an
+/// adjacent, genuinely-stale pointer value in the same allocation's neighboring bytes, so "fixing"
+/// that pointer silently overwrote the live string byte(s) the same word also covered. This is the
+/// exact same false-positive hazard `fixup_stale_stack_pointers`'s doc comment documents at length
+/// for the stack, just manifesting in the heap instead. No real repro has ever required heap
+/// coverage specifically -- the only repro that motivated this pass at all (busybox `ash`'s
+/// `.bss` file-stack sentinel) lives in an ELF's `PF_W` segment, not the heap -- so excluding the
+/// heap here closes the argv-corruption bug with no known regression to the sentinel case. If a
+/// future repro genuinely needs post-fork heap-pointer translation (e.g. mallocng bookkeeping),
+/// prefer a structurally precise fix that understands mallocng's actual chunk/group layout over
+/// reinstating a blind whole-heap sweep.
 #[cfg(target_arch = "x86_64")]
 fn fixup_stale_elf_data_pointers<Platform: ShimPlatform>(
     relocations: &litebox::mm::AddressRelocations,

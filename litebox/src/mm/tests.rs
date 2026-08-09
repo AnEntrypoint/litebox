@@ -17,7 +17,8 @@ use crate::{
 use zerocopy::{FromBytes, IntoBytes};
 
 use super::linux::{
-    NonZeroPageSize, PAGE_SIZE, PageRange, VmArea, VmFlags, Vmem, VmemProtectError, VmemResizeError,
+    NonZeroPageSize, PAGE_SIZE, PageRange, VmArea, VmFlags, Vmem, VmemProtectError,
+    VmemResizeError, is_heap_range, is_private_data_range,
 };
 
 /// A dummy implementation of [`VmemBackend`] that does nothing.
@@ -296,4 +297,56 @@ fn test_vmm_mapping() {
             DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
         ]
     );
+}
+
+/// `is_heap_range` must identify the range ending exactly at the captured `brk` -- the same
+/// identification `AddressRelocations::heap_range` uses -- and nothing else.
+#[test]
+fn is_heap_range_matches_only_the_range_ending_at_brk() {
+    assert!(is_heap_range(&(0x1000..0x2000), 0x2000));
+    assert!(!is_heap_range(&(0x1000..0x2000), 0x3000));
+    // `heap_top == 0` means no heap VMA exists yet: never a match, even for a range that happens
+    // to end at 0 (which cannot occur for a real VMA anyway).
+    assert!(!is_heap_range(&(0x1000..0x2000), 0));
+}
+
+/// Regression test for the argv-corruption bug: a private/writable/non-exec/non-stack range that
+/// is ALSO the `brk` heap must be excluded from `is_private_data_range`, even though it would
+/// otherwise satisfy every other criterion -- see that function's doc comment ("Why the heap is
+/// excluded") for the live repro (`apk add nodejs` + `node --version`) that motivated this
+/// exclusion: a fork-time fixup pass consuming `private_data_ranges()` corrupted a live
+/// heap-allocated argv string's NUL terminator because the heap was, before this fix, swept
+/// unconditionally alongside genuine ELF `.data`/`.bss` segments.
+#[test]
+fn heap_range_is_excluded_from_private_data_even_when_otherwise_qualifying() {
+    // A `VmArea` shaped exactly like a private, writable, non-executable, non-stack region -- the
+    // same shape as a qualifying ELF `.data`/`.bss` segment -- so the ONLY thing that can exclude
+    // it is the heap check itself.
+    let heap_vma =
+        VmArea::<DummyVmemBackend, PAGE_SIZE>::new(VmFlags::VM_READ | VmFlags::VM_WRITE, false);
+    let heap_like_range = 0x5000..0x6000;
+    let brk = 0x6000; // matches heap_like_range.end
+
+    assert!(
+        !is_private_data_range(&heap_vma, &heap_like_range, brk),
+        "a range ending at the captured brk must never be treated as private data, regardless \
+         of its VmFlags shape"
+    );
+
+    // Sanity check: the identical VMA/range shape IS accepted as private data once it no longer
+    // coincides with the heap (brk elsewhere) -- proves the heap check is what's doing the
+    // excluding above, not some other unrelated criterion.
+    assert!(is_private_data_range(&heap_vma, &heap_like_range, 0x9999));
+}
+
+/// A genuinely stack-shaped range (`VM_GROWSDOWN`) must still be excluded regardless of the heap
+/// check, confirming the two exclusions are independent (not accidentally aliased).
+#[test]
+fn stack_range_is_still_excluded_independent_of_heap_check() {
+    let stack_vma = VmArea::<DummyVmemBackend, PAGE_SIZE>::new(
+        VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_GROWSDOWN,
+        false,
+    );
+    let stack_range = 0x7000_0000..0x7080_0000;
+    assert!(!is_private_data_range(&stack_vma, &stack_range, 0));
 }

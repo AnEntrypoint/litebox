@@ -398,9 +398,26 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
     // value that then desynchronized later execution instead of fixing anything. Restricting back
     // to call/jmp targets keeps the same soundness argument as case (1) and case (2): the read is
     // only ever treated as a pointer when the instruction itself is about to use it as one.
+    //
+    // `load_address` is ALSO excluded when it falls in the DESTINATION heap
+    // (`is_in_destination_heap_range`), for the same reason `fixup_stale_elf_data_pointers`
+    // excludes the heap from its own proactive scan (see that function's doc comment in
+    // `litebox_shim_linux::syscalls::process`): the heap is dominated by live, allocator-managed
+    // payload data, not code-pointer-shaped slots, so even restricting to call/jmp *targets* is
+    // not enough there -- a heap slot can transiently hold a small integer that both (a) is the
+    // explicit memory operand of some unrelated indirect call/jmp reached via a mis-decoded or
+    // coincidental control-flow shape, and (b) happens to numerically fall in a tracked source
+    // range. Confirmed live: this exact case was found healing (i.e. corrupting) a live heap slot
+    // holding the tail bytes -- including the NUL terminator -- of a freshly-`fork()`ed shell's
+    // `argv` string being prepared for `execve()`, observed via a real interactive repro
+    // (`apk add nodejs` then `node --version`, and independently reproduced with plain `busybox`
+    // after heap-churning fork/exec cycles) that stopped reproducing whenever this module's own
+    // `LITEBOX_VEH_TRACE` tracing was enabled -- a timing-sensitivity signature consistent with a
+    // narrow single-step healing false-positive, not a deterministic layout bug.
     if (instruction.is_call_near_indirect() || instruction.is_jmp_near_indirect())
         && let Some(load_address) = explicit_memory_operand_address(&instruction, context)
         && relocations.is_in_destination(load_address)
+        && !relocations.is_in_destination_heap_range(load_address)
         && let Some(stale_value) = read_usize_fault_tolerant(load_address)
         && let Some(translated) = relocations.translate(stale_value)
     {
@@ -442,6 +459,12 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
     // exactly, the slot it came from is safe to heal -- the same soundness argument as case (3),
     // just with one more established fact (the value truly is about to be used as a control-
     // transfer target, not merely data that resembles a pointer).
+    //
+    // `load_address` is excluded when it falls in the DESTINATION heap, for the identical reason
+    // case (3) excludes it (see that case's comment) -- `last_memory_load` itself never records a
+    // heap-resident load in the first place (see the tracking update below), so this check is
+    // technically redundant today, but kept here too as defense in depth against a future change
+    // to that tracking that reintroduces heap addresses without noticing this heal path.
     if (instruction.is_call_near_indirect() || instruction.is_jmp_near_indirect())
         && explicit_memory_operand_address(&instruction, context).is_none()
         && instruction.op0_kind() == OpKind::Register
@@ -449,6 +472,7 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
         && let Some((load_address, loaded_value)) = tls.fork_verify_last_load.get()
         && loaded_value == target_value
         && relocations.is_in_source(target_value)
+        && !relocations.is_in_destination_heap_range(load_address)
         && let Some(translated) = relocations.translate(target_value)
     {
         if crate::veh_trace_enabled() {
@@ -469,8 +493,15 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
     // whether this step was itself flagged -- the read that matters is whichever one happened
     // most recently right before a register-indirect call/jmp, which may be several ordinary
     // (non-suspicious) steps earlier if intervening instructions don't also read memory.
+    //
+    // A heap-resident load is never recorded at all (rather than recorded and filtered out only
+    // at heal time in case (4) above): the heap is live payload data, not a plausible source of a
+    // genuine stale code pointer, so tracking it here serves no purpose case (4)'s exclusion check
+    // doesn't already cover, and not recording it keeps this the single source of truth for "was
+    // this ever a candidate slot" rather than splitting that decision across two places.
     tls.fork_verify_last_load.set(
         explicit_memory_operand_address(&instruction, context)
+            .filter(|addr| !relocations.is_in_destination_heap_range(*addr))
             .and_then(|addr| read_usize_fault_tolerant(addr).map(|v| (addr, v))),
     );
 

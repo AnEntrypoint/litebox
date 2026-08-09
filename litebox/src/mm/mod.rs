@@ -170,13 +170,33 @@ impl AddressRelocations {
             .cloned()
     }
 
+    /// Returns whether `addr` falls within the DESTINATION-space heap range (see
+    /// [`Self::heap_range`]), if a heap exists at all.
+    ///
+    /// Used by consumers that must exclude the heap from a broad DESTINATION-space memory scan or
+    /// heal, for the same reason [`Self::private_data_ranges`] excludes it from the proactive
+    /// fork-time fixup pass: the heap is dominated by live, allocator-managed payload data (argv
+    /// copies, strings, arbitrary buffers) that a scan cannot distinguish from a genuine stale
+    /// pointer by inspecting a single 8-byte word's bit pattern alone. Confirmed live: litebox's
+    /// post-`fork()` single-step verifier (`fork_verify`, in `litebox_platform_windows_userland`)
+    /// was found healing a DESTINATION-range heap slot holding a live argv string's tail bytes
+    /// during ash's `fork()`-then-`execve()` window, corrupting the string's NUL terminator --
+    /// the same false-positive hazard as the (already heap-excluded) `.data`/`.bss` fixup pass,
+    /// just reached through the verifier's indirect-call/jmp-target healing instead.
+    #[must_use]
+    pub fn is_in_destination_heap_range(&self, addr: usize) -> bool {
+        self.heap_range().is_some_and(|(source_range, dest_base)| {
+            (dest_base..dest_base + source_range.len()).contains(&addr)
+        })
+    }
+
     /// Returns the `(source range, destination base)` pairs of every tracked range classified as
     /// a *private writable data region* of the guest at the moment of duplication: private
     /// (non-`MAP_SHARED`), writable, non-executable, and not the stack -- i.e. a loaded ELF
     /// image's `.data`/`.got`/`.bss`-style segment or an anonymous private mapping, never code,
-    /// read-only data, a shared mapping, or the stack. That conjunction (not any inspection of
-    /// contents) is what makes it precise enough to scan and rewrite unconditionally, unlike a
-    /// heuristic whole-region sweep.
+    /// read-only data, a shared mapping, the stack, or (see `linux::is_private_data_range`'s doc
+    /// comment) the `brk` heap. That conjunction (not any inspection of contents) is what makes it
+    /// precise enough to scan and rewrite unconditionally, unlike a heuristic whole-region sweep.
     ///
     /// Used by a fork-time fixup pass that must translate stale, untranslated SOURCE-space
     /// pointers a loaded ELF image's `.data`/`.got`/`.bss` segment stored before duplication (e.g.
@@ -1025,7 +1045,7 @@ mod address_relocations_tests {
                 (0x1000_0000..0x1000_1000, 0x2000_0000), // code: excluded
                 (0x1000_1000..0x1000_2000, 0x2000_1000), // .data: included
                 (0x7000_0000..0x7080_0000, 0x9000_0000), // stack: excluded
-                (0x1000_2000..0x1000_3000, 0x2000_2000), // heap: included
+                (0x1000_2000..0x1000_3000, 0x2000_2000), // anon private mapping: included
             ],
             executable: alloc::vec![true, false, false, false],
             private_data: alloc::vec![false, true, false, true],

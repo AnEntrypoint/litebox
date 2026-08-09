@@ -363,20 +363,48 @@ impl<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> VmArea<Platfor
 ///   within a bounded window above `rsp` -- by the shim's separate stack fixup pass, for reasons
 ///   that pass documents at length.
 ///
-/// The `brk` heap is deliberately *not* excluded, unlike in the stack pass: the guest allocator's
-/// own bookkeeping lives there and genuinely holds pointers that must be relocated. See
-/// [`super::AddressRelocations::private_data_ranges`].
+/// - **not the `brk` heap**: like the stack, the heap is dominated by live allocator-managed
+///   payload data (strings, buffers, arbitrary program structures) that a scanning consumer cannot
+///   distinguish from the allocator's own bookkeeping pointers by inspecting the range alone.
+///   Originally the heap WAS included here on the theory that mallocng's own bookkeeping
+///   "genuinely holds pointers that must be relocated" and "never transient stack-style buffers" --
+///   disproven live: a real fork()-then-execve() repro (`apk add nodejs` followed by
+///   `node --version` in an interactive shell) showed the fork-time fixup pass that consumes this
+///   range corrupting the NUL terminator of a live heap-allocated argv string (`"--version\0"`)
+///   because its terminator byte shared an 8-byte-aligned scan word with an adjacent, unrelated,
+///   genuinely-stale pointer value elsewhere in the same allocation's slack/neighboring bytes --
+///   the pass "fixed" the pointer-shaped word and silently destroyed the live string byte(s) that
+///   word also happened to cover. This is exactly the same false-positive hazard the stack pass was
+///   narrowed to avoid (see [`Vmem`]'s stack-scan-window doc comment in
+///   `litebox_shim_linux::syscalls::process::fixup_stale_stack_pointers`), just manifesting in the
+///   heap instead of the stack. No real repro has ever required heap coverage specifically (the
+///   only repro that motivated adding [`super::AddressRelocations::private_data_ranges`] at all --
+///   busybox `ash`'s `.bss` file-stack sentinel -- lives in an ELF's `PF_W` `PT_LOAD` segment, not
+///   the heap), so excluding it here closes the argv-corruption bug with no known regression.
+///
+/// See [`super::AddressRelocations::private_data_ranges`].
 /// `(source range, destination base address, was executable in source, is a private data region)`
 /// for one relocated range -- see [`Vmem::duplicate`].
 type DuplicatedRangeInfo = (Range<usize>, usize, bool, bool);
 
-fn is_private_data_range<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize>(
+/// Whether `range` is the `brk`-allocated heap VMA, i.e. the same identification
+/// [`super::AddressRelocations::heap_range`] uses: the (unique, by construction) tracked range
+/// whose end equals the current program break. `heap_top == 0` means no heap VMA exists yet (`brk`
+/// was never initialized), so nothing can match.
+pub(super) fn is_heap_range(range: &Range<usize>, heap_top: usize) -> bool {
+    heap_top != 0 && range.end == heap_top
+}
+
+pub(super) fn is_private_data_range<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize>(
     vma: &VmArea<Platform, ALIGN>,
+    range: &Range<usize>,
+    heap_top: usize,
 ) -> bool {
     vma.shared_handle.is_none()
         && !vma.flags().contains(VmFlags::VM_GROWSDOWN)
         && vma.flags().contains(VmFlags::VM_WRITE)
         && !vma.flags().contains(VmFlags::VM_EXEC)
+        && !is_heap_range(range, heap_top)
 }
 
 /// Virtual Memory Manager
@@ -905,7 +933,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     range.clone(),
                     dest_ptr.as_usize(),
                     vma.flags.contains(VmFlags::VM_EXEC),
-                    is_private_data_range(&vma),
+                    is_private_data_range(&vma, &range, self.brk),
                 ));
                 continue;
             }
@@ -946,7 +974,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     range.clone(),
                     dest_ptr.as_usize(),
                     vma.flags.contains(VmFlags::VM_EXEC),
-                    is_private_data_range(&vma),
+                    is_private_data_range(&vma, &range, self.brk),
                 ));
                 continue;
             }
@@ -994,7 +1022,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 // The SOURCE's real flags (`vma.flags`), not `writable_vma`'s temporary
                 // READ|WRITE-forced flags used only to populate this mapping above.
                 vma.flags.contains(VmFlags::VM_EXEC),
-                is_private_data_range(&vma),
+                is_private_data_range(&vma, &range, self.brk),
             ));
 
             if vma.flags.intersection(VmFlags::VM_ACCESS_FLAGS)
