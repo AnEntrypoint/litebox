@@ -105,8 +105,8 @@ impl AddressRelocations {
     ///
     /// Identified precisely, not heuristically: `PageManager::brk`'s `create_pages` call always
     /// creates the heap VMA to end exactly at the current program break, so the (unique) tracked
-    /// source range whose end equals [`Self::heap_top`] -- via `self.heap_top`, captured at
-    /// duplication time -- *is* the heap, by construction of how that range came to exist. Used by
+    /// source range whose end equals the program break captured at duplication time -- *is* the
+    /// heap, by construction of how that range came to exist. Used by
     /// [`crate`]'s consumers that need to exclude the heap from a broad memory scan (e.g. a
     /// fork-time stale-pointer fixup pass): a `call`-instruction return address, a spilled
     /// register, or a TCB field can never legitimately live in `brk`-allocated memory, so any
