@@ -173,7 +173,31 @@ unsafe extern "system" fn vectored_exception_handler(
             let before_start = rip.wrapping_sub(8);
             let nb = fork_verify::read_code_bytes_for_diagnostics(before_start, &mut before);
             eprintln!("[veh] rip-8 bytes ({nb}): {:02x?}", &before[..nb]);
+            fork_verify::describe_crash_page_for_diagnostics(rip);
+            eprintln!(
+                "[veh] crash regs rdi={:#x} rsi={:#x} rdx={:#x} rax={:#x} rsp={:#x} rbp={:#x}",
+                context.Rdi, context.Rsi, context.Rdx, context.Rax, context.Rsp, context.Rbp,
+            );
         }
+    }
+
+    // Diagnostic code-page watchpoint (`LITEBOX_CODEWATCH=1`). Both of these must be triaged
+    // BEFORE the `!is_in_guest` branch below: the whole point of the watchpoint is to observe
+    // writes into a `fork()` child's own copied code that happen while LiteBox's *host*
+    // syscall-servicing code is running (i.e. `is_in_guest == false`), which that branch would
+    // otherwise hand straight to `EXCEPTION_CONTINUE_SEARCH` and turn into a process-killing
+    // unhandled exception -- as would the `TF` single-step the watchpoint uses to let the trapped
+    // write complete.
+    if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
+        && fork_verify::on_codewatch_write(exception_record, context)
+    {
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_SINGLE_STEP
+        && !tls.is_in_guest.get()
+        && fork_verify::on_codewatch_step(context)
+    {
+        return EXCEPTION_CONTINUE_EXECUTION;
     }
 
     if !tls.is_in_guest.get() {
@@ -735,6 +759,12 @@ struct TlsState {
     /// unrelated earlier read would risk the same false-positive hazard case (3)'s doc comment
     /// describes).
     fork_verify_last_load: Cell<Option<(usize, usize)>>,
+    /// Backing state for the diagnostic code-page watchpoint (`LITEBOX_CODEWATCH=1`); see
+    /// [`fork_verify`]'s `codewatch` module. A field here rather than a bare `static`, matching
+    /// `WindowsUserland::console_stdin_reader`'s reasoning -- it keeps this diagnostic off the
+    /// crate's ratcheted bare-static count, and per-thread is its natural scope anyway (the
+    /// `fork()` child arms the ranges on its own thread and is the thread that traps on them).
+    codewatch: fork_verify::CodewatchState,
 }
 
 /// Scratch space (in bytes) reserved below `host_sp` for the `EXCEPTION_RECORD` that
@@ -763,6 +793,7 @@ impl TlsState {
             has_entered_guest: false.into(),
             fork_verify: RefCell::new(None),
             fork_verify_last_load: Cell::new(None),
+            codewatch: fork_verify::CodewatchState::new(),
         }
     }
 }

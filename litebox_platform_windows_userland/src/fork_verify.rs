@@ -170,6 +170,17 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
     #[allow(clippy::cast_possible_truncation)]
     let eflags_tf = EFLAGS_TF as u32;
 
+    // The diagnostic code-page watchpoint borrows `TF` to step over a trapped write (see
+    // `codewatch`). That step is not a verification step, and on a thread that is not otherwise
+    // under verification it is the *only* reason `TF` is set -- so consume it here, re-arming the
+    // page, and clear `TF` unless verification wants it kept armed.
+    if codewatch::on_single_step_rearm() {
+        if !is_verifying(tls) {
+            context.EFlags &= !eflags_tf;
+        }
+        return StepOutcome::Continue;
+    }
+
     let borrow = tls.fork_verify.borrow();
     let Some(relocations) = borrow.as_ref() else {
         // Not a thread under verification: TF must have leaked in from somewhere. Clear it and
@@ -802,6 +813,333 @@ pub(crate) fn access_violation_record(
     record
 }
 
+/// Diagnostic-only `PAGE_GUARD` watchpoint over a `fork()` child's own destination *executable*
+/// pages.
+///
+/// # Why this exists
+///
+/// [`on_single_step`] is structurally blind to any write performed while `rip` is outside the
+/// child's destination ranges: it disarms `TF` unconditionally there (see the
+/// `!relocations.is_in_destination(rip)` early return), which is exactly the window in which
+/// LiteBox's own host-side syscall servicing runs -- every guest `syscall` is rewritten into a
+/// `call` to `syscall_callback`. A corruption of the child's *own copied code* that happens
+/// during that window therefore produces no trace line at all, which is precisely what the
+/// `base+0xa98a` `0xf4` (HLT) crash under investigation looks like.
+///
+/// A page-protection watchpoint has no such blind spot: it is a property of the *page*, not of
+/// the thread's trap flag, so it fires for any write from any thread, host or guest code alike.
+///
+/// The protection used is `PAGE_EXECUTE_READ` (write permission simply dropped), **not**
+/// `PAGE_GUard`-style one-shot guarding. `PAGE_GUARD` was tried first and is unusable here: it
+/// traps on *every* access including instruction fetches, so the guest executing its own code
+/// storms the handler thousands of times per millisecond and never makes forward progress
+/// (observed directly -- the repro stalled indefinitely). Dropping only write access instead
+/// lets execution and reads run at full speed and traps exclusively on the writes, which are the
+/// only accesses that can corrupt.
+///
+/// On a trapped write the handler logs the faulting `rip`, restores write permission, and
+/// single-steps the one faulting instruction via `EFLAGS.TF` so it can complete; the subsequent
+/// `#DB` re-drops write permission. That is why [`on_single_step`] consults
+/// [`codewatch::on_single_step_rearm`] before anything else.
+///
+/// Gated behind `LITEBOX_CODEWATCH=1` and inert otherwise.
+///
+/// # What it established
+///
+/// Run against the `sh -c "ls /; ls /usr; ls /tmp; ls /bin | head -3"` repro, this watchpoint
+/// **disproved** the long-running "something corrupts the child's copied code" theory that the
+/// deterministic `0xC0000096` (`STATUS_PRIVILEGED_INSTRUCTION`) crash at destination offset
+/// `+0xa98a` had been attributed to. With every executable destination range armed non-writable
+/// for the whole run, *zero* writes ever trapped, the page was still `PAGE_EXECUTE_READ` at crash
+/// time, and the bytes there matched the parent's source byte-for-byte. The `0xf4` at the crash
+/// `rip` is original, unmodified musl code: `testb $0xf, %dil; je +1; hlt` -- mallocng's inline
+/// "pointer is not 16-byte aligned" assertion inside `free()`, whose `hlt` is *designed* to be
+/// jumped over and only executes when the check fails. Nothing self-modifies; the same bytes
+/// simply execute with a bad `rdi` on a later pass.
+///
+/// The real defect is upstream: `rdi` holds an untranslated *source*-space pointer (observed as
+/// `0x100c55f8`, inside a tracked source range, while every other live register held a correctly
+/// relocated destination address), i.e. a stale post-`fork()` pointer that reached `free()`
+/// without being translated. See `.gm/prd.yml`'s
+/// `residual-second-fork-verify-corruption-bug` row.
+pub(crate) use codewatch::State as CodewatchState;
+
+mod codewatch {
+    use core::ffi::c_void;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use windows_sys::Win32::System::Memory as Win32_Memory;
+
+    /// A `fork()` child has a handful of executable destination ranges (three in practice for a
+    /// busybox/musl guest) and all of them must be watched, since the crash site is not always in
+    /// the first.
+    const MAX_WATCHED: usize = 8;
+
+    /// All of the watchpoint's mutable state. Lives as a field on [`crate::TlsState`] rather than
+    /// in a bare `static`, matching how the rest of this crate keeps long-lived state off the
+    /// `ratchet_globals` bare-static budget (see `WindowsUserland::console_stdin_reader`'s
+    /// comment). Per-thread is also its natural scope: the `fork()` child arms the ranges on its
+    /// own thread and is the thread that traps on them. Fixed-capacity and lock-free so the
+    /// exception handler never allocates or blocks.
+    pub(crate) struct State {
+        /// Number of ranges currently armed. Non-zero only under `LITEBOX_CODEWATCH=1`.
+        armed: AtomicUsize,
+        /// The watched regions, as parallel `[start, end)` pairs.
+        start: [AtomicUsize; MAX_WATCHED],
+        end: [AtomicUsize; MAX_WATCHED],
+        /// The page awaiting re-arm after its faulting write was stepped over, or 0 if none.
+        pending_rearm: AtomicUsize,
+    }
+
+    impl State {
+        pub(crate) const fn new() -> Self {
+            Self {
+                armed: AtomicUsize::new(0),
+                start: [const { AtomicUsize::new(0) }; MAX_WATCHED],
+                end: [const { AtomicUsize::new(0) }; MAX_WATCHED],
+                pending_rearm: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    /// Runs `f` against the calling thread's watchpoint state, or returns `default` if this thread
+    /// has no `TlsState` yet (the watchpoint is only ever armed from a thread that does).
+    fn with<R>(default: R, f: impl FnOnce(&State) -> R) -> R {
+        match crate::get_tls_ptr() {
+            // SAFETY: `get_tls_ptr` returns this thread's live `TlsState`.
+            Some(tls) => f(&unsafe { &*tls }.codewatch),
+            None => default,
+        }
+    }
+
+    pub(super) fn enabled() -> bool {
+        std::env::var_os("LITEBOX_CODEWATCH").is_some()
+    }
+
+    /// Whether `addr` falls inside any currently watched region.
+    pub(super) fn contains(addr: usize) -> bool {
+        with(false, |s| {
+            let armed = s.armed.load(Ordering::Relaxed).min(MAX_WATCHED);
+            (0..armed).any(|i| {
+                (s.start[i].load(Ordering::Relaxed)..s.end[i].load(Ordering::Relaxed))
+                    .contains(&addr)
+            })
+        })
+    }
+
+    /// Sets `[start, end)` to `protect`. Returns whether it succeeded.
+    fn protect(start: usize, len: usize, protect: u32) -> bool {
+        let mut old = 0u32;
+        // SAFETY: `VirtualProtect` validates the range itself and reports failure via a zero
+        // return; it never dereferences the range's contents.
+        unsafe {
+            Win32_Memory::VirtualProtect(start as *mut c_void, len, protect, &raw mut old) != 0
+        }
+    }
+
+    /// Reports the region type and protection backing `addr`, to tell a private commit apart from
+    /// a mapped section view (the latter can be aliased by a second view that this watchpoint's
+    /// `VirtualProtect` does not cover).
+    pub(super) fn describe(addr: usize) -> (u32, u32, usize) {
+        let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: `VirtualQuery` only reads process metadata and tolerates any address value.
+        let ok = unsafe {
+            Win32_Memory::VirtualQuery(
+                addr as *const c_void,
+                &raw mut mbi,
+                core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+            ) != 0
+        };
+        if ok {
+            (mbi.Type, mbi.Protect, mbi.AllocationBase.addr())
+        } else {
+            (0, 0, 0)
+        }
+    }
+
+    /// Drops write permission from `[start, end)` so that writes -- and only writes -- trap.
+    /// Returns whether the arm succeeded.
+    pub(super) fn arm(start: usize, end: usize) -> bool {
+        with(false, |s| {
+            let slot = s.armed.load(Ordering::Relaxed);
+            if slot >= MAX_WATCHED {
+                return false;
+            }
+            let ok = protect(start, end - start, Win32_Memory::PAGE_EXECUTE_READ);
+            if ok {
+                s.start[slot].store(start, Ordering::Relaxed);
+                s.end[slot].store(end, Ordering::Relaxed);
+                s.armed.store(slot + 1, Ordering::Relaxed);
+            }
+            ok
+        })
+    }
+
+    /// Temporarily restores write permission to the page containing `addr` so the faulting
+    /// instruction can be replayed and complete.
+    pub(super) fn unprotect_page(addr: usize) {
+        protect(addr & !0xfff, 0x1000, Win32_Memory::PAGE_EXECUTE_READWRITE);
+    }
+
+    /// Re-drops write permission on the page containing `addr` once the faulting instruction has
+    /// been stepped over.
+    fn rearm_page(addr: usize) {
+        protect(addr & !0xfff, 0x1000, Win32_Memory::PAGE_EXECUTE_READ);
+    }
+
+    /// Forgets all watched regions, so a subsequent `fork()` re-arms from a clean slate rather
+    /// than exhausting the fixed slot table across many forks.
+    pub(super) fn reset() {
+        with((), |s| s.armed.store(0, Ordering::Relaxed));
+    }
+
+    pub(super) fn set_pending_rearm(addr: usize) {
+        with((), |s| s.pending_rearm.store(addr, Ordering::Relaxed));
+    }
+
+    /// If a watched page had its protection temporarily lifted to let a faulting write complete,
+    /// re-drops write permission now that the write has been single-stepped. Returns whether this
+    /// single-step trap belonged to the watchpoint (and so should be consumed rather than treated
+    /// as a `fork_verify` verification step).
+    pub(super) fn on_single_step_rearm() -> bool {
+        let addr = with(0, |s| s.pending_rearm.swap(0, Ordering::Relaxed));
+        if addr == 0 {
+            return false;
+        }
+        rearm_page(addr);
+        true
+    }
+}
+
+/// Handles an `EXCEPTION_ACCESS_VIOLATION` that is really a watched-code-page write trap.
+///
+/// Returns whether the exception was ours (and has been handled, so the caller should resume by
+/// replaying the faulting instruction). See [`codewatch`] for why this exists and why it is
+/// diagnostic-only.
+pub(crate) fn on_codewatch_write(record: &EXCEPTION_RECORD, context: &mut CONTEXT) -> bool {
+    unsafe extern "C" {
+        safe static __ImageBase: core::ffi::c_void;
+    }
+    if !codewatch::enabled() {
+        return false;
+    }
+    // `ExceptionInformation[0]` is the access type (0 read / 1 write / 8 execute) and `[1]` the
+    // faulting address, per `EXCEPTION_ACCESS_VIOLATION`'s documented parameters. Only writes can
+    // corrupt, and only writes are trapped by the `PAGE_EXECUTE_READ` arming, so anything else
+    // reaching here is a genuine fault that must be left to the normal handling below.
+    if record.ExceptionInformation[0] != 1 {
+        return false;
+    }
+    let address = record.ExceptionInformation[1];
+    if !codewatch::contains(address) {
+        return false;
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "diagnostic-only; this platform is x86_64-only, rip fits in usize"
+    )]
+    let rip = context.Rip as usize;
+
+    let image_base = (&raw const __ImageBase).addr();
+    let mut code = [0u8; MAX_INSTRUCTION_LEN];
+    let len = read_code_bytes(rip, &mut code);
+    let mnemonic = if len == 0 {
+        None
+    } else {
+        let mut decoder = Decoder::with_ip(64, &code[..len], rip as u64, DecoderOptions::NONE);
+        let instruction = decoder.decode();
+        (!instruction.is_invalid()).then(|| instruction.mnemonic())
+    };
+    eprintln!(
+        "[codewatch] tid={:?} WRITE into watched guest code page address={address:#x} rip={rip:#x} host_rva={:#x} mnemonic={mnemonic:?} bytes={:02x?}",
+        std::thread::current().id(),
+        rip.wrapping_sub(image_base),
+        &code[..len],
+    );
+
+    // Let the faulting instruction complete: restore write permission and single-step it, so the
+    // page can be re-armed immediately afterwards in `on_single_step`.
+    codewatch::unprotect_page(address);
+    codewatch::set_pending_rearm(address);
+    #[allow(clippy::cast_possible_truncation)]
+    let eflags_tf = EFLAGS_TF as u32;
+    context.EFlags |= eflags_tf;
+    true
+}
+
+/// Reports the region backing a crash `rip`, so a genuinely corrupted byte can be told apart from
+/// execution having landed in a *different* mapping than the one the watchpoint armed.
+pub(crate) fn describe_crash_page_for_diagnostics(rip: usize) {
+    let (mtype, protect, alloc_base) = codewatch::describe(rip);
+    eprintln!(
+        "[codewatch] crash page rip={rip:#x} type={mtype:#x} protect={protect:#x} alloc_base={alloc_base:#x} watched={}",
+        codewatch::contains(rip),
+    );
+    // Re-read the surrounding bytes relative to the *page*, so a `0xf4` at `rip` can be checked
+    // against what the copy left there: if the page still holds the original instruction stream
+    // and only `rip` disagrees, execution arrived at a misaligned address rather than the byte
+    // having been overwritten.
+    let page = rip & !0xfff;
+    let offset = rip & 0xfff;
+    let start = page + offset.saturating_sub(16);
+    let mut window = [0u8; 32];
+    let n = read_code_bytes(start, &mut window);
+    eprintln!(
+        "[codewatch] crash page window at {start:#x} (rip at +{}): {:02x?}",
+        rip - start,
+        &window[..n],
+    );
+}
+
+/// Consumes the `TF` single-step the code-page watchpoint armed to let a trapped write complete,
+/// when that step lands in *host* code (`is_in_guest == false`), where [`on_single_step`] is never
+/// reached. Returns whether the step was the watchpoint's.
+pub(crate) fn on_codewatch_step(context: &mut CONTEXT) -> bool {
+    if !codewatch::enabled() || !codewatch::on_single_step_rearm() {
+        return false;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let eflags_tf = EFLAGS_TF as u32;
+    context.EFlags &= !eflags_tf;
+    true
+}
+
+/// Arms the diagnostic code-page watchpoint over `relocations`' destination executable ranges.
+fn arm_codewatch(relocations: &litebox::mm::AddressRelocations) {
+    if !codewatch::enabled() {
+        return;
+    }
+    codewatch::reset();
+    for (index, (source_range, dest_base)) in relocations.ranges().iter().enumerate() {
+        if !relocations.is_executable_range(index) {
+            continue;
+        }
+        let start = *dest_base;
+        let end = dest_base + source_range.len();
+        let armed = codewatch::arm(start, end);
+        let (mtype, protect, alloc_base) = codewatch::describe(start);
+        eprintln!(
+            "[codewatch] tid={:?} arm dest=[{start:#x},{end:#x}) len={:#x} ok={armed} type={mtype:#x} protect={protect:#x} alloc_base={alloc_base:#x}",
+            std::thread::current().id(),
+            source_range.len(),
+        );
+        // Self-test: a null result from this watchpoint ("no write ever trapped") is only
+        // meaningful if a write provably *does* trap. `LITEBOX_CODEWATCH=selftest` proves it by
+        // writing one byte back to itself per armed range and checking the trap fires; it is a
+        // separate mode because it deliberately perturbs the pages under investigation.
+        if armed && std::env::var_os("LITEBOX_CODEWATCH").is_some_and(|v| v == "selftest") {
+            let probe = start + 0x100;
+            // SAFETY: `probe` is inside a committed, just-armed executable destination range, and
+            // the value written is the one just read back, so guest state is left unchanged.
+            unsafe {
+                let byte = core::ptr::read_volatile(probe as *const u8);
+                core::ptr::write_volatile(probe as *mut u8, byte);
+            }
+            eprintln!("[codewatch] selftest wrote to {probe:#x}");
+        }
+    }
+}
+
 /// Per-thread arm/disarm entry points, called through
 /// [`litebox::platform::ForkChildVerificationProvider`].
 pub(crate) fn begin(relocations: alloc::sync::Arc<litebox::mm::AddressRelocations>) {
@@ -812,6 +1150,7 @@ pub(crate) fn begin(relocations: alloc::sync::Arc<litebox::mm::AddressRelocation
             relocations.ranges(),
         );
     }
+    arm_codewatch(&relocations);
     if let Some(tls) = crate::get_tls_ptr() {
         // SAFETY: `get_tls_ptr` returns this thread's live `TlsState`.
         let tls = unsafe { &*tls };
