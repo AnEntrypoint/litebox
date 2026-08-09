@@ -802,17 +802,62 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 /// every region instead of guessing which one is "the stack's group" is still fully bounded --
 /// this is the total mapped size of one (typically small) guest process, walked once per
 /// `fork()` -- and overwrites any slot whose value is itself a translatable SOURCE-range address
-/// with its DESTINATION equivalent. Non-pointer contents (small integers, saved flags, ...) are
-/// left untouched: `AddressRelocations::translate` only ever matches genuine addresses that fell
-/// within one of the parent's pre-`fork()` mappings, which no ordinary integer or flag value
-/// does.
+/// with its DESTINATION equivalent.
+///
+/// # Excluding the heap
+///
+/// The heap (`brk`-allocated region) is deliberately skipped entirely, via
+/// [`AddressRelocations::heap_range`] -- a `call`-instruction return address, a spilled
+/// callee-saved register, or a TCB field can never legitimately live there, so it is never a
+/// source of genuine stale pointers this pass needs to fix.
+///
+/// # Bounding the stack scan to a window above `rsp`
+///
+/// Even excluding the heap, a guest's *stack* can easily be hundreds of kilobytes deep by the
+/// time it reaches a `fork()` call several frames down a shell's command-parsing/expansion code
+/// (confirmed live: a guest shell's `stalloc`-style stack-string arena used to build up a
+/// command's `argv`/pathname text one byte at a time lives *on the stack*, not the heap, roughly
+/// 150KB below `rsp` at `fork()` time in one observed repro) -- scanning the *entire* stack range
+/// hits exactly the same false-positive hazard the heap exclusion above addresses: ordinary
+/// in-progress program data (partially-built strings, local variables) that happens to
+/// numerically fall within the parent's address range gets misidentified as a stale pointer and
+/// silently corrupted. But unlike the heap, the stack genuinely does contain the real stale
+/// pointers this pass exists to fix -- they are, by construction, always *shallow* (within the
+/// handful of frames libc's own `fork()`/`clone()` unwind touches immediately after `fork()`
+/// returns, before the child has executed a single guest instruction of its own). So for
+/// whichever tracked region contains `child_rsp` (the child's already-translated stack pointer),
+/// only the bounded window `[child_rsp - STACK_SCAN_MARGIN, region_top)` is scanned instead of
+/// the whole region; every *other* tracked region (the TCB, guard pages, ...) is still scanned in
+/// full, since those are not live guest call-stack data and the same "TCB commonly lands in a
+/// sibling entry" concern above still applies to them.
 #[cfg(target_arch = "x86_64")]
 fn fixup_stale_stack_pointers<Platform: ShimPlatform>(
     relocations: &litebox::mm::AddressRelocations,
+    child_rsp: usize,
 ) {
+    // Generous upper bound on how deep libc's own fork()/clone() unwind reads stale spilled
+    // registers/return addresses from -- musl's _Fork -> fork -> caller is a handful of stack
+    // frames, nowhere close to this; chosen to comfortably clear that with wide margin while
+    // still excluding guest call-stack data dozens of KB or more below rsp (observed corruption
+    // was ~150KB below rsp; this margin is well short of that).
+    const STACK_SCAN_MARGIN: usize = 64 * 1024;
+    let heap_range = relocations.heap_range();
     for (source_range, dest_base) in relocations.ranges() {
+        if heap_range.as_ref().is_some_and(|(heap_source, heap_dest)| {
+            heap_source == source_range && heap_dest == dest_base
+        }) {
+            continue;
+        }
         let dest_top = dest_base + source_range.len();
-        let mut addr = *dest_base;
+        // If this region contains `child_rsp`, only scan the bounded window starting
+        // `STACK_SCAN_MARGIN` bytes below it (clamped to the region's own start) -- see this
+        // function's doc comment for why. Every other region is scanned in full, as before.
+        let scan_start = if (*dest_base..dest_top).contains(&child_rsp) {
+            child_rsp.saturating_sub(STACK_SCAN_MARGIN).max(*dest_base)
+        } else {
+            *dest_base
+        };
+        let mut addr = scan_start;
         while addr < dest_top {
             let slot = UserPtrMut::<usize>::from_usize(addr);
             if let Some(value) = slot.read_at_offset::<Platform>(0)
@@ -1279,7 +1324,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // duplicated regions: fix them up here, once, before the child ever executes an
                 // instruction, exactly the same way the FS-base self-pointer below is fixed up
                 // for the same reason.
-                fixup_stale_stack_pointers::<Platform>(&relocations);
+                fixup_stale_stack_pointers::<Platform>(&relocations, child_ctx.rsp);
             }
 
             // Register the new process as a child of the caller's process so a later
