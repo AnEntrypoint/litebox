@@ -807,9 +807,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 /// # Excluding the heap
 ///
 /// The heap (`brk`-allocated region) is deliberately skipped entirely, via
-/// [`AddressRelocations::heap_range`] -- a `call`-instruction return address, a spilled
-/// callee-saved register, or a TCB field can never legitimately live there, so it is never a
-/// source of genuine stale pointers this pass needs to fix.
+/// [`litebox::mm::AddressRelocations::heap_range`] -- a `call`-instruction return address, a
+/// spilled callee-saved register, or a TCB field can never legitimately live there, so it is
+/// never a source of genuine stale pointers this pass needs to fix.
 ///
 /// # Bounding the stack scan to a window above `rsp`
 ///
