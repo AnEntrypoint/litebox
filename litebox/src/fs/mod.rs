@@ -16,6 +16,7 @@ pub mod backend;
 pub mod composer;
 pub mod devices;
 pub mod errors;
+pub mod export;
 pub mod in_mem;
 pub(crate) mod inode_allocator;
 pub mod layered;
