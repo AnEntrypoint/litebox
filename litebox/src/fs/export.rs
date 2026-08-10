@@ -29,7 +29,7 @@ pub struct ExportedEntry {
 ///
 /// Character devices are skipped (they have no meaningful exportable content and are expected to
 /// be recreated structurally by whatever consumes the export, e.g. `/dev` in a fresh guest boot).
-pub fn export_all<FS: FileSystem + ?Sized>(fs: &FS) -> Result<Vec<ExportedEntry>, ExportError> {
+pub fn export_all<FS: FileSystem>(fs: &FS) -> Result<Vec<ExportedEntry>, ExportError> {
     let mut out = Vec::new();
     walk(fs, "/", &mut out)?;
     Ok(out)
@@ -46,7 +46,7 @@ pub enum ExportError {
     Close,
 }
 
-fn walk<FS: FileSystem + ?Sized>(
+fn walk<FS: FileSystem>(
     fs: &FS,
     dir_path: &str,
     out: &mut Vec<ExportedEntry>,

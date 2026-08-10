@@ -95,6 +95,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         }
     }
 
+    /// Access the upper (writable) layer directly, e.g. to export its contents for a snapshot
+    /// independent of the read-only lower layer's contents.
+    pub fn upper(&self) -> &Upper {
+        &self.upper
+    }
+
     /// (private-only) check if the lower level has the path; if there is an I/O or path failure,
     /// propagate the relevant error.
     fn ensure_lower_contains(&self, path: &str) -> Result<FileType, FileStatusError> {
