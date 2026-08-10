@@ -2507,11 +2507,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(0)
             }
             IoctlArg::TIOCGWINSZ(ws) => {
+                // Query the real terminal size where the platform can provide it (e.g. via
+                // `GetConsoleScreenBufferInfo` on Windows); fall back to the traditional 80x24
+                // default otherwise. A guest's own line editor (e.g. `ash`'s `lineedit.c`) uses
+                // this to decide the column width at which to wrap its *own* echoed-input
+                // redisplay, so returning a fake, too-narrow size here (previously hardcoded to
+                // 20x20) caused spurious wraps in the echo of typed input well before the real
+                // terminal would ever need to wrap.
+                let (row, col) = self.global.platform.tty_window_size().unwrap_or((24, 80));
                 ws.write_at_offset::<Platform>(
                     0,
                     litebox_common_linux::Winsize {
-                        row: 20,
-                        col: 20,
+                        row,
+                        col,
                         xpixel: 0,
                         ypixel: 0,
                     },
@@ -3868,6 +3876,44 @@ mod tests {
             Ok(0)
         );
         assert_eq!(after_drain.c_lflag, 0x5678);
+    }
+
+    #[test]
+    fn tiocgwinsz_falls_back_to_80x24_when_platform_has_no_real_size() {
+        // Regression test for a genuine echo-wrapping bug: `TIOCGWINSZ` used to unconditionally
+        // report a hardcoded 20x20 window, regardless of the real terminal size. Guests' own
+        // line editors (e.g. `ash`'s `lineedit.c`) query this to decide the column width at
+        // which to wrap their own echoed-input redisplay, so a fake 20-column width caused
+        // spurious `\r\n` wraps to be inserted into the echo of typed input at ~20 characters,
+        // well before the real terminal (which may be 80, 120, or wider) would ever need to
+        // wrap. `MockPlatform::tty_window_size` returns `None` (no real terminal to query), so
+        // this exercises the fallback path: it must be the traditional 80x24 default, not the
+        // old hardcoded 20x20.
+        let task = crate::syscalls::tests::init_platform(None);
+        let files = task.files.borrow();
+        let Ok(stdin_fd) = files.raw_descriptor_store.read().fd_from_raw_integer(0) else {
+            panic!("test harness invariant: fd 0 must be the stdio-initialized stdin fd");
+        };
+        drop(files);
+
+        let mut ws = litebox_common_linux::Winsize {
+            row: 0xFFFF,
+            col: 0xFFFF,
+            xpixel: 0xFFFF,
+            ypixel: 0xFFFF,
+        };
+        let ws_ptr = UserPtrMut::from_usize((&raw mut ws).expose_provenance());
+        assert_eq!(
+            task.stdio_ioctl(&stdin_fd, &IoctlArg::TIOCGWINSZ(ws_ptr)),
+            Ok(0)
+        );
+        assert_eq!(ws.row, 24);
+        assert_eq!(ws.col, 80);
+        assert_ne!(
+            (ws.row, ws.col),
+            (20, 20),
+            "must not regress to the old hardcoded 20x20 fake window size"
+        );
     }
 
     #[test]

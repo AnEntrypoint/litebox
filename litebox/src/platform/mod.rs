@@ -526,6 +526,20 @@ pub trait StdioProvider {
     /// operations are both trivially non-blocking (e.g. a native Linux fd, where the host kernel
     /// already provides real `poll(2)` semantics) may simply return `true` unconditionally here.
     fn stdin_ready(&self) -> bool;
+
+    /// Returns the controlling terminal's current size as `(rows, cols)`, if this platform can
+    /// determine it (e.g. by querying the real console/tty window size). Returns `None` when
+    /// there is no real terminal to query (headless, redirected, or a platform where the guest's
+    /// own tty layer already tracks this independently) -- callers should fall back to a
+    /// reasonable default `Winsize` rather than treating `None` as an error.
+    ///
+    /// Backing `TIOCGWINSZ`: guests (notably `ash`'s line editor) use this to decide the visual
+    /// column width at which to wrap echoed input, so returning a fixed, too-narrow size here
+    /// causes the guest to insert spurious wraps into its own echo well before the real terminal
+    /// would ever need to.
+    fn tty_window_size(&self) -> Option<(u16, u16)> {
+        None
+    }
 }
 
 /// A provider that can verify a freshly-`fork()`ed child's execution against the address-space
