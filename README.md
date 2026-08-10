@@ -22,6 +22,61 @@ Example use cases include:
 
 ![LiteBox and related projects](./.figures/litebox.svg)
 
+## This build: real interactive Linux shells on Windows
+
+This checkout carries a set of fixes on top of upstream LiteBox that make the
+`litebox_runner_linux_on_windows_userland` target usable as a genuine,
+interactive Linux userland on Windows -- not just for running a single
+non-interactive command, but for driving a real shell session the way a human
+would: typing at a prompt, running `apk`/package-manager workflows, and using
+REPLs like Node's that depend on raw-mode terminal I/O, job control, and
+correct multithreaded stdio.
+
+Concretely, this build fixes (all landed on `main`, CI-verified):
+
+- **Real interactive keyboard input.** Typed keystrokes are now correctly
+  delivered to the guest shell instead of being silently dropped or hanging
+  the process (a missing epoll wakeup path and a Windows console
+  cooked-mode/CPR-reply bug).
+- **`setRawMode`/raw terminal mode** (used by Node's REPL, `less`, `vim`,
+  Python's `readline`, and any program that manages its own line editing) no
+  longer crashes with `ENOTTY`.
+- **Job control.** `TIOCSPGRP`/`TIOCGPGRP` are implemented, so shells no
+  longer fall back to `can't access tty; job control turned off`.
+- **A deep, multi-stage `fork()` correctness fix on Windows.** LiteBox
+  duplicates a forked child's address space to new host addresses (Windows
+  can't give two "processes" the same addresses in one host process), which
+  left a class of stale, untranslated pointers reachable after `fork()` --
+  fixed for both code pages (a `STATUS_PRIVILEGED_INSTRUCTION` crash on
+  chained shell commands) and argv/data pointers (intermittent, and in one
+  case perfectly deterministic per-command-length, corruption of a freshly
+  exec'd command's arguments).
+- **`chmod`/`fchmod`/`fchmodat`, `utimensat`/`futimens`, and `flock`**, which
+  were previously unimplemented (`ENOSYS`) despite the underlying filesystem
+  layer already supporting them.
+- **A real userspace NAT gateway** for guest network access on Windows,
+  needing neither Administrator privileges nor a driver, so `apk`/`curl`/etc.
+  can reach the real network.
+- **Multithreaded process correctness**: a lost-wakeup race in `poll()`, an
+  unbounded UDP NAT flow leak, orphan-process reparenting, a process-exit fd
+  leak that could hang pipe readers, and a missing `FUTEX_REQUEUE`
+  implementation that could deadlock a multithreaded guest process (e.g.
+  Node/V8) on exit.
+- **Concurrent stdio correctness**: guest writes to stdout/stderr from
+  different threads of the same process (as V8/libuv do heavily) are now
+  serialized, so output from one thread can no longer be spliced mid-write
+  into another thread's output.
+- **Missing syscalls that real-world programs call in practice**:
+  `sched_getparam`/`sched_setparam`/`sched_getscheduler`/`sched_setscheduler`,
+  and `clock_gettime`/`clock_getres` support for
+  `CLOCK_PROCESS_CPUTIME_ID`/`CLOCK_THREAD_CPUTIME_ID`/`CLOCK_MONOTONIC_RAW`/
+  `CLOCK_REALTIME_COARSE`/`CLOCK_BOOTTIME` (V8's own startup code aborts the
+  whole process if `clock_gettime` returns an error, which it previously did
+  for these clock IDs).
+
+A ready-to-run bundle (the Windows runner exe plus a packaged Alpine rootfs)
+is built by [`.github/workflows/release-windows-alpine.yml`](.github/workflows/release-windows-alpine.yml).
+
 ## Contributing
 
 See the following files for details:
