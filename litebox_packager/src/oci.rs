@@ -531,15 +531,19 @@ fn extract_tar<R: Read>(
         }
 
         // Normal file/directory: use the standard unpack.
-        // If a previous layer recorded a symlink at this path, as a child of
-        // this path, or as an ancestor of this path, the real file/directory
-        // from an upper layer takes precedence — remove the stale symlink
-        // entries. The ancestor check prevents stale symlinks from being
-        // resolved during scan_rootfs and incorrectly pulling in lower-layer
-        // content.
-        symlinks.retain(|s| {
-            s.rel_path != path && !s.rel_path.starts_with(&path) && !path.starts_with(&s.rel_path)
-        });
+        //
+        // If a previous layer recorded a symlink at exactly this path, or at an
+        // ancestor of this path, the real file/directory from an upper layer takes
+        // precedence -- remove that stale symlink entry (and, transitively, any
+        // symlink nested under it, since resolving through a symlink that no longer
+        // exists would be wrong). This must NOT evict symlinks nested *under* `path`
+        // merely because a directory entry for `path` reappears here: OCI layers
+        // routinely re-emit an unchanged parent directory (e.g. to update its
+        // mtime/mode) whenever any descendant file changes, without that directory
+        // becoming a fresh, empty directory that erases previously-extracted
+        // descendants -- so a plain `usr/lib` entry in an upper layer must not
+        // discard a lower layer's `usr/lib/libz.so.1` symlink.
+        symlinks.retain(|s| s.rel_path != path && !path.starts_with(&s.rel_path));
         entry
             .unpack(&target)
             .with_context(|| format!("failed to unpack entry: {path_str}"))?;
