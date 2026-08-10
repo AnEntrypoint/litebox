@@ -2,6 +2,7 @@ name: Release Windows Alpine Bundle
 
 permissions:
   contents: write
+  packages: write
 
 on:
   push:
@@ -17,8 +18,40 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  BASE_IMAGE: ghcr.io/${{ github.repository_owner }}/litebox-alpine-base:latest
 
 jobs:
+  build_base_image:
+    name: Build and publish Alpine base image (nodejs + python)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v6
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push base image
+        uses: docker/build-push-action@v6
+        with:
+          context: dist_tools/base-image
+          push: true
+          tags: ${{ env.BASE_IMAGE }}
+      - name: Make published package public
+        run: |
+          gh api --method PATCH \
+            -H "Accept: application/vnd.github+json" \
+            "/orgs/${{ github.repository_owner }}/packages/container/litebox-alpine-base/visibility" \
+            -f visibility=public \
+            || gh api --method PATCH \
+              -H "Accept: application/vnd.github+json" \
+              "/user/packages/container/litebox-alpine-base/visibility" \
+              -f visibility=public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   build_windows_runner:
     name: Build Windows runner
     runs-on: windows-latest
@@ -42,6 +75,7 @@ jobs:
 
   build_alpine_rootfs:
     name: Build Alpine rootfs tar
+    needs: [build_base_image]
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
@@ -56,9 +90,9 @@ jobs:
           key: release-litebox-packager
       - name: Build litebox_packager (release)
         run: cargo build --locked --release -p litebox_packager
-      - name: Package Alpine (BusyBox) rootfs
+      - name: Package Alpine rootfs (BusyBox + nodejs + python)
         run: |
-          ./target/release/litebox_packager --oci-image docker.io/library/alpine:latest -o alpine-rootfs.tar --verbose
+          ./target/release/litebox_packager --oci-image ${{ env.BASE_IMAGE }} -o alpine-rootfs.tar --verbose
       - name: Upload rootfs tar
         uses: actions/upload-artifact@v4
         with:
