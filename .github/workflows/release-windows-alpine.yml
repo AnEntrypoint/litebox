@@ -45,18 +45,10 @@ jobs:
           context: dist_tools/base-image
           push: true
           tags: ${{ steps.image_ref.outputs.image }}
-      - name: Make published package public
-        run: |
-          gh api --method PATCH \
-            -H "Accept: application/vnd.github+json" \
-            "/orgs/${GITHUB_REPOSITORY_OWNER,,}/packages/container/litebox-alpine-base/visibility" \
-            -f visibility=public \
-            || gh api --method PATCH \
-              -H "Accept: application/vnd.github+json" \
-              "/user/packages/container/litebox-alpine-base/visibility" \
-              -f visibility=public
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Package visibility (public) is set once, manually, in the GHCR package
+      # settings -- GITHUB_TOKEN cannot flip org-package visibility (404s: it
+      # lacks org-admin package scope), and that scope is intentionally not
+      # granted here via a PAT to avoid a standing high-privilege secret.
 
   build_windows_runner:
     name: Build Windows runner
