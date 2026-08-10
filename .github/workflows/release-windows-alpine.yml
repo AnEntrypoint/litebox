@@ -124,7 +124,7 @@ jobs:
         run: .\litebox_runner_linux_on_windows_userland.exe --initial-files alpine-rootfs.tar /bin/busybox nslookup dl-cdn.alpinelinux.org 8.8.8.8
       - name: Install and run an extra package via apk (proves further tooling is installable)
         working-directory: smoke
-        run: .\litebox_runner_linux_on_windows_userland.exe --initial-files alpine-rootfs.tar /bin/sh -c "apk add --no-cache jq && echo '{\"ok\":true}' | jq .ok"
+        run: .\litebox_runner_linux_on_windows_userland.exe --initial-files alpine-rootfs.tar /bin/sh -c 'apk add --no-cache jq && echo hello | jq -R .'
 
   bundle:
     name: Bundle release zip
