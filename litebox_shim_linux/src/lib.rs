@@ -245,6 +245,8 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
             flock_registry: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
             next_flock_holder_id: core::sync::atomic::AtomicU64::new(1),
+            pty_registry: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
+            next_pty_id: core::sync::atomic::AtomicU32::new(0),
         });
         LinuxShim(global)
     }
@@ -585,6 +587,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS
         eventfd: impl FnOnce(&TypedFd<syscalls::eventfd::EventfdSubsystem<Platform>>) -> R,
         epoll: impl FnOnce(&TypedFd<syscalls::epoll::EpollSubsystem<Platform, FS>>) -> R,
         unix: impl FnOnce(&TypedFd<syscalls::unix::UnixSocketSubsystem<Platform, FS>>) -> R,
+        pty: impl FnOnce(&TypedFd<syscalls::pty::PtySubsystem<Platform>>) -> R,
     ) -> Result<R, Errno> {
         let rds = self.raw_descriptor_store.read();
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
@@ -610,6 +613,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
             return Ok(unix(&fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(pty(&fd));
         }
         Err(Errno::EBADF)
     }
@@ -1441,6 +1448,20 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// `static`) so it composes with the crate's existing "no bare `static`s outside of the
     /// ratcheted set" discipline.
     next_flock_holder_id: core::sync::atomic::AtomicU64,
+    /// Registry of allocated ptys' slave-side fd, keyed by pty id (`TIOCGPTN`'s value).
+    ///
+    /// The slave fd held here is never installed into any process's own fd table directly; each
+    /// `open("/dev/pts/<id>")` duplicates it (via [`litebox::fd::Descriptors::duplicate`], the
+    /// same mechanism `dup()`/`fork()` use) to produce an independent fd sharing the same
+    /// underlying entry. Shim-wide (not per-process) because `/dev/pts/<id>` is a global
+    /// namespace: any process that knows the id (e.g. via a fd inherited across `fork()`, or by
+    /// reading `/proc/self/fd` in a real Linux guest) can open it.
+    pty_registry: litebox::sync::RwLock<
+        Platform,
+        alloc::collections::BTreeMap<u32, syscalls::pty::PtyFd<Platform>>,
+    >,
+    /// Next id to hand out to a freshly `open("/dev/ptmx")`-allocated pty pair.
+    next_pty_id: core::sync::atomic::AtomicU32,
     /// The first process created by [`LinuxShim::load_program`], set once and kept for the
     /// lifetime of the shim.
     ///

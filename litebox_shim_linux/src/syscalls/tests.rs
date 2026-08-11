@@ -569,7 +569,11 @@ fn test_rlimit_other_resources_dont_panic_and_have_sane_defaults() {
     let core = task
         .do_prlimit(RlimitResource::CORE, None)
         .expect("sys_getrlimit(CORE) failed");
-    assert_eq!(core.rlim_cur, rlim_t::MAX, "unenforced resources default to unlimited");
+    assert_eq!(
+        core.rlim_cur,
+        rlim_t::MAX,
+        "unenforced resources default to unlimited"
+    );
 
     // ...and a setrlimit for one of these (e.g. what `ulimit -c 0` does)
     // must not panic the runner, and must be observable on a later get.
