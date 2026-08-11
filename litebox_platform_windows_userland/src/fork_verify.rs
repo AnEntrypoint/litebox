@@ -460,11 +460,28 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
     // just with one more established fact (the value truly is about to be used as a control-
     // transfer target, not merely data that resembles a pointer).
     //
-    // `load_address` is excluded when it falls in the DESTINATION heap, for the identical reason
-    // case (3) excludes it (see that case's comment) -- `last_memory_load` itself never records a
-    // heap-resident load in the first place (see the tracking update below), so this check is
-    // technically redundant today, but kept here too as defense in depth against a future change
-    // to that tracking that reintroduces heap addresses without noticing this heal path.
+    // `load_address` must itself be in the DESTINATION (child) address space before we write
+    // through it -- the identical requirement case (3) enforces via `is_in_destination` just above.
+    // Without this check, `load_address` can be a SOURCE-space (parent) address: per
+    // `AddressRelocations::is_in_source`'s doc comment, the parent's original mappings are never
+    // unmapped after `fork()`, so a stale, not-yet-relocated GOT/TCB slot address is still live,
+    // writable host memory in the child's own process too -- `write_usize_fault_tolerant` cannot
+    // tell the difference and will happily patch it. That silently corrupts the PARENT's own
+    // live GOT/PLT-style slot with a DESTINATION-space (child) pointer, which the parent later
+    // reads back and jumps/calls through, itself faulting (typically at a stale or NULL address,
+    // since the child's mappings may have since been torn down by `exec()`/exit) -- observed in
+    // practice as the parent shell's own untouched OS thread taking a first-chance
+    // `STATUS_ACCESS_VIOLATION` with `CONTEXT.Rip == 0` moments after an unrelated `fork()` child
+    // exits, confirmed live via a debugger (`Rip == 0`, faulting address `0`, an "attempt to
+    // execute non-executable address 0" record, and a walked stack whose top return-address slot
+    // is literally `0x0`) despite the parent thread never itself running under verification.
+    //
+    // `load_address` is also excluded when it falls in the DESTINATION heap, for the identical
+    // reason case (3) excludes it (see that case's comment) -- `last_memory_load` itself never
+    // records a heap-resident load in the first place (see the tracking update below), so that
+    // half of this check is technically redundant today, but kept here too as defense in depth
+    // against a future change to that tracking that reintroduces heap addresses without noticing
+    // this heal path.
     if (instruction.is_call_near_indirect() || instruction.is_jmp_near_indirect())
         && explicit_memory_operand_address(&instruction, context).is_none()
         && instruction.op0_kind() == OpKind::Register
@@ -472,6 +489,7 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
         && let Some((load_address, loaded_value)) = tls.fork_verify_last_load.get()
         && loaded_value == target_value
         && relocations.is_in_source(target_value)
+        && relocations.is_in_destination(load_address)
         && !relocations.is_in_destination_heap_range(load_address)
         && let Some(translated) = relocations.translate(target_value)
     {
