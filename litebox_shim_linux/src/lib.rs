@@ -285,6 +285,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         let files = Arc::new(files);
         files.initialize_stdio_in_shared_descriptors_table(&self.0);
 
+        // Created once and threaded into both the new `Process` and the new `Task`'s
+        // `SignalState` -- see `do_clone`'s identically-shaped `child_shared_pending` for why
+        // they must end up sharing the exact same `Arc`.
+        let bootstrap_shared_pending = Arc::new(litebox::sync::Mutex::new(
+            syscalls::signal::PendingSignals::new(),
+        ));
         let entrypoints = crate::LinuxShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
@@ -294,6 +300,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                     PageManager::new(&self.0.litebox),
                     false,
                     None,
+                    bootstrap_shared_pending.clone(),
                 ),
                 wait_state: wait::WaitState::new(self.0.platform),
                 pid,
@@ -309,7 +316,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
-                signals: syscalls::signal::SignalState::new_process(),
+                signals: syscalls::signal::SignalState::new_process(bootstrap_shared_pending),
             },
         };
 
@@ -1555,6 +1562,9 @@ mod test_utils {
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let files = Arc::new(syscalls::file::FilesState::new(fs));
             files.initialize_stdio_in_shared_descriptors_table(&self);
+            let shared_pending = Arc::new(litebox::sync::Mutex::new(
+                syscalls::signal::PendingSignals::new(),
+            ));
             Task {
                 wait_state: wait::WaitState::new(self.platform),
                 thread: syscalls::process::ThreadState::new_process(
@@ -1562,6 +1572,7 @@ mod test_utils {
                     PageManager::new(&self.litebox),
                     false,
                     None,
+                    shared_pending.clone(),
                 ),
                 pid,
                 ppid: 0,
@@ -1575,7 +1586,7 @@ mod test_utils {
                 comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
-                signals: syscalls::signal::SignalState::new_process(),
+                signals: syscalls::signal::SignalState::new_process(shared_pending),
                 global: self,
             }
         }
@@ -1600,9 +1611,52 @@ mod test_utils {
                 fs: self.fs.clone(),
                 files: self.files.clone(),
                 // Always a same-process thread clone -- see `self.thread.new_thread(tid)` above.
-                signals: self.signals.clone_for_new_task(false),
+                signals: self.signals.clone_for_new_task(None),
             };
             Some(task)
+        }
+
+        /// Returns a clone of this task as a genuine new **process** (a real fork()-shaped
+        /// child: new `Process`, registered in `self`'s `children` so `do_kill`'s remote-child
+        /// case can find it, given its own independent `shared_pending`), rather than
+        /// [`Self::clone_for_test`]'s same-process thread-clone.
+        ///
+        /// Deliberately skips everything `do_clone`'s real process-clone branch does that isn't
+        /// relevant to testing cross-process signal delivery: address-space duplication,
+        /// register/TLS translation, `ThreadInitState::ForkedChild` setup. This produces a
+        /// process family shaped correctly for `do_kill`/`interrupt_all_threads` to exercise,
+        /// not a functioning forked guest process.
+        pub(crate) fn clone_as_forked_child_for_test(&self) -> Self {
+            let pid = self
+                .global
+                .next_thread_id
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let shared_pending = Arc::new(litebox::sync::Mutex::new(
+                syscalls::signal::PendingSignals::new(),
+            ));
+            let thread = syscalls::process::ThreadState::new_process(
+                pid,
+                PageManager::new(&self.global.litebox),
+                false,
+                Some(Arc::downgrade(self.process())),
+                shared_pending.clone(),
+            );
+            let child = Task {
+                wait_state: wait::WaitState::new(self.global.platform),
+                global: self.global.clone(),
+                thread,
+                pid,
+                ppid: self.pid,
+                tid: pid,
+                credentials: self.credentials.clone(),
+                comm: self.comm.clone(),
+                fs: self.fs.clone(),
+                files: self.files.clone(),
+                signals: self.signals.clone_for_new_task(Some(shared_pending)),
+            };
+            self.process()
+                .add_child_for_test(pid, child.process().clone());
+            child
         }
 
         /// Spawns a thread that runs with a clone of this task and a new TID.
