@@ -154,6 +154,17 @@ Concretely, this build fixes (all landed on `main`, CI-verified):
   independent pending-signal queue and a snapshotted copy of the handler
   table, while ordinary thread creation continues to correctly share both
   with the rest of its process.
+- **Two more crash-on-ordinary-usage panics fixed, and `ppoll`/`epoll_pwait`
+  gained real sigmask support.** `open(path, O_TRUNC, ...)` on a path that
+  turns out to be an existing directory (e.g. shell redirection into a
+  directory, `cmd > /some/dir`) crashed the runner instead of returning
+  `EISDIR`, because the underlying `TruncateError::IsDirectory` case fell
+  through an incomplete error-conversion match. Separately, `ppoll()` and
+  `epoll_pwait()` -- the standard signal-safe-polling idiom used by many
+  event loops/daemons to avoid the self-pipe race -- unconditionally
+  panicked whenever called with a real signal mask, even though `pselect()`
+  already correctly supported one; both now reuse the same
+  temporary-signal-mask mechanism `pselect()` uses, instead of panicking.
 
 A ready-to-run bundle (the Windows runner exe plus a packaged Alpine rootfs)
 is built by [`.github/workflows/release-windows-alpine.yml`](.github/workflows/release-windows-alpine.yml).
