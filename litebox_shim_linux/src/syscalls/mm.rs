@@ -348,7 +348,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             && prot.contains(ProtFlags::PROT_WRITE)
             && !flags.contains(MapFlags::MAP_ANONYMOUS)
         {
-            todo!("MAP_SHARED with PROT_WRITE on file-backed mappings is not supported");
+            // This used to panic (`todo!()`), crashing the whole runner on any guest program
+            // that mmaps a file `MAP_SHARED | PROT_WRITE` -- a fairly ordinary idiom (e.g.
+            // Python's `mmap.mmap(fd, length, mmap.MAP_SHARED, mmap.PROT_WRITE)` for
+            // memory-mapped file I/O, or SQLite/database libraries' write-back-mapped files).
+            // `ENODEV` is what real Linux returns for "the underlying filesystem does not
+            // support memory mapping" this way (see `mmap(2)`), which is an accurate description
+            // of the actual limitation here.
+            log_unsupported!("mmap MAP_SHARED|PROT_WRITE on a file-backed mapping");
+            return Err(Errno::ENODEV);
         }
 
         if flags.intersects(
@@ -361,7 +369,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 | MapFlags::MAP_HUGE_2MB
                 | MapFlags::MAP_HUGE_1GB,
         ) {
-            todo!("Unsupported flags {:?}", flags);
+            // Same rationale as above: don't panic on flag combinations we don't implement.
+            log_unsupported!("mmap with flags {:?}", flags);
+            return Err(Errno::EINVAL);
         }
 
         let aligned_len = align_up(len, PAGE_SIZE);
@@ -1593,6 +1603,34 @@ mod tests {
 
         task.sys_munmap(addr, 0x1000).unwrap();
         task.sys_close(fd).unwrap();
+    }
+
+    #[test]
+    fn test_map_shared_writable_file_returns_enodev_instead_of_panicking() {
+        // Regression test: `mmap(MAP_SHARED | PROT_WRITE)` on a file-backed fd used to
+        // unconditionally panic (`todo!()`), crashing the whole runner on an ordinary idiom like
+        // Python's `mmap.mmap(fd, length, mmap.MAP_SHARED, mmap.PROT_WRITE)`.
+        let task = init_platform(None);
+        let fd = task
+            .sys_open(
+                "shared_writable.txt",
+                OFlags::RDWR | OFlags::CREAT,
+                Mode::RWXU,
+            )
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+
+        let err = task
+            .sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_SHARED,
+                fd,
+                0,
+            )
+            .unwrap_err();
+        assert_eq!(err, Errno::ENODEV);
     }
 
     #[test]
