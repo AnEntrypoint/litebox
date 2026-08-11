@@ -115,6 +115,13 @@ Concretely, this build fixes (all landed on `main`, CI-verified):
   runner (hit by e.g. Python's `mmap.mmap(fd, len, mmap.MAP_SHARED,
   mmap.PROT_WRITE)`). All three now return the correct errno instead of
   panicking.
+- **`fork()` now inherits the parent's rlimits.** Every freshly forked
+  child used to get program-start default resource limits regardless of
+  what the parent had configured via `setrlimit()` beforehand -- so a
+  supervisor process that lowered e.g. `RLIMIT_NOFILE` before spawning a
+  child got a child that silently wasn't bounded by it. `fork()`/`clone()`
+  now copies the parent's current limits into the child, matching real
+  Linux.
 
 A ready-to-run bundle (the Windows runner exe plus a packaged Alpine rootfs)
 is built by [`.github/workflows/release-windows-alpine.yml`](.github/workflows/release-windows-alpine.yml).
