@@ -129,14 +129,21 @@ Concretely, this build fixes (all landed on `main`, CI-verified):
   child got a child that silently wasn't bounded by it. `fork()`/`clone()`
   now copies the parent's current limits into the child, matching real
   Linux.
-- **`kill(0, sig)` / `kill(-pgid, sig)` / `kill(-1, sig)` no longer hard-fail.**
-  `kill()` has no registry of *arbitrary* other live guest processes to
-  deliver to, but these three forms target the caller's own process group
-  or "everyone the caller may signal," and self is always a real member of
-  all three sets. Previously they failed with `ESRCH` unconditionally, even
-  in the common case of a script signaling its own group during cleanup;
-  they now deliver to self, which is exactly correct whenever no other
-  process happens to share the group.
+- **`kill(0, sig)` / `kill(-pgid, sig)` / `kill(-1, sig)` no longer hard-fail,
+  and now reach a whole live group, not just self.** `kill()` has no
+  registry of *arbitrary* other live guest processes to deliver to, but
+  these forms target the caller's own process group or "everyone the
+  caller may signal," and self is always a real member. Previously they
+  failed with `ESRCH` unconditionally, even in the common case of a script
+  signaling its own group during cleanup; they now deliver to self, which
+  is exactly correct whenever no other process happens to share the group
+  -- and additionally reach any live `fork()`ed child that's been moved
+  into that same group via `setpgid()` (the standard shell-job-control /
+  process-supervisor pattern of putting a whole spawned pipeline into one
+  group, then killing the group to tear the pipeline down), reusing the
+  exact same child-delivery mechanism described next. A group target that
+  matches neither self nor any reachable child correctly still fails with
+  `ESRCH`, matching real Linux's behavior for a pgid with zero members.
 - **`kill(child_pid, sig)` now works for a live, shim-known direct child.**
   This shim still has no general pid -> process registry (see the previous
   bullet), so a genuinely arbitrary remote pid still correctly fails with
