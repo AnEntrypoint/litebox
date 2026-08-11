@@ -192,22 +192,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
     /// makes the upper file empty (similar to a truncate). Generally speaking, you want to use
     /// `true` for `copy_data`.
     fn migrate_file_up(&self, path: &str, copy_data: bool) -> Result<(), MigrationError> {
-        match self.layering_semantics {
-            LayeringSemantics::LowerLayerReadOnly => {
-                // fallthrough
-            }
-            LayeringSemantics::LowerLayerWritableFiles => {
-                // If this is ever hit, then that specific layered function calling this
-                // `migrate_file_up` function needs to be looked at to make sure that it is
-                // implemented correctly and update its semantics if necessary. The
-                // `migrate_file_up` functionality was implemented when there was only one set of
-                // semantics for layered file systems (namely `LowerLayerReadOnly`), thus the file
-                // system may not correctly account for other situations just yet (specifically,
-                // some situations might attempt to migrate files when they shouldn't). This
-                // particular panic is simply to catch such cases.
-                unreachable!()
-            }
-        }
+        // This function's mechanics (open-for-read on `self.lower`, open/write on `self.upper`)
+        // are agnostic to `self.layering_semantics` -- both `write`'s and `truncate`'s
+        // `LowerLayerWritableFiles` branches now call this directly as a fallback when their own
+        // attempt to delegate straight to `self.lower` fails because the lower fs's own upper
+        // can't hold `path` (see `MigrationError::UpperCannotHoldPath`). There is deliberately no
+        // per-semantics guard here anymore -- every caller decides for itself, based on its own
+        // control flow, whether reaching this function is the correct thing to do for its layer.
 
         // We first open the file up at the lower level for reading
         let lower_fd = match self.lower.open(path, OFlags::RDONLY, Mode::empty()) {
