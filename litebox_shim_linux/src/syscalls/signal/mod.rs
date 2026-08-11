@@ -566,46 +566,73 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             log_unsupported!("sys_tkill/sys_tgkill with a remote tid");
             return Err(Errno::ESRCH);
         }
+        // Process-directed delivery to a live child `Process`: any one of its threads may end up
+        // handling it, exactly like a same-process `send_shared_signal`. Real Linux's SIG_IGN
+        // check can't be done here (that reads the *target's* handler dispositions, which live
+        // on its own `Task`, unreachable from a `Process` handle alone) -- `process_signals`
+        // already discards an ignored signal correctly once the child wakes and looks at its own
+        // handlers, so this only costs the child one spurious EINTR on an ignored signal, never
+        // an incorrect delivery.
+        let deliver_to_child = |child: &super::process::Process<Platform>| {
+            child
+                .shared_pending
+                .lock()
+                .push(&child.limits, signal, siginfo_kill(signal));
+            child.interrupt_all_threads();
+        };
+
         // `pid == 0` (send to the caller's own process group), a negative `pid` (send to process
         // group `-pid`), and `pid == -1` (send to every process the caller may signal) are
-        // approximated here as "signal self": this shim has no registry of *other* live
-        // processes to actually enumerate a process group or the whole guest (see
-        // `sys_setpgid`'s doc comment on why sessions/cross-process pid lookups aren't modeled at
-        // all), so self is the only member of any of those target sets it can ever actually know
-        // about -- and in the common case (no other process happens to share the group), that's
-        // also exactly correct, not just a fallback.
+        // approximated as "signal self plus any live child currently in that same group": this
+        // shim has no registry of *arbitrary* other live processes to enumerate a process group
+        // or the whole guest (see `sys_setpgid`'s doc comment on why sessions/cross-process pid
+        // lookups aren't modeled at all), but a live child that's been moved into the group via
+        // `setpgid()` -- the standard shell-job-control/process-supervisor pattern of putting a
+        // whole spawned pipeline into one group -- *is* reachable via `children`, covering
+        // "kill the whole pipeline"/"kill the whole group" without needing a general registry.
         let self_pgid = self.sys_getpgid(0)?;
         let targets_self = match pid {
             None | Some(0 | -1) => true,
             Some(p) if p == self.pid => true,
             Some(p) => p.checked_neg().is_some_and(|group| group == self_pgid),
         };
+        let mut delivered = targets_self;
         if targets_self {
             self.send_signal(signal, siginfo_kill(signal));
+        }
+        // `tid.is_some()` (tkill/tgkill) always targets one specific thread and never carries
+        // group semantics -- only plain `kill(pid, sig)` (tid.is_none()) does.
+        let target_group = tid
+            .is_none()
+            .then_some(pid)
+            .flatten()
+            .and_then(|p| match p {
+                0 | -1 => Some(self_pgid),
+                p if p < 0 => p.checked_neg(),
+                _ => None,
+            });
+        if let Some(group) = target_group {
+            for child in &self.process().children_in_group(group) {
+                deliver_to_child(child);
+                delivered = true;
+            }
+            // A group op targeting neither self's own group nor any reachable child's group has
+            // literally nothing this shim can deliver to -- ESRCH, matching real Linux's
+            // behavior for a pgid with zero members, rather than silently reporting success.
+            return if delivered { Ok(0) } else { Err(Errno::ESRCH) };
+        }
+        if targets_self {
             return Ok(0);
         }
         // A genuine remote pid (some other, specific process): still no shim-wide pid registry to
         // find an arbitrary process by pid, but a *direct child* of the caller is reachable via
         // `children` (populated by `do_clone`'s process-clone branch) -- covering the single most
         // common real-world case, a supervisor/process-manager signaling a worker it spawned.
-        // `tid.is_some()` (tkill/tgkill) is already rejected above for any non-self tid, so this
-        // path only ever runs for plain `kill(pid, sig)`.
         if let Some(pid) = pid
             && pid > 0
             && let Some(child) = self.process().find_child(pid)
         {
-            // Process-directed: any one of the child's threads may end up handling it, exactly
-            // like a same-process `send_shared_signal`. Real Linux's SIG_IGN check can't be
-            // done here (that reads the *target's* handler dispositions, which live on its own
-            // `Task`, unreachable from a `Process` handle alone) -- `process_signals` already
-            // discards an ignored signal correctly once the child wakes and looks at its own
-            // handlers, so this only costs the child one spurious EINTR on an ignored signal,
-            // not an incorrect delivery.
-            child
-                .shared_pending
-                .lock()
-                .push(&child.limits, signal, siginfo_kill(signal));
-            child.interrupt_all_threads();
+            deliver_to_child(&child);
             return Ok(0);
         }
         log_unsupported!("sys_kill with a remote pid that isn't a direct child");

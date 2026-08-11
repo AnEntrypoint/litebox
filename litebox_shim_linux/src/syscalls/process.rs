@@ -308,6 +308,20 @@ impl<Platform: ShimPlatform> Process<Platform> {
         self.children.lock().push((pid, child));
     }
 
+    /// Returns every live child of this process whose *own* current `pgid` equals `group` --
+    /// used by `do_kill`'s group-directed case (`kill(0|-1|-pgid, sig)`) to reach children that
+    /// have been moved into the caller's process group (e.g. via `setpgid()`, the standard
+    /// shell-job-control/process-supervisor pattern of putting a whole spawned pipeline into one
+    /// group), not just the caller itself.
+    pub(crate) fn children_in_group(&self, group: i32) -> alloc::vec::Vec<Arc<Process<Platform>>> {
+        self.children
+            .lock()
+            .iter()
+            .filter(|(_, child)| child.pgid.load(Ordering::Relaxed) == group)
+            .map(|(_, child)| child.clone())
+            .collect()
+    }
+
     /// Returns the live child `Process` with pid `pid`, if this process has one (see
     /// `children`'s doc comment) -- used by `do_kill`'s remote-child case, the one form of
     /// "signal some other, specific process" this shim can actually reach without a full
@@ -3265,6 +3279,50 @@ mod tests {
 
             bg.join().expect("child thread panicked");
         });
+    }
+
+    #[test]
+    fn test_kill_own_pgid_zero_also_reaches_a_child_moved_into_the_same_group() {
+        // Regression test: a group-directed kill(0/-1/-pgid, sig) used to only ever reach self
+        // (approximated, since this shim has no registry of arbitrary other processes) -- but a
+        // live child that's been moved into the caller's own group via setpgid() (the standard
+        // shell-job-control/process-supervisor pattern of putting a whole spawned pipeline into
+        // one group) is reachable via `children`, and must now be signaled too, not just self.
+        use litebox_common_linux::signal::Signal;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let child = task.clone_as_forked_child_for_test();
+
+        // Move the child into the parent's own process group.
+        child.sys_setpgid(0, task.pid).unwrap();
+        assert_eq!(child.sys_getpgid(0).unwrap(), task.pid);
+
+        assert_eq!(task.sys_kill(0, Signal::SIGTERM.as_i32()), Ok(0));
+
+        assert!(
+            task.pending_signal_set().contains(Signal::SIGTERM),
+            "self must still be signaled"
+        );
+        assert!(
+            child.pending_signal_set().contains(Signal::SIGTERM),
+            "a child in the same group must be signaled too"
+        );
+    }
+
+    #[test]
+    fn test_kill_negative_pgid_with_no_reachable_members_returns_esrch() {
+        // A group-directed kill() targeting a pgid that is neither the caller's own group nor
+        // any reachable child's group has literally nothing this shim can deliver to -- must be
+        // ESRCH (matching real Linux's behavior for a pgid with zero members), not a silently
+        // reported success.
+        use litebox_common_linux::signal::Signal;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let unrelated_group = task.sys_getpid().wrapping_add(999_999).max(1);
+        assert_eq!(
+            task.sys_kill(-unrelated_group, Signal::SIGTERM.as_i32()),
+            Err(Errno::ESRCH)
+        );
     }
 
     #[test]
