@@ -12,4 +12,5 @@ RUN apk add --no-cache \
     git \
     bash \
     curl \
-    openssh-client
+    openssh-client \
+    tzdata

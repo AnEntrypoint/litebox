@@ -81,10 +81,12 @@ Concretely, this build fixes (all landed on `main`, CI-verified):
   defaulted to a limit of `0`, silently dropping every real-time/queued
   signal a guest process sent; it now defaults to a realistic Linux value.
 - **Baked-in agent-sandbox tooling.** The published Alpine base image now
-  also includes `git`, `bash`, `curl`, and `openssh-client` alongside
-  `nodejs`/`npm`/`python3`/`py3-pip`/`build-base`, so common agent-workload
-  needs (cloning a repo, running a `#!/bin/bash` npm postinstall script,
-  fetching a file) don't require an extra `apk add` round-trip.
+  also includes `git`, `bash`, `curl`, `openssh-client`, and `tzdata`
+  alongside `nodejs`/`npm`/`python3`/`py3-pip`/`build-base`, so common
+  agent-workload needs (cloning a repo, running a `#!/bin/bash` npm
+  postinstall script, fetching a file, using Python's `zoneinfo` for
+  anything timezone-aware -- Alpine/musl doesn't ship timezone data by
+  default) don't require an extra `apk add` round-trip.
 - **Unix98 pseudoterminal (pty) support.** `/dev/ptmx`, `TIOCGPTN`,
   `TIOCSPTLCK` (`unlockpt`), and `/dev/pts/<id>` now work, with real duplex
   master/slave byte forwarding and shared `termios`/window-size/foreground-
