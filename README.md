@@ -122,6 +122,16 @@ Concretely, this build fixes (all landed on `main`, CI-verified):
   child got a child that silently wasn't bounded by it. `fork()`/`clone()`
   now copies the parent's current limits into the child, matching real
   Linux.
+- **`kill(0, sig)` / `kill(-pgid, sig)` / `kill(-1, sig)` no longer hard-fail.**
+  `kill()` has no registry of other live guest processes to deliver to (a
+  genuinely open architectural gap -- see below), but these three forms
+  target the caller's own process group or "everyone the caller may
+  signal," and self is always a real member of all three sets. Previously
+  they failed with `ESRCH` unconditionally, even in the common case of a
+  script signaling its own group during cleanup; they now deliver to self,
+  which is exactly correct whenever no other process happens to share the
+  group. A genuine remote pid (some specific *other* process) still
+  correctly fails, since actually reaching one isn't implemented.
 
 A ready-to-run bundle (the Windows runner exe plus a packaged Alpine rootfs)
 is built by [`.github/workflows/release-windows-alpine.yml`](.github/workflows/release-windows-alpine.yml).
