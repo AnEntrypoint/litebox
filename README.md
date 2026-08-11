@@ -188,6 +188,21 @@ Concretely, this build fixes (all landed on `main`, CI-verified):
   abstract-namespace address in the same format real Linux uses (a leading
   NUL byte followed by 5 lowercase hex digits, see `unix(7)`), unique per
   call via a shim-wide counter.
+- **Persistent, resumable state on the native Linux runner too.** The
+  `--export-writable-layer`/`--resume-from` flags -- walk every file the
+  guest created or modified this run into a delta tar archive on exit, and
+  seed a later run's writable layer from one -- previously only existed on
+  `litebox_runner_linux_on_windows_userland`, despite
+  `litebox_runner_linux_userland` (the native-Linux runner) building the
+  exact same layered filesystem underneath. Every native-Linux run used to
+  start fresh and silently discard all guest writes on exit; it now supports
+  both flags identically. One native-Linux-specific wrinkle the Windows
+  runner doesn't have: this process's own seccomp-bpf sandbox (see
+  `enable_seccomp_filter`) stays active for the rest of the process's
+  lifetime once installed, including after the guest exits, and only allows
+  a narrow `O_RDONLY` case of `open`/`openat` -- so the export file is opened
+  for writing *before* the filter goes up, and only `write()`s (always
+  allowed) happen on it afterward.
 
 A ready-to-run bundle (the Windows runner exe plus a packaged Alpine rootfs)
 is built by [`.github/workflows/release-windows-alpine.yml`](.github/workflows/release-windows-alpine.yml).
