@@ -165,6 +165,21 @@ Concretely, this build fixes (all landed on `main`, CI-verified):
   panicked whenever called with a real signal mask, even though `pselect()`
   already correctly supported one; both now reuse the same
   temporary-signal-mask mechanism `pselect()` uses, instead of panicking.
+- **Three more crash-on-ordinary-usage panics fixed**, found via a
+  systematic survey of remaining `unimplemented!()`/`todo!()` sites
+  reachable from ordinary syscall usage. An unexpected read failure (e.g.
+  genuine `EIO` from the backing filesystem) partway through the
+  `mmap()`-file-contents-copy fallback path crashed the runner instead of
+  returning `EIO`; a signal (e.g. a timer) landing mid-copy during that same
+  path also crashed the runner, even though real Linux's `mmap()` is never
+  interruptible by a signal in the first place -- it's now retried
+  internally instead, matching what a real caller would observe.
+  `fcntl(F_GETLK/F_SETLK/F_SETLKW)` (POSIX record locks) on a pipe or socket
+  fd crashed the runner instead of returning `EINVAL`, which is what real
+  Linux returns since record locks only apply to regular files.
+  `ioctl(fd, FIOCLEX)` on a pipe or socket fd crashed the runner instead of
+  setting close-on-exec, even though doing so needs the exact same
+  descriptor-table update already used for every other fd type.
 
 A ready-to-run bundle (the Windows runner exe plus a packaged Alpine rootfs)
 is built by [`.github/workflows/release-windows-alpine.yml`](.github/workflows/release-windows-alpine.yml).

@@ -287,14 +287,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let mut buffer = [0; PAGE_SIZE];
             let mut copied = 0;
             while copied < len {
-                let size =
-                    self.sys_read(fd, &mut buffer, Some(file_offset))
-                        .map_err(|e| match e {
-                            Errno::EBADF => MappingError::BadFD(fd),
-                            Errno::EISDIR => MappingError::NotAFile,
-                            Errno::EACCES => MappingError::NotForReading,
-                            _ => unimplemented!(),
-                        })?;
+                let size = match self.sys_read(fd, &mut buffer, Some(file_offset)) {
+                    Ok(size) => size,
+                    // Real Linux's mmap() is not among the syscalls interruptible by a signal
+                    // (see signal(7)): a signal arriving while the kernel is populating a
+                    // freshly mmap'd region never causes mmap() itself to return EINTR to the
+                    // caller. This fallback path does its file-reading via an internal
+                    // `sys_read()` call that *can* surface EINTR (e.g. a timer signal landing
+                    // mid-copy), but that's a shim implementation detail of *this* fallback,
+                    // not something a real mmap() caller would ever observe -- so retry instead
+                    // of propagating it as a (bogus) mmap() failure.
+                    Err(Errno::EINTR) => continue,
+                    Err(Errno::EBADF) => return Err(MappingError::BadFD(fd)),
+                    Err(Errno::EISDIR) => return Err(MappingError::NotAFile),
+                    Err(Errno::EACCES) => return Err(MappingError::NotForReading),
+                    // Any other, genuinely unexpected read failure (e.g. EIO from the backing
+                    // filesystem) used to panic here; report it as a mapping I/O error instead.
+                    Err(_) => return Err(MappingError::Io),
+                };
                 if size == 0 {
                     break;
                 }

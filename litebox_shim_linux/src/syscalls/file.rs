@@ -2299,8 +2299,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                 .ok_or(Errno::EFAULT)?;
                             Ok(0)
                         },
-                        |_fd| todo!("net"),
-                        |_fd| todo!("pipes"),
+                        // Real Linux's fcntl(2) record locks (F_GETLK/F_SETLK/F_SETLKW) only
+                        // apply to regular files; calling them on a socket or pipe fd returns
+                        // EINVAL, not a panic.
+                        |_fd| Err(Errno::EINVAL),
+                        |_fd| Err(Errno::EINVAL),
                         |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
@@ -2322,8 +2325,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             // can always acquire the lock it owns, so we don't need to maintain anything.
                             Ok(0)
                         },
-                        |_fd| todo!("net"),
-                        |_fd| todo!("pipes"),
+                        |_fd| Err(Errno::EINVAL),
+                        |_fd| Err(Errno::EINVAL),
                         |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
@@ -2911,8 +2914,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
                     Ok(0)
                 },
-                |_fd| todo!("net"),
-                |_fd| todo!("pipes"),
+                |fd| {
+                    // FIOCLEX (set close-on-exec) is a descriptor-table-level flag, not a
+                    // file-type-specific one, so it applies identically regardless of what kind
+                    // of fd this is -- unlike `net`/`pipes` above, which used to panic
+                    // (`todo!()`) here despite `set_fd_metadata` working the same way for them
+                    // as for every other fd type in this match.
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                    Ok(0)
+                },
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                    Ok(0)
+                },
                 |fd| {
                     let _old = self
                         .global
@@ -4458,5 +4480,62 @@ mod tests {
             .unwrap();
         assert_eq!(ready, 1);
         assert_eq!(out_event.events & 0x0001, 0x0001);
+    }
+
+    #[test]
+    fn fcntl_getlk_and_setlk_on_a_pipe_return_einval_instead_of_panicking() {
+        // Regression test: `fcntl(F_GETLK/F_SETLK/F_SETLKW)` on a pipe (or socket) fd used to
+        // unconditionally panic (`todo!("pipes")`/`todo!("net")`). Real Linux's record locks
+        // only apply to regular files and return EINVAL for a pipe/socket fd.
+        let task = crate::syscalls::tests::init_platform(None);
+        let (reader, _writer) = task.sys_pipe2(OFlags::empty()).unwrap();
+        let reader = i32::try_from(reader).unwrap();
+
+        let mut flock = litebox_common_linux::Flock {
+            type_: litebox_common_linux::FlockType::ReadLock as i16,
+            whence: 0,
+            #[cfg(target_pointer_width = "64")]
+            __pad0: 0,
+            start: 0,
+            len: 0,
+            pid: 0,
+            #[cfg(target_pointer_width = "64")]
+            __pad1: 0,
+        };
+        let lock_ptr = UserPtrMut::from_usize((&raw mut flock).expose_provenance());
+        assert_eq!(
+            task.sys_fcntl(reader, FcntlArg::GETLK(lock_ptr))
+                .unwrap_err(),
+            Errno::EINVAL
+        );
+
+        let lock_ptr = UserPtr::from_usize((&raw const flock).expose_provenance());
+        assert_eq!(
+            task.sys_fcntl(reader, FcntlArg::SETLK(lock_ptr))
+                .unwrap_err(),
+            Errno::EINVAL
+        );
+        assert_eq!(
+            task.sys_fcntl(reader, FcntlArg::SETLKW(lock_ptr))
+                .unwrap_err(),
+            Errno::EINVAL
+        );
+    }
+
+    #[test]
+    fn fioclex_on_a_pipe_sets_cloexec_instead_of_panicking() {
+        // Regression test: `ioctl(fd, FIOCLEX)` on a pipe (or socket) fd used to unconditionally
+        // panic (`todo!("pipes")`/`todo!("net")`), even though the underlying `set_fd_metadata`
+        // call it needs to make is identical to every other fd type in this dispatch.
+        let task = crate::syscalls::tests::init_platform(None);
+        let (reader, _writer) = task.sys_pipe2(OFlags::empty()).unwrap();
+        let reader = i32::try_from(reader).unwrap();
+
+        assert_eq!(task.sys_ioctl(reader, IoctlArg::FIOCLEX), Ok(0));
+        let flags = task.sys_fcntl(reader, FcntlArg::GETFD).unwrap();
+        assert_eq!(
+            flags & litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC.bits(),
+            litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC.bits()
+        );
     }
 }
