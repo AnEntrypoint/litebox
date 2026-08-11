@@ -3078,6 +3078,47 @@ mod tests {
     }
 
     #[test]
+    fn test_kill_own_pgid_zero_and_negative_deliver_to_self() {
+        // `kill(0, sig)` (own process group), `kill(-pgid, sig)`, and `kill(-1, sig)`
+        // (broadcast) used to unconditionally fail with ESRCH -- this shim has no registry of
+        // other live processes, but self is always a genuine member of all three of those target
+        // sets, so failing outright was needlessly wrong for what is likely the single most
+        // common real caller: a script signaling its own process group during cleanup.
+        use litebox_common_linux::PtRegs;
+        use litebox_common_linux::signal::Signal;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let pgid = task.sys_getpgid(0).unwrap();
+
+        assert_eq!(task.sys_kill(0, Signal::SIGUSR1.as_i32()), Ok(0));
+        assert!(task.pending_signal_set().contains(Signal::SIGUSR1));
+
+        // Drain it and try again via -pgid.
+        let mut regs = PtRegs::default();
+        task.process_signals(&mut regs);
+        assert!(!task.has_pending_signals());
+
+        assert_eq!(task.sys_kill(-pgid, Signal::SIGUSR2.as_i32()), Ok(0));
+        assert!(task.pending_signal_set().contains(Signal::SIGUSR2));
+    }
+
+    #[test]
+    fn test_kill_genuine_remote_pid_still_fails() {
+        // A pid that is neither self nor self's own process group is a real, specific target
+        // this shim genuinely cannot reach (no cross-process signal delivery exists at all yet)
+        // -- reporting that honestly (ESRCH) is correct, not a regression to "fix" by pretending
+        // to deliver it.
+        use litebox_common_linux::signal::Signal;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let other_pid = task.sys_getpid().wrapping_add(1000);
+        assert_eq!(
+            task.sys_kill(other_pid, Signal::SIGUSR1.as_i32()),
+            Err(Errno::ESRCH)
+        );
+    }
+
+    #[test]
     fn test_setsid_returns_own_pid_and_becomes_own_group_leader() {
         // Mirrors what glibc's login_tty() does immediately after fork(): setsid() must succeed
         // (not EPERM) and leave the caller as its own process-group leader, exactly the

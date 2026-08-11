@@ -523,11 +523,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     fn do_kill(&self, pid: Option<i32>, tid: Option<i32>, signal: i32) -> Result<usize, Errno> {
         let signal = Signal::try_from(signal)?;
-        if pid.is_none_or(|pid| pid == self.pid) && tid.is_none_or(|tid| tid == self.tid) {
+        if tid.is_some_and(|tid| tid != self.tid) {
+            log_unsupported!("sys_tkill/sys_tgkill with a remote tid");
+            return Err(Errno::ESRCH);
+        }
+        // `pid == 0` (send to the caller's own process group), a negative `pid` (send to process
+        // group `-pid`), and `pid == -1` (send to every process the caller may signal) are
+        // approximated here as "signal self": this shim has no registry of other live processes
+        // to actually enumerate a process group or the whole guest (see `sys_setpgid`'s doc
+        // comment on why sessions/cross-process pid lookups aren't modeled at all), so self is
+        // the only member of any of those target sets it can ever actually know about -- and in
+        // the common case (no other process happens to share the group), that's also exactly
+        // correct, not just a fallback. A genuine remote pid (some *other*, specific process) is
+        // still unsupported: correctly reporting "not delivered" there is preferable to silently
+        // dropping a signal aimed at a real target this shim just can't reach yet.
+        let self_pgid = self.sys_getpgid(0)?;
+        let targets_self = match pid {
+            None | Some(0 | -1) => true,
+            Some(p) if p == self.pid => true,
+            Some(p) => p.checked_neg().is_some_and(|group| group == self_pgid),
+        };
+        if targets_self {
             self.send_signal(signal, siginfo_kill(signal));
             Ok(0)
         } else {
-            log_unsupported!("sys_{{t|tg}}kill with remote pid/tid");
+            log_unsupported!("sys_kill with a remote pid");
             Err(Errno::ESRCH)
         }
     }
