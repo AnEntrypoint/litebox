@@ -125,6 +125,26 @@ jobs:
       - name: Install and run an extra package via apk (proves further tooling is installable)
         working-directory: smoke
         run: .\litebox_runner_linux_on_windows_userland.exe --initial-files alpine-rootfs.tar /bin/sh -c 'apk add --no-cache jq && echo hello | jq -R .'
+      - name: Run 4 concurrent instances against the same rootfs tar (multi-agent fan-out safety)
+        working-directory: smoke
+        shell: pwsh
+        run: |
+          $jobs = 1..4 | ForEach-Object {
+            $i = $_
+            Start-ThreadJob -ScriptBlock {
+              param($i)
+              & .\litebox_runner_linux_on_windows_userland.exe --initial-files alpine-rootfs.tar --export-writable-layer "session-$i.tar" /bin/sh -c "echo instance-$i-ok > /tmp/marker; cat /tmp/marker"
+              if ($LASTEXITCODE -ne 0) { throw "instance $i exited with code $LASTEXITCODE" }
+            } -ArgumentList $i
+          }
+          $jobs | Receive-Job -Wait -AutoRemoveJob
+          1..4 | ForEach-Object {
+            if (-not (Test-Path "session-$_.tar")) { throw "session-$_.tar was not created" }
+          }
+          Write-Host "All 4 concurrent instances completed and exported independent writable-layer snapshots"
+      - name: Resume from an exported writable layer
+        working-directory: smoke
+        run: .\litebox_runner_linux_on_windows_userland.exe --initial-files alpine-rootfs.tar --resume-from session-1.tar /bin/sh -c 'cat /tmp/marker'
 
   bundle:
     name: Bundle release zip
