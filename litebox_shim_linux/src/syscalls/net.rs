@@ -382,7 +382,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                         return Err(Errno::EBADF);
                     }
                     litebox::net::errors::SetTcpOptionError::NotTcpSocket => {
-                        unimplemented!("SO_KEEPALIVE is not supported for non-TCP sockets")
+                        // `SO_KEEPALIVE` is a generic `SOL_SOCKET` option real Linux accepts on
+                        // any socket type -- it's simply a no-op for a non-connection-oriented
+                        // protocol like UDP, not an error. `opt.keep_alive` (read back by
+                        // `getsockopt`) was already updated above regardless of this deferred
+                        // TCP-specific step failing, so there's nothing further to do. Reachable
+                        // via e.g. `s=socket(AF_INET,SOCK_DGRAM); setsockopt(s,SOL_SOCKET,
+                        // SO_KEEPALIVE,&1,4)`, a real pattern in libraries that set a common
+                        // socket-option baseline before checking the actual protocol.
                     }
                     _ => unimplemented!(),
                 }
@@ -2972,6 +2979,46 @@ mod tests {
         )
         .expect("failed to get SO_BROADCAST");
         assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn so_keepalive_on_a_udp_socket_is_a_no_op_not_a_panic() {
+        // Regression test: setsockopt(SOL_SOCKET, SO_KEEPALIVE, 1) on a non-TCP socket used to
+        // unconditionally panic (unimplemented!("SO_KEEPALIVE is not supported for non-TCP
+        // sockets")). Real Linux accepts SO_KEEPALIVE on any socket type -- it's a generic
+        // SOL_SOCKET option that's simply a no-op for a connectionless protocol like UDP, not an
+        // error -- so this must succeed, and the software-only flag getsockopt reads back must
+        // reflect the value that was set.
+        let task = init_platform(None);
+        let sockfd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Datagram,
+                SockFlags::empty(),
+                0,
+            )
+            .expect("failed to create socket");
+
+        let enable: u32 = 1;
+        let optval = UserPtr::from_usize((&raw const enable).cast::<u8>() as usize);
+        task.do_setsockopt(
+            sockfd,
+            SocketOptionName::Socket(SocketOption::KEEPALIVE),
+            optval,
+            core::mem::size_of::<u32>(),
+        )
+        .expect("SO_KEEPALIVE on a UDP socket must succeed, not panic");
+
+        let mut result: u32 = 0;
+        let optval_out = UserPtrMut::from_usize((&raw mut result).cast::<u8>() as usize);
+        task.do_getsockopt(
+            sockfd,
+            SocketOptionName::Socket(SocketOption::KEEPALIVE),
+            optval_out,
+            core::mem::size_of::<u32>().trunc(),
+        )
+        .expect("failed to get SO_KEEPALIVE");
+        assert_eq!(result, 1);
     }
 
     #[ignore = "timeout is 75s"]
