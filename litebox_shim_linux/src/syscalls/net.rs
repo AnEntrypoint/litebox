@@ -1149,7 +1149,19 @@ pub(crate) fn read_sockaddr_from_user<Platform: ShimPlatform>(
                 s.to_string_lossy().to_string(),
             )))
         }
-        _ => todo!("unsupported family {family:?}"),
+        // `AddressFamily` is a closed, 4-variant enum (`UNIX`/`INET`/`INET6`/`NETLINK`) -- any
+        // other wire value already fails the `try_from` above with `EAFNOSUPPORT`, so this arm
+        // is reached specifically for `INET6`/`NETLINK`, neither of which this shim implements.
+        // Real-world trigger: any guest `socket(AF_INET6, ...)` followed by `connect`/`bind`/
+        // `sendto` -- not exotic, since IPv6 is often the *default* resolution result (e.g.
+        // Node's/Python's DNS resolution preferring an AAAA record, or a guest explicitly
+        // dialing `::1`/`[::]` for "localhost"). This previously crashed the whole runner
+        // (`todo!()`) instead of returning the same `EAFNOSUPPORT` a real Linux kernel would
+        // give a caller for a family the *socket itself* wasn't created with support for.
+        _ => {
+            log_unsupported!("sockaddr with family {family:?}");
+            Err(Errno::EAFNOSUPPORT)
+        }
     }
 }
 
@@ -2135,6 +2147,34 @@ mod tests {
     const TUN_DEVICE_NAME: &str = "tun99";
     const SERVER_PORT: u16 = 8080;
     const CLIENT_PORT: u16 = 8081;
+
+    /// Regression test: a sockaddr with `sa_family` set to `AF_INET6` or `AF_NETLINK` used to
+    /// unconditionally panic (`todo!("unsupported family {family:?}")`) in
+    /// `read_sockaddr_from_user`, crashing the whole runner -- reachable from any guest
+    /// `connect`/`bind`/`sendto`/`sendmsg` call, independent of which family the fd itself was
+    /// created with (e.g. IPv6 being the default result of DNS resolution on many systems, or a
+    /// mismatched sockaddr passed to an unrelated fd). `AddressFamily` is a closed, 4-variant
+    /// enum (any other wire value already correctly fails with `EAFNOSUPPORT` one line above the
+    /// old panic site), so `INET6`/`NETLINK` are the only two values that could ever reach it.
+    #[test]
+    fn read_sockaddr_from_user_rejects_unsupported_families_instead_of_panicking() {
+        for (name, code) in [
+            ("AF_INET6", AddressFamily::INET6 as u16),
+            ("AF_NETLINK", AddressFamily::NETLINK as u16),
+        ] {
+            let mut buf = [0u8; core::mem::size_of::<CSockInetAddr>()];
+            buf[..2].copy_from_slice(&code.to_ne_bytes());
+            let result = read_sockaddr_from_user::<crate::syscalls::tests::TestPlatform>(
+                UserPtr::from_usize(buf.as_ptr() as usize),
+                buf.len(),
+            );
+            assert_eq!(
+                result.unwrap_err(),
+                Errno::EAFNOSUPPORT,
+                "family {name} must fail cleanly, not panic"
+            );
+        }
+    }
 
     fn close_socket(task: &TestTask, fd: u32) {
         task.sys_close(i32::try_from(fd).unwrap())

@@ -282,6 +282,24 @@ Concretely, this build fixes (all landed on `main`, CI-verified):
   `/dev/stdin` is tagged with its real open flags so `O_NONBLOCK` is
   honored (returns `EAGAIN` on an empty read) exactly like fd 0 already
   did.
+- **`connect()`/`bind()`/`sendto()`/`sendmsg()` no longer crash on an
+  `AF_INET6` or `AF_NETLINK` sockaddr.** `read_sockaddr_from_user` --
+  the shared helper every address-taking socket syscall routes a
+  userspace sockaddr buffer through -- unconditionally panicked
+  (`todo!("unsupported family ...")`) for any family other than
+  `AF_UNIX`/`AF_INET`. `AddressFamily` is a closed, 4-variant enum (any
+  other wire value already correctly failed with `EAFNOSUPPORT` one line
+  above the old panic site), so `AF_INET6`/`AF_NETLINK` were the only two
+  values that could ever reach it -- not exotic, since IPv6 is often the
+  *default* outcome of DNS resolution (e.g. an `AAAA` record winning
+  happy-eyeballs, or a guest dialing `::1`/`[::]` for "localhost"), and
+  `socket(AF_INET6, ...)` itself already correctly returns
+  `EAFNOSUPPORT` rather than crashing -- so the actual gap was reachable
+  the moment *any* fd (not necessarily an IPv6 one) was handed an
+  `AF_INET6`/`AF_NETLINK` sockaddr as a syscall argument. It now returns
+  `EAFNOSUPPORT`, matching both the family-parsing fallback right above
+  it and real Linux's behavior for a family the target socket doesn't
+  support.
 
 A ready-to-run bundle (the Windows runner exe plus a packaged Alpine rootfs)
 is built by [`.github/workflows/release-windows-alpine.yml`](.github/workflows/release-windows-alpine.yml).
