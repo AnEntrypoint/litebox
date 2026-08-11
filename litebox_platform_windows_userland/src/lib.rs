@@ -238,6 +238,18 @@ unsafe extern "system" fn vectored_exception_handler(
         // than being folded into this fix.
         if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
             && unsafe { litebox_common_linux::rdfsbase() } == 0
+            // A zero `Rip` is not a real FS_BASE-reset fault: the FS_BASE-reset repair's whole
+            // premise is that the guest/host instruction at `Rip` is genuine and merely read/wrote
+            // through the wrong (zeroed) segment base -- retrying it after `wrfsbase` makes forward
+            // progress. `Rip == 0` means the CPU never reached a real instruction at all, so
+            // "repairing" FS_BASE and resuming at address 0 just re-faults with the exact same
+            // signature (`EXCEPTION_ACCESS_VIOLATION`, `rdfsbase() == 0`, because execution never
+            // gets anywhere real to leave FS_BASE in a consistent state) -- an infinite repair loop
+            // observed in practice via `LITEBOX_VEH_TRACE=1` (1809+ repeated repairs, no forward
+            // progress). Skip the repair here so this falls through to the exception-table lookup /
+            // `EXCEPTION_CONTINUE_SEARCH` below instead, turning the silent livelock into a
+            // diagnosable crash.
+            && context.Rip != 0
         {
             let saved = WindowsUserland::get_thread_fs_base();
             if saved != 0 {
@@ -315,6 +327,11 @@ unsafe extern "system" fn vectored_exception_handler(
     // happened to occur at all.
     if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
         && unsafe { litebox_common_linux::rdfsbase() } == 0
+        // See the matching guard in the `!is_in_guest` branch above: `Rip == 0` means this is not
+        // a genuine FS_BASE-reset fault at a real instruction, and blindly repairing-and-resuming
+        // would just re-fault at address 0 forever. Fall through to the normal exception path
+        // below (single-step triage / `exception_callback`) instead of looping silently.
+        && context.Rip != 0
     {
         let saved = WindowsUserland::get_thread_fs_base();
         if saved != 0 {
