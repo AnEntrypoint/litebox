@@ -7,13 +7,16 @@
 //! duplex master<->slave byte forwarding -- the subset of Linux's pty machinery that
 //! `node-pty`/`pexpect`/`tmux`/`script`-style tools need to allocate and drive a pty.
 //!
-//! **No input-side line discipline is implemented**: there is no kernel-side canonical-mode
-//! input buffering, echo, or signal-generating special characters (^C/^Z/^\ -- the last of
-//! those also needs cross-process signal delivery, which this shim doesn't have at all yet, pty
-//! or otherwise). Bytes written to the master appear verbatim on the slave's read side. This
-//! covers every consumer that puts the pty into raw mode itself (which is what `node-pty`,
-//! `ptyprocess`/`pexpect`, and most modern pty libraries do immediately after opening) but not a
-//! guest shell relying on the kernel to echo typed characters back in cooked mode.
+//! **Input-side line discipline is only partially implemented**: raw-mode echo (`ECHO` set
+//! without `ICANON` -- e.g. `stty -icanon echo`) works (see [`PtyEnd::write`]'s echo handling),
+//! but there is no kernel-side canonical-mode input buffering (no backspace/erase editing, since
+//! that needs a buffer of not-yet-"readable" bytes this module doesn't have) and no
+//! signal-generating special characters (^C/^Z/^\ -- these need cross-process signal delivery,
+//! which this shim doesn't have at all yet, pty or otherwise). Bytes written to the master appear
+//! verbatim on the slave's read side unless `ECHO` is explicitly set. This covers every consumer
+//! that puts the pty into raw mode itself (which is what `node-pty`, `ptyprocess`/`pexpect`, and
+//! most modern pty libraries do immediately after opening) but not a guest shell relying on the
+//! kernel for full cooked-mode line editing.
 //!
 //! **Output-side processing is partially implemented**: a fresh pty defaults to `OPOST|ONLCR`
 //! (matching real Linux), and slave-side writes get `\n` translated to `\r\n` accordingly (see
@@ -113,6 +116,10 @@ pub(crate) struct PtyHalf<Platform: ShimPlatform> {
     /// File status flags (see [`OFlags::STATUS_FLAGS_MASK`]).
     status: AtomicU32,
     pair: Arc<PtyPair<Platform>>,
+    /// Master side only: a clone of the slave's write end (the same direction the master itself
+    /// *reads* from), used to echo bytes written to the master back to whatever's reading it --
+    /// see [`PtyEnd::write`]'s echo handling. `None` on the slave side, which never echoes.
+    echo_write: Option<WriteEnd<Platform, u8>>,
 }
 
 impl<Platform: ShimPlatform> PtyHalf<Platform> {
@@ -206,6 +213,33 @@ impl<Platform: ShimPlatform> PtyHalf<Platform> {
             )
             .map_err(Errno::from)
     }
+
+    /// Best-effort echo of `buf` (the bytes just accepted by [`Self::write`]) back through
+    /// `echo_write`, applying the same `\n` -> `\r\n` translation as an ordinary write when
+    /// `onlcr`. Master-side only -- see the `echo_write` field doc comment.
+    ///
+    /// Always non-blocking and never surfaces an error to the caller: a full destination channel
+    /// (`EAGAIN`) is exactly what a real terminal driver does under output backpressure (drop or
+    /// stop echoing, never block the write that triggered it), and a torn-down slave (`EPIPE`,
+    /// via the cloned `WriteEnd` sharing the real slave-side end's shutdown state) must not turn
+    /// an otherwise-successful `write()` to the master into an error.
+    fn echo(&self, buf: &[u8], onlcr: bool) {
+        let Some(echo_write) = &self.echo_write else {
+            return;
+        };
+        for &byte in buf {
+            let translated: &[u8] = if onlcr && byte == b'\n' {
+                b"\r\n"
+            } else {
+                core::slice::from_ref(&byte)
+            };
+            for &out_byte in translated {
+                if echo_write.try_write_one(out_byte).is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 impl<Platform: ShimPlatform> Drop for PtyHalf<Platform> {
@@ -292,13 +326,27 @@ impl<Platform: ShimPlatform> PtyEnd<Platform> {
     /// which is most programs: `ls`, `git log`, a Python script's `print()` -- renders as an
     /// unreadable "staircase" in any terminal UI reading the master (VS Code's pty panel,
     /// ttyd/wetty, xterm.js), since nothing ever adds the `\r`.
+    ///
+    /// On the *master* side only, if the pty's termios has `ECHO` set, the bytes actually
+    /// accepted are also best-effort echoed back to the master's own read side (see
+    /// [`PtyHalf::echo`]) -- this is raw-mode echo (`stty -icanon echo`), not canonical-mode line
+    /// editing: no input buffering, no backspace/erase handling, and no `ISIG` special characters
+    /// (^C/^Z/^\). `ECHO` is never set by default (see [`new_pty_pair`]'s termios default), so
+    /// this only ever fires for a consumer that explicitly opts in via `TCSETS`.
     pub(crate) fn write(&self, cx: &WaitContext<'_, Platform>, buf: &[u8]) -> Result<usize, Errno> {
+        let termios = self.pair().get_termios();
         let onlcr = !self.is_master() && {
-            let oflag = self.pair().get_termios().c_oflag;
-            oflag & (litebox_common_linux::OPOST | litebox_common_linux::ONLCR)
+            termios.c_oflag & (litebox_common_linux::OPOST | litebox_common_linux::ONLCR)
                 == (litebox_common_linux::OPOST | litebox_common_linux::ONLCR)
         };
-        self.half().write(cx, buf, onlcr)
+        let n = self.half().write(cx, buf, onlcr)?;
+        if self.is_master() && termios.c_lflag & litebox_common_linux::ECHO != 0 {
+            let echo_onlcr = termios.c_oflag
+                & (litebox_common_linux::OPOST | litebox_common_linux::ONLCR)
+                == (litebox_common_linux::OPOST | litebox_common_linux::ONLCR);
+            self.half().echo(&buf[..n], echo_onlcr);
+        }
+        Ok(n)
     }
 
     pub(crate) fn with_iopollable<R>(&self, f: impl FnOnce(&dyn IOPollable) -> R) -> R {
@@ -344,6 +392,7 @@ pub(crate) fn new_pty_pair<Platform: ShimPlatform>(
         pollee: master_pollee,
         status: AtomicU32::new((OFlags::RDWR).bits()),
         pair: pair.clone(),
+        echo_write: Some(s2m_write.clone()),
     });
     let slave = PtyEnd::Slave(PtyHalf {
         read: m2s_read,
@@ -351,6 +400,7 @@ pub(crate) fn new_pty_pair<Platform: ShimPlatform>(
         pollee: slave_pollee,
         status: AtomicU32::new((OFlags::RDWR).bits()),
         pair,
+        echo_write: None,
     });
 
     let mut dt = litebox.descriptor_table_mut();
@@ -651,6 +701,136 @@ mod tests {
         let mut buf = [0u8; 32];
         let n = task.sys_read(slave2, &mut buf, None).unwrap();
         assert_eq!(&buf[..n], b"still alive");
+    }
+
+    #[test]
+    fn echo_is_off_by_default() {
+        // ECHO is never set by default (see `new_pty_pair`'s termios default), so writing to the
+        // master must not produce anything on the master's own read side.
+        let task = crate::syscalls::tests::init_platform(None);
+        let (master, _slave) = open_unlocked_pty_pair(&task);
+
+        task.sys_fcntl(
+            master,
+            litebox_common_linux::FcntlArg::SETFL(OFlags::NONBLOCK),
+        )
+        .expect("fcntl(F_SETFL, O_NONBLOCK) failed");
+
+        task.sys_write(master, b"typed", None)
+            .expect("write to master failed");
+
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            task.sys_read(master, &mut buf, None),
+            Err(Errno::EAGAIN),
+            "no echo must appear on the master's read side when ECHO is unset"
+        );
+    }
+
+    #[test]
+    fn echo_reflects_master_writes_back_while_still_delivering_them_to_the_slave() {
+        // Regression test for the ECHO ("raw-mode echo", stty -icanon echo) slice of input-side
+        // line discipline: with ECHO set, bytes written to the master (simulating what's typed at
+        // a keyboard) must both (a) still reach the slave's read side unmodified (the real input
+        // path a shell reads as stdin) and (b) be echoed back to the master's own read side (what
+        // a terminal display shows as the user types), matching real Linux's `n_tty` echo.
+        let task = crate::syscalls::tests::init_platform(None);
+        let (master, slave) = open_unlocked_pty_pair(&task);
+
+        let mut termios = litebox_common_linux::Termios {
+            c_lflag: litebox_common_linux::ECHO,
+            ..litebox_common_linux::Termios::default()
+        };
+        let set_ptr = UserPtr::from_usize((&raw mut termios).expose_provenance());
+        task.sys_ioctl(master, IoctlArg::TCSETS(set_ptr))
+            .expect("TCSETS failed");
+
+        let n = task
+            .sys_write(master, b"hi", None)
+            .expect("write to master failed");
+        assert_eq!(n, 2);
+
+        let mut slave_buf = [0u8; 64];
+        let n = task
+            .sys_read(slave, &mut slave_buf, None)
+            .expect("read from slave failed");
+        assert_eq!(
+            &slave_buf[..n],
+            b"hi",
+            "ECHO must not change what the slave (the real input path) receives"
+        );
+
+        let mut master_buf = [0u8; 64];
+        let n = task
+            .sys_read(master, &mut master_buf, None)
+            .expect("read from master failed");
+        assert_eq!(
+            &master_buf[..n],
+            b"hi",
+            "ECHO must reflect the typed bytes back to the master's own read side"
+        );
+    }
+
+    #[test]
+    fn echo_applies_onlcr_but_does_not_affect_what_the_slave_receives() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let (master, slave) = open_unlocked_pty_pair(&task);
+
+        let mut termios = litebox_common_linux::Termios {
+            c_lflag: litebox_common_linux::ECHO,
+            c_oflag: litebox_common_linux::OPOST | litebox_common_linux::ONLCR,
+            ..litebox_common_linux::Termios::default()
+        };
+        let set_ptr = UserPtr::from_usize((&raw mut termios).expose_provenance());
+        task.sys_ioctl(master, IoctlArg::TCSETS(set_ptr))
+            .expect("TCSETS failed");
+
+        task.sys_write(master, b"hi\n", None)
+            .expect("write to master failed");
+
+        let mut slave_buf = [0u8; 64];
+        let n = task
+            .sys_read(slave, &mut slave_buf, None)
+            .expect("read from slave failed");
+        assert_eq!(
+            &slave_buf[..n],
+            b"hi\n",
+            "the input path itself is never ONLCR-translated"
+        );
+
+        let mut master_buf = [0u8; 64];
+        let n = task
+            .sys_read(master, &mut master_buf, None)
+            .expect("read from master failed");
+        assert_eq!(
+            &master_buf[..n],
+            b"hi\r\n",
+            "the echoed copy goes through the same ONLCR output processing as an ordinary write"
+        );
+    }
+
+    #[test]
+    fn echo_does_not_error_when_the_slave_is_already_closed() {
+        // The echo path shares the slave's real write end's shutdown state (it's a clone of the
+        // same underlying WriteEnd), so once the slave is gone, echoing must be silently skipped
+        // rather than turning an otherwise-successful write() to the master into an error.
+        let task = crate::syscalls::tests::init_platform(None);
+        let (master, slave) = open_unlocked_pty_pair(&task);
+
+        let mut termios = litebox_common_linux::Termios {
+            c_lflag: litebox_common_linux::ECHO,
+            ..litebox_common_linux::Termios::default()
+        };
+        let set_ptr = UserPtr::from_usize((&raw mut termios).expose_provenance());
+        task.sys_ioctl(master, IoctlArg::TCSETS(set_ptr))
+            .expect("TCSETS failed");
+
+        task.sys_close(slave).expect("closing slave failed");
+
+        let n = task
+            .sys_write(master, b"typed", None)
+            .expect("write to master must still succeed once the slave is closed");
+        assert_eq!(n, b"typed".len());
     }
 
     #[test]

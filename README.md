@@ -219,6 +219,18 @@ Concretely, this build fixes (all landed on `main`, CI-verified):
   isn't a bug to fix so much as an inherent property of two writers sharing
   one file path; avoid it with a per-branch path convention (e.g.
   `out/agent-<id>.tar`).
+- **`ECHO` (raw-mode terminal echo).** Bytes written to a pty's master (what
+  typing at a keyboard looks like from the shim's perspective) are now
+  echoed back to the master's own read side when the pty's termios has
+  `ECHO` set -- e.g. `stty -icanon echo`, or any consumer that explicitly
+  opts into it via `TCSETS`. `ECHO` is never set by default, so this doesn't
+  change behavior for `node-pty`/`pexpect`/`ptyprocess`/most modern pty
+  libraries, which put the pty into full raw mode (`ECHO` off) themselves
+  immediately after opening it. This is *raw-mode* echo only: there is
+  still no canonical-mode input buffering (no backspace/erase editing --
+  that needs a buffer of not-yet-"readable" bytes this module doesn't have)
+  and no `ISIG` special characters (^C/^Z/^\, which need cross-process
+  signal delivery, still an open architectural gap -- see below).
 
 A ready-to-run bundle (the Windows runner exe plus a packaged Alpine rootfs)
 is built by [`.github/workflows/release-windows-alpine.yml`](.github/workflows/release-windows-alpine.yml).
