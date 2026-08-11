@@ -737,6 +737,8 @@ pub struct Termios {
 pub const OPOST: tcflag_t = 0o0000001;
 /// `c_oflag` bit: map `\n` to `\r\n` on output. Only meaningful together with [`OPOST`].
 pub const ONLCR: tcflag_t = 0o0000004;
+/// `c_lflag` bit: echo input characters back to the terminal as they're typed.
+pub const ECHO: tcflag_t = 0o0000010;
 
 #[derive(Debug, Clone, Default, FromBytes, IntoBytes)]
 #[repr(C)]
