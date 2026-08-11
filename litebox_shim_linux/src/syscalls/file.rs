@@ -556,6 +556,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .litebox
                 .descriptor_table_mut()
                 .set_entry_metadata(&file, stream);
+            // Also tag with `StdioStatusFlags` (derived from this open's actual `flags`, unlike
+            // the bootstrap fd 0/1/2's hardcoded `APPEND | RDWR` in
+            // `initialize_stdio_in_shared_descriptors_table`) so `GETFL`/`SETFL` report the real
+            // status flags for a reopened stdio fd, and so `do_read`'s non-blocking-stdin check
+            // sees `O_NONBLOCK` when the guest passed it to `open("/dev/stdin", ...)` directly
+            // instead of via a later `fcntl(F_SETFL)` -- without this, a freshly reopened
+            // `/dev/stdin` fd carried no `StdioStatusFlags` metadata at all, so `do_read` could
+            // never treat it as non-blocking regardless of the flags it was opened with.
+            let _ = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .set_entry_metadata(
+                    &file,
+                    crate::StdioStatusFlags(flags & OFlags::STATUS_FLAGS_MASK),
+                );
         }
         let files = self.files.borrow();
         let raw_fd = files.insert_raw_fd(file).map_err(|file| {
@@ -4288,6 +4304,45 @@ mod tests {
             .with_metadata(&fd, |stream: &StdioStream| *stream)
             .expect("reopened /dev/stdin must carry StdioStream::Stdin metadata");
         assert_eq!(stream, StdioStream::Stdin);
+    }
+
+    #[test]
+    fn reopened_dev_stdin_with_o_nonblock_gets_stdio_status_flags_metadata() {
+        // Regression test for the `open("/dev/stdin", O_NONBLOCK)` panic (fixed in
+        // `litebox::fs::devices`'s `open_file_at`, which used to `unimplemented!()`
+        // unconditionally for `O_NONBLOCK` on any of the devices it serves) and its follow-on
+        // gap: even with that panic fixed, a freshly reopened `/dev/stdin` fd carried no
+        // `StdioStatusFlags` metadata at all -- only `StdioStream`, attached above in
+        // `reopened_dev_stdin_gets_stdio_stream_metadata` -- so `do_read`'s non-blocking-stdin
+        // `EAGAIN` check (which consults `StdioStatusFlags`) could never see `O_NONBLOCK` for
+        // it, regardless of the flags it was actually opened with. Confirms
+        // `insert_raw_file_fd_with_path` now also tags a reopened `/dev/stdin` with
+        // `StdioStatusFlags` reflecting its real open flags.
+        let task = crate::syscalls::tests::init_platform(None);
+
+        let raw_fd = task
+            .sys_open(
+                "/dev/stdin",
+                OFlags::RDONLY | OFlags::NONBLOCK,
+                Mode::empty(),
+            )
+            .expect("reopening /dev/stdin with O_NONBLOCK must succeed, not panic");
+
+        let files = task.files.borrow();
+        let fd = files
+            .raw_descriptor_store
+            .read()
+            .fd_from_raw_integer::<crate::DefaultFS<crate::syscalls::tests::TestPlatform>>(
+                usize::try_from(raw_fd).unwrap(),
+            )
+            .expect("freshly opened /dev/stdin must resolve to a filesystem-backed fd");
+        let flags = task
+            .global
+            .litebox
+            .descriptor_table()
+            .with_metadata(&fd, |crate::StdioStatusFlags(flags)| *flags)
+            .expect("reopened /dev/stdin must carry StdioStatusFlags metadata");
+        assert!(flags.contains(OFlags::NONBLOCK));
     }
 
     #[test]

@@ -263,6 +263,25 @@ Concretely, this build fixes (all landed on `main`, CI-verified):
   that needs a buffer of not-yet-"readable" bytes this module doesn't have)
   and no `ISIG` special characters (^C/^Z/^\, which need cross-process
   signal delivery, still an open architectural gap -- see below).
+- **`open(path, O_NONBLOCK)` no longer crashes for `/dev/stdin`,
+  `/dev/stdout`, `/dev/stderr`, or `/dev/urandom`.** These four paths
+  previously `unimplemented!()`'d unconditionally the moment `O_NONBLOCK`
+  was set, crashing the whole runner -- a real-world trigger is libuv/Node
+  reopening `/dev/stdin` to get a private fd for `setRawMode`-style termios
+  work (the same reopen pattern documented above for `StdioStream`
+  metadata), which some libuv code paths open non-blocking. None of these
+  four devices actually need this fix to be *non-blocking-aware* internally
+  to open successfully: `/dev/stdout`/`/dev/stderr`/`/dev/urandom` never
+  block in the first place, and `/dev/stdin` -- the one device that
+  genuinely can, via the platform's blocking stdin read -- already had a
+  correct `O_NONBLOCK`/`EAGAIN` path one layer up in the shim's `read()`
+  handling, but only for the bootstrap fd 0; a freshly reopened
+  `/dev/stdin` fd carried no status-flags metadata for that check to
+  consult, so it silently ignored `O_NONBLOCK` even after the crash was
+  fixed. Both are now fixed together: the panic is gone, and a reopened
+  `/dev/stdin` is tagged with its real open flags so `O_NONBLOCK` is
+  honored (returns `EAGAIN` on an empty read) exactly like fd 0 already
+  did.
 
 A ready-to-run bundle (the Windows runner exe plus a packaged Alpine rootfs)
 is built by [`.github/workflows/release-windows-alpine.yml`](.github/workflows/release-windows-alpine.yml).

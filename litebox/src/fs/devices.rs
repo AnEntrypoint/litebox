@@ -243,14 +243,22 @@ where
         if flags.contains(OFlags::DIRECTORY) {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
-        if flags.contains(OFlags::NONBLOCK)
-            && matches!(
-                device,
-                Device::Stdin | Device::Stdout | Device::Stderr | Device::URandom
-            )
-        {
-            unimplemented!("Non-blocking I/O is not yet supported for {:?}", device);
-        }
+        // `O_NONBLOCK` is accepted here without changing this backend's own `read`/`write`
+        // (mirroring the `O_TRUNC` handling below, which is likewise accepted but not literally
+        // honored by this backend). `Stdout`/`Stderr`/`Null`/`URandom` never block in the first
+        // place, so there is nothing to honor for them. `Stdin` is the one device that can
+        // genuinely block (`StdioProvider::read_from_stdin`) -- callers that need `O_NONBLOCK`
+        // to actually take effect on a stdin read (e.g. `open("/dev/stdin", O_NONBLOCK)`, the
+        // real-world case is libuv/Node putting a reopened stdin fd into non-blocking mode) get
+        // it from the shim layer instead: `litebox_shim_linux::syscalls::file::do_read` consults
+        // `StdioStatusFlags` metadata and the platform's `stdin_ready` probe to return `EAGAIN`
+        // rather than blocking, for any fd tagged `StdioStream::Stdin` -- see
+        // `insert_raw_file_fd_with_path`, which tags a freshly-(re)opened `/dev/stdin` with both
+        // `StdioStream` and `StdioStatusFlags` metadata derived from these same `flags`. This
+        // backend has no such per-fd status-flag storage of its own (`DeviceFileHandle` is a
+        // stateless `Copy` type), so previously this `unimplemented!()`'d unconditionally instead
+        // of ever reaching that shim-layer handling -- crashing the whole process on any
+        // `open("/dev/stdin"|"/dev/stdout"|"/dev/stderr"|"/dev/urandom", O_NONBLOCK)`.
 
         if flags.contains(OFlags::TRUNC) {
             // Note: matching Linux behavior, this does not actually perform any truncation, and
