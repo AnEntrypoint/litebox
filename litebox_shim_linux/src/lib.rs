@@ -247,6 +247,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             next_flock_holder_id: core::sync::atomic::AtomicU64::new(1),
             pty_registry: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
             next_pty_id: core::sync::atomic::AtomicU32::new(0),
+            next_unix_autobind_id: core::sync::atomic::AtomicU32::new(0),
         });
         LinuxShim(global)
     }
@@ -1489,6 +1490,14 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     >,
     /// Next id to hand out to a freshly `open("/dev/ptmx")`-allocated pty pair.
     next_pty_id: core::sync::atomic::AtomicU32,
+    /// Next id to hand out for AF_UNIX socket "autobind" (`bind()` called with no address),
+    /// formatted the same way real Linux formats its autobind abstract-namespace names: a
+    /// leading NUL byte followed by 5 lowercase hex digits (see `unix(7)`). Real Linux starts
+    /// from an unpredictable point and retries on collision; this shim-wide counter instead
+    /// increments monotonically, which is simpler and still unique for any realistic number of
+    /// autobind calls within one shim instance's lifetime (wraps at 2^20, matching the same
+    /// 5-hex-digit range Linux itself uses).
+    next_unix_autobind_id: core::sync::atomic::AtomicU32,
     /// The first process created by [`LinuxShim::load_program`], set once and kept for the
     /// lifetime of the shim.
     ///

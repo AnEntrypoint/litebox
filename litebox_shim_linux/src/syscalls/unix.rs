@@ -142,7 +142,22 @@ impl UnixSocketAddr {
                 // TODO: check if the abstract address is already in use
                 Ok(UnixBoundSocketAddr::Abstract(data))
             }
-            UnixSocketAddr::Unnamed => todo!("autobind for unnamed unix socket"),
+            UnixSocketAddr::Unnamed => {
+                // "Autobind": `bind()` called with no address at all (`addrlen ==
+                // sizeof(sa_family_t)`) asks the kernel to assign an abstract-namespace address
+                // automatically -- used by some IPC libraries to get a peer-identifiable address
+                // before `connect()`ing out, without caring what the address actually is. Real
+                // Linux's format (see `unix(7)`) is a leading NUL byte followed by 5 lowercase
+                // hex digits; this used to unconditionally panic (`todo!()`) instead.
+                let id = task
+                    .global
+                    .next_unix_autobind_id
+                    .fetch_add(1, Ordering::Relaxed)
+                    & 0xFFFFF;
+                let mut addr = alloc::vec![0u8];
+                addr.extend_from_slice(alloc::format!("{id:05x}").as_bytes());
+                Ok(UnixBoundSocketAddr::Abstract(addr))
+            }
         }
     }
 
