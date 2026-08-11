@@ -6,7 +6,7 @@ Contents:
   unmodified Linux ELF binaries on Windows.
 - `alpine-rootfs.tar` — an Alpine Linux rootfs (BusyBox userland) with
   `nodejs`, `npm`, `python3`, `py3-pip`, `build-base`, `git`, `bash`, `curl`,
-  and `openssh-client` preinstalled, built from
+  `openssh-client`, and `tzdata` preinstalled, built from
   [`dist_tools/base-image/Dockerfile`](base-image/Dockerfile), published to
   `ghcr.io/<org>/litebox-alpine-base`, and pre-rewritten with the LiteBox
   syscall rewriter via `litebox-packager --oci-image`.
@@ -40,8 +40,11 @@ so native npm/pip packages that need a compiler can build without any extra
 setup. `git`, `bash`, `curl`, and `openssh-client` are also preinstalled,
 covering the common day-one needs of an agent workload (cloning a repo,
 running `#!/bin/bash` scripts shipped by npm packages, fetching a file) so
-that no extra `apk add` round-trip is needed just to get started. Nothing
-about the base image blocks installing further tooling at runtime — see
+that no extra `apk add` round-trip is needed just to get started. `tzdata`
+is included too -- Alpine/musl doesn't ship timezone data by default, which
+otherwise silently breaks Python's `zoneinfo` module (and any date/time
+library built on it) for any timezone other than UTC. Nothing about the
+base image blocks installing further tooling at runtime — see
 Networking below for `apk add`/`npm install`/`pip install`.
 
 ## Networking

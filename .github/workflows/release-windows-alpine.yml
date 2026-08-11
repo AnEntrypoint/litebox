@@ -128,6 +128,9 @@ jobs:
       - name: Verify baked-in agent-sandbox tooling (git, bash, curl, ssh) needs no apk add
         working-directory: smoke
         run: .\litebox_runner_linux_on_windows_userland.exe --initial-files alpine-rootfs.tar /bin/bash -c 'set -e; git --version; curl --version; ssh -V'
+      - name: Verify tzdata is baked in (Python zoneinfo needs no apk add)
+        working-directory: smoke
+        run: .\litebox_runner_linux_on_windows_userland.exe --initial-files alpine-rootfs.tar /bin/sh -c 'test -f /usr/share/zoneinfo/America/New_York && echo tzdata-ok'
       - name: Run 4 concurrent instances against the same rootfs tar (multi-agent fan-out safety)
         working-directory: smoke
         shell: pwsh
