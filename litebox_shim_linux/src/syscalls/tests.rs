@@ -548,6 +548,69 @@ fn test_rlimit_nofile() {
 }
 
 #[test]
+fn test_rlimit_other_resources_dont_panic_and_have_sane_defaults() {
+    use litebox_common_linux::{Rlimit, RlimitResource, errno::Errno, rlim_t};
+
+    let task = crate::syscalls::tests::init_platform(None);
+
+    // RLIMIT_SIGPENDING is actually enforced (see SignalQueue::push): a
+    // default of 0 would silently drop every queued/real-time signal.
+    let sigpending = task
+        .do_prlimit(RlimitResource::SIGPENDING, None)
+        .expect("sys_getrlimit(SIGPENDING) failed");
+    assert!(
+        sigpending.rlim_cur > 0,
+        "RLIMIT_SIGPENDING must not default to 0"
+    );
+
+    // Resources beyond NOFILE/STACK/SIGPENDING used to return EINVAL on get
+    // and panic (`unimplemented!`) on set. Neither should happen now: a
+    // getrlimit should succeed with a sane (non-EINVAL) value...
+    let core = task
+        .do_prlimit(RlimitResource::CORE, None)
+        .expect("sys_getrlimit(CORE) failed");
+    assert_eq!(core.rlim_cur, rlim_t::MAX, "unenforced resources default to unlimited");
+
+    // ...and a setrlimit for one of these (e.g. what `ulimit -c 0` does)
+    // must not panic the runner, and must be observable on a later get.
+    let new_core = Rlimit {
+        rlim_cur: 0,
+        rlim_max: rlim_t::MAX,
+    };
+    task.do_prlimit(RlimitResource::CORE, Some(new_core))
+        .expect("setrlimit(CORE, 0) should succeed, not panic");
+    let after = task
+        .do_prlimit(RlimitResource::CORE, None)
+        .expect("sys_getrlimit(CORE) failed after set");
+    assert_eq!(after.rlim_cur, 0);
+
+    // Raising the hard limit above the previous max is still rejected.
+    let bad = Rlimit {
+        rlim_cur: rlim_t::MAX,
+        rlim_max: rlim_t::MAX,
+    };
+    // max is already rlim_t::MAX here so this should succeed (not raising);
+    // exercise the actual EPERM path on a resource with a finite max instead.
+    task.do_prlimit(RlimitResource::CORE, Some(bad))
+        .expect("raising cur to the existing max should succeed");
+    let lowered_max = Rlimit {
+        rlim_cur: 0,
+        rlim_max: 100,
+    };
+    task.do_prlimit(RlimitResource::CORE, Some(lowered_max))
+        .expect("lowering the hard limit should succeed");
+    let raise_above_new_max = Rlimit {
+        rlim_cur: 0,
+        rlim_max: 101,
+    };
+    assert_eq!(
+        task.do_prlimit(RlimitResource::CORE, Some(raise_above_new_max))
+            .expect_err("raising hard limit above current max should fail"),
+        Errno::EPERM
+    );
+}
+
+#[test]
 fn test_unlinkat() {
     let task = init_platform(None);
 

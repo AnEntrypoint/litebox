@@ -8,4 +8,8 @@ RUN apk add --no-cache \
     python3 \
     py3-pip \
     build-base \
-    ca-certificates
+    ca-certificates \
+    git \
+    bash \
+    curl \
+    openssh-client
