@@ -39,10 +39,15 @@ pub(crate) struct SignalState<Platform: ShimPlatform> {
 }
 
 impl<Platform: ShimPlatform> SignalState<Platform> {
-    pub fn new_process() -> Self {
+    /// `shared_pending` must be the exact same `Arc` stored as the new process's
+    /// `Process::shared_pending` (see that field's doc comment) -- this is what lets a signal
+    /// pushed there from a *different* process's `do_kill` (targeting this one as a live child)
+    /// actually be observed by this process's own `process_signals`/`has_pending_signals`, which
+    /// only ever look at `self.shared_pending`, never at `Process` directly.
+    pub fn new_process(shared_pending: Arc<Mutex<Platform, PendingSignals>>) -> Self {
         Self {
             pending: RefCell::new(PendingSignals::new()),
-            shared_pending: Arc::new(Mutex::new(PendingSignals::new())),
+            shared_pending,
             blocked: Cell::new(SigSet::empty()),
             handlers: RefCell::new(Arc::new(SignalHandlers::new())),
             altstack: Cell::new(SigAltStack {
@@ -61,16 +66,42 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         }
     }
 
-    pub fn clone_for_new_task(&self) -> Self {
+    /// Build the signal state for a new task from this one, via either `clone()` (a new
+    /// *thread* of the same process, `new_process_shared_pending = None`) or `fork()`/`vfork()`
+    /// (a genuine new *process*, `new_process_shared_pending = Some(the new Process's
+    /// shared_pending Arc)` -- see [`Self::new_process`]'s doc comment on why it must be that
+    /// exact `Arc`, not a freshly allocated one).
+    ///
+    /// Real Linux shares process-wide signal state (the pending-signal queue and handler
+    /// dispositions) across threads of the same process (`CLONE_THREAD`/`CLONE_SIGHAND`) but
+    /// gives a freshly `fork()`'d child its own independent copies -- later `sigaction()` calls
+    /// or process-directed (`kill(pid, ...)`) signals in either the parent or the child must not
+    /// affect the other. Before this distinction existed here, every call shared both
+    /// unconditionally, so a signal meant for a forked child's process-wide queue could
+    /// incorrectly land in (and be consumed by) the parent's queue instead, or vice versa, and a
+    /// later `sigaction()` in either process would silently change the other's handler too.
+    pub fn clone_for_new_task(
+        &self,
+        new_process_shared_pending: Option<Arc<Mutex<Platform, PendingSignals>>>,
+    ) -> Self {
+        let new_process = new_process_shared_pending.is_some();
         Self {
             // Reset pending
             pending: RefCell::new(PendingSignals::new()),
-            // Share process-wide pending signals
-            shared_pending: self.shared_pending.clone(),
+            shared_pending: new_process_shared_pending
+                .unwrap_or_else(|| self.shared_pending.clone()),
             // Preserve blocked
             blocked: Cell::new(self.blocked.get()),
-            // Share handlers across tasks
-            handlers: self.handlers.clone(),
+            handlers: if new_process {
+                // Snapshot the parent's *current* dispositions into an independent copy (real
+                // fork() semantics), rather than sharing the same handlers, or resetting to
+                // SIG_DFL (which would incorrectly discard whatever the parent had configured).
+                RefCell::new(Arc::new(SignalHandlers {
+                    inner: Mutex::new(self.handlers.borrow().inner.lock().clone()),
+                }))
+            } else {
+                self.handlers.clone()
+            },
             // Clear altstack
             altstack: SigAltStack {
                 flags: SsFlags::DISABLE,
@@ -175,7 +206,10 @@ impl<Platform: ShimPlatform> Clone for SignalHandlers<Platform> {
     }
 }
 
-struct PendingSignals {
+/// Shared with [`super::process::Process`] (as `Process::shared_pending`) so a signal aimed at a
+/// live, shim-known child process (see `do_kill`'s remote-child case) can be queued directly from
+/// the sender's context, without needing the target's own `Task`/`SignalState` in scope.
+pub(crate) struct PendingSignals {
     /// The set of pending signals.
     pending: SigSet,
     /// The queue of pending siginfo structures.
@@ -183,7 +217,7 @@ struct PendingSignals {
 }
 
 impl PendingSignals {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             pending: SigSet::empty(),
             queue: VecDeque::new(),
@@ -231,7 +265,12 @@ impl PendingSignals {
         self.queue.remove(pos).unwrap()
     }
 
-    fn push(&mut self, rlimits: &super::process::ResourceLimits, signal: Signal, siginfo: Siginfo) {
+    pub(crate) fn push(
+        &mut self,
+        rlimits: &super::process::ResourceLimits,
+        signal: Signal,
+        siginfo: Siginfo,
+    ) {
         assert_eq!(signal.as_i32(), siginfo.signo);
 
         // Don't queue duplicates for standard signals.
@@ -523,13 +562,81 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     fn do_kill(&self, pid: Option<i32>, tid: Option<i32>, signal: i32) -> Result<usize, Errno> {
         let signal = Signal::try_from(signal)?;
-        if pid.is_none_or(|pid| pid == self.pid) && tid.is_none_or(|tid| tid == self.tid) {
-            self.send_signal(signal, siginfo_kill(signal));
-            Ok(0)
-        } else {
-            log_unsupported!("sys_{{t|tg}}kill with remote pid/tid");
-            Err(Errno::ESRCH)
+        if tid.is_some_and(|tid| tid != self.tid) {
+            log_unsupported!("sys_tkill/sys_tgkill with a remote tid");
+            return Err(Errno::ESRCH);
         }
+        // Process-directed delivery to a live child `Process`: any one of its threads may end up
+        // handling it, exactly like a same-process `send_shared_signal`. Real Linux's SIG_IGN
+        // check can't be done here (that reads the *target's* handler dispositions, which live
+        // on its own `Task`, unreachable from a `Process` handle alone) -- `process_signals`
+        // already discards an ignored signal correctly once the child wakes and looks at its own
+        // handlers, so this only costs the child one spurious EINTR on an ignored signal, never
+        // an incorrect delivery.
+        let deliver_to_child = |child: &super::process::Process<Platform>| {
+            child
+                .shared_pending
+                .lock()
+                .push(&child.limits, signal, siginfo_kill(signal));
+            child.interrupt_all_threads();
+        };
+
+        // `pid == 0` (send to the caller's own process group), a negative `pid` (send to process
+        // group `-pid`), and `pid == -1` (send to every process the caller may signal) are
+        // approximated as "signal self plus any live child currently in that same group": this
+        // shim has no registry of *arbitrary* other live processes to enumerate a process group
+        // or the whole guest (see `sys_setpgid`'s doc comment on why sessions/cross-process pid
+        // lookups aren't modeled at all), but a live child that's been moved into the group via
+        // `setpgid()` -- the standard shell-job-control/process-supervisor pattern of putting a
+        // whole spawned pipeline into one group -- *is* reachable via `children`, covering
+        // "kill the whole pipeline"/"kill the whole group" without needing a general registry.
+        let self_pgid = self.sys_getpgid(0)?;
+        let targets_self = match pid {
+            None | Some(0 | -1) => true,
+            Some(p) if p == self.pid => true,
+            Some(p) => p.checked_neg().is_some_and(|group| group == self_pgid),
+        };
+        let mut delivered = targets_self;
+        if targets_self {
+            self.send_signal(signal, siginfo_kill(signal));
+        }
+        // `tid.is_some()` (tkill/tgkill) always targets one specific thread and never carries
+        // group semantics -- only plain `kill(pid, sig)` (tid.is_none()) does.
+        let target_group = tid
+            .is_none()
+            .then_some(pid)
+            .flatten()
+            .and_then(|p| match p {
+                0 | -1 => Some(self_pgid),
+                p if p < 0 => p.checked_neg(),
+                _ => None,
+            });
+        if let Some(group) = target_group {
+            for child in &self.process().children_in_group(group) {
+                deliver_to_child(child);
+                delivered = true;
+            }
+            // A group op targeting neither self's own group nor any reachable child's group has
+            // literally nothing this shim can deliver to -- ESRCH, matching real Linux's
+            // behavior for a pgid with zero members, rather than silently reporting success.
+            return if delivered { Ok(0) } else { Err(Errno::ESRCH) };
+        }
+        if targets_self {
+            return Ok(0);
+        }
+        // A genuine remote pid (some other, specific process): still no shim-wide pid registry to
+        // find an arbitrary process by pid, but a *direct child* of the caller is reachable via
+        // `children` (populated by `do_clone`'s process-clone branch) -- covering the single most
+        // common real-world case, a supervisor/process-manager signaling a worker it spawned.
+        if let Some(pid) = pid
+            && pid > 0
+            && let Some(child) = self.process().find_child(pid)
+        {
+            deliver_to_child(&child);
+            return Ok(0);
+        }
+        log_unsupported!("sys_kill with a remote pid that isn't a direct child");
+        Err(Errno::ESRCH)
     }
 
     /// Returns whether there are any pending signals that can be delivered.
@@ -755,5 +862,43 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         self.signals.last_exception.set(*info);
         self.force_signal_with_info(signal, false, siginfo_exception(signal, fault_address));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::syscalls::tests::TestPlatform;
+
+    #[test]
+    fn clone_for_new_task_shares_signal_state_for_a_thread_but_not_a_forked_process() {
+        // Regression test: `clone_for_new_task` used to share `shared_pending`/`handlers`
+        // unconditionally, including for a genuine `fork()` -- meaning a process-directed signal
+        // sent to either a forked child or its parent could land in (and be consumed by) the
+        // other's queue instead, and a later `sigaction()` in either process would silently
+        // change the other's handler too.
+        let parent =
+            SignalState::<TestPlatform>::new_process(Arc::new(Mutex::new(PendingSignals::new())));
+
+        let thread_clone = parent.clone_for_new_task(None);
+        assert!(
+            Arc::ptr_eq(&parent.shared_pending, &thread_clone.shared_pending),
+            "a new thread of the same process must share the process-wide pending-signal queue"
+        );
+        assert!(
+            Arc::ptr_eq(&*parent.handlers.borrow(), &*thread_clone.handlers.borrow()),
+            "a new thread of the same process must share signal handler dispositions"
+        );
+
+        let forked_child =
+            parent.clone_for_new_task(Some(Arc::new(Mutex::new(PendingSignals::new()))));
+        assert!(
+            !Arc::ptr_eq(&parent.shared_pending, &forked_child.shared_pending),
+            "a forked child must get its own independent pending-signal queue"
+        );
+        assert!(
+            !Arc::ptr_eq(&*parent.handlers.borrow(), &*forked_child.handlers.borrow()),
+            "a forked child must get its own independent (snapshotted) handler dispositions"
+        );
     }
 }

@@ -6,6 +6,12 @@ RUN apk add --no-cache \
     nodejs \
     npm \
     python3 \
+    python3-dev \
     py3-pip \
     build-base \
-    ca-certificates
+    ca-certificates \
+    git \
+    bash \
+    curl \
+    openssh-client \
+    tzdata

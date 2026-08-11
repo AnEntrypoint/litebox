@@ -5,9 +5,10 @@ Contents:
 - `litebox_runner_linux_on_windows_userland.exe` — the LiteBox runner; runs
   unmodified Linux ELF binaries on Windows.
 - `alpine-rootfs.tar` — an Alpine Linux rootfs (BusyBox userland) with
-  `nodejs`, `npm`, `python3`, `py3-pip`, and `build-base` preinstalled, built
-  from [`dist_tools/base-image/Dockerfile`](base-image/Dockerfile), published
-  to `ghcr.io/<org>/litebox-alpine-base`, and pre-rewritten with the LiteBox
+  `nodejs`, `npm`, `python3`, `py3-pip`, `build-base`, `git`, `bash`, `curl`,
+  `openssh-client`, and `tzdata` preinstalled, built from
+  [`dist_tools/base-image/Dockerfile`](base-image/Dockerfile), published to
+  `ghcr.io/<org>/litebox-alpine-base`, and pre-rewritten with the LiteBox
   syscall rewriter via `litebox-packager --oci-image`.
 - `run-alpine.cmd` / `run-alpine.ps1` — launcher scripts.
 
@@ -36,8 +37,22 @@ work normally.
 `node`, `npm`, `python3`, and `pip3` are preinstalled and ready to run agent
 workloads out of the box. `build-base` (gcc, make, and friends) is included
 so native npm/pip packages that need a compiler can build without any extra
-setup. Nothing about the base image blocks installing further tooling at
-runtime — see Networking below for `apk add`/`npm install`/`pip install`.
+setup, and `python3-dev` is included alongside it -- Alpine splits Python's
+own C headers (`Python.h`) into a separate package from the interpreter, so
+without it `pip install <anything with a C extension>` fails immediately
+with `Python.h: No such file or directory` even with `build-base` present.
+This bites harder on Alpine than on glibc-based images, since most PyPI
+wheels are `manylinux`-tagged rather than `musllinux`, so `pip` falls back
+to a source build (and therefore needs `Python.h`) far more often here.
+`git`, `bash`, `curl`, and `openssh-client` are also preinstalled,
+covering the common day-one needs of an agent workload (cloning a repo,
+running `#!/bin/bash` scripts shipped by npm packages, fetching a file) so
+that no extra `apk add` round-trip is needed just to get started. `tzdata`
+is included too -- Alpine/musl doesn't ship timezone data by default, which
+otherwise silently breaks Python's `zoneinfo` module (and any date/time
+library built on it) for any timezone other than UTC. Nothing about the
+base image blocks installing further tooling at runtime — see
+Networking below for `apk add`/`npm install`/`pip install`.
 
 ## Networking
 

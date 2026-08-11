@@ -49,6 +49,7 @@ pub(crate) enum EpollDescriptor<Platform: ShimPlatform, FS: ShimFS> {
     Socket(Arc<super::net::SocketFd<Platform>>),
     Pipe(Arc<litebox::pipes::PipeFd<Platform>>),
     Unix(Arc<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<Platform, FS>>>),
+    Pty(Arc<TypedFd<super::pty::PtySubsystem<Platform>>>),
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
@@ -76,6 +77,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
         {
             return Ok(EpollDescriptor::Unix(fd));
         }
+        if let Ok(fd) = rds.fd_from_raw_integer::<super::pty::PtySubsystem<Platform>>(raw_fd) {
+            return Ok(EpollDescriptor::Pty(fd));
+        }
         Err(Errno::EBADF)
     }
 }
@@ -87,6 +91,7 @@ enum DescriptorRef<Platform: ShimPlatform, FS: ShimFS> {
     Socket(Weak<super::net::SocketFd<Platform>>),
     Pipe(Weak<litebox::pipes::PipeFd<Platform>>),
     Unix(Weak<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<Platform, FS>>>),
+    Pty(Weak<TypedFd<super::pty::PtySubsystem<Platform>>>),
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> DescriptorRef<Platform, FS> {
@@ -98,6 +103,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> DescriptorRef<Platform, FS> {
             EpollDescriptor::Socket(socket) => Self::Socket(Arc::downgrade(socket)),
             EpollDescriptor::Pipe(pipe) => Self::Pipe(Arc::downgrade(pipe)),
             EpollDescriptor::Unix(unix) => Self::Unix(Arc::downgrade(unix)),
+            EpollDescriptor::Pty(pty) => Self::Pty(Arc::downgrade(pty)),
         }
     }
 
@@ -109,6 +115,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> DescriptorRef<Platform, FS> {
             DescriptorRef::Socket(socket) => socket.upgrade().map(EpollDescriptor::Socket),
             DescriptorRef::Pipe(pipe) => pipe.upgrade().map(EpollDescriptor::Pipe),
             DescriptorRef::Unix(unix) => unix.upgrade().map(EpollDescriptor::Unix),
+            DescriptorRef::Pty(pty) => pty.upgrade().map(EpollDescriptor::Pty),
         }
     }
 }
@@ -177,6 +184,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
             EpollDescriptor::Unix(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
                 Some(handle.with_entry(|entry| poll(entry)))
+            }
+            EpollDescriptor::Pty(fd) => {
+                let handle = global.litebox.descriptor_table().entry_handle(fd)?;
+                Some(handle.with_entry(|entry| entry.with_iopollable(poll)))
             }
         }
     }
@@ -420,6 +431,7 @@ impl EpollEntryKey {
             EpollDescriptor::Socket(socket_fd) => Arc::as_ptr(socket_fd).addr(),
             EpollDescriptor::Pipe(pipe_fd) => Arc::as_ptr(pipe_fd).addr(),
             EpollDescriptor::Unix(unix) => Arc::as_ptr(unix).addr(),
+            EpollDescriptor::Pty(pty) => Arc::as_ptr(pty).addr(),
         };
         Self(fd, ptr)
     }

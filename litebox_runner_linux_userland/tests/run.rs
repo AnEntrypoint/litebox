@@ -228,6 +228,53 @@ fn test_static_exec_with_rewriter() {
 }
 
 #[test]
+fn test_export_and_resume_writable_layer() {
+    // End-to-end regression test for `--export-writable-layer`/`--resume-from`: one runner
+    // invocation writes a file under /tmp and exports the resulting writable layer to a tar
+    // archive; a second, entirely independent runner invocation resumes from that archive (with
+    // no other shared state) and must see the file persist_write.c wrote.
+    let write_target = common::compile(
+        "./tests/persist_write.c",
+        "persist_write_resume_test",
+        false,
+        false,
+    );
+    let read_target = common::compile(
+        "./tests/persist_read.c",
+        "persist_read_resume_test",
+        false,
+        false,
+    );
+
+    let export_path =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("export_resume_roundtrip.tar");
+    let _ = std::fs::remove_file(&export_path);
+
+    let mut writer = Runner::new(&write_target, "persist_write_resume_test_run");
+    writer
+        .command
+        .arg("--export-writable-layer")
+        .arg(&export_path);
+    writer.run();
+    assert!(
+        export_path.exists(),
+        "--export-writable-layer should have created {}",
+        export_path.display()
+    );
+
+    let mut reader = Runner::new(&read_target, "persist_read_resume_test_run");
+    reader.command.arg("--resume-from").arg(&export_path);
+    let output = reader.output();
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("persisted-across-runs"),
+        "resumed run should see the file the exporting run wrote, got: {output_str:?}"
+    );
+
+    std::fs::remove_file(&export_path).unwrap();
+}
+
+#[test]
 fn test_host_program_with_rewrite_syscalls() {
     let target = common::compile("./tests/hello.c", "host_program_rewriter", true, false);
     let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")

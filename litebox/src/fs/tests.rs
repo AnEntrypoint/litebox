@@ -2257,6 +2257,62 @@ mod stdio {
             ))
         ));
     }
+
+    /// Regression test: `open(2)` with `O_NONBLOCK` used to `unimplemented!()`-panic (crashing the
+    /// whole process) for every device this backend serves. Real guests hit this routinely --
+    /// e.g. libuv/Node opening a private `/dev/stdin` fd for `setRawMode`-style termios work with
+    /// `O_NONBLOCK` set. None of these devices need this backend's own `read`/`write` to be
+    /// non-blocking-aware to open successfully: `Stdout`/`Stderr`/`Null`/`URandom` never block,
+    /// and `Stdin`'s actual non-blocking behavior is handled one layer up, by
+    /// `litebox_shim_linux`'s `StdioStatusFlags`-consulting `do_read` (see that crate's
+    /// `insert_raw_file_fd_with_path`) -- this test only needs to confirm opening no longer
+    /// panics, and that the resulting fd remains fully usable.
+    #[test]
+    fn open_with_o_nonblock_does_not_panic() {
+        let platform = MockPlatform::new();
+        let litebox = LiteBox::new(platform);
+        let fs = Resolver::new(
+            &litebox,
+            crate::fs::composer::Composer::builder()
+                .mount("/dev", |allocator| Devices::new(&litebox, allocator))
+                .build()
+                .unwrap(),
+        );
+
+        for (path, flags) in [
+            ("/dev/stdout", OFlags::WRONLY | OFlags::NONBLOCK),
+            ("/dev/stderr", OFlags::WRONLY | OFlags::NONBLOCK),
+            ("/dev/null", OFlags::RDWR | OFlags::NONBLOCK),
+            ("/dev/urandom", OFlags::RDONLY | OFlags::NONBLOCK),
+        ] {
+            let fd = fs
+                .open(path, flags, Mode::empty())
+                .unwrap_or_else(|e| panic!("Failed to open {path} with O_NONBLOCK: {e:?}"));
+            fs.close(&fd)
+                .unwrap_or_else(|e| panic!("Failed to close {path}: {e:?}"));
+        }
+
+        // `/dev/stdin` specifically: confirm a non-blocking open still reads real queued data
+        // rather than merely not panicking.
+        platform
+            .stdin_queue
+            .write()
+            .unwrap()
+            .push_back(b"hi".to_vec());
+        let fd_stdin = fs
+            .open(
+                "/dev/stdin",
+                OFlags::RDONLY | OFlags::NONBLOCK,
+                Mode::empty(),
+            )
+            .expect("Failed to open /dev/stdin with O_NONBLOCK");
+        let mut buffer = vec![0; 2];
+        let bytes_read = fs
+            .read(&fd_stdin, &mut buffer, None)
+            .expect("Failed to read from non-blocking /dev/stdin");
+        assert_eq!(&buffer[..bytes_read], b"hi");
+        fs.close(&fd_stdin).expect("Failed to close /dev/stdin");
+    }
 }
 
 mod layered_stdio {

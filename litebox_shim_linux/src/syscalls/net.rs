@@ -349,10 +349,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                         opt.reuse_address = val != 0;
                     }
                     (SocketOption::BROADCAST, SocketOptionValue::U32(val)) => {
+                        // `opt.broadcast` is a pure software flag here (only ever read back via
+                        // `getsockopt`, see the `SocketOption::BROADCAST` arm below -- nothing
+                        // else in this shim consults it to gate/enforce broadcast sends), so this
+                        // assignment already fully implements both enabling and disabling; the
+                        // `val == 0` case used to unconditionally panic (`todo!("disable
+                        // SO_BROADCAST")`) despite there being nothing further to do.
                         opt.broadcast = val != 0;
-                        if val == 0 {
-                            todo!("disable SO_BROADCAST");
-                        }
                     }
                     (SocketOption::KEEPALIVE, SocketOptionValue::U32(val)) => {
                         let keep_alive = val != 0;
@@ -379,7 +382,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                         return Err(Errno::EBADF);
                     }
                     litebox::net::errors::SetTcpOptionError::NotTcpSocket => {
-                        unimplemented!("SO_KEEPALIVE is not supported for non-TCP sockets")
+                        // `SO_KEEPALIVE` is a generic `SOL_SOCKET` option real Linux accepts on
+                        // any socket type -- it's simply a no-op for a non-connection-oriented
+                        // protocol like UDP, not an error. `opt.keep_alive` (read back by
+                        // `getsockopt`) was already updated above regardless of this deferred
+                        // TCP-specific step failing, so there's nothing further to do. Reachable
+                        // via e.g. `s=socket(AF_INET,SOCK_DGRAM); setsockopt(s,SOL_SOCKET,
+                        // SO_KEEPALIVE,&1,4)`, a real pattern in libraries that set a common
+                        // socket-option baseline before checking the actual protocol.
                     }
                     _ => unimplemented!(),
                 }
@@ -988,15 +998,38 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         }
                         litebox::net::Protocol::Udp
                     }
-                    SockType::Raw => todo!(),
+                    SockType::Raw => {
+                        // Raw sockets require CAP_NET_RAW on real Linux; this shim's guest always
+                        // runs as a single, fixed, unprivileged identity with no capability model
+                        // (see the shim-wide credentials design), so it's never entitled to one --
+                        // matching what an unprivileged process (e.g. `ping`/`traceroute` without
+                        // the setuid-root/CAP_NET_RAW bit, or inside a container missing that
+                        // capability) sees on real Linux, rather than panicking.
+                        log_unsupported!("raw sockets (SOCK_RAW)");
+                        return Err(Errno::EPERM);
+                    }
                     _ => unimplemented!(),
                 };
                 let socket = self.global.net.lock().socket(protocol)?;
                 let _ = self.global.initialize_socket(&socket, ty, flags);
-                let Ok(raw_fd) = files.insert_raw_fd(socket) else {
-                    unimplemented!()
-                };
-                raw_fd
+                files.insert_raw_fd(socket).map_err(|socket| {
+                    // Mirrors the `AddressFamily::UNIX` arm below: `insert_raw_fd` failing
+                    // means the fd table is at its `RLIMIT_NOFILE`/shim-wide limit -- an
+                    // ordinary, guest-triggerable condition (e.g. `setrlimit(RLIMIT_NOFILE,
+                    // small)` then `socket()`, or a server `socket()`/`accept()`ing past its
+                    // fd limit under load), not something that should crash the runner. This
+                    // fd was never exposed to the guest, so there's no pending data to drain
+                    // gracefully -- tear down the network-subsystem-side state
+                    // `initialize_socket`/`net.lock().socket()` already allocated immediately
+                    // (the same way `close_socket`'s own timed-out-wait path does) before
+                    // reporting `EMFILE`.
+                    let _ = self
+                        .global
+                        .net
+                        .lock()
+                        .close(&socket, CloseBehavior::Immediate);
+                    Errno::EMFILE
+                })?
             }
             AddressFamily::UNIX => {
                 let _ = UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
@@ -1137,7 +1170,19 @@ pub(crate) fn read_sockaddr_from_user<Platform: ShimPlatform>(
                 s.to_string_lossy().to_string(),
             )))
         }
-        _ => todo!("unsupported family {family:?}"),
+        // `AddressFamily` is a closed, 4-variant enum (`UNIX`/`INET`/`INET6`/`NETLINK`) -- any
+        // other wire value already fails the `try_from` above with `EAFNOSUPPORT`, so this arm
+        // is reached specifically for `INET6`/`NETLINK`, neither of which this shim implements.
+        // Real-world trigger: any guest `socket(AF_INET6, ...)` followed by `connect`/`bind`/
+        // `sendto` -- not exotic, since IPv6 is often the *default* resolution result (e.g.
+        // Node's/Python's DNS resolution preferring an AAAA record, or a guest explicitly
+        // dialing `::1`/`[::]` for "localhost"). This previously crashed the whole runner
+        // (`todo!()`) instead of returning the same `EAFNOSUPPORT` a real Linux kernel would
+        // give a caller for a family the *socket itself* wasn't created with support for.
+        _ => {
+            log_unsupported!("sockaddr with family {family:?}");
+            Err(Errno::EAFNOSUPPORT)
+        }
     }
 }
 
@@ -1283,9 +1328,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .global
                     .initialize_socket(&accepted_file, sock_type, flags);
                 proxy.set_state(SocketState::Connected);
-                let Ok(raw_fd) = files.insert_raw_fd(accepted_file) else {
-                    unimplemented!()
-                };
+                let raw_fd = files
+                    .insert_raw_fd(accepted_file)
+                    .map_err(|accepted_file| {
+                        // Mirrors `do_socket`'s identical `insert_raw_fd` handling: a busy server
+                        // `accept()`ing past its fd limit under load is an ordinary,
+                        // guest-triggerable condition on real Linux (which returns `EMFILE` from
+                        // `accept()` itself in exactly this case), not something that should crash
+                        // the runner. The accepted connection was never exposed to the guest, so
+                        // tear down its network-subsystem-side state immediately rather than
+                        // leaking it, before reporting `EMFILE`.
+                        let _ = self
+                            .global
+                            .net
+                            .lock()
+                            .close(&accepted_file, CloseBehavior::Immediate);
+                        Errno::EMFILE
+                    })?;
                 Ok((raw_fd, peer_addr))
             },
             |file| {
@@ -2124,6 +2183,66 @@ mod tests {
     const SERVER_PORT: u16 = 8080;
     const CLIENT_PORT: u16 = 8081;
 
+    /// Regression test: a sockaddr with `sa_family` set to `AF_INET6` or `AF_NETLINK` used to
+    /// unconditionally panic (`todo!("unsupported family {family:?}")`) in
+    /// `read_sockaddr_from_user`, crashing the whole runner -- reachable from any guest
+    /// `connect`/`bind`/`sendto`/`sendmsg` call, independent of which family the fd itself was
+    /// created with (e.g. IPv6 being the default result of DNS resolution on many systems, or a
+    /// mismatched sockaddr passed to an unrelated fd). `AddressFamily` is a closed, 4-variant
+    /// enum (any other wire value already correctly fails with `EAFNOSUPPORT` one line above the
+    /// old panic site), so `INET6`/`NETLINK` are the only two values that could ever reach it.
+    #[test]
+    fn read_sockaddr_from_user_rejects_unsupported_families_instead_of_panicking() {
+        for (name, code) in [
+            ("AF_INET6", AddressFamily::INET6 as u16),
+            ("AF_NETLINK", AddressFamily::NETLINK as u16),
+        ] {
+            let mut buf = [0u8; core::mem::size_of::<CSockInetAddr>()];
+            buf[..2].copy_from_slice(&code.to_ne_bytes());
+            let result = read_sockaddr_from_user::<crate::syscalls::tests::TestPlatform>(
+                UserPtr::from_usize(buf.as_ptr() as usize),
+                buf.len(),
+            );
+            assert_eq!(
+                result.unwrap_err(),
+                Errno::EAFNOSUPPORT,
+                "family {name} must fail cleanly, not panic"
+            );
+        }
+    }
+
+    /// Regression test: `socket(AF_INET, ...)` used to unconditionally panic
+    /// (`unimplemented!()`) when `insert_raw_fd` failed because the fd table was at its
+    /// `RLIMIT_NOFILE`/shim-wide limit -- an ordinary, guest-triggerable condition (e.g. a
+    /// server hitting its fd limit under load, or a guest explicitly lowering its own
+    /// `RLIMIT_NOFILE`), not something that should crash the runner. Confirms it now returns
+    /// `EMFILE`, matching the already-correct `AddressFamily::UNIX` sibling arm right below the
+    /// old panic site.
+    #[test]
+    fn socket_fails_with_emfile_instead_of_panicking_at_the_fd_limit() {
+        use litebox_common_linux::{Rlimit, RlimitResource};
+
+        let task = init_platform(None);
+
+        let cur = task
+            .do_prlimit(RlimitResource::NOFILE, None)
+            .expect("getrlimit(NOFILE) failed");
+        let probe_fd = task.sys_dup(0, None, None).expect("probe dup failed");
+        task.do_prlimit(
+            RlimitResource::NOFILE,
+            Some(Rlimit {
+                rlim_cur: probe_fd as usize + 1,
+                rlim_max: cur.rlim_max,
+            }),
+        )
+        .expect("lowering NOFILE cur limit should succeed");
+
+        let err = task
+            .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
+            .expect_err("socket() at the fd limit must fail cleanly, not panic");
+        assert_eq!(err, Errno::EMFILE);
+    }
+
     fn close_socket(task: &TestTask, fd: u32) {
         task.sys_close(i32::try_from(fd).unwrap())
             .expect("close socket failed");
@@ -2802,6 +2921,106 @@ mod tests {
         assert_eq!(result, 1);
     }
 
+    #[test]
+    fn raw_socket_returns_eperm_instead_of_panicking() {
+        // Regression test: socket(AF_INET, SOCK_RAW, ...) used to unconditionally panic
+        // (todo!()). Real Linux requires CAP_NET_RAW, which this shim's guest (a single, fixed,
+        // unprivileged identity with no capability model) never has -- matching what an
+        // unprivileged real-Linux process (e.g. ping/traceroute without CAP_NET_RAW) sees.
+        let task = init_platform(None);
+        let err = task
+            .do_socket(AddressFamily::INET, SockType::Raw, SockFlags::empty(), 0)
+            .unwrap_err();
+        assert_eq!(err, Errno::EPERM);
+    }
+
+    #[test]
+    fn so_broadcast_can_be_disabled_after_being_enabled() {
+        // Regression test: setsockopt(SOL_SOCKET, SO_BROADCAST, 0) (disabling it) used to
+        // unconditionally panic (todo!("disable SO_BROADCAST")), even though the assignment right
+        // before the panic already fully updates the (purely software) flag.
+        let task = init_platform(None);
+        let sockfd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Datagram,
+                SockFlags::empty(),
+                0,
+            )
+            .expect("failed to create socket");
+
+        let enable: u32 = 1;
+        let optval = UserPtr::from_usize((&raw const enable).cast::<u8>() as usize);
+        task.do_setsockopt(
+            sockfd,
+            SocketOptionName::Socket(SocketOption::BROADCAST),
+            optval,
+            core::mem::size_of::<u32>(),
+        )
+        .expect("failed to enable SO_BROADCAST");
+
+        let disable: u32 = 0;
+        let optval = UserPtr::from_usize((&raw const disable).cast::<u8>() as usize);
+        task.do_setsockopt(
+            sockfd,
+            SocketOptionName::Socket(SocketOption::BROADCAST),
+            optval,
+            core::mem::size_of::<u32>(),
+        )
+        .expect("failed to disable SO_BROADCAST");
+
+        let mut result: u32 = 42;
+        let optval_out = UserPtrMut::from_usize((&raw mut result).cast::<u8>() as usize);
+        task.do_getsockopt(
+            sockfd,
+            SocketOptionName::Socket(SocketOption::BROADCAST),
+            optval_out,
+            core::mem::size_of::<u32>().trunc(),
+        )
+        .expect("failed to get SO_BROADCAST");
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn so_keepalive_on_a_udp_socket_is_a_no_op_not_a_panic() {
+        // Regression test: setsockopt(SOL_SOCKET, SO_KEEPALIVE, 1) on a non-TCP socket used to
+        // unconditionally panic (unimplemented!("SO_KEEPALIVE is not supported for non-TCP
+        // sockets")). Real Linux accepts SO_KEEPALIVE on any socket type -- it's a generic
+        // SOL_SOCKET option that's simply a no-op for a connectionless protocol like UDP, not an
+        // error -- so this must succeed, and the software-only flag getsockopt reads back must
+        // reflect the value that was set.
+        let task = init_platform(None);
+        let sockfd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Datagram,
+                SockFlags::empty(),
+                0,
+            )
+            .expect("failed to create socket");
+
+        let enable: u32 = 1;
+        let optval = UserPtr::from_usize((&raw const enable).cast::<u8>() as usize);
+        task.do_setsockopt(
+            sockfd,
+            SocketOptionName::Socket(SocketOption::KEEPALIVE),
+            optval,
+            core::mem::size_of::<u32>(),
+        )
+        .expect("SO_KEEPALIVE on a UDP socket must succeed, not panic");
+
+        let mut result: u32 = 0;
+        let optval_out = UserPtrMut::from_usize((&raw mut result).cast::<u8>() as usize);
+        task.do_getsockopt(
+            sockfd,
+            SocketOptionName::Socket(SocketOption::KEEPALIVE),
+            optval_out,
+            core::mem::size_of::<u32>().trunc(),
+        )
+        .expect("failed to get SO_KEEPALIVE");
+        assert_eq!(result, 1);
+    }
+
     #[ignore = "timeout is 75s"]
     #[test]
     fn test_tun_tcp_so_error_network_unreachable() {
@@ -3440,6 +3659,45 @@ mod unix_tests {
         close_socket(&task, server_fd);
         task.sys_unlinkat(-1, server_path, AtFlags::empty())
             .unwrap();
+    }
+
+    #[test]
+    fn test_unix_socket_autobind_does_not_panic_and_assigns_unique_abstract_addrs() {
+        // Regression test: `bind()` called with no address at all (`addrlen ==
+        // sizeof(sa_family_t)`, i.e. `UnixSocketAddr::Unnamed`) used to unconditionally panic
+        // (`todo!("autobind for unnamed unix socket")`). Real Linux auto-assigns an
+        // abstract-namespace address in this case (see `unix(7)`); verify two independent
+        // autobind calls get distinct, non-empty abstract addresses starting with a NUL byte,
+        // matching Linux's format.
+        let task = init_platform(None);
+        let fd1 = create_unix_socket(&task, SockType::Datagram, SockFlags::empty());
+        let fd2 = create_unix_socket(&task, SockType::Datagram, SockFlags::empty());
+
+        task.do_bind(fd1, SocketAddress::Unix(UnixSocketAddr::Unnamed))
+            .unwrap();
+        task.do_bind(fd2, SocketAddress::Unix(UnixSocketAddr::Unnamed))
+            .unwrap();
+
+        let SocketAddress::Unix(UnixSocketAddr::Abstract(addr1)) =
+            task.do_getsockname(fd1).unwrap()
+        else {
+            panic!("autobind must assign an abstract-namespace address");
+        };
+        let SocketAddress::Unix(UnixSocketAddr::Abstract(addr2)) =
+            task.do_getsockname(fd2).unwrap()
+        else {
+            panic!("autobind must assign an abstract-namespace address");
+        };
+
+        assert!(!addr1.is_empty());
+        assert!(!addr2.is_empty());
+        assert_ne!(
+            addr1, addr2,
+            "two autobind calls must get distinct addresses"
+        );
+
+        close_socket(&task, fd1);
+        close_socket(&task, fd2);
     }
 
     #[test]
