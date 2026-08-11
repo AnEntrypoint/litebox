@@ -330,6 +330,17 @@ Concretely, this build fixes (all landed on `main`, CI-verified):
   before the fd-insert failure (so a failed `socket()`/`accept()` doesn't
   leak a `smoltcp` socket-set slot), matching the already-correct
   `AF_UNIX` sibling arm in both functions.
+- **`SO_KEEPALIVE` on a non-TCP socket no longer crashes.**
+  `setsockopt(SOL_SOCKET, SO_KEEPALIVE, ...)` on a UDP (or any non-TCP)
+  socket unconditionally panicked instead of succeeding as a no-op. Real
+  Linux accepts `SO_KEEPALIVE` on any socket type -- it's a generic
+  `SOL_SOCKET` option that simply has no effect on a connectionless
+  protocol, not an error -- and the software-only flag `getsockopt`
+  reads back was already updated before the deferred TCP-specific step
+  failed, so there was genuinely nothing left to do. Reachable via
+  ordinary code that sets a common socket-option baseline before
+  checking the actual protocol (e.g. `s=socket(AF_INET,SOCK_DGRAM);
+  setsockopt(s,SOL_SOCKET,SO_KEEPALIVE,&1,4)`).
 
 A ready-to-run bundle (the Windows runner exe plus a packaged Alpine rootfs)
 is built by [`.github/workflows/release-windows-alpine.yml`](.github/workflows/release-windows-alpine.yml).
