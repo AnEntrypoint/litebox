@@ -634,7 +634,8 @@ impl RawDescriptorStorage {
     /// `TypedFd`, or `None` if the fd could not be duplicated (e.g. already closed concurrently
     /// on the global table), in which case the slot is dropped from the duplicate table.
     #[must_use]
-    pub fn fork_duplicate<S1, S2, S3, S4, S5, S6>(
+    #[expect(clippy::too_many_arguments)]
+    pub fn fork_duplicate<S1, S2, S3, S4, S5, S6, S7>(
         &self,
         mut f1: impl FnMut(&TypedFd<S1>) -> Option<TypedFd<S1>>,
         mut f2: impl FnMut(&TypedFd<S2>) -> Option<TypedFd<S2>>,
@@ -642,6 +643,7 @@ impl RawDescriptorStorage {
         mut f4: impl FnMut(&TypedFd<S4>) -> Option<TypedFd<S4>>,
         mut f5: impl FnMut(&TypedFd<S5>) -> Option<TypedFd<S5>>,
         mut f6: impl FnMut(&TypedFd<S6>) -> Option<TypedFd<S6>>,
+        mut f7: impl FnMut(&TypedFd<S7>) -> Option<TypedFd<S7>>,
     ) -> Self
     where
         S1: FdEnabledSubsystem,
@@ -650,11 +652,12 @@ impl RawDescriptorStorage {
         S4: FdEnabledSubsystem,
         S5: FdEnabledSubsystem,
         S6: FdEnabledSubsystem,
+        S7: FdEnabledSubsystem,
     {
         let mut new = Self { stored_fds: vec![] };
         for raw_fd in self.iter_alive() {
             let new_fd = self
-                .invoke_matching_subsystem_6(
+                .invoke_matching_subsystem_7(
                     raw_fd,
                     |fd: Arc<TypedFd<S1>>| f1(&fd).map(StoredFd::new::<S1>),
                     |fd: Arc<TypedFd<S2>>| f2(&fd).map(StoredFd::new::<S2>),
@@ -662,6 +665,7 @@ impl RawDescriptorStorage {
                     |fd: Arc<TypedFd<S4>>| f4(&fd).map(StoredFd::new::<S4>),
                     |fd: Arc<TypedFd<S5>>| f5(&fd).map(StoredFd::new::<S5>),
                     |fd: Arc<TypedFd<S6>>| f6(&fd).map(StoredFd::new::<S6>),
+                    |fd: Arc<TypedFd<S7>>| f7(&fd).map(StoredFd::new::<S7>),
                 )
                 .ok()
                 .flatten();
@@ -855,7 +859,7 @@ impl RawDescriptorStorage {
     multi_subsystem_generic! {invoke_matching_subsystem_2, typed_fd_at_raw_2, f1 S1, f2 S2}
     multi_subsystem_generic! {invoke_matching_subsystem_3, typed_fd_at_raw_3, f1 S1, f2 S2, f3 S3}
     multi_subsystem_generic! {invoke_matching_subsystem_4, typed_fd_at_raw_4, f1 S1, f2 S2, f3 S3, f4 S4}
-    multi_subsystem_generic! {invoke_matching_subsystem_6, typed_fd_at_raw_6, f1 S1, f2 S2, f3 S3, f4 S4, f5 S5, f6 S6}
+    multi_subsystem_generic! {invoke_matching_subsystem_7, typed_fd_at_raw_7, f1 S1, f2 S2, f3 S3, f4 S4, f5 S5, f6 S6, f7 S7}
 }
 
 /// A LiteBox subsystem that support having file descriptors.

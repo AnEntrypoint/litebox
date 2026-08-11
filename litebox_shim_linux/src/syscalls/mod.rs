@@ -11,6 +11,7 @@ pub(crate) mod mm;
 pub(crate) mod net;
 pub(crate) mod pipe;
 pub mod process;
+pub(crate) mod pty;
 pub(crate) mod unix;
 
 pub(crate) mod signal;

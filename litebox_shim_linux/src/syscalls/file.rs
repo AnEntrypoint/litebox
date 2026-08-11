@@ -150,6 +150,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
             |fd: &TypedFd<super::unix::UnixSocketSubsystem<Platform, FS>>| {
                 dup_preserving_cloexec(litebox, fd)
             },
+            |fd: &TypedFd<super::pty::PtySubsystem<Platform>>| dup_preserving_cloexec(litebox, fd),
         );
         Self {
             fs: self.fs.clone(),
@@ -581,8 +582,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `open`
     pub fn sys_open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
         let path = self.resolve_path(path)?;
-        let file = self.do_open(path.clone(), flags, mode)?;
-        self.insert_raw_file_fd_with_path(file, flags, Some(path))
+        self.do_open_resolved(path, flags, mode)
     }
 
     /// Handle syscall `openat`
@@ -594,8 +594,54 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         mode: Mode,
     ) -> Result<u32, Errno> {
         let path = self.resolve_path_at(dirfd, pathname)?;
+        self.do_open_resolved(path, flags, mode)
+    }
+
+    /// Open an already-resolved absolute `path`, routing `/dev/ptmx` and `/dev/pts/<id>` to the
+    /// pty subsystem (see `syscalls::pty`) instead of the ordinary filesystem-backed path -- the
+    /// underlying `FileSystem` layer has no live per-open state to back a pty pair (`Device` in
+    /// `litebox::fs::devices` is stateless/`Copy`), so these two paths never reach `do_open`/`fs`
+    /// at all.
+    fn do_open_resolved(&self, path: CString, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
+        let path_str = path.to_str().unwrap_or_default();
+        if path_str == "/dev/ptmx" {
+            let (master, _id) = self.global.ptmx_open();
+            return self.insert_raw_pty_fd(master, flags, path);
+        }
+        if let Some(id_str) = path_str.strip_prefix("/dev/pts/")
+            && let Ok(id) = id_str.parse::<u32>()
+        {
+            let slave = self.global.pts_open(id)?;
+            return self.insert_raw_pty_fd(slave, flags, path);
+        }
         let file = self.do_open(path.clone(), flags, mode)?;
         self.insert_raw_file_fd_with_path(file, flags, Some(path))
+    }
+
+    /// Install a freshly allocated/looked-up pty fd (master via `/dev/ptmx`, slave via
+    /// `/dev/pts/<id>`) into this process's raw fd table, mirroring
+    /// `insert_raw_file_fd_with_path`'s `O_CLOEXEC`/path-bookkeeping handling for regular files.
+    fn insert_raw_pty_fd(
+        &self,
+        fd: super::pty::PtyFd<Platform>,
+        flags: OFlags,
+        path: CString,
+    ) -> Result<u32, Errno> {
+        if flags.contains(OFlags::CLOEXEC) {
+            let old = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
+            assert!(old.is_none());
+        }
+        let files = self.files.borrow();
+        let raw_fd = files.insert_raw_fd(fd).map_err(|fd| {
+            drop(self.global.litebox.descriptor_table_mut().remove(&fd));
+            Errno::EMFILE
+        })?;
+        files.record_fd_path(raw_fd, path);
+        Ok(u32::try_from(raw_fd).unwrap())
     }
 
     /// Handle syscall `ftruncate`
@@ -610,6 +656,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |fd| files.fs.truncate(fd, length, false).map_err(Errno::from),
                 |_fd| todo!("net"),
                 |_fd| todo!("pipes"),
+                |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
@@ -828,6 +875,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         )
                     })
                 },
+                |fd| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    espipe_for_non_seekable_offset(offset)?;
+                    handle.with_entry(|end| end.read(&self.wait_cx(), &mut buf.borrow_mut()))
+                },
             )
             .flatten()?;
         // For datagrams, the returned size represents the actual size of the message,
@@ -896,6 +953,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         file.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
                     })
                 },
+                |fd| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    espipe_for_non_seekable_offset(offset)?;
+                    handle.with_entry(|end| end.write(&self.wait_cx(), buf))
+                },
             )
             .flatten();
         if let Err(Errno::EPIPE) = res {
@@ -933,6 +1000,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .map(|_| ())
                         .map_err(Errno::from)
                 },
+                |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
@@ -986,6 +1054,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .run_on_raw_fd(
                         in_raw_fd,
                         |fd| files.fs.read(fd, buf_slice, cur_off).map_err(Errno::from),
+                        |_fd| Err(non_fs_err),
                         |_fd| Err(non_fs_err),
                         |_fd| Err(non_fs_err),
                         |_fd| Err(non_fs_err),
@@ -1112,6 +1181,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_| Err(Errno::ESPIPE),
                 |_| Err(Errno::ESPIPE),
                 |_| Err(Errno::ESPIPE),
+                |_| Err(Errno::ESPIPE),
             )
             .flatten()
     }
@@ -1191,6 +1261,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Eventfd(alloc::sync::Arc<TypedFd<super::eventfd::EventfdSubsystem<Platform>>>),
             Epoll(alloc::sync::Arc<TypedFd<super::epoll::EpollSubsystem<Platform, FS>>>),
             Unix(alloc::sync::Arc<TypedFd<super::unix::UnixSocketSubsystem<Platform, FS>>>),
+            Pty(alloc::sync::Arc<TypedFd<super::pty::PtySubsystem<Platform>>>),
         }
 
         let files = self.files.borrow();
@@ -1227,6 +1298,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     )
                 {
                     ConsumedFd::Unix(fd)
+                } else if let Ok(fd) =
+                    rds.fd_consume_raw_integer::<super::pty::PtySubsystem<Platform>>(raw_fd)
+                {
+                    ConsumedFd::Pty(fd)
                 } else {
                     unreachable!("all subsystems covered")
                 }
@@ -1276,6 +1351,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     let mut dt = self.global.litebox.descriptor_table_mut();
                     dt.remove(&fd)
                 };
+                // do not hold any locks while dropping the entry
+                drop(entry);
+                Ok(())
+            }
+            ConsumedFd::Pty(fd) => {
+                let entry = {
+                    let mut dt = self.global.litebox.descriptor_table_mut();
+                    dt.remove(&fd)
+                };
+                // Closing the *master* side's last reference releases this shim's own held
+                // template copy of the slave (see `GlobalState::ptmx_closed`); any fds a guest
+                // already obtained via `/dev/pts/<id>` keep working exactly like any other
+                // `dup()`'d fd surviving the original fd's close.
+                if let Some(end) = &entry
+                    && end.is_master()
+                {
+                    self.global.ptmx_closed(end.pair().id);
+                }
                 // do not hold any locks while dropping the entry
                 drop(entry);
                 Ok(())
@@ -1721,6 +1814,12 @@ where
             |_fd| Ok(T::from(synthetic(rw_user_mode, 4096))),
             |_fd| Ok(T::from(synthetic(rw_user_mode, 0))),
             |_fd| Ok(T::from(synthetic(socket_mode, 4096))),
+            |_fd| {
+                Ok(T::from(synthetic(
+                    litebox_common_linux::InodeType::CharDevice as u32 | rw_user_mode,
+                    0,
+                )))
+            },
         )
         .flatten()
 }
@@ -1750,6 +1849,7 @@ pub(crate) fn get_file_descriptor_flags<Platform: ShimPlatform, FS: ShimFS>(
         |fd| get_flags(global, fd),
         |fd| get_flags(global, fd),
         |fd| get_flags(global, fd),
+        |fd| get_flags(global, fd),
     )
 }
 
@@ -1772,6 +1872,7 @@ fn set_file_descriptor_flags<Platform: ShimPlatform, FS: ShimFS>(
 
     files.run_on_raw_fd(
         raw_fd,
+        |fd| set_flags(global, fd, flags),
         |fd| set_flags(global, fd, flags),
         |fd| set_flags(global, fd, flags),
         |fd| set_flags(global, fd, flags),
@@ -2050,6 +2151,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         |fd| getfl_from_handle!(fd),
                         |fd| getfl_from_handle!(fd),
                         |fd| getfl_from_handle!(fd),
+                        |fd| getfl_from_handle!(fd),
                     )
                     .flatten()?
                     .bits())
@@ -2151,6 +2253,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         toggle_flags!(fd);
                         Ok(())
                     },
+                    |fd| {
+                        toggle_flags!(fd);
+                        Ok(())
+                    },
                 )??;
                 Ok(0)
             }
@@ -2180,6 +2286,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
+                        |_fd| Err(Errno::EBADF),
                     )
                     .flatten()
             }
@@ -2199,6 +2306,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         },
                         |_fd| todo!("net"),
                         |_fd| todo!("pipes"),
+                        |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
@@ -2268,6 +2376,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // `flock()` on a non-regular-file fd (socket/pipe/eventfd/epoll/unix socket) is
                 // rejected with `EINVAL`, matching Linux (only regular files, directories, and a
                 // handful of special files support `flock()`; none of LiteBox's other fd kinds do).
+                |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
@@ -2519,7 +2628,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
-            IoctlArg::TIOCGPTN(_) => Err(Errno::ENOTTY),
+            // Both are pty-specific: meaningless (and `ENOTTY` on real Linux) for a plain stdio
+            // fd, unlike `pty_ioctl`'s handling of the same commands on an actual pty.
+            IoctlArg::TIOCGPTN(_) | IoctlArg::TIOCSPTLCK(_) => Err(Errno::ENOTTY),
             IoctlArg::TIOCGPGRP(pgrp_ptr) => {
                 let dt = self.global.litebox.descriptor_table();
                 let pgid = dt
@@ -2541,7 +2652,88 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 dt.set_entry_metadata(fd, crate::ForegroundPgid(pgid));
                 Ok(0)
             }
+            IoctlArg::TIOCSWINSZ(_) => {
+                // No window-size state is tracked for plain stdio fds (unlike ptys, where
+                // `pty_ioctl` stores it on the shared `PtyPair`): accept-and-ignore, matching
+                // this build's "accept every TCSETS*-family ioctl" stance rather than ENOTTY.
+                Ok(0)
+            }
             _ => todo!(),
+        }
+    }
+
+    /// Handle a `TCGETS`/`TCSETS*`/`TIOCGWINSZ`/`TIOCSWINSZ`/`TIOCGPTN`/`TIOCSPTLCK`/
+    /// `TIOCGPGRP`/`TIOCSPGRP` ioctl on a pty fd (master or slave).
+    ///
+    /// `TIOCGPTN`/`TIOCSPTLCK` are master-only (matching real Linux, which returns `ENOTTY` for
+    /// them on the slave); every other command works on both sides, reading/writing the state
+    /// shared on the pty's [`super::pty::PtyPair`] so master and slave observe the same tty
+    /// state, exactly as real Linux's master/slave pair do.
+    fn pty_ioctl(&self, end: &super::pty::PtyEnd<Platform>, arg: &IoctlArg) -> Result<u32, Errno> {
+        let pair = end.pair();
+        match arg {
+            IoctlArg::TCGETS(termios_ptr) => {
+                termios_ptr
+                    .write_at_offset::<Platform>(0, pair.get_termios())
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TCSETS(termios_ptr)
+            | IoctlArg::TCSETSW(termios_ptr)
+            | IoctlArg::TCSETSF(termios_ptr) => {
+                let termios = termios_ptr
+                    .read_at_offset::<Platform>(0)
+                    .ok_or(Errno::EFAULT)?;
+                pair.set_termios(termios);
+                Ok(0)
+            }
+            IoctlArg::TIOCGWINSZ(ws) => {
+                ws.write_at_offset::<Platform>(0, pair.get_winsize())
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TIOCSWINSZ(ws) => {
+                let winsize = ws.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                pair.set_winsize(winsize);
+                Ok(0)
+            }
+            IoctlArg::TIOCGPTN(ptr) => {
+                if !end.is_master() {
+                    return Err(Errno::ENOTTY);
+                }
+                ptr.write_at_offset::<Platform>(0, pair.id)
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TIOCSPTLCK(ptr) => {
+                if !end.is_master() {
+                    return Err(Errno::ENOTTY);
+                }
+                let val = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                pair.set_locked(val != 0);
+                Ok(0)
+            }
+            IoctlArg::TIOCGPGRP(pgrp_ptr) => {
+                let pgid = match pair.get_fg_pgid() {
+                    0 => self.pid,
+                    pgid => pgid,
+                };
+                pgrp_ptr
+                    .write_at_offset::<Platform>(0, pgid)
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TIOCSPGRP(pgrp_ptr) => {
+                let pgid = pgrp_ptr
+                    .read_at_offset::<Platform>(0)
+                    .ok_or(Errno::EFAULT)?;
+                if pgid <= 0 {
+                    return Err(Errno::EINVAL);
+                }
+                pair.set_fg_pgid(pgid);
+                Ok(0)
+            }
+            _ => Err(Errno::ENOTTY),
         }
     }
 
@@ -2651,6 +2843,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             });
                             Ok(())
                         },
+                        |fd| {
+                            let handle = self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .entry_handle(fd)
+                                .ok_or(Errno::EBADF)?;
+                            handle.with_entry(|end| {
+                                end.set_status(OFlags::NONBLOCK, val != 0);
+                            });
+                            Ok(())
+                        },
                     )
                     .flatten()?;
                 Ok(0)
@@ -2691,13 +2895,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
                     Ok(0)
                 },
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                    Ok(0)
+                },
             )?,
             IoctlArg::TCGETS(..)
             | IoctlArg::TCSETS(..)
             | IoctlArg::TCSETSW(..)
             | IoctlArg::TCSETSF(..)
-            | IoctlArg::TIOCGPTN(..)
             | IoctlArg::TIOCGWINSZ(..)
+            | IoctlArg::TIOCSWINSZ(..)
+            | IoctlArg::TIOCGPTN(..)
+            | IoctlArg::TIOCSPTLCK(..)
             | IoctlArg::TIOCGPGRP(..)
             | IoctlArg::TIOCSPGRP(..) => files.run_on_raw_fd(
                 desc,
@@ -2733,6 +2947,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
+                |fd| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|end| self.pty_ioctl(end, &arg))
+                },
             )?,
             _ => {
                 log_unsupported!("ioctl with arg {:?}", arg);
@@ -3181,6 +3404,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |fd| dup(self, &files, fd, close_on_exec, target),
                 |fd| dup(self, &files, fd, close_on_exec, target),
                 |fd| dup(self, &files, fd, close_on_exec, target),
+                |fd| dup(self, &files, fd, close_on_exec, target),
             )
             .map_err(|_| DupFdError::BadFd)?
     }
@@ -3337,6 +3561,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .set_fd_metadata(file, Diroff(dir_off));
                 Ok(nbytes)
             },
+            |_fd| Err(Errno::ENOTDIR),
             |_fd| Err(Errno::ENOTDIR),
             |_fd| Err(Errno::ENOTDIR),
             |_fd| Err(Errno::ENOTDIR),

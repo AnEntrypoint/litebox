@@ -85,6 +85,17 @@ Concretely, this build fixes (all landed on `main`, CI-verified):
   `nodejs`/`npm`/`python3`/`py3-pip`/`build-base`, so common agent-workload
   needs (cloning a repo, running a `#!/bin/bash` npm postinstall script,
   fetching a file) don't require an extra `apk add` round-trip.
+- **Unix98 pseudoterminal (pty) support.** `/dev/ptmx`, `TIOCGPTN`,
+  `TIOCSPTLCK` (`unlockpt`), and `/dev/pts/<id>` now work, with real duplex
+  master/slave byte forwarding and shared `termios`/window-size/foreground-
+  pgid state -- previously `TIOCGPTN` unconditionally returned `ENOTTY` and
+  there was no pty subsystem at all. This is what lets `node-pty`,
+  `pexpect`/`ptyprocess`, `tmux`, and `script` allocate and drive a pty
+  inside the guest. Line discipline (kernel-side canonical-mode input
+  buffering/echo/^C-^Z signal generation) is not implemented -- every
+  consumer that puts the pty into raw mode itself (which is what all of the
+  above do) is unaffected, but a guest shell relying on the kernel to echo
+  typed characters back in cooked mode will not see that echo.
 
 A ready-to-run bundle (the Windows runner exe plus a packaged Alpine rootfs)
 is built by [`.github/workflows/release-windows-alpine.yml`](.github/workflows/release-windows-alpine.yml).
