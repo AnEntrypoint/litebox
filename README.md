@@ -163,6 +163,14 @@ Concretely, this build fixes (all landed on `main`, CI-verified):
   reachable from the parent), so an ignored signal still costs the child
   one spurious wakeup before self-correcting at delivery time, instead of
   never disturbing it at all.
+- **`setpgid()`/`getpgid()` can now also target a live direct child**, not
+  just self -- the same reachability the two bullets above rely on. This is
+  the standard shell-job-control sequence for setting up a pipeline
+  (`cmd1 | cmd2 | cmd3`): the shell forks each stage, then calls
+  `setpgid(child_pid, pipeline_pgid)` on each one from the parent side
+  *before* letting them run, to put the whole pipeline in one process group
+  up front. Previously any pid other than self was rejected with `ESRCH`
+  unconditionally, which broke that exact sequence for a child.
 - **`fork()` no longer leaks signal state between parent and child.**
   `clone_for_new_task` (used by both thread-creation and `fork()`) shared the
   same `shared_pending` queue and `handlers`/`sigaction` table between parent
