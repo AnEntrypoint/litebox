@@ -1464,6 +1464,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 vforked,
                 Some(Arc::downgrade(self.process())),
             );
+            // Real fork() inherits the parent's current rlimits rather than resetting to
+            // program-start defaults (see `ResourceLimits::copy_from`'s doc comment).
+            thread.process.limits.copy_from(&self.process().limits);
 
             // The captured ctx's registers may hold addresses into the PARENT's address space --
             // the child's code, stack, and everything else generally live at a different host
@@ -1734,6 +1737,25 @@ impl ResourceLimits {
             max: core::sync::atomic::AtomicUsize::new(RLIMIT_SIGPENDING_DEFAULT),
         };
         Self { limits }
+    }
+
+    /// Overwrite every limit in `self` with the corresponding value from `other`, in place --
+    /// used by `fork()`/`clone()` (real process clone) so a freshly constructed child's limits
+    /// (which start out as `ResourceLimits::default()`) are replaced with the *parent's current*
+    /// limits rather than always resetting to program-start defaults.
+    ///
+    /// Real Linux inherits `rlimit`s across `fork()` (a parent that lowered e.g.
+    /// `RLIMIT_NOFILE` before spawning a child expects that child to actually be bounded by it);
+    /// before this, every new `Process` -- including every forked child -- kept its brand-new
+    /// `ResourceLimits::default()` forever, silently discarding whatever the parent had
+    /// configured.
+    pub(crate) fn copy_from(&self, other: &Self) {
+        for (mine, theirs) in self.limits.iter().zip(other.limits.iter()) {
+            mine.cur
+                .store(theirs.cur.load(Ordering::Relaxed), Ordering::Relaxed);
+            mine.max
+                .store(theirs.max.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn get_rlimit(
@@ -3026,6 +3048,33 @@ mod tests {
         assert_eq!(task.sys_setpgid(0, 4242), Ok(()));
         assert_eq!(task.sys_setpgid(0, 0), Ok(()));
         assert_eq!(task.sys_getpgid(0), Ok(pid));
+    }
+
+    #[test]
+    fn test_resource_limits_copy_from_inherits_parent_values() {
+        // Regression test for fork() not inheriting rlimits: before this, every freshly
+        // constructed `Process` (including every forked child) got `ResourceLimits::default()`
+        // and nothing ever copied the parent's actual current limits into it, silently
+        // discarding a `setrlimit()` the parent made before forking.
+        use litebox_common_linux::RlimitResource;
+
+        let parent = super::ResourceLimits::default();
+        parent.set_rlimit(
+            RlimitResource::NOFILE,
+            litebox_common_linux::Rlimit {
+                rlim_cur: 42,
+                rlim_max: 100,
+            },
+        );
+
+        let child = super::ResourceLimits::default();
+        // Sanity: the child's own default differs from what we're about to inherit.
+        assert_ne!(child.get_rlimit(RlimitResource::NOFILE).rlim_cur, 42);
+
+        child.copy_from(&parent);
+        let inherited = child.get_rlimit(RlimitResource::NOFILE);
+        assert_eq!(inherited.rlim_cur, 42);
+        assert_eq!(inherited.rlim_max, 100);
     }
 
     #[test]
