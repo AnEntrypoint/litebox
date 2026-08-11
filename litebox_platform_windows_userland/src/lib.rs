@@ -537,13 +537,25 @@ impl WindowsUserland {
             let _ = AddVectoredExceptionHandler(0, Some(vectored_exception_handler));
         }
 
-        // Register a console control handler to receive Ctrl+C
+        // Register a console control handler to receive Ctrl+C / Ctrl+Break
         unsafe {
             windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
                 Some(ctrl_c_handler),
                 1, // TRUE — add the handler
             );
         }
+
+        // Watch for real console window resizes and deliver SIGWINCH. There is no Win32 resize
+        // *event* callback equivalent to `SetConsoleCtrlHandler` -- `GetConsoleScreenBufferInfo`
+        // polling on a dedicated thread is the standard approach (e.g. used by libuv/Node's own
+        // Windows tty backend). This deliberately does not touch `STD_INPUT_HANDLE` or the input
+        // event queue at all (unlike `ConsoleStdinReader`), so it cannot race with or steal
+        // events from the existing stdin reader thread -- `GetConsoleScreenBufferInfo` reads the
+        // *output* buffer's window-size state, a wholly separate API surface.
+        std::thread::Builder::new()
+            .name("litebox-console-resize-watcher".to_owned())
+            .spawn(console_resize_watcher_thread_body)
+            .expect("failed to spawn console resize watcher thread");
 
         Box::leak(Box::new(platform))
     }
@@ -1358,19 +1370,81 @@ unsafe extern "system" fn threadpool_timer_callback(
 ///
 /// When the user presses Ctrl+C, this sets the SIGINT bit on every active
 /// managed thread and interrupts them so the shim can deliver the signal.
+/// Ctrl+Break similarly maps to SIGTSTP (job-control suspend): both are keyboard-driven console
+/// control events with no real Windows analog to "suspend a process group", so SIGTSTP is the
+/// closest Linux-shell-observable behavior a real terminal's Ctrl+Z would produce.
 unsafe extern "system" fn ctrl_c_handler(ctrl_type: u32) -> i32 {
-    if ctrl_type != windows_sys::Win32::System::Console::CTRL_C_EVENT {
-        return 0; // FALSE — let the next handler deal with it
-    }
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
+
+    let signal = match ctrl_type {
+        CTRL_C_EVENT => litebox_common_linux::signal::Signal::SIGINT,
+        CTRL_BREAK_EVENT => litebox_common_linux::signal::Signal::SIGTSTP,
+        _ => return 0, // FALSE — let the next handler deal with it
+    };
 
     // Pick one arbitrary thread to deliver the signal to.
     let thread = ACTIVE_THREADS.lock().unwrap().first().cloned();
 
     if let Some(thread) = thread {
-        thread.deliver_signal(litebox_common_linux::signal::Signal::SIGINT);
+        thread.deliver_signal(signal);
     }
 
     1 // TRUE — we handled it
+}
+
+/// Runs on a dedicated background thread for the lifetime of the process: polls the console
+/// output buffer's window size and delivers SIGWINCH to an active guest thread whenever it
+/// changes. See the doc comment at this thread's spawn site (`WindowsUserland::new`) for why
+/// polling `GetConsoleScreenBufferInfo` is used instead of an input-event-based approach.
+fn console_resize_watcher_thread_body() {
+    use windows_sys::Win32::System::Console::{
+        CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetStdHandle, STD_OUTPUT_HANDLE,
+    };
+
+    // No real console attached (e.g. fully redirected stdio): nothing to poll, exit quietly
+    // rather than spin forever on a handle that will never report window-size changes.
+    let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    if handle.is_null() || handle == Win32_Foundation::INVALID_HANDLE_VALUE {
+        return;
+    }
+
+    let read_size = || -> Option<(i16, i16)> {
+        let mut info: CONSOLE_SCREEN_BUFFER_INFO = unsafe { core::mem::zeroed() };
+        if unsafe { GetConsoleScreenBufferInfo(handle, &raw mut info) } == 0 {
+            return None;
+        }
+        Some((
+            info.srWindow.Right - info.srWindow.Left + 1,
+            info.srWindow.Bottom - info.srWindow.Top + 1,
+        ))
+    };
+
+    let Some(mut last_size) = read_size() else {
+        // Not actually a console handle (e.g. a redirected pipe) -- nothing to watch.
+        return;
+    };
+
+    loop {
+        // A short sleep, not a blocking wait: there is no Win32 wait handle that signals
+        // specifically on window-size change (`WaitForSingleObject` on the console input handle
+        // wakes on ANY input event, which would require also filtering/re-injecting events and
+        // risks the same cooked-read race `ConsoleStdinReader`'s doc comment describes -- plain
+        // polling avoids touching that handle at all). 250ms is frequent enough that a resize
+        // feels immediate to a human resizing a terminal window, and cheap enough not to matter
+        // against a whole guest program's runtime.
+        std::thread::sleep(core::time::Duration::from_millis(250));
+
+        let Some(size) = read_size() else {
+            continue;
+        };
+        if size != last_size {
+            last_size = size;
+            let thread = ACTIVE_THREADS.lock().unwrap().first().cloned();
+            if let Some(thread) = thread {
+                thread.deliver_signal(litebox_common_linux::signal::Signal::SIGWINCH);
+            }
+        }
+    }
 }
 
 #[derive(Clone)]

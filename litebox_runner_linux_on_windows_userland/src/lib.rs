@@ -41,6 +41,16 @@ pub struct CliArgs {
     /// (e.g., via `litebox-packager`).
     #[arg(long = "initial-files", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath)]
     pub initial_files: PathBuf,
+    /// After the program exits, export the writable upper layer (every file the guest created or
+    /// modified during this run) to a tar archive at this path, so a later run can resume from it
+    /// via `--resume-from`.
+    #[arg(long = "export-writable-layer", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath)]
+    pub export_writable_layer: Option<PathBuf>,
+    /// Seed the writable upper layer from a tar archive previously produced by
+    /// `--export-writable-layer`, resuming a prior session's on-disk state instead of starting
+    /// from an empty upper layer.
+    #[arg(long = "resume-from", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath)]
+    pub resume_from: Option<PathBuf>,
 }
 
 /// Run Linux programs with LiteBox on unmodified Windows
@@ -140,6 +150,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             )
             .unwrap();
             fs.close(&resolv_conf).unwrap();
+
+            if let Some(resume_from) = &cli_args.resume_from {
+                import_writable_layer(fs, resume_from)
+                    .unwrap_or_else(|e| panic!("failed to import --resume-from archive: {e}"));
+            }
         });
 
         shim_builder.default_fs(in_mem, tar_data.into())
@@ -198,6 +213,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
+    let fs_for_export = cli_args
+        .export_writable_layer
+        .is_some()
+        .then(|| initial_file_system.clone());
+
     let program = shim
         .load_program(
             initial_file_system,
@@ -215,10 +235,151 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
     let exit_code = program.process.wait();
 
+    if let Some(export_path) = &cli_args.export_writable_layer {
+        let fs = fs_for_export.expect("fs_for_export set whenever export_writable_layer is set");
+        export_writable_layer(&fs, export_path)
+            .unwrap_or_else(|e| panic!("failed to write --export-writable-layer archive: {e}"));
+    }
+
     shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
     // `wait_on_tun`'s timeout is always capped to `MAX_TIMEOUT` (1ms), so the worker re-checks
     // `shutdown` frequently even while otherwise idle; the join below returns promptly.
     let _ = net_worker.join();
 
     std::process::exit(exit_code)
+}
+
+/// Export the writable upper layer of a layered file system (every file the guest created or
+/// modified this run) to a tar archive at `export_path`, for a later run's `--resume-from`.
+///
+/// Only the upper layer is walked -- the read-only lower layer (the packaged base rootfs) is
+/// never re-exported, so the archive is a delta, not a full rootfs snapshot.
+fn export_writable_layer<Upper, Lower>(
+    fs: &litebox::fs::layered::FileSystem<Platform, Upper, Lower>,
+    export_path: &std::path::Path,
+) -> Result<()>
+where
+    Upper: litebox::fs::FileSystem,
+    Lower: litebox::fs::FileSystem,
+{
+    let entries = litebox::fs::export::export_all(fs.upper())
+        .map_err(|e| anyhow!("failed to walk writable layer: {e:?}"))?;
+
+    let file = std::fs::File::create(export_path)
+        .map_err(|e| anyhow!("failed to create {}: {e}", export_path.display()))?;
+    let mut builder = tar::Builder::new(file);
+    for entry in &entries {
+        let tar_path = entry.path.trim_start_matches('/');
+        if tar_path.is_empty() {
+            continue;
+        }
+        let mut header = tar::Header::new_ustar();
+        header.set_mode(entry.mode.bits() & 0o777);
+        header.set_uid(1000);
+        header.set_gid(1000);
+        match entry.file_type {
+            litebox::fs::FileType::Directory => {
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_size(0);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, tar_path, std::io::empty())
+                    .map_err(|e| anyhow!("failed to add {tar_path} to export tar: {e}"))?;
+            }
+            litebox::fs::FileType::RegularFile => {
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_size(entry.contents.len() as u64);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, tar_path, entry.contents.as_slice())
+                    .map_err(|e| anyhow!("failed to add {tar_path} to export tar: {e}"))?;
+            }
+            litebox::fs::FileType::Symlink => {
+                let Some(target) = &entry.symlink_target else {
+                    continue;
+                };
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_size(0);
+                header
+                    .set_link_name(target)
+                    .map_err(|e| anyhow!("symlink target {target} invalid for {tar_path}: {e}"))?;
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, tar_path, std::io::empty())
+                    .map_err(|e| anyhow!("failed to add {tar_path} to export tar: {e}"))?;
+            }
+            // Character devices and any future FileType variant: not archived (recreated
+            // structurally by whatever consumes the import, e.g. /dev in a fresh guest boot).
+            _ => {}
+        }
+    }
+    builder
+        .finish()
+        .map_err(|e| anyhow!("failed to finalize {}: {e}", export_path.display()))?;
+    Ok(())
+}
+
+/// Seed `fs`'s writable layer from a tar archive previously produced by
+/// [`export_writable_layer`], resuming a prior session's on-disk state.
+fn import_writable_layer(
+    fs: &mut litebox::fs::in_mem::FileSystem<Platform>,
+    resume_from: &std::path::Path,
+) -> Result<()> {
+    use litebox::fs::FileSystem as _;
+
+    let file = std::fs::File::open(resume_from)
+        .map_err(|e| anyhow!("failed to open {}: {e}", resume_from.display()))?;
+    let mut archive = tar::Archive::new(file);
+    let entries = archive
+        .entries()
+        .map_err(|e| anyhow!("failed to read {}: {e}", resume_from.display()))?;
+
+    for entry_result in entries {
+        let mut entry = entry_result.map_err(|e| anyhow!("failed to read tar entry: {e}"))?;
+        let header_path = entry
+            .path()
+            .map_err(|e| anyhow!("invalid entry path in {}: {e}", resume_from.display()))?
+            .to_string_lossy()
+            .into_owned();
+        let path = alloc::format!("/{header_path}");
+        let mode_bits = entry.header().mode().unwrap_or(0o644);
+        let mode = litebox::fs::Mode::from_bits_truncate(mode_bits & 0o777);
+
+        match entry.header().entry_type() {
+            tar::EntryType::Directory => {
+                // Ignore AlreadyExists: the guest's default fs layout may have already created
+                // this directory (e.g. `/tmp`, `/etc`).
+                let _ = fs.mkdir(&*path, mode);
+            }
+            tar::EntryType::Symlink => {
+                let target = entry
+                    .link_name()
+                    .map_err(|e| anyhow!("invalid symlink target for {path}: {e}"))?
+                    .ok_or_else(|| anyhow!("symlink entry {path} has no target"))?
+                    .to_string_lossy()
+                    .into_owned();
+                fs.symlink(&*target, &*path)
+                    .map_err(|e| anyhow!("failed to recreate symlink {path}: {e:?}"))?;
+            }
+            _ => {
+                let mut contents = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut contents)
+                    .map_err(|e| anyhow!("failed to read {path} from archive: {e}"))?;
+                let fd = fs
+                    .open(
+                        &*path,
+                        litebox::fs::OFlags::WRONLY
+                            | litebox::fs::OFlags::CREAT
+                            | litebox::fs::OFlags::TRUNC,
+                        mode,
+                    )
+                    .map_err(|e| anyhow!("failed to create {path} while resuming: {e:?}"))?;
+                fs.write(&fd, &contents, None)
+                    .map_err(|e| anyhow!("failed to write {path} while resuming: {e:?}"))?;
+                fs.close(&fd)
+                    .map_err(|e| anyhow!("failed to close {path} while resuming: {e:?}"))?;
+            }
+        }
+    }
+    Ok(())
 }
