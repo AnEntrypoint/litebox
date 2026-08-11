@@ -1737,7 +1737,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 0 => return Ok("/dev/stdin".to_string()),
                 1 => return Ok("/dev/stdout".to_string()),
                 2 => return Ok("/dev/stderr".to_string()),
-                _ => unimplemented!(),
+                _ => {
+                    // Any other fd: this used to unconditionally panic, crashing the whole
+                    // runner on something as ordinary as Python's
+                    // `os.readlink(f"/proc/self/fd/{fd}")` (used by e.g. introspection/sandboxing
+                    // libraries to see what a descriptor points to) or a shell's `<()` process
+                    // substitution. If the fd was opened from a real path, return that path (the
+                    // common case: a plain file); otherwise -- a pipe/socket/eventfd/pty/etc,
+                    // none of which have a filesystem path -- fall back to a synthetic
+                    // descriptor string, matching the *spirit* of real Linux's
+                    // "pipe:[12345]"/"socket:[12345]"/"anon_inode:[eventfd]" (without trying to
+                    // replicate its exact per-kind naming or inode numbers).
+                    self.check_raw_fd_exists(i32::try_from(fd).map_err(|_| Errno::EBADF)?)?;
+                    return Ok(self
+                        .files
+                        .borrow()
+                        .lookup_fd_path(fd as usize)
+                        .and_then(|p| p.into_string().ok())
+                        .unwrap_or_else(|| alloc::format!("anon_inode:[fd{fd}]")));
+                }
             }
         }
 
@@ -4226,6 +4244,50 @@ mod tests {
             .with_metadata(&fd, |stream: &StdioStream| *stream)
             .expect("reopened /dev/stdin must carry StdioStream::Stdin metadata");
         assert_eq!(stream, StdioStream::Stdin);
+    }
+
+    #[test]
+    fn readlink_proc_self_fd_for_arbitrary_open_fd_does_not_panic() {
+        // Regression test: `readlink("/proc/self/fd/<N>")` used to unconditionally panic
+        // (`unimplemented!()`) for any fd other than 0/1/2 -- something as ordinary as Python's
+        // `os.readlink(f"/proc/self/fd/{fd}")` (used by introspection/sandboxing libraries) or a
+        // shell's `<()` process substitution would crash the whole runner.
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // A path-backed fd: must resolve back to the path it was opened with.
+        task.sys_open(
+            "/readlink_target",
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RWXU,
+        )
+        .unwrap();
+        let fd = task
+            .sys_open("/readlink_target", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        let mut buf = [0u8; 64];
+        let n = task
+            .sys_readlink(alloc::format!("/proc/self/fd/{fd}"), &mut buf)
+            .unwrap();
+        assert_eq!(core::str::from_utf8(&buf[..n]).unwrap(), "/readlink_target");
+
+        // A pathless fd (a pipe): must not panic, and must return a non-empty synthetic path
+        // rather than erroring, matching real Linux's "pipe:[ino]"-style fallback.
+        let (reader, _writer) = task.sys_pipe2(OFlags::empty()).unwrap();
+        let mut buf2 = [0u8; 64];
+        let n = task
+            .sys_readlink(alloc::format!("/proc/self/fd/{reader}"), &mut buf2)
+            .unwrap();
+        assert!(
+            n > 0,
+            "must return a non-empty synthetic path for a pathless fd"
+        );
+
+        // An fd that was never opened: EBADF, not a panic.
+        assert_eq!(
+            task.sys_readlink("/proc/self/fd/999999", &mut buf2)
+                .unwrap_err(),
+            Errno::EBADF
+        );
     }
 
     #[test]

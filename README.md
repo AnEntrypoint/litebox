@@ -104,6 +104,15 @@ Concretely, this build fixes (all landed on `main`, CI-verified):
   `fork()`, this was a hard failure at session-open time for every one of
   the tools the pty support above exists to serve, not just a degraded-
   behavior gap. Both are implemented now.
+- **Three more crash-on-ordinary-usage panics fixed.** `readlink("/proc/self/fd/<N>")`
+  crashed the whole runner for any fd other than 0/1/2 (hit by e.g. Python's
+  `os.readlink(f"/proc/self/fd/{fd}")`, used by introspection/sandboxing
+  libraries); a single `read()` of more than 512KiB from a pipe/socket/pty
+  crashed the runner (hit by e.g. reading a subprocess's stdout in one large
+  read); and `mmap(MAP_SHARED | PROT_WRITE)` on a file-backed fd crashed the
+  runner (hit by e.g. Python's `mmap.mmap(fd, len, mmap.MAP_SHARED,
+  mmap.PROT_WRITE)`). All three now return the correct errno instead of
+  panicking.
 
 A ready-to-run bundle (the Windows runner exe plus a packaged Alpine rootfs)
 is built by [`.github/workflows/release-windows-alpine.yml`](.github/workflows/release-windows-alpine.yml).

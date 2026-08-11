@@ -679,6 +679,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(read_total)
     }
 
+    /// A single, size-bounded `read(2)` for a non-seekable fd (pipe/socket/eventfd/pty/etc) whose
+    /// guest-requested `count` exceeds [`MAX_KERNEL_BUF_SIZE`].
+    ///
+    /// Unlike [`Self::pread_with_user_buf`] (used for regular files), this doesn't loop to fill
+    /// the whole requested `count`: a non-seekable fd has no file offset to preserve across
+    /// chunks, and real `read(2)` semantics for a pipe/socket/pty return as soon as *any* data is
+    /// available rather than blocking to accumulate a specific amount -- looping here would mean
+    /// blocking indefinitely once the peer goes idle, well past what the guest actually asked to
+    /// wait for. Capping to a single bounded read is both correct and sufficient to avoid the
+    /// unbounded kernel-side allocation a naive `vec![0u8; count]` would otherwise need for an
+    /// arbitrarily large guest-requested `count`.
+    fn read_with_user_buf_no_offset(
+        &self,
+        fd: i32,
+        buf: UserPtrMut<u8>,
+        count: usize,
+    ) -> Result<usize, Errno> {
+        let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
+        let size = self.sys_read(fd, &mut kernel_buf, None)?;
+        buf.copy_from_slice::<Platform>(0, &kernel_buf[..size])
+            .ok_or(Errno::EFAULT)?;
+        Ok(size)
+    }
+
     /// Handle Linux syscalls and dispatch them to LiteBox implementations.
     ///
     /// # Panics
@@ -757,24 +781,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     })
                 } else {
                     // If the read size is too large, we need to do some extra work to avoid OOMing.
-                    // We read data in chunks and update the file offset ourselves only if the read succeeds.
-                    self.sys_lseek(fd, 0, litebox::fs::SeekWhence::RelativeToCurrentOffset)
-                    .inspect_err(|e| {
-                        match *e {
-                            Errno::EBADF => (), // safe errors to return
-                            Errno::ESPIPE => {
-                                unimplemented!("read on non-seekable fds with large buffers");
-                            }
-                            Errno::EINVAL => {
-                                unreachable!("seekable file should not return EINVAL when getting current offset");
-                            }
-                            _ => {
-                                unimplemented!("unexpected error from lseek: {}", e);
-                            }
-                        }
-                    })
-                    .and_then(|cur_loc| {
-                        self.pread_with_user_buf(fd, buf, count, i64::try_from(cur_loc).unwrap())
+                    // For a seekable fd (a regular file), read data in chunks and update the file
+                    // offset ourselves only if the read succeeds. A non-seekable fd
+                    // (pipe/socket/eventfd/pty/etc, `ESPIPE`) has no file offset to preserve, so
+                    // it takes a simpler single-bounded-read path instead (see
+                    // `read_with_user_buf_no_offset`) -- this used to unconditionally panic,
+                    // crashing the whole runner on something as ordinary as a single large
+                    // `read()` of a subprocess's stdout pipe or a socket.
+                    match self.sys_lseek(fd, 0, litebox::fs::SeekWhence::RelativeToCurrentOffset) {
+                        Ok(cur_loc) => self
+                            .pread_with_user_buf(fd, buf, count, i64::try_from(cur_loc).unwrap())
                             .inspect(|read_total| {
                                 // Update the file offset to reflect the read we just did.
                                 self.sys_lseek(
@@ -784,8 +800,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                 )
                                 // Given that previous lseek and pread succeeded, this lseek should also succeed.
                                 .expect("lseek failed");
-                            })
-                    })
+                            }),
+                        Err(Errno::EBADF) => Err(Errno::EBADF),
+                        Err(Errno::ESPIPE) => self.read_with_user_buf_no_offset(fd, buf, count),
+                        Err(Errno::EINVAL) => {
+                            unreachable!(
+                                "seekable file should not return EINVAL when getting current offset"
+                            );
+                        }
+                        Err(e) => {
+                            unimplemented!("unexpected error from lseek: {}", e);
+                        }
+                    }
                 }
             }
             SyscallRequest::Write { fd, buf, count } => match buf.to_owned_slice::<Platform>(count)
@@ -1603,5 +1629,31 @@ mod test_utils {
                 .set(alloc::boxed::Box::new(self.wait_state.thread_handle()))
                 .ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn large_read_on_pipe_does_not_panic() {
+        // Regression test: a single `read()` requesting more than `MAX_KERNEL_BUF_SIZE` from a
+        // non-seekable fd (pipe/socket/eventfd/pty/etc) used to unconditionally panic via
+        // `unimplemented!()` in the `SyscallRequest::Read` dispatch, because the large-read path
+        // always probed the fd's offset with `lseek` first and treated the resulting `ESPIPE`
+        // (correctly returned for any non-seekable fd) as an unhandled case. This exercises the
+        // `read_with_user_buf_no_offset` fallback that replaced that panic.
+        let task = crate::syscalls::tests::init_platform(None);
+        let (reader, writer) = task.sys_pipe2(litebox::fs::OFlags::empty()).unwrap();
+        task.sys_write(writer.try_into().unwrap(), b"hello", None)
+            .unwrap();
+
+        let mut buf = [0u8; 16];
+        let buf_ptr = UserPtrMut::from_usize(buf.as_mut_ptr().expose_provenance());
+        let n = task
+            .read_with_user_buf_no_offset(reader.try_into().unwrap(), buf_ptr, 600_000)
+            .expect("large read on a non-seekable fd must not panic or error");
+        assert_eq!(&buf[..n], b"hello");
     }
 }
