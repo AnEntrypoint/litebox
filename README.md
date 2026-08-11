@@ -300,6 +300,23 @@ Concretely, this build fixes (all landed on `main`, CI-verified):
   `EAFNOSUPPORT`, matching both the family-parsing fallback right above
   it and real Linux's behavior for a family the target socket doesn't
   support.
+- **`madvise()` no longer crashes for any behavior beyond
+  `MADV_NORMAL`/`MADV_DONTNEED`/`MADV_FREE`/`MADV_DONTFORK`/`MADV_DOFORK`.**
+  Every other advice value -- `MADV_WILLNEED`, `MADV_RANDOM`/`SEQUENTIAL`,
+  `MADV_HUGEPAGE`/`NOHUGEPAGE`, `MADV_DONTDUMP`, `MADV_WIPEONFORK`, and
+  others -- unconditionally panicked, crashing the whole runner on
+  something as ordinary as Python's `mmap.madvise(mmap.MADV_WILLNEED)` or
+  an allocator (jemalloc, musl/glibc) issuing a hugepage hint. These are
+  all advisory-only on real Linux: a real kernel accepts every one of
+  them as a no-op success even on a config that doesn't act on the hint
+  (e.g. `MADV_HUGEPAGE` succeeds even without transparent hugepages
+  configured), so they now return success rather than panicking.
+  `MADV_REMOVE` (requires a shmem/tmpfs-backed mapping, which litebox
+  doesn't support) and `MADV_HWPOISON`/`MADV_SOFT_OFFLINE` (privileged
+  memory-error-injection testing operations litebox has no machinery to
+  honor) now fail cleanly with `EINVAL` instead. The match is exhaustive
+  with no wildcard fallback, so a future `MadviseBehavior` addition fails
+  to compile instead of silently reintroducing the same panic.
 
 A ready-to-run bundle (the Windows runner exe plus a packaged Alpine rootfs)
 is built by [`.github/workflows/release-windows-alpine.yml`](.github/workflows/release-windows-alpine.yml).

@@ -1687,6 +1687,69 @@ mod tests {
         task.sys_munmap(addr, 0x2000).unwrap();
     }
 
+    /// Regression test: every `MadviseBehavior` variant beyond `Normal`/`DontFork`/`DoFork`/
+    /// `DontNeed`/`Free` used to unconditionally panic (`unimplemented!("Unsupported madvise
+    /// behavior")`), crashing the whole runner -- reachable from something as ordinary as
+    /// Python's `mmap.madvise(mmap.MADV_WILLNEED)` or musl/glibc allocators issuing
+    /// `MADV_HUGEPAGE`-style hints. Advisory-only hints (real Linux accepts every one of these
+    /// as a no-op success regardless of whether the kernel backs the hint with real behavior)
+    /// must return `Ok`; `MADV_REMOVE`/`MADV_HWPOISON`/`MADV_SOFT_OFFLINE` must fail cleanly
+    /// with `EINVAL` rather than panicking.
+    #[test]
+    fn madvise_covers_every_behavior_without_panicking() {
+        use litebox_common_linux::MadviseBehavior;
+
+        let task = init_platform(None);
+        let addr = task
+            .sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
+                -1,
+                0,
+            )
+            .unwrap();
+
+        for advice in [
+            MadviseBehavior::Random,
+            MadviseBehavior::Sequential,
+            MadviseBehavior::WillNeed,
+            MadviseBehavior::Mergeable,
+            MadviseBehavior::Unmergeable,
+            MadviseBehavior::HugePage,
+            MadviseBehavior::NoHugePage,
+            MadviseBehavior::DontDump,
+            MadviseBehavior::DoDump,
+            MadviseBehavior::WipeOnFork,
+            MadviseBehavior::KeepOnFork,
+            MadviseBehavior::Cold,
+            MadviseBehavior::Pageout,
+            MadviseBehavior::PopulateRead,
+            MadviseBehavior::PopulateWrite,
+            MadviseBehavior::DontNeedLocked,
+        ] {
+            assert!(
+                task.sys_madvise(addr, 0x1000, advice).is_ok(),
+                "advisory-only madvise behavior must succeed as a no-op, not panic"
+            );
+        }
+
+        for advice in [
+            MadviseBehavior::Remove,
+            MadviseBehavior::HWPoison,
+            MadviseBehavior::SoftOffline,
+        ] {
+            assert_eq!(
+                task.sys_madvise(addr, 0x1000, advice).unwrap_err(),
+                Errno::EINVAL,
+                "unsupported-mapping madvise behavior must fail cleanly, not panic"
+            );
+        }
+
+        task.sys_munmap(addr, 0x1000).unwrap();
+    }
+
     // Signal support for Windows is not ready yet.
     #[cfg(not(target_os = "windows"))]
     #[test]
