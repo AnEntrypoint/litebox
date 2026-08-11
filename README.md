@@ -317,6 +317,19 @@ Concretely, this build fixes (all landed on `main`, CI-verified):
   honor) now fail cleanly with `EINVAL` instead. The match is exhaustive
   with no wildcard fallback, so a future `MadviseBehavior` addition fails
   to compile instead of silently reintroducing the same panic.
+- **`socket()`/`accept()` on an `AF_INET`/`AF_INET6` socket no longer
+  crash at the process's fd-table limit.** Both unconditionally panicked
+  (`unimplemented!()`) whenever `insert_raw_fd` failed because the fd
+  table was already at its `RLIMIT_NOFILE`/shim-wide limit -- an
+  ordinary, guest-triggerable condition (a busy server `accept()`ing past
+  its fd limit under load, which real Linux itself reports as `EMFILE`
+  from `accept()`, or a guest explicitly lowering its own
+  `RLIMIT_NOFILE` then calling `socket()`), not something that should
+  crash the runner. Both now return `EMFILE` while cleanly tearing down
+  the network-subsystem-side socket state that was already allocated
+  before the fd-insert failure (so a failed `socket()`/`accept()` doesn't
+  leak a `smoltcp` socket-set slot), matching the already-correct
+  `AF_UNIX` sibling arm in both functions.
 
 A ready-to-run bundle (the Windows runner exe plus a packaged Alpine rootfs)
 is built by [`.github/workflows/release-windows-alpine.yml`](.github/workflows/release-windows-alpine.yml).
