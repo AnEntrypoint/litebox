@@ -1638,7 +1638,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         comm: self.comm.clone(),
                         fs: fs.into(),
                         files: files.into(),
-                        signals: self.signals.clone_for_new_task(),
+                        signals: self.signals.clone_for_new_task(is_process_clone),
                     },
                 }),
             )

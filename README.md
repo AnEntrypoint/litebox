@@ -139,6 +139,21 @@ Concretely, this build fixes (all landed on `main`, CI-verified):
   which is exactly correct whenever no other process happens to share the
   group. A genuine remote pid (some specific *other* process) still
   correctly fails, since actually reaching one isn't implemented.
+- **`fork()` no longer leaks signal state between parent and child.**
+  `clone_for_new_task` (used by both thread-creation and `fork()`) shared the
+  same `shared_pending` queue and `handlers`/`sigaction` table between parent
+  and child unconditionally -- correct for a same-process thread, but wrong
+  for a genuine `fork()`, where POSIX requires the child to start with an
+  independent (copied) signal disposition table and an empty pending-signal
+  set. Previously, a signal sent to the parent process after `fork()` could
+  be silently consumed by the child instead (or vice versa), and a
+  `sigaction()` call in either process after `fork()` would incorrectly
+  change the other's handler too -- both are classic patterns in real
+  daemons/supervisors (e.g. a process that forks a worker and then adjusts
+  its own `SIGCHLD`/`SIGTERM` handling). `fork()` now gives the child its own
+  independent pending-signal queue and a snapshotted copy of the handler
+  table, while ordinary thread creation continues to correctly share both
+  with the rest of its process.
 
 A ready-to-run bundle (the Windows runner exe plus a packaged Alpine rootfs)
 is built by [`.github/workflows/release-windows-alpine.yml`](.github/workflows/release-windows-alpine.yml).
