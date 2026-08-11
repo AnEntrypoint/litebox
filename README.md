@@ -130,15 +130,32 @@ Concretely, this build fixes (all landed on `main`, CI-verified):
   now copies the parent's current limits into the child, matching real
   Linux.
 - **`kill(0, sig)` / `kill(-pgid, sig)` / `kill(-1, sig)` no longer hard-fail.**
-  `kill()` has no registry of other live guest processes to deliver to (a
-  genuinely open architectural gap -- see below), but these three forms
-  target the caller's own process group or "everyone the caller may
-  signal," and self is always a real member of all three sets. Previously
-  they failed with `ESRCH` unconditionally, even in the common case of a
-  script signaling its own group during cleanup; they now deliver to self,
-  which is exactly correct whenever no other process happens to share the
-  group. A genuine remote pid (some specific *other* process) still
-  correctly fails, since actually reaching one isn't implemented.
+  `kill()` has no registry of *arbitrary* other live guest processes to
+  deliver to, but these three forms target the caller's own process group
+  or "everyone the caller may signal," and self is always a real member of
+  all three sets. Previously they failed with `ESRCH` unconditionally, even
+  in the common case of a script signaling its own group during cleanup;
+  they now deliver to self, which is exactly correct whenever no other
+  process happens to share the group.
+- **`kill(child_pid, sig)` now works for a live, shim-known direct child.**
+  This shim still has no general pid -> process registry (see the previous
+  bullet), so a genuinely arbitrary remote pid still correctly fails with
+  `ESRCH` -- but a `fork()`ed child of the calling process *is* always
+  reachable (it's already tracked, for `wait4`/`waitpid`), and this is by
+  far the single most common real-world use of cross-process `kill()`: a
+  supervisor/process-manager sending `SIGTERM`/`SIGKILL` to a worker it
+  spawned. Previously this failed with `ESRCH` unconditionally, exactly
+  like a truly unreachable pid. The signal is queued into the child's own
+  process-directed pending set and the child's live threads are woken via
+  the same `interrupt()` mechanism `exit_group`/`kill_other_threads`
+  already use for same-process delivery -- a blocked syscall in the child
+  (e.g. a `futex` wait) now genuinely returns `EINTR` and processes the
+  signal, not just something that sits unnoticed in a queue. One accepted
+  imprecision: the sender can't check the child's `SIG_IGN` disposition
+  before queuing (that state lives on the child's own thread context, not
+  reachable from the parent), so an ignored signal still costs the child
+  one spurious wakeup before self-correcting at delivery time, instead of
+  never disturbing it at all.
 - **`fork()` no longer leaks signal state between parent and child.**
   `clone_for_new_task` (used by both thread-creation and `fork()`) shared the
   same `shared_pending` queue and `handlers`/`sigaction` table between parent
