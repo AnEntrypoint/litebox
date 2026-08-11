@@ -77,6 +77,16 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub program_from_tar: bool,
+    /// After the program exits, export the writable upper layer (every file the guest created or
+    /// modified during this run) to a tar archive at this path, so a later run can resume from it
+    /// via `--resume-from`.
+    #[arg(long = "export-writable-layer", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath)]
+    pub export_writable_layer: Option<PathBuf>,
+    /// Seed the writable upper layer from a tar archive previously produced by
+    /// `--export-writable-layer`, resuming a prior session's on-disk state instead of starting
+    /// from an empty upper layer.
+    #[arg(long = "resume-from", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath)]
+    pub resume_from: Option<PathBuf>,
 }
 
 struct MmappedFile {
@@ -295,6 +305,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             }
         });
 
+        if let Some(resume_from) = &cli_args.resume_from {
+            import_writable_layer(&mut in_mem, resume_from)
+                .unwrap_or_else(|e| panic!("failed to import --resume-from archive: {e}"));
+        }
+
         shim_builder.default_fs(in_mem, tar_data.into())
     };
 
@@ -314,6 +329,19 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     })?;
 
     let initial_file_system = std::sync::Arc::new(initial_file_system);
+    let fs_for_export = cli_args
+        .export_writable_layer
+        .is_some()
+        .then(|| initial_file_system.clone());
+    // Open the export file now, before `enable_seccomp_filter()` below -- unlike the Windows
+    // runner (which has no such restriction), this process's own seccomp-bpf filter stays active
+    // for the rest of its lifetime, including after the guest exits, and only allows a narrow
+    // O_RDONLY case of `open`/`openat`. Opening for write has to happen before that filter is
+    // installed; only ordinary `write()`s (always allowed) are needed on it afterward.
+    let export_file = cli_args.export_writable_layer.as_ref().map(|export_path| {
+        std::fs::File::create(export_path)
+            .unwrap_or_else(|e| panic!("failed to create {}: {e}", export_path.display()))
+    });
 
     let shim = shim_builder.build();
 
@@ -399,11 +427,156 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         }
     }
 
+    let exit_code = program.process.wait();
+
+    if let Some(export_file) = export_file {
+        let fs = fs_for_export.expect("fs_for_export set whenever export_writable_layer is set");
+        export_writable_layer(&fs, export_file)
+            .unwrap_or_else(|e| panic!("failed to write --export-writable-layer archive: {e}"));
+    }
+
     if let Some(net_worker) = net_worker {
         shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
         net_worker.join().unwrap();
     }
-    std::process::exit(program.process.wait())
+    std::process::exit(exit_code)
+}
+
+/// Export the writable upper layer of a layered file system (every file the guest created or
+/// modified this run) as a tar archive to `export_file`, for a later run's `--resume-from`.
+///
+/// Only the upper layer is walked -- the read-only lower layer (the packaged base rootfs) is
+/// never re-exported, so the archive is a delta, not a full rootfs snapshot.
+///
+/// `export_file` must already be open for writing: on this platform (unlike Windows), the
+/// running process's own seccomp-bpf filter (see `enable_seccomp_filter`) stays active for the
+/// rest of the process's lifetime once installed and only allows a narrow `O_RDONLY` case of
+/// `open`/`openat`, so opening the export path has to happen before that filter goes up -- see
+/// this function's call site in `run()`.
+fn export_writable_layer<Upper, Lower>(
+    fs: &litebox::fs::layered::FileSystem<Platform, Upper, Lower>,
+    export_file: std::fs::File,
+) -> Result<()>
+where
+    Upper: litebox::fs::FileSystem,
+    Lower: litebox::fs::FileSystem,
+{
+    let entries = litebox::fs::export::export_all(fs.upper())
+        .map_err(|e| anyhow!("failed to walk writable layer: {e:?}"))?;
+
+    let mut builder = tar::Builder::new(export_file);
+    for entry in &entries {
+        let tar_path = entry.path.trim_start_matches('/');
+        if tar_path.is_empty() {
+            continue;
+        }
+        let mut header = tar::Header::new_ustar();
+        header.set_mode(entry.mode.bits() & 0o777);
+        header.set_uid(1000);
+        header.set_gid(1000);
+        match entry.file_type {
+            litebox::fs::FileType::Directory => {
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_size(0);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, tar_path, std::io::empty())
+                    .map_err(|e| anyhow!("failed to add {tar_path} to export tar: {e}"))?;
+            }
+            litebox::fs::FileType::RegularFile => {
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_size(entry.contents.len() as u64);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, tar_path, entry.contents.as_slice())
+                    .map_err(|e| anyhow!("failed to add {tar_path} to export tar: {e}"))?;
+            }
+            litebox::fs::FileType::Symlink => {
+                let Some(target) = &entry.symlink_target else {
+                    continue;
+                };
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_size(0);
+                header
+                    .set_link_name(target)
+                    .map_err(|e| anyhow!("symlink target {target} invalid for {tar_path}: {e}"))?;
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, tar_path, std::io::empty())
+                    .map_err(|e| anyhow!("failed to add {tar_path} to export tar: {e}"))?;
+            }
+            // Character devices and any future FileType variant: not archived (recreated
+            // structurally by whatever consumes the import, e.g. /dev in a fresh guest boot).
+            _ => {}
+        }
+    }
+    builder
+        .finish()
+        .map_err(|e| anyhow!("failed to finalize export archive: {e}"))?;
+    Ok(())
+}
+
+/// Seed `fs`'s writable layer from a tar archive previously produced by
+/// [`export_writable_layer`], resuming a prior session's on-disk state.
+fn import_writable_layer(
+    fs: &mut litebox::fs::in_mem::FileSystem<Platform>,
+    resume_from: &Path,
+) -> Result<()> {
+    let file = std::fs::File::open(resume_from)
+        .map_err(|e| anyhow!("failed to open {}: {e}", resume_from.display()))?;
+    let mut archive = tar::Archive::new(file);
+    let entries = archive
+        .entries()
+        .map_err(|e| anyhow!("failed to read {}: {e}", resume_from.display()))?;
+
+    for entry_result in entries {
+        let mut entry = entry_result.map_err(|e| anyhow!("failed to read tar entry: {e}"))?;
+        let header_path = entry
+            .path()
+            .map_err(|e| anyhow!("invalid entry path in {}: {e}", resume_from.display()))?
+            .to_string_lossy()
+            .into_owned();
+        let path = alloc::format!("/{header_path}");
+        let mode_bits = entry.header().mode().unwrap_or(0o644);
+        let mode = litebox::fs::Mode::from_bits_truncate(mode_bits & 0o777);
+
+        match entry.header().entry_type() {
+            tar::EntryType::Directory => {
+                // Ignore AlreadyExists: the guest's default fs layout may have already created
+                // this directory (e.g. `/tmp`).
+                let _ = fs.mkdir(&*path, mode);
+            }
+            tar::EntryType::Symlink => {
+                let target = entry
+                    .link_name()
+                    .map_err(|e| anyhow!("invalid symlink target for {path}: {e}"))?
+                    .ok_or_else(|| anyhow!("symlink entry {path} has no target"))?
+                    .to_string_lossy()
+                    .into_owned();
+                fs.symlink(&*target, &*path)
+                    .map_err(|e| anyhow!("failed to recreate symlink {path}: {e:?}"))?;
+            }
+            _ => {
+                let mut contents = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut contents)
+                    .map_err(|e| anyhow!("failed to read {path} from archive: {e}"))?;
+                let fd = fs
+                    .open(
+                        &*path,
+                        litebox::fs::OFlags::WRONLY
+                            | litebox::fs::OFlags::CREAT
+                            | litebox::fs::OFlags::TRUNC,
+                        mode,
+                    )
+                    .map_err(|e| anyhow!("failed to create {path} while resuming: {e:?}"))?;
+                fs.write(&fd, &contents, None)
+                    .map_err(|e| anyhow!("failed to write {path} while resuming: {e:?}"))?;
+                fs.close(&fd)
+                    .map_err(|e| anyhow!("failed to close {path} while resuming: {e:?}"))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Pin the current thread to a specific CPU core
@@ -416,5 +589,90 @@ fn pin_thread_to_cpu(cpu: usize) {
         if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw const set) != 0 {
             eprintln!("Warning: Failed to pin thread to CPU core {cpu}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Creates `/tmp` world-writable, exactly like `run()`'s own bootstrap step (see the
+    /// `in_mem.with_root_privileges(|fs| { ... fs.mkdir("/tmp", ...) ... })` block above) --
+    /// this is the realistic writable location a guest process (which always runs as a single
+    /// fixed, non-root uid/gid in this shim) can actually create content under, both on a fresh
+    /// run and after a `--resume-from` import.
+    fn bootstrap_tmp(fs: &mut litebox::fs::in_mem::FileSystem<Platform>) {
+        fs.with_root_privileges(|fs| {
+            fs.mkdir("/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .unwrap();
+        });
+    }
+
+    /// Regression test for the `--export-writable-layer`/`--resume-from` round trip: writes a
+    /// file (as the guest's own non-root identity, under `/tmp`, matching how a real guest
+    /// process can actually write) into a fresh guest filesystem's writable upper layer, exports
+    /// that layer to a tar archive, then imports it into a brand new filesystem (simulating a
+    /// later, independent run resuming from it, including the same `/tmp` bootstrap step `run()`
+    /// always does before importing) and checks the file, its directory, and a symlink all
+    /// survive with the right contents/target. This exercises the exact
+    /// `export_writable_layer`/`import_writable_layer` logic wired into `run()`, without needing
+    /// a full CLI invocation or a compiled guest binary.
+    #[test]
+    fn export_then_import_writable_layer_round_trips_files_dirs_and_symlinks() {
+        let platform = Platform::new(None);
+        let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
+        let litebox = shim_builder.litebox();
+
+        let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
+        bootstrap_tmp(&mut in_mem);
+        in_mem
+            .mkdir("/tmp/data", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+            .unwrap();
+        let fd = in_mem
+            .open(
+                "/tmp/data/greeting.txt",
+                litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
+                Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH,
+            )
+            .unwrap();
+        in_mem.write(&fd, b"hello from a prior run", None).unwrap();
+        in_mem.close(&fd).unwrap();
+        in_mem
+            .symlink("greeting.txt", "/tmp/data/link_to_greeting")
+            .unwrap();
+        let fs = shim_builder.default_fs(in_mem, litebox::fs::tar_ro::EMPTY_TAR_FILE.into());
+
+        let export_path = std::env::temp_dir().join(format!(
+            "litebox_export_import_roundtrip_test_{}.tar",
+            std::process::id()
+        ));
+        let export_file = std::fs::File::create(&export_path).unwrap();
+        export_writable_layer(&fs, export_file).unwrap();
+
+        let platform2 = Platform::new(None);
+        let shim_builder2 = litebox_shim_linux::LinuxShimBuilder::new(platform2);
+        let litebox2 = shim_builder2.litebox();
+        let mut fresh_in_mem = litebox::fs::in_mem::FileSystem::new(litebox2);
+        bootstrap_tmp(&mut fresh_in_mem);
+        import_writable_layer(&mut fresh_in_mem, &export_path).unwrap();
+
+        let fd = fresh_in_mem
+            .open(
+                "/tmp/data/greeting.txt",
+                litebox::fs::OFlags::RDONLY,
+                Mode::empty(),
+            )
+            .unwrap();
+        let mut buf = [0u8; 64];
+        let n = fresh_in_mem.read(&fd, &mut buf, None).unwrap();
+        assert_eq!(&buf[..n], b"hello from a prior run");
+        fresh_in_mem.close(&fd).unwrap();
+
+        let link_target = fresh_in_mem
+            .read_link("/tmp/data/link_to_greeting")
+            .unwrap();
+        assert_eq!(link_target, "greeting.txt");
+
+        std::fs::remove_file(&export_path).unwrap();
     }
 }
