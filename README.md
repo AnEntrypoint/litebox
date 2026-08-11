@@ -204,6 +204,22 @@ Concretely, this build fixes (all landed on `main`, CI-verified):
   for writing *before* the filter goes up, and only `write()`s (always
   allowed) happen on it afterward.
 
+  **Safe for multi-agent fan-out from one shared checkpoint.** `--resume-from`
+  only ever reads its archive (no locking, no write-back) into a fresh,
+  per-process in-memory filesystem, so any number of independent runner
+  invocations can resume from the *same* `--resume-from` archive
+  concurrently with zero interference -- e.g. an orchestrator spawning N
+  parallel agent runs from one common base snapshot. The one thing an
+  orchestrator must do itself: give each parallel invocation a **distinct**
+  `--export-writable-layer` path. Two invocations racing on the *same*
+  export path don't fail cleanly or simply "last write wins" -- each
+  independently truncates the file on open and issues many sequential
+  `write()`s as it walks the writable layer, so a collision produces
+  silently corrupted, byte-interleaved tar output in both archives. This
+  isn't a bug to fix so much as an inherent property of two writers sharing
+  one file path; avoid it with a per-branch path convention (e.g.
+  `out/agent-<id>.tar`).
+
 A ready-to-run bundle (the Windows runner exe plus a packaged Alpine rootfs)
 is built by [`.github/workflows/release-windows-alpine.yml`](.github/workflows/release-windows-alpine.yml).
 

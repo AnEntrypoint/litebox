@@ -4538,4 +4538,12 @@ mod tests {
             litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC.bits()
         );
     }
+
+    #[test]
+    fn pipe2_o_direct_returns_einval_instead_of_panicking() {
+        // Regression test: pipe2(..., O_DIRECT) ("packet mode", not implemented by this shim's
+        // pipes) used to unconditionally panic (todo!("O_DIRECT not supported")).
+        let task = crate::syscalls::tests::init_platform(None);
+        assert_eq!(task.sys_pipe2(OFlags::DIRECT).unwrap_err(), Errno::EINVAL);
+    }
 }
