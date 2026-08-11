@@ -723,7 +723,7 @@ bitflags::bitflags! {
 type cc_t = ::core::ffi::c_uchar;
 type tcflag_t = ::core::ffi::c_uint;
 #[repr(C)]
-#[derive(Debug, Clone, FromBytes, IntoBytes)]
+#[derive(Debug, Clone, Default, FromBytes, IntoBytes)]
 pub struct Termios {
     pub c_iflag: tcflag_t,
     pub c_oflag: tcflag_t,
@@ -733,7 +733,7 @@ pub struct Termios {
     pub c_cc: [cc_t; 19usize],
 }
 
-#[derive(Debug, Clone, FromBytes, IntoBytes)]
+#[derive(Debug, Clone, Default, FromBytes, IntoBytes)]
 #[repr(C)]
 pub struct Winsize {
     pub row: u16,
@@ -747,11 +747,13 @@ pub const TCSETS: u32 = 0x5402;
 pub const TCSETSW: u32 = 0x5403;
 pub const TCSETSF: u32 = 0x5404;
 pub const TIOCGWINSZ: u32 = 0x5413;
+pub const TIOCSWINSZ: u32 = 0x5414;
 pub const FIONBIO: u32 = 0x5421;
 pub const FIOCLEX: u32 = 0x5451;
-pub const TIOCGPTN: u32 = 0x80045430;
 pub const TIOCGPGRP: u32 = 0x540F;
 pub const TIOCSPGRP: u32 = 0x5410;
+pub const TIOCGPTN: u32 = 0x8004_5430;
+pub const TIOCSPTLCK: u32 = 0x4004_5431;
 
 /// Commands for use with `ioctl`.
 #[non_exhaustive]
@@ -770,9 +772,16 @@ pub enum IoctlArg {
     TCSETSF(UserPtr<Termios>),
     /// Get window size.
     TIOCGWINSZ(UserPtrMut<Winsize>),
+    /// Set window size (`ioctl(fd, TIOCSWINSZ, &ws)`), used e.g. by terminal multiplexers and
+    /// `node-pty`/`pty.js`-style libraries to propagate the real terminal size into a pty.
+    TIOCSWINSZ(UserPtr<Winsize>),
     /// Obtain device unit number, which can be used to generate
     /// the filename of the pseudo-terminal slave device.
     TIOCGPTN(UserPtrMut<u32>),
+    /// Unlock/lock the pty slave (`unlockpt`/glibc's `grantpt` path). A freshly allocated pty
+    /// pair starts locked (matching Linux): opening the slave before this is issued with `0`
+    /// fails with `EIO`, mirroring the real kernel's devpts behavior.
+    TIOCSPTLCK(UserPtr<i32>),
     /// Get the terminal's foreground process group ID (`tcgetpgrp`).
     TIOCGPGRP(UserPtrMut<i32>),
     /// Set the terminal's foreground process group ID (`tcsetpgrp`). A shell's job-control
@@ -2739,7 +2748,9 @@ impl SyscallRequest {
                         TCSETSW => IoctlArg::TCSETSW(ctx.sys_req_ptr(2)),
                         TCSETSF => IoctlArg::TCSETSF(ctx.sys_req_ptr(2)),
                         TIOCGWINSZ => IoctlArg::TIOCGWINSZ(ctx.sys_req_ptr(2)),
+                        TIOCSWINSZ => IoctlArg::TIOCSWINSZ(ctx.sys_req_ptr(2)),
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),
+                        TIOCSPTLCK => IoctlArg::TIOCSPTLCK(ctx.sys_req_ptr(2)),
                         TIOCGPGRP => IoctlArg::TIOCGPGRP(ctx.sys_req_ptr(2)),
                         TIOCSPGRP => IoctlArg::TIOCSPGRP(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
