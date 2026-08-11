@@ -750,6 +750,7 @@ pub const TIOCGWINSZ: u32 = 0x5413;
 pub const TIOCSWINSZ: u32 = 0x5414;
 pub const FIONBIO: u32 = 0x5421;
 pub const FIOCLEX: u32 = 0x5451;
+pub const TIOCSCTTY: u32 = 0x540E;
 pub const TIOCGPGRP: u32 = 0x540F;
 pub const TIOCSPGRP: u32 = 0x5410;
 pub const TIOCGPTN: u32 = 0x8004_5430;
@@ -782,6 +783,14 @@ pub enum IoctlArg {
     /// pair starts locked (matching Linux): opening the slave before this is issued with `0`
     /// fails with `EIO`, mirroring the real kernel's devpts behavior.
     TIOCSPTLCK(UserPtr<i32>),
+    /// Make the given terminal the calling process's controlling terminal
+    /// (`ioctl(fd, TIOCSCTTY, force)`). Unlike most other `ioctl`s here, the third argument is a
+    /// plain scalar (a "steal from another session" force flag), not a pointer -- so this is
+    /// parsed via `sys_req_arg`, not `sys_req_ptr`. glibc's `login_tty()` (the primitive behind
+    /// `forkpty()`/`openpty()`-based tools -- `node-pty`, Python's `os.forkpty()`, tmux, `script`)
+    /// always calls this right after `setsid()`; without it, every one of those fails to open a
+    /// session on this pty.
+    TIOCSCTTY(i32),
     /// Get the terminal's foreground process group ID (`tcgetpgrp`).
     TIOCGPGRP(UserPtrMut<i32>),
     /// Set the terminal's foreground process group ID (`tcsetpgrp`). A shell's job-control
@@ -2503,6 +2512,7 @@ pub enum SyscallRequest {
         pid: i32,
         pgid: i32,
     },
+    Setsid,
     Getuid,
     Geteuid,
     Getgid,
@@ -2751,6 +2761,7 @@ impl SyscallRequest {
                         TIOCSWINSZ => IoctlArg::TIOCSWINSZ(ctx.sys_req_ptr(2)),
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),
                         TIOCSPTLCK => IoctlArg::TIOCSPTLCK(ctx.sys_req_ptr(2)),
+                        TIOCSCTTY => IoctlArg::TIOCSCTTY(ctx.sys_req_arg(2)),
                         TIOCGPGRP => IoctlArg::TIOCGPGRP(ctx.sys_req_ptr(2)),
                         TIOCSPGRP => IoctlArg::TIOCSPGRP(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
@@ -2911,6 +2922,7 @@ impl SyscallRequest {
             Sysno::getppid => SyscallRequest::Getppid,
             Sysno::getpgid => sys_req!(Getpgid { pid }),
             Sysno::setpgid => sys_req!(Setpgid { pid, pgid }),
+            Sysno::setsid => SyscallRequest::Setsid,
             Sysno::getuid => SyscallRequest::Getuid,
             Sysno::getgid => SyscallRequest::Getgid,
             Sysno::geteuid => SyscallRequest::Geteuid,

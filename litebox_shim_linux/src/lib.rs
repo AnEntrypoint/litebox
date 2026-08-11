@@ -1327,6 +1327,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 self.sys_setpgid(pid, pgid)?;
                 Ok(0)
             }
+            SyscallRequest::Setsid => Ok(self.sys_setsid()?.reinterpret_as_unsigned() as usize),
             SyscallRequest::Getuid => Ok(self.sys_getuid() as usize),
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
