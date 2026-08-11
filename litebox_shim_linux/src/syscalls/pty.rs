@@ -464,6 +464,25 @@ mod tests {
     }
 
     #[test]
+    fn tiocsctty_on_slave_makes_own_pgrp_the_foreground_group() {
+        // Mirrors glibc's login_tty(): setsid() (own process-group leader) followed by
+        // ioctl(slave_fd, TIOCSCTTY, 0) -- the exact sequence forkpty()-based tools (node-pty,
+        // Python's os.forkpty(), tmux, script) rely on to attach a freshly forked child to its
+        // pty as a controlling terminal.
+        let task = crate::syscalls::tests::init_platform(None);
+        let (_master, slave) = open_unlocked_pty_pair(&task);
+
+        let pid = task.sys_setsid().expect("setsid must succeed");
+
+        assert_eq!(task.sys_ioctl(slave, IoctlArg::TIOCSCTTY(0)), Ok(0));
+
+        let mut got_pgrp: i32 = -1;
+        let got_ptr = UserPtrMut::from_usize((&raw mut got_pgrp).expose_provenance());
+        assert_eq!(task.sys_ioctl(slave, IoctlArg::TIOCGPGRP(got_ptr)), Ok(0));
+        assert_eq!(got_pgrp, pid);
+    }
+
+    #[test]
     fn winsize_is_shared_between_master_and_slave() {
         let task = crate::syscalls::tests::init_platform(None);
         let (master, slave) = open_unlocked_pty_pair(&task);

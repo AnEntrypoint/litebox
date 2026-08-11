@@ -2652,6 +2652,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 dt.set_entry_metadata(fd, crate::ForegroundPgid(pgid));
                 Ok(0)
             }
+            IoctlArg::TIOCSCTTY(_) => {
+                // Make this fd the calling process's controlling terminal: accept, and make the
+                // caller's own process group the terminal's foreground group (real Linux's
+                // default when a session leader with no controlling terminal issues this),
+                // mirroring `TIOCSPGRP`'s own metadata handling directly above.
+                let pgid = self.sys_getpgid(0)?;
+                let mut dt = self.global.litebox.descriptor_table_mut();
+                dt.set_entry_metadata(fd, crate::ForegroundPgid(pgid));
+                Ok(0)
+            }
             IoctlArg::TIOCSWINSZ(_) => {
                 // No window-size state is tracked for plain stdio fds (unlike ptys, where
                 // `pty_ioctl` stores it on the shared `PtyPair`): accept-and-ignore, matching
@@ -2730,6 +2740,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 if pgid <= 0 {
                     return Err(Errno::EINVAL);
                 }
+                pair.set_fg_pgid(pgid);
+                Ok(0)
+            }
+            IoctlArg::TIOCSCTTY(_) => {
+                // Make this pty the calling process's controlling terminal. We don't track "does
+                // this process already have a different controlling terminal" or "is another
+                // session already using this pty" (no session model at all -- see
+                // `sys_setsid`'s doc comment), so this always succeeds, matching this build's
+                // "accept and remember" idiom. Setting the terminal's foreground process group to
+                // the caller's own group is what real Linux does by default here, and is exactly
+                // what glibc's `login_tty()` (the primitive under `forkpty()`/`node-pty`/tmux)
+                // relies on: it calls `setsid()` then `ioctl(fd, TIOCSCTTY, 0)` and expects the
+                // pty to already be routing job-control signals to its own new group afterward.
+                let pgid = self.sys_getpgid(0)?;
                 pair.set_fg_pgid(pgid);
                 Ok(0)
             }
@@ -2912,6 +2936,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             | IoctlArg::TIOCSWINSZ(..)
             | IoctlArg::TIOCGPTN(..)
             | IoctlArg::TIOCSPTLCK(..)
+            | IoctlArg::TIOCSCTTY(..)
             | IoctlArg::TIOCGPGRP(..)
             | IoctlArg::TIOCSPGRP(..) => files.run_on_raw_fd(
                 desc,

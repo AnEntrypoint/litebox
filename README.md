@@ -96,6 +96,14 @@ Concretely, this build fixes (all landed on `main`, CI-verified):
   consumer that puts the pty into raw mode itself (which is what all of the
   above do) is unaffected, but a guest shell relying on the kernel to echo
   typed characters back in cooked mode will not see that echo.
+- **`setsid()` and `TIOCSCTTY`.** These were entirely missing -- `setsid()`
+  wasn't implemented as a syscall at all, and `TIOCSCTTY` fell through to a
+  hard `EINVAL`. Since glibc's `login_tty()` (the primitive under
+  `forkpty()`/`openpty()`-based tools -- `node-pty`, Python's
+  `os.forkpty()`, tmux, `script`) always calls exactly this pair right after
+  `fork()`, this was a hard failure at session-open time for every one of
+  the tools the pty support above exists to serve, not just a degraded-
+  behavior gap. Both are implemented now.
 
 A ready-to-run bundle (the Windows runner exe plus a packaged Alpine rootfs)
 is built by [`.github/workflows/release-windows-alpine.yml`](.github/workflows/release-windows-alpine.yml).

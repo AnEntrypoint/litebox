@@ -2253,6 +2253,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(())
     }
 
+    /// Handle syscall `setsid`.
+    ///
+    /// Real Linux fails with `EPERM` if the caller is already a process group leader (a session
+    /// leader always is). We don't model sessions or true parent/child pgid inheritance at all
+    /// (see `sys_setpgid`'s doc comment) -- and *every* process here starts out as its own
+    /// process-group leader by construction (`Process::new` seeds `pgid` with the process's own
+    /// pid) -- so enforcing that check faithfully would make `setsid()` unconditionally fail for
+    /// exactly the caller that most needs it to succeed: a freshly `fork()`ed child running
+    /// glibc's `login_tty()` (the primitive under `forkpty()`/`openpty()`-based tools --
+    /// node-pty, Python's `os.forkpty()`, tmux, `script`), which always calls `setsid()`
+    /// immediately after `fork()` and before anything else. Matching this build's existing
+    /// "accept and remember" idiom for state it doesn't fully model, this always succeeds and
+    /// makes the caller its own process-group leader (mirroring `setpgid(0, 0)`), returning its
+    /// pid as the new session id (session id == pid is exactly true for a real session leader,
+    /// which this is standing in for).
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "keeps the real syscall's fallible signature (matching sys_setpgid/sys_getpgid) rather than baking in that this build never rejects it, since that's a simplification of the real ABI, not a guarantee"
+    )]
+    pub(crate) fn sys_setsid(&self) -> Result<i32, Errno> {
+        self.process().pgid.store(self.pid, Ordering::Relaxed);
+        Ok(self.pid)
+    }
+
     /// Handle syscall `getuid`.
     pub(crate) fn sys_getuid(&self) -> u32 {
         self.credentials.uid
@@ -3001,6 +3025,21 @@ mod tests {
 
         assert_eq!(task.sys_setpgid(0, 4242), Ok(()));
         assert_eq!(task.sys_setpgid(0, 0), Ok(()));
+        assert_eq!(task.sys_getpgid(0), Ok(pid));
+    }
+
+    #[test]
+    fn test_setsid_returns_own_pid_and_becomes_own_group_leader() {
+        // Mirrors what glibc's login_tty() does immediately after fork(): setsid() must succeed
+        // (not EPERM) and leave the caller as its own process-group leader, exactly the
+        // precondition TIOCSCTTY needs to then succeed too.
+        let task = crate::syscalls::tests::init_platform(None);
+        let pid = task.sys_getpid();
+
+        task.sys_setpgid(0, 4242).unwrap();
+        assert_eq!(task.sys_getpgid(0), Ok(4242));
+
+        assert_eq!(task.sys_setsid(), Ok(pid));
         assert_eq!(task.sys_getpgid(0), Ok(pid));
     }
 
