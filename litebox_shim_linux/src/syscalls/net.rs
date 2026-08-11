@@ -1005,10 +1005,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 };
                 let socket = self.global.net.lock().socket(protocol)?;
                 let _ = self.global.initialize_socket(&socket, ty, flags);
-                let Ok(raw_fd) = files.insert_raw_fd(socket) else {
-                    unimplemented!()
-                };
-                raw_fd
+                files.insert_raw_fd(socket).map_err(|socket| {
+                    // Mirrors the `AddressFamily::UNIX` arm below: `insert_raw_fd` failing
+                    // means the fd table is at its `RLIMIT_NOFILE`/shim-wide limit -- an
+                    // ordinary, guest-triggerable condition (e.g. `setrlimit(RLIMIT_NOFILE,
+                    // small)` then `socket()`, or a server `socket()`/`accept()`ing past its
+                    // fd limit under load), not something that should crash the runner. This
+                    // fd was never exposed to the guest, so there's no pending data to drain
+                    // gracefully -- tear down the network-subsystem-side state
+                    // `initialize_socket`/`net.lock().socket()` already allocated immediately
+                    // (the same way `close_socket`'s own timed-out-wait path does) before
+                    // reporting `EMFILE`.
+                    let _ = self
+                        .global
+                        .net
+                        .lock()
+                        .close(&socket, CloseBehavior::Immediate);
+                    Errno::EMFILE
+                })?
             }
             AddressFamily::UNIX => {
                 let _ = UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
@@ -1307,9 +1321,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .global
                     .initialize_socket(&accepted_file, sock_type, flags);
                 proxy.set_state(SocketState::Connected);
-                let Ok(raw_fd) = files.insert_raw_fd(accepted_file) else {
-                    unimplemented!()
-                };
+                let raw_fd = files
+                    .insert_raw_fd(accepted_file)
+                    .map_err(|accepted_file| {
+                        // Mirrors `do_socket`'s identical `insert_raw_fd` handling: a busy server
+                        // `accept()`ing past its fd limit under load is an ordinary,
+                        // guest-triggerable condition on real Linux (which returns `EMFILE` from
+                        // `accept()` itself in exactly this case), not something that should crash
+                        // the runner. The accepted connection was never exposed to the guest, so
+                        // tear down its network-subsystem-side state immediately rather than
+                        // leaking it, before reporting `EMFILE`.
+                        let _ = self
+                            .global
+                            .net
+                            .lock()
+                            .close(&accepted_file, CloseBehavior::Immediate);
+                        Errno::EMFILE
+                    })?;
                 Ok((raw_fd, peer_addr))
             },
             |file| {
@@ -2174,6 +2202,38 @@ mod tests {
                 "family {name} must fail cleanly, not panic"
             );
         }
+    }
+
+    /// Regression test: `socket(AF_INET, ...)` used to unconditionally panic
+    /// (`unimplemented!()`) when `insert_raw_fd` failed because the fd table was at its
+    /// `RLIMIT_NOFILE`/shim-wide limit -- an ordinary, guest-triggerable condition (e.g. a
+    /// server hitting its fd limit under load, or a guest explicitly lowering its own
+    /// `RLIMIT_NOFILE`), not something that should crash the runner. Confirms it now returns
+    /// `EMFILE`, matching the already-correct `AddressFamily::UNIX` sibling arm right below the
+    /// old panic site.
+    #[test]
+    fn socket_fails_with_emfile_instead_of_panicking_at_the_fd_limit() {
+        use litebox_common_linux::{Rlimit, RlimitResource};
+
+        let task = init_platform(None);
+
+        let cur = task
+            .do_prlimit(RlimitResource::NOFILE, None)
+            .expect("getrlimit(NOFILE) failed");
+        let probe_fd = task.sys_dup(0, None, None).expect("probe dup failed");
+        task.do_prlimit(
+            RlimitResource::NOFILE,
+            Some(Rlimit {
+                rlim_cur: probe_fd as usize + 1,
+                rlim_max: cur.rlim_max,
+            }),
+        )
+        .expect("lowering NOFILE cur limit should succeed");
+
+        let err = task
+            .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
+            .expect_err("socket() at the fd limit must fail cleanly, not panic");
+        assert_eq!(err, Errno::EMFILE);
     }
 
     fn close_socket(task: &TestTask, fd: u32) {
