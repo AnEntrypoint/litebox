@@ -3082,11 +3082,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         maxevents: u32,
         timeout: i32,
         sigmask: Option<UserPtr<litebox_common_linux::signal::SigSet>>,
-        _sigsetsize: usize,
+        sigsetsize: usize,
     ) -> Result<usize, Errno> {
-        if sigmask.is_some() {
-            todo!("sigmask not supported");
-        }
+        let sigmask = if let Some(sigmask) = sigmask {
+            if sigsetsize != core::mem::size_of::<litebox_common_linux::signal::SigSet>() {
+                return Err(Errno::EINVAL);
+            }
+            Some(sigmask.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?)
+        } else {
+            None
+        };
         let Ok(epfd) = u32::try_from(epfd) else {
             return Err(Errno::EBADF);
         };
@@ -3121,24 +3126,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .ok_or(Errno::EBADF)?
             }
         };
-        handle.with_entry(|epoll_file| {
-            match epoll_file.wait(
-                &self.global,
-                &self.wait_cx().with_timeout(timeout),
-                maxevents,
-            ) {
-                Ok(epoll_events) => {
-                    if !epoll_events.is_empty() {
-                        events
-                            .copy_from_slice::<Platform>(0, &epoll_events)
-                            .ok_or(Errno::EFAULT)?;
+        let do_wait = || {
+            handle.with_entry(|epoll_file| {
+                match epoll_file.wait(
+                    &self.global,
+                    &self.wait_cx().with_timeout(timeout),
+                    maxevents,
+                ) {
+                    Ok(epoll_events) => {
+                        if !epoll_events.is_empty() {
+                            events
+                                .copy_from_slice::<Platform>(0, &epoll_events)
+                                .ok_or(Errno::EFAULT)?;
+                        }
+                        Ok(epoll_events.len())
                     }
-                    Ok(epoll_events.len())
+                    Err(WaitError::TimedOut) => Ok(0),
+                    Err(WaitError::Interrupted) => Err(Errno::EINTR),
                 }
-                Err(WaitError::TimedOut) => Ok(0),
-                Err(WaitError::Interrupted) => Err(Errno::EINTR),
-            }
-        })
+            })
+        };
+        if let Some(sigmask) = sigmask {
+            self.with_temporary_signal_mask(sigmask, do_wait)
+        } else {
+            do_wait()
+        }
     }
 
     /// Handle syscall `ppoll`.
@@ -3150,13 +3162,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         sigmask: Option<UserPtr<litebox_common_linux::signal::SigSet>>,
         sigsetsize: usize,
     ) -> Result<usize, Errno> {
-        if sigmask.is_some() {
+        let sigmask = if let Some(sigmask) = sigmask {
             if sigsetsize != core::mem::size_of::<litebox_common_linux::signal::SigSet>() {
                 // Expected via ppoll(2) manpage
-                unimplemented!()
+                return Err(Errno::EINVAL);
             }
-            unimplemented!("no sigmask support yet");
-        }
+            Some(sigmask.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?)
+        } else {
+            None
+        };
         let timeout = timeout.read::<Platform>()?;
         let nfds_signed = isize::try_from(nfds).map_err(|_| Errno::EINVAL)?;
 
@@ -3170,11 +3184,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             set.add_fd(fd.fd, events);
         }
 
-        match set.wait(
-            &self.global,
-            &self.wait_cx().with_timeout(timeout),
-            &self.files.borrow(),
-        ) {
+        let mut do_wait = || {
+            set.wait(
+                &self.global,
+                &self.wait_cx().with_timeout(timeout),
+                &self.files.borrow(),
+            )
+        };
+        let wait_result = if let Some(sigmask) = sigmask {
+            self.with_temporary_signal_mask(sigmask, do_wait)
+        } else {
+            do_wait()
+        };
+        match wait_result {
             Ok(()) => {}
             Err(WaitError::Interrupted) => {
                 // TODO: update the remaining time.
@@ -4317,5 +4339,124 @@ mod tests {
                 .unwrap_or_else(|_| panic!("reopened {path} must carry StdioStream metadata"));
             assert_eq!(stream, expected);
         }
+    }
+
+    #[test]
+    fn open_o_trunc_on_a_directory_returns_eisdir_instead_of_panicking() {
+        // Regression test: `open(dir_path, O_TRUNC, ...)` used to panic (`unimplemented!()`) in
+        // `From<OpenError> for Errno`, because the `OpenError::TruncateError(TruncateError::
+        // IsDirectory)` case fell through to the catch-all arm instead of being mapped to
+        // `EISDIR`. Triggerable via ordinary shell redirection (`cmd > /some/existing/dir`) or
+        // any program that opens a path for writing without first checking whether it is a
+        // directory.
+        let task = crate::syscalls::tests::init_platform(None);
+        task.sys_mkdirat(litebox_common_linux::AT_FDCWD, "/a_directory", 0o777)
+            .unwrap();
+
+        let err = task
+            .sys_open(
+                "/a_directory",
+                OFlags::WRONLY | OFlags::TRUNC,
+                Mode::empty(),
+            )
+            .unwrap_err();
+        assert_eq!(err, Errno::EISDIR);
+    }
+
+    #[test]
+    fn ppoll_with_sigmask_does_not_panic_and_reports_ready_fd() {
+        // Regression test: `ppoll()` with a non-null sigmask used to unconditionally panic
+        // (`unimplemented!("no sigmask support yet")`), which is the standard signal-safe-
+        // polling idiom used by many real-world event loops/daemons to avoid the self-pipe
+        // race. Mirrors the sigmask handling `sys_pselect` already implements correctly via
+        // `with_temporary_signal_mask`.
+        let task = crate::syscalls::tests::init_platform(None);
+        let (reader, writer) = task.sys_pipe2(OFlags::empty()).unwrap();
+        task.sys_write(i32::try_from(writer).unwrap(), b"x", None)
+            .unwrap();
+
+        let mut pollfd = litebox_common_linux::Pollfd {
+            fd: i32::try_from(reader).unwrap(),
+            events: 0x0001, // POLLIN
+            revents: 0,
+        };
+        let fds_ptr = UserPtrMut::from_usize((&raw mut pollfd).expose_provenance());
+
+        let sigmask = litebox_common_linux::signal::SigSet::empty();
+        let sigmask_ptr = UserPtr::from_usize((&raw const sigmask).expose_provenance());
+
+        let ready = task
+            .sys_ppoll(
+                fds_ptr,
+                1,
+                TimeParam::None,
+                Some(sigmask_ptr),
+                core::mem::size_of::<litebox_common_linux::signal::SigSet>(),
+            )
+            .unwrap();
+        assert_eq!(ready, 1);
+        assert_eq!(pollfd.revents, 0x0001);
+    }
+
+    #[test]
+    fn ppoll_with_wrong_sigsetsize_returns_einval_instead_of_panicking() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let mut pollfd = litebox_common_linux::Pollfd {
+            fd: 0,
+            events: 0x0001,
+            revents: 0,
+        };
+        let fds_ptr = UserPtrMut::from_usize((&raw mut pollfd).expose_provenance());
+        let sigmask = litebox_common_linux::signal::SigSet::empty();
+        let sigmask_ptr = UserPtr::from_usize((&raw const sigmask).expose_provenance());
+
+        let err = task
+            .sys_ppoll(fds_ptr, 1, TimeParam::None, Some(sigmask_ptr), 1)
+            .unwrap_err();
+        assert_eq!(err, Errno::EINVAL);
+    }
+
+    #[test]
+    fn epoll_pwait_with_sigmask_does_not_panic_and_reports_ready_fd() {
+        // Regression test: `epoll_pwait()` with a non-null sigmask used to unconditionally
+        // panic (`todo!("sigmask not supported")`).
+        let task = crate::syscalls::tests::init_platform(None);
+        let (reader, writer) = task.sys_pipe2(OFlags::empty()).unwrap();
+        task.sys_write(i32::try_from(writer).unwrap(), b"x", None)
+            .unwrap();
+
+        let epfd = task
+            .sys_epoll_create(litebox_common_linux::EpollCreateFlags::empty())
+            .unwrap();
+        let ctl_event = litebox_common_linux::EpollEvent {
+            events: 0x0001, // EPOLLIN
+            data: 0,
+        };
+        let ctl_event_ptr = UserPtr::from_usize((&raw const ctl_event).expose_provenance());
+        task.sys_epoll_ctl(
+            i32::try_from(epfd).unwrap(),
+            litebox_common_linux::EpollOp::EpollCtlAdd,
+            i32::try_from(reader).unwrap(),
+            ctl_event_ptr,
+        )
+        .unwrap();
+
+        let mut out_event = litebox_common_linux::EpollEvent { events: 0, data: 0 };
+        let out_event_ptr = UserPtrMut::from_usize((&raw mut out_event).expose_provenance());
+        let sigmask = litebox_common_linux::signal::SigSet::empty();
+        let sigmask_ptr = UserPtr::from_usize((&raw const sigmask).expose_provenance());
+
+        let ready = task
+            .sys_epoll_pwait(
+                i32::try_from(epfd).unwrap(),
+                out_event_ptr,
+                1,
+                -1,
+                Some(sigmask_ptr),
+                core::mem::size_of::<litebox_common_linux::signal::SigSet>(),
+            )
+            .unwrap();
+        assert_eq!(ready, 1);
+        assert_eq!(out_event.events & 0x0001, 0x0001);
     }
 }
