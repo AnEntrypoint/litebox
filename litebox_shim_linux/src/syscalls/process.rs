@@ -2328,11 +2328,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `getpgid`.
     ///
     /// We have no global pid registry (see `do_kill`'s doc comment), so `pid` may only name the
-    /// calling process itself (`0`, or the caller's own pid) -- matching real Linux's `ESRCH` for
-    /// any other pid, since there is nowhere to look one up.
+    /// calling process itself (`0`, or the caller's own pid) or a live direct child (reachable
+    /// via `children`, the same reachability `do_kill`'s remote-child case relies on) --
+    /// matching real Linux's `ESRCH` for any other pid, since there is nowhere to look one up.
     pub(crate) fn sys_getpgid(&self, pid: i32) -> Result<i32, Errno> {
         if pid == 0 || pid == self.pid {
             Ok(self.process().pgid.load(Ordering::Relaxed))
+        } else if pid > 0 {
+            self.process()
+                .find_child(pid)
+                .map(|child| child.pgid.load(Ordering::Relaxed))
+                .ok_or(Errno::ESRCH)
         } else {
             Err(Errno::ESRCH)
         }
@@ -2342,21 +2348,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ///
     /// Real Linux additionally restricts `setpgid` to processes within the same session and
     /// forbids changing the pgid of a process that has already called `execve` (`EACCES`); we
-    /// don't model sessions at all, so those checks are not enforced -- only the pid-target
-    /// restriction (see [`Self::sys_getpgid`]) and `EINVAL` for a negative `pgid` are.
+    /// don't model sessions or "has this process execve'd yet" at all, so those checks are not
+    /// enforced -- only the pid-target restriction (see [`Self::sys_getpgid`]) and `EINVAL` for a
+    /// negative `pgid` are. `pid` may target a live direct child, not just self -- the standard
+    /// shell-job-control pattern of a parent shell moving a freshly forked-but-not-yet-exec'd
+    /// child into a (possibly brand new) pipeline process group before letting it run.
     pub(crate) fn sys_setpgid(&self, pid: i32, requested_group: i32) -> Result<(), Errno> {
         if requested_group < 0 {
             return Err(Errno::EINVAL);
         }
-        if pid != 0 && pid != self.pid {
+        let (target_process, target_own_pid) = if pid == 0 || pid == self.pid {
+            (self.process().clone(), self.pid)
+        } else if pid > 0 {
+            let child = self.process().find_child(pid).ok_or(Errno::ESRCH)?;
+            (child, pid)
+        } else {
             return Err(Errno::ESRCH);
-        }
+        };
         let target_pgid = if requested_group == 0 {
-            self.pid
+            target_own_pid
         } else {
             requested_group
         };
-        self.process().pgid.store(target_pgid, Ordering::Relaxed);
+        target_process.pgid.store(target_pgid, Ordering::Relaxed);
         Ok(())
     }
 
@@ -3355,6 +3369,33 @@ mod tests {
 
         assert_eq!(task.sys_getpgid(other_pid), Err(Errno::ESRCH));
         assert_eq!(task.sys_setpgid(other_pid, 4242), Err(Errno::ESRCH));
+    }
+
+    #[test]
+    fn test_setpgid_and_getpgid_can_target_a_live_direct_child() {
+        // Regression test: setpgid()/getpgid() used to reject any pid other than self
+        // unconditionally, even a live direct child -- but a parent moving a freshly forked
+        // child into a (possibly brand new) pipeline process group before it runs is the
+        // standard shell-job-control pattern (e.g. bash setting up `cmd1 | cmd2 | cmd3`), and the
+        // child *is* reachable via `children`, the same reachability `do_kill`'s remote-child
+        // case already relies on.
+        let task = crate::syscalls::tests::init_platform(None);
+        let child = task.clone_as_forked_child_for_test();
+
+        // A freshly forked child defaults to being its own group leader.
+        assert_eq!(task.sys_getpgid(child.pid).unwrap(), child.pid);
+
+        // Move the child into an explicit new group (as a shell would for a pipeline).
+        assert_eq!(task.sys_setpgid(child.pid, 4242), Ok(()));
+        assert_eq!(task.sys_getpgid(child.pid).unwrap(), 4242);
+        // The child's own view of its pgid must agree.
+        assert_eq!(child.sys_getpgid(0).unwrap(), 4242);
+        // Self must be untouched.
+        assert_eq!(task.sys_getpgid(0).unwrap(), task.pid);
+
+        // pgid == 0 means "use the target pid's own pid", not the caller's.
+        assert_eq!(task.sys_setpgid(child.pid, 0), Ok(()));
+        assert_eq!(task.sys_getpgid(child.pid).unwrap(), child.pid);
     }
 
     #[test]
