@@ -1682,6 +1682,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 pub(crate) const RLIMIT_NOFILE_CUR: usize = 1024 * 1024;
 const RLIMIT_NOFILE_MAX: usize = 1024 * 1024;
 
+/// Default `RLIMIT_SIGPENDING` cur/max, matching a typical unprivileged Linux
+/// process (`ulimit -i`). Unlike most other resources this one is actually
+/// enforced (see `SignalQueue::push`), so it must not default to 0 -- a zero
+/// limit would silently drop every real-time/queued signal a guest sends.
+const RLIMIT_SIGPENDING_DEFAULT: usize = 62719;
+
 struct AtomicRlimit {
     cur: core::sync::atomic::AtomicUsize,
     max: core::sync::atomic::AtomicUsize,
@@ -1702,10 +1708,16 @@ pub(crate) struct ResourceLimits {
 
 impl ResourceLimits {
     const fn default() -> Self {
+        // Every resource defaults to "unlimited" (matching what an unprivileged
+        // process typically sees for the resources LiteBox doesn't actually
+        // enforce), except the handful below that LiteBox tracks for real.
         seq_macro::seq!(N in 0..16 {
             let mut limits = [
                 #(
-                    AtomicRlimit::new(0, 0),
+                    AtomicRlimit::new(
+                        litebox_common_linux::rlim_t::MAX,
+                        litebox_common_linux::rlim_t::MAX,
+                    ),
                 )*
             ];
         });
@@ -1716,6 +1728,10 @@ impl ResourceLimits {
         limits[litebox_common_linux::RlimitResource::STACK as usize] = AtomicRlimit {
             cur: core::sync::atomic::AtomicUsize::new(crate::loader::DEFAULT_STACK_SIZE),
             max: core::sync::atomic::AtomicUsize::new(litebox_common_linux::rlim_t::MAX),
+        };
+        limits[litebox_common_linux::RlimitResource::SIGPENDING as usize] = AtomicRlimit {
+            cur: core::sync::atomic::AtomicUsize::new(RLIMIT_SIGPENDING_DEFAULT),
+            max: core::sync::atomic::AtomicUsize::new(RLIMIT_SIGPENDING_DEFAULT),
         };
         Self { limits }
     }
@@ -1754,16 +1770,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         resource: litebox_common_linux::RlimitResource,
         new_limit: Option<litebox_common_linux::Rlimit>,
     ) -> Result<litebox_common_linux::Rlimit, Errno> {
-        let old_rlimit = match resource {
-            litebox_common_linux::RlimitResource::NOFILE
-            | litebox_common_linux::RlimitResource::STACK => {
-                self.thread.process.limits.get_rlimit(resource)
-            }
-            _ => {
-                log_unsupported!("Unsupported resource for get_rlimit: {:?}", resource);
-                return Err(Errno::EINVAL);
-            }
-        };
+        let old_rlimit = self.thread.process.limits.get_rlimit(resource);
         if let Some(new_limit) = new_limit {
             if new_limit.rlim_cur > new_limit.rlim_max {
                 return Err(Errno::EINVAL);
@@ -1778,13 +1785,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             if new_limit.rlim_max > old_rlimit.rlim_max {
                 return Err(Errno::EPERM);
             }
-            match resource {
-                litebox_common_linux::RlimitResource::NOFILE => {
-                    let new_max_fd = new_limit.rlim_cur.saturating_sub(1);
-                    self.thread.process.limits.set_rlimit(resource, new_limit);
-                    self.files.borrow().set_max_fd(new_max_fd);
-                }
-                _ => unimplemented!("Unsupported resource for set_rlimit: {:?}", resource),
+            // Every resource accepts and remembers the new limit (so a later
+            // getrlimit sees it and enforced resources like NOFILE/SIGPENDING
+            // pick it up), even though most resources beyond NOFILE/STACK/
+            // SIGPENDING aren't actually enforced by LiteBox -- matching this
+            // build's documented "no host-enforced resource limits" boundary
+            // without making ordinary `ulimit -c 0`/`ulimit -s ...` calls
+            // panic the whole runner.
+            let new_max_fd = new_limit.rlim_cur.saturating_sub(1);
+            self.thread.process.limits.set_rlimit(resource, new_limit);
+            if let litebox_common_linux::RlimitResource::NOFILE = resource {
+                self.files.borrow().set_max_fd(new_max_fd);
             }
         }
         Ok(old_rlimit)

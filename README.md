@@ -73,6 +73,18 @@ Concretely, this build fixes (all landed on `main`, CI-verified):
   `CLOCK_REALTIME_COARSE`/`CLOCK_BOOTTIME` (V8's own startup code aborts the
   whole process if `clock_gettime` returns an error, which it previously did
   for these clock IDs).
+- **`setrlimit`/`prlimit64` correctness.** Calling `setrlimit`/`prlimit64` for
+  any resource other than `RLIMIT_NOFILE` (e.g. `ulimit -c 0`, which is
+  extremely common in shell entrypoint scripts) used to panic and crash the
+  whole runner; it's now accepted for every resource. Separately,
+  `RLIMIT_SIGPENDING` -- which is actually enforced, unlike most rlimits --
+  defaulted to a limit of `0`, silently dropping every real-time/queued
+  signal a guest process sent; it now defaults to a realistic Linux value.
+- **Baked-in agent-sandbox tooling.** The published Alpine base image now
+  also includes `git`, `bash`, `curl`, and `openssh-client` alongside
+  `nodejs`/`npm`/`python3`/`py3-pip`/`build-base`, so common agent-workload
+  needs (cloning a repo, running a `#!/bin/bash` npm postinstall script,
+  fetching a file) don't require an extra `apk add` round-trip.
 
 A ready-to-run bundle (the Windows runner exe plus a packaged Alpine rootfs)
 is built by [`.github/workflows/release-windows-alpine.yml`](.github/workflows/release-windows-alpine.yml).
