@@ -139,6 +139,7 @@ const HEADERS_REQUIRED_PREFIX: &[(&str, &str)] = &[
 // tests. Please do NOT modify this unless you have a very compelling reason to.
 const SKIP_FILES: &[&str] = &[
     "LICENSE",
+    "dist_tools/base-image/Dockerfile",
     "litebox/src/sync/mutex.rs",
     "litebox/src/sync/rwlock.rs",
     "litebox_runner_linux_on_windows_userland/tests/test-bins/hello_exec_nolibc",
