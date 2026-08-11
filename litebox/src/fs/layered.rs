@@ -240,6 +240,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         // First, we make sure we've set up the ancestor directories.
                         match self.mkdir_migrating_ancestor_dirs(path) {
                             Ok(()) => {}
+                            Err(MkdirError::ReadOnlyFileSystem) => {
+                                // This upper layer physically cannot hold `path` (e.g. `dev_stdio`,
+                                // which only backs `/dev`, being asked to migrate a non-`/dev`
+                                // path). This is a structural mismatch, not a transient failure --
+                                // let the caller fall back to a different upper layer capable of
+                                // holding it, rather than treating it as unreachable/fatal.
+                                let _ = self.lower.close(&lower_fd);
+                                return Err(MigrationError::UpperCannotHoldPath);
+                            }
                             Err(e) => unimplemented!("{e} when setting up ancestor dirs"),
                         }
                         // Now we can actually open the file.
@@ -441,6 +450,13 @@ pub enum MigrationError {
     Io,
     #[error(transparent)]
     PathError(#[from] PathError),
+    /// The upper layer cannot hold this path at all (e.g. a namespace like `/dev` that only
+    /// backs a narrow subtree of the full path space) -- distinct from `Io`, since this is a
+    /// structural, always-reproducible mismatch rather than a transient failure. Callers that
+    /// have another upper layer capable of holding the path (e.g. an outer layered fs whose own
+    /// upper is a general-purpose in-memory fs) should fall back to migrating there instead.
+    #[error("upper layer cannot hold this path")]
+    UpperCannotHoldPath,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower: super::FileSystem>
@@ -821,12 +837,23 @@ impl<
                         // fallthrough
                     }
                     LayeringSemantics::LowerLayerWritableFiles => {
-                        // Allow direct write to lower layer
-                        let num_bytes = self.lower.write(lower_fd, buf, offset)?;
-                        if let Some(e) = self.litebox.descriptor_table().get_entry(fd) {
-                            e.entry.position.fetch_add(num_bytes, SeqCst);
+                        // Allow direct write to lower layer, unless the lower layer itself can't
+                        // hold this path in its own upper (e.g. the lower is a `dev_stdio`-over-
+                        // `tar_ro` fs and this path isn't under `/dev`) -- in which case fall
+                        // through below to migrate the file into *this* fs's own upper instead,
+                        // same as the `LowerLayerReadOnly` case.
+                        match self.lower.write(lower_fd, buf, offset) {
+                            Ok(num_bytes) => {
+                                if let Some(e) = self.litebox.descriptor_table().get_entry(fd) {
+                                    e.entry.position.fetch_add(num_bytes, SeqCst);
+                                }
+                                return Ok(num_bytes);
+                            }
+                            Err(WriteError::NotForWriting) => {
+                                // fallthrough to migrate into this fs's own upper
+                            }
+                            Err(e) => return Err(e),
                         }
-                        return Ok(num_bytes);
                     }
                 }
             }
@@ -840,6 +867,13 @@ impl<
             Err(MigrationError::NotAFile) => return Err(WriteError::NotAFile),
             Err(MigrationError::Io) => return Err(WriteError::Io),
             Err(MigrationError::PathError(_e)) => unreachable!(),
+            // This fs's own upper layer cannot hold `path` (see `UpperCannotHoldPath`'s doc
+            // comment) -- e.g. this is the inner `dev_stdio`-over-`tar_ro` fs and `path` isn't
+            // under `/dev`. Surface it as `NotForWriting`: not semantically precise, but the
+            // closest existing `WriteError` variant, and an outer fs composing this one as its
+            // `lower` (see the `EntryX::Lower` branch in the outer `write` above) specifically
+            // matches on this to fall back to migrating through its *own* upper instead.
+            Err(MigrationError::UpperCannotHoldPath) => return Err(WriteError::NotForWriting),
         }
         // As a sanity check, in debug mode, confirm that it is now an upper file
         debug_assert!(matches!(
@@ -899,7 +933,24 @@ impl<
             EntryX::Lower { fd } => {
                 match self.layering_semantics {
                     LayeringSemantics::LowerLayerWritableFiles => {
-                        self.lower.truncate(fd, length, reset_offset)
+                        match self.lower.truncate(fd, length, reset_offset) {
+                            Err(TruncateError::NotForWriting) => {
+                                // The lower fs's own upper can't hold this path -- fall back to
+                                // migrating into *this* fs's own upper, same pattern as `write`'s
+                                // `LowerLayerWritableFiles` branch above.
+                                drop(entry);
+                                let path = self
+                                    .litebox
+                                    .descriptor_table()
+                                    .with_entry(layered_fd, |descriptor| {
+                                        descriptor.entry.path.clone()
+                                    })
+                                    .ok_or(TruncateError::ClosedFd)?;
+                                self.migrate_file_up(&path, false)
+                                    .map_err(|e| unreachable!("unexpected migration failure: {e}"))
+                            }
+                            other => other,
+                        }
                     }
                     LayeringSemantics::LowerLayerReadOnly => {
                         if flags.contains(OFlags::WRONLY) || flags.contains(OFlags::RDWR) {
@@ -923,10 +974,21 @@ impl<
                                             descriptor.entry.path.clone()
                                         })
                                         .ok_or(TruncateError::ClosedFd)?;
-                                    self.migrate_file_up(&path, false)
-                                        .expect("this migration should always succeed");
-
-                                    Ok(())
+                                    match self.migrate_file_up(&path, false) {
+                                        Ok(()) => Ok(()),
+                                        // This fs's own upper can't hold `path` (see
+                                        // `UpperCannotHoldPath`'s doc comment). Surface as
+                                        // `NotForWriting`, the same signal an outer fs composing
+                                        // this one as its `lower` already matches on to fall back
+                                        // to migrating through its own upper instead (see the
+                                        // outer `truncate`'s `LowerLayerWritableFiles` branch).
+                                        Err(MigrationError::UpperCannotHoldPath) => {
+                                            Err(TruncateError::NotForWriting)
+                                        }
+                                        Err(e) => {
+                                            unreachable!("unexpected migration failure: {e}")
+                                        }
+                                    }
                                 }
                                 Err(TruncateError::Io) => Err(TruncateError::Io),
                             }
@@ -977,6 +1039,9 @@ impl<
             Err(MigrationError::NotAFile) => unimplemented!(),
             Err(MigrationError::Io) => return Err(ChmodError::Io),
             Err(MigrationError::PathError(_e)) => unreachable!(),
+            Err(MigrationError::UpperCannotHoldPath) => unreachable!(
+                "this fs's own upper should always be able to hold a path already confirmed to exist in its lower"
+            ),
         }
         // Since it has been migrated, we can just re-trigger, causing it to apply to the
         // upper layer
@@ -1023,6 +1088,9 @@ impl<
             Err(MigrationError::NotAFile) => unimplemented!(),
             Err(MigrationError::Io) => return Err(ChownError::Io),
             Err(MigrationError::PathError(_e)) => unreachable!(),
+            Err(MigrationError::UpperCannotHoldPath) => unreachable!(
+                "this fs's own upper should always be able to hold a path already confirmed to exist in its lower"
+            ),
         }
         // Since it has been migrated, we can just re-trigger, causing it to apply to the
         // upper layer
@@ -1069,6 +1137,9 @@ impl<
             Err(MigrationError::NotAFile) => unimplemented!(),
             Err(MigrationError::Io) => return Err(SetTimesError::Io),
             Err(MigrationError::PathError(_e)) => unreachable!(),
+            Err(MigrationError::UpperCannotHoldPath) => unreachable!(
+                "this fs's own upper should always be able to hold a path already confirmed to exist in its lower"
+            ),
         }
         // Since it has been migrated, we can just re-trigger, causing it to apply to the
         // upper layer
