@@ -61,11 +61,19 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
         pm: litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
         vforked: bool,
         parent: Option<Weak<Process<Platform>>>,
+        shared_pending: Arc<Mutex<Platform, super::signal::PendingSignals>>,
     ) -> Self {
         let remote = Arc::new(ThreadRemote::new());
         Self {
             init_state: Cell::new(ThreadInitState::None),
-            process: Arc::new(Process::new(pid, remote.clone(), pm, vforked, parent)),
+            process: Arc::new(Process::new(
+                pid,
+                remote.clone(),
+                pm,
+                vforked,
+                parent,
+                shared_pending,
+            )),
             remote,
             attached_tid: Cell::new(Some(pid)),
             clear_child_tid: Cell::new(None),
@@ -195,6 +203,16 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     /// ever target the calling process itself -- there is nowhere to look up another process by
     /// pid to move it into a different group.
     pgid: core::sync::atomic::AtomicI32,
+    /// This process's process-directed pending-signal queue -- the exact same `Arc` as this
+    /// process's own live `Task`'s `SignalState::shared_pending` (see that field's doc comment
+    /// on why they must be identical). Reachable from a `Process` handle alone (e.g. via
+    /// `children`), unlike the rest of `SignalState`, which lives on `Task` and needs a live
+    /// thread context -- this is what lets `do_kill` queue a signal for a live, shim-known
+    /// *child* process without needing that child's own `Task` in scope. Actually waking the
+    /// child up afterward still goes through this `Process`'s own `inner.threads`/`ThreadRemote`
+    /// (see `do_kill`'s remote-child case), which needs no signal-specific plumbing at all --
+    /// `ThreadRemote::interrupt` and `has_pending_signals` already existed for exactly this.
+    pub(crate) shared_pending: Arc<Mutex<Platform, super::signal::PendingSignals>>,
 }
 
 pub(crate) struct Alarm<Platform: ShimPlatform> {
@@ -250,6 +268,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
         pm: litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
         vforked: bool,
         parent: Option<Weak<Process<Platform>>>,
+        shared_pending: Arc<Mutex<Platform, super::signal::PendingSignals>>,
     ) -> Self {
         let nr_threads = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
         nr_threads.underlying_atomic().store(1, Ordering::Relaxed);
@@ -275,7 +294,44 @@ impl<Platform: ShimPlatform> Process<Platform> {
             children: Mutex::new(alloc::vec::Vec::new()),
             vfork_done,
             pgid: core::sync::atomic::AtomicI32::new(pid),
+            shared_pending,
         }
+    }
+
+    /// Registers `child` as a child of this process, exactly as `do_clone`'s process-clone
+    /// branch does. Test-only: production code goes through `do_clone` itself, which has
+    /// several other steps (rlimit inheritance, register/TLS translation) around this single
+    /// step that a real fork() needs but a test constructing a minimal process family for
+    /// signal-delivery testing doesn't.
+    #[cfg(test)]
+    pub(crate) fn add_child_for_test(&self, pid: i32, child: Arc<Process<Platform>>) {
+        self.children.lock().push((pid, child));
+    }
+
+    /// Returns every live child of this process whose *own* current `pgid` equals `group` --
+    /// used by `do_kill`'s group-directed case (`kill(0|-1|-pgid, sig)`) to reach children that
+    /// have been moved into the caller's process group (e.g. via `setpgid()`, the standard
+    /// shell-job-control/process-supervisor pattern of putting a whole spawned pipeline into one
+    /// group), not just the caller itself.
+    pub(crate) fn children_in_group(&self, group: i32) -> alloc::vec::Vec<Arc<Process<Platform>>> {
+        self.children
+            .lock()
+            .iter()
+            .filter(|(_, child)| child.pgid.load(Ordering::Relaxed) == group)
+            .map(|(_, child)| child.clone())
+            .collect()
+    }
+
+    /// Returns the live child `Process` with pid `pid`, if this process has one (see
+    /// `children`'s doc comment) -- used by `do_kill`'s remote-child case, the one form of
+    /// "signal some other, specific process" this shim can actually reach without a full
+    /// shim-wide pid registry.
+    pub(crate) fn find_child(&self, pid: i32) -> Option<Arc<Process<Platform>>> {
+        self.children
+            .lock()
+            .iter()
+            .find(|(child_pid, _)| *child_pid == pid)
+            .map(|(_, child)| child.clone())
     }
 
     /// Returns this process's parent `Process`, if it is still live (its `Arc` not yet fully
@@ -335,6 +391,25 @@ impl<Platform: ShimPlatform> Process<Platform> {
             let _ = self.nr_threads.block(n);
         }
         self.inner.lock().exit_status
+    }
+
+    /// Interrupts every currently-live thread in this process, causing each to re-evaluate its
+    /// wait condition (e.g. pick up a newly pushed pending signal, see `has_pending_signals`) at
+    /// its next opportunity. Used by `do_kill`'s remote-child case, after pushing a signal into
+    /// this process's own `shared_pending`, to actually wake it up -- mirroring the exact
+    /// collect-then-interrupt pattern `exit_group`/`kill_other_threads` already use for
+    /// same-process delivery. See `exit_group`'s doc comment on why `interrupt()` must never be
+    /// called while still holding `inner` (it can OS-suspend the target thread directly).
+    ///
+    /// A no-op if every thread has already exited (e.g. the target is a zombie awaiting `wait4`)
+    /// -- the pushed signal simply sits unconsumed in `shared_pending` until this `Process` is
+    /// eventually dropped, matching real Linux's `kill()` on a zombie: it succeeds but delivers
+    /// to nothing.
+    pub(crate) fn interrupt_all_threads(&self) {
+        let remotes: alloc::vec::Vec<_> = self.inner.lock().threads.values().cloned().collect();
+        for thread in remotes {
+            thread.interrupt();
+        }
     }
 
     /// Returns the exit code if all threads in this process have already exited, without
@@ -1448,7 +1523,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             None
         };
 
-        let (thread, init_state, pid, ppid) = if is_process_clone {
+        let (thread, init_state, pid, ppid, child_shared_pending) = if is_process_clone {
             // Real `fork()`/`vfork()`: build a brand-new `Process` (new thread group) whose
             // address space is an eager duplicate of the parent's -- writes made by either the
             // parent or the child after this point are independent.
@@ -1458,12 +1533,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     Errno::ENOMEM
                 })?;
             let vforked = flags.contains(CloneFlags::VFORK);
+            // Created once here and threaded into both the new `Process` (below) and the new
+            // `Task`'s `SignalState` (see `clone_for_new_task`'s call site further down) -- they
+            // must end up sharing the exact same `Arc`, not two independently allocated queues.
+            let child_shared_pending = Arc::new(Mutex::new(super::signal::PendingSignals::new()));
             let thread = crate::syscalls::process::ThreadState::new_process(
                 child_tid,
                 dest_pm,
                 vforked,
                 Some(Arc::downgrade(self.process())),
+                child_shared_pending.clone(),
             );
+            // Real fork() inherits the parent's current rlimits rather than resetting to
+            // program-start defaults (see `ResourceLimits::copy_from`'s doc comment).
+            thread.process.limits.copy_from(&self.process().limits);
 
             // The captured ctx's registers may hold addresses into the PARENT's address space --
             // the child's code, stack, and everything else generally live at a different host
@@ -1597,6 +1680,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 ),
                 child_tid,
                 self.pid,
+                Some(child_shared_pending),
             )
         } else {
             let thread = self.thread.new_thread(child_tid).ok_or(Errno::EBUSY)?;
@@ -1609,6 +1693,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 },
                 self.pid,
                 self.ppid,
+                None,
             )
         };
         thread.init_state.set(init_state);
@@ -1635,7 +1720,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         comm: self.comm.clone(),
                         fs: fs.into(),
                         files: files.into(),
-                        signals: self.signals.clone_for_new_task(),
+                        signals: self.signals.clone_for_new_task(child_shared_pending),
                     },
                 }),
             )
@@ -1682,6 +1767,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 pub(crate) const RLIMIT_NOFILE_CUR: usize = 1024 * 1024;
 const RLIMIT_NOFILE_MAX: usize = 1024 * 1024;
 
+/// Default `RLIMIT_SIGPENDING` cur/max, matching a typical unprivileged Linux
+/// process (`ulimit -i`). Unlike most other resources this one is actually
+/// enforced (see `SignalQueue::push`), so it must not default to 0 -- a zero
+/// limit would silently drop every real-time/queued signal a guest sends.
+const RLIMIT_SIGPENDING_DEFAULT: usize = 62719;
+
 struct AtomicRlimit {
     cur: core::sync::atomic::AtomicUsize,
     max: core::sync::atomic::AtomicUsize,
@@ -1702,10 +1793,16 @@ pub(crate) struct ResourceLimits {
 
 impl ResourceLimits {
     const fn default() -> Self {
+        // Every resource defaults to "unlimited" (matching what an unprivileged
+        // process typically sees for the resources LiteBox doesn't actually
+        // enforce), except the handful below that LiteBox tracks for real.
         seq_macro::seq!(N in 0..16 {
             let mut limits = [
                 #(
-                    AtomicRlimit::new(0, 0),
+                    AtomicRlimit::new(
+                        litebox_common_linux::rlim_t::MAX,
+                        litebox_common_linux::rlim_t::MAX,
+                    ),
                 )*
             ];
         });
@@ -1717,7 +1814,30 @@ impl ResourceLimits {
             cur: core::sync::atomic::AtomicUsize::new(crate::loader::DEFAULT_STACK_SIZE),
             max: core::sync::atomic::AtomicUsize::new(litebox_common_linux::rlim_t::MAX),
         };
+        limits[litebox_common_linux::RlimitResource::SIGPENDING as usize] = AtomicRlimit {
+            cur: core::sync::atomic::AtomicUsize::new(RLIMIT_SIGPENDING_DEFAULT),
+            max: core::sync::atomic::AtomicUsize::new(RLIMIT_SIGPENDING_DEFAULT),
+        };
         Self { limits }
+    }
+
+    /// Overwrite every limit in `self` with the corresponding value from `other`, in place --
+    /// used by `fork()`/`clone()` (real process clone) so a freshly constructed child's limits
+    /// (which start out as `ResourceLimits::default()`) are replaced with the *parent's current*
+    /// limits rather than always resetting to program-start defaults.
+    ///
+    /// Real Linux inherits `rlimit`s across `fork()` (a parent that lowered e.g.
+    /// `RLIMIT_NOFILE` before spawning a child expects that child to actually be bounded by it);
+    /// before this, every new `Process` -- including every forked child -- kept its brand-new
+    /// `ResourceLimits::default()` forever, silently discarding whatever the parent had
+    /// configured.
+    pub(crate) fn copy_from(&self, other: &Self) {
+        for (mine, theirs) in self.limits.iter().zip(other.limits.iter()) {
+            mine.cur
+                .store(theirs.cur.load(Ordering::Relaxed), Ordering::Relaxed);
+            mine.max
+                .store(theirs.max.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn get_rlimit(
@@ -1754,16 +1874,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         resource: litebox_common_linux::RlimitResource,
         new_limit: Option<litebox_common_linux::Rlimit>,
     ) -> Result<litebox_common_linux::Rlimit, Errno> {
-        let old_rlimit = match resource {
-            litebox_common_linux::RlimitResource::NOFILE
-            | litebox_common_linux::RlimitResource::STACK => {
-                self.thread.process.limits.get_rlimit(resource)
-            }
-            _ => {
-                log_unsupported!("Unsupported resource for get_rlimit: {:?}", resource);
-                return Err(Errno::EINVAL);
-            }
-        };
+        let old_rlimit = self.thread.process.limits.get_rlimit(resource);
         if let Some(new_limit) = new_limit {
             if new_limit.rlim_cur > new_limit.rlim_max {
                 return Err(Errno::EINVAL);
@@ -1778,22 +1889,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             if new_limit.rlim_max > old_rlimit.rlim_max {
                 return Err(Errno::EPERM);
             }
-            match resource {
-                litebox_common_linux::RlimitResource::NOFILE => {
-                    let new_max_fd = new_limit.rlim_cur.saturating_sub(1);
-                    self.thread.process.limits.set_rlimit(resource, new_limit);
-                    self.files.borrow().set_max_fd(new_max_fd);
-                }
-                _ => unimplemented!("Unsupported resource for set_rlimit: {:?}", resource),
+            // Every resource accepts and remembers the new limit (so a later
+            // getrlimit sees it and enforced resources like NOFILE/SIGPENDING
+            // pick it up), even though most resources beyond NOFILE/STACK/
+            // SIGPENDING aren't actually enforced by LiteBox -- matching this
+            // build's documented "no host-enforced resource limits" boundary
+            // without making ordinary `ulimit -c 0`/`ulimit -s ...` calls
+            // panic the whole runner.
+            let new_max_fd = new_limit.rlim_cur.saturating_sub(1);
+            self.thread.process.limits.set_rlimit(resource, new_limit);
+            if let litebox_common_linux::RlimitResource::NOFILE = resource {
+                self.files.borrow().set_max_fd(new_max_fd);
             }
         }
         Ok(old_rlimit)
     }
 
     /// Handle syscall `prlimit64`.
-    ///
-    /// Note for now setting new limits is not supported yet, and thus returning constant values
-    /// for the requested resource. Getting resources for a specific PID is also not supported yet.
     pub(crate) fn sys_prlimit(
         &self,
         pid: i32,
@@ -1801,8 +1913,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         new_rlim: Option<UserPtr<litebox_common_linux::Rlimit64>>,
         old_rlim: Option<UserPtrMut<litebox_common_linux::Rlimit64>>,
     ) -> Result<(), Errno> {
-        if pid != 0 {
-            unimplemented!("prlimit for a specific PID is not supported yet");
+        // `pid == 0` means "the calling process" per prlimit(2); `pid == self.pid` is exactly
+        // equivalent (e.g. the util-linux `prlimit` CLI, unlike getrlimit()/setrlimit() callers,
+        // defaults to passing its own real pid rather than 0). Both target self, which this shim
+        // can always answer. A genuine *other* pid can't be reached: there's no shim-wide
+        // process registry to look one up (see the same limitation `kill()`/`tkill()` document).
+        if pid != 0 && pid != self.pid {
+            log_unsupported!("prlimit64 for a remote pid");
+            return Err(Errno::ESRCH);
         }
         let new_limit = match new_rlim {
             Some(rlim) => {
@@ -2210,11 +2328,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `getpgid`.
     ///
     /// We have no global pid registry (see `do_kill`'s doc comment), so `pid` may only name the
-    /// calling process itself (`0`, or the caller's own pid) -- matching real Linux's `ESRCH` for
-    /// any other pid, since there is nowhere to look one up.
+    /// calling process itself (`0`, or the caller's own pid) or a live direct child (reachable
+    /// via `children`, the same reachability `do_kill`'s remote-child case relies on) --
+    /// matching real Linux's `ESRCH` for any other pid, since there is nowhere to look one up.
     pub(crate) fn sys_getpgid(&self, pid: i32) -> Result<i32, Errno> {
         if pid == 0 || pid == self.pid {
             Ok(self.process().pgid.load(Ordering::Relaxed))
+        } else if pid > 0 {
+            self.process()
+                .find_child(pid)
+                .map(|child| child.pgid.load(Ordering::Relaxed))
+                .ok_or(Errno::ESRCH)
         } else {
             Err(Errno::ESRCH)
         }
@@ -2224,22 +2348,54 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ///
     /// Real Linux additionally restricts `setpgid` to processes within the same session and
     /// forbids changing the pgid of a process that has already called `execve` (`EACCES`); we
-    /// don't model sessions at all, so those checks are not enforced -- only the pid-target
-    /// restriction (see [`Self::sys_getpgid`]) and `EINVAL` for a negative `pgid` are.
+    /// don't model sessions or "has this process execve'd yet" at all, so those checks are not
+    /// enforced -- only the pid-target restriction (see [`Self::sys_getpgid`]) and `EINVAL` for a
+    /// negative `pgid` are. `pid` may target a live direct child, not just self -- the standard
+    /// shell-job-control pattern of a parent shell moving a freshly forked-but-not-yet-exec'd
+    /// child into a (possibly brand new) pipeline process group before letting it run.
     pub(crate) fn sys_setpgid(&self, pid: i32, requested_group: i32) -> Result<(), Errno> {
         if requested_group < 0 {
             return Err(Errno::EINVAL);
         }
-        if pid != 0 && pid != self.pid {
+        let (target_process, target_own_pid) = if pid == 0 || pid == self.pid {
+            (self.process().clone(), self.pid)
+        } else if pid > 0 {
+            let child = self.process().find_child(pid).ok_or(Errno::ESRCH)?;
+            (child, pid)
+        } else {
             return Err(Errno::ESRCH);
-        }
+        };
         let target_pgid = if requested_group == 0 {
-            self.pid
+            target_own_pid
         } else {
             requested_group
         };
-        self.process().pgid.store(target_pgid, Ordering::Relaxed);
+        target_process.pgid.store(target_pgid, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Handle syscall `setsid`.
+    ///
+    /// Real Linux fails with `EPERM` if the caller is already a process group leader (a session
+    /// leader always is). We don't model sessions or true parent/child pgid inheritance at all
+    /// (see `sys_setpgid`'s doc comment) -- and *every* process here starts out as its own
+    /// process-group leader by construction (`Process::new` seeds `pgid` with the process's own
+    /// pid) -- so enforcing that check faithfully would make `setsid()` unconditionally fail for
+    /// exactly the caller that most needs it to succeed: a freshly `fork()`ed child running
+    /// glibc's `login_tty()` (the primitive under `forkpty()`/`openpty()`-based tools --
+    /// node-pty, Python's `os.forkpty()`, tmux, `script`), which always calls `setsid()`
+    /// immediately after `fork()` and before anything else. Matching this build's existing
+    /// "accept and remember" idiom for state it doesn't fully model, this always succeeds and
+    /// makes the caller its own process-group leader (mirroring `setpgid(0, 0)`), returning its
+    /// pid as the new session id (session id == pid is exactly true for a real session leader,
+    /// which this is standing in for).
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "keeps the real syscall's fallible signature (matching sys_setpgid/sys_getpgid) rather than baking in that this build never rejects it, since that's a simplification of the real ABI, not a guarantee"
+    )]
+    pub(crate) fn sys_setsid(&self) -> Result<i32, Errno> {
+        self.process().pgid.store(self.pid, Ordering::Relaxed);
+        Ok(self.pid)
     }
 
     /// Handle syscall `getuid`.
@@ -2994,6 +3150,211 @@ mod tests {
     }
 
     #[test]
+    fn test_resource_limits_copy_from_inherits_parent_values() {
+        // Regression test for fork() not inheriting rlimits: before this, every freshly
+        // constructed `Process` (including every forked child) got `ResourceLimits::default()`
+        // and nothing ever copied the parent's actual current limits into it, silently
+        // discarding a `setrlimit()` the parent made before forking.
+        use litebox_common_linux::RlimitResource;
+
+        let parent = super::ResourceLimits::default();
+        parent.set_rlimit(
+            RlimitResource::NOFILE,
+            litebox_common_linux::Rlimit {
+                rlim_cur: 42,
+                rlim_max: 100,
+            },
+        );
+
+        let child = super::ResourceLimits::default();
+        // Sanity: the child's own default differs from what we're about to inherit.
+        assert_ne!(child.get_rlimit(RlimitResource::NOFILE).rlim_cur, 42);
+
+        child.copy_from(&parent);
+        let inherited = child.get_rlimit(RlimitResource::NOFILE);
+        assert_eq!(inherited.rlim_cur, 42);
+        assert_eq!(inherited.rlim_max, 100);
+    }
+
+    #[test]
+    fn test_kill_own_pgid_zero_and_negative_deliver_to_self() {
+        // `kill(0, sig)` (own process group), `kill(-pgid, sig)`, and `kill(-1, sig)`
+        // (broadcast) used to unconditionally fail with ESRCH -- this shim has no registry of
+        // other live processes, but self is always a genuine member of all three of those target
+        // sets, so failing outright was needlessly wrong for what is likely the single most
+        // common real caller: a script signaling its own process group during cleanup.
+        use litebox_common_linux::PtRegs;
+        use litebox_common_linux::signal::Signal;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let pgid = task.sys_getpgid(0).unwrap();
+
+        assert_eq!(task.sys_kill(0, Signal::SIGUSR1.as_i32()), Ok(0));
+        assert!(task.pending_signal_set().contains(Signal::SIGUSR1));
+
+        // Drain it and try again via -pgid.
+        let mut regs = PtRegs::default();
+        task.process_signals(&mut regs);
+        assert!(!task.has_pending_signals());
+
+        assert_eq!(task.sys_kill(-pgid, Signal::SIGUSR2.as_i32()), Ok(0));
+        assert!(task.pending_signal_set().contains(Signal::SIGUSR2));
+    }
+
+    #[test]
+    fn test_kill_genuine_remote_pid_still_fails() {
+        // A pid that is neither self, self's own process group, nor a direct child (the one
+        // remote-process case `do_kill` can actually reach -- see the tests below) is a real,
+        // specific target this shim genuinely cannot find (no shim-wide pid registry) -- reporting
+        // that honestly (ESRCH) is correct, not a regression to "fix" by pretending to deliver it.
+        use litebox_common_linux::signal::Signal;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let other_pid = task.sys_getpid().wrapping_add(1000);
+        assert_eq!(
+            task.sys_kill(other_pid, Signal::SIGUSR1.as_i32()),
+            Err(Errno::ESRCH)
+        );
+    }
+
+    #[test]
+    fn test_kill_queues_signal_for_a_live_direct_child_without_touching_the_parent() {
+        // The synchronous half of cross-process signal delivery: kill(child_pid, sig) from the
+        // parent must land in the CHILD's own process-directed pending set, not the parent's, and
+        // must not require the child to be actively running to be queued.
+        use litebox_common_linux::signal::Signal;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let child = task.clone_as_forked_child_for_test();
+        assert_ne!(
+            child.pid, task.pid,
+            "a forked child must be a genuinely different process"
+        );
+
+        assert_eq!(task.sys_kill(child.pid, Signal::SIGTERM.as_i32()), Ok(0));
+
+        assert!(
+            child.pending_signal_set().contains(Signal::SIGTERM),
+            "the signal must be queued for the child"
+        );
+        assert!(
+            task.pending_signal_set().is_empty(),
+            "the parent's own pending set must be untouched by kill()ing its child"
+        );
+    }
+
+    /// Regression test for the cross-process signal delivery slice added this round:
+    /// `kill(child_pid, sig)` targeting a *live, currently-blocked* direct child must actually
+    /// wake it (via `Process::interrupt_all_threads`, mirroring `exit_group`/`kill_other_threads`'s
+    /// existing collect-then-interrupt pattern for same-process delivery), surfacing `EINTR` from
+    /// whatever blocking syscall it was in -- not just silently sit in the child's queue until it
+    /// happens to check again on its own. See `test_exit_group_wakes_thread_blocked_in_futex_wait`
+    /// for the same interrupt mechanism exercised same-process; this is its cross-process sibling.
+    #[test]
+    fn test_kill_wakes_a_live_direct_child_blocked_in_futex_wait() {
+        use litebox_common_linux::signal::Signal;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+            let mut futex_word: u32 = 0;
+            let futex_addr = (&raw mut futex_word) as usize;
+
+            let child_task = task.clone_as_forked_child_for_test();
+            let child_pid = child_task.pid;
+            assert_ne!(child_pid, task.pid);
+
+            let bg = std::thread::spawn(move || {
+                <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+                    // See `test_exit_group_wakes_thread_blocked_in_futex_wait`'s identical setup
+                    // step for why this is required for `interrupt()` to reach this thread at all.
+                    child_task.set_thread_handle_for_test();
+
+                    let futex_ptr = UserPtrMut::from_usize(futex_addr);
+                    let result = child_task.sys_futex(litebox_common_linux::FutexArgs::Wait {
+                        addr: futex_ptr,
+                        flags: litebox_common_linux::FutexFlags::PRIVATE,
+                        val: 0,
+                        timeout: litebox_common_linux::TimeParam::None,
+                    });
+                    assert_eq!(
+                        result,
+                        Err(litebox_common_linux::errno::Errno::EINTR),
+                        "the child's blocking futex wait must be interrupted by the parent's kill()"
+                    );
+                });
+            });
+
+            // Give the child a real chance to enter the blocking wait before signaling it --
+            // otherwise this would trivially pass even without cross-process wakeup, since the
+            // signal would already be pending before the child's wait ever started blocking.
+            std::thread::sleep(core::time::Duration::from_millis(50));
+
+            assert_eq!(task.sys_kill(child_pid, Signal::SIGTERM.as_i32()), Ok(0));
+
+            bg.join().expect("child thread panicked");
+        });
+    }
+
+    #[test]
+    fn test_kill_own_pgid_zero_also_reaches_a_child_moved_into_the_same_group() {
+        // Regression test: a group-directed kill(0/-1/-pgid, sig) used to only ever reach self
+        // (approximated, since this shim has no registry of arbitrary other processes) -- but a
+        // live child that's been moved into the caller's own group via setpgid() (the standard
+        // shell-job-control/process-supervisor pattern of putting a whole spawned pipeline into
+        // one group) is reachable via `children`, and must now be signaled too, not just self.
+        use litebox_common_linux::signal::Signal;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let child = task.clone_as_forked_child_for_test();
+
+        // Move the child into the parent's own process group.
+        child.sys_setpgid(0, task.pid).unwrap();
+        assert_eq!(child.sys_getpgid(0).unwrap(), task.pid);
+
+        assert_eq!(task.sys_kill(0, Signal::SIGTERM.as_i32()), Ok(0));
+
+        assert!(
+            task.pending_signal_set().contains(Signal::SIGTERM),
+            "self must still be signaled"
+        );
+        assert!(
+            child.pending_signal_set().contains(Signal::SIGTERM),
+            "a child in the same group must be signaled too"
+        );
+    }
+
+    #[test]
+    fn test_kill_negative_pgid_with_no_reachable_members_returns_esrch() {
+        // A group-directed kill() targeting a pgid that is neither the caller's own group nor
+        // any reachable child's group has literally nothing this shim can deliver to -- must be
+        // ESRCH (matching real Linux's behavior for a pgid with zero members), not a silently
+        // reported success.
+        use litebox_common_linux::signal::Signal;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let unrelated_group = task.sys_getpid().wrapping_add(999_999).max(1);
+        assert_eq!(
+            task.sys_kill(-unrelated_group, Signal::SIGTERM.as_i32()),
+            Err(Errno::ESRCH)
+        );
+    }
+
+    #[test]
+    fn test_setsid_returns_own_pid_and_becomes_own_group_leader() {
+        // Mirrors what glibc's login_tty() does immediately after fork(): setsid() must succeed
+        // (not EPERM) and leave the caller as its own process-group leader, exactly the
+        // precondition TIOCSCTTY needs to then succeed too.
+        let task = crate::syscalls::tests::init_platform(None);
+        let pid = task.sys_getpid();
+
+        task.sys_setpgid(0, 4242).unwrap();
+        assert_eq!(task.sys_getpgid(0), Ok(4242));
+
+        assert_eq!(task.sys_setsid(), Ok(pid));
+        assert_eq!(task.sys_getpgid(0), Ok(pid));
+    }
+
+    #[test]
     fn test_setpgid_rejects_negative_pgid() {
         let task = crate::syscalls::tests::init_platform(None);
 
@@ -3008,6 +3369,33 @@ mod tests {
 
         assert_eq!(task.sys_getpgid(other_pid), Err(Errno::ESRCH));
         assert_eq!(task.sys_setpgid(other_pid, 4242), Err(Errno::ESRCH));
+    }
+
+    #[test]
+    fn test_setpgid_and_getpgid_can_target_a_live_direct_child() {
+        // Regression test: setpgid()/getpgid() used to reject any pid other than self
+        // unconditionally, even a live direct child -- but a parent moving a freshly forked
+        // child into a (possibly brand new) pipeline process group before it runs is the
+        // standard shell-job-control pattern (e.g. bash setting up `cmd1 | cmd2 | cmd3`), and the
+        // child *is* reachable via `children`, the same reachability `do_kill`'s remote-child
+        // case already relies on.
+        let task = crate::syscalls::tests::init_platform(None);
+        let child = task.clone_as_forked_child_for_test();
+
+        // A freshly forked child defaults to being its own group leader.
+        assert_eq!(task.sys_getpgid(child.pid).unwrap(), child.pid);
+
+        // Move the child into an explicit new group (as a shell would for a pipeline).
+        assert_eq!(task.sys_setpgid(child.pid, 4242), Ok(()));
+        assert_eq!(task.sys_getpgid(child.pid).unwrap(), 4242);
+        // The child's own view of its pgid must agree.
+        assert_eq!(child.sys_getpgid(0).unwrap(), 4242);
+        // Self must be untouched.
+        assert_eq!(task.sys_getpgid(0).unwrap(), task.pid);
+
+        // pgid == 0 means "use the target pid's own pid", not the caller's.
+        assert_eq!(task.sys_setpgid(child.pid, 0), Ok(()));
+        assert_eq!(task.sys_getpgid(child.pid).unwrap(), child.pid);
     }
 
     #[test]
@@ -3613,5 +4001,29 @@ mod tests {
             parse_shebang(b"#!/usr/bin/env\tpython3\n"),
             Some(("/usr/bin/env", Some("python3")))
         );
+    }
+
+    #[test]
+    fn prlimit_for_own_pid_succeeds_but_remote_pid_returns_esrch() {
+        // Regression test: prlimit64(pid, ...) used to unconditionally panic (unimplemented!())
+        // whenever pid != 0, even though pid == the caller's own real pid means exactly the same
+        // thing per prlimit(2) -- and is what the util-linux `prlimit` CLI actually passes by
+        // default (unlike getrlimit()/setrlimit(), which always use pid 0).
+        use crate::syscalls::tests::init_platform;
+        use litebox_common_linux::RlimitResource;
+
+        let task = init_platform(None);
+        let own_pid = task.sys_getpid();
+
+        task.sys_prlimit(0, RlimitResource::NOFILE, None, None)
+            .expect("pid=0 must mean self");
+        task.sys_prlimit(own_pid, RlimitResource::NOFILE, None, None)
+            .expect("pid == own real pid must mean self, not panic");
+
+        let remote_pid = own_pid.wrapping_add(1234);
+        let err = task
+            .sys_prlimit(remote_pid, RlimitResource::NOFILE, None, None)
+            .unwrap_err();
+        assert_eq!(err, Errno::ESRCH);
     }
 }

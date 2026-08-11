@@ -51,7 +51,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
             }
             pipe_flags.set(Flags::NON_BLOCKING, flags.contains(OFlags::NONBLOCK));
             if flags.contains(OFlags::DIRECT) {
-                todo!("O_DIRECT not supported");
+                // O_DIRECT ("packet mode": each write()'s bytes become one atomic, boundary-
+                // preserving unit for read(), like a datagram socket) isn't implemented -- this
+                // shim's pipe only offers ordinary byte-stream semantics. Real Linux returns
+                // EINVAL for a pipe2() flag combination it can't honor (see the identical
+                // rejection just above for any flag outside CLOEXEC|NONBLOCK|DIRECT), which is
+                // exactly what should happen here instead of panicking.
+                log_unsupported!("pipe2 with O_DIRECT");
+                return Err(Errno::EINVAL);
             }
             (pipe_flags, flags.contains(OFlags::CLOEXEC))
         };

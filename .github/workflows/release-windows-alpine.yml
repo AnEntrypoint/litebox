@@ -125,6 +125,28 @@ jobs:
       - name: Install and run an extra package via apk (proves further tooling is installable)
         working-directory: smoke
         run: .\litebox_runner_linux_on_windows_userland.exe --initial-files alpine-rootfs.tar /bin/sh -c 'apk add --no-cache jq && echo hello | jq -R .'
+      - name: Verify baked-in agent-sandbox tooling (git, bash, curl, ssh) needs no apk add
+        working-directory: smoke
+        run: .\litebox_runner_linux_on_windows_userland.exe --initial-files alpine-rootfs.tar /bin/bash -c 'set -e; git --version; curl --version; ssh -V'
+      - name: Verify tzdata is baked in (Python zoneinfo needs no apk add)
+        working-directory: smoke
+        run: .\litebox_runner_linux_on_windows_userland.exe --initial-files alpine-rootfs.tar /bin/sh -c 'test -f /usr/share/zoneinfo/America/New_York && echo tzdata-ok'
+      - name: Verify the Unix98 pty subsystem end-to-end (ptmx/setsid/TIOCSCTTY/fork+exec) via Python's pty.spawn
+        # Invokes python3 directly (not via `/bin/sh -c '...'`) specifically to avoid nested
+        # shell/Python quoting inside a PowerShell string -- this workflow has already been bitten
+        # once by PowerShell mangling nested quotes before they reached the guest (see 4059b4a).
+        # `pty.spawn` is CPython's own forkpty()/login_tty()-based helper, so a clean run exercises
+        # the real end-to-end path this session's pty support exists for: open("/dev/ptmx"),
+        # TIOCSPTLCK, setsid(), open("/dev/pts/<id>"), TIOCSCTTY, fork+exec, and master<->slave byte
+        # forwarding, all through the actual Windows runner (unit tests alone don't cover this).
+        working-directory: smoke
+        shell: pwsh
+        run: |
+          $py = "import pty`npty.spawn(['/bin/echo', 'pty-smoke-ok'])"
+          $output = & .\litebox_runner_linux_on_windows_userland.exe --initial-files alpine-rootfs.tar /usr/bin/python3 -c $py
+          if ($LASTEXITCODE -ne 0) { throw "pty smoke test exited with code $LASTEXITCODE" }
+          if ($output -notmatch "pty-smoke-ok") { throw "pty smoke test did not relay expected output through the pty; got: $output" }
+          Write-Host "pty subsystem smoke test passed: $output"
       - name: Run 4 concurrent instances against the same rootfs tar (multi-agent fan-out safety)
         working-directory: smoke
         shell: pwsh

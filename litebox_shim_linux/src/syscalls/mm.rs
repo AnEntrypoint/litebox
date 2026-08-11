@@ -194,6 +194,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_| None,
                 |_| None,
                 |_| None,
+                |_| None,
             )
             .ok()??;
 
@@ -286,14 +287,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let mut buffer = [0; PAGE_SIZE];
             let mut copied = 0;
             while copied < len {
-                let size =
-                    self.sys_read(fd, &mut buffer, Some(file_offset))
-                        .map_err(|e| match e {
-                            Errno::EBADF => MappingError::BadFD(fd),
-                            Errno::EISDIR => MappingError::NotAFile,
-                            Errno::EACCES => MappingError::NotForReading,
-                            _ => unimplemented!(),
-                        })?;
+                let size = match self.sys_read(fd, &mut buffer, Some(file_offset)) {
+                    Ok(size) => size,
+                    // Real Linux's mmap() is not among the syscalls interruptible by a signal
+                    // (see signal(7)): a signal arriving while the kernel is populating a
+                    // freshly mmap'd region never causes mmap() itself to return EINTR to the
+                    // caller. This fallback path does its file-reading via an internal
+                    // `sys_read()` call that *can* surface EINTR (e.g. a timer signal landing
+                    // mid-copy), but that's a shim implementation detail of *this* fallback,
+                    // not something a real mmap() caller would ever observe -- so retry instead
+                    // of propagating it as a (bogus) mmap() failure.
+                    Err(Errno::EINTR) => continue,
+                    Err(Errno::EBADF) => return Err(MappingError::BadFD(fd)),
+                    Err(Errno::EISDIR) => return Err(MappingError::NotAFile),
+                    Err(Errno::EACCES) => return Err(MappingError::NotForReading),
+                    // Any other, genuinely unexpected read failure (e.g. EIO from the backing
+                    // filesystem) used to panic here; report it as a mapping I/O error instead.
+                    Err(_) => return Err(MappingError::Io),
+                };
                 if size == 0 {
                     break;
                 }
@@ -347,7 +358,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             && prot.contains(ProtFlags::PROT_WRITE)
             && !flags.contains(MapFlags::MAP_ANONYMOUS)
         {
-            todo!("MAP_SHARED with PROT_WRITE on file-backed mappings is not supported");
+            // This used to panic (`todo!()`), crashing the whole runner on any guest program
+            // that mmaps a file `MAP_SHARED | PROT_WRITE` -- a fairly ordinary idiom (e.g.
+            // Python's `mmap.mmap(fd, length, mmap.MAP_SHARED, mmap.PROT_WRITE)` for
+            // memory-mapped file I/O, or SQLite/database libraries' write-back-mapped files).
+            // `ENODEV` is what real Linux returns for "the underlying filesystem does not
+            // support memory mapping" this way (see `mmap(2)`), which is an accurate description
+            // of the actual limitation here.
+            log_unsupported!("mmap MAP_SHARED|PROT_WRITE on a file-backed mapping");
+            return Err(Errno::ENODEV);
         }
 
         if flags.intersects(
@@ -360,7 +379,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 | MapFlags::MAP_HUGE_2MB
                 | MapFlags::MAP_HUGE_1GB,
         ) {
-            todo!("Unsupported flags {:?}", flags);
+            // Same rationale as above: don't panic on flag combinations we don't implement.
+            log_unsupported!("mmap with flags {:?}", flags);
+            return Err(Errno::EINVAL);
         }
 
         let aligned_len = align_up(len, PAGE_SIZE);
@@ -1595,6 +1616,34 @@ mod tests {
     }
 
     #[test]
+    fn test_map_shared_writable_file_returns_enodev_instead_of_panicking() {
+        // Regression test: `mmap(MAP_SHARED | PROT_WRITE)` on a file-backed fd used to
+        // unconditionally panic (`todo!()`), crashing the whole runner on an ordinary idiom like
+        // Python's `mmap.mmap(fd, length, mmap.MAP_SHARED, mmap.PROT_WRITE)`.
+        let task = init_platform(None);
+        let fd = task
+            .sys_open(
+                "shared_writable.txt",
+                OFlags::RDWR | OFlags::CREAT,
+                Mode::RWXU,
+            )
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+
+        let err = task
+            .sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_SHARED,
+                fd,
+                0,
+            )
+            .unwrap_err();
+        assert_eq!(err, Errno::ENODEV);
+    }
+
+    #[test]
     fn test_madvise() {
         let task = init_platform(None);
 
@@ -1636,6 +1685,69 @@ mod tests {
             });
 
         task.sys_munmap(addr, 0x2000).unwrap();
+    }
+
+    /// Regression test: every `MadviseBehavior` variant beyond `Normal`/`DontFork`/`DoFork`/
+    /// `DontNeed`/`Free` used to unconditionally panic (`unimplemented!("Unsupported madvise
+    /// behavior")`), crashing the whole runner -- reachable from something as ordinary as
+    /// Python's `mmap.madvise(mmap.MADV_WILLNEED)` or musl/glibc allocators issuing
+    /// `MADV_HUGEPAGE`-style hints. Advisory-only hints (real Linux accepts every one of these
+    /// as a no-op success regardless of whether the kernel backs the hint with real behavior)
+    /// must return `Ok`; `MADV_REMOVE`/`MADV_HWPOISON`/`MADV_SOFT_OFFLINE` must fail cleanly
+    /// with `EINVAL` rather than panicking.
+    #[test]
+    fn madvise_covers_every_behavior_without_panicking() {
+        use litebox_common_linux::MadviseBehavior;
+
+        let task = init_platform(None);
+        let addr = task
+            .sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
+                -1,
+                0,
+            )
+            .unwrap();
+
+        for advice in [
+            MadviseBehavior::Random,
+            MadviseBehavior::Sequential,
+            MadviseBehavior::WillNeed,
+            MadviseBehavior::Mergeable,
+            MadviseBehavior::Unmergeable,
+            MadviseBehavior::HugePage,
+            MadviseBehavior::NoHugePage,
+            MadviseBehavior::DontDump,
+            MadviseBehavior::DoDump,
+            MadviseBehavior::WipeOnFork,
+            MadviseBehavior::KeepOnFork,
+            MadviseBehavior::Cold,
+            MadviseBehavior::Pageout,
+            MadviseBehavior::PopulateRead,
+            MadviseBehavior::PopulateWrite,
+            MadviseBehavior::DontNeedLocked,
+        ] {
+            assert!(
+                task.sys_madvise(addr, 0x1000, advice).is_ok(),
+                "advisory-only madvise behavior must succeed as a no-op, not panic"
+            );
+        }
+
+        for advice in [
+            MadviseBehavior::Remove,
+            MadviseBehavior::HWPoison,
+            MadviseBehavior::SoftOffline,
+        ] {
+            assert_eq!(
+                task.sys_madvise(addr, 0x1000, advice).unwrap_err(),
+                Errno::EINVAL,
+                "unsupported-mapping madvise behavior must fail cleanly, not panic"
+            );
+        }
+
+        task.sys_munmap(addr, 0x1000).unwrap();
     }
 
     // Signal support for Windows is not ready yet.

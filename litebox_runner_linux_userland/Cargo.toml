@@ -13,6 +13,7 @@ litebox_platform_linux_userland = { version = "0.1.0", path = "../litebox_platfo
 litebox_shim_linux = { version = "0.1.0", path = "../litebox_shim_linux" }
 litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter" }
 memmap2 = "0.9.8"
+tar = "0.4.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 litebox_util_log = { version = "0.1.0", path = "../litebox_util_log", features = ["backend_tracing"] }
 

@@ -133,6 +133,7 @@ impl From<litebox::fs::errors::OpenError> for Errno {
             litebox::fs::errors::OpenError::ReadOnlyFileSystem => Errno::EROFS,
             litebox::fs::errors::OpenError::AlreadyExists => Errno::EEXIST,
             litebox::fs::errors::OpenError::Io => Errno::EIO,
+            litebox::fs::errors::OpenError::TruncateError(truncate_error) => truncate_error.into(),
             _ => unimplemented!(),
         }
     }
@@ -352,6 +353,7 @@ impl From<litebox::mm::linux::MappingError> for Errno {
             litebox::mm::linux::MappingError::BadFD(_) => Errno::EBADF,
             litebox::mm::linux::MappingError::NotAFile => Errno::EISDIR,
             litebox::mm::linux::MappingError::NotForReading => Errno::EACCES,
+            litebox::mm::linux::MappingError::Io => Errno::EIO,
             litebox::mm::linux::MappingError::MapError(e) => e.into(),
             _ => unimplemented!(),
         }
@@ -690,5 +692,32 @@ impl From<litebox::platform::ArchSpecificError> for Errno {
             litebox::platform::ArchSpecificError::RegisterUnpermittedValue => Errno::EPERM,
             _ => unimplemented!(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_error_truncate_error_is_directory_maps_to_eisdir_instead_of_panicking() {
+        // Regression test: `From<OpenError> for Errno` used to fall through to
+        // `unimplemented!()` for `OpenError::TruncateError`, so `open(dir_path, O_TRUNC, ...)`
+        // crashed the runner instead of returning EISDIR.
+        let err: Errno = litebox::fs::errors::OpenError::TruncateError(
+            litebox::fs::errors::TruncateError::IsDirectory,
+        )
+        .into();
+        assert_eq!(err, Errno::EISDIR);
+    }
+
+    #[test]
+    fn mapping_error_io_maps_to_eio_instead_of_panicking() {
+        // Regression test: `From<MappingError> for Errno` used to fall through to
+        // `unimplemented!()` for any read failure other than EBADF/EISDIR/EACCES surfacing
+        // during the mmap CoW-fallback memcpy path (e.g. a genuine EIO from the backing
+        // filesystem), crashing the runner instead of returning EIO.
+        let err: Errno = litebox::mm::linux::MappingError::Io.into();
+        assert_eq!(err, Errno::EIO);
     }
 }

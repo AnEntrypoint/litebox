@@ -276,6 +276,44 @@ pub fn sys_madvise<
         crate::MadviseBehavior::Free => {
             unsafe { pm.reset_pages(addr, aligned_len, true) }.map_err(Errno::from)
         }
-        _ => unimplemented!("Unsupported madvise behavior {:?}", advice),
+        crate::MadviseBehavior::Random
+        | crate::MadviseBehavior::Sequential
+        | crate::MadviseBehavior::WillNeed
+        | crate::MadviseBehavior::Mergeable
+        | crate::MadviseBehavior::Unmergeable
+        | crate::MadviseBehavior::HugePage
+        | crate::MadviseBehavior::NoHugePage
+        | crate::MadviseBehavior::DontDump
+        | crate::MadviseBehavior::DoDump
+        | crate::MadviseBehavior::WipeOnFork
+        | crate::MadviseBehavior::KeepOnFork
+        | crate::MadviseBehavior::Cold
+        | crate::MadviseBehavior::Pageout
+        | crate::MadviseBehavior::PopulateRead
+        | crate::MadviseBehavior::PopulateWrite
+        | crate::MadviseBehavior::DontNeedLocked => {
+            // Advisory/hint-only on real Linux: a real kernel accepts every one of these as a
+            // success even when it has no matching machinery to back the hint with real
+            // behavior (e.g. `MADV_HUGEPAGE` succeeds even when transparent hugepages aren't
+            // configured; `MADV_DONTDUMP`/`MADV_WIPEONFORK` are core-dump/fork-only hints with
+            // no effect on ordinary read/write access). litebox has no page-eviction,
+            // hugepage, KSM, or core-dump machinery to act on any of these, so a no-op success
+            // matches what a real guest already observes on a kernel/config that doesn't act
+            // on the hint either. Previously this crashed the whole runner instead -- e.g.
+            // `mmap.madvise(mmap.MADV_WILLNEED)` in Python, or musl/glibc allocators issuing
+            // `MADV_FREE`-adjacent hints like `MADV_HUGEPAGE` on Alpine.
+            Ok(())
+        }
+        crate::MadviseBehavior::Remove
+        | crate::MadviseBehavior::HWPoison
+        | crate::MadviseBehavior::SoftOffline => {
+            // `MADV_REMOVE` requires a shareable (shmem/tmpfs-backed) mapping -- real Linux
+            // returns `EINVAL` for a private/anonymous mapping, which is all litebox ever has.
+            // `MADV_HWPOISON`/`MADV_SOFT_OFFLINE` are privileged memory-error-injection
+            // operations for testing; litebox has no error-injection machinery to honor them,
+            // and failing loudly is safer than silently pretending to poison memory that stays
+            // perfectly readable.
+            Err(Errno::EINVAL)
+        }
     }
 }

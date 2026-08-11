@@ -245,6 +245,9 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
             flock_registry: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
             next_flock_holder_id: core::sync::atomic::AtomicU64::new(1),
+            pty_registry: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
+            next_pty_id: core::sync::atomic::AtomicU32::new(0),
+            next_unix_autobind_id: core::sync::atomic::AtomicU32::new(0),
         });
         LinuxShim(global)
     }
@@ -282,6 +285,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         let files = Arc::new(files);
         files.initialize_stdio_in_shared_descriptors_table(&self.0);
 
+        // Created once and threaded into both the new `Process` and the new `Task`'s
+        // `SignalState` -- see `do_clone`'s identically-shaped `child_shared_pending` for why
+        // they must end up sharing the exact same `Arc`.
+        let bootstrap_shared_pending = Arc::new(litebox::sync::Mutex::new(
+            syscalls::signal::PendingSignals::new(),
+        ));
         let entrypoints = crate::LinuxShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
@@ -291,6 +300,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                     PageManager::new(&self.0.litebox),
                     false,
                     None,
+                    bootstrap_shared_pending.clone(),
                 ),
                 wait_state: wait::WaitState::new(self.0.platform),
                 pid,
@@ -306,7 +316,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
-                signals: syscalls::signal::SignalState::new_process(),
+                signals: syscalls::signal::SignalState::new_process(bootstrap_shared_pending),
             },
         };
 
@@ -585,6 +595,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS
         eventfd: impl FnOnce(&TypedFd<syscalls::eventfd::EventfdSubsystem<Platform>>) -> R,
         epoll: impl FnOnce(&TypedFd<syscalls::epoll::EpollSubsystem<Platform, FS>>) -> R,
         unix: impl FnOnce(&TypedFd<syscalls::unix::UnixSocketSubsystem<Platform, FS>>) -> R,
+        pty: impl FnOnce(&TypedFd<syscalls::pty::PtySubsystem<Platform>>) -> R,
     ) -> Result<R, Errno> {
         let rds = self.raw_descriptor_store.read();
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
@@ -610,6 +621,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
             return Ok(unix(&fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(pty(&fd));
         }
         Err(Errno::EBADF)
     }
@@ -670,6 +685,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         assert!(read_total <= count);
         Ok(read_total)
+    }
+
+    /// A single, size-bounded `read(2)` for a non-seekable fd (pipe/socket/eventfd/pty/etc) whose
+    /// guest-requested `count` exceeds [`MAX_KERNEL_BUF_SIZE`].
+    ///
+    /// Unlike [`Self::pread_with_user_buf`] (used for regular files), this doesn't loop to fill
+    /// the whole requested `count`: a non-seekable fd has no file offset to preserve across
+    /// chunks, and real `read(2)` semantics for a pipe/socket/pty return as soon as *any* data is
+    /// available rather than blocking to accumulate a specific amount -- looping here would mean
+    /// blocking indefinitely once the peer goes idle, well past what the guest actually asked to
+    /// wait for. Capping to a single bounded read is both correct and sufficient to avoid the
+    /// unbounded kernel-side allocation a naive `vec![0u8; count]` would otherwise need for an
+    /// arbitrarily large guest-requested `count`.
+    fn read_with_user_buf_no_offset(
+        &self,
+        fd: i32,
+        buf: UserPtrMut<u8>,
+        count: usize,
+    ) -> Result<usize, Errno> {
+        let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
+        let size = self.sys_read(fd, &mut kernel_buf, None)?;
+        buf.copy_from_slice::<Platform>(0, &kernel_buf[..size])
+            .ok_or(Errno::EFAULT)?;
+        Ok(size)
     }
 
     /// Handle Linux syscalls and dispatch them to LiteBox implementations.
@@ -750,24 +789,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     })
                 } else {
                     // If the read size is too large, we need to do some extra work to avoid OOMing.
-                    // We read data in chunks and update the file offset ourselves only if the read succeeds.
-                    self.sys_lseek(fd, 0, litebox::fs::SeekWhence::RelativeToCurrentOffset)
-                    .inspect_err(|e| {
-                        match *e {
-                            Errno::EBADF => (), // safe errors to return
-                            Errno::ESPIPE => {
-                                unimplemented!("read on non-seekable fds with large buffers");
-                            }
-                            Errno::EINVAL => {
-                                unreachable!("seekable file should not return EINVAL when getting current offset");
-                            }
-                            _ => {
-                                unimplemented!("unexpected error from lseek: {}", e);
-                            }
-                        }
-                    })
-                    .and_then(|cur_loc| {
-                        self.pread_with_user_buf(fd, buf, count, i64::try_from(cur_loc).unwrap())
+                    // For a seekable fd (a regular file), read data in chunks and update the file
+                    // offset ourselves only if the read succeeds. A non-seekable fd
+                    // (pipe/socket/eventfd/pty/etc, `ESPIPE`) has no file offset to preserve, so
+                    // it takes a simpler single-bounded-read path instead (see
+                    // `read_with_user_buf_no_offset`) -- this used to unconditionally panic,
+                    // crashing the whole runner on something as ordinary as a single large
+                    // `read()` of a subprocess's stdout pipe or a socket.
+                    match self.sys_lseek(fd, 0, litebox::fs::SeekWhence::RelativeToCurrentOffset) {
+                        Ok(cur_loc) => self
+                            .pread_with_user_buf(fd, buf, count, i64::try_from(cur_loc).unwrap())
                             .inspect(|read_total| {
                                 // Update the file offset to reflect the read we just did.
                                 self.sys_lseek(
@@ -777,8 +808,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                 )
                                 // Given that previous lseek and pread succeeded, this lseek should also succeed.
                                 .expect("lseek failed");
-                            })
-                    })
+                            }),
+                        Err(Errno::EBADF) => Err(Errno::EBADF),
+                        Err(Errno::ESPIPE) => self.read_with_user_buf_no_offset(fd, buf, count),
+                        Err(Errno::EINVAL) => {
+                            unreachable!(
+                                "seekable file should not return EINVAL when getting current offset"
+                            );
+                        }
+                        Err(e) => {
+                            unimplemented!("unexpected error from lseek: {}", e);
+                        }
+                    }
                 }
             }
             SyscallRequest::Write { fd, buf, count } => match buf.to_owned_slice::<Platform>(count)
@@ -1320,6 +1361,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 self.sys_setpgid(pid, pgid)?;
                 Ok(0)
             }
+            SyscallRequest::Setsid => Ok(self.sys_setsid()?.reinterpret_as_unsigned() as usize),
             SyscallRequest::Getuid => Ok(self.sys_getuid() as usize),
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
@@ -1441,6 +1483,28 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// `static`) so it composes with the crate's existing "no bare `static`s outside of the
     /// ratcheted set" discipline.
     next_flock_holder_id: core::sync::atomic::AtomicU64,
+    /// Registry of allocated ptys' slave-side fd, keyed by pty id (`TIOCGPTN`'s value).
+    ///
+    /// The slave fd held here is never installed into any process's own fd table directly; each
+    /// `open("/dev/pts/<id>")` duplicates it (via [`litebox::fd::Descriptors::duplicate`], the
+    /// same mechanism `dup()`/`fork()` use) to produce an independent fd sharing the same
+    /// underlying entry. Shim-wide (not per-process) because `/dev/pts/<id>` is a global
+    /// namespace: any process that knows the id (e.g. via a fd inherited across `fork()`, or by
+    /// reading `/proc/self/fd` in a real Linux guest) can open it.
+    pty_registry: litebox::sync::RwLock<
+        Platform,
+        alloc::collections::BTreeMap<u32, syscalls::pty::PtyFd<Platform>>,
+    >,
+    /// Next id to hand out to a freshly `open("/dev/ptmx")`-allocated pty pair.
+    next_pty_id: core::sync::atomic::AtomicU32,
+    /// Next id to hand out for AF_UNIX socket "autobind" (`bind()` called with no address),
+    /// formatted the same way real Linux formats its autobind abstract-namespace names: a
+    /// leading NUL byte followed by 5 lowercase hex digits (see `unix(7)`). Real Linux starts
+    /// from an unpredictable point and retries on collision; this shim-wide counter instead
+    /// increments monotonically, which is simpler and still unique for any realistic number of
+    /// autobind calls within one shim instance's lifetime (wraps at 2^20, matching the same
+    /// 5-hex-digit range Linux itself uses).
+    next_unix_autobind_id: core::sync::atomic::AtomicU32,
     /// The first process created by [`LinuxShim::load_program`], set once and kept for the
     /// lifetime of the shim.
     ///
@@ -1498,6 +1562,9 @@ mod test_utils {
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let files = Arc::new(syscalls::file::FilesState::new(fs));
             files.initialize_stdio_in_shared_descriptors_table(&self);
+            let shared_pending = Arc::new(litebox::sync::Mutex::new(
+                syscalls::signal::PendingSignals::new(),
+            ));
             Task {
                 wait_state: wait::WaitState::new(self.platform),
                 thread: syscalls::process::ThreadState::new_process(
@@ -1505,6 +1572,7 @@ mod test_utils {
                     PageManager::new(&self.litebox),
                     false,
                     None,
+                    shared_pending.clone(),
                 ),
                 pid,
                 ppid: 0,
@@ -1518,7 +1586,7 @@ mod test_utils {
                 comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
-                signals: syscalls::signal::SignalState::new_process(),
+                signals: syscalls::signal::SignalState::new_process(shared_pending),
                 global: self,
             }
         }
@@ -1542,9 +1610,53 @@ mod test_utils {
                 comm: self.comm.clone(),
                 fs: self.fs.clone(),
                 files: self.files.clone(),
-                signals: self.signals.clone_for_new_task(),
+                // Always a same-process thread clone -- see `self.thread.new_thread(tid)` above.
+                signals: self.signals.clone_for_new_task(None),
             };
             Some(task)
+        }
+
+        /// Returns a clone of this task as a genuine new **process** (a real fork()-shaped
+        /// child: new `Process`, registered in `self`'s `children` so `do_kill`'s remote-child
+        /// case can find it, given its own independent `shared_pending`), rather than
+        /// [`Self::clone_for_test`]'s same-process thread-clone.
+        ///
+        /// Deliberately skips everything `do_clone`'s real process-clone branch does that isn't
+        /// relevant to testing cross-process signal delivery: address-space duplication,
+        /// register/TLS translation, `ThreadInitState::ForkedChild` setup. This produces a
+        /// process family shaped correctly for `do_kill`/`interrupt_all_threads` to exercise,
+        /// not a functioning forked guest process.
+        pub(crate) fn clone_as_forked_child_for_test(&self) -> Self {
+            let pid = self
+                .global
+                .next_thread_id
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let shared_pending = Arc::new(litebox::sync::Mutex::new(
+                syscalls::signal::PendingSignals::new(),
+            ));
+            let thread = syscalls::process::ThreadState::new_process(
+                pid,
+                PageManager::new(&self.global.litebox),
+                false,
+                Some(Arc::downgrade(self.process())),
+                shared_pending.clone(),
+            );
+            let child = Task {
+                wait_state: wait::WaitState::new(self.global.platform),
+                global: self.global.clone(),
+                thread,
+                pid,
+                ppid: self.pid,
+                tid: pid,
+                credentials: self.credentials.clone(),
+                comm: self.comm.clone(),
+                fs: self.fs.clone(),
+                files: self.files.clone(),
+                signals: self.signals.clone_for_new_task(Some(shared_pending)),
+            };
+            self.process()
+                .add_child_for_test(pid, child.process().clone());
+            child
         }
 
         /// Spawns a thread that runs with a clone of this task and a new TID.
@@ -1581,5 +1693,31 @@ mod test_utils {
                 .set(alloc::boxed::Box::new(self.wait_state.thread_handle()))
                 .ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn large_read_on_pipe_does_not_panic() {
+        // Regression test: a single `read()` requesting more than `MAX_KERNEL_BUF_SIZE` from a
+        // non-seekable fd (pipe/socket/eventfd/pty/etc) used to unconditionally panic via
+        // `unimplemented!()` in the `SyscallRequest::Read` dispatch, because the large-read path
+        // always probed the fd's offset with `lseek` first and treated the resulting `ESPIPE`
+        // (correctly returned for any non-seekable fd) as an unhandled case. This exercises the
+        // `read_with_user_buf_no_offset` fallback that replaced that panic.
+        let task = crate::syscalls::tests::init_platform(None);
+        let (reader, writer) = task.sys_pipe2(litebox::fs::OFlags::empty()).unwrap();
+        task.sys_write(writer.try_into().unwrap(), b"hello", None)
+            .unwrap();
+
+        let mut buf = [0u8; 16];
+        let buf_ptr = UserPtrMut::from_usize(buf.as_mut_ptr().expose_provenance());
+        let n = task
+            .read_with_user_buf_no_offset(reader.try_into().unwrap(), buf_ptr, 600_000)
+            .expect("large read on a non-seekable fd must not panic or error");
+        assert_eq!(&buf[..n], b"hello");
     }
 }
