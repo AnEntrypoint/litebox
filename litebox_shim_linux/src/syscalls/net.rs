@@ -3443,6 +3443,45 @@ mod unix_tests {
     }
 
     #[test]
+    fn test_unix_socket_autobind_does_not_panic_and_assigns_unique_abstract_addrs() {
+        // Regression test: `bind()` called with no address at all (`addrlen ==
+        // sizeof(sa_family_t)`, i.e. `UnixSocketAddr::Unnamed`) used to unconditionally panic
+        // (`todo!("autobind for unnamed unix socket")`). Real Linux auto-assigns an
+        // abstract-namespace address in this case (see `unix(7)`); verify two independent
+        // autobind calls get distinct, non-empty abstract addresses starting with a NUL byte,
+        // matching Linux's format.
+        let task = init_platform(None);
+        let fd1 = create_unix_socket(&task, SockType::Datagram, SockFlags::empty());
+        let fd2 = create_unix_socket(&task, SockType::Datagram, SockFlags::empty());
+
+        task.do_bind(fd1, SocketAddress::Unix(UnixSocketAddr::Unnamed))
+            .unwrap();
+        task.do_bind(fd2, SocketAddress::Unix(UnixSocketAddr::Unnamed))
+            .unwrap();
+
+        let SocketAddress::Unix(UnixSocketAddr::Abstract(addr1)) =
+            task.do_getsockname(fd1).unwrap()
+        else {
+            panic!("autobind must assign an abstract-namespace address");
+        };
+        let SocketAddress::Unix(UnixSocketAddr::Abstract(addr2)) =
+            task.do_getsockname(fd2).unwrap()
+        else {
+            panic!("autobind must assign an abstract-namespace address");
+        };
+
+        assert!(!addr1.is_empty());
+        assert!(!addr2.is_empty());
+        assert_ne!(
+            addr1, addr2,
+            "two autobind calls must get distinct addresses"
+        );
+
+        close_socket(&task, fd1);
+        close_socket(&task, fd2);
+    }
+
+    #[test]
     fn test_unix_datagram_addr() {
         let task = init_platform(None);
         let server_path = "/unix_datagram_sockname_server.sock";

@@ -180,6 +180,14 @@ Concretely, this build fixes (all landed on `main`, CI-verified):
   `ioctl(fd, FIOCLEX)` on a pipe or socket fd crashed the runner instead of
   setting close-on-exec, even though doing so needs the exact same
   descriptor-table update already used for every other fd type.
+- **AF_UNIX socket "autobind."** Calling `bind()` on a Unix domain socket
+  with no address at all (`addrlen == sizeof(sa_family_t)`) -- used by some
+  IPC libraries to get a peer-identifiable address before `connect()`ing out
+  without caring what the address actually is -- used to unconditionally
+  panic (`todo!("autobind for unnamed unix socket")`). It now assigns an
+  abstract-namespace address in the same format real Linux uses (a leading
+  NUL byte followed by 5 lowercase hex digits, see `unix(7)`), unique per
+  call via a shim-wide counter.
 
 A ready-to-run bundle (the Windows runner exe plus a packaged Alpine rootfs)
 is built by [`.github/workflows/release-windows-alpine.yml`](.github/workflows/release-windows-alpine.yml).
