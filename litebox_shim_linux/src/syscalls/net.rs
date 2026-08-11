@@ -349,10 +349,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                         opt.reuse_address = val != 0;
                     }
                     (SocketOption::BROADCAST, SocketOptionValue::U32(val)) => {
+                        // `opt.broadcast` is a pure software flag here (only ever read back via
+                        // `getsockopt`, see the `SocketOption::BROADCAST` arm below -- nothing
+                        // else in this shim consults it to gate/enforce broadcast sends), so this
+                        // assignment already fully implements both enabling and disabling; the
+                        // `val == 0` case used to unconditionally panic (`todo!("disable
+                        // SO_BROADCAST")`) despite there being nothing further to do.
                         opt.broadcast = val != 0;
-                        if val == 0 {
-                            todo!("disable SO_BROADCAST");
-                        }
                     }
                     (SocketOption::KEEPALIVE, SocketOptionValue::U32(val)) => {
                         let keep_alive = val != 0;
@@ -988,7 +991,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         }
                         litebox::net::Protocol::Udp
                     }
-                    SockType::Raw => todo!(),
+                    SockType::Raw => {
+                        // Raw sockets require CAP_NET_RAW on real Linux; this shim's guest always
+                        // runs as a single, fixed, unprivileged identity with no capability model
+                        // (see the shim-wide credentials design), so it's never entitled to one --
+                        // matching what an unprivileged process (e.g. `ping`/`traceroute` without
+                        // the setuid-root/CAP_NET_RAW bit, or inside a container missing that
+                        // capability) sees on real Linux, rather than panicking.
+                        log_unsupported!("raw sockets (SOCK_RAW)");
+                        return Err(Errno::EPERM);
+                    }
                     _ => unimplemented!(),
                 };
                 let socket = self.global.net.lock().socket(protocol)?;
@@ -2800,6 +2812,66 @@ mod tests {
             .expect("failed to get SO_KEEPALIVE");
         assert_eq!(len, core::mem::size_of::<u32>());
         assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn raw_socket_returns_eperm_instead_of_panicking() {
+        // Regression test: socket(AF_INET, SOCK_RAW, ...) used to unconditionally panic
+        // (todo!()). Real Linux requires CAP_NET_RAW, which this shim's guest (a single, fixed,
+        // unprivileged identity with no capability model) never has -- matching what an
+        // unprivileged real-Linux process (e.g. ping/traceroute without CAP_NET_RAW) sees.
+        let task = init_platform(None);
+        let err = task
+            .do_socket(AddressFamily::INET, SockType::Raw, SockFlags::empty(), 0)
+            .unwrap_err();
+        assert_eq!(err, Errno::EPERM);
+    }
+
+    #[test]
+    fn so_broadcast_can_be_disabled_after_being_enabled() {
+        // Regression test: setsockopt(SOL_SOCKET, SO_BROADCAST, 0) (disabling it) used to
+        // unconditionally panic (todo!("disable SO_BROADCAST")), even though the assignment right
+        // before the panic already fully updates the (purely software) flag.
+        let task = init_platform(None);
+        let sockfd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Datagram,
+                SockFlags::empty(),
+                0,
+            )
+            .expect("failed to create socket");
+
+        let enable: u32 = 1;
+        let optval = UserPtr::from_usize((&raw const enable).cast::<u8>() as usize);
+        task.do_setsockopt(
+            sockfd,
+            SocketOptionName::Socket(SocketOption::BROADCAST),
+            optval,
+            core::mem::size_of::<u32>(),
+        )
+        .expect("failed to enable SO_BROADCAST");
+
+        let disable: u32 = 0;
+        let optval = UserPtr::from_usize((&raw const disable).cast::<u8>() as usize);
+        task.do_setsockopt(
+            sockfd,
+            SocketOptionName::Socket(SocketOption::BROADCAST),
+            optval,
+            core::mem::size_of::<u32>(),
+        )
+        .expect("failed to disable SO_BROADCAST");
+
+        let mut result: u32 = 42;
+        let optval_out = UserPtrMut::from_usize((&raw mut result).cast::<u8>() as usize);
+        task.do_getsockopt(
+            sockfd,
+            SocketOptionName::Socket(SocketOption::BROADCAST),
+            optval_out,
+            core::mem::size_of::<u32>().trunc(),
+        )
+        .expect("failed to get SO_BROADCAST");
+        assert_eq!(result, 0);
     }
 
     #[ignore = "timeout is 75s"]

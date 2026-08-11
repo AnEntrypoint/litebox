@@ -37,7 +37,14 @@ work normally.
 `node`, `npm`, `python3`, and `pip3` are preinstalled and ready to run agent
 workloads out of the box. `build-base` (gcc, make, and friends) is included
 so native npm/pip packages that need a compiler can build without any extra
-setup. `git`, `bash`, `curl`, and `openssh-client` are also preinstalled,
+setup, and `python3-dev` is included alongside it -- Alpine splits Python's
+own C headers (`Python.h`) into a separate package from the interpreter, so
+without it `pip install <anything with a C extension>` fails immediately
+with `Python.h: No such file or directory` even with `build-base` present.
+This bites harder on Alpine than on glibc-based images, since most PyPI
+wheels are `manylinux`-tagged rather than `musllinux`, so `pip` falls back
+to a source build (and therefore needs `Python.h`) far more often here.
+`git`, `bash`, `curl`, and `openssh-client` are also preinstalled,
 covering the common day-one needs of an agent workload (cloning a repo,
 running `#!/bin/bash` scripts shipped by npm packages, fetching a file) so
 that no extra `apk add` round-trip is needed just to get started. `tzdata`

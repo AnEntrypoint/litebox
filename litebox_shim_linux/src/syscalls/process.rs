@@ -1824,9 +1824,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     /// Handle syscall `prlimit64`.
-    ///
-    /// Note for now setting new limits is not supported yet, and thus returning constant values
-    /// for the requested resource. Getting resources for a specific PID is also not supported yet.
     pub(crate) fn sys_prlimit(
         &self,
         pid: i32,
@@ -1834,8 +1831,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         new_rlim: Option<UserPtr<litebox_common_linux::Rlimit64>>,
         old_rlim: Option<UserPtrMut<litebox_common_linux::Rlimit64>>,
     ) -> Result<(), Errno> {
-        if pid != 0 {
-            unimplemented!("prlimit for a specific PID is not supported yet");
+        // `pid == 0` means "the calling process" per prlimit(2); `pid == self.pid` is exactly
+        // equivalent (e.g. the util-linux `prlimit` CLI, unlike getrlimit()/setrlimit() callers,
+        // defaults to passing its own real pid rather than 0). Both target self, which this shim
+        // can always answer. A genuine *other* pid can't be reached: there's no shim-wide
+        // process registry to look one up (see the same limitation `kill()`/`tkill()` document).
+        if pid != 0 && pid != self.pid {
+            log_unsupported!("prlimit64 for a remote pid");
+            return Err(Errno::ESRCH);
         }
         let new_limit = match new_rlim {
             Some(rlim) => {
@@ -3753,5 +3756,29 @@ mod tests {
             parse_shebang(b"#!/usr/bin/env\tpython3\n"),
             Some(("/usr/bin/env", Some("python3")))
         );
+    }
+
+    #[test]
+    fn prlimit_for_own_pid_succeeds_but_remote_pid_returns_esrch() {
+        // Regression test: prlimit64(pid, ...) used to unconditionally panic (unimplemented!())
+        // whenever pid != 0, even though pid == the caller's own real pid means exactly the same
+        // thing per prlimit(2) -- and is what the util-linux `prlimit` CLI actually passes by
+        // default (unlike getrlimit()/setrlimit(), which always use pid 0).
+        use crate::syscalls::tests::init_platform;
+        use litebox_common_linux::RlimitResource;
+
+        let task = init_platform(None);
+        let own_pid = task.sys_getpid();
+
+        task.sys_prlimit(0, RlimitResource::NOFILE, None, None)
+            .expect("pid=0 must mean self");
+        task.sys_prlimit(own_pid, RlimitResource::NOFILE, None, None)
+            .expect("pid == own real pid must mean self, not panic");
+
+        let remote_pid = own_pid.wrapping_add(1234);
+        let err = task
+            .sys_prlimit(remote_pid, RlimitResource::NOFILE, None, None)
+            .unwrap_err();
+        assert_eq!(err, Errno::ESRCH);
     }
 }
