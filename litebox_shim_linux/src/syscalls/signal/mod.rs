@@ -61,16 +61,39 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         }
     }
 
-    pub fn clone_for_new_task(&self) -> Self {
+    /// Build the signal state for a new task from this one, via either `clone()` (a new
+    /// *thread* of the same process, `new_process = false`) or `fork()`/`vfork()` (a genuine new
+    /// *process*, `new_process = true`).
+    ///
+    /// Real Linux shares process-wide signal state (the pending-signal queue and handler
+    /// dispositions) across threads of the same process (`CLONE_THREAD`/`CLONE_SIGHAND`) but
+    /// gives a freshly `fork()`'d child its own independent copies -- later `sigaction()` calls
+    /// or process-directed (`kill(pid, ...)`) signals in either the parent or the child must not
+    /// affect the other. Before this distinction existed here, every call shared both
+    /// unconditionally, so a signal meant for a forked child's process-wide queue could
+    /// incorrectly land in (and be consumed by) the parent's queue instead, or vice versa, and a
+    /// later `sigaction()` in either process would silently change the other's handler too.
+    pub fn clone_for_new_task(&self, new_process: bool) -> Self {
         Self {
             // Reset pending
             pending: RefCell::new(PendingSignals::new()),
-            // Share process-wide pending signals
-            shared_pending: self.shared_pending.clone(),
+            shared_pending: if new_process {
+                Arc::new(Mutex::new(PendingSignals::new()))
+            } else {
+                self.shared_pending.clone()
+            },
             // Preserve blocked
             blocked: Cell::new(self.blocked.get()),
-            // Share handlers across tasks
-            handlers: self.handlers.clone(),
+            handlers: if new_process {
+                // Snapshot the parent's *current* dispositions into an independent copy (real
+                // fork() semantics), rather than sharing the same handlers, or resetting to
+                // SIG_DFL (which would incorrectly discard whatever the parent had configured).
+                RefCell::new(Arc::new(SignalHandlers {
+                    inner: Mutex::new(self.handlers.borrow().inner.lock().clone()),
+                }))
+            } else {
+                self.handlers.clone()
+            },
             // Clear altstack
             altstack: SigAltStack {
                 flags: SsFlags::DISABLE,
@@ -775,5 +798,41 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         self.signals.last_exception.set(*info);
         self.force_signal_with_info(signal, false, siginfo_exception(signal, fault_address));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::syscalls::tests::TestPlatform;
+
+    #[test]
+    fn clone_for_new_task_shares_signal_state_for_a_thread_but_not_a_forked_process() {
+        // Regression test: `clone_for_new_task` used to share `shared_pending`/`handlers`
+        // unconditionally, including for a genuine `fork()` -- meaning a process-directed signal
+        // sent to either a forked child or its parent could land in (and be consumed by) the
+        // other's queue instead, and a later `sigaction()` in either process would silently
+        // change the other's handler too.
+        let parent = SignalState::<TestPlatform>::new_process();
+
+        let thread_clone = parent.clone_for_new_task(false);
+        assert!(
+            Arc::ptr_eq(&parent.shared_pending, &thread_clone.shared_pending),
+            "a new thread of the same process must share the process-wide pending-signal queue"
+        );
+        assert!(
+            Arc::ptr_eq(&*parent.handlers.borrow(), &*thread_clone.handlers.borrow()),
+            "a new thread of the same process must share signal handler dispositions"
+        );
+
+        let forked_child = parent.clone_for_new_task(true);
+        assert!(
+            !Arc::ptr_eq(&parent.shared_pending, &forked_child.shared_pending),
+            "a forked child must get its own independent pending-signal queue"
+        );
+        assert!(
+            !Arc::ptr_eq(&*parent.handlers.borrow(), &*forked_child.handlers.borrow()),
+            "a forked child must get its own independent (snapshotted) handler dispositions"
+        );
     }
 }

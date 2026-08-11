@@ -1590,7 +1590,8 @@ mod test_utils {
                 comm: self.comm.clone(),
                 fs: self.fs.clone(),
                 files: self.files.clone(),
-                signals: self.signals.clone_for_new_task(),
+                // Always a same-process thread clone -- see `self.thread.new_thread(tid)` above.
+                signals: self.signals.clone_for_new_task(false),
             };
             Some(task)
         }
