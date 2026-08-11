@@ -733,6 +733,11 @@ pub struct Termios {
     pub c_cc: [cc_t; 19usize],
 }
 
+/// `c_oflag` bit: enable implementation-defined output processing.
+pub const OPOST: tcflag_t = 0o0000001;
+/// `c_oflag` bit: map `\n` to `\r\n` on output. Only meaningful together with [`OPOST`].
+pub const ONLCR: tcflag_t = 0o0000004;
+
 #[derive(Debug, Clone, Default, FromBytes, IntoBytes)]
 #[repr(C)]
 pub struct Winsize {

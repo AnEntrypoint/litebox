@@ -7,12 +7,19 @@
 //! duplex master<->slave byte forwarding -- the subset of Linux's pty machinery that
 //! `node-pty`/`pexpect`/`tmux`/`script`-style tools need to allocate and drive a pty.
 //!
-//! **No line discipline is implemented**: there is no kernel-side canonical-mode input
-//! buffering, echo, or signal-generating special characters (^C/^Z/^\). Bytes written to the
-//! master appear verbatim on the slave's read side and vice versa. This covers every consumer
-//! that puts the pty into raw mode itself (which is what `node-pty`, `ptyprocess`/`pexpect`, and
-//! most modern pty libraries do immediately after opening) but not a guest shell relying on the
-//! kernel to echo typed characters back in cooked mode.
+//! **No input-side line discipline is implemented**: there is no kernel-side canonical-mode
+//! input buffering, echo, or signal-generating special characters (^C/^Z/^\ -- the last of
+//! those also needs cross-process signal delivery, which this shim doesn't have at all yet, pty
+//! or otherwise). Bytes written to the master appear verbatim on the slave's read side. This
+//! covers every consumer that puts the pty into raw mode itself (which is what `node-pty`,
+//! `ptyprocess`/`pexpect`, and most modern pty libraries do immediately after opening) but not a
+//! guest shell relying on the kernel to echo typed characters back in cooked mode.
+//!
+//! **Output-side processing is partially implemented**: a fresh pty defaults to `OPOST|ONLCR`
+//! (matching real Linux), and slave-side writes get `\n` translated to `\r\n` accordingly (see
+//! [`PtyEnd::write`]) -- this is what keeps ordinary programs that don't manage their own raw
+//! mode (`ls`, `git log`, a plain `print()`) from rendering as an unreadable "staircase" in a
+//! real terminal UI reading the master.
 //!
 //! Master and slave are each their own fd-table entry (this subsystem's [`PtyEnd`]), cross-wired
 //! via two [`crate::channel::Channel`]s (one per direction) so each fd is independently readable
@@ -141,17 +148,39 @@ impl<Platform: ShimPlatform> PtyHalf<Platform> {
             .map_err(Errno::from)
     }
 
-    fn try_write_from(&self, buf: &[u8]) -> Result<usize, TryOpError<Errno>> {
+    /// Write `buf`, optionally applying `ONLCR` output processing (`\n` -> `\r\n`) as each byte
+    /// is queued.
+    ///
+    /// `n`, the returned/counted progress, is always in units of *original* `buf` bytes (matching
+    /// `write(2)`'s contract that the return value describes how much of the caller's buffer was
+    /// consumed) even though a translated `\n` enqueues two channel bytes.
+    ///
+    /// Edge case: if the channel has exactly one free slot when a `\n` is being translated, the
+    /// `\r` can be enqueued but the paired `\n` then fails with the channel full -- since the
+    /// channel has no "undo the last enqueue" operation, that `\r` is left queued without its
+    /// `\n`. This is a narrow, cosmetic-only edge case (a stray `\r` rendered, not a crash, hang,
+    /// or data loss) that only a stalled/slow reader against a nearly-full 8192-byte channel can
+    /// trigger; not worth the added complexity of a fully atomic two-byte enqueue for that.
+    fn try_write_from(&self, buf: &[u8], onlcr: bool) -> Result<usize, TryOpError<Errno>> {
         let mut n = 0;
         let mut first_err = None;
-        while n < buf.len() {
-            match self.write.try_write_one(buf[n]) {
-                Ok(()) => n += 1,
-                Err((_, e)) => {
-                    first_err = Some(e);
-                    break;
+        'outer: while n < buf.len() {
+            let byte = buf[n];
+            let translated: &[u8] = if onlcr && byte == b'\n' {
+                b"\r\n"
+            } else {
+                core::slice::from_ref(&byte)
+            };
+            for &out_byte in translated {
+                match self.write.try_write_one(out_byte) {
+                    Ok(()) => {}
+                    Err((_, e)) => {
+                        first_err = Some(e);
+                        break 'outer;
+                    }
                 }
             }
+            n += 1;
         }
         if n > 0 {
             return Ok(n);
@@ -162,13 +191,18 @@ impl<Platform: ShimPlatform> PtyHalf<Platform> {
         }
     }
 
-    fn write(&self, cx: &WaitContext<'_, Platform>, buf: &[u8]) -> Result<usize, Errno> {
+    fn write(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        buf: &[u8],
+        onlcr: bool,
+    ) -> Result<usize, Errno> {
         self.pollee
             .wait(
                 cx,
                 self.get_status().contains(OFlags::NONBLOCK),
                 Events::OUT,
-                || self.try_write_from(buf),
+                || self.try_write_from(buf, onlcr),
             )
             .map_err(Errno::from)
     }
@@ -247,8 +281,24 @@ impl<Platform: ShimPlatform> PtyEnd<Platform> {
         self.half().read(cx, buf)
     }
 
+    /// Write `buf` to this side of the pty.
+    ///
+    /// On the *slave* side only, this applies `ONLCR` output processing (`\n` -> `\r\n`) when the
+    /// pty's current termios has `OPOST | ONLCR` set -- matching real Linux, where output
+    /// processing happens on what a program writes to its controlling terminal (the slave), not
+    /// on what's written to the master (which would instead go through *input* processing, e.g.
+    /// `ICRNL`, that this module doesn't implement). Without this, any program that doesn't
+    /// manage its own raw mode (i.e. hasn't cleared `OPOST` itself) and just writes plain `\n` --
+    /// which is most programs: `ls`, `git log`, a Python script's `print()` -- renders as an
+    /// unreadable "staircase" in any terminal UI reading the master (VS Code's pty panel,
+    /// ttyd/wetty, xterm.js), since nothing ever adds the `\r`.
     pub(crate) fn write(&self, cx: &WaitContext<'_, Platform>, buf: &[u8]) -> Result<usize, Errno> {
-        self.half().write(cx, buf)
+        let onlcr = !self.is_master() && {
+            let oflag = self.pair().get_termios().c_oflag;
+            oflag & (litebox_common_linux::OPOST | litebox_common_linux::ONLCR)
+                == (litebox_common_linux::OPOST | litebox_common_linux::ONLCR)
+        };
+        self.half().write(cx, buf, onlcr)
     }
 
     pub(crate) fn with_iopollable<R>(&self, f: impl FnOnce(&dyn IOPollable) -> R) -> R {
@@ -264,7 +314,17 @@ pub(crate) fn new_pty_pair<Platform: ShimPlatform>(
 ) -> (PtyFd<Platform>, PtyFd<Platform>) {
     let pair = Arc::new(PtyPair {
         id,
-        termios: Mutex::new(Termios::default()),
+        // `c_oflag` defaults to `OPOST | ONLCR` -- matching a real, freshly allocated Linux
+        // pty's cooked-mode default -- because that's the one piece of output-side line
+        // discipline this module actually implements (see `PtyEnd::write`'s doc comment).
+        // Every other flag (input processing, canonical-mode input buffering/echo, ISIG special
+        // characters) stays at zero: this module doesn't implement any of those, so claiming
+        // otherwise via TCGETS would be actively misleading to a guest program deciding its own
+        // behavior based on what it reads back.
+        termios: Mutex::new(Termios {
+            c_oflag: litebox_common_linux::OPOST | litebox_common_linux::ONLCR,
+            ..Termios::default()
+        }),
         winsize: Mutex::new(Winsize::default()),
         fg_pgid: AtomicI32::new(0),
         locked: AtomicBool::new(true),
@@ -421,6 +481,70 @@ mod tests {
                 .is_ok(),
             "TIOCSPTLCK(0) must unlock the slave for opening"
         );
+    }
+
+    #[test]
+    fn slave_writes_get_onlcr_translated_by_default() {
+        // A fresh pty defaults to OPOST|ONLCR (matching real Linux's cooked-mode default), and
+        // this is the one piece of output-side line discipline actually implemented: a plain
+        // `\n` written by whatever's attached to the slave (an ordinary program that doesn't
+        // manage its own raw mode -- most programs) must come out the master side as `\r\n`.
+        let task = crate::syscalls::tests::init_platform(None);
+        let (master, slave) = open_unlocked_pty_pair(&task);
+
+        let n = task
+            .sys_write(slave, b"line1\nline2\n", None)
+            .expect("write to slave failed");
+        assert_eq!(
+            n,
+            b"line1\nline2\n".len(),
+            "return value counts original bytes, not translated ones"
+        );
+
+        let mut buf = [0u8; 64];
+        let n = task
+            .sys_read(master, &mut buf, None)
+            .expect("read from master failed");
+        assert_eq!(&buf[..n], b"line1\r\nline2\r\n");
+    }
+
+    #[test]
+    fn master_writes_are_not_onlcr_translated() {
+        // ONLCR is output processing for what a program writes to its controlling terminal (the
+        // slave); writing to the master simulates something typed at a keyboard and must not be
+        // touched by it, regardless of the pty's OPOST|ONLCR default.
+        let task = crate::syscalls::tests::init_platform(None);
+        let (master, slave) = open_unlocked_pty_pair(&task);
+
+        task.sys_write(master, b"typed\n", None)
+            .expect("write to master failed");
+        let mut buf = [0u8; 64];
+        let n = task
+            .sys_read(slave, &mut buf, None)
+            .expect("read from slave failed");
+        assert_eq!(&buf[..n], b"typed\n");
+    }
+
+    #[test]
+    fn onlcr_is_not_applied_once_opost_is_cleared() {
+        // A consumer that puts the pty in raw mode (cfmakeraw()-style, which clears OPOST among
+        // other flags -- exactly what node-pty/pexpect/ptyprocess do) must see raw, untranslated
+        // bytes even on the slave side.
+        let task = crate::syscalls::tests::init_platform(None);
+        let (master, slave) = open_unlocked_pty_pair(&task);
+
+        let mut raw_termios = litebox_common_linux::Termios::default();
+        let set_ptr = UserPtr::from_usize((&raw mut raw_termios).expose_provenance());
+        task.sys_ioctl(slave, IoctlArg::TCSETS(set_ptr))
+            .expect("TCSETS failed");
+
+        task.sys_write(slave, b"raw\n", None)
+            .expect("write to slave failed");
+        let mut buf = [0u8; 64];
+        let n = task
+            .sys_read(master, &mut buf, None)
+            .expect("read from master failed");
+        assert_eq!(&buf[..n], b"raw\n");
     }
 
     #[test]

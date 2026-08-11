@@ -93,11 +93,18 @@ Concretely, this build fixes (all landed on `main`, CI-verified):
   pgid state -- previously `TIOCGPTN` unconditionally returned `ENOTTY` and
   there was no pty subsystem at all. This is what lets `node-pty`,
   `pexpect`/`ptyprocess`, `tmux`, and `script` allocate and drive a pty
-  inside the guest. Line discipline (kernel-side canonical-mode input
-  buffering/echo/^C-^Z signal generation) is not implemented -- every
-  consumer that puts the pty into raw mode itself (which is what all of the
-  above do) is unaffected, but a guest shell relying on the kernel to echo
-  typed characters back in cooked mode will not see that echo.
+  inside the guest. Input-side line discipline (kernel-side canonical-mode
+  input buffering, echo, ^C/^Z/^\ signal generation) is not implemented --
+  every consumer that puts the pty into raw mode itself (which is what all
+  of the above do) is unaffected, but a guest shell relying on the kernel
+  to echo typed characters back in cooked mode will not see that echo.
+  Output-side processing is partially implemented: a fresh pty defaults to
+  `OPOST|ONLCR` (matching real Linux), so a plain `\n` written by an
+  ordinary program that doesn't manage its own raw mode (`ls`, `git log`,
+  a Python script's `print()`) comes out `\r\n` on the master side --
+  without this, any real terminal UI reading the master (VS Code's pty
+  panel, ttyd/wetty, xterm.js) would render that output as an unreadable
+  "staircase".
 - **`setsid()` and `TIOCSCTTY`.** These were entirely missing -- `setsid()`
   wasn't implemented as a syscall at all, and `TIOCSCTTY` fell through to a
   hard `EINVAL`. Since glibc's `login_tty()` (the primitive under
