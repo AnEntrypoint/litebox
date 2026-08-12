@@ -59,8 +59,25 @@ pub(crate) struct ElfPatchState {
     patched_ranges: BTreeSet<(usize, usize)>,
 }
 
-/// Per-process collection of ELF patching state, keyed by fd number.
-pub(crate) type ElfPatchCache = BTreeMap<i32, ElfPatchState>;
+/// Key identifying one process's patching state for one of its file descriptors.
+///
+/// The `pid` component is load-bearing, not cosmetic. [`ElfPatchState`] holds *absolute*
+/// guest addresses (`trampoline_addr`, `file_mappings`, `patched_ranges`) that are only
+/// meaningful within the address space that produced them, while the cache itself lives on the
+/// shim-wide `global` state that every `fork()`ed child shares by `Arc`. File descriptor numbers
+/// are per-process and heavily reused (every process gets 0/1/2 and typically allocates 3, 4, ...
+/// for the binaries it loads), so keying on `fd` alone made two unrelated processes collide on
+/// one entry: one process could observe another's `patched_ranges` (skipping patching it still
+/// needed), link stubs against another's `trampoline_addr`, or -- via
+/// [`Task::finalize_elf_patch`] -- remove and `munmap` a trampoline region a concurrently
+/// running sibling was still executing through.
+///
+/// The collision is not hypothetical: instrumenting `finalize_elf_patch` while running a
+/// `fork()`/`execve`-heavy shell pipeline shows repeated calls for the same low fd numbers
+/// (0, 1, 2, 3, 4, ...) from several different pids against this one shared map.
+pub(crate) type ElfPatchKey = (i32, i32);
+
+pub(crate) type ElfPatchCache = BTreeMap<ElfPatchKey, ElfPatchState>;
 
 #[inline]
 fn align_up(addr: usize, align: usize) -> usize {
@@ -147,7 +164,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // Track non-exec file mappings so we can patch them if they later
             // gain PROT_EXEC via mprotect.
             let mut cache = self.global.elf_patch_cache.lock();
-            if let Some(state) = cache.get_mut(&fd) {
+            if let Some(state) = cache.get_mut(&self.elf_patch_key(fd)) {
                 let mapping_key = (result.as_usize(), len);
                 // Overlapping entries are safe here: file_mappings is only used
                 // to know which (addr, len) ranges belong to this fd so we can
@@ -424,7 +441,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn clear_file_mappings_for_range(&self, unmap_start: usize, unmap_len: usize) {
         let unmap_end = unmap_start.saturating_add(unmap_len);
         let mut cache = self.global.elf_patch_cache.lock();
-        for state in cache.values_mut() {
+        for ((pid, _), state) in cache.iter_mut() {
+            // The unmapped range is an address in *this* process's address space; entries owned by
+            // other processes describe unrelated address spaces (see [`ElfPatchKey`]).
+            if *pid != self.pid {
+                continue;
+            }
             state.file_mappings.retain(|&(vaddr, seg_len)| {
                 let seg_end = vaddr.saturating_add(seg_len);
                 seg_end <= unmap_start || vaddr >= unmap_end
@@ -517,8 +539,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let to_patch: alloc::vec::Vec<(i32, usize, usize)> = {
             let cache = self.global.elf_patch_cache.lock();
             let mut result = alloc::vec::Vec::new();
-            for (&fd, state) in cache.iter() {
-                if state.pre_patched {
+            for (&(pid, fd), state) in cache.iter() {
+                // Only this process's own entries describe this address space; another process's
+                // absolute `file_mappings` addresses are meaningless here (see [`ElfPatchKey`]).
+                if pid != self.pid || state.pre_patched {
                     continue;
                 }
                 for &(seg_start, seg_len) in &state.file_mappings {
@@ -576,7 +600,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// x86_64 only: assumes 64-bit ELF layout and program header offsets.
     fn init_elf_patch_state(&self, fd: i32, mapped_addr: usize, file_offset: usize) {
         // Quick check: skip if already initialized.
-        if self.global.elf_patch_cache.lock().contains_key(&fd) {
+        if self
+            .global
+            .elf_patch_cache
+            .lock()
+            .contains_key(&self.elf_patch_key(fd))
+        {
             return;
         }
 
@@ -691,18 +720,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         // Insert under lock (re-check for races).
         let mut cache = self.global.elf_patch_cache.lock();
-        cache.entry(fd).or_insert(ElfPatchState {
-            pre_patched,
-            trampoline_file_offset: tramp_file_offset,
-            trampoline_file_size: tramp_file_size.trunc(),
-            trampoline_addr: trampoline_vaddr,
-            trampoline_cursor: 0,
-            trampoline_mapped: false,
-            trampoline_mapped_len: 0,
-            runtime_patches_committed: false,
-            file_mappings: BTreeSet::new(),
-            patched_ranges: BTreeSet::new(),
-        });
+        cache
+            .entry(self.elf_patch_key(fd))
+            .or_insert(ElfPatchState {
+                pre_patched,
+                trampoline_file_offset: tramp_file_offset,
+                trampoline_file_size: tramp_file_size.trunc(),
+                trampoline_addr: trampoline_vaddr,
+                trampoline_cursor: 0,
+                trampoline_mapped: false,
+                trampoline_mapped_len: 0,
+                runtime_patches_committed: false,
+                file_mappings: BTreeSet::new(),
+                patched_ranges: BTreeSet::new(),
+            });
     }
 
     /// Check if a file has the LITEBOX trampoline magic at its tail.
@@ -801,7 +832,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // Initialize patch state if this is the first mmap for this fd.
         // Typically the first mapping is at offset 0 (the ELF header), but
         // some loaders may map an executable segment at a non-zero offset first.
-        if !self.global.elf_patch_cache.lock().contains_key(&fd) {
+        if !self
+            .global
+            .elf_patch_cache
+            .lock()
+            .contains_key(&self.elf_patch_key(fd))
+        {
             self.init_elf_patch_state(fd, mapped_addr.as_usize(), file_offset.unwrap_or(0));
         }
 
@@ -809,7 +845,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // patching operation. In practice this is fine because the dynamic
         // linker loads shared libraries sequentially.
         let mut cache = self.global.elf_patch_cache.lock();
-        let Some(state) = cache.get_mut(&fd) else {
+        let Some(state) = cache.get_mut(&self.elf_patch_key(fd)) else {
             return true; // No patch state — not an ELF we're tracking
         };
 
@@ -1145,12 +1181,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         true
     }
 
+    /// The [`ElfPatchCache`] key for `fd` in *this* task's process. See [`ElfPatchKey`].
+    fn elf_patch_key(&self, fd: i32) -> ElfPatchKey {
+        (self.pid, fd)
+    }
+
     /// Finalize the ELF patching state for `fd`.
     ///
     /// Removes the cache entry (preventing stale state if the fd is reused)
     /// and unmaps any trampoline that was allocated but never used.
     pub(crate) fn finalize_elf_patch(&self, fd: i32) {
-        let state = self.global.elf_patch_cache.lock().remove(&fd);
+        let state = self
+            .global
+            .elf_patch_cache
+            .lock()
+            .remove(&self.elf_patch_key(fd));
         if let Some(state) = state
             && state.trampoline_mapped
             && !state.pre_patched

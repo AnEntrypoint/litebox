@@ -604,6 +604,19 @@ pub(crate) fn read_code_bytes_for_diagnostics(rip: usize, buf: &mut [u8]) -> usi
     read_code_bytes(rip, buf)
 }
 
+/// Diagnostic-only: reads the `usize` at `addr`, or `None` if that address is not readable.
+///
+/// Used by [`crate::vectored_exception_handler`]'s `rip == 0` diagnostic to inspect the faulting
+/// guest stack, distinguishing a guest-side `ret` off a zeroed stack slot from host-side
+/// corruption of the saved guest context.
+pub(crate) fn read_stack_word_for_diagnostics(addr: usize) -> Option<usize> {
+    if addr == 0 || !addr.is_multiple_of(core::mem::align_of::<usize>()) || !is_readable(addr) {
+        return None;
+    }
+    // SAFETY: `addr` is aligned and was just shown to be readable.
+    Some(unsafe { core::ptr::read(addr as *const usize) })
+}
+
 fn read_code_bytes(rip: usize, buf: &mut [u8]) -> usize {
     let page_size = 0x1000usize;
     // The CPU already fetched the instruction at `rip`, so at minimum the bytes up to the end of
@@ -1192,6 +1205,9 @@ fn arm_codewatch(relocations: &litebox::mm::AddressRelocations) {
 /// Per-thread arm/disarm entry points, called through
 /// [`litebox::platform::ForkChildVerificationProvider`].
 pub(crate) fn begin(relocations: alloc::sync::Arc<litebox::mm::AddressRelocations>) {
+    if crate::diag_rip0_enabled() {
+        eprintln!("[diag-fv] tid={:?} begin", std::thread::current().id());
+    }
     if crate::veh_trace_enabled() {
         eprintln!(
             "[fork_verify] tid={:?} begin: ranges={:?}",
@@ -1210,6 +1226,9 @@ pub(crate) fn begin(relocations: alloc::sync::Arc<litebox::mm::AddressRelocation
 }
 
 pub(crate) fn end() {
+    if crate::diag_rip0_enabled() {
+        eprintln!("[diag-fv] tid={:?} end", std::thread::current().id());
+    }
     if crate::veh_trace_enabled() {
         eprintln!("[fork_verify] tid={:?} end", std::thread::current().id());
     }
