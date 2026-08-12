@@ -39,7 +39,10 @@ fn ratchet_globals() -> Result<()> {
             ("litebox_platform_linux_userland/", 5),
             ("litebox_platform_lvbs/", 24),
             ("litebox_platform_multiplex/", 1),
-            ("litebox_platform_windows_userland/", 10),
+            // 11 rather than 10 for the single `LITEBOX_DIAG_WAIT4GATE` diagnostic thread-local,
+            // which is inert unless that environment variable is set. It is deliberately one
+            // thread-local holding a small struct rather than one per recorded field.
+            ("litebox_platform_windows_userland/", 11),
             ("litebox_runner_lvbs/", 5),
             ("litebox_runner_snp/", 2),
             ("litebox_shim_linux/", 1),
