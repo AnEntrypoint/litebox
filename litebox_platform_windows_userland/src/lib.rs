@@ -182,6 +182,34 @@ unsafe extern "system" fn vectored_exception_handler(
         }
     }
 
+    // Diagnostic-only (`LITEBOX_CTXWATCH=1`): decisive aliasing-vs-overwrite check at the exact
+    // moment of the `rip=0` crash this whole mechanism was built to root-cause. If a hardware
+    // write watchpoint was armed on this thread's `ctx.rip` field (`ctxwatch::current_armed_addr`
+    // non-zero) and we just trapped with `context.Rip == 0`, read the LIVE memory currently at
+    // that watched address: if it is non-zero, the watchpoint's silence (established across 70+
+    // runs in prior passes: zero hits, correct address, correct cross-thread arming) is explained
+    // -- nothing ever wrote 0 there, so whatever produced `rip=0` read a DIFFERENT address than
+    // the one that was armed/validated (an aliasing/wrong-pointer-read bug). If it reads back 0
+    // too, the field really was zeroed by a write the watchpoint should have caught but didn't,
+    // pointing at a watchpoint/CPU-level gap instead.
+    if ctxwatch::enabled() && context.Rip == 0 {
+        let watched = ctxwatch::current_armed_addr();
+        if watched != 0 {
+            let live_value = unsafe { core::ptr::read_unaligned(watched as *const u64) };
+            eprintln!(
+                "[ctxwatch] CRASH tid={:?} rip=0 watched_addr={:#x} live_value_at_watched_addr={:#x}",
+                std::thread::current().id(),
+                watched,
+                live_value,
+            );
+        } else {
+            eprintln!(
+                "[ctxwatch] CRASH tid={:?} rip=0 but no watchpoint currently armed on this thread",
+                std::thread::current().id(),
+            );
+        }
+    }
+
     // Diagnostic code-page watchpoint (`LITEBOX_CODEWATCH=1`). Both of these must be triaged
     // BEFORE the `!is_in_guest` branch below: the whole point of the watchpoint is to observe
     // writes into a `fork()` child's own copied code that happen while LiteBox's *host*

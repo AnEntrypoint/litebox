@@ -213,6 +213,16 @@ fn is_armed_here(addr: usize) -> bool {
     with(false, |s| s.armed_addr.get() == addr && addr != 0)
 }
 
+/// The address currently armed on the calling thread (0 if none). Used by a one-shot,
+/// crash-time diagnostic in `vectored_exception_handler` to distinguish "the watched memory
+/// really does contain 0" (a genuine overwrite -- the watchpoint should then also have fired,
+/// which prior passes established it never does) from "the watched memory still holds the
+/// correct, non-zero value" (proof that whatever jumped to `rip=0` read a DIFFERENT address
+/// than the one that was armed/validated -- an aliasing/wrong-pointer bug, not a corruption).
+pub(super) fn current_armed_addr() -> usize {
+    with(0, |s| s.armed_addr.get())
+}
+
 /// Handles an `EXCEPTION_SINGLE_STEP` that might be this watchpoint firing. `Dr6` bit 0 (`B0`)
 /// indicates breakpoint 0 tripped. On real x86-64 hardware, a data write breakpoint traps *after*
 /// the write completes, so the new value is already visible in memory -- no extra single-step is
