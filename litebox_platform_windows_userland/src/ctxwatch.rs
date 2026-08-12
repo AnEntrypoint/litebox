@@ -1,13 +1,23 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Diagnostic, self-armed hardware write-watchpoint (`LITEBOX_CTXWATCH=1`) on the calling
-//! thread's own `PtRegs.rip` field, used to root-cause an intermittent `EXCEPTION_ACCESS_VIOLATION
-//! rip=0` crash (a jump to a null `ctx.rip`) that repeated tracing has shown happens strictly
-//! between `switch_to_guest`'s entry fast-path check (`ctx.rcx == ctx.rip`, confirmed valid) and
-//! `switch_to_guest_sysret`'s own final `mov rcx, [rcx+0x80]` read of that same field a few
-//! instructions later -- i.e. something zeroes `ctx.rip` in memory during that narrow window,
-//! and the leading (not yet confirmed) hypothesis is a stray cross-thread write.
+//! Diagnostic, self-armed hardware write-watchpoint machinery used across many passes of
+//! `scratchpad/jqrepro/FINDINGS.txt`'s investigation into an intermittent, guest-visible
+//! `EXCEPTION_ACCESS_VIOLATION rip=0` crash (a jump to address 0).
+//!
+//! HISTORY (see `FINDINGS.txt` for the full account): passes 20-25 used [`arm`]/[`arm_on_handle`]
+//! to watch the HOST-side `ctx.rip` field of the resuming thread's `PtRegs` -- the leading
+//! hypothesis at the time was that some write zeroed that field between `switch_to_guest`'s entry
+//! fast-path check and `switch_to_guest_sysret`'s final `[rcx+0x80]` read of it. That watchpoint
+//! never fired across 100+ armed-and-crashed trials. Pass 28 then read the VEH-reported
+//! `ExceptionInformation` directly at fault time and found `av_type == EXCEPTION_EXECUTE_FAULT`
+//! at `av_addr == 0` with the saved host context otherwise intact: the GUEST itself branches to
+//! null (most often via a `ret` that popped a zeroed word off its own stack), which retroactively
+//! explains why the host-side `ctx.rip` watch never fired -- it was watching the wrong address
+//! the whole time. Pass 30 added [`arm_addr`], a generic (not `PtRegs`-specific) arm entry point,
+//! so the crash handler can reactively watch the actual implicated GUEST stack slot
+//! (`faulting_rsp - 8`) computed fresh from each run's own first crash, rather than a fixed,
+//! pre-guessed host address.
 //!
 //! This uses real x86-64 debug registers (`Dr0`/`Dr7`), armed via `SetThreadContext` on the
 //! CURRENT thread only -- no external debugger attaches, since prior passes found that both `cdb`
@@ -15,12 +25,6 @@
 //! mask it (see `scratchpad/jqrepro/FINDINGS.txt`, PASS 17+/PASS 18). Setting one's own debug
 //! registers is an ordinary instruction, not a suspend-and-inspect from another process, so it
 //! should not carry the same timing hazard.
-//!
-//! A **write** watchpoint on `ctx.rip` should never legitimately fire: `switch_to_guest_sysret`
-//! only *reads* that field, and no other code should be writing this specific stack-local `ctx`'s
-//! `rip` field at all once the fast-path guard has already observed it non-zero. If the
-//! watchpoint fires, that is itself the finding -- capturing which thread and which instruction
-//! did the write pins the corruption's source directly.
 
 use core::cell::Cell;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -105,7 +109,17 @@ pub(super) fn arm(ctx: *const litebox_common_linux::PtRegs) {
         return;
     }
     let addr = (ctx as usize).wrapping_add(RIP_FIELD_OFFSET);
+    arm_addr(addr);
+}
 
+/// Arms a hardware write-watchpoint on the calling thread covering an arbitrary 8-byte-aligned
+/// `addr`. Unlike [`arm`], not gated on `enabled()` (`LITEBOX_CTXWATCH`) -- pass-30's reactive
+/// guest-stack-slot watch (armed from the `LITEBOX_DIAG_WAIT4GATE`-gated `[diag-rip0]` crash
+/// handler, a separate diagnostic) uses this directly so the two diagnostics stay independently
+/// controllable. A `SetThreadContext` failure is reported but non-fatal -- this is
+/// diagnostic-only. Always overwrites whatever this thread's `armed_addr`/hit-detection state
+/// currently holds, so at most one watch is tracked as "ours" per thread at a time.
+pub(super) fn arm_addr(addr: usize) {
     // SAFETY: `GetCurrentThread` returns a pseudo-handle valid for the lifetime of the call;
     // `GetThreadContext`/`SetThreadContext` on it operate on the calling thread's own registers.
     unsafe {
@@ -231,10 +245,13 @@ pub(super) fn current_armed_addr() -> usize {
 /// caller may choose to disarm afterward if only one hit is wanted).
 ///
 /// Returns whether this trap belonged to the ctxwatch mechanism (and so has been handled).
+///
+/// Not gated on `enabled()` (`LITEBOX_CTXWATCH`): pass-30's reactive guest-stack-slot watch,
+/// armed via `arm_addr` from the separate `LITEBOX_DIAG_WAIT4GATE` diagnostic, must still be
+/// able to report its own hits when `LITEBOX_CTXWATCH` is unset. `is_armed_here` below already
+/// returns `false` (a no-op) whenever nothing is actually armed on this thread, so this stays
+/// free when neither diagnostic is active.
 pub(crate) fn on_possible_hit(context: &mut CONTEXT) -> bool {
-    if !enabled() {
-        return false;
-    }
     // Windows' exception dispatch always populates `ContextRecord.Dr0`/`Dr6`/`Dr7` for a real
     // hardware-debug-register trap (`EXCEPTION_SINGLE_STEP` raised by Dr7, as opposed to an
     // `int3`/`EFLAGS.TF` software single-step) -- no extra `GetThreadContext` round-trip needed,
