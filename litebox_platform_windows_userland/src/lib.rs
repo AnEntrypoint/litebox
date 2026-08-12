@@ -292,6 +292,10 @@ unsafe extern "system" fn vectored_exception_handler(
                 walk,
             );
         }
+        // Pass-30: record the faulting rsp so the reactive watchpoint (armed further below, AFTER
+        // `ctxwatch::disarm()` runs on this same VEH call as the crash is absorbed into a
+        // guest-visible SIGSEGV) targets `faulting_rsp - 8` -- see that arm site's own comment.
+        diag_pending_watch_addr(context.Rsp);
     }
     if ctxwatch::enabled() && context.Rip == 0 {
         let watched = ctxwatch::current_armed_addr();
@@ -548,6 +552,26 @@ unsafe extern "system" fn vectored_exception_handler(
     // done once we're leaving guest mode again; the next `ContinueOperation::Resume` re-arms it
     // fresh for the new `ctx`. Cheap no-op when never armed.
     ctxwatch::disarm();
+    // Pass-30 (`LITEBOX_DIAG_WAIT4GATE=1`): if the `[diag-rip0]` block above (this same VEH call)
+    // just recorded a pending guest-stack-slot address from a `rip=0` fault, arm the reactive
+    // write-watchpoint on it now -- strictly AFTER `ctxwatch::disarm()` above, so it survives past
+    // this handler's return instead of being immediately cleared by it. Pass 28/29 established
+    // this is a genuine guest-side null branch (the guest's own stack held a bad zero at
+    // `rsp - 8`), so unlike every pass 20-25 watchpoint (armed on the HOST-side `ctx.rip` field,
+    // which pass 28 retracted as never actually implicated), this watches the address proven to
+    // hold the bad value. Left armed across the crash: the process survives (pass 28 item 3), and
+    // watching stays live for whatever the guest shell runs next in the SAME session, so a SECOND
+    // repro attempt in the same run can catch a hit even though the exact faulting address differs
+    // run-to-run (this pass reactively re-derives it fresh from each run's own first crash instead
+    // of guessing a fixed address up front).
+    if let Some(addr) = diag_take_pending_watch_addr() {
+        ctxwatch::arm_addr(addr);
+        eprintln!(
+            "[diag-rip0-watch] tid={:?} armed reactive write-watch on faulting_rsp-8={:#x} (post-crash, for next repro attempt in this session)",
+            std::thread::current().id(),
+            addr,
+        );
+    }
 
     // From here on, `context` is being redirected into `exception_callback` or
     // `interrupt_callback` (host code), and control never returns to `fork_verify::on_single_step`
@@ -1228,6 +1252,11 @@ struct DiagState {
     /// Ring buffer of this thread's most recent resumes, plus the running total, so a crash
     /// handler can print the exact sequence of resumes leading up to a fault.
     history: (usize, [DiagResume; DIAG_RESUME_HISTORY_LEN]),
+    /// Pass-30: `faulting_rsp - 8` recorded by the `[diag-rip0]` block, consumed once (after
+    /// `ctxwatch::disarm()` runs later in the same `vectored_exception_handler` call) to arm the
+    /// reactive guest-stack-slot watchpoint. `None` when no fault has queued an address yet, or
+    /// after it has already been consumed.
+    pending_watch_addr: Option<usize>,
 }
 
 impl DiagState {
@@ -1236,8 +1265,28 @@ impl DiagState {
             enabled: None,
             last_resume_path: "none",
             history: (0, [(0, 0, 0, 0, 0); DIAG_RESUME_HISTORY_LEN]),
+            pending_watch_addr: None,
         }
     }
+}
+
+/// Diagnostic-only (`LITEBOX_DIAG_WAIT4GATE=1`): records `faulting_rsp - 8` -- the guest stack
+/// slot proven (pass 28/29) to hold the bad zero a null-branching guest read -- for the reactive
+/// watchpoint armed later in the same `vectored_exception_handler` call, after `ctxwatch::disarm()`
+/// runs.
+fn diag_pending_watch_addr(faulting_rsp: u64) {
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "diagnostic-only; this platform is x86_64-only, so rsp fits in usize"
+    )]
+    let addr = (faulting_rsp as usize).wrapping_sub(8);
+    DIAG.with_borrow_mut(|d| d.pending_watch_addr = Some(addr));
+}
+
+/// Diagnostic-only (`LITEBOX_DIAG_WAIT4GATE=1`): takes (clears) this thread's pending reactive
+/// watch address, if any, set by [`diag_pending_watch_addr`] earlier in the same VEH call.
+fn diag_take_pending_watch_addr() -> Option<usize> {
+    DIAG.with_borrow_mut(|d| d.pending_watch_addr.take())
 }
 
 /// Diagnostic-only (`LITEBOX_DIAG_WAIT4GATE=1`): records one guest resume, along with which path
