@@ -123,6 +123,25 @@ pub(crate) fn veh_trace_enabled() -> bool {
     std::env::var_os("LITEBOX_VEH_TRACE").is_some()
 }
 
+/// Whether the targeted `rip == 0` crash diagnostics (`LITEBOX_DIAG_WAIT4GATE=1`) are enabled.
+///
+/// Deliberately a separate, much narrower gate than [`veh_trace_enabled`]: full `LITEBOX_VEH_TRACE`
+/// emits a per-instruction trace that perturbs timing enough to hide the crash being investigated,
+/// whereas this gate only enables a handful of one-off prints around fork-child verification and
+/// the fault itself. Cached so the resume path pays only a relaxed atomic load when unset.
+pub(crate) fn diag_rip0_enabled() -> bool {
+    static CACHED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+    match CACHED.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let enabled = std::env::var_os("LITEBOX_DIAG_WAIT4GATE").is_some();
+            CACHED.store(u8::from(enabled), Ordering::Relaxed);
+            enabled
+        }
+    }
+}
+
 unsafe extern "system" fn vectored_exception_handler(
     exception_info: *mut EXCEPTION_POINTERS,
 ) -> i32 {
@@ -192,6 +211,51 @@ unsafe extern "system" fn vectored_exception_handler(
     // the one that was armed/validated (an aliasing/wrong-pointer-read bug). If it reads back 0
     // too, the field really was zeroed by a write the watchpoint should have caught but didn't,
     // pointing at a watchpoint/CPU-level gap instead.
+    if context.Rip == 0 && diag_rip0_enabled() {
+        eprintln!(
+            "[diag-rip0] tid={:?} exc_code={:#x} rsp={:#x} rax={:#x} is_in_guest={} is_verifying={} last_resume_path={} last_orig_rax={:#x}",
+            std::thread::current().id(),
+            exception_record.ExceptionCode,
+            context.Rsp,
+            context.Rax,
+            tls.is_in_guest.get(),
+            fork_verify::is_verifying(tls),
+            DIAG_LAST_RESUME_PATH.with(std::cell::Cell::get),
+            DIAG_LAST_ORIG_RAX.with(std::cell::Cell::get),
+        );
+        eprintln!(
+            "[diag-rip0-hist] tid={:?} {}",
+            std::thread::current().id(),
+            diag_resume_history()
+        );
+        // Classify the fault. `av_type == 8` (EXCEPTION_EXECUTE_FAULT) at `av_addr == 0` means
+        // the CPU faulted *fetching* an instruction at address 0, i.e. the guest itself branched
+        // to null -- as opposed to LiteBox resuming the guest with a corrupted saved `rip`. The
+        // words around the faulting `rsp` disambiguate further: a zero immediately below `rsp` is
+        // the signature of a `ret` that popped a zeroed return address off the guest's own stack.
+        {
+            use core::fmt::Write as _;
+            let mut around = String::new();
+            for i in -4i64..4 {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "diagnostic-only; this platform is x86_64-only, so rsp fits in usize"
+                )]
+                let addr = (context.Rsp as usize).wrapping_add_signed(
+                    isize::try_from(i * 8).expect("small constant offset fits in isize"),
+                );
+                let v = fork_verify::read_stack_word_for_diagnostics(addr);
+                let _ = write!(around, " [rsp{i:+}*8={addr:#x}]={v:?}");
+            }
+            eprintln!(
+                "[diag-rip0-av] tid={:?} av_type={:#x} av_addr={:#x}{}",
+                std::thread::current().id(),
+                exception_record.ExceptionInformation[0],
+                exception_record.ExceptionInformation[1],
+                around,
+            );
+        }
+    }
     if ctxwatch::enabled() && context.Rip == 0 {
         let watched = ctxwatch::current_armed_addr();
         if watched != 0 {
@@ -1101,6 +1165,66 @@ interrupt_callback:
     );
 }
 
+thread_local! {
+    /// Diagnostic-only (`LITEBOX_DIAG_WAIT4GATE=1`): records which resume path
+    /// (`"sysret"`/`"ntcontinue"`) was last taken on this thread, so a crash handler can report
+    /// which path was actually in effect for the resume immediately preceding a crash. Purely
+    /// a debugging aid for this workaround's own validation; not required for correctness.
+    static DIAG_LAST_RESUME_PATH: std::cell::Cell<&'static str> =
+        const { std::cell::Cell::new("none") };
+
+    /// Diagnostic-only (`LITEBOX_DIAG_WAIT4GATE=1`): records the `orig_rax` (Linux syscall
+    /// number) of the syscall this thread was returning from on its most recent guest resume, so
+    /// a crash handler can report what the crashing thread was last doing before it faulted.
+    static DIAG_LAST_ORIG_RAX: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+
+    /// Diagnostic-only (`LITEBOX_DIAG_WAIT4GATE=1`): ring buffer of the last
+    /// `DIAG_RESUME_HISTORY_LEN` guest resumes on this thread, as
+    /// `(orig_rax, rip, rcx, rsp, rax)`, plus the running count of resumes. Lets a crash handler
+    /// print the exact sequence of resumes leading up to a fault.
+    static DIAG_RESUME_HISTORY: RefCell<DiagResumeHistory> =
+        const { RefCell::new((0, [(0, 0, 0, 0, 0); DIAG_RESUME_HISTORY_LEN])) };
+}
+
+/// Number of recent guest resumes [`DIAG_RESUME_HISTORY`] retains per thread.
+const DIAG_RESUME_HISTORY_LEN: usize = 8;
+
+/// `(total resumes so far, ring buffer of `(orig_rax, rip, rcx, rsp, rax)`)`.
+type DiagResumeHistory = (
+    usize,
+    [(usize, usize, usize, usize, usize); DIAG_RESUME_HISTORY_LEN],
+);
+
+/// Diagnostic-only (`LITEBOX_DIAG_WAIT4GATE=1`): records one guest resume into this thread's
+/// [`DIAG_RESUME_HISTORY`] ring buffer.
+fn diag_record_resume(ctx: &litebox_common_linux::PtRegs) {
+    DIAG_RESUME_HISTORY.with(|h| {
+        let mut h = h.borrow_mut();
+        let n = h.0;
+        h.1[n % DIAG_RESUME_HISTORY_LEN] = (ctx.orig_rax, ctx.rip, ctx.rcx, ctx.rsp, ctx.rax);
+        h.0 = n.wrapping_add(1);
+    });
+}
+
+/// Diagnostic-only: formats this thread's recent-resume history, oldest first.
+fn diag_resume_history() -> String {
+    use core::fmt::Write as _;
+    DIAG_RESUME_HISTORY.with(|h| {
+        let h = h.borrow();
+        let total = h.0;
+        let shown = total.min(DIAG_RESUME_HISTORY_LEN);
+        let mut out = format!("total={total}");
+        for i in (0..shown).rev() {
+            let (orig_rax, rip, rcx, rsp, rax) = h.1[(total - 1 - i) % DIAG_RESUME_HISTORY_LEN];
+            let _ = write!(
+                out,
+                " | -{i}: orig_rax={orig_rax:#x} rip={rip:#x} rcx={rcx:#x} rsp={rsp:#x} rax={rax:#x}"
+            );
+        }
+        out
+    })
+}
+
 /// Switches to the provided guest context.
 ///
 /// # Safety
@@ -1261,9 +1385,19 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     // the only one that can set `EFLAGS.TF` (the fast path restores eflags from `ctx`, which
     // never carries TF) to arm the single-step trap `fork_verify` depends on.
     if ctx.rcx == ctx.rip && tls.has_entered_guest.get() && !fork_verify::is_verifying(tls) {
+        if diag_rip0_enabled() {
+            DIAG_LAST_RESUME_PATH.with(|c| c.set("sysret"));
+            DIAG_LAST_ORIG_RAX.with(|c| c.set(ctx.orig_rax));
+            diag_record_resume(ctx);
+        }
         tls.is_in_guest.set(true);
         switch_to_guest_sysret(ctx)
     } else {
+        if diag_rip0_enabled() {
+            DIAG_LAST_RESUME_PATH.with(|c| c.set("ntcontinue"));
+            DIAG_LAST_ORIG_RAX.with(|c| c.set(ctx.orig_rax));
+            diag_record_resume(ctx);
+        }
         tls.has_entered_guest.set(true);
         switch_to_guest_ntcontinue(tls, ctx)
     }
@@ -1811,6 +1945,14 @@ impl ThreadHandle {
             ..switch_to_guest_end as *const () as usize)
             .contains(&(context.Rip.trunc()))
         {
+            if diag_rip0_enabled() {
+                eprintln!(
+                    "[diag-interrupt] tid={:?} target_tid={:?} case=1 target_rip={:#x}",
+                    std::thread::current().id(),
+                    inner.handle.as_raw_handle(),
+                    context.Rip,
+                );
+            }
             // Case 1: jump to interrupt callback without saving the guest
             // context, since it's already saved.
             true
@@ -1830,6 +1972,14 @@ impl ThreadHandle {
             false
         } else {
             // Case 4: save the guest context and jump to interrupt callback.
+            if diag_rip0_enabled() {
+                eprintln!(
+                    "[diag-interrupt] tid={:?} case=4 target_rip={:#x} guest_context={:#x}",
+                    std::thread::current().id(),
+                    context.Rip,
+                    guest_context as usize,
+                );
+            }
             save_guest_context(unsafe { &mut *guest_context }, &context);
             true
         };
