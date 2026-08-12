@@ -22,6 +22,7 @@
 //! watchpoint fires, that is itself the finding -- capturing which thread and which instruction
 //! did the write pins the corruption's source directly.
 
+use core::cell::Cell;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -33,26 +34,46 @@ use windows_sys::Win32::System::Threading::GetCurrentThread;
 /// `[rcx + 0x80]` field-offset comment.
 const RIP_FIELD_OFFSET: usize = 0x80;
 
+/// Backing state for this watchpoint, held as a [`crate::TlsState`] field rather than a bare
+/// `static`/`thread_local!` -- matches [`crate::fork_verify`]'s `codewatch` module's own reasoning
+/// (see that module's doc comment): keeps this diagnostic off the crate's ratcheted bare-static
+/// count, and per-thread is its natural scope anyway (each host OS thread has its own debug
+/// registers, and only the thread arming the watchpoint ever needs to recognize/disarm its own).
+pub(crate) struct State {
+    /// The address currently armed on this thread (0 if none).
+    armed_addr: Cell<usize>,
+    /// Diagnostics-only counters, safe to read from any thread after a hit.
+    hit_count: AtomicUsize,
+    last_hit_writer_tid: AtomicU64,
+}
+
+impl State {
+    pub(crate) const fn new() -> Self {
+        Self {
+            armed_addr: Cell::new(0),
+            hit_count: AtomicUsize::new(0),
+            last_hit_writer_tid: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Runs `f` against the calling thread's watchpoint state, or returns `default` if this thread
+/// has no `TlsState` yet (the watchpoint is only ever armed from a thread that does).
+fn with<R>(default: R, f: impl FnOnce(&State) -> R) -> R {
+    match crate::get_tls_ptr() {
+        // SAFETY: `get_tls_ptr` returns this thread's live `TlsState`.
+        Some(tls) => f(&unsafe { &*tls }.ctxwatch),
+        None => default,
+    }
+}
+
 pub(super) fn enabled() -> bool {
     std::env::var_os("LITEBOX_CTXWATCH").is_some()
 }
 
-thread_local! {
-    // The address currently armed on *this* thread (0 if none), so `disarm` and the VEH handler
-    // can recognize a hit belongs to this mechanism without re-deriving the address. Per-thread
-    // by construction (each host OS thread has its own debug registers), so a simple
-    // thread-local is correct and avoids cross-thread false positives on the "was this armed"
-    // check itself.
-    static ARMED_ADDR: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
-}
-
-/// Diagnostics-only counters, safe to read from any thread after a hit.
-static HIT_COUNT: AtomicUsize = AtomicUsize::new(0);
-static LAST_HIT_WRITER_TID: AtomicU64 = AtomicU64::new(0);
-
 /// Arms a hardware write-watchpoint on the calling thread covering the 8-byte `rip` field of the
-/// `PtRegs` at `ctx`. Returns whether the arm succeeded (a `SetThreadContext` failure is reported
-/// but non-fatal -- this is diagnostic-only).
+/// `PtRegs` at `ctx`. A `SetThreadContext` failure is reported but non-fatal -- this is
+/// diagnostic-only.
 pub(super) fn arm(ctx: *const litebox_common_linux::PtRegs) {
     if !enabled() {
         return;
@@ -96,7 +117,7 @@ pub(super) fn arm(ctx: *const litebox_common_linux::PtRegs) {
             return;
         }
     }
-    ARMED_ADDR.with(|a| a.set(addr));
+    with((), |s| s.armed_addr.set(addr));
     eprintln!(
         "[ctxwatch] tid={:?} armed write watch on {:#x}",
         std::thread::current().id(),
@@ -106,7 +127,7 @@ pub(super) fn arm(ctx: *const litebox_common_linux::PtRegs) {
 
 /// Disarms the calling thread's watchpoint, if any. Safe to call even if never armed.
 pub(super) fn disarm() {
-    let addr = ARMED_ADDR.with(|a| a.replace(0));
+    let addr = with(0, |s| s.armed_addr.replace(0));
     if addr == 0 {
         return;
     }
@@ -127,7 +148,7 @@ pub(super) fn disarm() {
 
 /// Whether `addr` is the address currently armed on the calling thread.
 fn is_armed_here(addr: usize) -> bool {
-    ARMED_ADDR.with(|a| a.get() == addr && addr != 0)
+    with(false, |s| s.armed_addr.get() == addr && addr != 0)
 }
 
 /// Handles an `EXCEPTION_SINGLE_STEP` that might be this watchpoint firing. `Dr6` bit 0 (`B0`)
@@ -158,16 +179,18 @@ pub(crate) fn on_possible_hit(context: &mut CONTEXT) -> bool {
         return false;
     }
 
-    HIT_COUNT.fetch_add(1, Ordering::Relaxed);
-    // `ThreadId::as_u64` is unstable on this toolchain; hash the `Debug` representation instead
-    // (diagnostic-only, does not need to be a "real" numeric thread id).
-    let tid = {
-        use core::hash::{Hash as _, Hasher as _};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        std::thread::current().id().hash(&mut hasher);
-        hasher.finish()
-    };
-    LAST_HIT_WRITER_TID.store(tid, Ordering::Relaxed);
+    with((), |s| {
+        s.hit_count.fetch_add(1, Ordering::Relaxed);
+        // `ThreadId::as_u64` is unstable on this toolchain; hash the `Debug` representation
+        // instead (diagnostic-only, does not need to be a "real" numeric thread id).
+        let tid = {
+            use core::hash::{Hash as _, Hasher as _};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::thread::current().id().hash(&mut hasher);
+            hasher.finish()
+        };
+        s.last_hit_writer_tid.store(tid, Ordering::Relaxed);
+    });
 
     // The write already completed (hardware data breakpoints trap post-write); read the new value
     // directly.
@@ -190,17 +213,4 @@ pub(crate) fn on_possible_hit(context: &mut CONTEXT) -> bool {
     context.Dr6 = 0;
 
     true
-}
-
-/// Silences "unused" warnings for the diagnostics-only counters when `LITEBOX_CTXWATCH` tracing
-/// never fires in a given run; kept as real state (not `#[allow(dead_code)]`) since a future pass
-/// may want to read them back, e.g. from a panic handler.
-#[allow(dead_code, reason = "diagnostic accessor, not yet consumed elsewhere")]
-pub(super) fn last_hit_writer_tid() -> u64 {
-    LAST_HIT_WRITER_TID.load(Ordering::Relaxed)
-}
-
-#[allow(dead_code, reason = "diagnostic accessor, not yet consumed elsewhere")]
-pub(super) fn hit_count() -> usize {
-    HIT_COUNT.load(Ordering::Relaxed)
 }
