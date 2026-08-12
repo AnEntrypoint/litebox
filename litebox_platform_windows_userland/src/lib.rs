@@ -1523,6 +1523,77 @@ fn console_resize_watcher_thread_body() {
     }
 }
 
+/// Helper to lock two mutexes in address order, to prevent deadlock. Shared by
+/// `ThreadHandle::interrupt` and `ctxwatch_arm_other_threads`, both of which suspend a target
+/// thread from a "current" thread and must avoid two threads each locking the other's mutex in
+/// opposite order concurrently.
+fn lock_two<'a, T, U>(
+    left: &'a Mutex<T>,
+    right: &'a Mutex<U>,
+) -> (std::sync::MutexGuard<'a, T>, std::sync::MutexGuard<'a, U>) {
+    if std::ptr::from_ref(left).addr() < std::ptr::from_ref(right).addr() {
+        let l = left.lock().unwrap();
+        let r = right.lock().unwrap();
+        (l, r)
+    } else {
+        let r = right.lock().unwrap();
+        let l = left.lock().unwrap();
+        (l, r)
+    }
+}
+
+/// Diagnostic-only (`LITEBOX_CTXWATCH=1`): arms the same `ctx.rip` write-watchpoint `ctxwatch::arm`
+/// just set on the calling thread on every OTHER live thread registered in `ACTIVE_THREADS` too.
+/// Debug registers are per-thread Windows state (virtualized via `Get`/`SetThreadContext`), so a
+/// watchpoint armed on only one thread can never catch a write made by an instruction executing
+/// on a different thread -- this closes that coverage gap by reusing the same
+/// suspend/get-context/set-context/resume sequence `ThreadHandle::interrupt` already relies on for
+/// cross-thread context manipulation elsewhere in this file. Best-effort and non-fatal: a thread
+/// that disappears or fails to arm is skipped, logged, and does not stop the rest.
+///
+/// Lock ordering mirrors `ThreadHandle::interrupt` exactly: `current`'s own mutex is held for the
+/// duration of each per-target suspend/arm/resume, via the same `lock_two` address-ordered
+/// two-mutex acquisition `interrupt` uses. This matters because, unlike a diagnostic that only
+/// ever touches one target, multiple pipeline threads can each independently reach this same
+/// exit_group path and call this function concurrently -- without holding its own lock while
+/// suspending another thread, thread A suspending B while B concurrently (and lock-free) suspends
+/// A is exactly the ABBA deadlock/race `interrupt`'s `lock_two` pattern was written to prevent.
+fn ctxwatch_arm_other_threads(ctx: *const litebox_common_linux::PtRegs) {
+    let addr = (ctx as usize).wrapping_add(ctxwatch::RIP_FIELD_OFFSET);
+    let Some(current) = CURRENT_THREAD_HANDLE.with(|c| c.borrow().clone()) else {
+        // Not a LiteBox-managed thread; nothing to lock ourselves against.
+        return;
+    };
+    let others: alloc::vec::Vec<ThreadHandle> = ACTIVE_THREADS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|h| !Arc::ptr_eq(&current.0, &h.0))
+        .cloned()
+        .collect();
+    for other in others {
+        // Lock both `current` and `other` (address-ordered, matching `interrupt`) so this thread
+        // is never suspended by a concurrent caller while it holds `other`'s lock, and vice versa.
+        let (_current_guard, guard) = lock_two(&current.0, &other.0);
+        let Some(inner) = guard.as_ref() else {
+            continue;
+        };
+        let raw_handle = inner.handle.as_raw_handle();
+        // SAFETY: `raw_handle` comes from a live `ThreadHandleInner` held under its own lock, so
+        // the OS thread handle is valid for the duration of this suspend/arm/resume sequence.
+        unsafe {
+            windows_sys::Win32::System::Threading::SuspendThread(raw_handle);
+        }
+        let _resume_guard = litebox::utils::defer(|| unsafe {
+            windows_sys::Win32::System::Threading::ResumeThread(raw_handle);
+        });
+        // SAFETY: `raw_handle` is a valid, now-suspended thread handle.
+        unsafe {
+            ctxwatch::arm_on_handle(raw_handle, addr);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ThreadHandle(Arc<Mutex<Option<ThreadHandleInner>>>);
 
@@ -1634,22 +1705,6 @@ impl ThreadHandle {
     ///    context to resume at the interrupt callback.
     /// 5. Resume the target thread.
     fn interrupt(&self, current: Option<&ThreadHandle>) {
-        /// Helper to lock two mutexes in address order, to prevent deadlock.
-        fn lock_two<'a, T, U>(
-            left: &'a Mutex<T>,
-            right: &'a Mutex<U>,
-        ) -> (std::sync::MutexGuard<'a, T>, std::sync::MutexGuard<'a, U>) {
-            if std::ptr::from_ref(left).addr() < std::ptr::from_ref(right).addr() {
-                let l = left.lock().unwrap();
-                let r = right.lock().unwrap();
-                (l, r)
-            } else {
-                let r = right.lock().unwrap();
-                let l = left.lock().unwrap();
-                (l, r)
-            }
-        }
-
         let (_current_guard, target) = if let Some(current) = current {
             if Arc::ptr_eq(&current.0, &self.0) {
                 // Interrupting self; just set the flag.
@@ -3190,6 +3245,15 @@ impl ThreadContext<'_> {
                 // time this thread leaves guest mode.
                 if ctxwatch::enabled() && self.ctx.orig_rax == 0x3d {
                     ctxwatch::arm(self.ctx);
+                    // Debug registers are per-thread on Windows (virtualized via
+                    // Get/SetThreadContext): a watchpoint armed only on this (the shell's own)
+                    // thread can never observe a write performed by an instruction executing on
+                    // a DIFFERENT OS thread, e.g. a pipeline child's own exit/teardown code
+                    // running on its own thread. Arm the identical watchpoint on every other
+                    // live thread too, reusing the same suspend/set-context/resume pattern
+                    // `ThreadHandle::interrupt` already uses for cross-thread context
+                    // manipulation.
+                    ctxwatch_arm_other_threads(self.ctx);
                 }
                 unsafe { switch_to_guest(self.ctx) }
             }
