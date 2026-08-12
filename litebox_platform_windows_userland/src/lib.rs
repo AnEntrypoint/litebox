@@ -7,6 +7,7 @@
 // Windows, but we _may_ allow for more in the future, if we find it useful to do so.
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
+mod ctxwatch;
 mod fork_verify;
 mod net;
 
@@ -196,6 +197,18 @@ unsafe extern "system" fn vectored_exception_handler(
     if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_SINGLE_STEP
         && !tls.is_in_guest.get()
         && fork_verify::on_codewatch_step(context)
+    {
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    // Diagnostic-only (`LITEBOX_CTXWATCH=1`): a hardware write-watchpoint hit on some thread's
+    // `ctx.rip` field. Checked regardless of `is_in_guest` -- the whole point is to catch a
+    // WRITER thread that may be running host code, not necessarily the watched thread's own
+    // guest execution (which never legitimately writes this field via the watched path at all).
+    // Resume immediately after logging; the write already completed (hardware data watchpoints
+    // trap post-write), so there is nothing further to step over.
+    if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_SINGLE_STEP
+        && ctxwatch::on_possible_hit(context)
     {
         return EXCEPTION_CONTINUE_EXECUTION;
     }
@@ -402,6 +415,10 @@ unsafe extern "system" fn vectored_exception_handler(
         synthesized_record.as_ref().unwrap_or(exception_record);
 
     tls.is_in_guest.set(false);
+    // Diagnostic-only (`LITEBOX_CTXWATCH=1`): the watchpoint's job for this guest-entry cycle is
+    // done once we're leaving guest mode again; the next `ContinueOperation::Resume` re-arms it
+    // fresh for the new `ctx`. Cheap no-op when never armed.
+    ctxwatch::disarm();
 
     // From here on, `context` is being redirected into `exception_callback` or
     // `interrupt_callback` (host code), and control never returns to `fork_verify::on_single_step`
@@ -3157,7 +3174,18 @@ impl ThreadContext<'_> {
         // before returning.
         let op = f(self.shim, self.ctx, self.tls.interrupt.replace(false));
         match op {
-            ContinueOperation::Resume => unsafe { switch_to_guest(self.ctx) },
+            ContinueOperation::Resume => {
+                // Diagnostic-only (`LITEBOX_CTXWATCH=1`): arm a hardware write-watchpoint on
+                // this thread's own `ctx.rip` field right before resuming into the guest,
+                // conditioned on `orig_rax == 0x3d` (wait4) to minimize overhead and match the
+                // exact syscall this bug's crashes have consistently followed. See `ctxwatch`
+                // for the full rationale. `vectored_exception_handler` disarms it again the next
+                // time this thread leaves guest mode.
+                if ctxwatch::enabled() && self.ctx.orig_rax == 0x3d {
+                    ctxwatch::arm(self.ctx);
+                }
+                unsafe { switch_to_guest(self.ctx) }
+            }
             ContinueOperation::Terminate => {}
         }
     }
