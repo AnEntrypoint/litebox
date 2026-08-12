@@ -1131,6 +1131,14 @@ pub(crate) fn on_codewatch_write(record: &EXCEPTION_RECORD, context: &mut CONTEX
 
 /// Reports the region backing a crash `rip`, so a genuinely corrupted byte can be told apart from
 /// execution having landed in a *different* mapping than the one the watchpoint armed.
+/// Diagnostic-only: exposes `codewatch::describe` for an arbitrary address, used by
+/// [`crate::vectored_exception_handler`]'s `rip == 0` stack walk to classify each word found on
+/// the faulting guest stack (executable-region values look like return addresses; writable,
+/// non-executable ones look like stack-local data).
+pub(crate) fn describe_addr_for_diagnostics(addr: usize) -> (u32, u32, usize) {
+    codewatch::describe(addr)
+}
+
 pub(crate) fn describe_crash_page_for_diagnostics(rip: usize) {
     let (mtype, protect, alloc_base) = codewatch::describe(rip);
     eprintln!(

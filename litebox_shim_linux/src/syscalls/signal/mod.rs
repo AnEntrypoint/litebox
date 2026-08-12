@@ -395,6 +395,23 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             return Err(DeliverFault);
         }
 
+        // Pass-29 diagnostic: the long-running `rip == 0` crash investigation (see FINDINGS.txt)
+        // established the guest branches to address 0 under its own power. `write_signal_frame`
+        // (x86_64.rs) sets `ctx.rip = action.sigaction` directly from caller-supplied dispositions
+        // with no validation; `action.sigaction == 0` is supposed to be structurally impossible
+        // here (the `SIG_DFL`/`SIG_IGN` match arms in `process_signals` are meant to intercept it
+        // before `deliver_signal` is ever called), but has never been empirically confirmed never
+        // to happen. Gated behind the `error!` log level (already filterable/cheap when disabled)
+        // rather than an env var, since this crate is `no_std` and has no direct env access; this
+        // is the cheapest possible falsification of the "signal delivery hands the guest a null
+        // handler" hypothesis.
+        if action.sigaction == 0 {
+            litebox_util_log::error!(
+                signal:? = signal;
+                "[diag-rip0-sigdeliver] delivering signal with sigaction==0 (should be unreachable: SIG_DFL/SIG_IGN ought to have intercepted this in process_signals)"
+            );
+        }
+
         self.write_signal_frame(frame_addr, siginfo, action, ctx)?;
 
         let mut mask = self.blocked.get() | action.mask;

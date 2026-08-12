@@ -248,6 +248,50 @@ unsafe extern "system" fn vectored_exception_handler(
                 around,
             );
         }
+        // Pass-29: walk the faulting guest stack upward from `rsp`, classifying each word so the
+        // return-address chain identifies which guest function executed the null branch. Each
+        // word's own host-memory region is described via `codewatch::describe` (page type/protect/
+        // alloc_base) -- a plausible return address lands in an executable, non-writable region; a
+        // stack-local value lands in a writable, non-executable region; `None`/zero are called out
+        // directly. 32 words covers several stack frames on a typical musl/busybox call depth.
+        {
+            use core::fmt::Write as _;
+            let mut walk = String::new();
+            for i in 0i64..32 {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "diagnostic-only; this platform is x86_64-only, so rsp fits in usize"
+                )]
+                let addr = (context.Rsp as usize).wrapping_add(
+                    usize::try_from(i * 8).expect("small constant offset fits in usize"),
+                );
+                let v = fork_verify::read_stack_word_for_diagnostics(addr);
+                match v {
+                    None => {
+                        let _ = write!(walk, "\n  [rsp+{:#06x}={:#x}] <unreadable>", i * 8, addr);
+                    }
+                    Some(0) => {
+                        let _ = write!(walk, "\n  [rsp+{:#06x}={:#x}] = 0", i * 8, addr);
+                    }
+                    Some(val) => {
+                        let (mtype, protect, alloc_base) =
+                            fork_verify::describe_addr_for_diagnostics(val);
+                        let _ = write!(
+                            walk,
+                            "\n  [rsp+{:#06x}={:#x}] = {val:#x}  page_type={mtype:#x} protect={protect:#x} alloc_base={alloc_base:#x}",
+                            i * 8,
+                            addr,
+                        );
+                    }
+                }
+            }
+            eprintln!(
+                "[diag-rip0-stackwalk] tid={:?} rsp={:#x}{}",
+                std::thread::current().id(),
+                context.Rsp,
+                walk,
+            );
+        }
     }
     if ctxwatch::enabled() && context.Rip == 0 {
         let watched = ctxwatch::current_armed_addr();
