@@ -1062,31 +1062,66 @@ interrupt_callback:
 unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     #[unsafe(naked)]
     extern "C" fn switch_to_guest_sysret(ctx: &litebox_common_linux::PtRegs) -> ! {
+        // SAFETY/CORRECTNESS NOTE: this function must never repoint the real CPU `rsp`
+        // at `ctx`'s own backing memory (a `&PtRegs`, not a real guarded stack) while
+        // any GPR field is still unread. Doing so leaves a window in which any
+        // synchronous, thread-local event (SEH/VEH dispatch, a debug/trace trap, or
+        // any other mechanism that pushes data onto "the current stack") would corrupt
+        // not-yet-consumed fields -- including `rip`/`rcx` -- before they are used.
+        // Every GPR is therefore addressed directly off `rcx` (the `ctx` pointer, per
+        // the `extern "C"` ABI) via fixed offsets matching `PtRegs`'s `#[repr(C)]`
+        // field order, and the real `rsp` is set to the guest's `rsp` only in the
+        // second-to-last instruction, immediately before the final `jmp`, mirroring
+        // the same narrow, unavoidable gap the original fast path already had at its
+        // very end.
         core::arch::naked_asm!(
-            // Load all registers from the guest context structure.
             "switch_to_guest_start:",
-            "mov rsp, rcx",
-            "pop r15",
-            "pop r14",
-            "pop r13",
-            "pop r12",
-            "pop rbp",
-            "pop rbx",
-            "pop r11",
-            "pop r10",
-            "pop r9",
-            "pop r8",
-            "pop rax",
-            "pop rcx",
-            "pop rdx",
-            "pop rsi",
-            "pop rdi",
-            "pop rcx",    // skip orig_rax
-            "pop rcx",    // read rip into rcx
-            "add rsp, 8", // skip cs
-            "popfq",
-            "pop rsp",
-            "jmp rcx", // jump to the entry point of the thread
+            // `rcx` (the `ctx` pointer, per the extern "C" ABI) is the base for every
+            // field read below, addressed by fixed offset matching `PtRegs`'s
+            // `#[repr(C)]` field order: r15=0x00 r14=0x08 r13=0x10 r12=0x18 rbp=0x20
+            // rbx=0x28 r11=0x30 r10=0x38 r9=0x40 r8=0x48 rax=0x50 rcx=0x58 rdx=0x60
+            // rsi=0x68 rdi=0x70 orig_rax=0x78 rip=0x80 cs=0x88 eflags=0x90 rsp=0x98.
+            //
+            // The real `rsp` is never repointed at `ctx`'s own backing memory --
+            // every GPR is loaded directly into its final register while `rsp` still
+            // refers to the real (host) stack, which remains valid the entire time,
+            // so any synchronous, thread-local event (SEH/VEH dispatch, a debug/trace
+            // trap, etc.) that lands during this window pushes onto real stack
+            // memory, never onto `ctx`'s fields. `rcx` itself (the base pointer) is
+            // the very last register loaded, immediately before the jump, the same
+            // way the original fast path only set the real `rsp` immediately before
+            // its own final `jmp rcx`. Like the original fast path, this relies on
+            // the sysret-entry invariant `ctx.rcx == ctx.rip` (checked by the caller
+            // before choosing this path): `rcx` is used as the `ctx` base pointer for
+            // every field read, then overwritten with `ctx.rip` (equal to `ctx.rcx`
+            // by that invariant) as its own final value immediately before the jump.
+            "mov r15, [rcx + 0x00]",
+            "mov r14, [rcx + 0x08]",
+            "mov r13, [rcx + 0x10]",
+            "mov r12, [rcx + 0x18]",
+            "mov rbp, [rcx + 0x20]",
+            "mov rbx, [rcx + 0x28]",
+            "mov r11, [rcx + 0x30]",
+            "mov r10, [rcx + 0x38]",
+            "mov r9,  [rcx + 0x40]",
+            "mov r8,  [rcx + 0x48]",
+            "mov rax, [rcx + 0x50]",
+            "mov rdx, [rcx + 0x60]",
+            "mov rsi, [rcx + 0x68]",
+            "mov rdi, [rcx + 0x70]",
+            // Stage and restore `eflags` on the still-valid real (host) stack --
+            // ordinary `push`/`popfq` here are no different from any other function
+            // using its own stack; it is not the hazardous "rsp points into a
+            // struct" pattern, since `rsp` itself has not moved yet. Only once
+            // `eflags` is fully restored does `rsp` adopt the guest's real value, in
+            // a single `mov`, immediately followed by the jump -- the same narrow,
+            // unavoidable gap the original fast path already had at its own end.
+            "push qword ptr [rcx + 0x90]", // eflags
+            "popfq",                       // restore guest eflags, from the real host stack
+            "mov rsp, [rcx + 0x98]",       // adopt the guest's real rsp
+            "mov rcx, [rcx + 0x80]",       // guest rip -> rcx (also satisfies the sysret
+            // ABI invariant that rcx == rip on guest entry)
+            "jmp rcx", // jump to guest rip
             "switch_to_guest_end:",
         );
     }
