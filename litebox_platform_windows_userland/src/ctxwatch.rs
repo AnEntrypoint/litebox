@@ -32,7 +32,7 @@ use windows_sys::Win32::System::Threading::GetCurrentThread;
 
 /// Offset of `PtRegs::rip` within the struct, matching `switch_to_guest_sysret`'s own
 /// `[rcx + 0x80]` field-offset comment.
-const RIP_FIELD_OFFSET: usize = 0x80;
+pub(super) const RIP_FIELD_OFFSET: usize = 0x80;
 
 /// Backing state for this watchpoint, held as a [`crate::TlsState`] field rather than a bare
 /// `static`/`thread_local!` -- matches [`crate::fork_verify`]'s `codewatch` module's own reasoning
@@ -71,6 +71,32 @@ pub(super) fn enabled() -> bool {
     std::env::var_os("LITEBOX_CTXWATCH").is_some()
 }
 
+/// Builds the `Dr0`/`Dr7`/`Dr6` fields for an 8-byte write watchpoint on `addr`, applied to an
+/// otherwise-zeroed `CONTEXT_DEBUG_REGISTERS_AMD64` context. Shared by both the current-thread
+/// arm path (`arm`) and the all-threads path (`arm_on_handle`, driven by `lib.rs` for every
+/// OTHER live thread) so the exact same encoding is used everywhere -- debug registers are
+/// per-thread on Windows (virtualized via `Get`/`SetThreadContext`), so a watchpoint armed only
+/// on the calling (shell) thread can never observe a write made by an instruction executing on a
+/// different OS thread, e.g. a pipeline child's own teardown code running on its own thread.
+fn build_watch_context(addr: usize) -> CONTEXT {
+    let mut context = CONTEXT {
+        ContextFlags: CONTEXT_DEBUG_REGISTERS_AMD64,
+        ..unsafe { core::mem::zeroed() }
+    };
+    context.Dr0 = addr as u64;
+    // Dr7 encoding (x86-64 debug control register):
+    //   bit 0  (L0)      = 1  -- local enable for breakpoint 0
+    //   bits 16-17 (R/W0) = 01 -- break on data write only
+    //   bits 18-19 (LEN0) = 10 -- 8-byte length
+    // All other breakpoints (1-3) left disabled; LE/GE (bits 8-9) and the reserved bit 10 are
+    // set for compatibility with older documentation/tooling, though modern CPUs ignore LE/GE.
+    let rw0_write: u64 = 0b01;
+    let len0_8bytes: u64 = 0b10;
+    context.Dr7 = (1 << 0) | (rw0_write << 16) | (len0_8bytes << 18) | (1 << 10);
+    context.Dr6 = 0;
+    context
+}
+
 /// Arms a hardware write-watchpoint on the calling thread covering the 8-byte `rip` field of the
 /// `PtRegs` at `ctx`. A `SetThreadContext` failure is reported but non-fatal -- this is
 /// diagnostic-only.
@@ -96,17 +122,10 @@ pub(super) fn arm(ctx: *const litebox_common_linux::PtRegs) {
             return;
         }
 
-        context.Dr0 = addr as u64;
-        // Dr7 encoding (x86-64 debug control register):
-        //   bit 0  (L0)      = 1  -- local enable for breakpoint 0
-        //   bits 16-17 (R/W0) = 01 -- break on data write only
-        //   bits 18-19 (LEN0) = 10 -- 8-byte length
-        // All other breakpoints (1-3) left disabled; LE/GE (bits 8-9) and the reserved bit 10 are
-        // set for compatibility with older documentation/tooling, though modern CPUs ignore LE/GE.
-        let rw0_write: u64 = 0b01;
-        let len0_8bytes: u64 = 0b10;
-        context.Dr7 = (1 << 0) | (rw0_write << 16) | (len0_8bytes << 18) | (1 << 10);
-        context.Dr6 = 0;
+        let watch = build_watch_context(addr);
+        context.Dr0 = watch.Dr0;
+        context.Dr7 = watch.Dr7;
+        context.Dr6 = watch.Dr6;
 
         if SetThreadContext(GetCurrentThread(), &raw const context) == 0 {
             eprintln!(
@@ -123,6 +142,49 @@ pub(super) fn arm(ctx: *const litebox_common_linux::PtRegs) {
         std::thread::current().id(),
         addr,
     );
+}
+
+/// Arms the SAME watchpoint (`addr`, matching whatever `arm` used on the calling thread) on a
+/// DIFFERENT, already-suspended OS thread via its raw handle. Callers are responsible for
+/// suspending the target thread first and resuming it afterward (mirrors
+/// `ThreadHandle::interrupt`'s existing `SuspendThread`/`Get`/`SetThreadContext`/`ResumeThread`
+/// pattern in `lib.rs`, reused here rather than duplicated). Returns whether the arm succeeded;
+/// failures are reported but non-fatal, same as `arm`.
+///
+/// # Safety
+/// `handle` must be a valid, currently-suspended thread handle with `THREAD_SET_CONTEXT` /
+/// `THREAD_GET_CONTEXT` access.
+pub(super) unsafe fn arm_on_handle(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    addr: usize,
+) -> bool {
+    // SAFETY: caller guarantees `handle` is valid and the thread is suspended.
+    unsafe {
+        let mut context = CONTEXT {
+            ContextFlags: CONTEXT_DEBUG_REGISTERS_AMD64,
+            ..core::mem::zeroed()
+        };
+        if GetThreadContext(handle, &raw mut context) == 0 {
+            eprintln!(
+                "[ctxwatch] cross-thread GetThreadContext failed: {}",
+                std::io::Error::last_os_error(),
+            );
+            return false;
+        }
+        let watch = build_watch_context(addr);
+        context.Dr0 = watch.Dr0;
+        context.Dr7 = watch.Dr7;
+        context.Dr6 = watch.Dr6;
+        if SetThreadContext(handle, &raw const context) == 0 {
+            eprintln!(
+                "[ctxwatch] cross-thread SetThreadContext (arm) failed: {}",
+                std::io::Error::last_os_error(),
+            );
+            return false;
+        }
+    }
+    eprintln!("[ctxwatch] cross-thread armed write watch on {addr:#x}");
+    true
 }
 
 /// Disarms the calling thread's watchpoint, if any. Safe to call even if never armed.
