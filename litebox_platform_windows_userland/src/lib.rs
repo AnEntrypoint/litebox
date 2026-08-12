@@ -128,18 +128,13 @@ pub(crate) fn veh_trace_enabled() -> bool {
 /// Deliberately a separate, much narrower gate than [`veh_trace_enabled`]: full `LITEBOX_VEH_TRACE`
 /// emits a per-instruction trace that perturbs timing enough to hide the crash being investigated,
 /// whereas this gate only enables a handful of one-off prints around fork-child verification and
-/// the fault itself. Cached so the resume path pays only a relaxed atomic load when unset.
+/// the fault itself. Cached per thread so the resume path pays only a thread-local read rather
+/// than an environment lookup when unset.
 pub(crate) fn diag_rip0_enabled() -> bool {
-    static CACHED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
-    match CACHED.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let enabled = std::env::var_os("LITEBOX_DIAG_WAIT4GATE").is_some();
-            CACHED.store(u8::from(enabled), Ordering::Relaxed);
-            enabled
-        }
-    }
+    DIAG.with_borrow_mut(|d| {
+        *d.enabled
+            .get_or_insert_with(|| std::env::var_os("LITEBOX_DIAG_WAIT4GATE").is_some())
+    })
 }
 
 unsafe extern "system" fn vectored_exception_handler(
@@ -213,15 +208,13 @@ unsafe extern "system" fn vectored_exception_handler(
     // pointing at a watchpoint/CPU-level gap instead.
     if context.Rip == 0 && diag_rip0_enabled() {
         eprintln!(
-            "[diag-rip0] tid={:?} exc_code={:#x} rsp={:#x} rax={:#x} is_in_guest={} is_verifying={} last_resume_path={} last_orig_rax={:#x}",
+            "[diag-rip0] tid={:?} exc_code={:#x} rsp={:#x} rax={:#x} is_in_guest={} is_verifying={}",
             std::thread::current().id(),
             exception_record.ExceptionCode,
             context.Rsp,
             context.Rax,
             tls.is_in_guest.get(),
             fork_verify::is_verifying(tls),
-            DIAG_LAST_RESUME_PATH.with(std::cell::Cell::get),
-            DIAG_LAST_ORIG_RAX.with(std::cell::Cell::get),
         );
         eprintln!(
             "[diag-rip0-hist] tid={:?} {}",
@@ -1166,56 +1159,65 @@ interrupt_callback:
 }
 
 thread_local! {
-    /// Diagnostic-only (`LITEBOX_DIAG_WAIT4GATE=1`): records which resume path
-    /// (`"sysret"`/`"ntcontinue"`) was last taken on this thread, so a crash handler can report
-    /// which path was actually in effect for the resume immediately preceding a crash. Purely
-    /// a debugging aid for this workaround's own validation; not required for correctness.
-    static DIAG_LAST_RESUME_PATH: std::cell::Cell<&'static str> =
-        const { std::cell::Cell::new("none") };
-
-    /// Diagnostic-only (`LITEBOX_DIAG_WAIT4GATE=1`): records the `orig_rax` (Linux syscall
-    /// number) of the syscall this thread was returning from on its most recent guest resume, so
-    /// a crash handler can report what the crashing thread was last doing before it faulted.
-    static DIAG_LAST_ORIG_RAX: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
-
-    /// Diagnostic-only (`LITEBOX_DIAG_WAIT4GATE=1`): ring buffer of the last
-    /// `DIAG_RESUME_HISTORY_LEN` guest resumes on this thread, as
-    /// `(orig_rax, rip, rcx, rsp, rax)`, plus the running count of resumes. Lets a crash handler
-    /// print the exact sequence of resumes leading up to a fault.
-    static DIAG_RESUME_HISTORY: RefCell<DiagResumeHistory> =
-        const { RefCell::new((0, [(0, 0, 0, 0, 0); DIAG_RESUME_HISTORY_LEN])) };
+    /// All per-thread state for the `LITEBOX_DIAG_WAIT4GATE` diagnostics, in one thread-local.
+    static DIAG: RefCell<DiagState> = const { RefCell::new(DiagState::new()) };
 }
 
-/// Number of recent guest resumes [`DIAG_RESUME_HISTORY`] retains per thread.
+/// Number of recent guest resumes [`DiagState::history`] retains per thread.
 const DIAG_RESUME_HISTORY_LEN: usize = 8;
 
-/// `(total resumes so far, ring buffer of `(orig_rax, rip, rcx, rsp, rax)`)`.
-type DiagResumeHistory = (
-    usize,
-    [(usize, usize, usize, usize, usize); DIAG_RESUME_HISTORY_LEN],
-);
+/// One recorded guest resume: `(orig_rax, rip, rcx, rsp, rax)`.
+type DiagResume = (usize, usize, usize, usize, usize);
 
-/// Diagnostic-only (`LITEBOX_DIAG_WAIT4GATE=1`): records one guest resume into this thread's
-/// [`DIAG_RESUME_HISTORY`] ring buffer.
-fn diag_record_resume(ctx: &litebox_common_linux::PtRegs) {
-    DIAG_RESUME_HISTORY.with(|h| {
-        let mut h = h.borrow_mut();
-        let n = h.0;
-        h.1[n % DIAG_RESUME_HISTORY_LEN] = (ctx.orig_rax, ctx.rip, ctx.rcx, ctx.rsp, ctx.rax);
-        h.0 = n.wrapping_add(1);
+/// Per-thread state backing the `LITEBOX_DIAG_WAIT4GATE` diagnostics.
+///
+/// Purely a debugging aid, and entirely inert unless that environment variable is set: nothing
+/// here is required for correctness, and no field is read except by the diagnostic prints in
+/// [`vectored_exception_handler`].
+struct DiagState {
+    /// Cache of whether the diagnostics are enabled, `None` until first queried. Caching this
+    /// per thread keeps the guest-resume path off the environment-lookup path when unset.
+    enabled: Option<bool>,
+    /// Which resume path (`"sysret"`/`"ntcontinue"`) this thread last took, so a crash handler
+    /// can report which one was in effect for the resume immediately preceding a fault.
+    last_resume_path: &'static str,
+    /// Ring buffer of this thread's most recent resumes, plus the running total, so a crash
+    /// handler can print the exact sequence of resumes leading up to a fault.
+    history: (usize, [DiagResume; DIAG_RESUME_HISTORY_LEN]),
+}
+
+impl DiagState {
+    const fn new() -> Self {
+        Self {
+            enabled: None,
+            last_resume_path: "none",
+            history: (0, [(0, 0, 0, 0, 0); DIAG_RESUME_HISTORY_LEN]),
+        }
+    }
+}
+
+/// Diagnostic-only (`LITEBOX_DIAG_WAIT4GATE=1`): records one guest resume, along with which path
+/// it took, into this thread's [`DiagState`].
+fn diag_record_resume(path: &'static str, ctx: &litebox_common_linux::PtRegs) {
+    DIAG.with_borrow_mut(|d| {
+        d.last_resume_path = path;
+        let n = d.history.0;
+        d.history.1[n % DIAG_RESUME_HISTORY_LEN] =
+            (ctx.orig_rax, ctx.rip, ctx.rcx, ctx.rsp, ctx.rax);
+        d.history.0 = n.wrapping_add(1);
     });
 }
 
-/// Diagnostic-only: formats this thread's recent-resume history, oldest first.
+/// Diagnostic-only: formats this thread's last resume path and recent-resume history, oldest
+/// first.
 fn diag_resume_history() -> String {
     use core::fmt::Write as _;
-    DIAG_RESUME_HISTORY.with(|h| {
-        let h = h.borrow();
-        let total = h.0;
+    DIAG.with_borrow(|d| {
+        let (total, ring) = d.history;
         let shown = total.min(DIAG_RESUME_HISTORY_LEN);
-        let mut out = format!("total={total}");
+        let mut out = format!("last_resume_path={} total={total}", d.last_resume_path);
         for i in (0..shown).rev() {
-            let (orig_rax, rip, rcx, rsp, rax) = h.1[(total - 1 - i) % DIAG_RESUME_HISTORY_LEN];
+            let (orig_rax, rip, rcx, rsp, rax) = ring[(total - 1 - i) % DIAG_RESUME_HISTORY_LEN];
             let _ = write!(
                 out,
                 " | -{i}: orig_rax={orig_rax:#x} rip={rip:#x} rcx={rcx:#x} rsp={rsp:#x} rax={rax:#x}"
@@ -1386,17 +1388,13 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     // never carries TF) to arm the single-step trap `fork_verify` depends on.
     if ctx.rcx == ctx.rip && tls.has_entered_guest.get() && !fork_verify::is_verifying(tls) {
         if diag_rip0_enabled() {
-            DIAG_LAST_RESUME_PATH.with(|c| c.set("sysret"));
-            DIAG_LAST_ORIG_RAX.with(|c| c.set(ctx.orig_rax));
-            diag_record_resume(ctx);
+            diag_record_resume("sysret", ctx);
         }
         tls.is_in_guest.set(true);
         switch_to_guest_sysret(ctx)
     } else {
         if diag_rip0_enabled() {
-            DIAG_LAST_RESUME_PATH.with(|c| c.set("ntcontinue"));
-            DIAG_LAST_ORIG_RAX.with(|c| c.set(ctx.orig_rax));
-            diag_record_resume(ctx);
+            diag_record_resume("ntcontinue", ctx);
         }
         tls.has_entered_guest.set(true);
         switch_to_guest_ntcontinue(tls, ctx)
