@@ -811,6 +811,12 @@ struct TlsState {
     /// crate's ratcheted bare-static count, and per-thread is its natural scope anyway (the
     /// `fork()` child arms the ranges on its own thread and is the thread that traps on them).
     codewatch: fork_verify::CodewatchState,
+    /// Backing state for the diagnostic `ctx.rip` hardware watchpoint (`LITEBOX_CTXWATCH=1`); see
+    /// [`ctxwatch`]. A field here rather than a bare `static`/`thread_local!`, same reasoning as
+    /// `codewatch` above: keeps this diagnostic off the crate's ratcheted bare-static count, and
+    /// per-thread is its natural scope (each host OS thread has its own debug registers, and only
+    /// the thread arming the watchpoint ever needs to recognize/disarm its own).
+    ctxwatch: ctxwatch::State,
 }
 
 /// Scratch space (in bytes) reserved below `host_sp` for the `EXCEPTION_RECORD` that
@@ -840,6 +846,7 @@ impl TlsState {
             fork_verify: RefCell::new(None),
             fork_verify_last_load: Cell::new(None),
             codewatch: fork_verify::CodewatchState::new(),
+            ctxwatch: ctxwatch::State::new(),
         }
     }
 }
