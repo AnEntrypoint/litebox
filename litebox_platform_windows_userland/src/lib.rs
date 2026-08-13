@@ -2417,7 +2417,24 @@ impl litebox::platform::ArchSpecificProvider for WindowsUserland {
     ) -> Result<(), litebox::platform::ArchSpecificError> {
         match reg {
             litebox::platform::ArchSpecificRegister::FsBase => {
-                if litebox_common_linux::arch::is_valid_user_fs_base(val) {
+                // Two checks, deliberately layered: `is_valid_user_fs_base` enforces the generic
+                // x86_64 Linux ABI ceiling (`USER_ADDR_END`), which is NOT tight enough on this
+                // platform specifically -- this platform's actual guest-addressable ceiling
+                // (`TASK_ADDR_MAX`) sits far below `USER_ADDR_END`, and everything from
+                // `TASK_ADDR_MAX` up through `HOST_ALLOCATOR_REGION_MIN`'s reserved 64 GiB span
+                // belongs to the HOST process (its own stack, modules, and the host global
+                // allocator's own reserved region -- see `HOST_ALLOCATOR_REGION_MIN`'s doc
+                // comment), never to the guest. Every caller that can set a thread's FS base
+                // (`arch_prctl(ARCH_SET_FS)`, `clone(CLONE_SETTLS)`, and `fork()`'s own
+                // parent-to-child FS-base propagation) funnels through this one function, so
+                // rejecting an out-of-range value here closes off, at a single choke point, the
+                // musl dtv-clear crash this investigation has chased for many passes (`mov rdx,
+                // [rax+0x80]` on a `rax` proven to be a live `HOST_ALLOCATOR_REGION_MIN`-range
+                // address) regardless of how such a value could ever have been computed upstream.
+                let task_addr_max = <Self as litebox::platform::PageManagementProvider<
+                    { litebox::mm::linux::PAGE_SIZE },
+                >>::TASK_ADDR_MAX;
+                if litebox_common_linux::arch::is_valid_user_fs_base(val) && val < task_addr_max {
                     // Use WindowsUserland's per-thread FS base management system
                     Self::set_thread_fs_base(val);
                     Ok(())

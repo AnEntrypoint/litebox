@@ -1480,8 +1480,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let addr = tls.trunc();
             #[cfg(target_arch = "x86_64")]
             {
-                // Validate the user-controlled TLS base before spawning the thread.
-                if !litebox_common_linux::arch::is_valid_user_fs_base(addr) {
+                // Validate the user-controlled TLS base before spawning the thread. Two checks,
+                // deliberately layered: `is_valid_user_fs_base` enforces the generic x86_64 Linux
+                // ABI ceiling (`USER_ADDR_END`, the same on every platform this shim targets), but
+                // that ceiling is NOT tight enough on `litebox_platform_windows_userland`
+                // specifically, whose actual guest-addressable ceiling (`TASK_ADDR_MAX`) sits far
+                // below `USER_ADDR_END` -- everything from `TASK_ADDR_MAX` up to
+                // `HOST_ALLOCATOR_REGION_MIN`'s reserved 64 GiB span belongs to the HOST process
+                // (its own stack, modules, and the host global allocator's own reserved region;
+                // see `HOST_ALLOCATOR_REGION_MIN`'s doc comment), never to the guest. A guest-
+                // supplied (or, more concerningly, a corrupted/mistranslated) TLS base landing up
+                // there would pass the generic ABI check yet still let the guest's own `%fs`-
+                // relative TLS/TCB accesses dereference live host heap memory instead of guest
+                // memory -- exactly the shape of this investigation's long-standing musl dtv-clear
+                // crash (`mov rdx, [rax+0x80]` on a `rax` proven to be a live `HOST_ALLOCATOR_
+                // REGION_MIN`-range address). Rejecting it here closes that off at the one syscall
+                // that can set a thread's FS base directly, regardless of how such a value could
+                // ever have been computed.
+                if !litebox_common_linux::arch::is_valid_user_fs_base(addr)
+                    || addr >= Platform::TASK_ADDR_MAX
+                {
                     return Err(Errno::EPERM);
                 }
             }
