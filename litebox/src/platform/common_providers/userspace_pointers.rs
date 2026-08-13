@@ -348,6 +348,28 @@ impl<V: ValidateAccess, T: FromBytes + IntoBytes> RawMutPointer<T> for UserMutPt
         unimplemented!("use write_slice_at_offset instead")
     }
 
+    // Overridden (rather than relying on the default per-`T`-element loop in the
+    // `RawMutPointer` trait) to perform a single bulk `memcpy_fallible` instead of one
+    // `write_at_offset` call per element. Large callers -- e.g. `Vmem::duplicate`'s
+    // eager region copy at `fork()` time, which can move several MiB of stack/data per
+    // region -- would otherwise perform millions of individual fallible single-element
+    // writes. This mirrors `copy_from_slice` below, which already takes the same
+    // bulk-memcpy shortcut for the same reason.
+    fn write_slice_at_offset(self, count: isize, values: &[T]) -> Option<()>
+    where
+        T: Clone,
+    {
+        if values.is_empty() {
+            return Some(());
+        }
+        let dst = self.as_ptr().wrapping_add(usize::try_from(count).ok()?);
+        let dst = V::validate_slice(core::ptr::slice_from_raw_parts_mut(dst, values.len()))?;
+        V::with_user_memory_access(|| unsafe {
+            memcpy_fallible(dst.cast(), values.as_ptr().cast(), size_of_val(values))
+        })
+        .ok()
+    }
+
     fn copy_from_slice(self, start_offset: usize, buf: &[T]) -> Option<()>
     where
         T: Copy,
