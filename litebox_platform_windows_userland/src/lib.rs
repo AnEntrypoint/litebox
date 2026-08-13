@@ -138,6 +138,22 @@ pub(crate) fn diag_rip0_enabled() -> bool {
     })
 }
 
+/// Whether the fatal-fault-only dump (`LITEBOX_DIAG_FATALDUMP=1`) is enabled.
+///
+/// Pass-39/40: split out from [`veh_trace_enabled`] because that gate also turns on
+/// `fork_verify`'s own per-single-step trace print on every trapped instruction of a
+/// verifying fork child (thousands of prints per fork, each an expensive `eprintln!` to a
+/// piped terminal) -- perturbing timing enough in practice to hide the very crash under
+/// investigation (see FINDINGS.txt pass 39 item 3). This gate covers only the rare block
+/// below that dumps rip bytes/regs on an actual fatal fault (rip==0 privileged-instruction
+/// class, or a near-null access violation), so it is cheap enough to leave on for an entire
+/// local repro run without masking the bug. Deliberately re-reads the environment on every
+/// call for the same "rare path, avoid growing the bare-static count" reason documented on
+/// `veh_trace_enabled`.
+pub(crate) fn diag_fataldump_enabled() -> bool {
+    veh_trace_enabled() || std::env::var_os("LITEBOX_DIAG_FATALDUMP").is_some()
+}
+
 unsafe extern "system" fn vectored_exception_handler(
     exception_info: *mut EXCEPTION_POINTERS,
 ) -> i32 {
@@ -176,7 +192,9 @@ unsafe extern "system" fn vectored_exception_handler(
             unsafe { litebox_common_linux::rdfsbase() },
             WindowsUserland::get_thread_fs_base(),
         );
-        if exception_record.ExceptionCode == 0xC000_0096_u32.cast_signed()
+    }
+    if diag_fataldump_enabled()
+        && (exception_record.ExceptionCode == 0xC000_0096_u32.cast_signed()
             // TEMPORARY (pass 37): also dump on an ordinary access violation whose faulting
             // address is small (a near-null pointer, as opposed to an unrelated guard-page/
             // demand-paging fault at a normal-looking guest address) -- this is the shape of the
@@ -184,41 +202,64 @@ unsafe extern "system" fn vectored_exception_handler(
             // (`addr=0x18` observed live), which is a *data* access, not the privileged-
             // instruction/rip==0 shape the rest of this block was built for. Remove once that
             // crash is root-caused and fixed; see FINDINGS.txt pass 37.
+            //
+            // Pass-40: EXCLUDE the extremely common, already-diagnosed, already-repaired
+            // "Windows spontaneously clears this thread's FS_BASE MSR" condition (see the long
+            // comment ~40 lines below this one) -- that path also produces
+            // `EXCEPTION_ACCESS_VIOLATION` with a small `ExceptionInformation[1]` (any `mov
+            // %fs:offset` reads/writes through linear address `0 + offset`), fires many times per
+            // second under ordinary scheduler pressure, and is unconditionally repaired and
+            // retried a few lines down -- it is not fatal and was never the crash this dump exists
+            // to catch. Without this exclusion the dump fired on nearly every guest instruction
+            // during scheduler pressure, which is exactly the "expensive `eprintln!` perturbs
+            // timing enough to hide the crash" problem `diag_fataldump_enabled` was split out to
+            // avoid (confirmed empirically this pass: with the exclusion absent, a local repro run
+            // that crashes in seconds under no tracing took the entire 480s budget without ever
+            // reaching the real fault). Uses the EXACT same condition the repair branches below
+            // use to decide whether to repair-and-retry (`rdfsbase() == 0`, `Rip != 0`, AND a
+            // non-zero saved FS base to restore -- not just `rdfsbase() == 0` alone, which a first
+            // pass at this exclusion used and which risked also silencing a genuine fatal fault
+            // that happened to occur while FS_BASE was zero for an unrelated reason): only
+            // excluded when the repair below is actually about to fire and resolve the fault,
+            // never when the fault is going to reach `EXCEPTION_CONTINUE_SEARCH`/deliver a real
+            // SIGSEGV to the guest.
             || (exception_record.ExceptionCode == 0xC000_0005_u32.cast_signed()
-                && exception_record.ExceptionInformation[1] < 0x1_0000)
-        {
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "diagnostic-only; this platform is x86_64-only, rip fits in usize"
-            )]
-            let rip = context.Rip as usize;
-            let mut buf = [0u8; 16];
-            let n = fork_verify::read_code_bytes_for_diagnostics(rip, &mut buf);
-            eprintln!("[veh] rip bytes ({n}): {:02x?}", &buf[..n]);
-            let mut before = [0u8; 8];
-            let before_start = rip.wrapping_sub(8);
-            let nb = fork_verify::read_code_bytes_for_diagnostics(before_start, &mut before);
-            eprintln!("[veh] rip-8 bytes ({nb}): {:02x?}", &before[..nb]);
-            fork_verify::describe_crash_page_for_diagnostics(rip);
-            eprintln!(
-                "[veh] crash regs rdi={:#x} rsi={:#x} rdx={:#x} rax={:#x} rsp={:#x} rbp={:#x} rbx={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
-                context.Rdi,
-                context.Rsi,
-                context.Rdx,
-                context.Rax,
-                context.Rsp,
-                context.Rbp,
-                context.Rbx,
-                context.R8,
-                context.R9,
-                context.R10,
-                context.R11,
-                context.R12,
-                context.R13,
-                context.R14,
-                context.R15,
-            );
-        }
+                && exception_record.ExceptionInformation[1] < 0x1_0000
+                && !(unsafe { litebox_common_linux::rdfsbase() } == 0
+                    && context.Rip != 0
+                    && WindowsUserland::get_thread_fs_base() != 0)))
+    {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "diagnostic-only; this platform is x86_64-only, rip fits in usize"
+        )]
+        let rip = context.Rip as usize;
+        let mut buf = [0u8; 16];
+        let n = fork_verify::read_code_bytes_for_diagnostics(rip, &mut buf);
+        eprintln!("[veh] rip bytes ({n}): {:02x?}", &buf[..n]);
+        let mut before = [0u8; 8];
+        let before_start = rip.wrapping_sub(8);
+        let nb = fork_verify::read_code_bytes_for_diagnostics(before_start, &mut before);
+        eprintln!("[veh] rip-8 bytes ({nb}): {:02x?}", &before[..nb]);
+        fork_verify::describe_crash_page_for_diagnostics(rip);
+        eprintln!(
+            "[veh] crash regs rdi={:#x} rsi={:#x} rdx={:#x} rax={:#x} rsp={:#x} rbp={:#x} rbx={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+            context.Rdi,
+            context.Rsi,
+            context.Rdx,
+            context.Rax,
+            context.Rsp,
+            context.Rbp,
+            context.Rbx,
+            context.R8,
+            context.R9,
+            context.R10,
+            context.R11,
+            context.R12,
+            context.R13,
+            context.R14,
+            context.R15,
+        );
     }
 
     // Diagnostic-only (`LITEBOX_CTXWATCH=1`): decisive aliasing-vs-overwrite check at the exact
