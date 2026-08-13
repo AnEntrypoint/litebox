@@ -1039,7 +1039,23 @@ fn fixup_stale_stack_pointers<Platform: ShimPlatform>(
                 // false positives" below for why this extra check, not just range membership,
                 // is required. Ordinary shell-arena data that merely looks stack-address-shaped
                 // never satisfies this, since it does not point into code.
-                && relocations.is_in_destination_executable_range(translated)
+                //
+                // A saved STACK pointer (not a return address) is the other narrow, precise class
+                // this pass also heals: musl's `_Fork` spills its own live `rsp` into a scratch
+                // slot (its `rt_sigprocmask`/signal-mask-restore bookkeeping) before recursing
+                // deeper, and reloads it directly into RSP on the way back out -- observed live via
+                // `fork_verify`'s single-step diagnostic reloading a raw, untranslated PARENT-stack
+                // address straight into RSP with no intervening `call`/`ret`. Unlike the
+                // shell-arena false positives the executable-range check above exists to reject,
+                // this class is safe to identify by exact-range membership alone: a value that
+                // both (a) exactly matches a live parent-stack address (`translate` already
+                // requires this) AND (b) falls within the child's OWN translated stack region
+                // (`dest_base..dest_top`, the same narrow, single-region bound this whole scan is
+                // already limited to) cannot be ordinary non-pointer shell data, because shell
+                // stack-arena bookkeeping never stores an absolute pointer into the interpreter's
+                // OWN call stack -- only a genuinely saved stack pointer does.
+                && (relocations.is_in_destination_executable_range(translated)
+                    || (dest_base..dest_top).contains(&translated))
             {
                 let _ = slot.write_at_offset::<Platform>(0, translated);
             }
