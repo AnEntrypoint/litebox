@@ -780,9 +780,22 @@ fn read_usize_fault_tolerant(addr: usize) -> Option<usize> {
 fn write_usize_fault_tolerant(addr: usize, value: usize) {
     use windows_sys::Win32::System::Memory as Win32_Memory;
 
+    // Hold the process-wide `VIRTUAL_PROTECT_LOCK` for the entire query-flip-write-restore span,
+    // not just around the `VirtualProtect` calls: an ordinary guest `mprotect()` on an unrelated
+    // thread (`WindowsUserland::update_permissions`, which takes the same lock) can otherwise
+    // change this exact page's protection concurrently, racing both the `is_writable` fast-path
+    // check and the temporary-widen-then-restore sequence below and leaving the page transiently
+    // in whichever protection state won the race -- see `VIRTUAL_PROTECT_LOCK`'s doc comment for
+    // the observed crash signature this produced.
+    let _guard = crate::VIRTUAL_PROTECT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     if is_writable(addr) {
         // SAFETY: `is_writable` confirmed `addr` is in a committed, writable region; see
         // `read_usize_fault_tolerant`'s comment on why a full `usize` is always in-bounds here.
+        // Holding `VIRTUAL_PROTECT_LOCK` (above) keeps this check-then-write atomic with respect
+        // to any concurrent `VirtualProtect` on the same page from another thread.
         unsafe { core::ptr::write_unaligned(addr as *mut usize, value) };
         return;
     }

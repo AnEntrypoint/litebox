@@ -2798,6 +2798,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
     ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
         debug_assert_alignment!(range, ALIGN);
         let flags = prot_flags(new_permissions);
+        // Hold `VIRTUAL_PROTECT_LOCK` for the whole region walk: see its doc comment for why an
+        // unsynchronized `VirtualProtect` here can race `fork_verify`'s own temporary
+        // protection-flip-and-restore on a page shared with an unrelated thread.
+        let _guard = VIRTUAL_PROTECT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         process_memory_range_by_regions(
             range,
             |r, state| -> Result<bool, std::convert::Infallible> {
@@ -3340,6 +3346,27 @@ fn stdin_ready_raw_handle(platform: &'static WindowsUserland) -> bool {
 /// writers only ever wait for one bounded `WriteFile` call to finish.
 static STDOUT_WRITE_LOCK: Mutex<()> = Mutex::new(());
 static STDERR_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Serializes every `VirtualProtect` call this process issues against guest-mapped memory.
+///
+/// `VirtualProtect` changes are page-granular and process-wide: two threads racing independent
+/// `VirtualProtect` calls that happen to cover the same page (e.g. an ordinary guest `mprotect()`
+/// on one thread racing [`fork_verify`](crate::fork_verify)'s own temporary
+/// read-only-to-`PAGE_EXECUTE_READWRITE`-and-back flip on another, unrelated, thread while healing
+/// a stale post-`fork()` pointer slot) can interleave: one thread's `VirtualProtect(...,
+/// old_protect_restore)` can land between another thread's `VirtualProtect(...,
+/// PAGE_EXECUTE_READWRITE)` and its write, transiently narrowing the page back to a
+/// non-writable/non-executable protection out from under an in-flight write or a concurrent
+/// instruction fetch on a third thread executing code on the same page -- observed in practice as
+/// a `STATUS_ACCESS_VIOLATION` on a small-offset near-null address (`addr=0x18`-shaped) on a
+/// completely unrelated thread shortly after an unrelated fork-child's own post-exit healing pass
+/// ran. Every call site that mutates page protection on guest-mapped memory (both
+/// [`WindowsUserland::update_permissions`](crate) and
+/// [`fork_verify::write_usize_fault_tolerant`](crate::fork_verify)) must hold this lock for the
+/// full read-modify-write span (query/flip, mutate, restore), not just around the `VirtualProtect`
+/// call itself, so the two paths can never observe or produce a torn intermediate protection state
+/// on a shared page.
+pub(crate) static VIRTUAL_PROTECT_LOCK: Mutex<()> = Mutex::new(());
 
 fn write_to_raw_handle(
     handle: windows_sys::Win32::Foundation::HANDLE,
