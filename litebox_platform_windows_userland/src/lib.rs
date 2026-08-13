@@ -1568,6 +1568,29 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
                 R14: ctx.r14 as u64,
                 R15: ctx.r15 as u64,
                 Rip: ctx.rip as u64,
+                // `CONTEXT_CONTROL_AMD64` covers `SegCs`/`SegSs` in addition to
+                // `Rip`/`Rsp`/`Rbp`/`EFlags` (all of which this literal already sets) -- omitting
+                // them here left them at `CONTEXT::default()`'s zero, i.e. every `NtContinue`-path
+                // resume (every thread's very first resume, and every resume of a `fork()` child
+                // under verification) asked the kernel to establish an invalid/null code and stack
+                // segment selector instead of the guest's real user-mode `0x33`/`0x2b` (see
+                // `litebox_common_linux::arch::USER_CS`/`USER_DS`, which `PtRegs::cs`/`ss` are
+                // always populated with). Populate them explicitly from `ctx.cs`/`ctx.ss`, the
+                // same values the `switch_to_guest_sysret` fast path already restores correctly
+                // via its own `popfq`-preserved segment state. Segment selectors are always
+                // 16-bit values (`ctx.cs`/`ctx.ss` are `usize` only for uniform `PtRegs` field
+                // typing); the exact values written here are always `arch::USER_CS`/`USER_DS`
+                // (`0x33`/`0x2b`), which trivially fit.
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "segment selectors are always 16-bit values (USER_CS/USER_DS)"
+                )]
+                SegCs: ctx.cs as u16,
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "segment selectors are always 16-bit values (USER_CS/USER_DS)"
+                )]
+                SegSs: ctx.ss as u16,
                 ..CONTEXT::default()
             });
         }
