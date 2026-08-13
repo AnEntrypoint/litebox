@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0.99"
 glob = "0.3.3"
 clap = { version = "4.5.33", features = ["derive"] }
+libc = "0.2.169"
 tracing = "0.1.43"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 xshell = "0.2.7"
