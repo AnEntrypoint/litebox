@@ -2685,16 +2685,58 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
          -> *mut c_void {
             let aligned_start_addr = self.round_down_to_granu(r.start);
             let aligned_end_addr = self.round_up_to_granu(r.end);
-            let ptr = unsafe {
-                VirtualAlloc2(
-                    GetCurrentProcess(),
-                    aligned_start_addr as *mut c_void,
-                    aligned_end_addr - aligned_start_addr,
-                    Win32_Memory::MEM_RESERVE,
-                    Win32_Memory::PAGE_NOACCESS,
-                    core::ptr::null_mut(),
-                    0,
-                )
+
+            // When the caller (guest `Vmem`) does not suggest a specific address (`r.start ==
+            // 0`), the MEM_RESERVE below previously asked Windows to pick ANY free address in
+            // the whole process with no upper bound -- unlike every OTHER guest allocation path
+            // in this function, which is asserted to stay within `TASK_ADDR_MIN..TASK_ADDR_MAX`
+            // (see the `suggested_range.start != 0` branch below). Windows is free to satisfy an
+            // unconstrained request from anywhere, including inside
+            // `HOST_ALLOCATOR_REGION_MIN..`, the range this process's own global allocator
+            // (`WindowsUserland::alloc`, below) is exclusively constrained to via the mirror-image
+            // `MEM_ADDRESS_REQUIREMENTS` there. A guest allocation landing in that region is
+            // indistinguishable, from the guest's perspective, from ordinary guest heap memory --
+            // it silently aliases whatever the host allocator later places at the same address,
+            // corrupting both sides with no page fault to signal it. Constrain this path
+            // symmetrically to `TASK_ADDR_MIN..TASK_ADDR_MAX` so the two regions can never
+            // overlap.
+            let mut addr_req = MEM_ADDRESS_REQUIREMENTS {
+                LowestStartingAddress: <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::TASK_ADDR_MIN as *mut c_void,
+                HighestEndingAddress: (<WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::TASK_ADDR_MAX - 1) as *mut c_void,
+                Alignment: 0,
+            };
+            let mut ext_param = MEM_EXTENDED_PARAMETER {
+                Anonymous1: MEM_EXTENDED_PARAMETER_0 {
+                    _bitfield: MemExtendedParameterAddressRequirements as u64,
+                },
+                Anonymous2: windows_sys::Win32::System::Memory::MEM_EXTENDED_PARAMETER_1 {
+                    Pointer: (&raw mut addr_req).cast::<c_void>(),
+                },
+            };
+            let ptr = if r.start == 0 {
+                unsafe {
+                    VirtualAlloc2(
+                        GetCurrentProcess(),
+                        core::ptr::null_mut(),
+                        aligned_end_addr - aligned_start_addr,
+                        Win32_Memory::MEM_RESERVE,
+                        Win32_Memory::PAGE_NOACCESS,
+                        &raw mut ext_param,
+                        1,
+                    )
+                }
+            } else {
+                unsafe {
+                    VirtualAlloc2(
+                        GetCurrentProcess(),
+                        aligned_start_addr as *mut c_void,
+                        aligned_end_addr - aligned_start_addr,
+                        Win32_Memory::MEM_RESERVE,
+                        Win32_Memory::PAGE_NOACCESS,
+                        core::ptr::null_mut(),
+                        0,
+                    )
+                }
             };
             if ptr.is_null() {
                 core::ptr::null_mut()
