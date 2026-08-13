@@ -331,6 +331,41 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
     }
 
     let Some(address) = memory_write_address(&instruction, context) else {
+        // (2b) The same stale-base-register case as (2) below, but for an instruction that only
+        // READS through the stale pointer. `memory_write_address` deliberately reports only
+        // operands `iced-x86` classifies as writes, so a plain `mov reg, [reg]` (or a `cmp`,
+        // `test`, `movzx`, ...) whose base register still holds an untranslated PARENT-space
+        // address was previously left completely alone -- and, because the parent's address space
+        // is still mapped and live in the SAME host process, such a read does not fault. It
+        // silently returns whatever the parent has since written at that address, so the child
+        // proceeds on data the parent is concurrently mutating and freeing. Observed live in
+        // bash's `list_length()` walking a linked list through a stale parent-space head pointer
+        // in `r15`/`rbp`, loading a freed, allocator-poisoned `next` value
+        // (`0xdfdfdfdfdfdfdfdf`) and faulting on the following dereference -- i.e. this
+        // manifested as a use-after-free of the PARENT's memory, not as a fault at the stale
+        // access itself, which is why every prior investigation pass saw only the downstream
+        // poison value and never the stale read that produced it.
+        //
+        // The repair is exactly the one case (2) already performs and argues for: translate the
+        // instruction's own named base/index register(s) through the same relocation map
+        // `sys_clone` applies to every GPR at fork-resume time, then retry the same instruction.
+        // It is strictly narrower than case (2) in the one way that matters for false positives:
+        // there is no fallback kill here. If the address-forming registers cannot be translated
+        // (i.e. no named register actually holds a translatable source-range address, so the
+        // source-range hit was a coincidence of some other addressing form), this falls through
+        // to `Continue` and the instruction executes exactly as it did before, unchanged.
+        if let Some(read_address) = explicit_memory_operand_address(&instruction, context)
+            && relocations.is_in_source(read_address)
+            && translate_memory_operand_registers(&instruction, context, relocations)
+        {
+            litebox_util_log::warn!(
+                rip:? = rip, address:? = read_address, mnemonic:? = instruction.mnemonic();
+                "fork_verify: stale DATA pointer read detected, translating base/index register(s) and retrying"
+            );
+            // Do not advance rip: retry the same instruction now that its address-forming
+            // register(s) have been corrected.
+            return StepOutcome::Continue;
+        }
         return StepOutcome::Continue;
     };
 
