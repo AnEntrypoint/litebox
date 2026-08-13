@@ -36,8 +36,9 @@ use windows_sys::Win32::{
         EXCEPTION_POINTERS, EXCEPTION_RECORD,
     },
     System::Memory::{
-        self as Win32_Memory, CreateFileMappingW, MapViewOfFile3, PrefetchVirtualMemory,
-        UnmapViewOfFileEx, VirtualAlloc2, VirtualFree, VirtualProtect,
+        self as Win32_Memory, CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_EXTENDED_PARAMETER,
+        MEM_EXTENDED_PARAMETER_0, MapViewOfFile3, MemExtendedParameterAddressRequirements,
+        PrefetchVirtualMemory, UnmapViewOfFileEx, VirtualAlloc2, VirtualFree, VirtualProtect,
     },
     System::SystemInformation::{self as Win32_SysInfo, GetSystemTimePreciseAsFileTime},
     System::Threading::{self as Win32_Threading, GetCurrentProcess},
@@ -706,7 +707,7 @@ impl WindowsUserland {
             );
         }
 
-        let reserved_pages = Self::read_memory_maps();
+        let reserved_pages = Self::read_memory_maps::<4096>();
 
         let platform = Self {
             reserved_pages,
@@ -766,11 +767,28 @@ impl WindowsUserland {
         unsafe { &*core::ptr::from_ref(self) }
     }
 
-    fn read_memory_maps() -> alloc::vec::Vec<core::ops::Range<usize>> {
+    fn read_memory_maps<const ALIGN: usize>() -> alloc::vec::Vec<core::ops::Range<usize>> {
         let mut reserved_pages = alloc::vec::Vec::new();
         let mut address = 0usize;
+        // Only regions inside the guest's own addressable range are ever meaningful to
+        // `Vmem`'s placement logic (see `TASK_ADDR_MAX`'s and `HOST_ALLOCATOR_REGION_MIN`'s doc
+        // comments): anything at or above `TASK_ADDR_MAX` belongs to the host process itself
+        // (its own stack, loaded modules, TEB, and -- since this split was introduced -- the
+        // host global allocator's own reserved region) and must never be recorded as "reserved
+        // guest space". Recording it anyway would make `Vmem::new_excluding`'s
+        // `last_range_value()` see a spurious high-address entry, defeating the top-down
+        // placement fast path and forcing every guest allocation through the slower gap-search
+        // fallback -- or exhausting it outright once `TASK_ADDR_MAX` sits meaningfully below the
+        // real top of the process address space (confirmed live: this broke ordinary anonymous
+        // `mmap`/`mremap` once `TASK_ADDR_MAX` was lowered by 64 GiB to make room for
+        // `HOST_ALLOCATOR_REGION_MIN`).
+        let task_addr_max =
+            <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::TASK_ADDR_MAX;
 
         loop {
+            if address >= task_addr_max {
+                break;
+            }
             let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
             let ok = unsafe {
                 Win32_Memory::VirtualQuery(
@@ -784,10 +802,11 @@ impl WindowsUserland {
             }
 
             if mbi.State == Win32_Memory::MEM_RESERVE || mbi.State == Win32_Memory::MEM_COMMIT {
-                reserved_pages.push(core::ops::Range {
-                    start: mbi.BaseAddress as usize,
-                    end: (mbi.BaseAddress as usize + mbi.RegionSize),
-                });
+                let start = mbi.BaseAddress as usize;
+                let end = (start + mbi.RegionSize).min(task_addr_max);
+                if start < end {
+                    reserved_pages.push(core::ops::Range { start, end });
+                }
             }
 
             address = mbi.BaseAddress as usize + mbi.RegionSize;
@@ -2521,13 +2540,46 @@ macro_rules! debug_assert_alignment {
     };
 }
 
+/// Lower boundary (inclusive) of the address range exclusively reserved for the host-side
+/// global Rust allocator ([`SLAB_ALLOC`]/[`WindowsUserland::alloc`]). Nothing below this
+/// address is ever requested by [`WindowsUserland::alloc`], and the guest's own
+/// [`litebox::platform::PageManagementProvider::TASK_ADDR_MAX`] is set to end strictly below
+/// it (see that constant's own doc comment). This is a fixed split of the process's 47-bit
+/// canonical user address space (`0`..`0x7FFF_FFFF_FFFF`), carving off the top 64 GiB for the
+/// host allocator and leaving the rest for the guest. 64 GiB (not a smaller value) because the
+/// host allocator backs ordinary host-process `Vec`/`String` growth too -- e.g. reading a
+/// multi-gigabyte initial-files tar archive via `std::fs::read` -- and a too-small reservation
+/// reintroduces a real, easily-hit out-of-memory failure (confirmed live: a 2 GiB reservation
+/// failed to read a 1.3 GB tar file, since `SafeZoneAllocator` doubles requested size for
+/// alignment padding and its buddy allocator's largest block class is `1 << ORDER` = 16 GiB).
+///
+/// # Why this exists
+///
+/// Before this split existed, [`WindowsUserland::alloc`] called `VirtualAlloc2` with a null
+/// (OS-chosen) base address, completely unconstrained. Windows was therefore free to hand back
+/// an address anywhere in the process's address space, including inside
+/// `TASK_ADDR_MIN..TASK_ADDR_MAX`, the same range the guest's own `Vmem` independently manages
+/// for guest mmap/heap/stack placement. `Vmem`'s own placement logic only avoids addresses
+/// captured in a one-time startup snapshot (`WindowsUserland::read_memory_maps`), so it had no
+/// visibility into memory the global allocator committed later during ordinary guest execution.
+/// When both sides raced to commit overlapping virtual addresses, Windows gave no error --
+/// each `VirtualAlloc2` call "succeeds" independently -- and whichever side committed second
+/// silently aliased memory the other side believed it exclusively owned, corrupting guest state
+/// (e.g. musl's malloc/TLS bookkeeping) with unrelated host allocator content. Statically
+/// partitioning the address space so the two allocators' domains are disjoint makes that
+/// collision unrepresentable rather than merely unlikely.
+const HOST_ALLOCATOR_REGION_MIN: usize = 0x7FF0_0000_0000;
+
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for WindowsUserland {
     // TODO(chuqi): These are currently "magic numbers" grabbed from my Windows 11 SystemInformation.
     // The actual values should be determined by `GetSystemInfo()`.
     //
     // NOTE: make sure the values are PAGE_ALIGNED.
     const TASK_ADDR_MIN: usize = 0x1_0000;
-    const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
+    /// Kept strictly below [`HOST_ALLOCATOR_REGION_MIN`] so the guest's own `Vmem` placement
+    /// (which only avoids a one-time startup snapshot of committed regions, see that constant's
+    /// doc comment) can never be handed an address the host global allocator later claims.
+    const TASK_ADDR_MAX: usize = HOST_ALLOCATOR_REGION_MIN - 0x1_0000;
     fn allocate_pages(
         &self,
         suggested_range: core::ops::Range<usize>,
@@ -3393,6 +3445,24 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
             core::cmp::max(layout.align(), 0x1000) << 1,
         );
 
+        // Constrain every host-allocator-backing page to `HOST_ALLOCATOR_REGION_MIN..`, strictly
+        // above the guest's own `TASK_ADDR_MAX`, so this allocator can never be handed an address
+        // the guest's `Vmem` also considers fair game. See `HOST_ALLOCATOR_REGION_MIN`'s doc
+        // comment for why an unconstrained (null-base) request was unsafe here.
+        let mut addr_req = MEM_ADDRESS_REQUIREMENTS {
+            LowestStartingAddress: HOST_ALLOCATOR_REGION_MIN as *mut c_void,
+            HighestEndingAddress: core::ptr::null_mut(),
+            Alignment: 0,
+        };
+        let mut ext_param = MEM_EXTENDED_PARAMETER {
+            Anonymous1: MEM_EXTENDED_PARAMETER_0 {
+                _bitfield: MemExtendedParameterAddressRequirements as u64,
+            },
+            Anonymous2: windows_sys::Win32::System::Memory::MEM_EXTENDED_PARAMETER_1 {
+                Pointer: (&raw mut addr_req).cast::<c_void>(),
+            },
+        };
+
         match unsafe {
             VirtualAlloc2(
                 GetCurrentProcess(),
@@ -3400,8 +3470,8 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
                 size,
                 Win32_Memory::MEM_COMMIT | Win32_Memory::MEM_RESERVE,
                 Win32_Memory::PAGE_READWRITE,
-                core::ptr::null_mut(),
-                0,
+                &raw mut ext_param,
+                1,
             )
         } {
             addr if addr.is_null() => None,

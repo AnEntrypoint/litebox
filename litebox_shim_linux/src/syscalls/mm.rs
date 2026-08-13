@@ -1214,11 +1214,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
 #[cfg(test)]
 mod tests {
-    use litebox::{
-        fs::{Mode, OFlags},
-        platform::PageManagementProvider,
-    };
-    use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
+    use litebox::fs::{Mode, OFlags};
+    #[cfg(target_os = "linux")]
+    use litebox::platform::PageManagementProvider;
+    #[cfg(target_os = "linux")]
+    use litebox_common_linux::MRemapFlags;
+    use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
 
     use crate::syscalls::tests::TestPlatform as Platform;
     use crate::{UserPtrMut, syscalls::tests::init_platform};
@@ -1420,7 +1421,16 @@ mod tests {
         task.sys_munmap(addr2, 0x1000).unwrap();
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    // Windows-only historically, but no longer applicable there: `WindowsUserland::alloc` (the
+    // host global allocator's `MemoryProvider` impl) now requests memory exclusively from
+    // `HOST_ALLOCATOR_REGION_MIN..` (see that constant's doc comment in
+    // `litebox_platform_windows_userland`), strictly above the guest's own `TASK_ADDR_MAX`, so
+    // the collision this test manufactures (looping until the host allocator happens to land
+    // inside guest-visible address space) is now structurally impossible on Windows -- the loop
+    // below would spin until it exhausts the process's memory instead of terminating. Linux's
+    // `MemoryProvider` impl has no equivalent partitioning, so the collision-avoidance behavior
+    // under test remains real and exercised there.
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_collision_with_global_allocator() {
         let task = init_platform(None);
