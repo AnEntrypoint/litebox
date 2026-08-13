@@ -423,6 +423,15 @@ unsafe extern "system" fn vectored_exception_handler(
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
+    // Temporary (see FINDINGS.txt PASS 48): `LITEBOX_DIAG_WATCHADDR=<hex>`-gated fixed-address
+    // `Dr1` write watch, independent of the `Dr0`-based mechanism above -- see
+    // `ctxwatch::arm_fixed_on_current_thread`'s doc comment.
+    if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_SINGLE_STEP
+        && ctxwatch::on_possible_fixed_hit(context)
+    {
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
     if !tls.is_in_guest.get() {
         // Same FS_BASE-reset repair as the guest-mode case below, but for *host* Rust code: live
         // tracing (`LITEBOX_VEH_TRACE=1`) while investigating an `apk add nodejs` trigger-script
@@ -3904,6 +3913,12 @@ impl ThreadContext<'_> {
                 // exact syscall this bug's crashes have consistently followed. See `ctxwatch`
                 // for the full rationale. `vectored_exception_handler` disarms it again the next
                 // time this thread leaves guest mode.
+                // Temporary (see FINDINGS.txt PASS 48): re-arm the fixed-address `Dr1` watch
+                // every resume -- cheap (no-op unless `LITEBOX_DIAG_WATCHADDR` is set) and
+                // idempotent, and unlike the `Dr0` mechanism below this one is never cleared by
+                // `ctxwatch::disarm()`, but re-arming here guarantees it is set before the very
+                // first guest instruction runs on this thread too.
+                ctxwatch::arm_fixed_on_current_thread();
                 if ctxwatch::enabled() && self.ctx.orig_rax == 0x3d {
                     ctxwatch::arm(self.ctx);
                     // Debug registers are per-thread on Windows (virtualized via
