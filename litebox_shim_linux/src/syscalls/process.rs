@@ -2839,6 +2839,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         let path = path_cstr.to_str().map_err(|_| Errno::ENOENT)?;
 
+        litebox_util_log::debug!(tid:% = self.tid, path:% = path; "sys_execve: entry");
+
         // Copy argv and envp vectors
         let argv_vec = if argv.as_usize() == 0 {
             alloc::vec::Vec::new()
