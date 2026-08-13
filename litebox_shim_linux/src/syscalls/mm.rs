@@ -410,12 +410,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
-        if flags.contains(MapFlags::MAP_ANONYMOUS) {
+        let result = if flags.contains(MapFlags::MAP_ANONYMOUS) {
             self.do_mmap_anonymous(suggested_addr, aligned_len, prot, flags)
         } else {
             self.do_mmap_file(suggested_addr, aligned_len, prot, flags, fd, offset)
+        };
+        // Temporary (see FINDINGS.txt PASS 48): trace every mmap's returned guest address so a
+        // return value landing in the host allocator's own reserved region (a bug this
+        // investigation is actively chasing) is caught the moment it is produced, not just
+        // later when something dereferences the resulting bad pointer.
+        if let Ok(r) = &result {
+            litebox_util_log::debug!(
+                addr:% = addr, len:% = aligned_len, returned:% = r.as_usize();
+                "sys_mmap: returned"
+            );
         }
-        .map_err(Errno::from)
+        result.map_err(Errno::from)
     }
 
     /// Handle syscall `munmap`
