@@ -176,7 +176,17 @@ unsafe extern "system" fn vectored_exception_handler(
             unsafe { litebox_common_linux::rdfsbase() },
             WindowsUserland::get_thread_fs_base(),
         );
-        if exception_record.ExceptionCode == 0xC000_0096_u32.cast_signed() {
+        if exception_record.ExceptionCode == 0xC000_0096_u32.cast_signed()
+            // TEMPORARY (pass 37): also dump on an ordinary access violation whose faulting
+            // address is small (a near-null pointer, as opposed to an unrelated guard-page/
+            // demand-paging fault at a normal-looking guest address) -- this is the shape of the
+            // CI-only "segfault right after apk's own child reaps, before jq prints hello" crash
+            // (`addr=0x18` observed live), which is a *data* access, not the privileged-
+            // instruction/rip==0 shape the rest of this block was built for. Remove once that
+            // crash is root-caused and fixed; see FINDINGS.txt pass 37.
+            || (exception_record.ExceptionCode == 0xC000_0005_u32.cast_signed()
+                && exception_record.ExceptionInformation[1] < 0x1_0000)
+        {
             #[allow(
                 clippy::cast_possible_truncation,
                 reason = "diagnostic-only; this platform is x86_64-only, rip fits in usize"
@@ -191,8 +201,22 @@ unsafe extern "system" fn vectored_exception_handler(
             eprintln!("[veh] rip-8 bytes ({nb}): {:02x?}", &before[..nb]);
             fork_verify::describe_crash_page_for_diagnostics(rip);
             eprintln!(
-                "[veh] crash regs rdi={:#x} rsi={:#x} rdx={:#x} rax={:#x} rsp={:#x} rbp={:#x}",
-                context.Rdi, context.Rsi, context.Rdx, context.Rax, context.Rsp, context.Rbp,
+                "[veh] crash regs rdi={:#x} rsi={:#x} rdx={:#x} rax={:#x} rsp={:#x} rbp={:#x} rbx={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+                context.Rdi,
+                context.Rsi,
+                context.Rdx,
+                context.Rax,
+                context.Rsp,
+                context.Rbp,
+                context.Rbx,
+                context.R8,
+                context.R9,
+                context.R10,
+                context.R11,
+                context.R12,
+                context.R13,
+                context.R14,
+                context.R15,
             );
         }
     }
