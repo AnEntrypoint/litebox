@@ -54,7 +54,12 @@ fn ratchet_globals() -> Result<()> {
             // call to locate the long-standing deterministic leaked-pointer offset (0x1013480)
             // seen at the apk/jq smoke-test crash site. Remove both statics (and this bump) once
             // that investigation is root-caused and the diagnostic is deleted.
-            ("litebox_platform_windows_userland/", 14),
+            // 15 rather than 14 for `ctxwatch.rs`'s `TARGET` (`LITEBOX_DIAG_WATCHADDR`'s armed
+            // address, a `thread_local!`), which a prior pass introduced without bumping this
+            // count. Remove alongside the rest of the `ctxwatch` Dr1 diagnostic once the mallocng
+            // `hlt` crash this investigation is now chasing (see `FINDINGS.txt` pass 49) is
+            // root-caused and the diagnostic is deleted.
+            ("litebox_platform_windows_userland/", 15),
             ("litebox_runner_lvbs/", 5),
             ("litebox_runner_snp/", 2),
             ("litebox_shim_linux/", 1),
