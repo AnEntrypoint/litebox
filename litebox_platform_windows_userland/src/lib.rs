@@ -752,6 +752,10 @@ impl WindowsUserland {
     ///
     /// Panics if the TLS slot cannot be created.
     pub fn new() -> &'static Self {
+        // Must run before anything else in this function: see `DIAG_ALLOC_ENABLED_CACHE`'s doc
+        // comment for why this cannot instead be a lazily-initialized-on-first-`alloc`-call cache.
+        init_diag_alloc_enabled();
+
         let mut sys_info = Win32_SysInfo::SYSTEM_INFO::default();
         Self::get_system_information(&mut sys_info);
 
@@ -2968,25 +2972,67 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, SharedMemoryError> {
         debug_assert_alignment!(suggested_range, ALIGN);
-        let try_map = |base_addr: *const c_void| unsafe {
-            MapViewOfFile3(
-                handle as *mut c_void,
-                GetCurrentProcess(),
-                base_addr,
-                0,
-                suggested_range.len(),
-                0,
-                prot_flags(initial_permissions),
-                core::ptr::null_mut(),
-                0,
-            )
+        // Mirrors `allocate_pages`'s `reserve_and_commit` null-address branch (see
+        // `HOST_ALLOCATOR_REGION_MIN`'s doc comment): when no hint address is available (either
+        // `suggested_range.start == 0`, or a hinted address was rejected and we fall back to
+        // asking Windows to place it), `MapViewOfFile3` used to be called with a null base
+        // address and NO `MEM_EXTENDED_PARAMETER` array at all -- completely unconstrained,
+        // unlike every other guest allocation path in this file. Windows was free to satisfy
+        // that request from anywhere, including inside `HOST_ALLOCATOR_REGION_MIN..`, the host
+        // global allocator's exclusive region, silently aliasing an anonymous `MAP_SHARED`
+        // guest mapping with host allocator memory. Constrain the null-address case the same
+        // way, via `MEM_ADDRESS_REQUIREMENTS`.
+        let mut addr_req = MEM_ADDRESS_REQUIREMENTS {
+            LowestStartingAddress: <WindowsUserland as litebox::platform::PageManagementProvider<
+                ALIGN,
+            >>::TASK_ADDR_MIN as *mut c_void,
+            HighestEndingAddress: (<WindowsUserland as litebox::platform::PageManagementProvider<
+                ALIGN,
+            >>::TASK_ADDR_MAX
+                - 1) as *mut c_void,
+            Alignment: 0,
+        };
+        let mut ext_param = MEM_EXTENDED_PARAMETER {
+            Anonymous1: MEM_EXTENDED_PARAMETER_0 {
+                _bitfield: MemExtendedParameterAddressRequirements as u64,
+            },
+            Anonymous2: windows_sys::Win32::System::Memory::MEM_EXTENDED_PARAMETER_1 {
+                Pointer: (&raw mut addr_req).cast::<c_void>(),
+            },
+        };
+        let mut try_map = |base_addr: *const c_void, constrained: bool| unsafe {
+            if constrained {
+                MapViewOfFile3(
+                    handle as *mut c_void,
+                    GetCurrentProcess(),
+                    base_addr,
+                    0,
+                    suggested_range.len(),
+                    0,
+                    prot_flags(initial_permissions),
+                    &raw mut ext_param,
+                    1,
+                )
+            } else {
+                MapViewOfFile3(
+                    handle as *mut c_void,
+                    GetCurrentProcess(),
+                    base_addr,
+                    0,
+                    suggested_range.len(),
+                    0,
+                    prot_flags(initial_permissions),
+                    core::ptr::null_mut(),
+                    0,
+                )
+            }
         };
         let base_addr = if suggested_range.start == 0 {
             core::ptr::null()
         } else {
             suggested_range.start as *const c_void
         };
-        let mut view = try_map(base_addr);
+        let mut view = try_map(base_addr, base_addr.is_null());
         // `Hint` means the platform may pick a different address if the hint isn't available
         // (matching `allocate_pages`'s handling of the same case): retry with no address hint
         // rather than surfacing an address collision as an error.
@@ -2994,7 +3040,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             && !base_addr.is_null()
             && fixed_address_behavior == FixedAddressBehavior::Hint
         {
-            view = try_map(core::ptr::null());
+            view = try_map(core::ptr::null(), true);
         }
         if view.Value.is_null() {
             let err = unsafe { GetLastError() };
@@ -3587,6 +3633,98 @@ impl litebox::platform::StdioProvider for WindowsUserland {
 static SLAB_ALLOC: litebox::mm::allocator::SafeZoneAllocator<'static, 34, WindowsUserland> =
     litebox::mm::allocator::SafeZoneAllocator::new();
 
+/// Temporary, allocation-free diagnostic for the long-standing deterministic `rax =
+/// HOST_ALLOCATOR_REGION_MIN + 0x1013480` leak (see this file's `HOST_ALLOCATOR_REGION_MIN` doc
+/// comment and the investigation notes it links to). Gated behind `LITEBOX_DIAG_ALLOC=1`; logs
+/// every `WindowsUserland::alloc` call's returned base address and size via a raw `OutputDebugStringA`
+/// call so it cannot recurse into this same allocator (unlike `eprintln!`/`format!`, which route
+/// through allocating machinery elsewhere in the host Rust runtime). Remove once the leak is
+/// root-caused and fixed.
+static DIAG_ALLOC_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Tri-state cache for [`diag_alloc_enabled`]: 0 = not yet initialized, 1 = enabled, 2 = disabled.
+/// Deliberately NOT a `OnceLock`/lazily-initialized-on-first-call cache: this function runs on the
+/// hot path of every single host allocation, including the very first one at process startup, so
+/// initializing it lazily would call `std::env::var_os` (which allocates an `OsString`) from
+/// *inside* `WindowsUserland::alloc` itself -- a direct reentrant call into the allocator it is
+/// currently servicing, observed in practice to hang (`OnceLock`'s internal synchronization
+/// self-deadlocks when entered reentrantly on the same thread). Populated once, eagerly, from
+/// [`init_diag_alloc_enabled`], which must run from a context that is NOT inside the allocator.
+static DIAG_ALLOC_ENABLED_CACHE: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
+
+/// Populates [`DIAG_ALLOC_ENABLED_CACHE`] by reading `LITEBOX_DIAG_ALLOC` exactly once. Must be
+/// called from a context that is not itself inside `WindowsUserland::alloc` (e.g. this platform's
+/// construction, before any guest code runs) -- see that static's doc comment for why. A no-op if
+/// called more than once.
+fn init_diag_alloc_enabled() {
+    let enabled = std::env::var_os("LITEBOX_DIAG_ALLOC").is_some();
+    DIAG_ALLOC_ENABLED_CACHE.store(if enabled { 1 } else { 2 }, Ordering::Relaxed);
+}
+
+/// Allocation-free: only reads the cache populated by [`init_diag_alloc_enabled`]. Safe to call
+/// from inside `WindowsUserland::alloc` itself. Before `init_diag_alloc_enabled` has run (cache
+/// still 0, e.g. very early allocations before platform construction), conservatively reports
+/// disabled rather than risking a reentrant env-var lookup.
+fn diag_alloc_enabled() -> bool {
+    DIAG_ALLOC_ENABLED_CACHE.load(Ordering::Relaxed) == 1
+}
+
+/// Format `n` as decimal into `buf`, returning the written prefix. No heap allocation.
+fn fmt_usize_hex(mut n: usize, buf: &mut [u8; 20]) -> &[u8] {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut i = buf.len();
+    if n == 0 {
+        i -= 1;
+        buf[i] = b'0';
+    } else {
+        while n != 0 {
+            i -= 1;
+            buf[i] = DIGITS[n & 0xf];
+            n >>= 4;
+        }
+    }
+    &buf[i..]
+}
+
+/// Raw, allocation-free debug print: writes `prefix` + hex(`a`) + `mid` + hex(`b`) + "\n" straight
+/// to the process's `STD_ERROR_HANDLE` via `WriteFile`, entirely on the stack, so CI's captured
+/// stderr picks it up exactly like every other `LITEBOX_VEH_TRACE`-style diagnostic. Safe to call
+/// from inside the global allocator itself since it never touches `SLAB_ALLOC` (unlike
+/// `eprintln!`/`format!`, which can recurse into it via the host Rust I/O stack). Deliberately
+/// skips `STDERR_WRITE_LOCK` -- interleaving with other stderr writers is an acceptable, purely
+/// cosmetic risk for this temporary, allocation-free diagnostic.
+fn diag_raw_print(prefix: &[u8], a: usize, mid: &[u8], b: usize) {
+    let mut line = [0u8; 128];
+    let mut pos = 0usize;
+    let push = |bytes: &[u8], line: &mut [u8; 128], pos: &mut usize| {
+        let n = bytes.len().min(line.len().saturating_sub(*pos));
+        line[*pos..*pos + n].copy_from_slice(&bytes[..n]);
+        *pos += n;
+    };
+    push(prefix, &mut line, &mut pos);
+    let mut hexbuf = [0u8; 20];
+    push(fmt_usize_hex(a, &mut hexbuf), &mut line, &mut pos);
+    push(mid, &mut line, &mut pos);
+    let mut hexbuf2 = [0u8; 20];
+    push(fmt_usize_hex(b, &mut hexbuf2), &mut line, &mut pos);
+    push(b"\n", &mut line, &mut pos);
+    unsafe {
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
+        let handle = GetStdHandle(STD_ERROR_HANDLE);
+        if !handle.is_null() && handle != Win32_Foundation::INVALID_HANDLE_VALUE {
+            let mut written: u32 = 0;
+            windows_sys::Win32::Storage::FileSystem::WriteFile(
+                handle,
+                line.as_ptr(),
+                u32::try_from(pos).unwrap_or(u32::MAX),
+                &raw mut written,
+                core::ptr::null_mut(),
+            );
+        }
+    }
+}
+
 impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
     fn alloc(layout: &std::alloc::Layout) -> Option<(usize, usize)> {
         let size = core::cmp::max(
@@ -3626,7 +3764,14 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
             )
         } {
             addr if addr.is_null() => None,
-            addr => Some((addr as usize, size)),
+            addr => {
+                if diag_alloc_enabled() {
+                    let n = DIAG_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+                    let offset = (addr as usize).wrapping_sub(HOST_ALLOCATOR_REGION_MIN);
+                    diag_raw_print(b"[diag_alloc] n=0x", n, b" off=0x", offset);
+                }
+                Some((addr as usize, size))
+            }
         }
     }
 
