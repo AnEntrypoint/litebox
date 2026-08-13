@@ -56,7 +56,10 @@ pub struct CliArgs {
 
 struct MmappedFile {
     data: &'static [u8],
-    #[expect(dead_code, reason = "kept for parity with the native-Linux runner's identical helper")]
+    #[expect(
+        dead_code,
+        reason = "kept for parity with the native-Linux runner's identical helper"
+    )]
     abs_path: PathBuf,
 }
 
@@ -112,10 +115,20 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         // self-defeating case of exporting onto the same file being read from
         // with a clear error up front, rather than a confusing failure deep in
         // `export_writable_layer` after the whole guest session has already run.
-        let initial_files_abs = std::path::absolute(tar_file)
-            .map_err(|e| anyhow!("Could not get absolute path for {}: {}", tar_file.display(), e))?;
-        let export_path_abs = std::path::absolute(export_path)
-            .map_err(|e| anyhow!("Could not get absolute path for {}: {}", export_path.display(), e))?;
+        let initial_files_abs = std::path::absolute(tar_file).map_err(|e| {
+            anyhow!(
+                "Could not get absolute path for {}: {}",
+                tar_file.display(),
+                e
+            )
+        })?;
+        let export_path_abs = std::path::absolute(export_path).map_err(|e| {
+            anyhow!(
+                "Could not get absolute path for {}: {}",
+                export_path.display(),
+                e
+            )
+        })?;
         if initial_files_abs == export_path_abs {
             anyhow::bail!(
                 "--export-writable-layer must not point at the same file as --initial-files ({}): \

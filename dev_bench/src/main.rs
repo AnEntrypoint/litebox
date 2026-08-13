@@ -510,7 +510,9 @@ fn reap_children(children: Vec<std::process::Child>) -> Result<i64> {
         }
         if !libc::WIFEXITED(wait_status) || libc::WEXITSTATUS(wait_status) != 0 {
             first_err.get_or_insert_with(|| {
-                anyhow!("concurrent session pid {pid} did not exit cleanly (wait status {wait_status})")
+                anyhow!(
+                    "concurrent session pid {pid} did not exit cleanly (wait status {wait_status})"
+                )
             });
             continue;
         }
