@@ -3789,6 +3789,12 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
                     let n = DIAG_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
                     let offset = (addr as usize).wrapping_sub(HOST_ALLOCATOR_REGION_MIN);
                     diag_raw_print(b"[diag_alloc] n=0x", n, b" off=0x", offset);
+                    diag_raw_print(
+                        b"[diag_alloc]   size=0x",
+                        size,
+                        b" layout_size=0x",
+                        layout.size(),
+                    );
                 }
                 Some((addr as usize, size))
             }
