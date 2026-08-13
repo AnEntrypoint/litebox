@@ -1025,6 +1025,23 @@ struct TlsState {
     host_sp: Cell<*mut u128>,
     host_bp: Cell<*mut u128>,
     guest_context_top: Cell<*mut litebox_common_linux::PtRegs>,
+    /// The guest's `xmm0`-`xmm5` (the Windows x64 ABI's *caller-saved* SSE registers) at the
+    /// moment the guest last entered the host via `syscall_callback`. These are deliberately not
+    /// part of `PtRegs` (a Linux ABI-shaped struct whose layout other code depends on via fixed
+    /// byte offsets, e.g. `switch_to_guest_sysret`'s hardcoded field offsets) -- this is
+    /// host-only bookkeeping.
+    ///
+    /// `run_thread_arch`'s prologue already saves/restores `xmm6`-`xmm15` (the ABI's
+    /// *callee*-saved SSE registers) around the entire guest-thread lifetime, because the host
+    /// Rust code that runs between guest entries is a normal Windows x64 callee and is only
+    /// obligated to preserve those. `xmm0`-`xmm5` are caller-saved, so any host code path
+    /// reached from `syscall_callback` (the syscall handler, allocator code it calls into, etc.)
+    /// is free to clobber them -- and every guest resume path (`switch_to_guest_sysret`,
+    /// `switch_to_guest_ntcontinue`/`NtContinue`) previously left whatever value was physically
+    /// in those registers untouched, silently replacing the guest's own `xmm0`-`xmm5` with
+    /// leftover host state on every single syscall return. `NtContinue`'s `CONTEXT` was also
+    /// never given `CONTEXT_FLOATING_POINT`, so the slow resume path had the identical gap.
+    guest_xmm0_5: Cell<[u128; 6]>,
     scratch: Cell<usize>,
     is_in_guest: Cell<bool>,
     interrupt: Cell<bool>,
@@ -1093,6 +1110,7 @@ impl TlsState {
             host_sp: Cell::new(core::ptr::null_mut()),
             host_bp: Cell::new(core::ptr::null_mut()),
             guest_context_top: core::ptr::null_mut::<litebox_common_linux::PtRegs>().into(),
+            guest_xmm0_5: Cell::new([0; 6]),
             scratch: 0.into(),
             is_in_guest: false.into(),
             interrupt: false.into(),
@@ -1240,11 +1258,20 @@ syscall_callback:
     mov     r11d, DWORD PTR [rip + {TLS_INDEX}]
     mov     r11, QWORD PTR gs:[r11 * 8 + TEB_TLS_SLOTS_OFFSET]
     mov     BYTE PTR [r11 + {IS_IN_GUEST}], 0
+    // Save the guest's caller-saved xmm0-xmm5 into TlsState before any other host code (which
+    // is free to clobber them) runs. xmm6-xmm15 are already protected for the whole guest-thread
+    // lifetime by run_thread_arch's own prologue/epilogue; these are the remaining, previously
+    // unsaved ones. Must happen before the `call {syscall_handler}` below.
+    movups  XMMWORD PTR [r11 + {GUEST_XMM0_5} + 0*16], xmm0
+    movups  XMMWORD PTR [r11 + {GUEST_XMM0_5} + 1*16], xmm1
+    movups  XMMWORD PTR [r11 + {GUEST_XMM0_5} + 2*16], xmm2
+    movups  XMMWORD PTR [r11 + {GUEST_XMM0_5} + 3*16], xmm3
+    movups  XMMWORD PTR [r11 + {GUEST_XMM0_5} + 4*16], xmm4
+    movups  XMMWORD PTR [r11 + {GUEST_XMM0_5} + 5*16], xmm5
     // Set rsp to the top of the guest context.
     mov     QWORD PTR [r11 + {SCRATCH}], rsp
     mov     rsp, QWORD PTR [r11 + {GUEST_CONTEXT_TOP}]
 
-    // TODO: save float and vector registers (xsave or fxsave)
     // Save caller-saved registers
     push    0x2b       // pt_regs->ss = __USER_DS
     push    QWORD PTR [r11 + {SCRATCH}] // pt_regs->sp
@@ -1325,6 +1352,7 @@ interrupt_callback:
     HOST_SP = const core::mem::offset_of!(TlsState, host_sp),
     HOST_BP = const core::mem::offset_of!(TlsState, host_bp),
     GUEST_CONTEXT_TOP = const core::mem::offset_of!(TlsState, guest_context_top),
+    GUEST_XMM0_5 = const core::mem::offset_of!(TlsState, guest_xmm0_5),
     SCRATCH = const core::mem::offset_of!(TlsState, scratch),
     IS_IN_GUEST = const core::mem::offset_of!(TlsState, is_in_guest),
     );
@@ -1564,6 +1592,28 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
 
     // Restore fsbase for the guest.
     WindowsUserland::restore_thread_fs_base();
+
+    // Restore the guest's xmm0-xmm5 (the caller-saved SSE registers, see `guest_xmm0_5`'s doc
+    // comment) as late as possible, immediately before handing control to either resume path --
+    // no host Rust code runs between this and the jump into guest code on either path, so
+    // nothing here can re-clobber them.
+    {
+        let xmm = tls.guest_xmm0_5.get();
+        unsafe {
+            core::arch::asm!(
+                "movups xmm0, [{p} + 0*16]",
+                "movups xmm1, [{p} + 1*16]",
+                "movups xmm2, [{p} + 2*16]",
+                "movups xmm3, [{p} + 3*16]",
+                "movups xmm4, [{p} + 4*16]",
+                "movups xmm5, [{p} + 5*16]",
+                p = in(reg) xmm.as_ptr(),
+                out("xmm0") _, out("xmm1") _, out("xmm2") _,
+                out("xmm3") _, out("xmm4") _, out("xmm5") _,
+                options(nostack, readonly),
+            );
+        }
+    }
 
     // The fast path for switching to the guest relies on rcx == rip. This is
     // the common case, because the syscall instruction sets rcx to rip at entry
