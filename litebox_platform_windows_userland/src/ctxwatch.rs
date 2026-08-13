@@ -30,7 +30,7 @@ use core::cell::Cell;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    CONTEXT, CONTEXT_DEBUG_REGISTERS_AMD64, GetThreadContext, SetThreadContext,
+    CONTEXT, CONTEXT_DEBUG_REGISTERS_AMD64, GetThreadContext, M128A, SetThreadContext,
 };
 use windows_sys::Win32::System::Threading::GetCurrentThread;
 
@@ -331,8 +331,8 @@ pub(crate) fn on_possible_fixed_hit(context: &mut CONTEXT) -> bool {
         reason = "diagnostic-only; this platform is x86_64-only, addresses fit in usize"
     )]
     let rsp = context.Rsp as usize;
-    let mut code = [0u8; 24];
-    let code_start = rip.wrapping_sub(16);
+    let mut code = [0u8; 96];
+    let code_start = rip.wrapping_sub(48);
     for (i, b) in code.iter_mut().enumerate() {
         *b = unsafe { core::ptr::read_unaligned((code_start + i) as *const u8) };
     }
@@ -345,11 +345,16 @@ pub(crate) fn on_possible_fixed_hit(context: &mut CONTEXT) -> bool {
     for (i, w) in rdi_window.iter_mut().enumerate() {
         *w = unsafe { core::ptr::read_unaligned((rdi_base + i * 8) as *const u64) };
     }
-    let mut rsp_window = [0u64; 32];
+    let mut rsp_window = [0u64; 64];
     for (i, w) in rsp_window.iter_mut().enumerate() {
         *w = unsafe { core::ptr::read_unaligned((rsp + i * 8) as *const u64) };
     }
-    let xmm0 = unsafe { context.Anonymous.FltSave.XmmRegisters[0] };
+    // PASS 49: dump every xmm register, not just xmm0 -- pass 48 established xmm0 already held
+    // the poisoned value at the `movups` write but never located the load that put it there; if
+    // the true load target a different xmm register that got moved into xmm0 by an instruction
+    // outside the previously-captured 24-byte code window, this directly reveals it.
+    let xmm_all: [M128A; 16] = unsafe { context.Anonymous.FltSave.XmmRegisters };
+    let xmm0 = xmm_all[0];
     // Temporary (PASS 48): also dump musl's `__copy_tls`-adjacent globals (`libc.tls_size`-shaped
     // and `builtin_tls`-shaped storage at module-relative 0xa4890/0xa4898/0xa48a0, i.e.
     // `alloc_base + those offsets` where `alloc_base` is ld-musl's own guest load base) to see
@@ -373,10 +378,16 @@ pub(crate) fn on_possible_fixed_hit(context: &mut CONTEXT) -> bool {
         "[ctxwatch-fixed] HIT writer_tid={:?} writer_rip={rip:#x} watched_addr={target:#x} \
          new_value={new_value:#x} below={below:#x} above={above:#x} rsp={rsp:#x} rax={rax:#x} \
          rbx={rbx:#x} rcx={rcx:#x} rdx={rdx:#x} rdi={rdi:#x} rsi={rsi:#x} rbp={rbp:#x} \
-         r12={r12:#x} r13={r13:#x} code@rip-16={code:02x?} rdi_window@-16={rdi_window:x?} \
+         r12={r12:#x} r13={r13:#x} code@rip-48={code:02x?} rdi_window@-16={rdi_window:x?} \
          rsp_window={rsp_window:x?} xmm0.Low={xmm0_low:#x} xmm0.High={xmm0_high:#x}",
         std::thread::current().id(),
     );
+    for (i, x) in xmm_all.iter().enumerate() {
+        eprintln!(
+            "[ctxwatch-fixed] xmm{i}.Low={:#x} xmm{i}.High={:#x}",
+            x.Low, x.High
+        );
+    }
     eprintln!(
         "[ctxwatch-fixed] globals tls_image_global={tls_image_global:#x} \
          tls_size_global={tls_size_global:#x} tls_align_global={tls_align_global:#x}"
