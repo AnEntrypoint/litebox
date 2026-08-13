@@ -10,7 +10,8 @@ extern crate alloc;
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use litebox_platform_windows_userland::WindowsUserland as Platform;
-use std::path::PathBuf;
+use memmap2::Mmap;
+use std::path::{Path, PathBuf};
 
 /// Run Linux programs with LiteBox on unmodified Windows.
 ///
@@ -53,6 +54,35 @@ pub struct CliArgs {
     pub resume_from: Option<PathBuf>,
 }
 
+struct MmappedFile {
+    data: &'static [u8],
+    #[expect(dead_code, reason = "kept for parity with the native-Linux runner's identical helper")]
+    abs_path: PathBuf,
+}
+
+/// Memory-maps `path` read-only instead of copying its bytes into a private heap
+/// buffer, so the OS page cache transparently shares the physical pages across
+/// every concurrent runner process reading the same rootfs archive -- mirrors
+/// `litebox_runner_linux_userland`'s identical helper.
+fn mmapped_file(path: impl AsRef<Path>) -> Result<MmappedFile> {
+    let path = path.as_ref();
+    let abs_path = std::path::absolute(path)
+        .map_err(|e| anyhow!("Could not get absolute path for {}: {}", path.display(), e))?;
+    let file = std::fs::File::open(&abs_path)?;
+    let data = {
+        // SAFETY: We assume that the file given to us is not going to change _externally_ while in
+        // the middle of execution. Since we are mapping it as read-only and mapping it only once,
+        // we are not planning to change it either. With both these in mind, this call is safe.
+        //
+        // We need to leak the `Mmap` object, so that it stays alive until the end of the program,
+        // rather than being unmapped at function finish (i.e., to get the `'static` lifetime).
+        Box::leak(Box::new(unsafe { Mmap::map(&file) }.map_err(|e| {
+            anyhow!("Could not read tar file at {}: {}", path.display(), e)
+        })?))
+    };
+    Ok(MmappedFile { data, abs_path })
+}
+
 /// Run Linux programs with LiteBox on unmodified Windows
 ///
 /// # Panics
@@ -75,8 +105,30 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
         anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
     }
-    let tar_data = std::fs::read(tar_file)
-        .map_err(|e| anyhow!("Could not read tar file at {}: {}", tar_file.display(), e))?;
+    if let Some(export_path) = &cli_args.export_writable_layer {
+        // `tar_file` stays memory-mapped for this process's entire lifetime (see
+        // `mmapped_file` below), and Windows generally refuses to open a file
+        // for writing while a mapping of it is still active. Catch the
+        // self-defeating case of exporting onto the same file being read from
+        // with a clear error up front, rather than a confusing failure deep in
+        // `export_writable_layer` after the whole guest session has already run.
+        let initial_files_abs = std::path::absolute(tar_file)
+            .map_err(|e| anyhow!("Could not get absolute path for {}: {}", tar_file.display(), e))?;
+        let export_path_abs = std::path::absolute(export_path)
+            .map_err(|e| anyhow!("Could not get absolute path for {}: {}", export_path.display(), e))?;
+        if initial_files_abs == export_path_abs {
+            anyhow::bail!(
+                "--export-writable-layer must not point at the same file as --initial-files ({}): \
+                 the rootfs archive stays memory-mapped for the whole run, so exporting onto it \
+                 would try to overwrite a file that's still open for reading",
+                initial_files_abs.display()
+            );
+        }
+    }
+    // Memory-mapped, not heap-copied: every concurrent runner process reading
+    // the same rootfs archive shares its physical pages via the OS page cache
+    // instead of each holding a private copy.
+    let tar_data = mmapped_file(tar_file)?.data;
 
     let platform = Platform::new();
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
