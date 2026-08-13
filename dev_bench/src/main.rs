@@ -419,6 +419,7 @@ const BENCHMARKS: &[(&str, BenchFn)] = benchtable![
     //
     rewriter_hello_static,
     run_rewritten_hello_static,
+    run_rewritten_hello_static_concurrent,
     rewriter_node,
     run_rewritten_node,
     rewriter_iperf3,
@@ -469,6 +470,123 @@ fn run_rewritten_hello_static(ctx: BenchCtx<'_>) -> Result<()> {
             sh,
             "{project_root}/target/release/litebox_runner_linux_userland --unstable hello_static_rewritten"
         ).run()?;
+    }
+    Ok(())
+}
+
+/// Number of guest sessions launched concurrently by
+/// [`run_rewritten_hello_static_concurrent`]. Deliberately modest: this
+/// benchmark's point is to catch per-session host-resource regressions (e.g. a
+/// static bulk allocation growing back), not to load-test a specific fleet size.
+const CONCURRENT_SESSION_COUNT: usize = 16;
+
+/// Waits on every child via `wait4` (for its `rusage`), continuing through a
+/// failed wait or a non-clean exit instead of stopping early, so one bad child
+/// never leaves the rest as zombies for the remainder of this long-lived,
+/// multi-benchmark `dev_bench` process. Returns the summed `ru_maxrss` (peak
+/// RSS, in KB on Linux) if every child exited cleanly, otherwise the first
+/// error encountered -- after every child has still been reaped.
+fn reap_children(children: Vec<std::process::Child>) -> Result<i64> {
+    let mut total_max_rss_kb: i64 = 0;
+    let mut first_err: Option<anyhow::Error> = None;
+    for child in children {
+        let pid = child.id().cast_signed();
+        let mut wait_status: libc::c_int = 0;
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: `pid` names a child spawned by this process that has not yet
+        // been waited on; `wait4` blocks until exactly that pid exits and fills
+        // `wait_status`/`usage` for it. We deliberately bypass `Child::wait` to
+        // get the `rusage` (peak RSS) `wait4` reports on exit, which
+        // `std::process` has no way to surface.
+        let ret = unsafe { libc::wait4(pid, &raw mut wait_status, 0, &raw mut usage) };
+        if ret < 0 {
+            first_err.get_or_insert_with(|| {
+                anyhow!(
+                    "wait4 failed for concurrent session pid {pid}: {}",
+                    std::io::Error::last_os_error()
+                )
+            });
+            continue;
+        }
+        if !libc::WIFEXITED(wait_status) || libc::WEXITSTATUS(wait_status) != 0 {
+            first_err.get_or_insert_with(|| {
+                anyhow!("concurrent session pid {pid} did not exit cleanly (wait status {wait_status})")
+            });
+            continue;
+        }
+        total_max_rss_kb += usage.ru_maxrss;
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(total_max_rss_kb),
+    }
+}
+
+/// Spawns [`CONCURRENT_SESSION_COUNT`] `litebox_runner_linux_userland` sessions
+/// at once (each an independent host process running the same rewritten
+/// `hello_static` binary) and waits for all of them, reporting both the total
+/// wall time (via the usual benchmark timing) and each session's peak RSS (via
+/// `wait4`'s `rusage`, logged separately since this harness's CSV only tracks
+/// duration). No prior benchmark here exercises many-sessions-at-once behavior;
+/// a change that makes per-session host allocation smaller or more shareable
+/// should show up as a lower `total_max_rss_kb`.
+fn run_rewritten_hello_static_concurrent(ctx: BenchCtx<'_>) -> Result<()> {
+    let BenchCtx {
+        sh,
+        cli_args: _,
+        project_root,
+        is_init,
+        lock_tracing,
+    } = ctx;
+    if is_init {
+        rewriter_hello_static(ctx.with_init(true))?;
+        rewriter_hello_static(ctx.with_init(false))?;
+        let features: &[&str] = if lock_tracing {
+            &["--features", "lock_tracing"]
+        } else {
+            &[]
+        };
+        cmd!(
+            sh,
+            "cargo build -p litebox_runner_linux_userland --release {features...}"
+        )
+        .run()?;
+    } else {
+        let runner = project_root.join("target/release/litebox_runner_linux_userland");
+        // `sh.change_dir` (used by `run_benchmark` to enter `BENCH_DIR_BASE`, where
+        // `hello_static_rewritten` lives) only tracks xshell's own virtual cwd --
+        // it never calls `std::env::set_current_dir` -- so a raw `Command` must be
+        // pointed at it explicitly or the child inherits this process's real cwd
+        // and fails to find the relative binary path.
+        let bench_cwd = sh.current_dir();
+        let mut children = Vec::with_capacity(CONCURRENT_SESSION_COUNT);
+        for spawn_result in std::iter::repeat_with(|| {
+            std::process::Command::new(&runner)
+                .arg("--unstable")
+                .arg("hello_static_rewritten")
+                .current_dir(&bench_cwd)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+        })
+        .take(CONCURRENT_SESSION_COUNT)
+        {
+            match spawn_result {
+                Ok(child) => children.push(child),
+                Err(e) => {
+                    let spawn_err = anyhow!("Could not spawn concurrent session: {e}");
+                    return Err(reap_children(children).err().unwrap_or(spawn_err));
+                }
+            }
+        }
+
+        let total_max_rss_kb = reap_children(children)?;
+        info!(
+            sessions = CONCURRENT_SESSION_COUNT,
+            total_max_rss_kb,
+            avg_max_rss_kb = total_max_rss_kb / i64::try_from(CONCURRENT_SESSION_COUNT).unwrap(),
+            "Concurrent session peak RSS"
+        );
     }
     Ok(())
 }

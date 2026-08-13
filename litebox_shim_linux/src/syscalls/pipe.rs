@@ -19,7 +19,11 @@ use litebox_common_linux::{FileDescriptorFlags, InodeType, errno::Errno};
 
 use crate::{GlobalState, ShimFS, ShimPlatform};
 
-const DEFAULT_PIPE_BUF_SIZE: usize = 1024 * 1024;
+/// Matches real Linux's default pipe capacity before any `fcntl(F_SETPIPE_SZ)`
+/// resize (16 pages on a 4KiB-page system -- see `man 7 pipe`). The previous
+/// 1 MiB default cost 16x this in physically-backed ring-buffer bytes for
+/// every pipe a guest opened, whether or not it ever needed the space.
+const DEFAULT_PIPE_BUF_SIZE: usize = 65536;
 
 /// Status flags for Linux pipe file descriptions.
 ///
