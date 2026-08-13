@@ -42,7 +42,14 @@ fn ratchet_globals() -> Result<()> {
             // 11 rather than 10 for the single `LITEBOX_DIAG_WAIT4GATE` diagnostic thread-local,
             // which is inert unless that environment variable is set. It is deliberately one
             // thread-local holding a small struct rather than one per recorded field.
-            ("litebox_platform_windows_userland/", 11),
+            // 12 rather than 11 for `VIRTUAL_PROTECT_LOCK`, a process-wide lock serializing every
+            // `VirtualProtect` call this crate issues (`WindowsUserland::update_permissions` and
+            // `fork_verify::write_usize_fault_tolerant`) so an ordinary guest `mprotect()` on one
+            // thread can never race `fork_verify`'s own temporary protection-flip-and-restore on
+            // an overlapping page from another thread -- see its doc comment for the crash
+            // signature (`STATUS_ACCESS_VIOLATION` at a small-offset near-null address on a
+            // completely unrelated thread) this closes.
+            ("litebox_platform_windows_userland/", 12),
             ("litebox_runner_lvbs/", 5),
             ("litebox_runner_snp/", 2),
             ("litebox_shim_linux/", 1),
