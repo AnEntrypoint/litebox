@@ -49,7 +49,12 @@ fn ratchet_globals() -> Result<()> {
             // an overlapping page from another thread -- see its doc comment for the crash
             // signature (`STATUS_ACCESS_VIOLATION` at a small-offset near-null address on a
             // completely unrelated thread) this closes.
-            ("litebox_platform_windows_userland/", 12),
+            // 14 rather than 12 for `DIAG_ALLOC_COUNT`/`DIAG_ALLOC_ENABLED_CACHE`, the temporary,
+            // allocation-free `LITEBOX_DIAG_ALLOC=1` diagnostic instrumenting every host-allocator
+            // call to locate the long-standing deterministic leaked-pointer offset (0x1013480)
+            // seen at the apk/jq smoke-test crash site. Remove both statics (and this bump) once
+            // that investigation is root-caused and the diagnostic is deleted.
+            ("litebox_platform_windows_userland/", 14),
             ("litebox_runner_lvbs/", 5),
             ("litebox_runner_snp/", 2),
             ("litebox_shim_linux/", 1),

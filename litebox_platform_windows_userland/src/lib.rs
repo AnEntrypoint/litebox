@@ -224,7 +224,18 @@ unsafe extern "system" fn vectored_exception_handler(
             // never when the fault is going to reach `EXCEPTION_CONTINUE_SEARCH`/deliver a real
             // SIGSEGV to the guest.
             || (exception_record.ExceptionCode == 0xC000_0005_u32.cast_signed()
-                && exception_record.ExceptionInformation[1] < 0x1_0000
+                && (exception_record.ExceptionInformation[1] < 0x1_0000
+                    // Pass-42: ALSO dump on the GP-fault-shaped variant of this same crash (see
+                    // `exception_handler`'s own `read_write_flag == 0 && faulting_address == !0`
+                    // reclassification a few hundred lines below): a local repro of the apk/jq
+                    // crash was observed to fault with `ExceptionInformation[1] ==
+                    // 0xffff_ffff_ffff_ffff` at the SAME `rip` this investigation's CI captures
+                    // have repeatedly shown for the `addr=0x18` shape, rather than a small
+                    // near-null offset -- evidently which exact shape appears depends on what
+                    // happens to be mapped at the leaked pointer's `+0x80`/dtv-slot offset on a
+                    // given run, not a different bug. Remove alongside the rest of this gate once
+                    // root-caused.
+                    || exception_record.ExceptionInformation[1] == usize::MAX)
                 && !(unsafe { litebox_common_linux::rdfsbase() } == 0
                     && context.Rip != 0
                     && WindowsUserland::get_thread_fs_base() != 0)))
@@ -752,10 +763,6 @@ impl WindowsUserland {
     ///
     /// Panics if the TLS slot cannot be created.
     pub fn new() -> &'static Self {
-        // Must run before anything else in this function: see `DIAG_ALLOC_ENABLED_CACHE`'s doc
-        // comment for why this cannot instead be a lazily-initialized-on-first-`alloc`-call cache.
-        init_diag_alloc_enabled();
-
         let mut sys_info = Win32_SysInfo::SYSTEM_INFO::default();
         Self::get_system_information(&mut sys_info);
 
@@ -3642,32 +3649,45 @@ static SLAB_ALLOC: litebox::mm::allocator::SafeZoneAllocator<'static, 34, Window
 /// root-caused and fixed.
 static DIAG_ALLOC_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-/// Tri-state cache for [`diag_alloc_enabled`]: 0 = not yet initialized, 1 = enabled, 2 = disabled.
-/// Deliberately NOT a `OnceLock`/lazily-initialized-on-first-call cache: this function runs on the
-/// hot path of every single host allocation, including the very first one at process startup, so
-/// initializing it lazily would call `std::env::var_os` (which allocates an `OsString`) from
-/// *inside* `WindowsUserland::alloc` itself -- a direct reentrant call into the allocator it is
-/// currently servicing, observed in practice to hang (`OnceLock`'s internal synchronization
-/// self-deadlocks when entered reentrantly on the same thread). Populated once, eagerly, from
-/// [`init_diag_alloc_enabled`], which must run from a context that is NOT inside the allocator.
+/// Tri-state cache for [`diag_alloc_enabled`]: 0 = not yet checked, 1 = enabled, 2 = disabled.
+/// Populated lazily, on the FIRST call, directly via the raw `GetEnvironmentVariableA` Win32 API
+/// rather than `std::env::var_os` -- `var_os` allocates an `OsString`, which would recurse into
+/// this very allocator when called from `WindowsUserland::alloc` itself (observed in practice to
+/// hang: reentering `OnceLock`'s internal synchronization on the same thread self-deadlocks, and a
+/// naive allocating re-check on every call is no better, just slower to hang). `GetEnvironmentVariableA`
+/// writes into a fixed-size stack buffer and touches no Rust allocator at all, so it is safe to call
+/// from inside `alloc` on the very first host allocation the process ever makes -- unlike the
+/// earlier `init`-called-from-`WindowsUserland::new` approach, this has no blind spot for
+/// allocations made before that constructor runs (e.g. `tracing_subscriber`/`clap`/the mmapped
+/// rootfs tar setup in `litebox_runner_linux_on_windows_userland::run`, all of which allocate via
+/// this same global allocator before `Platform::new()` is ever reached).
 static DIAG_ALLOC_ENABLED_CACHE: core::sync::atomic::AtomicU8 =
     core::sync::atomic::AtomicU8::new(0);
 
-/// Populates [`DIAG_ALLOC_ENABLED_CACHE`] by reading `LITEBOX_DIAG_ALLOC` exactly once. Must be
-/// called from a context that is not itself inside `WindowsUserland::alloc` (e.g. this platform's
-/// construction, before any guest code runs) -- see that static's doc comment for why. A no-op if
-/// called more than once.
-fn init_diag_alloc_enabled() {
-    let enabled = std::env::var_os("LITEBOX_DIAG_ALLOC").is_some();
-    DIAG_ALLOC_ENABLED_CACHE.store(if enabled { 1 } else { 2 }, Ordering::Relaxed);
-}
-
-/// Allocation-free: only reads the cache populated by [`init_diag_alloc_enabled`]. Safe to call
-/// from inside `WindowsUserland::alloc` itself. Before `init_diag_alloc_enabled` has run (cache
-/// still 0, e.g. very early allocations before platform construction), conservatively reports
-/// disabled rather than risking a reentrant env-var lookup.
+/// Allocation-free: reads `LITEBOX_DIAG_ALLOC` via the raw Win32 API on first call (caching the
+/// result), or just the cache thereafter. Safe to call from inside `WindowsUserland::alloc` itself,
+/// including the very first allocation the process ever makes.
 fn diag_alloc_enabled() -> bool {
-    DIAG_ALLOC_ENABLED_CACHE.load(Ordering::Relaxed) == 1
+    let cached = DIAG_ALLOC_ENABLED_CACHE.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached == 1;
+    }
+    let mut buf = [0u8; 4];
+    let name = b"LITEBOX_DIAG_ALLOC\0";
+    let len = unsafe {
+        windows_sys::Win32::System::Environment::GetEnvironmentVariableA(
+            name.as_ptr(),
+            buf.as_mut_ptr(),
+            4u32,
+        )
+    };
+    // `GetEnvironmentVariableA` returns 0 (with `GetLastError() ==
+    // ERROR_ENVIRONMENT_VARIABLE_NOT_FOUND`) when the variable is unset -- any successful return
+    // (the variable exists, regardless of its value) is enough to enable this diagnostic, matching
+    // every other `LITEBOX_*`-gated diagnostic in this file (`std::env::var_os(..).is_some()`).
+    let enabled = len != 0;
+    DIAG_ALLOC_ENABLED_CACHE.store(if enabled { 1 } else { 2 }, Ordering::Relaxed);
+    enabled
 }
 
 /// Format `n` as decimal into `buf`, returning the written prefix. No heap allocation.
