@@ -1093,8 +1093,32 @@ fn fixup_stale_stack_pointers<Platform: ShimPlatform>(
                 // already limited to) cannot be ordinary non-pointer shell data, because shell
                 // stack-arena bookkeeping never stores an absolute pointer into the interpreter's
                 // OWN call stack -- only a genuinely saved stack pointer does.
+                //
+                // A HEAP pointer spilled to the stack by musl's own `_Fork`/`fork` unwind is the
+                // third narrow, precise class this pass heals (pass 87, `queue()`'s double-null
+                // assert in mallocng's `nontrivial_free`: `ctx.active[sc]`, a `struct meta*`,
+                // register-spilled into this exact bounded window and left untranslated,
+                // compared against a correctly-translated pointer, spuriously failing to compare
+                // equal and re-queuing an already-queued node). This is NOT the sweep-narrowing
+                // heuristic three prior attempts reverted (see
+                // `AddressRelocations::private_data_ranges_excluding_anonymous_mmap`'s doc
+                // comment): that class scanned the HEAP itself -- megabytes of dense,
+                // allocator-owned bitmasks/indices/small integers where `translate`'s exact
+                // range-membership match can still coincidentally fire on ordinary payload data
+                // that numerically falls in some *other* tracked range's wide span. This check
+                // scans only the SAME already-bounded `STACK_SCAN_MARGIN` window (a handful of
+                // libc unwind frames, not live payload/arena data -- see this function's
+                // top-level doc comment for why that window is safe to scan at all), and requires
+                // the translated value to land specifically in `is_in_destination_heap_range`
+                // (musl's mallocng slab/meta objects), not merely somewhere in the wide private
+                // data range. A libc unwind frame's spilled scratch slots hold pointers a
+                // fork()-in-progress call chain is actively using (allocator bookkeeping among
+                // them) or nothing at all; ordinary integers this shallow in the unwind have no
+                // reason to coincide with a live heap object's address any more than a return
+                // address coincides with code by chance.
                 && (relocations.is_in_destination_executable_range(translated)
-                    || (dest_base..dest_top).contains(&translated))
+                    || (dest_base..dest_top).contains(&translated)
+                    || relocations.is_in_destination_heap_range(translated))
             {
                 let _ = slot.write_at_offset::<Platform>(0, translated);
             }
