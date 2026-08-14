@@ -59,6 +59,15 @@ pub struct AddressRelocations {
     /// Parallel to `ranges`: whether the corresponding range is a *private writable data region*
     /// of the guest -- see [`Self::private_data_ranges`], which this exists to back.
     private_data: Vec<bool>,
+    /// Parallel to `ranges`: whether the corresponding range was file-backed (`mmap`ped from a
+    /// real file, e.g. an ELF's `PT_LOAD` segment reached via `MAP_PRIVATE`) in the SOURCE address
+    /// space at the moment of duplication, as opposed to anonymous. Used together with
+    /// `private_data` by [`Self::is_in_destination_heap_range`] to identify "heap-like" memory:
+    /// anonymous, private, writable, non-executable, non-stack data the guest's allocator (not the
+    /// loader) owns -- see that method's doc comment for why file-backed private data (an ELF's
+    /// `.data`/`.got`/`.bss`) must stay excluded from this classification even though it also
+    /// satisfies every other `is_private_data_range` condition.
+    is_file_backed: Vec<bool>,
     /// The source (parent) process's program break at the moment of duplication, i.e. the current
     /// upper bound of its heap (`brk`-allocated) region -- `0` if `set_initial_brk` was never
     /// called (no heap exists yet). By construction (`PageManager::brk`'s `create_pages` call),
@@ -170,24 +179,55 @@ impl AddressRelocations {
             .cloned()
     }
 
-    /// Returns whether `addr` falls within the DESTINATION-space heap range (see
-    /// [`Self::heap_range`]), if a heap exists at all.
+    /// Returns whether `addr` falls within any DESTINATION-space "heap-like" range: the `brk`
+    /// heap (see [`Self::heap_range`]) *or* any anonymous (not file-backed), private, writable,
+    /// non-executable, non-stack range -- i.e. exactly [`Self::private_data_ranges`]'s
+    /// classification minus file-backed regions (an ELF's `.data`/`.got`/`.bss`, reached via
+    /// `MAP_PRIVATE` over a file, which must stay eligible for healing below).
     ///
-    /// Used by consumers that must exclude the heap from a broad DESTINATION-space memory scan or
-    /// heal, for the same reason [`Self::private_data_ranges`] excludes it from the proactive
-    /// fork-time fixup pass: the heap is dominated by live, allocator-managed payload data (argv
-    /// copies, strings, arbitrary buffers) that a scan cannot distinguish from a genuine stale
-    /// pointer by inspecting a single 8-byte word's bit pattern alone. Confirmed live: litebox's
-    /// post-`fork()` single-step verifier (`fork_verify`, in `litebox_platform_windows_userland`)
-    /// was found healing a DESTINATION-range heap slot holding a live argv string's tail bytes
-    /// during ash's `fork()`-then-`execve()` window, corrupting the string's NUL terminator --
-    /// the same false-positive hazard as the (already heap-excluded) `.data`/`.bss` fixup pass,
-    /// just reached through the verifier's indirect-call/jmp-target healing instead.
+    /// Used by consumers that must exclude heap-like memory from a broad DESTINATION-space memory
+    /// scan or heal, for the same reason [`Self::private_data_ranges`] excludes the `brk` heap
+    /// from the proactive fork-time fixup pass: it is dominated by live, allocator-managed payload
+    /// data (argv copies, strings, arbitrary buffers, allocator metadata) that a scan cannot
+    /// distinguish from a genuine stale pointer by inspecting a single 8-byte word's bit pattern
+    /// alone. Confirmed live: litebox's post-`fork()` single-step verifier (`fork_verify`, in
+    /// `litebox_platform_windows_userland`) was found healing a DESTINATION-range heap slot
+    /// holding a live argv string's tail bytes during ash's `fork()`-then-`execve()` window,
+    /// corrupting the string's NUL terminator -- the same false-positive hazard as the (already
+    /// heap-excluded) `.data`/`.bss` fixup pass, just reached through the verifier's indirect-
+    /// call/jmp-target healing instead.
+    ///
+    /// The anonymous-range half of this predicate closes a second, later-discovered instance of
+    /// the identical hazard: `heap_range` alone only identifies the single VMA `PageManager::brk`
+    /// grows, which is `None` (or excludes everything) for a process whose allocator never calls
+    /// `brk` at all -- musl's mallocng, the allocator every repro in this investigation actually
+    /// runs under, allocates its slab groups via anonymous `mmap`, not `sbrk`. For such a process
+    /// `heap_top == 0`, so the old `heap_range`-only check was a permanent no-op and every one of
+    /// mallocng's live slab-group/meta-object allocations was fully exposed to case (3)/(4)
+    /// healing -- confirmed live via `python3 -c "import pty; pty.spawn(['/bin/echo','x'])"`
+    /// (`os.fork()` under mallocng): a case (3) heal fired on a `call [mem]` target slot
+    /// milliseconds before the child crashed in mallocng's own `get_meta` back-link integrity
+    /// check (`cmp [rax+0x10],rcx; je +1; hlt`, `rax` holding `0x65`, a small integer -- not a
+    /// pointer in either address space -- consistent with a heap-metadata slot having been
+    /// overwritten by an unrelated healing write rather than a genuine stale pointer ever having
+    /// been there).
     #[must_use]
     pub fn is_in_destination_heap_range(&self, addr: usize) -> bool {
-        self.heap_range().is_some_and(|(source_range, dest_base)| {
+        if self.heap_range().is_some_and(|(source_range, dest_base)| {
             (dest_base..dest_base + source_range.len()).contains(&addr)
-        })
+        }) {
+            return true;
+        }
+        self.ranges
+            .iter()
+            .zip(self.private_data.iter().zip(&self.is_file_backed))
+            .any(
+                |((source_range, dest_base), (is_private_data, is_file_backed))| {
+                    *is_private_data
+                        && !*is_file_backed
+                        && (*dest_base..dest_base + source_range.len()).contains(&addr)
+                },
+            )
     }
 
     /// Returns the `(source range, destination base)` pairs of every tracked range classified as
@@ -207,6 +247,71 @@ impl AddressRelocations {
             .iter()
             .zip(&self.private_data)
             .filter(|(_, is_private)| **is_private)
+            .map(|((source_range, dest_base), _)| (source_range.clone(), *dest_base))
+    }
+
+    /// Returns the `(source range, destination base)` pairs [`Self::private_data_ranges`] would,
+    /// *excluding* any anonymous (non-file-backed) range other than the `brk` heap itself.
+    ///
+    /// **Not currently used by `fixup_stale_elf_data_pointers`** (tried and reverted -- see below).
+    /// Kept, tested, and documented for a future attempt, since the underlying diagnosis (why
+    /// `private_data_ranges` scanning mallocng's own anonymous-mmap arenas is unsound) is real and
+    /// re-deriving it would waste a future investigation pass's time.
+    ///
+    /// [`Self::private_data_ranges`] deliberately includes the `brk` heap alongside a loaded ELF's
+    /// `.data`/`.got`/`.bss` -- see that method's doc comment and `fixup_stale_elf_data_pointers`'s
+    /// (in `litebox_shim_linux`) for why: excluding the heap there reopened a real crash where
+    /// busybox `ash`'s `brk`-resident file-stack sentinel needed the same proactive translation an
+    /// ELF's `.data` segment gets. But `private_data_ranges` also, necessarily, includes every
+    /// *other* anonymous private-writable mapping -- in particular every one of an mmap-based
+    /// allocator's own slab/arena groups (musl's mallocng allocates this way exclusively; it never
+    /// calls `brk` at all). Those are not ELF globals or a `brk`-grown heap: they are dense,
+    /// allocator-owned metadata -- bitmasks, size classes, indices -- packed with small integers
+    /// that can coincidentally fall inside some *other* tracked range's numeric span (ranges can
+    /// be megabytes wide), which `translate`'s range-membership check (not a value-identity check,
+    /// despite `private_data_ranges`' doc comment describing it as "precise") then "translates" and
+    /// overwrites in place, corrupting live allocator bookkeeping.
+    ///
+    /// Confirmed live: `python3 -c "import pty; pty.spawn(['/bin/echo','x'])"` (`os.fork()` under
+    /// mallocng, which never calls `brk`) crashed deterministically in mallocng's own `get_meta`
+    /// back-link integrity check (`cmp [rax+0x10],rcx; je +1; hlt`) moments after `fork()`, with
+    /// the checked slot holding a small integer (`0x65`) rather than a pointer in either address
+    /// space -- consistent with exactly this class of miscategorized overwrite, not a genuine
+    /// stale pointer.
+    ///
+    /// # Why wiring this into `fixup_stale_elf_data_pointers` was reverted
+    ///
+    /// Narrowing that pass to use this method DOES eliminate the crash above, but trades it for a
+    /// worse failure: a genuine infinite livelock in `fork_verify`'s reactive single-step healer,
+    /// observed live on the identical repro -- two instructions (a `Cmp` and a `Movzx`) alternate
+    /// forever, `fork_verify`'s case (2b)/(2c) each retrying and (for 2c) attempting to heal the
+    /// memory slot the stale register was loaded from, but never converging. The proactive sweep
+    /// this method would narrow was, it turns out, ALSO incidentally pre-healing a heap-resident
+    /// slot that case (2b)/(2c)'s narrower, single-slot-at-a-time healing cannot reach on its own
+    /// (most likely a base pointer reached through more than one level of indirection, or advanced
+    /// by pointer arithmetic rather than a single fixed load) -- removing that incidental coverage
+    /// exposes a second, previously-latent gap in the reactive healer that a future pass should
+    /// close (e.g. extending case (2b)/(2c) to trace back further than one memory load, or a
+    /// different proactive strategy that is narrower than a full range sweep but still covers
+    /// whatever this loop's base pointer needs) BEFORE re-attempting this narrowing.
+    pub fn private_data_ranges_excluding_anonymous_mmap(
+        &self,
+    ) -> impl Iterator<Item = (Range<usize>, usize)> + '_ {
+        let heap_range = self.heap_range();
+        self.ranges
+            .iter()
+            .zip(self.private_data.iter().zip(&self.is_file_backed))
+            .filter(
+                move |((source_range, dest_base), (is_private, is_file_backed))| {
+                    **is_private
+                        && (**is_file_backed
+                            || heap_range.as_ref().is_some_and(|(hr, hd)| {
+                                hr.start == source_range.start
+                                    && hr.end == source_range.end
+                                    && hd == dest_base
+                            }))
+                },
+            )
             .map(|((source_range, dest_base), _)| (source_range.clone(), *dest_base))
     }
 }
@@ -258,10 +363,12 @@ where
         let mut ranges = Vec::with_capacity(relocations.len());
         let mut executable = Vec::with_capacity(relocations.len());
         let mut private_data = Vec::with_capacity(relocations.len());
-        for (range, dest_base, is_executable, is_private_data) in relocations {
+        let mut is_file_backed = Vec::with_capacity(relocations.len());
+        for (range, dest_base, is_executable, is_private_data, was_file_backed) in relocations {
             ranges.push((range, dest_base));
             executable.push(is_executable);
             private_data.push(is_private_data);
+            is_file_backed.push(was_file_backed);
         }
         Ok((
             Self {
@@ -271,6 +378,7 @@ where
                 ranges,
                 executable,
                 private_data,
+                is_file_backed,
                 heap_top,
             },
         ))
@@ -989,6 +1097,7 @@ mod address_relocations_tests {
             ],
             executable: alloc::vec![false, false, false],
             private_data: alloc::vec![false, true, false],
+            is_file_backed: alloc::vec![false, false, false],
             heap_top: 0x1010_0000,
         };
 
@@ -1010,6 +1119,7 @@ mod address_relocations_tests {
             ranges: alloc::vec![(0x7000_0000..0x7080_0000, 0x9000_0000)],
             executable: alloc::vec![false],
             private_data: alloc::vec![false],
+            is_file_backed: alloc::vec![false],
             heap_top: 0,
         };
 
@@ -1026,6 +1136,7 @@ mod address_relocations_tests {
             ranges: alloc::vec![(0x7000_0000..0x7080_0000, 0x9000_0000)],
             executable: alloc::vec![false],
             private_data: alloc::vec![false],
+            is_file_backed: alloc::vec![false],
             heap_top: 0x1234_5678,
         };
 
@@ -1049,6 +1160,10 @@ mod address_relocations_tests {
             ],
             executable: alloc::vec![true, false, false, false],
             private_data: alloc::vec![false, true, false, true],
+            // The `.data` segment is file-backed (mmap'd from the ELF); the anon private mapping
+            // is not -- see the new `is_in_destination_heap_range` test below, which relies on
+            // exactly this distinction.
+            is_file_backed: alloc::vec![true, true, false, false],
             heap_top: 0x1000_3000,
         };
 
@@ -1059,6 +1174,75 @@ mod address_relocations_tests {
                 (0x1000_1000..0x1000_2000, 0x2000_1000),
                 (0x1000_2000..0x1000_3000, 0x2000_2000),
             ]
+        );
+    }
+
+    /// Regression coverage for the mallocng/`os.fork()` `hlt` crash this investigation
+    /// root-caused: a process whose allocator never calls `brk` at all (musl's mallocng, which
+    /// allocates its slab groups via anonymous `mmap`) has `heap_top == 0`, so `heap_range()`
+    /// alone can never identify any range as heap-like -- `is_in_destination_heap_range` must
+    /// still recognize an anonymous, private, writable, non-executable range as heap-like via the
+    /// `private_data`/`is_file_backed` classification, while continuing to treat a file-backed
+    /// private range (an ELF's `.data`/`.got`/`.bss`) as NOT heap-like, since `fork_verify`'s
+    /// case (3)/(4) healing must still be able to patch stale GOT/PLT-style pointers living there.
+    #[test]
+    fn is_in_destination_heap_range_covers_anonymous_private_data_even_without_a_brk_heap() {
+        let relocations = AddressRelocations {
+            ranges: alloc::vec![
+                (0x1000_0000..0x1000_1000, 0x2000_0000), // .data (file-backed): NOT heap-like
+                (0x3000_0000..0x3000_2000, 0x4000_0000), // mallocng slab group (anon mmap): heap-like
+                (0x7000_0000..0x7080_0000, 0x9000_0000), // stack: NOT heap-like
+            ],
+            executable: alloc::vec![false, false, false],
+            private_data: alloc::vec![true, true, false],
+            is_file_backed: alloc::vec![true, false, false],
+            heap_top: 0, // mallocng never calls brk: no brk-heap VMA exists at all.
+        };
+
+        assert!(
+            !relocations.is_in_destination_heap_range(0x2000_0500),
+            "a file-backed private range (.data/.got/.bss) must stay eligible for healing"
+        );
+        assert!(
+            relocations.is_in_destination_heap_range(0x4000_1000),
+            "an anonymous private-writable range must be treated as heap-like even with no brk heap"
+        );
+        assert!(!relocations.is_in_destination_heap_range(0x9000_0100));
+    }
+
+    /// Regression coverage for the same mallocng/`os.fork()` bug from the consuming side:
+    /// `private_data_ranges_excluding_anonymous_mmap` must still include a file-backed private
+    /// range (ELF `.data`/`.got`/`.bss`, needed for the ordinary RELR/RELATIVE-relocation fixup
+    /// case) and the `brk` heap itself (needed for the `ash` file-stack-sentinel case this pass
+    /// was originally written for), while excluding every OTHER anonymous private-writable range
+    /// -- i.e. an mmap-based allocator's own slab/arena groups, which is what `private_data_ranges`
+    /// alone (no exclusion) would still incorrectly sweep.
+    #[test]
+    fn private_data_ranges_excluding_anonymous_mmap_keeps_brk_heap_and_elf_data_only() {
+        let relocations = AddressRelocations {
+            ranges: alloc::vec![
+                (0x1000_0000..0x1000_1000, 0x2000_0000), // .data (file-backed): included
+                (0x1000_3000..0x1000_5000, 0x2000_3000), // brk heap: included
+                (0x3000_0000..0x3000_2000, 0x4000_0000), // mallocng slab group (anon, non-brk): excluded
+                (0x7000_0000..0x7080_0000, 0x9000_0000), // stack: excluded (not private_data at all)
+            ],
+            executable: alloc::vec![false, false, false, false],
+            private_data: alloc::vec![true, true, true, false],
+            is_file_backed: alloc::vec![true, false, false, false],
+            heap_top: 0x1000_5000,
+        };
+
+        let got: alloc::vec::Vec<_> = relocations
+            .private_data_ranges_excluding_anonymous_mmap()
+            .collect();
+        assert_eq!(
+            got,
+            alloc::vec![
+                (0x1000_0000..0x1000_1000, 0x2000_0000),
+                (0x1000_3000..0x1000_5000, 0x2000_3000),
+            ],
+            "must keep the file-backed ELF-data range and the brk heap range, excluding the \
+             anonymous non-brk mmap range"
         );
     }
 }

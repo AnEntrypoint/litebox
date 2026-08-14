@@ -356,16 +356,68 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
         // to `Continue` and the instruction executes exactly as it did before, unchanged.
         if let Some(read_address) = explicit_memory_operand_address(&instruction, context)
             && relocations.is_in_source(read_address)
-            && translate_memory_operand_registers(&instruction, context, relocations)
         {
-            litebox_util_log::warn!(
-                rip:? = rip, address:? = read_address, mnemonic:? = instruction.mnemonic();
-                "fork_verify: stale DATA pointer read detected, translating base/index register(s) and retrying"
-            );
-            // Do not advance rip: retry the same instruction now that its address-forming
-            // register(s) have been corrected.
-            return StepOutcome::Continue;
+            let stale_value = register_value(instruction.memory_base(), context)
+                .filter(|v| relocations.is_in_source(*v))
+                .or_else(|| {
+                    register_value(instruction.memory_index(), context)
+                        .filter(|v| relocations.is_in_source(*v))
+                });
+            if translate_memory_operand_registers(&instruction, context, relocations) {
+                litebox_util_log::warn!(
+                    rip:? = rip, address:? = read_address, mnemonic:? = instruction.mnemonic();
+                    "fork_verify: stale DATA pointer read detected, translating base/index register(s) and retrying"
+                );
+                // (2c) Heal the slot the stale register value was itself just loaded from, exactly
+                // as case (4) does for a register-indirect call/jmp target: without this, an
+                // instruction reached via a genuine guest loop (e.g. a linked-list walk) that
+                // reloads the same stale value from the same never-healed memory slot on every
+                // iteration retries this instruction forever -- the register gets fixed each time,
+                // but the SLOT it came from does not, so the next loop iteration reloads the exact
+                // same stale value and re-triggers this identical trap. This closes a real,
+                // independently confirmed gap: `AddressRelocations::
+                // private_data_ranges_excluding_anonymous_mmap`'s doc comment records a live
+                // repro (musl mallocng's own free-list/meta-object walk during `os.fork()`
+                // startup) where narrowing the proactive fork-time heap sweep (which this case
+                // does NOT depend on -- that narrowing was tried separately and reverted, see that
+                // method's doc comment) exposed a livelock this case (2c) alone did not fully
+                // close either, since that specific loop's stale base pointer is reached through
+                // more indirection than one memory load can trace -- left as a known limitation
+                // for a future pass, not claimed fixed here. Gated on the same soundness argument
+                // as case (4): the value that made this trap fire (`stale_value`) must exactly
+                // match the most recently recorded memory load, and the slot it came from must be
+                // in the DESTINATION range (never the parent's own live memory) and not
+                // heap-resident (`is_in_destination_heap_range`), the identical exclusion case
+                // (3)/(4) apply, for the identical false-positive reason.
+                if let Some(stale_value) = stale_value
+                    && let Some((load_address, loaded_value)) = tls.fork_verify_last_load.get()
+                    && loaded_value == stale_value
+                    && relocations.is_in_destination(load_address)
+                    && !relocations.is_in_destination_heap_range(load_address)
+                    && let Some(translated) = relocations.translate(stale_value)
+                {
+                    if crate::veh_trace_enabled() {
+                        eprintln!(
+                            "[fork_verify] HEAL case=2c load_address={load_address:#x} old={stale_value:#x} new={translated:#x} rip={rip:#x}",
+                        );
+                    }
+                    litebox_util_log::warn!(
+                        rip:? = rip, load_address:? = load_address, stale_value:? = stale_value,
+                        translated:? = translated, mnemonic:? = instruction.mnemonic();
+                        "fork_verify: stale DATA pointer previously loaded from memory slot, patching slot in place"
+                    );
+                    write_usize_fault_tolerant(load_address, translated);
+                }
+                // Do not advance rip: retry the same instruction now that its address-forming
+                // register(s) have been corrected.
+                return StepOutcome::Continue;
+            }
         }
+        tls.fork_verify_last_load.set(
+            explicit_memory_operand_address(&instruction, context)
+                .filter(|addr| !relocations.is_in_destination_heap_range(*addr))
+                .and_then(|addr| read_usize_fault_tolerant(addr).map(|v| (addr, v))),
+        );
         return StepOutcome::Continue;
     };
 
