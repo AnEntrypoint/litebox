@@ -3916,6 +3916,34 @@ unsafe extern "C-unwind" fn exception_handler(
     thread_ctx: &mut ThreadContext<'_>,
     exception_record: &EXCEPTION_RECORD,
 ) {
+    // Temporary (PASS 59, see FINDINGS.txt): `LITEBOX_DIAG_MALLOCNG=1`-gated dump of the mallocng
+    // `free()` self-consistency check's operands (`rax = [rdi-0x10]` = the group pointer loaded
+    // from the chunk header, `rcx = rdi-0x10` = the self-address the group's own `->self`-shaped
+    // field at `[rax+0x10]` is expected to equal) right before the `0xc0000096` (privileged
+    // instruction, i.e. `hlt`) catch-all panic below. Directly reads both the expected value
+    // (`rcx`) and the actual value found at `[rax+0x10]` at the moment of the trap, without
+    // needing a second run or a hardware watchpoint -- distinguishes "the slot holds a stale
+    // pointer" (a translatable/healable value) from "the slot holds something not pointer-shaped
+    // at all" (a wrong-length-copy/layout bug, pass 43's alternate hypothesis) directly.
+    if exception_record.ExceptionCode == 0xc0000096u32.cast_signed()
+        && std::env::var_os("LITEBOX_DIAG_MALLOCNG").is_some()
+    {
+        let ctx = &*thread_ctx.ctx;
+        let rdi = ctx.rdi;
+        let rax = ctx.rax;
+        let rcx = ctx.rcx;
+        let group_ptr =
+            unsafe { core::ptr::read_unaligned((rdi.wrapping_sub(0x10)) as *const u64) };
+        let self_slot_addr = rax.wrapping_add(0x10);
+        let self_slot_value = unsafe { core::ptr::read_unaligned(self_slot_addr as *const u64) };
+        eprintln!(
+            "[diag-mallocng] tid={:?} rdi={rdi:#x} rax={rax:#x} rcx={rcx:#x} \
+             [rdi-0x10]={group_ptr:#x} self_slot_addr(rax+0x10)={self_slot_addr:#x} \
+             self_slot_value={self_slot_value:#x} expected(rcx)={rcx:#x} match={}",
+            std::thread::current().id(),
+            self_slot_value == rcx as u64,
+        );
+    }
     let (exception, error_code, cr2) = match exception_record.ExceptionCode {
         Win32_Foundation::EXCEPTION_ACCESS_VIOLATION => {
             let info = exception_record.ExceptionInformation;

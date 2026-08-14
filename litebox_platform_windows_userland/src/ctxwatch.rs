@@ -386,14 +386,25 @@ pub(crate) fn on_possible_fixed_hit(context: &mut CONTEXT) -> bool {
     // outside the previously-captured 24-byte code window, this directly reveals it.
     let xmm_all: [M128A; 16] = unsafe { context.Anonymous.FltSave.XmmRegisters };
     let xmm0 = xmm_all[0];
-    // Temporary (PASS 48): also dump musl's `__copy_tls`-adjacent globals (`libc.tls_size`-shaped
-    // and `builtin_tls`-shaped storage at module-relative 0xa4890/0xa4898/0xa48a0, i.e.
-    // `alloc_base + those offsets` where `alloc_base` is ld-musl's own guest load base) to see
-    // whether the DTV/TLS-size bookkeeping that feeds `__init_tp`'s TCB pointer computation is
-    // itself already holding a host-range value before this write.
-    let tls_image_global = unsafe { core::ptr::read_unaligned(0xe64890usize as *const u64) };
-    let tls_size_global = unsafe { core::ptr::read_unaligned(0xe64898usize as *const u64) };
-    let tls_align_global = unsafe { core::ptr::read_unaligned(0xe648a0usize as *const u64) };
+    // REMOVED (PASS 59, see FINDINGS.txt): this used to unconditionally dump musl's
+    // `__copy_tls`-adjacent globals at three bare, hardcoded absolute addresses (`0xe64890`,
+    // `0xe64898`, `0xe648a0`) that pass 48's own comment already flagged as really needing to be
+    // `alloc_base + <module-relative offset>` (`alloc_base` = ld-musl's own guest load base,
+    // never actually computed or plumbed into this function) rather than a fixed literal --
+    // i.e. these were always a hardcoded guess from one specific pass-48 run, not a real
+    // computation. Pass 59 root-caused the years-long "arming a Dr1 watch causes the process to
+    // stall forever" blocker (passes 53/54/57/58) directly to this: on a run where `alloc_base`
+    // differs from pass 48's run, `0xe64890` lands on an unmapped host address, so the very first
+    // Dr1 hit's diagnostic dump raises `EXCEPTION_ACCESS_VIOLATION`, which the VEH handler's
+    // FS_BASE-reset repair (`lib.rs`, host-mode branch) retries in place -- but retrying re-runs
+    // this exact same bad read, which faults identically forever, an unconditional infinite
+    // repair loop with zero forward progress (confirmed via `LITEBOX_VEH_TRACE=1`: the trace
+    // shows `mov 0xe64890,%rdx` as the faulting instruction, `is_in_guest=false`, looping without
+    // ever reaching a second guest instruction). Removed rather than fixed-forward (e.g.
+    // recomputing `alloc_base` here) because no caller of this function currently has that value
+    // available, and this dump was already diagnostic-only extra context beyond the four
+    // registers/xmm/code-window captures every hit already reports -- those are unaffected and
+    // remain sufficient for the next live-watchpoint pass.
     let (rax, rbx, rcx, rdx, rsi, rbp, r12, r13) = (
         context.Rax,
         context.Rbx,
@@ -419,10 +430,6 @@ pub(crate) fn on_possible_fixed_hit(context: &mut CONTEXT) -> bool {
             x.Low, x.High
         );
     }
-    eprintln!(
-        "[ctxwatch-fixed] globals tls_image_global={tls_image_global:#x} \
-         tls_size_global={tls_size_global:#x} tls_align_global={tls_align_global:#x}"
-    );
     context.Dr6 &= !0b10;
     true
 }
