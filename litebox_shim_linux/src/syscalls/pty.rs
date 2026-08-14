@@ -242,6 +242,20 @@ impl<Platform: ShimPlatform> PtyHalf<Platform> {
     }
 }
 
+impl<Platform: ShimPlatform> PtyHalf<Platform> {
+    /// Shuts this half's channel ends down, waking any peer blocked on them. Idempotent (see
+    /// `common_functions_for_channel!`'s `shutdown`), so safe to call redundantly from both
+    /// [`crate::GlobalState::hangup_slave`] (an explicit early trigger fired at real process
+    /// death, bypassing the registry's own extra `Arc` reference -- see that function's doc
+    /// comment) and `Drop` (the eventual true last-`Arc`-reference release, which is what
+    /// ordinarily performs this and remains the only trigger for the master side and for a slave
+    /// that never had a registry template to begin with).
+    fn shutdown_channel(&self) {
+        self.read.shutdown();
+        self.write.shutdown();
+    }
+}
+
 impl<Platform: ShimPlatform> Drop for PtyHalf<Platform> {
     fn drop(&mut self) {
         // `channel::{ReadEnd,WriteEnd}` (unlike `litebox::pipes`' own end types) don't notify
@@ -253,8 +267,7 @@ impl<Platform: ShimPlatform> Drop for PtyHalf<Platform> {
         // exactly once per pty side, when its last surviving fd (the last `dup()`/`fork()`-shared
         // reference to this entry) is actually closed -- matching real Linux's "HUP fires on the
         // last close of an open file description," not on every individual fd's close.
-        self.read.shutdown();
-        self.write.shutdown();
+        self.shutdown_channel();
     }
 }
 
@@ -297,6 +310,10 @@ impl<Platform: ShimPlatform> PtyEnd<Platform> {
 
     pub(crate) fn is_master(&self) -> bool {
         matches!(self, PtyEnd::Master(_))
+    }
+
+    pub(crate) fn is_slave(&self) -> bool {
+        matches!(self, PtyEnd::Slave(_))
     }
 
     pub(crate) fn get_status(&self) -> OFlags {
@@ -450,6 +467,31 @@ impl<Platform: ShimPlatform, FS: crate::ShimFS> crate::GlobalState<Platform, FS>
     pub(crate) fn ptmx_closed(&self, id: u32) {
         if let Some(slave) = self.pty_registry.write().remove(&id) {
             drop(self.litebox.descriptor_table_mut().remove(&slave));
+        }
+    }
+
+    /// Wakes a thread blocked reading `pair`'s master, matching real Linux's behavior of
+    /// delivering a pty hangup the instant the process holding the slave's last real open
+    /// terminates -- unconditionally, whether or not that process bothered to `close()` its own
+    /// fds first.
+    ///
+    /// Called ONLY from [`crate::Task::close_all_fds_on_process_exit`] (see the call site's own
+    /// doc comment), i.e. only at genuine process death, never from an ordinary mid-life
+    /// `close()`/`sys_close`. That distinction matters: `ptmx_open`'s registry keeps one extra
+    /// `Arc` reference to the slave alive purely so `/dev/pts/<id>` can still be reopened later --
+    /// real Linux devpts allows exactly this (a detached tmux/screen session's slave has zero
+    /// current opens yet the pty and its master both stay fully alive and reopenable). An ordinary
+    /// `close()` of what happens to be the last real slave fd must NOT itself force this wakeup,
+    /// or reattachment after a deliberate detach would break -- only actual process termination
+    /// should. This directly calls the shared [`PtyHalf`]'s channel shutdown (looked up via the
+    /// registry, which is guaranteed to still hold a live reference to it), which is the same
+    /// shared instance every dup/duplicate of this pty id's slave points at.
+    pub(crate) fn hangup_slave(&self, pair: &Arc<PtyPair<Platform>>) {
+        let registry = self.pty_registry.read();
+        if let Some(slave) = registry.get(&pair.id)
+            && let Some(h) = self.litebox.descriptor_table().entry_handle(slave)
+        {
+            h.with_entry(|end: &PtyEnd<Platform>| end.half().shutdown_channel());
         }
     }
 }
