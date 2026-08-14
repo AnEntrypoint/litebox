@@ -3986,11 +3986,15 @@ impl ThreadContext<'_> {
                 // exact syscall this bug's crashes have consistently followed. See `ctxwatch`
                 // for the full rationale. `vectored_exception_handler` disarms it again the next
                 // time this thread leaves guest mode.
-                // Temporary (see FINDINGS.txt PASS 48): re-arm the fixed-address `Dr1` watch
-                // every resume -- cheap (no-op unless `LITEBOX_DIAG_WATCHADDR` is set) and
-                // idempotent, and unlike the `Dr0` mechanism below this one is never cleared by
-                // `ctxwatch::disarm()`, but re-arming here guarantees it is set before the very
-                // first guest instruction runs on this thread too.
+                // Temporary (see FINDINGS.txt PASS 48, revised PASS 54): arm the fixed-address
+                // `Dr1` watch on this thread's first resume -- cheap (no-op unless
+                // `LITEBOX_DIAG_WATCHADDR` is set) and self-limiting to once per thread (see
+                // `ctxwatch::State::fixed_armed`), guaranteeing it is set before the very first
+                // guest instruction runs on this thread without re-arming (and paying a
+                // `GetThreadContext`/`SetThreadContext` round-trip) on every subsequent syscall
+                // return for that thread's whole lifetime, which pass 53 found perturbs some
+                // repros' timing badly enough to prevent them ever reaching the code being
+                // watched.
                 ctxwatch::arm_fixed_on_current_thread();
                 if ctxwatch::enabled() && self.ctx.orig_rax == 0x3d {
                     ctxwatch::arm(self.ctx);
