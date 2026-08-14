@@ -831,7 +831,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     fn force_signal_with_info(&self, signal: Signal, force_exit: bool, siginfo: Siginfo) {
-        assert!(matches!(signal, Signal::SIGKILL | Signal::SIGSEGV));
+        // `handle_exception_request` maps every architectural trap (not just page faults) through
+        // this path: SIGFPE (`#DE`), SIGTRAP (`#BP`), SIGILL (`#UD` -- notably reachable via
+        // Windows' `STATUS_PRIVILEGED_INSTRUCTION`/`hlt` mapping in
+        // `litebox_platform_windows_userland`, which is how musl mallocng's `a_crash()` abort
+        // primitive is delivered to the guest), alongside the original SIGKILL/SIGSEGV callers.
+        assert!(matches!(
+            signal,
+            Signal::SIGKILL | Signal::SIGSEGV | Signal::SIGFPE | Signal::SIGTRAP | Signal::SIGILL
+        ));
 
         self.signals
             .pending
