@@ -49,6 +49,13 @@ pub(crate) struct State {
     /// Diagnostics-only counters, safe to read from any thread after a hit.
     hit_count: AtomicUsize,
     last_hit_writer_tid: AtomicU64,
+    /// Whether [`arm_fixed_on_current_thread`] has already armed `Dr1` on this thread. `Dr1` is
+    /// never cleared by [`disarm`] (see that fixed-watch mechanism's own doc comment), so once
+    /// set on a thread it stays armed for that thread's whole lifetime -- re-arming on every
+    /// `call_shim` resume (as pass 48 originally did) is redundant after the first time and, per
+    /// pass 53/54, expensive enough to perturb some repros' timing before they ever reach the
+    /// code the watch exists to observe.
+    fixed_armed: Cell<bool>,
 }
 
 impl State {
@@ -57,6 +64,7 @@ impl State {
             armed_addr: Cell::new(0),
             hit_count: AtomicUsize::new(0),
             last_hit_writer_tid: AtomicU64::new(0),
+            fixed_armed: Cell::new(false),
         }
     }
 }
@@ -253,9 +261,32 @@ fn diag_watchaddr_target() -> usize {
 /// Arms a `Dr1` 8-byte write watchpoint on `LITEBOX_DIAG_WATCHADDR` (if set) on the calling
 /// thread. No-op if the env var is unset/unparseable. Idempotent-safe to call repeatedly (e.g.
 /// once per live thread at thread-start) -- always re-applies the same encoding.
+///
+/// PASS 54 (see `FINDINGS.txt`): this used to be called unconditionally from `call_shim`'s
+/// per-syscall `Resume` path, i.e. once per syscall return for the ENTIRE process lifetime of
+/// every thread. `Dr1` is never cleared by `ctxwatch::disarm()` (see this module's own doc
+/// comment above), so re-arming it on every single resume was pure waste beyond the very first
+/// call on each thread -- and worse, pass 53 found that for the cheap `pty.spawn` repro
+/// specifically, merely having this watch armed (via the resulting `GetThreadContext`/
+/// `SetThreadContext` pair repeated hundreds of times during python3's own interpreter startup,
+/// well before the guest ever calls `fork()`) was enough to change guest-visible timing so much
+/// the repro never reached `fork()` at all within a 40s window. Skipping the redundant re-arms
+/// removes that overhead while preserving the exact guarantee the original comment wanted: the
+/// watch is still set before the first guest instruction ever runs on this thread, because the
+/// one-shot arm below still happens on this thread's very first `Resume`.
 pub(super) fn arm_fixed_on_current_thread() {
     let addr = diag_watchaddr_target();
     if addr == 0 {
+        return;
+    }
+    if !with(false, |s| {
+        if s.fixed_armed.get() {
+            false
+        } else {
+            s.fixed_armed.set(true);
+            true
+        }
+    }) {
         return;
     }
     unsafe {
