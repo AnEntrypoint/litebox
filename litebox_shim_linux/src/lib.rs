@@ -579,7 +579,47 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let files = self.files.borrow();
         let alive_fds: Vec<usize> = files.raw_descriptor_store.read().iter_alive().collect();
         for raw_fd in alive_fds {
+            // Capture the pty pair (if any) this raw fd refers to BEFORE closing it: real Linux
+            // delivers a pty slave hangup (waking a thread blocked reading the master) the instant
+            // the last process holding an open slave fd terminates -- unconditionally, whether or
+            // not that process bothered to `close()` its fds itself first (see this function's
+            // own doc comment for the identical, already-fixed pipe-EOF case). This shim's own
+            // `ptmx_open` registry keeps one extra `Arc` reference to the slave alive purely so
+            // `pts_open`/`/dev/pts/<id>` can still work (real Linux devpts allows exactly this:
+            // reopening a pty whose slave has no current opens, e.g. a detached tmux session), so
+            // an ordinary mid-life `close()` of the last real slave fd must NOT itself force a
+            // wakeup -- only true process death should. `close_all_fds_on_process_exit`'s own
+            // precondition (only ever called once, at real process exit, per its doc comment)
+            // makes this the correct and only place to apply that "process actually died" signal,
+            // without touching `do_close`'s ordinary semantics at all (a real, previously
+            // reproduced hang: a `pty.fork()`-style child crashing before its parent ever closes
+            // the master left the registry's own template `Arc` reference as the sole remaining
+            // one, since only the master's own close ever drops it -- the master's blocking
+            // `read()` then waited forever for an EOF that could now never arrive).
+            let slave_pair = files.run_on_raw_fd(
+                raw_fd,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |fd: &litebox::fd::TypedFd<syscalls::pty::PtySubsystem<Platform>>| {
+                    self.global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .and_then(|h| {
+                            h.with_entry(|end: &syscalls::pty::PtyEnd<Platform>| {
+                                end.is_slave().then(|| end.pair().clone())
+                            })
+                        })
+                },
+            );
             let _ = self.do_close(raw_fd);
+            if let Ok(Some(pair)) = slave_pair {
+                self.global.hangup_slave(&pair);
+            }
         }
     }
 }
