@@ -133,6 +133,290 @@ pub(crate) const EFLAGS_TF: usize = 1 << 8;
 /// `rip` to decode one.
 const MAX_INSTRUCTION_LEN: usize = 15;
 
+/// The minimum alignment a genuine heap/allocator-owned pointer is guaranteed to have under musl's
+/// mallocng (this investigation's only allocator of interest -- see `AddressRelocations::
+/// private_data_ranges_excluding_anonymous_mmap`'s doc comment), and hence the alignment case (2c)
+/// requires of a loaded value before treating it as pointer-shaped enough to heal.
+///
+/// # Why this exists
+///
+/// Case (2c) heals the memory slot a stale-range-shaped register value was itself just loaded
+/// from. Unlike case (3)/(4), which are restricted to values about to be used as an indirect
+/// call/jmp target (a context that, on its own, proves the value is meant to be a pointer), case
+/// (2c) fires on any read through a register that merely holds a value falling in a tracked source
+/// range -- numeric range membership alone, with no proof the value was ever a pointer at all.
+/// Live-confirmed to bite: `private_data_ranges_excluding_anonymous_mmap`'s doc comment records a
+/// slot holding `0x100c55f8` -- 8-byte aligned but NOT 16-byte aligned, i.e. not a shape mallocng's
+/// own allocator ever hands out -- that case (2c) "healed" into an equally non-16-byte-aligned bogus
+/// destination value, which then reached `free()`'s own 16-byte alignment assertion and crashed via
+/// a different mechanism than the bug the heal was trying to fix.
+///
+/// # Why this is narrow, not a repeat of the magnitude heuristics already rejected elsewhere
+///
+/// This is not a blanket "small values aren't pointers" rule (that shape was tried and rejected
+/// earlier in this investigation for false-positive risk against legitimately small tracked
+/// ranges). It is scoped to apply only inside case (2c)'s own already-narrow, chain-traced context
+/// -- after `is_in_source` has already independently confirmed the value's numeric range membership,
+/// and after the multi-hop `LastLoad` chain has already independently confirmed exactly which slot
+/// it came from. Within that context, requiring 16-byte alignment costs nothing for a genuine
+/// pointer (every allocation this allocator hands out already satisfies it) and rejects exactly the
+/// class of tagged/packed small-integer value that produced the observed corruption.
+const MIN_POINTER_ALIGN: usize = 16;
+
+/// A bounded provenance chain: "the value currently in `register` equals the `usize` last read
+/// from `load_address`, plus a constant offset accumulated since that read via simple
+/// additive-constant pointer arithmetic on that same register".
+///
+/// This exists to close a real multi-hop gap the single-slot exact-match tracking it replaces
+/// left open: `mov reg, [slot]` followed immediately by `call reg`/`jmp reg` (or a later
+/// stale-pointer memory read through `reg`) is case (2c)/(4)'s bounded base case, but `mov reg,
+/// [slot]` followed by `add reg, 8` (a genuine, extremely common shape -- indexing into a struct
+/// through a base pointer that itself needs translating, e.g. musl mallocng's own `next`-link
+/// arithmetic) changed the register's bit pattern, so a prior exact-match-only check
+/// (`loaded_value == stale_value`) never recognized the connection: the chain broke the instant
+/// any arithmetic touched the register, the slot the base pointer came from was never healed, and
+/// the same stale base got reloaded and re-walked on every iteration of whatever loop was doing
+/// the indexing -- an infinite single-step livelock, not a crash, since case (2b) keeps
+/// "succeeding" at translating the *register* every time without ever fixing the *slot* it keeps
+/// being reloaded from. See `AddressRelocations::private_data_ranges_excluding_anonymous_mmap`'s
+/// doc comment for the concrete repro this closes.
+///
+/// # Why tracking an offset cannot reintroduce case (3)'s false-positive hazard
+///
+/// Case (3)'s doc comment describes the hazard of treating an arbitrary memory read as pointer
+/// provenance: ordinary small-integer program data can coincidentally look like a tracked-range
+/// address. This chain does not weaken that guard at all -- it only widens what counts as "the
+/// same provenance" for a value *already independently confirmed* to be a translatable
+/// source-range address at heal time (every call site below still requires
+/// `relocations.is_in_source(stale_value)`/`is_in_source(target_value)` to hold before healing).
+/// The chain merely answers "which slot, if any, is this specific already-flagged value derived
+/// from" more completely than an exact-match check could -- it can never cause a value that is
+/// NOT itself flagged as source-range to be healed, and never touches any register/slot other than
+/// the one instruction operands explicitly name.
+///
+/// # Why this cannot become its own unbounded loop
+///
+/// The chain is a single `Cell` overwritten from scratch, in O(1), from the currently decoded
+/// instruction's shape alone, on every single-step trap -- never a scan, never recursion, never
+/// growing history. `offset` accumulates only while a run of qualifying arithmetic instructions
+/// keeps naming the same tracked register with no other register involved; the very next
+/// instruction that is not one of {qualifying load, qualifying constant-offset update of the
+/// tracked register} replaces or clears the chain outright. There is no path by which tracking
+/// this can prevent forward progress -- it is pure bookkeeping consulted only at heal time.
+#[derive(Clone, Copy)]
+pub(crate) struct LastLoad {
+    /// The memory address the chain's value was originally read from.
+    load_address: usize,
+    /// The raw `usize` read from `load_address` at the moment of that read, untouched by any
+    /// subsequent arithmetic -- this is what gets translated and written back at heal time, never
+    /// the offset-adjusted current value.
+    loaded_value: usize,
+    /// Which register currently carries `loaded_value` plus `offset`. Cleared (chain dropped)
+    /// the instant any instruction writes to this register through a form other than the
+    /// qualifying constant-offset update recognized by [`Self::advance`].
+    register: Register,
+    /// The net constant offset applied to `loaded_value` via `add`/`sub`/`lea` instructions naming
+    /// only `register` and an immediate, since the original read. `stale_value` at a call site
+    /// below matches this chain when `stale_value == loaded_value.wrapping_add(offset as usize)`.
+    offset: i64,
+}
+
+impl LastLoad {
+    /// The value this chain's tracked register currently carries: the original load, advanced by
+    /// every constant-offset update applied since.
+    fn current_value(&self) -> usize {
+        // A 64-bit sign-agnostic reinterpretation: `wrapping_add` on `usize` treats its argument
+        // as a bit pattern, so casting the signed offset to `usize` first (rather than converting
+        // its value) is exact and intentional -- this is two's-complement wraparound addition, not
+        // a narrowing or a value-preserving conversion.
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let offset = self.offset as usize;
+        self.loaded_value.wrapping_add(offset)
+    }
+}
+
+/// Updates `tls.fork_verify_last_load` for the step about to execute `instruction`, extending,
+/// replacing, or dropping the chain as appropriate:
+///
+/// * If `instruction` is an explicit-memory-operand read into a single named register (a `mov
+///   reg, [mem]`-shaped load; anything wider, e.g. a two-register destination, is out of scope
+///   and drops the chain rather than guess), that read starts a *fresh* chain from that register,
+///   discarding whatever chain existed before -- matching this function's previous behaviour
+///   exactly when no arithmetic intervenes.
+/// * Else if `instruction` is a qualifying constant-offset update (`add`/`sub reg, imm` or `lea
+///   reg, [reg+imm]`, the destination and the sole source register both equal to the chain's
+///   currently tracked register, no other register or memory operand involved) of a register an
+///   existing chain is already tracking, the chain's `offset` is updated and `register` stays the
+///   same -- the chain survives, wider by one hop.
+/// * Else if `instruction` writes to the chain's tracked register through any other form (a
+///   different `mov`, `xor reg,reg`, a call clobbering it, ...), the chain is dropped: its
+///   provenance claim about that register is no longer true.
+/// * Otherwise (an instruction that touches neither the tracked register nor performs a fresh
+///   qualifying load) the existing chain, if any, is left untouched.
+///
+/// A load target/chain register that is later found heap-resident is filtered out at heal time by
+/// each case's own `is_in_destination_heap_range` check (unchanged from before this function
+/// existed), not here -- this function's only job is provenance, not the heap exclusion policy.
+fn advance_last_load(
+    tls: &TlsState,
+    instruction: &Instruction,
+    context: &CONTEXT,
+    relocations: &litebox::mm::AddressRelocations,
+) {
+    let existing = tls.fork_verify_last_load.get();
+
+    // A fresh qualifying load: an explicit memory operand read into exactly one general-purpose
+    // register destination.
+    if let Some(load_address) = explicit_memory_operand_address(instruction, context)
+        && instruction.op_count() == 2
+        && instruction.op0_kind() == OpKind::Register
+        && instruction.op1_kind() == OpKind::Memory
+        && let Some(dest_register) = qualifying_gpr(instruction.op0_register())
+        && !relocations.is_in_destination_heap_range(load_address)
+        && let Some(loaded_value) = read_usize_fault_tolerant(load_address)
+    {
+        tls.fork_verify_last_load.set(Some(LastLoad {
+            load_address,
+            loaded_value,
+            register: dest_register,
+            offset: 0,
+        }));
+        return;
+    }
+
+    // A qualifying constant-offset update of the chain's currently tracked register: `add`/`sub
+    // reg, imm` (register destination, register source identical to itself, immediate second
+    // operand) or `lea reg, [reg+imm]` (memory operand whose base is that same register, no
+    // index, displacement only).
+    if let Some(chain) = existing
+        && let Some(delta) = constant_offset_delta(instruction, chain.register)
+    {
+        tls.fork_verify_last_load.set(Some(LastLoad {
+            offset: chain.offset.wrapping_add(delta),
+            ..chain
+        }));
+        return;
+    }
+
+    // Any other write to the chain's tracked register invalidates the chain -- its provenance
+    // claim no longer holds. `iced-x86`'s `InstructionInfoFactory` is the same mechanism `case
+    // (2)`/`memory_write_address` above already trusts to enumerate written operands (registers
+    // included, not just memory), so this reuses that rather than hand-rolling a second notion of
+    // "does this instruction write this register".
+    if let Some(chain) = existing {
+        let mut info_factory = iced_x86::InstructionInfoFactory::new();
+        let info = info_factory.info(instruction);
+        let clobbered = info.used_registers().iter().any(|r| {
+            r.register().full_register() == chain.register
+                && matches!(
+                    r.access(),
+                    OpAccess::Write
+                        | OpAccess::CondWrite
+                        | OpAccess::ReadWrite
+                        | OpAccess::ReadCondWrite
+                )
+        });
+        if clobbered {
+            tls.fork_verify_last_load.set(None);
+        }
+        // Otherwise: instruction does not touch the tracked register at all -- leave the chain as
+        // it is (matches the pre-existing behaviour for `last_memory_load` when a step had no
+        // explicit memory operand of its own).
+    }
+}
+
+/// A general-purpose 64/32/16/8-bit integer register [`advance_last_load`]/[`register_value`] can
+/// read and write, normalized to its full 64-bit form -- i.e. exactly the set
+/// [`register_value`]/[`write_register_value`] already support. `None` for anything else (vector,
+/// segment, `RIP`, ...), so a load into an unsupported destination simply does not start a chain
+/// rather than risk mis-tracking one.
+fn qualifying_gpr(register: Register) -> Option<Register> {
+    register_value_register_class(register)
+}
+
+/// Shared classification `qualifying_gpr` and [`register_value`]/[`write_register_value`] agree
+/// on: the 16 integer GPRs, identified by their full 64-bit register.
+fn register_value_register_class(register: Register) -> Option<Register> {
+    let full = register.full_register();
+    matches!(
+        full,
+        Register::RAX
+            | Register::RBX
+            | Register::RCX
+            | Register::RDX
+            | Register::RSI
+            | Register::RDI
+            | Register::RBP
+            | Register::RSP
+            | Register::R8
+            | Register::R9
+            | Register::R10
+            | Register::R11
+            | Register::R12
+            | Register::R13
+            | Register::R14
+            | Register::R15
+    )
+    .then_some(full)
+}
+
+/// If `instruction` is a constant-offset update of `register` this chain can safely fold in --
+/// `add reg, imm`/`sub reg, imm` with `reg` as both destination and sole source, or `lea reg,
+/// [reg+imm]` with no index register -- returns the signed delta it applies. `None` for anything
+/// else, including any form naming a *different* register anywhere in the instruction (a second
+/// register operand means the result no longer depends solely on the tracked chain, so folding it
+/// in would be a guess, not a proof).
+fn constant_offset_delta(instruction: &Instruction, register: Register) -> Option<i64> {
+    use iced_x86::Mnemonic;
+
+    match instruction.mnemonic() {
+        Mnemonic::Add | Mnemonic::Sub => {
+            if instruction.op_count() != 2
+                || instruction.op0_kind() != OpKind::Register
+                || instruction.op0_register().full_register() != register
+            {
+                return None;
+            }
+            let imm = match instruction.op1_kind() {
+                OpKind::Immediate8 => i64::from(instruction.immediate8().cast_signed()),
+                OpKind::Immediate8to64 => instruction.immediate8to64(),
+                OpKind::Immediate32 => i64::from(instruction.immediate32().cast_signed()),
+                OpKind::Immediate32to64 => instruction.immediate32to64(),
+                OpKind::Immediate64 => {
+                    // Exact: interpreting the raw 64-bit encoding as `i64` is a lossless
+                    // reinterpretation, never a truncation.
+                    #[allow(clippy::cast_possible_wrap)]
+                    let value = instruction.immediate64() as i64;
+                    value
+                }
+                _ => return None,
+            };
+            Some(if instruction.mnemonic() == Mnemonic::Sub {
+                -imm
+            } else {
+                imm
+            })
+        }
+        Mnemonic::Lea => {
+            if instruction.op_count() != 2
+                || instruction.op0_kind() != OpKind::Register
+                || instruction.op0_register().full_register() != register
+                || instruction.op1_kind() != OpKind::Memory
+                || instruction.memory_base() != register
+                || instruction.memory_index() != Register::None
+            {
+                return None;
+            }
+            // Exact on this crate's only target (`x86_64`): a 64-bit displacement always fits
+            // `i64` as a lossless reinterpretation of the same bits.
+            #[allow(clippy::cast_possible_wrap)]
+            let displacement = instruction.memory_displacement64() as i64;
+            Some(displacement)
+        }
+        _ => None,
+    }
+}
+
 /// Whether the current thread is a `fork()` child whose execution is being verified.
 pub(crate) fn is_verifying(tls: &TlsState) -> bool {
     tls.fork_verify.borrow().is_some()
@@ -388,36 +672,46 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
                 // match the most recently recorded memory load, and the slot it came from must be
                 // in the DESTINATION range (never the parent's own live memory) and not
                 // heap-resident (`is_in_destination_heap_range`), the identical exclusion case
-                // (3)/(4) apply, for the identical false-positive reason.
+                // (3)/(4) apply, for the identical false-positive reason -- plus, unlike case (3)/
+                // (4), a `MIN_POINTER_ALIGN` check on the loaded value itself (see that constant's
+                // doc comment): case (3)/(4) are restricted to call/jmp targets, a context that on
+                // its own proves the value is meant to be a pointer, but case (2c) fires on any read
+                // through a stale-shaped base register with no equivalent proof, so an ordinary
+                // tagged/packed integer that merely coincides numerically with a tracked source
+                // range would otherwise get "healed" into an equally bogus, misaligned destination
+                // value -- observed live corrupting mallocng bookkeeping this exact way.
                 if let Some(stale_value) = stale_value
-                    && let Some((load_address, loaded_value)) = tls.fork_verify_last_load.get()
-                    && loaded_value == stale_value
-                    && relocations.is_in_destination(load_address)
-                    && !relocations.is_in_destination_heap_range(load_address)
-                    && let Some(translated) = relocations.translate(stale_value)
+                    && let Some(chain) = tls.fork_verify_last_load.get()
+                    && chain.current_value() == stale_value
+                    && relocations.is_in_destination(chain.load_address)
+                    && !relocations.is_in_destination_heap_range(chain.load_address)
+                    // Require the loaded value to be at least as aligned as a genuine allocator-
+                    // owned pointer -- see `MIN_POINTER_ALIGN`'s doc comment for why this, and only
+                    // this, closes the soundness gap pass 69 found: an ordinary tagged/packed
+                    // integer that merely coincides numerically with a tracked source range is
+                    // rejected here without weakening the range-membership check itself.
+                    && chain.loaded_value.is_multiple_of(MIN_POINTER_ALIGN)
+                    && let Some(translated) = relocations.translate(chain.loaded_value)
                 {
                     if crate::veh_trace_enabled() {
                         eprintln!(
-                            "[fork_verify] HEAL case=2c load_address={load_address:#x} old={stale_value:#x} new={translated:#x} rip={rip:#x}",
+                            "[fork_verify] HEAL case=2c load_address={:#x} offset={:#x} old={:#x} new={translated:#x} rip={rip:#x}",
+                            chain.load_address, chain.offset, chain.loaded_value,
                         );
                     }
                     litebox_util_log::warn!(
-                        rip:? = rip, load_address:? = load_address, stale_value:? = stale_value,
+                        rip:? = rip, load_address:? = chain.load_address, stale_value:? = chain.loaded_value,
                         translated:? = translated, mnemonic:? = instruction.mnemonic();
-                        "fork_verify: stale DATA pointer previously loaded from memory slot, patching slot in place"
+                        "fork_verify: stale DATA pointer previously loaded from memory slot (through zero or more constant-offset hops), patching slot in place"
                     );
-                    write_usize_fault_tolerant(load_address, translated);
+                    write_usize_fault_tolerant(chain.load_address, translated);
                 }
                 // Do not advance rip: retry the same instruction now that its address-forming
                 // register(s) have been corrected.
                 return StepOutcome::Continue;
             }
         }
-        tls.fork_verify_last_load.set(
-            explicit_memory_operand_address(&instruction, context)
-                .filter(|addr| !relocations.is_in_destination_heap_range(*addr))
-                .and_then(|addr| read_usize_fault_tolerant(addr).map(|v| (addr, v))),
-        );
+        advance_last_load(tls, &instruction, context, relocations);
         return StepOutcome::Continue;
     };
 
@@ -573,25 +867,28 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
         && explicit_memory_operand_address(&instruction, context).is_none()
         && instruction.op0_kind() == OpKind::Register
         && let Some(target_value) = register_value(instruction.op0_register(), context)
-        && let Some((load_address, loaded_value)) = tls.fork_verify_last_load.get()
-        && loaded_value == target_value
+        && let Some(chain) = tls.fork_verify_last_load.get()
+        && chain.current_value() == target_value
         && relocations.is_in_source(target_value)
-        && relocations.is_in_destination(load_address)
-        && !relocations.is_in_destination_heap_range(load_address)
-        && let Some(translated) = relocations.translate(target_value)
+        && relocations.is_in_destination(chain.load_address)
+        && !relocations.is_in_destination_heap_range(chain.load_address)
+        && let Some(translated) = relocations.translate(chain.loaded_value)
     {
         if crate::veh_trace_enabled() {
             eprintln!(
-                "[fork_verify] HEAL case=4 load_address={load_address:#x} in_exec_range={} old={target_value:#x} new={translated:#x} rip={rip:#x}",
-                relocations.is_in_destination_executable_range(load_address),
+                "[fork_verify] HEAL case=4 load_address={:#x} offset={:#x} in_exec_range={} old={:#x} new={translated:#x} rip={rip:#x}",
+                chain.load_address,
+                chain.offset,
+                relocations.is_in_destination_executable_range(chain.load_address),
+                chain.loaded_value,
             );
         }
         litebox_util_log::warn!(
-            rip:? = rip, load_address:? = load_address, stale_value:? = target_value,
+            rip:? = rip, load_address:? = chain.load_address, stale_value:? = chain.loaded_value,
             translated:? = translated, mnemonic:? = instruction.mnemonic();
-            "fork_verify: stale CODE pointer previously loaded from memory slot into register, patching slot in place"
+            "fork_verify: stale CODE pointer previously loaded from memory slot (through zero or more constant-offset hops) into register, patching slot in place"
         );
-        write_usize_fault_tolerant(load_address, translated);
+        write_usize_fault_tolerant(chain.load_address, translated);
     }
 
     // Record this step's memory read (if any) for case (4) on the *next* step, regardless of
@@ -604,11 +901,7 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
     // genuine stale code pointer, so tracking it here serves no purpose case (4)'s exclusion check
     // doesn't already cover, and not recording it keeps this the single source of truth for "was
     // this ever a candidate slot" rather than splitting that decision across two places.
-    tls.fork_verify_last_load.set(
-        explicit_memory_operand_address(&instruction, context)
-            .filter(|addr| !relocations.is_in_destination_heap_range(*addr))
-            .and_then(|addr| read_usize_fault_tolerant(addr).map(|v| (addr, v))),
-    );
+    advance_last_load(tls, &instruction, context, relocations);
 
     StepOutcome::Continue
 }
