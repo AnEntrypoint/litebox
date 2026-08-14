@@ -383,9 +383,9 @@ impl<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> VmArea<Platfor
 ///   the heap), so excluding it here closes the argv-corruption bug with no known regression.
 ///
 /// See [`super::AddressRelocations::private_data_ranges`].
-/// `(source range, destination base address, was executable in source, is a private data region)`
-/// for one relocated range -- see [`Vmem::duplicate`].
-type DuplicatedRangeInfo = (Range<usize>, usize, bool, bool);
+/// `(source range, destination base address, was executable in source, is a private data region,
+/// was file-backed in source)` for one relocated range -- see [`Vmem::duplicate`].
+type DuplicatedRangeInfo = (Range<usize>, usize, bool, bool, bool);
 
 /// Whether `range` qualifies for `fork()`-time stale-pointer translation as a loaded ELF's
 /// writable data segment or the `brk` heap.
@@ -951,6 +951,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     dest_ptr.as_usize(),
                     vma.flags.contains(VmFlags::VM_EXEC),
                     is_private_data_range(&vma),
+                    vma.is_file_backed(),
                 ));
                 continue;
             }
@@ -992,6 +993,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     dest_ptr.as_usize(),
                     vma.flags.contains(VmFlags::VM_EXEC),
                     is_private_data_range(&vma),
+                    vma.is_file_backed(),
                 ));
                 continue;
             }
@@ -1040,6 +1042,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 // READ|WRITE-forced flags used only to populate this mapping above.
                 vma.flags.contains(VmFlags::VM_EXEC),
                 is_private_data_range(&vma),
+                vma.is_file_backed(),
             ));
 
             if vma.flags.intersection(VmFlags::VM_ACCESS_FLAGS)
