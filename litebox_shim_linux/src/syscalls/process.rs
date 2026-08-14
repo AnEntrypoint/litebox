@@ -95,15 +95,37 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
         })
     }
 
-    /// Detaches this thread from its process, returning `true` if this was the process's last
-    /// thread (i.e. the process has now fully exited). Returns `false` if this thread was already
-    /// detached (double-detach is possible via `ThreadState`'s own `Drop` running after
-    /// `Task::prepare_for_exit` already called this explicitly) or was never attached.
+    /// Detaches this thread from its process and immediately wakes any `wait4`/`wait_for_exit`
+    /// waiters, returning `true` if this was the process's last thread (i.e. the process has now
+    /// fully exited). Returns `false` if this thread was already detached (double-detach is
+    /// possible via `ThreadState`'s own `Drop` running after `Task::prepare_for_exit` already
+    /// called `detach_from_process_deferred` explicitly) or was never attached.
+    ///
+    /// Used only by the `Drop` safety-net path below, where no further teardown needs to happen
+    /// before waiters are allowed to observe the exit -- the normal exit path goes through
+    /// `detach_from_process_deferred` instead, see that function's doc comment.
     fn detach_from_process(&self) -> bool {
+        if let Some(tid) = self.attached_tid.take() {
+            let (notify, process_exited) = self.process.detach_thread(tid);
+            if notify {
+                self.process.notify_detached();
+            }
+            process_exited
+        } else {
+            false
+        }
+    }
+
+    /// Like [`Self::detach_from_process`], but defers waking `wait4`/`wait_for_exit` waiters:
+    /// returns `(notify, process_exited)` and leaves the caller responsible for calling
+    /// [`syscalls::process::Process::notify_detached`] itself once any process-exit teardown that
+    /// must be externally observable first (fd release, etc.) has completed. See
+    /// `Process::detach_thread`'s doc comment for why this ordering matters.
+    fn detach_from_process_deferred(&self) -> (bool, bool) {
         if let Some(tid) = self.attached_tid.take() {
             self.process.detach_thread(tid)
         } else {
-            false
+            (false, false)
         }
     }
 
@@ -438,15 +460,27 @@ impl<Platform: ShimPlatform> Process<Platform> {
         Some(remote)
     }
 
-    /// Detaches a thread from this process.
+    /// Detaches a thread from this process, WITHOUT waking any `wait4`/`wait_for_exit` waiters
+    /// yet. Returns `(notify, process_exited)`: `process_exited` is `true` if this was the
+    /// process's last thread (i.e. the whole process has now exited); `notify` indicates whether
+    /// [`Self::notify_detached`] must be called once the caller is ready to publish that fact.
     ///
-    /// Returns `true` if this was the process's last thread (i.e. the whole process has now
-    /// exited) -- the caller (`Task::prepare_for_exit`) uses this to trigger reparenting of any
-    /// still-running children this process leaves behind (see that function's doc comment).
+    /// Split from the actual wake-up (`notify_detached`) so that callers who need to perform
+    /// process-exit teardown that other processes can observe -- most importantly, releasing this
+    /// process's fds (see `close_all_fds_on_process_exit`'s doc comment) -- can do so BEFORE any
+    /// `wait4()`-blocked parent is woken and allowed to proceed as though the child were fully
+    /// dead. Real Linux's `do_exit()` releases a process's files (`exit_files`) before it becomes
+    /// reapable by `wait4()`/appears as a zombie to `release_task()`, so a parent's `wait4()`
+    /// returning is always ordered-after every peer (e.g. a pipe reader on the other end of a
+    /// closed fd) observing that release. Calling `detach_thread` and waking waiters as a single
+    /// atomic step breaks that ordering: a parent's `wait4()` could return (and the shell proceed
+    /// to, e.g., read from a pipe expecting EOF, or simply believe the whole pipeline is now fully
+    /// quiescent) before this process's fds have actually been released, exposing a shim-only
+    /// observable-timing divergence from real Linux on exactly this path.
     ///
     /// # Panics
     /// Panics if the thread ID does not exist in this process.
-    fn detach_thread(&self, tid: i32) -> bool {
+    fn detach_thread(&self, tid: i32) -> (bool, bool) {
         let data;
         let (notify, process_exited) = {
             let mut inner = self.inner.lock();
@@ -482,10 +516,15 @@ impl<Platform: ShimPlatform> Process<Platform> {
             )
         };
         litebox_util_log::debug!(tid:% = tid, notify:% = notify, process_exited:% = process_exited; "detach_thread: notify decision");
-        if notify {
-            self.nr_threads.wake_all();
-        }
-        process_exited
+        (notify, process_exited)
+    }
+
+    /// Wakes any `wait4`/`wait_for_exit` waiters previously deferred by [`Self::detach_thread`].
+    /// Must only be called with the `notify` value that call returned, after any process-exit
+    /// teardown (fd release, etc.) that must be externally observable before waiters proceed has
+    /// completed -- see `detach_thread`'s doc comment for why the split exists.
+    fn notify_detached(&self) {
+        self.nr_threads.wake_all();
     }
 
     /// Takes and returns every remaining (not-yet-waited-for) child of this process, leaving its
@@ -1231,7 +1270,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// resolution.
     pub(crate) fn prepare_for_exit(&mut self) {
         litebox_util_log::debug!(tid:% = self.tid; "prepare_for_exit: entry (Task dropping)");
-        let process_exited = self.thread.detach_from_process();
+        // Deferred: do NOT wake `wait4`/`wait_for_exit` waiters yet. See
+        // `Process::detach_thread`'s doc comment -- a parent's `wait4()` must never be allowed to
+        // return before this process's fds are released below, mirroring real Linux's `do_exit()`
+        // ordering (`exit_files` before the task becomes reapable). Waking early was a genuine,
+        // shim-only observable-timing divergence from real Linux on this exact path: a pipeline
+        // parent's `wait4()` could return while a just-exited child's pipe fd was still open from
+        // a peer's point of view.
+        let (notify, process_exited) = self.thread.detach_from_process_deferred();
         litebox_util_log::debug!(tid:% = self.tid, process_exited:% = process_exited; "prepare_for_exit: detach_from_process done");
         if process_exited {
             // Real Linux implicitly closes every fd a process holds when its last thread exits,
@@ -1241,8 +1287,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // `close_all_fds_on_process_exit`'s doc comment for the real, reproduced hang this
             // fixes (a pipe reader blocking forever because a writer's fd was never released on
             // the writer's ordinary process exit). Must happen before reparenting orphans below,
-            // though the ordering is not itself load-bearing -- fd closure and child reparenting
-            // are independent cleanup steps.
+            // though the ordering relative to reparenting is not itself load-bearing -- fd
+            // closure and child reparenting are independent cleanup steps. It MUST, however,
+            // happen before `notify_detached` below -- see this function's comment above.
             self.close_all_fds_on_process_exit();
             let orphans = self.process().take_children();
             if !orphans.is_empty() {
@@ -1256,6 +1303,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     target.adopt_children(orphans);
                 }
             }
+        }
+        if notify {
+            self.process().notify_detached();
         }
 
         if let Some(clear_child_tid) = self.thread.clear_child_tid.take() {
