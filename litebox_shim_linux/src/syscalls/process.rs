@@ -118,7 +118,7 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
 
     /// Like [`Self::detach_from_process`], but defers waking `wait4`/`wait_for_exit` waiters:
     /// returns `(notify, process_exited)` and leaves the caller responsible for calling
-    /// [`syscalls::process::Process::notify_detached`] itself once any process-exit teardown that
+    /// [`Process::notify_detached`] itself once any process-exit teardown that
     /// must be externally observable first (fd release, etc.) has completed. See
     /// `Process::detach_thread`'s doc comment for why this ordering matters.
     fn detach_from_process_deferred(&self) -> (bool, bool) {
