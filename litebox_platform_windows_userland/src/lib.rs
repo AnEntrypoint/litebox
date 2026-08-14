@@ -3966,6 +3966,17 @@ unsafe extern "C-unwind" fn exception_handler(
         Win32_Foundation::EXCEPTION_ILLEGAL_INSTRUCTION => (Exception::INVALID_OPCODE, 0, 0),
         Win32_Foundation::EXCEPTION_BREAKPOINT => (Exception::BREAKPOINT, 0, 0),
         Win32_Foundation::EXCEPTION_INT_DIVIDE_BY_ZERO => (Exception::DIVIDE_ERROR, 0, 0),
+        // `STATUS_PRIVILEGED_INSTRUCTION` (0xc0000096): Windows' name for trapping an `hlt`
+        // executed at CPL3. On real x86_64/Linux, an unprivileged `hlt` raises vector 6 (`#UD`,
+        // Invalid Opcode) -- the exact trap musl's `a_crash()` (mallocng's heap-integrity-assert
+        // abort primitive, `src/malloc/mallocng/*.c`) deliberately executes on a failed
+        // assertion. Before this arm existed, this code reached the catch-all `panic!` below
+        // instead of being delivered to the guest as `SIGILL` like real Linux would: harmless to
+        // the host process itself (the panic unwinds and the OS thread's own outcome is usually
+        // unobserved) but printed spurious "Unhandled Win32 exception" panic noise to stderr on
+        // every mallocng-assert trap, including ones the guest's own signal handling could
+        // otherwise report/recover from normally.
+        code if code == 0xc0000096u32.cast_signed() => (Exception::INVALID_OPCODE, 0, 0),
         code => panic!("Unhandled Win32 exception code: {code:#x}"),
     };
 
