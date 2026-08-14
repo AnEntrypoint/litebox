@@ -1065,20 +1065,26 @@ struct TlsState {
     ///
     /// See [`fork_verify`] and [`litebox::platform::ForkChildVerificationProvider`].
     fork_verify: RefCell<Option<Arc<litebox::mm::AddressRelocations>>>,
-    /// The `(effective address, loaded value)` of the most recent explicit-memory-operand read
-    /// `fork_verify::on_single_step` observed, from the immediately preceding single-step trap on
-    /// this thread -- `None` if the preceding step had no explicit memory operand, or was not
-    /// itself observed under verification.
+    /// The provenance chain [`fork_verify::on_single_step`] is tracking for the most recent
+    /// explicit-memory-operand read on this thread, or `None` if no register currently carries a
+    /// value traceable back to a specific memory slot this way.
     ///
     /// Lets [`fork_verify::on_single_step`] recognize a register-indirect `call reg`/`jmp reg`
-    /// whose target was loaded from a stale memory slot one instruction earlier (`mov reg,
-    /// [slot]` then `call reg`), so that slot can be healed even though the call/jmp instruction
-    /// itself has no memory operand to read the slot address from directly. See that function's
-    /// case (4) for the full reasoning, including why this is restricted to the *immediately
-    /// preceding* step's read rather than an unbounded history (a false match against a stale,
-    /// unrelated earlier read would risk the same false-positive hazard case (3)'s doc comment
-    /// describes).
-    fork_verify_last_load: Cell<Option<(usize, usize)>>,
+    /// (or a case (2c) memory read) whose target was loaded from a stale memory slot -- possibly
+    /// several instructions earlier, and possibly after the loaded value was advanced by simple
+    /// constant-offset pointer arithmetic (`add`/`sub`/`lea` naming only the tracked register and
+    /// an immediate, e.g. `mov reg, [slot]` then `add reg, 8` then `call reg`) -- so that slot can
+    /// be healed even though the instruction that ultimately uses the stale value has no memory
+    /// operand naming the slot directly, and even though the exact bit pattern read from the slot
+    /// is no longer what is in the register by the time it is used. See
+    /// [`fork_verify::on_single_step`]'s case (2c)/(4) for the full reasoning, including why this
+    /// is restricted to a single register carrying a chain of *purely additive-constant* updates
+    /// from one specific load (never an unbounded history, never more than one register, never an
+    /// update that folds in another register's value) -- a false match against a stale, unrelated
+    /// earlier read, or against ordinary pointer-to-pointer-style double indirection that does not
+    /// actually chain back to the same slot, would risk the same false-positive hazard case (3)'s
+    /// doc comment describes.
+    fork_verify_last_load: Cell<Option<fork_verify::LastLoad>>,
     /// Backing state for the diagnostic code-page watchpoint (`LITEBOX_CODEWATCH=1`); see
     /// [`fork_verify`]'s `codewatch` module. A field here rather than a bare `static`, matching
     /// `WindowsUserland::console_stdin_reader`'s reasoning -- it keeps this diagnostic off the

@@ -253,10 +253,40 @@ impl AddressRelocations {
     /// Returns the `(source range, destination base)` pairs [`Self::private_data_ranges`] would,
     /// *excluding* any anonymous (non-file-backed) range other than the `brk` heap itself.
     ///
-    /// **Not currently used by `fixup_stale_elf_data_pointers`** (tried and reverted -- see below).
-    /// Kept, tested, and documented for a future attempt, since the underlying diagnosis (why
-    /// `private_data_ranges` scanning mallocng's own anonymous-mmap arenas is unsound) is real and
-    /// re-deriving it would waste a future investigation pass's time.
+    /// **Not currently used by `fixup_stale_elf_data_pointers`** (tried and reverted three times --
+    /// see below). Kept, tested, and documented for a future attempt.
+    ///
+    /// The first revert (see "Why wiring this into `fixup_stale_elf_data_pointers` was reverted"
+    /// below) traded the crash this method fixes for a livelock in `fork_verify`'s reactive
+    /// healer, caused by case (2c)/(4) being unable to recognize a stale value reached through
+    /// more than one memory load, or through a load followed by pointer arithmetic. That gap was
+    /// closed by `fork_verify::LastLoad`, which traces a chain of constant-offset arithmetic
+    /// applied to a value read from a tracked slot, not just an exact single-load match.
+    ///
+    /// Re-attempting the narrowing with that fix in place surfaced a SECOND, independent
+    /// soundness gap instead of the livelock: case (2c) was not restricted to call/jmp targets the
+    /// way case (3)/(4) are (see that case's own doc comment in `fork_verify.rs`), so on a slot
+    /// this narrower scan no longer proactively covers, it could "heal" (mistranslate) an ordinary
+    /// non-pointer, non-16-byte-aligned tagged value that merely coincides with a tracked source
+    /// range -- observed live producing a bogus, still-misaligned address subsequently passed to
+    /// `free()`, tripping its alignment assertion. That gap was closed too: case (2c) now
+    /// additionally requires the loaded value to satisfy `fork_verify::MIN_POINTER_ALIGN` (16-byte
+    /// alignment, matching every allocation mallocng's own allocator ever hands out) before
+    /// healing -- see that constant's doc comment for the full soundness argument.
+    ///
+    /// A THIRD attempt, with both of those fixes in place, traded the first crash for a genuine,
+    /// deterministic, unbounded livelock on a DIFFERENT repro than the first revert's (the pty
+    /// smoke test, `python3 -c "import pty; pty.spawn(['/bin/echo','x'])"`): `LITEBOX_VEH_TRACE=1`
+    /// showed `rip` cycling through the exact same ~120-instruction sequence forever, never
+    /// terminating even after 2+ minutes (the broad sweep lets the identical repro finish in well
+    /// under a second). Both the multi-hop chain and the alignment gate are real, sound,
+    /// independently verified improvements to case (2c) -- but neither, together or alone, closes
+    /// the deeper multi-indirection gap this narrowing exposes: some base pointer this loop
+    /// reloads is reached through more indirection (or a different traversal shape entirely) than
+    /// one memory-load chain can trace, and the broad sweep's proactive coverage of it is load-
+    /// bearing. Landing this narrowing again requires a genuinely deeper reactive trace (not just
+    /// one more hop, as the constant-offset chain added) or a different, still-narrower proactive
+    /// strategy that keeps covering whatever this loop's base pointer needs.
     ///
     /// [`Self::private_data_ranges`] deliberately includes the `brk` heap alongside a loaded ELF's
     /// `.data`/`.got`/`.bss` -- see that method's doc comment and `fixup_stale_elf_data_pointers`'s

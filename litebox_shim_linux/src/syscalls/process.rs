@@ -1148,6 +1148,30 @@ fn fixup_stale_stack_pointers<Platform: ShimPlatform>(
 /// INCLUDED, across two different builds -- meaning the heap was never actually the source of that
 /// corruption; a different, contemporaneous heuristic-scan bug was, and it is gone now. See
 /// `litebox::mm::linux::is_private_data_range`'s doc comment for the fuller before/after evidence.
+/// # Still scans `private_data_ranges`, not `private_data_ranges_excluding_anonymous_mmap`
+///
+/// See `AddressRelocations::private_data_ranges_excluding_anonymous_mmap`'s doc comment in
+/// `litebox::mm` for the full history of why narrowing this scan away from mallocng's own
+/// anonymous-mmap arenas looks appealing (it does eliminate one crash class) and why three
+/// attempts have now been reverted: the first traded that crash for a livelock in `fork_verify`'s
+/// reactive healer (closed by `fork_verify::LastLoad`'s multi-hop chain tracing); the second
+/// surfaced a DIFFERENT soundness gap in case (2c) itself (values healed with no proof they were
+/// ever pointer-shaped, closed by requiring `fork_verify::MIN_POINTER_ALIGN`-aligned loaded
+/// values); the third -- with BOTH of those fixes in place -- reproduced a genuine, deterministic,
+/// unbounded single-step livelock on the pty smoke repro (`python3 -c "import pty;
+/// pty.spawn(['/bin/echo','x'])"`), confirmed via `LITEBOX_VEH_TRACE=1`: `rip` cycles through the
+/// exact same ~120-instruction sequence indefinitely (e.g. `...0x66be40..0x66be95, 0x4c4c0a,
+/// 0x66beb6.., 0x59495c..0x5947f4, 0x594937.., 0x66be40...` repeating byte-for-byte), never
+/// terminating even after 2+ minutes, unlike the broad sweep (which lets the same repro finish in
+/// well under a second). The multi-hop chain and alignment gate are each independently real,
+/// sound, verified improvements to case (2c) -- but neither, together or alone, closes the
+/// multi-indirection gap that makes this specific proactive-sweep coverage load-bearing: the
+/// broad sweep is proactively fixing up a base pointer this loop reloads from, reached through
+/// more indirection (or a different traversal shape) than one memory-load chain can trace, and
+/// removing that proactive coverage leaves the reactive healer unable to ever converge on it.
+/// Narrowing this scan remains NOT safe to land; left for a future pass with a genuinely deeper
+/// multi-indirection reactive trace (or a different, still-narrower proactive strategy that keeps
+/// covering whatever this loop's base pointer needs).
 #[cfg(target_arch = "x86_64")]
 fn fixup_stale_elf_data_pointers<Platform: ShimPlatform>(
     relocations: &litebox::mm::AddressRelocations,
