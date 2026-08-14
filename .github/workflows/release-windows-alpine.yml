@@ -153,6 +153,7 @@ jobs:
           $py = "import pty`npty.spawn(['/bin/echo', 'pty-smoke-ok'])"
           $output = & .\litebox_runner_linux_on_windows_userland.exe --initial-files alpine-rootfs.tar /usr/bin/python3 -c $py
           if ($LASTEXITCODE -ne 0) { throw "pty smoke test exited with code $LASTEXITCODE" }
+          if ([string]::IsNullOrEmpty($output)) { throw "pty smoke test produced no output at all (process exited 0 but relayed nothing through the pty -- this masks a real failure, e.g. a crash inside the guest whose exit code the runner still reports as 0)" }
           if ($output -notmatch "pty-smoke-ok") { throw "pty smoke test did not relay expected output through the pty; got: $output" }
           Write-Host "pty subsystem smoke test passed: $output"
       - name: Run 4 concurrent instances against the same rootfs tar (multi-agent fan-out safety)
