@@ -275,6 +275,28 @@ unsafe extern "system" fn vectored_exception_handler(
             "[veh] group meta-slot rdi-0x10={meta_slot:#x} type={ms_mtype:#x} protect={ms_protect:#x} alloc_base={ms_alloc_base:#x} bytes({nmb})={:02x?}",
             &meta_bytes[..nmb],
         );
+        // Pass 132 lead (B): dump the FULL `struct group` at meta_slot (not just the 8-byte
+        // `.meta` field) to distinguish "never-constructed group" (everything zero, including
+        // bytes musl's own code would only ever leave nonzero) from "legitimately-retired group,
+        // poisoned by `free_group()`" (per pass 131 STEP 4, musl's free.c line 30 explicitly does
+        // `g->mem->meta = 0` on a genuine retirement -- ONLY that one field, nothing else in
+        // `struct group`/`struct meta`). `struct group` layout (meta.h): `meta` at +0x00 (8
+        // bytes, already dumped above as `meta_bytes`), `active_idx:5` bit-packed into the byte
+        // at +0x08, then `pad[...]`, then `storage[]` (the actual chunk payload, i.e. what `rdi`
+        // itself points at) starting at +UNIT (0x10 on this build, matching `rdi` itself). Dump
+        // 0x30 bytes starting at meta_slot: covers `.meta` (+0x00..0x08), `.active_idx`+pad
+        // (+0x08..0x10), and the first 0x20 bytes of `storage[]` (+0x10..0x30, i.e. what `rdi`
+        // points at -- the guest chunk CPython's dict-resize free() was about to operate on) so a
+        // human/future pass can see whether the surrounding bytes look like live, non-zero guest
+        // heap data (supporting "group struct specifically zeroed, chunk payload untouched" i.e.
+        // the free_group() poison theory) or whether the WHOLE region reads as zero (supporting
+        // "this entire page/range was never populated with real data at all").
+        let mut group_full = [0u8; 0x30];
+        let ngf = fork_verify::read_code_bytes_for_diagnostics(meta_slot, &mut group_full);
+        eprintln!(
+            "[veh] group full-dump meta_slot={meta_slot:#x} (+0x00 .meta, +0x08 .active_idx/pad, +0x10.. storage[]/rdi) bytes({ngf})={:02x?}",
+            &group_full[..ngf],
+        );
         // Pass 129: reverse-lookup the meta-slot's PARENT-side (pre-`fork()` `duplicate()`
         // source) address and read what is still live there -- the parent's original mapping is
         // never unmapped, so this tells us whether the PARENT's own copy of this slot was
