@@ -344,8 +344,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 /// only crate in the dependency graph that has both the shim-construction API and the
 /// `--initial-files` tar path.
 ///
-/// Only ever called from `main()`'s diagnostic-resume-child branch, AFTER
-/// `run_diagnostic_resume_child()` -- never from the normal (non-fork-diagnostic) `run()` path,
+/// Only ever called from `main()`'s diagnostic-resume-child branch, BEFORE
+/// `run_diagnostic_resume_child()` (which, for the real-resume gate combination, parks its thread
+/// and never returns) -- never from the normal (non-fork-diagnostic) `run()` path,
 /// and never in a way that feeds back into the real, unmodified thread-based `do_clone` fork
 /// path this crate's normal execution still uses exclusively.
 pub fn diag_process_fork_globalstate_probe() {
@@ -390,11 +391,113 @@ pub fn diag_process_fork_globalstate_probe() {
     // itself does not collide with anything the pass 111/112 memory-copy step already populated
     // in this address space, independent of whether its CONTENTS end up matching the parent
     // (out of scope this pass; see FINDINGS.txt PASS 136's "what pass 137 should do" section).
-    let _shim = shim_builder.build::<litebox_shim_linux::DefaultFS<Platform>>();
+    let shim = shim_builder.build::<litebox_shim_linux::DefaultFS<Platform>>();
 
     eprintln!(
         "[process_fork_diag] globalstate-probe (child): GlobalState constructed successfully, no crash/hang/error"
     );
+
+    diag_process_fork_vmem_adopt_probe(shim.litebox());
+}
+
+/// Pass 137's `Vmem`/`PageManager`-adoption probe, gated behind
+/// `LITEBOX_DIAG_PROCESS_FORK_VMEM_ADOPT=1` (layered on the pass-136 `GLOBALSTATE` gate, which is
+/// what constructs the `LiteBox` handed in here); a complete no-op otherwise.
+///
+/// The `GlobalState` pass 136 proved constructible in this child carries a `PageManager` built by
+/// the ordinary `PageManager::new` -- empty, describing nothing, and normally grown by an ELF load
+/// that a fork child must not perform. This probe instead builds a SECOND, independent
+/// `PageManager` via `litebox::mm::PageManager::new_adopting_existing_memory`, whose bookkeeping
+/// describes the guest memory that pass 111/112's `WriteProcessMemory` step ALREADY placed in this
+/// process's address space at the parent's own addresses -- allocating, reserving and copying
+/// nothing. It then verifies, region by region, that the reconstruction round-trips the parent's
+/// real layout (boundaries, raw `VmFlags`, file-backing) and that the program break matches.
+///
+/// Purely observational: the adopted `PageManager` is dropped at the end of this function and is
+/// never installed into `shim`, never used to build a `Task`, and never resumed into -- those are
+/// pass 138+'s job (FINDINGS.txt pass 135 STEP 4 item 3). Nothing here can feed back into the
+/// real, unmodified thread-based `do_clone` fork path.
+fn diag_process_fork_vmem_adopt_probe(litebox: &litebox::LiteBox<Platform>) {
+    use litebox_platform_windows_userland::process_fork as pf;
+
+    if !pf::diag_process_fork_vmem_adopt_enabled() {
+        return;
+    }
+    let Some(line) = std::env::var_os(pf::FORK_CHILD_VMA_LAYOUT_ENV_VAR) else {
+        eprintln!(
+            "[process_fork_diag] vmem-adopt-probe (child): no VMA layout arrived via {}, skipping",
+            pf::FORK_CHILD_VMA_LAYOUT_ENV_VAR
+        );
+        return;
+    };
+    let Some(line) = line.to_str().map(str::to_owned) else {
+        eprintln!(
+            "[process_fork_diag] vmem-adopt-probe (child): VMA layout env var is not valid UTF-8, skipping"
+        );
+        return;
+    };
+    let Some(relocations) = litebox::mm::AddressRelocations::deserialize_for_diagnostic(&line)
+    else {
+        eprintln!(
+            "[process_fork_diag] vmem-adopt-probe (child): failed to parse VMA layout line (len={}), skipping",
+            line.len()
+        );
+        return;
+    };
+
+    // SOURCE coordinates == this child's own coordinates: the whole design of the process-based
+    // fork is that the child's reservations are forced to the parent's own bases, so the
+    // source-to-destination translation is the identity here (FINDINGS.txt passes 111/112/122).
+    let expected = relocations.vma_layout();
+    let heap_top = relocations.heap_top();
+    eprintln!(
+        "[process_fork_diag] vmem-adopt-probe (child): adopting {} pre-populated region(s), brk={heap_top:#x}",
+        expected.len()
+    );
+
+    // The SAME `ALIGN` the shim's own `PageManager` uses (`LinuxShim::page_manager`'s
+    // `PageManager<Platform, PAGE_SIZE>`), so this reconstruction is directly comparable to the
+    // real one a future pass would install in its place.
+    let (page_manager, adopted, shared) = litebox::mm::PageManager::<
+        Platform,
+        { litebox::mm::linux::PAGE_SIZE },
+    >::new_adopting_existing_memory(
+        litebox, expected.iter().cloned(), heap_top
+    );
+
+    let (tracked_count, tracked_brk) = page_manager.tracked_region_summary();
+    let tracked = page_manager.tracked_regions();
+
+    // Region-by-region equality, not merely a count: the point of this probe is proving the
+    // reconstructed bookkeeping MATCHES the parent's real layout, boundaries and permissions
+    // included (the CONTENTS at those addresses are already correct by construction, having been
+    // `WriteProcessMemory`'d there verbatim -- this is the Rust-level bookkeeping catching up).
+    let mut sorted_expected = expected.clone();
+    sorted_expected.sort_by_key(|(r, _, _)| r.start);
+    let layout_matches = tracked == sorted_expected;
+    let mismatches = sorted_expected
+        .iter()
+        .zip(tracked.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+
+    eprintln!(
+        "[process_fork_diag] vmem-adopt-probe (child): adopted={adopted} (of which VM_SHARED={shared}), \
+         tracked={tracked_count}, expected={}, brk={tracked_brk:#x} (expected {heap_top:#x})",
+        sorted_expected.len()
+    );
+    if layout_matches && tracked_brk == heap_top {
+        eprintln!(
+            "[process_fork_diag] vmem-adopt-probe (child): VMA layout adoption VERIFIED -- every \
+             region's boundaries, flags and file-backing round-trip exactly, no allocation performed"
+        );
+    } else {
+        eprintln!(
+            "[process_fork_diag] vmem-adopt-probe (child): VMA layout adoption MISMATCH -- \
+             {mismatches} differing region(s), count {tracked_count} vs {}, brk {tracked_brk:#x} vs {heap_top:#x}",
+            sorted_expected.len()
+        );
+    }
 }
 
 /// Export the writable upper layer of a layered file system (every file the guest created or

@@ -68,6 +68,17 @@ pub struct AddressRelocations {
     /// `.data`/`.got`/`.bss`) must stay excluded from this classification even though it also
     /// satisfies every other `is_private_data_range` condition.
     is_file_backed: Vec<bool>,
+    /// Parallel to `ranges`: the SOURCE `VmArea`'s complete raw `VmFlags` bit word at the moment
+    /// of duplication.
+    ///
+    /// `executable`/`private_data`/`is_file_backed` are each derived from this word but are not
+    /// jointly sufficient to reconstruct it (`VM_READ`, `VM_GROWSDOWN`, `VM_SHARED` and every
+    /// `VM_MAY*` bit are unrecoverable from those three booleans -- see `linux::DuplicatedRangeInfo`'s
+    /// doc comment). Carried so that a consumer reconstructing an equivalent address-space
+    /// description in ANOTHER process -- [`PageManager::new_adopting_existing_memory`], whose whole
+    /// job is bookkeeping that matches memory already physically present at these addresses -- can
+    /// restore each region's real flags rather than an approximation of them.
+    flags: Vec<u32>,
     /// The source (parent) process's program break at the moment of duplication, i.e. the current
     /// upper bound of its heap (`brk`-allocated) region -- `0` if `set_initial_brk` was never
     /// called (no heap exists yet). By construction (`PageManager::brk`'s `create_pages` call),
@@ -117,15 +128,39 @@ impl AddressRelocations {
         is_file_backed: Vec<bool>,
         heap_top: usize,
         group_relocations: Vec<(Range<usize>, usize)>,
+        flags: Vec<u32>,
     ) -> Self {
         Self {
             ranges,
             executable,
             private_data,
             is_file_backed,
+            flags,
             heap_top,
             group_relocations,
         }
+    }
+
+    /// The per-range `(range, raw VmFlags bits, is_file_backed)` triples describing the SOURCE
+    /// address space's layout, in exactly the shape
+    /// [`PageManager::new_adopting_existing_memory`] consumes.
+    ///
+    /// Ranges are returned in SOURCE coordinates. For the process-based-`fork()` case those are
+    /// also the destination's coordinates (the child's reservations are forced to the parent's own
+    /// bases, so translation is the identity) -- see that constructor's doc comment.
+    #[must_use]
+    pub fn vma_layout(&self) -> Vec<(Range<usize>, u32, bool)> {
+        self.ranges
+            .iter()
+            .enumerate()
+            .map(|(i, (range, _))| (range.clone(), self.flags[i], self.is_file_backed[i]))
+            .collect()
+    }
+
+    /// The source process's program break at duplication time -- see the `heap_top` field.
+    #[must_use]
+    pub fn heap_top(&self) -> usize {
+        self.heap_top
     }
 
     /// Serializes this object's raw fields into a single newline-free text line, the inverse of
@@ -138,8 +173,14 @@ impl AddressRelocations {
     /// field, one line total (so the receiving end's existing newline-delimited pipe-read loop --
     /// see `duplicate_stdio_into_child`'s sibling in `process_fork.rs` -- needs no changes):
     ///
-    /// `heap_top;range_count;r0_start,r0_end,r0_dest,r0_exec,r0_priv,r0_filebacked;...;
+    /// `heap_top;range_count;r0_start,r0_end,r0_dest,r0_exec,r0_priv,r0_filebacked,r0_flags;...;
     /// group_count;g0_start,g0_end,g0_dest;...`
+    ///
+    /// `r*_flags` is the source `VmArea`'s raw `VmFlags` bit word (see the `flags` field), added
+    /// in pass 137 for [`PageManager::new_adopting_existing_memory`]'s benefit. Both ends of this
+    /// wire format are always the SAME binary (the diagnostic child is a re-exec of
+    /// `current_exe()`), so this is a synchronized-by-construction format change, not a
+    /// compatibility break with any persisted or independently-versioned reader.
     ///
     /// `bool` fields serialize as `1`/`0`. Every numeric field is a plain decimal `usize`/`u64` --
     /// addresses in this investigation's repros are always well within `u64` range, and a
@@ -155,13 +196,14 @@ impl AddressRelocations {
         for (i, (range, dest_base)) in self.ranges.iter().enumerate() {
             let _ = write!(
                 out,
-                ";{},{},{},{},{},{}",
+                ";{},{},{},{},{},{},{}",
                 range.start,
                 range.end,
                 dest_base,
                 u8::from(self.executable[i]),
                 u8::from(self.private_data[i]),
                 u8::from(self.is_file_backed[i]),
+                self.flags[i],
             );
         }
         let _ = write!(out, ";{}", self.group_relocations.len());
@@ -185,6 +227,7 @@ impl AddressRelocations {
         let mut executable = Vec::with_capacity(range_count);
         let mut private_data = Vec::with_capacity(range_count);
         let mut is_file_backed = Vec::with_capacity(range_count);
+        let mut flags = Vec::with_capacity(range_count);
         for _ in 0..range_count {
             let field = parts.next()?;
             let mut f = field.split(',');
@@ -194,6 +237,7 @@ impl AddressRelocations {
             let exec: u8 = f.next()?.parse().ok()?;
             let priv_: u8 = f.next()?.parse().ok()?;
             let file_backed: u8 = f.next()?.parse().ok()?;
+            let flag_bits: u32 = f.next()?.parse().ok()?;
             if f.next().is_some() {
                 return None;
             }
@@ -201,6 +245,7 @@ impl AddressRelocations {
             executable.push(exec != 0);
             private_data.push(priv_ != 0);
             is_file_backed.push(file_backed != 0);
+            flags.push(flag_bits);
         }
         let group_count: usize = parts.next()?.parse().ok()?;
         let mut group_relocations = Vec::with_capacity(group_count);
@@ -225,6 +270,7 @@ impl AddressRelocations {
             is_file_backed,
             heap_top,
             group_relocations,
+            flags,
         ))
     }
 
@@ -515,6 +561,67 @@ where
         Self { vmem }
     }
 
+    /// Create a `PageManager` whose guest-tracked address space ADOPTS memory that already exists,
+    /// at exactly these addresses, in the CURRENT process -- allocating, reserving, committing and
+    /// copying nothing.
+    ///
+    /// This is the process-based-`fork()` counterpart to [`Self::new`] (which starts empty and is
+    /// grown by a real ELF load plus the guest's own `mmap`/`brk` calls) and to [`Self::duplicate`]
+    /// (which allocates and copies every destination page itself, within a single host process).
+    /// A process-based-fork child's guest memory is already fully populated at the parent's own
+    /// addresses before any `PageManager` exists there at all, so what it needs is bookkeeping that
+    /// DESCRIBES that layout, not machinery that recreates it -- see
+    /// `linux::Vmem::new_adopting_existing_memory`'s doc comment for the full rationale and for why
+    /// the platform's `reserved_pages()` must deliberately not be folded in here.
+    ///
+    /// `regions` is `(range, raw VmFlags bits, is_file_backed)` per already-present region, in this
+    /// process's own coordinates -- exactly what [`AddressRelocations::vma_layout`] returns (the
+    /// process-fork case's source-to-destination translation being the identity). `brk` is the
+    /// parent's program break, i.e. [`AddressRelocations::heap_top`].
+    ///
+    /// Returns the `PageManager` plus `(regions adopted, of which VM_SHARED)`; a `VM_SHARED`
+    /// region is adopted with its flags but WITHOUT a usable platform shared-memory handle (the
+    /// parent's handle is meaningless in this process), so a caller should surface a non-zero
+    /// second count rather than treat such a region as fully reconstructed.
+    pub fn new_adopting_existing_memory(
+        litebox: &LiteBox<Platform>,
+        regions: impl Iterator<Item = (Range<usize>, u32, bool)>,
+        brk: usize,
+    ) -> (Self, usize, usize) {
+        let (vmem, adopted, shared) =
+            linux::Vmem::new_adopting_existing_memory(litebox.x.platform, regions, brk);
+        (
+            Self {
+                vmem: RwLock::new(vmem),
+            },
+            adopted,
+            shared,
+        )
+    }
+
+    /// The number of guest regions currently tracked, and the current program break -- a cheap
+    /// read-only summary for a caller that needs to verify a reconstructed address-space
+    /// description matches the one it was built from (see
+    /// [`Self::new_adopting_existing_memory`]).
+    #[must_use]
+    pub fn tracked_region_summary(&self) -> (usize, usize) {
+        let vmem = self.vmem.read();
+        (vmem.iter().count(), vmem.brk)
+    }
+
+    /// Every tracked guest region as `(range, raw VmFlags bits, is_file_backed)`, in ascending
+    /// address order -- the exact shape [`Self::new_adopting_existing_memory`] consumes, so a
+    /// caller can compare a reconstructed `PageManager` against the layout data it was built from
+    /// region by region rather than only by count.
+    #[must_use]
+    pub fn tracked_regions(&self) -> Vec<(Range<usize>, u32, bool)> {
+        self.vmem
+            .read()
+            .iter()
+            .map(|(r, vma)| (r.clone(), vma.flags().bits(), vma.is_file_backed()))
+            .collect()
+    }
+
     /// Create a new `PageManager` for the same `Platform`, whose guest-tracked address space is
     /// an eager, independent copy of `self`'s current guest-tracked address space.
     ///
@@ -556,11 +663,15 @@ where
         let mut executable = Vec::with_capacity(relocations.len());
         let mut private_data = Vec::with_capacity(relocations.len());
         let mut is_file_backed = Vec::with_capacity(relocations.len());
-        for (range, dest_base, is_executable, is_private_data, was_file_backed) in relocations {
+        let mut flags = Vec::with_capacity(relocations.len());
+        for (range, dest_base, is_executable, is_private_data, was_file_backed, flag_bits) in
+            relocations
+        {
             ranges.push((range, dest_base));
             executable.push(is_executable);
             private_data.push(is_private_data);
             is_file_backed.push(was_file_backed);
+            flags.push(flag_bits);
         }
         // Re-exposed as a plain tuple (see `AddressRelocations::group_relocations`'s doc
         // comment) -- consumed only by the `LITEBOX_DIAG_PROCESS_FORK_SPAWN`-gated diagnostic in
@@ -578,6 +689,7 @@ where
                 executable,
                 private_data,
                 is_file_backed,
+                flags,
                 heap_top,
                 group_relocations,
             },
@@ -1299,6 +1411,7 @@ mod address_relocations_tests {
             private_data: alloc::vec![false, true, false],
             is_file_backed: alloc::vec![false, false, false],
             heap_top: 0x1010_0000,
+            flags: alloc::vec![],
             group_relocations: alloc::vec![],
         };
 
@@ -1322,6 +1435,7 @@ mod address_relocations_tests {
             private_data: alloc::vec![false],
             is_file_backed: alloc::vec![false],
             heap_top: 0,
+            flags: alloc::vec![],
             group_relocations: alloc::vec![],
         };
 
@@ -1340,6 +1454,7 @@ mod address_relocations_tests {
             private_data: alloc::vec![false],
             is_file_backed: alloc::vec![false],
             heap_top: 0x1234_5678,
+            flags: alloc::vec![],
             group_relocations: alloc::vec![],
         };
 
@@ -1368,6 +1483,7 @@ mod address_relocations_tests {
             // exactly this distinction.
             is_file_backed: alloc::vec![true, true, false, false],
             heap_top: 0x1000_3000,
+            flags: alloc::vec![],
             group_relocations: alloc::vec![],
         };
 
@@ -1401,6 +1517,7 @@ mod address_relocations_tests {
             private_data: alloc::vec![true, true, false],
             is_file_backed: alloc::vec![true, false, false],
             heap_top: 0, // mallocng never calls brk: no brk-heap VMA exists at all.
+            flags: alloc::vec![],
             group_relocations: alloc::vec![],
         };
 
@@ -1435,6 +1552,7 @@ mod address_relocations_tests {
             private_data: alloc::vec![true, true, true, false],
             is_file_backed: alloc::vec![true, false, false, false],
             heap_top: 0x1000_5000,
+            flags: alloc::vec![],
             group_relocations: alloc::vec![],
         };
 

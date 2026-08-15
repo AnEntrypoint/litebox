@@ -662,6 +662,44 @@ pub fn diag_process_fork_globalstate_enabled() -> bool {
 /// path.
 pub const FORK_CHILD_TAR_PATH_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_TAR_PATH";
 
+/// Whether the operator opted into the `Vmem`-adoption probe
+/// (`LITEBOX_DIAG_PROCESS_FORK_VMEM_ADOPT=1`). A NINTH gate, layered on top of
+/// [`diag_process_fork_globalstate_enabled`] (pass 136 proved a standalone `GlobalState` can be
+/// constructed a second time in the diagnostic child; this gate is inert unless that one is also
+/// set, since it has nothing to adopt into otherwise).
+///
+/// Pass 137: the `GlobalState` pass 136 builds in the child contains a `PageManager` built by the
+/// ORDINARY `PageManager::new` -- empty, describing nothing, and about to be grown by an ELF load
+/// that never happens for a fork child. Meanwhile the child's address space ALREADY holds the
+/// parent's full guest memory, at the parent's own addresses, courtesy of pass 111/112's
+/// `VirtualAlloc2`-at-a-forced-base + `WriteProcessMemory` step. This gate exercises
+/// `litebox::mm::PageManager::new_adopting_existing_memory`, which builds a `PageManager` whose
+/// bookkeeping DESCRIBES that already-present memory (VMA boundaries, permissions/flags,
+/// file-backing) instead of allocating anything -- and then verifies, region by region, that the
+/// reconstruction round-trips the parent's real layout exactly.
+///
+/// The layout itself rides across the process boundary in
+/// [`FORK_CHILD_VMA_LAYOUT_ENV_VAR`], carrying the SAME serialized `AddressRelocations` line the
+/// pass-122 relocations probe already transmits (extended in pass 137 with each region's raw
+/// `VmFlags` word) -- deliberately via the environment rather than the child's stdin pipe, because
+/// this probe runs in the runner crate BEFORE `run_diagnostic_resume_child`, and reading the pipe
+/// there would consume the line the pass-122 probe expects to read later inside it.
+#[must_use]
+pub fn diag_process_fork_vmem_adopt_enabled() -> bool {
+    std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_VMEM_ADOPT").is_some()
+}
+
+/// Internal-only marker env var (pass 137): carries the parent's serialized `AddressRelocations`
+/// line -- whose per-range records now include each source region's raw `VmFlags` word, i.e. the
+/// parent's REAL `Vmem` layout at `fork()` time -- across the `CreateProcessW`-spawned diagnostic
+/// child boundary, for [`diag_process_fork_vmem_adopt_enabled`]'s probe to adopt.
+///
+/// Set (and cleared again immediately) around the spawn in [`diagnostic_spawn_and_copy`], the same
+/// way [`REEXEC_CHILD_ENV_VAR`] is, so it is inherited via `lpEnvironment: null` without
+/// hand-building an environment block. See [`diag_process_fork_vmem_adopt_enabled`]'s doc comment
+/// for why the environment rather than the existing stdin pipe carries this. Never guest-visible.
+pub const FORK_CHILD_VMA_LAYOUT_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_VMA_LAYOUT";
+
 /// Per-group outcome reported by [`diagnostic_spawn_and_copy`].
 pub struct GroupCopyResult {
     /// The group's span in the (real, live) parent address space, exactly as `Vmem::duplicate`
@@ -768,10 +806,20 @@ pub fn diagnostic_spawn_and_copy(
         want_resume && diag_process_fork_real_resume_enabled() && inject_full_gprs.is_some();
     let want_relocations =
         want_real_resume && diag_process_fork_relocations_enabled() && relocations_line.is_some();
+    // Pass 137: the `Vmem`-adoption probe needs the parent's real VMA layout, and runs in the
+    // runner crate BEFORE `run_diagnostic_resume_child` ever touches the stdin pipe -- so it rides
+    // the environment instead, set here and cleared immediately after the spawn exactly like
+    // `REEXEC_CHILD_ENV_VAR`. See `FORK_CHILD_VMA_LAYOUT_ENV_VAR`'s doc comment.
+    let want_vmem_adopt = diag_process_fork_vmem_adopt_enabled()
+        && diag_process_fork_globalstate_enabled()
+        && relocations_line.is_some();
     unsafe {
         std::env::set_var(REEXEC_CHILD_ENV_VAR, "1");
         if want_real_resume {
             std::env::set_var(REAL_RESUME_CHILD_ENV_VAR, "1");
+        }
+        if want_vmem_adopt && let Some(line) = relocations_line.as_deref() {
+            std::env::set_var(FORK_CHILD_VMA_LAYOUT_ENV_VAR, line);
         }
     }
     // The relocations line needs the same stdin pipe the fds probe uses -- request it whenever
@@ -783,6 +831,7 @@ pub fn diagnostic_spawn_and_copy(
     unsafe {
         std::env::remove_var(REEXEC_CHILD_ENV_VAR);
         std::env::remove_var(REAL_RESUME_CHILD_ENV_VAR);
+        std::env::remove_var(FORK_CHILD_VMA_LAYOUT_ENV_VAR);
     }
     let (process, thread, stdout_read, stdin_write) = spawn_result?;
     let guard = SuspendedChildGuard {
