@@ -67,6 +67,40 @@ use windows_sys::Win32::System::Threading::{
 /// `CliArgs::parse()` path, which requires a program path and `--initial-files`).
 const REEXEC_CHILD_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD";
 
+/// Internal-only marker env var (pass 120), set alongside [`REEXEC_CHILD_ENV_VAR`] only when the
+/// real-guest-resume probe (`LITEBOX_DIAG_PROCESS_FORK_REAL_RESUME=1`) is active for this `fork()`
+/// call. Distinguishes "park after my own init, waiting to be injected with a real guest context"
+/// from every other resume-diagnostic child shape (pass 114's plain survive-startup child, and pass
+/// 118/119's never-run-thread minimal-stub-injection child, neither of which ever reaches
+/// [`run_diagnostic_resume_child`]'s park point).
+const REAL_RESUME_CHILD_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_REAL_RESUME";
+
+/// Whether the CURRENT process is a pass-120 real-guest-resume diagnostic child -- see
+/// [`REAL_RESUME_CHILD_ENV_VAR`]'s doc comment.
+#[must_use]
+fn is_real_resume_child() -> bool {
+    std::env::var_os(REAL_RESUME_CHILD_ENV_VAR).is_some()
+}
+
+/// Parks the current (child) thread in a bounded kernel wait so the parent can safely
+/// `SuspendThread` + `SetThreadContext` it -- see [`run_diagnostic_resume_child`]'s call site doc
+/// comment for why this is safe (the thread has already run, unlike pass 118/119's never-run-thread
+/// target) and necessary (the parent cannot inject into a thread that is not suspended). Bounded to
+/// 10 seconds so a child that is somehow never injected into (e.g. the parent crashed, or the probe
+/// is disabled after all) still exits instead of hanging forever; the parent unconditionally
+/// `TerminateProcess`'s this child on drop regardless, so this bound is a courtesy, not a
+/// correctness requirement.
+fn park_for_real_resume_injection() {
+    use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+    let event = unsafe { CreateEventW(core::ptr::null(), 1, 0, core::ptr::null()) };
+    if event.is_null() {
+        return;
+    }
+    unsafe {
+        WaitForSingleObject(event, 10_000);
+    }
+}
+
 /// Marker line the resume-diagnostic child prints to its (pipe-redirected) stdout once it has
 /// reached its own normal process initialization -- i.e. once `WindowsUserland::new()` has run
 /// and registered its own VEH via `AddVectoredExceptionHandler`. The parent reads this line back
@@ -107,6 +141,21 @@ pub fn run_diagnostic_resume_child() -> Result<(), std::convert::Infallible> {
     let _platform = litebox_platform_windows_userland_new_for_diagnostic_resume();
     println!("{RESUME_CHILD_READY_MARKER}");
     let _ = std::io::stdout().flush();
+
+    // Pass 120: if the parent requested the real-guest-resume probe, park THIS thread (via a
+    // blocking wait on an event the parent never signals) immediately after `WindowsUserland::new()`
+    // completes -- i.e. after VEH registration, matching pass 114's proven-safe "child survives its
+    // own startup" shape -- so the parent can `SuspendThread` it (safe: this thread is blocked in a
+    // kernel wait, not mid-instruction) and inject the REAL translated guest context via
+    // `SetThreadContext`. Unlike pass 118/119's probe (which targets a NEVER-RUN thread, unconditionally
+    // hitting ntdll's loader-init thunk first), this thread HAS already run -- it reached this wait via
+    // ordinary execution -- so the loader-thunk hazard pass 119 found does not apply here; this is
+    // the same "resume an already-run thread via SetThreadContext" shape `ThreadHandle::interrupt`'s
+    // own already-proven-working cross-thread injection uses. Never blocks in the pass-114-only or
+    // pass-118/119-only resume paths (no writer ever signals this env var there).
+    if is_real_resume_child() {
+        park_for_real_resume_injection();
+    }
 
     // Pass 115's fd-inheritance probe: if the parent handed us (via our own inherited stdin pipe --
     // see `SuspendedChildGuard::stdin_write`'s doc comment for why a pipe carries this rather than
@@ -336,6 +385,24 @@ pub fn diag_process_fork_registers_enabled() -> bool {
     std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_REGISTERS").is_some()
 }
 
+/// Whether pass 120's real-guest-resume probe is enabled (`LITEBOX_DIAG_PROCESS_FORK_REAL_RESUME=1`).
+/// A FIFTH gate, layered on top of SPAWN/RESUME/REGISTERS: unlike pass 118/119's probe (which
+/// injects a tiny, purpose-built diagnostic stub -- never real guest code -- into a fresh
+/// `CREATE_SUSPENDED` child and never lets the child reach its own `main()`), this probe lets the
+/// child run its OWN normal `run_diagnostic_resume_child()` init first (so `WindowsUserland::new()`
+/// registers this child process's own VEH, matching pass 114's proven-safe shape), THEN -- after
+/// that init completes but before the child's `main()` would otherwise return -- injects the REAL
+/// translated guest register context (every GPR, `eflags`, `cs`/`ss`, the exact values `do_clone`'s
+/// own `child_ctx` carries) via the same `SetThreadContext` mechanism pass 118/119 proved reliable,
+/// with `Rip` pointing at a stub that immediately parks (not `switch_to_guest` itself -- see this
+/// module's `real_resume` doc comment for why). Mutually exclusive with the pass 118/119 minimal-stub
+/// probe for a given `fork()` call (see `diagnostic_spawn_and_copy`'s dispatch): the two probe two
+/// different questions and must not race the same suspended thread.
+#[must_use]
+pub fn diag_process_fork_real_resume_enabled() -> bool {
+    std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_REAL_RESUME").is_some()
+}
+
 /// Whether pass 116's fd-complexity classification log (a pure, read-only report of whether the
 /// fork()ing process's fd table is "simple" -- only stdio slots 0/1/2 occupied -- or "complex" --
 /// any other fd open, which per pass 115's finding cannot yet be inherited by a process-based
@@ -428,6 +495,7 @@ pub fn diagnostic_spawn_and_copy(
     group_relocations: &[(Range<usize>, usize)],
     mut read_source_bytes: impl FnMut(Range<usize>) -> Option<Vec<u8>>,
     inject_gprs: Option<litebox::platform::ForkGprSnapshot>,
+    inject_full_gprs: Option<litebox::platform::ForkFullGprSnapshot>,
 ) -> Result<Vec<GroupCopyResult>, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe() failed: {e}"))?;
     let mut exe_wide: Vec<u16> = exe
@@ -450,12 +518,18 @@ pub fn diagnostic_spawn_and_copy(
     // guarantee.
     let want_resume = diag_process_fork_resume_enabled();
     let want_fds = want_resume && diag_process_fork_fds_enabled();
+    let want_real_resume =
+        want_resume && diag_process_fork_real_resume_enabled() && inject_full_gprs.is_some();
     unsafe {
         std::env::set_var(REEXEC_CHILD_ENV_VAR, "1");
+        if want_real_resume {
+            std::env::set_var(REAL_RESUME_CHILD_ENV_VAR, "1");
+        }
     }
     let spawn_result = spawn_suspended(&mut exe_wide, want_resume, want_fds);
     unsafe {
         std::env::remove_var(REEXEC_CHILD_ENV_VAR);
+        std::env::remove_var(REAL_RESUME_CHILD_ENV_VAR);
     }
     let (process, thread, stdout_read, stdin_write) = spawn_result?;
     let guard = SuspendedChildGuard {
@@ -480,17 +554,29 @@ pub fn diagnostic_spawn_and_copy(
     }
 
     if want_resume {
-        // Pass 118: when an operator opts into BOTH the resume gate and the register-injection
-        // gate AND `do_clone` supplied a translated snapshot (only present on `target_arch =
-        // "x86_64"`, this whole crate's only supported architecture, so always `Some` in practice
-        // when the gate is on), take the injection path instead of pass 114's "resume into the
-        // child's own normal entry point" path -- the two are mutually exclusive for a given
-        // fork() call: injecting a context and then also letting the loader's entry point run
-        // would race two completely different execution paths in the same suspended thread, which
-        // is not a sensible thing to attempt.
-        match inject_gprs {
-            Some(gprs) => inject_and_observe(&guard, gprs),
-            None => resume_and_observe(&guard, want_fds),
+        // Pass 120's real-guest-resume probe takes priority when active (it already required
+        // `want_resume` and a full snapshot above): the child was spawned with
+        // `REAL_RESUME_CHILD_ENV_VAR` set, so it will run its OWN normal init then park, rather
+        // than either pass 114's "print marker and return" shape or pass 118/119's "never resumed
+        // into its own entry point at all" shape -- none of the other three probes are meaningful
+        // for this same child, so they are mutually exclusive for a given `fork()` call.
+        if want_real_resume {
+            if let Some(full_gprs) = inject_full_gprs {
+                real_resume_and_observe(&guard, full_gprs);
+            }
+        } else {
+            // Pass 118: when an operator opts into BOTH the resume gate and the register-injection
+            // gate AND `do_clone` supplied a translated snapshot (only present on `target_arch =
+            // "x86_64"`, this whole crate's only supported architecture, so always `Some` in
+            // practice when the gate is on), take the injection path instead of pass 114's "resume
+            // into the child's own normal entry point" path -- the two are mutually exclusive for a
+            // given fork() call: injecting a context and then also letting the loader's entry point
+            // run would race two completely different execution paths in the same suspended thread,
+            // which is not a sensible thing to attempt.
+            match inject_gprs {
+                Some(gprs) => inject_and_observe(&guard, gprs),
+                None => resume_and_observe(&guard, want_fds),
+            }
         }
     }
 
@@ -683,6 +769,401 @@ fn resume_and_observe(guard: &SuspendedChildGuard, want_fds: bool) {
              (collected stdout: {:?}, WaitForSingleObject={wait_result})",
             String::from_utf8_lossy(&collected)
         );
+    }
+}
+
+/// Pass 120: lets the child run its OWN normal `run_diagnostic_resume_child()` init (VEH
+/// registration via `WindowsUserland::new()`, matching pass 114's proven-safe shape) by
+/// `ResumeThread`-ing it exactly as [`resume_and_observe`] does, waits for
+/// [`RESUME_CHILD_READY_MARKER`] to confirm that init completed, then -- BEFORE the child's own
+/// `main()` would otherwise return -- `SuspendThread`s it (safe: the child is parked in a bounded
+/// kernel wait via [`park_for_real_resume_injection`], not mid-instruction) and injects the REAL
+/// translated guest register context via `SetThreadContext`, mirroring `switch_to_guest_ntcontinue`'s
+/// own `CONTEXT` field mapping exactly (`lib.rs`), with `Rip` set directly to the real, translated
+/// guest instruction address `do_clone`'s own `child_ctx.rip` computed for this `fork()` call --
+/// not a diagnostic stub, unlike pass 118/119's probe.
+///
+/// # Why this does NOT call the real `switch_to_guest` function
+///
+/// `switch_to_guest` is a private `unsafe extern "C" fn` in `lib.rs`, callable only from within this
+/// SAME process on the CURRENT thread (its own doc comment: "This can only be called if
+/// `run_thread_arch` is on the stack"). There is no cross-process calling convention for invoking
+/// another process's private function -- the only cross-process mechanism this whole investigation
+/// has ever had available is `SetThreadContext`, which is exactly `switch_to_guest_ntcontinue`'s OWN
+/// underlying mechanism (it builds a `CONTEXT` and calls `NtContinue`, itself just a same-process,
+/// same-thread `SetThreadContext`-equivalent). This function therefore reuses `switch_to_guest_ntcontinue`'s
+/// `CONTEXT`-construction logic AS DATA (the exact same field mapping, mirrored here since it cannot
+/// be called as code across the process boundary) rather than its code, and injects that `CONTEXT`
+/// via the literal cross-process `SetThreadContext` pass 118/119 already proved reliable for an
+/// ALREADY-RUN thread (this child's thread has run its own init and reached the park point, unlike
+/// pass 118/119's never-run thread) -- see [`set_child_context`]'s doc comment for why `Rsp` must
+/// never be substituted on a never-run thread; that hazard does not apply here (this thread's `Rsp`
+/// IS already the child's own loader-established, already-in-use stack, and this function does not
+/// touch it, deliberately, to remain on the safe side of that finding either way).
+///
+/// This deliberately does NOT attempt cross-process `Task` reconstruction (fs/files/signals/
+/// process-tree state) -- the child's own `WindowsUserland::new()` set up a BLANK slate, not a copy
+/// of the parent's real `Task`. Injecting the real guest `Rip` into that blank-slate child and
+/// observing exactly where/how it fails is this function's whole purpose -- see this module's
+/// `FINDINGS.txt` PASS 120 section for what was actually observed.
+fn real_resume_and_observe(
+    guard: &SuspendedChildGuard,
+    gprs: litebox::platform::ForkFullGprSnapshot,
+) {
+    use windows_sys::Win32::System::Threading::SuspendThread;
+
+    const READY_TIMEOUT_MS: u32 = 2000;
+
+    let resumed = unsafe { ResumeThread(guard.thread) };
+    if resumed == u32::MAX {
+        eprintln!(
+            "[process_fork_diag] real-resume: initial ResumeThread failed, GetLastError={}",
+            unsafe { GetLastError() }
+        );
+        return;
+    }
+
+    let Some(stdout_read) = guard.stdout_read else {
+        eprintln!(
+            "[process_fork_diag] real-resume: no stdout pipe available, cannot observe marker"
+        );
+        return;
+    };
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(u64::from(READY_TIMEOUT_MS));
+    let mut collected = Vec::new();
+    let mut buf = [0u8; 256];
+    let mut saw_ready = false;
+    loop {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        let mut read = 0u32;
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::ReadFile(
+                stdout_read,
+                buf.as_mut_ptr(),
+                u32::try_from(buf.len()).expect("small fixed-size buffer fits in u32"),
+                &raw mut read,
+                core::ptr::null_mut(),
+            )
+        };
+        if ok == 0 || read == 0 {
+            break;
+        }
+        collected.extend_from_slice(&buf[..read as usize]);
+        if collected
+            .windows(RESUME_CHILD_READY_MARKER.len())
+            .any(|w| w == RESUME_CHILD_READY_MARKER.as_bytes())
+        {
+            saw_ready = true;
+            break;
+        }
+    }
+    if !saw_ready {
+        eprintln!(
+            "[process_fork_diag] real-resume: child never reached its own readiness marker \
+             (collected stdout: {:?}) -- cannot proceed to injection",
+            String::from_utf8_lossy(&collected)
+        );
+        return;
+    }
+    eprintln!(
+        "[process_fork_diag] real-resume: child reached its own readiness marker (VEH registered); \
+         giving it a brief moment to reach its park point before suspending"
+    );
+    // The child prints its marker, THEN calls `park_for_real_resume_injection` -- a short, bounded
+    // sleep here is a pragmatic wait for it to actually reach the blocking `WaitForSingleObject`
+    // (a handful of instructions after the marker print) rather than racing `SuspendThread` against
+    // that brief window. `SuspendThread` on a thread NOT yet in the wait would still be safe (it
+    // would simply suspend at whatever instruction it is executing instead), but waiting first keeps
+    // the observed state consistent and easy to reason about run-to-run.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let suspend_count = unsafe { SuspendThread(guard.thread) };
+    if suspend_count == u32::MAX {
+        eprintln!(
+            "[process_fork_diag] real-resume: SuspendThread failed, GetLastError={}",
+            unsafe { GetLastError() }
+        );
+        return;
+    }
+
+    if !set_child_full_context(guard.thread, &gprs) {
+        eprintln!(
+            "[process_fork_diag] real-resume: SetThreadContext (full guest context) failed, GetLastError={}",
+            unsafe { GetLastError() }
+        );
+        return;
+    }
+
+    eprintln!(
+        "[process_fork_diag] real-resume: injected REAL translated guest context Rip={:#x} Rsp={:#x} \
+         Rax={:#x} -- resuming into real guest execution on a blank-slate child (no Task reconstruction)",
+        gprs.rip, gprs.rsp, gprs.rax
+    );
+
+    let child_pid = unsafe { windows_sys::Win32::System::Threading::GetProcessId(guard.process) };
+    let debug_attached =
+        unsafe { windows_sys::Win32::System::Diagnostics::Debug::DebugActiveProcess(child_pid) }
+            != 0;
+
+    let resumed = unsafe { ResumeThread(guard.thread) };
+    if resumed == u32::MAX {
+        eprintln!(
+            "[process_fork_diag] real-resume: post-injection ResumeThread failed, GetLastError={}",
+            unsafe { GetLastError() }
+        );
+        if debug_attached {
+            unsafe {
+                windows_sys::Win32::System::Diagnostics::Debug::DebugActiveProcessStop(child_pid);
+            }
+        }
+        return;
+    }
+
+    if debug_attached {
+        observe_real_resume_fault(child_pid);
+        unsafe {
+            windows_sys::Win32::System::Diagnostics::Debug::DebugActiveProcessStop(child_pid);
+        }
+    }
+
+    let wait_result = unsafe { WaitForSingleObject(guard.process, 5000) };
+    let mut exit_code = 0u32;
+    let got_exit_code = unsafe {
+        windows_sys::Win32::System::Threading::GetExitCodeProcess(guard.process, &raw mut exit_code)
+    };
+    eprintln!(
+        "[process_fork_diag] real-resume: post-resume WaitForSingleObject={wait_result} exit_code={} ({:#x})",
+        if got_exit_code != 0 {
+            exit_code.to_string()
+        } else {
+            "?".to_string()
+        },
+        exit_code
+    );
+
+    // Drain and surface whatever the child itself wrote to its (pipe-captured, stdout+stderr
+    // combined) output after the readiness marker -- in particular its OWN VEH's `LITEBOX_VEH_TRACE`
+    // output and/or panic message when it hits an unhandled exception, which is exactly the evidence
+    // needed to characterize precisely where real guest execution against a blank-slate `Task`
+    // breaks down. The child has already exited (or the wait above timed out) by this point, so a
+    // short bounded read is safe and will not hang.
+    let mut post_injection_output = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let mut avail = 0u32;
+        let peek_ok = unsafe {
+            windows_sys::Win32::System::Pipes::PeekNamedPipe(
+                stdout_read,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                &raw mut avail,
+                core::ptr::null_mut(),
+            )
+        };
+        if peek_ok == 0 || avail == 0 {
+            break;
+        }
+        let mut read = 0u32;
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::ReadFile(
+                stdout_read,
+                buf.as_mut_ptr(),
+                u32::try_from(buf.len().min(avail as usize)).unwrap_or(0),
+                &raw mut read,
+                core::ptr::null_mut(),
+            )
+        };
+        if ok == 0 || read == 0 {
+            break;
+        }
+        post_injection_output.extend_from_slice(&buf[..read as usize]);
+    }
+    if !post_injection_output.is_empty() {
+        eprintln!(
+            "[process_fork_diag] real-resume: child's own post-injection output:\n{}",
+            String::from_utf8_lossy(&post_injection_output)
+        );
+    }
+}
+
+/// Builds the FULL `CONTEXT` (every GPR, `eflags`, `cs`/`ss`, `rsp`) from `gprs` and injects it via
+/// `SetThreadContext` -- the same `CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64` flag shape and
+/// field mapping `switch_to_guest_ntcontinue` (`lib.rs`) uses for its own, same-process `NtContinue`
+/// call, mirrored here as the cross-process equivalent (see `real_resume_and_observe`'s doc comment
+/// for why the real function cannot be called directly across the process boundary). Unlike
+/// [`set_child_context`] (pass 118/119's minimal-stub injector, which deliberately leaves `Rsp`
+/// untouched because its target thread has NEVER run), this DOES set `Rsp` to the real, translated
+/// guest stack pointer -- this target thread has already run (it reached the park point via ordinary
+/// execution), so the pass-119 loader-thunk hazard (which only applies to a thread's very FIRST-EVER
+/// resume) does not apply.
+fn set_child_full_context(thread: HANDLE, gprs: &litebox::platform::ForkFullGprSnapshot) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_INTEGER_AMD64, SetThreadContext,
+    };
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "segment selectors are always 16-bit values (USER_CS/USER_DS)"
+    )]
+    let context = CONTEXT {
+        ContextFlags: CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64,
+        R15: gprs.r15 as u64,
+        R14: gprs.r14 as u64,
+        R13: gprs.r13 as u64,
+        R12: gprs.r12 as u64,
+        Rbp: gprs.rbp as u64,
+        Rbx: gprs.rbx as u64,
+        R11: gprs.r11 as u64,
+        R10: gprs.r10 as u64,
+        R9: gprs.r9 as u64,
+        R8: gprs.r8 as u64,
+        Rax: gprs.rax as u64,
+        Rcx: gprs.rcx as u64,
+        Rdx: gprs.rdx as u64,
+        Rsi: gprs.rsi as u64,
+        Rdi: gprs.rdi as u64,
+        Rip: gprs.rip as u64,
+        Rsp: gprs.rsp as u64,
+        EFlags: gprs.eflags as u32,
+        SegCs: gprs.cs as u16,
+        SegSs: gprs.ss as u16,
+        ..unsafe { core::mem::zeroed() }
+    };
+    unsafe { SetThreadContext(thread, &raw const context) != 0 }
+}
+
+/// Bounded debug-event observation loop for [`real_resume_and_observe`] -- unlike
+/// [`capture_first_exception_context`] (pass 118/119's version, which also reads a specific
+/// diagnostic-stub marker address), this has no stub-specific marker to check: it simply logs every
+/// exception's faulting `CONTEXT` (address, code, register state) so the exact failure point of a
+/// REAL guest instruction executing against a blank-slate `Task` is captured precisely. Continues
+/// every event via `ContinueDebugEvent` either way (the child's own VEH, registered by its own
+/// `WindowsUserland::new()`, gets first crack at any exception through the normal, un-debugged
+/// dispatch path -- this observer only watches, never handles).
+fn observe_real_resume_fault(child_pid: u32) {
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_INTEGER_AMD64, ContinueDebugEvent, DEBUG_EVENT,
+        EXCEPTION_DEBUG_EVENT, GetThreadContext, WaitForDebugEvent,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, THREAD_ALL_ACCESS};
+
+    // `DebugActiveProcess` unconditionally delivers ONE synthetic `EXCEPTION_BREAKPOINT` (the
+    // well-known `ntdll!DbgBreakPoint` attach breakpoint every Windows debugger sees immediately
+    // on attach, entirely independent of anything this probe's own injected context does) as part
+    // of the very first batch of debug events after attaching -- this is NOT a fault produced by
+    // the injected guest context, and must be skipped, not reported as this probe's own result.
+    let mut skipped_attach_breakpoint = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            eprintln!(
+                "[process_fork_diag] real-resume: debug-attach observation timed out with no exception event \
+                 (may mean the child is still running, or exited cleanly without a fault)"
+            );
+            return;
+        }
+        let mut event: DEBUG_EVENT = unsafe { core::mem::zeroed() };
+        let got = unsafe {
+            WaitForDebugEvent(
+                &raw mut event,
+                u32::try_from(remaining.as_millis().min(u128::from(u32::MAX))).unwrap_or(u32::MAX),
+            )
+        };
+        if got == 0 {
+            eprintln!(
+                "[process_fork_diag] real-resume: WaitForDebugEvent failed/timed out, GetLastError={}",
+                unsafe { GetLastError() }
+            );
+            return;
+        }
+        if event.dwProcessId != child_pid {
+            unsafe {
+                ContinueDebugEvent(
+                    event.dwProcessId,
+                    event.dwThreadId,
+                    windows_sys::Win32::Foundation::DBG_CONTINUE,
+                );
+            }
+            continue;
+        }
+        if event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT {
+            let record = unsafe { &event.u.Exception.ExceptionRecord };
+            if !skipped_attach_breakpoint
+                && record.ExceptionCode == EXCEPTION_BREAKPOINT
+                && unsafe { event.u.Exception.dwFirstChance } != 0
+            {
+                skipped_attach_breakpoint = true;
+                eprintln!(
+                    "[process_fork_diag] real-resume: skipping DebugActiveProcess's own synthetic \
+                     attach breakpoint (addr={:#x}, ntdll!DbgBreakPoint) -- not this probe's own fault",
+                    record.ExceptionAddress as usize
+                );
+                unsafe {
+                    ContinueDebugEvent(
+                        event.dwProcessId,
+                        event.dwThreadId,
+                        windows_sys::Win32::Foundation::DBG_CONTINUE,
+                    );
+                }
+                continue;
+            }
+            eprintln!(
+                "[process_fork_diag] real-resume: EXCEPTION_DEBUG_EVENT code={:#x} addr={:#x} \
+                 tid={} first_chance={}",
+                record.ExceptionCode,
+                record.ExceptionAddress as usize,
+                event.dwThreadId,
+                unsafe { event.u.Exception.dwFirstChance }
+            );
+            let thread_handle = unsafe { OpenThread(THREAD_ALL_ACCESS, 0, event.dwThreadId) };
+            if !thread_handle.is_null() {
+                let mut ctx = CONTEXT {
+                    ContextFlags: CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64,
+                    ..unsafe { core::mem::zeroed() }
+                };
+                let ok = unsafe { GetThreadContext(thread_handle, &raw mut ctx) };
+                eprintln!(
+                    "[process_fork_diag] real-resume: faulting-thread CONTEXT ok={} Rip={:#x} Rsp={:#x} \
+                     Rax={:#x} Rcx={:#x} Rdx={:#x} Rbx={:#x} Rsi={:#x} Rdi={:#x}",
+                    ok != 0,
+                    ctx.Rip,
+                    ctx.Rsp,
+                    ctx.Rax,
+                    ctx.Rcx,
+                    ctx.Rdx,
+                    ctx.Rbx,
+                    ctx.Rsi,
+                    ctx.Rdi,
+                );
+                unsafe {
+                    CloseHandle(thread_handle);
+                }
+            }
+            // Let the child's OWN VEH (registered by its own `WindowsUserland::new()`) see this
+            // exception through the normal, un-debugged dispatch path -- this observer only watches.
+            unsafe {
+                ContinueDebugEvent(
+                    event.dwProcessId,
+                    event.dwThreadId,
+                    windows_sys::Win32::Foundation::DBG_EXCEPTION_NOT_HANDLED,
+                );
+            }
+            // Keep watching: a VEH-handled exception may be followed by a SECOND, unhandled one
+            // (e.g. the guest instruction retried and faulted again, or a different guest
+            // instruction faults next) -- bounded by the same 3s deadline as the outer loop.
+            continue;
+        }
+        unsafe {
+            ContinueDebugEvent(
+                event.dwProcessId,
+                event.dwThreadId,
+                windows_sys::Win32::Foundation::DBG_CONTINUE,
+            );
+        }
     }
 }
 

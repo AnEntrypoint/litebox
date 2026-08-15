@@ -621,15 +621,26 @@ pub trait ForkChildVerificationProvider {
     /// suspended child needs to prove cross-process register injection works at all, before any
     /// larger cross-process `Task`-reconstruction work is attempted. `None` on every call site that
     /// does not (yet) compute a translated snapshot ahead of this hook.
+    /// `full_translated_gprs` (pass 120): the SAME `child_ctx` values as `translated_gprs`, carried
+    /// in full (every GPR plus `eflags`/`cs`/`ss`, matching `litebox_common_linux::PtRegs`'s x86_64
+    /// layout -- see [`ForkFullGprSnapshot`]'s doc comment for why this is a separate type rather
+    /// than widening [`ForkGprSnapshot`] in place). Pass 118/119's minimal-stub probe only ever
+    /// needed `rip`/`rsp`/`rax`; pass 120's real-guest-resume probe needs the complete context to
+    /// build a full `CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64` structure mirroring
+    /// `switch_to_guest_ntcontinue`'s own field mapping exactly. `None` on every call site that does
+    /// not (yet) compute this (every platform except `litebox_platform_windows_userland`, and every
+    /// non-`x86_64` target there too).
     fn diagnostic_process_fork_probe(
         &self,
         relocations: &crate::mm::AddressRelocations,
         fd_complexity: ForkFdComplexity,
         translated_gprs: Option<ForkGprSnapshot>,
+        full_translated_gprs: Option<ForkFullGprSnapshot>,
     ) {
         let _ = relocations;
         let _ = fd_complexity;
         let _ = translated_gprs;
+        let _ = full_translated_gprs;
     }
 }
 
@@ -649,6 +660,38 @@ pub struct ForkGprSnapshot {
     pub rsp: usize,
     /// The child's `fork()` return value (always `0`, the child-side ABI contract).
     pub rax: usize,
+}
+
+/// The FULL translated register set a pass-120 "real guest resume" diagnostic probe needs --
+/// every GPR plus `eflags`/`cs`/`ss`, mirroring `litebox_common_linux::PtRegs`'s x86_64 field
+/// layout exactly (same bespoke-struct-not-`PtRegs` reasoning as [`ForkGprSnapshot`]: `litebox`
+/// sits below `litebox_common_linux` in the crate dependency graph). Distinct from
+/// [`ForkGprSnapshot`] (kept as-is, still used by pass 118/119's minimal-stub probe) rather than
+/// widening that type in place, since the two probes are independently gated and this pass's own
+/// FINDINGS.txt entry documents the minimal-stub probe as already proven and not to be disturbed.
+#[derive(Debug, Clone, Copy)]
+pub struct ForkFullGprSnapshot {
+    pub r15: usize,
+    pub r14: usize,
+    pub r13: usize,
+    pub r12: usize,
+    pub rbp: usize,
+    pub rbx: usize,
+    pub r11: usize,
+    pub r10: usize,
+    pub r9: usize,
+    pub r8: usize,
+    pub rax: usize,
+    pub rcx: usize,
+    pub rdx: usize,
+    pub rsi: usize,
+    pub rdi: usize,
+    pub orig_rax: usize,
+    pub rip: usize,
+    pub cs: usize,
+    pub eflags: usize,
+    pub rsp: usize,
+    pub ss: usize,
 }
 
 /// Cheap, read-only classification of a fork()ing process's fd table, computed in `do_clone`

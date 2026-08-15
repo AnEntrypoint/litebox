@@ -4075,6 +4075,7 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         relocations: &litebox::mm::AddressRelocations,
         fd_complexity: litebox::platform::ForkFdComplexity,
         translated_gprs: Option<litebox::platform::ForkGprSnapshot>,
+        full_translated_gprs: Option<litebox::platform::ForkFullGprSnapshot>,
     ) {
         // Independent of the spawn probe's own gate below (pass 116): purely logs the fd-table
         // classification `do_clone` already computed, never touches the spawn/resume/fds probes'
@@ -4116,10 +4117,17 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         } else {
             None
         };
+        let want_real_resume = process_fork::diag_process_fork_real_resume_enabled();
+        let inject_full_gprs = if want_real_resume {
+            full_translated_gprs
+        } else {
+            None
+        };
         match process_fork::diagnostic_spawn_and_copy(
             group_relocations,
             read_source_bytes,
             inject_gprs,
+            inject_full_gprs,
         ) {
             Ok(results) => {
                 let succeeded = results.iter().filter(|r| r.succeeded).count();
