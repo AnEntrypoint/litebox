@@ -224,6 +224,7 @@ fn copy_one_group(
     _dest_base: usize,
     read_source_bytes: &mut impl FnMut(Range<usize>) -> Option<Vec<u8>>,
 ) -> GroupCopyResult {
+    const PAGE_SIZE: usize = 4096;
     let len = source_group.len();
     let fail = |err: u32| GroupCopyResult {
         source_group: source_group.clone(),
@@ -285,25 +286,46 @@ fn copy_one_group(
 
     // Step 2: copy the parent's real, live bytes for this group into the child's newly reserved
     // span at the identical address.
-    let Some(bytes) = read_source_bytes(source_group.clone()) else {
-        unsafe {
-            VirtualFreeEx(child, reserved, 0, MEM_RELEASE);
-        }
-        return fail(0);
-    };
-    debug_assert_eq!(bytes.len(), len, "read_source_bytes returned wrong length");
-    let mut written = 0usize;
-    let ok = unsafe {
-        WriteProcessMemory(
-            child,
-            reserved,
-            bytes.as_ptr().cast::<c_void>(),
+    //
+    // `source_group` here is `GroupRelocation::source_group` (see its doc comment in
+    // `litebox::mm::linux`), rounded OUT to Windows allocation granularity so `VirtualAllocEx`
+    // above can force-reserve it -- it may therefore extend beyond the actual mapped guest content
+    // (padding pages the real, page-granularity `Vmem::duplicate` copy loop never touches and that
+    // are genuinely unmapped/unreadable in the parent). A single whole-span
+    // `read_source_bytes(source_group)` would fail outright the moment ANY page in that padding is
+    // unreadable, even though every REAL content page copied fine -- read page-by-page instead so
+    // an unreadable padding page is simply left as the zero-fill `VirtualAlloc2`/`MEM_COMMIT`
+    // already guarantees for it, matching what a real fork() would produce there (nothing, since
+    // no guest mapping exists in that padding either).
+    let mut cursor = source_group.start;
+    while cursor < source_group.end {
+        let page_end = (cursor + PAGE_SIZE).min(source_group.end);
+        let page_range = cursor..page_end;
+        let Some(bytes) = read_source_bytes(page_range.clone()) else {
+            // Unreadable page: leave it as the child's already-zero-filled MEM_COMMIT content
+            // (real guest padding pages are unmapped too, so this matches production behavior).
+            cursor = page_end;
+            continue;
+        };
+        debug_assert_eq!(
             bytes.len(),
-            &raw mut written,
-        )
-    };
-    if ok == 0 || written != bytes.len() {
-        return fail(unsafe { GetLastError() });
+            page_range.len(),
+            "read_source_bytes returned wrong length"
+        );
+        let mut written = 0usize;
+        let ok = unsafe {
+            WriteProcessMemory(
+                child,
+                (reserved as usize + (cursor - source_group.start)) as *mut c_void,
+                bytes.as_ptr().cast::<c_void>(),
+                bytes.len(),
+                &raw mut written,
+            )
+        };
+        if ok == 0 || written != bytes.len() {
+            return fail(unsafe { GetLastError() });
+        }
+        cursor = page_end;
     }
 
     GroupCopyResult {
