@@ -652,6 +652,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             deliver_to_child(&child);
             return Ok(0);
         }
+        // Pass 141, documented gap: a cross-process `fork()` child (`LITEBOX_PROCESS_FORK=1`) is
+        // tracked in `Process::cross_process_children`, not `children` -- `find_child` above
+        // never finds it, so it would otherwise fall through to the generic "unsupported remote
+        // pid" `ESRCH` below silently. Distinguish that specific case in the log so it reads as
+        // "known, scoped-out signal delivery" rather than "the shim has no idea what this pid
+        // is" -- the child is real and reachable via `sys_wait4`, just not signalable yet; see
+        // `Process::cross_process_children`'s doc comment for the full scope statement.
+        if let Some(pid) = pid
+            && pid > 0
+            && self.process().find_cross_process_child(pid).is_some()
+        {
+            log_unsupported!(
+                "sys_kill with pid={pid}: signal delivery to a cross-process fork() child is not \
+                 implemented (pass 141 documented gap -- wait4() works, kill() does not)"
+            );
+            return Err(Errno::ESRCH);
+        }
         log_unsupported!("sys_kill with a remote pid that isn't a direct child");
         Err(Errno::ESRCH)
     }

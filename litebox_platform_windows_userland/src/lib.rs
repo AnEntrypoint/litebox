@@ -4226,6 +4226,24 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
             }
         }
     }
+
+    fn wait_for_cross_process_exit(&self, handle: litebox::platform::CrossProcessChildHandle) -> u32 {
+        process_fork::wait_for_process_exit(handle.0 as windows_sys::Win32::Foundation::HANDLE)
+    }
+
+    fn try_wait_for_cross_process_exit(
+        &self,
+        handle: litebox::platform::CrossProcessChildHandle,
+    ) -> Option<u32> {
+        process_fork::try_wait_for_process_exit(handle.0 as windows_sys::Win32::Foundation::HANDLE)
+    }
+
+    fn diagnostic_cross_process_wait4_probe(
+        &self,
+        register: &mut dyn FnMut(i32, litebox::platform::CrossProcessChildHandle),
+    ) {
+        process_fork::diagnostic_cross_process_wait4_probe(register);
+    }
 }
 
 impl litebox::platform::SystemInfoProvider for WindowsUserland {

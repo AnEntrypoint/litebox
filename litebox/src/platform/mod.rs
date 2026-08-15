@@ -642,7 +642,71 @@ pub trait ForkChildVerificationProvider {
         let _ = translated_gprs;
         let _ = full_translated_gprs;
     }
+
+    /// Blocks the calling thread until the real OS process identified by `handle` (opaque,
+    /// platform-defined -- see [`CrossProcessChildHandle`]'s doc comment) terminates, then returns
+    /// its raw OS exit code.
+    ///
+    /// Part of pass 141 of `scratchpad/jqrepro/FINDINGS.txt`'s cross-process `wait4()` bridge: a
+    /// `LITEBOX_PROCESS_FORK=1` child (a genuinely separate Windows process, not the existing
+    /// same-process thread-based `fork()`) cannot be waited for via `Process::wait_for_exit`'s
+    /// existing `nr_threads`-futex mechanism -- that only observes threads inside THIS OS process.
+    /// A platform whose `fork()` can produce such a child overrides this to call the real
+    /// OS-level blocking wait (`WaitForSingleObject` + `GetExitCodeProcess` on Windows). The
+    /// default implementation panics: it must never be called on a platform/build that never
+    /// registers a [`CrossProcessChildHandle`] in the first place (see
+    /// `Process::cross_process_children`'s doc comment -- the caller only reaches this method for
+    /// a pid actually found in that registry).
+    fn wait_for_cross_process_exit(&self, handle: CrossProcessChildHandle) -> u32 {
+        let _ = handle;
+        unreachable!(
+            "wait_for_cross_process_exit called on a platform with no cross-process fork support"
+        )
+    }
+
+    /// Non-blocking poll variant of [`Self::wait_for_cross_process_exit`], used by
+    /// `wait4(WNOHANG)`. Returns `Some(raw_exit_code)` if the process has already terminated,
+    /// `None` if it is still running. Same default-panics contract as the blocking variant.
+    fn try_wait_for_cross_process_exit(&self, handle: CrossProcessChildHandle) -> Option<u32> {
+        let _ = handle;
+        unreachable!(
+            "try_wait_for_cross_process_exit called on a platform with no cross-process fork support"
+        )
+    }
+
+    /// Diagnostic-only hook (pass 141, `LITEBOX_DIAG_PROCESS_FORK_WAIT4=1`, off by default),
+    /// called from `do_clone`'s process-clone branch at the SAME call site as
+    /// [`Self::diagnostic_process_fork_probe`], purely to live-exercise the cross-process
+    /// `wait4()` exit-status bridge ([`Self::wait_for_cross_process_exit`],
+    /// [`CrossProcessChildHandle`], and `litebox_shim_linux::syscalls::process::Process::
+    /// cross_process_children`/`encode_cross_process_exit_status`/
+    /// `decode_cross_process_wait_status`) end-to-end against a REAL, ordinary Windows child
+    /// process -- entirely independent of, and without altering, this actual `fork()` call's
+    /// real outcome. `register` is the callback a platform implementation uses to register the
+    /// real child it spawns into the CALLING process's actual `cross_process_children` registry
+    /// (so the proof exercises the real production registry, not a throwaway one), keyed to the
+    /// pid the platform makes up for this diagnostic exercise (any value not colliding with a
+    /// real guest pid; the default implementation never calls it). The default implementation
+    /// does nothing.
+    fn diagnostic_cross_process_wait4_probe(&self, register: &mut dyn FnMut(i32, CrossProcessChildHandle)) {
+        let _ = register;
+    }
 }
+
+/// An opaque, platform-defined handle to a cross-process `fork()` child's real OS process,
+/// stored in [`Process::cross_process_children`](crate's shim-side registry -- see
+/// `litebox_shim_linux::syscalls::process::Process`'s doc comment) instead of the normal
+/// same-process `Arc<Process>` a thread-based `fork()` child uses.
+///
+/// Represented as a raw `usize` (a Windows `HANDLE` is pointer-sized and `Copy`) rather than an
+/// associated type on [`ForkChildVerificationProvider`], so `litebox_shim_linux`'s `Process`
+/// struct -- which is generic over `Platform: ShimPlatform` but must stay `Send`/`Sync` without
+/// per-platform `unsafe impl` boilerplate -- can hold it directly. The platform implementation is
+/// solely responsible for interpreting this value correctly (on Windows: a raw `HANDLE` value,
+/// kept alive for as long as this registry entry exists -- see the entry's own removal/`CloseHandle`
+/// discipline in `sys_wait4`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrossProcessChildHandle(pub usize);
 
 /// A minimal, platform-agnostic snapshot of the three registers a diagnostic cross-process
 /// register-injection probe (pass 118) needs: where the child's translated instruction pointer,
