@@ -597,9 +597,47 @@ pub trait ForkChildVerificationProvider {
     /// production guest memory layout, then tears the experimental child down without ever
     /// resuming it. See that implementation's module doc comment for the full mechanism and why
     /// it is safe to run alongside the real, unmodified, thread-based fork path.
-    fn diagnostic_process_fork_probe(&self, relocations: &crate::mm::AddressRelocations) {
+    ///
+    /// `fd_complexity` is a cheap, read-only classification of the fd table this `fork()` call is
+    /// about to duplicate (see [`ForkFdComplexity`]), computed unconditionally in `do_clone`
+    /// before this hook is dispatched (see that computation's own doc comment for why it is
+    /// unconditional and inert on every platform by default). Per pass 116 of
+    /// `scratchpad/jqrepro/FINDINGS.txt`'s design investigation: none of litebox's 7 fd subsystems
+    /// (FS/Network/Pipes/Eventfd/Epoll/UnixSocket/Pty) are backed by a real Windows HANDLE, so a
+    /// future process-based `fork()` cannot inherit a "complex" fd (anything beyond the inherited
+    /// stdio slots 0/1/2) via `DuplicateHandle` the way pass 115 proved works for the host's own
+    /// real stdio HANDLEs -- see that pass's findings for the full reasoning and the recommended
+    /// scope-reduction path (fall back to the existing thread-based fork whenever a fork() call's
+    /// fd table has any occupied slot beyond 0/1/2).
+    fn diagnostic_process_fork_probe(
+        &self,
+        relocations: &crate::mm::AddressRelocations,
+        fd_complexity: ForkFdComplexity,
+    ) {
         let _ = relocations;
+        let _ = fd_complexity;
     }
+}
+
+/// Cheap, read-only classification of a fork()ing process's fd table, computed in `do_clone`
+/// immediately before duplicating it, purely to inform diagnostic instrumentation (see
+/// [`PlatformProvider::diagnostic_process_fork_probe`]'s doc comment). Never changes `fork()`'s
+/// real behavior.
+///
+/// Per pass 115/116 of `scratchpad/jqrepro/FINDINGS.txt`, none of litebox's fd subsystems are
+/// backed by a real Windows HANDLE, so a process-based fork cannot yet inherit any fd beyond the
+/// conventional stdio slots (0/1/2) via the `DuplicateHandle` mechanism pass 115 proved out. This
+/// type exists so a future process-based fork implementation can cheaply decide, at the exact
+/// `do_clone` call site, whether to take that (not-yet-implemented) path or fall back to the
+/// existing thread-based fork -- without re-deriving the fd table scan itself.
+#[derive(Debug, Clone, Copy)]
+pub struct ForkFdComplexity {
+    /// Total number of currently-occupied raw fd slots in the fork()ing process's fd table.
+    pub total_alive: usize,
+    /// Number of occupied raw fd slots whose raw index is 3 or greater, i.e. anything beyond the
+    /// conventional stdin/stdout/stderr slots (0/1/2). A real process-based fork can only safely
+    /// inherit this process's fd table today (per pass 116's finding) when this is `0`.
+    pub beyond_stdio: usize,
 }
 
 /// A provider for system information.

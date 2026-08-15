@@ -1671,9 +1671,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // this `fork()` call's real outcome -- see `ForkChildVerificationProvider::
             // diagnostic_process_fork_probe`'s doc comment for the full mechanism and safety
             // argument.
+            //
+            // `fd_complexity` (pass 116) is a cheap, read-only scan of the pre-fork fd table --
+            // `RawDescriptorStorage::iter_alive` over `self.files`, the SAME table
+            // `fork_duplicate` (below) is about to duplicate -- computed unconditionally (it is
+            // O(occupied fd count) and touches no subsystem state) so the diagnostic hook can
+            // classify this fork() call's fd complexity without a second, gated fd-table walk.
+            // See `litebox::platform::ForkFdComplexity`'s doc comment for why this matters.
+            let fd_complexity = {
+                let files = self.files.borrow();
+                let raw_descriptors = files.raw_descriptor_store.read();
+                let total_alive = raw_descriptors.iter_alive().count();
+                let beyond_stdio = raw_descriptors.iter_alive().filter(|&raw| raw >= 3).count();
+                litebox::platform::ForkFdComplexity {
+                    total_alive,
+                    beyond_stdio,
+                }
+            };
             self.global
                 .platform
-                .diagnostic_process_fork_probe(&relocations);
+                .diagnostic_process_fork_probe(&relocations, fd_complexity);
             let vforked = flags.contains(CloneFlags::VFORK);
             // Created once here and threaded into both the new `Process` (below) and the new
             // `Task`'s `SignalState` (see `clone_for_new_task`'s call site further down) -- they

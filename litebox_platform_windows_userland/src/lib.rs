@@ -4070,7 +4070,26 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         fork_verify::end();
     }
 
-    fn diagnostic_process_fork_probe(&self, relocations: &litebox::mm::AddressRelocations) {
+    fn diagnostic_process_fork_probe(
+        &self,
+        relocations: &litebox::mm::AddressRelocations,
+        fd_complexity: litebox::platform::ForkFdComplexity,
+    ) {
+        // Independent of the spawn probe's own gate below (pass 116): purely logs the fd-table
+        // classification `do_clone` already computed, never touches the spawn/resume/fds probes'
+        // own state, and is itself inert unless its own env var is set.
+        if process_fork::diag_process_fork_fd_complexity_enabled() {
+            eprintln!(
+                "[process_fork_diag] fork(): fd-complexity total_alive={} beyond_stdio={} ({})",
+                fd_complexity.total_alive,
+                fd_complexity.beyond_stdio,
+                if fd_complexity.beyond_stdio == 0 {
+                    "simple: process-based fork could inherit this fd table today"
+                } else {
+                    "complex: process-based fork would need to fall back to thread-based fork for this fd table"
+                }
+            );
+        }
         if !process_fork::diag_process_fork_spawn_enabled() {
             return;
         }
