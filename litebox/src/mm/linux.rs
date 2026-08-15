@@ -393,8 +393,17 @@ impl<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> VmArea<Platfor
 ///
 /// See [`super::AddressRelocations::private_data_ranges`].
 /// `(source range, destination base address, was executable in source, is a private data region,
-/// was file-backed in source)` for one relocated range -- see [`Vmem::duplicate`].
-type DuplicatedRangeInfo = (Range<usize>, usize, bool, bool, bool);
+/// was file-backed in source, the source `VmArea`'s raw [`VmFlags`] bits)` for one relocated range
+/// -- see [`Vmem::duplicate`].
+///
+/// The final `u32` is the SOURCE VMA's complete flag word, verbatim. The three `bool`s before it
+/// are each derived from it, but are NOT jointly sufficient to reconstruct it: `VM_READ`,
+/// `VM_GROWSDOWN`, `VM_SHARED` and every `VM_MAY*` bit are unrecoverable from them (e.g. a false
+/// `is private data` says only that at least one of "writable, non-exec, non-stack, non-shared"
+/// failed, not which). [`Vmem::new_adopting_existing_memory`] needs the exact flag word to
+/// reconstruct a bookkeeping-equivalent `vmas` map for memory that already exists at these
+/// addresses in another process, so it is carried explicitly rather than re-derived.
+type DuplicatedRangeInfo = (Range<usize>, usize, bool, bool, bool, u32);
 
 /// One coherent-group reservation made by [`Vmem::duplicate`]: the aligned span it reserved in
 /// the SOURCE address space (`source_base..source_base + size`, i.e. `source_group` verbatim) and
@@ -595,6 +604,87 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             }
         }
         vmem
+    }
+
+    /// Create a [`Vmem`] whose `vmas` bookkeeping ADOPTS memory that ALREADY EXISTS, at exactly
+    /// the given addresses, in this process's address space -- performing no allocation, no
+    /// reservation, no commit, and no copying of any kind.
+    ///
+    /// # Why this exists (and why it is NOT [`Self::new`] or [`Self::new_excluding`])
+    ///
+    /// The normal startup path builds an EMPTY `Vmem` ([`Self::new`]) and grows it as the ELF
+    /// loader's `PT_LOAD` segments, then the guest's own `mmap`/`brk` calls, allocate real pages
+    /// through it. [`Self::new_excluding`] is the `fork()`-into-the-same-host-process variant,
+    /// which still allocates every destination page itself (see [`Self::duplicate`]).
+    ///
+    /// A genuine process-based `fork()` child (this repo's `FINDINGS.txt` passes 107-137) needs
+    /// the exact OPPOSITE of both: by the time any `Vmem` is constructed in that child, its guest
+    /// memory is ALREADY fully populated, at the parent's own addresses, by the parent's
+    /// `VirtualAlloc2`-at-a-forced-base + `WriteProcessMemory` step (passes 111/112). Re-running
+    /// either constructor there would be wrong twice over -- it would attempt to allocate pages
+    /// that are already committed, and it would produce a `vmas` map describing a layout that is
+    /// not the one actually in memory. What the child needs is purely Rust-level bookkeeping
+    /// catching up to a memory layout that already physically exists: precisely this function.
+    ///
+    /// `regions` yields `(range, raw VmFlags bits, is_file_backed)` per already-present guest
+    /// region, in the DESTINATION address space's own coordinates. For the process-fork case the
+    /// source-to-destination translation is the identity (the whole point of forcing the child's
+    /// reservations to the parent's own bases), so a caller transmitting
+    /// [`super::AddressRelocations`]'s source ranges verbatim is already supplying destination
+    /// coordinates; a caller for which that is not true must translate before calling.
+    ///
+    /// Deliberately does NOT consult [`PageManagementProvider::reserved_pages`]: that reports the
+    /// whole host process's committed memory, which in an adopting child ALREADY INCLUDES the
+    /// pre-populated guest regions this function is being asked to describe. Folding it in would
+    /// overwrite each adopted region's real flags with `VmFlags::empty()` (the placeholder
+    /// [`Self::new_excluding`] inserts for host-reserved space) and so silently destroy exactly
+    /// the information this constructor exists to preserve.
+    ///
+    /// `brk` is the parent's program break at fork() time, or `0` if it had no heap yet -- the
+    /// same value [`super::AddressRelocations`] carries as its `heap_top`.
+    ///
+    /// Shared (`VM_SHARED`) regions cannot be adopted: a `VmArea`'s
+    /// [`VmArea::shared_handle`] is a live platform handle in the PARENT's handle table with no
+    /// meaning in another process. Such regions are adopted with their flags intact but no handle,
+    /// and are reported by the returned count so a caller can surface the discrepancy rather than
+    /// silently mis-describing them.
+    ///
+    /// Returns the `Vmem` plus the number of regions adopted and the number of those that carried
+    /// `VM_SHARED` (i.e. adopted without a usable handle, as above).
+    pub(super) fn new_adopting_existing_memory(
+        platform: &'static Platform,
+        regions: impl Iterator<Item = (Range<usize>, u32, bool)>,
+        brk: usize,
+    ) -> (Self, usize, usize) {
+        let mut vmem = Self {
+            vmas: RangeMap::new(),
+            brk,
+            platform,
+        };
+        let mut adopted = 0usize;
+        let mut shared = 0usize;
+        for (range, flag_bits, is_file_backed) in regions {
+            if range.start >= range.end || range.start % ALIGN != 0 || range.end % ALIGN != 0 {
+                // Malformed/unaligned input (this data crossed a process boundary): skip rather
+                // than panic, matching `AddressRelocations::deserialize_for_diagnostic`'s own
+                // "degrade, never crash the process being diagnosed" contract.
+                continue;
+            }
+            let flags = VmFlags::from_bits_truncate(flag_bits);
+            if flags.contains(VmFlags::VM_SHARED) {
+                shared += 1;
+            }
+            vmem.vmas.insert(
+                range,
+                VmArea {
+                    flags,
+                    is_file_backed,
+                    shared_handle: None,
+                },
+            );
+            adopted += 1;
+        }
+        (vmem, adopted, shared)
     }
 
     /// Gets an iterator over all pairs of ([`Range<usize>`], [`VmArea`]),
@@ -1086,6 +1176,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     vma.flags.contains(VmFlags::VM_EXEC),
                     is_private_data_range(&vma),
                     vma.is_file_backed(),
+                    vma.flags.bits(),
                 ));
                 continue;
             }
@@ -1128,6 +1219,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     vma.flags.contains(VmFlags::VM_EXEC),
                     is_private_data_range(&vma),
                     vma.is_file_backed(),
+                    vma.flags.bits(),
                 ));
                 continue;
             }
@@ -1177,6 +1269,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 vma.flags.contains(VmFlags::VM_EXEC),
                 is_private_data_range(&vma),
                 vma.is_file_backed(),
+                vma.flags.bits(),
             ));
 
             if vma.flags.intersection(VmFlags::VM_ACCESS_FLAGS)
