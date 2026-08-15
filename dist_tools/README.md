@@ -129,4 +129,21 @@ LiteBox will contain a deliberately malicious payload — it is built to run
 *unmodified* Linux programs correctly, not to defend against one that is
 actively trying to escape.
 
+## Known limitations
+
+**PTY-based CPython workloads may crash intermittently (upstream bug, not a
+LiteBox defect).** Programs that combine `fork()` with CPython's `pty`
+module (e.g. `pty.spawn(...)`, `pty.fork()`) can hit a use-after-free inside
+CPython 3.14.7's fork-child cleanup path (`threading._after_fork()`
+resizing a dict while musl 1.2.6's `mallocng` allocator is in a
+post-`fork()` state), causing a segfault in the guest. This was
+root-caused across an extensive investigation (see the project's git
+history and `FINDINGS.txt` for the full characterization) to be a genuine
+bug in upstream CPython/musl, reproducible independent of LiteBox, with no
+newer CPython or musl version available in Alpine to fix it and no known
+mitigation (including `PYTHONMALLOC=malloc`). It is tracked as a known,
+currently-unfixable-from-LiteBox's-side limitation. All other functionality
+in this bundle, including `apk add`, general `fork`+`exec`, and the rest of
+this smoke-tested surface, is unaffected.
+
 All files must stay in the same directory.
