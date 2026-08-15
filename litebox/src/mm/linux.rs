@@ -23,6 +23,15 @@ use crate::platform::page_mgmt::SharedMemoryError;
 /// Page size in bytes
 pub const PAGE_SIZE: usize = 4096;
 
+/// Windows' `dwAllocationGranularity` (the platform's own
+/// `WindowsUserland::round_up_to_granu`/`round_down_to_granu` in
+/// `litebox_platform_windows_userland/src/lib.rs` read this same value dynamically from
+/// `GetSystemInfo`, but it is a fixed OS-wide constant that has been 64KB on every Windows
+/// version since NT -- hardcoded here because this module cannot see the platform's `sys_info`
+/// (it is platform-agnostic), and only [`GroupRelocation::source_group`]'s reservation-bounds
+/// rounding (a Windows-process-fork-specific concern, see that field's doc comment) needs it.
+pub(super) const WINDOWS_ALLOCATION_GRANULARITY: usize = 0x1_0000;
+
 bitflags::bitflags! {
     /// Flags to describe the properties of a memory region.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -415,9 +424,34 @@ type DuplicatedRangeInfo = (Range<usize>, usize, bool, bool, bool);
 /// against REAL guest memory layouts, that reserving+populating a genuine child process at these
 /// exact group bases works end-to-end -- see that diagnostic's own doc comment for the mechanism.
 /// The actual `fork()` path this crate uses today does not consume it yet.
+///
+/// # `source_group` is rounded to Windows allocation-granularity, not page-granularity
+///
+/// Pass 111 live-verified this struct's naive page-granularity `source_group` bounds (the exact
+/// same `Range<usize>` used by the per-region copy loop's `groups`/`group_bases`) against real
+/// production guest memory layouts and found only 2 of 5 reservation groups succeeded when a
+/// diagnostic process-fork spawn tried to `VirtualAlloc2` a NEW process at that exact source span:
+/// `MEM_ADDRESS_REQUIREMENTS` unconditionally rejects a non-64KB-aligned forced base/size with
+/// `ERROR_INVALID_PARAMETER` (see this module's own top-of-function doc comment on pass 109's
+/// empirical confirmation of that constraint), and a page-granularity guest VMA boundary is only
+/// 64KB-aligned by chance. `source_group` here is therefore rounded OUT to
+/// [`WINDOWS_ALLOCATION_GRANULARITY`] (start rounded down, end rounded up) -- the SAME
+/// `round_down_to_granu`/`round_up_to_granu` pattern `WindowsUserland`'s own `reserve_and_commit`
+/// closure already uses for the real reservation (`litebox_platform_windows_userland/src/lib.rs`
+/// ~2786-2787) -- while the per-region copy loop's `groups`/`group_bases` (and every address this
+/// function actually writes bytes to or relocates a pointer through) stay at exact page
+/// granularity, unchanged, since that is what correctly preserves each region's RIP-relative
+/// offset from every other region in its group (see this function's "COHERENT GROUPS" doc
+/// comment). These are deliberately two separate concepts: `source_group`/`GroupRelocation` is a
+/// coarser, Windows-allocation-shaped RESERVATION bound for a future process-based fork's own use
+/// (not yet consumed by the real `fork()` path), while `groups`/`group_bases` remain the precise
+/// CONTENT bounds the existing, byte-perfect duplication logic has always used.
 #[derive(Debug, Clone)]
 pub(super) struct GroupRelocation {
-    /// The group's aligned span in the SOURCE address space.
+    /// The group's span in the SOURCE address space, rounded OUT to
+    /// [`WINDOWS_ALLOCATION_GRANULARITY`] (start rounded down, end rounded up) -- see this
+    /// struct's own doc comment for why this differs from the page-granularity `groups`/
+    /// `group_bases` spans the per-region copy loop actually uses.
     pub(super) source_group: Range<usize>,
     /// The aligned base address the platform actually placed this group's span at in the
     /// destination (`dest`) address space; every region within `source_group` is offset from
@@ -956,11 +990,51 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // Preserved additively for `DuplicateOutcome::group_relocations` -- see that field's doc
         // comment. Built from the same `group_bases` entries used by the per-region placement loop
         // below; not consulted by anything in that loop itself.
+        //
+        // Each `source_group` is rounded OUT to `WINDOWS_ALLOCATION_GRANULARITY` (see
+        // `GroupRelocation`'s doc comment) -- but only when doing so does not make this group's
+        // rounded bounds collide with an ADJACENT group's rounded bounds. `max_intra_group_gap`
+        // (16 * ALIGN = 65536 = exactly one allocation-granularity unit at ALIGN=4096) is why two
+        // groups can be as close as 65537 bytes apart while still staying unmerged above -- rounding
+        // group A's end up and group B's start down by up to 65536 bytes each could make their
+        // reservation bounds touch or overlap despite `groups`/`group_bases` correctly keeping them
+        // as two independent, independently-placed spans with unrelated `dest_base`s. A collision
+        // there is a real bookkeeping conflict, not a rounding artifact to paper over: the two
+        // groups' `dest_base`s were chosen by two independent `insert_mapping(Hint)` calls with no
+        // relative-offset relationship to each other, so merging their reservation bounds into one
+        // `GroupRelocation` would misrepresent that as one coherent reservation. When rounding would
+        // collide, this group's `source_group` is left at its exact (page-granularity, from
+        // `group_bases`) bounds instead -- correct but possibly still rejected by
+        // `MEM_ADDRESS_REQUIREMENTS` for THIS group specifically, same as before this fix; every
+        // other, non-colliding group still gets the full benefit of the rounded-out bounds.
+        let round_down_granu = |x: usize| x & !(WINDOWS_ALLOCATION_GRANULARITY - 1);
+        let round_up_granu = |x: usize| {
+            (x + WINDOWS_ALLOCATION_GRANULARITY - 1) & !(WINDOWS_ALLOCATION_GRANULARITY - 1)
+        };
+        let rounded_bounds: Vec<Range<usize>> = group_bases
+            .iter()
+            .map(|(group, _)| round_down_granu(group.start)..round_up_granu(group.end))
+            .collect();
         let group_relocations: Vec<GroupRelocation> = group_bases
             .iter()
-            .map(|(group, dest_base)| GroupRelocation {
-                source_group: group.clone(),
-                dest_base: *dest_base,
+            .enumerate()
+            .map(|(i, (group, dest_base))| {
+                let rounded = &rounded_bounds[i];
+                let collides_with_prev = i
+                    .checked_sub(1)
+                    .is_some_and(|prev_i| rounded.start < rounded_bounds[prev_i].end);
+                let collides_with_next = rounded_bounds
+                    .get(i + 1)
+                    .is_some_and(|next| rounded.end > next.start);
+                let source_group = if collides_with_prev || collides_with_next {
+                    group.clone()
+                } else {
+                    rounded.clone()
+                };
+                GroupRelocation {
+                    source_group,
+                    dest_base: *dest_base,
+                }
             })
             .collect();
 
