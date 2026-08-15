@@ -605,6 +605,24 @@ pub fn diag_process_fork_relocations_enabled() -> bool {
 /// creation, memory copy, or HANDLE duplication at all -- it only logs a count `do_clone` already
 /// computed -- so it is safe to enable on its own, without also opting into any of the heavier,
 /// child-process-spawning probes.
+/// Whether pass 124's copy-time zero-slot probe is enabled
+/// (`LITEBOX_DIAG_PROCESS_FORK_COPY_ZEROES=1`). Pass 123's STEP 6 named the precise open question
+/// left after pass 122's diagnostic crash (a genuinely-zero mallocng `group->meta` back-link slot
+/// at a real, correctly identity-mapped heap address): was that slot ALREADY zero in the PARENT's
+/// own live memory at the exact moment [`copy_one_group`] read it via `read_source_bytes`, or did
+/// something mutate it between copy-time and the later crash (a sampling race, not a genuine
+/// guest-timing artifact)? This gate logs, for every page copied in every group, every 8-byte-
+/// aligned all-zero word found in the PARENT-side bytes JUST READ (before they are
+/// `WriteProcessMemory`'d into the child) -- tagged with its absolute source address -- so a
+/// later crash's `[rdi-0x10]` address can be grep'd against this log to see whether that exact
+/// address was already logged as zero at copy time. Independent of every other gate: like
+/// `diag_process_fork_fd_complexity_enabled`, this performs no additional process/memory
+/// operations of its own, only logs bytes already read for the real copy.
+#[must_use]
+pub fn diag_process_fork_copy_zeroes_enabled() -> bool {
+    std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_COPY_ZEROES").is_some()
+}
+
 #[must_use]
 pub fn diag_process_fork_fd_complexity_enabled() -> bool {
     std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_FD_COMPLEXITY").is_some()
@@ -2270,6 +2288,14 @@ fn copy_one_group(
     // an unreadable padding page is simply left as the zero-fill `VirtualAlloc2`/`MEM_COMMIT`
     // already guarantees for it, matching what a real fork() would produce there (nothing, since
     // no guest mapping exists in that padding either).
+    let log_zeroes = diag_process_fork_copy_zeroes_enabled();
+    // Accumulated as (start_addr, run_length_in_words) pairs, coalescing consecutive all-zero
+    // 8-byte words into one run -- avoids one `eprintln!` per zero word (a real heap group can
+    // have hundreds of thousands of zero words in its unused/uncommitted regions; per-word
+    // logging was measured to stall the whole diagnostic past its wall-clock budget before it
+    // ever reached the resume/injection step). The full per-address log is reconstructible from
+    // (start_addr, run_length) at analysis time by grep'ing the printed range.
+    let mut zero_runs: Vec<(usize, usize)> = Vec::new();
     let mut cursor = source_group.start;
     while cursor < source_group.end {
         let page_end = (cursor + PAGE_SIZE).min(source_group.end);
@@ -2285,6 +2311,19 @@ fn copy_one_group(
             page_range.len(),
             "read_source_bytes returned wrong length"
         );
+        if log_zeroes {
+            for (word_offset, word) in bytes.chunks_exact(8).enumerate() {
+                if word.iter().all(|b| *b == 0) {
+                    let addr = page_range.start + word_offset * 8;
+                    match zero_runs.last_mut() {
+                        Some((run_start, run_words)) if *run_start + *run_words * 8 == addr => {
+                            *run_words += 1;
+                        }
+                        _ => zero_runs.push((addr, 1)),
+                    }
+                }
+            }
+        }
         let mut written = 0usize;
         let ok = unsafe {
             WriteProcessMemory(
@@ -2299,6 +2338,16 @@ fn copy_one_group(
             return fail(unsafe { GetLastError() });
         }
         cursor = page_end;
+    }
+
+    if log_zeroes {
+        for (run_start, run_words) in &zero_runs {
+            let run_end = run_start + run_words * 8;
+            eprintln!(
+                "[process_fork_diag] copy-zero: addr={run_start:#x}..{run_end:#x} ({run_words} word(s), 8 bytes each) ALL ZERO at parent-read time (group={:#x}..{:#x})",
+                source_group.start, source_group.end
+            );
+        }
     }
 
     GroupCopyResult {
