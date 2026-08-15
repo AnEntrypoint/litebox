@@ -261,6 +261,10 @@ unsafe extern "system" fn vectored_exception_handler(
             "[veh] fault addr={fault_addr:#x} type={fa_mtype:#x} protect={fa_protect:#x} alloc_base={fa_alloc_base:#x} watched={}",
             fork_verify::addr_is_codewatched_for_diagnostics(fault_addr),
         );
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "diagnostic-only; this platform is x86_64-only, rdi fits in usize"
+        )]
         let rdi = context.Rdi as usize;
         let meta_slot = rdi.wrapping_sub(0x10);
         let (ms_mtype, ms_protect, ms_alloc_base) =
