@@ -1,5 +1,9 @@
 name: throwaway-native-fork-check
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/throwaway-native-fork-check.yml'
 jobs:
   native:
     runs-on: ubuntu-latest
