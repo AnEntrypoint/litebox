@@ -108,6 +108,21 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
         anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
     }
+    // Pass 136: carry this run's tar path across the CreateProcessW-spawned diagnostic-fork-
+    // child boundary (inherited automatically via `lpEnvironment: null`) so a child built with
+    // `LITEBOX_DIAG_PROCESS_FORK_GLOBALSTATE=1` can remount the SAME rootfs a real GlobalState-
+    // reconstruction probe needs -- see `process_fork::FORK_CHILD_TAR_PATH_ENV_VAR`'s doc
+    // comment. Set unconditionally (cheap, a single env var) rather than gated behind the probe's
+    // own flag, matching this module's existing precedent of computing cheap diagnostic inputs
+    // unconditionally while gating only the logging/behavior that consumes them.
+    if let Ok(abs_tar) = std::path::absolute(tar_file) {
+        unsafe {
+            std::env::set_var(
+                litebox_platform_windows_userland::process_fork::FORK_CHILD_TAR_PATH_ENV_VAR,
+                &abs_tar,
+            );
+        }
+    }
     if let Some(export_path) = &cli_args.export_writable_layer {
         // `tar_file` stays memory-mapped for this process's entire lifetime (see
         // `mmapped_file` below), and Windows generally refuses to open a file
@@ -312,6 +327,74 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let _ = net_worker.join();
 
     std::process::exit(exit_code)
+}
+
+/// Pass 136 -- STEP 1 of pass 135's four-step plan: prove a REAL, standalone `GlobalState` (the
+/// entire shim-wide runtime state pass 135 found blocks wiring process-based fork into
+/// production -- `LiteBox`/`PageManager`, filesystem+tar mount, network subsystem, futex
+/// manager, pipes, unix-socket table, elf-patch-cache, flock registry, pty registry) can be
+/// constructed a SECOND time, standalone, inside a process-fork diagnostic child that has
+/// already gone through pass 114's proven-safe `WindowsUserland::new()` init with pre-populated
+/// foreign memory present -- WITHOUT yet trying to make its contents match the parent's actual
+/// live state (that is a later step; see `scratchpad/jqrepro/FINDINGS.txt` PASS 136). Gated
+/// behind `LITEBOX_DIAG_PROCESS_FORK_GLOBALSTATE=1`
+/// (`process_fork::diag_process_fork_globalstate_enabled`); a complete no-op otherwise. Lives in
+/// THIS crate (not `litebox_platform_windows_userland`, which has no dependency on
+/// `litebox_shim_linux` and so cannot reference `LinuxShimBuilder` at all) because this is the
+/// only crate in the dependency graph that has both the shim-construction API and the
+/// `--initial-files` tar path.
+///
+/// Only ever called from `main()`'s diagnostic-resume-child branch, AFTER
+/// `run_diagnostic_resume_child()` -- never from the normal (non-fork-diagnostic) `run()` path,
+/// and never in a way that feeds back into the real, unmodified thread-based `do_clone` fork
+/// path this crate's normal execution still uses exclusively.
+pub fn diag_process_fork_globalstate_probe() {
+    if !litebox_platform_windows_userland::process_fork::diag_process_fork_globalstate_enabled() {
+        return;
+    }
+    let Some(tar_path) = std::env::var_os(
+        litebox_platform_windows_userland::process_fork::FORK_CHILD_TAR_PATH_ENV_VAR,
+    ) else {
+        eprintln!(
+            "[process_fork_diag] globalstate-probe (child): no tar path arrived via {}, skipping",
+            litebox_platform_windows_userland::process_fork::FORK_CHILD_TAR_PATH_ENV_VAR
+        );
+        return;
+    };
+    eprintln!(
+        "[process_fork_diag] globalstate-probe (child): attempting standalone GlobalState construction"
+    );
+
+    let tar_data = match mmapped_file(&tar_path) {
+        Ok(f) => f.data,
+        Err(e) => {
+            eprintln!(
+                "[process_fork_diag] globalstate-probe (child): failed to mmap tar at {}: {e}",
+                PathBuf::from(&tar_path).display()
+            );
+            return;
+        }
+    };
+
+    let platform = Platform::new();
+    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
+    let litebox = shim_builder.litebox();
+
+    let in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
+    let fs = shim_builder.default_fs(in_mem, tar_data.into());
+    let _fs = std::sync::Arc::new(fs);
+
+    // `LinuxShimBuilder::build()` is the exact call pass 135 identified as the sole construction
+    // site of `GlobalState`, exercised here a SECOND time within this same host OS process
+    // lifetime (the diagnostic child's own, freshly re-exec'd process) -- proving construction
+    // itself does not collide with anything the pass 111/112 memory-copy step already populated
+    // in this address space, independent of whether its CONTENTS end up matching the parent
+    // (out of scope this pass; see FINDINGS.txt PASS 136's "what pass 137 should do" section).
+    let _shim = shim_builder.build::<litebox_shim_linux::DefaultFS<Platform>>();
+
+    eprintln!(
+        "[process_fork_diag] globalstate-probe (child): GlobalState constructed successfully, no crash/hang/error"
+    );
 }
 
 /// Export the writable upper layer of a layered file system (every file the guest created or

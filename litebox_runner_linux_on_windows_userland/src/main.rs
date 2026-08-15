@@ -10,6 +10,13 @@ fn main() -> anyhow::Result<()> {
     use litebox_runner_linux_on_windows_userland::CliArgs;
 
     if litebox_platform_windows_userland::process_fork::is_diagnostic_resume_child() {
+        // Runs BEFORE `run_diagnostic_resume_child()` (which prints `RESUME_CHILD_READY_MARKER`
+        // and, for the real-resume probe, immediately parks this thread for cross-process
+        // injection without ever returning to this call site) -- the parent's own
+        // `resume_and_observe`/`inject_and_observe` stop reading this child's stdout pipe the
+        // moment they see that marker, so any diagnostic output emitted AFTER it would never
+        // reach the parent. See `diag_process_fork_globalstate_probe`'s own doc comment.
+        litebox_runner_linux_on_windows_userland::diag_process_fork_globalstate_probe();
         litebox_platform_windows_userland::process_fork::run_diagnostic_resume_child();
         return Ok(());
     }
