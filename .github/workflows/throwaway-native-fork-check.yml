@@ -1,4 +1,8 @@
 name: throwaway-native-fork-check
+
+permissions:
+  contents: read
+
 on:
   workflow_dispatch:
   push:
