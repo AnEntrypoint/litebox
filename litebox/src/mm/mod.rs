@@ -74,6 +74,16 @@ pub struct AddressRelocations {
     /// the heap VMA's tracked range always ends exactly here, which is what lets
     /// [`Self::heap_range`] identify it precisely rather than by heuristic.
     heap_top: usize,
+    /// One `(source_group, dest_base)` pair per non-shared coherent reservation group duplicated
+    /// during this call -- the same bookkeeping as `linux::GroupRelocation`, re-exposed here as a
+    /// plain tuple so callers outside the `mm` module (currently: a diagnostic, `LITEBOX_DIAG_
+    /// PROCESS_FORK_SPAWN`-gated probe in `do_clone` proving out a future process-based `fork()`;
+    /// see `scratchpad/jqrepro/FINDINGS.txt` passes 107-110) can read each group's aligned base
+    /// without needing `linux`-module visibility. Unlike `ranges` (per individual guest-visible
+    /// VMA, frequently a sub-64KB-granularity offset within a shared reservation), each entry here
+    /// is independently `VirtualAlloc2`-at-a-forced-address-able -- see `linux::GroupRelocation`'s
+    /// doc comment for why that distinction matters.
+    group_relocations: Vec<(Range<usize>, usize)>,
 }
 
 impl AddressRelocations {
@@ -120,6 +130,14 @@ impl AddressRelocations {
     #[must_use]
     pub fn ranges(&self) -> &[(Range<usize>, usize)] {
         &self.ranges
+    }
+
+    /// Returns the `(source reservation-group span, destination group base)` pairs -- see this
+    /// struct's `group_relocations` field doc comment for why this is a coarser granularity than
+    /// [`Self::ranges`] and who currently consumes it.
+    #[must_use]
+    pub fn group_relocations(&self) -> &[(Range<usize>, usize)] {
+        &self.group_relocations
     }
 
     /// Returns whether the range at `ranges()[index]` was executable (`VM_EXEC`) in the source
@@ -389,12 +407,9 @@ where
         let heap_top = source_vmem.brk;
         let mut dest_vmem =
             linux::Vmem::new_excluding(litebox.x.platform, source_ranges.into_iter());
-        // `group_relocations` is intentionally unused here -- see `linux::GroupRelocation`'s doc
-        // comment: it is bookkeeping for a not-yet-built process-based `fork()`, not consumed by
-        // today's same-host-process design.
         let linux::DuplicateOutcome {
             relocations,
-            group_relocations: _,
+            group_relocations,
         } = unsafe { source_vmem.duplicate(&mut dest_vmem) }?;
         let mut ranges = Vec::with_capacity(relocations.len());
         let mut executable = Vec::with_capacity(relocations.len());
@@ -406,6 +421,13 @@ where
             private_data.push(is_private_data);
             is_file_backed.push(was_file_backed);
         }
+        // Re-exposed as a plain tuple (see `AddressRelocations::group_relocations`'s doc
+        // comment) -- consumed only by the `LITEBOX_DIAG_PROCESS_FORK_SPAWN`-gated diagnostic in
+        // `do_clone`, not by today's same-host-process fork path itself.
+        let group_relocations = group_relocations
+            .into_iter()
+            .map(|g| (g.source_group, g.dest_base))
+            .collect();
         Ok((
             Self {
                 vmem: RwLock::new(dest_vmem),
@@ -416,6 +438,7 @@ where
                 private_data,
                 is_file_backed,
                 heap_top,
+                group_relocations,
             },
         ))
     }
@@ -1135,6 +1158,7 @@ mod address_relocations_tests {
             private_data: alloc::vec![false, true, false],
             is_file_backed: alloc::vec![false, false, false],
             heap_top: 0x1010_0000,
+            group_relocations: alloc::vec![],
         };
 
         assert_eq!(
@@ -1157,6 +1181,7 @@ mod address_relocations_tests {
             private_data: alloc::vec![false],
             is_file_backed: alloc::vec![false],
             heap_top: 0,
+            group_relocations: alloc::vec![],
         };
 
         assert_eq!(relocations.heap_range(), None);
@@ -1174,6 +1199,7 @@ mod address_relocations_tests {
             private_data: alloc::vec![false],
             is_file_backed: alloc::vec![false],
             heap_top: 0x1234_5678,
+            group_relocations: alloc::vec![],
         };
 
         assert_eq!(relocations.heap_range(), None);
@@ -1201,6 +1227,7 @@ mod address_relocations_tests {
             // exactly this distinction.
             is_file_backed: alloc::vec![true, true, false, false],
             heap_top: 0x1000_3000,
+            group_relocations: alloc::vec![],
         };
 
         let got: alloc::vec::Vec<_> = relocations.private_data_ranges().collect();
@@ -1233,6 +1260,7 @@ mod address_relocations_tests {
             private_data: alloc::vec![true, true, false],
             is_file_backed: alloc::vec![true, false, false],
             heap_top: 0, // mallocng never calls brk: no brk-heap VMA exists at all.
+            group_relocations: alloc::vec![],
         };
 
         assert!(
@@ -1266,6 +1294,7 @@ mod address_relocations_tests {
             private_data: alloc::vec![true, true, true, false],
             is_file_backed: alloc::vec![true, false, false, false],
             heap_top: 0x1000_5000,
+            group_relocations: alloc::vec![],
         };
 
         let got: alloc::vec::Vec<_> = relocations
