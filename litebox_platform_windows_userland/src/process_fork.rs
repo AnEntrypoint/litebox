@@ -46,28 +46,90 @@ use core::ffi::c_void;
 use std::ops::Range;
 
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
 use windows_sys::Win32::System::Memory::{
     MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_EXTENDED_PARAMETER_0,
     MEM_EXTENDED_PARAMETER_1, MEM_RELEASE, MEM_RESERVE, MemExtendedParameterAddressRequirements,
     PAGE_READWRITE, VirtualFreeEx,
 };
+use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess,
+    CREATE_SUSPENDED, CreateProcessW, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
+    STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
 
 /// Internal-only marker env var: set (never read as guest-visible) on a `CreateProcess`-spawned
 /// litebox child so a future resuming implementation can distinguish "I am being set up as a
-/// forked child" from "I am a normal fresh litebox invocation". Not consulted by this pass's own
-/// diagnostic (the child is always torn down suspended, before any code that would check it
-/// runs) -- set here only to establish the contract early, per this module's own doc comment.
+/// forked child" from "I am a normal fresh litebox invocation". Pass 114 is the first consumer:
+/// the runner's own `main()` checks [`is_diagnostic_resume_child`] before clap-parsing argv (a
+/// resume-diagnostic child is spawned with NO argv at all, so it must never reach the normal
+/// `CliArgs::parse()` path, which requires a program path and `--initial-files`).
 const REEXEC_CHILD_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD";
+
+/// Marker line the resume-diagnostic child prints to its (pipe-redirected) stdout once it has
+/// reached its own normal process initialization -- i.e. once `WindowsUserland::new()` has run
+/// and registered its own VEH via `AddVectoredExceptionHandler`. The parent reads this line back
+/// out of the pipe as the live proof the child's own startup completed without crashing despite
+/// its address space having been pre-populated with the parent's guest bytes before the OS loader
+/// and CRT/Rust runtime init ran. Never emitted by a normal litebox invocation (guarded by
+/// [`is_diagnostic_resume_child`]), so it cannot be confused with ordinary guest output.
+pub const RESUME_CHILD_READY_MARKER: &str = "LITEBOX_DIAG_RESUME_CHILD_READY";
+
+/// Whether the CURRENT process is a `CreateProcess`-spawned diagnostic resume child (pass 114),
+/// checked by the runner's `main()` before clap-parsing argv. `std::env::var` (not `var_os`) is
+/// deliberate: the marker's value is meaningless, only presence matters, and this mirrors
+/// [`diag_process_fork_spawn_enabled`]'s own presence-check style.
+#[must_use]
+pub fn is_diagnostic_resume_child() -> bool {
+    std::env::var_os(REEXEC_CHILD_ENV_VAR).is_some()
+}
+
+/// Entry point the runner's `main()` calls instead of the normal `CliArgs::parse()` + `run()`
+/// path when [`is_diagnostic_resume_child`] is true. Deliberately does NOT construct `CliArgs`,
+/// load a guest tar, or touch `litebox_shim_linux` at all -- this pass's whole point is proving
+/// the child survives its OWN process startup (loader, CRT, `WindowsUserland::new()`'s VEH
+/// registration) with pre-populated foreign memory already sitting in its address space, not
+/// resuming the ORIGINAL parent's guest execution (which needs fd inheritance and signal IPC that
+/// do not exist yet -- pass 108 Q3/Q4, explicitly out of scope here).
+pub fn run_diagnostic_resume_child() -> Result<(), std::convert::Infallible> {
+    use std::io::Write as _;
+
+    let _platform = litebox_platform_windows_userland_new_for_diagnostic_resume();
+    println!("{RESUME_CHILD_READY_MARKER}");
+    let _ = std::io::stdout().flush();
+    Ok(())
+}
+
+/// Thin indirection so this module (which the child's own `main()` calls into) does not need a
+/// circular dependency on the `WindowsUserland` type it lives alongside in the same crate --
+/// calls `WindowsUserland::new()` directly, which is the exact same per-process initialization
+/// (VEH registration included) every normal litebox invocation already performs once.
+fn litebox_platform_windows_userland_new_for_diagnostic_resume() -> &'static crate::WindowsUserland
+{
+    crate::WindowsUserland::new()
+}
 
 /// Whether the pass-111 `CreateProcess`-based fork diagnostic is enabled
 /// (`LITEBOX_DIAG_PROCESS_FORK_SPAWN=1`). Never runs otherwise -- see this module's doc comment.
 #[must_use]
 pub fn diag_process_fork_spawn_enabled() -> bool {
     std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_SPAWN").is_some()
+}
+
+/// Whether pass 114's further, riskier step -- actually `ResumeThread`-ing the diagnostic child
+/// after its memory has been pre-populated, to see whether it survives its OWN process
+/// initialization -- is enabled (`LITEBOX_DIAG_PROCESS_FORK_RESUME=1`). Deliberately a SEPARATE
+/// gate from [`diag_process_fork_spawn_enabled`]: the memory-copy probe (pass 111/112) is fully
+/// proven and safe (the child is never resumed), while actually resuming a real child process
+/// into execution is this pass's own, narrower, higher-risk addition -- an operator/CI run can
+/// opt into the proven memory-copy probe without also opting into the resume step, or vice versa
+/// (though in practice this flag is only meaningful when the spawn flag is also set, since resume
+/// happens after the same spawn+copy sequence). Only checked when
+/// [`diag_process_fork_spawn_enabled`] is already true.
+#[must_use]
+pub fn diag_process_fork_resume_enabled() -> bool {
+    std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_RESUME").is_some()
 }
 
 /// Per-group outcome reported by [`diagnostic_spawn_and_copy`].
@@ -89,15 +151,24 @@ pub struct GroupCopyResult {
 struct SuspendedChildGuard {
     process: HANDLE,
     thread: HANDLE,
+    /// Read end of the child's stdout pipe, present whenever pass 114's resume step might read
+    /// the child's readiness marker back. `None` keeps the pre-pass-114 no-pipe shape when the
+    /// resume gate is off, so the memory-copy-only probe stays byte-identical to pass 111/112.
+    stdout_read: Option<HANDLE>,
 }
 
 impl Drop for SuspendedChildGuard {
     fn drop(&mut self) {
-        // Best-effort: the child is CREATE_SUSPENDED and has executed no guest or litebox-runtime
-        // code, so there is nothing to fail cleanly -- an unconditional TerminateProcess is the
-        // whole intended cleanup, not a fallback path.
+        // Best-effort, unconditional cleanup regardless of whether the child was ever resumed:
+        // TerminateProcess is a no-op-equivalent for a process that already exited on its own
+        // (pass 114's resumed child exits cleanly after printing its marker), and is the correct,
+        // safe teardown for a child still suspended or still running (pass 111/112's untouched
+        // memory-copy-only path, and pass 114's resume path if the child hangs).
         unsafe {
             TerminateProcess(self.process, 0);
+            if let Some(read) = self.stdout_read {
+                CloseHandle(read);
+            }
             CloseHandle(self.thread);
             CloseHandle(self.process);
         }
@@ -148,15 +219,20 @@ pub fn diagnostic_spawn_and_copy(
     // safety contract: "no other code is concurrently mutating memory ... other threads must be
     // stopped"), so this diagnostic, invoked from exactly that same call site, inherits the same
     // guarantee.
+    let want_resume = diag_process_fork_resume_enabled();
     unsafe {
         std::env::set_var(REEXEC_CHILD_ENV_VAR, "1");
     }
-    let spawn_result = spawn_suspended(&mut exe_wide);
+    let spawn_result = spawn_suspended(&mut exe_wide, want_resume);
     unsafe {
         std::env::remove_var(REEXEC_CHILD_ENV_VAR);
     }
-    let (process, thread) = spawn_result?;
-    let guard = SuspendedChildGuard { process, thread };
+    let (process, thread, stdout_read) = spawn_result?;
+    let guard = SuspendedChildGuard {
+        process,
+        thread,
+        stdout_read,
+    };
 
     let mut results = Vec::with_capacity(group_relocations.len());
     for (source_group, dest_base) in group_relocations {
@@ -167,8 +243,109 @@ pub fn diagnostic_spawn_and_copy(
             &mut read_source_bytes,
         ));
     }
-    // `guard` drops here: TerminateProcess + CloseHandle, unconditionally.
+
+    if want_resume {
+        resume_and_observe(&guard);
+    }
+
+    // `guard` drops here: TerminateProcess + CloseHandle, unconditionally, whether or not it was
+    // ever resumed -- see the guard's own doc comment.
     Ok(results)
+}
+
+/// Pass 114's own step, gated entirely behind [`diag_process_fork_resume_enabled`]: resumes the
+/// child's main thread (its memory already pre-populated with the parent's guest bytes at the
+/// SAME addresses by the per-group copy loop above) and checks whether it reaches its own
+/// [`RESUME_CHILD_READY_MARKER`] -- i.e. whether it survives its own process initialization
+/// (loader, CRT, Rust runtime init, `WindowsUserland::new()`'s VEH registration) despite that
+/// foreign memory already sitting in its address space before any of that init ran. Bounded wait
+/// (2 seconds): if the marker never arrives, this is reported as a hang/crash, not left to block
+/// indefinitely -- the caller's `guard` unconditionally terminates the child immediately
+/// afterward regardless of the outcome either way.
+fn resume_and_observe(guard: &SuspendedChildGuard) {
+    const TIMEOUT_MS: u32 = 2000;
+
+    let resumed = unsafe { ResumeThread(guard.thread) };
+    if resumed == u32::MAX {
+        eprintln!(
+            "[process_fork_diag] resume: ResumeThread failed, GetLastError={}",
+            unsafe { GetLastError() }
+        );
+        return;
+    }
+
+    let Some(stdout_read) = guard.stdout_read else {
+        eprintln!("[process_fork_diag] resume: no stdout pipe available, cannot observe marker");
+        return;
+    };
+
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(u64::from(TIMEOUT_MS));
+    let mut collected = Vec::new();
+    let mut buf = [0u8; 256];
+    loop {
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "[process_fork_diag] resume: TIMED OUT waiting for child readiness marker after {TIMEOUT_MS}ms \
+                 (collected so far: {:?})",
+                String::from_utf8_lossy(&collected)
+            );
+            return;
+        }
+        let mut read = 0u32;
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::ReadFile(
+                stdout_read,
+                buf.as_mut_ptr(),
+                u32::try_from(buf.len()).expect("small fixed-size buffer fits in u32"),
+                &raw mut read,
+                core::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            // ERROR_BROKEN_PIPE (109): child exited (closed its stdout) -- expected exit path for
+            // a well-behaved resume child that printed its marker and returned from main().
+            if err == 109 {
+                break;
+            }
+            eprintln!(
+                "[process_fork_diag] resume: ReadFile on child stdout failed, GetLastError={err}"
+            );
+            return;
+        }
+        if read == 0 {
+            break;
+        }
+        collected.extend_from_slice(&buf[..read as usize]);
+        if collected
+            .windows(RESUME_CHILD_READY_MARKER.len())
+            .any(|w| w == RESUME_CHILD_READY_MARKER.as_bytes())
+        {
+            break;
+        }
+    }
+
+    let saw_marker = collected
+        .windows(RESUME_CHILD_READY_MARKER.len())
+        .any(|w| w == RESUME_CHILD_READY_MARKER.as_bytes());
+
+    if saw_marker {
+        eprintln!(
+            "[process_fork_diag] resume: child reached its own startup successfully (marker observed) \
+             -- pre-populated foreign memory did NOT interfere with child process init"
+        );
+    } else {
+        // Give the process a brief moment to actually finish exiting/crashing so the exit code is
+        // meaningful, then report it -- a crash inside the child's own init (loader collision,
+        // CRT init failure, VEH registration failure) is exactly what this probe exists to catch.
+        let wait_result = unsafe { WaitForSingleObject(guard.process, 500) };
+        eprintln!(
+            "[process_fork_diag] resume: child did NOT print its readiness marker \
+             (collected stdout: {:?}, WaitForSingleObject={wait_result})",
+            String::from_utf8_lossy(&collected)
+        );
+    }
 }
 
 /// Trait-free helper: `OsStr::encode_wide` is already available via
@@ -186,11 +363,52 @@ impl EncodeWideExt for std::ffi::OsStr {
     }
 }
 
-fn spawn_suspended(exe_wide: &mut [u16]) -> Result<(HANDLE, HANDLE), String> {
+/// Spawns the `CREATE_SUSPENDED` diagnostic child. When `want_stdout_pipe` is true (pass 114's
+/// resume step only -- the pass 111/112 memory-copy-only probe never sets this), also creates an
+/// inheritable stdout pipe and wires it into the child via `STARTF_USESTDHANDLES`, returning the
+/// PARENT's own read end so [`resume_and_observe`] can read the child's readiness marker back.
+fn spawn_suspended(
+    exe_wide: &mut [u16],
+    want_stdout_pipe: bool,
+) -> Result<(HANDLE, HANDLE, Option<HANDLE>), String> {
     let mut startup_info: STARTUPINFOW = unsafe { core::mem::zeroed() };
     startup_info.cb =
         u32::try_from(core::mem::size_of::<STARTUPINFOW>()).expect("STARTUPINFOW fits in u32");
     let mut process_info: PROCESS_INFORMATION = unsafe { core::mem::zeroed() };
+
+    let mut stdout_read: HANDLE = core::ptr::null_mut();
+    let mut inherit_handles = 0i32;
+    if want_stdout_pipe {
+        let mut sec_attrs: SECURITY_ATTRIBUTES = unsafe { core::mem::zeroed() };
+        sec_attrs.nLength =
+            u32::try_from(core::mem::size_of::<SECURITY_ATTRIBUTES>()).expect("fits in u32");
+        sec_attrs.bInheritHandle = 1;
+        let mut stdout_write: HANDLE = core::ptr::null_mut();
+        let pipe_ok = unsafe {
+            CreatePipe(
+                &raw mut stdout_read,
+                &raw mut stdout_write,
+                &raw const sec_attrs,
+                0,
+            )
+        };
+        if pipe_ok == 0 {
+            return Err(format!("CreatePipe failed: GetLastError={}", unsafe {
+                GetLastError()
+            }));
+        }
+        // Ensure the PARENT's own read end is never inherited by the child (it must only ever
+        // hold the write end) -- a leaked read-end handle in the child would keep the pipe open
+        // even after the child's own write end closes, defeating the ERROR_BROKEN_PIPE-on-exit
+        // signal `resume_and_observe` relies on to detect the child exiting.
+        unsafe {
+            windows_sys::Win32::Foundation::SetHandleInformation(stdout_read, 1, 0);
+        }
+        startup_info.dwFlags |= STARTF_USESTDHANDLES;
+        startup_info.hStdOutput = stdout_write;
+        startup_info.hStdError = stdout_write;
+        inherit_handles = 1;
+    }
 
     let ok = unsafe {
         CreateProcessW(
@@ -198,7 +416,7 @@ fn spawn_suspended(exe_wide: &mut [u16]) -> Result<(HANDLE, HANDLE), String> {
             exe_wide.as_mut_ptr(),
             core::ptr::null(),
             core::ptr::null(),
-            0,
+            inherit_handles,
             CREATE_SUSPENDED,
             core::ptr::null(),
             core::ptr::null(),
@@ -206,13 +424,35 @@ fn spawn_suspended(exe_wide: &mut [u16]) -> Result<(HANDLE, HANDLE), String> {
             &raw mut process_info,
         )
     };
+    // The child's own inherited copy of the write handle keeps it open in the child; the parent
+    // must close ITS copy of the write end regardless of CreateProcessW's outcome so the pipe
+    // only stays open via the child's handle (needed for ERROR_BROKEN_PIPE to fire correctly once
+    // the child exits).
+    if want_stdout_pipe && !startup_info.hStdOutput.is_null() {
+        unsafe {
+            CloseHandle(startup_info.hStdOutput);
+        }
+    }
     if ok == 0 {
+        if !stdout_read.is_null() {
+            unsafe {
+                CloseHandle(stdout_read);
+            }
+        }
         return Err(format!(
             "CreateProcessW(CREATE_SUSPENDED) failed: GetLastError={}",
             unsafe { GetLastError() }
         ));
     }
-    Ok((process_info.hProcess, process_info.hThread))
+    Ok((
+        process_info.hProcess,
+        process_info.hThread,
+        if want_stdout_pipe {
+            Some(stdout_read)
+        } else {
+            None
+        },
+    ))
 }
 
 /// Attempts steps 1-2 of [`diagnostic_spawn_and_copy`]'s doc comment for a single reservation
