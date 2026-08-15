@@ -415,7 +415,10 @@ type DuplicatedRangeInfo = (Range<usize>, usize, bool, bool, bool);
 /// coherent-group-partitioning loop below, but previously discarded once the loop finished)
 /// without changing any existing caller's behavior.
 #[derive(Debug, Clone)]
-#[allow(dead_code, reason = "consumed by the not-yet-built process-based fork; see doc comment")]
+#[allow(
+    dead_code,
+    reason = "consumed by the not-yet-built process-based fork; see doc comment"
+)]
 pub(super) struct GroupRelocation {
     /// The group's aligned span in the SOURCE address space.
     pub(super) source_group: Range<usize>,
@@ -435,7 +438,10 @@ pub(super) struct DuplicateOutcome {
     /// One entry per non-shared coherent group reserved during this call (see this function's
     /// "COHERENT GROUPS" doc comment) -- `VM_SHARED` regions are relocated independently and so
     /// never appear here.
-    #[allow(dead_code, reason = "consumed by the not-yet-built process-based fork; see GroupRelocation's doc comment")]
+    #[allow(
+        dead_code,
+        reason = "consumed by the not-yet-built process-based fork; see GroupRelocation's doc comment"
+    )]
     pub(super) group_relocations: Vec<GroupRelocation>,
 }
 
