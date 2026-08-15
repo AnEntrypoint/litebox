@@ -254,6 +254,23 @@ unsafe extern "system" fn vectored_exception_handler(
         let nb = fork_verify::read_code_bytes_for_diagnostics(before_start, &mut before);
         eprintln!("[veh] rip-8 bytes ({nb}): {:02x?}", &before[..nb]);
         fork_verify::describe_crash_page_for_diagnostics(rip);
+        let fault_addr = exception_record.ExceptionInformation[1];
+        let (fa_mtype, fa_protect, fa_alloc_base) =
+            fork_verify::describe_addr_for_diagnostics(fault_addr);
+        eprintln!(
+            "[veh] fault addr={fault_addr:#x} type={fa_mtype:#x} protect={fa_protect:#x} alloc_base={fa_alloc_base:#x} watched={}",
+            fork_verify::addr_is_codewatched_for_diagnostics(fault_addr),
+        );
+        let rdi = context.Rdi as usize;
+        let meta_slot = rdi.wrapping_sub(0x10);
+        let (ms_mtype, ms_protect, ms_alloc_base) =
+            fork_verify::describe_addr_for_diagnostics(meta_slot);
+        let mut meta_bytes = [0u8; 8];
+        let nmb = fork_verify::read_code_bytes_for_diagnostics(meta_slot, &mut meta_bytes);
+        eprintln!(
+            "[veh] group meta-slot rdi-0x10={meta_slot:#x} type={ms_mtype:#x} protect={ms_protect:#x} alloc_base={ms_alloc_base:#x} bytes({nmb})={:02x?}",
+            &meta_bytes[..nmb],
+        );
         eprintln!(
             "[veh] crash regs rdi={:#x} rsi={:#x} rdx={:#x} rax={:#x} rsp={:#x} rbp={:#x} rbx={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
             context.Rdi,

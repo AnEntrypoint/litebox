@@ -1532,6 +1532,10 @@ pub(crate) fn describe_addr_for_diagnostics(addr: usize) -> (u32, u32, usize) {
     codewatch::describe(addr)
 }
 
+pub(crate) fn addr_is_codewatched_for_diagnostics(addr: usize) -> bool {
+    codewatch::contains(addr)
+}
+
 pub(crate) fn describe_crash_page_for_diagnostics(rip: usize) {
     let (mtype, protect, alloc_base) = codewatch::describe(rip);
     eprintln!(
