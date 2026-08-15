@@ -694,7 +694,7 @@ pub trait ForkChildVerificationProvider {
 }
 
 /// An opaque, platform-defined handle to a cross-process `fork()` child's real OS process,
-/// stored in [`Process::cross_process_children`](crate's shim-side registry -- see
+/// stored in the shim's `Process::cross_process_children` registry (see
 /// `litebox_shim_linux::syscalls::process::Process`'s doc comment) instead of the normal
 /// same-process `Arc<Process>` a thread-based `fork()` child uses.
 ///
