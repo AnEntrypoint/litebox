@@ -8,6 +8,12 @@
 fn main() -> anyhow::Result<()> {
     use clap::Parser as _;
     use litebox_runner_linux_on_windows_userland::CliArgs;
+
+    if litebox_platform_windows_userland::process_fork::is_diagnostic_resume_child() {
+        litebox_platform_windows_userland::process_fork::run_diagnostic_resume_child();
+        return Ok(());
+    }
+
     litebox_runner_linux_on_windows_userland::run(CliArgs::parse())
 }
 
