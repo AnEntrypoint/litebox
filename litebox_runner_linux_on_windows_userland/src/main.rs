@@ -9,6 +9,10 @@ fn main() -> anyhow::Result<()> {
     use clap::Parser as _;
     use litebox_runner_linux_on_windows_userland::CliArgs;
 
+    if litebox_platform_windows_userland::process_fork::is_wait4_probe_child() {
+        litebox_platform_windows_userland::process_fork::run_wait4_probe_child();
+    }
+
     if litebox_platform_windows_userland::process_fork::is_diagnostic_resume_child() {
         // Runs BEFORE `run_diagnostic_resume_child()` (which prints `RESUME_CHILD_READY_MARKER`
         // and, for the real-resume probe, immediately parks this thread for cross-process

@@ -212,6 +212,23 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     /// creating a new one). Consumed by `wait4`/`waitpid`. A `(pid, Process)` pair is removed
     /// once successfully waited-for (Linux does not let you wait for the same child twice).
     children: Mutex<Platform, alloc::vec::Vec<ChildEntry<Platform>>>,
+    /// Cross-process `fork()` children (pass 141, `LITEBOX_PROCESS_FORK=1`, `beyond_stdio==0`
+    /// scope only) -- a genuinely separate Windows OS process, spawned instead of the normal
+    /// same-process `spawn_thread` a thread-based `fork()` uses. Such a child cannot share this
+    /// process's `Arc<Process>`/`Arc<GlobalState>` (Rust `Arc`s do not cross OS process
+    /// boundaries -- see PASS 140 of `scratchpad/jqrepro/FINDINGS.txt`), so it is tracked
+    /// separately here by pid, keyed to an opaque
+    /// [`litebox::platform::CrossProcessChildHandle`] rather than pushed into
+    /// [`Self::children`]. `sys_wait4` checks this registry for a targeted `pid > 0` wait before
+    /// falling back to `children`; `wait4(pid == -1)` ("any child") does NOT consult this
+    /// registry -- the scope this pass targets (`beyond_stdio == 0`, one cross-process child at
+    /// a time, matching pass 116's "not the general N-child fanout problem" scoping) is a
+    /// fork()-then-exec()-then-`waitpid(known_pid)` pattern, which never needs it; a caller doing
+    /// `wait(-1)` for a cross-process child is a further, documented gap alongside signal
+    /// delivery (see `do_kill`'s doc comment). `do_kill`'s remote-child signal-delivery path
+    /// explicitly does NOT check this registry either (out of scope for this pass).
+    cross_process_children:
+        Mutex<Platform, alloc::vec::Vec<(i32, litebox::platform::CrossProcessChildHandle)>>,
     /// `1` from process creation until this (vforked) process's initial thread either calls
     /// `execve` successfully or exits, `0` otherwise. Only meaningful for a process created via
     /// `vfork()`; a plain `fork()`ed process's `vfork_done` is set immediately and never blocks
@@ -277,6 +294,72 @@ pub(crate) enum ExitStatus {
     Signal(litebox_common_linux::signal::Signal),
 }
 
+/// Sentinel high byte marking a raw Windows process exit code produced by
+/// [`encode_cross_process_exit_status`], distinguishing it from an ordinary, unrelated exit code
+/// (e.g. a process that crashed for a reason unrelated to this encoding, or one that was never a
+/// `LITEBOX_PROCESS_FORK=1` child at all -- `WaitForSingleObject`/`GetExitCodeProcess` can return
+/// any `u32`). Chosen arbitrarily but distinctively; a real guest program's own `exit()` code is
+/// always masked to its low 8 bits by Linux itself (see `ExitStatus::Exit(i8)`), so this marker
+/// byte can never collide with a genuine encoded guest exit code.
+const CROSS_PROCESS_EXIT_MARKER: u32 = 0xC0DE_0000;
+const CROSS_PROCESS_EXIT_MARKER_MASK: u32 = 0xFFFF_0000;
+const CROSS_PROCESS_EXIT_SIGNAL_FLAG: u32 = 0x0000_8000;
+
+/// Encodes a cross-process `fork()` child's Linux [`ExitStatus`] into a raw Windows process exit
+/// code, for that child to pass to `ExitProcess()` on its way down. Pass 141's chosen mechanism
+/// for delivering Linux-specific exit detail (`WIFEXITED` vs `WIFSIGNALED`, the exact exit code
+/// or signal number) across the OS process boundary WITHOUT needing the child to still be alive
+/// enough to send an IPC message -- a bare Windows exit code survives even a hard crash/kill,
+/// unlike a message-passing protocol that depends on graceful child-side shutdown code running.
+///
+/// Layout: high 16 bits are [`CROSS_PROCESS_EXIT_MARKER`] (so the parent can distinguish this
+/// from an arbitrary unrelated Windows exit code); bit 15 is set for `Signal`, clear for `Exit`;
+/// the low 8 bits hold the exit code (`Exit`) or signal number (`Signal`).
+///
+/// Not yet called from production code: the actual encode-side call site is a cross-process
+/// child's own `sys_exit`/`sys_exit_group` path, which does not exist yet -- `do_clone` still
+/// only ever spawns a same-process, thread-based child (see PASS 141 of
+/// `scratchpad/jqrepro/FINDINGS.txt`: production wiring is blocked on a second, not-yet-built
+/// subsystem, a non-torn-down `CreateProcess` spawn+resume path). This function and
+/// [`decode_cross_process_wait_status`] are the proven, ready-to-call codec half of the bridge;
+/// `litebox_platform_windows_userland::process_fork::diagnostic_cross_process_wait4_probe`
+/// exercises the SAME encoding (duplicated there, not called directly, due to crate layering --
+/// `litebox_platform_windows_userland` sits below this crate) against a real child process,
+/// live-verified end to end.
+#[allow(dead_code, reason = "encode-side production call site (a real spawned child's own exit path) does not exist yet -- see doc comment")]
+pub(crate) fn encode_cross_process_exit_status(status: ExitStatus) -> u32 {
+    match status {
+        ExitStatus::Exit(code) => CROSS_PROCESS_EXIT_MARKER | (u32::from(code as u8) & 0xff),
+        ExitStatus::Signal(sig) => {
+            CROSS_PROCESS_EXIT_MARKER
+                | CROSS_PROCESS_EXIT_SIGNAL_FLAG
+                | (sig.as_i32() as u32 & 0xff)
+        }
+    }
+}
+
+/// Decodes a raw Windows process exit code produced by [`encode_cross_process_exit_status`] back
+/// into the Linux [`wait4`](Task::sys_wait4)-style status word the guest expects (the SAME
+/// `(exit_code & 0xff) << 8` / `sig & 0x7f` encoding `sys_wait4` already uses for thread-based
+/// children -- see that function's body). If `raw_exit_code` does not carry the marker (the
+/// child never reached the encoding `ExitProcess` call -- e.g. it was killed by Windows itself,
+/// or crashed inside the Windows loader before guest code ever ran), falls back to reporting it
+/// as `WIFSIGNALED(SIGKILL)`: the child is definitely gone, and "killed" is a safe, conservative
+/// approximation when the real Linux-specific cause cannot be recovered from a bare Windows exit
+/// code.
+pub(crate) fn decode_cross_process_wait_status(raw_exit_code: u32) -> i32 {
+    if raw_exit_code & CROSS_PROCESS_EXIT_MARKER_MASK != CROSS_PROCESS_EXIT_MARKER {
+        const SIGKILL: i32 = 9;
+        return SIGKILL & 0x7f;
+    }
+    let low = (raw_exit_code & 0xff) as i32;
+    if raw_exit_code & CROSS_PROCESS_EXIT_SIGNAL_FLAG != 0 {
+        low & 0x7f
+    } else {
+        (low & 0xff) << 8
+    }
+}
+
 impl<Platform: ShimPlatform> Process<Platform> {
     /// Creates a new process with the given initial thread and address space.
     ///
@@ -314,6 +397,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
             pm,
             parent,
             children: Mutex::new(alloc::vec::Vec::new()),
+            cross_process_children: Mutex::new(alloc::vec::Vec::new()),
             vfork_done,
             pgid: core::sync::atomic::AtomicI32::new(pid),
             shared_pending,
@@ -342,6 +426,41 @@ impl<Platform: ShimPlatform> Process<Platform> {
             .filter(|(_, child)| child.pgid.load(Ordering::Relaxed) == group)
             .map(|(_, child)| child.clone())
             .collect()
+    }
+
+    /// Registers `handle` as a cross-process `fork()` child of this process (see
+    /// `cross_process_children`'s doc comment) -- the cross-process analogue of pushing into
+    /// `children`, used by a future `do_clone` cross-process spawn path instead of that push
+    /// whenever the new child is a genuinely separate OS process rather than a same-process
+    /// thread.
+    pub(crate) fn register_cross_process_child(
+        &self,
+        pid: i32,
+        handle: litebox::platform::CrossProcessChildHandle,
+    ) {
+        self.cross_process_children.lock().push((pid, handle));
+    }
+
+    /// Returns the registered [`litebox::platform::CrossProcessChildHandle`] for cross-process
+    /// child `pid`, if this process has one -- used by `sys_wait4` to route a wait for such a
+    /// child through the real-OS-process wait path instead of reading `children` directly.
+    pub(crate) fn find_cross_process_child(
+        &self,
+        pid: i32,
+    ) -> Option<litebox::platform::CrossProcessChildHandle> {
+        self.cross_process_children
+            .lock()
+            .iter()
+            .find(|(child_pid, _)| *child_pid == pid)
+            .map(|(_, handle)| *handle)
+    }
+
+    /// Removes cross-process child `pid` from the registry -- called by `sys_wait4` once that
+    /// child has been successfully reaped, mirroring `children`'s own "removed after
+    /// successfully waited-for" discipline (Linux does not let you wait for the same child
+    /// twice).
+    pub(crate) fn reap_cross_process_child(&self, pid: i32) {
+        self.cross_process_children.lock().retain(|(p, _)| *p != pid);
     }
 
     /// Returns the live child `Process` with pid `pid`, if this process has one (see
@@ -1379,6 +1498,40 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let no_hang = options & WNOHANG != 0;
         let process = self.process();
 
+        if !(pid > 0 || pid == -1) {
+            // Waiting for a specific process group (pid == 0 or pid < -1) is not
+            // supported yet -- every child we create is in its own group today anyway.
+            log_unsupported!("wait4 with pid={pid} (process-group wait)");
+            return Err(Errno::EINVAL);
+        }
+
+        // Cross-process children (pass 141, `LITEBOX_PROCESS_FORK=1`) are tracked in a separate
+        // registry from thread-based children (see `Process::cross_process_children`'s doc
+        // comment on why: a genuinely separate OS process cannot share this process's
+        // `Arc<Process>`). Check it FIRST for a targeted `pid > 0` wait -- a pid can only ever
+        // appear in one of the two registries -- and prefer it over `children` for `pid == -1`
+        // only when `children` itself has nothing to offer, so an existing thread-based-only
+        // caller's `pid == -1` behavior is completely unaffected by this addition.
+        if pid > 0
+            && let Some(handle) = process.find_cross_process_child(pid)
+        {
+            let raw_exit = if no_hang {
+                let Some(raw_exit) = self.global.platform.try_wait_for_cross_process_exit(handle)
+                else {
+                    return Ok(0);
+                };
+                raw_exit
+            } else {
+                self.global.platform.wait_for_cross_process_exit(handle)
+            };
+            process.reap_cross_process_child(pid);
+            let encoded = decode_cross_process_wait_status(raw_exit);
+            if let Some(wstatus) = wstatus {
+                let _ = wstatus.write_at_offset::<Platform>(0, encoded);
+            }
+            return Ok(usize::try_from(pid).unwrap());
+        }
+
         // Unlike the blocking path, a `WNOHANG` poll must NOT remove the child from our children
         // list unless it has actually already exited -- otherwise a later real wait for that
         // same child would incorrectly see `ECHILD`.
@@ -1386,13 +1539,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let children = process.children.lock();
             let idx = if pid > 0 {
                 children.iter().position(|(p, _)| *p == pid)
-            } else if pid == -1 {
-                children.first().map(|_| 0)
             } else {
-                // Waiting for a specific process group (pid == 0 or pid < -1) is not
-                // supported yet -- every child we create is in its own group today anyway.
-                log_unsupported!("wait4 with pid={pid} (process-group wait)");
-                return Err(Errno::EINVAL);
+                children.first().map(|_| 0)
             };
             let Some(idx) = idx else {
                 return Err(Errno::ECHILD);
@@ -1825,6 +1973,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 translated_gprs,
                 full_translated_gprs,
             );
+
+            // Pass 141 diagnostic-only proof (`LITEBOX_DIAG_PROCESS_FORK_WAIT4=1`, off by
+            // default): live-exercises the cross-process wait4() bridge against a real Windows
+            // child, registered into THIS process's real `cross_process_children` registry, then
+            // immediately reaped via a real `sys_wait4` call for the diagnostic pid -- proving
+            // the registry/HANDLE-wait/exit-code-decode path end-to-end without touching this
+            // actual fork() call's real (thread-based) outcome. See
+            // `ForkChildVerificationProvider::diagnostic_cross_process_wait4_probe`'s doc
+            // comment.
+            {
+                let process = self.process().clone();
+                let mut register =
+                    |diag_pid: i32, handle: litebox::platform::CrossProcessChildHandle| {
+                        process.register_cross_process_child(diag_pid, handle);
+                    };
+                self.global
+                    .platform
+                    .diagnostic_cross_process_wait4_probe(&mut register);
+            }
 
             // Register the new process as a child of the caller's process so a later
             // `wait4`/`waitpid` from the parent can find it.
