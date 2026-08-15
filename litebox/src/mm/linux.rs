@@ -393,32 +393,29 @@ type DuplicatedRangeInfo = (Range<usize>, usize, bool, bool, bool);
 /// region within the group is offset identically (see `Vmem::duplicate`'s "COHERENT GROUPS" doc
 /// comment on why groups are relocated as one unit rather than per-region).
 ///
-/// # Why this exists (currently unused by any caller)
+/// # Why this exists
 ///
-/// This is bookkeeping for a NOT-YET-BUILT process-based `fork()`: today's `fork()` runs the
-/// child as a thread in the same host process, so `Vmem::duplicate` only needs each individual
-/// region's final destination address (carried in [`DuplicatedRangeInfo`]) -- nothing downstream
-/// currently needs to know which regions came from the SAME reservation group, or what that
-/// group's own aligned base/size was, once the per-region copy loop finishes.
+/// Today's `fork()` runs the child as a thread in the same host process, so `Vmem::duplicate`'s
+/// own copy logic only needs each individual region's final destination address (carried in
+/// [`DuplicatedRangeInfo`]) -- the copy itself never needed to know which regions came from the
+/// SAME reservation group, or what that group's own aligned base/size was.
 ///
-/// A prior investigation (documented in this repo's `FINDINGS.txt`, passes 107-109) root-caused a
+/// A prior investigation (documented in this repo's `FINDINGS.txt`, passes 107-110) root-caused a
 /// class of nondeterministic crash to exactly this same-host-process design and designed a real
 /// fix: make the child a genuine separate Windows process, `WriteProcessMemory`'d into the SAME
 /// addresses the parent used, via forced-address allocation (`VirtualAlloc2` with an explicit
 /// address in the child process). That only works at RESERVATION-GROUP granularity -- an
 /// already-64KB-aligned base -- not at the granularity of individual guest-visible VMA addresses,
 /// which are frequently sub-granularity offsets within one aligned reservation and cannot
-/// themselves be independently `VirtualAlloc2`'d at a forced address in a fresh process. A future
-/// process-based-fork implementation will need exactly this triple, per group, to replicate each
-/// reservation's aligned span in the child process before `WriteProcessMemory`-ing the per-region
-/// contents into it. This struct preserves that information (computed internally by the
-/// coherent-group-partitioning loop below, but previously discarded once the loop finished)
-/// without changing any existing caller's behavior.
+/// themselves be independently `VirtualAlloc2`'d at a forced address in a fresh process (pass 109
+/// confirmed this empirically: `MEM_ADDRESS_REQUIREMENTS` rejects a non-64KB-aligned forced base
+/// with `ERROR_INVALID_PARAMETER`, unconditionally, regardless of which process is targeted).
+/// Pass 111 is the first real consumer: a `LITEBOX_DIAG_PROCESS_FORK_SPAWN`-gated diagnostic in
+/// `do_clone` reads this struct (via [`super::AddressRelocations::group_relocations`]) to prove,
+/// against REAL guest memory layouts, that reserving+populating a genuine child process at these
+/// exact group bases works end-to-end -- see that diagnostic's own doc comment for the mechanism.
+/// The actual `fork()` path this crate uses today does not consume it yet.
 #[derive(Debug, Clone)]
-#[allow(
-    dead_code,
-    reason = "consumed by the not-yet-built process-based fork; see doc comment"
-)]
 pub(super) struct GroupRelocation {
     /// The group's aligned span in the SOURCE address space.
     pub(super) source_group: Range<usize>,
@@ -429,8 +426,7 @@ pub(super) struct GroupRelocation {
 }
 
 /// Return value of [`Vmem::duplicate`]: the existing per-region relocation list plus, additively,
-/// the per-group aligned-base bookkeeping described on [`GroupRelocation`]. `group_relocations` is
-/// not consulted by any current caller -- see that type's doc comment for why it exists anyway.
+/// the per-group aligned-base bookkeeping described on [`GroupRelocation`].
 pub(super) struct DuplicateOutcome {
     /// One entry per relocated region, in the order regions were processed -- identical in
     /// content and order to what this function returned before `group_relocations` existed.
@@ -438,10 +434,6 @@ pub(super) struct DuplicateOutcome {
     /// One entry per non-shared coherent group reserved during this call (see this function's
     /// "COHERENT GROUPS" doc comment) -- `VM_SHARED` regions are relocated independently and so
     /// never appear here.
-    #[allow(
-        dead_code,
-        reason = "consumed by the not-yet-built process-based fork; see GroupRelocation's doc comment"
-    )]
     pub(super) group_relocations: Vec<GroupRelocation>,
 }
 

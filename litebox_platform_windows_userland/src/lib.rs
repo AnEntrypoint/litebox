@@ -10,6 +10,7 @@
 mod ctxwatch;
 mod fork_verify;
 mod net;
+pub mod process_fork;
 
 use core::cell::Cell;
 use core::panic;
@@ -4067,6 +4068,58 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
 
     fn end_fork_child_verification(&self) {
         fork_verify::end();
+    }
+
+    fn diagnostic_process_fork_probe(&self, relocations: &litebox::mm::AddressRelocations) {
+        if !process_fork::diag_process_fork_spawn_enabled() {
+            return;
+        }
+        let group_relocations = relocations.group_relocations();
+        eprintln!(
+            "[process_fork_diag] fork(): probing {} reservation group(s) against a real, inert CreateProcess child",
+            group_relocations.len()
+        );
+        // Read each group's real, live bytes out of THIS (the parent) process -- same primitive
+        // `Vmem::duplicate` itself uses (`RawConstPointer::to_owned_slice`), just invoked here
+        // for a diagnostic side channel rather than the real duplication path.
+        let read_source_bytes = |range: core::ops::Range<usize>| {
+            use litebox::platform::RawConstPointer as _;
+            let ptr =
+                <Self as litebox::platform::RawPointerProvider>::RawConstPointer::<u8>::from_usize(
+                    range.start,
+                );
+            ptr.to_owned_slice(range.len()).map(<[u8]>::into_vec)
+        };
+        match process_fork::diagnostic_spawn_and_copy(group_relocations, read_source_bytes) {
+            Ok(results) => {
+                let succeeded = results.iter().filter(|r| r.succeeded).count();
+                eprintln!(
+                    "[process_fork_diag] fork(): {succeeded}/{} group(s) succeeded",
+                    results.len()
+                );
+                for r in &results {
+                    if r.succeeded {
+                        eprintln!(
+                            "[process_fork_diag]   OK    group={:#x}..{:#x} (len={:#x})",
+                            r.source_group.start,
+                            r.source_group.end,
+                            r.source_group.len()
+                        );
+                    } else {
+                        eprintln!(
+                            "[process_fork_diag]   FAIL  group={:#x}..{:#x} (len={:#x}) GetLastError={}",
+                            r.source_group.start,
+                            r.source_group.end,
+                            r.source_group.len(),
+                            r.last_error
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[process_fork_diag] fork(): probe setup failed: {e}");
+            }
+        }
     }
 }
 

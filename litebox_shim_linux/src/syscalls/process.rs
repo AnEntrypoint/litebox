@@ -1664,6 +1664,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     litebox_util_log::error!(err:% = err; "failed to duplicate address space for fork()");
                     Errno::ENOMEM
                 })?;
+            // Diagnostic-only (pass 111, `LITEBOX_DIAG_PROCESS_FORK_SPAWN=1`, off by default): a
+            // no-op on every platform except `litebox_platform_windows_userland`, and a no-op
+            // there too unless the env var is set. Runs on the PARENT's own thread, right after
+            // the real duplication this actual `fork()` call just performed, and does not affect
+            // this `fork()` call's real outcome -- see `ForkChildVerificationProvider::
+            // diagnostic_process_fork_probe`'s doc comment for the full mechanism and safety
+            // argument.
+            self.global
+                .platform
+                .diagnostic_process_fork_probe(&relocations);
             let vforked = flags.contains(CloneFlags::VFORK);
             // Created once here and threaded into both the new `Process` (below) and the new
             // `Task`'s `SignalState` (see `clone_for_new_task`'s call site further down) -- they

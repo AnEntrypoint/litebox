@@ -577,6 +577,29 @@ pub trait ForkChildVerificationProvider {
 
     /// Stop verifying the current thread's guest execution, if it was being verified.
     fn end_fork_child_verification(&self) {}
+
+    /// Diagnostic-only hook, called from `do_clone` immediately after a real `fork()`/`vfork()`
+    /// duplicates the parent's address space (same call site as
+    /// [`begin_fork_child_verification`](Self::begin_fork_child_verification), on the PARENT's
+    /// own thread before the new child thread/process is spawned).
+    ///
+    /// A platform MAY use this to exercise an experimental, alternative fork mechanism against
+    /// the REAL `relocations` this actual `fork()` call just produced, entirely as a side effect
+    /// that must not observably affect this `fork()` call's real outcome. The default
+    /// implementation does nothing.
+    ///
+    /// Concretely: `litebox_platform_windows_userland`'s implementation (pass 111 of
+    /// `scratchpad/jqrepro/FINDINGS.txt`'s investigation, gated behind
+    /// `LITEBOX_DIAG_PROCESS_FORK_SPAWN=1`, off by default) spawns a real, inert, suspended
+    /// Windows child process and proves out `relocations.group_relocations()`'s per-group
+    /// forced-address `VirtualAlloc2` + `WriteProcessMemory` copy mechanism -- the first
+    /// concrete building block of a future process-based `fork()` -- against this call's actual
+    /// production guest memory layout, then tears the experimental child down without ever
+    /// resuming it. See that implementation's module doc comment for the full mechanism and why
+    /// it is safe to run alongside the real, unmodified, thread-based fork path.
+    fn diagnostic_process_fork_probe(&self, relocations: &crate::mm::AddressRelocations) {
+        let _ = relocations;
+    }
 }
 
 /// A provider for system information.
