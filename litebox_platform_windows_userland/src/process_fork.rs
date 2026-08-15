@@ -700,6 +700,114 @@ pub fn diag_process_fork_vmem_adopt_enabled() -> bool {
 /// for why the environment rather than the existing stdin pipe carries this. Never guest-visible.
 pub const FORK_CHILD_VMA_LAYOUT_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_VMA_LAYOUT";
 
+/// Whether the operator opted into the pass-139 in-process `Task`-resume probe
+/// (`LITEBOX_DIAG_PROCESS_FORK_TASK_RESUME=1`). A TENTH gate, layered on top of
+/// [`diag_process_fork_vmem_adopt_enabled`] (this probe consumes that one's adopted
+/// `PageManager`, so it is inert unless that gate is also set).
+///
+/// Pass 138 found that the pass 118-122 cross-process `SetThreadContext`-injection mechanism
+/// cannot compose with a real `Task`/`switch_to_guest` resume: the target thread never runs
+/// `spawn_thread`/`thread_start`/`run_thread_arch`, so `TlsState`'s `HOST_SP`/`HOST_BP` and the
+/// `syscall_callback` return-address contract -- established only as those functions' own first
+/// instructions -- are never in place, meaning an injected guest `Rip` would fault on its very
+/// first syscall with no diagnostic value (per FINDINGS.txt PASS 138 STEP 3).
+///
+/// This gate takes the alternative path 138 named: rather than externally injecting a register
+/// context into an already-parked, externally-controlled thread, the diagnostic child instead
+/// builds a real `Task` (via `litebox_shim_linux::LinuxShim::adopt_forked_process`, using pass
+/// 136's `GlobalState` and pass 137's adopted `PageManager`) and calls the PUBLIC, ordinary
+/// `litebox_platform_windows_userland::run_thread` entry point on ITS OWN current thread --
+/// exactly the same function the real, unmodified, non-fork initial-process-load path already
+/// calls (`litebox_runner_linux_on_windows_userland::run`'s own `run_thread(program.entrypoints,
+/// ..)` call). No cross-process `SetThreadContext` is used for this leg at all: the child already
+/// has the real translated `PtRegs` locally (carried across the process boundary via
+/// [`FORK_CHILD_GPRS_ENV_VAR`], not injected into an external thread), so it can start its own
+/// guest execution the normal way `run_thread_arch`'s naked-asm prologue expects.
+#[must_use]
+pub fn diag_process_fork_task_resume_enabled() -> bool {
+    std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_TASK_RESUME").is_some()
+}
+
+/// Internal-only marker env var (pass 139): carries the parent's `ForkFullGprSnapshot` -- the
+/// already-translated guest register state at the instant `fork()` returns in the child, the SAME
+/// data [`real_resume_and_observe`]'s cross-process `SetThreadContext` injection uses -- as a
+/// newline-free, comma-separated decimal-hex line, across the `CreateProcessW`-spawned diagnostic
+/// child boundary. Consumed by [`diag_process_fork_task_resume_enabled`]'s probe to build the
+/// child's own initial `PtRegs` for an in-process `run_thread` call, instead of being injected
+/// into an externally suspended thread. Set (and cleared again immediately) around the spawn in
+/// [`diagnostic_spawn_and_copy`], the same way [`FORK_CHILD_VMA_LAYOUT_ENV_VAR`] is. Never
+/// guest-visible.
+pub const FORK_CHILD_GPRS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_GPRS";
+
+/// Serializes a [`litebox::platform::ForkFullGprSnapshot`] as one comma-separated line of
+/// hex fields, in a fixed field order matching [`deserialize_full_gprs`] exactly. Mirrors
+/// `AddressRelocations::serialize_for_diagnostic`'s own "both ends are always the same binary"
+/// reasoning: this format is never persisted or read by any other tool.
+#[must_use]
+pub fn serialize_full_gprs(g: &litebox::platform::ForkFullGprSnapshot) -> String {
+    format!(
+        "{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x}",
+        g.r15,
+        g.r14,
+        g.r13,
+        g.r12,
+        g.rbp,
+        g.rbx,
+        g.r11,
+        g.r10,
+        g.r9,
+        g.r8,
+        g.rax,
+        g.rcx,
+        g.rdx,
+        g.rsi,
+        g.rdi,
+        g.orig_rax,
+        g.rip,
+        g.cs,
+        g.eflags,
+        g.rsp,
+        g.ss,
+    )
+}
+
+/// Inverse of [`serialize_full_gprs`]. Returns `None` on any malformed input (field count
+/// mismatch or a non-hex field) rather than panicking -- data crossing a process boundary must
+/// degrade gracefully, matching every other `deserialize_for_diagnostic`-style helper in this
+/// investigation.
+#[must_use]
+pub fn deserialize_full_gprs(line: &str) -> Option<litebox::platform::ForkFullGprSnapshot> {
+    let mut it = line.split(',');
+    let mut next = || usize::from_str_radix(it.next()?, 16).ok();
+    let g = litebox::platform::ForkFullGprSnapshot {
+        r15: next()?,
+        r14: next()?,
+        r13: next()?,
+        r12: next()?,
+        rbp: next()?,
+        rbx: next()?,
+        r11: next()?,
+        r10: next()?,
+        r9: next()?,
+        r8: next()?,
+        rax: next()?,
+        rcx: next()?,
+        rdx: next()?,
+        rsi: next()?,
+        rdi: next()?,
+        orig_rax: next()?,
+        rip: next()?,
+        cs: next()?,
+        eflags: next()?,
+        rsp: next()?,
+        ss: next()?,
+    };
+    if it.next().is_some() {
+        return None;
+    }
+    Some(g)
+}
+
 /// Per-group outcome reported by [`diagnostic_spawn_and_copy`].
 pub struct GroupCopyResult {
     /// The group's span in the (real, live) parent address space, exactly as `Vmem::duplicate`
@@ -813,13 +921,26 @@ pub fn diagnostic_spawn_and_copy(
     let want_vmem_adopt = diag_process_fork_vmem_adopt_enabled()
         && diag_process_fork_globalstate_enabled()
         && relocations_line.is_some();
+    // Pass 139: the in-process `Task`-resume probe supersedes `want_real_resume`'s cross-process
+    // `SetThreadContext` injection for this fork() call when opted into -- it needs everything
+    // `want_vmem_adopt` needs (a real adopted `PageManager` to build the `Task` from) PLUS the
+    // translated `PtRegs` itself, transmitted via the environment (not injected into an external
+    // thread) so the child can build its own initial context and call `run_thread` locally. The
+    // two are mutually exclusive: injecting a context into a park-then-inject child and ALSO
+    // starting a real `Task`'s own `run_thread` on that same thread would race two different
+    // resume mechanisms against one another.
+    let want_task_resume =
+        diag_process_fork_task_resume_enabled() && want_vmem_adopt && inject_full_gprs.is_some();
     unsafe {
         std::env::set_var(REEXEC_CHILD_ENV_VAR, "1");
-        if want_real_resume {
+        if want_real_resume && !want_task_resume {
             std::env::set_var(REAL_RESUME_CHILD_ENV_VAR, "1");
         }
         if want_vmem_adopt && let Some(line) = relocations_line.as_deref() {
             std::env::set_var(FORK_CHILD_VMA_LAYOUT_ENV_VAR, line);
+        }
+        if want_task_resume && let Some(g) = inject_full_gprs.as_ref() {
+            std::env::set_var(FORK_CHILD_GPRS_ENV_VAR, serialize_full_gprs(g));
         }
     }
     // The relocations line needs the same stdin pipe the fds probe uses -- request it whenever
@@ -832,6 +953,7 @@ pub fn diagnostic_spawn_and_copy(
         std::env::remove_var(REEXEC_CHILD_ENV_VAR);
         std::env::remove_var(REAL_RESUME_CHILD_ENV_VAR);
         std::env::remove_var(FORK_CHILD_VMA_LAYOUT_ENV_VAR);
+        std::env::remove_var(FORK_CHILD_GPRS_ENV_VAR);
     }
     let (process, thread, stdout_read, stdin_write) = spawn_result?;
     let guard = SuspendedChildGuard {
@@ -866,7 +988,16 @@ pub fn diagnostic_spawn_and_copy(
         // than either pass 114's "print marker and return" shape or pass 118/119's "never resumed
         // into its own entry point at all" shape -- none of the other three probes are meaningful
         // for this same child, so they are mutually exclusive for a given `fork()` call.
-        if want_real_resume {
+        if want_task_resume {
+            // The child never parks for injection in this configuration (its own `main()` runs
+            // the task-resume probe -- which calls `run_thread` directly, in-process -- BEFORE
+            // `run_diagnostic_resume_child` would print the ready marker or park at all), so
+            // there is nothing to inject from the parent side: just resume the thread past
+            // `CREATE_SUSPENDED` and observe its own outcome (see `task_resume_and_observe`'s doc
+            // comment for why this needs a dedicated, longer-timeout observer rather than the
+            // ready-marker-based `resume_and_observe`).
+            task_resume_and_observe(&guard);
+        } else if want_real_resume {
             if let Some(full_gprs) = inject_full_gprs {
                 real_resume_and_observe(&guard, full_gprs);
             }
@@ -1024,6 +1155,92 @@ fn write_relocations_line_into_child(guard: &SuspendedChildGuard, line: &str) {
 /// (2 seconds): if the marker never arrives, this is reported as a hang/crash, not left to block
 /// indefinitely -- the caller's `guard` unconditionally terminates the child immediately
 /// afterward regardless of the outcome either way.
+/// Pass 139's observer for the in-process `Task`-resume probe: unlike every other probe in this
+/// module, a child running this probe never prints [`RESUME_CHILD_READY_MARKER`] on this path at
+/// all -- `run_diagnostic_resume_child` (which prints it) is only reached AFTER the runner crate's
+/// own `main()` calls the task-resume probe first, and that probe's own `run_thread` call BLOCKS
+/// until the newly-started guest thread terminates (by design: `run_thread`'s own doc comment,
+/// "this will run until the thread terminates"). So the only useful terminal conditions to wait
+/// for here are the pipe closing (the child process exited, whether cleanly or via a crash) or the
+/// probe's own "run_thread returned" line appearing (guest thread terminated but the process
+/// itself has not yet exited) -- both are much slower to arrive than the other probes' near-
+/// instant readiness marker, hence the longer timeout.
+fn task_resume_and_observe(guard: &SuspendedChildGuard) {
+    const TASK_RESUME_TIMEOUT_MS: u64 = 15_000;
+    const RUN_THREAD_RETURNED: &str = "run_thread returned";
+
+    let resumed = unsafe { ResumeThread(guard.thread) };
+    if resumed == u32::MAX {
+        eprintln!(
+            "[process_fork_diag] task-resume: ResumeThread failed, GetLastError={}",
+            unsafe { GetLastError() }
+        );
+        return;
+    }
+
+    let Some(stdout_read) = guard.stdout_read else {
+        eprintln!(
+            "[process_fork_diag] task-resume: no stdout pipe available, cannot observe outcome"
+        );
+        return;
+    };
+
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(TASK_RESUME_TIMEOUT_MS);
+    let mut collected = Vec::new();
+    let mut buf = [0u8; 256];
+    let mut child_exited = false;
+    loop {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        let mut read = 0u32;
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::ReadFile(
+                stdout_read,
+                buf.as_mut_ptr(),
+                u32::try_from(buf.len()).expect("small fixed-size buffer fits in u32"),
+                &raw mut read,
+                core::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            if err == 109 {
+                // ERROR_BROKEN_PIPE: child's stdout closed -- it exited (or crashed and was torn
+                // down), the real terminal condition this probe is watching for.
+                child_exited = true;
+            } else {
+                eprintln!(
+                    "[process_fork_diag] task-resume: ReadFile on child stdout failed, GetLastError={err}"
+                );
+            }
+            break;
+        }
+        if read == 0 {
+            child_exited = true;
+            break;
+        }
+        collected.extend_from_slice(&buf[..read as usize]);
+        if collected
+            .windows(RUN_THREAD_RETURNED.len())
+            .any(|w| w == RUN_THREAD_RETURNED.as_bytes())
+        {
+            break;
+        }
+    }
+
+    let saw_return = collected
+        .windows(RUN_THREAD_RETURNED.len())
+        .any(|w| w == RUN_THREAD_RETURNED.as_bytes());
+
+    eprintln!(
+        "[process_fork_diag] task-resume: observation window ended (child_stdout_closed={child_exited}, \
+         saw_run_thread_returned={saw_return})\n[process_fork_diag] task-resume: child's full output:\n{}",
+        String::from_utf8_lossy(&collected)
+    );
+}
+
 fn resume_and_observe(guard: &SuspendedChildGuard, want_fds: bool) {
     const TIMEOUT_MS: u32 = 2000;
 

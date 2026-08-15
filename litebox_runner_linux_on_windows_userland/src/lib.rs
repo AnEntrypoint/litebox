@@ -383,7 +383,7 @@ pub fn diag_process_fork_globalstate_probe() {
 
     let in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
     let fs = shim_builder.default_fs(in_mem, tar_data.into());
-    let _fs = std::sync::Arc::new(fs);
+    let fs = std::sync::Arc::new(fs);
 
     // `LinuxShimBuilder::build()` is the exact call pass 135 identified as the sole construction
     // site of `GlobalState`, exercised here a SECOND time within this same host OS process
@@ -397,7 +397,7 @@ pub fn diag_process_fork_globalstate_probe() {
         "[process_fork_diag] globalstate-probe (child): GlobalState constructed successfully, no crash/hang/error"
     );
 
-    diag_process_fork_vmem_adopt_probe(shim.litebox());
+    diag_process_fork_vmem_adopt_probe(&shim, fs);
 }
 
 /// Pass 137's `Vmem`/`PageManager`-adoption probe, gated behind
@@ -417,12 +417,16 @@ pub fn diag_process_fork_globalstate_probe() {
 /// never installed into `shim`, never used to build a `Task`, and never resumed into -- those are
 /// pass 138+'s job (FINDINGS.txt pass 135 STEP 4 item 3). Nothing here can feed back into the
 /// real, unmodified thread-based `do_clone` fork path.
-fn diag_process_fork_vmem_adopt_probe(litebox: &litebox::LiteBox<Platform>) {
+fn diag_process_fork_vmem_adopt_probe(
+    shim: &litebox_shim_linux::LinuxShim<Platform, litebox_shim_linux::DefaultFS<Platform>>,
+    fs: std::sync::Arc<litebox_shim_linux::DefaultFS<Platform>>,
+) {
     use litebox_platform_windows_userland::process_fork as pf;
 
     if !pf::diag_process_fork_vmem_adopt_enabled() {
         return;
     }
+    let litebox = shim.litebox();
     let Some(line) = std::env::var_os(pf::FORK_CHILD_VMA_LAYOUT_ENV_VAR) else {
         eprintln!(
             "[process_fork_diag] vmem-adopt-probe (child): no VMA layout arrived via {}, skipping",
@@ -498,6 +502,104 @@ fn diag_process_fork_vmem_adopt_probe(litebox: &litebox::LiteBox<Platform>) {
             sorted_expected.len()
         );
     }
+
+    diag_process_fork_task_resume_probe(shim, fs, page_manager);
+}
+
+/// Pass 139's in-process `Task`-resume probe, gated behind
+/// `LITEBOX_DIAG_PROCESS_FORK_TASK_RESUME=1` (layered on the pass-137 `VMEM_ADOPT` gate, which is
+/// what supplies `page_manager` here).
+///
+/// Where passes 118-122/138 injected a translated register context into an externally-suspended
+/// thread via cross-process `SetThreadContext` -- proven (pass 138) to fault immediately on the
+/// guest's very first syscall, since the target thread never ran `spawn_thread`/`thread_start`/
+/// `run_thread_arch`'s own init -- this probe instead builds a real `Task` locally (via
+/// `LinuxShim::adopt_forked_process`, using this pass's freshly-adopted `page_manager`) and calls
+/// the PUBLIC `litebox_platform_windows_userland::run_thread` entry point directly, on THIS
+/// thread, exactly the same function the real, unmodified, non-fork initial-process-load path
+/// already calls. This establishes `run_thread_arch`'s own init (`TlsState`'s `HOST_SP`/
+/// `HOST_BP`, the `syscall_callback` return-address contract) the normal way, in-process, with no
+/// cross-process register injection needed for this leg at all.
+fn diag_process_fork_task_resume_probe(
+    shim: &litebox_shim_linux::LinuxShim<Platform, litebox_shim_linux::DefaultFS<Platform>>,
+    fs: std::sync::Arc<litebox_shim_linux::DefaultFS<Platform>>,
+    page_manager: litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
+) {
+    use litebox_platform_windows_userland::process_fork as pf;
+
+    if !pf::diag_process_fork_task_resume_enabled() {
+        return;
+    }
+    let Some(line) = std::env::var_os(pf::FORK_CHILD_GPRS_ENV_VAR) else {
+        eprintln!(
+            "[process_fork_diag] task-resume-probe (child): no register snapshot arrived via {}, skipping",
+            pf::FORK_CHILD_GPRS_ENV_VAR
+        );
+        return;
+    };
+    let Some(line) = line.to_str() else {
+        eprintln!(
+            "[process_fork_diag] task-resume-probe (child): register snapshot env var is not valid UTF-8, skipping"
+        );
+        return;
+    };
+    let Some(gprs) = pf::deserialize_full_gprs(line) else {
+        eprintln!(
+            "[process_fork_diag] task-resume-probe (child): failed to parse register snapshot line (len={}), skipping",
+            line.len()
+        );
+        return;
+    };
+
+    // Stdio-only, single-thread, freshly-"execve'd"-looking process shape -- mirrors the same
+    // credentials/pid/ppid a real forked child would carry. pid==tid matches `load_program`'s own
+    // bootstrap-process convention (a single-threaded process's tid equals its pid).
+    let pid = std::process::id().cast_signed();
+    let task_params = litebox_common_linux::TaskParams {
+        pid,
+        ppid: pid,
+        uid: 0,
+        euid: 0,
+        gid: 0,
+        egid: 0,
+    };
+    let entrypoints = shim.adopt_forked_process(fs, task_params, page_manager);
+
+    let mut ctx = litebox_common_linux::PtRegs {
+        r15: gprs.r15,
+        r14: gprs.r14,
+        r13: gprs.r13,
+        r12: gprs.r12,
+        rbp: gprs.rbp,
+        rbx: gprs.rbx,
+        r11: gprs.r11,
+        r10: gprs.r10,
+        r9: gprs.r9,
+        r8: gprs.r8,
+        rax: gprs.rax,
+        rcx: gprs.rcx,
+        rdx: gprs.rdx,
+        rsi: gprs.rsi,
+        rdi: gprs.rdi,
+        orig_rax: gprs.orig_rax,
+        rip: gprs.rip,
+        cs: gprs.cs,
+        eflags: gprs.eflags,
+        rsp: gprs.rsp,
+        ss: gprs.ss,
+    };
+
+    eprintln!(
+        "[process_fork_diag] task-resume-probe (child): built Task, calling run_thread with \
+         rip={:#x} rsp={:#x} -- entering real guest execution",
+        ctx.rip, ctx.rsp
+    );
+    unsafe {
+        litebox_platform_windows_userland::run_thread(entrypoints, &mut ctx);
+    }
+    eprintln!(
+        "[process_fork_diag] task-resume-probe (child): run_thread returned (guest thread terminated)"
+    );
 }
 
 /// Export the writable upper layer of a layered file system (every file the guest created or
