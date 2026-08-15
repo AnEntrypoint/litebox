@@ -621,8 +621,8 @@ pub trait ForkChildVerificationProvider {
 
 /// Cheap, read-only classification of a fork()ing process's fd table, computed in `do_clone`
 /// immediately before duplicating it, purely to inform diagnostic instrumentation (see
-/// [`PlatformProvider::diagnostic_process_fork_probe`]'s doc comment). Never changes `fork()`'s
-/// real behavior.
+/// [`ForkChildVerificationProvider::diagnostic_process_fork_probe`]'s doc comment). Never changes
+/// `fork()`'s real behavior.
 ///
 /// Per pass 115/116 of `scratchpad/jqrepro/FINDINGS.txt`, none of litebox's fd subsystems are
 /// backed by a real Windows HANDLE, so a process-based fork cannot yet inherit any fd beyond the
