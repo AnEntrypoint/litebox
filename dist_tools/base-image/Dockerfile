@@ -1,7 +1,12 @@
 # Base image for litebox_packager --oci-image: Alpine plus a ready-to-use
 # nodejs + python toolchain, so the packaged rootfs needs no further setup to
 # run Node/Python agent workloads or install additional packages via apk.
-FROM alpine:latest
+# Pinned (not :latest): the fork_verify musl mallocng exclusion logic is derived
+# from this specific musl version's on-disk struct layout (see FINDINGS.txt PASS
+# 44/60/66) -- an unpinned :latest could silently drift the layout out from under
+# that logic. 3.24.1 matches the currently-bundled alpine-rootfs.tar (musl
+# 1.2.6-r2, confirmed via /etc/alpine-release and /lib/apk/db/installed).
+FROM alpine:3.24.1
 RUN apk add --no-cache \
     nodejs \
     npm \
