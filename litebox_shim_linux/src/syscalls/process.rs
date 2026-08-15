@@ -1789,12 +1789,41 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 rsp: child_ctx.rsp,
                 rax: child_ctx.rax,
             });
+            // Pass 120: the SAME already-translated `child_ctx`, carried in full (every GPR plus
+            // eflags/cs/ss) alongside the pre-existing 3-field snapshot -- see
+            // `ForkFullGprSnapshot`'s doc comment for why this is a second, wider struct rather
+            // than widening `ForkGprSnapshot` in place.
+            #[cfg(target_arch = "x86_64")]
+            let full_translated_gprs = Some(litebox::platform::ForkFullGprSnapshot {
+                r15: child_ctx.r15,
+                r14: child_ctx.r14,
+                r13: child_ctx.r13,
+                r12: child_ctx.r12,
+                rbp: child_ctx.rbp,
+                rbx: child_ctx.rbx,
+                r11: child_ctx.r11,
+                r10: child_ctx.r10,
+                r9: child_ctx.r9,
+                r8: child_ctx.r8,
+                rax: child_ctx.rax,
+                rcx: child_ctx.rcx,
+                rdx: child_ctx.rdx,
+                rsi: child_ctx.rsi,
+                rdi: child_ctx.rdi,
+                orig_rax: child_ctx.orig_rax,
+                rip: child_ctx.rip,
+                cs: child_ctx.cs,
+                eflags: child_ctx.eflags,
+                rsp: child_ctx.rsp,
+                ss: child_ctx.ss,
+            });
             #[cfg(not(target_arch = "x86_64"))]
-            let translated_gprs = None;
+            let full_translated_gprs = None;
             self.global.platform.diagnostic_process_fork_probe(
                 &relocations,
                 fd_complexity,
                 translated_gprs,
+                full_translated_gprs,
             );
 
             // Register the new process as a child of the caller's process so a later
