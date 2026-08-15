@@ -520,7 +520,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `brk`
     #[inline]
     pub(crate) fn sys_brk(&self, addr: UserPtrMut<u8>) -> Result<usize, Errno> {
-        litebox_common_linux::mm::sys_brk(&self.process().pm, addr)
+        let result = litebox_common_linux::mm::sys_brk(&self.process().pm, addr);
+        // Temporary (see FINDINGS.txt PASS 128): trace every brk() call's requested and
+        // returned break address, mirroring PASS 48's sys_mmap trace above, to determine
+        // whether the ~10.2MB region containing the mallocng meta-slot bug (BUG B,
+        // alloc_base=0x9c0000) is established via brk() rather than mmap().
+        if let Ok(r) = &result {
+            litebox_util_log::debug!(
+                addr:% = addr.as_usize(), returned:% = r;
+                "sys_brk: returned"
+            );
+        }
+        result
     }
 
     /// Handle syscall `madvise`
