@@ -76,6 +76,15 @@ const REEXEC_CHILD_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD";
 /// [`is_diagnostic_resume_child`]), so it cannot be confused with ordinary guest output.
 pub const RESUME_CHILD_READY_MARKER: &str = "LITEBOX_DIAG_RESUME_CHILD_READY";
 
+/// Marker line the resume-diagnostic child prints, THROUGH a `DuplicateHandle`'d copy of the
+/// parent's own `STD_OUTPUT_HANDLE` rather than its own inherited stdout pipe, when pass 115's
+/// fd-inheritance probe ([`diag_process_fork_fds_enabled`]) is also enabled. Distinct from
+/// [`RESUME_CHILD_READY_MARKER`] specifically so the parent can tell the two proofs apart: this
+/// marker traveling through a duplicated HANDLE and successfully reaching whatever the parent's
+/// own stdout is wired to (a real console, a pipe, `NUL`) is the live, end-to-end evidence that
+/// `DuplicateHandle`-based fd inheritance works, not merely that the marker text exists somewhere.
+pub const RESUME_CHILD_FD_MARKER: &str = "LITEBOX_DIAG_RESUME_CHILD_FD_OK";
+
 /// Whether the CURRENT process is a `CreateProcess`-spawned diagnostic resume child (pass 114),
 /// checked by the runner's `main()` before clap-parsing argv. `std::env::var` (not `var_os`) is
 /// deliberate: the marker's value is meaningless, only presence matters, and this mirrors
@@ -98,7 +107,125 @@ pub fn run_diagnostic_resume_child() -> Result<(), std::convert::Infallible> {
     let _platform = litebox_platform_windows_userland_new_for_diagnostic_resume();
     println!("{RESUME_CHILD_READY_MARKER}");
     let _ = std::io::stdout().flush();
+
+    // Pass 115's fd-inheritance probe: if the parent handed us (via our own inherited stdin pipe --
+    // see `SuspendedChildGuard::stdin_write`'s doc comment for why a pipe carries this rather than
+    // the environment/argv) a `DuplicateHandle`'d copy of ITS own `STD_OUTPUT_HANDLE`, write a
+    // SEPARATE marker directly through that duplicated handle via a raw `WriteFile` -- proving,
+    // from the CHILD's own side, that a HANDLE explicitly duplicated into this process at spawn
+    // time is valid and immediately usable for real I/O, not merely present in the handle table.
+    // This is deliberately independent of the `RESUME_CHILD_READY_MARKER` print above (which goes
+    // through this child's own INHERITED stdout pipe, not a duplicated handle) so the two proofs
+    // cannot be confused with one another. Silently does nothing if no line arrives quickly (the
+    // pass-114-only resume path, fds probe not requested, never writes to this child's stdin at
+    // all, so a blocking read would hang forever -- a short bounded read avoids that).
+    if let Some(handle_value) = try_read_duplicated_handle_value_from_stdin() {
+        write_marker_through_duplicated_handle(handle_value as HANDLE);
+    }
+
     Ok(())
+}
+
+/// Reads one newline-terminated decimal line from this child's own inherited `STD_INPUT_HANDLE`,
+/// bounded to a short timeout via a byte-at-a-time non-blocking-ish poll loop (this child has no
+/// async I/O available at this point in startup) -- returns `None` if no line arrives in time
+/// (the ordinary case when pass 115's fds probe was not requested, so the parent never writes
+/// anything to this pipe) or if the line does not parse as a handle value.
+fn try_read_duplicated_handle_value_from_stdin() -> Option<isize> {
+    let stdin = unsafe {
+        windows_sys::Win32::System::Console::GetStdHandle(
+            windows_sys::Win32::System::Console::STD_INPUT_HANDLE,
+        )
+    };
+    if stdin.is_null() || stdin == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        return None;
+    }
+    // Bounded wait: peek for available bytes rather than a blocking ReadFile, since a normal
+    // pass-114-only resume child has NO writer on this pipe at all and would hang forever
+    // otherwise.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let mut collected = Vec::new();
+    loop {
+        let mut avail = 0u32;
+        let peek_ok = unsafe {
+            windows_sys::Win32::System::Pipes::PeekNamedPipe(
+                stdin,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                &raw mut avail,
+                core::ptr::null_mut(),
+            )
+        };
+        if peek_ok == 0 {
+            // Not a pipe (e.g. a real console STD_INPUT_HANDLE, or the write end already closed
+            // with nothing buffered) -- nothing to read.
+            return None;
+        }
+        if avail > 0 {
+            let mut buf = [0u8; 64];
+            let mut read = 0u32;
+            let read_ok = unsafe {
+                windows_sys::Win32::Storage::FileSystem::ReadFile(
+                    stdin,
+                    buf.as_mut_ptr(),
+                    u32::try_from(buf.len().min(avail as usize))
+                        .expect("bounded by fixed-size buf.len()"),
+                    &raw mut read,
+                    core::ptr::null_mut(),
+                )
+            };
+            if read_ok == 0 {
+                return None;
+            }
+            collected.extend_from_slice(&buf[..read as usize]);
+            if collected.contains(&b'\n') {
+                break;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+    }
+    let line = String::from_utf8_lossy(&collected);
+    line.trim().parse::<isize>().ok()
+}
+
+/// Writes [`RESUME_CHILD_FD_MARKER`] (newline-terminated) directly via `WriteFile` on the given
+/// HANDLE value -- interpreted as a raw Win32 `HANDLE` already valid IN THIS (child) process's own
+/// handle table, exactly the shape `DuplicateHandle(..., dest_process = child, ...)` produces.
+/// Never panics: a stale/invalid handle value simply fails the `WriteFile` call, which is reported
+/// via `GetLastError` on stderr (the resume-diagnostic child's stderr is also pipe-captured by the
+/// parent alongside stdout) rather than crashing the child.
+fn write_marker_through_duplicated_handle(handle: HANDLE) {
+    let msg = alloc_marker_bytes();
+    let mut written = 0u32;
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::WriteFile(
+            handle,
+            msg.as_ptr(),
+            u32::try_from(msg.len()).expect("small fixed marker fits in u32"),
+            &raw mut written,
+            core::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        eprintln!(
+            "[process_fork_diag] fd-probe (child): WriteFile through duplicated handle FAILED, GetLastError={}",
+            unsafe { GetLastError() }
+        );
+    } else if written as usize != msg.len() {
+        eprintln!(
+            "[process_fork_diag] fd-probe (child): WriteFile through duplicated handle short write ({written}/{})",
+            msg.len()
+        );
+    }
+}
+
+fn alloc_marker_bytes() -> Vec<u8> {
+    let mut v = RESUME_CHILD_FD_MARKER.as_bytes().to_vec();
+    v.push(b'\n');
+    v
 }
 
 /// Thin indirection so this module (which the child's own `main()` calls into) does not need a
@@ -132,6 +259,49 @@ pub fn diag_process_fork_resume_enabled() -> bool {
     std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_RESUME").is_some()
 }
 
+/// Whether pass 115's fd/HANDLE-inheritance probe (Q3 of pass 108's design) is enabled
+/// (`LITEBOX_DIAG_PROCESS_FORK_FDS=1`). A THIRD, separate gate from
+/// [`diag_process_fork_spawn_enabled`]/[`diag_process_fork_resume_enabled`]: this probe needs the
+/// resume step to already be live (there is no child to hand a duplicated HANDLE to otherwise), so
+/// it is only meaningful -- and only checked -- when both of those are also set, but keeping it a
+/// distinct flag lets an operator opt into the proven memory-copy-and-resume probes without also
+/// opting into this pass's own, narrower fd-duplication addition.
+///
+/// # Scope (see this module's and `duplicate_stdio_into_child`'s doc comments for the full
+/// investigation)
+///
+/// Reading `litebox::fd::RawDescriptorStorage`/`fork_duplicate` and every one of the 7 fd
+/// subsystems it dispatches to (FS, Network, Pipes, Eventfd, Epoll, UnixSocket, Pty) found that
+/// **none** of litebox's guest file descriptors are directly backed by a real Windows `HANDLE`:
+/// every subsystem's `Entry` type is pure in-process Rust state (mutexes, atomics, ring buffers,
+/// `smoltcp` virtual sockets, `BTreeMap`s) with no `OwnedHandle`/raw `HANDLE` field anywhere,
+/// transitively. `OwnedFd` itself (`litebox/src/fd/mod.rs`) is just `{ raw: u32, closed:
+/// AtomicBool }` -- an index into `Descriptors`' own in-process `Vec<Option<IndividualEntry<_>>>`
+/// table, not a HANDLE wrapper. This means pass 108's Q3 proposal ("explicit per-fd
+/// `DuplicateHandle` calls, building on `fork_duplicate`'s already-fork-aware per-subsystem
+/// duplication design") does not apply to guest fds as originally framed -- there is no HANDLE
+/// backing a guest fd for `DuplicateHandle` to duplicate; a real cross-process fork would instead
+/// need to re-establish each subsystem's in-process object graph in the child some other way
+/// (shared memory, a real IPC channel, or literally proxying reads/writes back to the parent),
+/// which is a materially different, and NOT yet designed, mechanism -- named explicitly as the
+/// genuine limitation this pass found, not glossed over.
+///
+/// The ONE class of real Windows `HANDLE` this investigation found anywhere near the guest process
+/// boundary is the host's own `STD_OUTPUT_HANDLE`/`STD_ERROR_HANDLE`/`STD_INPUT_HANDLE` -- used
+/// directly via `GetStdHandle`/`WriteFile`/`ReadFile` in `lib.rs`'s `write_stdio`/console-reader
+/// paths, entirely OUTSIDE the guest fd-table abstraction (it is how litebox's OWN platform layer
+/// talks to the real console/pipe the litebox process itself was launched with, not a per-guest-fd
+/// mechanism). This probe scopes itself to exactly that straightforward, genuinely HANDLE-backed
+/// case: it duplicates the CURRENT process's real `STD_OUTPUT_HANDLE` into the diagnostic resume
+/// child and verifies, from the child's own side, that the duplicated handle is valid and usable
+/// for real I/O -- proving the `DuplicateHandle` mechanism itself works end-to-end for the one
+/// concrete HANDLE-backed case that exists, while documenting precisely why it does NOT generalize
+/// to guest fds without further, materially different design work.
+#[must_use]
+pub fn diag_process_fork_fds_enabled() -> bool {
+    std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_FDS").is_some()
+}
+
 /// Per-group outcome reported by [`diagnostic_spawn_and_copy`].
 pub struct GroupCopyResult {
     /// The group's span in the (real, live) parent address space, exactly as `Vmem::duplicate`
@@ -155,6 +325,13 @@ struct SuspendedChildGuard {
     /// the child's readiness marker back. `None` keeps the pre-pass-114 no-pipe shape when the
     /// resume gate is off, so the memory-copy-only probe stays byte-identical to pass 111/112.
     stdout_read: Option<HANDLE>,
+    /// Write end of a SEPARATE inheritable pipe wired to the child's stdin, present only when
+    /// pass 115's fd-inheritance probe is active. Used to hand the child the (child-process-
+    /// relative) `HANDLE` VALUE that `duplicate_stdio_into_child` produced -- there is no argv (a
+    /// resume-diagnostic child is spawned with none) and the environment block is fixed at
+    /// `CreateProcessW` time, before the child process (and hence a valid `DuplicateHandle` target)
+    /// exists, so this pipe is the simplest correct way to deliver a value computed AFTER spawn.
+    stdin_write: Option<HANDLE>,
 }
 
 impl Drop for SuspendedChildGuard {
@@ -168,6 +345,9 @@ impl Drop for SuspendedChildGuard {
             TerminateProcess(self.process, 0);
             if let Some(read) = self.stdout_read {
                 CloseHandle(read);
+            }
+            if let Some(write) = self.stdin_write {
+                CloseHandle(write);
             }
             CloseHandle(self.thread);
             CloseHandle(self.process);
@@ -220,18 +400,20 @@ pub fn diagnostic_spawn_and_copy(
     // stopped"), so this diagnostic, invoked from exactly that same call site, inherits the same
     // guarantee.
     let want_resume = diag_process_fork_resume_enabled();
+    let want_fds = want_resume && diag_process_fork_fds_enabled();
     unsafe {
         std::env::set_var(REEXEC_CHILD_ENV_VAR, "1");
     }
-    let spawn_result = spawn_suspended(&mut exe_wide, want_resume);
+    let spawn_result = spawn_suspended(&mut exe_wide, want_resume, want_fds);
     unsafe {
         std::env::remove_var(REEXEC_CHILD_ENV_VAR);
     }
-    let (process, thread, stdout_read) = spawn_result?;
+    let (process, thread, stdout_read, stdin_write) = spawn_result?;
     let guard = SuspendedChildGuard {
         process,
         thread,
         stdout_read,
+        stdin_write,
     };
 
     let mut results = Vec::with_capacity(group_relocations.len());
@@ -244,13 +426,95 @@ pub fn diagnostic_spawn_and_copy(
         ));
     }
 
+    if want_fds {
+        duplicate_stdio_into_child(&guard);
+    }
+
     if want_resume {
-        resume_and_observe(&guard);
+        resume_and_observe(&guard, want_fds);
     }
 
     // `guard` drops here: TerminateProcess + CloseHandle, unconditionally, whether or not it was
     // ever resumed -- see the guard's own doc comment.
     Ok(results)
+}
+
+/// Pass 115's fd-inheritance probe: `DuplicateHandle`s the CURRENT (parent) process's real
+/// `STD_OUTPUT_HANDLE` into `guard.process` (still suspended at this point -- called before
+/// [`resume_and_observe`]'s `ResumeThread`), then writes the resulting child-process-relative
+/// `HANDLE` value as a decimal line through `guard.stdin_write` so the child can read it back and
+/// use it once resumed (see [`SuspendedChildGuard::stdin_write`]'s doc comment for why a pipe,
+/// not argv/env, carries this post-spawn-computed value). A `DuplicateHandle` failure is reported
+/// but not fatal to the rest of the diagnostic -- the memory-copy-and-resume probes above already
+/// completed and their own results stand regardless of whether this additional fd probe succeeds.
+fn duplicate_stdio_into_child(guard: &SuspendedChildGuard) {
+    use windows_sys::Win32::Foundation::DUPLICATE_SAME_ACCESS;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let Some(stdin_write) = guard.stdin_write else {
+        eprintln!(
+            "[process_fork_diag] fd-probe: no stdin pipe available, cannot hand child a duplicated handle"
+        );
+        return;
+    };
+
+    let source_stdout = unsafe {
+        windows_sys::Win32::System::Console::GetStdHandle(
+            windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE,
+        )
+    };
+    if source_stdout.is_null()
+        || source_stdout == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE
+    {
+        eprintln!(
+            "[process_fork_diag] fd-probe: GetStdHandle(STD_OUTPUT_HANDLE) returned no real handle \
+             (GetLastError={}) -- skipping (e.g. no console/redirected-to-nothing environment)",
+            unsafe { GetLastError() }
+        );
+        return;
+    }
+
+    let mut dest_handle: HANDLE = core::ptr::null_mut();
+    let ok = unsafe {
+        windows_sys::Win32::Foundation::DuplicateHandle(
+            GetCurrentProcess(),
+            source_stdout,
+            guard.process,
+            &raw mut dest_handle,
+            0,
+            0, // bInheritHandle: irrelevant here, we hand the value over explicitly via the pipe
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if ok == 0 {
+        eprintln!(
+            "[process_fork_diag] fd-probe: DuplicateHandle(STD_OUTPUT_HANDLE -> child) FAILED, GetLastError={}",
+            unsafe { GetLastError() }
+        );
+        return;
+    }
+    eprintln!(
+        "[process_fork_diag] fd-probe: DuplicateHandle(STD_OUTPUT_HANDLE -> child) succeeded, \
+         child-relative handle value={dest_handle:#x?}"
+    );
+
+    let line = format!("{}\n", dest_handle as isize);
+    let mut written = 0u32;
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::WriteFile(
+            stdin_write,
+            line.as_ptr(),
+            u32::try_from(line.len()).expect("small line fits in u32"),
+            &raw mut written,
+            core::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        eprintln!(
+            "[process_fork_diag] fd-probe: WriteFile(child stdin, handle value) FAILED, GetLastError={}",
+            unsafe { GetLastError() }
+        );
+    }
 }
 
 /// Pass 114's own step, gated entirely behind [`diag_process_fork_resume_enabled`]: resumes the
@@ -262,7 +526,7 @@ pub fn diagnostic_spawn_and_copy(
 /// (2 seconds): if the marker never arrives, this is reported as a hang/crash, not left to block
 /// indefinitely -- the caller's `guard` unconditionally terminates the child immediately
 /// afterward regardless of the outcome either way.
-fn resume_and_observe(guard: &SuspendedChildGuard) {
+fn resume_and_observe(guard: &SuspendedChildGuard, want_fds: bool) {
     const TIMEOUT_MS: u32 = 2000;
 
     let resumed = unsafe { ResumeThread(guard.thread) };
@@ -335,6 +599,20 @@ fn resume_and_observe(guard: &SuspendedChildGuard) {
             "[process_fork_diag] resume: child reached its own startup successfully (marker observed) \
              -- pre-populated foreign memory did NOT interfere with child process init"
         );
+        if want_fds {
+            // The fd-probe marker (`RESUME_CHILD_FD_MARKER`) was written by the child through a
+            // `DuplicateHandle`'d copy of the PARENT's own `STD_OUTPUT_HANDLE` -- i.e. it travels
+            // to wherever the PARENT's real stdout is wired to (this diagnostic process's own
+            // console/pipe/NUL), NOT through the pass-114 stdout-capture pipe this function is
+            // reading from. There is nothing further to read here; the live proof is that the
+            // marker text appears on THIS process's own real stdout stream (verified externally by
+            // the operator/CI capturing this process's stdout, exactly as pass 115's FINDINGS.txt
+            // entry documents doing for its live verification runs).
+            eprintln!(
+                "[process_fork_diag] fd-probe: duplicated-HANDLE marker was requested -- check this \
+                 process's own real stdout (not this diagnostic's stderr) for {RESUME_CHILD_FD_MARKER:?}"
+            );
+        }
     } else {
         // Give the process a brief moment to actually finish exiting/crashing so the exit code is
         // meaningful, then report it -- a crash inside the child's own init (loader collision,
@@ -367,16 +645,23 @@ impl EncodeWideExt for std::ffi::OsStr {
 /// resume step only -- the pass 111/112 memory-copy-only probe never sets this), also creates an
 /// inheritable stdout pipe and wires it into the child via `STARTF_USESTDHANDLES`, returning the
 /// PARENT's own read end so [`resume_and_observe`] can read the child's readiness marker back.
+/// When `want_stdin_pipe` is ALSO true (pass 115's fd-inheritance probe only), additionally creates
+/// a second inheritable pipe wired to the child's stdin, returning the PARENT's own write end so
+/// [`duplicate_stdio_into_child`] can hand the child the duplicated-handle value it needs (see
+/// [`SuspendedChildGuard::stdin_write`]'s doc comment for why a pipe, not the environment/argv, is
+/// used for this).
 fn spawn_suspended(
     exe_wide: &mut [u16],
     want_stdout_pipe: bool,
-) -> Result<(HANDLE, HANDLE, Option<HANDLE>), String> {
+    want_stdin_pipe: bool,
+) -> Result<(HANDLE, HANDLE, Option<HANDLE>, Option<HANDLE>), String> {
     let mut startup_info: STARTUPINFOW = unsafe { core::mem::zeroed() };
     startup_info.cb =
         u32::try_from(core::mem::size_of::<STARTUPINFOW>()).expect("STARTUPINFOW fits in u32");
     let mut process_info: PROCESS_INFORMATION = unsafe { core::mem::zeroed() };
 
     let mut stdout_read: HANDLE = core::ptr::null_mut();
+    let mut stdin_write: HANDLE = core::ptr::null_mut();
     let mut inherit_handles = 0i32;
     if want_stdout_pipe {
         let mut sec_attrs: SECURITY_ATTRIBUTES = unsafe { core::mem::zeroed() };
@@ -408,6 +693,32 @@ fn spawn_suspended(
         startup_info.hStdOutput = stdout_write;
         startup_info.hStdError = stdout_write;
         inherit_handles = 1;
+
+        if want_stdin_pipe {
+            let mut stdin_read: HANDLE = core::ptr::null_mut();
+            let pipe_ok = unsafe {
+                CreatePipe(
+                    &raw mut stdin_read,
+                    &raw mut stdin_write,
+                    &raw const sec_attrs,
+                    0,
+                )
+            };
+            if pipe_ok == 0 {
+                let err = unsafe { GetLastError() };
+                unsafe {
+                    CloseHandle(stdout_read);
+                    CloseHandle(stdout_write);
+                }
+                return Err(format!("CreatePipe (stdin) failed: GetLastError={err}"));
+            }
+            // Symmetric to the stdout read end above: the PARENT's own write end must never be
+            // inherited by the child.
+            unsafe {
+                windows_sys::Win32::Foundation::SetHandleInformation(stdin_write, 1, 0);
+            }
+            startup_info.hStdInput = stdin_read;
+        }
     }
 
     let ok = unsafe {
@@ -424,19 +735,29 @@ fn spawn_suspended(
             &raw mut process_info,
         )
     };
-    // The child's own inherited copy of the write handle keeps it open in the child; the parent
-    // must close ITS copy of the write end regardless of CreateProcessW's outcome so the pipe
-    // only stays open via the child's handle (needed for ERROR_BROKEN_PIPE to fire correctly once
-    // the child exits).
+    // The child's own inherited copy of the write/read handles keeps them open in the child; the
+    // parent must close ITS copies regardless of CreateProcessW's outcome so each pipe only stays
+    // open via the child's handle (needed for ERROR_BROKEN_PIPE to fire correctly once the child
+    // exits, and to avoid leaking the parent's copy of the child's stdin read end either way).
     if want_stdout_pipe && !startup_info.hStdOutput.is_null() {
         unsafe {
             CloseHandle(startup_info.hStdOutput);
+        }
+    }
+    if want_stdin_pipe && !startup_info.hStdInput.is_null() {
+        unsafe {
+            CloseHandle(startup_info.hStdInput);
         }
     }
     if ok == 0 {
         if !stdout_read.is_null() {
             unsafe {
                 CloseHandle(stdout_read);
+            }
+        }
+        if !stdin_write.is_null() {
+            unsafe {
+                CloseHandle(stdin_write);
             }
         }
         return Err(format!(
@@ -449,6 +770,11 @@ fn spawn_suspended(
         process_info.hThread,
         if want_stdout_pipe {
             Some(stdout_read)
+        } else {
+            None
+        },
+        if want_stdin_pipe {
+            Some(stdin_write)
         } else {
             None
         },
