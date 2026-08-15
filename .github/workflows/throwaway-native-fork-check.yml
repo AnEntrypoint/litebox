@@ -1,0 +1,28 @@
+name: throwaway-native-fork-check
+on: workflow_dispatch
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    container: alpine:latest
+    steps:
+      - name: install python3
+        run: apk add --no-cache python3
+      - name: plain fork+execv repro, single-threaded, 200 iterations
+        run: |
+          for i in $(seq 1 200); do
+            python3 -c '
+import os, sys
+pid = os.fork()
+if pid == 0:
+    os.execv("/bin/echo", ["/bin/echo", "plain-fork-ok"])
+else:
+    _, status = os.waitpid(pid, 0)
+    if os.WIFSIGNALED(status):
+        print("CHILD KILLED BY SIGNAL", os.WTERMSIG(status), file=sys.stderr)
+        sys.exit(1)
+    if os.WEXITSTATUS(status) != 0:
+        print("CHILD BAD EXIT", os.WEXITSTATUS(status), file=sys.stderr)
+        sys.exit(1)
+' || exit 1
+          done
+          echo "native-fork-200-clean"
