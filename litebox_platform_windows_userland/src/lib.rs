@@ -4228,14 +4228,26 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
     }
 
     fn wait_for_cross_process_exit(&self, handle: litebox::platform::CrossProcessChildHandle) -> u32 {
-        process_fork::wait_for_process_exit(handle.0 as windows_sys::Win32::Foundation::HANDLE)
+        // Safety: `handle.0` is a `HANDLE` value registered via `Process::register_cross_process_child`,
+        // which only ever receives a real, currently-open process handle (see
+        // `diagnostic_cross_process_wait4_probe`, this pass's only producer) not yet closed --
+        // the registry entry's removal (`sys_wait4`'s `reap_cross_process_child`) is the only
+        // thing that ever invalidates it, and that always happens strictly after this call.
+        unsafe {
+            process_fork::wait_for_process_exit(handle.0 as windows_sys::Win32::Foundation::HANDLE)
+        }
     }
 
     fn try_wait_for_cross_process_exit(
         &self,
         handle: litebox::platform::CrossProcessChildHandle,
     ) -> Option<u32> {
-        process_fork::try_wait_for_process_exit(handle.0 as windows_sys::Win32::Foundation::HANDLE)
+        // Safety: same contract as `wait_for_cross_process_exit` above.
+        unsafe {
+            process_fork::try_wait_for_process_exit(
+                handle.0 as windows_sys::Win32::Foundation::HANDLE,
+            )
+        }
     }
 
     fn diagnostic_cross_process_wait4_probe(

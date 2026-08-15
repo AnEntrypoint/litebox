@@ -329,11 +329,13 @@ const CROSS_PROCESS_EXIT_SIGNAL_FLAG: u32 = 0x0000_8000;
 #[allow(dead_code, reason = "encode-side production call site (a real spawned child's own exit path) does not exist yet -- see doc comment")]
 pub(crate) fn encode_cross_process_exit_status(status: ExitStatus) -> u32 {
     match status {
-        ExitStatus::Exit(code) => CROSS_PROCESS_EXIT_MARKER | (u32::from(code as u8) & 0xff),
+        ExitStatus::Exit(code) => {
+            CROSS_PROCESS_EXIT_MARKER | (u32::from(code.cast_unsigned()) & 0xff)
+        }
         ExitStatus::Signal(sig) => {
             CROSS_PROCESS_EXIT_MARKER
                 | CROSS_PROCESS_EXIT_SIGNAL_FLAG
-                | (sig.as_i32() as u32 & 0xff)
+                | (sig.as_i32().cast_unsigned() & 0xff)
         }
     }
 }
@@ -348,11 +350,11 @@ pub(crate) fn encode_cross_process_exit_status(status: ExitStatus) -> u32 {
 /// approximation when the real Linux-specific cause cannot be recovered from a bare Windows exit
 /// code.
 pub(crate) fn decode_cross_process_wait_status(raw_exit_code: u32) -> i32 {
+    const SIGKILL: i32 = 9;
     if raw_exit_code & CROSS_PROCESS_EXIT_MARKER_MASK != CROSS_PROCESS_EXIT_MARKER {
-        const SIGKILL: i32 = 9;
         return SIGKILL & 0x7f;
     }
-    let low = (raw_exit_code & 0xff) as i32;
+    let low = (raw_exit_code & 0xff).cast_signed();
     if raw_exit_code & CROSS_PROCESS_EXIT_SIGNAL_FLAG != 0 {
         low & 0x7f
     } else {

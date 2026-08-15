@@ -2701,7 +2701,13 @@ fn copy_one_group(
 /// the registry entry's own removal (`sys_wait4`'s `reap_cross_process_child` call) is what
 /// eventually drops it, matching how a thread-based child's `Arc<Process>` is dropped only once
 /// reaped.
-pub fn wait_for_process_exit(handle: HANDLE) -> u32 {
+///
+/// # Safety
+///
+/// `handle` must be a valid, open Windows process `HANDLE` (e.g. the value this module's own
+/// `diagnostic_cross_process_wait4_probe` registers, or a real handle a future production
+/// cross-process spawn primitive produces) that the caller has not already closed.
+pub unsafe fn wait_for_process_exit(handle: HANDLE) -> u32 {
     unsafe {
         WaitForSingleObject(handle, INFINITE);
         let mut exit_code: u32 = 0;
@@ -2722,7 +2728,12 @@ pub fn wait_for_process_exit(handle: HANDLE) -> u32 {
 /// object is signaled (terminated) but the OS hasn't finished tearing it down" vs. genuinely
 /// still running -- treated the same as "still running" here since there is nothing meaningful
 /// to report yet either way.
-pub fn try_wait_for_process_exit(handle: HANDLE) -> Option<u32> {
+///
+/// # Safety
+///
+/// Same contract as [`wait_for_process_exit`]: `handle` must be a valid, open, not-yet-closed
+/// Windows process `HANDLE`.
+pub unsafe fn try_wait_for_process_exit(handle: HANDLE) -> Option<u32> {
     unsafe {
         const WAIT_OBJECT_0: u32 = 0;
         if WaitForSingleObject(handle, 0) != WAIT_OBJECT_0 {
@@ -2772,7 +2783,7 @@ pub fn run_wait4_probe_child() -> ! {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    std::process::exit(code as i32);
+    std::process::exit(code.cast_signed());
 }
 
 /// Diagnostic-only (pass 141, `LITEBOX_DIAG_PROCESS_FORK_WAIT4=1`, off by default): spawns a
@@ -2789,9 +2800,6 @@ pub fn run_wait4_probe_child() -> ! {
 pub fn diagnostic_cross_process_wait4_probe(
     register: &mut dyn FnMut(i32, litebox::platform::CrossProcessChildHandle),
 ) {
-    if std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_WAIT4").is_none() {
-        return;
-    }
     const DIAG_PID: i32 = -1_000_000;
     // Exit code encodes ExitStatus::Exit(42) via the SAME codec `sys_wait4` decodes with --
     // see `litebox_shim_linux::syscalls::process::encode_cross_process_exit_status`. Duplicated
@@ -2799,7 +2807,10 @@ pub fn diagnostic_cross_process_wait4_probe(
     // sits BELOW `litebox_shim_linux` in the crate dependency graph and cannot depend on it --
     // matching this file's already-established layering (see `ForkGprSnapshot`'s doc comment for
     // the same reasoning applied to register snapshots).
-    const ENCODED_EXIT_42: u32 = 0xC0DE_0000 | 42;
+    const ENCODED_EXIT_42: u32 = 0xC0DE_0000 | 0x2a;
+    if std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_WAIT4").is_none() {
+        return;
+    }
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => {
@@ -2825,7 +2836,9 @@ pub fn diagnostic_cross_process_wait4_probe(
     let handle = litebox::platform::CrossProcessChildHandle(raw_handle);
     register(DIAG_PID, handle);
 
-    let poll_result = try_wait_for_process_exit(raw_handle as HANDLE);
+    // Safety: `raw_handle` is `child`'s own just-spawned, still-open `HANDLE`, valid for as
+    // long as `child` (a `std::process::Child`) is alive -- it is, until `child.wait()` below.
+    let poll_result = unsafe { try_wait_for_process_exit(raw_handle as HANDLE) };
     eprintln!(
         "[process_fork_diag] wait4-probe: immediate WNOHANG poll -> {}",
         match poll_result {
@@ -2834,7 +2847,8 @@ pub fn diagnostic_cross_process_wait4_probe(
         }
     );
 
-    let raw_exit_code = wait_for_process_exit(raw_handle as HANDLE);
+    // Safety: same handle, same liveness argument as the poll above.
+    let raw_exit_code = unsafe { wait_for_process_exit(raw_handle as HANDLE) };
     let marker_ok = raw_exit_code & 0xFFFF_0000 == 0xC0DE_0000;
     let low = raw_exit_code & 0xff;
     let signaled = raw_exit_code & 0x0000_8000 != 0;
