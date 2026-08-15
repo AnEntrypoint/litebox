@@ -154,6 +154,9 @@ pub fn run_diagnostic_resume_child() -> Result<(), std::convert::Infallible> {
     // own already-proven-working cross-thread injection uses. Never blocks in the pass-114-only or
     // pass-118/119-only resume paths (no writer ever signals this env var there).
     if is_real_resume_child() {
+        if diag_process_fork_tls_enabled() {
+            install_minimal_tls_for_diagnostic_resume();
+        }
         park_for_real_resume_injection();
     }
 
@@ -286,6 +289,38 @@ fn litebox_platform_windows_userland_new_for_diagnostic_resume() -> &'static cra
     crate::WindowsUserland::new()
 }
 
+/// Pass 121: installs a bare-minimum, STUB `TlsState` (see `crate::TlsState`, private to `lib.rs`
+/// but visible here as a descendant module) into this thread's Windows TLS slot so
+/// `crate::get_tls_ptr()` -- and hence `vectored_exception_handler`'s very first check -- resolves
+/// to `Some(...)` once the parent injects a real guest context and resumes this thread.
+///
+/// What this stub genuinely provides: every `TlsState` field `vectored_exception_handler` reads
+/// on its early path (`tls.is_in_guest`, `fork_verify::is_verifying(tls)` which reads
+/// `tls.fork_verify`) is present and well-formed, because `TlsState::new()` default-constructs the
+/// whole struct with no dependency on any `Task`/process object -- confirmed by reading its
+/// definition, which holds only `Cell`s, a `RefCell<Option<Arc<..>>>`, atomics, and a boxed
+/// `CONTEXT`, none of them requiring guest/process state to exist first.
+///
+/// What remains a STUB, not real state: `fork_verify` is left `None` (this diagnostic child has no
+/// `AddressRelocations` map -- that requires the fuller cross-process `Vmem`/`Task` reconstruction
+/// subsystem #2 is scoped to build), so `fork_verify::is_verifying` reports `false` and none of
+/// `vectored_exception_handler`'s fork-child-specific repair branches engage. `guest_context_top`
+/// is left null (no real guest stack has been established for this diagnostic thread). This is
+/// deliberately the SMALLEST stand-in that clears the pass-120 `None` bail-out, not a correct or
+/// complete per-thread state -- a future pass building full `Task` reconstruction replaces this
+/// entire function, not just extends it.
+///
+/// Leaked (`Box::leak`) rather than kept as a stack local: `run_diagnostic_resume_child` returns
+/// (dropping any stack local) after this call while the thread itself keeps running inside
+/// `park_for_real_resume_injection`'s wait and, if injected, the resumed real guest code -- both of
+/// which outlive this function's own stack frame, so the `TlsState` must outlive it too. This
+/// diagnostic child process is unconditionally `TerminateProcess`'d by the parent (never a normal
+/// exit), so the leak is bounded to the process's own short diagnostic lifetime.
+fn install_minimal_tls_for_diagnostic_resume() {
+    let tls: &'static crate::TlsState = Box::leak(Box::new(crate::TlsState::new()));
+    unsafe { crate::install_tls(tls) };
+}
+
 /// Whether the pass-111 `CreateProcess`-based fork diagnostic is enabled
 /// (`LITEBOX_DIAG_PROCESS_FORK_SPAWN=1`). Never runs otherwise -- see this module's doc comment.
 #[must_use]
@@ -401,6 +436,26 @@ pub fn diag_process_fork_registers_enabled() -> bool {
 #[must_use]
 pub fn diag_process_fork_real_resume_enabled() -> bool {
     std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_REAL_RESUME").is_some()
+}
+
+/// Whether pass 121's minimal-`TlsState` probe is enabled (`LITEBOX_DIAG_PROCESS_FORK_TLS=1`). A
+/// SIXTH gate, layered on top of REAL_RESUME: pass 120 found that the injected real guest context,
+/// once resumed, hits `vectored_exception_handler`'s very first line -- `get_tls_ptr()` -- which
+/// returns `None` because `TlsState` is normally installed by `ThreadHandle::run_with_handle` as
+/// part of the thread-based fork/exec path, which this diagnostic child's park-and-inject shape
+/// never runs. When this gate is set (only meaningful alongside REAL_RESUME, since there is no
+/// injected resume without it), the child installs a bare-minimum `TlsState` for its own parked
+/// thread, via `install_tls`, before parking for injection -- so `get_tls_ptr()` resolves to
+/// `Some(...)` once the parent's `SetThreadContext`-injected real guest register context resumes
+/// this same thread, and `vectored_exception_handler` can reach its actual repair logic instead of
+/// bailing out immediately. This `TlsState` is NOT the real guest thread's state: `fork_verify` is
+/// `None` (no `AddressRelocations` map has been threaded through to this diagnostic child), so any
+/// repair logic gated on `fork_verify::is_verifying` will not engage -- only the `get_tls_ptr()`
+/// bail-out itself is addressed. See `run_diagnostic_resume_child`'s call site for the exact
+/// sequencing this stub is installed at.
+#[must_use]
+pub fn diag_process_fork_tls_enabled() -> bool {
+    std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_TLS").is_some()
 }
 
 /// Whether pass 116's fd-complexity classification log (a pure, read-only report of whether the
