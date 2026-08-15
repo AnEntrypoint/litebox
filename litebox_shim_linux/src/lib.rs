@@ -345,6 +345,78 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         })
     }
 
+    /// Constructs a `LinuxShimEntrypoints`/`Task` for a process-based-fork child whose guest
+    /// memory is ALREADY fully populated at the correct addresses (by an external mechanism --
+    /// e.g. a `WriteProcessMemory` copy into a separately-spawned Windows process) and whose
+    /// `PageManager` has already been reconstructed to describe that memory (e.g. via
+    /// [`litebox::mm::PageManager::new_adopting_existing_memory`]), rather than freshly allocated
+    /// and ELF-loaded the way [`Self::load_program`] does.
+    ///
+    /// This is the process-based-fork analogue of `do_clone`'s real, same-process, thread-based
+    /// fork path (`Task::do_clone`'s `CloneFlags::empty()` branch), which likewise never calls
+    /// `load_program`/ELF-loads a forked child -- it constructs a `Task` directly from the
+    /// parent's already-running state. The difference here is that there is no parent `Task` in
+    /// this process to copy from (the parent lives in a different OS process); every field is
+    /// built fresh from the caller-supplied `pm`/`pid`/`ppid`/credentials, mirroring a stdio-only,
+    /// single-thread, freshly-execve'd-looking process shape.
+    ///
+    /// Returns bare `LinuxShimEntrypoints`, not a `LoadedProgram` -- there is no ELF-derived
+    /// initial register state to report (the caller already has the forked child's own translated
+    /// `PtRegs`, captured at the parent's `fork()` call site) and no argv/envp/entry point to
+    /// resolve.
+    pub fn adopt_forked_process(
+        &self,
+        fs: alloc::sync::Arc<FS>,
+        task: litebox_common_linux::TaskParams,
+        pm: PageManager<Platform, PAGE_SIZE>,
+    ) -> LinuxShimEntrypoints<Platform, FS> {
+        let litebox_common_linux::TaskParams {
+            pid,
+            ppid,
+            uid,
+            euid,
+            gid,
+            egid,
+        } = task;
+        let files = syscalls::file::FilesState::new(fs);
+        files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR - 1);
+        let files = Arc::new(files);
+        files.initialize_stdio_in_shared_descriptors_table(&self.0);
+
+        let shared_pending = Arc::new(litebox::sync::Mutex::new(
+            syscalls::signal::PendingSignals::new(),
+        ));
+
+        LinuxShimEntrypoints {
+            _not_send: core::marker::PhantomData,
+            task: Task {
+                global: self.0.clone(),
+                thread: syscalls::process::ThreadState::new_process(
+                    pid,
+                    pm,
+                    false,
+                    None,
+                    shared_pending.clone(),
+                ),
+                wait_state: wait::WaitState::new(self.0.platform),
+                pid,
+                ppid,
+                tid: pid,
+                credentials: syscalls::process::Credentials {
+                    uid,
+                    euid,
+                    gid,
+                    egid,
+                }
+                .into(),
+                comm: [0; litebox_common_linux::TASK_COMM_LEN].into(),
+                fs: Arc::new(syscalls::file::FsState::new()).into(),
+                files: files.into(),
+                signals: syscalls::signal::SignalState::new_process(shared_pending),
+            },
+        }
+    }
+
     /// Get the page manager for the shim's bootstrap process (the one created by the first
     /// `load_program` call).
     ///

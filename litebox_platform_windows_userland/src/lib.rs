@@ -4175,7 +4175,8 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
             None
         };
         let want_real_resume = process_fork::diag_process_fork_real_resume_enabled();
-        let inject_full_gprs = if want_real_resume {
+        let want_task_resume = process_fork::diag_process_fork_task_resume_enabled();
+        let inject_full_gprs = if want_real_resume || want_task_resume {
             full_translated_gprs
         } else {
             None
