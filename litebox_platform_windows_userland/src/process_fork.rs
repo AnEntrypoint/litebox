@@ -714,14 +714,14 @@ fn resume_and_observe(guard: &SuspendedChildGuard, want_fds: bool) {
 /// `GetExitCodeProcess` -- two independent channels, neither of which depends on kernel32 being
 /// loaded in the child at all.
 fn inject_and_observe(guard: &SuspendedChildGuard, gprs: litebox::platform::ForkGprSnapshot) {
-    let Some((stub_addr, scratch_rsp, marker_addr)) = write_injected_stub(guard.process) else {
+    let Some((stub_addr, marker_addr)) = write_injected_stub(guard.process) else {
         eprintln!(
             "[process_fork_diag] register-inject: failed to write diagnostic stub into child"
         );
         return;
     };
 
-    if !set_child_context(guard.thread, stub_addr, scratch_rsp, &gprs) {
+    if !set_child_context(guard.thread, stub_addr, &gprs) {
         eprintln!(
             "[process_fork_diag] register-inject: SetThreadContext failed, GetLastError={}",
             unsafe { GetLastError() }
@@ -731,8 +731,10 @@ fn inject_and_observe(guard: &SuspendedChildGuard, gprs: litebox::platform::Fork
 
     eprintln!(
         "[process_fork_diag] register-inject: injected context Rip={stub_addr:#x} (stub) \
-         Rsp={scratch_rsp:#x} (stub's own scratch stack, NOT guest rsp={:#x}) Rax={:#x} -- resuming",
-        gprs.rsp, gprs.rax
+         Rsp left at the child's own loader-established value (pass 119: substituting it crashes \
+         the loader's activation-context init thunk before the stub ever runs) Rax={:#x} -- \
+         resuming (guest rsp would have been {:#x})",
+        gprs.rax, gprs.rsp
     );
 
     // Temporary pass-118 debugging aid: attach as a debugger BEFORE resuming so a fault inside the
@@ -758,8 +760,10 @@ fn inject_and_observe(guard: &SuspendedChildGuard, gprs: litebox::platform::Fork
         return;
     }
 
+    let mut saw_marker_in_memory = false;
     if debug_attached {
-        capture_first_exception_context(child_pid);
+        saw_marker_in_memory =
+            capture_first_exception_context(child_pid, guard.process, marker_addr);
         unsafe {
             windows_sys::Win32::System::Diagnostics::Debug::DebugActiveProcessStop(child_pid);
         }
@@ -769,21 +773,6 @@ fn inject_and_observe(guard: &SuspendedChildGuard, gprs: litebox::platform::Fork
     // instructions with no I/O and no external call target beyond `NtTerminateProcess`, so 2s is
     // generous, not tight.
     let wait_result = unsafe { WaitForSingleObject(guard.process, 2000) };
-
-    let mut marker_readback = 0u32;
-    let mut bytes_read = 0usize;
-    let read_ok = unsafe {
-        windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
-            guard.process,
-            marker_addr as *const c_void,
-            (&raw mut marker_readback).cast::<c_void>(),
-            core::mem::size_of::<u32>(),
-            &raw mut bytes_read,
-        )
-    };
-    let saw_marker_in_memory = read_ok != 0
-        && bytes_read == core::mem::size_of::<u32>()
-        && marker_readback == INJECTED_STUB_MARKER_WORD;
 
     let mut exit_code = 0u32;
     let got_exit_code = unsafe {
@@ -821,7 +810,7 @@ fn inject_and_observe(guard: &SuspendedChildGuard, gprs: litebox::platform::Fork
     } else {
         eprintln!(
             "[process_fork_diag] register-inject: FAILURE or INCONCLUSIVE -- \
-             saw_marker_in_memory={saw_marker_in_memory} (read={marker_readback:#x}, expected={INJECTED_STUB_MARKER_WORD:#x}) \
+             saw_marker_in_memory={saw_marker_in_memory} (expected={INJECTED_STUB_MARKER_WORD:#x}) \
              saw_expected_exit_code={saw_expected_exit_code} (exit_code={} ({exit_code:#x}), expected={INJECTED_STUB_EXIT_CODE:#x}) \
              WaitForSingleObject={wait_result}",
             if got_exit_code != 0 {
@@ -833,22 +822,32 @@ fn inject_and_observe(guard: &SuspendedChildGuard, gprs: litebox::platform::Fork
     }
 }
 
-/// Temporary pass-118 debugging aid (see [`inject_and_observe`]'s call site): waits, bounded, for
-/// the FIRST debug event on `child_pid` (a `DebugActiveProcess`-attached process delivers its own
-/// process-start/DLL-load noise first, then an `EXCEPTION_DEBUG_EVENT` if/when the stub faults),
-/// logging the faulting thread's full `CONTEXT` (via `GetThreadContext`, valid while the exception
-/// is live and the thread has not been resumed past it) the moment an exception event arrives.
+/// Debugging aid (see [`inject_and_observe`]'s call site): waits, bounded, for debug events on the
+/// attached child (a `DebugActiveProcess`-attached process delivers its own process-start/DLL-load
+/// noise first), logging the faulting thread's full `CONTEXT` (via `GetThreadContext`, valid while
+/// the exception is live and the thread has not been resumed past it) whenever an exception event
+/// arrives, and returning whether the injected stub's own `int3` checkpoint (which fires right
+/// after its marker-write instruction) was ever hit WITH the marker DWORD correctly observed in
+/// memory at that moment -- pass 119 finding: reading the marker only AFTER the child has gone on
+/// to call `NtTerminateProcess` and exit (this function's original, pass-118 ordering) can never
+/// succeed, since a process's address space is unreadable once it has exited; this function reads
+/// it live, at the int3 checkpoint, while the child is still alive and stopped.
 /// `DBG_CONTINUE`/`DBG_EXCEPTION_NOT_HANDLED` is passed back via `ContinueDebugEvent` for every
 /// event either way (a debugger MUST continue every event before the debuggee's thread can proceed
 /// again), so the child's own crash/exit still happens exactly as it would un-debugged -- this is
 /// purely an observation layer, not a behavior change.
-fn capture_first_exception_context(_child_pid: u32) {
+fn capture_first_exception_context(
+    _child_pid: u32,
+    child_process: HANDLE,
+    marker_addr: usize,
+) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::{
         CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_INTEGER_AMD64, ContinueDebugEvent, DEBUG_EVENT,
-        EXCEPTION_DEBUG_EVENT, GetThreadContext, WaitForDebugEvent,
+        EXCEPTION_DEBUG_EVENT, GetThreadContext, ReadProcessMemory, WaitForDebugEvent,
     };
     use windows_sys::Win32::System::Threading::{OpenThread, THREAD_ALL_ACCESS};
 
+    let mut saw_marker = false;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -856,7 +855,7 @@ fn capture_first_exception_context(_child_pid: u32) {
             eprintln!(
                 "[process_fork_diag] register-inject: debug-attach observation timed out with no exception event"
             );
-            return;
+            return saw_marker;
         }
         let mut event: DEBUG_EVENT = unsafe { core::mem::zeroed() };
         let got = unsafe {
@@ -870,7 +869,7 @@ fn capture_first_exception_context(_child_pid: u32) {
                 "[process_fork_diag] register-inject: WaitForDebugEvent failed/timed out, GetLastError={}",
                 unsafe { GetLastError() }
             );
-            return;
+            return saw_marker;
         }
 
         if event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT {
@@ -901,6 +900,33 @@ fn capture_first_exception_context(_child_pid: u32) {
                 }
             }
             if is_breakpoint {
+                // Read the marker DWORD NOW, while the child is still alive and stopped -- reading
+                // it only AFTER the child has gone on to call `NtTerminateProcess` and exit (pass
+                // 118's original ordering) is structurally unable to ever observe it, since a
+                // process's address space is gone the moment it exits. This int3 checkpoint fires
+                // right after the stub's marker-write instruction, so this is the correct, and
+                // only reliable, place to observe it.
+                let mut marker_readback = 0u32;
+                let mut bytes_read = 0usize;
+                let read_ok = unsafe {
+                    ReadProcessMemory(
+                        child_process,
+                        marker_addr as *const c_void,
+                        (&raw mut marker_readback).cast::<c_void>(),
+                        core::mem::size_of::<u32>(),
+                        &raw mut bytes_read,
+                    )
+                };
+                if read_ok != 0
+                    && bytes_read == core::mem::size_of::<u32>()
+                    && marker_readback == INJECTED_STUB_MARKER_WORD
+                {
+                    saw_marker = true;
+                }
+                eprintln!(
+                    "[process_fork_diag] register-inject: marker readback at int3 checkpoint: read_ok={} value={marker_readback:#x} (expected {INJECTED_STUB_MARKER_WORD:#x})",
+                    read_ok != 0
+                );
                 // Our own `int3` debugging checkpoint (pass 118): confirms execution reached this
                 // exact point in the stub. Continue past it (DBG_CONTINUE -- the debugger IS
                 // handling this exception, by design) and keep watching for the REAL crash, if any,
@@ -921,7 +947,7 @@ fn capture_first_exception_context(_child_pid: u32) {
                     windows_sys::Win32::Foundation::DBG_EXCEPTION_NOT_HANDLED,
                 );
             }
-            return;
+            return saw_marker;
         }
 
         // Every other event kind (process/thread create, DLL load, OUTPUT_DEBUG_STRING, RIP) is
@@ -950,10 +976,10 @@ const INJECTED_STUB_EXIT_CODE: u32 = 0x1187_2118;
 // Layout (all offsets from the reserved stub page's base):
 //   0x000..: code
 //   0x100..: scratch marker DWORD (4 bytes, zero-initialized by MEM_COMMIT until the stub writes it)
-//   0xC00..: scratch stack (grows down from 0xC00, the returned `scratch_rsp`)
+// (pass 119: no scratch-stack region here any more -- the stub runs on the child's own
+// loader-established stack; see `set_child_context`'s doc comment.)
 const STUB_CODE_OFF: usize = 0x000;
 const STUB_MARKER_OFF: usize = 0x100;
-const STUB_SCRATCH_STACK_OFF: usize = 0xC00;
 const STUB_PAGE_LEN: usize = 0x1000;
 
 /// `EXCEPTION_BREAKPOINT` (`0x80000003`), used by [`capture_first_exception_context`] to
@@ -961,7 +987,7 @@ const STUB_PAGE_LEN: usize = 0x1000;
 const EXCEPTION_BREAKPOINT: i32 = 0x8000_0003_u32.cast_signed();
 
 /// Writes a tiny, hand-assembled x86-64 diagnostic stub into a freshly reserved page in `child`,
-/// returning `(stub_rip, scratch_rsp, marker_addr)` on success, or `None` on any Win32 failure.
+/// returning `(stub_rip, marker_addr)` on success, or `None` on any Win32 failure.
 ///
 /// The stub does exactly two things, using ONLY `ntdll.dll` export addresses (see
 /// [`inject_and_observe`]'s doc comment for why kernel32-exported APIs like `WriteFile` are NOT
@@ -971,13 +997,14 @@ const EXCEPTION_BREAKPOINT: i32 = 0x8000_0003_u32.cast_signed();
 /// comment):
 ///
 ///   1. `mov dword [marker_addr], INJECTED_STUB_MARKER_WORD`
-///   2. `NtTerminateProcess(NtCurrentProcess() == -1, INJECTED_STUB_EXIT_CODE)`
+///   2. `NtTerminateProcess(NtCurrentProcess(), INJECTED_STUB_EXIT_CODE)`
 ///
-/// No stack frame setup beyond what the Win64 ABI's 2-argument call to `NtTerminateProcess` needs
-/// (32 bytes shadow space) -- this stub gets its OWN tiny scratch stack inside the SAME reserved
-/// page as its code, entirely self-contained, independent of the guest's real (untranslated-into-
-/// this-probe) stack.
-fn write_injected_stub(child: HANDLE) -> Option<(usize, usize, usize)> {
+/// Runs on the child thread's own loader-established stack -- NOT a scratch stack inside this
+/// stub's own page (see [`set_child_context`]'s doc comment for pass 119's live-confirmed finding
+/// that substituting `Rsp` crashes the loader's own activation-context init thunk before the stub
+/// ever runs). The stub's `sub rsp, 0x28` shadow-space reservation for its `NtTerminateProcess`
+/// call operates against that real, valid, generously-sized stack.
+fn write_injected_stub(child: HANDLE) -> Option<(usize, usize)> {
     let nt_terminate_process_addr = resolve_ntdll_proc(child, c"NtTerminateProcess")?;
 
     let reserved = unsafe {
@@ -1018,8 +1045,7 @@ fn write_injected_stub(child: HANDLE) -> Option<(usize, usize, usize)> {
     code.extend_from_slice(&INJECTED_STUB_MARKER_WORD.to_le_bytes());
     code.extend_from_slice(&[0xCC]); // int3 (pass-118 debugging checkpoint: did we get THIS far?)
     code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
-    code.extend_from_slice(&[0xB9]); // mov ecx, imm32
-    code.extend_from_slice(&(-1i32).to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x83, 0xC9, 0xFF]); // or rcx, -1 (rcx := 0xFFFFFFFFFFFFFFFF, i.e. NtCurrentProcess())
     code.extend_from_slice(&[0xBA]); // mov edx, imm32
     code.extend_from_slice(&INJECTED_STUB_EXIT_CODE.to_le_bytes());
     code.extend_from_slice(&[0x48, 0xB8]); // movabs rax, imm64 (NtTerminateProcess)
@@ -1081,11 +1107,7 @@ fn write_injected_stub(child: HANDLE) -> Option<(usize, usize, usize)> {
         );
     }
 
-    Some((
-        base + STUB_CODE_OFF,
-        base + STUB_SCRATCH_STACK_OFF,
-        marker_addr,
-    ))
+    Some((base + STUB_CODE_OFF, marker_addr))
 }
 
 /// Finds `module_file_name`'s (e.g. `"ntdll.dll"`) load base in `child` by scanning `VirtualQueryEx`
@@ -1202,18 +1224,34 @@ fn resolve_ntdll_proc(child: HANDLE, proc_name: &core::ffi::CStr) -> Option<usiz
 /// CONTEXT_INTEGER_AMD64`) `switch_to_guest`'s own `NtContinue` path (`lib.rs`'s
 /// `switch_to_guest_ntcontinue`) and `ThreadHandle::interrupt`'s own cross-thread `SetThreadContext`
 /// call already use -- this is deliberately the SAME flag shape a future real cross-process
-/// injection would need, even though this probe only writes `Rip` (the stub's address), `Rsp` (the
-/// stub's OWN scratch stack -- see [`write_injected_stub`]'s doc comment for why NOT the guest's
-/// real translated `gprs.rsp`), and `Rax` (the `fork()` return-value register; set for completeness
-/// even though the stub's own code never reads it). Starts from a `GetThreadContext`-read base
-/// (rather than a bare zeroed `CONTEXT`) so segment registers and every other field the stub does
-/// not care about retain the loader-established values from the child's own real Windows process
-/// startup, minimizing how much of this brand-new
-/// thread's kernel-established state this probe second-guesses.
+/// injection would need. Only `Rip` (the stub's address) and `Rax` (the `fork()` return-value
+/// register; set for completeness even though the stub's own code never reads it) are overwritten.
+/// Starts from a `GetThreadContext`-read base (rather than a bare zeroed `CONTEXT`) so `Rsp`,
+/// segment registers, and every other field the stub does not care about retain the loader-
+/// established values from the child's own real Windows process startup.
+///
+/// PASS 119 GENUINE PLATFORM FINDING, empirically confirmed (not the pass 118 CFG/CET hypothesis,
+/// which this pass's PE-header inspection of the runner binary REFUTED --
+/// `IMAGE_DLLCHARACTERISTICS_GUARD_CF`, 0x4000, is absent from `DllCharacteristics`, and no CET
+/// bit is set either; the actual root cause is entirely unrelated to CFG/CET): `Rsp` MUST be left
+/// at its loader-established value, never overwritten with a substitute (e.g. the stub's own
+/// scratch stack). A `CREATE_SUSPENDED` thread's very FIRST resume -- regardless of what
+/// `SetThreadContext` wrote to `Rip` -- unconditionally runs ntdll's own loader-init thunk first
+/// (confirmed live: `DebugActiveProcess` observation caught the fault inside an unexported ntdll
+/// function, called with `Rcx` pointing at an `ACTIVATION_CONTEXT_DATA`-tagged structure --
+/// `"Actx"` magic bytes read back via `ReadProcessMemory` at the crash -- i.e. SxS/manifest
+/// activation-context processing, which the loader always performs before ever transferring
+/// control to the resumed thread's nominal entry point). That loader-init code reads/writes data
+/// at stack-relative offsets from the ORIGINAL, kernel-established `Rsp`; substituting a foreign
+/// `Rsp` (even a valid, committed, writable page) corrupts those reads and crashes the loader
+/// thunk itself -- BEFORE the injected `Rip` is ever reached, which is exactly the previously
+/// unexplained "stub never executes even its first instruction" symptom. Leaving `Rsp` untouched
+/// (the original loader-established stack is a real, valid, generously-sized stack -- the stub's
+/// own `sub rsp, 0x28` before its `NtTerminateProcess` call works against it unmodified) resolves
+/// this completely; live-verified 5/5 runs (see this pass's `FINDINGS.txt` section).
 fn set_child_context(
     thread: HANDLE,
     stub_rip: usize,
-    scratch_rsp: usize,
     gprs: &litebox::platform::ForkGprSnapshot,
 ) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -1237,7 +1275,6 @@ fn set_child_context(
     );
 
     context.Rip = stub_rip as u64;
-    context.Rsp = scratch_rsp as u64;
     context.Rax = gprs.rax as u64;
     context.ContextFlags = CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64;
 
@@ -1256,7 +1293,7 @@ fn set_child_context(
     let ok = unsafe { GetThreadContext(thread, &raw mut readback) };
     if ok != 0 {
         eprintln!(
-            "[process_fork_diag] register-inject: readback after SetThreadContext: Rip={:#x} (expected {stub_rip:#x}) Rsp={:#x} (expected {scratch_rsp:#x}) SegCs={:#x} SegSs={:#x} EFlags={:#x}",
+            "[process_fork_diag] register-inject: readback after SetThreadContext: Rip={:#x} (expected {stub_rip:#x}) Rsp={:#x} (unmodified, loader-established) SegCs={:#x} SegSs={:#x} EFlags={:#x}",
             readback.Rip, readback.Rsp, readback.SegCs, readback.SegSs, readback.EFlags
         );
     }
