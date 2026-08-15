@@ -326,7 +326,10 @@ const CROSS_PROCESS_EXIT_SIGNAL_FLAG: u32 = 0x0000_8000;
 /// exercises the SAME encoding (duplicated there, not called directly, due to crate layering --
 /// `litebox_platform_windows_userland` sits below this crate) against a real child process,
 /// live-verified end to end.
-#[allow(dead_code, reason = "encode-side production call site (a real spawned child's own exit path) does not exist yet -- see doc comment")]
+#[allow(
+    dead_code,
+    reason = "encode-side production call site (a real spawned child's own exit path) does not exist yet -- see doc comment"
+)]
 pub(crate) fn encode_cross_process_exit_status(status: ExitStatus) -> u32 {
     match status {
         ExitStatus::Exit(code) => {
@@ -462,7 +465,9 @@ impl<Platform: ShimPlatform> Process<Platform> {
     /// successfully waited-for" discipline (Linux does not let you wait for the same child
     /// twice).
     pub(crate) fn reap_cross_process_child(&self, pid: i32) {
-        self.cross_process_children.lock().retain(|(p, _)| *p != pid);
+        self.cross_process_children
+            .lock()
+            .retain(|(p, _)| *p != pid);
     }
 
     /// Returns the live child `Process` with pid `pid`, if this process has one (see

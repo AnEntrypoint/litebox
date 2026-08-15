@@ -688,7 +688,10 @@ pub trait ForkChildVerificationProvider {
     /// pid the platform makes up for this diagnostic exercise (any value not colliding with a
     /// real guest pid; the default implementation never calls it). The default implementation
     /// does nothing.
-    fn diagnostic_cross_process_wait4_probe(&self, register: &mut dyn FnMut(i32, CrossProcessChildHandle)) {
+    fn diagnostic_cross_process_wait4_probe(
+        &self,
+        register: &mut dyn FnMut(i32, CrossProcessChildHandle),
+    ) {
         let _ = register;
     }
 }
