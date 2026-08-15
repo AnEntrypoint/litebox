@@ -275,6 +275,20 @@ unsafe extern "system" fn vectored_exception_handler(
             "[veh] group meta-slot rdi-0x10={meta_slot:#x} type={ms_mtype:#x} protect={ms_protect:#x} alloc_base={ms_alloc_base:#x} bytes({nmb})={:02x?}",
             &meta_bytes[..nmb],
         );
+        // Pass 129: reverse-lookup the meta-slot's PARENT-side (pre-`fork()` `duplicate()`
+        // source) address and read what is still live there -- the parent's original mapping is
+        // never unmapped, so this tells us whether the PARENT's own copy of this slot was
+        // already zero (meaning `duplicate()` faithfully copied an already-zero value) or
+        // non-zero (meaning `duplicate()`'s copy path itself lost the value).
+        if let Some((source_addr, source_bytes)) =
+            fork_verify::reverse_translate_and_read_for_diagnostics(tls, meta_slot)
+        {
+            eprintln!(
+                "[veh] meta-slot parent-side source_addr={source_addr:#x} bytes={source_bytes:02x?}",
+            );
+        } else {
+            eprintln!("[veh] meta-slot parent-side: no reverse translation found");
+        }
         eprintln!(
             "[veh] crash regs rdi={:#x} rsi={:#x} rdx={:#x} rax={:#x} rsp={:#x} rbp={:#x} rbx={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
             context.Rdi,

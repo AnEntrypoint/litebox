@@ -1536,6 +1536,34 @@ pub(crate) fn addr_is_codewatched_for_diagnostics(addr: usize) -> bool {
     codewatch::contains(addr)
 }
 
+/// Diagnostic-only (pass 129): reverse-lookup `dest_addr` (a DESTINATION/child-side address,
+/// e.g. the BUG B meta-slot) against this thread's `AddressRelocations` ranges to find the
+/// corresponding SOURCE/parent-side address `duplicate()` copied it from, then read the live
+/// byte content still at that source address (the parent's original mapping is never unmapped
+/// after `fork()`, so it stays live, readable host memory in this same process -- see
+/// `AddressRelocations::is_in_source`'s doc comment). Returns `None` if `dest_addr` does not
+/// fall within any tracked destination range, or if `tls` is not a verifying fork child.
+pub(crate) fn reverse_translate_and_read_for_diagnostics(
+    tls: &TlsState,
+    dest_addr: usize,
+) -> Option<(usize, [u8; 8])> {
+    let borrow = tls.fork_verify.borrow();
+    let relocations = borrow.as_ref()?;
+    let (source_range, dest_base) = relocations
+        .ranges()
+        .iter()
+        .find(|(source_range, dest_base)| {
+            (*dest_base..dest_base + source_range.len()).contains(&dest_addr)
+        })?;
+    let source_addr = source_range.start + (dest_addr - dest_base);
+    let mut buf = [0u8; 8];
+    let n = read_code_bytes(source_addr, &mut buf);
+    if n == 0 {
+        return Some((source_addr, [0u8; 8]));
+    }
+    Some((source_addr, buf))
+}
+
 pub(crate) fn describe_crash_page_for_diagnostics(rip: usize) {
     let (mtype, protect, alloc_base) = codewatch::describe(rip);
     eprintln!(

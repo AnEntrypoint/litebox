@@ -739,6 +739,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             base + max_end.next_multiple_of(PAGE_SIZE)
         };
 
+        litebox_util_log::debug!(
+            fd:? = fd, mapped_addr:? = mapped_addr, base_addr:? = base_addr,
+            pre_patched:? = pre_patched, tramp_file_size:? = tramp_file_size,
+            trampoline_vaddr:? = trampoline_vaddr;
+            "init_elf_patch_state: computed trampoline"
+        );
+
         // Insert under lock (re-check for races).
         let mut cache = self.global.elf_patch_cache.lock();
         cache
