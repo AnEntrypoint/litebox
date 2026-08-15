@@ -389,7 +389,13 @@ where
         let heap_top = source_vmem.brk;
         let mut dest_vmem =
             linux::Vmem::new_excluding(litebox.x.platform, source_ranges.into_iter());
-        let relocations = unsafe { source_vmem.duplicate(&mut dest_vmem) }?;
+        // `group_relocations` is intentionally unused here -- see `linux::GroupRelocation`'s doc
+        // comment: it is bookkeeping for a not-yet-built process-based `fork()`, not consumed by
+        // today's same-host-process design.
+        let linux::DuplicateOutcome {
+            relocations,
+            group_relocations: _,
+        } = unsafe { source_vmem.duplicate(&mut dest_vmem) }?;
         let mut ranges = Vec::with_capacity(relocations.len());
         let mut executable = Vec::with_capacity(relocations.len());
         let mut private_data = Vec::with_capacity(relocations.len());
