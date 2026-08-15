@@ -87,6 +87,147 @@ pub struct AddressRelocations {
 }
 
 impl AddressRelocations {
+    /// Reconstructs an [`AddressRelocations`] from its raw parallel-vector parts.
+    ///
+    /// Diagnostic-only (pass 122 of `scratchpad/jqrepro/FINDINGS.txt`'s investigation): the real
+    /// constructor is [`PageManager::duplicate`], which always runs in the SAME process as its
+    /// caller, so the normal thread-based `fork()` path never needs this -- it just moves the
+    /// `Self` [`PageManager::duplicate`] already built, by value, into the new thread's closure
+    /// (same address space, no serialization). A cross-PROCESS diagnostic child cannot receive
+    /// that `Arc<AddressRelocations>` by reference at all (a different process has a different
+    /// address space; the pointer is meaningless there), so the parent instead calls
+    /// [`Self::serialize_for_diagnostic`] and transmits the resulting text line to the child
+    /// through the same stdin pipe `duplicate_stdio_into_child` (in
+    /// `litebox_platform_windows_userland::process_fork`) already proves works for cross-process
+    /// data transfer, and the child calls this constructor to rebuild an equivalent object from
+    /// the parsed line before calling
+    /// [`crate::platform::ForkChildVerificationProvider::begin_fork_child_verification`] with it --
+    /// see that module's `LITEBOX_DIAG_PROCESS_FORK_RELOCATIONS` gate for the exact wire format and
+    /// the diagnostic that drives both ends.
+    ///
+    /// `ranges`/`executable`/`private_data`/`is_file_backed` must all be the same length (the
+    /// invariant [`Self::is_executable_range`] and friends already rely on); this constructor does
+    /// not itself re-validate that beyond what indexing would panic on, since it is only ever
+    /// called with data this same module serialized moments earlier.
+    #[must_use]
+    pub fn from_raw_parts_for_diagnostic(
+        ranges: Vec<(Range<usize>, usize)>,
+        executable: Vec<bool>,
+        private_data: Vec<bool>,
+        is_file_backed: Vec<bool>,
+        heap_top: usize,
+        group_relocations: Vec<(Range<usize>, usize)>,
+    ) -> Self {
+        Self {
+            ranges,
+            executable,
+            private_data,
+            is_file_backed,
+            heap_top,
+            group_relocations,
+        }
+    }
+
+    /// Serializes this object's raw fields into a single newline-free text line, the inverse of
+    /// [`Self::from_raw_parts_for_diagnostic`].
+    ///
+    /// Diagnostic-only (pass 122, see that constructor's doc comment for the full cross-process
+    /// motivation). Format, chosen for simplicity over compactness since this is a diagnostic-only,
+    /// small-cardinality (a handful of VMAs per process in every repro this investigation has run)
+    /// data path, not a hot one: semicolon-separated top-level fields, comma-separated within a
+    /// field, one line total (so the receiving end's existing newline-delimited pipe-read loop --
+    /// see `duplicate_stdio_into_child`'s sibling in `process_fork.rs` -- needs no changes):
+    ///
+    /// `heap_top;range_count;r0_start,r0_end,r0_dest,r0_exec,r0_priv,r0_filebacked;...;
+    /// group_count;g0_start,g0_end,g0_dest;...`
+    ///
+    /// `bool` fields serialize as `1`/`0`. Every numeric field is a plain decimal `usize`/`u64` --
+    /// addresses in this investigation's repros are always well within `u64` range, and a
+    /// diagnostic-only text format prioritizes being trivially greppable in a `LITEBOX_VEH_TRACE`
+    /// log over binary compactness.
+    #[must_use]
+    pub fn serialize_for_diagnostic(&self) -> alloc::string::String {
+        use alloc::string::String;
+        use core::fmt::Write as _;
+
+        let mut out = String::new();
+        let _ = write!(out, "{};{}", self.heap_top, self.ranges.len());
+        for (i, (range, dest_base)) in self.ranges.iter().enumerate() {
+            let _ = write!(
+                out,
+                ";{},{},{},{},{},{}",
+                range.start,
+                range.end,
+                dest_base,
+                u8::from(self.executable[i]),
+                u8::from(self.private_data[i]),
+                u8::from(self.is_file_backed[i]),
+            );
+        }
+        let _ = write!(out, ";{}", self.group_relocations.len());
+        for (range, dest_base) in &self.group_relocations {
+            let _ = write!(out, ";{},{},{}", range.start, range.end, dest_base);
+        }
+        out
+    }
+
+    /// Parses a line produced by [`Self::serialize_for_diagnostic`] back into an
+    /// [`AddressRelocations`]. Diagnostic-only (pass 122); returns `None` on any malformed input
+    /// rather than panicking, since this parses data that crossed a process boundary over a pipe --
+    /// a transmission glitch or a stale/mismatched sender must degrade to "no relocations
+    /// available" (the pass-121 status quo), never a crash in the child being diagnosed.
+    #[must_use]
+    pub fn deserialize_for_diagnostic(line: &str) -> Option<Self> {
+        let mut parts = line.trim().split(';');
+        let heap_top: usize = parts.next()?.parse().ok()?;
+        let range_count: usize = parts.next()?.parse().ok()?;
+        let mut ranges = Vec::with_capacity(range_count);
+        let mut executable = Vec::with_capacity(range_count);
+        let mut private_data = Vec::with_capacity(range_count);
+        let mut is_file_backed = Vec::with_capacity(range_count);
+        for _ in 0..range_count {
+            let field = parts.next()?;
+            let mut f = field.split(',');
+            let start: usize = f.next()?.parse().ok()?;
+            let end: usize = f.next()?.parse().ok()?;
+            let dest_base: usize = f.next()?.parse().ok()?;
+            let exec: u8 = f.next()?.parse().ok()?;
+            let priv_: u8 = f.next()?.parse().ok()?;
+            let file_backed: u8 = f.next()?.parse().ok()?;
+            if f.next().is_some() {
+                return None;
+            }
+            ranges.push((start..end, dest_base));
+            executable.push(exec != 0);
+            private_data.push(priv_ != 0);
+            is_file_backed.push(file_backed != 0);
+        }
+        let group_count: usize = parts.next()?.parse().ok()?;
+        let mut group_relocations = Vec::with_capacity(group_count);
+        for _ in 0..group_count {
+            let field = parts.next()?;
+            let mut f = field.split(',');
+            let start: usize = f.next()?.parse().ok()?;
+            let end: usize = f.next()?.parse().ok()?;
+            let dest_base: usize = f.next()?.parse().ok()?;
+            if f.next().is_some() {
+                return None;
+            }
+            group_relocations.push((start..end, dest_base));
+        }
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(Self::from_raw_parts_for_diagnostic(
+            ranges,
+            executable,
+            private_data,
+            is_file_backed,
+            heap_top,
+            group_relocations,
+        ))
+    }
+
     /// Translate `addr` (assumed to be a valid address in the source address space at the time
     /// of duplication) into the corresponding address in the destination address space.
     ///

@@ -156,6 +156,41 @@ pub fn run_diagnostic_resume_child() -> Result<(), std::convert::Infallible> {
     if is_real_resume_child() {
         if diag_process_fork_tls_enabled() {
             install_minimal_tls_for_diagnostic_resume();
+            // Pass 122: if the parent also opted into the relocations probe, read the
+            // `AddressRelocations` line it wrote to our stdin pipe BEFORE parking -- `park_for_
+            // real_resume_injection` never returns once the parent's `SetThreadContext` injects a
+            // real guest context and resumes us into it, so this is the only point at which
+            // ordinary post-init code on this thread still runs. Reconstructs and arms
+            // `fork_verify` exactly the way the real, working thread-based fork path's
+            // `ForkChildVerificationProvider::begin_fork_child_verification` call does, just fed
+            // cross-process-transmitted data instead of a same-process `Arc` move -- see
+            // `diag_process_fork_relocations_enabled`'s doc comment for the full mechanism.
+            if diag_process_fork_relocations_enabled() {
+                if let Some(line) = read_relocations_line_from_stdin() {
+                    match litebox::mm::AddressRelocations::deserialize_for_diagnostic(&line) {
+                        Some(relocations) => {
+                            eprintln!(
+                                "[process_fork_diag] relocations-probe (child): reconstructed AddressRelocations \
+                                 with {} range(s), arming fork_verify",
+                                relocations.ranges().len()
+                            );
+                            crate::fork_verify::begin(alloc::sync::Arc::new(relocations));
+                        }
+                        None => {
+                            eprintln!(
+                                "[process_fork_diag] relocations-probe (child): failed to parse relocations line \
+                                 (len={}), fork_verify stays unarmed",
+                                line.len()
+                            );
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "[process_fork_diag] relocations-probe (child): no relocations line arrived on stdin, \
+                         fork_verify stays unarmed"
+                    );
+                }
+            }
         }
         park_for_real_resume_injection();
     }
@@ -241,6 +276,78 @@ fn try_read_duplicated_handle_value_from_stdin() -> Option<isize> {
     }
     let line = String::from_utf8_lossy(&collected);
     line.trim().parse::<isize>().ok()
+}
+
+/// Pass 122's own stdin read: reads one newline-terminated line from this child's own inherited
+/// `STD_INPUT_HANDLE` and returns it verbatim (trimmed), the same bounded-poll shape as
+/// [`try_read_duplicated_handle_value_from_stdin`] just above (a separate function rather than a
+/// shared generic helper, so each probe's own timeout/buffer sizing can be tuned independently --
+/// a relocations line for a guest process with many VMAs can run to several hundred bytes, wider
+/// than the fixed 64-byte buffer that function uses for a single decimal HANDLE value). Called
+/// EARLY (before [`park_for_real_resume_injection`] blocks this thread), at a point in the child's
+/// own startup where the parent has already written the line (see
+/// [`write_relocations_line_into_child`]'s doc comment for why the parent writes it before ever
+/// resuming this thread) -- so, unlike the fds probe's own read (deliberately placed AFTER the
+/// real-resume park, and therefore dead code on that path), this one has a real chance to observe
+/// the line the real-resume path actually needs.
+fn read_relocations_line_from_stdin() -> Option<String> {
+    let stdin = unsafe {
+        windows_sys::Win32::System::Console::GetStdHandle(
+            windows_sys::Win32::System::Console::STD_INPUT_HANDLE,
+        )
+    };
+    if stdin.is_null() || stdin == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let mut collected = Vec::new();
+    loop {
+        let mut avail = 0u32;
+        let peek_ok = unsafe {
+            windows_sys::Win32::System::Pipes::PeekNamedPipe(
+                stdin,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                &raw mut avail,
+                core::ptr::null_mut(),
+            )
+        };
+        if peek_ok == 0 {
+            return None;
+        }
+        if avail > 0 {
+            let mut buf = [0u8; 4096];
+            let mut read = 0u32;
+            let read_ok = unsafe {
+                windows_sys::Win32::Storage::FileSystem::ReadFile(
+                    stdin,
+                    buf.as_mut_ptr(),
+                    u32::try_from(buf.len().min(avail as usize))
+                        .expect("bounded by fixed-size buf.len()"),
+                    &raw mut read,
+                    core::ptr::null_mut(),
+                )
+            };
+            if read_ok == 0 {
+                return None;
+            }
+            collected.extend_from_slice(&buf[..read as usize]);
+            if collected.contains(&b'\n') {
+                break;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+    }
+    let line = String::from_utf8_lossy(&collected);
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 /// Writes [`RESUME_CHILD_FD_MARKER`] (newline-terminated) directly via `WriteFile` on the given
@@ -458,6 +565,37 @@ pub fn diag_process_fork_tls_enabled() -> bool {
     std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_TLS").is_some()
 }
 
+/// Whether pass 122's real-`AddressRelocations` probe is enabled
+/// (`LITEBOX_DIAG_PROCESS_FORK_RELOCATIONS=1`). A SEVENTH gate, layered on top of TLS: pass 121
+/// found that once `TlsState` exists, `fork_verify`'s real single-step verification loop genuinely
+/// engages (`is_in_guest=true is_verifying=true` in the VEH trace) -- but `fork_verify` was still
+/// `None` (the TLS gate's own stub leaves it that way, see [`diag_process_fork_tls_enabled`]'s doc
+/// comment), so none of the loop's actual healing logic could run, and the child crashed on a
+/// guest instruction the loop never got a chance to repair.
+///
+/// This gate closes that gap using a diagnostic-only-but-structurally-sound shortcut: pass 109's
+/// `MEM_ADDRESS_REQUIREMENTS`-forced `VirtualAlloc2` (see [`copy_one_group`]) guarantees every
+/// group this diagnostic copies lands in the child at EXACTLY its parent (source) address --
+/// `dest_base == source_group.start`, always, by construction (a mismatch is treated as a hard
+/// failure, not silently tolerated). `AddressRelocations::translate` is therefore the identity
+/// function on every range this diagnostic's child actually has: `dest_base + (addr -
+/// source_range.start) == source_range.start + (addr - source_range.start) == addr`. So the SAME
+/// real `AddressRelocations` object `relocations()` the parent's actual `fork()` call already built
+/// (the exact data the working thread-based path hands to `fork_verify::begin` today) is already
+/// correct for this diagnostic child too -- no new relocation math is needed, only transmission:
+/// the parent serializes that same object's raw fields into a single text line and writes it
+/// through the same `guard.stdin_write` pipe [`duplicate_stdio_into_child`] already proves works
+/// for cross-process data transfer, before ever resuming the child's thread; the child reads it
+/// back (via [`read_relocations_from_stdin`]) and reconstructs an equivalent object via
+/// [`litebox::mm::AddressRelocations::from_raw_parts_for_diagnostic`], then calls
+/// `fork_verify::begin` with it -- the SAME call the real, working thread-based fork path makes,
+/// just fed cross-process-transmitted data instead of a same-process `Arc` move. Only meaningful
+/// alongside TLS (there is no `fork_verify` slot to populate otherwise).
+#[must_use]
+pub fn diag_process_fork_relocations_enabled() -> bool {
+    std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_RELOCATIONS").is_some()
+}
+
 /// Whether pass 116's fd-complexity classification log (a pure, read-only report of whether the
 /// fork()ing process's fd table is "simple" -- only stdio slots 0/1/2 occupied -- or "complex" --
 /// any other fd open, which per pass 115's finding cannot yet be inherited by a process-based
@@ -551,6 +689,7 @@ pub fn diagnostic_spawn_and_copy(
     mut read_source_bytes: impl FnMut(Range<usize>) -> Option<Vec<u8>>,
     inject_gprs: Option<litebox::platform::ForkGprSnapshot>,
     inject_full_gprs: Option<litebox::platform::ForkFullGprSnapshot>,
+    relocations_line: Option<String>,
 ) -> Result<Vec<GroupCopyResult>, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe() failed: {e}"))?;
     let mut exe_wide: Vec<u16> = exe
@@ -575,13 +714,20 @@ pub fn diagnostic_spawn_and_copy(
     let want_fds = want_resume && diag_process_fork_fds_enabled();
     let want_real_resume =
         want_resume && diag_process_fork_real_resume_enabled() && inject_full_gprs.is_some();
+    let want_relocations =
+        want_real_resume && diag_process_fork_relocations_enabled() && relocations_line.is_some();
     unsafe {
         std::env::set_var(REEXEC_CHILD_ENV_VAR, "1");
         if want_real_resume {
             std::env::set_var(REAL_RESUME_CHILD_ENV_VAR, "1");
         }
     }
-    let spawn_result = spawn_suspended(&mut exe_wide, want_resume, want_fds);
+    // The relocations line needs the same stdin pipe the fds probe uses -- request it whenever
+    // EITHER probe wants it, not just `want_fds`, so `LITEBOX_DIAG_PROCESS_FORK_RELOCATIONS` works
+    // whether or not `LITEBOX_DIAG_PROCESS_FORK_FDS` is also set (the two are otherwise unrelated
+    // gates -- see each one's own doc comment).
+    let want_stdin_pipe = want_fds || want_relocations;
+    let spawn_result = spawn_suspended(&mut exe_wide, want_resume, want_stdin_pipe);
     unsafe {
         std::env::remove_var(REEXEC_CHILD_ENV_VAR);
         std::env::remove_var(REAL_RESUME_CHILD_ENV_VAR);
@@ -606,6 +752,10 @@ pub fn diagnostic_spawn_and_copy(
 
     if want_fds {
         duplicate_stdio_into_child(&guard);
+    }
+
+    if want_relocations && let Some(line) = relocations_line.as_deref() {
+        write_relocations_line_into_child(&guard, line);
     }
 
     if want_resume {
@@ -714,6 +864,52 @@ fn duplicate_stdio_into_child(guard: &SuspendedChildGuard) {
         eprintln!(
             "[process_fork_diag] fd-probe: WriteFile(child stdin, handle value) FAILED, GetLastError={}",
             unsafe { GetLastError() }
+        );
+    }
+}
+
+/// Pass 122's `AddressRelocations` transfer: writes `line` (a single
+/// `litebox::mm::AddressRelocations::serialize_for_diagnostic`-produced line, newline-terminated
+/// here) through `guard.stdin_write`, the SAME pipe [`duplicate_stdio_into_child`] already proves
+/// carries cross-process data reliably to this diagnostic child, before the child's thread is ever
+/// resumed (called from [`diagnostic_spawn_and_copy`] before its `want_resume` block, exactly like
+/// that sibling function). The child reads it back via [`read_relocations_line_from_stdin`], early
+/// in [`run_diagnostic_resume_child`] -- well before [`park_for_real_resume_injection`] blocks --
+/// and reconstructs an `AddressRelocations` from it. A `WriteFile` failure is reported but not
+/// fatal to the rest of the diagnostic, matching [`duplicate_stdio_into_child`]'s own style: the
+/// memory-copy probe above already completed and its own results stand regardless.
+fn write_relocations_line_into_child(guard: &SuspendedChildGuard, line: &str) {
+    let Some(stdin_write) = guard.stdin_write else {
+        eprintln!(
+            "[process_fork_diag] relocations-probe: no stdin pipe available, cannot hand child the relocations line"
+        );
+        return;
+    };
+    let payload = format!("{line}\n");
+    let mut written = 0u32;
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::WriteFile(
+            stdin_write,
+            payload.as_ptr(),
+            u32::try_from(payload.len()).unwrap_or(u32::MAX),
+            &raw mut written,
+            core::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        eprintln!(
+            "[process_fork_diag] relocations-probe: WriteFile(child stdin, relocations line) FAILED, GetLastError={}",
+            unsafe { GetLastError() }
+        );
+    } else if written as usize != payload.len() {
+        eprintln!(
+            "[process_fork_diag] relocations-probe: WriteFile(child stdin, relocations line) short write ({written}/{})",
+            payload.len()
+        );
+    } else {
+        eprintln!(
+            "[process_fork_diag] relocations-probe: wrote {} byte relocations line into child stdin",
+            payload.len()
         );
     }
 }

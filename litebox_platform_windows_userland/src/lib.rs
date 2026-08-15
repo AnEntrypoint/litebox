@@ -4123,11 +4123,20 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         } else {
             None
         };
+        // Pass 122: serialize the REAL `AddressRelocations` this actual `fork()` call just built
+        // (the same object the working thread-based path hands to `fork_verify::begin` today) so
+        // the cross-process diagnostic child can reconstruct an equivalent object and arm its own
+        // `fork_verify` -- see `diag_process_fork_relocations_enabled`'s doc comment for why this
+        // is sound for this diagnostic's identity-address design. Computed unconditionally
+        // (cheap: a handful of VMAs in every repro this investigation has run) and gated inside
+        // `diagnostic_spawn_and_copy` itself, matching every other probe's own style.
+        let relocations_line = Some(relocations.serialize_for_diagnostic());
         match process_fork::diagnostic_spawn_and_copy(
             group_relocations,
             read_source_bytes,
             inject_gprs,
             inject_full_gprs,
+            relocations_line,
         ) {
             Ok(results) => {
                 let succeeded = results.iter().filter(|r| r.succeeded).count();
