@@ -1549,12 +1549,13 @@ pub(crate) fn reverse_translate_and_read_for_diagnostics(
 ) -> Option<(usize, [u8; 8])> {
     let borrow = tls.fork_verify.borrow();
     let relocations = borrow.as_ref()?;
-    let (source_range, dest_base) = relocations
-        .ranges()
-        .iter()
-        .find(|(source_range, dest_base)| {
-            (*dest_base..dest_base + source_range.len()).contains(&dest_addr)
-        })?;
+    let (source_range, dest_base) =
+        relocations
+            .ranges()
+            .iter()
+            .find(|(source_range, dest_base)| {
+                (*dest_base..dest_base + source_range.len()).contains(&dest_addr)
+            })?;
     let source_addr = source_range.start + (dest_addr - dest_base);
     let mut buf = [0u8; 8];
     let n = read_code_bytes(source_addr, &mut buf);
