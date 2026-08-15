@@ -628,6 +628,40 @@ pub fn diag_process_fork_fd_complexity_enabled() -> bool {
     std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_FD_COMPLEXITY").is_some()
 }
 
+/// Whether pass 136's standalone `GlobalState`-construction probe is enabled
+/// (`LITEBOX_DIAG_PROCESS_FORK_GLOBALSTATE=1`). Pass 135 found the real remaining blocker to
+/// wiring process-based fork into production is not fd/`Task` plumbing (already handled) but
+/// `Task::global: Arc<GlobalState<Platform, FS>>` -- the entire shim-wide runtime state
+/// (`LiteBox`/`PageManager`, filesystem+tar mount, network subsystem, futex manager, pipes,
+/// unix-socket table, elf-patch-cache, flock registry, pty registry), constructed exactly once
+/// per host OS process via `LinuxShimBuilder::build()`. A process-fork child is a separate OS
+/// process and cannot share the parent's `Arc<GlobalState>` (a pointer meaningless across a
+/// process boundary) -- it needs a real reconstruction. This gate, consumed by the RUNNER
+/// crate's own `main()` (not by this platform crate, which has no dependency on
+/// `litebox_shim_linux` and so cannot construct a `GlobalState` itself -- see this module's own
+/// doc comment on crate layering), controls whether the diagnostic resume child attempts to
+/// construct a REAL, standalone `GlobalState` after `WindowsUserland::new()` completes, using
+/// the tar path carried across the process boundary via [`FORK_CHILD_TAR_PATH_ENV_VAR`].
+/// Independent of every other gate in this module: performs no memory copy or register
+/// injection of its own, only a shim-level construction attempt.
+#[must_use]
+pub fn diag_process_fork_globalstate_enabled() -> bool {
+    std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_GLOBALSTATE").is_some()
+}
+
+/// Internal-only marker env var (pass 136): carries the absolute path to the `--initial-files`
+/// tar archive across the `CreateProcessW`-spawned diagnostic child boundary, so a child built
+/// with [`diag_process_fork_globalstate_enabled`] set can remount the SAME rootfs the parent's
+/// own `GlobalState` was built from (a fresh `LinuxShimBuilder::default_fs` call needs the tar's
+/// bytes, not merely a reference to the parent's already-constructed filesystem, since the whole
+/// point of this probe is proving GlobalState construction succeeds standalone in the child's own
+/// process). Set once by the runner crate's own `run()` at startup (the parent, which already
+/// knows this path from `CliArgs::initial_files`) -- inherited automatically by any
+/// `CreateProcessW`-spawned child via `lpEnvironment: null`, exactly like [`REEXEC_CHILD_ENV_VAR`].
+/// Never guest-visible; not read anywhere except the runner crate's own diagnostic-child startup
+/// path.
+pub const FORK_CHILD_TAR_PATH_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_TAR_PATH";
+
 /// Per-group outcome reported by [`diagnostic_spawn_and_copy`].
 pub struct GroupCopyResult {
     /// The group's span in the (real, live) parent address space, exactly as `Vmem::duplicate`
@@ -1014,6 +1048,23 @@ fn resume_and_observe(guard: &SuspendedChildGuard, want_fds: bool) {
             "[process_fork_diag] resume: child reached its own startup successfully (marker observed) \
              -- pre-populated foreign memory did NOT interfere with child process init"
         );
+        // Pass 136: surface whatever the child itself printed BEFORE the ready marker (e.g. the
+        // globalstate-probe's own diagnostic lines, which run before `run_diagnostic_resume_child`
+        // prints this marker -- see `diag_process_fork_globalstate_probe`'s doc comment) rather
+        // than silently discarding `collected`'s content once the marker is found. A prior version
+        // of this function only logged "marker observed" and dropped the buffer, which meant any
+        // diagnostic the child emitted before printing the marker was captured off this pipe but
+        // never actually surfaced to the operator.
+        let pre_marker: &[u8] = collected
+            .windows(RESUME_CHILD_READY_MARKER.len())
+            .position(|w| w == RESUME_CHILD_READY_MARKER.as_bytes())
+            .map_or(&collected[..], |pos| &collected[..pos]);
+        if !pre_marker.is_empty() {
+            eprintln!(
+                "[process_fork_diag] resume: child's own pre-marker output:\n{}",
+                String::from_utf8_lossy(pre_marker)
+            );
+        }
         if want_fds {
             // The fd-probe marker (`RESUME_CHILD_FD_MARKER`) was written by the child through a
             // `DuplicateHandle`'d copy of the PARENT's own `STD_OUTPUT_HANDLE` -- i.e. it travels
@@ -1141,6 +1192,20 @@ fn real_resume_and_observe(
         "[process_fork_diag] real-resume: child reached its own readiness marker (VEH registered); \
          giving it a brief moment to reach its park point before suspending"
     );
+    // Pass 136: surface whatever the child printed BEFORE the ready marker (e.g. the
+    // globalstate-probe's own diagnostic lines, which run before `run_diagnostic_resume_child`
+    // prints this marker) -- mirrors the identical fix in `resume_and_observe` above; previously
+    // this function reported "marker observed" and silently dropped `collected`'s content.
+    let pre_marker: &[u8] = collected
+        .windows(RESUME_CHILD_READY_MARKER.len())
+        .position(|w| w == RESUME_CHILD_READY_MARKER.as_bytes())
+        .map_or(&collected[..], |pos| &collected[..pos]);
+    if !pre_marker.is_empty() {
+        eprintln!(
+            "[process_fork_diag] real-resume: child's own pre-marker output:\n{}",
+            String::from_utf8_lossy(pre_marker)
+        );
+    }
     // The child prints its marker, THEN calls `park_for_real_resume_injection` -- a short, bounded
     // sleep here is a pragmatic wait for it to actually reach the blocking `WaitForSingleObject`
     // (a handful of instructions after the marker print) rather than racing `SuspendThread` against
