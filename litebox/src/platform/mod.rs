@@ -609,14 +609,46 @@ pub trait ForkChildVerificationProvider {
     /// real stdio HANDLEs -- see that pass's findings for the full reasoning and the recommended
     /// scope-reduction path (fall back to the existing thread-based fork whenever a fork() call's
     /// fd table has any occupied slot beyond 0/1/2).
+    /// `translated_gprs`, when present, is the child's already-translated (post-
+    /// `AddressRelocations::translate`) `rip`/`rsp`/`rax` snapshot at the exact instant this
+    /// `fork()` call would resume the child -- the SAME values `do_clone` computes into its own
+    /// `child_ctx` immediately after this hook returns, just narrowed to a platform-agnostic
+    /// `[usize; 3]`-shaped struct so `litebox` (this crate) never needs a dependency on
+    /// `litebox_common_linux::PtRegs` (a strict layering violation: `litebox` sits BELOW
+    /// `litebox_common_linux`/`litebox_shim_linux` in the dependency graph). Pass 118 of
+    /// `scratchpad/jqrepro/FINDINGS.txt` is the first consumer: it is the exact register triple a
+    /// narrow, diagnostic-only `SetThreadContext` injection into a `CreateProcess`-spawned
+    /// suspended child needs to prove cross-process register injection works at all, before any
+    /// larger cross-process `Task`-reconstruction work is attempted. `None` on every call site that
+    /// does not (yet) compute a translated snapshot ahead of this hook.
     fn diagnostic_process_fork_probe(
         &self,
         relocations: &crate::mm::AddressRelocations,
         fd_complexity: ForkFdComplexity,
+        translated_gprs: Option<ForkGprSnapshot>,
     ) {
         let _ = relocations;
         let _ = fd_complexity;
+        let _ = translated_gprs;
     }
+}
+
+/// A minimal, platform-agnostic snapshot of the three registers a diagnostic cross-process
+/// register-injection probe (pass 118) needs: where the child's translated instruction pointer,
+/// stack pointer, and `fork()` return value (`rax`, always `0` for the child per the `fork()`
+/// ABI) would be if this `fork()` call resumed the child for real today. See
+/// [`ForkChildVerificationProvider::diagnostic_process_fork_probe`]'s doc comment for why this is
+/// a bespoke 3-field struct here rather than reusing `litebox_common_linux::PtRegs` directly.
+#[derive(Debug, Clone, Copy)]
+pub struct ForkGprSnapshot {
+    /// The child's translated instruction pointer (`child_ctx.rip` after
+    /// `AddressRelocations::translate`).
+    pub rip: usize,
+    /// The child's translated stack pointer (`child_ctx.rsp` after
+    /// `AddressRelocations::translate`).
+    pub rsp: usize,
+    /// The child's `fork()` return value (always `0`, the child-side ABI contract).
+    pub rax: usize,
 }
 
 /// Cheap, read-only classification of a fork()ing process's fd table, computed in `do_clone`

@@ -1688,9 +1688,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     beyond_stdio,
                 }
             };
-            self.global
-                .platform
-                .diagnostic_process_fork_probe(&relocations, fd_complexity);
             let vforked = flags.contains(CloneFlags::VFORK);
             // Created once here and threaded into both the new `Process` (below) and the new
             // `Task`'s `SignalState` (see `clone_for_new_task`'s call site further down) -- they
@@ -1775,6 +1772,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 fixup_stale_stack_pointers::<Platform>(&relocations, child_ctx.rsp);
                 fixup_stale_elf_data_pointers::<Platform>(&relocations);
             }
+
+            // Diagnostic-only (pass 111, `LITEBOX_DIAG_PROCESS_FORK_SPAWN=1`, off by default): a
+            // no-op on every platform except `litebox_platform_windows_userland`, and a no-op
+            // there too unless the env var is set. Runs on the PARENT's own thread, right after
+            // `child_ctx`'s registers have been translated above, and does not affect this
+            // `fork()` call's real outcome -- see `ForkChildVerificationProvider::
+            // diagnostic_process_fork_probe`'s doc comment for the full mechanism and safety
+            // argument. Called here (rather than immediately after `pm.duplicate` as before pass
+            // 118) specifically so `translated_gprs` can carry the already-translated rip/rsp/rax
+            // pass 118's `SetThreadContext` injection probe needs -- computing it required moving
+            // this call site past the register-translation block above.
+            #[cfg(target_arch = "x86_64")]
+            let translated_gprs = Some(litebox::platform::ForkGprSnapshot {
+                rip: child_ctx.rip,
+                rsp: child_ctx.rsp,
+                rax: child_ctx.rax,
+            });
+            #[cfg(not(target_arch = "x86_64"))]
+            let translated_gprs = None;
+            self.global.platform.diagnostic_process_fork_probe(
+                &relocations,
+                fd_complexity,
+                translated_gprs,
+            );
 
             // Register the new process as a child of the caller's process so a later
             // `wait4`/`waitpid` from the parent can find it.

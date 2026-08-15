@@ -302,6 +302,40 @@ pub fn diag_process_fork_fds_enabled() -> bool {
     std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_FDS").is_some()
 }
 
+/// Whether pass 118's cross-process register-injection probe is enabled
+/// (`LITEBOX_DIAG_PROCESS_FORK_REGISTERS=1`). A FOURTH, separate gate layered on top of
+/// [`diag_process_fork_spawn_enabled`]/[`diag_process_fork_resume_enabled`]: this probe replaces
+/// pass 114/115's "resume into the child's own normal entry point" step with "inject a translated
+/// register context via `SetThreadContext`, pointing `Rip` at a tiny diagnostic stub THIS module
+/// writes into the child's memory, and resume into THAT instead" -- so it only makes sense, and is
+/// only checked, when the resume gate is also set (there is no suspended thread to inject into
+/// otherwise). Kept independent so an operator can opt into the proven spawn+copy+resume-into-own-
+/// startup probes without also opting into this pass's own, narrower, purpose-built register-
+/// injection addition.
+///
+/// # Scope (pass 118 of `scratchpad/jqrepro/FINDINGS.txt`)
+///
+/// This probe deliberately does NOT attempt to resume the real guest's actual next instruction via
+/// the full `switch_to_guest` machinery -- pass 117 measured that gap and found it needs cross-
+/// process `Task` reconstruction (fs/files/signals/process-tree state) and process-local runtime
+/// state (VEH, TLS, `fork_verify`) neither of which exist for a `CreateProcess`-spawned child yet.
+/// Instead this probe answers ONE narrow, previously-completely-untested question: does
+/// `SetThreadContext`, targeting a cross-process `CREATE_SUSPENDED` thread that has NEVER run any
+/// instruction yet, with a translated register context whose `Rip` points into memory this module
+/// itself wrote via `WriteProcessMemory` (the same shape the real `switch_to_guest`-based injection
+/// would eventually need), actually take effect -- i.e. does the CPU start executing AT the injected
+/// context, not at the loader's normal entry point? The injected stub is a handful of bytes THIS
+/// module controls (not real guest code), ending in a marker write to its own memory followed by
+/// `NtTerminateProcess` with a distinctive exit code (see `inject_and_observe`'s doc comment for
+/// why NOT a stdout-pipe marker, unlike this module's other probes -- kernel32.dll, which
+/// `WriteFile` needs, is not even loaded yet in a `CREATE_SUSPENDED` child that has never run its
+/// own first instruction) -- it never touches `switch_to_guest`, `Task`, `WindowsUserland::new()`,
+/// or any of the missing subsystems pass 117 identified.
+#[must_use]
+pub fn diag_process_fork_registers_enabled() -> bool {
+    std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_REGISTERS").is_some()
+}
+
 /// Whether pass 116's fd-complexity classification log (a pure, read-only report of whether the
 /// fork()ing process's fd table is "simple" -- only stdio slots 0/1/2 occupied -- or "complex" --
 /// any other fd open, which per pass 115's finding cannot yet be inherited by a process-based
@@ -393,6 +427,7 @@ impl Drop for SuspendedChildGuard {
 pub fn diagnostic_spawn_and_copy(
     group_relocations: &[(Range<usize>, usize)],
     mut read_source_bytes: impl FnMut(Range<usize>) -> Option<Vec<u8>>,
+    inject_gprs: Option<litebox::platform::ForkGprSnapshot>,
 ) -> Result<Vec<GroupCopyResult>, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe() failed: {e}"))?;
     let mut exe_wide: Vec<u16> = exe
@@ -445,7 +480,18 @@ pub fn diagnostic_spawn_and_copy(
     }
 
     if want_resume {
-        resume_and_observe(&guard, want_fds);
+        // Pass 118: when an operator opts into BOTH the resume gate and the register-injection
+        // gate AND `do_clone` supplied a translated snapshot (only present on `target_arch =
+        // "x86_64"`, this whole crate's only supported architecture, so always `Some` in practice
+        // when the gate is on), take the injection path instead of pass 114's "resume into the
+        // child's own normal entry point" path -- the two are mutually exclusive for a given
+        // fork() call: injecting a context and then also letting the loader's entry point run
+        // would race two completely different execution paths in the same suspended thread, which
+        // is not a sensible thing to attempt.
+        match inject_gprs {
+            Some(gprs) => inject_and_observe(&guard, gprs),
+            None => resume_and_observe(&guard, want_fds),
+        }
     }
 
     // `guard` drops here: TerminateProcess + CloseHandle, unconditionally, whether or not it was
@@ -638,6 +684,584 @@ fn resume_and_observe(guard: &SuspendedChildGuard, want_fds: bool) {
             String::from_utf8_lossy(&collected)
         );
     }
+}
+
+/// Pass 118: injects a translated register context into the still-suspended child's main thread
+/// via `SetThreadContext`, pointing `Rip` at a tiny diagnostic stub this function first writes into
+/// the child's own memory, then `ResumeThread`s and observes whether the stub's marker word landed
+/// in the child's memory AND its exit code matches -- the live proof the CPU actually started
+/// executing AT the injected context rather than the loader's normal entry point.
+///
+/// # Why this does NOT use a stdout-pipe marker (unlike every other probe in this module)
+///
+/// GENUINE PLATFORM FINDING (pass 118, empirically confirmed): a `CREATE_SUSPENDED` child's initial
+/// thread, before it has EVER executed a single instruction, has only its own EXE image and
+/// `ntdll.dll` mapped -- confirmed live via a `VirtualQueryEx`-based scan of the child's address
+/// space, which found exactly those two images and nothing else (not kernel32.dll, not any other
+/// DLL). `kernel32.dll` (and hence `WriteFile`/`GetStdHandle`/every Win32-layer API this module's
+/// OTHER probes call from a child that DID reach its own `main()`) is loaded by ntdll's OWN loader
+/// code running AS the thread's first execution -- which, for this probe specifically, never
+/// happens, because the whole point is to redirect that first execution somewhere else entirely.
+/// `K32EnumProcessModules`/`Ex` also fail (`ERROR_PARTIAL_COPY`, persistent, not a timing race) for
+/// the same underlying reason: they walk the PEB's `Ldr` list, which is populated by that same
+/// loader code. This means the injected stub CANNOT safely call `WriteFile` (or anything else
+/// exported only by kernel32) -- only `ntdll.dll` exports are guaranteed present. This probe's stub
+/// therefore does the simplest thing that is still genuinely conclusive: write a distinctive marker
+/// DWORD into a fixed, known address in the child's own memory (a plain `mov`, no external call at
+/// all), then call `NtTerminateProcess` (an ntdll export, always present) with a distinctive exit
+/// code. The parent verifies BOTH independently after the child exits: [`INJECTED_STUB_MARKER_WORD`]
+/// read back via `ReadProcessMemory` at the known address, AND the process exit code via
+/// `GetExitCodeProcess` -- two independent channels, neither of which depends on kernel32 being
+/// loaded in the child at all.
+fn inject_and_observe(guard: &SuspendedChildGuard, gprs: litebox::platform::ForkGprSnapshot) {
+    let Some((stub_addr, scratch_rsp, marker_addr)) = write_injected_stub(guard.process) else {
+        eprintln!(
+            "[process_fork_diag] register-inject: failed to write diagnostic stub into child"
+        );
+        return;
+    };
+
+    if !set_child_context(guard.thread, stub_addr, scratch_rsp, &gprs) {
+        eprintln!(
+            "[process_fork_diag] register-inject: SetThreadContext failed, GetLastError={}",
+            unsafe { GetLastError() }
+        );
+        return;
+    }
+
+    eprintln!(
+        "[process_fork_diag] register-inject: injected context Rip={stub_addr:#x} (stub) \
+         Rsp={scratch_rsp:#x} (stub's own scratch stack, NOT guest rsp={:#x}) Rax={:#x} -- resuming",
+        gprs.rsp, gprs.rax
+    );
+
+    // Temporary pass-118 debugging aid: attach as a debugger BEFORE resuming so a fault inside the
+    // stub is caught live (full faulting CONTEXT available) instead of only being visible after the
+    // fact as an opaque `STATUS_ACCESS_VIOLATION` exit code. Best-effort -- if `DebugActiveProcess`
+    // fails, fall through to the normal (non-debugged) resume+wait path unchanged.
+    let child_pid = unsafe { windows_sys::Win32::System::Threading::GetProcessId(guard.process) };
+    let debug_attached =
+        unsafe { windows_sys::Win32::System::Diagnostics::Debug::DebugActiveProcess(child_pid) }
+            != 0;
+
+    let resumed = unsafe { ResumeThread(guard.thread) };
+    if resumed == u32::MAX {
+        eprintln!(
+            "[process_fork_diag] register-inject: ResumeThread failed, GetLastError={}",
+            unsafe { GetLastError() }
+        );
+        if debug_attached {
+            unsafe {
+                windows_sys::Win32::System::Diagnostics::Debug::DebugActiveProcessStop(child_pid);
+            }
+        }
+        return;
+    }
+
+    if debug_attached {
+        capture_first_exception_context(child_pid);
+        unsafe {
+            windows_sys::Win32::System::Diagnostics::Debug::DebugActiveProcessStop(child_pid);
+        }
+    }
+
+    // Bounded wait for the child to run the stub and self-terminate -- the stub is a handful of
+    // instructions with no I/O and no external call target beyond `NtTerminateProcess`, so 2s is
+    // generous, not tight.
+    let wait_result = unsafe { WaitForSingleObject(guard.process, 2000) };
+
+    let mut marker_readback = 0u32;
+    let mut bytes_read = 0usize;
+    let read_ok = unsafe {
+        windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+            guard.process,
+            marker_addr as *const c_void,
+            (&raw mut marker_readback).cast::<c_void>(),
+            core::mem::size_of::<u32>(),
+            &raw mut bytes_read,
+        )
+    };
+    let saw_marker_in_memory = read_ok != 0
+        && bytes_read == core::mem::size_of::<u32>()
+        && marker_readback == INJECTED_STUB_MARKER_WORD;
+
+    let mut exit_code = 0u32;
+    let got_exit_code = unsafe {
+        windows_sys::Win32::System::Threading::GetExitCodeProcess(guard.process, &raw mut exit_code)
+    };
+    let saw_expected_exit_code = got_exit_code != 0 && exit_code == INJECTED_STUB_EXIT_CODE;
+
+    if !saw_marker_in_memory || !saw_expected_exit_code {
+        // Diagnostic-only: the thread is likely already gone (process terminated on fault), so
+        // this GetThreadContext call is expected to fail in the common crash case -- logged either
+        // way for completeness, not treated as an additional failure signal.
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_INTEGER_AMD64, GetThreadContext,
+        };
+        let mut post_context = CONTEXT {
+            ContextFlags: CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64,
+            ..unsafe { core::mem::zeroed() }
+        };
+        let ok = unsafe { GetThreadContext(guard.thread, &raw mut post_context) };
+        eprintln!(
+            "[process_fork_diag] register-inject: post-mortem GetThreadContext ok={} Rip={:#x} Rsp={:#x}",
+            ok != 0,
+            post_context.Rip,
+            post_context.Rsp
+        );
+    }
+
+    if saw_marker_in_memory && saw_expected_exit_code {
+        eprintln!(
+            "[process_fork_diag] register-inject: SUCCESS -- child executed the INJECTED stub \
+             (marker word {INJECTED_STUB_MARKER_WORD:#x} observed in child memory at {marker_addr:#x}, \
+             exit_code={exit_code:#x} matches expected {INJECTED_STUB_EXIT_CODE:#x}), \
+             not its own normal entry point (WaitForSingleObject={wait_result})"
+        );
+    } else {
+        eprintln!(
+            "[process_fork_diag] register-inject: FAILURE or INCONCLUSIVE -- \
+             saw_marker_in_memory={saw_marker_in_memory} (read={marker_readback:#x}, expected={INJECTED_STUB_MARKER_WORD:#x}) \
+             saw_expected_exit_code={saw_expected_exit_code} (exit_code={} ({exit_code:#x}), expected={INJECTED_STUB_EXIT_CODE:#x}) \
+             WaitForSingleObject={wait_result}",
+            if got_exit_code != 0 {
+                exit_code.to_string()
+            } else {
+                "?".to_string()
+            }
+        );
+    }
+}
+
+/// Temporary pass-118 debugging aid (see [`inject_and_observe`]'s call site): waits, bounded, for
+/// the FIRST debug event on `child_pid` (a `DebugActiveProcess`-attached process delivers its own
+/// process-start/DLL-load noise first, then an `EXCEPTION_DEBUG_EVENT` if/when the stub faults),
+/// logging the faulting thread's full `CONTEXT` (via `GetThreadContext`, valid while the exception
+/// is live and the thread has not been resumed past it) the moment an exception event arrives.
+/// `DBG_CONTINUE`/`DBG_EXCEPTION_NOT_HANDLED` is passed back via `ContinueDebugEvent` for every
+/// event either way (a debugger MUST continue every event before the debuggee's thread can proceed
+/// again), so the child's own crash/exit still happens exactly as it would un-debugged -- this is
+/// purely an observation layer, not a behavior change.
+fn capture_first_exception_context(_child_pid: u32) {
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_INTEGER_AMD64, ContinueDebugEvent, DEBUG_EVENT,
+        EXCEPTION_DEBUG_EVENT, GetThreadContext, WaitForDebugEvent,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, THREAD_ALL_ACCESS};
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            eprintln!(
+                "[process_fork_diag] register-inject: debug-attach observation timed out with no exception event"
+            );
+            return;
+        }
+        let mut event: DEBUG_EVENT = unsafe { core::mem::zeroed() };
+        let got = unsafe {
+            WaitForDebugEvent(
+                &raw mut event,
+                u32::try_from(remaining.as_millis().min(u128::from(u32::MAX))).unwrap_or(u32::MAX),
+            )
+        };
+        if got == 0 {
+            eprintln!(
+                "[process_fork_diag] register-inject: WaitForDebugEvent failed/timed out, GetLastError={}",
+                unsafe { GetLastError() }
+            );
+            return;
+        }
+
+        if event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT {
+            let record = unsafe { &event.u.Exception.ExceptionRecord };
+            let is_breakpoint = record.ExceptionCode == EXCEPTION_BREAKPOINT;
+            eprintln!(
+                "[process_fork_diag] register-inject: EXCEPTION_DEBUG_EVENT code={:#x} addr={:#x} tid={} is_breakpoint={is_breakpoint}",
+                record.ExceptionCode, record.ExceptionAddress as usize, event.dwThreadId
+            );
+            let thread_handle = unsafe { OpenThread(THREAD_ALL_ACCESS, 0, event.dwThreadId) };
+            if !thread_handle.is_null() {
+                let mut ctx = CONTEXT {
+                    ContextFlags: CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64,
+                    ..unsafe { core::mem::zeroed() }
+                };
+                let ok = unsafe { GetThreadContext(thread_handle, &raw mut ctx) };
+                eprintln!(
+                    "[process_fork_diag] register-inject: faulting-thread CONTEXT ok={} Rip={:#x} Rsp={:#x} Rax={:#x} Rcx={:#x} Rdx={:#x}",
+                    ok != 0,
+                    ctx.Rip,
+                    ctx.Rsp,
+                    ctx.Rax,
+                    ctx.Rcx,
+                    ctx.Rdx
+                );
+                unsafe {
+                    CloseHandle(thread_handle);
+                }
+            }
+            if is_breakpoint {
+                // Our own `int3` debugging checkpoint (pass 118): confirms execution reached this
+                // exact point in the stub. Continue past it (DBG_CONTINUE -- the debugger IS
+                // handling this exception, by design) and keep watching for the REAL crash, if any,
+                // further along in the stub.
+                unsafe {
+                    ContinueDebugEvent(
+                        event.dwProcessId,
+                        event.dwThreadId,
+                        windows_sys::Win32::Foundation::DBG_CONTINUE,
+                    );
+                }
+                continue;
+            }
+            unsafe {
+                ContinueDebugEvent(
+                    event.dwProcessId,
+                    event.dwThreadId,
+                    windows_sys::Win32::Foundation::DBG_EXCEPTION_NOT_HANDLED,
+                );
+            }
+            return;
+        }
+
+        // Every other event kind (process/thread create, DLL load, OUTPUT_DEBUG_STRING, RIP) is
+        // uninteresting to this probe -- continue it and keep waiting for the exception (or for the
+        // bounded deadline above).
+        unsafe {
+            ContinueDebugEvent(
+                event.dwProcessId,
+                event.dwThreadId,
+                windows_sys::Win32::Foundation::DBG_CONTINUE,
+            );
+        }
+    }
+}
+
+/// The distinctive 4-byte value the injected stub writes into its own memory (at a known,
+/// parent-computed address) as ONE of the two independent proofs [`inject_and_observe`] checks --
+/// see that function's doc comment for why memory-write + exit-code, rather than a stdout-pipe
+/// marker, is used for this specific probe.
+const INJECTED_STUB_MARKER_WORD: u32 = 0x1187_1187;
+
+/// The distinctive exit code the injected stub passes to `NtTerminateProcess` -- the SECOND of the
+/// two independent proofs [`inject_and_observe`] checks.
+const INJECTED_STUB_EXIT_CODE: u32 = 0x1187_2118;
+
+// Layout (all offsets from the reserved stub page's base):
+//   0x000..: code
+//   0x100..: scratch marker DWORD (4 bytes, zero-initialized by MEM_COMMIT until the stub writes it)
+//   0xC00..: scratch stack (grows down from 0xC00, the returned `scratch_rsp`)
+const STUB_CODE_OFF: usize = 0x000;
+const STUB_MARKER_OFF: usize = 0x100;
+const STUB_SCRATCH_STACK_OFF: usize = 0xC00;
+const STUB_PAGE_LEN: usize = 0x1000;
+
+/// `EXCEPTION_BREAKPOINT` (`0x80000003`), used by [`capture_first_exception_context`] to
+/// distinguish this module's own `int3` debugging checkpoint from a genuine crash.
+const EXCEPTION_BREAKPOINT: i32 = 0x8000_0003_u32.cast_signed();
+
+/// Writes a tiny, hand-assembled x86-64 diagnostic stub into a freshly reserved page in `child`,
+/// returning `(stub_rip, scratch_rsp, marker_addr)` on success, or `None` on any Win32 failure.
+///
+/// The stub does exactly two things, using ONLY `ntdll.dll` export addresses (see
+/// [`inject_and_observe`]'s doc comment for why kernel32-exported APIs like `WriteFile` are NOT
+/// usable here) resolved relative to the CHILD's own `ntdll.dll` base (kernel32 is not even loaded
+/// in the child yet at this point, but per pass 118's own live finding, `ntdll.dll` is -- mapped by
+/// kernel-mode process creation before any usermode code runs; see [`find_child_module_base`]'s doc
+/// comment):
+///
+///   1. `mov dword [marker_addr], INJECTED_STUB_MARKER_WORD`
+///   2. `NtTerminateProcess(NtCurrentProcess() == -1, INJECTED_STUB_EXIT_CODE)`
+///
+/// No stack frame setup beyond what the Win64 ABI's 2-argument call to `NtTerminateProcess` needs
+/// (32 bytes shadow space) -- this stub gets its OWN tiny scratch stack inside the SAME reserved
+/// page as its code, entirely self-contained, independent of the guest's real (untranslated-into-
+/// this-probe) stack.
+fn write_injected_stub(child: HANDLE) -> Option<(usize, usize, usize)> {
+    let nt_terminate_process_addr = resolve_ntdll_proc(child, c"NtTerminateProcess")?;
+
+    let reserved = unsafe {
+        windows_sys::Win32::System::Memory::VirtualAlloc2(
+            child,
+            core::ptr::null_mut(),
+            STUB_PAGE_LEN,
+            MEM_RESERVE | MEM_COMMIT,
+            windows_sys::Win32::System::Memory::PAGE_EXECUTE_READWRITE,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+    if reserved.is_null() {
+        eprintln!(
+            "[process_fork_diag] register-inject: VirtualAlloc2 (stub page) failed, GetLastError={}",
+            unsafe { GetLastError() }
+        );
+        return None;
+    }
+    let base = reserved as usize;
+    let marker_addr = base + STUB_MARKER_OFF;
+
+    // Hand-assembled x86-64, Win64 calling convention:
+    //
+    //   movabs rax, marker_addr
+    //   mov dword [rax], INJECTED_STUB_MARKER_WORD
+    //   sub  rsp, 0x28
+    //   mov  ecx, -1                    ; NtCurrentProcess() == (HANDLE)-1
+    //   mov  edx, INJECTED_STUB_EXIT_CODE
+    //   movabs rax, <nt_terminate_process_addr>
+    //   call rax
+    //   ud2                             ; NtTerminateProcess(-1, ...) never returns; fault safely if it did
+    let mut code = Vec::<u8>::new();
+    code.extend_from_slice(&[0x48, 0xB8]); // movabs rax, imm64 (marker_addr)
+    code.extend_from_slice(&(marker_addr as u64).to_le_bytes());
+    code.extend_from_slice(&[0xC7, 0x00]); // mov dword [rax], imm32
+    code.extend_from_slice(&INJECTED_STUB_MARKER_WORD.to_le_bytes());
+    code.extend_from_slice(&[0xCC]); // int3 (pass-118 debugging checkpoint: did we get THIS far?)
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    code.extend_from_slice(&[0xB9]); // mov ecx, imm32
+    code.extend_from_slice(&(-1i32).to_le_bytes());
+    code.extend_from_slice(&[0xBA]); // mov edx, imm32
+    code.extend_from_slice(&INJECTED_STUB_EXIT_CODE.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xB8]); // movabs rax, imm64 (NtTerminateProcess)
+    code.extend_from_slice(&(nt_terminate_process_addr as u64).to_le_bytes());
+    code.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    code.extend_from_slice(&[0x0F, 0x0B]); // ud2 (unreachable in the success case)
+    debug_assert!(STUB_CODE_OFF + code.len() <= STUB_MARKER_OFF);
+
+    let mut written = 0usize;
+    let ok = unsafe {
+        WriteProcessMemory(
+            child,
+            (base + STUB_CODE_OFF) as *mut c_void,
+            code.as_ptr().cast::<c_void>(),
+            code.len(),
+            &raw mut written,
+        )
+    };
+    if ok == 0 || written != code.len() {
+        eprintln!(
+            "[process_fork_diag] register-inject: WriteProcessMemory (stub code) failed, GetLastError={}",
+            unsafe { GetLastError() }
+        );
+        return None;
+    }
+    // Diagnostic readback (pass 118): confirm the exact bytes landed, ruling out a silent partial
+    // write or an `ok != 0` short-write not caught by the `written != code.len()` check above.
+    {
+        let mut readback = vec![0u8; code.len()];
+        let mut n_bytes_read = 0usize;
+        let rok = unsafe {
+            windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+                child,
+                (base + STUB_CODE_OFF) as *const c_void,
+                readback.as_mut_ptr().cast::<c_void>(),
+                readback.len(),
+                &raw mut n_bytes_read,
+            )
+        };
+        let matches = rok != 0 && n_bytes_read == code.len() && readback == code;
+        eprintln!(
+            "[process_fork_diag] register-inject: stub code readback matches written bytes: {matches} ({} bytes)",
+            code.len()
+        );
+        let mut mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION =
+            unsafe { core::mem::zeroed() };
+        let n = unsafe {
+            windows_sys::Win32::System::Memory::VirtualQueryEx(
+                child,
+                (base + STUB_CODE_OFF) as *const c_void,
+                &raw mut mbi,
+                core::mem::size_of::<windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION>(
+                ),
+            )
+        };
+        eprintln!(
+            "[process_fork_diag] register-inject: stub page VirtualQueryEx -> n={n} State={:#x} Protect={:#x} Type={:#x}",
+            mbi.State, mbi.Protect, mbi.Type
+        );
+    }
+
+    Some((
+        base + STUB_CODE_OFF,
+        base + STUB_SCRATCH_STACK_OFF,
+        marker_addr,
+    ))
+}
+
+/// Finds `module_file_name`'s (e.g. `"ntdll.dll"`) load base in `child` by scanning `VirtualQueryEx`
+/// regions directly and matching each distinct `MEM_IMAGE` allocation's mapped filename via
+/// `K32GetMappedFileNameW`, rather than `K32EnumProcessModules`/`Ex`.
+///
+/// GENUINE PLATFORM FINDING (pass 118, empirically confirmed, not assumed): `K32EnumProcessModules`
+/// and `K32EnumProcessModulesEx` (even with `LIST_MODULES_ALL`) both fail with `ERROR_PARTIAL_COPY`
+/// (299) against a `CREATE_SUSPENDED` child whose initial thread has NEVER run a single instruction
+/// yet -- confirmed persistent across a 500ms bounded retry loop, not a transient race. Both K32
+/// APIs walk the PEB's `Ldr->InMemoryOrderModuleList`, which is populated by ntdll's OWN loader
+/// init code (`LdrInitializeThunk`) running as part of the thread's first execution -- kernel-mode
+/// process creation (`NtCreateUserProcess`) maps the EXE image and `ntdll.dll` into the address
+/// space BEFORE the thread ever runs (confirmed live: a raw `VirtualQueryEx` scan of a freshly
+/// `CREATE_SUSPENDED` child found EXACTLY its own EXE and `ntdll.dll` mapped, and nothing else --
+/// notably NOT kernel32.dll, which is loaded by ntdll's usermode loader code, i.e. by that same
+/// first-execution-dependent mechanism), but the USERMODE PEB bookkeeping describing those mappings
+/// is not written until that first execution happens. A `CREATE_SUSPENDED` thread, by definition,
+/// has not done that yet -- so the module LIST is genuinely empty/inconsistent from the K32 APIs'
+/// point of view, not merely slow to populate.
+///
+/// `VirtualQueryEx` + `K32GetMappedFileNameW`, in contrast, only depend on the underlying VAD
+/// (kernel virtual-address-descriptor) mapping, which DOES exist from the moment
+/// `NtCreateUserProcess` returns -- entirely independent of the PEB/Ldr usermode bookkeeping. This
+/// is exactly why this probe's injected stub only ever calls `ntdll.dll`-exported functions
+/// ([`write_injected_stub`]'s doc comment): `ntdll.dll` is the ONE module guaranteed present in a
+/// `CREATE_SUSPENDED` child's address space this early, found via this same mechanism.
+fn find_child_module_base(child: HANDLE, module_file_name: &str) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQueryEx};
+    use windows_sys::Win32::System::ProcessStatus::K32GetMappedFileNameW;
+
+    let mut addr: usize = 0;
+    let mbi_size = core::mem::size_of::<MEMORY_BASIC_INFORMATION>();
+    let mut image_regions_seen = Vec::new();
+    // Bounded to a sane number of distinct regions -- a fresh, never-run process's address space
+    // has only its own image and ntdll.dll mapped at this point (plus whatever this diagnostic's
+    // own group-copy loop force-reserved earlier), nowhere near this bound in practice.
+    for _ in 0..4096 {
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { core::mem::zeroed() };
+        let n = unsafe { VirtualQueryEx(child, addr as *const c_void, &raw mut mbi, mbi_size) };
+        if n == 0 {
+            break;
+        }
+        if mbi.Type == windows_sys::Win32::System::Memory::MEM_IMAGE {
+            let mut name_buf = [0u16; 260];
+            let len = unsafe {
+                K32GetMappedFileNameW(child, mbi.BaseAddress, name_buf.as_mut_ptr(), 260)
+            };
+            let name = if len > 0 {
+                String::from_utf16_lossy(&name_buf[..len as usize])
+            } else {
+                format!("<K32GetMappedFileNameW failed, GetLastError={}>", unsafe {
+                    GetLastError()
+                })
+            };
+            image_regions_seen.push(format!("{:#x}:{name}", mbi.BaseAddress as usize));
+            let file_component = name.rsplit(['\\', '/']).next().unwrap_or(&name);
+            if file_component.eq_ignore_ascii_case(module_file_name) {
+                return Some(mbi.AllocationBase as usize);
+            }
+        }
+        let region_end = (mbi.BaseAddress as usize).wrapping_add(mbi.RegionSize);
+        if region_end <= addr {
+            // Defensive: avoid an infinite loop if `RegionSize` is ever `0` or wraps.
+            break;
+        }
+        addr = region_end;
+    }
+    eprintln!(
+        "[process_fork_diag] register-inject: {module_file_name} MEM_IMAGE region not found while scanning child's address space; MEM_IMAGE regions seen: {image_regions_seen:?}"
+    );
+    None
+}
+
+/// Resolves `proc_name`'s address in `ntdll.dll` as loaded in the CHILD, via
+/// `RVA = parent_addr - parent_ntdll_base; child_addr = child_ntdll_base + RVA` -- valid because a
+/// single `ntdll.dll` BINARY's own internal RVA layout is identical across every process that loads
+/// it on a given machine/OS build, only the load BASE differs (confirmed live to differ between
+/// parent and a `CREATE_SUSPENDED` child on this platform -- see [`find_child_module_base`]'s doc
+/// comment). `GetProcAddress` itself is only ever called on the PARENT's own already-loaded
+/// `ntdll.dll` (always safe -- the parent is a normal, fully-initialized running process), never on
+/// the child.
+fn resolve_ntdll_proc(child: HANDLE, proc_name: &core::ffi::CStr) -> Option<usize> {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    let parent_ntdll = unsafe { GetModuleHandleA(c"ntdll.dll".as_ptr().cast()) };
+    if parent_ntdll.is_null() {
+        eprintln!(
+            "[process_fork_diag] register-inject: GetModuleHandleA(ntdll.dll) in parent failed, GetLastError={}",
+            unsafe { GetLastError() }
+        );
+        return None;
+    }
+    let parent_addr = unsafe { GetProcAddress(parent_ntdll, proc_name.as_ptr().cast()) };
+    let Some(parent_addr) = parent_addr else {
+        eprintln!(
+            "[process_fork_diag] register-inject: GetProcAddress({proc_name:?}) in parent failed, GetLastError={}",
+            unsafe { GetLastError() }
+        );
+        return None;
+    };
+    let parent_ntdll_base = parent_ntdll as usize;
+    let child_ntdll_base = find_child_module_base(child, "ntdll.dll")?;
+    let rva = (parent_addr as usize) - parent_ntdll_base;
+    let child_addr = child_ntdll_base + rva;
+    eprintln!(
+        "[process_fork_diag] register-inject: parent ntdll={parent_ntdll_base:#x} child ntdll={child_ntdll_base:#x} \
+         {proc_name:?} rva={rva:#x} -> child_addr={child_addr:#x}"
+    );
+    Some(child_addr)
+}
+
+/// Sets the still-suspended child thread's `Rip`/`Rsp`/`Rax` via `GetThreadContext` +
+/// `SetThreadContext`, using the SAME `ContextFlags` shape (`CONTEXT_CONTROL_AMD64 |
+/// CONTEXT_INTEGER_AMD64`) `switch_to_guest`'s own `NtContinue` path (`lib.rs`'s
+/// `switch_to_guest_ntcontinue`) and `ThreadHandle::interrupt`'s own cross-thread `SetThreadContext`
+/// call already use -- this is deliberately the SAME flag shape a future real cross-process
+/// injection would need, even though this probe only writes `Rip` (the stub's address), `Rsp` (the
+/// stub's OWN scratch stack -- see [`write_injected_stub`]'s doc comment for why NOT the guest's
+/// real translated `gprs.rsp`), and `Rax` (the `fork()` return-value register; set for completeness
+/// even though the stub's own code never reads it). Starts from a `GetThreadContext`-read base
+/// (rather than a bare zeroed `CONTEXT`) so segment registers and every other field the stub does
+/// not care about retain the loader-established values from the child's own real Windows process
+/// startup, minimizing how much of this brand-new
+/// thread's kernel-established state this probe second-guesses.
+fn set_child_context(
+    thread: HANDLE,
+    stub_rip: usize,
+    scratch_rsp: usize,
+    gprs: &litebox::platform::ForkGprSnapshot,
+) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_INTEGER_AMD64, GetThreadContext, SetThreadContext,
+    };
+    let mut context = CONTEXT {
+        ContextFlags: CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64,
+        ..unsafe { core::mem::zeroed() }
+    };
+    let ok = unsafe { GetThreadContext(thread, &raw mut context) };
+    if ok == 0 {
+        eprintln!(
+            "[process_fork_diag] register-inject: GetThreadContext failed, GetLastError={}",
+            unsafe { GetLastError() }
+        );
+        return false;
+    }
+    eprintln!(
+        "[process_fork_diag] register-inject: pre-injection (loader-established) context: Rip={:#x} Rsp={:#x}",
+        context.Rip, context.Rsp
+    );
+
+    context.Rip = stub_rip as u64;
+    context.Rsp = scratch_rsp as u64;
+    context.Rax = gprs.rax as u64;
+    context.ContextFlags = CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64;
+
+    let ok = unsafe { SetThreadContext(thread, &raw const context) };
+    if ok == 0 {
+        return false;
+    }
+
+    // Diagnostic readback (pass 118): confirm the CONTEXT we just wrote is what `GetThreadContext`
+    // reports back, BEFORE resuming -- isolates "SetThreadContext silently did not take" from
+    // "the CPU took the context but then faulted executing the stub itself".
+    let mut readback = CONTEXT {
+        ContextFlags: CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64,
+        ..unsafe { core::mem::zeroed() }
+    };
+    let ok = unsafe { GetThreadContext(thread, &raw mut readback) };
+    if ok != 0 {
+        eprintln!(
+            "[process_fork_diag] register-inject: readback after SetThreadContext: Rip={:#x} (expected {stub_rip:#x}) Rsp={:#x} (expected {scratch_rsp:#x}) SegCs={:#x} SegSs={:#x} EFlags={:#x}",
+            readback.Rip, readback.Rsp, readback.SegCs, readback.SegSs, readback.EFlags
+        );
+    }
+
+    true
 }
 
 /// Trait-free helper: `OsStr::encode_wide` is already available via
