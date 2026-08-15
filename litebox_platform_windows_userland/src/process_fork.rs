@@ -302,6 +302,20 @@ pub fn diag_process_fork_fds_enabled() -> bool {
     std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_FDS").is_some()
 }
 
+/// Whether pass 116's fd-complexity classification log (a pure, read-only report of whether the
+/// fork()ing process's fd table is "simple" -- only stdio slots 0/1/2 occupied -- or "complex" --
+/// any other fd open, which per pass 115's finding cannot yet be inherited by a process-based
+/// fork at all, since none of litebox's fd subsystems are backed by a real Windows HANDLE) is
+/// enabled (`LITEBOX_DIAG_PROCESS_FORK_FD_COMPLEXITY=1`). Deliberately independent of every other
+/// gate in this module: unlike the spawn/resume/fds probes, this one performs NO process
+/// creation, memory copy, or HANDLE duplication at all -- it only logs a count `do_clone` already
+/// computed -- so it is safe to enable on its own, without also opting into any of the heavier,
+/// child-process-spawning probes.
+#[must_use]
+pub fn diag_process_fork_fd_complexity_enabled() -> bool {
+    std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_FD_COMPLEXITY").is_some()
+}
+
 /// Per-group outcome reported by [`diagnostic_spawn_and_copy`].
 pub struct GroupCopyResult {
     /// The group's span in the (real, live) parent address space, exactly as `Vmem::duplicate`
