@@ -387,6 +387,58 @@ impl<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> VmArea<Platfor
 /// was file-backed in source)` for one relocated range -- see [`Vmem::duplicate`].
 type DuplicatedRangeInfo = (Range<usize>, usize, bool, bool, bool);
 
+/// One coherent-group reservation made by [`Vmem::duplicate`]: the aligned span it reserved in
+/// the SOURCE address space (`source_base..source_base + size`, i.e. `source_group` verbatim) and
+/// the aligned base it was actually placed at in the destination (`dest_base`), from which every
+/// region within the group is offset identically (see `Vmem::duplicate`'s "COHERENT GROUPS" doc
+/// comment on why groups are relocated as one unit rather than per-region).
+///
+/// # Why this exists (currently unused by any caller)
+///
+/// This is bookkeeping for a NOT-YET-BUILT process-based `fork()`: today's `fork()` runs the
+/// child as a thread in the same host process, so `Vmem::duplicate` only needs each individual
+/// region's final destination address (carried in [`DuplicatedRangeInfo`]) -- nothing downstream
+/// currently needs to know which regions came from the SAME reservation group, or what that
+/// group's own aligned base/size was, once the per-region copy loop finishes.
+///
+/// A prior investigation (documented in this repo's `FINDINGS.txt`, passes 107-109) root-caused a
+/// class of nondeterministic crash to exactly this same-host-process design and designed a real
+/// fix: make the child a genuine separate Windows process, `WriteProcessMemory`'d into the SAME
+/// addresses the parent used, via forced-address allocation (`VirtualAlloc2` with an explicit
+/// address in the child process). That only works at RESERVATION-GROUP granularity -- an
+/// already-64KB-aligned base -- not at the granularity of individual guest-visible VMA addresses,
+/// which are frequently sub-granularity offsets within one aligned reservation and cannot
+/// themselves be independently `VirtualAlloc2`'d at a forced address in a fresh process. A future
+/// process-based-fork implementation will need exactly this triple, per group, to replicate each
+/// reservation's aligned span in the child process before `WriteProcessMemory`-ing the per-region
+/// contents into it. This struct preserves that information (computed internally by the
+/// coherent-group-partitioning loop below, but previously discarded once the loop finished)
+/// without changing any existing caller's behavior.
+#[derive(Debug, Clone)]
+#[allow(dead_code, reason = "consumed by the not-yet-built process-based fork; see doc comment")]
+pub(super) struct GroupRelocation {
+    /// The group's aligned span in the SOURCE address space.
+    pub(super) source_group: Range<usize>,
+    /// The aligned base address the platform actually placed this group's span at in the
+    /// destination (`dest`) address space; every region within `source_group` is offset from
+    /// `dest_base` identically to how it was offset from `source_group.start`.
+    pub(super) dest_base: usize,
+}
+
+/// Return value of [`Vmem::duplicate`]: the existing per-region relocation list plus, additively,
+/// the per-group aligned-base bookkeeping described on [`GroupRelocation`]. `group_relocations` is
+/// not consulted by any current caller -- see that type's doc comment for why it exists anyway.
+pub(super) struct DuplicateOutcome {
+    /// One entry per relocated region, in the order regions were processed -- identical in
+    /// content and order to what this function returned before `group_relocations` existed.
+    pub(super) relocations: Vec<DuplicatedRangeInfo>,
+    /// One entry per non-shared coherent group reserved during this call (see this function's
+    /// "COHERENT GROUPS" doc comment) -- `VM_SHARED` regions are relocated independently and so
+    /// never appear here.
+    #[allow(dead_code, reason = "consumed by the not-yet-built process-based fork; see GroupRelocation's doc comment")]
+    pub(super) group_relocations: Vec<GroupRelocation>,
+}
+
 /// Whether `range` qualifies for `fork()`-time stale-pointer translation as a loaded ELF's
 /// writable data segment or the `brk` heap.
 ///
@@ -809,7 +861,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     pub(super) unsafe fn duplicate<DestPlatform>(
         &self,
         dest: &mut Vmem<DestPlatform, ALIGN>,
-    ) -> Result<Vec<DuplicatedRangeInfo>, VmemDuplicateError>
+    ) -> Result<DuplicateOutcome, VmemDuplicateError>
     where
         DestPlatform: PageManagementProvider<ALIGN, SharedMemoryHandle = Platform::SharedMemoryHandle>
             + 'static,
@@ -903,6 +955,16 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .map_err(VmemDuplicateError::Allocation)?;
             group_bases.push((group.clone(), base_ptr.as_usize()));
         }
+        // Preserved additively for `DuplicateOutcome::group_relocations` -- see that field's doc
+        // comment. Built from the same `group_bases` entries used by the per-region placement loop
+        // below; not consulted by anything in that loop itself.
+        let group_relocations: Vec<GroupRelocation> = group_bases
+            .iter()
+            .map(|(group, dest_base)| GroupRelocation {
+                source_group: group.clone(),
+                dest_base: *dest_base,
+            })
+            .collect();
 
         // Tracks the relocation of whichever source region contains `self.brk`, if any, so the
         // destination's brk can point at the corresponding relocated address rather than a
@@ -1062,7 +1124,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             Some((source_range, dest_start)) => dest_start + (self.brk - source_range.start),
             None => self.brk,
         };
-        Ok(relocations)
+        Ok(DuplicateOutcome {
+            relocations,
+            group_relocations,
+        })
     }
 
     /// Create a new mapping in the virtual address space.
