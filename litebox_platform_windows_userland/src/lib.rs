@@ -1167,6 +1167,12 @@ struct TlsState {
     ///
     /// See [`fork_verify`] and [`litebox::platform::ForkChildVerificationProvider`].
     fork_verify: RefCell<Option<Arc<litebox::mm::AddressRelocations>>>,
+    /// Count of single-step traps [`fork_verify::on_single_step`] has processed on this thread
+    /// since the most recent [`fork_verify::begin`], used only to bound verification duration for
+    /// an IDENTITY (cross-process) relocation map -- see `MAX_IDENTITY_VERIFICATION_STEPS`'s doc
+    /// comment. Meaningless (and never consulted) once `fork_verify` is `None`; reset to `0` by
+    /// every [`fork_verify::begin`] call, matching that method's own reset of `fork_verify` itself.
+    fork_verify_step_count: Cell<u64>,
     /// The provenance chain [`fork_verify::on_single_step`] is tracking for the most recent
     /// explicit-memory-operand read on this thread, or `None` if no register currently carries a
     /// value traceable back to a specific memory slot this way.
@@ -1227,6 +1233,7 @@ impl TlsState {
             waiting_waker: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             has_entered_guest: false.into(),
             fork_verify: RefCell::new(None),
+            fork_verify_step_count: Cell::new(0),
             fork_verify_last_load: Cell::new(None),
             codewatch: fork_verify::CodewatchState::new(),
             ctxwatch: ctxwatch::State::new(),
