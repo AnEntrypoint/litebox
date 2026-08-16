@@ -1052,6 +1052,7 @@ pub fn diagnostic_spawn_and_copy(
 /// success path's entire point is to hand back a live, un-closed handle.
 pub fn spawn_process_fork_child(
     group_relocations: &[(Range<usize>, usize)],
+    vma_layout: &[(Range<usize>, u32, bool)],
     mut read_source_bytes: impl FnMut(Range<usize>) -> Option<Vec<u8>>,
     full_gprs: litebox::platform::ForkFullGprSnapshot,
     relocations_line: String,
@@ -1116,12 +1117,109 @@ pub fn spawn_process_fork_child(
         }
     }
 
+    // PASS 144: `copy_one_group` above commits every reservation-group span as blanket
+    // `PAGE_READWRITE` (see that function's own `VirtualAlloc2` call) -- it has no per-region
+    // permission information, only the coarse group span. This is fine for DATA pages but WRONG for
+    // CODE pages: a guest code region (the same, byte-identical, `WriteProcessMemory`-copied bytes
+    // as the parent's own code) is never marked executable in the child. This was NOT, on its own,
+    // this pass's actual root cause (see the `do_clone` fix in `litebox_shim_linux/src/syscalls/
+    // process.rs`, which fixes a coordinate-space mismatch between where `copy_one_group` places
+    // memory -- SOURCE addresses -- and where the resumed guest registers used to point --
+    // dest-relocated addresses computed for the thread-based fork path -- causing the very first
+    // instruction fetch to land entirely outside every copied region). With that coordinate fix
+    // alone, the resumed `Rip` correctly lands inside a real copied region again -- but that region
+    // is still only `PAGE_READWRITE`, so the fetch would still fault on DEP once the coordinates are
+    // correct. This EXEC-permission fixup is therefore a real, necessary, ADDITIONAL fix, applied
+    // together with the coordinate fix, not a fix for a separate crash: after every group's bytes
+    // are copied (still under the uniform `PAGE_READWRITE` `copy_one_group` left them at), walk
+    // `vma_layout` -- the SAME per-region `(range, raw VmFlags, is_file_backed)` triples
+    // `PageManager::new_adopting_existing_memory` already uses to reconstruct this child's
+    // bookkeeping (see `AddressRelocations::vma_layout`'s doc comment) -- and `VirtualProtectEx`
+    // each range to match its SOURCE permissions exactly (`VM_READ`=bit0, `VM_WRITE`=bit1,
+    // `VM_EXEC`=bit2, matching `linux::VmFlags`' bit layout verbatim, mirrored here as raw bit tests
+    // since this crate does not depend on the `litebox` crate's private `VmFlags` type). A region
+    // with none of READ/WRITE/EXEC set is left at the group's default `PAGE_READWRITE` rather than
+    // narrowed to `PAGE_NOACCESS` -- narrowing is not needed to fix this crash and additively
+    // narrowing every region here risks a DIFFERENT regression this pass has no evidence for; only
+    // the EXEC bit is actionable/necessary from this fault's own evidence.
+    for (range, flags, _is_file_backed) in vma_layout {
+        const VM_READ: u32 = 1 << 0;
+        const VM_WRITE: u32 = 1 << 1;
+        const VM_EXEC: u32 = 1 << 2;
+        if flags & VM_EXEC == 0 {
+            continue;
+        }
+        let readable = flags & VM_READ != 0;
+        let writable = flags & VM_WRITE != 0;
+        let protect = match (readable, writable) {
+            (_, true) => windows_sys::Win32::System::Memory::PAGE_EXECUTE_READWRITE,
+            _ => windows_sys::Win32::System::Memory::PAGE_EXECUTE_READ,
+        };
+        let mut old_protect = 0u32;
+        let ok = unsafe {
+            windows_sys::Win32::System::Memory::VirtualProtectEx(
+                process,
+                range.start as *mut c_void,
+                range.len(),
+                protect,
+                &raw mut old_protect,
+            )
+        };
+        if ok == 0 {
+            fail_teardown!(
+                "[process_fork] spawn_process_fork_child: VirtualProtectEx (exec fixup) FAILED \
+                 range={:#x}..{:#x} protect={protect:#x} GetLastError={}",
+                range.start,
+                range.end,
+                unsafe { GetLastError() }
+            );
+        }
+    }
+
+    // PASS 144 (external-observer diagnostic, kept alongside the fix above): pass 143 found the cross-process child crashing with a genuine
+    // `STATUS_ACCESS_VIOLATION` (raw=0xc0000005) AFTER `fork_verify` correctly arms and the FS base
+    // is correctly propagated, yet with ZERO corresponding VEH trace output -- not even under
+    // `LITEBOX_DIAG_FATALDUMP=1`'s broadened gate. This means litebox's OWN in-process VEH never
+    // sees the fault at all. `DebugActiveProcess` sees every exception delivered to the debuggee
+    // regardless of whether the debuggee's own in-process handlers ever run (a Windows kernel-level
+    // debug-event channel, entirely independent of VEH/SEH registration state in the target) -- so
+    // attaching as an external debugger BEFORE `ResumeThread` and observing here reveals the fault's
+    // real `Rip`/exception code/address even when the guest's own VEH is bypassed, not yet
+    // registered, or declines the exception. Gated behind
+    // `LITEBOX_DIAG_PROCESS_FORK_EXTERNAL_DEBUGGER=1` (opt-in, diagnostic-only): the debug loop below
+    // blocks this call until the child either hits a fault or exits, so it must never run in the
+    // default/production path.
+    let external_debugger_requested =
+        std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_EXTERNAL_DEBUGGER").is_some();
+    let debug_attached = external_debugger_requested
+        && unsafe { windows_sys::Win32::System::Diagnostics::Debug::DebugActiveProcess(pid) } != 0;
+    if external_debugger_requested && !debug_attached {
+        eprintln!(
+            "[process_fork] spawn_process_fork_child: LITEBOX_DIAG_PROCESS_FORK_EXTERNAL_DEBUGGER=1 \
+             requested but DebugActiveProcess FAILED, GetLastError={} -- proceeding without external \
+             observation",
+            unsafe { GetLastError() }
+        );
+    }
+
     let resumed = unsafe { ResumeThread(thread) };
     if resumed == u32::MAX {
+        if debug_attached {
+            unsafe {
+                windows_sys::Win32::System::Diagnostics::Debug::DebugActiveProcessStop(pid);
+            }
+        }
         fail_teardown!(
             "[process_fork] spawn_process_fork_child: ResumeThread failed, GetLastError={}",
             unsafe { GetLastError() }
         );
+    }
+
+    if debug_attached {
+        observe_real_resume_fault(pid);
+        unsafe {
+            windows_sys::Win32::System::Diagnostics::Debug::DebugActiveProcessStop(pid);
+        }
     }
 
     // Success: the child is now running real, ongoing guest execution (pass 139's `Task`-resume
@@ -1832,6 +1930,44 @@ fn observe_real_resume_fault(child_pid: u32) {
                 event.dwThreadId,
                 unsafe { event.u.Exception.dwFirstChance }
             );
+            // For `STATUS_ACCESS_VIOLATION` (0xc0000005), `ExceptionAddress` above is the faulting
+            // INSTRUCTION's address (Rip at fault) -- it does NOT say whether the fault was a
+            // read/write/execute, nor the actual memory address touched when that differs from Rip
+            // (e.g. a data read/write fault at some OTHER address than the instruction itself).
+            // `ExceptionInformation[0]` carries the access type (0=read, 1=write, 8=DEP/execute) and
+            // `ExceptionInformation[1]` the actual faulting address -- decode both explicitly so a
+            // "faults on entry" signature (fetch access violation AT Rip, e.g. an unmapped/
+            // non-executable code page) can be told apart from a data access violation (e.g. a wild
+            // pointer dereference reachable from the entry instruction).
+            if record.ExceptionCode == 0xc0000005_u32.cast_signed() && record.NumberParameters >= 2
+            {
+                let access_type = record.ExceptionInformation[0];
+                let fault_addr = record.ExceptionInformation[1];
+                let kind = match access_type {
+                    0 => "READ",
+                    1 => "WRITE",
+                    8 => "EXECUTE/DEP",
+                    other => {
+                        eprintln!(
+                            "[process_fork_diag] real-resume: unrecognized access-violation type {other}"
+                        );
+                        "UNKNOWN"
+                    }
+                };
+                eprintln!(
+                    "[process_fork_diag] real-resume: STATUS_ACCESS_VIOLATION detail: {kind} at \
+                     address={fault_addr:#x} (instruction Rip={:#x}) -- {}",
+                    record.ExceptionAddress as usize,
+                    if fault_addr == record.ExceptionAddress as usize {
+                        "fault address EQUALS the faulting instruction's own address (an \
+                         instruction-FETCH fault: the code page at Rip is unmapped, not committed, \
+                         or not executable in this process)"
+                    } else {
+                        "fault address DIFFERS from the faulting instruction's address (a data \
+                         access fault: the instruction at Rip dereferenced a bad pointer)"
+                    }
+                );
+            }
             let thread_handle = unsafe { OpenThread(THREAD_ALL_ACCESS, 0, event.dwThreadId) };
             if !thread_handle.is_null() {
                 let mut ctx = CONTEXT {
