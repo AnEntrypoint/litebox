@@ -214,6 +214,35 @@ impl AddressRelocations {
         }
     }
 
+    /// Returns whether this relocation map is an identity mapping produced by
+    /// [`Self::identity_for_cross_process`] (or, in principle, any map that happens to translate
+    /// every range to itself) -- i.e. whether [`Self::translate`] is the identity function over
+    /// every tracked range, so [`Self::is_in_source`] and [`Self::is_in_destination`] cover
+    /// exactly the same addresses.
+    ///
+    /// The THREAD-based `fork()` path's own `AddressRelocations` (built directly by
+    /// [`PageManager::duplicate`], never through [`Self::identity_for_cross_process`]) always
+    /// relocates every range to a freshly, separately chosen `dest_base`, disjoint from its
+    /// `source_range` by construction (see this struct's own "why this cannot produce false
+    /// positives" reasoning, mirrored in `fork_verify`'s module doc) -- so this is always `false`
+    /// there, `ranges.is_empty()` aside (an empty map is vacuously identity but never arises in
+    /// practice: `PageManager::duplicate` always duplicates at least the stack). Existing purely
+    /// so a consumer like `fork_verify::on_single_step` can tell whether `is_in_source(rip)` being
+    /// true is a rare, meaningful "stale pre-fork pointer" signal (thread-based path) or the
+    /// expected, unconditional state of essentially all guest code (cross-process/identity path,
+    /// where source and destination are, by design, the SAME address range) -- see
+    /// `scratchpad/jqrepro/FINDINGS.txt` pass 152 for why that distinction matters.
+    #[must_use]
+    pub fn is_identity(&self) -> bool {
+        self.ranges
+            .iter()
+            .all(|(range, dest_base)| *dest_base == range.start)
+            && self
+                .group_relocations
+                .iter()
+                .all(|(range, dest_base)| *dest_base == range.start)
+    }
+
     /// Serializes this object's raw fields into a single newline-free text line, the inverse of
     /// [`Self::from_raw_parts_for_diagnostic`].
     ///

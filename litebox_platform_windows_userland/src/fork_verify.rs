@@ -133,6 +133,22 @@ pub(crate) const EFLAGS_TF: usize = 1 << 8;
 /// `rip` to decode one.
 const MAX_INSTRUCTION_LEN: usize = 15;
 
+/// The maximum number of single-step traps [`on_single_step`] will process, on one thread, for a
+/// child verified against an IDENTITY (`AddressRelocations::is_identity`) relocation map before
+/// ending verification proactively, rather than re-arming `EFLAGS.TF` forever.
+///
+/// See the comment at this constant's use site in [`on_single_step`] for why this is scoped to
+/// identity relocations only (the cross-process fork mechanism) and never applied to the
+/// THREAD-based fork path. Chosen generously relative to the size of a `fork()`-to-`execve()`
+/// unwind (observed live, `scratchpad/jqrepro/FINDINGS.txt` pass 150, to be on the order of tens
+/// of instructions for apk/busybox's own post-`fork()` cleanup) while staying far short of the
+/// tens of thousands of traps a real interpreter's (CPython's) full post-`fork()` run would take
+/// to single-step to completion (pass 151: 76768+ traps observed before the child was killed,
+/// still climbing) -- i.e. large enough to never cut off genuine early-`fork()` healing, small
+/// enough that hitting it is itself strong evidence execution has moved well past any pointer
+/// that could plausibly still be stale.
+const MAX_IDENTITY_VERIFICATION_STEPS: u64 = 4096;
+
 /// The minimum alignment a genuine heap/allocator-owned pointer is guaranteed to have under musl's
 /// mallocng (this investigation's only allocator of interest -- see `AddressRelocations::
 /// private_data_ranges_excluding_anonymous_mmap`'s doc comment), and hence the alignment case (2c)
@@ -477,6 +493,50 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
     // `usize` and `u64` are the same width here; the cast is exact, never truncating.
     #[allow(clippy::cast_possible_truncation)]
     let rip = context.Rip as usize;
+
+    // Cross-process/identity children (`AddressRelocations::is_identity`, see its doc comment):
+    // `is_in_source`/`is_in_destination` cover the SAME address range (source == destination by
+    // design), so case (1) below fires on essentially every instruction the child executes, not
+    // just genuine stale pre-`fork()` pointers -- unconditionally re-arming `TF` on every such
+    // `Continue` (as this function always has, correctly, for the THREAD-based path, where
+    // `is_in_source` is a rare, meaningful signal) turns the child's ENTIRE remaining execution
+    // into a permanent, one-instruction-at-a-time trace. For a real workload with a long post-
+    // `fork()` run before `execve`/`exit`/`exit_group` (confirmed live: any CPython `os.fork()`,
+    // with or without a following `execv()`) that is not merely slow, it is functionally an
+    // indefinite hang (`scratchpad/jqrepro/FINDINGS.txt` pass 151).
+    //
+    // The staleness this module exists to catch is inherently front-loaded: it comes from
+    // pointers that were sitting in memory at the *moment* `fork()` was called (return addresses
+    // on the stack, spilled TCB fields, ...) and gets exercised by the child's own post-`fork()`
+    // unwind back through the frames that were live at that moment -- a bounded amount of code,
+    // not something that recurs deep into a long-running child's unrelated later execution (new
+    // stack frames/heap allocations the child makes AFTER `fork()` are never in a source range in
+    // the first place -- `PageManager::duplicate`'s own "why this cannot produce false positives"
+    // reasoning). So once a generous bound on the number of single-step traps taken *on this
+    // thread* is exceeded, any further staleness this module could still catch is far less likely
+    // than the risk of single-stepping the child forever -- end verification proactively (exactly
+    // the same teardown `end()` performs) instead of re-arming `TF` again, rather than requiring
+    // the child to reach `execve`/`exit`/`exit_group` on its own to escape the trace.
+    //
+    // Scoped to identity relocations only: the THREAD-based path's own `is_in_source` is already
+    // rare (disjoint ranges by construction), so this bound is never expected to matter there, and
+    // is deliberately not applied there to leave that path's own behavior completely unchanged.
+    if relocations.is_identity() {
+        let steps = tls.fork_verify_step_count.get() + 1;
+        tls.fork_verify_step_count.set(steps);
+        if steps > MAX_IDENTITY_VERIFICATION_STEPS {
+            if crate::veh_trace_enabled() {
+                eprintln!(
+                    "[fork_verify] tid={:?} on_single_step: identity relocations, step bound {MAX_IDENTITY_VERIFICATION_STEPS} exceeded at rip={rip:#x}, ending verification early",
+                    std::thread::current().id(),
+                );
+            }
+            drop(borrow);
+            context.EFlags &= !eflags_tf;
+            *tls.fork_verify.borrow_mut() = None;
+            return StepOutcome::Continue;
+        }
+    }
 
     if crate::veh_trace_enabled() {
         let fsbase = unsafe { litebox_common_linux::rdfsbase() };
@@ -1654,6 +1714,7 @@ pub(crate) fn begin(relocations: alloc::sync::Arc<litebox::mm::AddressRelocation
         // SAFETY: `get_tls_ptr` returns this thread's live `TlsState`.
         let tls = unsafe { &*tls };
         if std::env::var_os("LITEBOX_FORKVERIFY_OFF").is_none() {
+            tls.fork_verify_step_count.set(0);
             *tls.fork_verify.borrow_mut() = Some(relocations);
         }
     }
