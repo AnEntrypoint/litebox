@@ -1981,6 +1981,40 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 full_translated_gprs,
             );
 
+            // Pass 142: production process-based fork(), opt-in via `LITEBOX_PROCESS_FORK=1`
+            // (checked platform-side, inside `spawn_cross_process_fork_child` itself -- this
+            // crate is `no_std` and cannot read the environment directly; the default
+            // implementation and every platform but Windows return `None` unconditionally, which
+            // is exactly the always-safe fallback this `if` already handles).
+            // Scoped exactly as pass 116 established (`fd_complexity.beyond_stdio == 0` -- none of
+            // this shim's 7 fd subsystems are backed by a real Windows HANDLE, so a cross-process
+            // child cannot inherit anything beyond the 0/1/2 stdio slots the OS itself hands a
+            // fresh `CreateProcessW` child automatically). On success, the guest child is ALREADY
+            // running for real in a genuinely separate Windows process (see
+            // `ForkChildVerificationProvider::spawn_cross_process_fork_child`'s doc comment) --
+            // this `do_clone` call returns immediately without ever touching the thread-based
+            // `spawn_thread` path below, exactly like real fork(): both parent and child continue
+            // independently, the child just happens to live in a different OS process here. On
+            // any failure (or when the platform has no such mechanism, or fds are too complex),
+            // falls through completely unchanged into the existing, always-available thread-based
+            // path -- zero risk to anyone not explicitly opting in via the env var.
+            if fd_complexity.beyond_stdio == 0
+                && let Some(full_gprs) = full_translated_gprs
+                && let Some(handle) = self
+                    .global
+                    .platform
+                    .spawn_cross_process_fork_child(&relocations, full_gprs)
+            {
+                self.process()
+                    .register_cross_process_child(child_tid, handle);
+                litebox_util_log::debug!(
+                    parent_tid:% = self.tid,
+                    child_tid:% = child_tid;
+                    "clone: spawned cross-process fork() child"
+                );
+                return Ok(usize::try_from(child_tid).unwrap());
+            }
+
             // Pass 141 diagnostic-only proof (`LITEBOX_DIAG_PROCESS_FORK_WAIT4=1`, off by
             // default): live-exercises the cross-process wait4() bridge against a real Windows
             // child, registered into THIS process's real `cross_process_children` registry, then

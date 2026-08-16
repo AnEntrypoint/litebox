@@ -960,7 +960,7 @@ pub fn diagnostic_spawn_and_copy(
         std::env::remove_var(FORK_CHILD_VMA_LAYOUT_ENV_VAR);
         std::env::remove_var(FORK_CHILD_GPRS_ENV_VAR);
     }
-    let (process, thread, stdout_read, stdin_write) = spawn_result?;
+    let (process, thread, _pid, stdout_read, stdin_write) = spawn_result?;
     let guard = SuspendedChildGuard {
         process,
         thread,
@@ -1025,6 +1025,112 @@ pub fn diagnostic_spawn_and_copy(
     // `guard` drops here: TerminateProcess + CloseHandle, unconditionally, whether or not it was
     // ever resumed -- see the guard's own doc comment.
     Ok(results)
+}
+
+/// Production (pass 142) counterpart to [`diagnostic_spawn_and_copy`]: performs the SAME proven
+/// mechanism (`CREATE_SUSPENDED` spawn, per-group forced-address `VirtualAlloc2` +
+/// `WriteProcessMemory` copy via [`copy_one_group`], relocations-line and translated-GPR
+/// transmission via the environment -- [`FORK_CHILD_VMA_LAYOUT_ENV_VAR`]/
+/// [`FORK_CHILD_GPRS_ENV_VAR`], the same channel pass 137/139's diagnostic probes already proved
+/// -- `Task`-resume via [`ResumeThread`]) but WITHOUT [`SuspendedChildGuard`]'s unconditional
+/// `TerminateProcess`-on-drop: on success the child is resumed into real, ongoing guest execution
+/// and this function returns its real pid and process `HANDLE` to the caller, alive and running,
+/// for registration into `Process::cross_process_children` (see `do_clone`'s
+/// `LITEBOX_PROCESS_FORK=1` call site).
+///
+/// No stdout/stdin pipe is created (unlike the diagnostic probes, which need one to observe the
+/// child's readiness marker) -- `CreateProcessW` is called with `bInheritHandles=0` and no
+/// `STARTF_USESTDHANDLES`, so the child inherits the parent's real console session's stdio the
+/// ordinary way a genuine `fork()` child would, letting a subsequent guest `execve` (e.g.
+/// `/bin/echo`) produce real, visible output -- there is no diagnostic marker to observe here;
+/// success is "the child was spawned, memory copied, and resumed without error."
+///
+/// Every failure path explicitly `TerminateProcess`+`CloseHandle`s the child itself before
+/// returning `Err`/`Ok(None)` -- there is deliberately no `Drop`-based guard here, since the
+/// success path's entire point is to hand back a live, un-closed handle.
+pub fn spawn_process_fork_child(
+    group_relocations: &[(Range<usize>, usize)],
+    mut read_source_bytes: impl FnMut(Range<usize>) -> Option<Vec<u8>>,
+    full_gprs: litebox::platform::ForkFullGprSnapshot,
+    relocations_line: String,
+) -> Result<Option<(u32, HANDLE)>, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe() failed: {e}"))?;
+    let mut exe_wide: Vec<u16> = exe
+        .as_os_str()
+        .encode_wide_for_windows()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // Safety: same reasoning as `diagnostic_spawn_and_copy`'s identical block -- `do_clone`'s
+    // caller already holds whatever process-wide serialization real fork() requires.
+    //
+    // Reuses passes 136/137/139's own diagnostic dispatch chain in the child (`diag_process_fork_
+    // globalstate_probe` -> `diag_process_fork_vmem_adopt_probe` -> `diag_process_fork_task_resume_
+    // probe`, wired in the runner crate's `main()`) by setting the SAME three gate env vars those
+    // passes introduced as opt-in flags -- this production path always wants that exact chain, so
+    // it sets all three unconditionally rather than exposing them as separately-toggleable knobs.
+    unsafe {
+        std::env::set_var(REEXEC_CHILD_ENV_VAR, "1");
+        std::env::set_var("LITEBOX_DIAG_PROCESS_FORK_GLOBALSTATE", "1");
+        std::env::set_var("LITEBOX_DIAG_PROCESS_FORK_VMEM_ADOPT", "1");
+        std::env::set_var("LITEBOX_DIAG_PROCESS_FORK_TASK_RESUME", "1");
+        std::env::set_var(FORK_CHILD_VMA_LAYOUT_ENV_VAR, &relocations_line);
+        std::env::set_var(FORK_CHILD_GPRS_ENV_VAR, serialize_full_gprs(&full_gprs));
+    }
+    let spawn_result = spawn_suspended(&mut exe_wide, false, false);
+    unsafe {
+        std::env::remove_var(REEXEC_CHILD_ENV_VAR);
+        std::env::remove_var("LITEBOX_DIAG_PROCESS_FORK_GLOBALSTATE");
+        std::env::remove_var("LITEBOX_DIAG_PROCESS_FORK_VMEM_ADOPT");
+        std::env::remove_var("LITEBOX_DIAG_PROCESS_FORK_TASK_RESUME");
+        std::env::remove_var(FORK_CHILD_VMA_LAYOUT_ENV_VAR);
+        std::env::remove_var(FORK_CHILD_GPRS_ENV_VAR);
+    }
+    let (process, thread, pid, _stdout_read, _stdin_write) = spawn_result?;
+
+    // From here on, any early-return path must explicitly tear the child down itself -- there is
+    // no `Drop` guard doing it implicitly, by design (see this function's doc comment).
+    macro_rules! fail_teardown {
+        ($($arg:tt)*) => {{
+            unsafe {
+                TerminateProcess(process, 1);
+                CloseHandle(thread);
+                CloseHandle(process);
+            }
+            eprintln!($($arg)*);
+            return Ok(None);
+        }};
+    }
+
+    for (source_group, dest_base) in group_relocations {
+        let result = copy_one_group(process, source_group, *dest_base, &mut read_source_bytes);
+        if !result.succeeded {
+            fail_teardown!(
+                "[process_fork] spawn_process_fork_child: group copy FAILED group={:#x}..{:#x} GetLastError={}",
+                result.source_group.start,
+                result.source_group.end,
+                result.last_error
+            );
+        }
+    }
+
+    let resumed = unsafe { ResumeThread(thread) };
+    if resumed == u32::MAX {
+        fail_teardown!(
+            "[process_fork] spawn_process_fork_child: ResumeThread failed, GetLastError={}",
+            unsafe { GetLastError() }
+        );
+    }
+
+    // Success: the child is now running real, ongoing guest execution (pass 139's `Task`-resume
+    // path, taken because `FORK_CHILD_GPRS_ENV_VAR`/`FORK_CHILD_VMA_LAYOUT_ENV_VAR` and the three
+    // gate env vars above are set -- see `run_diagnostic_resume_child`'s and `main()`'s dispatch).
+    // Close the thread handle (no longer needed -- the process handle alone is enough to
+    // wait/kill by pid) and hand the caller the process handle and pid, alive, un-terminated.
+    unsafe {
+        CloseHandle(thread);
+    }
+    Ok(Some((pid, process)))
 }
 
 /// Pass 115's fd-inheritance probe: `DuplicateHandle`s the CURRENT (parent) process's real
@@ -2411,11 +2517,14 @@ impl EncodeWideExt for std::ffi::OsStr {
 /// [`duplicate_stdio_into_child`] can hand the child the duplicated-handle value it needs (see
 /// [`SuspendedChildGuard::stdin_write`]'s doc comment for why a pipe, not the environment/argv, is
 /// used for this).
+/// `(process, thread, pid, stdout_read_end, stdin_write_end)`.
+type SpawnSuspendedResult = (HANDLE, HANDLE, u32, Option<HANDLE>, Option<HANDLE>);
+
 fn spawn_suspended(
     exe_wide: &mut [u16],
     want_stdout_pipe: bool,
     want_stdin_pipe: bool,
-) -> Result<(HANDLE, HANDLE, Option<HANDLE>, Option<HANDLE>), String> {
+) -> Result<SpawnSuspendedResult, String> {
     let mut startup_info: STARTUPINFOW = unsafe { core::mem::zeroed() };
     startup_info.cb =
         u32::try_from(core::mem::size_of::<STARTUPINFOW>()).expect("STARTUPINFOW fits in u32");
@@ -2529,6 +2638,7 @@ fn spawn_suspended(
     Ok((
         process_info.hProcess,
         process_info.hThread,
+        process_info.dwProcessId,
         if want_stdout_pipe {
             Some(stdout_read)
         } else {

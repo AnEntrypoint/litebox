@@ -4259,6 +4259,51 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
     ) {
         process_fork::diagnostic_cross_process_wait4_probe(register);
     }
+
+    fn spawn_cross_process_fork_child(
+        &self,
+        relocations: &litebox::mm::AddressRelocations,
+        full_gprs: litebox::platform::ForkFullGprSnapshot,
+    ) -> Option<litebox::platform::CrossProcessChildHandle> {
+        std::env::var_os("LITEBOX_PROCESS_FORK")?;
+        let group_relocations = relocations.group_relocations();
+        let read_source_bytes = |range: core::ops::Range<usize>| {
+            use litebox::platform::RawConstPointer as _;
+            let ptr =
+                <Self as litebox::platform::RawPointerProvider>::RawConstPointer::<u8>::from_usize(
+                    range.start,
+                );
+            ptr.to_owned_slice(range.len()).map(<[u8]>::into_vec)
+        };
+        let relocations_line = relocations.serialize_for_diagnostic();
+        match process_fork::spawn_process_fork_child(
+            group_relocations,
+            read_source_bytes,
+            full_gprs,
+            relocations_line,
+        ) {
+            Ok(Some((pid, handle))) => {
+                litebox_util_log::debug!(
+                    pid:% = pid;
+                    "spawn_cross_process_fork_child: child spawned and resumed successfully"
+                );
+                Some(litebox::platform::CrossProcessChildHandle(handle as usize))
+            }
+            Ok(None) => {
+                litebox_util_log::warn!(
+                    "spawn_cross_process_fork_child: spawn/resume failed, caller should fall back to thread-based fork"
+                );
+                None
+            }
+            Err(e) => {
+                litebox_util_log::warn!(
+                    err:% = e;
+                    "spawn_cross_process_fork_child: setup error, caller should fall back to thread-based fork"
+                );
+                None
+            }
+        }
+    }
 }
 
 impl litebox::platform::SystemInfoProvider for WindowsUserland {
