@@ -9,7 +9,6 @@ extern crate alloc;
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
-use litebox::platform::ForkChildVerificationProvider as _;
 use litebox_platform_windows_userland::WindowsUserland as Platform;
 use memmap2::Mmap;
 use std::path::{Path, PathBuf};
@@ -398,7 +397,7 @@ pub fn diag_process_fork_globalstate_probe() {
         "[process_fork_diag] globalstate-probe (child): GlobalState constructed successfully, no crash/hang/error"
     );
 
-    diag_process_fork_vmem_adopt_probe(&shim, fs);
+    diag_process_fork_vmem_adopt_probe(platform, &shim, fs);
 }
 
 /// Pass 137's `Vmem`/`PageManager`-adoption probe, gated behind
@@ -419,6 +418,7 @@ pub fn diag_process_fork_globalstate_probe() {
 /// pass 138+'s job (FINDINGS.txt pass 135 STEP 4 item 3). Nothing here can feed back into the
 /// real, unmodified thread-based `do_clone` fork path.
 fn diag_process_fork_vmem_adopt_probe(
+    platform: &'static Platform,
     shim: &litebox_shim_linux::LinuxShim<Platform, litebox_shim_linux::DefaultFS<Platform>>,
     fs: std::sync::Arc<litebox_shim_linux::DefaultFS<Platform>>,
 ) {
@@ -504,7 +504,7 @@ fn diag_process_fork_vmem_adopt_probe(
         );
     }
 
-    diag_process_fork_task_resume_probe(shim, fs, page_manager, relocations);
+    diag_process_fork_task_resume_probe(platform, shim, fs, page_manager, relocations);
 }
 
 /// Pass 139's in-process `Task`-resume probe, gated behind
@@ -522,6 +522,7 @@ fn diag_process_fork_vmem_adopt_probe(
 /// `HOST_BP`, the `syscall_callback` return-address contract) the normal way, in-process, with no
 /// cross-process register injection needed for this leg at all.
 fn diag_process_fork_task_resume_probe(
+    platform: &'static Platform,
     shim: &litebox_shim_linux::LinuxShim<Platform, litebox_shim_linux::DefaultFS<Platform>>,
     fs: std::sync::Arc<litebox_shim_linux::DefaultFS<Platform>>,
     page_manager: litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
@@ -591,10 +592,49 @@ fn diag_process_fork_task_resume_probe(
         ss: gprs.ss,
     };
 
+    // Pass 143: this child's guest thread is a BRAND-NEW OS thread in a BRAND-NEW OS process --
+    // unlike the thread-based fork path (`ThreadInitState::ForkedChild`'s own `sys_arch_prctl
+    // (ArchPrctlArg::SetFs(fs_base))` call, `litebox_shim_linux/src/syscalls/process.rs`), nothing
+    // has ever propagated the parent's `%fs` base (backing the guest's TLS pointer) to this
+    // thread. Without this, the guest's very first FS-relative access (musl issues one
+    // essentially immediately after `fork()` returns) dereferences FS base 0 and crashes on the
+    // guest's first instruction -- exactly the 100%-reproducible `addr=0x0` SIGSEGV pass 142
+    // root-caused. `gprs.fs_base` carries the SAME already-translated-and-self-pointer-fixed-up
+    // value `do_clone`'s own `fs_base` computation derives for the thread-based path (see that
+    // computation's doc comment for the ABI self-referential-pointer fixup, already applied on
+    // the parent's side, in the parent's own address space, before this child was ever spawned --
+    // `WriteProcessMemory`-visible to this child by construction). Set it the SAME way the
+    // thread-based path does: through the platform's own `ArchSpecificProvider`, which internally
+    // calls `wrfsbase` for the CURRENT thread -- this call runs ON the child's own host thread,
+    // exactly where `%fs` needs to be programmed.
+    //
+    // Deliberately reuses the SAME `platform` reference `diag_process_fork_globalstate_probe`
+    // already constructed via its one `Platform::new()` call, rather than calling `Platform::new()`
+    // again here: `WindowsUserland::new()` is a genuine full re-init (per-call
+    // `AddVectoredExceptionHandler` registration, a fresh console-resize-watcher thread spawn, and
+    // -- the actual bug this fixes -- `WindowsUserland::init_thread_fs_base()`, which unconditionally
+    // resets `THREAD_FS_BASE` to 0 on the calling thread). A second `Platform::new()` call here would
+    // reset the very FS base this call is trying to set, immediately before setting it, but any code
+    // between here and `run_thread` (or Windows' own periodic FS_BASE-to-0 reset, see this module's
+    // VEH repair mechanism) reading `THREAD_FS_BASE` via a stale second copy of platform-internal
+    // state would still observe 0 -- exactly the symptom live-observed before this fix (the child's
+    // own `[veh]` trace line read `thread_fs_base=0x7feffffebb28`, a leftover loader-thread-local
+    // value from a LATER spurious `Platform::new()` call in this function, never this call's actual
+    // `gprs.fs_base` value).
+    litebox::platform::ArchSpecificProvider::set_arch_specific_register(
+        platform,
+        &litebox::platform::ArchSpecificRegister::FsBase,
+        gprs.fs_base,
+    )
+    .expect("cross-process fork child: failed to set FS base before resuming guest code");
+
     eprintln!(
-        "[process_fork_diag] task-resume-probe (child): built Task, calling run_thread with \
-         rip={:#x} rsp={:#x} -- entering real guest execution",
-        ctx.rip, ctx.rsp
+        "[process_fork_diag] task-resume-probe (child, winpid={}): built Task, set fs_base={:#x}, calling \
+         run_thread with rip={:#x} rsp={:#x} -- entering real guest execution",
+        std::process::id(),
+        gprs.fs_base,
+        ctx.rip,
+        ctx.rsp
     );
     // Arm the SAME post-fork stale-pointer verification the real, working thread-based fork path
     // arms via `Task::init`'s `ThreadInitState::ForkedChild` branch (`begin_fork_child_
@@ -603,14 +643,21 @@ fn diag_process_fork_task_resume_probe(
     // same-process path), so without this call `fork_verify` never engages here and any stale
     // pointer left over from the `WriteProcessMemory` copy (the same class of hazard the
     // thread-based path's own verification exists to heal) goes completely unrepaired.
-    let verify_platform = Platform::new();
-    verify_platform.begin_fork_child_verification(std::sync::Arc::new(relocations));
-
+    //
+    // Pass 143: calling `begin_fork_child_verification` HERE, before `run_thread`, was itself a
+    // silent no-op -- `fork_verify::begin`'s effect only takes hold once `get_tls_ptr()` returns
+    // `Some`, which is only true from partway through `run_thread`'s OWN internals onward (see
+    // `run_thread_with_fork_verification`'s doc comment in `litebox_platform_windows_userland`).
+    // Use that dedicated entry point instead, which arms fork_verify at exactly the right point in
+    // the sequence -- after TLS install, before the guest is ever resumed.
     let process = entrypoints.process();
     unsafe {
-        litebox_platform_windows_userland::run_thread(entrypoints, &mut ctx);
+        litebox_platform_windows_userland::run_thread_with_fork_verification(
+            entrypoints,
+            &mut ctx,
+            std::sync::Arc::new(relocations),
+        );
     }
-    verify_platform.end_fork_child_verification();
     eprintln!(
         "[process_fork_diag] task-resume-probe (child): run_thread returned (guest thread terminated)"
     );
