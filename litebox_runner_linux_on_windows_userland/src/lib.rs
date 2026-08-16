@@ -9,6 +9,7 @@ extern crate alloc;
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
+use litebox::platform::ForkChildVerificationProvider as _;
 use litebox_platform_windows_userland::WindowsUserland as Platform;
 use memmap2::Mmap;
 use std::path::{Path, PathBuf};
@@ -602,7 +603,6 @@ fn diag_process_fork_task_resume_probe(
     // same-process path), so without this call `fork_verify` never engages here and any stale
     // pointer left over from the `WriteProcessMemory` copy (the same class of hazard the
     // thread-based path's own verification exists to heal) goes completely unrepaired.
-    use litebox::platform::ForkChildVerificationProvider as _;
     let verify_platform = Platform::new();
     verify_platform.begin_fork_child_verification(std::sync::Arc::new(relocations));
 
