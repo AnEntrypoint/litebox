@@ -694,6 +694,33 @@ pub trait ForkChildVerificationProvider {
     ) {
         let _ = register;
     }
+
+    /// Production (pass 142) counterpart to [`Self::diagnostic_process_fork_probe`]: spawns a
+    /// genuine, ongoing cross-process `fork()` child -- the SAME proven mechanism (memory
+    /// placement, register/context setup, real guest resume) that hook exercises, but WITHOUT its
+    /// diagnostic teardown. On success the child is left running real guest execution and this
+    /// returns its real pid, wrapped in a [`CrossProcessChildHandle`] the caller registers into
+    /// `litebox_shim_linux::syscalls::process::Process::cross_process_children` for a later
+    /// `wait4()` to reap (see that registry's doc comment). Returns `None` on any failure (the
+    /// child is torn down internally before returning) or when this platform has no such
+    /// mechanism (the default implementation) -- either way the caller falls back to the existing,
+    /// unconditionally-safe thread-based `fork()` path.
+    ///
+    /// `child_tid` is the pid the shim has already allocated for this `fork()` call's child
+    /// `Process` (see `do_clone`) -- the real Windows pid a spawned cross-process child gets is
+    /// necessarily different (assigned by the OS), so the caller uses ITS OWN `child_tid` as the
+    /// `cross_process_children` registry key (matching how a thread-based child is keyed), not
+    /// whatever this function returns as the process's real OS pid (needed only to interpret the
+    /// `HANDLE`, never exposed to the guest).
+    fn spawn_cross_process_fork_child(
+        &self,
+        relocations: &crate::mm::AddressRelocations,
+        full_gprs: ForkFullGprSnapshot,
+    ) -> Option<CrossProcessChildHandle> {
+        let _ = relocations;
+        let _ = full_gprs;
+        None
+    }
 }
 
 /// An opaque, platform-defined handle to a cross-process `fork()` child's real OS process,

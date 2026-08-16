@@ -503,7 +503,7 @@ fn diag_process_fork_vmem_adopt_probe(
         );
     }
 
-    diag_process_fork_task_resume_probe(shim, fs, page_manager);
+    diag_process_fork_task_resume_probe(shim, fs, page_manager, relocations);
 }
 
 /// Pass 139's in-process `Task`-resume probe, gated behind
@@ -524,6 +524,7 @@ fn diag_process_fork_task_resume_probe(
     shim: &litebox_shim_linux::LinuxShim<Platform, litebox_shim_linux::DefaultFS<Platform>>,
     fs: std::sync::Arc<litebox_shim_linux::DefaultFS<Platform>>,
     page_manager: litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
+    relocations: litebox::mm::AddressRelocations,
 ) {
     use litebox_platform_windows_userland::process_fork as pf;
 
@@ -594,12 +595,41 @@ fn diag_process_fork_task_resume_probe(
          rip={:#x} rsp={:#x} -- entering real guest execution",
         ctx.rip, ctx.rsp
     );
+    // Arm the SAME post-fork stale-pointer verification the real, working thread-based fork path
+    // arms via `Task::init`'s `ThreadInitState::ForkedChild` branch (`begin_fork_child_
+    // verification`, litebox_shim_linux/src/syscalls/process.rs) -- this cross-process child never
+    // goes through that dispatch (it is built via `adopt_forked_process`, not `do_clone`'s
+    // same-process path), so without this call `fork_verify` never engages here and any stale
+    // pointer left over from the `WriteProcessMemory` copy (the same class of hazard the
+    // thread-based path's own verification exists to heal) goes completely unrepaired.
+    use litebox::platform::ForkChildVerificationProvider as _;
+    let verify_platform = Platform::new();
+    verify_platform.begin_fork_child_verification(std::sync::Arc::new(relocations));
+
+    let process = entrypoints.process();
     unsafe {
         litebox_platform_windows_userland::run_thread(entrypoints, &mut ctx);
     }
+    verify_platform.end_fork_child_verification();
     eprintln!(
         "[process_fork_diag] task-resume-probe (child): run_thread returned (guest thread terminated)"
     );
+
+    // Pass 142: this child process only ever exists as a `LITEBOX_PROCESS_FORK=1` cross-process
+    // fork() child (or this same probe's pre-existing diagnostic use, which never previously
+    // reached this point live) -- there is no other reason a `CreateProcessW`-spawned re-exec of
+    // this binary would take the task-resume path. Falling through to this function's caller and
+    // an ordinary `main()` return would exit with Windows code 0 regardless of the guest's real
+    // exit status, discarding exactly the information `sys_wait4`'s cross-process branch (see
+    // `litebox_shim_linux::syscalls::process::decode_cross_process_wait_status`) needs to report
+    // correctly to the parent. `wait_for_encoded_cross_process_exit_status` blocks for the real
+    // status (already available immediately -- `run_thread` only returns once the guest's last
+    // thread has terminated) and encodes it via the SAME scheme `sys_wait4` decodes.
+    let encoded = process.wait_for_encoded_cross_process_exit_status();
+    eprintln!(
+        "[process_fork_diag] task-resume-probe (child): exiting with encoded status {encoded:#x}"
+    );
+    std::process::exit(encoded.cast_signed());
 }
 
 /// Export the writable upper layer of a layered file system (every file the guest created or

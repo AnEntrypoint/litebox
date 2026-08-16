@@ -181,6 +181,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> LinuxShimEntrypoints<Platform, FS> {
+    /// Returns a handle to this task's underlying process, usable to wait for its exit after
+    /// this `LinuxShimEntrypoints` has been consumed (e.g. by
+    /// `litebox_platform_windows_userland::run_thread`, which takes it by value).
+    ///
+    /// Added for pass 142's production process-based-`fork()` child: a `CreateProcessW`-spawned
+    /// child built via [`LinuxShim::adopt_forked_process`] has no other way to recover its real
+    /// Linux exit status once `run_thread` has consumed the entrypoints it was called with -- see
+    /// [`LinuxShimProcess::wait_for_encoded_cross_process_exit_status`]'s doc comment for why that
+    /// status then needs to become this child's real Windows exit code.
+    pub fn process(&self) -> LinuxShimProcess<Platform> {
+        LinuxShimProcess(self.task.process().clone())
+    }
+
     fn enter_shim(
         &self,
         is_init: bool,
@@ -484,6 +497,33 @@ impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
             syscalls::process::ExitStatus::Exit(v) => v.into(),
             // TODO: return the enum instead of just a code?
             syscalls::process::ExitStatus::Signal(signal) => signal.as_i32() + 256,
+        }
+    }
+
+    /// Waits for the process to exit, then returns its exit status encoded into a raw Windows
+    /// exit code via the SAME scheme `syscalls::process::sys_wait4`'s cross-process branch
+    /// decodes (see `syscalls::process::decode_cross_process_wait_status`'s doc comment): high 16
+    /// bits `0xC0DE`, bit 15 set for `Signal`, low 8 bits the exit code or signal number.
+    ///
+    /// This is pass 142's production call site for that encoding -- a `LITEBOX_PROCESS_FORK=1`
+    /// cross-process fork() child (built via [`LinuxShim::adopt_forked_process`], resumed via
+    /// `litebox_platform_windows_userland::run_thread`) has no other way to deliver its real Linux
+    /// exit status to the parent's `wait4()`: this process IS a bare re-exec of the litebox
+    /// runner binary with no guest tar/CLI args of its own, so its normal Rust `main()` return
+    /// would otherwise exit 0 regardless of what the guest actually did. The caller is expected to
+    /// pass this value directly to `std::process::exit`.
+    pub fn wait_for_encoded_cross_process_exit_status(&self) -> u32 {
+        const CROSS_PROCESS_EXIT_MARKER: u32 = 0xC0DE_0000;
+        const CROSS_PROCESS_EXIT_SIGNAL_FLAG: u32 = 0x0000_8000;
+        match self.0.wait_for_exit() {
+            syscalls::process::ExitStatus::Exit(code) => {
+                CROSS_PROCESS_EXIT_MARKER | (u32::from(code.cast_unsigned()) & 0xff)
+            }
+            syscalls::process::ExitStatus::Signal(sig) => {
+                CROSS_PROCESS_EXIT_MARKER
+                    | CROSS_PROCESS_EXIT_SIGNAL_FLAG
+                    | (sig.as_i32().cast_unsigned() & 0xff)
+            }
         }
     }
 }
