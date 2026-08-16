@@ -4320,7 +4320,17 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
                 );
             ptr.to_owned_slice(range.len()).map(<[u8]>::into_vec)
         };
-        let relocations_line = relocations.serialize_for_diagnostic();
+        // PASS 150: the child's own `fork_verify` reads this line back and calls `translate()` on
+        // it to repair stale pointers it observes mid-execution -- but the cross-process child's
+        // real memory always lives at SOURCE coordinates (`copy_one_group` never uses `dest_base`
+        // to place bytes), so the child must see an IDENTITY relocation map, not the thread-based
+        // path's own `dest_base` values. See `AddressRelocations::identity_for_cross_process`'s
+        // doc comment for the exact fault this fixes (a repeating `EXECUTE/DEP` instruction-fetch
+        // crash from `fork_verify` "healing" a live `rip` into an unmapped thread-based-path
+        // destination address).
+        let relocations_line = relocations
+            .identity_for_cross_process()
+            .serialize_for_diagnostic();
         match process_fork::spawn_process_fork_child(
             group_relocations,
             &vma_layout,
