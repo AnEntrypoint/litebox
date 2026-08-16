@@ -1142,10 +1142,38 @@ pub fn spawn_process_fork_child(
     // narrowed to `PAGE_NOACCESS` -- narrowing is not needed to fix this crash and additively
     // narrowing every region here risks a DIFFERENT regression this pass has no evidence for; only
     // the EXEC bit is actionable/necessary from this fault's own evidence.
+    let diag_exec_fixup = std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_EXEC_FIXUP").is_some();
+    if diag_exec_fixup {
+        eprintln!(
+            "[process_fork] spawn_process_fork_child: exec-fixup covering {} vma_layout range(s), \
+             {} group_relocation span(s)",
+            vma_layout.len(),
+            group_relocations.len()
+        );
+        for (source_group, dest_base) in group_relocations {
+            eprintln!(
+                "[process_fork]   group source={:#x}..{:#x} dest_base={:#x}",
+                source_group.start, source_group.end, dest_base
+            );
+        }
+    }
     for (range, flags, _is_file_backed) in vma_layout {
         const VM_READ: u32 = 1 << 0;
         const VM_WRITE: u32 = 1 << 1;
         const VM_EXEC: u32 = 1 << 2;
+        if diag_exec_fixup {
+            let covered = group_relocations
+                .iter()
+                .any(|(g, _)| g.start <= range.start && range.end <= g.end);
+            eprintln!(
+                "[process_fork]   vma range={:#x}..{:#x} flags={:#x} exec={} covered_by_group={}",
+                range.start,
+                range.end,
+                flags,
+                flags & VM_EXEC != 0,
+                covered
+            );
+        }
         if flags & VM_EXEC == 0 {
             continue;
         }
@@ -1165,6 +1193,15 @@ pub fn spawn_process_fork_child(
                 &raw mut old_protect,
             )
         };
+        if diag_exec_fixup {
+            eprintln!(
+                "[process_fork]   VirtualProtectEx range={:#x}..{:#x} protect={protect:#x} ok={} \
+                 old_protect={old_protect:#x}",
+                range.start,
+                range.end,
+                ok != 0
+            );
+        }
         if ok == 0 {
             fail_teardown!(
                 "[process_fork] spawn_process_fork_child: VirtualProtectEx (exec fixup) FAILED \

@@ -163,6 +163,57 @@ impl AddressRelocations {
         self.heap_top
     }
 
+    /// Returns a copy of this relocation map with every `dest_base` (both per-range and
+    /// per-group) forced to equal its own `source_range.start`, i.e. [`Self::translate`] becomes
+    /// the identity function everywhere.
+    ///
+    /// [`PageManager::duplicate`] always computes `dest_base` for the THREAD-based `fork()` case
+    /// (a genuinely separate destination `Vmem` in the SAME OS process, at freshly-chosen
+    /// addresses -- see that method's own doc comment on why non-shared regions are relocated in
+    /// coherent groups). The cross-process `fork()` mechanism
+    /// (`spawn_process_fork_child`/`copy_one_group`, `litebox_platform_windows_userland`) never
+    /// uses those `dest_base` values to place memory -- by design, `copy_one_group` always
+    /// `VirtualAllocEx`s and `WriteProcessMemory`s at each group's exact SOURCE address in the
+    /// fresh child process (a fresh Windows process has nothing else occupying the parent's own
+    /// addresses, so preserving them verbatim is the whole point -- see pass 108/109's design and
+    /// pass 144's `FINDINGS.txt` section fixing the analogous bug in the initial register
+    /// snapshot). But this SAME `AddressRelocations` object -- with its thread-based-path
+    /// `dest_base` values still intact -- is also handed, unmodified, to `fork_verify`'s reactive
+    /// single-step healer (`on_single_step`'s "stale CODE pointer" case), which calls
+    /// [`Self::translate`] to repair a stale `rip`/`rbp`/data pointer it observes mid-execution.
+    /// For a cross-process child, translating through the thread-based `dest_base` produces a
+    /// coordinate that was NEVER populated in that child (nothing lives there -- `copy_one_group`
+    /// only ever wrote source-coordinate addresses), causing the exact repeating
+    /// `STATUS_ACCESS_VIOLATION: EXECUTE/DEP` instruction-fetch fault this method exists to fix
+    /// (pass 150 of `scratchpad/jqrepro/FINDINGS.txt`: a source-coordinate `rip` inside group
+    /// `0x7feffff40000..0x7fefffff0000` with real `dest_base=0xcf0000` was "healed" to
+    /// `0xd5064b = 0xcf0000 + (rip - 0x7feffff40000)`, a fully unmapped address in the child).
+    /// The caller building the cross-process child's relocation line (`spawn_cross_process_fork_
+    /// child`) applies this transform before serializing, so every consumer downstream of that
+    /// wire format -- `fork_verify` included -- sees a `translate()` that is a correct no-op for
+    /// this fork mechanism, with zero change to the thread-based path's own `AddressRelocations`
+    /// (constructed and used directly, never through this method).
+    #[must_use]
+    pub fn identity_for_cross_process(&self) -> Self {
+        Self {
+            ranges: self
+                .ranges
+                .iter()
+                .map(|(range, _)| (range.clone(), range.start))
+                .collect(),
+            executable: self.executable.clone(),
+            private_data: self.private_data.clone(),
+            is_file_backed: self.is_file_backed.clone(),
+            flags: self.flags.clone(),
+            heap_top: self.heap_top,
+            group_relocations: self
+                .group_relocations
+                .iter()
+                .map(|(range, _)| (range.clone(), range.start))
+                .collect(),
+        }
+    }
+
     /// Serializes this object's raw fields into a single newline-free text line, the inverse of
     /// [`Self::from_raw_parts_for_diagnostic`].
     ///
