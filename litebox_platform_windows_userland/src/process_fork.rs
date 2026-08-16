@@ -751,7 +751,7 @@ pub const FORK_CHILD_GPRS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_GPRS";
 #[must_use]
 pub fn serialize_full_gprs(g: &litebox::platform::ForkFullGprSnapshot) -> String {
     format!(
-        "{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x}",
+        "{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x}",
         g.r15,
         g.r14,
         g.r13,
@@ -773,6 +773,7 @@ pub fn serialize_full_gprs(g: &litebox::platform::ForkFullGprSnapshot) -> String
         g.eflags,
         g.rsp,
         g.ss,
+        g.fs_base,
     )
 }
 
@@ -806,6 +807,7 @@ pub fn deserialize_full_gprs(line: &str) -> Option<litebox::platform::ForkFullGp
         eflags: next()?,
         rsp: next()?,
         ss: next()?,
+        fs_base: next()?,
     };
     if it.next().is_some() {
         return None;

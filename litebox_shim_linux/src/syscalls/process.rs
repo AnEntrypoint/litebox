@@ -1971,6 +1971,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 eflags: child_ctx.eflags,
                 rsp: child_ctx.rsp,
                 ss: child_ctx.ss,
+                // Overwritten with the real, translated `fs_base` just below (before the
+                // cross-process branch uses it) -- 0 here is never observed live.
+                fs_base: 0,
             });
             #[cfg(not(target_arch = "x86_64"))]
             let full_translated_gprs = None;
@@ -1981,7 +1984,67 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 full_translated_gprs,
             );
 
-            // Pass 142: production process-based fork(), opt-in via `LITEBOX_PROCESS_FORK=1`
+            // The child runs on a brand-new host thread (or, for the cross-process path below, an
+            // entirely new host process), whose platform-level FS base (backing the guest's TLS
+            // pointer) starts unset -- explicitly propagate the parent's current value so the
+            // child's TLS accesses (which libc issues immediately after `clone()`/`fork()`
+            // returns) don't dereference FS base 0. See `ThreadInitState::ForkedChild`'s doc
+            // comment. Computed here, BEFORE the cross-process branch below (rather than at its
+            // original pass-111 position just before `ThreadInitState::ForkedChild` is
+            // constructed), so both the thread-based and cross-process paths can use the exact
+            // same already-fixed-up value -- pass 142 found the cross-process child never called
+            // `arch_prctl(SetFs(..))` at all because this computation used to happen strictly
+            // after the cross-process branch already returned.
+            //
+            // Like `rip`/`rsp`/`rbp` above, this is a guest address (validated against
+            // `USER_ADDR_END` by `is_valid_user_fs_base`), not a host pointer -- and it points at
+            // musl's `struct pthread` TCB, which per musl's own `__init_tls.c` layout lives
+            // directly adjacent to the thread's stack, i.e. within the same relocation group
+            // `Vmem::duplicate` may move for the child. Without translation the child's `%fs`
+            // would point at the PARENT's original TCB address instead of its own relocated copy,
+            // and the child's first TLS access (which musl issues immediately on return from
+            // `clone()`) would dereference the wrong guest address.
+            #[cfg(target_arch = "x86_64")]
+            let fs_base = {
+                let parent_fs_base = self
+                    .global
+                    .platform
+                    .get_arch_specific_register(&ArchSpecificRegister::FsBase)
+                    .map_err(Errno::from)?;
+                let child_fs_base = relocations
+                    .translate(parent_fs_base)
+                    .unwrap_or(parent_fs_base);
+
+                // The x86-64 TLS ABI requires the thread pointer to be *self-referential*: the
+                // word at `%fs:0` holds the thread pointer's own value, and that is how position-
+                // independent code materializes it at all (`mov reg, fs:[0]`, which musl's
+                // `__pthread_self()` -- and hence every `errno` access -- compiles to; the CPU
+                // cannot read `%fs.base` directly from user mode). That word lives in *memory*,
+                // so `Vmem::duplicate` copies it verbatim and it still holds the PARENT's TCB
+                // address in the child. Translating the FS base register alone therefore is not
+                // enough: the child's very first `errno` write would compute its address from the
+                // stale self-pointer and land in the parent's live TCB.
+                //
+                // Fix up that one ABI-mandated slot so the child's thread pointer is
+                // self-consistent, exactly as the register translation above intends. For the
+                // cross-process path this is `WriteProcessMemory`-visible immediately: the slot
+                // lives inside one of `Vmem::duplicate`'s own relocation groups, already
+                // `WriteProcessMemory`-copied into the child process by the time this write
+                // happens, since this is still the PARENT's own address space (the child's
+                // corresponding page is a separate, but byte-identical-until-this-write, physical
+                // mapping) -- so writing it here, on the parent's thread, before the child process
+                // is ever resumed, is exactly as correct as it is for the thread-based case.
+                if child_fs_base != parent_fs_base {
+                    let slot = UserPtrMut::<usize>::from_usize(child_fs_base);
+                    let _ = slot.write_at_offset::<Platform>(0, child_fs_base);
+                }
+
+                child_fs_base
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let fs_base = 0;
+
+            // Pass 142/143: production process-based fork(), opt-in via `LITEBOX_PROCESS_FORK=1`
             // (checked platform-side, inside `spawn_cross_process_fork_child` itself -- this
             // crate is `no_std` and cannot read the environment directly; the default
             // implementation and every platform but Windows return `None` unconditionally, which
@@ -1998,8 +2061,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // any failure (or when the platform has no such mechanism, or fds are too complex),
             // falls through completely unchanged into the existing, always-available thread-based
             // path -- zero risk to anyone not explicitly opting in via the env var.
+            //
+            // Pass 143: `full_gprs.fs_base` carries the SAME already-translated-and-fixed-up
+            // `fs_base` computed just above, so the cross-process child can call
+            // `arch_prctl(SetFs(..))` on itself before ever resuming guest code -- see
+            // `diag_process_fork_task_resume_probe`'s use of this field.
             if fd_complexity.beyond_stdio == 0
-                && let Some(full_gprs) = full_translated_gprs
+                && let Some(mut full_gprs) = full_translated_gprs
+                && {
+                    full_gprs.fs_base = fs_base;
+                    true
+                }
                 && let Some(handle) = self
                     .global
                     .platform
@@ -2041,53 +2113,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .lock()
                 .push((child_tid, thread.process.clone()));
 
-            // The child runs on a brand-new host thread, whose platform-level FS base (backing
-            // the guest's TLS pointer) starts unset -- explicitly propagate the parent's current
-            // value so the child's TLS accesses (which libc issues immediately after `clone()`
-            // returns) don't dereference FS base 0. See `ThreadInitState::ForkedChild`'s doc
-            // comment.
-            //
-            // Like `rip`/`rsp`/`rbp` above, this is a guest address (validated against
-            // `USER_ADDR_END` by `is_valid_user_fs_base`), not a host pointer -- and it points at
-            // musl's `struct pthread` TCB, which per musl's own `__init_tls.c` layout lives
-            // directly adjacent to the thread's stack, i.e. within the same relocation group
-            // `Vmem::duplicate` may move for the child. Without translation the child's `%fs`
-            // would point at the PARENT's original TCB address instead of its own relocated
-            // copy, and the child's first TLS access (which musl issues immediately on return
-            // from `clone()`) would dereference the wrong guest address.
-            #[cfg(target_arch = "x86_64")]
-            let fs_base = {
-                let parent_fs_base = self
-                    .global
-                    .platform
-                    .get_arch_specific_register(&ArchSpecificRegister::FsBase)
-                    .map_err(Errno::from)?;
-                let child_fs_base = relocations
-                    .translate(parent_fs_base)
-                    .unwrap_or(parent_fs_base);
-
-                // The x86-64 TLS ABI requires the thread pointer to be *self-referential*: the
-                // word at `%fs:0` holds the thread pointer's own value, and that is how position-
-                // independent code materializes it at all (`mov reg, fs:[0]`, which musl's
-                // `__pthread_self()` -- and hence every `errno` access -- compiles to; the CPU
-                // cannot read `%fs.base` directly from user mode). That word lives in *memory*,
-                // so `Vmem::duplicate` copies it verbatim and it still holds the PARENT's TCB
-                // address in the child. Translating the FS base register alone therefore is not
-                // enough: the child's very first `errno` write would compute its address from
-                // the stale self-pointer and land in the parent's live TCB.
-                //
-                // Fix up that one ABI-mandated slot so the child's thread pointer is
-                // self-consistent, exactly as the register translation above intends.
-                if child_fs_base != parent_fs_base {
-                    let slot = UserPtrMut::<usize>::from_usize(child_fs_base);
-                    let _ = slot.write_at_offset::<Platform>(0, child_fs_base);
-                }
-
-                child_fs_base
-            };
-            #[cfg(not(target_arch = "x86_64"))]
-            let fs_base = 0;
-
+            // `fs_base` was already computed above (before the cross-process branch), fixing up
+            // the ABI self-pointer slot at the same time -- reused verbatim here for the
+            // thread-based path, exactly as before pass 143 moved the computation earlier.
             (
                 thread,
                 ThreadInitState::ForkedChild(

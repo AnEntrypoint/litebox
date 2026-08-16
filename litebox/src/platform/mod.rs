@@ -786,6 +786,14 @@ pub struct ForkFullGprSnapshot {
     pub eflags: usize,
     pub rsp: usize,
     pub ss: usize,
+    /// Pass 143: the already-translated-and-fixed-up `%fs` base (see `do_clone`'s `fs_base`
+    /// computation, `litebox_shim_linux/src/syscalls/process.rs`) the child's own host thread
+    /// must install via `arch_prctl(ARCH_SET_FS(..))`-equivalent before ever resuming guest
+    /// code. The thread-based fork path gets this for free (`ThreadInitState::ForkedChild`'s own
+    /// `fs_base` field, set on the SAME OS thread that goes on to run the guest); a
+    /// cross-process child is a brand-new OS thread in a brand-new OS process with no such
+    /// propagation, so this field is the cross-process carrier for the exact same value.
+    pub fs_base: usize,
 }
 
 /// Cheap, read-only classification of a fork()ing process's fd table, computed in `do_clone`

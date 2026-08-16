@@ -1055,12 +1055,49 @@ pub unsafe fn run_thread(
     ctx: &mut litebox_common_linux::PtRegs,
 ) {
     ensure_tls_index();
-    run_thread_inner(&shim, ctx);
+    run_thread_inner(&shim, ctx, None);
+}
+
+/// Identical to [`run_thread`], but additionally arms [`fork_verify`]'s post-fork stale-pointer
+/// single-step verification for this thread -- the cross-process fork() child's equivalent of what
+/// the thread-based fork path's own `ThreadInitState::ForkedChild` dispatch achieves via
+/// `EnterShim::init` (`litebox_shim_linux/src/syscalls/process.rs`'s `begin_fork_child_verification`
+/// call, itself invoked from inside `run_thread_arch`'s guest-entry machinery, strictly after TLS
+/// installation).
+///
+/// # Why this exists (pass 143)
+///
+/// A cross-process fork() child is built via `LinuxShim::adopt_forked_process`, not `do_clone`'s
+/// same-process `ThreadInitState::ForkedChild` path, so it never goes through that dispatch. Before
+/// this function existed, callers (the diagnostic/production task-resume probes in
+/// `litebox_runner_linux_on_windows_userland`) called
+/// `ForkChildVerificationProvider::begin_fork_child_verification` directly, BEFORE calling
+/// [`run_thread`] -- but that provider method's own implementation (`fork_verify::begin`) only takes
+/// effect if `get_tls_ptr()` returns `Some`, which is only true from partway through
+/// [`run_thread`]'s own internals ([`ThreadHandle::run_with_handle`]'s `install_tls` call) onward.
+/// Called too early, `fork_verify::begin`'s `tls.fork_verify = Some(relocations)` step was silently
+/// a no-op (the `if let Some(tls) = get_tls_ptr()` guard simply never entered its body), leaving
+/// `fork_verify::is_verifying` permanently `false` for the whole resumed thread -- the guest's
+/// single-step healing regime never engaged, and any stale pointer left over from the parent's
+/// `WriteProcessMemory` memory copy went completely unrepaired, producing an unexplained
+/// `STATUS_ACCESS_VIOLATION` on the guest's very first few instructions with zero VEH trace output
+/// (the SAME symptom shape as a missing FS base, but a distinct root cause).
+///
+/// # Safety
+/// Same contract as [`run_thread`].
+pub unsafe fn run_thread_with_fork_verification(
+    shim: impl litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    ctx: &mut litebox_common_linux::PtRegs,
+    relocations: Arc<litebox::mm::AddressRelocations>,
+) {
+    ensure_tls_index();
+    run_thread_inner(&shim, ctx, Some(relocations));
 }
 
 fn run_thread_inner(
     shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     ctx: &mut litebox_common_linux::PtRegs,
+    fork_verify_relocations: Option<Arc<litebox::mm::AddressRelocations>>,
 ) {
     let tls_state = TlsState::new();
     tls_state
@@ -1073,6 +1110,13 @@ fn run_thread_inner(
         tls: &tls_state,
     };
     ThreadHandle::run_with_handle(&tls_state, || unsafe {
+        // Arm fork_verify (if requested) strictly AFTER `run_with_handle`'s own `install_tls` call
+        // (already done by the time this closure body runs) and strictly BEFORE `run_thread_arch`
+        // ever resumes guest code -- see this function's caller, `run_thread_with_fork_verification`,
+        // for why the timing matters.
+        if let Some(relocations) = fork_verify_relocations {
+            fork_verify::begin(relocations);
+        }
         run_thread_arch(&mut thread_ctx, &tls_state);
     });
 }
@@ -1744,7 +1788,7 @@ fn thread_start(
     // Allow caller to run some code before we return to the new thread.
     let shim = init_thread.init();
 
-    run_thread_inner(shim.as_ref(), &mut ctx);
+    run_thread_inner(shim.as_ref(), &mut ctx, None);
 }
 
 impl litebox::platform::ThreadProvider for WindowsUserland {
