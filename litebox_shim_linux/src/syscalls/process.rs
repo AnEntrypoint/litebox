@@ -1977,6 +1977,92 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             });
             #[cfg(not(target_arch = "x86_64"))]
             let full_translated_gprs = None;
+
+            // PASS 144: a SEPARATE, UNTRANSLATED (source-coordinate) register snapshot for the
+            // cross-process branch below, built from the ORIGINAL `ctx` rather than `child_ctx`.
+            //
+            // `child_ctx`/`full_translated_gprs` above are relocation-TRANSLATED (every pointer-
+            // shaped register rewritten from the parent's source address to `dest_pm`'s newly
+            // allocated destination address) because the thread-based fork path this translation
+            // was designed for really does place the child's memory content at those `dest_base`
+            // addresses (see `AddressRelocations`/`Vmem::duplicate`'s own doc comments: the
+            // SAME-process child cannot reuse the parent's own live source addresses, since they
+            // are already occupied in that same address space, so `pm.duplicate` allocates fresh
+            // memory elsewhere and `relocations` records the shift).
+            //
+            // The cross-process path is fundamentally different: `spawn_process_fork_child`'s own
+            // `copy_one_group` (`litebox_platform_windows_userland/src/process_fork.rs`)
+            // deliberately `VirtualAlloc2`s each reservation group at its ORIGINAL SOURCE address
+            // in the brand-new, genuinely separate Windows process (this is pass 108/109's whole
+            // design point: a fresh process has nothing else occupying those addresses, so the
+            // parent's exact layout can be preserved byte-for-byte instead of relocated) -- so the
+            // cross-process child's real, `WriteProcessMemory`-copied content lives at SOURCE
+            // coordinates, not `dest_base` coordinates. Live-confirmed via an external
+            // `DebugActiveProcess` observer (`LITEBOX_DIAG_PROCESS_FORK_EXTERNAL_DEBUGGER=1`,
+            // `litebox_platform_windows_userland::process_fork::observe_real_resume_fault`): every
+            // run showed a 100%-reproducible `STATUS_ACCESS_VIOLATION` EXECUTE/DEP fault with the
+            // faulting address EXACTLY equal to the resumed `Rip`, and that `Rip` (the dest-
+            // translated value) fell inside a *different* reservation group's `dest_base` range
+            // than the group containing the guest's real, source-coordinate entry point -- i.e. the
+            // resumed register state pointed at content that was never written there at all,
+            // because `copy_one_group` wrote it at the SOURCE address instead. Feeding the
+            // dest-translated `full_translated_gprs` into `spawn_cross_process_fork_child` was
+            // therefore a genuine coordinate-space bug, not a missing-permission bug (the earlier,
+            // now-reverted `VirtualProtectEx` executable-permission fixup in `copy_one_group`'s
+            // caller made no difference precisely because it was walking `vma_layout()`'s SOURCE
+            // ranges while the crash was a dest-coordinate `Rip` pointing outside every one of
+            // them).
+            //
+            // `sanitize_for_user_return`'s CS/SS/RFLAGS normalization is unrelated to address
+            // translation (pure ABI hygiene for a freshly resumed context) and is still applied
+            // here. The two proactive stale-pointer fixup passes below
+            // (`fixup_stale_stack_pointers`/`fixup_stale_elf_data_pointers`) are NOT applied to
+            // this snapshot: both write directly into `UserPtrMut::from_usize(dest_addr)`, i.e.
+            // into the CALLING (parent) process's own address space at `dest_base` coordinates --
+            // for the cross-process child, that is a different, unrelated process, so those writes
+            // would not reach the child's memory at all even if retargeted at source coordinates
+            // (this snapshot has none of `dest_base`'s stale-in-a-different-sense pointer hazards
+            // to begin with, since nothing here was relocated). `fork_verify`'s existing reactive,
+            // single-step healing (armed by `run_thread_with_fork_verification`, pass 143) remains
+            // the cross-process child's own safety net for any stale-pointer class this proactive
+            // pass would otherwise catch, exactly as this function's own comment already documents
+            // for the thread-based path's residual cases.
+            #[cfg(target_arch = "x86_64")]
+            let cross_process_gprs = {
+                let mut source_ctx = ctx.clone();
+                let sanitized = source_ctx.sanitize_for_user_return();
+                debug_assert!(
+                    sanitized,
+                    "forked child's rip/rsp left the user address range"
+                );
+                Some(litebox::platform::ForkFullGprSnapshot {
+                    r15: source_ctx.r15,
+                    r14: source_ctx.r14,
+                    r13: source_ctx.r13,
+                    r12: source_ctx.r12,
+                    rbp: source_ctx.rbp,
+                    rbx: source_ctx.rbx,
+                    r11: source_ctx.r11,
+                    r10: source_ctx.r10,
+                    r9: source_ctx.r9,
+                    r8: source_ctx.r8,
+                    rax: source_ctx.rax,
+                    rcx: source_ctx.rcx,
+                    rdx: source_ctx.rdx,
+                    rsi: source_ctx.rsi,
+                    rdi: source_ctx.rdi,
+                    orig_rax: source_ctx.orig_rax,
+                    rip: source_ctx.rip,
+                    cs: source_ctx.cs,
+                    eflags: source_ctx.eflags,
+                    rsp: source_ctx.rsp,
+                    ss: source_ctx.ss,
+                    // Overwritten with the untranslated `parent_fs_base` just below.
+                    fs_base: 0,
+                })
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let cross_process_gprs: Option<litebox::platform::ForkFullGprSnapshot> = None;
             self.global.platform.diagnostic_process_fork_probe(
                 &relocations,
                 fd_complexity,
@@ -2044,6 +2130,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             #[cfg(not(target_arch = "x86_64"))]
             let fs_base = 0;
 
+            // PASS 144: the cross-process child's FS base must stay UNTRANSLATED (source
+            // coordinates), matching `cross_process_gprs` above -- for the same reason `rip`/`rsp`
+            // above must not be dest-translated for that path. Also skips the self-referential
+            // `%fs:0` slot fixup entirely: that write targets `UserPtrMut::from_usize(dest coord)`
+            // in the PARENT's own address space (see `fs_base`'s block above), which cannot reach
+            // the cross-process child's memory at all -- for the cross-process case the slot at
+            // `%fs:0` in the PARENT's SOURCE-coordinate address space already correctly holds the
+            // parent's own (== child's, since source==dest for this path) FS base value verbatim,
+            // copied byte-for-byte by `copy_one_group`'s `WriteProcessMemory`, so no fixup is
+            // needed there at all.
+            #[cfg(target_arch = "x86_64")]
+            let cross_process_fs_base = self
+                .global
+                .platform
+                .get_arch_specific_register(&ArchSpecificRegister::FsBase)
+                .map_err(Errno::from)?;
+            #[cfg(not(target_arch = "x86_64"))]
+            let cross_process_fs_base: usize = 0;
+
             // Pass 142/143: production process-based fork(), opt-in via `LITEBOX_PROCESS_FORK=1`
             // (checked platform-side, inside `spawn_cross_process_fork_child` itself -- this
             // crate is `no_std` and cannot read the environment directly; the default
@@ -2067,9 +2172,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // `arch_prctl(SetFs(..))` on itself before ever resuming guest code -- see
             // `diag_process_fork_task_resume_probe`'s use of this field.
             if fd_complexity.beyond_stdio == 0
-                && let Some(mut full_gprs) = full_translated_gprs
+                && let Some(mut full_gprs) = cross_process_gprs
                 && {
-                    full_gprs.fs_base = fs_base;
+                    full_gprs.fs_base = cross_process_fs_base;
                     true
                 }
                 && let Some(handle) = self

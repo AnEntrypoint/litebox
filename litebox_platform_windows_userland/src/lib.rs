@@ -4311,6 +4311,7 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
     ) -> Option<litebox::platform::CrossProcessChildHandle> {
         std::env::var_os("LITEBOX_PROCESS_FORK")?;
         let group_relocations = relocations.group_relocations();
+        let vma_layout = relocations.vma_layout();
         let read_source_bytes = |range: core::ops::Range<usize>| {
             use litebox::platform::RawConstPointer as _;
             let ptr =
@@ -4322,6 +4323,7 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         let relocations_line = relocations.serialize_for_diagnostic();
         match process_fork::spawn_process_fork_child(
             group_relocations,
+            &vma_layout,
             read_source_bytes,
             full_gprs,
             relocations_line,
