@@ -1,0 +1,10 @@
+[package]
+name = "litebox_termemu"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+vt100 = "0.16"
+
+[lints]
+workspace = true
