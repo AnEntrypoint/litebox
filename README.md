@@ -22,41 +22,46 @@ Example use cases include:
 
 ![LiteBox and related projects](./.figures/litebox.svg)
 
-## This build: real interactive Linux shells on Windows
+## This build: real interactive Linux shells
 
-This checkout carries a set of fixes on top of upstream LiteBox that make the
-`litebox_runner_linux_on_windows_userland` target usable as a genuine,
-interactive Linux userland on Windows -- not just for running a single
-non-interactive command, but for driving a real shell session the way a human
-would: typing at a prompt, running `apk`/package-manager workflows, and using
-REPLs like Node's that depend on raw-mode terminal I/O, job control, and
-correct multithreaded stdio.
+This checkout carries a set of fixes on top of upstream LiteBox that make
+LiteBox usable as a genuine, interactive Linux userland -- not just for
+running a single non-interactive command, but for driving a real shell
+session the way a human would: typing at a prompt, running
+`apk`/package-manager workflows, and using REPLs like Node's that depend on
+raw-mode terminal I/O, job control, and correct multithreaded stdio. Most of
+these fixes live in `litebox_shim_linux` (the "North" shim shared by every
+platform LiteBox runs on) and so apply equally to
+`litebox_runner_linux_on_windows_userland` and `litebox_runner_linux_userland`
+(the native-Linux runner); a few are specific to one target and are called
+out explicitly below.
 
 Concretely, this build fixes (all landed on `main`, CI-verified):
 
-- **Real interactive keyboard input.** Typed keystrokes are now correctly
-  delivered to the guest shell instead of being silently dropped or hanging
-  the process (a missing epoll wakeup path and a Windows console
-  cooked-mode/CPR-reply bug).
+- **Real interactive keyboard input (Windows-specific).** Typed keystrokes
+  are now correctly delivered to the guest shell instead of being silently
+  dropped or hanging the process (a missing epoll wakeup path and a Windows
+  console cooked-mode/CPR-reply bug).
 - **`setRawMode`/raw terminal mode** (used by Node's REPL, `less`, `vim`,
   Python's `readline`, and any program that manages its own line editing) no
   longer crashes with `ENOTTY`.
 - **Job control.** `TIOCSPGRP`/`TIOCGPGRP` are implemented, so shells no
   longer fall back to `can't access tty; job control turned off`.
-- **A deep, multi-stage `fork()` correctness fix on Windows.** LiteBox
-  duplicates a forked child's address space to new host addresses (Windows
-  can't give two "processes" the same addresses in one host process), which
-  left a class of stale, untranslated pointers reachable after `fork()` --
-  fixed for both code pages (a `STATUS_PRIVILEGED_INSTRUCTION` crash on
-  chained shell commands) and argv/data pointers (intermittent, and in one
-  case perfectly deterministic per-command-length, corruption of a freshly
-  exec'd command's arguments).
+- **A deep, multi-stage `fork()` correctness fix (Windows-specific).**
+  LiteBox duplicates a forked child's address space to new host addresses on
+  Windows (Windows can't give two "processes" the same addresses in one host
+  process; this doesn't apply to the native-Linux runner, which uses a real
+  `fork()`), which left a class of stale, untranslated pointers reachable
+  after `fork()` -- fixed for both code pages (a `STATUS_PRIVILEGED_INSTRUCTION`
+  crash on chained shell commands) and argv/data pointers (intermittent, and
+  in one case perfectly deterministic per-command-length, corruption of a
+  freshly exec'd command's arguments).
 - **`chmod`/`fchmod`/`fchmodat`, `utimensat`/`futimens`, and `flock`**, which
   were previously unimplemented (`ENOSYS`) despite the underlying filesystem
   layer already supporting them.
-- **A real userspace NAT gateway** for guest network access on Windows,
-  needing neither Administrator privileges nor a driver, so `apk`/`curl`/etc.
-  can reach the real network.
+- **A real userspace NAT gateway (Windows-specific)** for guest network
+  access, needing neither Administrator privileges nor a driver, so
+  `apk`/`curl`/etc. can reach the real network.
 - **Multithreaded process correctness**: a lost-wakeup race in `poll()`, an
   unbounded UDP NAT flow leak, orphan-process reparenting, a process-exit fd
   leak that could hang pipe readers, and a missing `FUTEX_REQUEUE`
