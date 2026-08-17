@@ -1486,6 +1486,38 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.exit_group(ExitStatus::Exit(status.trunc()));
     }
 
+    /// Pass 157: after a cross-process `fork()` child has been observed to exit (but before it is
+    /// reaped from the registry), pulls back any writable filesystem-layer changes it made (e.g.
+    /// `apk`'s installed packages) and applies them into THIS process's own writable layer --
+    /// closing the gap pass 156 (STEP 7/8 of `scratchpad/jqrepro/FINDINGS.txt`) documented: a
+    /// cross-process child's independently-reconstructed in-memory filesystem previously
+    /// vanished with the child's own process on exit, invisible to a later `&&`/pipeline-chained
+    /// command running in the parent shell's own process. Best-effort: `None` (no export was
+    /// produced, or this platform has no cross-process fork support) or a malformed archive is
+    /// silently ignored rather than failing the wait -- exactly matching this child's own
+    /// best-effort export (see `diag_process_fork_task_resume_probe`'s doc comment), so a lost
+    /// filesystem propagation degrades to pre-pass-157 behavior instead of breaking `wait4`
+    /// itself for callers that don't care about the writable layer at all.
+    fn import_cross_process_writable_layer(
+        &self,
+        handle: litebox::platform::CrossProcessChildHandle,
+    ) {
+        let Some(tar_bytes) = self
+            .global
+            .platform
+            .take_cross_process_writable_layer_export(handle)
+        else {
+            return;
+        };
+        let fs = self.files.borrow().fs.clone();
+        if let Err(e) = litebox::fs::import::import_all(&*fs, &tar_bytes) {
+            litebox_util_log::warn!(
+                error:? = e;
+                "wait4: failed to import cross-process child's exported writable layer"
+            );
+        }
+    }
+
     /// Handle syscall `wait4`.
     ///
     /// Supports waiting for a specific child (`pid > 0`) or any child (`pid == -1`), either
@@ -1529,6 +1561,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             } else {
                 self.global.platform.wait_for_cross_process_exit(handle)
             };
+            self.import_cross_process_writable_layer(handle);
             process.reap_cross_process_child(pid);
             let encoded = decode_cross_process_wait_status(raw_exit);
             if let Some(wstatus) = wstatus {
@@ -1568,6 +1601,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 } else {
                     self.global.platform.wait_for_cross_process_exit(handle)
                 };
+                self.import_cross_process_writable_layer(handle);
                 process.reap_cross_process_child(cross_pid);
                 let encoded = decode_cross_process_wait_status(raw_exit);
                 if let Some(wstatus) = wstatus {

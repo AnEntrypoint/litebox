@@ -4311,6 +4311,30 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         process_fork::diagnostic_cross_process_wait4_probe(register);
     }
 
+    fn take_cross_process_writable_layer_export(
+        &self,
+        handle: litebox::platform::CrossProcessChildHandle,
+    ) -> Option<alloc::vec::Vec<u8>> {
+        // The child's own export path is derived from its REAL Windows pid (see
+        // `process_fork::cross_process_writable_export_path`'s doc comment) -- recover that pid
+        // from the still-open process `HANDLE` this registry entry carries, exactly as
+        // `spawn_process_fork_child`'s own diagnostics already do via `GetProcessId`.
+        let raw_handle = handle.0 as windows_sys::Win32::Foundation::HANDLE;
+        let pid = unsafe { windows_sys::Win32::System::Threading::GetProcessId(raw_handle) };
+        if pid == 0 {
+            return None;
+        }
+        let tar_path = std::env::var_os(process_fork::FORK_CHILD_TAR_PATH_ENV_VAR)?;
+        let export_path =
+            process_fork::cross_process_writable_export_path(std::path::Path::new(&tar_path), pid);
+        let bytes = std::fs::read(&export_path).ok()?;
+        // The export is single-use: once read back into the parent, remove it so a later,
+        // unrelated child that happens to reuse the same (now-recycled) pid never sees a stale
+        // archive left over from a previous run.
+        let _ = std::fs::remove_file(&export_path);
+        Some(bytes)
+    }
+
     fn spawn_cross_process_fork_child(
         &self,
         relocations: &litebox::mm::AddressRelocations,
