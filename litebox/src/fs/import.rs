@@ -7,7 +7,7 @@
 //! calls.
 //!
 //! Walks the archive's raw 512-byte POSIX header blocks directly (the same technique
-//! [`super::tar_ro::TarIndex::new`] uses, for the same reason: `tar_no_std::TarArchiveRef::
+//! `super::tar_ro::TarIndex::new` uses, for the same reason: `tar_no_std::TarArchiveRef::
 //! entries()` silently skips every non-regular-file entry, so a symlink in the archive would
 //! otherwise be invisible), so this stays `no_std`/`alloc`-only like the rest of this crate --
 //! unlike [`super::export`]'s sibling doc comment, this module both reads its input format
