@@ -593,6 +593,7 @@ fn diag_process_fork_task_resume_probe(
         gid: 0,
         egid: 0,
     };
+    let fs_for_export = fs.clone();
     let entrypoints = shim.adopt_forked_process(fs, task_params, page_manager);
 
     let mut ctx = litebox_common_linux::PtRegs {
@@ -732,6 +733,33 @@ fn diag_process_fork_task_resume_probe(
     // status (already available immediately -- `run_thread` only returns once the guest's last
     // thread has terminated) and encodes it via the SAME scheme `sys_wait4` decodes.
     let encoded = process.wait_for_encoded_cross_process_exit_status();
+
+    // Pass 157: export this child's writable filesystem-layer deltas (every file it created or
+    // modified during its run, e.g. `apk`'s installed packages) to the SAME deterministic,
+    // pid-keyed path the parent's `sys_wait4` cross-process branch reads back from once it
+    // observes this exit -- closing the gap pass 156 (STEP 7/8) documented: a cross-process
+    // child's filesystem writes previously vanished with its own process, invisible to the
+    // parent's subsequent `&&`/pipeline commands. Best-effort: if the tar path never arrived (the
+    // env var missing, or a write failure), the child still exits with its real, correctly
+    // encoded status below -- a lost filesystem export degrades to today's pre-pass-157 behavior
+    // rather than blocking this process's own exit.
+    if let Some(tar_path) = std::env::var_os(pf::FORK_CHILD_TAR_PATH_ENV_VAR) {
+        let export_path = pf::cross_process_writable_export_path(
+            std::path::Path::new(&tar_path),
+            std::process::id(),
+        );
+        match export_writable_layer(&fs_for_export, &export_path) {
+            Ok(()) => eprintln!(
+                "[process_fork_diag] task-resume-probe (child): exported writable layer to {}",
+                export_path.display()
+            ),
+            Err(e) => eprintln!(
+                "[process_fork_diag] task-resume-probe (child): failed to export writable layer to {}: {e}",
+                export_path.display()
+            ),
+        }
+    }
+
     eprintln!(
         "[process_fork_diag] task-resume-probe (child): exiting with encoded status {encoded:#x}"
     );

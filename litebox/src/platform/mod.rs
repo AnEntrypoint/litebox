@@ -674,6 +674,34 @@ pub trait ForkChildVerificationProvider {
         )
     }
 
+    /// Pass 157: after `sys_wait4` has observed cross-process child `handle`'s real exit (via
+    /// [`Self::wait_for_cross_process_exit`]/[`Self::try_wait_for_cross_process_exit`]) but
+    /// BEFORE reaping it from the registry, returns the raw bytes of a tar archive containing
+    /// that child's writable filesystem-layer deltas (every file it created or modified during
+    /// its run, e.g. `apk`'s installed packages), if that child exported one before exiting.
+    /// `sys_wait4`'s caller applies these entries into the calling (parent) process's own
+    /// writable layer, so a later `&&`/pipeline-chained command sharing the parent's process sees
+    /// them -- closing the gap documented in pass 156 (STEP 7/8) of
+    /// `scratchpad/jqrepro/FINDINGS.txt`: real Linux processes always share one filesystem
+    /// regardless of process boundaries, but a `LITEBOX_PROCESS_FORK=1` cross-process child's
+    /// independently-reconstructed in-memory filesystem previously vanished with the child's own
+    /// process on exit, invisible to the parent.
+    ///
+    /// `None` if the child never exported anything (e.g. it made no writable-layer changes, or
+    /// this platform/build has no cross-process fork support at all -- the default
+    /// implementation). Not a hard error either way: a fork() child that dies before reaching its
+    /// own export call (a crash, a signal) simply contributes no filesystem changes back, exactly
+    /// as if it had never written anything -- matching this call's best-effort, no-panic
+    /// contract, mirroring [`Self::try_wait_for_cross_process_exit`]'s own `Option`-based (not
+    /// `Result`-based) shape.
+    fn take_cross_process_writable_layer_export(
+        &self,
+        handle: CrossProcessChildHandle,
+    ) -> Option<alloc::vec::Vec<u8>> {
+        let _ = handle;
+        None
+    }
+
     /// Diagnostic-only hook (pass 141, `LITEBOX_DIAG_PROCESS_FORK_WAIT4=1`, off by default),
     /// called from `do_clone`'s process-clone branch at the SAME call site as
     /// [`Self::diagnostic_process_fork_probe`], purely to live-exercise the cross-process

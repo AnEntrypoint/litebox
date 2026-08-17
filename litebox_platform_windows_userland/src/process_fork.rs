@@ -667,6 +667,33 @@ pub fn diag_process_fork_globalstate_enabled() -> bool {
 /// path.
 pub const FORK_CHILD_TAR_PATH_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_TAR_PATH";
 
+/// Pass 157: the deterministic filesystem path a cross-process `fork()` child exports its
+/// writable upper layer to just before exiting (see `diag_process_fork_task_resume_probe`'s
+/// export call in the runner crate), and the SAME path the parent's `sys_wait4` cross-process
+/// branch later reads back from once it observes that child's real exit -- closing the gap pass
+/// 156 (STEP 7/8 of `scratchpad/jqrepro/FINDINGS.txt`) documented: a cross-process child's
+/// filesystem writes (e.g. `apk`'s installed packages) previously vanished with the child's
+/// process, invisible to the parent shell's subsequent `&&`/pipeline commands.
+///
+/// Keyed by the child's own real Windows pid (not the guest `tid`/`child_tid` the shim uses --
+/// this function runs on the PLATFORM side, which only knows the real OS pid, and the pid is
+/// already guaranteed unique among concurrently-running processes on this machine, which is
+/// exactly the uniqueness this path needs). Lives under the system temp directory rather than
+/// next to `--initial-files` (which may be read-only or on a path the child has no reason to
+/// have write access to) and is named from the tar's own file stem so concurrent, unrelated
+/// litebox invocations against different rootfs archives on the same machine cannot collide.
+#[must_use]
+pub fn cross_process_writable_export_path(
+    tar_path: &std::path::Path,
+    pid: u32,
+) -> std::path::PathBuf {
+    let stem = tar_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("litebox");
+    std::env::temp_dir().join(format!("litebox-forkwrite-{stem}-{pid}.tar"))
+}
+
 /// Whether the operator opted into the `Vmem`-adoption probe
 /// (`LITEBOX_DIAG_PROCESS_FORK_VMEM_ADOPT=1`). A NINTH gate, layered on top of
 /// [`diag_process_fork_globalstate_enabled`] (pass 136 proved a standalone `GlobalState` can be
