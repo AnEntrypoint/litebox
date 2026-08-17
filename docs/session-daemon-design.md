@@ -319,3 +319,191 @@ sequences are special, everything else is sent byte-for-byte.
 Each phase should be its own pass with its own live-execution verification,
 per this project's standing discipline against building large features
 blind in one shot.
+
+## Phase 2 (DONE, committed): guest `--pty-mode` + daemon + IPC surface
+
+Implements phases 2-4 of the plan above (guest-side `--pty-mode`, daemon
+skeleton, and `vt100` wiring/`GetScreen`) in one pass, plus a direct test
+client standing in for phase 5's CLI subcommands. Live-verified against the
+real `C:\dev\litebox-windows-alpine\alpine-rootfs.tar` bundle.
+
+### Guest-side `--pty-mode` (`litebox_shim_linux` + `litebox_runner_linux_on_windows_userland`)
+
+Reality diverged from this doc's original "add a new CLI mode to the
+*runner*" framing in one respect: the actual `login_tty()`-equivalent
+sequence (`open(/dev/ptmx)` -> `TIOCSPTLCK` -> `TIOCGPTN` -> `setsid()` ->
+`TIOCSCTTY` -> `dup2` onto fds 0/1/2) had to live *inside*
+`litebox_shim_linux`, not the runner crate, because the `Task` type that
+owns all of this (`sys_open`/`sys_ioctl`/`sys_setsid`/`sys_dup`) is private
+to that crate and only ever reachable from a guest syscall context. The
+runner has no host-side way to drive those syscalls directly.
+
+Concretely:
+
+- `LinuxShim::load_program_attach_pty` (new, `litebox_shim_linux/src/lib.rs`):
+  like `load_program`, but after ELF loading succeeds, calls a new
+  `Task::attach_pty_stdio` (in `litebox_shim_linux/src/syscalls/pty.rs`)
+  that allocates a fresh pty pair via the existing (internal) `new_pty_pair`,
+  unlocks it, sets a real (24x80, not zero) default `Winsize` (see "Known
+  limitations" below for why), replaces fds 0/1/2 with independent dups of
+  the slave, and performs `setsid()` + `TIOCSCTTY`. Returns the new pty's id.
+- The pty's **master** side is registered in a new shim-wide
+  `GlobalState::daemon_pty_masters` registry (keyed by pty id), separate
+  from the existing guest-driven `pty_registry` (which only ever tracks the
+  *slave*, on the assumption a guest-side `/dev/ptmx` opener holds the
+  master itself). Two new `pub fn` methods on `LinuxShim`,
+  `pty_master_read`/`pty_master_write`, look the master up in that registry
+  and read/write it using a throwaway, call-local
+  `litebox::event::wait::WaitState` -- deliberately callable from ANY host
+  thread with no `Task` in scope, mirroring the exact pattern
+  `LinuxShim::perform_network_interaction` (the pre-existing `net_worker`
+  background thread) already established for driving shim-internal I/O from
+  outside a guest context.
+- The slave is *also* registered in the ordinary `pty_registry` (not just
+  `daemon_pty_masters`), purely so `GlobalState::hangup_slave` (called at
+  real process exit) can find it the same way it finds every other pty's
+  slave -- without this, `pty_master_read` blocks forever past guest exit,
+  since real Linux's "hang up the master's read side when the last slave
+  closes at process death" semantics only fire through that lookup.
+- `litebox_runner_linux_on_windows_userland`: new `--pty-mode` CLI flag.
+  When set, `run()` calls `load_program_attach_pty` instead of
+  `load_program`, spawns two background threads mirroring the existing
+  `net_worker` pattern (one draining `pty_master_read` into this process's
+  real `stdout`, one copying real `stdin` into `pty_master_write`), then
+  calls `run_thread` exactly as before. The daemon (below) spawns this exe
+  with piped stdio and treats that pipe pair as the pty master's byte
+  stream -- confirming design option 1 from this doc's "Exposing the
+  guest's pty master to the host process" section, unchanged from the
+  original plan.
+
+### Daemon (`litebox_session_daemon`, new crate)
+
+New workspace crate (`std`, Windows-only, excluded from the no_std CI check
+alongside `litebox_termemu` for the same reason: host-side only, never runs
+in the guest). Three modules:
+
+- `protocol.rs`: the `Request`/`Response` enums exactly as specified in this
+  doc's "IPC surface" section (`CreateSession`/`SendInput`/`GetScreen`/
+  `GetHistory`/`ListSessions`/`KillSession`), `serde`-derived, wire format
+  is a 4-byte little-endian length prefix + that many bytes of JSON (as this
+  doc proposed) over `\\.\pipe\litebox-session-daemon`.
+- `pipe_io.rs`: `read_message`/`write_message` framing helpers over a raw
+  `HANDLE`, using `ReadFile`/`WriteFile` directly -- matching this project's
+  existing raw-Win32-API style (`process_fork.rs`) rather than pulling in
+  `tokio` or `interprocess` for a genuinely small win. No prior named-pipe
+  *server* pattern existed anywhere in the workspace (confirmed via a full
+  grep before starting) -- `CreateNamedPipeW`/`ConnectNamedPipe` in
+  `lib.rs`'s `create_and_accept_one_instance` is the first one.
+- `session.rs`: `Session` (one real guest process, spawned via
+  `std::process::Command` with piped stdio -- the anonymous-pipe stdio
+  plumbing this doc's option 1 called for, no new spawn primitive needed)
+  and `Registry` (`Arc<Mutex<HashMap<SessionId, Session>>>`, IDs are a
+  simple incrementing counter formatted as a string, matching this doc's
+  "stable ID... simple incrementing counter or UUID is fine"). Each
+  session's reader thread drains the guest's real stdout into a
+  `litebox_termemu::TerminalEmulator`, exactly mirroring the "drain in a
+  background thread, mutate shared state under a lock" shape this doc's
+  "Daemon" section called out from the fork-diagnostics precedent.
+- `lib.rs`: `run_daemon(runner_exe)` -- accept loop, one thread per
+  connected client (a client may send several requests over one connection;
+  the design doc's "one connection per CLI invocation" client shape is
+  still what a future thin CLI would do, but the server itself doesn't
+  assume it).
+- `examples/session_client.rs`: the phase-2 verification harness (per this
+  doc's phasing plan step 1's own precedent of a standalone proof-of-concept
+  example) -- connects, creates several sessions, drives them, and asserts
+  on the real returned screen/history text. NOT a test file (no `#[test]`,
+  never run via `cargo test`) -- run directly via
+  `cargo run -p litebox_session_daemon --example session_client -- <rootfs.tar>`
+  against a separately-started `litebox_session_daemon.exe` instance, per
+  this project's live-execution-only verification discipline.
+
+### Live verification performed
+
+Daemon started against the real `litebox_runner_linux_on_windows_userland.exe`
+and the real Alpine bundle; `session_client` example run against it and
+confirmed, by reading the actual returned text (not just "didn't crash"):
+
+1. `CreateSession { program: "/bin/echo", args: ["hello"] }` ->
+   `GetHistory` returns text containing `hello`.
+2. `CreateSession { program: "/bin/cat" }` -> `SendInput` with
+   `"echo test from daemon\n"` -> `GetScreen` returns text containing
+   `"echo test from daemon"` (the pty echoing `cat`'s own stdin back via its
+   stdout, round-tripped correctly through the vt100 emulator).
+3. Two simultaneous `/bin/cat` sessions -> input sent to session A appears
+   in session A's `GetScreen` and is CONFIRMED ABSENT from session B's
+   `GetScreen` -- session isolation verified, not assumed.
+4. `ListSessions` reflects all created sessions; `KillSession` on each
+   returns `ok: true` and the underlying guest processes are confirmed
+   gone (`Get-Process` after the run shows none left).
+5. Separately, `/usr/bin/vi <file>` under `--pty-mode` (direct runner
+   invocation, not yet routed through the daemon in this pass, but the same
+   underlying pty machinery) was confirmed to draw a correct alternate-
+   screen VT100 stream (tilde-filled empty lines, status line, `~[m` etc.) --
+   this is the design's actual target scenario (driving `vi`) and the pty
+   plumbing underneath it works.
+
+### Known limitations (narrow, scoped, not blocking this phase)
+
+- **Bare interactive `/bin/sh`/`ash` with no `-c` hangs under `--pty-mode`.**
+  Root-caused to something in busybox `ash`'s interactive-mode startup path
+  specifically (not the pty plumbing itself, and not `sh -c "..."`, which
+  works instantly): `attach_pty_stdio` completes and `run_thread` is
+  entered, but the guest's first thread never returns and never writes a
+  single byte to the pty, even with a real (non-zero) winsize and
+  `TERM=xterm` set. `/bin/cat`, `/bin/echo`, and `/usr/bin/vi` -- none of
+  which rely on `ash`'s own job-control/interactive-prompt machinery -- all
+  work correctly and promptly under the identical pty setup. This is
+  scoped as a follow-up rather than blocking: it doesn't block driving `vi`
+  (the doc's actual stated goal), and a session daemon can front real
+  interactive work via `sh -c` (or any non-`ash` shell, or `vi` itself)
+  without hitting it. Needs further root-causing (likely something in
+  `ash`'s own terminal-size/job-control probe sequence hanging waiting on
+  a response the shim doesn't provide) before bare interactive `ash` is
+  claimed to work.
+- **`\x1b[6n` (Device Status Report / cursor-position query) has no
+  responder.** A program that asks "where is the cursor" and blocks on the
+  answer (some of `ash`'s own startup path, in earlier debugging, before
+  landing on a fixed winsize) will stall, since nothing on the daemon or
+  guest side answers this query today. `litebox_termemu`'s `vt100::Parser`
+  tracks cursor position internally and could answer this if wired up
+  (either guest-side, echoing a synthesized response back into the pty
+  master input path, or daemon-side); not implemented this phase.
+- **CLI subcommands (`session start`/`send`/`screen`/`history`/`list`/
+  `kill`, the key-encoding mini-language, daemon auto-spawn-on-first-use)
+  are still phase 3+, unimplemented.** `session_client.rs` proves the wire
+  protocol and daemon logic work; the thin CLI wrapper described in this
+  doc's "CLI subcommand surface" section does not exist yet.
+
+## Phase 3 should do next
+
+1. **CLI subcommands.** Thin named-pipe client matching this doc's "CLI
+   subcommand surface" section, added to
+   `litebox_runner_linux_on_windows_userland`'s `CliArgs` as a `session`
+   subcommand (start/send/screen/history/list/kill/daemon-start/
+   daemon-stop), including the key-encoding mini-language parser (`<Esc>`,
+   `<Enter>`, `<C-x>`, etc.) and daemon auto-spawn-on-first-use (a `session
+   start`/`send`/etc. invocation that finds no daemon listening on
+   `\\.\pipe\litebox-session-daemon` should spawn one detached, matching
+   this doc's original "start once, address by ID forever after"
+   requirement -- `litebox_session_daemon::run_daemon` already exists and
+   is directly callable/spawnable for this).
+2. **Root-cause the bare-interactive-`ash` hang.** Narrow it further than
+   phase 2 did (busybox `ash`'s interactive-startup code path specifically)
+   -- likely worth building busybox with debug symbols or instrumenting the
+   shim's syscall dispatch to log every syscall a hung `ash` process last
+   issued before going silent, to find exactly which syscall/ioctl it's
+   blocked in.
+3. **Wire up `\x1b[6n` (DSR) response**, at minimum as a documented
+   follow-up even if not required to unblock (2) -- some real programs
+   query cursor position and will otherwise hang the same way.
+4. **End-to-end `vi` drive test purely via CLI invocations** (open, `i`,
+   type text, `<Esc>`, `:wq<Enter>`, confirm `session screen` shows the
+   expected file content at each step) -- this doc's phase 6, deferred
+   until (1) exists.
+5. Consider whether `GetScreen`'s ANSI-preserving variant
+   (`contents_formatted()`, already exposed by `litebox_termemu` as
+   `render_screen`, alongside the plain-text `render_screen_plain` this
+   phase's `GetScreen` uses) should be a `session screen --ansi` flag once
+   the CLI exists, per this doc's original "CLI subcommand surface"
+   section.

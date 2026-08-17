@@ -259,6 +259,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             flock_registry: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
             next_flock_holder_id: core::sync::atomic::AtomicU64::new(1),
             pty_registry: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
+            daemon_pty_masters: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
             next_pty_id: core::sync::atomic::AtomicU32::new(0),
             next_unix_autobind_id: core::sync::atomic::AtomicU32::new(0),
         });
@@ -283,6 +284,61 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         path: &str,
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
+    ) -> Result<LoadedProgram<Platform, FS>, loader::elf::ElfLoaderError> {
+        self.load_program_with_pty(fs, task, path, argv, envp, false)
+    }
+
+    /// Like [`Self::load_program`], but when `attach_pty` is set, allocates a fresh pty pair and
+    /// attaches the loaded process to its slave as controlling terminal (mirroring glibc's
+    /// `login_tty()`: `setsid()` + `ioctl(slave, TIOCSCTTY, 0)` + `dup2(slave, 0/1/2)`, the exact
+    /// sequence [`syscalls::pty`]'s own test suite exercises) BEFORE the process's normal
+    /// `/dev/stdin`/`/dev/stdout`/`/dev/stderr` stdio wiring would otherwise take effect -- this
+    /// is the guest-side half of the session-daemon feature (see
+    /// `docs/session-daemon-design.md`'s `--pty-mode`): a HOST-side caller with no `Task` in scope
+    /// (a plain background thread) can then drive the pty's master side via
+    /// [`Self::pty_master_read`]/[`Self::pty_master_write`], keyed by the returned pty id, while
+    /// the loaded process's stdio (attached to the slave) sees ordinary raw-mode-capable terminal
+    /// semantics -- exactly what an interactive `vi`/`sh` session needs, and exactly what plain
+    /// piped (non-console) stdio cannot provide (`TCSETS` on a non-tty stdio fd routes through
+    /// `stdio_ioctl`, gated on `Platform::is_a_tty`, which is false for piped/non-console stdio).
+    ///
+    /// On success, returns `(LoadedProgram, pty_id)`. Failure to attach the pty (an `Errno` from
+    /// the underlying `sys_open`/`sys_ioctl`/`sys_dup` calls) is reported as
+    /// [`loader::elf::ElfLoaderError::OpenError`], reusing the ELF loader's existing open-failure
+    /// error shape rather than inventing a second error type for what is, from this function
+    /// signature's point of view, just another way process setup can fail.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: `load_program_with_pty(.., attach_pty: true)` always sets
+    /// `attached_pty_id` before returning `Ok`, so the internal `.get().expect(..)` this function
+    /// uses to recover it can only panic if that invariant is broken by a future edit.
+    pub fn load_program_attach_pty(
+        &self,
+        fs: alloc::sync::Arc<FS>,
+        task: litebox_common_linux::TaskParams,
+        path: &str,
+        argv: Vec<alloc::ffi::CString>,
+        envp: Vec<alloc::ffi::CString>,
+    ) -> Result<(LoadedProgram<Platform, FS>, u32), loader::elf::ElfLoaderError> {
+        let loaded = self.load_program_with_pty(fs, task, path, argv, envp, true)?;
+        let pty_id = loaded
+            .entrypoints
+            .task
+            .attached_pty_id
+            .get()
+            .expect("load_program_with_pty(attach_pty=true) always sets attached_pty_id on success");
+        Ok((loaded, pty_id))
+    }
+
+    fn load_program_with_pty(
+        &self,
+        fs: alloc::sync::Arc<FS>,
+        task: litebox_common_linux::TaskParams,
+        path: &str,
+        argv: Vec<alloc::ffi::CString>,
+        envp: Vec<alloc::ffi::CString>,
+        attach_pty: bool,
     ) -> Result<LoadedProgram<Platform, FS>, loader::elf::ElfLoaderError> {
         let litebox_common_linux::TaskParams {
             pid,
@@ -330,6 +386,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(bootstrap_shared_pending),
+                attached_pty_id: Cell::new(None),
             },
         };
 
@@ -351,11 +408,56 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
             argv,
             envp,
         )?;
+
+        if attach_pty {
+            let pty_id = entrypoints
+                .task
+                .attach_pty_stdio(&self.0)
+                .map_err(loader::elf::ElfLoaderError::OpenError)?;
+            entrypoints.task.attached_pty_id.set(Some(pty_id));
+        }
+
         let process = LinuxShimProcess(entrypoints.task.process().clone());
         Ok(LoadedProgram {
             entrypoints,
             process,
         })
+    }
+
+    /// Read bytes from the master side of a pty allocated via [`Self::load_program_attach_pty`],
+    /// keyed by the pty id that call returned. Callable from any thread with no `Task` in scope
+    /// (see [`GlobalState::daemon_pty_masters`]'s doc comment) -- this is what lets a plain
+    /// background thread in the runner drain a session's pty output concurrently with
+    /// `run_thread` running the guest on its own thread. Blocking: waits for at least one byte
+    /// using a throwaway, this-call-only [`wait::WaitState`] (never the guest's own), matching
+    /// [`Self::perform_network_interaction`]'s precedent of driving shim-internal I/O from a
+    /// caller with no guest `Task` in scope.
+    pub fn pty_master_read(&self, pty_id: u32, buf: &mut [u8]) -> Result<usize, Errno> {
+        let masters = self.0.daemon_pty_masters.read();
+        let master = masters.get(&pty_id).ok_or(Errno::ENXIO)?;
+        let wait_state = litebox::event::wait::WaitState::new(self.0.platform);
+        let cx = wait_state.context();
+        self.0
+            .litebox
+            .descriptor_table()
+            .entry_handle(master)
+            .ok_or(Errno::ENXIO)?
+            .with_entry(|end: &syscalls::pty::PtyEnd<Platform>| end.read(&cx, buf))
+    }
+
+    /// Write bytes to the master side of a pty allocated via [`Self::load_program_attach_pty`].
+    /// See [`Self::pty_master_read`]'s doc comment for the threading/host-caller rationale.
+    pub fn pty_master_write(&self, pty_id: u32, buf: &[u8]) -> Result<usize, Errno> {
+        let masters = self.0.daemon_pty_masters.read();
+        let master = masters.get(&pty_id).ok_or(Errno::ENXIO)?;
+        let wait_state = litebox::event::wait::WaitState::new(self.0.platform);
+        let cx = wait_state.context();
+        self.0
+            .litebox
+            .descriptor_table()
+            .entry_handle(master)
+            .ok_or(Errno::ENXIO)?
+            .with_entry(|end: &syscalls::pty::PtyEnd<Platform>| end.write(&cx, buf))
     }
 
     /// Constructs a `LinuxShimEntrypoints`/`Task` for a process-based-fork child whose guest
@@ -426,6 +528,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(shared_pending),
+                attached_pty_id: Cell::new(None),
             },
         }
     }
@@ -1647,6 +1750,19 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
         Platform,
         alloc::collections::BTreeMap<u32, syscalls::pty::PtyFd<Platform>>,
     >,
+    /// Registry of allocated ptys' master-side fd, keyed by pty id, populated only for a pty
+    /// created via [`LinuxShim::attach_pty_stdio`] (the session-daemon `--pty-mode` path).
+    /// Ordinary guest-driven `/dev/ptmx` opens (`ptmx_open`) never populate this -- the master fd
+    /// there lives purely in the opening process's own fd table, reachable only via the guest's
+    /// own syscalls, matching real Linux. This registry exists so a HOST-side caller (the runner,
+    /// via [`LinuxShim::pty_master_read`]/[`LinuxShim::pty_master_write`]) can drive the master
+    /// side of a session-daemon pty from a plain background thread with no `Task` in scope --
+    /// `PtyFd` read/write only need the shared [`syscalls::pty::PtyEnd`] entry itself, not a
+    /// process's fd table, so no per-thread `Task` is needed to use it.
+    daemon_pty_masters: litebox::sync::RwLock<
+        Platform,
+        alloc::collections::BTreeMap<u32, syscalls::pty::PtyFd<Platform>>,
+    >,
     /// Next id to hand out to a freshly `open("/dev/ptmx")`-allocated pty pair.
     next_pty_id: core::sync::atomic::AtomicU32,
     /// Next id to hand out for AF_UNIX socket "autobind" (`bind()` called with no address),
@@ -1690,6 +1806,12 @@ struct Task<Platform: ShimPlatform, FS: ShimFS> {
     files: RefCell<Arc<syscalls::file::FilesState<Platform, FS>>>,
     /// Signal state
     signals: syscalls::signal::SignalState<Platform>,
+    /// Set by [`LinuxShim::load_program_attach_pty`]'s internal call to [`Self::attach_pty_stdio`]
+    /// once this task's stdio has been attached to a fresh pty's slave -- the pty id a host-side
+    /// caller (with no `Task` in scope) should pass to
+    /// [`LinuxShim::pty_master_read`]/[`LinuxShim::pty_master_write`]. `None` for every ordinary
+    /// (non-`--pty-mode`) process.
+    attached_pty_id: Cell<Option<u32>>,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Drop for Task<Platform, FS> {
@@ -1739,6 +1861,7 @@ mod test_utils {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(shared_pending),
+                attached_pty_id: Cell::new(None),
                 global: self,
             }
         }
@@ -1764,6 +1887,7 @@ mod test_utils {
                 files: self.files.clone(),
                 // Always a same-process thread clone -- see `self.thread.new_thread(tid)` above.
                 signals: self.signals.clone_for_new_task(None),
+                attached_pty_id: Cell::new(self.attached_pty_id.get()),
             };
             Some(task)
         }
@@ -1805,6 +1929,7 @@ mod test_utils {
                 fs: self.fs.clone(),
                 files: self.files.clone(),
                 signals: self.signals.clone_for_new_task(Some(shared_pending)),
+                attached_pty_id: Cell::new(self.attached_pty_id.get()),
             };
             self.process()
                 .add_child_for_test(pid, child.process().clone());

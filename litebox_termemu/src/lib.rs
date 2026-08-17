@@ -53,6 +53,13 @@ impl TerminalEmulator {
         self.parser.screen().cursor_position()
     }
 
+    /// The screen's size as (rows, cols), matching what this emulator was constructed with (a
+    /// full-screen app's `SIGWINCH`-driven resize is not modeled -- see [`Self::new`]).
+    #[must_use]
+    pub fn size(&self) -> (u16, u16) {
+        self.parser.screen().size()
+    }
+
     /// The full raw scrollback: every byte ever fed via `feed`, in order.
     #[must_use]
     pub fn history(&self) -> &[u8] {
