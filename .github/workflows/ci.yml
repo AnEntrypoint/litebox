@@ -305,6 +305,10 @@ jobs:
           #
           # - `litebox_runner_snp` is `no_std` but requires custom target to build
           #
+          # - `litebox_termemu` is a host-side (Windows daemon/CLI) VT100
+          #   terminal emulator library that never runs inside the guest, and
+          #   thus is allowed to have `std` access.
+          #
           # - `dev_tests` is meant to only be used for tests, and thus can
           #   safely use std.
           #
@@ -324,6 +328,7 @@ jobs:
             -not -path './litebox_syscall_rewriter/Cargo.toml' \
             -not -path './litebox_packager/Cargo.toml' \
             -not -path './litebox_runner_snp/Cargo.toml' \
+            -not -path './litebox_termemu/Cargo.toml' \
             -not -path './dev_tests/Cargo.toml' \
             -not -path './dev_bench/Cargo.toml' \
             -print0 | \
