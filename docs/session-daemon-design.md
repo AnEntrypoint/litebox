@@ -636,13 +636,36 @@ tested.
   buffering) is the most valuable next debugging step for this feature,
   since it's the one remaining rough edge in the doc's own definitive
   test. Workaround (split the command) is reliable today.
-- **Bare interactive `/bin/sh`/`ash` with no `-c` still hangs** (unchanged
-  from phase 2; not re-investigated this phase, per the task's own scoping
-  -- this phase's file-I/O deadlock fix is a different bug from the
-  already-documented ash startup hang, confirmed by `sh -c "..."` and
-  every non-ash program continuing to work correctly both before and
-  after this phase's fix).
-- **`\x1b[6n` (DSR) still has no responder** (unchanged from phase 2).
+- **Bare interactive `/bin/sh`/`ash` with no `-c` -- FIXED.** Root-caused
+  via a live `LITEBOX_LOG=error`-traced repro (bisected step-by-step
+  through `run()`'s preamble, `load_program_with_pty`, and
+  `attach_pty_stdio` with temporary diagnostic logging at each stage) to
+  exactly the mechanism this doc's phase-2 "Known limitations" section
+  suspected but never confirmed: `attach_pty_stdio` completes, `ash` prints
+  its `/ # ` prompt, then immediately writes `\x1b[6n` (Device Status
+  Report / cursor-position query) to its stdout (the pty slave) as part of
+  its own interactive-prompt startup, and blocks forever reading a reply
+  that nothing ever sent -- confirmed live by capturing the exact byte
+  sequence `/ # \x1b[6n` as the last bytes written before the hang.
+  Fixed in `litebox_shim_linux/src/syscalls/pty.rs`: `PtyHalf` gained a
+  slave-side-only `dsr_reply_write` field (a clone of the master-to-slave
+  channel's write end, the same direction a real keyboard would feed
+  input), and `PtyEnd::write`'s slave branch now scans each write for the
+  `\x1b[6n` byte sequence and synthesizes `\x1b[1;1R` back through it when
+  found (`PtyHalf::maybe_reply_to_dsr`). The reply always reports row 1,
+  column 1 -- this shim tracks no real cursor position of its own, so this
+  is a placeholder answer sufficient to unblock a program that only needs
+  "yes, something answered," not an accurate live cursor position; wiring
+  `litebox_termemu`'s already-integrated `vt100::Parser` (which does track
+  real cursor position) through to answer this accurately is a reasonable
+  follow-up if a program that actually depends on the real position is
+  found. Live-verified: 20/20 repeated bare `/bin/sh` invocations under
+  `--pty-mode` (via `System.Diagnostics.Process` with piped, closed stdin,
+  matching how the daemon itself spawns sessions) start, print their
+  prompt, accept and echo a piped `echo`/`exit` command sequence, and exit
+  cleanly with zero hangs; existing `pty::tests` (14/14) unaffected.
+- **`\x1b[6n` (DSR) now has a responder** -- see the bare-`ash`-hang fix
+  immediately above; this was the same underlying gap.
 - **No cross-session filesystem persistence.** Every `CreateSession` spawns
   an independent guest process with its own fresh in-memory upper layer
   (`--initial-files` only, no `--resume-from`/`--export-writable-layer`
