@@ -291,7 +291,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
     /// Like [`Self::load_program`], but when `attach_pty` is set, allocates a fresh pty pair and
     /// attaches the loaded process to its slave as controlling terminal (mirroring glibc's
     /// `login_tty()`: `setsid()` + `ioctl(slave, TIOCSCTTY, 0)` + `dup2(slave, 0/1/2)`, the exact
-    /// sequence [`syscalls::pty`]'s own test suite exercises) BEFORE the process's normal
+    /// sequence `syscalls::pty`'s own test suite exercises) BEFORE the process's normal
     /// `/dev/stdin`/`/dev/stdout`/`/dev/stderr` stdio wiring would otherwise take effect -- this
     /// is the guest-side half of the session-daemon feature (see
     /// `docs/session-daemon-design.md`'s `--pty-mode`): a HOST-side caller with no `Task` in scope
@@ -423,10 +423,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
 
     /// Read bytes from the master side of a pty allocated via [`Self::load_program_attach_pty`],
     /// keyed by the pty id that call returned. Callable from any thread with no `Task` in scope
-    /// (see [`GlobalState::daemon_pty_masters`]'s doc comment) -- this is what lets a plain
+    /// (see `GlobalState::daemon_pty_masters`'s doc comment) -- this is what lets a plain
     /// background thread in the runner drain a session's pty output concurrently with
     /// `run_thread` running the guest on its own thread. Blocking: waits for at least one byte
-    /// using a throwaway, this-call-only [`wait::WaitState`] (never the guest's own), matching
+    /// using a throwaway, this-call-only `litebox::event::wait::WaitState` (never the guest's own), matching
     /// [`Self::perform_network_interaction`]'s precedent of driving shim-internal I/O from a
     /// caller with no guest `Task` in scope.
     pub fn pty_master_read(&self, pty_id: u32, buf: &mut [u8]) -> Result<usize, Errno> {
@@ -1748,13 +1748,13 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
         alloc::collections::BTreeMap<u32, syscalls::pty::PtyFd<Platform>>,
     >,
     /// Registry of allocated ptys' master-side fd, keyed by pty id, populated only for a pty
-    /// created via [`LinuxShim::attach_pty_stdio`] (the session-daemon `--pty-mode` path).
+    /// created via `Task::attach_pty_stdio` (the session-daemon `--pty-mode` path).
     /// Ordinary guest-driven `/dev/ptmx` opens (`ptmx_open`) never populate this -- the master fd
     /// there lives purely in the opening process's own fd table, reachable only via the guest's
     /// own syscalls, matching real Linux. This registry exists so a HOST-side caller (the runner,
     /// via [`LinuxShim::pty_master_read`]/[`LinuxShim::pty_master_write`]) can drive the master
     /// side of a session-daemon pty from a plain background thread with no `Task` in scope --
-    /// `PtyFd` read/write only need the shared [`syscalls::pty::PtyEnd`] entry itself, not a
+    /// `PtyFd` read/write only need the shared `syscalls::pty::PtyEnd` entry itself, not a
     /// process's fd table, so no per-thread `Task` is needed to use it.
     daemon_pty_masters: litebox::sync::RwLock<
         Platform,
@@ -1803,7 +1803,7 @@ struct Task<Platform: ShimPlatform, FS: ShimFS> {
     files: RefCell<Arc<syscalls::file::FilesState<Platform, FS>>>,
     /// Signal state
     signals: syscalls::signal::SignalState<Platform>,
-    /// Set by [`LinuxShim::load_program_attach_pty`]'s internal call to [`Self::attach_pty_stdio`]
+    /// Set by [`LinuxShim::load_program_attach_pty`]'s internal call to `Self::attach_pty_stdio`
     /// once this task's stdio has been attached to a fresh pty's slave -- the pty id a host-side
     /// caller (with no `Task` in scope) should pass to
     /// [`LinuxShim::pty_master_read`]/[`LinuxShim::pty_master_write`]. `None` for every ordinary
