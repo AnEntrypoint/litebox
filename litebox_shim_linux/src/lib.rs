@@ -430,31 +430,50 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
     /// [`Self::perform_network_interaction`]'s precedent of driving shim-internal I/O from a
     /// caller with no guest `Task` in scope.
     pub fn pty_master_read(&self, pty_id: u32, buf: &mut [u8]) -> Result<usize, Errno> {
-        let masters = self.0.daemon_pty_masters.read();
-        let master = masters.get(&pty_id).ok_or(Errno::ENXIO)?;
+        // Resolve the master's `EntryHandle` (which holds its own `Arc` clone of the entry's
+        // lock, independent of the descriptor table itself -- see `EntryHandle`'s doc comment)
+        // and drop BOTH the `daemon_pty_masters` and the shim-wide `descriptors` table read
+        // guards before blocking below. `end.read(&cx, buf)` can block indefinitely (until the
+        // guest writes to the pty), and the shim-wide `descriptor_table()`/`descriptor_table_mut()`
+        // lock is a single global `RwLock` shared by every fd in the whole process -- holding its
+        // read guard across an indefinite block starves any concurrent guest syscall that needs
+        // `descriptor_table_mut()` (e.g. `open`/`close`/`dup`), which the guest thread routinely
+        // does during ordinary program startup (dynamic-library loading, `ls`'s `opendir`, etc).
+        // That produced a real, intermittent (guest-syscall-timing-dependent) full deadlock: this
+        // reader thread parked forever waiting for pty output, while the guest thread sat parked
+        // forever waiting for a write lock this thread was still holding. Getting the handle then
+        // dropping the table guards before the blocking call fixes it.
+        let handle = {
+            let masters = self.0.daemon_pty_masters.read();
+            let master = masters.get(&pty_id).ok_or(Errno::ENXIO)?;
+            self.0
+                .litebox
+                .descriptor_table()
+                .entry_handle(master)
+                .ok_or(Errno::ENXIO)?
+        };
         let wait_state = litebox::event::wait::WaitState::new(self.0.platform);
         let cx = wait_state.context();
-        self.0
-            .litebox
-            .descriptor_table()
-            .entry_handle(master)
-            .ok_or(Errno::ENXIO)?
-            .with_entry(|end: &syscalls::pty::PtyEnd<Platform>| end.read(&cx, buf))
+        handle.with_entry(|end: &syscalls::pty::PtyEnd<Platform>| end.read(&cx, buf))
     }
 
     /// Write bytes to the master side of a pty allocated via [`Self::load_program_attach_pty`].
-    /// See [`Self::pty_master_read`]'s doc comment for the threading/host-caller rationale.
+    /// See [`Self::pty_master_read`]'s doc comment for the threading/host-caller rationale AND
+    /// (as of the fix noted there) the lock-ordering rationale for resolving the `EntryHandle`
+    /// and dropping the table guards before the blocking `end.write(&cx, buf)` call below.
     pub fn pty_master_write(&self, pty_id: u32, buf: &[u8]) -> Result<usize, Errno> {
-        let masters = self.0.daemon_pty_masters.read();
-        let master = masters.get(&pty_id).ok_or(Errno::ENXIO)?;
+        let handle = {
+            let masters = self.0.daemon_pty_masters.read();
+            let master = masters.get(&pty_id).ok_or(Errno::ENXIO)?;
+            self.0
+                .litebox
+                .descriptor_table()
+                .entry_handle(master)
+                .ok_or(Errno::ENXIO)?
+        };
         let wait_state = litebox::event::wait::WaitState::new(self.0.platform);
         let cx = wait_state.context();
-        self.0
-            .litebox
-            .descriptor_table()
-            .entry_handle(master)
-            .ok_or(Errno::ENXIO)?
-            .with_entry(|end: &syscalls::pty::PtyEnd<Platform>| end.write(&cx, buf))
+        handle.with_entry(|end: &syscalls::pty::PtyEnd<Platform>| end.write(&cx, buf))
     }
 
     /// Constructs a `LinuxShimEntrypoints`/`Task` for a process-based-fork child whose guest

@@ -7,6 +7,8 @@
 
 extern crate alloc;
 
+pub mod session_cli;
+
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use litebox_platform_windows_userland::WindowsUserland as Platform;

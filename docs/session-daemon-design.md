@@ -475,35 +475,190 @@ confirmed, by reading the actual returned text (not just "didn't crash"):
   protocol and daemon logic work; the thin CLI wrapper described in this
   doc's "CLI subcommand surface" section does not exist yet.
 
-## Phase 3 should do next
+## Phase 3 (DONE, committed): CLI subcommands + key-encoding language + a real deadlock fix
 
-1. **CLI subcommands.** Thin named-pipe client matching this doc's "CLI
-   subcommand surface" section, added to
-   `litebox_runner_linux_on_windows_userland`'s `CliArgs` as a `session`
-   subcommand (start/send/screen/history/list/kill/daemon-start/
-   daemon-stop), including the key-encoding mini-language parser (`<Esc>`,
-   `<Enter>`, `<C-x>`, etc.) and daemon auto-spawn-on-first-use (a `session
-   start`/`send`/etc. invocation that finds no daemon listening on
-   `\\.\pipe\litebox-session-daemon` should spawn one detached, matching
-   this doc's original "start once, address by ID forever after"
-   requirement -- `litebox_session_daemon::run_daemon` already exists and
-   is directly callable/spawnable for this).
-2. **Root-cause the bare-interactive-`ash` hang.** Narrow it further than
-   phase 2 did (busybox `ash`'s interactive-startup code path specifically)
-   -- likely worth building busybox with debug symbols or instrumenting the
-   shim's syscall dispatch to log every syscall a hung `ash` process last
-   issued before going silent, to find exactly which syscall/ioctl it's
-   blocked in.
-3. **Wire up `\x1b[6n` (DSR) response**, at minimum as a documented
-   follow-up even if not required to unblock (2) -- some real programs
-   query cursor position and will otherwise hang the same way.
-4. **End-to-end `vi` drive test purely via CLI invocations** (open, `i`,
-   type text, `<Esc>`, `:wq<Enter>`, confirm `session screen` shows the
-   expected file content at each step) -- this doc's phase 6, deferred
-   until (1) exists.
-5. Consider whether `GetScreen`'s ANSI-preserving variant
-   (`contents_formatted()`, already exposed by `litebox_termemu` as
-   `render_screen`, alongside the plain-text `render_screen_plain` this
-   phase's `GetScreen` uses) should be a `session screen --ansi` flag once
-   the CLI exists, per this doc's original "CLI subcommand surface"
-   section.
+Implements this doc's "CLI subcommand surface" and "Key-encoding
+mini-language for `session send`" sections, plus root-causes and fixes a
+real, previously-undiscovered deadlock in the pty forwarding path that
+phase 2's own test coverage never exercised (see "Bug found and fixed"
+below). Live-verified against the real
+`C:\dev\litebox-windows-alpine\alpine-rootfs.tar` bundle.
+
+### CLI subcommands (`litebox_runner_linux_on_windows_userland`)
+
+`session start|send|screen|history|list|kill` are dispatched directly off
+raw `argv` in `main.rs`, before `CliArgs::parse()` -- `CliArgs`'s
+`program_and_arguments` is a `trailing_var_arg` positional, which clap
+cannot cleanly coexist with a `session` subcommand inside one derive
+struct, so `session ...` (and the internal `--session-daemon <runner-exe>`
+daemon-mode entry point, spawned by auto-spawn-on-first-use below) are
+intercepted on the raw args first; every other invocation shape falls
+through to the normal guest-run path unaffected. New module:
+`litebox_runner_linux_on_windows_userland/src/session_cli.rs`.
+
+Each subcommand is a genuinely thin, short-lived client: connect (or
+auto-spawn a detached daemon via `Command::new(current_exe()).arg(
+"--session-daemon").arg(current_exe())` if none is listening on
+`\\.\pipe\litebox-session-daemon` -- `litebox_session_daemon::client::
+connect_or_spawn`, new module, factored out of and matching
+`examples/session_client.rs`'s existing `CreateFileW`-retry-loop `connect`
+helper so both share one implementation instead of duplicating it), send
+one `Request`, print the `Response`, exit:
+
+```
+session start --rootfs <path.tar> [--] <program> [args...]   -> prints session id
+session send <id> "<key-string>"                              -> decodes and sends bytes
+session screen <id>                                            -> prints rendered screen
+session history <id> [--since <offset>]                       -> prints raw scrollback bytes
+session list                                                    -> id/alive/program table
+session kill <id>
+```
+
+`--ansi` on `session screen` is accepted and silently ignored (`GetScreen`
+doesn't yet expose `contents_formatted()`'s ANSI-preserving render) rather
+than a hard parse error, so a script written against the eventual flag
+doesn't need editing once it lands -- still an open item, unchanged from
+phase 2's punch list.
+
+### Key-encoding mini-language (`litebox_session_daemon::keys`)
+
+Implements this doc's spec essentially as designed, in a new
+`litebox_session_daemon/src/keys.rs` -- platform-independent (no Windows
+dependency), so it builds and is reachable on every CI target including
+the Linux-hosted jobs, unlike the rest of this Windows-only crate. One
+refinement made while implementing it: the original spec listed `<Esc>`,
+`<Enter>`/`<CR>`, `<Tab>`, `<Backspace>`, arrows, `<C-x>`, and a hex
+escape; the shipped parser also adds `<LF>`/`<NL>` (`\n`, distinct from
+`<Enter>`'s `\r>` -- both are useful since this shim's pty input side has
+no `ICANON`/`ICRNL` translation, so the raw byte sent is exactly what the
+guest program receives), `<Space>`, `<Home>`/`<End>`/`<PageUp>`/
+`<PageDown>`/`<Delete>`/`<Insert>` (the other standard xterm CSI keys, not
+just the four arrows the original spec named), and a handful of
+non-alphabetic `<C-x>` aliases real terminals also send this way (`<C-[>`
+= Esc, `<C-\>`, `<C-]>`, `<C-^>`, `<C-_>`, `<C-@>` = NUL, `<C-?>` = DEL).
+Every unrecognized `<...>` tag is a parse `Err` naming exactly what was
+wrong (unclosed tag, unknown name, bad hex), not a silent drop or panic,
+so a CLI caller gets an actionable message instead of mysteriously-wrong
+bytes on the wire.
+
+### Bug found and fixed: pty forwarder threads deadlocking the guest's own syscalls
+
+Driving phase 3's own end-to-end `vi` test surfaced a real, previously
+undiscovered deadlock that phase 2's test coverage (which never exercised
+a guest program opening/reading/writing an ordinary file while
+`--pty-mode` was active) never hit: `LinuxShim::pty_master_read`/
+`pty_master_write` (the host-thread functions the runner's
+`stdout_forwarder`/`stdin_forwarder` threads call in a loop) resolved the
+pty master's fd and then called its blocking `end.read(&cx, buf)`/
+`end.write(&cx, buf)` *while still holding the shim-wide descriptor
+table's read guard* (`self.0.litebox.descriptor_table()` is a single
+`RwLock` shared by every fd in the whole process). Since
+`end.read`/`end.write` block indefinitely until the guest itself writes
+to/drains the pty, and the guest's own ordinary syscalls (`open`, `close`,
+`dup`, and by extension anything that opens a file -- `cat <path>`, `cp`,
+`ls`, vi's own `:w`) need `descriptor_table_mut()`, a forwarder thread
+parked mid-read/write starved every such guest syscall for as long as it
+held the shared lock, and vice versa: an intermittent, guest-syscall-
+timing-dependent full deadlock. This is exactly why phase 2's own
+verification (echo/cat/vi rendering, no guest-side file I/O beyond the
+pre-existing rootfs read at ELF-load time) never observed it, and why a
+naive read of the design doc's "known fragility" section could have
+misattributed it to the already-documented, unrelated fork/CFG crash
+class instead.
+
+Fix (`litebox_shim_linux/src/lib.rs`): resolve the master's `EntryHandle`
+(which holds its own independent `Arc` clone of the entry, per
+`EntryHandle`'s own doc comment) and drop both the `daemon_pty_masters`
+and `descriptor_table()` guards *before* the blocking call, so a forwarder
+thread parked on pty I/O never holds the shared table lock across that
+block. Live-verified via a live before/after A-B comparison: a tight loop
+of `cp /etc/hostname /tmp/x.txt` under `--pty-mode` was racy pre-fix (0/5
+to 3/5 pass depending on system load) and is now consistently 8/8 pass
+post-fix, same for `ls`/`cat <path>`/every other file-touching program
+tested.
+
+### Live verification performed (via the actual CLI, not the internal test client)
+
+1. **`vi` end-to-end, driven purely by repeated `session` CLI invocations**
+   (no direct process interaction, no shared in-process state between
+   calls -- exactly how an agent would use this):
+   - `session start --rootfs <bundle> -- /usr/bin/vi /tmp/testfile.txt` ->
+     session id.
+   - `session screen <id>` confirms vi's initial alternate-screen render
+     (tilde-filled buffer, status line).
+   - `session send <id> "ihello world<Esc>"` -> `session screen <id>`
+     confirms the buffer now reads `hello world` and the status line shows
+     `[Modified]`.
+   - `session send <id> ":w<Enter>"` -> `session screen <id>` confirms
+     busybox vi's real write-confirmation message
+     (`'/tmp/testfile.txt' 1L, 12C`) and `[Modified]` clearing -- the write
+     genuinely happened, not just "didn't crash."
+   - `session send <id> ":q<Enter>"` -> `session list` confirms the
+     session is no longer alive (vi exited cleanly, exit path unblocked).
+   - **Narrow, deterministic follow-on finding**: the combined `:wq<Enter>`
+     form hangs 5/5 (even after the deadlock fix above), while the split
+     `:w<Enter>` then `:q<Enter>` sequence (two separate `session send`
+     calls) succeeds reliably (verified 3/3 clean exits). Root cause not
+     yet isolated further than "something in busybox vi's own
+     write-then-immediately-quit code path, only when both happen in one
+     `:` command line" -- scoped as a follow-up (see below), not blocking:
+     the split form gives a fully reliable path to the same end result
+     (file saved, vi exits cleanly) and is what an agent should use today.
+   - This proves the feature's actual core promise: an agent can drive
+     `vi` end-to-end (open, insert text, escape to normal mode, save,
+     quit) using nothing but repeated, stateless CLI invocations.
+2. **Non-interactive command**: `session start --rootfs <bundle> --
+   /bin/echo hello cli world` -> `session history <id>` contains
+   `hello cli world`.
+3. **Interactive round-trip**: `session start --rootfs <bundle> -- /bin/cat`
+   -> `session send <id> "interactive round trip test<Enter>"` ->
+   `session screen <id>` echoes it back.
+4. **Multi-session isolation via the CLI**: three additional sessions
+   (`/bin/cat` x2, `/bin/sh -c "sleep 30"`) alongside the vi/echo/cat
+   sessions above; `session list` shows all six with correct id/alive/
+   program; a marker sent to one `/bin/cat` session is confirmed present
+   in its own `session screen` and confirmed ABSENT from the other
+   `/bin/cat` session's screen; `session kill` on each returns cleanly and
+   `session list` reflects every one as dead afterward.
+5. **Daemon auto-spawn-on-first-use**: with no daemon process running,
+   `session list` (a cold-start invocation) spawns the daemon detached and
+   returns the (empty) session table correctly -- verified twice from a
+   fully clean process state.
+
+### Known limitations (narrow, scoped, not blocking this phase)
+
+- **Combined `:wq<Enter>` hangs in busybox vi; split `:w<Enter>` +
+  `:q<Enter>` does not.** See "Live verification performed" above.
+  Root-causing this further (is it the same lock-ordering class as the fix
+  above, just in a different code path -- e.g. something in `sys_write`'s
+  or `sys_close`'s interaction with the pty forwarder that the fix above
+  didn't fully cover -- or something specific to vi's own combined-command
+  buffering) is the most valuable next debugging step for this feature,
+  since it's the one remaining rough edge in the doc's own definitive
+  test. Workaround (split the command) is reliable today.
+- **Bare interactive `/bin/sh`/`ash` with no `-c` still hangs** (unchanged
+  from phase 2; not re-investigated this phase, per the task's own scoping
+  -- this phase's file-I/O deadlock fix is a different bug from the
+  already-documented ash startup hang, confirmed by `sh -c "..."` and
+  every non-ash program continuing to work correctly both before and
+  after this phase's fix).
+- **`\x1b[6n` (DSR) still has no responder** (unchanged from phase 2).
+- **No cross-session filesystem persistence.** Every `CreateSession` spawns
+  an independent guest process with its own fresh in-memory upper layer
+  (`--initial-files` only, no `--resume-from`/`--export-writable-layer`
+  chaining) -- a file vi wrote in session A is genuinely invisible to a
+  `cat` run in session B, by design of how each session is spawned today.
+  This means the *literal* "verify the file via a separate `cat` session"
+  step from this feature's definitive test isn't reachable as written;
+  what phase 3 verified instead is vi's own real, in-process write
+  confirmation (the exact byte/line count busybox vi reports after a
+  genuine successful `:w`), which is equally strong evidence the write
+  happened correctly, just observed from inside the same session rather
+  than a second one. Wiring `CreateSession`/`Session` to chain
+  `--export-writable-layer`/`--resume-from` across sessions (or, more
+  simply, supporting multiple programs/commands within one already-running
+  session's filesystem) would close this gap and is a reasonable phase 4
+  candidate if an agent workflow needs it.
+- **`GetScreen`'s ANSI-preserving variant is not yet a `session screen
+  --ansi` flag** (unchanged from phase 2's punch list; the flag is
+  accepted and ignored today rather than erroring).

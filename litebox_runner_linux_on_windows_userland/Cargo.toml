@@ -9,6 +9,7 @@ clap = { version = "4.5.33", features = ["derive"] }
 litebox = { version = "0.1.0", path = "../litebox" }
 litebox_common_linux = { version = "0.1.0", path = "../litebox_common_linux" }
 litebox_platform_windows_userland = { version = "0.1.0", path = "../litebox_platform_windows_userland" }
+litebox_session_daemon = { version = "0.1.0", path = "../litebox_session_daemon" }
 litebox_shim_linux = { version = "0.1.0", path = "../litebox_shim_linux", default-features = false }
 litebox_util_log = { version = "0.1.0", path = "../litebox_util_log", features = ["backend_tracing"] }
 memmap2 = "0.9.8"

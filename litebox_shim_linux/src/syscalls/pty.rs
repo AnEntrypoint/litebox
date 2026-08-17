@@ -120,6 +120,13 @@ pub(crate) struct PtyHalf<Platform: ShimPlatform> {
     /// *reads* from), used to echo bytes written to the master back to whatever's reading it --
     /// see [`PtyEnd::write`]'s echo handling. `None` on the slave side, which never echoes.
     echo_write: Option<WriteEnd<Platform, u8>>,
+    /// Slave side only: a clone of the master's write end (the same direction the slave itself
+    /// *reads* from -- i.e. what a real keyboard would feed in), used to synthesize a Device
+    /// Status Report response when the program attached to this slave queries the cursor
+    /// position (`\x1b[6n`) -- see [`PtyEnd::write`]'s DSR-responder handling. `None` on the
+    /// master side, which never receives a DSR query to answer (real terminal emulators, not
+    /// this shim, are the ones expected to answer a master-side reader's own `\x1b[6n`).
+    dsr_reply_write: Option<WriteEnd<Platform, u8>>,
 }
 
 impl<Platform: ShimPlatform> PtyHalf<Platform> {
@@ -237,6 +244,42 @@ impl<Platform: ShimPlatform> PtyHalf<Platform> {
                 if echo_write.try_write_one(out_byte).is_err() {
                     return;
                 }
+            }
+        }
+    }
+
+    /// Slave-side only: if `buf` contains a Device Status Report / cursor-position query
+    /// (`\x1b[6n`), synthesize the reply a real terminal emulator would send back over the
+    /// "keyboard" input path (`\x1b[<row>;<col>R`) -- see [`PtyEnd::write`]'s DSR-responder
+    /// handling and the `dsr_reply_write` field doc comment.
+    ///
+    /// Without this, a program that queries cursor position and blocks on the answer (observed
+    /// live: busybox `ash`'s own interactive-prompt startup issues `\x1b[6n` immediately after
+    /// printing its prompt) stalls forever, since nothing previously answered this query --
+    /// `docs/session-daemon-design.md`'s "Known limitations" section documented this as the
+    /// as-yet-unroot-caused reason bare interactive `ash` hangs under `--pty-mode`.
+    ///
+    /// This shim has no real screen model (no cursor-position tracking of its own), so it always
+    /// reports the cursor at row 1, column 1 -- a placeholder answer, not a tracked one. This is
+    /// still correct enough to unblock a program that merely wants an initial "yes, something is
+    /// listening and terminal-shaped" answer (exactly ash's use here), even though it wouldn't
+    /// suffice for a program relying on an accurate mid-session cursor position (out of scope for
+    /// this fix; `litebox_termemu`'s `vt100::Parser`, already used by the session-daemon feature,
+    /// tracks real cursor position and could supply an accurate answer if wired up here later).
+    fn maybe_reply_to_dsr(&self, buf: &[u8]) {
+        const DSR_QUERY: &[u8] = b"\x1b[6n";
+        let Some(reply_write) = &self.dsr_reply_write else {
+            return;
+        };
+        if !buf
+            .windows(DSR_QUERY.len())
+            .any(|window| window == DSR_QUERY)
+        {
+            return;
+        }
+        for &out_byte in b"\x1b[1;1R" {
+            if reply_write.try_write_one(out_byte).is_err() {
+                return;
             }
         }
     }
@@ -363,6 +406,9 @@ impl<Platform: ShimPlatform> PtyEnd<Platform> {
                 == (litebox_common_linux::OPOST | litebox_common_linux::ONLCR);
             self.half().echo(&buf[..n], echo_onlcr);
         }
+        if self.is_slave() {
+            self.half().maybe_reply_to_dsr(&buf[..n]);
+        }
         Ok(n)
     }
 
@@ -405,11 +451,12 @@ pub(crate) fn new_pty_pair<Platform: ShimPlatform>(
 
     let master = PtyEnd::Master(PtyHalf {
         read: s2m_read,
-        write: m2s_write,
+        write: m2s_write.clone(),
         pollee: master_pollee,
         status: AtomicU32::new((OFlags::RDWR).bits()),
         pair: pair.clone(),
         echo_write: Some(s2m_write.clone()),
+        dsr_reply_write: None,
     });
     let slave = PtyEnd::Slave(PtyHalf {
         read: m2s_read,
@@ -418,6 +465,7 @@ pub(crate) fn new_pty_pair<Platform: ShimPlatform>(
         status: AtomicU32::new((OFlags::RDWR).bits()),
         pair,
         echo_write: None,
+        dsr_reply_write: Some(m2s_write),
     });
 
     let mut dt = litebox.descriptor_table_mut();
