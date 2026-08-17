@@ -105,7 +105,7 @@ fn cmd_start(client: &litebox_session_daemon::client::DaemonClient, args: &[Stri
         program,
         args: rest,
     };
-    match client.call(&req) {
+    match client.call_with_timeout(&req, litebox_session_daemon::client::CREATE_SESSION_CALL_TIMEOUT) {
         Ok(Response::CreateSession { session_id }) => {
             println!("{session_id}");
             0

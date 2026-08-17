@@ -685,3 +685,142 @@ tested.
 - **`GetScreen`'s ANSI-preserving variant is not yet a `session screen
   --ansi` flag** (unchanged from phase 2's punch list; the flag is
   accepted and ignored today rather than erroring).
+
+## Phase 4 (DONE, committed): `:wq<Enter>` hang root-caused and fixed, per-request client timeout, filesystem-isolation ambiguity resolved
+
+Closes out the three items phase 3 left open. All three investigated and
+verified via live execution against the real
+`C:\dev\litebox-windows-alpine\alpine-rootfs.tar` bundle, PowerShell
+methodology, many repeated runs for the timing-sensitive fix.
+
+### 1. `:wq<Enter>` hang: root cause found, real fix landed (not `:wq`-specific)
+
+**Root cause**: busybox `vi` (like many raw-mode readline/vi-alike
+programs) cannot distinguish "the user pressed `Esc` alone" from "the
+user pressed the first byte of a multi-byte escape sequence" (an arrow
+key, etc.) without waiting a short interval to see whether more bytes
+follow -- the same ambiguity every real terminal-attached program
+resolves via an `ESCDELAY`-style timeout. A human typing at a keyboard
+produces that gap for free; this feature's key-encoding mini-language
+encoding `<Esc>:wq<Enter>` as one contiguous byte string does not. Live,
+byte-exact reproduction directly against `--pty-mode` (bypassing the
+daemon entirely, via a `System.Diagnostics.ProcessStartInfo`-driven pty
+test with raw bytes, not PowerShell string escapes which turned out to
+mask the real bytes on a first attempt) showed vi's own
+`'?' is not implemented` status-line message firing when bytes follow
+`Esc` inside its disambiguation window, and a delay-threshold sweep
+pinned that window at >50ms and <=100ms.
+
+**This is NOT specific to the combined `:wq<Enter>` form.** The
+identical window is hit two ways: (a) any bytes following `<Esc>` in the
+*same* `session send` call, and (b) -- found only after the first fix
+alone still left the documented test hanging in a 19/20 live repro --
+bytes arriving in a SEPARATE, immediately-following `session send` call.
+A live-measured real CLI-to-CLI gap between two consecutive invocations
+(e.g. `session send <id> "i...<Esc>"` then `session send <id> ":wq<Enter>"`,
+exactly this feature's own definitive test) was ~24ms -- comfortably
+inside the danger window.
+
+**Fix** (`litebox_session_daemon/src/session.rs`, `Session::send_input`):
+splits a single write at every `Esc` byte followed by more bytes in that
+same call, inserting a 120ms pause (headroom above the observed 100ms
+threshold) before continuing; and tracks
+`last_write_ended_with_bare_esc` per session so a call whose bytes begin
+right after a PRIOR call's trailing bare `Esc` pays that same guard delay
+before writing anything, closing the cross-call gap too.
+
+**A second, independent bug surfaced and was fixed in the same pass**:
+`Registry::send_input`/`screen`/`history`/`list`/`kill` originally held
+the WHOLE registry's single `Mutex<HashMap<..>>` for the full duration of
+each per-session call -- harmless before this fix (nothing blocked for
+long), but the new 120ms-scale guard delay would have serialized EVERY
+session's every operation behind whichever session happened to be
+mid-`Esc`-delay, a real daemon-wide head-of-line-blocking regression.
+Fixed by wrapping each `Session` in `Arc` in the registry map and having
+every accessor clone the `Arc` (a quick, bounded map-lock hold) before
+calling into the session itself, so a slow/blocking call against one
+session never stalls any other session's concurrent request.
+
+**Live verification**: 40/40 clean runs (two independent 20-run batches)
+of the definitive `session start --rootfs <bundle> -- /usr/bin/vi
+/tmp/testfile.txt` -> `session send <id> "ihello world<Esc>"` ->
+`session send <id> ":wq<Enter>"` sequence, confirmed via `session list`
+(session no longer alive, exited cleanly) AND `session history` showing
+vi's own genuine write confirmation (`'/tmp/testfile.txt' 1L, 12C`)
+followed by the alternate-screen-exit sequence (`[?1049l`) -- real content
+correctness, not just "the process died." Multi-session isolation
+re-verified post-fix (two concurrent `/bin/cat` sessions, markers sent to
+each confirmed present in their own screen and absent from the other's).
+
+### 2. Per-request `DaemonClient::call` timeout: implemented and verified against a genuinely wedged session
+
+`litebox_session_daemon/src/client.rs`: `DaemonClient::call_with_timeout`
+runs the blocking `write_message`+`read_message` round-trip on a
+background thread and waits via `mpsc::Receiver::recv_timeout`, returning
+a `std::io::ErrorKind::TimedOut` error naming the timeout and suggesting
+`session kill <id>`/`session list` if no reply lands in time. On timeout
+the worker thread is deliberately leaked (Windows has no safe
+mid-`ReadFile` cancellation for a handle used this way) rather than
+force-killed -- a bounded, rare cost far preferable to the caller hanging
+forever. `DaemonClient::call` (used by `send`/`screen`/`history`/`list`/
+`kill`) defaults to a 5s `DEFAULT_CALL_TIMEOUT`; `session start`
+(`CreateSession`, which needs to spawn a real guest process) uses the
+30s `CREATE_SESSION_CALL_TIMEOUT` instead, via
+`session_cli.rs::cmd_start` calling `call_with_timeout` explicitly.
+
+**Live verification against a real wedge, not a simulated one**: a
+session's actual guest process's threads were suspended via a live
+`SuspendThread` call (Win32 API, driven from PowerShell) to produce a
+genuinely unresponsive session -- not a mock, not a sleep stand-in. A
+burst of `session send` calls against it first absorbed into the OS pipe
+buffer (fast, since `SendInput` doesn't wait for the guest to read),
+then, once that buffer filled, a `session send` call blocked on the
+now-full pipe write and, after exactly 5 seconds, the CLI printed:
+`error: session daemon did not respond within 5s; it may be
+unresponsive -- consider \`session kill <id>\` for the session this
+request targeted, or \`session list\` to check overall daemon health`
+and exited with a nonzero code -- instead of hanging forever. While that
+session stayed wedged, a brand-new, unrelated session's `session start`
++ `session history` (via the Arc-based per-session lock fix from item 1)
+completed normally in under 100ms, confirming the daemon-wide
+head-of-line-blocking fix and the timeout fix compose correctly: one
+wedged session can no longer freeze the daemon for every other session,
+and even a request that DOES end up genuinely stuck against ITS OWN
+session's pipe now surfaces cleanly instead of hanging the calling CLI
+process (and therefore the calling agent) forever.
+
+### 3. Cross-session filesystem persistence: confirmed NOT a gap -- isolation is the intended design
+
+Re-read against the feature's own stated goal (this doc's own "Goal"
+section, item 1: "Start multiple INDEPENDENT guest terminal sessions,
+each with its own pty") and the broader request's phrasing ("multiple
+TERMINALS on multiple SYSTEMS", not "multiple terminals on one system")
+-- both point at the same reading: each session models an independent
+*system* (like separate remote machines an agent might be driving), not
+multiple tabs into one shared machine's filesystem (which is what a
+literal tmux/screen analogy would suggest, and was the other candidate
+reading). "Multiple systems" is the load-bearing phrase distinguishing
+the two: N independent systems, not N views of one system.
+
+Per-session isolation (each `CreateSession` gets its own fresh
+`--initial-files`-only rootfs, no `--resume-from`/
+`--export-writable-layer` chaining across sessions) is therefore the
+CORRECT design already in place, not an unfixed gap -- this phase made no
+architectural change here, keeping the existing (and, on this reading,
+intentional) safe default. If a future workflow genuinely needs shared
+state across sessions (e.g. an agent explicitly wanting several
+"terminals" that are tabs into the SAME machine), that would be a new,
+explicit feature request distinct from what this doc's existing design
+already commits to, and should be scoped and named as such rather than
+folded into "fixing" what turned out not to be a bug.
+
+### Verification notes for future work in this area
+
+The two-bug shape found here (an ESC-timing bug the direct `--pty-mode`
+bypass test caught immediately, PLUS a completely separate registry-lock
+head-of-line-blocking bug the direct bypass test could never have caught
+since it doesn't go through the daemon at all) is a reminder that a
+`--pty-mode` bypass repro is necessary but not sufficient evidence a
+daemon-level fix is complete -- always re-verify through the actual
+`session` CLI/daemon path with many repeated runs, not just the
+lower-level mechanism in isolation.
