@@ -13,8 +13,22 @@ use std::sync::{Arc, Mutex};
 
 pub struct Session {
     pub program: String,
-    child: Child,
+    /// `Mutex`-wrapped (not plain `&mut`-accessed) because every `Session` in the registry is
+    /// held behind an `Arc` (see `Registry::sessions`' doc comment for why): a caller that needs
+    /// `&mut Child` (`is_alive`/`kill`) gets it by locking this instead of requiring exclusive
+    /// ownership of the whole `Session`.
+    child: Mutex<Child>,
     stdin: Mutex<ChildStdin>,
+    /// Set when the most recent [`Self::send_input`] call's last byte was a bare `Esc` (`0x1b`)
+    /// with nothing after it in that same call -- see [`Self::send_input`]'s doc comment for why
+    /// this matters: a SEPARATE, immediately-following `session send` call (a distinct CLI
+    /// invocation, a distinct `SendInput` IPC round-trip) hits the identical vi
+    /// escape-sequence-disambiguation window a same-call trailing `Esc` does, just split across
+    /// two calls instead of one write buffer. Live-measured gap between two such consecutive real
+    /// `session send` CLI invocations: ~24ms -- far under the ~100ms window that must elapse
+    /// before it's safe to send more bytes, so this flag lets the NEXT call pay that delay itself
+    /// rather than requiring the caller to know to add it.
+    last_write_ended_with_bare_esc: std::sync::atomic::AtomicBool,
     /// Live rendered-screen state and full scrollback, updated by this session's reader thread as
     /// bytes arrive from the guest's pty-master-over-stdout stream (see
     /// `docs/session-daemon-design.md`'s "Exposing the guest's pty master to the host process" --
@@ -25,13 +39,73 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn is_alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+    pub fn is_alive(&self) -> bool {
+        matches!(self.child.lock().unwrap().try_wait(), Ok(None))
     }
 
+    /// Writes `bytes` to the session's pty input, splitting the write at every `Esc` (`0x1b`)
+    /// byte that is followed by more bytes (in this call, or -- via
+    /// `last_write_ended_with_bare_esc` -- carried over from the immediately preceding call),
+    /// with a short pause after each split point.
+    ///
+    /// Why: busybox `vi` (and many other readline/vi-alike raw-mode consumers) cannot tell "the
+    /// user pressed Escape alone" from "the user pressed the first byte of an escape sequence
+    /// (arrow key, etc.)" without waiting a short interval to see whether more bytes follow --
+    /// this is the same ambiguity every real terminal-attached program resolves via an
+    /// `ESCDELAY`-style timeout (traditionally tens of milliseconds). A human typing at a real
+    /// keyboard naturally produces that gap for free; encoding `<Esc>:wq<Enter>` as one
+    /// contiguous byte string in a single `session send` call (this feature's own key-encoding
+    /// mini-language, see `keys.rs`) does not, so all of `:wq<CR>` arrives inside vi's
+    /// escape-sequence disambiguation window and gets silently swallowed as an unrecognized
+    /// sequence instead of being processed as the `Esc` keypress followed by a `:wq` command --
+    /// live-reproduced (`PowerShell` `ProcessStartInfo`-driven byte-exact repro against
+    /// `--pty-mode` directly, bypassing the daemon entirely) as busybox vi's own
+    /// `'?' is not implemented` status-line message, and confirmed via a delay-threshold sweep:
+    /// splitting the write with a >=100ms pause after `Esc` reliably avoids it, while <=50ms does
+    /// not. 120ms is used here for headroom above the observed 100ms threshold.
+    ///
+    /// The SAME window is also hit across two SEPARATE `session send` calls (e.g.
+    /// `session send <id> "ihello world<Esc>"` immediately followed by
+    /// `session send <id> ":wq<Enter>"`, exactly this feature's own definitive `vi` test) -- a
+    /// live-measured real CLI-to-CLI gap of ~24ms between two such consecutive invocations is
+    /// still far under the ~100ms threshold. `last_write_ended_with_bare_esc` carries that fact
+    /// across the call boundary so this call pays the same guard delay before writing anything,
+    /// without requiring the CALLER to know to add it (an agent driving this via repeated CLI
+    /// invocations has no way to control the inter-call gap precisely).
+    ///
+    /// This was previously misdiagnosed as specific to the combined `:wq<Enter>` vi command; it
+    /// is not `:wq`-specific at all -- any bytes following an `Esc` (same call or the next one)
+    /// hit the same window, `:wq<Enter>` merely being the design doc's own definitive end-to-end
+    /// test and therefore the case that surfaced it.
     pub fn send_input(&self, bytes: &[u8]) -> std::io::Result<()> {
-        self.stdin.lock().unwrap().write_all(bytes)?;
-        self.stdin.lock().unwrap().flush()
+        const ESC: u8 = 0x1b;
+        const POST_ESC_DELAY: std::time::Duration = std::time::Duration::from_millis(120);
+
+        let mut stdin = self.stdin.lock().unwrap();
+
+        if !bytes.is_empty()
+            && self
+                .last_write_ended_with_bare_esc
+                .swap(false, Ordering::Relaxed)
+        {
+            std::thread::sleep(POST_ESC_DELAY);
+        }
+
+        let mut start = 0;
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == ESC && i + 1 < bytes.len() {
+                stdin.write_all(&bytes[start..=i])?;
+                stdin.flush()?;
+                std::thread::sleep(POST_ESC_DELAY);
+                start = i + 1;
+            }
+        }
+        stdin.write_all(&bytes[start..])?;
+        stdin.flush()?;
+
+        self.last_write_ended_with_bare_esc
+            .store(bytes.last() == Some(&ESC), Ordering::Relaxed);
+        Ok(())
     }
 
     pub fn screen(&self) -> (u16, u16, (u16, u16), String) {
@@ -49,14 +123,14 @@ impl Session {
         (full[start..].to_vec(), cursor)
     }
 
-    pub fn kill(&mut self) -> bool {
-        self.child.kill().is_ok()
+    pub fn kill(&self) -> bool {
+        self.child.lock().unwrap().kill().is_ok()
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        let _ = self.child.lock().unwrap().kill();
         if let Some(t) = self.reader_thread.take() {
             let _ = t.join();
         }
@@ -64,7 +138,17 @@ impl Drop for Session {
 }
 
 pub struct Registry {
-    sessions: Mutex<HashMap<String, Session>>,
+    /// Each session is `Arc`-wrapped so every accessor below can clone the `Arc` while holding
+    /// this map's lock only long enough to look the id up, then drop the map lock before calling
+    /// into the session itself -- crucial for anything that can block for a nontrivial duration
+    /// (`Session::send_input`'s post-`Esc` pacing delay, see its own doc comment; a slow/wedged
+    /// guest process's pipe write blocking on a full OS pipe buffer). Without this, EVERY
+    /// session's `list`/`send`/`screen`/`history`/`kill` would stall for as long as the map lock
+    /// is held by one in-progress call touching a single, possibly-unrelated session -- a
+    /// daemon-wide head-of-line-blocking bug that would defeat this crate's own per-session
+    /// isolation design (`docs/session-daemon-design.md`'s "Process model" section) at the
+    /// registry layer even though each session's underlying guest process is already isolated.
+    sessions: Mutex<HashMap<String, Arc<Session>>>,
     next_id: AtomicU64,
 }
 
@@ -130,51 +214,55 @@ impl Registry {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
         self.sessions.lock().unwrap().insert(
             id.clone(),
-            Session {
+            Arc::new(Session {
                 program: program.to_string(),
-                child,
+                child: Mutex::new(child),
                 stdin: Mutex::new(stdin),
+                last_write_ended_with_bare_esc: std::sync::atomic::AtomicBool::new(false),
                 emulator,
                 reader_thread: Some(reader_thread),
-            },
+            }),
         );
         Ok(id)
     }
 
+    /// Clones the `id`'d session's `Arc` under the map lock and immediately drops the lock --
+    /// every accessor below builds on this so a slow/blocking call against one session (see
+    /// `sessions`' own doc comment) never stalls any other session's concurrent request.
+    fn get(&self, id: &str) -> Option<Arc<Session>> {
+        self.sessions.lock().unwrap().get(id).cloned()
+    }
+
     pub fn send_input(&self, id: &str, bytes: &[u8]) -> bool {
-        self.sessions
-            .lock()
-            .unwrap()
-            .get(id)
-            .is_some_and(|s| s.send_input(bytes).is_ok())
+        self.get(id).is_some_and(|s| s.send_input(bytes).is_ok())
     }
 
     pub fn screen(&self, id: &str) -> Option<(u16, u16, (u16, u16), String)> {
-        self.sessions.lock().unwrap().get(id).map(Session::screen)
+        self.get(id).map(|s| s.screen())
     }
 
     pub fn history(&self, id: &str, since: Option<u64>) -> Option<(Vec<u8>, u64)> {
-        self.sessions
-            .lock()
-            .unwrap()
-            .get(id)
-            .map(|s| s.history(since))
+        self.get(id).map(|s| s.history(since))
     }
 
     pub fn list(&self) -> Vec<(String, String, bool)> {
-        self.sessions
+        let snapshot: Vec<(String, Arc<Session>)> = self
+            .sessions
             .lock()
             .unwrap()
-            .iter_mut()
-            .map(|(id, s)| (id.clone(), s.program.clone(), s.is_alive()))
+            .iter()
+            .map(|(id, s)| (id.clone(), s.clone()))
+            .collect();
+        snapshot
+            .into_iter()
+            .map(|(id, s)| {
+                let alive = s.is_alive();
+                (id, s.program.clone(), alive)
+            })
             .collect()
     }
 
     pub fn kill(&self, id: &str) -> bool {
-        self.sessions
-            .lock()
-            .unwrap()
-            .get_mut(id)
-            .is_some_and(Session::kill)
+        self.get(id).is_some_and(|s| s.kill())
     }
 }
