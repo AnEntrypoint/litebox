@@ -322,12 +322,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         envp: Vec<alloc::ffi::CString>,
     ) -> Result<(LoadedProgram<Platform, FS>, u32), loader::elf::ElfLoaderError> {
         let loaded = self.load_program_with_pty(fs, task, path, argv, envp, true)?;
-        let pty_id = loaded
-            .entrypoints
-            .task
-            .attached_pty_id
-            .get()
-            .expect("load_program_with_pty(attach_pty=true) always sets attached_pty_id on success");
+        let pty_id = loaded.entrypoints.task.attached_pty_id.get().expect(
+            "load_program_with_pty(attach_pty=true) always sets attached_pty_id on success",
+        );
         Ok((loaded, pty_id))
     }
 
