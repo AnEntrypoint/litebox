@@ -2046,7 +2046,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     r10: source_ctx.r10,
                     r9: source_ctx.r9,
                     r8: source_ctx.r8,
-                    rax: source_ctx.rax,
+                    // Fork()'s child-side return value convention (0), NOT `source_ctx.rax` --
+                    // at this point in `do_clone`, `ctx.rax` still holds the syscall trampoline's
+                    // pre-dispatch placeholder (`push -38` in `syscall_callback`, i.e. `-ENOSYS`),
+                    // since `handle_syscall_request` only overwrites `ctx.rax` with the real
+                    // return value AFTER `do_syscall` (and thus this whole `do_clone` call)
+                    // returns. The thread-based fork path avoids this exact hazard via
+                    // `ThreadInitState::ForkedChild`'s own `parent_ctx.rax = 0` in
+                    // `init_thread_context` -- this snapshot needs the identical fixup, since
+                    // nothing downstream (the cross-process child never goes through
+                    // `init_thread_context` at all) would otherwise zero it. Confirmed live: this
+                    // was the root cause of every `LITEBOX_PROCESS_FORK=1` guest fork() call
+                    // (nested or otherwise) failing with a synthesized `OSError: [Errno 38]
+                    // Function not implemented` immediately on return from `fork()`/`clone()` in
+                    // the cross-process child, before any further guest code ran.
+                    rax: 0,
                     rcx: source_ctx.rcx,
                     rdx: source_ctx.rdx,
                     rsi: source_ctx.rsi,
