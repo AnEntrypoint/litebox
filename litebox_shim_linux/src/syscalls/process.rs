@@ -2357,6 +2357,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         fs: fs.into(),
                         files: files.into(),
                         signals: self.signals.clone_for_new_task(child_shared_pending),
+                        attached_pty_id: core::cell::Cell::new(self.attached_pty_id.get()),
                     },
                 }),
             )

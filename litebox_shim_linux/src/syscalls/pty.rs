@@ -47,7 +47,7 @@ use litebox::{
 use litebox_common_linux::{Termios, Winsize, errno::Errno};
 
 use crate::{
-    ShimPlatform,
+    GlobalState, ShimPlatform, Task,
     channel::{Channel, ReadEnd, WriteEnd},
 };
 
@@ -493,6 +493,101 @@ impl<Platform: ShimPlatform, FS: crate::ShimFS> crate::GlobalState<Platform, FS>
         {
             h.with_entry(|end: &PtyEnd<Platform>| end.half().shutdown_channel());
         }
+    }
+}
+
+impl<Platform: ShimPlatform, FS: crate::ShimFS> Task<Platform, FS> {
+    /// Session-daemon `--pty-mode` support (see `docs/session-daemon-design.md`): allocate a
+    /// fresh pty pair, attach this task to its slave as controlling terminal, and replace fds
+    /// 0/1/2 with the slave -- mirroring glibc's `login_tty()` (`setsid()` +
+    /// `ioctl(slave, TIOCSCTTY, 0)`), the exact sequence this module's own test suite exercises
+    /// (see `tests::open_unlocked_pty_pair`/`tests::tiocsctty_on_slave_makes_own_pgrp_the_foreground_group`).
+    ///
+    /// Unlike an ordinary guest-driven `open("/dev/ptmx")` (`GlobalState::ptmx_open`, which only
+    /// registers the slave, on the assumption the *guest* itself will hold and use the master fd),
+    /// this ALSO registers the master side in `global.daemon_pty_masters`, keyed by the returned
+    /// pty id, so a HOST-side caller with no `Task` in scope can drive it via
+    /// `LinuxShim::pty_master_read`/`pty_master_write`. The master is deliberately never installed
+    /// into this task's own fd table -- nothing inside the guest should be able to `read()`/
+    /// `write()` its own controlling terminal's master side directly, matching how a real
+    /// `forkpty()`-spawned child never sees its own master fd either (the parent that called
+    /// `forkpty()` keeps it).
+    ///
+    /// Returns the new pty's id (`TIOCGPTN`'s value) on success.
+    pub(crate) fn attach_pty_stdio(&self, global: &Arc<GlobalState<Platform, FS>>) -> Result<u32, Errno> {
+        let id = global.next_pty_id.fetch_add(1, Ordering::Relaxed);
+        let (master, slave) = new_pty_pair(&global.litebox, id);
+
+        // Unlock the slave (mirrors `TIOCSPTLCK(0)`/`unlockpt()`) -- `new_pty_pair` starts every
+        // fresh pty locked, matching real Linux devpts, but there is no separate guest-visible
+        // `open("/dev/pts/<id>")` step here to perform the unlock through; do it directly. Also
+        // give the pty a real (non-zero) default winsize here: `new_pty_pair` otherwise leaves it
+        // at `Winsize::default()` (all zeros), which makes a shell that checks its terminal size
+        // at startup (e.g. busybox `ash`) treat the pty as size-unknown and fall back to probing
+        // via a `\x1b[6n` (Device Status Report / cursor-position query) escape sequence -- a
+        // query this session-daemon feature has no consumer wired up to answer yet, stalling the
+        // shell's own prompt. 24x80 matches `litebox_termemu::TerminalEmulator`'s own default
+        // (see `litebox_termemu/src/lib.rs`) and `verify_live.rs`'s usage of it.
+        global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&master)
+            .expect("just-inserted master fd must still be present")
+            .with_entry(|end: &PtyEnd<Platform>| {
+                end.pair().set_locked(false);
+                end.pair().set_winsize(litebox_common_linux::Winsize {
+                    row: 24,
+                    col: 80,
+                    xpixel: 0,
+                    ypixel: 0,
+                });
+            });
+
+        global.daemon_pty_masters.write().insert(id, master);
+        // Register the slave in `pty_registry` too -- exactly like `GlobalState::ptmx_open` does
+        // for an ordinary guest-driven `/dev/ptmx` open -- so `GlobalState::hangup_slave` (called
+        // from `Task::close_all_fds_on_process_exit` at real process death) can find this pty's
+        // slave the same way it already finds every other pty's, and correctly wake up a thread
+        // blocked in `LinuxShim::pty_master_read` once this process exits. Without this, a
+        // session-daemon pty's master-side read would block forever past guest exit: real Linux
+        // (and this shim's own `ptmx_open` path) delivers that hangup unconditionally at process
+        // death, not only when the process explicitly closed its slave fds first.
+        global.pty_registry.write().insert(id, slave);
+
+        // The registry above holds the canonical slave entry now (mirroring `ptmx_open`'s own
+        // comment: "never installed into any process's own fd table directly"). Get an
+        // independent duplicate -- the same mechanism `pts_open`/`dup()`/`fork()` use -- to serve
+        // as the scratch source for the `sys_dup` (dup2 semantics: closes whatever currently
+        // occupies the target, matching real Linux's `dup2`) calls below that install it at fds
+        // 0/1/2, then close the scratch fd once each of 0/1/2 holds its own independent
+        // duplicate -- reusing the exact same fd-table machinery three real
+        // `dup2(slave_fd, n)` calls would, rather than reaching into descriptor-table internals
+        // directly.
+        let scratch_fd = {
+            let dup = global
+                .litebox
+                .descriptor_table_mut()
+                .duplicate(
+                    global
+                        .pty_registry
+                        .read()
+                        .get(&id)
+                        .expect("just-inserted slave must still be present"),
+                )
+                .expect("just-inserted slave must still be duplicable");
+            let files = self.files.borrow();
+            files.raw_descriptor_store.write().fd_into_raw_integer(dup)
+        };
+        let scratch_fd = i32::try_from(scratch_fd).map_err(|_| Errno::EMFILE)?;
+        self.sys_dup(scratch_fd, Some(0), None)?;
+        self.sys_dup(scratch_fd, Some(1), None)?;
+        self.sys_dup(scratch_fd, Some(2), None)?;
+        self.do_close(usize::try_from(scratch_fd).unwrap())?;
+
+        self.sys_setsid()?;
+        self.sys_ioctl(0, litebox_common_linux::IoctlArg::TIOCSCTTY(0))?;
+
+        Ok(id)
     }
 }
 

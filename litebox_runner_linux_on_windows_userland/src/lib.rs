@@ -52,6 +52,20 @@ pub struct CliArgs {
     /// from an empty upper layer.
     #[arg(long = "resume-from", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath)]
     pub resume_from: Option<PathBuf>,
+    /// Attach the launched program to a fresh pty as its controlling terminal (mirroring glibc's
+    /// `login_tty()`: `setsid()` + `TIOCSCTTY` + `dup2` onto fds 0/1/2), and forward the pty
+    /// master's byte stream to/from this process's own real stdout/stdin.
+    ///
+    /// This is the session-daemon feature's guest-side half (see
+    /// `docs/session-daemon-design.md`): unlike plain stdio (which routes straight through to
+    /// this process's real Windows stdio handles, and thus is not a real tty when the daemon
+    /// spawns this process with piped, non-console stdio), a pty gives the guest program raw-mode
+    /// terminal semantics (`TCSETS`/`ioctl` succeed, matching a real Linux pty) regardless of
+    /// whether this process's own stdio is a console. The session daemon spawns this process with
+    /// `--pty-mode` and reads its stdout / writes its stdin exactly as if they were a pty master's
+    /// byte stream.
+    #[arg(long = "pty-mode")]
+    pub pty_mode: bool,
 }
 
 struct MmappedFile {
@@ -315,22 +329,99 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         .is_some()
         .then(|| initial_file_system.clone());
 
-    let program = shim
-        .load_program(
-            initial_file_system,
-            platform.init_task(),
-            prog_path,
-            argv,
-            envp,
-        )
-        .unwrap();
-    unsafe {
-        litebox_platform_windows_userland::run_thread(
-            program.entrypoints,
-            &mut litebox_common_linux::PtRegs::default(),
-        );
-    }
-    let exit_code = program.process.wait();
+    let exit_code = if cli_args.pty_mode {
+        let (program, pty_id) = shim
+            .load_program_attach_pty(
+                initial_file_system,
+                platform.init_task(),
+                prog_path,
+                argv,
+                envp,
+            )
+            .unwrap();
+
+        // Two forwarding threads, mirroring `net_worker`'s existing "background thread pumping
+        // shim-internal I/O" pattern above: one drains the pty master's output to this process's
+        // real stdout, one copies this process's real stdin to the pty master's input. Both use
+        // `LinuxShim::pty_master_read`/`pty_master_write`, which need no `Task` in scope and are
+        // safe to call from any thread concurrently with `run_thread` running the guest below (see
+        // those methods' doc comments in `litebox_shim_linux`).
+        let out_shim = shim.clone();
+        let stdout_forwarder = std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            let mut stdout = std::io::stdout();
+            loop {
+                match out_shim.pty_master_read(pty_id, &mut buf) {
+                    // `Ok(0)`: guest exited and the pty hung up. `Err`: a real read failure. Both
+                    // end this forwarding loop the same way.
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        use std::io::Write as _;
+                        if stdout.write_all(&buf[..n]).is_err() || stdout.flush().is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let in_shim = shim.clone();
+        let stdin_forwarder = std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            let mut stdin = std::io::stdin();
+            loop {
+                use std::io::Read as _;
+                match stdin.read(&mut buf) {
+                    // `Ok(0)`: real stdin hit EOF. `Err`: a real read failure. Both end this
+                    // forwarding loop the same way.
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if in_shim.pty_master_write(pty_id, &buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        unsafe {
+            litebox_platform_windows_userland::run_thread(
+                program.entrypoints,
+                &mut litebox_common_linux::PtRegs::default(),
+            );
+        }
+        let exit_code = program.process.wait();
+
+        // The guest has exited: its slave-side fds are gone, so the pty's real Linux hangup
+        // semantics (`PtyEnd::drop`/`GlobalState::hangup_slave`, already exercised by this
+        // module's own test suite) shut down the master's read side, which unblocks
+        // `stdout_forwarder`'s `pty_master_read` with `Ok(0)`/`Err`. `stdin_forwarder` reading
+        // this process's own real stdin has no such natural unblock (a daemon-piped stdin with no
+        // more bytes coming just blocks forever), so it's deliberately not joined -- it exits on
+        // its own once the process itself exits (`std::process::exit` below tears down every
+        // thread unconditionally), matching how a real terminal's write-side simply stops
+        // mattering once the session it was feeding is gone.
+        let _ = stdout_forwarder.join();
+        drop(stdin_forwarder);
+
+        exit_code
+    } else {
+        let program = shim
+            .load_program(
+                initial_file_system,
+                platform.init_task(),
+                prog_path,
+                argv,
+                envp,
+            )
+            .unwrap();
+        unsafe {
+            litebox_platform_windows_userland::run_thread(
+                program.entrypoints,
+                &mut litebox_common_linux::PtRegs::default(),
+            );
+        }
+        program.process.wait()
+    };
 
     if let Some(export_path) = &cli_args.export_writable_layer {
         let fs = fs_for_export.expect("fs_for_export set whenever export_writable_layer is set");
