@@ -190,16 +190,14 @@ impl DaemonClient {
             Err(
                 std::sync::mpsc::RecvTimeoutError::Timeout
                 | std::sync::mpsc::RecvTimeoutError::Disconnected,
-            ) => {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!(
-                        "session daemon did not respond within {timeout:?}; it may be \
+            ) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "session daemon did not respond within {timeout:?}; it may be \
                          unresponsive -- consider `session kill <id>` for the session this \
                          request targeted, or `session list` to check overall daemon health"
-                    ),
-                ))
-            }
+                ),
+            )),
         }
     }
 }
