@@ -655,6 +655,38 @@ fn diag_process_fork_task_resume_probe(
     )
     .expect("cross-process fork child: failed to set FS base before resuming guest code");
 
+    // Pass 156: `run()`'s bootstrap spawns a background `net_worker` thread that repeatedly calls
+    // `perform_network_interaction()` to drive the guest's smoltcp `Network` state machine --
+    // this is what actually turns a guest socket syscall into a real packet reaching the
+    // `WindowsUserland` NAT gateway (`litebox_platform_windows_userland::net`) and pumps replies
+    // (e.g. DNS UDP responses) back into the guest's socket buffers. The NAT gateway itself is a
+    // separate, `OnceLock`-lazily-initialized per-`Platform` thread (`net::NatGateway::new`) that
+    // starts fine on its own the first time any `IPInterfaceProvider` method is called on this
+    // child's freshly-constructed `platform` -- but nothing upstream of this call ever spawned
+    // the `net_worker` counterpart in the process-fork child's bootstrap
+    // (`diag_process_fork_globalstate_probe`/`diag_process_fork_vmem_adopt_probe` never touch
+    // networking at all), so a process-forked child's guest DNS/socket traffic was enqueued into
+    // `Network`'s internal state but never actually polled/flushed, matching pass 155's
+    // "NAT gateway starts but DNS still fails" observation exactly. Spawn the SAME worker here,
+    // mirroring `run()`'s own construction verbatim, so this child's guest execution gets the
+    // same continuous network pump the default (non-process-fork) path always had.
+    let net_shim = shim.clone();
+    std::thread::spawn(move || {
+        const DEFAULT_TIMEOUT: core::time::Duration = core::time::Duration::from_micros(100);
+        const MAX_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(1);
+        loop {
+            let timeout = loop {
+                match net_shim.perform_network_interaction() {
+                    litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately => {}
+                    litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction { timeout } => {
+                        break timeout;
+                    }
+                }
+            };
+            platform.wait_on_tun(Some(timeout.unwrap_or(DEFAULT_TIMEOUT).min(MAX_TIMEOUT)));
+        }
+    });
+
     eprintln!(
         "[process_fork_diag] task-resume-probe (child, winpid={}): built Task, set fs_base={:#x}, calling \
          run_thread with rip={:#x} rsp={:#x} -- entering real guest execution",

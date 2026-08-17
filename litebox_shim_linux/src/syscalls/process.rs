@@ -220,13 +220,11 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     /// separately here by pid, keyed to an opaque
     /// [`litebox::platform::CrossProcessChildHandle`] rather than pushed into
     /// [`Self::children`]. `sys_wait4` checks this registry for a targeted `pid > 0` wait before
-    /// falling back to `children`; `wait4(pid == -1)` ("any child") does NOT consult this
-    /// registry -- the scope this pass targets (`beyond_stdio == 0`, one cross-process child at
-    /// a time, matching pass 116's "not the general N-child fanout problem" scoping) is a
-    /// fork()-then-exec()-then-`waitpid(known_pid)` pattern, which never needs it; a caller doing
-    /// `wait(-1)` for a cross-process child is a further, documented gap alongside signal
-    /// delivery (see `do_kill`'s doc comment). `do_kill`'s remote-child signal-delivery path
-    /// explicitly does NOT check this registry either (out of scope for this pass).
+    /// falling back to `children`; `wait4(pid == -1)` ("any child") also consults this registry
+    /// (pass 156) whenever `children` is empty, covering the shell `A && B`/pipeline wait pattern
+    /// (busybox ash included) that calls `wait(-1)` rather than `waitpid(known_pid)` after a
+    /// cross-process `fork()`. `do_kill`'s remote-child signal-delivery path still does NOT check
+    /// this registry (a separate, still-open gap, out of scope for this pass).
     cross_process_children:
         Mutex<Platform, alloc::vec::Vec<(i32, litebox::platform::CrossProcessChildHandle)>>,
     /// `1` from process creation until this (vforked) process's initial thread either calls
@@ -1537,6 +1535,46 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let _ = wstatus.write_at_offset::<Platform>(0, encoded);
             }
             return Ok(usize::try_from(pid).unwrap());
+        }
+
+        // Pass 156: `wait4(-1, ...)` ("any child") previously consulted only `children`
+        // (thread-based), never `cross_process_children` -- documented above as a known gap. A
+        // shell's `A && B`/pipeline wait loop (busybox ash included) calls exactly this pattern
+        // after `fork()`ing a cross-process child (`LITEBOX_PROCESS_FORK=1`'s `beyond_stdio == 0`
+        // shape, e.g. `apk` spawned by `/bin/sh -c "apk add ... && ..."`) -- with `children` empty
+        // and this registry never consulted, the wait fell straight through to `ECHILD` below,
+        // silently short-circuiting the shell's own wait loop and never running the rest of the
+        // `&&`/pipeline chain (live-observed: `apk add --no-cache jq` completes for real under
+        // `LITEBOX_PROCESS_FORK=1`, but the following `echo hello | jq -R .` never executes).
+        // Only taken when `children` has nothing (checked first, just below) so an existing
+        // thread-based-only caller's `pid == -1` behavior is completely unaffected.
+        if pid == -1 && process.children.lock().is_empty() {
+            let first_cross_pid = process
+                .cross_process_children
+                .lock()
+                .first()
+                .map(|(p, _)| *p);
+            if let Some(cross_pid) = first_cross_pid {
+                let handle = process
+                    .find_cross_process_child(cross_pid)
+                    .expect("pid just read from cross_process_children must still be registered");
+                let raw_exit = if no_hang {
+                    let Some(raw_exit) =
+                        self.global.platform.try_wait_for_cross_process_exit(handle)
+                    else {
+                        return Ok(0);
+                    };
+                    raw_exit
+                } else {
+                    self.global.platform.wait_for_cross_process_exit(handle)
+                };
+                process.reap_cross_process_child(cross_pid);
+                let encoded = decode_cross_process_wait_status(raw_exit);
+                if let Some(wstatus) = wstatus {
+                    let _ = wstatus.write_at_offset::<Platform>(0, encoded);
+                }
+                return Ok(usize::try_from(cross_pid).unwrap());
+            }
         }
 
         // Unlike the blocking path, a `WNOHANG` poll must NOT remove the child from our children
