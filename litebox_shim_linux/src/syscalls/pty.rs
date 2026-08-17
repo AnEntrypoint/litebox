@@ -514,7 +514,10 @@ impl<Platform: ShimPlatform, FS: crate::ShimFS> Task<Platform, FS> {
     /// `forkpty()` keeps it).
     ///
     /// Returns the new pty's id (`TIOCGPTN`'s value) on success.
-    pub(crate) fn attach_pty_stdio(&self, global: &Arc<GlobalState<Platform, FS>>) -> Result<u32, Errno> {
+    pub(crate) fn attach_pty_stdio(
+        &self,
+        global: &Arc<GlobalState<Platform, FS>>,
+    ) -> Result<u32, Errno> {
         let id = global.next_pty_id.fetch_add(1, Ordering::Relaxed);
         let (master, slave) = new_pty_pair(&global.litebox, id);
 
