@@ -86,6 +86,85 @@ fn mmapped_file(path: impl AsRef<Path>) -> Result<MmappedFile> {
     Ok(MmappedFile { data, abs_path })
 }
 
+/// Set up the root-owned identity and FHS scaffolding every fresh in-mem upper layer needs before
+/// it can back a real guest process's filesystem -- shared by `run()`'s own bootstrap and the
+/// `LITEBOX_PROCESS_FORK=1` cross-process child's `diag_process_fork_globalstate_probe`
+/// filesystem reconstruction, so the two never drift apart (see `layered.rs:243`'s
+/// `unimplemented!` and this function's own inline comments for why each step here matters).
+fn initialize_root_in_mem_layer<Platform: litebox::sync::RawSyncPrimitivesProvider>(
+    in_mem: &mut litebox::fs::in_mem::FileSystem<Platform>,
+) {
+    // The guest's persistent identity is root, matching `Platform::init_task`'s credentials (for
+    // `run()`) or `task_params`'s credentials (for the process-fork child's adopted `Task`) and
+    // matching how a real container's initial process runs (a fresh OCI rootfs's `/`, `/etc`,
+    // `/lib`, etc. are root-owned at mode 0755, not world-writable). Without this, `getuid()`
+    // would report root while the file system's own permission checks still enforced a
+    // mismatched non-root identity, breaking any program (e.g. `apk`) that needs to write into
+    // the rootfs's root-owned directories -- for the process-fork child specifically, this
+    // mismatch is what previously hit `unimplemented!("{e} when setting up ancestor dirs")` at
+    // `litebox/src/fs/layered.rs:243` (a `MkdirError::NoWritePerms` this in-mem layer's own
+    // `mkdir` returns once `apk`'s file-migration-from-the-read-only-tar-layer path reaches a
+    // root-owned ancestor directory).
+    in_mem.set_default_user(0, 0);
+    in_mem.with_root_privileges(|fs| {
+        use litebox::fs::FileSystem as _;
+        fs.mkdir(
+            "/tmp",
+            litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
+        )
+        .unwrap();
+        fs.chown("/tmp", Some(1000), Some(1000)).unwrap();
+
+        // Standard FHS directories that tools like `apk` expect to already exist
+        // (e.g. `apk` opens a log file under `/var/log`) but which don't survive
+        // as empty-directory entries when an OCI image's rootfs is scanned into a
+        // file-based tar (an empty directory has no file contents, so it produces
+        // no tar entry, and `TarRo`'s directory tree is inferred purely from file
+        // paths -- see litebox/src/fs/tar_ro.rs).
+        for dir in ["/run", "/var", "/var/log", "/var/cache", "/var/tmp"] {
+            fs.mkdir(
+                dir,
+                litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
+            )
+            .unwrap();
+        }
+
+        // A container's `/etc/resolv.conf` normally comes from the *host* runtime at
+        // container-start (e.g. Docker bind-mounts the host's own resolver config in), not
+        // from the image itself -- a plain OCI rootfs like this one has no such file. Without
+        // it, DNS-using tools (`apk`, `wget`, ...) have no configured nameserver at all and
+        // fail immediately rather than reaching the network. Point at a public resolver
+        // reachable through the platform's NAT gateway, mirroring what a real container
+        // runtime would inject.
+        //
+        // `/etc` itself isn't created here (it comes from the tar layer composed in later),
+        // so create it in this in-mem layer too, matching the `/tmp`, `/run`, etc. pattern
+        // above.
+        fs.mkdir(
+            "/etc",
+            litebox::fs::Mode::RWXU | litebox::fs::Mode::RGRP | litebox::fs::Mode::ROTH,
+        )
+        .unwrap();
+        let resolv_conf = fs
+            .open(
+                "/etc/resolv.conf",
+                litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
+                litebox::fs::Mode::RUSR
+                    | litebox::fs::Mode::WUSR
+                    | litebox::fs::Mode::RGRP
+                    | litebox::fs::Mode::ROTH,
+            )
+            .unwrap();
+        fs.write(
+            &resolv_conf,
+            b"nameserver 8.8.8.8\nnameserver 1.1.1.1\n",
+            None,
+        )
+        .unwrap();
+        fs.close(&resolv_conf).unwrap();
+    });
+}
+
 /// Run Linux programs with LiteBox on unmodified Windows
 ///
 /// # Panics
@@ -167,75 +246,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
-        // The guest's persistent identity is root, matching `Platform::init_task`'s credentials
-        // below and matching how a real container's initial process runs (a fresh OCI rootfs's
-        // `/`, `/etc`, `/lib`, etc. are root-owned at mode 0755, not world-writable). Without
-        // this, `getuid()` would report root while the file system's own permission checks still
-        // enforced a mismatched non-root identity, breaking any program (e.g. `apk`) that needs
-        // to write into the rootfs's root-owned directories.
-        in_mem.set_default_user(0, 0);
-        in_mem.with_root_privileges(|fs| {
-            use litebox::fs::FileSystem as _;
-            fs.mkdir(
-                "/tmp",
-                litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
-            )
-            .unwrap();
-            fs.chown("/tmp", Some(1000), Some(1000)).unwrap();
-
-            // Standard FHS directories that tools like `apk` expect to already exist
-            // (e.g. `apk` opens a log file under `/var/log`) but which don't survive
-            // as empty-directory entries when an OCI image's rootfs is scanned into a
-            // file-based tar (an empty directory has no file contents, so it produces
-            // no tar entry, and `TarRo`'s directory tree is inferred purely from file
-            // paths -- see litebox/src/fs/tar_ro.rs).
-            for dir in ["/run", "/var", "/var/log", "/var/cache", "/var/tmp"] {
-                fs.mkdir(
-                    dir,
-                    litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
-                )
-                .unwrap();
-            }
-
-            // A container's `/etc/resolv.conf` normally comes from the *host* runtime at
-            // container-start (e.g. Docker bind-mounts the host's own resolver config in), not
-            // from the image itself -- a plain OCI rootfs like this one has no such file. Without
-            // it, DNS-using tools (`apk`, `wget`, ...) have no configured nameserver at all and
-            // fail immediately rather than reaching the network. Point at a public resolver
-            // reachable through the platform's NAT gateway, mirroring what a real container
-            // runtime would inject.
-            //
-            // `/etc` itself isn't created here (it comes from the tar layer composed in later),
-            // so create it in this in-mem layer too, matching the `/tmp`, `/run`, etc. pattern
-            // above.
-            fs.mkdir(
-                "/etc",
-                litebox::fs::Mode::RWXU | litebox::fs::Mode::RGRP | litebox::fs::Mode::ROTH,
-            )
-            .unwrap();
-            let resolv_conf = fs
-                .open(
-                    "/etc/resolv.conf",
-                    litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
-                    litebox::fs::Mode::RUSR
-                        | litebox::fs::Mode::WUSR
-                        | litebox::fs::Mode::RGRP
-                        | litebox::fs::Mode::ROTH,
-                )
-                .unwrap();
-            fs.write(
-                &resolv_conf,
-                b"nameserver 8.8.8.8\nnameserver 1.1.1.1\n",
-                None,
-            )
-            .unwrap();
-            fs.close(&resolv_conf).unwrap();
-
-            if let Some(resume_from) = &cli_args.resume_from {
+        initialize_root_in_mem_layer(&mut in_mem);
+        if let Some(resume_from) = &cli_args.resume_from {
+            in_mem.with_root_privileges(|fs| {
                 import_writable_layer(fs, resume_from)
                     .unwrap_or_else(|e| panic!("failed to import --resume-from archive: {e}"));
-            }
-        });
+            });
+        }
 
         shim_builder.default_fs(in_mem, tar_data.into())
     };
@@ -381,7 +398,17 @@ pub fn diag_process_fork_globalstate_probe() {
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
     let litebox = shim_builder.litebox();
 
-    let in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
+    // This cross-process child's adopted `Task` carries `uid: 0, euid: 0, gid: 0, egid: 0`
+    // (`diag_process_fork_task_resume_probe`'s `task_params` below), matching the real bootstrap
+    // process's own root identity -- so this freshly-reconstructed in-mem upper layer needs the
+    // SAME root-identity/FHS-scaffolding setup `run()`'s own bootstrap performs, via the shared
+    // `initialize_root_in_mem_layer` helper, or a write into a root-owned ancestor directory
+    // inherited from the real bootstrap's rootfs (e.g. apk migrating a file up from the
+    // read-only tar layer) fails `in_mem::FileSystem::mkdir`'s permission check with
+    // `MkdirError::NoWritePerms`, which `FileSystem::mkdir_migrating_ancestor_dirs`'s caller has
+    // no handling for besides `unimplemented!` (`litebox/src/fs/layered.rs:243`).
+    let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
+    initialize_root_in_mem_layer(&mut in_mem);
     let fs = shim_builder.default_fs(in_mem, tar_data.into());
     let fs = std::sync::Arc::new(fs);
 
