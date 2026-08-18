@@ -384,7 +384,10 @@ mod tests {
     const PROGRAM_HEADER_SIZE_U16: u16 = 56;
     const ET_EXEC: u16 = 2;
     const ET_DYN: u16 = 3;
-    const EM_X86_64: u16 = 62;
+    #[cfg(target_arch = "x86_64")]
+    const EM_MACHINE: u16 = 62; // EM_X86_64
+    #[cfg(target_arch = "aarch64")]
+    const EM_MACHINE: u16 = 183; // EM_AARCH64
     const PT_LOAD: u32 = 1;
     const PT_INTERP: u32 = 3;
     const PF_X: u32 = 1;
@@ -421,7 +424,7 @@ mod tests {
         buf.extend_from_slice(&[2, 1, 1, 0]);
         buf.extend_from_slice(&[0; 8]);
         push_u16(buf, elf_type);
-        push_u16(buf, EM_X86_64);
+        push_u16(buf, EM_MACHINE);
         push_u32(buf, 1);
         push_u64(buf, entry);
         push_u64(buf, u64::from(ELF_HEADER_SIZE_U16));

@@ -1659,9 +1659,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
 /// A descriptor for thread-local storage (TLS).
 ///
-/// On `x86_64`, this is represented as a `*mut u8`. The TLS pointer can point to
-/// an arbitrary-sized memory region.
-#[cfg(target_arch = "x86_64")]
+/// On both `x86_64` and `aarch64`, this is represented as a `*mut u8` (the raw TLS base
+/// address written to the guest's FS-base / `TPIDR_EL0`, respectively). The TLS pointer can
+/// point to an arbitrary-sized memory region.
 type ThreadLocalDescriptor = UserPtrMut<u8>;
 
 struct NewThreadArgs<Platform: ShimPlatform, FS: ShimFS> {
@@ -1803,32 +1803,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         let tls = if flags.contains(CloneFlags::SETTLS) {
             let addr = tls.trunc();
-            #[cfg(target_arch = "x86_64")]
+            // Validate the user-controlled TLS base before spawning the thread. Two checks,
+            // deliberately layered: `is_valid_user_fs_base` enforces the generic Linux ABI
+            // ceiling (`USER_ADDR_END`, the same on every platform this shim targets), but
+            // that ceiling is NOT tight enough on `litebox_platform_windows_userland`
+            // specifically, whose actual guest-addressable ceiling (`TASK_ADDR_MAX`) sits far
+            // below `USER_ADDR_END` -- everything from `TASK_ADDR_MAX` up to
+            // `HOST_ALLOCATOR_REGION_MIN`'s reserved 64 GiB span belongs to the HOST process
+            // (its own stack, modules, and the host global allocator's own reserved region;
+            // see `HOST_ALLOCATOR_REGION_MIN`'s doc comment), never to the guest. A guest-
+            // supplied (or, more concerningly, a corrupted/mistranslated) TLS base landing up
+            // there would pass the generic ABI check yet still let the guest's own TLS/TCB
+            // accesses (FS-relative on x86_64, TPIDR_EL0-relative on aarch64) dereference live
+            // host heap memory instead of guest memory -- exactly the shape of this
+            // investigation's long-standing musl dtv-clear crash (`mov rdx, [rax+0x80]` on a
+            // `rax` proven to be a live `HOST_ALLOCATOR_REGION_MIN`-range address). Rejecting it
+            // here closes that off at the one syscall that can set a thread's TLS base directly,
+            // regardless of how such a value could ever have been computed.
+            if !litebox_common_linux::arch::is_valid_user_fs_base(addr)
+                || addr >= Platform::TASK_ADDR_MAX
             {
-                // Validate the user-controlled TLS base before spawning the thread. Two checks,
-                // deliberately layered: `is_valid_user_fs_base` enforces the generic x86_64 Linux
-                // ABI ceiling (`USER_ADDR_END`, the same on every platform this shim targets), but
-                // that ceiling is NOT tight enough on `litebox_platform_windows_userland`
-                // specifically, whose actual guest-addressable ceiling (`TASK_ADDR_MAX`) sits far
-                // below `USER_ADDR_END` -- everything from `TASK_ADDR_MAX` up to
-                // `HOST_ALLOCATOR_REGION_MIN`'s reserved 64 GiB span belongs to the HOST process
-                // (its own stack, modules, and the host global allocator's own reserved region;
-                // see `HOST_ALLOCATOR_REGION_MIN`'s doc comment), never to the guest. A guest-
-                // supplied (or, more concerningly, a corrupted/mistranslated) TLS base landing up
-                // there would pass the generic ABI check yet still let the guest's own `%fs`-
-                // relative TLS/TCB accesses dereference live host heap memory instead of guest
-                // memory -- exactly the shape of this investigation's long-standing musl dtv-clear
-                // crash (`mov rdx, [rax+0x80]` on a `rax` proven to be a live `HOST_ALLOCATOR_
-                // REGION_MIN`-range address). Rejecting it here closes that off at the one syscall
-                // that can set a thread's FS base directly, regardless of how such a value could
-                // ever have been computed.
-                if !litebox_common_linux::arch::is_valid_user_fs_base(addr)
-                    || addr >= Platform::TASK_ADDR_MAX
-                {
-                    return Err(Errno::EPERM);
-                }
+                return Err(Errno::EPERM);
             }
-            #[cfg(target_arch = "x86_64")]
             let desc = UserPtrMut::from_usize(addr);
             Some(desc)
         } else {
@@ -1942,6 +1938,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // already safely returns `None` (leaving the value untouched) for anything that
             // isn't a relocated address, so this is a no-op for non-pointer register contents
             // (small integers, flags, the post-fork `rax=0` return value, etc.).
+            #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
             let mut child_ctx = ctx.clone();
             #[cfg(target_arch = "x86_64")]
             {
@@ -2016,6 +2013,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 rsp: child_ctx.rsp,
                 rax: child_ctx.rax,
             });
+            #[cfg(not(target_arch = "x86_64"))]
+            let translated_gprs: Option<litebox::platform::ForkGprSnapshot> = None;
             // Pass 120: the SAME already-translated `child_ctx`, carried in full (every GPR plus
             // eflags/cs/ss) alongside the pre-existing 3-field snapshot -- see
             // `ForkFullGprSnapshot`'s doc comment for why this is a second, wider struct rather
@@ -3387,19 +3386,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `execve`.
     pub(crate) fn sys_execve(
         &self,
-        pathname: UserPtr<i8>,
-        argv: UserPtr<UserPtr<i8>>,
-        envp: UserPtr<UserPtr<i8>>,
+        pathname: UserPtr<core::ffi::c_char>,
+        argv: UserPtr<UserPtr<core::ffi::c_char>>,
+        envp: UserPtr<UserPtr<core::ffi::c_char>>,
         ctx: &mut litebox_common_linux::PtRegs,
     ) -> Result<usize, Errno> {
         fn copy_vector<Platform: ShimPlatform>(
-            mut base: UserPtr<UserPtr<i8>>,
+            mut base: UserPtr<UserPtr<core::ffi::c_char>>,
             which: &str,
         ) -> Result<alloc::vec::Vec<alloc::ffi::CString>, Errno> {
             let mut out = alloc::vec::Vec::new();
             let mut total = 0usize;
             for _ in 0..MAX_VEC {
-                let p: UserPtr<i8> = {
+                let p: UserPtr<core::ffi::c_char> = {
                     // read pointer-sized entries
                     match base.read_at_offset::<Platform>(0) {
                         Some(ptr) => ptr,
@@ -3485,9 +3484,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         unsafe { self.process().pm.release_memory(release) }
             .expect("failed to release memory mappings");
 
+        #[cfg(target_arch = "x86_64")]
         self.global
             .platform
             .set_arch_specific_register(&ArchSpecificRegister::FsBase, 0)
+            .expect("failed to clear guest TLS on execve");
+        #[cfg(target_arch = "aarch64")]
+        self.global
+            .platform
+            .set_arch_specific_register(&ArchSpecificRegister::TpidrEl0, 0)
             .expect("failed to clear guest TLS on execve");
 
         self.load_program(loader, argv_vec, envp_vec)
@@ -3562,6 +3567,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         ss: 0x2b, // __USER_DS
                     };
                 }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    *ctx = litebox_common_linux::PtRegs {
+                        regs: [0; litebox_common_linux::AARCH64_GENERAL_REGISTER_COUNT],
+                        sp: load_info.user_stack_top,
+                        pc: load_info.entry_point,
+                        pstate: 0,
+                        orig_x0: 0,
+                        syscallno: 0,
+                        unused2: 0,
+                    };
+                }
             }
             ThreadInitState::NewThread {
                 tls,
@@ -3576,12 +3593,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     }
                     ctx.rax = 0;
                 }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    if let Some(stack) = stack {
+                        ctx.sp = stack;
+                    }
+                    ctx.regs[0] = 0;
+                }
 
                 // Set the TLS for the new thread.
                 if let Some(tls) = tls {
                     #[cfg(target_arch = "x86_64")]
                     {
                         self.sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()))
+                            .unwrap();
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        self.global
+                            .platform
+                            .set_arch_specific_register(
+                                &ArchSpecificRegister::TpidrEl0,
+                                tls.as_usize(),
+                            )
                             .unwrap();
                     }
                 }
@@ -3591,12 +3625,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     let _ = child_tid_ptr.write_at_offset::<Platform>(0, self.tid);
                 }
             }
-            #[cfg_attr(not(target_arch = "x86_64"), expect(unused_variables))]
             ThreadInitState::ForkedChild(mut parent_ctx, fs_base, relocations) => {
                 #[cfg(target_arch = "x86_64")]
                 {
                     parent_ctx.rax = 0;
                     self.sys_arch_prctl(ArchPrctlArg::SetFs(fs_base)).unwrap();
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    parent_ctx.regs[0] = 0;
+                    self.global
+                        .platform
+                        .set_arch_specific_register(&ArchSpecificRegister::TpidrEl0, fs_base)
+                        .unwrap();
                 }
                 *ctx = parent_ctx;
                 // This runs on the child's own (brand-new) host thread, immediately before it
@@ -4144,9 +4185,21 @@ mod tests {
             );
 
              // `process_signals` is called when about to switch back to userspace, so simulate that here.
+             //
+             // aarch64's on-stack signal frame is much larger than x86_64's: Sigcontext alone
+             // reserves 4096 bytes for the FPSIMD/SVE context record (matching the real kernel
+             // ABI), so the whole SignalFrame (Ucontext{..,mcontext: Sigcontext} + Siginfo)
+             // does not fit in a 4096-byte buffer the way it does on x86_64 -- a too-small
+             // buffer here underflows `get_signal_frame`'s `sp - size_of::<SignalFrame>()`
+             // below the buffer entirely.
+             #[cfg(target_arch = "x86_64")]
              let mut stack = [0u8; 4096];
+             #[cfg(target_arch = "aarch64")]
+             let mut stack = [0u8; 8192];
              #[cfg(target_arch = "x86_64")]
              let mut regs = litebox_common_linux::PtRegs { rsp: stack.as_mut_ptr() as usize + stack.len(), ..Default::default() };
+             #[cfg(target_arch = "aarch64")]
+             let mut regs = litebox_common_linux::PtRegs { sp: stack.as_mut_ptr() as usize + stack.len(), ..Default::default() };
              task.process_signals(&mut regs);
             assert_eq!(
                 regs.get_ip(), callback_addr,

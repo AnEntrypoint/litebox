@@ -158,14 +158,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
         ctx: &mut Self::ExecutionContext,
         info: &litebox::shim::ExceptionInfo,
     ) -> ContinueOperation {
-        if info.kernel_mode && info.exception == litebox::shim::Exception::PAGE_FAULT {
-            if unsafe {
-                self.task
-                    .process()
-                    .pm
-                    .handle_page_fault(info.cr2, info.error_code.into())
-            }
-            .is_ok()
+        #[cfg(target_arch = "x86_64")]
+        let is_kernel_page_fault =
+            info.kernel_mode && info.exception == litebox::shim::Exception::PAGE_FAULT;
+        #[cfg(target_arch = "aarch64")]
+        let is_kernel_page_fault = info.kernel_mode
+            && matches!(
+                info.exception,
+                litebox::shim::Exception::DATA_ABORT_CURRENT_EL
+                    | litebox::shim::Exception::DATA_ABORT_LOWER_EL
+                    | litebox::shim::Exception::INSTRUCTION_ABORT_CURRENT_EL
+                    | litebox::shim::Exception::INSTRUCTION_ABORT_LOWER_EL
+            );
+        if is_kernel_page_fault {
+            #[cfg(target_arch = "x86_64")]
+            let (fault_addr, error_code) = (info.cr2, u64::from(info.error_code));
+            #[cfg(target_arch = "aarch64")]
+            let (fault_addr, error_code) = (info.fault_address, info.esr);
+            if unsafe { self.task.process().pm.handle_page_fault(fault_addr, error_code) }.is_ok()
             {
                 return ContinueOperation::Resume;
             } else {
@@ -996,6 +1006,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         {
             ctx.rax = return_value;
         }
+        #[cfg(target_arch = "aarch64")]
+        {
+            ctx.regs[0] = return_value;
+        }
     }
 
     fn do_syscall(&self, ctx: &mut litebox_common_linux::PtRegs) -> Result<usize, Errno> {
@@ -1008,6 +1022,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         #[cfg(target_arch = "x86_64")]
         let syscall_number = ctx.orig_rax;
+        #[cfg(target_arch = "aarch64")]
+        let syscall_number = ctx.syscallno.reinterpret_as_unsigned() as usize;
         let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
         if matches!(
             request,
@@ -1584,11 +1600,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::Clone { args } => self.sys_clone(ctx, &args),
             SyscallRequest::Clone3 { args } => self.sys_clone3(ctx, args),
             SyscallRequest::SetThreadArea { user_desc } => {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    let _ = user_desc;
-                    Err(Errno::ENOSYS) // x86_64 does not support set_thread_area
-                }
+                let _ = user_desc;
+                Err(Errno::ENOSYS) // x86_64 does not support set_thread_area
             }
             SyscallRequest::SetTidAddress { tidptr } => {
                 Ok(self.sys_set_tid_address(tidptr).reinterpret_as_unsigned() as usize)

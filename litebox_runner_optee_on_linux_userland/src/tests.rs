@@ -82,9 +82,9 @@ pub fn run_ta_with_test_commands(
                 );
             }
             assert!(
-                ctx.rax == 0,
+                ctx.return_value() == 0,
                 "ldelf exits with error: return_code={:#x}",
-                ctx.rax
+                ctx.return_value()
             );
             // The session persists across all commands, so disarm the token:
             // its drop must not recycle the id or clear the client identity.
@@ -119,9 +119,9 @@ pub fn run_ta_with_test_commands(
                 );
             }
             assert!(
-                ctx.rax == 0,
+                ctx.return_value() == 0,
                 "TA exits with error: return_code={:#x}",
-                ctx.rax
+                ctx.return_value()
             );
             // TA stores results in the `UteeParams` structure and/or buffers it refers to.
             if let Some(params_address) = info.params_address {

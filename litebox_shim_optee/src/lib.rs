@@ -3,7 +3,7 @@
 
 //! A shim that provides an OP-TEE-compatible ABI via LiteBox
 
-#![cfg(target_arch = "x86_64")]
+#![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #![no_std]
 
 extern crate alloc;
@@ -71,13 +71,23 @@ impl litebox::shim::EnterShim for OpteeShimEntrypoints {
         ctx: &mut Self::ExecutionContext,
         info: &litebox::shim::ExceptionInfo,
     ) -> ContinueOperation {
-        if info.exception == litebox::shim::Exception::PAGE_FAULT {
-            let result = unsafe {
-                self.task
-                    .global
-                    .pm
-                    .handle_page_fault(info.cr2, info.error_code.into())
-            };
+        #[cfg(target_arch = "x86_64")]
+        let is_page_fault = info.exception == litebox::shim::Exception::PAGE_FAULT;
+        #[cfg(target_arch = "aarch64")]
+        let is_page_fault = matches!(
+            info.exception,
+            litebox::shim::Exception::DATA_ABORT_CURRENT_EL
+                | litebox::shim::Exception::DATA_ABORT_LOWER_EL
+                | litebox::shim::Exception::INSTRUCTION_ABORT_CURRENT_EL
+                | litebox::shim::Exception::INSTRUCTION_ABORT_LOWER_EL
+        );
+        if is_page_fault {
+            #[cfg(target_arch = "x86_64")]
+            let (fault_addr, error_code) = (info.cr2, u64::from(info.error_code));
+            #[cfg(target_arch = "aarch64")]
+            let (fault_addr, error_code) = (info.fault_address, info.esr);
+            let result =
+                unsafe { self.task.global.pm.handle_page_fault(fault_addr, error_code) };
             if info.kernel_mode {
                 return if result.is_ok() {
                     ContinueOperation::Resume
@@ -92,7 +102,7 @@ impl litebox::shim::EnterShim for OpteeShimEntrypoints {
             // fall through to kill the TA below.
         }
         // OP-TEE has no signal handling. Kill the TA on any non-PF exception.
-        ctx.rax = (TeeResult::TargetDead as u32) as usize;
+        ctx.set_return_value((TeeResult::TargetDead as u32) as usize);
         self.task.clear_ta_context();
         ContinueOperation::Terminate
     }
@@ -272,7 +282,6 @@ impl OpteeShim {
                 ta_entry_point: Cell::new(0),
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
-                #[cfg(target_arch = "x86_64")]
                 tls_base_addr: Cell::new(0),
             },
         };
@@ -382,20 +391,20 @@ impl Task {
         &self,
         ctx: &mut litebox_common_linux::PtRegs,
     ) -> ContinueOperation {
-        let request = match SyscallRequest::<Platform>::try_from_raw(ctx.orig_rax, ctx) {
+        let request = match SyscallRequest::<Platform>::try_from_raw(ctx.syscall_number(), ctx) {
             Ok(request) => request,
             Err(err) => {
-                ctx.rax = TeeResult::from(err) as usize;
+                ctx.set_return_value(TeeResult::from(err) as usize);
                 return ContinueOperation::Resume;
             }
         };
 
         if let SyscallRequest::Return { ret } = request {
-            ctx.rax = self.sys_return(ret);
+            ctx.set_return_value(self.sys_return(ret));
             self.clear_ta_context();
             return ContinueOperation::Terminate;
         } else if let SyscallRequest::Panic { code } = request {
-            ctx.rax = self.sys_panic(code);
+            ctx.set_return_value(self.sys_panic(code));
             self.clear_ta_context();
             return ContinueOperation::Terminate;
         }
@@ -600,10 +609,10 @@ impl Task {
             }
         };
 
-        ctx.rax = match res {
+        ctx.set_return_value(match res {
             Ok(()) => u32::from(TeeResult::Success),
             Err(e) => e.into(),
-        } as usize;
+        } as usize);
         ContinueOperation::Resume
     }
 
@@ -628,6 +637,13 @@ impl Task {
                     ctx.cs = 0x33; // __USER_CS
                     ctx.ss = 0x2b; // __USER_DS
                     ctx.eflags = 0x202; // IF (interrupt enable) and reserved bit 1
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    ctx.regs[0] = ldelf_arg_address;
+                    ctx.pc = entry_point;
+                    ctx.sp = stack_top;
+                    ctx.pstate = 0;
                 }
                 ContinueOperation::Resume
             }
@@ -665,6 +681,16 @@ impl Task {
                     ctx.ss = 0x2b; // __USER_DS
                     ctx.eflags = 0x202; // IF (interrupt enable) and reserved bit 1
                 }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    ctx.regs[0] = func_id;
+                    ctx.regs[1] = session_id;
+                    ctx.regs[2] = params_address;
+                    ctx.regs[3] = cmd_id;
+                    ctx.pc = entry_point;
+                    ctx.sp = stack_top;
+                    ctx.pstate = 0;
+                }
                 ContinueOperation::Resume
             }
         }
@@ -674,22 +700,22 @@ impl Task {
         &self,
         ctx: &mut litebox_common_linux::PtRegs,
     ) -> ContinueOperation {
-        let request = match LdelfSyscallRequest::<Platform>::try_from_raw(ctx.orig_rax, ctx) {
+        let request = match LdelfSyscallRequest::<Platform>::try_from_raw(ctx.syscall_number(), ctx) {
             Ok(request) => request,
             Err(err) => {
-                ctx.rax = TeeResult::from(err) as usize;
+                ctx.set_return_value(TeeResult::from(err) as usize);
                 return ContinueOperation::Resume;
             }
         };
 
         if let LdelfSyscallRequest::Return { ret } = request {
-            ctx.rax = self.sys_return(ret);
-            if ctx.rax == 0 {
+            ctx.set_return_value(self.sys_return(ret));
+            if ctx.return_value() == 0 {
                 self.get_ldelf_result();
             }
             return ContinueOperation::Terminate;
         } else if let LdelfSyscallRequest::Panic { code } = request {
-            ctx.rax = self.sys_panic(code);
+            ctx.set_return_value(self.sys_panic(code));
             return ContinueOperation::Terminate;
         }
         let res: Result<(), TeeResult> = match request {
@@ -763,10 +789,10 @@ impl Task {
             _ => Err(TeeResult::NotSupported),
         };
 
-        ctx.rax = match res {
+        ctx.set_return_value(match res {
             Ok(()) => u32::from(TeeResult::Success),
             Err(e) => e.into(),
-        } as usize;
+        } as usize);
         ContinueOperation::Resume
     }
 
@@ -804,7 +830,6 @@ impl Task {
             self.ta_prepared.set(true);
         }
 
-        #[cfg(target_arch = "x86_64")]
         self.restore_guest_tls();
 
         let mut ta_stack =
@@ -866,7 +891,6 @@ impl Task {
     /// Instead of using this function, we could change the flags of the toolchain to not use TLS
     /// (e.g., `-fno-stack-protector`), but this might be insecure. Also, the toolchain might have
     /// other features relying on TLS.
-    #[cfg(target_arch = "x86_64")]
     fn allocate_guest_tls(
         &self,
         tls_size: Option<usize>,
@@ -886,20 +910,24 @@ impl Task {
         Ok(())
     }
 
-    /// Restore the guest TLS (FS base) before entering the TA.
+    /// Restore the guest TLS (FS base on x86_64, `TPIDR_EL0` on aarch64) before entering the
+    /// TA.
     ///
-    /// FS base is cleared across VTL switches, so we must restore it before
-    /// every TA entry.
-    #[cfg(target_arch = "x86_64")]
+    /// The guest TLS base register is cleared across VTL switches (x86_64/LVBS) or a fresh
+    /// guest-entry trampoline run (aarch64), so we must restore it before every TA entry.
     fn restore_guest_tls(&self) {
         use litebox::platform::ArchSpecificProvider as _;
         let addr = self.tls_base_addr.get();
         if addr == 0 {
             return; // TLS not allocated yet
         }
+        #[cfg(target_arch = "x86_64")]
+        let reg = litebox::platform::ArchSpecificRegister::FsBase;
+        #[cfg(target_arch = "aarch64")]
+        let reg = litebox::platform::ArchSpecificRegister::TpidrEl0;
         litebox_platform_multiplex::platform()
-            .set_arch_specific_register(&litebox::platform::ArchSpecificRegister::FsBase, addr)
-            .expect("requires guaranteed platform support for FsBase");
+            .set_arch_specific_register(&reg, addr)
+            .expect("requires guaranteed platform support for the guest TLS base register");
     }
 
     /// Retrieve the result of the `ldelf` execution.
@@ -1390,8 +1418,7 @@ struct Task {
     ta_stack_base_addr: Cell<usize>,
     /// Whether the TA has been prepared
     ta_prepared: Cell<bool>,
-    /// TLS base address for x86_64 (stored to restore FS before each TA entry)
-    #[cfg(target_arch = "x86_64")]
+    /// Guest TLS base address (stored to restore FS base / `TPIDR_EL0` before each TA entry)
     tls_base_addr: Cell<usize>,
     // TODO: OP-TEE supports global, persistent objects across sessions. Add these maps if needed.
 }
@@ -1557,7 +1584,6 @@ mod test_utils {
                 ta_entry_point: Cell::new(0),
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
-                #[cfg(target_arch = "x86_64")]
                 tls_base_addr: Cell::new(0),
             }
         }
