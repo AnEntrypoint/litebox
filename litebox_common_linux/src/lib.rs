@@ -3553,6 +3553,18 @@ pub mod arch {
     pub const PSR_DIT_BIT: u64 = 1 << 24;
     /// PSTATE bits a guest may keep when returning to EL0.
     pub const SAFE_USER_PSTATE: u64 = PSR_NZCV_MASK | PSR_SSBS_BIT | PSR_DIT_BIT;
+
+    /// Returns whether `base` is a valid aarch64 Linux user TLS base (the value written to
+    /// `TPIDR_EL0`).
+    ///
+    /// A user TLS base is valid iff it is below the top of the user address space -- unlike
+    /// x86_64's FS-base check, aarch64 has no non-canonical-address #GP fault to guard against
+    /// (`TPIDR_EL0` accepts any 64-bit value), so this is purely an address-space-separation
+    /// check, matching `is_valid_user_fs_base`'s role on x86_64.
+    #[must_use]
+    pub fn is_valid_user_fs_base(base: usize) -> bool {
+        base < USER_ADDR_END
+    }
 }
 
 impl PtRegs {
@@ -3660,6 +3672,42 @@ impl PtRegs {
     #[cfg(target_arch = "aarch64")]
     pub fn get_ip(&self) -> usize {
         self.pc
+    }
+
+    /// Get the syscall return-value register (`rax` on x86_64, `x0`/`regs[0]` on aarch64).
+    #[cfg(target_arch = "x86_64")]
+    pub fn return_value(&self) -> usize {
+        self.rax
+    }
+
+    /// Get the syscall return-value register (`rax` on x86_64, `x0`/`regs[0]` on aarch64).
+    #[cfg(target_arch = "aarch64")]
+    pub fn return_value(&self) -> usize {
+        self.regs[0]
+    }
+
+    /// Set the syscall return-value register (`rax` on x86_64, `x0`/`regs[0]` on aarch64).
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_return_value(&mut self, val: usize) {
+        self.rax = val;
+    }
+
+    /// Set the syscall return-value register (`rax` on x86_64, `x0`/`regs[0]` on aarch64).
+    #[cfg(target_arch = "aarch64")]
+    pub fn set_return_value(&mut self, val: usize) {
+        self.regs[0] = val;
+    }
+
+    /// Get the trapped syscall number (`orig_rax` on x86_64, `syscallno` on aarch64).
+    #[cfg(target_arch = "x86_64")]
+    pub fn syscall_number(&self) -> usize {
+        self.orig_rax
+    }
+
+    /// Get the trapped syscall number (`orig_rax` on x86_64, `syscallno` on aarch64).
+    #[cfg(target_arch = "aarch64")]
+    pub fn syscall_number(&self) -> usize {
+        self.syscallno.reinterpret_as_unsigned() as usize
     }
 }
 

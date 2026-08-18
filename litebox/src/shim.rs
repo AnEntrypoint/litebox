@@ -114,6 +114,18 @@ pub struct ExceptionInfo {
     pub kernel_mode: bool,
 }
 
+#[cfg(target_arch = "x86_64")]
+impl Default for ExceptionInfo {
+    fn default() -> Self {
+        Self {
+            exception: Exception(0),
+            error_code: 0,
+            cr2: 0,
+            kernel_mode: false,
+        }
+    }
+}
+
 /// Information about a hardware exception on aarch64.
 #[cfg(target_arch = "aarch64")]
 #[derive(Copy, Clone, Debug)]
@@ -126,6 +138,18 @@ pub struct ExceptionInfo {
     pub esr: u64,
     /// Whether the exception occurred in kernel mode.
     pub kernel_mode: bool,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Default for ExceptionInfo {
+    fn default() -> Self {
+        Self {
+            exception: Exception(0),
+            fault_address: 0,
+            esr: 0,
+            kernel_mode: false,
+        }
+    }
 }
 
 /// An x86 exception type.

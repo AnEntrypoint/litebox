@@ -618,7 +618,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// the segment being mapped. The `file_offset` parameter identifies which
     /// segment is being mapped so we can look up its `p_vaddr`.
     ///
-    /// x86_64 only: assumes 64-bit ELF layout and program header offsets.
+    /// x86_64 only: assumes 64-bit ELF layout and program header offsets, and
+    /// `litebox_syscall_rewriter::patch_code_segment` itself only recognizes x86_64 `syscall`
+    /// opcodes -- on any other architecture, scanning a guest binary's actual machine code for
+    /// that specific byte pattern risks a false-positive match (e.g. `0f 05` occurring inside
+    /// legitimate aarch64 instructions) and corrupting the guest's executable memory with a
+    /// bogus patch attempt. Skip this entire subsystem outside x86_64; the seccomp+SIGSYS
+    /// fallback path handles every syscall correctly there regardless.
+    #[cfg(not(target_arch = "x86_64"))]
+    fn init_elf_patch_state(&self, _fd: i32, _mapped_addr: usize, _file_offset: usize) {}
+
+    #[cfg(target_arch = "x86_64")]
     fn init_elf_patch_state(&self, fd: i32, mapped_addr: usize, file_offset: usize) {
         // Quick check: skip if already initialized.
         if self
@@ -772,11 +782,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return (false, 0, 0, 0);
         };
         let file_size = stat.st_size;
-        if file_size < HEADER_SIZE {
+        if file_size < HEADER_SIZE as i64 {
             return (false, 0, 0, 0);
         }
         let mut tail = [0u8; HEADER_SIZE];
-        match self.sys_read(fd, &mut tail, Some(file_size - HEADER_SIZE)) {
+        let Ok(read_offset) = usize::try_from(file_size - HEADER_SIZE as i64) else {
+            return (false, 0, 0, 0);
+        };
+        match self.sys_read(fd, &mut tail, Some(read_offset)) {
             Ok(n) if n == HEADER_SIZE => {}
             _ => return (false, 0, 0, 0),
         }

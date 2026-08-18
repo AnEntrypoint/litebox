@@ -3,7 +3,7 @@
 
 //! Common elements to enable OP-TEE-like functionalities
 
-#![cfg(target_arch = "x86_64")]
+#![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #![no_std]
 
 extern crate alloc;
@@ -342,6 +342,7 @@ impl SyscallContext {
     }
 
     /// Create OP-TEE TA's `SyscallContext` from `PtRegs`.
+    #[cfg(target_arch = "x86_64")]
     pub fn from_pt_regs(pt_regs: &PtRegs) -> Self {
         SyscallContext {
             args: [
@@ -355,6 +356,20 @@ impl SyscallContext {
                 pt_regs.r13,
             ],
         }
+    }
+
+    /// Create OP-TEE TA's `SyscallContext` from `PtRegs`, aarch64 variant.
+    ///
+    /// Unlike x86_64's `syscall` instruction (which clobbers `rcx`/`r11`, forcing OP-TEE's own
+    /// x86_64 ABI to substitute `r10` for the 4th argument and skip straight to `r12`/`r13` for
+    /// args 7-8), aarch64's `svc` instruction leaves every general-purpose register untouched,
+    /// so OP-TEE's aarch64 syscall ABI passes all 8 arguments in the natural, unmodified AAPCS64
+    /// argument registers `x0..x7`.
+    #[cfg(target_arch = "aarch64")]
+    pub fn from_pt_regs(pt_regs: &PtRegs) -> Self {
+        let mut args = [0usize; MAX_SYSCALL_ARGS];
+        args.copy_from_slice(&pt_regs.regs[..MAX_SYSCALL_ARGS]);
+        SyscallContext { args }
     }
 }
 

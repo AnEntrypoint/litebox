@@ -3,15 +3,18 @@
 
 //! A [LiteBox platform](../litebox/platform/index.html) for running LiteBox on userland Linux.
 
-// Restrict this crate to only work on Linux. For now, we are restricting this to only x86/x86-64
-// Linux, but we _may_ allow for more in the future, if we find it useful to do so.
-#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
+// Restrict this crate to only work on Linux, on the architectures with a real implementation
+// below (x86_64 and aarch64).
+#![cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 
 use std::cell::Cell;
 use std::io::IsTerminal as _;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 use std::unimplemented;
 
@@ -167,6 +170,33 @@ pub union Ifru {
     // pub ifru_data: *mut i8,
 }
 
+/// Opens `path` on the host, matching the real `open(2)` ABI (`(fd, errno)`-style raw syscall
+/// return convention).
+///
+/// `open` does not exist as a syscall number on aarch64 (only `openat` does); this dispatches
+/// to `openat(AT_FDCWD, path, flags, mode)` there and to `open(path, flags, mode)` on x86_64,
+/// giving every call site a single, arch-neutral entry point instead of repeating the cfg-gate.
+///
+/// # Safety
+/// `path` must be a valid, NUL-terminated pointer for the duration of the call.
+unsafe fn raw_open(path: usize, flags: usize, mode: usize) -> Result<usize, syscalls::Errno> {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        syscalls::syscall3(syscalls::Sysno::open, path, flags, mode)
+    }
+    #[cfg(target_arch = "aarch64")]
+    #[allow(clippy::cast_sign_loss, reason = "AT_FDCWD is a negative sentinel, passed as-is")]
+    unsafe {
+        syscalls::syscall4(
+            syscalls::Sysno::openat,
+            libc::AT_FDCWD as usize,
+            path,
+            flags,
+            mode,
+        )
+    }
+}
+
 impl LinuxUserland {
     /// Create a new userland-Linux platform for use in `LiteBox`.
     ///
@@ -183,8 +213,7 @@ impl LinuxUserland {
             .map(|tun_device_name| {
                 let tun_path = b"/dev/net/tun\0";
                 let tun_fd = unsafe {
-                    syscalls::syscall3(
-                        syscalls::Sysno::open,
+                    raw_open(
                         tun_path.as_ptr() as usize,
                         (litebox::fs::OFlags::RDWR
                             | litebox::fs::OFlags::CLOEXEC
@@ -318,14 +347,7 @@ impl LinuxUserland {
         // We should either fix `mmap` to handle this error, or let global allocator call this function
         // whenever it get more pages from the host.
         let path = c"/proc/self/maps";
-        let fd = unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::open,
-                path.as_ptr() as usize,
-                OFlags::RDONLY.bits() as usize,
-                0,
-            )
-        };
+        let fd = unsafe { raw_open(path.as_ptr() as usize, OFlags::RDONLY.bits() as usize, 0) };
         let Ok(fd) = fd else {
             return alloc::vec::Vec::new();
         };
@@ -417,7 +439,6 @@ impl LinuxUserland {
         };
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[allow(
         clippy::missing_panics_doc,
         reason = "the seccomp filter rules are hardcoded and not expected to fail"
@@ -432,7 +453,12 @@ impl LinuxUserland {
             // TUN and terminal
             (libc::SYS_read, vec![]),
             (libc::SYS_write, vec![]),
+            // `poll` does not exist as a syscall number on aarch64 (glibc's `poll()` calls
+            // `ppoll` there instead).
+            #[cfg(target_arch = "x86_64")]
             (libc::SYS_poll, vec![]),
+            #[cfg(target_arch = "aarch64")]
+            (libc::SYS_ppoll, vec![]),
             // memory management
             (libc::SYS_mmap, vec![]),
             (libc::SYS_mprotect, vec![]),
@@ -471,12 +497,36 @@ impl LinuxUserland {
             (libc::SYS_brk, vec![]),
             (libc::SYS_getpid, vec![]),
             // TODO: could be removed if we pre-open files (see `try_allocate_cow_pages`)
+            //
+            // `open` does not exist as a syscall number on aarch64 (glibc always emits
+            // `openat` there); only add this x86_64-specific legacy-syscall rule where the
+            // syscall number actually exists.
+            #[cfg(target_arch = "x86_64")]
             (
                 libc::SYS_open,
                 vec![
                     SeccompRule::new(vec![
                         SeccompCondition::new(
                             1,
+                            SeccompCmpArgLen::Dword,
+                            SeccompCmpOp::Eq,
+                            u64::from(OFlags::RDONLY.bits()),
+                        )
+                        .unwrap(),
+                    ])
+                    .unwrap(),
+                ],
+            ),
+            // aarch64 equivalent of the `open`(RDONLY) rule above: `raw_open` dispatches to
+            // `openat(AT_FDCWD, path, flags, mode)` there, so the flags argument moves from
+            // index 1 to index 2.
+            #[cfg(target_arch = "aarch64")]
+            (
+                libc::SYS_openat,
+                vec![
+                    SeccompRule::new(vec![
+                        SeccompCondition::new(
+                            2,
                             SeccompCmpArgLen::Dword,
                             SeccompCmpOp::Eq,
                             u64::from(OFlags::RDONLY.bits()),
@@ -500,7 +550,10 @@ impl LinuxUserland {
                 SeccompAction::Errno(libc::EINVAL.cast_unsigned())
             },
             SeccompAction::Allow,
+            #[cfg(target_arch = "x86_64")]
             seccompiler::TargetArch::x86_64,
+            #[cfg(target_arch = "aarch64")]
+            seccompiler::TargetArch::aarch64,
         )
         .unwrap();
         // TODO: bpf program can be compiled offline
@@ -524,6 +577,7 @@ impl litebox::platform::SignalProvider for LinuxUserland {
 }
 
 /// Atomically takes the per-thread pending host signal bitmask.
+#[cfg(target_arch = "x86_64")]
 fn take_pending_host_signals() -> litebox_common_linux::signal::SigSet {
     // Atomically swap the per-thread pending signals with zero.
     // Only the low 32 bits are used (covers traditional signals 1-31).
@@ -536,6 +590,22 @@ fn take_pending_host_signals() -> litebox_common_linux::signal::SigSet {
             options(nostack)
         );
     }
+    litebox_common_linux::signal::SigSet::from_u64(u64::from(lo))
+}
+
+/// AArch64 variant. `pending_host_signals` is only ever written by
+/// [`record_pending_signal`], which runs strictly on THIS thread's own execution (a signal
+/// handler fully interrupts and returns to the same thread it interrupted -- per POSIX, no
+/// other thread can concurrently write it), so a plain (non-atomic-instruction) swap is
+/// sufficient here, mirroring x86_64's `xchg` in effect if not in literal instruction form.
+#[cfg(target_arch = "aarch64")]
+fn take_pending_host_signals() -> litebox_common_linux::signal::SigSet {
+    let ptr = aarch64_scratch_or_host_only();
+    let lo = unsafe {
+        let val = core::ptr::read_volatile(&raw const (*ptr).pending_host_signals);
+        core::ptr::write_volatile(&raw mut (*ptr).pending_host_signals, 0);
+        val
+    };
     litebox_common_linux::signal::SigSet::from_u64(u64::from(lo))
 }
 
@@ -593,8 +663,18 @@ fn run_thread_inner(
     let ctx_ptr = core::ptr::from_mut(ctx);
     let mut thread_ctx = ThreadContext { shim, ctx };
     ThreadHandle::run_with_handle(|| {
-        with_signal_alt_stack(|| unsafe {
+        #[cfg(target_arch = "x86_64")]
+        with_signal_alt_stack(|_alt_stack_base| unsafe {
             run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter));
+        });
+        #[cfg(target_arch = "aarch64")]
+        with_signal_alt_stack(|alt_stack_base| unsafe {
+            run_thread_arch(
+                &mut thread_ctx,
+                ctx_ptr,
+                u8::from(reenter),
+                aarch64_scratch_from_alt_stack_base(alt_stack_base),
+            );
         });
     });
 }
@@ -653,6 +733,161 @@ fn get_guest_fsbase() -> usize {
         }
     }
     value
+}
+
+/// Per-thread host/guest transition scratch state, aarch64 only.
+///
+/// AArch64 has exactly one EL0-writable TLS-base register (`TPIDR_EL0`) -- unlike x86_64's
+/// independent FS/GS pair, there is no second register the host can use to stash its own
+/// per-thread state while the guest owns the TLS register for its own use. Real sandboxes
+/// (gVisor, QEMU) handle this by explicitly serializing the swap and finding host scratch
+/// state via a lookup that does NOT depend on TPIDR_EL0 already being correct.
+///
+/// This struct is placed directly below the guard page of each guest thread's alternate
+/// signal stack (see [`with_signal_alt_stack`]/[`AARCH64_SCRATCH_SIZE`]), which lets a signal
+/// handler recover its address purely from `context.uc_stack.ss_sp` (populated by the kernel
+/// from whichever `sigaltstack` was active when the signal was delivered) -- no TLS access,
+/// no syscall, no global table, before this struct's own `host_tpidr` field can be restored
+/// into the hardware register.
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+struct Aarch64ThreadScratch {
+    /// A fixed sentinel value (never anything else), written once when this struct is placed
+    /// below a guest thread's alternate signal stack. `context.uc_stack.ss_sp` reports the
+    /// PREVIOUSLY REGISTERED alt-stack config even for a thread that never registered one at
+    /// all (verified live: the kernel does NOT null it out or set `SS_DISABLE` -- it reports
+    /// arbitrary primary-stack-derived values), so `ss_sp`'s mere non-nullness is not
+    /// sufficient evidence this is really a guest thread's alt-stack. This magic number, at a
+    /// fixed offset from the candidate `mapping_base`, is what actually verifies it -- read
+    /// this field FIRST and bail out on any mismatch before trusting anything else here.
+    magic: u64,
+    /// The host's own `TPIDR_EL0` value (this thread's real pthread/glibc TLS base),
+    /// saved here immediately before switching to the guest and restored from here as the
+    /// very first thing any signal handler (or `syscall_callback`) does.
+    host_tpidr: usize,
+    /// Host stack pointer, saved across the switch to guest context.
+    host_sp: usize,
+    /// Host frame pointer (`x29`), saved across the switch to guest context.
+    host_fp: usize,
+    /// Address one-past-the-end of the guest [`litebox_common_linux::PtRegs`] on the host
+    /// stack -- the top of the region `syscall_callback` pushes the trapped guest register
+    /// state into.
+    guest_context_top: usize,
+    /// The guest's own `TPIDR_EL0` value, restored into the hardware register on every
+    /// guest re-entry (mirrors x86_64's `guest_fsbase`).
+    guest_tpidr: usize,
+    /// Whether the thread is currently executing guest code (`1`) or host code (`0`).
+    /// Read/written as a single byte so a signal handler can safely inspect and clear it
+    /// without a wider (potentially non-atomic-with-respect-to-the-interrupted-code) access.
+    in_guest: u8,
+    /// Set by [`interrupt_signal_handler`] when it needs `run_thread_arch` to route through
+    /// `interrupt_callback` instead of resuming the guest normally.
+    interrupt: u8,
+    _pad: [u8; 2],
+    /// Bitmask of traditional signals (1..=31) pending delivery to the shim, set by
+    /// [`record_pending_signal`] and atomically drained by [`take_pending_host_signals`].
+    pending_host_signals: u32,
+    /// Address of a `Box<Waker>` to notify when a host signal becomes pending, or 0 if none
+    /// is currently registered (mirrors x86_64's `wait_waker_addr`).
+    wait_waker_addr: usize,
+}
+
+#[cfg(target_arch = "aarch64")]
+thread_local! {
+    /// Points at the current thread's [`Aarch64ThreadScratch`]. For a genuine guest thread,
+    /// [`run_thread_arch`] overrides this to point at the alt-stack-backed struct that its own
+    /// signal-handler paths can also recover via `context.uc_stack.ss_sp` (see that type's doc
+    /// comment). For any OTHER thread (a plain host thread calling `update_waker`/
+    /// `take_pending_host_signals` -- e.g. a thread merely waiting on an epoll/futex, never a
+    /// guest at all), this lazily allocates a private, heap-backed scratch struct on first use:
+    /// unlike x86_64 (where every thread transparently has a `.tbss` slot for this regardless of
+    /// whether it is a guest thread), aarch64 has no such free per-thread storage, so a plain
+    /// host thread needs its own real backing struct to match x86_64's behavior of these
+    /// functions succeeding on any thread, not just guest ones. Reading/writing this
+    /// thread_local itself is only ever done from normal host code (never from inside a signal
+    /// handler while a guest owns `TPIDR_EL0`), so it can safely use ordinary Rust TLS.
+    static AARCH64_SCRATCH_PTR: core::cell::Cell<*mut Aarch64ThreadScratch> =
+        const { core::cell::Cell::new(core::ptr::null_mut()) };
+    static AARCH64_HOST_ONLY_SCRATCH: core::cell::RefCell<Option<alloc::boxed::Box<Aarch64ThreadScratch>>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// Returns this thread's [`Aarch64ThreadScratch`] pointer, lazily allocating a private
+/// host-only one if this thread never went through [`run_thread_arch`] -- see
+/// `AARCH64_SCRATCH_PTR`'s doc comment.
+#[cfg(target_arch = "aarch64")]
+fn aarch64_scratch_or_host_only() -> *mut Aarch64ThreadScratch {
+    let ptr = AARCH64_SCRATCH_PTR.get();
+    if !ptr.is_null() {
+        return ptr;
+    }
+    AARCH64_HOST_ONLY_SCRATCH.with_borrow_mut(|slot| {
+        let scratch = slot.get_or_insert_with(|| {
+            alloc::boxed::Box::new(Aarch64ThreadScratch {
+                magic: AARCH64_SCRATCH_MAGIC,
+                host_tpidr: 0,
+                host_sp: 0,
+                host_fp: 0,
+                guest_context_top: 0,
+                guest_tpidr: 0,
+                in_guest: 0,
+                interrupt: 0,
+                _pad: [0; 2],
+                pending_host_signals: 0,
+                wait_waker_addr: 0,
+            })
+        });
+        core::ptr::from_mut(scratch.as_mut())
+    })
+}
+
+#[cfg(target_arch = "aarch64")]
+fn aarch64_scratch_from_alt_stack_base(alt_stack_base: *mut u8) -> *mut Aarch64ThreadScratch {
+    alt_stack_base.cast::<Aarch64ThreadScratch>()
+}
+
+#[cfg(target_arch = "aarch64")]
+fn set_guest_tpidr(value: usize) {
+    let ptr = AARCH64_SCRATCH_PTR.get();
+    debug_assert!(!ptr.is_null(), "guest_tpidr set outside a guest thread");
+    unsafe { (*ptr).guest_tpidr = value };
+}
+
+#[cfg(target_arch = "aarch64")]
+fn get_guest_tpidr() -> usize {
+    let ptr = AARCH64_SCRATCH_PTR.get();
+    debug_assert!(!ptr.is_null(), "guest_tpidr read outside a guest thread");
+    unsafe { (*ptr).guest_tpidr }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl litebox::platform::ArchSpecificProvider for LinuxUserland {
+    fn set_arch_specific_register(
+        &self,
+        reg: &litebox::platform::ArchSpecificRegister,
+        val: usize,
+    ) -> Result<(), litebox::platform::ArchSpecificError> {
+        match reg {
+            litebox::platform::ArchSpecificRegister::TpidrEl0 => {
+                if litebox_common_linux::arch::is_valid_user_fs_base(val) {
+                    set_guest_tpidr(val);
+                    Ok(())
+                } else {
+                    Err(litebox::platform::ArchSpecificError::RegisterUnpermittedValue)
+                }
+            }
+            _ => Err(litebox::platform::ArchSpecificError::RegisterUnsupported),
+        }
+    }
+    fn get_arch_specific_register(
+        &self,
+        reg: &litebox::platform::ArchSpecificRegister,
+    ) -> Result<usize, litebox::platform::ArchSpecificError> {
+        match reg {
+            litebox::platform::ArchSpecificRegister::TpidrEl0 => Ok(get_guest_tpidr()),
+            _ => Err(litebox::platform::ArchSpecificError::RegisterUnsupported),
+        }
+    }
 }
 
 /// Runs the guest thread until it terminates.
@@ -803,6 +1038,196 @@ interrupt_callback:
     );
 }
 
+/// AArch64 equivalent of `run_thread_arch` above -- same overall shape (save host
+/// non-volatiles, remember where the guest context lives, dispatch to `init_handler` or
+/// `reenter_handler`, provide `syscall_callback`/`exception_callback`/`interrupt_callback`
+/// re-entry points), adapted for the AAPCS64 calling convention and for AArch64 having no
+/// hardware `syscall`/`sysret`-equivalent fast path: `syscall_callback` is reached only via a
+/// `bl` instruction that `litebox_syscall_rewriter` patches directly into the guest binary in
+/// place of `svc #0` (or, for any unpatched/dynamically-generated `svc #0`, via the SIGSYS
+/// signal handler jumping here through [`set_signal_return`]).
+///
+/// `x0` = `thread_ctx`, `x1` = `ctx` (guest [`litebox_common_linux::PtRegs`]*), `x2` = `reenter`
+/// (0 or 1), `x3` = this thread's [`Aarch64ThreadScratch`]* (see that type's doc comment).
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+unsafe extern "C-unwind" fn run_thread_arch(
+    thread_ctx: &mut ThreadContext,
+    ctx: *mut litebox_common_linux::PtRegs,
+    reenter: u8,
+    scratch: *mut Aarch64ThreadScratch,
+) {
+    core::arch::naked_asm!(
+    "
+    .cfi_startproc
+    // Push all non-volatiles (x19-x28), the frame-record pair (x29, x30), plus x0 (thread_ctx)
+    // and x3 (scratch) which are needed again at .Ldone/the *_callback labels.
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    .cfi_def_cfa w29, 16
+    .cfi_offset w30, -8
+    .cfi_offset w29, -16
+    stp x19, x20, [sp, #-16]!
+    stp x21, x22, [sp, #-16]!
+    stp x23, x24, [sp, #-16]!
+    stp x25, x26, [sp, #-16]!
+    stp x27, x28, [sp, #-16]!
+    stp x0, x3, [sp, #-16]!   // save thread_ctx (x0) and scratch (x3)
+
+    // Save host sp/fp and guest context top into the scratch struct.
+    mov x9, sp
+    str x9, [x3, #16]          // scratch->host_sp (offset 16, see Aarch64ThreadScratch layout)
+    str x29, [x3, #24]         // scratch->host_fp (offset 24)
+    add x9, x1, {GUEST_CONTEXT_SIZE}
+    str x9, [x3, #32]          // scratch->guest_context_top (offset 32)
+
+    // Save the host's current TPIDR_EL0 into the scratch struct -- this is what every signal
+    // handler restores as its very first action (see Aarch64ThreadScratch's doc comment).
+    mrs x9, tpidr_el0
+    str x9, [x3, #8]           // scratch->host_tpidr (offset 8)
+
+    // Record this thread's scratch pointer in Rust TLS -- safe here since TPIDR_EL0 still
+    // holds the host's own value at this point (we haven't switched to the guest yet).
+    //
+    // `scratch_entry_setup` is an ordinary Rust function call: per AAPCS64 it is free to
+    // clobber x1-x18, x30 (every caller-saved register/LR except x0's own argument use), so x2
+    // (the reenter flag, still needed right after this call) MUST be preserved across it
+    // explicitly on the stack -- not in another register, since any other caller-saved
+    // register is equally at risk of being clobbered by the call.
+    str x2, [sp, #-16]!
+    mov x0, x3
+    bl {scratch_entry_setup}
+    ldp x0, x3, [x29, #-{THREAD_CTX_SAVE_OFFSET}]
+    ldr x2, [sp], #16
+
+    // Dispatch to init_handler or reenter_handler based on the reenter flag (x2).
+    cbnz w2, 1f
+    bl {init_handler}
+    b .Ldone
+1:
+    bl {reenter_handler}
+    b .Ldone
+
+    // Reached via a `bl` that litebox_syscall_rewriter patches in place of `svc #0` in the
+    // guest binary (fast path, no kernel round-trip), or via the SIGSYS signal handler for an
+    // unpatched trap (slow path) -- either way, x30 (LR) holds the guest's own return address
+    // and the guest's other registers are still live exactly as the guest left them.
+    .globl syscall_callback
+syscall_callback:
+    // Clear in_guest. Must be the very first store, matching interrupt_signal_handler's
+    // expectations (it treats a clear in_guest as \"safe, not mid-guest-execution\").
+    mov x9, xzr
+    strb w9, [x3, #48]          // scratch->in_guest = 0 (offset 48)
+
+    // Save the guest's TPIDR_EL0 (its own TLS base) into the scratch struct, then restore the
+    // host's TPIDR_EL0 so host code (including the Rust handlers called below) has correct TLS.
+    mrs x9, tpidr_el0
+    str x9, [x3, #40]           // scratch->guest_tpidr (offset 40)
+    ldr x9, [x3, #8]            // scratch->host_tpidr
+    msr tpidr_el0, x9
+
+    // Switch to the top of the guest context region and dump the full guest register file
+    // there, matching PtRegs<aarch64>'s layout: regs[31], sp, pc, pstate, orig_x0, syscallno,
+    // unused2.
+    mov x10, sp                 // remember the guest sp before switching
+    ldr x11, [x3, #32]          // scratch->guest_context_top
+    mov sp, x11
+
+    // regs[0..31): x0-x30, in order (x30/LR holds the guest's return address, i.e. PtRegs.pc
+    // on syscall entry).
+    stp x0, x1, [sp, #-16*16]!
+    stp x2, x3, [sp, #16]
+    stp x4, x5, [sp, #32]
+    stp x6, x7, [sp, #48]
+    stp x8, x9, [sp, #64]
+    stp x10, x11, [sp, #80]
+    stp x12, x13, [sp, #96]
+    stp x14, x15, [sp, #112]
+    stp x16, x17, [sp, #128]
+    stp x18, x19, [sp, #144]
+    stp x20, x21, [sp, #160]
+    stp x22, x23, [sp, #176]
+    stp x24, x25, [sp, #192]
+    stp x26, x27, [sp, #208]
+    stp x28, x29, [sp, #224]
+    str x30, [sp, #240]         // regs[30]
+    str x10, [sp, #248]         // PtRegs.sp -- the guest's own sp, saved above in x10
+    str x30, [sp, #256]         // PtRegs.pc -- syscall return address (from x30/LR)
+    mrs x9, nzcv
+    str x9, [sp, #264]          // PtRegs.pstate (condition flags only; enough for signal
+                                 // delivery/restore round-tripping through this shim)
+    ldr x9, [sp]                 // PtRegs.regs[0] (the original x0)
+    str x9, [sp, #272]           // PtRegs.orig_x0
+    mov w9, #0                   // matches x86_64's `push -38` (ENOSYS) landing in orig_ax's
+                                  // sibling slot there; on aarch64 there is no direct
+                                  // equivalent slot to pre-poison, so this is a no-op placeholder
+                                  // kept only so the two trampolines' structure stays easy to
+                                  // compare -- syscallno is set for real immediately below.
+    ldr w9, [sp, #64]            // x8 (syscall number) was stored at regs[8], offset 64
+    str w9, [sp, #280]           // PtRegs.syscallno
+
+    // Restore the host stack and frame pointer.
+    ldr x9, [x3, #16]           // scratch->host_sp
+    mov sp, x9
+    ldr x29, [x3, #24]          // scratch->host_fp
+
+    // Handle the syscall. Returns only if the thread is exiting.
+    ldp x0, x3, [x29, #-{THREAD_CTX_SAVE_OFFSET}]  // reload thread_ctx (x0), scratch (x3)
+    bl {syscall_handler}
+    b .Ldone
+
+exception_callback:
+    ldr x9, [x3, #16]           // scratch->host_sp
+    mov sp, x9
+    ldr x29, [x3, #24]          // scratch->host_fp
+    ldp x0, x3, [x29, #-{THREAD_CTX_SAVE_OFFSET}]
+    bl {exception_handler}
+    b .Ldone
+
+interrupt_callback:
+    ldr x9, [x3, #16]           // scratch->host_sp
+    mov sp, x9
+    ldr x29, [x3, #24]          // scratch->host_fp
+    ldp x0, x3, [x29, #-{THREAD_CTX_SAVE_OFFSET}]
+    bl {interrupt_handler}
+
+.Ldone:
+    sub sp, x29, #{NONVOLATILE_SAVE_SIZE}
+    ldp x0, x3, [sp], #16
+    ldp x27, x28, [sp], #16
+    ldp x25, x26, [sp], #16
+    ldp x23, x24, [sp], #16
+    ldp x21, x22, [sp], #16
+    ldp x19, x20, [sp], #16
+    ldp x29, x30, [sp], #16
+    .cfi_def_cfa wsp, 0
+    ret
+    .cfi_endproc
+",
+    GUEST_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
+    // Offset from the saved x29 (frame pointer, pointing at the {x29,x30} pair pushed in the
+    // prologue) back down to the {x0,x3} pair pushed right after it -- 6 further 16-byte pairs
+    // (x19/20, x21/22, x23/24, x25/26, x27/28, x0/x3) below the frame-record pair itself.
+    THREAD_CTX_SAVE_OFFSET = const 6 * 16,
+    NONVOLATILE_SAVE_SIZE = const 6 * 16,
+    scratch_entry_setup = sym aarch64_scratch_entry_setup,
+    init_handler = sym init_handler,
+    reenter_handler = sym reenter_handler,
+    syscall_handler = sym syscall_handler,
+    exception_handler = sym exception_handler,
+    interrupt_handler = sym interrupt_handler,
+    );
+}
+
+/// Records `scratch` as the current thread's [`Aarch64ThreadScratch`] pointer in Rust TLS.
+/// Called once, early, from [`run_thread_arch`]'s prologue (aarch64 only), before the guest
+/// is ever entered -- at that point `TPIDR_EL0` still holds the host's own value, so this
+/// ordinary `thread_local!` write is safe.
+#[cfg(target_arch = "aarch64")]
+extern "C" fn aarch64_scratch_entry_setup(scratch: *mut Aarch64ThreadScratch) {
+    AARCH64_SCRATCH_PTR.set(scratch);
+}
+
 /// Switches to the provided guest context.
 ///
 /// # Safety
@@ -853,6 +1278,57 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         "popfq",
         "pop rsp",
         "jmp gs:scratch@tpoff", // jump to the guest
+        "switch_to_guest_end:",
+    );
+}
+
+/// AArch64 equivalent of `switch_to_guest` above.
+///
+/// # Safety
+/// Same contract as the x86_64 version; `scratch` must be this thread's own
+/// [`Aarch64ThreadScratch`], the same one `run_thread_arch` set up.
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_to_guest(
+    ctx: &litebox_common_linux::PtRegs,
+    scratch: *mut Aarch64ThreadScratch,
+) -> ! {
+    core::arch::naked_asm!(
+        "switch_to_guest_start:",
+        // Set in_guest now, then check for a pending interrupt -- mirrors x86_64's ordering
+        // and comment: if an interrupt arrives after this check, the signal handler sees the
+        // PC is between switch_to_guest_start/_end and routes to interrupt_callback itself.
+        "mov w9, #1",
+        "strb w9, [x1, #48]",       // scratch->in_guest = 1
+        "ldrb w9, [x1, #49]",       // scratch->interrupt
+        "cbnz w9, interrupt_callback",
+        // Restore the guest's TPIDR_EL0.
+        "ldr x9, [x1, #40]",        // scratch->guest_tpidr
+        "msr tpidr_el0, x9",
+        // Reload the guest register file from ctx (x0), matching syscall_callback's dump
+        // layout: regs[0..31), sp, pc, pstate, orig_x0, syscallno, unused2.
+        "ldp x2, x3, [x0, #16]",
+        "ldp x4, x5, [x0, #32]",
+        "ldp x6, x7, [x0, #48]",
+        "ldp x8, x9, [x0, #64]",
+        "ldp x10, x11, [x0, #80]",
+        "ldp x12, x13, [x0, #96]",
+        "ldp x14, x15, [x0, #112]",
+        "ldp x16, x17, [x0, #128]",
+        "ldp x18, x19, [x0, #144]",
+        "ldp x20, x21, [x0, #160]",
+        "ldp x22, x23, [x0, #176]",
+        "ldp x24, x25, [x0, #192]",
+        "ldp x26, x27, [x0, #208]",
+        "ldp x28, x29, [x0, #224]",
+        "ldr x30, [x0, #240]",       // regs[30]
+        "ldr x1, [x0, #248]",        // PtRegs.sp -> stash in x1 temporarily
+        "mov sp, x1",
+        "ldr x1, [x0, #256]",        // PtRegs.pc -> the guest branch target
+        // Reload x0/x1 last (x0 was our own `ctx` argument, x1 is now the branch target).
+        "ldr x9, [x0]",              // regs[0]
+        "mov x0, x9",
+        "br x1",
         "switch_to_guest_end:",
     );
 }
@@ -1002,6 +1478,40 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
             );
         }
 
+        // aarch64 equivalent: register a REAL alt-stack-backed Aarch64ThreadScratch for this
+        // thread (the same mechanism a genuine guest thread uses, via with_signal_alt_stack),
+        // not just the AARCH64_SCRATCH_PTR thread_local. This matters because
+        // interrupt_signal_handler's requeue logic (mirroring x86_64's `gsbase != 0` check)
+        // deliberately only recognizes a thread as a valid signal target via the alt-stack
+        // lookup (`aarch64_scratch_from_context`, keyed off `uc_stack.ss_sp` + the registry) --
+        // a signal delivered `SIGEV_SIGNAL`/process-directed is not guaranteed to land on the
+        // thread that armed it, so `record_pending_signal` must only ever accept it on a thread
+        // that lookup recognizes, exactly like x86_64's real guest threads; a thread that only
+        // has AARCH64_SCRATCH_PTR set (but no registered alt-stack) would be silently invisible
+        // to that lookup and drop every signal delivered to it.
+        #[cfg(target_arch = "aarch64")]
+        {
+            return with_signal_alt_stack(|alt_stack_base| {
+                let scratch = aarch64_scratch_from_alt_stack_base(alt_stack_base);
+                // `run_thread_arch`'s naked-asm prologue is the only other writer of
+                // `host_tpidr`, and it never runs for a plain test thread -- without this, it
+                // stays zeroed (from the fresh mmap), and `signal_handler_exit_guest`'s
+                // `msr tpidr_el0, {host_tpidr}` would then zero out this thread's REAL TLS
+                // base, corrupting every subsequent TLS access for the rest of the signal
+                // handler (and this thread, until something restores it).
+                unsafe {
+                    let real_tpidr: usize;
+                    core::arch::asm!("mrs {}, tpidr_el0", out(reg) real_tpidr, options(nostack, preserves_flags));
+                    (*scratch).host_tpidr = real_tpidr;
+                }
+                AARCH64_SCRATCH_PTR.set(scratch);
+                let result = ThreadHandle::run_with_handle(f);
+                AARCH64_SCRATCH_PTR.set(core::ptr::null_mut());
+                result
+            });
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
         ThreadHandle::run_with_handle(f)
     }
 }
@@ -1019,9 +1529,20 @@ impl litebox::platform::TimerProvider for LinuxUserland {
         // *desired* guest signal in `sigev_value.sival_int`.  The signal handler
         // reads `si_value` when `si_code == SI_TIMER` to determine which guest
         // signal to record.
+        //
+        // `SIGEV_THREAD_ID` (Linux-specific), not `SIGEV_SIGNAL`, targets this exact thread
+        // (via its real kernel TID) deterministically -- plain `SIGEV_SIGNAL` is
+        // process-directed and Linux explicitly does not guarantee it lands on the thread that
+        // armed the timer (`signal(7)`: delivered to "any one of the threads that does not
+        // currently have the signal blocked"), which is a real, live-reproduced race in a
+        // multi-threaded process (e.g. every guest thread running concurrently) that only
+        // `interrupt_signal_handler`'s own thread-agnostic-guest requeue fallback (asymmetric
+        // in cost, and on aarch64 specifically vulnerable to spinning if the requeue never
+        // converges) was previously covering for.
         let mut sev: libc::sigevent = unsafe { core::mem::zeroed() };
-        sev.sigev_notify = libc::SIGEV_SIGNAL;
+        sev.sigev_notify = libc::SIGEV_THREAD_ID;
         sev.sigev_signo = libc::SIGALRM;
+        sev.sigev_notify_thread_id = unsafe { libc::gettid() };
         sev.sigev_value.sival_ptr = signal.as_i32() as *mut libc::c_void;
 
         let mut timer_id: libc::timer_t = std::ptr::null_mut();
@@ -1085,7 +1606,10 @@ impl litebox::platform::RawMutexProvider for LinuxUserland {
     where
         Self: litebox::sync::RawSyncPrimitivesProvider,
     {
-        let mut waker_ptr = waker.map_or(std::ptr::null_mut(), |w| Box::into_raw(Box::new(w)));
+        let waker_ptr = waker.map_or(std::ptr::null_mut(), |w| Box::into_raw(Box::new(w)));
+        #[cfg(target_arch = "x86_64")]
+        let mut waker_ptr = waker_ptr;
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             core::arch::asm!(
                 concat!("xchg ", tls!("wait_waker_addr"), ", {}"),
@@ -1093,6 +1617,18 @@ impl litebox::platform::RawMutexProvider for LinuxUserland {
                 options(nostack),
             );
         }
+        // SAFETY: `record_pending_signal` (the only reader of `wait_waker_addr` besides this
+        // function) runs strictly on this same thread's execution -- see
+        // `take_pending_host_signals`'s doc comment for the identical same-thread argument.
+        #[cfg(target_arch = "aarch64")]
+        let waker_ptr = {
+            let scratch_ptr = aarch64_scratch_or_host_only();
+            unsafe {
+                let old = core::ptr::read_volatile(&raw const (*scratch_ptr).wait_waker_addr);
+                core::ptr::write_volatile(&raw mut (*scratch_ptr).wait_waker_addr, waker_ptr as usize);
+                old as *mut litebox::event::wait::Waker<Self>
+            }
+        };
         if !waker_ptr.is_null() {
             // SAFETY: old waker_ptr was created by Box::into_raw in a previous call to update_waker.
             unsafe { drop(Box::from_raw(waker_ptr)) };
@@ -1235,7 +1771,7 @@ impl litebox::platform::TimeProvider for LinuxUserland {
         unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, t.as_mut_ptr()) };
         let t = unsafe { t.assume_init() };
         Instant {
-            #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
+            #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), expect(clippy::useless_conversion))]
             inner: Duration::new(
                 t.tv_sec.reinterpret_as_unsigned().into(),
                 t.tv_nsec.reinterpret_as_unsigned().trunc(),
@@ -1248,7 +1784,7 @@ impl litebox::platform::TimeProvider for LinuxUserland {
         unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, t.as_mut_ptr()) };
         let t = unsafe { t.assume_init() };
         SystemTime {
-            #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
+            #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), expect(clippy::useless_conversion))]
             inner: Duration::new(
                 t.tv_sec.reinterpret_as_unsigned().into(),
                 t.tv_nsec.reinterpret_as_unsigned().trunc(),
@@ -1384,12 +1920,7 @@ fn futex_timeout(
     let uaddr2: *const AtomicU32 = uaddr2.map_or(std::ptr::null(), |u| u);
     unsafe {
         syscalls::syscall6(
-            {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    syscalls::Sysno::futex
-                }
-            },
+            syscalls::Sysno::futex,
             uaddr as usize,
             usize::try_from(futex_op).unwrap(),
             val as usize,
@@ -1418,12 +1949,7 @@ fn futex_val2(
     let uaddr2: *const AtomicU32 = uaddr2.map_or(std::ptr::null(), |u| u);
     unsafe {
         syscalls::syscall6(
-            {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    syscalls::Sysno::futex
-                }
-            },
+            syscalls::Sysno::futex,
             uaddr as usize,
             usize::try_from(futex_op).unwrap(),
             val as usize,
@@ -1459,6 +1985,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
     #[cfg(target_arch = "x86_64")]
     const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
+    #[cfg(target_arch = "aarch64")]
+    const TASK_ADDR_MAX: usize = 0xFFFF_FFFF_F000; // (1 << 48) - PAGE_SIZE; matches
+    // litebox_common_linux::arch::USER_ADDR_END for the default 48-bit aarch64 Linux VA config.
 
     // A `memfd_create` file descriptor. Cast to/from `usize` at the trait boundary; the raw fd
     // number is just an opaque per-process kernel-object identifier, safe to copy and pass
@@ -1493,12 +2022,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             };
         let r = unsafe {
             syscalls::syscall6(
-                {
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        syscalls::Sysno::mmap
-                    }
-                },
+                syscalls::Sysno::mmap,
                 suggested_range.start,
                 suggested_range.len(),
                 prot_flags(initial_permissions)
@@ -1591,8 +2115,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             std::ffi::CString::new(file_path.as_os_str().as_encoded_bytes()).unwrap();
         // TODO(jb): We should likely be storing pre-opened FDs, right?
         let fd = unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::open,
+            raw_open(
                 file_path_cstr.as_ptr() as usize,
                 OFlags::RDONLY.bits() as usize,
                 0,
@@ -1609,23 +2132,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
 
         let result = unsafe {
             syscalls::syscall6(
-                {
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        syscalls::Sysno::mmap
-                    }
-                },
+                syscalls::Sysno::mmap,
                 suggested_start,
                 source_data.len(),
                 prot_flags(permissions).bits().reinterpret_as_unsigned() as usize,
                 flags.bits().reinterpret_as_unsigned() as usize,
                 fd,
-                {
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        file_offset
-                    }
-                },
+                file_offset,
             )
         };
 
@@ -1668,12 +2181,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
 
         let result = unsafe {
             syscalls::syscall6(
-                {
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        syscalls::Sysno::mmap
-                    }
-                },
+                syscalls::Sysno::mmap,
                 suggested_range.start,
                 suggested_range.len(),
                 prot_flags(initial_permissions)
@@ -1775,11 +2283,28 @@ impl litebox::platform::StdioProvider for LinuxUserland {
             events: POLLIN,
             revents: 0,
         };
+        #[cfg(target_arch = "x86_64")]
         let ret = unsafe {
             syscalls::syscall3(
                 syscalls::Sysno::poll,
                 core::ptr::from_mut(&mut pfd) as usize,
                 1,
+                0,
+            )
+        };
+        // aarch64 has no `poll` syscall; `ppoll` with a zeroed (non-null but immediate) timeout
+        // and no signal mask is the exact non-blocking equivalent.
+        #[cfg(target_arch = "aarch64")]
+        let ret = unsafe {
+            let timeout = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            syscalls::syscall4(
+                syscalls::Sysno::ppoll,
+                core::ptr::from_mut(&mut pfd) as usize,
+                1,
+                core::ptr::from_ref(&timeout) as usize,
                 0,
             )
         };
@@ -1826,6 +2351,7 @@ unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext) {
     thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx));
 }
 
+#[cfg(target_arch = "x86_64")]
 extern "C-unwind" fn exception_handler(
     thread_ctx: &mut ThreadContext,
     trapno: usize,
@@ -1836,6 +2362,22 @@ extern "C-unwind" fn exception_handler(
         exception: litebox::shim::Exception(trapno.try_into().unwrap()),
         error_code: error.try_into().unwrap(),
         cr2,
+        kernel_mode: false,
+    };
+    thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info));
+}
+
+#[cfg(target_arch = "aarch64")]
+extern "C-unwind" fn exception_handler(
+    thread_ctx: &mut ThreadContext,
+    exception_class: usize,
+    fault_address: usize,
+    _unused: usize,
+) {
+    let info = litebox::shim::ExceptionInfo {
+        exception: litebox::shim::Exception(exception_class.try_into().unwrap()),
+        fault_address,
+        esr: 0,
         kernel_mode: false,
     };
     thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info));
@@ -1857,15 +2399,26 @@ impl ThreadContext<'_> {
         // Clear the interrupt flag before calling the shim, since we've handled it
         // now (by calling into the shim), and it might be set again by the shim
         // before returning.
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             core::arch::asm!(
                 concat!("mov BYTE PTR ", tls!("interrupt"), ", 0"),
                 options(nostack, preserves_flags)
             );
         }
+        #[cfg(target_arch = "aarch64")]
+        let scratch_ptr = {
+            let ptr = AARCH64_SCRATCH_PTR.get();
+            debug_assert!(!ptr.is_null(), "call_shim invoked outside a guest thread");
+            unsafe { core::ptr::write_volatile(&raw mut (*ptr).interrupt, 0) };
+            ptr
+        };
         let op = f(self.shim, self.ctx);
         match op {
+            #[cfg(target_arch = "x86_64")]
             ContinueOperation::Resume => unsafe { switch_to_guest(self.ctx) },
+            #[cfg(target_arch = "aarch64")]
+            ContinueOperation::Resume => unsafe { switch_to_guest(self.ctx, scratch_ptr) },
             ContinueOperation::Terminate => {}
         }
     }
@@ -2001,14 +2554,94 @@ fn register_exception_handlers() {
     });
 }
 
-/// Runs `f` with an alternate signal stack set up.
-fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
+/// Extra space reserved before the alternate signal stack's usable region, on aarch64 only, to
+/// hold a [`Aarch64ThreadScratch`] -- see that type's doc comment for why this lives here rather
+/// than in TLS.
+#[cfg(target_arch = "aarch64")]
+const AARCH64_SCRATCH_SIZE: usize = 0x1000;
+
+/// Sentinel stamped into [`Aarch64ThreadScratch::magic`] -- see that field's doc comment.
+/// Arbitrary but fixed; chosen to be unmistakable in a hex dump/debugger, never a plausible
+/// stack/heap address or all-zero/all-one pattern that could arise by coincidence.
+#[cfg(target_arch = "aarch64")]
+const AARCH64_SCRATCH_MAGIC: u64 = 0xA64_5CA7C_A64_5CA7;
+
+/// A fixed-capacity, lock-free registry of every live guest thread's `mapping_base` address
+/// (see [`with_signal_alt_stack`]) -- checked by [`aarch64_scratch_from_context`] BEFORE ever
+/// dereferencing a `uc_stack.ss_sp`-derived pointer, since that pointer's provenance cannot be
+/// trusted (verified live: a thread that never registered any alt-stack still reports a
+/// non-null `ss_sp`/nonzero `ss_size` for its primary stack). Membership is checked via a
+/// bounded linear scan over plain atomics -- safe to call from a signal handler, unlike a
+/// mutex/lock (which risks self-deadlock if the interrupted code already held it).
+///
+/// A generous fixed capacity (not a dynamically-growing collection, which would need a lock or
+/// a lock-free allocator neither of which are signal-handler-safe) -- exceeding it only means a
+/// newly-registered guest thread's alt-stack won't be found this way, which the code degrades
+/// out of gracefully (treated as \"not a guest thread\", same as index-not-found).
+#[cfg(target_arch = "aarch64")]
+const AARCH64_MAX_GUEST_THREADS: usize = 4096;
+#[cfg(target_arch = "aarch64")]
+static AARCH64_GUEST_ALT_STACK_BASES: [AtomicUsize; AARCH64_MAX_GUEST_THREADS] = {
+    const ZERO: AtomicUsize = AtomicUsize::new(0);
+    [ZERO; AARCH64_MAX_GUEST_THREADS]
+};
+
+/// Registers `mapping_base` as a live guest thread's alt-stack scratch region. Called once from
+/// [`with_signal_alt_stack`] right after allocation, before the stack is ever registered or
+/// used for real.
+#[cfg(target_arch = "aarch64")]
+fn aarch64_register_guest_alt_stack(mapping_base: usize) {
+    for slot in &AARCH64_GUEST_ALT_STACK_BASES {
+        if slot
+            .compare_exchange(0, mapping_base, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return;
+        }
+    }
+    // Registry exhausted -- see AARCH64_MAX_GUEST_THREADS's doc comment; this thread's
+    // signal-handler-side lookups simply won't find it (same as a never-guest thread), a
+    // capacity-exceeded degradation rather than a hard failure.
+}
+
+/// Unregisters `mapping_base`, called when a guest thread's alt-stack is torn down.
+#[cfg(target_arch = "aarch64")]
+fn aarch64_unregister_guest_alt_stack(mapping_base: usize) {
+    for slot in &AARCH64_GUEST_ALT_STACK_BASES {
+        if slot
+            .compare_exchange(mapping_base, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+/// Returns whether `mapping_base` is a currently-registered guest thread alt-stack -- safe to
+/// call from a signal handler (see [`AARCH64_GUEST_ALT_STACK_BASES`]'s doc comment).
+#[cfg(target_arch = "aarch64")]
+fn aarch64_is_registered_guest_alt_stack(mapping_base: usize) -> bool {
+    AARCH64_GUEST_ALT_STACK_BASES
+        .iter()
+        .any(|slot| slot.load(Ordering::SeqCst) == mapping_base)
+}
+
+/// Runs `f` with an alternate signal stack set up. `f` receives the raw base address of the
+/// mapping backing that alternate stack (below the guard page, i.e. the very start of the
+/// mmap'd region) -- on aarch64, this address is where [`Aarch64ThreadScratch`] lives; on
+/// x86_64 it is unused (host/guest scratch state there lives in ordinary `.tbss` TLS instead,
+/// reachable via the fs/gs swap).
+fn with_signal_alt_stack<R>(f: impl FnOnce(*mut u8) -> R) -> R {
     let alt_stack_size = libc::SIGSTKSZ * 2;
     let guard_page_size = 0x1000;
-    let stack_base = unsafe {
+    #[cfg(target_arch = "aarch64")]
+    let extra_size = AARCH64_SCRATCH_SIZE;
+    #[cfg(not(target_arch = "aarch64"))]
+    let extra_size = 0;
+    let mapping_base = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
-            guard_page_size + alt_stack_size,
+            extra_size + guard_page_size + alt_stack_size,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
             -1,
@@ -2016,18 +2649,42 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
         )
     };
     assert!(
-        stack_base != libc::MAP_FAILED,
+        mapping_base != libc::MAP_FAILED,
         "failed to allocate memory for alternate signal stack: {}",
         std::io::Error::last_os_error()
     );
     let _unmap_guard = litebox::utils::defer(|| {
-        let r = unsafe { libc::munmap(stack_base, guard_page_size + alt_stack_size) };
+        #[cfg(target_arch = "aarch64")]
+        aarch64_unregister_guest_alt_stack(mapping_base as usize);
+        let r = unsafe {
+            libc::munmap(
+                mapping_base,
+                extra_size + guard_page_size + alt_stack_size,
+            )
+        };
         assert!(
             r == 0,
             "failed to free memory for alternate signal stack: {}",
             std::io::Error::last_os_error()
         );
     });
+
+    let stack_base = unsafe { mapping_base.cast::<u8>().add(extra_size).cast::<libc::c_void>() };
+
+    // Stamp the magic sentinel into the scratch struct and register this mapping in the
+    // lock-free guest-alt-stack registry, both before this stack is ever registered/used --
+    // see `Aarch64ThreadScratch::magic` and `AARCH64_GUEST_ALT_STACK_BASES`'s doc comments for
+    // why both checks are required (uc_stack.ss_sp alone is not sufficient evidence of a real
+    // guest alt-stack, and dereferencing an address before confirming registry membership
+    // risks a second, nested fault).
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64_register_guest_alt_stack(mapping_base as usize);
+        unsafe {
+            (*aarch64_scratch_from_alt_stack_base(mapping_base.cast::<u8>())).magic =
+                AARCH64_SCRATCH_MAGIC;
+        }
+    }
 
     // Set up a guard page to catch stack overflows.
     let r = unsafe { libc::mprotect(stack_base, guard_page_size, libc::PROT_NONE) };
@@ -2063,7 +2720,7 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
             std::io::Error::last_os_error()
         );
     });
-    f()
+    f(mapping_base.cast::<u8>())
 }
 
 /// Called from signal handlers to fix up thread state after potentially running
@@ -2073,6 +2730,7 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
 /// and optionally sets `interrupt`. If `in_guest` was previously set, returns
 /// the guest context pointer (which does not necessarily have up-to-date guest
 /// register state yet).
+#[cfg(target_arch = "x86_64")]
 #[cfg(target_arch = "x86_64")]
 fn signal_handler_exit_guest(
     _context: &libc::ucontext_t,
@@ -2113,6 +2771,68 @@ fn signal_handler_exit_guest(
             guest_context_top = out(reg) guest_context_top,
             options(nostack, preserves_flags)
         };
+        Some(guest_context_top.sub(1))
+    }
+}
+
+/// Recovers this signal-handler invocation's [`Aarch64ThreadScratch`] purely from
+/// `context.uc_stack.ss_sp` (populated by the kernel from whichever `sigaltstack` was active
+/// when the signal was delivered) -- safe to call unconditionally, before `TPIDR_EL0` has been
+/// restored to the host's value, since it touches no TLS.
+///
+/// Returns `None` if this thread never registered a guest alternate signal stack (i.e. it is
+/// not a guest thread at all -- mirrors x86_64's `gsbase == 0` check).
+#[cfg(target_arch = "aarch64")]
+fn aarch64_scratch_from_context(context: &libc::ucontext_t) -> Option<*mut Aarch64ThreadScratch> {
+    let alt_stack_sp = context.uc_stack.ss_sp;
+    if alt_stack_sp.is_null() {
+        return None;
+    }
+    // `stack_base` (== `ss_sp`, registered with `sigaltstack`) is `mapping_base +
+    // AARCH64_SCRATCH_SIZE` -- the guard page lives WITHIN the alt-stack region itself (its
+    // first page, via `mprotect(stack_base, guard_page_size, PROT_NONE)`), not as a separate
+    // region between the scratch struct and the stack; do not subtract it again here.
+    let mapping_base = alt_stack_sp.cast::<u8>().wrapping_sub(AARCH64_SCRATCH_SIZE);
+    // `uc_stack.ss_sp` alone is not trustworthy evidence this is really one of our guest
+    // alt-stacks -- verified live, a thread that never called `sigaltstack` at all still
+    // reports a non-null `ss_sp` (its ordinary primary stack). Check registry membership
+    // FIRST (a lock-free address comparison, never a dereference) before ever reading through
+    // the derived pointer; only once membership is confirmed is it safe to check the magic
+    // sentinel too (defense in depth against a registry/derivation bug).
+    if !aarch64_is_registered_guest_alt_stack(mapping_base as usize) {
+        return None;
+    }
+    let scratch = aarch64_scratch_from_alt_stack_base(mapping_base);
+    if unsafe { (*scratch).magic } != AARCH64_SCRATCH_MAGIC {
+        return None;
+    }
+    Some(scratch)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn signal_handler_exit_guest(
+    context: &libc::ucontext_t,
+    set_interrupt: bool,
+) -> Option<*mut litebox_common_linux::PtRegs> {
+    let scratch = aarch64_scratch_from_context(context)?;
+    // Restore the host's own TPIDR_EL0 first, before touching anything else -- this is the one
+    // mandatory first step on every aarch64 signal-handler path (see `Aarch64ThreadScratch`'s
+    // doc comment): every subsequent access in this function (Rust TLS via `AARCH64_SCRATCH_PTR`,
+    // ordinary heap/stack data) requires a correct host TPIDR_EL0.
+    unsafe {
+        let host_tpidr = (*scratch).host_tpidr;
+        core::arch::asm!("msr tpidr_el0, {}", in(reg) host_tpidr, options(nostack, preserves_flags));
+        AARCH64_SCRATCH_PTR.set(scratch);
+
+        let in_guest = (*scratch).in_guest;
+        (*scratch).in_guest = 0;
+        if set_interrupt {
+            (*scratch).interrupt = 1;
+        }
+        if in_guest == 0 {
+            return None;
+        }
+        let guest_context_top = (*scratch).guest_context_top as *mut litebox_common_linux::PtRegs;
         Some(guest_context_top.sub(1))
     }
 }
@@ -2171,6 +2891,19 @@ fn copy_signal_context(regs: &mut litebox_common_linux::PtRegs, context: &libc::
     *orig_rax = *rax;
 }
 
+/// Copies register state from a Linux signal context to a LiteBox PtRegs
+/// structure, aarch64 variant.
+#[cfg(target_arch = "aarch64")]
+fn copy_signal_context(regs: &mut litebox_common_linux::PtRegs, context: &libc::ucontext_t) {
+    for (dst, src) in regs.regs.iter_mut().zip(context.uc_mcontext.regs.iter()) {
+        *dst = (*src).trunc();
+    }
+    regs.sp = context.uc_mcontext.sp.trunc();
+    regs.pc = context.uc_mcontext.pc.trunc();
+    regs.pstate = context.uc_mcontext.pstate;
+    regs.orig_x0 = regs.regs[0];
+}
+
 /// Updates a Linux signal context to return to `f` with the given arguments.
 #[cfg(target_arch = "x86_64")]
 fn set_signal_return(
@@ -2189,6 +2922,30 @@ fn set_signal_return(
     sigctx.gregs[libc::REG_RCX as usize] = p3 as i64;
 }
 
+/// Updates a Linux signal context to return to `f` with the given arguments, aarch64 variant
+/// (args in `x0-x3`, matching the AAPCS64 calling convention `f` itself is called under).
+#[cfg(target_arch = "aarch64")]
+#[allow(
+    clippy::cast_sign_loss,
+    reason = "p0..p3 carry bit patterns (an exception class, a raw address), not signed \
+              magnitudes -- reinterpreted, not converted"
+)]
+fn set_signal_return(
+    context: &mut libc::ucontext_t,
+    f: unsafe extern "C" fn(),
+    p0: isize,
+    p1: isize,
+    p2: isize,
+    p3: isize,
+) {
+    let sigctx = &mut context.uc_mcontext;
+    sigctx.pc = f as usize as u64;
+    sigctx.regs[0] = p0 as u64;
+    sigctx.regs[1] = p1 as u64;
+    sigctx.regs[2] = p2 as u64;
+    sigctx.regs[3] = p3 as u64;
+}
+
 /// Signal handler for hardware exceptions (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP).
 unsafe extern "C" fn exception_signal_handler(
     signum: libc::c_int,
@@ -2200,15 +2957,31 @@ unsafe extern "C" fn exception_signal_handler(
     if signum == libc::SIGSYS {
         use core::fmt::Write as _;
         #[cfg(target_arch = "x86_64")]
-        let eax_idx = libc::REG_RAX as usize;
-        let sysno = context.uc_mcontext.gregs[eax_idx];
-        context.uc_mcontext.gregs[eax_idx] = i64::from(-libc::EINVAL);
+        let (sysno, path_arg) = {
+            let eax_idx = libc::REG_RAX as usize;
+            let sysno = context.uc_mcontext.gregs[eax_idx];
+            context.uc_mcontext.gregs[eax_idx] = i64::from(-libc::EINVAL);
+            let rsi = context.uc_mcontext.gregs[libc::REG_RSI as usize] as *const i8;
+            (sysno, rsi)
+        };
+        #[cfg(target_arch = "aarch64")]
+        let (sysno, path_arg) = {
+            // x8 holds the syscall number on aarch64; the kernel's SIGSYS delivery leaves the
+            // trapped registers in uc_mcontext.regs, indexed the same way as PtRegs.regs.
+            let sysno = context.uc_mcontext.regs[8].cast_signed();
+            // Sign-extend, not zero-extend: the aarch64 syscall-return-value convention (like
+            // x86_64's) is a signed 64-bit value in the return register, and `Errno::from_ret`
+            // (and the kernel's own `IS_ERR_VALUE`) test the top bits of the full 64-bit word --
+            // a zero-extended `-EINVAL` (0x0000_0000_ffff_ffea) reads back as a huge but
+            // "successful" positive value instead of the intended error.
+            context.uc_mcontext.regs[0] = i64::from(-libc::EINVAL).cast_unsigned();
+            let path_arg = context.uc_mcontext.regs[1] as *const core::ffi::c_char;
+            (sysno, path_arg)
+        };
         // Signal-safe: format on the stack via arrayvec (no heap allocation).
         let mut buf = arrayvec::ArrayString::<320>::new();
         if sysno == libc::SYS_openat {
-            #[cfg(target_arch = "x86_64")]
-            let rsi = context.uc_mcontext.gregs[libc::REG_RSI as usize] as *const i8;
-            let c_path = unsafe { core::ffi::CStr::from_ptr(rsi) };
+            let c_path = unsafe { core::ffi::CStr::from_ptr(path_arg) };
             // libc may call `openat` for certain files that we can ignore, e.g., /proc/sys/vm/overcommit_memory.
             // Log the paths in case we need to allow some of them in the future.
             let _ = writeln!(buf, "INFO: openat with {c_path:?} is not allowed");
@@ -2235,14 +3008,45 @@ unsafe extern "C" fn exception_signal_handler(
     let _ = run_thread_arch as *const () as usize;
 
     // Jump to exception_callback.
-    let sigctx = &context.uc_mcontext;
     #[cfg(target_arch = "x86_64")]
-    let (trapno, err, cr2) = (
-        sigctx.gregs[libc::REG_TRAPNO as usize].trunc(),
-        sigctx.gregs[libc::REG_ERR as usize].trunc(),
-        sigctx.gregs[libc::REG_CR2 as usize].trunc(),
-    );
-    set_signal_return(context, exception_callback, 0, trapno, err, cr2);
+    {
+        let sigctx = &context.uc_mcontext;
+        let (trapno, err, cr2) = (
+            sigctx.gregs[libc::REG_TRAPNO as usize].trunc(),
+            sigctx.gregs[libc::REG_ERR as usize].trunc(),
+            sigctx.gregs[libc::REG_CR2 as usize].trunc(),
+        );
+        set_signal_return(context, exception_callback, 0, trapno, err, cr2);
+    }
+    // aarch64's SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGTRAP delivery carries the exception class and
+    // fault address via siginfo/an extended sigcontext record, not fixed mcontext fields the
+    // way x86_64's TRAPNO/ERR/CR2 gregs slots do -- `signum` and `info.si_addr()` are the
+    // portable, reliable sources here, matched to litebox::shim::Exception's ARM exception
+    // classes by `signum` alone (ESR_EL1 itself is not exposed through the standard
+    // ucontext_t/siginfo_t ABI, only through the kernel's optional `esr_context` sigcontext
+    // extension record, which this handler does not currently walk).
+    #[cfg(target_arch = "aarch64")]
+    {
+        let exception = match signum {
+            libc::SIGILL => litebox::shim::Exception::BRK64,
+            libc::SIGTRAP => litebox::shim::Exception::BREAKPOINT_CURRENT_EL,
+            // SIGSEGV/SIGBUS (and anything else reaching this arm) are both address-fault
+            // classes on real hardware; map to a data abort, the more common of the two aborts
+            // for a userspace fault (as opposed to an instruction abort on execute-from an
+            // unmapped page, which is comparatively rare for the guest workloads this shim
+            // targets).
+            _ => litebox::shim::Exception::DATA_ABORT_CURRENT_EL,
+        };
+        let fault_address = unsafe { info.si_addr() } as usize;
+        set_signal_return(
+            context,
+            exception_callback,
+            0,
+            isize::from(exception.0),
+            fault_address.cast_signed(),
+            0,
+        );
+    }
 }
 
 /// Runs the next signal handler in the chain.
@@ -2259,12 +3063,20 @@ unsafe fn next_signal_handler(
                     .reinterpret_as_unsigned()
                     .trunc()
             }
+            #[cfg(target_arch = "aarch64")]
+            {
+                context.uc_mcontext.pc.trunc()
+            }
         };
         if let Some(fixup_addr) = litebox::mm::exception_table::search_exception_tables(ip) {
             #[cfg(target_arch = "x86_64")]
             {
                 context.uc_mcontext.gregs[libc::REG_RIP as usize] =
                     fixup_addr.reinterpret_as_signed() as i64;
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                context.uc_mcontext.pc = fixup_addr as u64;
             }
             return;
         }
@@ -2309,6 +3121,7 @@ unsafe fn next_signal_handler(
 ///
 /// Must be called from a signal handler on a guest thread whose saved host TLS
 /// segment register is valid.
+#[cfg(target_arch = "x86_64")]
 unsafe fn record_pending_signal(signal: litebox_common_linux::signal::Signal) {
     let mask: u32 = 1u32 << (signal.as_i32() - 1);
     unsafe {
@@ -2326,6 +3139,35 @@ unsafe fn record_pending_signal(signal: litebox_common_linux::signal::Signal) {
             options(nostack, preserves_flags)
         );
     }
+    if waker_addr == 0 {
+        return;
+    }
+    // SAFETY: if `waker_addr` is not zero, that means the current thread is suspended
+    // to handle this signal and it points to a valid Waker whose lifetime spans the
+    // entire interruptible wait, set by [`RawMutexProvider::update_waker`].
+    let waker = unsafe { &*(waker_addr as *const litebox::event::wait::Waker<LinuxUserland>) };
+    waker.wake();
+}
+
+/// aarch64 variant: `scratch` must be a valid, already-recovered pointer to this thread's
+/// [`Aarch64ThreadScratch`] (see [`aarch64_scratch_from_context`]) -- unlike x86_64's version,
+/// this does not (and cannot safely) re-derive it, since doing so from inside a signal handler
+/// requires the same context-dependent lookup the caller has already performed.
+#[cfg(target_arch = "aarch64")]
+unsafe fn record_pending_signal(
+    scratch: *mut Aarch64ThreadScratch,
+    signal: litebox_common_linux::signal::Signal,
+) {
+    let mask: u32 = 1u32 << (signal.as_i32() - 1);
+    // SAFETY: `scratch` is valid per this function's own safety contract; this is the only
+    // writer of `pending_host_signals` from a signal-handler context, and `take_pending_host_
+    // signals` only ever runs on this thread's own non-signal execution, so no atomic RMW is
+    // needed here beyond ordinary same-thread visibility (a signal handler always fully
+    // interrupts and returns to the same thread's own execution, per POSIX).
+    unsafe {
+        (*scratch).pending_host_signals |= mask;
+    }
+    let waker_addr = unsafe { (*scratch).wait_waker_addr };
     if waker_addr == 0 {
         return;
     }
@@ -2382,21 +3224,42 @@ unsafe fn interrupt_signal_handler(
 
         // Check whether the saved host TLS segment is valid (i.e. this is a
         // guest thread). If not, re-raise the signal process-wide.
-        let is_guest_thread;
         #[cfg(target_arch = "x86_64")]
         {
             let gsbase: u64;
             unsafe { core::arch::asm!("rdgsbase {}", out(reg) gsbase) };
-            is_guest_thread = gsbase != 0;
+            if gsbase != 0 {
+                // SAFETY: we verified the saved host TLS segment is valid above.
+                unsafe { record_pending_signal(signal) };
+            } else {
+                #[cfg(debug_assertions)]
+                raise_signal(signum, info);
+                return;
+            }
         }
-
-        if is_guest_thread {
-            // SAFETY: we verified the saved host TLS segment is valid above.
-            unsafe { record_pending_signal(signal) };
-        } else {
-            #[cfg(debug_assertions)]
-            raise_signal(signum, info);
-            return;
+        #[cfg(target_arch = "aarch64")]
+        {
+            // A genuine guest thread's scratch (found via the alt-stack lookup) is the ONLY
+            // case that stops the re-queue chain -- mirrors x86_64's `gsbase != 0` check
+            // exactly. A host-only thread (this signal landed on some cargo-test worker
+            // thread, or a host thread merely waiting via WaitState, neither the actual
+            // *guest* thread the signal targets) must still fall through to `raise_signal`'s
+            // process-wide re-queue below: `SIGEV_SIGNAL`-delivered timer signals (and `kill()`
+            // targeting the process) are NOT guaranteed to land on the specific thread that
+            // armed them, so the only correct way to eventually reach the right thread is the
+            // same requeue-until-a-guest-thread-catches-it loop x86_64 already relies on.
+            // (A host-only thread's own record via `aarch64_scratch_or_host_only` -- used by
+            // `update_waker`/`take_pending_host_signals` -- is written/read on that thread's
+            // OWN normal execution, never through this signal-handler path.)
+            if let Some(scratch) = aarch64_scratch_from_context(context) {
+                // SAFETY: `scratch` was just derived from this thread's own active
+                // sigaltstack, valid per `aarch64_scratch_from_context`'s contract.
+                unsafe { record_pending_signal(scratch, signal) };
+            } else {
+                #[cfg(debug_assertions)]
+                raise_signal(signum, info);
+                return;
+            }
         }
     }
 
@@ -2419,6 +3282,8 @@ unsafe fn interrupt_signal_handler(
     let ip = context.uc_mcontext.gregs[libc::REG_RIP as usize]
         .reinterpret_as_unsigned()
         .trunc();
+    #[cfg(target_arch = "aarch64")]
+    let ip = context.uc_mcontext.pc.trunc();
 
     // Case 1: at the beginning of the syscall handler.
     //
@@ -2580,27 +3445,32 @@ mod tests {
 
         let pathname = c"/tmp/test_seccomp";
         let mkdir_res = unsafe {
-            syscalls::syscall2(syscalls::Sysno::mkdir, pathname.as_ptr() as usize, 0o755)
+            syscalls::syscall3(
+                syscalls::Sysno::mkdirat,
+                libc::AT_FDCWD.cast_unsigned() as usize,
+                pathname.as_ptr() as usize,
+                0o755,
+            )
         };
         assert_eq!(
             mkdir_res.unwrap_err(),
             syscalls::Errno::EINVAL,
-            "mkdir should be blocked by seccomp filter"
+            "mkdirat should be blocked by seccomp filter"
         );
 
         let pathname =
             std::ffi::CString::new(format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"))).unwrap();
         let open_res = unsafe {
-            syscalls::syscall2(
-                syscalls::Sysno::open,
+            crate::raw_open(
                 pathname.as_ptr() as usize,
                 OFlags::RDWR.bits() as usize,
+                0,
             )
         };
         assert_eq!(
             open_res.unwrap_err(),
             syscalls::Errno::EINVAL,
-            "open with RDWR should be blocked by seccomp filter"
+            "openat with RDWR should be blocked by seccomp filter"
         );
     }
 }

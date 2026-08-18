@@ -48,7 +48,12 @@ pub enum ArchSpecificRegister {
 /// Architecture-specific registers for AArch64.
 #[cfg(target_arch = "aarch64")]
 #[non_exhaustive]
-pub enum ArchSpecificRegister {}
+pub enum ArchSpecificRegister {
+    /// `TPIDR_EL0`, the user-mode thread-ID/TLS-base register -- the aarch64 analogue of
+    /// x86_64's `FsBase`, set via the `set_tls` syscall (`arch_prctl` does not exist on
+    /// aarch64).
+    TpidrEl0,
+}
 
 /// Errors that can be produced by a [`ArchSpecificProvider`] operation.
 #[non_exhaustive]
