@@ -86,8 +86,12 @@ impl litebox::shim::EnterShim for OpteeShimEntrypoints {
             let (fault_addr, error_code) = (info.cr2, u64::from(info.error_code));
             #[cfg(target_arch = "aarch64")]
             let (fault_addr, error_code) = (info.fault_address, info.esr);
-            let result =
-                unsafe { self.task.global.pm.handle_page_fault(fault_addr, error_code) };
+            let result = unsafe {
+                self.task
+                    .global
+                    .pm
+                    .handle_page_fault(fault_addr, error_code)
+            };
             if info.kernel_mode {
                 return if result.is_ok() {
                     ContinueOperation::Resume
@@ -700,7 +704,8 @@ impl Task {
         &self,
         ctx: &mut litebox_common_linux::PtRegs,
     ) -> ContinueOperation {
-        let request = match LdelfSyscallRequest::<Platform>::try_from_raw(ctx.syscall_number(), ctx) {
+        let request = match LdelfSyscallRequest::<Platform>::try_from_raw(ctx.syscall_number(), ctx)
+        {
             Ok(request) => request,
             Err(err) => {
                 ctx.set_return_value(TeeResult::from(err) as usize);

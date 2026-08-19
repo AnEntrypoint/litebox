@@ -1820,9 +1820,9 @@ where
         st_gid: 0,
         st_rdev: 0,
         st_size: 0,
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_arch = "aarch64")]
         st_blksize: blksize as i32,
-        #[cfg(target_os = "windows")]
+        #[cfg(not(target_arch = "aarch64"))]
         st_blksize: blksize,
         st_blocks: 0,
         ..Default::default()

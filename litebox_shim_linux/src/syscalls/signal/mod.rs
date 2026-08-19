@@ -3,16 +3,16 @@
 
 //! Signal handling syscalls and support.
 
-#[cfg(target_arch = "x86_64")]
-mod x86_64;
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
+#[cfg(target_arch = "x86_64")]
+mod x86_64;
 
+#[cfg(target_arch = "aarch64")]
+use aarch64 as arch;
 use litebox_common_linux::signal::SignalDisposition;
 #[cfg(target_arch = "x86_64")]
 use x86_64 as arch;
-#[cfg(target_arch = "aarch64")]
-use aarch64 as arch;
 use zerocopy::FromZeros;
 
 use crate::syscalls::process::ExitStatus;
@@ -461,7 +461,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             0,
             litebox::mm::linux::PAGE_SIZE,
             litebox_common_linux::ProtFlags::PROT_READ_EXEC,
-            litebox_common_linux::MapFlags::MAP_PRIVATE | litebox_common_linux::MapFlags::MAP_ANONYMOUS,
+            litebox_common_linux::MapFlags::MAP_PRIVATE
+                | litebox_common_linux::MapFlags::MAP_ANONYMOUS,
             -1,
             0,
         ) else {

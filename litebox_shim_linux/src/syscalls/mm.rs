@@ -781,9 +781,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Ok(stat) = self.sys_fstat(fd) else {
             return (false, 0, 0, 0);
         };
+        #[cfg(target_arch = "aarch64")]
         let Ok(file_size) = usize::try_from(stat.st_size) else {
             return (false, 0, 0, 0);
         };
+        #[cfg(not(target_arch = "aarch64"))]
+        let file_size = stat.st_size;
         if file_size < HEADER_SIZE {
             return (false, 0, 0, 0);
         }

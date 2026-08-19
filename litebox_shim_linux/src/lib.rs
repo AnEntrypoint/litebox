@@ -175,7 +175,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
             let (fault_addr, error_code) = (info.cr2, u64::from(info.error_code));
             #[cfg(target_arch = "aarch64")]
             let (fault_addr, error_code) = (info.fault_address, info.esr);
-            if unsafe { self.task.process().pm.handle_page_fault(fault_addr, error_code) }.is_ok()
+            if unsafe {
+                self.task
+                    .process()
+                    .pm
+                    .handle_page_fault(fault_addr, error_code)
+            }
+            .is_ok()
             {
                 return ContinueOperation::Resume;
             } else {

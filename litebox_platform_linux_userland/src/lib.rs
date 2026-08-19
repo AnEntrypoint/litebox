@@ -185,7 +185,10 @@ unsafe fn raw_open(path: usize, flags: usize, mode: usize) -> Result<usize, sysc
         syscalls::syscall3(syscalls::Sysno::open, path, flags, mode)
     }
     #[cfg(target_arch = "aarch64")]
-    #[allow(clippy::cast_sign_loss, reason = "AT_FDCWD is a negative sentinel, passed as-is")]
+    #[allow(
+        clippy::cast_sign_loss,
+        reason = "AT_FDCWD is a negative sentinel, passed as-is"
+    )]
     unsafe {
         syscalls::syscall4(
             syscalls::Sysno::openat,
@@ -714,8 +717,7 @@ mod aarch64_syscall_proxy {
                 futex_wait(&MAILBOX.state, STATE_IDLE);
             }
             let sysno = MAILBOX.sysno.load(Ordering::Relaxed);
-            let args: [usize; 6] =
-                std::array::from_fn(|i| MAILBOX.args[i].load(Ordering::Relaxed));
+            let args: [usize; 6] = std::array::from_fn(|i| MAILBOX.args[i].load(Ordering::Relaxed));
             let result = unsafe {
                 syscalls::raw_syscall!(
                     syscalls::Sysno::new(sysno as usize).expect("invalid proxied syscall number"),
@@ -1573,11 +1575,11 @@ unsafe extern "C" fn switch_to_guest(
         // and comment: if an interrupt arrives after this check, the signal handler sees the
         // PC is between switch_to_guest_start/_end and routes to interrupt_callback itself.
         "mov w9, #1",
-        "strb w9, [x1, #48]",       // scratch->in_guest = 1
-        "ldrb w9, [x1, #49]",       // scratch->interrupt
+        "strb w9, [x1, #48]", // scratch->in_guest = 1
+        "ldrb w9, [x1, #49]", // scratch->interrupt
         "cbnz w9, interrupt_callback",
         // Restore the guest's TPIDR_EL0.
-        "ldr x9, [x1, #40]",        // scratch->guest_tpidr
+        "ldr x9, [x1, #40]", // scratch->guest_tpidr
         "msr tpidr_el0, x9",
         // Reload the guest register file from ctx (x0), matching syscall_callback's dump
         // layout: regs[0..31), sp, pc, pstate, orig_x0, syscallno, unused2.
@@ -1595,12 +1597,12 @@ unsafe extern "C" fn switch_to_guest(
         "ldp x24, x25, [x0, #192]",
         "ldp x26, x27, [x0, #208]",
         "ldp x28, x29, [x0, #224]",
-        "ldr x30, [x0, #240]",       // regs[30]
-        "ldr x1, [x0, #248]",        // PtRegs.sp -> stash in x1 temporarily
+        "ldr x30, [x0, #240]", // regs[30]
+        "ldr x1, [x0, #248]",  // PtRegs.sp -> stash in x1 temporarily
         "mov sp, x1",
-        "ldr x1, [x0, #256]",        // PtRegs.pc -> the guest branch target
+        "ldr x1, [x0, #256]", // PtRegs.pc -> the guest branch target
         // Reload x0/x1 last (x0 was our own `ctx` argument, x1 is now the branch target).
-        "ldr x9, [x0]",              // regs[0]
+        "ldr x9, [x0]", // regs[0]
         "mov x0, x9",
         "br x1",
         "switch_to_guest_end:",
@@ -1899,7 +1901,10 @@ impl litebox::platform::RawMutexProvider for LinuxUserland {
             let scratch_ptr = aarch64_scratch_or_host_only();
             unsafe {
                 let old = core::ptr::read_volatile(&raw const (*scratch_ptr).wait_waker_addr);
-                core::ptr::write_volatile(&raw mut (*scratch_ptr).wait_waker_addr, waker_ptr as usize);
+                core::ptr::write_volatile(
+                    &raw mut (*scratch_ptr).wait_waker_addr,
+                    waker_ptr as usize,
+                );
                 old as *mut litebox::event::wait::Waker<Self>
             }
         };
@@ -2045,7 +2050,10 @@ impl litebox::platform::TimeProvider for LinuxUserland {
         unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, t.as_mut_ptr()) };
         let t = unsafe { t.assume_init() };
         Instant {
-            #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), expect(clippy::useless_conversion))]
+            #[cfg_attr(
+                any(target_arch = "x86_64", target_arch = "aarch64"),
+                expect(clippy::useless_conversion)
+            )]
             inner: Duration::new(
                 t.tv_sec.reinterpret_as_unsigned().into(),
                 t.tv_nsec.reinterpret_as_unsigned().trunc(),
@@ -2058,7 +2066,10 @@ impl litebox::platform::TimeProvider for LinuxUserland {
         unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, t.as_mut_ptr()) };
         let t = unsafe { t.assume_init() };
         SystemTime {
-            #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), expect(clippy::useless_conversion))]
+            #[cfg_attr(
+                any(target_arch = "x86_64", target_arch = "aarch64"),
+                expect(clippy::useless_conversion)
+            )]
             inner: Duration::new(
                 t.tv_sec.reinterpret_as_unsigned().into(),
                 t.tv_nsec.reinterpret_as_unsigned().trunc(),
@@ -2930,12 +2941,8 @@ fn with_signal_alt_stack<R>(f: impl FnOnce(*mut u8) -> R) -> R {
     let _unmap_guard = litebox::utils::defer(|| {
         #[cfg(target_arch = "aarch64")]
         aarch64_unregister_guest_alt_stack(mapping_base as usize);
-        let r = unsafe {
-            libc::munmap(
-                mapping_base,
-                extra_size + guard_page_size + alt_stack_size,
-            )
-        };
+        let r =
+            unsafe { libc::munmap(mapping_base, extra_size + guard_page_size + alt_stack_size) };
         assert!(
             r == 0,
             "failed to free memory for alternate signal stack: {}",
@@ -2943,7 +2950,12 @@ fn with_signal_alt_stack<R>(f: impl FnOnce(*mut u8) -> R) -> R {
         );
     });
 
-    let stack_base = unsafe { mapping_base.cast::<u8>().add(extra_size).cast::<libc::c_void>() };
+    let stack_base = unsafe {
+        mapping_base
+            .cast::<u8>()
+            .add(extra_size)
+            .cast::<libc::c_void>()
+    };
 
     // Stamp the magic sentinel into the scratch struct and register this mapping in the
     // lock-free guest-alt-stack registry, both before this stack is ever registered/used --
@@ -3875,13 +3887,8 @@ mod tests {
 
         let pathname =
             std::ffi::CString::new(format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"))).unwrap();
-        let open_res = unsafe {
-            crate::raw_open(
-                pathname.as_ptr() as usize,
-                OFlags::RDWR.bits() as usize,
-                0,
-            )
-        };
+        let open_res =
+            unsafe { crate::raw_open(pathname.as_ptr() as usize, OFlags::RDWR.bits() as usize, 0) };
         assert_eq!(
             open_res.unwrap_err(),
             syscalls::Errno::EINVAL,
