@@ -481,7 +481,18 @@ impl LinuxUserland {
             // `ppoll` there instead).
             #[cfg(target_arch = "x86_64")]
             (libc::SYS_poll, vec![]),
-            #[cfg(target_arch = "aarch64")]
+            // ppoll is deliberately NOT allow-listed here on aarch64, same reasoning as
+            // close/dup/etc above: an Allow rule would let a GUEST's own poll()/ppoll() call
+            // bypass litebox's emulation and hit the real kernel directly against the HOST's
+            // own (unrelated) fd table -- live-confirmed as the root cause of
+            // test_alarm_interrupts_poll's failure: the guest's litebox-virtual pipe fd (valid
+            // in litebox's own fd table, confirmed via working read()/write() on it) doesn't
+            // exist in the real host fd table, so the real kernel's ppoll() correctly reports
+            // POLLNVAL for it -- immediately, never blocking long enough to observe the SIGALRM
+            // interrupt the test expects. Proxied instead via aarch64_syscall_proxy for the
+            // host-code case (litebox's own runtime has no legitimate use for this today, but
+            // future ones are handled the same way as every other proxied syscall here).
+            #[cfg(not(target_arch = "aarch64"))]
             (libc::SYS_ppoll, vec![]),
             // memory management
             (libc::SYS_mmap, vec![]),
