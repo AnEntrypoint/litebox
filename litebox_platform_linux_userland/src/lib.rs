@@ -1675,6 +1675,15 @@ unsafe extern "C" fn switch_to_guest(
         "mov w9, #1",
         "strb w9, [x1, #48]", // scratch->in_guest = 1
         "ldrb w9, [x1, #49]", // scratch->interrupt
+        // `interrupt_callback`'s own first instruction (`ldr x9, [x3, #16]`, scratch->host_sp)
+        // requires x3 to already hold the scratch pointer -- true for every OTHER path that
+        // reaches this label (via `set_signal_return`, which explicitly sets `regs[3] =
+        // scratch`), but NOT for this direct in-asm branch: at this point x3 is still whatever
+        // the CALLER of `switch_to_guest` happened to leave there (garbage, live-confirmed:
+        // observed as the small integer 0x2, causing `interrupt_callback` to fault
+        // dereferencing `0x2 + 16 = 0x12`), since only x1 has been loaded with the scratch
+        // pointer so far in this function. Load it into x3 too before branching.
+        "mov x3, x1",
         "cbnz w9, interrupt_callback",
         // Restore the guest's TPIDR_EL0.
         "ldr x9, [x1, #40]", // scratch->guest_tpidr
