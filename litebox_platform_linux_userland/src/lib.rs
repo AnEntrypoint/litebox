@@ -472,7 +472,9 @@ impl LinuxUserland {
 
         let rules = vec![
             // TUN and terminal
+            #[cfg(not(target_arch = "aarch64"))]
             (libc::SYS_read, vec![]),
+            #[cfg(not(target_arch = "aarch64"))]
             (libc::SYS_write, vec![]),
             // `poll` does not exist as a syscall number on aarch64 (glibc's `poll()` calls
             // `ppoll` there instead).
@@ -538,10 +540,19 @@ impl LinuxUserland {
                     .unwrap(),
                 ],
             ),
-            // aarch64 equivalent of the `open`(RDONLY) rule above: `raw_open` dispatches to
-            // `openat(AT_FDCWD, path, flags, mode)` there, so the flags argument moves from
-            // index 1 to index 2.
-            #[cfg(target_arch = "aarch64")]
+            // aarch64: unlike x86_64's open(RDONLY)-conditioned rule above, openat is NOT
+            // allow-listed here at all (even conditionally) -- an earlier version of this rule
+            // matched RDONLY opens unconditionally by syscall number, which also let a GUEST's
+            // own openat(path, O_RDONLY) bypass litebox's VFS entirely (live-confirmed: open()
+            // on a real host device path like /dev/null returned a REAL, unregistered host fd,
+            // and subsequent read()/close() on it either hit the same real host fd -- a false
+            // positive masking the bug -- or correctly-but-confusingly failed EBADF against
+            // litebox's own, genuinely-empty descriptor table once read/write were also fixed).
+            // Host-only openat(RDONLY) needs (`raw_open`, litebox's own ELF-reading code) are
+            // proxied via aarch64_syscall_proxy instead, same as close/dup/etc -- see the
+            // PROXIED array below; the flags-argument condition that used to gate this rule is
+            // preserved there procedurally (only RDONLY opens are proxied, not writes).
+            #[cfg(all(false, target_arch = "aarch64"))]
             (
                 libc::SYS_openat,
                 vec![
@@ -3344,7 +3355,7 @@ unsafe extern "C" fn exception_signal_handler(
         // through directly -- only reached for these seven numbers; anything else still falls
         // through to the debug-log+EINVAL path below unchanged.
         let sysno = context.uc_mcontext.regs[8].cast_signed();
-        const PROXIED: [i64; 7] = [
+        const PROXIED: [i64; 9] = [
             libc::SYS_close,
             libc::SYS_dup,
             libc::SYS_clock_gettime,
@@ -3352,8 +3363,16 @@ unsafe extern "C" fn exception_signal_handler(
             libc::SYS_prlimit64,
             libc::SYS_readlinkat,
             libc::SYS_fstat,
+            libc::SYS_read,
+            libc::SYS_write,
         ];
-        if PROXIED.contains(&sysno) {
+        // openat is proxied too, but only for RDONLY opens (matching the flags-argument
+        // condition the removed seccomp rule used to enforce) -- host code opening a file
+        // for writing is not a case this proxy needs to support (litebox's own host-side needs,
+        // e.g. raw_open reading an ELF binary, are always RDONLY).
+        let is_proxied_openat = sysno == libc::SYS_openat
+            && context.uc_mcontext.regs[3] as u32 == OFlags::RDONLY.bits();
+        if PROXIED.contains(&sysno) || is_proxied_openat {
             let regs = &context.uc_mcontext.regs;
             let args = [
                 regs[0] as usize,
