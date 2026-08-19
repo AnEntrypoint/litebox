@@ -549,6 +549,25 @@ impl LinuxUserland {
             (libc::SYS_exit, vec![]),
             (libc::SYS_exit_group, vec![]),
             (libc::SYS_clone3, vec![]),
+            // A GUEST clone()/clone3() call NEVER reaches this real syscall number directly --
+            // sys_clone/sys_clone3 (litebox_shim_linux/src/syscalls/process.rs) both dispatch
+            // to LinuxUserland::spawn_thread, which uses std::thread::Builder::spawn (this
+            // crate's own HOST-runtime code, not guest-controlled). That in turn issues a raw
+            // clone3 syscall first, falling back to plain clone on ENOSYS (confirmed live via
+            // strace: this environment's clone3 genuinely returns ENOSYS, likely a
+            // container-level restriction, not a seccomp effect -- real deployments with a
+            // working clone3 never reach this fallback at all). So a trapped SYS_clone here is
+            // unambiguously host-originated, exactly like the already-allowed SYS_clone3 right
+            // above -- unlike tgkill/rt_sigaction/rt_sigreturn/rt_sigprocmask (which a GUEST
+            // genuinely can reach directly), there is no guest-vs-host ambiguity to resolve for
+            // this one, so it can be allowed unconditionally rather than proxied. (A proxy-style
+            // fix was attempted and rejected: the new thread would become a child of the proxy
+            // worker, not a sibling of the real calling thread -- wrong TLS base, wrong stack,
+            // wrong parentage. A raw in-place `svc` re-issue was also attempted and rejected: it
+            // re-traps recursively since the calling thread's own seccomp filter is still
+            // active, and SIGSYS lacks SA_NODEFER, so the nested trap gets the default
+            // disposition and kills the process.)
+            (libc::SYS_clone, vec![]),
             // sync
             (libc::SYS_futex, vec![]),
             // misc
