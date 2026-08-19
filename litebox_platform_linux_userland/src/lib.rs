@@ -439,11 +439,27 @@ impl LinuxUserland {
         };
     }
 
+    /// Spawns the host-syscall-proxy thread (see [`aarch64_syscall_proxy`]'s module doc) and
+    /// installs the seccomp filter. MUST be called in this order (the proxy thread must exist,
+    /// unfiltered, before the filter goes on) and only once per process. On x86_64 the proxy
+    /// thread is unnecessary (guest syscalls never reach this filter at all -- they're
+    /// intercepted by the ELF-patched fast-path trampoline before ever executing `syscall`), so
+    /// this is a thin wrapper calling the real `enable_seccomp_filter` directly there.
+    #[cfg(target_arch = "aarch64")]
+    pub fn enable_seccomp_filter() {
+        aarch64_syscall_proxy::spawn();
+        Self::enable_seccomp_filter_inner();
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    pub fn enable_seccomp_filter() {
+        Self::enable_seccomp_filter_inner();
+    }
+
     #[allow(
         clippy::missing_panics_doc,
         reason = "the seccomp filter rules are hardcoded and not expected to fail"
     )]
-    pub fn enable_seccomp_filter() {
+    fn enable_seccomp_filter_inner() {
         use seccompiler::{
             BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
             SeccompFilter, SeccompRule,
@@ -536,16 +552,33 @@ impl LinuxUserland {
                     .unwrap(),
                 ],
             ),
+            // close/dup/clock_gettime/set_tid_address/prlimit64/readlinkat/fstat are
+            // deliberately NOT allow-listed here on aarch64 (they are on x86_64, see the
+            // `not(aarch64)` arms below): unlike x86_64 (which intercepts every GUEST syscall
+            // via the ELF-patched fast-path trampoline before it ever reaches the kernel),
+            // aarch64 has no such trampoline yet, so an `Allow` rule here would let the GUEST's
+            // own calls to these same syscall numbers bypass emulation entirely and hit the
+            // real kernel directly -- live-confirmed: a guest's `close(3)` reaching the real
+            // kernel and failing EBADF against the real host fd table instead of litebox's own
+            // virtual one. These seven are still needed by litebox's OWN host-side runtime code
+            // (fd cleanup, elapsed-time reads, glibc/std internals) -- handled instead by
+            // `exception_signal_handler`'s aarch64 host-syscall-proxy branch (see
+            // `aarch64_syscall_proxy`'s module doc), which discriminates host-vs-guest via the
+            // same `in_guest` scratch flag the SIGSYS syscall-dispatch bridge uses, and forwards
+            // only the host-code case to a dedicated, always-unfiltered proxy thread.
+            #[cfg(not(target_arch = "aarch64"))]
             (libc::SYS_close, vec![]),
+            #[cfg(not(target_arch = "aarch64"))]
             (libc::SYS_dup, vec![]),
-            // required for the host's own clock_gettime backing the guest's sys_clock_gettime
-            // shim call, plus glibc/std's own monotonic-time reads
+            #[cfg(not(target_arch = "aarch64"))]
             (libc::SYS_clock_gettime, vec![]),
-            // called by glibc pthread_create's stack-guard setup
+            #[cfg(not(target_arch = "aarch64"))]
             (libc::SYS_set_tid_address, vec![]),
+            #[cfg(not(target_arch = "aarch64"))]
             (libc::SYS_prlimit64, vec![]),
-            // called by std's panic/backtrace machinery
+            #[cfg(not(target_arch = "aarch64"))]
             (libc::SYS_readlinkat, vec![]),
+            #[cfg(not(target_arch = "aarch64"))]
             (libc::SYS_fstat, vec![]),
         ];
         let rule_map: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
@@ -570,6 +603,168 @@ impl LinuxUserland {
         let bpf_prog: BpfProgram = filter.try_into().unwrap();
 
         seccompiler::apply_filter(&bpf_prog).unwrap();
+    }
+}
+
+/// A dedicated, always-unfiltered thread that performs real syscalls on behalf of HOST code
+/// (litebox's own runtime/glibc/std internals) for the six syscall numbers that were removed
+/// from the seccomp allow-list on aarch64.
+///
+/// Background: on aarch64 there is no ELF-patched fast-path trampoline (unlike x86_64), so
+/// every GUEST syscall reaches the kernel directly and must be caught by the seccomp filter's
+/// SIGSYS trap to be emulated (see `exception_signal_handler`'s aarch64 SIGSYS branch). But
+/// litebox's own host-side code also needs a handful of these same syscall numbers (`close`,
+/// `dup`, `clock_gettime`, `set_tid_address`, `prlimit64`, `readlinkat`, `fstat`) for entirely
+/// unrelated reasons (fd cleanup, elapsed-time reads, glibc/std internals) -- and seccomp-bpf
+/// has no way to see WHO issued a syscall (only the syscall number, arch, instruction pointer,
+/// and up to 6 argument words), so a simple `Allow` rule for these would let a GUEST'S calls to
+/// the same numbers bypass emulation entirely (live-confirmed: a guest's `close(3)` reaching the
+/// real kernel directly, failing EBADF against the real process's fd table instead of going
+/// through litebox's own virtual fd table).
+///
+/// This module closes that gap: instead of an `Allow` rule, these six syscalls use `Trap`
+/// (SIGSYS) unconditionally, same as any other unhandled syscall. `exception_signal_handler`'s
+/// aarch64 branch discriminates guest-vs-host the same way it already does for the
+/// syscall-emulation dispatch (`in_guest` in the trapping thread's `Aarch64ThreadScratch`): a
+/// guest-issued trap for these numbers still dispatches into `syscall_callback` for real
+/// emulation (litebox's own `sys_close`/etc, which manage a virtual fd table), while a
+/// host-issued trap for these numbers is forwarded to this proxy thread -- the ONLY thread in
+/// the process that never has the seccomp filter installed (it's spawned before
+/// `enable_seccomp_filter` ever runs, and a thread's seccomp filter is never retroactively
+/// applied to threads that already exist) -- which performs the real syscall and returns the
+/// result.
+///
+/// Communication is a single-slot mailbox (no heap allocation, no libc calls beyond `futex`,
+/// which is itself already always allowed): a request is written under a spinlock (so
+/// concurrent host threads serialize rather than racing), the proxy thread is woken via
+/// `futex(FUTEX_WAKE)`, and the caller blocks on `futex(FUTEX_WAIT)` for the response -- both
+/// safe to call from inside a signal handler (no allocation, no non-reentrant libc state).
+#[cfg(target_arch = "aarch64")]
+mod aarch64_syscall_proxy {
+    use std::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering};
+
+    const STATE_IDLE: u32 = 0;
+    const STATE_REQUEST: u32 = 1;
+    const STATE_RESPONSE: u32 = 2;
+
+    struct Mailbox {
+        /// Spinlock guarding request submission: only one host thread may have a request
+        /// in flight at a time (0 = unlocked, 1 = locked).
+        lock: AtomicU32,
+        state: AtomicU32,
+        sysno: AtomicI64,
+        args: [AtomicUsize; 6],
+        result: AtomicI64,
+    }
+
+    static MAILBOX: Mailbox = Mailbox {
+        lock: AtomicU32::new(0),
+        state: AtomicU32::new(STATE_IDLE),
+        sysno: AtomicI64::new(0),
+        args: [
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        ],
+        result: AtomicI64::new(0),
+    };
+
+    fn futex_wait(addr: &AtomicU32, expected: u32) {
+        unsafe {
+            let _ = syscalls::syscall4(
+                syscalls::Sysno::futex,
+                std::ptr::from_ref(addr) as usize,
+                libc::FUTEX_WAIT as usize,
+                expected as usize,
+                0, // no timeout
+            );
+        }
+    }
+
+    fn futex_wake(addr: &AtomicU32) {
+        unsafe {
+            let _ = syscalls::syscall3(
+                syscalls::Sysno::futex,
+                std::ptr::from_ref(addr) as usize,
+                libc::FUTEX_WAKE as usize,
+                1,
+            );
+        }
+    }
+
+    /// Spawns the proxy thread. MUST be called before the seccomp filter is installed (see this
+    /// module's doc comment) and only once.
+    pub(super) fn spawn() {
+        std::thread::Builder::new()
+            .name("aarch64-syscall-proxy".to_owned())
+            .spawn(run)
+            .expect("failed to spawn aarch64 syscall proxy thread");
+    }
+
+    fn run() {
+        loop {
+            // Wait for a request. A spurious wake (state still IDLE) just loops back.
+            loop {
+                if MAILBOX.state.load(Ordering::Acquire) == STATE_REQUEST {
+                    break;
+                }
+                futex_wait(&MAILBOX.state, STATE_IDLE);
+            }
+            let sysno = MAILBOX.sysno.load(Ordering::Relaxed);
+            let args: [usize; 6] =
+                std::array::from_fn(|i| MAILBOX.args[i].load(Ordering::Relaxed));
+            let result = unsafe {
+                syscalls::raw_syscall!(
+                    syscalls::Sysno::new(sysno as usize).expect("invalid proxied syscall number"),
+                    args[0],
+                    args[1],
+                    args[2],
+                    args[3],
+                    args[4],
+                    args[5]
+                )
+            };
+            MAILBOX.result.store(result as i64, Ordering::Relaxed);
+            MAILBOX.state.store(STATE_RESPONSE, Ordering::Release);
+            futex_wake(&MAILBOX.state);
+        }
+    }
+
+    /// Proxies a syscall through the dedicated unfiltered thread and returns its real result.
+    /// Called from `exception_signal_handler`'s SIGSYS handler for the host-code case -- must
+    /// remain signal-safe (no allocation, no non-reentrant libc calls).
+    pub(super) fn proxy(sysno: i64, args: [usize; 6]) -> i64 {
+        // Acquire the single-slot mailbox's spinlock. Contention is expected to be rare (these
+        // six syscalls are only host-runtime-init-path calls, not steady-state guest traffic),
+        // so a spin (rather than a futex-based lock) keeps this path simple and allocation-free.
+        while MAILBOX
+            .lock
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            std::hint::spin_loop();
+        }
+
+        MAILBOX.sysno.store(sysno, Ordering::Relaxed);
+        for (i, arg) in args.iter().enumerate() {
+            MAILBOX.args[i].store(*arg, Ordering::Relaxed);
+        }
+        MAILBOX.state.store(STATE_REQUEST, Ordering::Release);
+        futex_wake(&MAILBOX.state);
+
+        loop {
+            if MAILBOX.state.load(Ordering::Acquire) == STATE_RESPONSE {
+                break;
+            }
+            futex_wait(&MAILBOX.state, STATE_REQUEST);
+        }
+        let result = MAILBOX.result.load(Ordering::Relaxed);
+        MAILBOX.state.store(STATE_IDLE, Ordering::Release);
+        MAILBOX.lock.store(0, Ordering::Release);
+        result
     }
 }
 
@@ -3127,6 +3322,36 @@ unsafe extern "C" fn exception_signal_handler(
                 );
                 return;
             }
+        }
+        // HOST code (litebox's own runtime, not the guest) invoked one of the seven syscalls
+        // removed from the seccomp allow-list above (see `aarch64_syscall_proxy`'s module doc).
+        // Forward the real syscall to the dedicated unfiltered proxy thread and write its real
+        // result back, so host code sees the same behavior as if the syscall had been allowed
+        // through directly -- only reached for these seven numbers; anything else still falls
+        // through to the debug-log+EINVAL path below unchanged.
+        let sysno = context.uc_mcontext.regs[8].cast_signed();
+        const PROXIED: [i64; 7] = [
+            libc::SYS_close,
+            libc::SYS_dup,
+            libc::SYS_clock_gettime,
+            libc::SYS_set_tid_address,
+            libc::SYS_prlimit64,
+            libc::SYS_readlinkat,
+            libc::SYS_fstat,
+        ];
+        if PROXIED.contains(&sysno) {
+            let regs = &context.uc_mcontext.regs;
+            let args = [
+                regs[0] as usize,
+                regs[1] as usize,
+                regs[2] as usize,
+                regs[3] as usize,
+                regs[4] as usize,
+                regs[5] as usize,
+            ];
+            let result = aarch64_syscall_proxy::proxy(sysno, args);
+            context.uc_mcontext.regs[0] = result as u64;
+            return;
         }
     }
     // Return an error code for the syscall and log it in debug mode.
