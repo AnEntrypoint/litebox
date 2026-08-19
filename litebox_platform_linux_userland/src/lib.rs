@@ -1629,14 +1629,42 @@ unsafe extern "C" fn switch_to_guest(
         "ldp x24, x25, [x0, #192]",
         "ldp x26, x27, [x0, #208]",
         "ldp x28, x29, [x0, #224]",
-        "ldr x30, [x0, #240]", // regs[30]
-        "ldr x1, [x0, #248]",  // PtRegs.sp -> stash in x1 temporarily
-        "mov sp, x1",
-        "ldr x1, [x0, #256]", // PtRegs.pc -> the guest branch target
-        // Reload x0/x1 last (x0 was our own `ctx` argument, x1 is now the branch target).
-        "ldr x9, [x0]", // regs[0]
-        "mov x0, x9",
-        "br x1",
+        "ldr x30, [x0, #240]", // regs[30], x30's real, final guest value
+        // Every one of x0-x30 is real guest state that must end up holding its own regs[N]
+        // value by the time `br` executes -- none of them can be used as a dedicated scratch
+        // register without being reloaded from the correct offset afterward. An earlier version
+        // of this asm used x1 as scratch for PtRegs.sp/PtRegs.pc and never reloaded it from
+        // regs[1] at all, leaving the guest's x1 permanently corrupted (holding the
+        // branch-target address) after every single guest resume -- live-confirmed via a
+        // raise(SIGINT)-triggered tgkill() whose apparent return value (x0, read by strace at
+        // syscall-exit) matched the guest's own tid argument instead of the real 0, a
+        // downstream symptom of this same corruption reaching a later syscall's argument
+        // registers. Fixed by routing the branch target through a transient push/pop on the
+        // guest's OWN stack: switch `sp` to the guest's real stack pointer, push the branch
+        // target below it (using the 16 bytes right below the guest's real sp -- part of the
+        // guest's own stack redzone/zone-below-sp, which the guest itself never has live data
+        // in at a syscall boundary per AAPCS64), reload every remaining real register
+        // (including x9, needed as `ldr`'s destination) from `regs[]`, then `ldr`+`br` the
+        // pushed target back off the stack as the last two instructions -- `sp` itself is
+        // restored to the guest's exact real value by the `add sp, sp, #16` immediately after
+        // the load, before the guest ever gets to observe it.
+        "ldr x9, [x0, #248]", // PtRegs.sp -> the guest's real stack pointer
+        "sub x9, x9, #16",
+        "mov sp, x9",
+        "ldr x9, [x0, #256]",    // PtRegs.pc -> the guest branch target
+        "str x9, [sp]",          // stash it just below the guest's real sp
+        "ldp x8, x9, [x0, #64]", // reload the real regs[8]/regs[9] (overwritten above)
+        "ldr x1, [x0, #8]",      // regs[1]
+        "ldr x0, [x0]",          // regs[0] (x0 itself, our ctx pointer, no longer needed after)
+        "ldr x16, [sp], #16",    // pop the branch target into x16 (ip0, restored from its own
+        // real regs[16] value further above and now transiently
+        // reused for exactly this one instruction gap, same
+        // reasoning as x9's use above -- but see the AAPCS64 note:
+        // x16/ip0 is a valid intra-procedure-call scratch register by
+        // ABI convention, so a guest's own code can never rely on its
+        // value surviving a call boundary, making it safe to leave
+        // holding the (now-irrelevant, post-branch) pop result)
+        "br x16",
         "switch_to_guest_end:",
     );
 }
