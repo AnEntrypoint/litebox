@@ -1072,6 +1072,21 @@ struct Aarch64ThreadScratch {
     /// address reinterpreted as a mode bitmask). Mirrors `svc_resume_pc`'s pattern: stashed here
     /// before dispatch, patched into `PtRegs.regs[3]` by `syscall_callback`'s dump when nonzero.
     svc_real_x3: usize,
+    /// Transient scratch slot for `switch_to_guest`'s branch-target register shuffle -- holds
+    /// the guest's real PC while every one of x0-x30 is reloaded from `PtRegs`, since none of
+    /// those registers can be used as a dedicated temporary without corrupting real guest
+    /// state. An earlier version of this asm used the 16 bytes just below the guest's real `sp`
+    /// for this (reasoning: aarch64 has "no redzone that must be preserved" the way x86_64
+    /// does) -- but that write is still guest-visible, unlike x86_64's redzone-avoidance
+    /// argument: on a signal-delivery resume specifically, `sp` is set to `frame_addr` (the
+    /// just-written `SignalFrame`'s base), and the guest signal handler's own prologue
+    /// (`sub sp, sp, #N` then storing its own locals starting at the new, lower `sp`) can
+    /// legitimately write into that same below-sp region within its very first few
+    /// instructions -- a race between this transient scratch write/read (usually resolved by
+    /// the time the handler runs, but not guaranteed to be free of any host-side
+    /// interruption/re-entrancy in between) and the handler's own stack usage. Using this
+    /// host-only scratch field instead removes the guest-visible side effect entirely.
+    switch_target: usize,
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -1119,6 +1134,7 @@ fn aarch64_scratch_or_host_only() -> *mut Aarch64ThreadScratch {
                 wait_waker_addr: 0,
                 svc_resume_pc: 0,
                 svc_real_x3: 0,
+                switch_target: 0,
             })
         });
         core::ptr::from_mut(scratch.as_mut())
@@ -1642,39 +1658,51 @@ unsafe extern "C" fn switch_to_guest(
         "ldp x28, x29, [x0, #224]",
         "ldr x30, [x0, #240]", // regs[30], x30's real, final guest value
         // Every one of x0-x30 is real guest state that must end up holding its own regs[N]
-        // value by the time `br` executes -- none of them can be used as a dedicated scratch
-        // register without being reloaded from the correct offset afterward. An earlier version
-        // of this asm used x1 as scratch for PtRegs.sp/PtRegs.pc and never reloaded it from
-        // regs[1] at all, leaving the guest's x1 permanently corrupted (holding the
-        // branch-target address) after every single guest resume -- live-confirmed via a
-        // raise(SIGINT)-triggered tgkill() whose apparent return value (x0, read by strace at
-        // syscall-exit) matched the guest's own tid argument instead of the real 0, a
-        // downstream symptom of this same corruption reaching a later syscall's argument
-        // registers. Fixed by routing the branch target through a transient push/pop on the
-        // guest's OWN stack: switch `sp` to the guest's real stack pointer, push the branch
-        // target below it (using the 16 bytes right below the guest's real sp -- part of the
-        // guest's own stack redzone/zone-below-sp, which the guest itself never has live data
-        // in at a syscall boundary per AAPCS64), reload every remaining real register
-        // (including x9, needed as `ldr`'s destination) from `regs[]`, then `ldr`+`br` the
-        // pushed target back off the stack as the last two instructions -- `sp` itself is
-        // restored to the guest's exact real value by the `add sp, sp, #16` immediately after
-        // the load, before the guest ever gets to observe it.
+        // value by the time `br` executes -- except the ONE register that must hold the
+        // branch target itself for that final instruction, which is therefore unavoidably
+        // "wrong" (not its real regs[N] value) at the instant of the jump. Two earlier
+        // versions of this asm got this wrong in different ways: the first used x1 as scratch
+        // for PtRegs.sp/PtRegs.pc and never reloaded it from regs[1] at all, permanently
+        // corrupting the guest's x1 on every resume; the second routed the branch target
+        // through a transient write to the 16 bytes just below the guest's real sp (reasoning
+        // that aarch64 has no x86-style redzone requiring preservation there) -- but that
+        // doesn't hold for a signal-delivery resume specifically: `sp` here is `frame_addr`,
+        // the just-written `SignalFrame`'s base, and a signal handler's own prologue (`sub sp,
+        // sp, #N` then storing its own locals at the new lower sp) can and does write into
+        // that exact below-sp region within its very first instructions -- live-confirmed via
+        // gdb: a trivial signal handler (verified via objdump to never touch x30 itself)
+        // returned via `ret` to address 0 instead of the sigreturn trampoline just written
+        // into x30/regs[30], with x30 reading back as 0 at the crash, consistent with the
+        // scratch write colliding with memory the handler's own prologue overwrote before the
+        // pushed value was ever popped back off.
+        //
+        // Fixed by using x16 (ip0) as the dedicated branch-target register: per AAPCS64, x16
+        // and x17 are reserved as intra-procedure-call scratch registers that veneers/PLT
+        // stubs use freely -- no well-behaved guest code (including a signal handler, whose
+        // invocation is architecturally similar to an indirect call through these registers)
+        // relies on x16's value surviving a control-flow transfer into it. x16/x17 are loaded
+        // with their real regs[16]/regs[17] values earlier in this dump (matching every other
+        // register) for the ORDINARY resume case (returning into normal guest code mid-
+        // execution, where x16 must be correct); this branch-target use only applies for the
+        // instant for the FINAL jump, using scratch->switch_target (a dedicated field in the
+        // host-only Aarch64ThreadScratch struct, never guest-visible memory) as the actual
+        // source of truth so no guest-visible state (register OR memory) is used as scratch.
+        "ldr x9, [x0, #256]", // PtRegs.pc -> the guest branch target
+        "str x9, [x1, #80]",  // scratch->switch_target = branch target (x1 is still the real
+        // scratch pointer here -- has not been reloaded from regs[1] yet)
+        "ldr x16, [x1, #80]", // x16 = scratch->switch_target, read back immediately while x1
+        // is still valid as the scratch pointer -- x16's own real
+        // regs[16] value is intentionally sacrificed here (already
+        // loaded correctly far above for the ordinary case; this is the
+        // one register whose final value is the branch target instead,
+        // matching AAPCS64's designation of x16/ip0 as an
+        // intra-procedure-call scratch register no well-behaved guest
+        // code relies on surviving a control transfer into it)
         "ldr x9, [x0, #248]", // PtRegs.sp -> the guest's real stack pointer
-        "sub x9, x9, #16",
         "mov sp, x9",
-        "ldr x9, [x0, #256]",    // PtRegs.pc -> the guest branch target
-        "str x9, [sp]",          // stash it just below the guest's real sp
-        "ldp x8, x9, [x0, #64]", // reload the real regs[8]/regs[9] (overwritten above)
-        "ldr x1, [x0, #8]",      // regs[1]
+        "ldp x8, x9, [x0, #64]", // reload the real regs[8]/regs[9] (x9 was scratch above)
+        "ldr x1, [x0, #8]",      // regs[1] (x1 was the scratch pointer, no longer needed as such)
         "ldr x0, [x0]",          // regs[0] (x0 itself, our ctx pointer, no longer needed after)
-        "ldr x16, [sp], #16",    // pop the branch target into x16 (ip0, restored from its own
-        // real regs[16] value further above and now transiently
-        // reused for exactly this one instruction gap, same
-        // reasoning as x9's use above -- but see the AAPCS64 note:
-        // x16/ip0 is a valid intra-procedure-call scratch register by
-        // ABI convention, so a guest's own code can never rely on its
-        // value surviving a call boundary, making it safe to leave
-        // holding the (now-irrelevant, post-branch) pop result)
         "br x16",
         "switch_to_guest_end:",
     );
