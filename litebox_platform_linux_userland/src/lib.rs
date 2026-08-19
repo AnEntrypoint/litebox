@@ -3071,6 +3071,22 @@ unsafe extern "C" fn exception_signal_handler(
                 unsafe { (*scratch).svc_resume_pc = context.uc_mcontext.pc as usize };
                 // Ensure `run_thread_arch` (and therefore `syscall_callback`) is linked in.
                 let _ = run_thread_arch as *const () as usize;
+                // `set_signal_return` unconditionally overwrites `regs[0..3]` with its p0/p1/p2
+                // arguments (needed by `exception_callback`/`interrupt_callback`, whose payload
+                // really does travel through those registers) -- but `syscall_callback` does NOT
+                // read its dispatch payload from x0-x2 at all; it re-dumps the guest's LIVE
+                // x0-x30 (via `sigreturn`-restored `context.uc_mcontext.regs`) as `PtRegs.regs[]`
+                // once it's running. Passing p0=p1=p2=0 (as an earlier version of this fix did)
+                // clobbers the guest's real x0/x1/x2 syscall arguments with zeros BEFORE that
+                // dump ever runs, corrupting every syscall's first three arguments --
+                // live-confirmed via `getcwd(buf, 4096)`: the dumped `PtRegs.regs[0]` (buf) and
+                // `regs[1]` (size) both read back as 0. Round-tripping the guest's OWN current
+                // x0-x2 through as p0-p2 makes this overwrite a no-op.
+                let (x0, x1, x2) = (
+                    context.uc_mcontext.regs[0] as isize,
+                    context.uc_mcontext.regs[1] as isize,
+                    context.uc_mcontext.regs[2] as isize,
+                );
                 set_signal_return(
                     context,
                     scratch,
@@ -3080,9 +3096,9 @@ unsafe extern "C" fn exception_signal_handler(
                             unsafe extern "C" fn(),
                         >(syscall_callback)
                     },
-                    0,
-                    0,
-                    0,
+                    x0,
+                    x1,
+                    x2,
                     0,
                 );
                 return;
