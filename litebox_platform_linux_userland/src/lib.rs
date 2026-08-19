@@ -537,6 +537,16 @@ impl LinuxUserland {
                 ],
             ),
             (libc::SYS_close, vec![]),
+            (libc::SYS_dup, vec![]),
+            // required for the host's own clock_gettime backing the guest's sys_clock_gettime
+            // shim call, plus glibc/std's own monotonic-time reads
+            (libc::SYS_clock_gettime, vec![]),
+            // called by glibc pthread_create's stack-guard setup
+            (libc::SYS_set_tid_address, vec![]),
+            (libc::SYS_prlimit64, vec![]),
+            // called by std's panic/backtrace machinery
+            (libc::SYS_readlinkat, vec![]),
+            (libc::SYS_fstat, vec![]),
         ];
         let rule_map: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
             rules.into_iter().collect();
@@ -1135,7 +1145,21 @@ syscall_callback:
 
     // regs[0..31): x0-x30, in order (x30/LR holds the guest's return address, i.e. PtRegs.pc
     // on syscall entry).
-    stp x0, x1, [sp, #-16*16]!
+    //
+    // The pre-index decrement here MUST equal `size_of::<PtRegs>()` (`GUEST_CONTEXT_SIZE`),
+    // not merely `size_of::<[usize; 31]>()` (256) -- `guest_context_top` (loaded into x11
+    // above) is one-past-the-end of the WHOLE `PtRegs` struct (regs[] + sp + pc + pstate +
+    // orig_x0 + syscallno + unused2 = 288 bytes, not just the 256-byte regs[] array), matching
+    // its definition at `run_thread_arch`'s prologue (`add x9, x1, {GUEST_CONTEXT_SIZE}`). A
+    // literal `#-256` here under-decrements by 32 bytes, landing `sp` 32 bytes INSIDE the
+    // struct instead of at its start -- every subsequent `[sp, #N]` write in this dump then
+    // lands 32 bytes past its intended `PtRegs` field (`syscallno` ends up overlapping past the
+    // struct's real end into whatever memory follows it), corrupting `PtRegs.syscallno` (read
+    // back by the shim as garbage) and everything else in this dump -- confirmed live: the
+    // guest's real x8=25 (`fcntl`) at trap time, but `PtRegs.syscallno` read back as
+    // 0xffefec90, byte-identical to a stale guest stack-pointer value sitting exactly 32 bytes
+    // beyond where `syscallno` should have landed.
+    stp x0, x1, [sp, #-{GUEST_CONTEXT_SIZE}]!
     stp x2, x3, [sp, #16]
     stp x4, x5, [sp, #32]
     stp x6, x7, [sp, #48]
@@ -2924,6 +2948,20 @@ fn set_signal_return(
 
 /// Updates a Linux signal context to return to `f` with the given arguments, aarch64 variant
 /// (args in `x0-x3`, matching the AAPCS64 calling convention `f` itself is called under).
+///
+/// `f` is always one of `syscall_callback`/`exception_callback`/`interrupt_callback` (labels
+/// inside [`run_thread_arch`]'s naked-asm block). Each one's FIRST instruction is `ldr x9, [x3,
+/// #16]` (`scratch->host_sp`) -- x3 is read as the scratch pointer immediately, before anything
+/// else, to switch onto the host stack; only after that does it reload `x29` from `[x3, #24]`
+/// (`scratch->host_fp`) and re-derive `x0`/`x3` from `[x29, #-THREAD_CTX_SAVE_OFFSET]`. So `p3`
+/// here (which becomes x3) MUST be the real scratch pointer, not a discardable payload slot --
+/// confirmed live: passing p3=0 (garbage x3) segfaulted immediately on this very first `ldr`,
+/// while the guest's real x3 at signal-delivery time is whatever the interrupted guest code
+/// happened to leave there (guest code runs with a fully guest-owned register file --
+/// `switch_to_guest` loads x0-x30 from the guest's `PtRegs` before `br`-ing in -- so it is
+/// never safely usable as scratch without this explicit override). `p0`, once inside the
+/// callback, is separately overwritten by that same `[x29, #-offset]` reload before the Rust
+/// handler runs, so it stays a free/unused slot; only `p3` carries real meaning on this arch.
 #[cfg(target_arch = "aarch64")]
 #[allow(
     clippy::cast_sign_loss,
@@ -2932,18 +2970,22 @@ fn set_signal_return(
 )]
 fn set_signal_return(
     context: &mut libc::ucontext_t,
+    scratch: *const Aarch64ThreadScratch,
     f: unsafe extern "C" fn(),
     p0: isize,
     p1: isize,
     p2: isize,
     p3: isize,
 ) {
+    let _ = p3;
     let sigctx = &mut context.uc_mcontext;
     sigctx.pc = f as usize as u64;
     sigctx.regs[0] = p0 as u64;
     sigctx.regs[1] = p1 as u64;
     sigctx.regs[2] = p2 as u64;
-    sigctx.regs[3] = p3 as u64;
+    // x3 = scratch pointer, not `p3` -- see this function's doc comment. All three callbacks'
+    // very first instruction reads `[x3, #16]` before touching anything else.
+    sigctx.regs[3] = scratch as u64;
 }
 
 /// Signal handler for hardware exceptions (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP).
@@ -2952,6 +2994,57 @@ unsafe extern "C" fn exception_signal_handler(
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
+    // On aarch64 there is no fast-path syscall-rewriting trampoline (unlike x86_64's patched
+    // `syscall`->`call` rewrite): every guest `svc #0` is unpatched and always reaches the
+    // kernel directly, so this SIGSYS handler is the ONLY guest-syscall interception point on
+    // this architecture. A SIGSYS while guest code was actually executing (`in_guest != 0` in
+    // this thread's `Aarch64ThreadScratch`, the same discriminator the exception/interrupt
+    // paths already use) must be dispatched into the shim's real syscall emulation via
+    // `syscall_callback` -- not logged and EINVAL'd -- or every guest syscall not already on
+    // the host's own seccomp allow-list would either bypass litebox's sandboxing/emulation
+    // entirely (if the host happens to allow it) or spuriously fail (if not), live-verified via
+    // dup2/dup3/kill/setitimer/getcwd/umask/unlinkat/openat(write)/fcntl all being silently
+    // dropped before this fix. A SIGSYS while HOST code was executing (glibc/std/litebox's own
+    // runtime internals, not the guest) still falls through to the existing debug-log+EINVAL
+    // path below.
+    #[cfg(target_arch = "aarch64")]
+    if signum == libc::SIGSYS {
+        if let Some(scratch) = aarch64_scratch_from_context(context) {
+            if unsafe { (*scratch).in_guest } != 0 {
+                // Do NOT call `signal_handler_exit_guest` here: `syscall_callback`'s own asm
+                // (its very first instructions) already clears `in_guest` and swaps
+                // TPIDR_EL0 guest->host itself, matching its normal fast-path entry. Doing
+                // it again here first would make that asm save the ALREADY-host TPIDR_EL0
+                // as "guest_tpidr", corrupting the guest's real TLS base on next re-entry.
+                // `syscall_callback`'s asm reads x30/LR as the guest's own return address
+                // (correct for its normal entry via a `bl` from the patched fast-path
+                // trampoline, where the CPU sets LR = the instruction after the `bl`). A
+                // trapped `svc #0` does NOT touch LR at all -- the kernel instead advances
+                // `uc_mcontext.pc` past the faulting instruction before signal delivery.
+                // Without this fix, x30 holds whatever the guest last put there (garbage
+                // w.r.t. this syscall), `syscall_callback` stores it as `PtRegs.pc`, and the
+                // guest is resumed at a garbage address on the next syscall-return.
+                context.uc_mcontext.regs[30] = context.uc_mcontext.pc;
+                // Ensure `run_thread_arch` (and therefore `syscall_callback`) is linked in.
+                let _ = run_thread_arch as *const () as usize;
+                set_signal_return(
+                    context,
+                    scratch,
+                    unsafe {
+                        core::mem::transmute::<
+                            unsafe extern "C" fn() -> isize,
+                            unsafe extern "C" fn(),
+                        >(syscall_callback)
+                    },
+                    0,
+                    0,
+                    0,
+                    0,
+                );
+                return;
+            }
+        }
+    }
     // Return an error code for the syscall and log it in debug mode.
     #[cfg(debug_assertions)]
     if signum == libc::SIGSYS {
@@ -3038,8 +3131,13 @@ unsafe extern "C" fn exception_signal_handler(
             _ => litebox::shim::Exception::DATA_ABORT_CURRENT_EL,
         };
         let fault_address = unsafe { info.si_addr() } as usize;
+        // Safe to unwrap: `signal_handler_exit_guest` above already confirmed `context` maps to
+        // a real, registered guest alt-stack (it returned `Some`), which is the same evidence
+        // `aarch64_scratch_from_context` re-derives here.
+        let scratch = aarch64_scratch_from_context(context).unwrap();
         set_signal_return(
             context,
+            scratch,
             exception_callback,
             0,
             isize::from(exception.0),
@@ -3314,7 +3412,15 @@ unsafe fn interrupt_signal_handler(
         copy_signal_context(unsafe { &mut *regs }, context);
     }
     // Cases 3 and 4: jump to interrupt handler.
+    #[cfg(target_arch = "x86_64")]
     set_signal_return(context, interrupt_callback, 0, 0, 0, 0);
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Safe to unwrap: `signal_handler_exit_guest` above already confirmed `context` maps to
+        // a real, registered guest alt-stack (it returned `Some`).
+        let scratch = aarch64_scratch_from_context(context).unwrap();
+        set_signal_return(context, scratch, interrupt_callback, 0, 0, 0, 0);
+    }
 }
 
 impl litebox::platform::CrngProvider for LinuxUserland {
