@@ -48,10 +48,28 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         siginfo: &Siginfo,
         action: &SigAction,
         ctx: &mut PtRegs,
+        sigreturn_trampoline: usize,
     ) -> Result<(), DeliverFault> {
-        if !action.flags.contains(SaFlags::RESTORER) {
+        // Unlike x86_64 (where glibc always transparently supplies SA_RESTORER + a real
+        // restorer address, regardless of whether the caller explicitly asked for it), aarch64
+        // glibc's sigaction() wrapper does NOT set SA_RESTORER or sa_restorer at all -- live
+        // confirmed: a guest calling sigaction(SIGSEGV, {.sa_flags = SA_SIGINFO}) (no
+        // SA_RESTORER) reaches here with flags=SA_SIGINFO only and restorer=0. This matches
+        // real aarch64 Linux's ABI: the kernel always provides sigreturn via a fixed VDSO page
+        // regardless of sa_restorer, so userspace on real hardware never needs to supply one.
+        // litebox has no real VDSO (see get_vdso_address's doc comment), so it must supply its
+        // OWN synthesized restorer -- `sigreturn_trampoline`, a tiny guest-visible
+        // `mov x8, #139 (rt_sigreturn) ; svc #0` stub lazily allocated by
+        // `Task::ensure_sigreturn_trampoline` -- whenever the guest didn't provide a real one.
+        // The original SA_RESTORER-required behavior is kept as a fallback for a guest that DID
+        // supply one (a hand-rolled restorer, matching real Linux's actual contract).
+        let restorer = if action.flags.contains(SaFlags::RESTORER) {
+            action.restorer
+        } else if sigreturn_trampoline != 0 {
+            sigreturn_trampoline
+        } else {
             return Err(DeliverFault);
-        }
+        };
 
         let last_exception = self.last_exception.get();
         let mut regs = [0u64; litebox_common_linux::AARCH64_GENERAL_REGISTER_COUNT];
@@ -89,7 +107,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         // transferring control, rather than pushing a return address onto the stack the way
         // x86_64's `call`-based ABI does -- there is no return-address slot in `SignalFrame`
         // itself (unlike x86_64's `SignalFrame::return_address`).
-        ctx.regs[30] = action.restorer; // lr
+        ctx.regs[30] = restorer; // lr
         ctx.sp = frame_addr;
         ctx.pc = action.sigaction;
         ctx.regs[0] = siginfo.signo.reinterpret_as_unsigned() as usize; // x0: signum
