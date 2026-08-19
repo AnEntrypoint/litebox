@@ -14,7 +14,9 @@ use std::cell::Cell;
 use std::io::IsTerminal as _;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
+#[cfg(target_arch = "aarch64")]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::time::Duration;
 use std::unimplemented;
 
