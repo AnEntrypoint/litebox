@@ -823,6 +823,15 @@ struct Aarch64ThreadScratch {
     /// `syscall_callback`'s dump patches `PtRegs.pc` from here instead of from x30 whenever
     /// it's nonzero, leaving `PtRegs.regs[30]`/the guest's real x30 untouched.
     svc_resume_pc: usize,
+    /// The guest's real x3 (its 4th syscall argument) for a SIGSYS-dispatched syscall, or 0
+    /// when not applicable. `set_signal_return` unconditionally overwrites `regs[3]` with the
+    /// scratch pointer (every callback's very first instruction reads `[x3, #16]`, so this
+    /// can't be avoided) -- destroying the guest's real x3 before `syscall_callback`'s dump ever
+    /// runs, corrupting the 4th argument of any syscall reached this way (live-confirmed via
+    /// `openat(path, flags, mode)`: `PtRegs.regs[3]`/`mode` read back as the scratch pointer's
+    /// address reinterpreted as a mode bitmask). Mirrors `svc_resume_pc`'s pattern: stashed here
+    /// before dispatch, patched into `PtRegs.regs[3]` by `syscall_callback`'s dump when nonzero.
+    svc_real_x3: usize,
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -869,6 +878,7 @@ fn aarch64_scratch_or_host_only() -> *mut Aarch64ThreadScratch {
                 pending_host_signals: 0,
                 wait_waker_addr: 0,
                 svc_resume_pc: 0,
+                svc_real_x3: 0,
             })
         });
         core::ptr::from_mut(scratch.as_mut())
@@ -1203,16 +1213,25 @@ syscall_callback:
     str x30, [sp, #256]         // PtRegs.pc -- syscall return address (from x30/LR)
 
     // If this dispatch came via the SIGSYS fallback path (an unpatched `svc #0`, see
-    // `exception_signal_handler`'s aarch64 branch), x30/LR here is the GUEST's real
-    // return-address for its own caller, not the resume PC -- already correctly dumped as
-    // `regs[30]` above, but WRONG as `PtRegs.pc` (just written from the same x30). Patch
-    // `PtRegs.pc` from `scratch->svc_resume_pc` (offset 64) when nonzero, then clear it so a
-    // later FAST-PATH entry (once one exists) is unaffected.
+    // `exception_signal_handler`'s aarch64 branch), two live registers here are wrong and need
+    // patching from values `exception_signal_handler` stashed in the scratch struct before the
+    // jump: x30/LR is the GUEST's real return-address for its own caller, not the resume PC --
+    // already correctly dumped as `regs[30]` above, but WRONG as `PtRegs.pc` (just written from
+    // that same x30) -- and x3 is the scratch pointer this whole trampoline depends on, not the
+    // guest's real x3 (its 4th syscall argument), already (wrongly) dumped as `regs[3]` by `stp
+    // x2, x3, [sp, #16]` above. `scratch->svc_resume_pc` is the gate for BOTH patches (nonzero
+    // exactly when this dispatch came via SIGSYS -- a real resume PC of address 0 is
+    // impossible, so this is an unambiguous sentinel; `svc_real_x3` can legitimately BE zero
+    // as a real argument value, so it can't gate itself the same way, but it's only ever
+    // written together with `svc_resume_pc` and so shares its gate safely).
     ldr x9, [x3, #64]           // scratch->svc_resume_pc
-    cbz x9, .Lno_svc_resume_pc
+    cbz x9, .Lno_svc_dispatch_fixup
     str x9, [sp, #256]          // overwrite PtRegs.pc with the real resume address
     str xzr, [x3, #64]          // clear scratch->svc_resume_pc
-.Lno_svc_resume_pc:
+    ldr x9, [x3, #72]           // scratch->svc_real_x3
+    str x9, [sp, #24]           // overwrite PtRegs.regs[3] with the guest's real x3
+    str xzr, [x3, #72]          // clear scratch->svc_real_x3
+.Lno_svc_dispatch_fixup:
     mrs x9, nzcv
     str x9, [sp, #264]          // PtRegs.pstate (condition flags only; enough for signal
                                  // delivery/restore round-tripping through this shim)
@@ -3069,6 +3088,11 @@ unsafe extern "C" fn exception_signal_handler(
                 // past the faulting `svc`) in the scratch struct instead; `syscall_callback`'s
                 // asm patches `PtRegs.pc` from there when nonzero, leaving x30/`regs[30]` alone.
                 unsafe { (*scratch).svc_resume_pc = context.uc_mcontext.pc as usize };
+                // Stash the guest's real x3 (4th syscall arg) too -- `set_signal_return` below
+                // unconditionally overwrites `regs[3]` with the scratch pointer itself (every
+                // callback's first instruction depends on x3 already being scratch), so the
+                // guest's real x3 must be preserved out-of-band the same way as the resume PC.
+                unsafe { (*scratch).svc_real_x3 = context.uc_mcontext.regs[3] as usize };
                 // Ensure `run_thread_arch` (and therefore `syscall_callback`) is linked in.
                 let _ = run_thread_arch as *const () as usize;
                 // `set_signal_return` unconditionally overwrites `regs[0..3]` with its p0/p1/p2
