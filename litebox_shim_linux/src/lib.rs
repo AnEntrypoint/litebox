@@ -158,6 +158,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
         ctx: &mut Self::ExecutionContext,
         info: &litebox::shim::ExceptionInfo,
     ) -> ContinueOperation {
+        // The guest's synthesized sigreturn trampoline (see `ensure_sigreturn_trampoline`)
+        // traps via `brk #0xdead` (SIGTRAP/BRK64) rather than the real `rt_sigreturn` syscall
+        // number, which stays unconditionally seccomp-allowed on this platform (see the
+        // allow-list's doc comment on `SYS_rt_sigreturn`). `ctx.pc` landing exactly on the
+        // trampoline's own address is this trap's unambiguous signature -- no other guest code
+        // executes this specific brk immediate at this specific address.
+        #[cfg(target_arch = "aarch64")]
+        if info.exception == litebox::shim::Exception::BREAKPOINT_CURRENT_EL
+            && ctx.pc == self.task.sigreturn_trampoline_addr()
+            && ctx.pc != 0
+        {
+            return match self.task.sys_rt_sigreturn(ctx) {
+                Ok(_) => ContinueOperation::Resume,
+                Err(_) => ContinueOperation::Terminate,
+            };
+        }
         #[cfg(target_arch = "x86_64")]
         let is_kernel_page_fault =
             info.kernel_mode && info.exception == litebox::shim::Exception::PAGE_FAULT;
