@@ -800,6 +800,29 @@ struct Aarch64ThreadScratch {
     /// Address of a `Box<Waker>` to notify when a host signal becomes pending, or 0 if none
     /// is currently registered (mirrors x86_64's `wait_waker_addr`).
     wait_waker_addr: usize,
+    /// The real resume PC for a guest syscall reached via the SIGSYS fallback path (an
+    /// unpatched `svc #0`, see `exception_signal_handler`'s aarch64 SIGSYS branch), or 0 when
+    /// not applicable (the normal fast-path `bl`-trampoline entry, where x30/LR IS already the
+    /// correct resume address and this field is unused).
+    ///
+    /// `syscall_callback`'s register-dump asm writes BOTH `PtRegs.regs[30]` (the guest's own
+    /// return-address-for-its-caller) and `PtRegs.pc` (where to resume the guest) from the SAME
+    /// x30 register -- correct only for the fast path, where a `bl` naturally sets LR to the
+    /// resume point (the guest's own real return address is separately preserved by normal
+    /// AAPCS64 call-site convention, spilled to the guest's stack by its caller before the
+    /// call). A trapped `svc #0` does NOT touch LR at all: x30 at signal-delivery time is
+    /// whatever the guest's OWN in-flight call chain has it set to (its real, needed
+    /// return-address for whatever function contains the `svc`), and overwriting it with the
+    /// resume PC -- as an earlier version of this fix did -- corrupts that value, so when the
+    /// syscall wrapper function later executes `ret`, it jumps to the (former) resume PC
+    /// instead of its real caller, immediately re-executing that same address forever (a
+    /// deterministic infinite loop, confirmed live: `PtRegs.regs[30]` and `PtRegs.pc` observed
+    /// byte-identical after a SIGSYS-dispatched syscall, both holding the resume address,
+    /// neither holding the guest's real call-return address). This field lets
+    /// `exception_signal_handler` stash the correct resume PC separately, and
+    /// `syscall_callback`'s dump patches `PtRegs.pc` from here instead of from x30 whenever
+    /// it's nonzero, leaving `PtRegs.regs[30]`/the guest's real x30 untouched.
+    svc_resume_pc: usize,
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -845,6 +868,7 @@ fn aarch64_scratch_or_host_only() -> *mut Aarch64ThreadScratch {
                 _pad: [0; 2],
                 pending_host_signals: 0,
                 wait_waker_addr: 0,
+                svc_resume_pc: 0,
             })
         });
         core::ptr::from_mut(scratch.as_mut())
@@ -1177,6 +1201,18 @@ syscall_callback:
     str x30, [sp, #240]         // regs[30]
     str x10, [sp, #248]         // PtRegs.sp -- the guest's own sp, saved above in x10
     str x30, [sp, #256]         // PtRegs.pc -- syscall return address (from x30/LR)
+
+    // If this dispatch came via the SIGSYS fallback path (an unpatched `svc #0`, see
+    // `exception_signal_handler`'s aarch64 branch), x30/LR here is the GUEST's real
+    // return-address for its own caller, not the resume PC -- already correctly dumped as
+    // `regs[30]` above, but WRONG as `PtRegs.pc` (just written from the same x30). Patch
+    // `PtRegs.pc` from `scratch->svc_resume_pc` (offset 64) when nonzero, then clear it so a
+    // later FAST-PATH entry (once one exists) is unaffected.
+    ldr x9, [x3, #64]           // scratch->svc_resume_pc
+    cbz x9, .Lno_svc_resume_pc
+    str x9, [sp, #256]          // overwrite PtRegs.pc with the real resume address
+    str xzr, [x3, #64]          // clear scratch->svc_resume_pc
+.Lno_svc_resume_pc:
     mrs x9, nzcv
     str x9, [sp, #264]          // PtRegs.pstate (condition flags only; enough for signal
                                  // delivery/restore round-tripping through this shim)
@@ -3016,15 +3052,23 @@ unsafe extern "C" fn exception_signal_handler(
                 // TPIDR_EL0 guest->host itself, matching its normal fast-path entry. Doing
                 // it again here first would make that asm save the ALREADY-host TPIDR_EL0
                 // as "guest_tpidr", corrupting the guest's real TLS base on next re-entry.
-                // `syscall_callback`'s asm reads x30/LR as the guest's own return address
-                // (correct for its normal entry via a `bl` from the patched fast-path
-                // trampoline, where the CPU sets LR = the instruction after the `bl`). A
-                // trapped `svc #0` does NOT touch LR at all -- the kernel instead advances
-                // `uc_mcontext.pc` past the faulting instruction before signal delivery.
-                // Without this fix, x30 holds whatever the guest last put there (garbage
-                // w.r.t. this syscall), `syscall_callback` stores it as `PtRegs.pc`, and the
-                // guest is resumed at a garbage address on the next syscall-return.
-                context.uc_mcontext.regs[30] = context.uc_mcontext.pc;
+                // `syscall_callback`'s asm normally reads x30/LR as both the guest's own
+                // return-address (into `PtRegs.regs[30]`) AND the resume PC (into `PtRegs.pc`)
+                // -- correct for its normal entry via a `bl` from the patched fast-path
+                // trampoline, where the CPU sets LR = the instruction after the `bl` (the
+                // guest's real return address for ITS OWN caller is separately preserved on
+                // the guest's stack per normal AAPCS64 convention, untouched by this). A
+                // trapped `svc #0` does NOT touch LR at all: x30 at this point is the guest's
+                // real, needed return address for whatever function contains the `svc`, and
+                // must NOT be overwritten -- an earlier version of this fix clobbered it with
+                // the resume PC instead, which live-reproduced as an infinite loop (the
+                // syscall wrapper's own `ret` then jumps to the former resume PC forever,
+                // re-executing the same instruction with no further syscalls, matching the
+                // 100%-CPU spin-hang observed on mkdirat.c/sigint.c/statx.c/faccessat.c).
+                // Stash the correct resume PC (`uc_mcontext.pc`, which the kernel DOES advance
+                // past the faulting `svc`) in the scratch struct instead; `syscall_callback`'s
+                // asm patches `PtRegs.pc` from there when nonzero, leaving x30/`regs[30]` alone.
+                unsafe { (*scratch).svc_resume_pc = context.uc_mcontext.pc as usize };
                 // Ensure `run_thread_arch` (and therefore `syscall_callback`) is linked in.
                 let _ = run_thread_arch as *const () as usize;
                 set_signal_return(
