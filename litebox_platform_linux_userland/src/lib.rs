@@ -446,7 +446,7 @@ impl LinuxUserland {
         };
     }
 
-    /// Spawns the host-syscall-proxy thread (see [`aarch64_syscall_proxy`]'s module doc) and
+    /// Spawns the host-syscall-proxy thread (see `aarch64_syscall_proxy`'s module doc) and
     /// installs the seccomp filter. MUST be called in this order (the proxy thread must exist,
     /// unfiltered, before the filter goes on) and only once per process. On x86_64 the proxy
     /// thread is unnecessary (guest syscalls never reach this filter at all -- they're
@@ -2955,7 +2955,7 @@ fn aarch64_is_registered_guest_alt_stack(mapping_base: usize) -> bool {
 
 /// Runs `f` with an alternate signal stack set up. `f` receives the raw base address of the
 /// mapping backing that alternate stack (below the guard page, i.e. the very start of the
-/// mmap'd region) -- on aarch64, this address is where [`Aarch64ThreadScratch`] lives; on
+/// mmap'd region) -- on aarch64, this address is where `Aarch64ThreadScratch` lives; on
 /// x86_64 it is unused (host/guest scratch state there lives in ordinary `.tbss` TLS instead,
 /// reachable via the fs/gs swap).
 fn with_signal_alt_stack<R>(f: impl FnOnce(*mut u8) -> R) -> R {
