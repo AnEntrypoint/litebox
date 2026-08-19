@@ -40,6 +40,10 @@ pub(crate) struct SignalState<Platform: ShimPlatform> {
     altstack: Cell<SigAltStack>,
     /// The last exception info recorded for signal delivery.
     last_exception: Cell<litebox::shim::ExceptionInfo>,
+    /// Guest-visible address of a litebox-synthesized `rt_sigreturn` trampoline, lazily
+    /// allocated on first use (see [`Task::sigreturn_trampoline_addr`]'s doc comment), or 0 if
+    /// not yet allocated.
+    sigreturn_trampoline: Cell<usize>,
 }
 
 impl<Platform: ShimPlatform> SignalState<Platform> {
@@ -61,6 +65,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
                 __pad: 0,
             }),
             last_exception: Cell::new(litebox::shim::ExceptionInfo::default()),
+            sigreturn_trampoline: Cell::new(0),
         }
     }
 
@@ -110,11 +115,20 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             .into(),
             // Preserve last exception
             last_exception: self.last_exception.clone(),
+            // A clone()'d thread shares the SAME address space, so an already-allocated
+            // trampoline address stays valid; fork()'s child gets a COW-copied address space
+            // where the same virtual address is still valid too. Only execve() (reset_for_exec,
+            // below) actually invalidates it.
+            sigreturn_trampoline: Cell::new(self.sigreturn_trampoline.get()),
         }
     }
 
     /// Resets signal state for an `execve` call.
     pub(crate) fn reset_for_exec(&self) {
+        // execve() replaces the entire address space with a fresh ELF image -- any previously
+        // allocated trampoline address is no longer valid (or even mapped); `write_signal_frame`
+        // lazily re-allocates a fresh one on next use.
+        self.sigreturn_trampoline.set(0);
         let mut handlers = self.handlers.borrow_mut();
         // Ensure that the signal handlers are no longer shared.
         let handlers = Arc::make_mut(&mut handlers);
@@ -367,6 +381,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         siginfo: &Siginfo,
         action: &SigAction,
         ctx: &mut PtRegs,
+        sigreturn_trampoline: usize,
     ) -> Result<(), DeliverFault> {
         let sp = arch::sp(ctx);
         let on_alt_stack = is_on_stack(&self.altstack.get(), sp);
@@ -403,7 +418,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             );
         }
 
-        self.write_signal_frame(frame_addr, siginfo, action, ctx)?;
+        self.write_signal_frame(frame_addr, siginfo, action, ctx, sigreturn_trampoline)?;
 
         let mut mask = self.blocked.get() | action.mask;
         if !action.flags.contains(SaFlags::NODEFER) {
@@ -422,6 +437,66 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
 struct DeliverFault;
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    /// Returns the guest-visible address of a litebox-synthesized `rt_sigreturn` trampoline
+    /// (a tiny `mov x8, #139 ; svc #0` stub), allocating it via a real guest `mmap` on first
+    /// use and caching the address for the lifetime of this address space (see
+    /// `SignalState::sigreturn_trampoline`'s doc comment for why it's invalidated on `execve`
+    /// but preserved across `clone`/`fork`). Returns 0 if the allocation itself fails (e.g. the
+    /// guest is out of address space) -- the caller treats that the same as "no restorer
+    /// available" (see `write_signal_frame`'s aarch64 doc comment).
+    ///
+    /// aarch64-only: x86_64 glibc always supplies its own real restorer transparently, so no
+    /// synthesized one is ever needed there.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn ensure_sigreturn_trampoline(&self) -> usize {
+        let existing = self.signals.sigreturn_trampoline.get();
+        if existing != 0 {
+            return existing;
+        }
+        // `mov x8, #139 ; svc #0` (139 = __NR_rt_sigreturn on aarch64) -- see this function's
+        // doc comment. Encoded by hand (verified via `as`/`objdump`) rather than depending on an
+        // assembler at build time for 8 fixed bytes.
+        const TRAMPOLINE_CODE: [u8; 8] = [0x68, 0x11, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4];
+        let Ok(page) = self.sys_mmap(
+            0,
+            litebox::mm::linux::PAGE_SIZE,
+            litebox_common_linux::ProtFlags::PROT_READ_EXEC,
+            litebox_common_linux::MapFlags::MAP_PRIVATE | litebox_common_linux::MapFlags::MAP_ANONYMOUS,
+            -1,
+            0,
+        ) else {
+            return 0;
+        };
+        let addr = page.as_usize();
+        // The mapping above is already PROT_EXEC; briefly mprotect it writable to seed the
+        // trampoline bytes, then drop write permission again -- keeps this guest-visible page
+        // execute-only for its entire useful lifetime (W^X), matching how a real VDSO page
+        // behaves, rather than leaving a permanently writable+executable page around.
+        if self
+            .sys_mprotect(
+                page,
+                litebox::mm::linux::PAGE_SIZE,
+                litebox_common_linux::ProtFlags::PROT_READ_WRITE,
+            )
+            .is_err()
+        {
+            return 0;
+        }
+        let write_ok = UserPtrMut::<[u8; 8]>::from_usize(addr)
+            .write_at_offset::<Platform>(0, TRAMPOLINE_CODE)
+            .is_some();
+        let _ = self.sys_mprotect(
+            page,
+            litebox::mm::linux::PAGE_SIZE,
+            litebox_common_linux::ProtFlags::PROT_READ_EXEC,
+        );
+        if !write_ok {
+            return 0;
+        }
+        self.signals.sigreturn_trampoline.set(addr);
+        addr
+    }
+
     pub(crate) fn with_temporary_signal_mask<R>(&self, mask: SigSet, f: impl FnOnce() -> R) -> R {
         let old = self.signals.blocked.get();
         self.signals.set_signal_mask(mask);
@@ -734,9 +809,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
                 SIG_IGN => {}
                 _ => {
-                    if let Err(DeliverFault) =
-                        self.signals.deliver_signal(signal, &siginfo, &action, ctx)
-                    {
+                    #[cfg(target_arch = "aarch64")]
+                    let sigreturn_trampoline = self.ensure_sigreturn_trampoline();
+                    #[cfg(not(target_arch = "aarch64"))]
+                    let sigreturn_trampoline = 0;
+                    if let Err(DeliverFault) = self.signals.deliver_signal(
+                        signal,
+                        &siginfo,
+                        &action,
+                        ctx,
+                        sigreturn_trampoline,
+                    ) {
                         // Failed to deliver signal. Inject a SIGSEGV
                         // (terminating the process if we were trying to deliver
                         // a SIGSEGV).
