@@ -77,6 +77,7 @@ macro_rules! saved_tls_seg {
 ///
 /// Example: `tls!("pending_host_signals")` expands to
 /// `"fs:pending_host_signals@tpoff"` on x86_64.
+#[cfg(target_arch = "x86_64")]
 macro_rules! tls {
     ($var:literal) => {
         concat!(tls_seg!(), ":", $var, tls_suffix!())
@@ -88,6 +89,7 @@ macro_rules! tls {
 ///
 /// Example: `saved_tls!("in_guest")` expands to
 /// `"gs:in_guest@tpoff"` on x86_64.
+#[cfg(target_arch = "x86_64")]
 macro_rules! saved_tls {
     ($var:literal) => {
         concat!(saved_tls_seg!(), ":", $var, tls_suffix!())
@@ -465,10 +467,9 @@ impl LinuxUserland {
         reason = "the seccomp filter rules are hardcoded and not expected to fail"
     )]
     fn enable_seccomp_filter_inner() {
-        use seccompiler::{
-            BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
-            SeccompFilter, SeccompRule,
-        };
+        use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule};
+        #[cfg(target_arch = "x86_64")]
+        use seccompiler::{SeccompCmpArgLen, SeccompCmpOp, SeccompCondition};
 
         let rules = vec![
             // TUN and terminal
@@ -602,8 +603,16 @@ impl LinuxUserland {
         let filter = SeccompFilter::new(
             rule_map,
             // In debug builds, log violations instead of silently returning an error so that
-            // it won't fail silently during development (which may be hard to debug).
-            if cfg!(debug_assertions) {
+            // it won't fail silently during development (which may be hard to debug). On
+            // aarch64 `Trap` is required unconditionally, not just for debug logging: unlike
+            // x86_64 (which intercepts every guest syscall via the ELF-patched fast-path
+            // trampoline before it ever reaches the kernel/seccomp), aarch64 has no such
+            // trampoline, so the SIGSYS trap IS the guest-syscall dispatch mechanism and the
+            // aarch64_syscall_proxy host-syscall forwarding path -- an `Errno` default action
+            // here would silently fail every such syscall in release builds instead of
+            // reaching either (live-confirmed: release build's `openat` on the guest's own ELF
+            // returned EINVAL directly from seccomp, never reaching the handler at all).
+            if cfg!(debug_assertions) || cfg!(target_arch = "aarch64") {
                 SeccompAction::Trap
             } else {
                 SeccompAction::Errno(libc::EINVAL.cast_unsigned())
@@ -720,6 +729,10 @@ mod aarch64_syscall_proxy {
             .expect("failed to spawn aarch64 syscall proxy thread");
     }
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "raw register-width bit-pattern reinterpretation (isize -> i64), not a semantically-bounded numeric conversion"
+    )]
     fn run() {
         loop {
             // Wait for a request. A spurious wake (state still IDLE) just loops back.
@@ -733,7 +746,8 @@ mod aarch64_syscall_proxy {
             let args: [usize; 6] = std::array::from_fn(|i| MAILBOX.args[i].load(Ordering::Relaxed));
             let result = unsafe {
                 syscalls::raw_syscall!(
-                    syscalls::Sysno::new(sysno as usize).expect("invalid proxied syscall number"),
+                    syscalls::Sysno::new(usize::try_from(sysno).expect("valid syscall number"))
+                        .expect("invalid proxied syscall number"),
                     args[0],
                     args[1],
                     args[2],
@@ -742,7 +756,12 @@ mod aarch64_syscall_proxy {
                     args[5]
                 )
             };
-            MAILBOX.result.store(result as i64, Ordering::Relaxed);
+            // `raw_syscall!` returns the raw usize register value (a negative errno arrives
+            // wrapped, per the kernel's syscall-return convention), so reinterpret the bits
+            // rather than a fallible numeric conversion.
+            MAILBOX
+                .result
+                .store(result.cast_signed() as i64, Ordering::Relaxed);
             MAILBOX.state.store(STATE_RESPONSE, Ordering::Release);
             futex_wake(&MAILBOX.state);
         }
@@ -1780,7 +1799,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         // to that lookup and drop every signal delivered to it.
         #[cfg(target_arch = "aarch64")]
         {
-            return with_signal_alt_stack(|alt_stack_base| {
+            with_signal_alt_stack(|alt_stack_base| {
                 let scratch = aarch64_scratch_from_alt_stack_base(alt_stack_base);
                 // `run_thread_arch`'s naked-asm prologue is the only other writer of
                 // `host_tpidr`, and it never runs for a plain test thread -- without this, it
@@ -1797,7 +1816,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
                 let result = ThreadHandle::run_with_handle(f);
                 AARCH64_SCRATCH_PTR.set(core::ptr::null_mut());
                 result
-            });
+            })
         }
 
         #[cfg(not(target_arch = "aarch64"))]
@@ -2809,8 +2828,14 @@ fn register_exception_handlers() {
             libc::SIGFPE,
             libc::SIGILL,
             libc::SIGTRAP,
-            // We'd like to log forbidden syscalls in debug mode
-            #[cfg(debug_assertions)]
+            // On aarch64 this is not just a debug-mode log: it is the ONLY guest-syscall
+            // interception point (no fast-path trampoline rewrite exists there, see
+            // `exception_signal_handler`'s aarch64 SIGSYS branch) and also carries the
+            // host-code `aarch64_syscall_proxy` forwarding for the syscalls removed from the
+            // seccomp allow-list -- both are required in release builds too, not just debug
+            // (live-confirmed: a release build with this gated out killed the process with a
+            // real SIGSYS/"Bad system call" on the first non-allow-listed syscall).
+            #[cfg(any(debug_assertions, target_arch = "aarch64"))]
             libc::SIGSYS,
         ];
         for &sig in exception_signals {
@@ -2862,7 +2887,7 @@ const AARCH64_SCRATCH_SIZE: usize = 0x1000;
 /// Arbitrary but fixed; chosen to be unmistakable in a hex dump/debugger, never a plausible
 /// stack/heap address or all-zero/all-one pattern that could arise by coincidence.
 #[cfg(target_arch = "aarch64")]
-const AARCH64_SCRATCH_MAGIC: u64 = 0xA64_5CA7C_A64_5CA7;
+const AARCH64_SCRATCH_MAGIC: u64 = 0x0A64_5CA7_CA64_5CA7;
 
 /// A fixed-capacity, lock-free registry of every live guest thread's `mapping_base` address
 /// (see [`with_signal_alt_stack`]) -- checked by [`aarch64_scratch_from_context`] BEFORE ever
@@ -2880,6 +2905,10 @@ const AARCH64_SCRATCH_MAGIC: u64 = 0xA64_5CA7C_A64_5CA7;
 const AARCH64_MAX_GUEST_THREADS: usize = 4096;
 #[cfg(target_arch = "aarch64")]
 static AARCH64_GUEST_ALT_STACK_BASES: [AtomicUsize; AARCH64_MAX_GUEST_THREADS] = {
+    #[allow(
+        clippy::declare_interior_mutable_const,
+        reason = "used only as a repeated array-init template, never referenced by name elsewhere"
+    )]
     const ZERO: AtomicUsize = AtomicUsize::new(0);
     [ZERO; AARCH64_MAX_GUEST_THREADS]
 };
@@ -3029,7 +3058,6 @@ fn with_signal_alt_stack<R>(f: impl FnOnce(*mut u8) -> R) -> R {
 /// and optionally sets `interrupt`. If `in_guest` was previously set, returns
 /// the guest context pointer (which does not necessarily have up-to-date guest
 /// register state yet).
-#[cfg(target_arch = "x86_64")]
 #[cfg(target_arch = "x86_64")]
 fn signal_handler_exit_guest(
     _context: &libc::ucontext_t,
@@ -3263,7 +3291,66 @@ fn set_signal_return(
     sigctx.regs[3] = scratch as u64;
 }
 
+/// HOST code (litebox's own runtime, not the guest) invoked one of the syscalls removed from
+/// the seccomp allow-list (see `aarch64_syscall_proxy`'s module doc). Forwards the real syscall
+/// to the dedicated unfiltered proxy thread and writes its real result back into `context`, so
+/// host code sees the same behavior as if the syscall had been allowed through directly --
+/// returns `true` (and has already updated `context`) only for the syscalls this proxy
+/// supports; anything else is left untouched for the caller's own fallback path.
+#[cfg(target_arch = "aarch64")]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "raw 64-bit register values round-tripped bit-for-bit through usize, not semantically-bounded numbers"
+)]
+fn aarch64_proxy_host_syscall_if_applicable(context: &mut libc::ucontext_t) -> bool {
+    const PROXIED: [i64; 9] = [
+        libc::SYS_close,
+        libc::SYS_dup,
+        libc::SYS_clock_gettime,
+        libc::SYS_set_tid_address,
+        libc::SYS_prlimit64,
+        libc::SYS_readlinkat,
+        libc::SYS_fstat,
+        libc::SYS_read,
+        libc::SYS_write,
+    ];
+    let sysno = context.uc_mcontext.regs[8].cast_signed();
+    // openat is proxied too, but only for RDONLY opens (matching the flags-argument condition
+    // the removed seccomp rule used to enforce) -- host code opening a file for writing is not
+    // a case this proxy needs to support (litebox's own host-side needs, e.g. raw_open reading
+    // an ELF binary, are always RDONLY). Only the access-mode bits (O_ACCMODE = 0o3) need to be
+    // RDONLY (0) here -- real callers (e.g. the dynamic linker's own opens, live-confirmed via
+    // strace) also set flags like O_CLOEXEC, which an exact-equality check against bare RDONLY
+    // would wrongly reject, sending the open down the EINVAL debug-log path instead of being
+    // proxied.
+    let is_proxied_openat = sysno == libc::SYS_openat
+        && (context.uc_mcontext.regs[2] as u32 & 0o3) == OFlags::RDONLY.bits();
+    if !(PROXIED.contains(&sysno) || is_proxied_openat) {
+        return false;
+    }
+    let regs = &context.uc_mcontext.regs;
+    // These are raw 64-bit register values (pointers, fds, flags, sizes) round-tripped through
+    // `usize`, not semantically-bounded numbers -- a bit-pattern cast is correct here, a
+    // fallible `try_from` is not (it would spuriously reject the top half of the address space
+    // on a real 64-bit register value).
+    let args = [
+        regs[0] as usize,
+        regs[1] as usize,
+        regs[2] as usize,
+        regs[3] as usize,
+        regs[4] as usize,
+        regs[5] as usize,
+    ];
+    let result = aarch64_syscall_proxy::proxy(sysno, args);
+    context.uc_mcontext.regs[0] = result.cast_unsigned();
+    true
+}
+
 /// Signal handler for hardware exceptions (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP).
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "raw register-width bit-pattern reinterpretation (u64 -> isize on aarch64's SIGSYS path), not a semantically-bounded numeric conversion"
+)]
 unsafe extern "C" fn exception_signal_handler(
     signum: libc::c_int,
     info: &mut libc::siginfo_t,
@@ -3284,108 +3371,89 @@ unsafe extern "C" fn exception_signal_handler(
     // path below.
     #[cfg(target_arch = "aarch64")]
     if signum == libc::SIGSYS {
-        if let Some(scratch) = aarch64_scratch_from_context(context) {
-            if unsafe { (*scratch).in_guest } != 0 {
-                // Do NOT call `signal_handler_exit_guest` here: `syscall_callback`'s own asm
-                // (its very first instructions) already clears `in_guest` and swaps
-                // TPIDR_EL0 guest->host itself, matching its normal fast-path entry. Doing
-                // it again here first would make that asm save the ALREADY-host TPIDR_EL0
-                // as "guest_tpidr", corrupting the guest's real TLS base on next re-entry.
-                // `syscall_callback`'s asm normally reads x30/LR as both the guest's own
-                // return-address (into `PtRegs.regs[30]`) AND the resume PC (into `PtRegs.pc`)
-                // -- correct for its normal entry via a `bl` from the patched fast-path
-                // trampoline, where the CPU sets LR = the instruction after the `bl` (the
-                // guest's real return address for ITS OWN caller is separately preserved on
-                // the guest's stack per normal AAPCS64 convention, untouched by this). A
-                // trapped `svc #0` does NOT touch LR at all: x30 at this point is the guest's
-                // real, needed return address for whatever function contains the `svc`, and
-                // must NOT be overwritten -- an earlier version of this fix clobbered it with
-                // the resume PC instead, which live-reproduced as an infinite loop (the
-                // syscall wrapper's own `ret` then jumps to the former resume PC forever,
-                // re-executing the same instruction with no further syscalls, matching the
-                // 100%-CPU spin-hang observed on mkdirat.c/sigint.c/statx.c/faccessat.c).
-                // Stash the correct resume PC (`uc_mcontext.pc`, which the kernel DOES advance
-                // past the faulting `svc`) in the scratch struct instead; `syscall_callback`'s
-                // asm patches `PtRegs.pc` from there when nonzero, leaving x30/`regs[30]` alone.
-                unsafe { (*scratch).svc_resume_pc = context.uc_mcontext.pc as usize };
-                // Stash the guest's real x3 (4th syscall arg) too -- `set_signal_return` below
-                // unconditionally overwrites `regs[3]` with the scratch pointer itself (every
-                // callback's first instruction depends on x3 already being scratch), so the
-                // guest's real x3 must be preserved out-of-band the same way as the resume PC.
-                unsafe { (*scratch).svc_real_x3 = context.uc_mcontext.regs[3] as usize };
-                // Ensure `run_thread_arch` (and therefore `syscall_callback`) is linked in.
-                let _ = run_thread_arch as *const () as usize;
-                // `set_signal_return` unconditionally overwrites `regs[0..3]` with its p0/p1/p2
-                // arguments (needed by `exception_callback`/`interrupt_callback`, whose payload
-                // really does travel through those registers) -- but `syscall_callback` does NOT
-                // read its dispatch payload from x0-x2 at all; it re-dumps the guest's LIVE
-                // x0-x30 (via `sigreturn`-restored `context.uc_mcontext.regs`) as `PtRegs.regs[]`
-                // once it's running. Passing p0=p1=p2=0 (as an earlier version of this fix did)
-                // clobbers the guest's real x0/x1/x2 syscall arguments with zeros BEFORE that
-                // dump ever runs, corrupting every syscall's first three arguments --
-                // live-confirmed via `getcwd(buf, 4096)`: the dumped `PtRegs.regs[0]` (buf) and
-                // `regs[1]` (size) both read back as 0. Round-tripping the guest's OWN current
-                // x0-x2 through as p0-p2 makes this overwrite a no-op.
-                let (x0, x1, x2) = (
-                    context.uc_mcontext.regs[0] as isize,
-                    context.uc_mcontext.regs[1] as isize,
-                    context.uc_mcontext.regs[2] as isize,
-                );
-                set_signal_return(
-                    context,
-                    scratch,
-                    unsafe {
-                        core::mem::transmute::<
-                            unsafe extern "C" fn() -> isize,
-                            unsafe extern "C" fn(),
-                        >(syscall_callback)
-                    },
-                    x0,
-                    x1,
-                    x2,
-                    0,
-                );
-                return;
+        if let Some(scratch) = aarch64_scratch_from_context(context)
+            && unsafe { (*scratch).in_guest } != 0
+        {
+            // Do NOT call `signal_handler_exit_guest` here: `syscall_callback`'s own asm
+            // (its very first instructions) already clears `in_guest` and swaps
+            // TPIDR_EL0 guest->host itself, matching its normal fast-path entry. Doing
+            // it again here first would make that asm save the ALREADY-host TPIDR_EL0
+            // as "guest_tpidr", corrupting the guest's real TLS base on next re-entry.
+            // `syscall_callback`'s asm normally reads x30/LR as both the guest's own
+            // return-address (into `PtRegs.regs[30]`) AND the resume PC (into `PtRegs.pc`)
+            // -- correct for its normal entry via a `bl` from the patched fast-path
+            // trampoline, where the CPU sets LR = the instruction after the `bl` (the
+            // guest's real return address for ITS OWN caller is separately preserved on
+            // the guest's stack per normal AAPCS64 convention, untouched by this). A
+            // trapped `svc #0` does NOT touch LR at all: x30 at this point is the guest's
+            // real, needed return address for whatever function contains the `svc`, and
+            // must NOT be overwritten -- an earlier version of this fix clobbered it with
+            // the resume PC instead, which live-reproduced as an infinite loop (the
+            // syscall wrapper's own `ret` then jumps to the former resume PC forever,
+            // re-executing the same instruction with no further syscalls, matching the
+            // 100%-CPU spin-hang observed on mkdirat.c/sigint.c/statx.c/faccessat.c).
+            // Stash the correct resume PC (`uc_mcontext.pc`, which the kernel DOES advance
+            // past the faulting `svc`) in the scratch struct instead; `syscall_callback`'s
+            // asm patches `PtRegs.pc` from there when nonzero, leaving x30/`regs[30]` alone.
+            unsafe {
+                (*scratch).svc_resume_pc = usize::try_from(context.uc_mcontext.pc)
+                    .expect("pc fits in usize on this platform");
             }
-        }
-        // HOST code (litebox's own runtime, not the guest) invoked one of the seven syscalls
-        // removed from the seccomp allow-list above (see `aarch64_syscall_proxy`'s module doc).
-        // Forward the real syscall to the dedicated unfiltered proxy thread and write its real
-        // result back, so host code sees the same behavior as if the syscall had been allowed
-        // through directly -- only reached for these seven numbers; anything else still falls
-        // through to the debug-log+EINVAL path below unchanged.
-        let sysno = context.uc_mcontext.regs[8].cast_signed();
-        const PROXIED: [i64; 9] = [
-            libc::SYS_close,
-            libc::SYS_dup,
-            libc::SYS_clock_gettime,
-            libc::SYS_set_tid_address,
-            libc::SYS_prlimit64,
-            libc::SYS_readlinkat,
-            libc::SYS_fstat,
-            libc::SYS_read,
-            libc::SYS_write,
-        ];
-        // openat is proxied too, but only for RDONLY opens (matching the flags-argument
-        // condition the removed seccomp rule used to enforce) -- host code opening a file
-        // for writing is not a case this proxy needs to support (litebox's own host-side needs,
-        // e.g. raw_open reading an ELF binary, are always RDONLY).
-        let is_proxied_openat = sysno == libc::SYS_openat
-            && context.uc_mcontext.regs[3] as u32 == OFlags::RDONLY.bits();
-        if PROXIED.contains(&sysno) || is_proxied_openat {
-            let regs = &context.uc_mcontext.regs;
-            let args = [
-                regs[0] as usize,
-                regs[1] as usize,
-                regs[2] as usize,
-                regs[3] as usize,
-                regs[4] as usize,
-                regs[5] as usize,
-            ];
-            let result = aarch64_syscall_proxy::proxy(sysno, args);
-            context.uc_mcontext.regs[0] = result as u64;
+            // Stash the guest's real x3 (4th syscall arg) too -- `set_signal_return` below
+            // unconditionally overwrites `regs[3]` with the scratch pointer itself (every
+            // callback's first instruction depends on x3 already being scratch), so the
+            // guest's real x3 must be preserved out-of-band the same way as the resume PC.
+            unsafe {
+                (*scratch).svc_real_x3 = usize::try_from(context.uc_mcontext.regs[3])
+                    .expect("register value fits in usize on this platform");
+            }
+            // Ensure `run_thread_arch` (and therefore `syscall_callback`) is linked in.
+            let _ = run_thread_arch as *const () as usize;
+            // `set_signal_return` unconditionally overwrites `regs[0..3]` with its p0/p1/p2
+            // arguments (needed by `exception_callback`/`interrupt_callback`, whose payload
+            // really does travel through those registers) -- but `syscall_callback` does NOT
+            // read its dispatch payload from x0-x2 at all; it re-dumps the guest's LIVE
+            // x0-x30 (via `sigreturn`-restored `context.uc_mcontext.regs`) as `PtRegs.regs[]`
+            // once it's running. Passing p0=p1=p2=0 (as an earlier version of this fix did)
+            // clobbers the guest's real x0/x1/x2 syscall arguments with zeros BEFORE that
+            // dump ever runs, corrupting every syscall's first three arguments --
+            // live-confirmed via `getcwd(buf, 4096)`: the dumped `PtRegs.regs[0]` (buf) and
+            // `regs[1]` (size) both read back as 0. Round-tripping the guest's OWN current
+            // x0-x2 through as p0-p2 makes this overwrite a no-op.
+            let (x0, x1, x2) = (
+                context.uc_mcontext.regs[0].cast_signed() as isize,
+                context.uc_mcontext.regs[1].cast_signed() as isize,
+                context.uc_mcontext.regs[2].cast_signed() as isize,
+            );
+            set_signal_return(
+                context,
+                scratch,
+                unsafe {
+                    core::mem::transmute::<unsafe extern "C" fn() -> isize, unsafe extern "C" fn()>(
+                        syscall_callback,
+                    )
+                },
+                x0,
+                x1,
+                x2,
+                0,
+            );
             return;
         }
+        if aarch64_proxy_host_syscall_if_applicable(context) {
+            return;
+        }
+    }
+    // Release-mode aarch64 fallback for a genuinely-unhandled syscall (not the guest-dispatch
+    // or aarch64_syscall_proxy cases above, both of which already returned): just set EINVAL,
+    // no logging. The debug-mode block right below does the same plus a log line, but is
+    // gated out in release; without this, a release build's aarch64 SIGSYS Trap (now
+    // unconditional, see the seccomp filter setup) would return to the caller with the
+    // register state unset -- the debug block cannot be relied on to run.
+    #[cfg(all(not(debug_assertions), target_arch = "aarch64"))]
+    if signum == libc::SIGSYS {
+        context.uc_mcontext.regs[0] = i64::from(-libc::EINVAL).cast_unsigned();
+        return;
     }
     // Return an error code for the syscall and log it in debug mode.
     #[cfg(debug_assertions)]

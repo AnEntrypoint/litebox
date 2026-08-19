@@ -13,7 +13,13 @@ fn ratchet_transmutes() -> Result<()> {
         &[
             ("dev_tests/", 2),
             ("litebox/", 8),
-            ("litebox_platform_linux_userland/", 2),
+            // 3 rather than 2: the aarch64 guest-dispatch branch transmutes
+            // `syscall_callback`'s `unsafe extern "C" fn() -> isize` to a
+            // `fn()` so `set_signal_return` can install it as a raw signal
+            // return target; landed with the earlier aarch64 proxy work this
+            // session but never bumped then -- unavoidable at this boundary
+            // since `set_signal_return`'s target type is untyped.
+            ("litebox_platform_linux_userland/", 3),
         ],
         |file| {
             Ok(file
@@ -36,7 +42,15 @@ fn ratchet_globals() -> Result<()> {
             ("dev_bench/", 1),
             ("litebox/", 9),
             ("litebox_platform_linux_kernel/", 6),
-            ("litebox_platform_linux_userland/", 5),
+            // 9 rather than 5: AARCH64_SCRATCH_PTR/AARCH64_HOST_ONLY_SCRATCH/
+            // AARCH64_GUEST_ALT_STACK_BASES were introduced by the aarch64 userland port
+            // earlier this session but never bumped this ratchet (an oversight in that pass,
+            // not new growth here); MAILBOX (aarch64_syscall_proxy's single-slot,
+            // signal-safe request/response mailbox to the dedicated always-unfiltered proxy
+            // thread) is the one genuinely new static added in this pass, needed because the
+            // mailbox must be process-wide (one proxy thread serving every host-code caller)
+            // and signal-handler-safe (no allocation), which rules out anything but a `static`.
+            ("litebox_platform_linux_userland/", 9),
             ("litebox_platform_lvbs/", 24),
             ("litebox_platform_multiplex/", 1),
             // 11 rather than 10 for the single `LITEBOX_DIAG_WAIT4GATE` diagnostic thread-local,
