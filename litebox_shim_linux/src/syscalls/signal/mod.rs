@@ -41,8 +41,7 @@ pub(crate) struct SignalState<Platform: ShimPlatform> {
     /// The last exception info recorded for signal delivery.
     last_exception: Cell<litebox::shim::ExceptionInfo>,
     /// Guest-visible address of a litebox-synthesized `rt_sigreturn` trampoline, lazily
-    /// allocated on first use (see [`Task::sigreturn_trampoline_addr`]'s doc comment), or 0 if
-    /// not yet allocated.
+    /// allocated on first use, or 0 if not yet allocated.
     sigreturn_trampoline: Cell<usize>,
 }
 
