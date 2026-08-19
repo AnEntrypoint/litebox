@@ -533,6 +533,17 @@ impl LinuxUserland {
             #[cfg(all(debug_assertions, not(target_arch = "aarch64")))]
             (libc::SYS_rt_sigaction, vec![]),
             // TODO: also called by `next_signal_handler`, but I'm not sure if it's really needed.
+            //
+            // GUEST rt_sigprocmask() must be litebox-emulated (updating SignalState::blocked,
+            // not the real kernel's per-thread mask) -- unconditionally allowing it here let a
+            // guest's sigprocmask() bypass litebox's own block-mask tracking entirely, so a
+            // signal blocked by the guest was never actually recorded as blocked internally,
+            // and a subsequent raise() delivered it immediately instead of queuing it
+            // (live-confirmed: sigint.c's block/unblock test observed the handler firing
+            // synchronously despite an intervening SIG_BLOCK). Proxied for host-code use
+            // instead (litebox's own runtime does call this, e.g. around thread setup), see
+            // PROXIED below.
+            #[cfg(not(target_arch = "aarch64"))]
             (libc::SYS_rt_sigprocmask, vec![]),
             // thread management
             (libc::SYS_exit, vec![]),
@@ -3398,7 +3409,7 @@ fn set_signal_return(
     reason = "raw 64-bit register values round-tripped bit-for-bit through usize, not semantically-bounded numbers"
 )]
 fn aarch64_proxy_host_syscall_if_applicable(context: &mut libc::ucontext_t) -> bool {
-    const PROXIED: [i64; 11] = [
+    const PROXIED: [i64; 12] = [
         libc::SYS_close,
         libc::SYS_dup,
         libc::SYS_clock_gettime,
@@ -3410,6 +3421,7 @@ fn aarch64_proxy_host_syscall_if_applicable(context: &mut libc::ucontext_t) -> b
         libc::SYS_write,
         libc::SYS_tgkill,
         libc::SYS_rt_sigaction,
+        libc::SYS_rt_sigprocmask,
     ];
     let sysno = context.uc_mcontext.regs[8].cast_signed();
     // openat is proxied too, but only for RDONLY opens (matching the flags-argument condition
