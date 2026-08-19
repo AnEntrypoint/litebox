@@ -500,16 +500,37 @@ impl LinuxUserland {
             (libc::SYS_munmap, vec![]),
             (libc::SYS_mremap, vec![]),
             // signal
+            //
+            // Real (host-originated) `rt_sigreturn` must stay allowed unconditionally on
+            // aarch64 too: the kernel's own VDSO/restorer issues it implicitly at the end of
+            // EVERY real signal handler invocation on this thread (including
+            // `exception_signal_handler`/`interrupt_signal_handler` themselves returning), and
+            // seccomp has no BPF-visible way to distinguish that from a GUEST's own explicit
+            // call to the same real syscall number -- trapping it unconditionally live-proved
+            // unfixable without either an infinite SIGSYS-recursion loop (manually replaying
+            // the real syscall from inside the trap handler re-traps itself) or an
+            // unmasked-signal termination (SA_NODEFER opened a second, worse failure mode).
+            // The guest's OWN synthesized sigreturn trampoline therefore does NOT use this
+            // real syscall number at all -- see `ensure_sigreturn_trampoline`'s `brk`-based
+            // trampoline, always trapped via SIGTRAP (never bypassable through this Allow
+            // entry) and dispatched to `sys_rt_sigreturn` from there instead.
             (libc::SYS_rt_sigreturn, vec![]),
             (libc::SYS_sigaltstack, vec![]),
+            // GUEST tgkill()/raise() must be litebox-emulated (queued as a pending signal,
+            // delivered via process_signals), not bounced to the real kernel -- see
+            // aarch64_syscall_proxy's PROXIED array, which forwards litebox's OWN host-runtime
+            // tgkill/rt_sigaction calls (e.g. glibc's pthread_create signal setup) instead.
+            #[cfg(not(target_arch = "aarch64"))]
             (libc::SYS_tgkill, vec![]),
             (libc::SYS_timer_create, vec![]),
             (libc::SYS_timer_settime, vec![]),
             (libc::SYS_timer_delete, vec![]),
             // called by [pthread_create](https://codebrowser.dev/glibc/glibc/nptl/pthread_create.c.html#83) to set up signal handler
             // to support setuid et.al. functions (which we probably don't need, but include them in debug mode to suppress the warnings
-            // about missing seccomp rules for these syscalls).
-            #[cfg(debug_assertions)]
+            // about missing seccomp rules for these syscalls). On aarch64, GUEST rt_sigaction()
+            // must be litebox-emulated (updating SignalHandlersInner, not the real kernel's
+            // handler table) -- proxied for host-code use instead, see PROXIED below.
+            #[cfg(all(debug_assertions, not(target_arch = "aarch64")))]
             (libc::SYS_rt_sigaction, vec![]),
             // TODO: also called by `next_signal_handler`, but I'm not sure if it's really needed.
             (libc::SYS_rt_sigprocmask, vec![]),
@@ -1088,6 +1109,13 @@ struct Aarch64ThreadScratch {
     /// host-only scratch field instead removes the guest-visible side effect entirely.
     switch_target: usize,
 }
+
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(core::mem::offset_of!(Aarch64ThreadScratch, switch_target) == 80);
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(core::mem::offset_of!(Aarch64ThreadScratch, in_guest) == 48);
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(core::mem::offset_of!(Aarch64ThreadScratch, interrupt) == 49);
 
 #[cfg(target_arch = "aarch64")]
 thread_local! {
@@ -3370,7 +3398,7 @@ fn set_signal_return(
     reason = "raw 64-bit register values round-tripped bit-for-bit through usize, not semantically-bounded numbers"
 )]
 fn aarch64_proxy_host_syscall_if_applicable(context: &mut libc::ucontext_t) -> bool {
-    const PROXIED: [i64; 9] = [
+    const PROXIED: [i64; 11] = [
         libc::SYS_close,
         libc::SYS_dup,
         libc::SYS_clock_gettime,
@@ -3380,6 +3408,8 @@ fn aarch64_proxy_host_syscall_if_applicable(context: &mut libc::ucontext_t) -> b
         libc::SYS_fstat,
         libc::SYS_read,
         libc::SYS_write,
+        libc::SYS_tgkill,
+        libc::SYS_rt_sigaction,
     ];
     let sysno = context.uc_mcontext.regs[8].cast_signed();
     // openat is proxied too, but only for RDONLY opens (matching the flags-argument condition

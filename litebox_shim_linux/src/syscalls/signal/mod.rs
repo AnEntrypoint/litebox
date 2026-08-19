@@ -436,8 +436,17 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
 struct DeliverFault;
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    /// Returns the already-allocated sigreturn trampoline's guest address, or 0 if
+    /// [`Task::ensure_sigreturn_trampoline`] has never been called for this address space.
+    /// Used to recognize a trap at exactly this address as the trampoline's own `brk`, not a
+    /// genuine guest breakpoint (see aarch64's `LinuxShimEntrypoints::exception`).
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn sigreturn_trampoline_addr(&self) -> usize {
+        self.signals.sigreturn_trampoline.get()
+    }
+
     /// Returns the guest-visible address of a litebox-synthesized `rt_sigreturn` trampoline
-    /// (a tiny `mov x8, #139 ; svc #0` stub), allocating it via a real guest `mmap` on first
+    /// (a tiny `brk #0xdead` stub), allocating it via a real guest `mmap` on first
     /// use and caching the address for the lifetime of this address space (see
     /// `SignalState::sigreturn_trampoline`'s doc comment for why it's invalidated on `execve`
     /// but preserved across `clone`/`fork`). Returns 0 if the allocation itself fails (e.g. the
@@ -446,16 +455,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ///
     /// aarch64-only: x86_64 glibc always supplies its own real restorer transparently, so no
     /// synthesized one is ever needed there.
+    ///
+    /// Uses `brk #0xdead` (a debug breakpoint trap, SIGTRAP) rather than the real
+    /// `mov x8, #139 ; svc #0` (139 = __NR_rt_sigreturn) an earlier version of this trampoline
+    /// used: the real syscall number is unconditionally seccomp-allowed on this platform (the
+    /// host's own real signal-handler returns implicitly issue the same real syscall, and
+    /// seccomp has no way to distinguish that from this trampoline's own explicit call --
+    /// trapping it unconditionally live-proved unfixable, see the seccomp allow-list's doc
+    /// comment on `SYS_rt_sigreturn`), so a guest reaching the real syscall number here would
+    /// silently bypass litebox's own signal-frame restoration and hit the real kernel's
+    /// `rt_sigreturn` instead, corrupting this thread's actual execution state. `brk` traps
+    /// unconditionally and unambiguously (host code never executes this specific immediate),
+    /// routing cleanly to `exception_signal_handler`'s SIGTRAP dispatch instead.
     #[cfg(target_arch = "aarch64")]
     pub(crate) fn ensure_sigreturn_trampoline(&self) -> usize {
         let existing = self.signals.sigreturn_trampoline.get();
         if existing != 0 {
             return existing;
         }
-        // `mov x8, #139 ; svc #0` (139 = __NR_rt_sigreturn on aarch64) -- see this function's
-        // doc comment. Encoded by hand (verified via `as`/`objdump`) rather than depending on an
-        // assembler at build time for 8 fixed bytes.
-        const TRAMPOLINE_CODE: [u8; 8] = [0x68, 0x11, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4];
+        // `brk #0xdead` -- see this function's doc comment. Encoded by hand (verified via
+        // `as`/`objdump`) rather than depending on an assembler at build time for 4 fixed bytes.
+        const TRAMPOLINE_CODE: [u8; 4] = [0xa0, 0xd5, 0x3b, 0xd4];
         let Ok(page) = self.sys_mmap(
             0,
             litebox::mm::linux::PAGE_SIZE,
@@ -482,7 +502,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         {
             return 0;
         }
-        let write_ok = UserPtrMut::<[u8; 8]>::from_usize(addr)
+        let write_ok = UserPtrMut::<[u8; 4]>::from_usize(addr)
             .write_at_offset::<Platform>(0, TRAMPOLINE_CODE)
             .is_some();
         let _ = self.sys_mprotect(
