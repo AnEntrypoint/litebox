@@ -1820,7 +1820,10 @@ where
         st_gid: 0,
         st_rdev: 0,
         st_size: 0,
+        #[cfg(not(target_os = "windows"))]
         st_blksize: blksize as i32,
+        #[cfg(target_os = "windows")]
+        st_blksize: blksize,
         st_blocks: 0,
         ..Default::default()
     };

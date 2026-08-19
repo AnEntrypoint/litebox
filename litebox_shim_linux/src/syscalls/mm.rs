@@ -781,14 +781,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Ok(stat) = self.sys_fstat(fd) else {
             return (false, 0, 0, 0);
         };
-        let file_size = stat.st_size;
-        if file_size < HEADER_SIZE as i64 {
+        let Ok(file_size) = usize::try_from(stat.st_size) else {
+            return (false, 0, 0, 0);
+        };
+        if file_size < HEADER_SIZE {
             return (false, 0, 0, 0);
         }
         let mut tail = [0u8; HEADER_SIZE];
-        let Ok(read_offset) = usize::try_from(file_size - HEADER_SIZE as i64) else {
-            return (false, 0, 0, 0);
-        };
+        let read_offset = file_size - HEADER_SIZE;
         match self.sys_read(fd, &mut tail, Some(read_offset)) {
             Ok(n) if n == HEADER_SIZE => {}
             _ => return (false, 0, 0, 0),
