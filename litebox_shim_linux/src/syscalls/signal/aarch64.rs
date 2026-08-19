@@ -82,7 +82,8 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
                 link: 0,
                 stack: self.altstack.get(),
                 sigmask: self.blocked.get(),
-                __unused: [0; 1024 / 8 - core::mem::size_of::<litebox_common_linux::signal::SigSet>()],
+                __unused: [0; 1024 / 8
+                    - core::mem::size_of::<litebox_common_linux::signal::SigSet>()],
                 __align_pad: [0; 8],
                 mcontext: Sigcontext {
                     fault_address: last_exception.fault_address as u64,
