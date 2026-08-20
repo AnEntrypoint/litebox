@@ -425,6 +425,14 @@ impl TarIndex {
         let mut symlinks = Vec::new();
         let mut raw_entries: Vec<RawEntry> = Vec::new();
 
+        // A PAX extended header (`XHDTYPE`, typeflag `'x'`) precedes the one entry it applies to
+        // and carries overrides -- most commonly `path=<full name>` -- for any field the following
+        // header's own fixed-width fields can't hold (GNU/POSIX tar's answer to the 100-byte `name`
+        // field being too short for a deeply nested path, e.g. anything under a real
+        // `node_modules/`). Carried across loop iterations and consumed by the very next non-`x`
+        // entry, matching every other real tar reader's PAX semantics.
+        let mut pending_pax_path: Option<String> = None;
+
         let mut block_index = 0usize;
         let total_blocks = data.len() / BLOCKSIZE;
         while block_index < total_blocks {
@@ -446,10 +454,52 @@ impl TarIndex {
             let Ok(typeflag) = header.typeflag.try_to_type_flag() else {
                 continue;
             };
-            let Ok(filename) = header.name.as_str() else {
+
+            if typeflag == tar_no_std::TypeFlag::XHDTYPE {
+                let payload_blocks = header.payload_block_count().unwrap_or(0);
+                let content_start = block_index * BLOCKSIZE;
+                let content_len = header.size.as_number::<usize>().unwrap_or(0);
+                let content_end = content_start.saturating_add(content_len).min(data.len());
+                block_index += payload_blocks;
+                if let Ok(payload) = core::str::from_utf8(&data[content_start..content_end]) {
+                    pending_pax_path =
+                        parse_pax_path(payload).map(|p| normalize_tar_filename(p).into());
+                }
                 continue;
+            }
+            // A global extended header (`XGLTYPE`) applies to every subsequent entry in the
+            // archive, not just the next one -- not needed by any base image this backend
+            // supports; skip its payload without touching `pending_pax_path`.
+            if typeflag == tar_no_std::TypeFlag::XGLTYPE {
+                let payload_blocks = header.payload_block_count().unwrap_or(0);
+                block_index += payload_blocks;
+                continue;
+            }
+
+            let path = if let Some(pax_path) = pending_pax_path.take() {
+                pax_path
+            } else {
+                let Ok(filename) = header.name.as_str() else {
+                    continue;
+                };
+                // POSIX ustar splits a path too long for the 100-byte `name` field across it and
+                // the separate 155-byte `prefix` field (joined as `prefix/name`) rather than
+                // truncating -- GNU tar (and every other modern implementation) does this whenever
+                // `name` alone can't hold the path, which is routine for anything a few directories
+                // deep (e.g. `usr/include/c++/<ver>/ext/pb_ds/detail/...`, `usr/lib/node_modules/
+                // npm/node_modules/...`). Ignoring `prefix` silently drops every such entry's real
+                // directory component, leaving only the basename -- indistinguishable from a
+                // legitimate root-level file, which is exactly the corruption this join prevents.
+                match header.prefix.as_str() {
+                    Ok(prefix) if !prefix.is_empty() => {
+                        let mut joined = String::from(normalize_tar_filename(prefix));
+                        joined.push('/');
+                        joined.push_str(normalize_tar_filename(filename));
+                        joined
+                    }
+                    _ => normalize_tar_filename(filename).into(),
+                }
             };
-            let path = normalize_tar_filename(filename);
             if path.is_empty() {
                 continue;
             }
@@ -469,10 +519,7 @@ impl TarIndex {
                         owner: owner_from_posix_header(header),
                         node_info: inode_allocator.next(),
                     });
-                    raw_entries.push(RawEntry::File {
-                        path: path.into(),
-                        file_idx,
-                    });
+                    raw_entries.push(RawEntry::File { path, file_idx });
                 }
                 tar_no_std::TypeFlag::SYMTYPE => {
                     let Ok(target) = header.linkname.as_str() else {
@@ -484,10 +531,7 @@ impl TarIndex {
                         owner: owner_from_posix_header(header),
                         node_info: inode_allocator.next(),
                     });
-                    raw_entries.push(RawEntry::Symlink {
-                        path: path.into(),
-                        symlink_idx,
-                    });
+                    raw_entries.push(RawEntry::Symlink { path, symlink_idx });
                 }
                 _ => {
                     // Directories are implied by file/symlink paths below; hardlinks, device nodes,
@@ -548,6 +592,30 @@ impl TarIndex {
         let range = self.files[file_idx].data_range.clone();
         &self.tar_data[range]
     }
+}
+
+/// Extract the `path` record's value from a PAX extended header payload (POSIX.1-2001 `pax`
+/// format: a sequence of `"<length> <keyword>=<value>\n"` records, `<length>` counting itself).
+/// Ignores every other keyword (`mtime`, `uid`, `linkpath`, ...) -- only the long-name override is
+/// needed by this backend's read-only, metadata-light use case.
+fn parse_pax_path(payload: &str) -> Option<&str> {
+    let mut rest = payload;
+    while !rest.is_empty() {
+        let (len_str, after_len) = rest.split_once(' ')?;
+        let len: usize = len_str.parse().ok()?;
+        if len == 0 || len > rest.len() {
+            return None;
+        }
+        let record = &rest[..len];
+        let body = &record[len_str.len() + 1..];
+        let body = body.strip_suffix('\n').unwrap_or(body);
+        if let Some(value) = body.strip_prefix("path=") {
+            return Some(value);
+        }
+        rest = &rest[len..];
+        let _ = after_len;
+    }
+    None
 }
 
 /// Strip the `./` prefix from tar filenames if present.
