@@ -1400,6 +1400,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.do_close(raw_fd)
     }
 
+    /// Handle syscall `fsync`
+    ///
+    /// litebox's filesystem backend has no write-buffering/durability model to actually flush
+    /// (confirmed: no `fn sync`/`fn flush` anywhere under `litebox/src/fs/`), so once the fd is
+    /// validated there is nothing left to do -- an honest no-op success, matching real Unix
+    /// semantics for a backend with no in-flight buffered writes.
+    pub(crate) fn sys_fsync(&self, fd: i32) -> Result<(), Errno> {
+        self.check_raw_fd_exists(fd)
+    }
+
+    /// Handle syscall `fdatasync`
+    ///
+    /// See `sys_fsync`: same no-op-after-validation rationale applies.
+    pub(crate) fn sys_fdatasync(&self, fd: i32) -> Result<(), Errno> {
+        self.check_raw_fd_exists(fd)
+    }
+
     /// Handle syscall `preadv`
     pub(crate) fn sys_preadv(
         &self,
