@@ -22,9 +22,9 @@ use crate::{ShimFS, ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
-use litebox::{shim::Exception, sync::Mutex, utils::ReinterpretUnsignedExt as _};
 #[cfg(target_arch = "x86_64")]
 use litebox::utils::TruncateExt as _;
+use litebox::{shim::Exception, sync::Mutex, utils::ReinterpretUnsignedExt as _};
 use litebox_common_linux::signal::{
     MINSIGSTKSZ, NSIG, SI_KERNEL, SI_USER, SIG_DFL, SIG_IGN, SaFlags, SigAction, SigAltStack,
     SigSet, Siginfo, SiginfoData, SigmaskHow, Signal, SsFlags, Ucontext,
@@ -422,7 +422,14 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             );
         }
 
-        self.write_signal_frame(platform, frame_addr, siginfo, action, ctx, sigreturn_trampoline)?;
+        self.write_signal_frame(
+            platform,
+            frame_addr,
+            siginfo,
+            action,
+            ctx,
+            sigreturn_trampoline,
+        )?;
 
         let mut mask = self.blocked.get() | action.mask;
         if !action.flags.contains(SaFlags::NODEFER) {
@@ -619,10 +626,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // rather than faulting the whole sigreturn.
         #[cfg(target_arch = "x86_64")]
         if uctx.mcontext.fpstate != 0 {
-            let fpstate_ptr =
-                UserPtr::<litebox_common_linux::signal::x86_64::FpState>::from_usize(
-                    uctx.mcontext.fpstate.trunc(),
-                );
+            let fpstate_ptr = UserPtr::<litebox_common_linux::signal::x86_64::FpState>::from_usize(
+                uctx.mcontext.fpstate.trunc(),
+            );
             if let Some(fpregs) = fpstate_ptr.read_at_offset::<Platform>(0) {
                 let _ = self
                     .global
