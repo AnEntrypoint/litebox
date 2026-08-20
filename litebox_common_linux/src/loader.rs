@@ -658,8 +658,8 @@ impl ElfParsedFile {
         mem.read(base_addr + relr_vaddr, &mut relr_bytes)?;
 
         let mut current_addr: usize = 0;
-        for chunk in relr_bytes.chunks_exact(8) {
-            let word = u64::from_le_bytes(chunk.try_into().unwrap());
+        for chunk in relr_bytes.as_chunks::<8>().0 {
+            let word = u64::from_le_bytes(*chunk);
             if word & 1 == 0 {
                 // An address entry: relocate the slot at this address, then advance.
                 let target_addr = base_addr
