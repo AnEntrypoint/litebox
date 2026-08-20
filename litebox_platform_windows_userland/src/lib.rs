@@ -309,6 +309,48 @@ unsafe extern "system" fn vectored_exception_handler_entry(
     );
 }
 
+/// Whether the instruction at `rip` genuinely has an `FS:` segment-override prefix (opcode byte
+/// `0x64`), i.e. is a real `%fs:`-relative access that a stale/zeroed `FS_BASE` could plausibly
+/// explain.
+///
+/// The FS_BASE-reset repair sites below (both the guest-mode and host-mode occurrences) used to
+/// treat *every* `EXCEPTION_ACCESS_VIOLATION` seen while `rdfsbase() == 0` as "Windows cleared
+/// this thread's FS_BASE MSR again, just restore it and retry" -- with no check that the faulting
+/// instruction actually reads/writes through the FS segment at all. Since Windows clearing
+/// `FS_BASE` is asynchronous ("apparently as part of ordinary scheduling", per the repair sites'
+/// own comments) it can coincide with an *unrelated* real fault -- e.g. a genuine null-pointer
+/// dereference in guest code -- at which point `wrfsbase`-then-retry does nothing to fix the real
+/// problem and the identical instruction re-faults immediately, forever: a silent, non-converging
+/// repair loop with the exact same observable shape (`EXCEPTION_ACCESS_VIOLATION`, `rdfsbase() ==
+/// 0`, same `rip` every time) as the real FS_BASE-reset case, confirmed live via
+/// `LITEBOX_VEH_TRACE=1` against a `process.title = <string>` repro under Node.js (a plain `mov
+/// rdx, [rdx+0x788]` with `rdx` already null -- no FS override, no REX.W-only coincidence -- was
+/// being "repaired" and retried unboundedly). This mirrors the file's own precedent for exactly
+/// this class of bug: the `Rip != 0` guard a few lines below this function's call sites was added
+/// after an earlier livelock (1809+ repeated repairs, no forward progress) was found to be the
+/// same shape -- blindly retrying a fault the repair could never actually fix.
+///
+/// x86_64 legacy prefixes (`LOCK` `0xF0`, `REP`/`REPNE` `0xF2`/`0xF3`, the six segment overrides
+/// `0x2E`/`0x36`/`0x3E`/`0x26`/`0x64`/`0x65`, operand-size `0x66`, address-size `0x67`) may appear
+/// in any order before the opcode, followed optionally by a single REX prefix (`0x40`-`0x4F`)
+/// immediately before the opcode itself -- per the Intel SDM, at most four legacy prefixes are
+/// architecturally meaningful, though nothing stops more from being *present* in an
+/// (unusual/malformed) encoding. Scanning a bounded window (the SDM's own 15-byte maximum
+/// instruction length) and stopping at the first REX/opcode-shaped byte once at least one
+/// definite non-prefix byte class is hit would require a much more complete decoder than this
+/// narrow check needs; instead, scan only the legacy-prefix run (bounded to 4 bytes, matching the
+/// SDM's own limit) and check whether `0x64` appears anywhere in it -- false-negatives (missing a
+/// real FS-relative access) are safe here, since they only fall through to the normal exception
+/// path instead of repairing, at worst turning a real FS_BASE-reset case into a diagnosable crash
+/// rather than a silent hang; false-positives (wrongly treating a non-FS-relative fault as
+/// FS-relative) are what this function exists to eliminate, and requiring the exact `0x64` byte to
+/// be genuinely present in the prefix run has none.
+fn faulting_instruction_has_fs_override(rip: usize) -> bool {
+    let mut buf = [0u8; 4];
+    let n = fork_verify::read_code_bytes_for_diagnostics(rip, &mut buf);
+    buf[..n].contains(&0x64)
+}
+
 unsafe extern "system" fn vectored_exception_handler(
     exception_info: *mut EXCEPTION_POINTERS,
 ) -> i32 {
@@ -694,6 +736,13 @@ unsafe extern "system" fn vectored_exception_handler(
             // `EXCEPTION_CONTINUE_SEARCH` below instead, turning the silent livelock into a
             // diagnosable crash.
             && context.Rip != 0
+            // The fault must actually be an FS-relative access -- see
+            // `faulting_instruction_has_fs_override`'s doc comment for why this guard exists: an
+            // unrelated real fault (e.g. a null-pointer dereference with no FS prefix at all)
+            // coinciding with `rdfsbase() == 0` was being misdiagnosed as FS_BASE-reset and
+            // retried forever, since `wrfsbase` does nothing to fix a fault that was never about
+            // FS_BASE in the first place.
+            && faulting_instruction_has_fs_override(context.Rip.trunc())
         {
             let saved = WindowsUserland::get_thread_fs_base();
             if saved != 0 {
@@ -776,6 +825,14 @@ unsafe extern "system" fn vectored_exception_handler(
         // would just re-fault at address 0 forever. Fall through to the normal exception path
         // below (single-step triage / `exception_callback`) instead of looping silently.
         && context.Rip != 0
+        // Same guard as the host-mode repair above -- see
+        // `faulting_instruction_has_fs_override`'s doc comment. Without this, a real guest fault
+        // (e.g. a null-pointer dereference with no FS-segment prefix) coinciding with
+        // `rdfsbase() == 0` gets misdiagnosed as FS_BASE-reset and retried forever; confirmed live
+        // via a `process.title = <string>` repro under Node.js, where a plain `mov rdx,
+        // [rdx+0x788]` (no FS override) with `rdx` already null was being "repaired" and retried
+        // unboundedly on a background guest thread.
+        && faulting_instruction_has_fs_override(context.Rip.trunc())
     {
         let saved = WindowsUserland::get_thread_fs_base();
         if saved != 0 {
