@@ -6,7 +6,7 @@
 use zerocopy::{FromBytes, IntoBytes};
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, FromBytes, IntoBytes)]
 pub struct FpxSwBytes {
     pub magic1: u32,
     pub extended_size: u32,
@@ -49,7 +49,7 @@ pub struct Sigcontext {
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, FromBytes, IntoBytes)]
 pub struct FpState {
     pub cwd: u16,
     pub swd: u16,
