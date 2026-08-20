@@ -2960,7 +2960,7 @@ fn copy_one_group(
             "read_source_bytes returned wrong length"
         );
         if log_zeroes {
-            for (word_offset, word) in bytes.chunks_exact(8).enumerate() {
+            for (word_offset, word) in bytes.as_chunks::<8>().0.iter().enumerate() {
                 if word.iter().all(|b| *b == 0) {
                     let addr = page_range.start + word_offset * 8;
                     match zero_runs.last_mut() {
