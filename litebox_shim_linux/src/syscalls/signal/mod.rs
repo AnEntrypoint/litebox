@@ -469,13 +469,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// routing cleanly to `exception_signal_handler`'s SIGTRAP dispatch instead.
     #[cfg(target_arch = "aarch64")]
     pub(crate) fn ensure_sigreturn_trampoline(&self) -> usize {
+        // `brk #0xdead` -- see this function's doc comment. Encoded by hand (verified via
+        // `as`/`objdump`) rather than depending on an assembler at build time for 4 fixed bytes.
+        const TRAMPOLINE_CODE: [u8; 4] = [0xa0, 0xd5, 0x3b, 0xd4];
         let existing = self.signals.sigreturn_trampoline.get();
         if existing != 0 {
             return existing;
         }
-        // `brk #0xdead` -- see this function's doc comment. Encoded by hand (verified via
-        // `as`/`objdump`) rather than depending on an assembler at build time for 4 fixed bytes.
-        const TRAMPOLINE_CODE: [u8; 4] = [0xa0, 0xd5, 0x3b, 0xd4];
         let Ok(page) = self.sys_mmap(
             0,
             litebox::mm::linux::PAGE_SIZE,

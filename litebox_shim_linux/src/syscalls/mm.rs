@@ -19,12 +19,15 @@ use crate::ShimPlatform;
 use crate::Task;
 use crate::UserPtrMut;
 use litebox::utils::TruncateExt as _;
+#[cfg(target_arch = "x86_64")]
 use object::elf::{ET_DYN, FileHeader64, PT_LOAD, ProgramHeader64};
+#[cfg(target_arch = "x86_64")]
 use object::endian::LittleEndian;
 
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("ELF patching code assumes 64-bit pointers (u64 <-> usize is lossless)");
 
+#[cfg(target_arch = "x86_64")]
 const ENDIAN: LittleEndian = LittleEndian;
 
 /// Per-fd state for the shim's runtime ELF syscall rewriter.
@@ -85,6 +88,7 @@ fn align_up(addr: usize, align: usize) -> usize {
     (addr + align - 1) & !(align - 1)
 }
 
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn align_down(addr: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());
@@ -776,6 +780,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Check if a file has the LITEBOX trampoline magic at its tail.
     /// Returns (is_pre_patched, file_offset, vaddr, trampoline_size).
+    #[cfg(target_arch = "x86_64")]
     fn check_trampoline_magic(&self, fd: i32) -> (bool, u64, u64, u64) {
         const HEADER_SIZE: usize = 32; // TrampolineHeader64: magic(8) + file_offset(8) + vaddr(8) + size(8)
         let Ok(stat) = self.sys_fstat(fd) else {

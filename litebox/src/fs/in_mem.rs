@@ -750,7 +750,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let Some(from_entry) = from_entry else {
             return Err(PathError::NoSuchFileOrDirectory)?;
         };
-        // Only regular-file rename is supported -- see `FileSystem::rename`'s docs.
         if let Entry::Dir(_) = from_entry {
             return Err(RenameError::IsADirectory);
         }
@@ -776,28 +775,30 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             if !self.current_user.can_write(&parent.perms) {
                 return Err(RenameError::NoWritePerms);
             }
-            let removed = parent.children.remove(&from_name);
-            debug_assert!(matches!(removed, Some(FileType::RegularFile)));
-            parent.children.insert(to_name, FileType::RegularFile);
+            let Some(ft) = parent.children.remove(&from_name) else {
+                return Err(PathError::NoSuchFileOrDirectory)?;
+            };
+            parent.children.insert(to_name, ft);
         } else {
             if !self.current_user.can_write(&from_parent.read().perms)
                 || !self.current_user.can_write(&to_parent.read().perms)
             {
                 return Err(RenameError::NoWritePerms);
             }
-            {
+            let ft = {
                 let mut from_parent = from_parent.write();
-                let removed = from_parent.children.remove(&from_name);
-                debug_assert!(matches!(removed, Some(FileType::RegularFile)));
-            }
+                from_parent
+                    .children
+                    .remove(&from_name)
+                    .ok_or(PathError::NoSuchFileOrDirectory)?
+            };
             {
                 let mut to_parent = to_parent.write();
-                to_parent.children.insert(to_name, FileType::RegularFile);
+                to_parent.children.insert(to_name, ft);
             }
         }
 
         let moved = root.entries.remove(&from).unwrap();
-        debug_assert!(matches!(moved, Entry::File(_)));
         root.entries.insert(to, moved);
 
         Ok(())
