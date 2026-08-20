@@ -1137,6 +1137,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 None => Err(Errno::EFAULT),
             },
             SyscallRequest::Close { fd } => syscall!(sys_close(fd)),
+            SyscallRequest::Fsync { fd } => syscall!(sys_fsync(fd)),
+            SyscallRequest::Fdatasync { fd } => syscall!(sys_fdatasync(fd)),
             SyscallRequest::Lseek { fd, offset, whence } => {
                 use litebox::utils::TruncateExt as _;
                 syscalls::file::try_into_whence(whence.trunc())
@@ -1673,6 +1675,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::Getegid => Ok(self.sys_getegid() as usize),
             SyscallRequest::Setuid { uid } => syscall!(sys_setuid(uid)),
             SyscallRequest::Setgid { gid } => syscall!(sys_setgid(gid)),
+            SyscallRequest::Getgroups { size, list } => syscall!(sys_getgroups(size, list)),
+            SyscallRequest::Setgroups { size, list } => syscall!(sys_setgroups(size, list)),
             SyscallRequest::Sysinfo { buf } => {
                 let sysinfo = self.sys_sysinfo();
                 buf.write_at_offset::<Platform>(0, sysinfo)

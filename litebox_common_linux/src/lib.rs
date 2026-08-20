@@ -2070,6 +2070,12 @@ pub enum SyscallRequest {
     Close {
         fd: i32,
     },
+    Fsync {
+        fd: i32,
+    },
+    Fdatasync {
+        fd: i32,
+    },
     Stat {
         pathname: UserPtr<c_char>,
         buf: UserPtrMut<FileStat>,
@@ -2530,6 +2536,14 @@ pub enum SyscallRequest {
     Setgid {
         gid: u32,
     },
+    Getgroups {
+        size: i32,
+        list: UserPtrMut<u32>,
+    },
+    Setgroups {
+        size: usize,
+        list: UserPtr<u32>,
+    },
     Sysinfo {
         buf: UserPtrMut<Sysinfo>,
     },
@@ -2895,6 +2909,8 @@ impl SyscallRequest {
                 }
             }
             Sysno::flock => sys_req!(Flock { fd, operation }),
+            Sysno::fsync => sys_req!(Fsync { fd }),
+            Sysno::fdatasync => sys_req!(Fdatasync { fd }),
             Sysno::gettimeofday => sys_req!(Gettimeofday { tv:*, tz:* }),
             Sysno::clock_gettime => {
                 sys_req!(ClockGettime { clockid, tp: { =*> TimeParam::timespec_old } })
@@ -2936,6 +2952,8 @@ impl SyscallRequest {
             Sysno::getegid => SyscallRequest::Getegid,
             Sysno::setuid => sys_req!(Setuid { uid }),
             Sysno::setgid => sys_req!(Setgid { gid }),
+            Sysno::getgroups => sys_req!(Getgroups { size, list:* }),
+            Sysno::setgroups => sys_req!(Setgroups { size, list:* }),
             Sysno::epoll_ctl => sys_req!(EpollCtl { epfd, op:?, fd, event:* }),
             #[cfg(target_arch = "x86_64")]
             Sysno::epoll_wait => {

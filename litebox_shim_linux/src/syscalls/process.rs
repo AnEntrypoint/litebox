@@ -3078,6 +3078,41 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Err(Errno::EPERM)
         }
     }
+
+    /// Handle syscall `getgroups`.
+    ///
+    /// LiteBox has no real supplementary-group model (see [`Self::sys_setuid`]'s single-fixed-
+    /// credentials rationale), so the guest's supplementary group list is always exactly its own
+    /// primary gid -- matching a real Linux process that was never granted any extra groups.
+    /// `size == 0` is the standard "just tell me the count" query and never touches `list`.
+    pub(crate) fn sys_getgroups(&self, size: i32, list: UserPtrMut<u32>) -> Result<u32, Errno> {
+        if size == 0 {
+            return Ok(1);
+        }
+        if size < 1 {
+            return Err(Errno::EINVAL);
+        }
+        list.copy_from_slice::<Platform>(0, &[self.credentials.gid])
+            .ok_or(Errno::EFAULT)?;
+        Ok(1)
+    }
+
+    /// Handle syscall `setgroups`. See [`Self::sys_setuid`] for the same no-op-if-unchanged
+    /// rationale: succeeds only when the requested list is exactly the guest's current
+    /// (sole) supplementary group, i.e. its own primary gid.
+    pub(crate) fn sys_setgroups(&self, size: usize, list: UserPtr<u32>) -> Result<(), Errno> {
+        if size != 1 {
+            return Err(Errno::EPERM);
+        }
+        let Some(gid) = list.read_at_offset::<Platform>(0) else {
+            return Err(Errno::EFAULT);
+        };
+        if gid == self.credentials.gid {
+            Ok(())
+        } else {
+            Err(Errno::EPERM)
+        }
+    }
 }
 
 /// Number of CPUs
