@@ -97,6 +97,15 @@ impl WindowsUserland {
     /// Set the current thread's FS base
     fn set_thread_fs_base(new_base: usize) {
         THREAD_FS_BASE.set(new_base);
+        // Mirror into `TlsState.guest_fs_base` too, if this thread's `TlsState` is already
+        // installed -- see that field's doc comment for why the mirror exists. Not yet installed
+        // during this platform's own construction (the main thread's very first
+        // `init_thread_fs_base()` call, before `install_tls` has ever run for it); harmless to
+        // skip the mirror there, since `vectored_exception_handler_entry`'s fast path already
+        // falls through to the full handler whenever `get_tls_ptr()` finds nothing installed.
+        if let Some(tls) = get_tls_ptr() {
+            unsafe { &*tls }.guest_fs_base.set(new_base);
+        }
         Self::restore_thread_fs_base();
     }
 
@@ -153,6 +162,151 @@ pub(crate) fn diag_rip0_enabled() -> bool {
 /// `veh_trace_enabled`.
 pub(crate) fn diag_fataldump_enabled() -> bool {
     veh_trace_enabled() || std::env::var_os("LITEBOX_DIAG_FATALDUMP").is_some()
+}
+
+/// Minimal-footprint entry point registered with `AddVectoredExceptionHandler`, in place of
+/// [`vectored_exception_handler`] directly.
+///
+/// # Why this exists
+///
+/// Guest code runs with the real CPU `rsp`/`rbp` holding a GUEST-address value (this platform
+/// has no separate emulated guest stack -- see `switch_to_guest`'s doc comment) -- memory that,
+/// while genuinely backed by real committed pages, has no relationship to Windows' own per-thread
+/// stack-overflow/guard-page bookkeeping (`TEB.StackBase`/`StackLimit`). Windows always invokes a
+/// registered VEH callback using whatever `rsp` the CPU held at fault time -- there is no
+/// mechanism to make it invoke the callback on a different, pre-chosen stack. A `fork()` child's
+/// very first exception (routinely the "Windows cleared FS_BASE upon scheduling" condition the
+/// full [`vectored_exception_handler`] below already repairs, just far down in its body) was
+/// confirmed live to make that full handler's own sizeable stack frame (several hundred lines of
+/// body, multiple large diagnostic branches) trip `__chkstk`'s guard-page probe against that
+/// unrecognized guest-address memory, which recursively re-faulted at the same instruction on
+/// every retry -- exhausting the thread's REAL stack one guard page at a time until the process
+/// died with a genuine stack overflow, never once reaching the repair the full handler already
+/// has.
+///
+/// This entry point's own frame is kept deliberately minimal (raw register/memory reads only, no
+/// heap allocation) specifically so it can safely run in that same narrow, guest-address-stack
+/// window. Two things happen here, in order:
+///
+/// 1. A fast path for exactly the one condition the guest hits almost immediately after a
+///    `fork()` resume (`EXCEPTION_ACCESS_VIOLATION`, `rdfsbase() == 0`, a genuine instruction
+///    rather than a null `Rip`): repaired in place with a handful of instructions, matching
+///    exactly what [`vectored_exception_handler`]'s own later, redundant repair already does, and
+///    returns immediately -- avoiding entering the full handler's larger frame at all for the
+///    single most common case.
+/// 2. For every other exception code/condition, this thread's own `TlsState.host_sp`/`host_bp`
+///    (populated by `run_thread_arch`'s prologue before guest code ever runs, and always a real,
+///    Windows-registered stack address for this exact thread -- see those fields' own doc
+///    comments) are swapped into the LIVE `rsp`/`rbp` registers before `call`ing the full
+///    [`vectored_exception_handler`], so its own much larger frame -- and everything it in turn
+///    calls (`fork_verify::on_single_step`'s instruction-decode logic, the diagnostic branches,
+///    ...) -- runs on real, guard-page-protected memory instead of the guest's. The original
+///    (guest-address) `rsp`/`rbp` are saved first and restored after the call returns, immediately
+///    before this function's own `ret` -- the full handler communicates any guest-context changes
+///    (including a deliberate `Rsp`/`Rbp` rewrite, e.g. `exception_callback`'s own redirect) via
+///    the `CONTEXT` structure in memory, which this stack swap never touches, so nothing about the
+///    full handler's existing behavior changes -- only which stack ITS OWN Rust code executes on
+///    while deciding what to write into that `CONTEXT`.
+#[unsafe(naked)]
+unsafe extern "system" fn vectored_exception_handler_entry(
+    exception_info: *mut EXCEPTION_POINTERS,
+) -> i32 {
+    core::arch::naked_asm!(
+        "
+        // rcx = exception_info (EXCEPTION_POINTERS*), per the x64 'extern system' ABI. No stack
+        // use yet, so no shadow space/alignment to establish for this first, read-only portion.
+        mov     rax, [rcx]           // rax = ExceptionRecord*
+        mov     edx, [rax]           // edx = ExceptionRecord->ExceptionCode (i32)
+
+        // Read this thread's TlsState pointer via the same TEB-slot lookup pattern
+        // `syscall_callback` already uses elsewhere in this file. Needed by both the fast path
+        // below and the host-stack swap before falling through to the full handler, so done once,
+        // unconditionally, up front.
+        mov     r8d, DWORD PTR [rip + {TLS_INDEX}]
+        mov     r8, QWORD PTR gs:[r8 * 8 + {TEB_TLS_SLOTS_OFFSET}]
+        test    r8, r8
+        je      .Lsearch             // TLS not installed on this thread -- matches the full handler's
+                                      // own `get_tls_ptr()`-is-`None` early return: not our exception.
+
+        cmp     edx, {EXCEPTION_ACCESS_VIOLATION}
+        jne     .Lswap
+
+        rdfsbase r9
+        test    r9, r9
+        jne     .Lswap               // FS base is not zero; not this condition
+
+        mov     r10, [rcx + 8]       // r10 = ContextRecord*
+        mov     r11, [r10 + {CONTEXT_RIP}]
+        test    r11, r11
+        je      .Lswap               // Rip == 0: not a real instruction, let the full handler triage it
+
+        mov     rax, QWORD PTR [r8 + {GUEST_FS_BASE}]
+        test    rax, rax
+        je      .Lswap               // no saved FS base to restore; let the full handler decide
+
+        wrfsbase rax
+        mov     eax, {EXCEPTION_CONTINUE_EXECUTION}
+        ret
+
+    .Lswap:
+        // TLS is installed (r8 non-null, checked above) but `host_sp` is only populated by
+        // `run_thread_arch`'s own prologue, which runs strictly after `install_tls` -- there is a
+        // narrow window on every thread between the two where `TlsState` exists but `host_sp` is
+        // still its `TlsState::new()` default of null. Guard against swapping onto a null stack in
+        // that window; fall through to calling the full handler on whatever stack is already live,
+        // exactly as this trampoline did not exist -- strictly no worse than the pre-existing
+        // behavior for a window this narrow.
+        mov     r11, QWORD PTR [r8 + {HOST_SP}]
+        test    r11, r11
+        je      .Lcall_here
+
+        // Save the live (guest-address) rsp/rbp, then swap to this thread's real, Windows-
+        // registered host stack (`TlsState.host_sp`/`host_bp`) before calling the full handler, so
+        // ITS much larger frame -- and everything it calls -- runs on real, guard-page-protected
+        // memory instead of guest-address memory `__chkstk` cannot safely probe.
+        mov     r9, rsp
+        mov     r10, rbp
+        mov     rbp, QWORD PTR [r8 + {HOST_BP}]
+        // Reserve 48 bytes on the host stack: 32 for the Win64 shadow space the callee is entitled
+        // to write into, plus 16 to save the original guest rsp/rbp across the call (rsp must also
+        // land 16-byte-aligned at the `call` below, per the Win64 ABI -- `host_sp` is a fresh,
+        // untouched stack top and 48 is a multiple of 16, so this holds as long as `host_sp`
+        // itself came in aligned, which `run_thread_arch`'s own prologue -- a normal `extern
+        // \"C-unwind\"` function the Win64 ABI already requires 16-byte-aligned entry for --
+        // guarantees).
+        lea     rsp, [r11 - 48]
+        mov     QWORD PTR [rsp + 32], r9
+        mov     QWORD PTR [rsp + 40], r10
+
+        call    {vectored_exception_handler}
+
+        mov     r9, QWORD PTR [rsp + 32]
+        mov     r10, QWORD PTR [rsp + 40]
+        mov     rsp, r9
+        mov     rbp, r10
+        ret
+
+    .Lcall_here:
+        jmp     {vectored_exception_handler}
+
+    .Lsearch:
+        mov     eax, {EXCEPTION_CONTINUE_SEARCH}
+        ret
+        ",
+        EXCEPTION_ACCESS_VIOLATION = const Win32_Foundation::EXCEPTION_ACCESS_VIOLATION,
+        EXCEPTION_CONTINUE_EXECUTION = const EXCEPTION_CONTINUE_EXECUTION,
+        EXCEPTION_CONTINUE_SEARCH = const EXCEPTION_CONTINUE_SEARCH,
+        CONTEXT_RIP = const core::mem::offset_of!(
+            windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+            Rip
+        ),
+        TLS_INDEX = sym TLS_INDEX,
+        TEB_TLS_SLOTS_OFFSET = const 5248,
+        GUEST_FS_BASE = const core::mem::offset_of!(TlsState, guest_fs_base),
+        HOST_SP = const core::mem::offset_of!(TlsState, host_sp),
+        HOST_BP = const core::mem::offset_of!(TlsState, host_bp),
+        vectored_exception_handler = sym vectored_exception_handler,
+    );
 }
 
 unsafe extern "system" fn vectored_exception_handler(
@@ -865,7 +1019,7 @@ impl WindowsUserland {
         // Windows sets FS_BASE to 0 regularly upon scheduling; we register an exception handler
         // to set FS_BASE back to a "stored" value whenever we notice that it has become 0.
         unsafe {
-            let _ = AddVectoredExceptionHandler(0, Some(vectored_exception_handler));
+            let _ = AddVectoredExceptionHandler(0, Some(vectored_exception_handler_entry));
         }
 
         // Register a console control handler to receive Ctrl+C / Ctrl+Break
@@ -1144,6 +1298,13 @@ struct TlsState {
     /// leftover host state on every single syscall return. `NtContinue`'s `CONTEXT` was also
     /// never given `CONTEXT_FLOATING_POINT`, so the slow resume path had the identical gap.
     guest_xmm0_5: Cell<[u128; 6]>,
+    /// Mirrors `THREAD_FS_BASE`'s value for this thread, kept in sync by
+    /// `WindowsUserland::set_thread_fs_base`. `THREAD_FS_BASE` itself is a Rust `thread_local!`,
+    /// whose storage location is not reachable from hand-written assembly the way a plain
+    /// `#[repr(Rust)]` struct field is via `core::mem::offset_of!` -- this mirror exists solely so
+    /// `vectored_exception_handler_entry`'s naked fast path can read the saved FS base value
+    /// without depending on `thread_local!`'s internal ABI.
+    guest_fs_base: Cell<usize>,
     scratch: Cell<usize>,
     is_in_guest: Cell<bool>,
     interrupt: Cell<bool>,
@@ -1225,6 +1386,7 @@ impl TlsState {
             host_bp: Cell::new(core::ptr::null_mut()),
             guest_context_top: core::ptr::null_mut::<litebox_common_linux::PtRegs>().into(),
             guest_xmm0_5: Cell::new([0; 6]),
+            guest_fs_base: Cell::new(0),
             scratch: 0.into(),
             is_in_guest: false.into(),
             interrupt: false.into(),
