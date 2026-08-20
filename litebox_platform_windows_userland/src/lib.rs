@@ -2912,6 +2912,90 @@ impl litebox::platform::ArchSpecificProvider for WindowsUserland {
             _ => Err(litebox::platform::ArchSpecificError::RegisterUnsupported),
         }
     }
+
+    /// Writes the guest's live xmm0-xmm15 (256 bytes) into `out[..256]`.
+    ///
+    /// Correctness depends on the same invariant `guest_xmm0_5` itself relies on (see that
+    /// field's doc comment): whenever host Rust code is running (which this function's own
+    /// caller always is, since it's a plain Rust method, never reached from the naked-asm guest
+    /// entry trampolines directly), xmm0-xmm5 are the Windows x64 ABI's *caller-saved* registers
+    /// -- any host code between a guest exit and this call is free to have clobbered them, so the
+    /// only reliably-guest-valid copy is the one `syscall_callback` already captured into
+    /// `TlsState.guest_xmm0_5` before any other host code ran. xmm6-xmm15 are *callee*-saved by
+    /// the same ABI, and `run_thread_arch`'s own prologue/epilogue already preserves them for the
+    /// guest-thread's *entire* lifetime around all host code -- so those six-through-fifteen are
+    /// still genuinely live, guest-valid values in the real hardware registers right now, with no
+    /// separate capture needed.
+    fn get_fp_state(&self, out: &mut [u8]) -> Result<(), litebox::platform::ArchSpecificError> {
+        const XMM_BYTES: usize = 16 * 16;
+        if out.len() < XMM_BYTES {
+            return Err(litebox::platform::ArchSpecificError::RegisterUnpermittedValue);
+        }
+        let Some(tls) = get_tls_ptr() else {
+            return Err(litebox::platform::ArchSpecificError::RegisterUnsupported);
+        };
+        let tls = unsafe { &*tls };
+        out[0..96].copy_from_slice(tls.guest_xmm0_5.get().as_bytes());
+        let p = out.as_mut_ptr();
+        unsafe {
+            core::arch::asm!(
+                "movups [{p} + 6*16], xmm6",
+                "movups [{p} + 7*16], xmm7",
+                "movups [{p} + 8*16], xmm8",
+                "movups [{p} + 9*16], xmm9",
+                "movups [{p} + 10*16], xmm10",
+                "movups [{p} + 11*16], xmm11",
+                "movups [{p} + 12*16], xmm12",
+                "movups [{p} + 13*16], xmm13",
+                "movups [{p} + 14*16], xmm14",
+                "movups [{p} + 15*16], xmm15",
+                p = in(reg) p,
+                options(nostack),
+            );
+        }
+        Ok(())
+    }
+
+    /// Writes `state[..256]` back into the guest's real xmm0-xmm15, the inverse of
+    /// [`Self::get_fp_state`]. See that function's doc comment for why xmm0-5 must go through
+    /// `TlsState.guest_xmm0_5` (restored to the live registers later, at the same point
+    /// `switch_to_guest`'s existing xmm0-5 restore already runs) rather than being written to the
+    /// hardware registers directly here: this call's own caller is host Rust code, so any xmm0-5
+    /// value written straight to hardware now would just be clobbered by the next caller-saved
+    /// use before the guest ever resumes.
+    fn set_fp_state(&self, state: &[u8]) -> Result<(), litebox::platform::ArchSpecificError> {
+        const XMM_BYTES: usize = 16 * 16;
+        if state.len() < XMM_BYTES {
+            return Err(litebox::platform::ArchSpecificError::RegisterUnpermittedValue);
+        }
+        let Some(tls) = get_tls_ptr() else {
+            return Err(litebox::platform::ArchSpecificError::RegisterUnsupported);
+        };
+        let tls = unsafe { &*tls };
+        let mut xmm0_5 = [0u128; 6];
+        xmm0_5.as_mut_bytes().copy_from_slice(&state[0..96]);
+        tls.guest_xmm0_5.set(xmm0_5);
+        let p = state.as_ptr();
+        unsafe {
+            core::arch::asm!(
+                "movups xmm6, [{p} + 6*16]",
+                "movups xmm7, [{p} + 7*16]",
+                "movups xmm8, [{p} + 8*16]",
+                "movups xmm9, [{p} + 9*16]",
+                "movups xmm10, [{p} + 10*16]",
+                "movups xmm11, [{p} + 11*16]",
+                "movups xmm12, [{p} + 12*16]",
+                "movups xmm13, [{p} + 13*16]",
+                "movups xmm14, [{p} + 14*16]",
+                "movups xmm15, [{p} + 15*16]",
+                p = in(reg) p,
+                out("xmm6") _, out("xmm7") _, out("xmm8") _, out("xmm9") _, out("xmm10") _,
+                out("xmm11") _, out("xmm12") _, out("xmm13") _, out("xmm14") _, out("xmm15") _,
+                options(nostack, readonly),
+            );
+        }
+        Ok(())
+    }
 }
 
 type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::UserConstPtr<

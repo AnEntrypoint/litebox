@@ -31,6 +31,27 @@ pub trait ArchSpecificProvider {
         reg: &ArchSpecificRegister,
         val: usize,
     ) -> Result<(), ArchSpecificError>;
+
+    /// Read the current guest thread's floating-point/SIMD register state into `out`.
+    ///
+    /// This exists so a shim's signal-delivery path can snapshot the guest's FP/SIMD registers
+    /// into the signal frame it hands the guest's handler, the same way real Linux does -- `Err`
+    /// (default: unsupported) means the shim must fall back to real Linux's own null-`fpstate`
+    /// convention (no FP state saved this delivery) rather than fabricate a value.
+    fn get_fp_state(&self, out: &mut [u8]) -> Result<(), ArchSpecificError> {
+        let _ = out;
+        Err(ArchSpecificError::RegisterUnsupported)
+    }
+
+    /// Write `state` back into the current guest thread's floating-point/SIMD registers, the
+    /// inverse of [`Self::get_fp_state`]. `state` must be the exact bytes a prior `get_fp_state`
+    /// call on this same platform produced (or the platform's own null/identity state) -- this is
+    /// not a generic register-file loader, it exists solely to restore what signal delivery
+    /// captured.
+    fn set_fp_state(&self, state: &[u8]) -> Result<(), ArchSpecificError> {
+        let _ = state;
+        Err(ArchSpecificError::RegisterUnsupported)
+    }
 }
 
 /// Architecture-specific registers.

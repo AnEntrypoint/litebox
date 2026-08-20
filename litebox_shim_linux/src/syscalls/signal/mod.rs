@@ -14,6 +14,8 @@ use litebox_common_linux::signal::SignalDisposition;
 #[cfg(target_arch = "x86_64")]
 use x86_64 as arch;
 use zerocopy::FromZeros;
+#[cfg(target_arch = "x86_64")]
+use zerocopy::IntoBytes;
 
 use crate::syscalls::process::ExitStatus;
 use crate::{ShimFS, ShimPlatform, Task, UserPtr, UserPtrMut};
@@ -21,6 +23,8 @@ use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use litebox::{shim::Exception, sync::Mutex, utils::ReinterpretUnsignedExt as _};
+#[cfg(target_arch = "x86_64")]
+use litebox::utils::TruncateExt as _;
 use litebox_common_linux::signal::{
     MINSIGSTKSZ, NSIG, SI_KERNEL, SI_USER, SIG_DFL, SIG_IGN, SaFlags, SigAction, SigAltStack,
     SigSet, Siginfo, SiginfoData, SigmaskHow, Signal, SsFlags, Ucontext,
@@ -376,6 +380,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
 
     fn deliver_signal(
         &self,
+        platform: &Platform,
         signal: Signal,
         siginfo: &Siginfo,
         action: &SigAction,
@@ -417,7 +422,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             );
         }
 
-        self.write_signal_frame(frame_addr, siginfo, action, ctx, sigreturn_trampoline)?;
+        self.write_signal_frame(platform, frame_addr, siginfo, action, ctx, sigreturn_trampoline)?;
 
         let mut mask = self.blocked.get() | action.mask;
         if !action.flags.contains(SaFlags::NODEFER) {
@@ -605,6 +610,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.signals.set_sigaltstack(uctx.stack).ok();
 
         self.signals.set_signal_mask(uctx.sigmask);
+
+        // Restore xmm0-xmm15 from the fpstate block this same handler's `write_signal_frame`
+        // wrote, if any (non-null fpstate = this delivery genuinely captured FP state; null =
+        // real Linux's own "no FP state was saved" convention, honestly left alone rather than
+        // writing a fabricated value into the guest's real registers). Best-effort: a guest that
+        // corrupted `mcontext.fpstate` itself (rare, and its own doing) just skips FP restore
+        // rather than faulting the whole sigreturn.
+        #[cfg(target_arch = "x86_64")]
+        if uctx.mcontext.fpstate != 0 {
+            let fpstate_ptr =
+                UserPtr::<litebox_common_linux::signal::x86_64::FpState>::from_usize(
+                    uctx.mcontext.fpstate.trunc(),
+                );
+            if let Some(fpregs) = fpstate_ptr.read_at_offset::<Platform>(0) {
+                let _ = self
+                    .global
+                    .platform
+                    .set_fp_state(fpregs.xmm_space.as_bytes());
+            }
+        }
 
         Ok(arch::restore_sigcontext(ctx, &uctx.mcontext))
     }
@@ -834,6 +859,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     #[cfg(not(target_arch = "aarch64"))]
                     let sigreturn_trampoline = 0;
                     if let Err(DeliverFault) = self.signals.deliver_signal(
+                        self.global.platform,
                         signal,
                         &siginfo,
                         &action,

@@ -44,6 +44,12 @@ pub(super) fn get_signal_frame(sp: usize, _action: &SigAction) -> usize {
 impl<Platform: ShimPlatform> SignalState<Platform> {
     pub(super) fn write_signal_frame(
         &self,
+        // aarch64 FPSIMD-context capture/restore is not yet implemented (no `FpsimdContext`
+        // struct exists yet in litebox_common_linux::signal::aarch64, unlike x86_64's `FpState`)
+        // -- this parameter exists only for signature symmetry with the shared `deliver_signal`
+        // caller and x86_64's own `write_signal_frame`; genuinely unused until that follow-up
+        // lands.
+        _platform: &Platform,
         frame_addr: usize,
         siginfo: &Siginfo,
         action: &SigAction,
