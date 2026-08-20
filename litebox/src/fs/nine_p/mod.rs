@@ -609,8 +609,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         flags: super::OFlags,
         mode: super::Mode,
     ) -> Result<FileFd<Platform, T>, super::errors::OpenError> {
-        // TODO: we don't support non-blocking, so ignore that flag instead of returning an error
+        // We don't support non-blocking, so ignore that flag instead of returning an error.
         let flags = flags - OFlags::NONBLOCK;
+        // Every flag here is one `oflags_to_lopen` (below) actually translates to its 9P
+        // `Lopen` wire equivalent -- this allowlist previously lagged that function, so an
+        // ordinary `open(path, O_WRONLY|O_CREAT|O_TRUNC)` (one of the single most common
+        // open patterns in real software) unconditionally panicked the whole runner even
+        // though the translation for TRUNC/APPEND/etc. was already implemented and correct.
         let currently_supported_oflags: OFlags = OFlags::RDONLY
             | OFlags::WRONLY
             | OFlags::RDWR
@@ -618,7 +623,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             | OFlags::NOCTTY
             | OFlags::EXCL
             | OFlags::DIRECTORY
-            | OFlags::LARGEFILE;
+            | OFlags::LARGEFILE
+            | OFlags::TRUNC
+            | OFlags::APPEND
+            | OFlags::NOFOLLOW
+            | OFlags::SYNC
+            | OFlags::DSYNC
+            | OFlags::DIRECT
+            | OFlags::NOATIME;
         if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!("{flags:?}")
         }
