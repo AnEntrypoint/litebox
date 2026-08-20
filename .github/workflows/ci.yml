@@ -116,8 +116,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: ./.github/tools/github_actions_run_cargo fmt
       - run: |
-          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features -p litebox -p litebox_common_linux
-          ./.github/tools/github_actions_run_cargo build -p litebox -p litebox_common_linux
+          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features -p litebox -p litebox_common_linux -p litebox_shim_linux -p litebox_platform_linux_userland
+          ./.github/tools/github_actions_run_cargo build -p litebox -p litebox_common_linux -p litebox_shim_linux -p litebox_platform_linux_userland
           ./.github/tools/github_actions_run_cargo nextest -p litebox -p litebox_common_linux
 
   build_and_test_lvbs:

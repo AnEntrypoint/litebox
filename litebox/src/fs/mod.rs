@@ -142,7 +142,7 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
 
     /// Rename (move) `from` to `to`, atomically replacing `to` if it already exists.
     ///
-    /// Only regular-file renames are currently supported (directory rename returns
+    /// Regular-file and symlink renames are supported (directory rename returns
     /// [`RenameError::IsADirectory`]) -- this covers the common "atomically replace a file with a
     /// freshly-written temp file" pattern (e.g. package managers like `apk` installing a
     /// downloaded package), which is the scenario this method exists to support. `from` and `to`

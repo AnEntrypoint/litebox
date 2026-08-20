@@ -1821,7 +1821,7 @@ where
         st_rdev: 0,
         st_size: 0,
         #[cfg(target_arch = "aarch64")]
-        st_blksize: blksize as i32,
+        st_blksize: i32::try_from(blksize).unwrap_or(i32::MAX),
         #[cfg(not(target_arch = "aarch64"))]
         st_blksize: blksize,
         st_blocks: 0,

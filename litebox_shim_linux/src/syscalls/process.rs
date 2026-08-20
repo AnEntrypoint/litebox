@@ -824,7 +824,7 @@ enum ThreadInitState {
     /// the parent's address space before they silently corrupt the still-running parent). See
     /// [`litebox::platform::ForkChildVerificationProvider`].
     ForkedChild(
-        litebox_common_linux::PtRegs,
+        Box<litebox_common_linux::PtRegs>,
         usize,
         alloc::sync::Arc<litebox::mm::AddressRelocations>,
     ),
@@ -2309,7 +2309,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             (
                 thread,
                 ThreadInitState::ForkedChild(
-                    child_ctx,
+                    Box::new(child_ctx),
                     fs_base,
                     alloc::sync::Arc::new(relocations),
                 ),
@@ -3639,7 +3639,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .set_arch_specific_register(&ArchSpecificRegister::TpidrEl0, fs_base)
                         .unwrap();
                 }
-                *ctx = parent_ctx;
+                *ctx = *parent_ctx;
                 // This runs on the child's own (brand-new) host thread, immediately before it
                 // first resumes into guest code -- ask the platform to verify that the child
                 // never executes at, nor writes through, a stale pointer into the parent's
