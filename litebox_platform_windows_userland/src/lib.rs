@@ -1792,10 +1792,34 @@ fn thread_start(
     >,
     mut ctx: litebox_common_linux::PtRegs,
 ) {
-    // Allow caller to run some code before we return to the new thread.
-    let shim = init_thread.init();
+    let tls_state = TlsState::new();
+    tls_state
+        .guest_context_top
+        .set(std::ptr::from_mut(&mut ctx).wrapping_add(1));
 
-    run_thread_inner(shim.as_ref(), &mut ctx, None);
+    ThreadHandle::run_with_handle(&tls_state, || {
+        // `init_thread.init()` -- which, for a `fork()` child, does real work capable of
+        // faulting or arming `EFLAGS.TF` (`ThreadInitState::ForkedChild`'s `sys_arch_prctl`/
+        // `begin_fork_child_verification` calls in `litebox_shim_linux`) -- must run strictly
+        // AFTER `install_tls` (done by `run_with_handle` above), never before: this thread's
+        // Windows TLS slot is otherwise still unpopulated, so `vectored_exception_handler`'s
+        // very first check (`get_tls_ptr()`) finds nothing, bails via
+        // `EXCEPTION_CONTINUE_SEARCH`, and every one of this file's own carefully-built
+        // exception repair paths (the FS_BASE-reset repair, fork_verify's single-step healing)
+        // is silently bypassed for any fault raised during that window -- confirmed live as the
+        // cause of a 100%-reproducible stack overflow on `sh -c "a; b"` (any two-command shell
+        // sequence forking a child): `LITEBOX_VEH_TRACE=1` showed zero `[veh]` trace lines
+        // despite a real, dispatched exception, which is only possible via that early-return.
+        let shim = init_thread.init();
+
+        // Allow caller to run some code before we return to the new thread.
+        let mut thread_ctx = ThreadContext {
+            shim: shim.as_ref(),
+            ctx: &mut ctx,
+            tls: &tls_state,
+        };
+        unsafe { run_thread_arch(&mut thread_ctx, &tls_state) };
+    });
 }
 
 impl litebox::platform::ThreadProvider for WindowsUserland {
@@ -1810,9 +1834,21 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
             dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
         >,
     ) -> Result<(), Self::ThreadSpawnError> {
+        // Guest code (both a brand-new thread's entry point and a `fork()` child resuming via
+        // `ThreadInitState::ForkedChild`) runs directly on this real Windows thread's own stack --
+        // there is no separate emulated guest-stack region (see `switch_to_guest`'s doc comment).
+        // `std::thread::Builder`'s default stack size (1 MiB on Windows) is far smaller than a
+        // Linux guest program is entitled to assume (`DEFAULT_STACK_SIZE` in
+        // `litebox_shim_linux::loader` is 8 MiB, matching real Linux's default `ulimit -s`).
+        // Mirror the guest's own expected stack size here so an undersized real host stack is
+        // never a needless bottleneck; TODO(perf): const should live at a shared layer both
+        // crates use instead of being duplicated here once one exists.
+        const GUEST_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
         let ctx = ctx.clone();
         // TODO: do we need to wait for the handle in the main thread?
-        let _handle = std::thread::Builder::new().spawn(move || thread_start(init_thread, ctx))?;
+        let _handle = std::thread::Builder::new()
+            .stack_size(GUEST_THREAD_STACK_SIZE)
+            .spawn(move || thread_start(init_thread, ctx))?;
 
         Ok(())
     }
