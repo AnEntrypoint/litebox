@@ -72,14 +72,32 @@ pub struct Fault;
 pub unsafe fn memcpy_fallible(dst: *mut u8, src: *const u8, size: usize) -> Result<(), Fault> {
     #[cfg(target_arch = "x86_64")]
     unsafe {
+        // `rep movsb` alone is byte-granularity for the ENTIRE copy -- correct, but far slower
+        // than necessary for the large (multi-MiB to multi-GiB) regions `Vmem::duplicate` copies
+        // at `fork()` time (see that function's call site): moving one byte per iteration instead
+        // of eight leaves most of the copy bandwidth on the table. `rep movsq` moves 8 bytes per
+        // iteration for the bulk of the copy, then a second `rep movsb` handles the 0..7-byte
+        // tail (or the whole copy, when `size < 8`, since `movsq` runs zero times). `dst`/`src`
+        // are left exactly where `rep movsq` advanced them to (RDI/RSI advance by 8 per
+        // iteration, `RCX` counts iterations, not bytes -- so after `rep movsq` completes, RDI/RSI
+        // point at the first untouched byte and only the byte count in RCX needs resetting for
+        // the tail). Every faulting load/store stays covered by the single [2:, 3:) exception
+        // table range spanning both `rep`s -- a fault in either phase lands at the same recovery
+        // label, discarding whatever partial progress happened, matching this function's existing
+        // documented contract (partially-copied destination is observable to the caller).
+        let qword_count = size / 8;
+        let tail_len = size & 7;
         core::arch::asm! {
             "2:",
+            "rep movsq",
+            "mov rcx, {tail_len}",
             "rep movsb",
             "3:",
             ex_table_entry!("2b", "3b", "{fault}"),
-            inout("di") dst => _,
-            inout("si") src => _,
-            inout("cx") size => _,
+            inout("rdi") dst => _,
+            inout("rsi") src => _,
+            inout("rcx") qword_count => _,
+            tail_len = in(reg) tail_len,
             fault = label { return Err(Fault) }
         }
     }
