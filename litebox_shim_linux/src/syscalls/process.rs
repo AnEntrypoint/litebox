@@ -3592,12 +3592,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.load_program(loader, argv_vec, envp_vec)
             .expect("TODO: terminate the process cleanly");
 
+        self.init_thread_context(ctx);
+
         // If this process was created via `vfork()`, this is the point its POSIX-mandated
         // parent suspension ends (see `Process::wait_for_vfork_done`'s doc comment). A no-op for
-        // a plain `fork()`ed or never-vforked process.
+        // a plain `fork()`ed or never-vforked process. Deliberately AFTER `init_thread_context`:
+        // this wakes the suspended vfork parent, whose thread resumes concurrently on its own
+        // real OS thread from that point on, so everything this thread still needs to set up for
+        // ITSELF (finishing the new program's initial register/stack state) must be done first.
+        // Confirmed live (`LITEBOX_LOG=warn` progress markers): with the old ordering, a SECOND
+        // (nested) vfork's exec -- e.g. `gcc` (itself a vfork child of a shell/`posix_spawn`
+        // caller) vforking `cc1` -- silently died between `signal_vfork_done()` and
+        // `init_thread_context()`, never reaching the final "returning from sys_execve" point,
+        // because waking the suspended grandparent let it resume concurrently on its own real OS
+        // thread while this thread's own new-program register/stack state was still mid-setup.
         self.process().signal_vfork_done();
-
-        self.init_thread_context(ctx);
         Ok(0)
     }
 
