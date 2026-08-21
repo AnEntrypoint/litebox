@@ -836,11 +836,28 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             }
             FixedAddressBehavior::Replace => {
                 if self.vmas.overlaps(&(start..end)) {
-                    if self.vmas.gaps(&(start..end)).next().is_some() {
-                        // The range is partially overlapping with existing
-                        // mappings. If we call into the platform with
-                        // `Replace`, then it may overwrite external mappings
-                        // that are not managed by us.
+                    if self.vmas.gaps(&(start..end)).next().is_some()
+                        // A partial overlap is only unsafe to blindly `Replace` over when some
+                        // piece of it is a REAL guest mapping (non-empty flags) this shim doesn't
+                        // own the full picture of. An empty-flags entry is one of `new_excluding`'s
+                        // own reserved-but-not-guest-visible placeholders -- reserved specifically
+                        // so *some* guest allocation doesn't land there and silently alias host
+                        // memory, not a promise that no guest allocation may ever legitimately need
+                        // that exact address. A `MAP_FIXED` request (real Linux: unconditionally
+                        // overwrites whatever is there) whose target happens to straddle one of
+                        // these placeholders is exactly the case `new_excluding`'s own reservation
+                        // was defending against becoming unrepresentable -- allow it through rather
+                        // than rejecting a legitimate ELF segment placement (confirmed live: cc1's
+                        // own large BSS/data segment straddling a small reserved placeholder,
+                        // `vfork-child-execve-large-elf-enomem` investigation) with ENOMEM.
+                        && self
+                            .vmas
+                            .iter()
+                            .any(|(r, vma)| r.start < end && r.end > start && !vma.flags.is_empty())
+                    {
+                        // The range is partially overlapping with a REAL (non-empty-flags) guest
+                        // mapping. If we call into the platform with `Replace`, then it may
+                        // overwrite external mappings that are not managed by us.
                         //
                         // FUTURE: support this case, either by splitting this
                         // into multiple allocate calls or by separating VA
@@ -849,9 +866,27 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     }
                     FixedAddressBehavior::Replace
                 } else {
-                    // There are no mappings managed by us, so just treat this
-                    // as NoReplace.
-                    FixedAddressBehavior::NoReplace
+                    // No mapping *managed by us* overlaps this range, but the host may still
+                    // have real, committed pages here that we once tracked and released --
+                    // `deallocate_pages` decommits but does not always fully release the
+                    // underlying host reservation immediately (e.g. a second/third-generation
+                    // `fork()`-duplicated process's own prior `execve()` can leave a stale
+                    // committed region at a host address no longer present in `self.vmas` at
+                    // all, confirmed live: a real ELF's own link-time base address, e.g.
+                    // `0x400000`, reused by two DIFFERENT guest programs executed in sequence
+                    // within the same duplicated address space -- see the
+                    // `vfork-child-execve-large-elf-enomem` investigation). Real Linux's
+                    // `MAP_FIXED` (without `MAP_FIXED_NOREPLACE`) unconditionally overwrites
+                    // whatever is at the target address regardless of who put it there --
+                    // downgrading to `NoReplace` here because *we* have no record of an
+                    // overlap incorrectly rejects a legitimate `MAP_FIXED` call the instant the
+                    // host's own bookkeeping and ours have drifted apart, even though nothing
+                    // about the request itself is unsafe: `allocate_pages` below already knows
+                    // how to decommit-then-recommit a genuinely `MEM_COMMIT` host region for
+                    // `Replace`. Pass `Replace` through unconditionally so a guest-untracked but
+                    // host-committed leftover gets cleanly overwritten instead of spuriously
+                    // failing with `AddressInUse`/`ENOMEM`.
+                    FixedAddressBehavior::Replace
                 }
             }
         };
@@ -1740,9 +1775,21 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             } else {
                 0
             };
-            let start = r.start.checked_sub(size + gap_below_r.max(gap_above_new))?;
+            // `checked_sub` underflowing here means `r` sits too close to address 0 for a
+            // region of this `size` to fit BELOW it -- not that no region anywhere can fit.
+            // `self.vmas.iter().rev()` walks from the highest mapped range down to the lowest,
+            // so a later (lower-address) `r` is exactly where this underflow becomes likely
+            // (e.g. one of `new_excluding`'s own low, small reserved-placeholder pieces) while
+            // an earlier, higher-address `r` may already have offered a perfectly good gap this
+            // early-return would otherwise discard, or a still-lower `r` might. Skip this one
+            // candidate and keep searching rather than aborting the whole scan -- mirroring the
+            // `start > high_limit` case just below, which already treats "this candidate doesn't
+            // work" as a reason to try the next one, not a reason to give up entirely.
+            let Some(start) = r.start.checked_sub(size + gap_below_r.max(gap_above_new)) else {
+                continue;
+            };
             if start < low_limit {
-                return None;
+                continue;
             }
             if start > high_limit {
                 // Note we may have pre-allocated memory that are higher than `TASK_ADDR_MAX`
@@ -1754,6 +1801,18 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             }
         }
 
+        // A genuine address-space exhaustion is rare enough (`TASK_ADDR_MAX` is enormous) that
+        // logging every occurrence is cheap, and the alternative -- a bare `ENOMEM` with no
+        // further context -- has repeatedly cost real investigation time (see the
+        // `vfork-child-execve-large-elf-enomem` investigation, where the actual cause turned out
+        // to be a `FixedAddressBehavior` decision two call frames up, not a real capacity limit,
+        // and this log line's absence during that investigation was itself a signal worth having).
+        litebox_util_log::warn!(
+            size:% = size, low_limit:% = low_limit, high_limit:% = high_limit,
+            vmas_count:% = self.vmas.iter().count(),
+            last_range:? = self.vmas.last_range_value().map(|r| r.0.clone());
+            "get_unmmaped_area: exhausted top-down search, no gap large enough"
+        );
         None
     }
 }
