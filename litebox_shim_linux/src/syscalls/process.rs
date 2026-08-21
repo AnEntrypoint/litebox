@@ -1994,6 +1994,37 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 translate_reg!(r9);
                 translate_reg!(r10);
                 translate_reg!(r11);
+
+                // An explicit `stack` argument (real Linux: clone(2)'s 2nd argument) means the
+                // caller built a SEPARATE, purpose-built stack for this child rather than
+                // intending it to continue on (a duplicate of) the calling thread's own current
+                // stack -- musl/glibc's posix_spawn() is the canonical example: it deliberately
+                // allocates its own small `char stack[1024+PATH_MAX]` buffer specifically so the
+                // vforked child does not have to share posix_spawn's own (potentially large,
+                // deeply-nested) frame, and passes `stack+sizeof stack` as clone()'s stack
+                // argument. Every register translated above still needs translating (rbp/rbx/
+                // r12-r15/etc. may legitimately hold pointers into the PARENT's other memory the
+                // child inherits unchanged), but `rsp`/`rbp` specifically must come from this
+                // explicit stack, not from `ctx.rsp` (the calling thread's stack pointer at the
+                // moment of the `clone()` syscall trap, which for a deeply-nested caller like
+                // posix_spawn() is somewhere inside ITS OWN frame -- an address that, once
+                // translated, is a perfectly valid, in-range destination-space stack address, but
+                // the WRONG one: not where the caller's `mov arg,(%rsi)`-style stack-relative
+                // hand-off actually wrote anything). Silently reusing the parent's own `rsp` here
+                // resumes the child on a plausible-looking but unrelated stack region, so its
+                // first `pop`/stack-relative read returns whatever leftover frame content
+                // happens to sit there instead of the value the caller intentionally placed at
+                // the explicit stack's top -- confirmed live as the root cause of a real SIGSEGV
+                // in musl's posix_spawn() (`gcc-cc1-posix-spawnp-invalid-argument` investigation):
+                // its child() helper's very first `pop %rdi` (retrieving `&args`) read garbage
+                // from the wrong stack entirely, with every downstream field access built on that
+                // one wrong pointer.
+                if let Some(explicit_sp) = sp {
+                    let translated_sp = relocations.translate(explicit_sp).unwrap_or(explicit_sp);
+                    child_ctx.rsp = translated_sp;
+                    child_ctx.rbp = translated_sp;
+                }
+
                 // Clear privileged/reserved RFLAGS bits and normalize CS/SS to the user ABI
                 // values before this context is ever resumed on a brand-new thread -- see
                 // PtRegs::sanitize_for_user_return's doc comment.
