@@ -1078,26 +1078,23 @@ fn read_code_bytes(rip: usize, buf: &mut [u8]) -> usize {
 
 /// Whether `addr` is in a committed, readable region of the host address space.
 fn is_readable(addr: usize) -> bool {
-    use windows_sys::Win32::System::Memory as Win32_Memory;
-    const NO_ACCESS: u32 = Win32_Memory::PAGE_NOACCESS | Win32_Memory::PAGE_GUARD;
-
-    let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
-    let ok = unsafe {
-        Win32_Memory::VirtualQuery(
-            addr as *const core::ffi::c_void,
-            &raw mut mbi,
-            core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
-        ) != 0
-    };
-    if !ok || mbi.State != Win32_Memory::MEM_COMMIT {
-        return false;
-    }
-    mbi.Protect & NO_ACCESS == 0
+    readable_and_writable(addr).0
 }
 
-/// Whether `addr` is in a committed, writable region of the host address space.
-fn is_writable(addr: usize) -> bool {
+/// A single `VirtualQuery` call answering both "is `addr` in a committed, readable region" and
+/// "is `addr` in a committed, writable region" of the host address space -- the shared query
+/// [`is_readable`] and [`write_usize_fault_tolerant`] both need, split out so a caller needing
+/// both answers (like `write_usize_fault_tolerant`'s common RELRO/GOT-healing path) pays for one
+/// Windows kernel round-trip instead of two. `VirtualQuery` walks the process's VAD tree, whose
+/// cost scales with the process's total committed memory (confirmed independently: real-world
+/// tools like Cheat Engine measure a visible slowdown from repeated `VirtualQuery`/
+/// `VirtualQueryEx` calls against a large address space) -- this is called from `fork_verify`'s
+/// single-step-triggered healing path, potentially thousands of times per verified `fork()`
+/// child, so halving the syscall count here is a real, input-size-independent win on every call,
+/// largest exactly where it matters most (a large guest process forking).
+fn readable_and_writable(addr: usize) -> (bool, bool) {
     use windows_sys::Win32::System::Memory as Win32_Memory;
+    const NO_ACCESS: u32 = Win32_Memory::PAGE_NOACCESS | Win32_Memory::PAGE_GUARD;
     const WRITABLE: u32 = Win32_Memory::PAGE_READWRITE
         | Win32_Memory::PAGE_WRITECOPY
         | Win32_Memory::PAGE_EXECUTE_READWRITE
@@ -1112,9 +1109,9 @@ fn is_writable(addr: usize) -> bool {
         ) != 0
     };
     if !ok || mbi.State != Win32_Memory::MEM_COMMIT {
-        return false;
+        return (false, false);
     }
-    mbi.Protect & WRITABLE != 0
+    (mbi.Protect & NO_ACCESS == 0, mbi.Protect & WRITABLE != 0)
 }
 
 /// If `instruction` writes to memory, computes the effective address it writes to from its
@@ -1231,15 +1228,19 @@ fn write_usize_fault_tolerant(addr: usize, value: usize) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    if is_writable(addr) {
-        // SAFETY: `is_writable` confirmed `addr` is in a committed, writable region; see
+    // See `readable_and_writable`'s doc comment for why this is one query instead of separate
+    // `is_writable`/`is_readable` calls.
+    let (readable, writable) = readable_and_writable(addr);
+
+    if writable {
+        // SAFETY: the query above confirmed `addr` is in a committed, writable region; see
         // `read_usize_fault_tolerant`'s comment on why a full `usize` is always in-bounds here.
         // Holding `VIRTUAL_PROTECT_LOCK` (above) keeps this check-then-write atomic with respect
         // to any concurrent `VirtualProtect` on the same page from another thread.
         unsafe { core::ptr::write_unaligned(addr as *mut usize, value) };
         return;
     }
-    if !is_readable(addr) {
+    if !readable {
         // Not committed/accessible at all: nothing to patch.
         return;
     }
