@@ -1705,13 +1705,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Creates a new thread or process.
     ///
-    /// Thread-style clone requires VM, THREAD, SIGHAND, and FILES all set (sharing address
-    /// space, thread group, signal handlers, and fd table with the caller). Process-style clone
-    /// (real `fork()`/`vfork()`) requires NONE of VM/THREAD/SIGHAND/FILES set: the child gets
-    /// its own address space (an eager duplicate of the caller's, at possibly-different host
-    /// addresses -- see [`litebox::mm::PageManager::duplicate`]'s doc comment on the resulting
-    /// address-relocation limitation), its own thread group, and its own fd table (an
-    /// independent copy sharing the same underlying open file descriptions).
+    /// The address-space decision is keyed on `CLONE_VM` alone, not on the historical
+    /// all-4-flags-or-nothing split: `CLONE_VM` set shares the caller's address space in place
+    /// (the classic `pthread_create` shape, always paired with THREAD/SIGHAND/FILES); `CLONE_VM`
+    /// absent gives the child its own address space (an eager duplicate of the caller's, at
+    /// possibly-different host addresses -- see [`litebox::mm::PageManager::duplicate`]'s doc
+    /// comment on the resulting address-relocation limitation) and, since that requires building
+    /// a brand-new `Process`, also a new pid and its own thread group -- regardless of whether
+    /// THREAD/SIGHAND/FILES happen to be set too. `fs`/`files` sharing already keys off the
+    /// individual `CLONE_FS`/`CLONE_FILES` flags either way (see below).
+    ///
+    /// This matters for musl/glibc's `posix_spawn`, which internally calls
+    /// `clone(CLONE_VM-less, CLONE_THREAD | CLONE_SIGHAND | CLONE_FILES)`: an independent address
+    /// space (safety: the spawn helper must not corrupt the caller's memory before `execve`), but
+    /// shared fd table and signal-handler table for `posix_spawn`'s own contract. Real `fork()`/
+    /// `vfork()` (no flags at all) falls out of the same `!CLONE_VM` test.
     #[expect(
         clippy::similar_names,
         reason = "pid/ppid is standard Unix terminology"
@@ -1744,17 +1752,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             flags.remove(CloneFlags::DETACHED);
         }
 
-        let thread_clone_flags =
-            CloneFlags::VM | CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::FILES;
-
-        // Real `fork()`/`vfork()` set none of VM/THREAD/SIGHAND/FILES: the child gets its own
-        // address space, its own thread group (i.e. becomes a new process), its own signal
-        // handler table copy, and its own (initially fd-table-copied) files. `vfork()` sets
-        // VFORK in addition; it is otherwise the same shape (see sys_vfork's caller, which sets
-        // exit_signal but not VM/THREAD/SIGHAND/FILES either).
-        let is_process_clone = !flags.intersects(
-            CloneFlags::VM | CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::FILES,
-        );
+        // `CLONE_VM` decides whether the child shares the caller's address space (thread-style:
+        // `pm` reused in place, child stays attached to the caller's existing `Process`) or gets
+        // its own (process-style: a brand-new `Process`, built by duplicating the caller's
+        // address space -- real `fork()` sets no flags at all and falls out of this same test;
+        // musl/glibc's `posix_spawn` sets THREAD|SIGHAND|FILES but NOT VM, and must land here too
+        // so its child gets a real, independently-addressed, waitable pid rather than being
+        // rejected outright). `fs`/`files` sharing below already keys off the individual
+        // `CLONE_FS`/`CLONE_FILES` flags regardless of which branch this takes.
+        //
+        // `CLONE_VFORK` is a deliberate exception to the `CLONE_VM` rule above: real `vfork()`
+        // sets `CLONE_VM | CLONE_VFORK` (musl/glibc, confirmed live: gcc's `cc1` invocation issues
+        // exactly `CloneFlags(16640)` = `VM | VFORK`), which on real Linux really does share the
+        // address space until the child calls `execve`/`_exit`. This shim never shares -- it
+        // always builds the child via `pm.duplicate()` (see the `is_process_clone` branch below)
+        // and instead emulates `vfork()`'s "parent blocked until child execve/exits" contract via
+        // `wait_for_vfork_done` (gated on `is_process_clone && CLONE_VFORK`, further down) --
+        // giving equivalent *observable* behavior without ever needing raw VM sharing. So a
+        // `CLONE_VFORK` clone must classify as `is_process_clone = true` exactly like plain
+        // `fork()`, regardless of `CLONE_VM` being set alongside it.
+        let is_process_clone = !flags.contains(CloneFlags::VM) || flags.contains(CloneFlags::VFORK);
 
         let supported_clone_flags = CloneFlags::VM
             | CloneFlags::FS
@@ -1777,11 +1794,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             );
             return Err(Errno::EINVAL);
         }
-        if !is_process_clone && !flags.contains(thread_clone_flags) {
-            log_unsupported!(
-                "clone with missing required flags: {:?}",
-                thread_clone_flags & !flags
-            );
+        // Sharing the address space without joining the caller's thread group isn't a shape this
+        // shim models for the THREAD-attach branch (`new_thread`, below, attaches the child to
+        // the caller's existing `Process` unconditionally whenever this check passes) -- require
+        // `CLONE_THREAD` alongside `CLONE_VM`, matching every real `CLONE_VM` caller in practice
+        // (pthread_create always sets both). SIGHAND/FILES are NOT required here: `fs`/`files`
+        // sharing already keys off their own individual flags below, and a
+        // `CLONE_VM`-without-`CLONE_SIGHAND` caller (rare, but valid per the Linux ABI) just gets
+        // `clone_for_new_task`'s existing thread-shape signal handling, which does not consult
+        // `CLONE_SIGHAND` today either. `CLONE_VFORK` is exempted: it is already routed to
+        // `is_process_clone`'s address-space-duplicating branch above regardless of `CLONE_VM`,
+        // so it never reaches `new_thread` and this constraint does not apply to it.
+        if flags.contains(CloneFlags::VM)
+            && !flags.contains(CloneFlags::THREAD)
+            && !flags.contains(CloneFlags::VFORK)
+        {
+            log_unsupported!("clone with CLONE_VM but not CLONE_THREAD");
             return Err(Errno::EINVAL);
         }
 
