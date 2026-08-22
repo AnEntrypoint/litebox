@@ -807,6 +807,59 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
                 return StepOutcome::Continue;
             }
         }
+
+        // (2d) Stack-relative read of a stale VALUE (as opposed to (2b)'s stale ADDRESS): a plain
+        // `mov reg, [rsp+disp]`/`[rbp+disp]` load whose *read address* is perfectly valid
+        // destination-space memory (the child's own stack, never flagged by (2b) above) but whose
+        // *loaded value* is itself an untranslated source-range pointer. This is the shallow-
+        // post-fork-unwind case `fixup_stale_stack_pointers` already proactively targets, reached a
+        // moment too late for that one-shot scan: a value that already sat in a to-be-scanned stack
+        // slot at the instant `fork()` returned is caught there, but a value the child's OWN early
+        // execution copies onto the stack a few instructions later (e.g. musl's `fork()` unwind
+        // reloading a stale `self` pointer that was spilled to the stack by the CALLER, one frame
+        // above where the proactive scan's margin ends, then re-pushed a few instructions further
+        // down) is not -- the proactive pass only ever runs once, against memory as it existed at
+        // that one moment.
+        //
+        // Confirmed live: musl's `fork()` (`src/process/fork.c`) reloads its own `self` argument
+        // (cached across the `_Fork()` call in a stack slot) via `mov rcx, [rsp+8]` immediately
+        // after resuming, then walks `self->next` in a loop comparing against this stale `rcx` --
+        // the loop this case exists to close never terminates because `rcx` never becomes
+        // reachable from any translated pointer, since it was never translated at all.
+        //
+        // Restricted to `[rsp+disp]`/`[rbp+disp]` addressing (no other base register, no index) --
+        // the same narrow, structurally-safe addressing shape `fixup_stale_stack_pointers` already
+        // trusts for exactly this reason: ordinary stack-relative locals/spills, not heap or
+        // `.data` bookkeeping where a coincidentally-range-shaped small integer is a real risk (see
+        // this module's and that function's own extensive false-positive history). The loaded value
+        // must independently satisfy `is_in_source` (a genuine, exact relocation-map hit, not a
+        // heuristic guess) and `MIN_POINTER_ALIGN` (the same tagged-integer guard case (2c) uses)
+        // before the slot is healed.
+        if matches!(instruction.memory_base(), Register::RSP | Register::RBP)
+            && instruction.memory_index() == Register::None
+            && let Some(read_address) = explicit_memory_operand_address(&instruction, context)
+            && !relocations.is_in_source(read_address)
+            && let Some(loaded_value) = read_usize_fault_tolerant(read_address)
+            && loaded_value.is_multiple_of(MIN_POINTER_ALIGN)
+            && relocations.is_in_source(loaded_value)
+            && let Some(translated) = relocations.translate(loaded_value)
+        {
+            if crate::veh_trace_enabled() {
+                eprintln!(
+                    "[fork_verify] HEAL case=2d read_address={read_address:#x} old={loaded_value:#x} new={translated:#x} rip={rip:#x}",
+                );
+            }
+            litebox_util_log::warn!(
+                rip:? = rip, read_address:? = read_address, stale_value:? = loaded_value,
+                translated:? = translated, mnemonic:? = instruction.mnemonic();
+                "fork_verify: stack slot holding a stale DATA pointer detected on read, patching slot in place"
+            );
+            write_usize_fault_tolerant(read_address, translated);
+            // Do not advance rip: retry the same instruction now that the slot it reads holds the
+            // translated value.
+            return StepOutcome::Continue;
+        }
+
         advance_last_load(tls, &instruction, context, relocations);
         return StepOutcome::Continue;
     };
