@@ -116,15 +116,34 @@ impl<Platform: ShimPlatform> UserStack<Platform> {
 
     /// Push a vector of strings with null terminators to the stack.
     ///
-    /// Returns the offsets of the strings in the stack.
+    /// Returns the offsets of the strings in the stack, indexed the same as `vals` (i.e. the
+    /// `i`-th offset is `vals[i]`'s).
     /// Returns `None` if the stack has insufficient space.
+    ///
+    /// Pushes in REVERSE order (`vals[last]` first, `vals[0]` last) so that `vals[0]`'s bytes end
+    /// up at the LOWEST address of the whole string-data region -- the stack pointer here only
+    /// ever decreases, so whichever string is pushed last ends up lowest. This matters beyond
+    /// mere convention: real Linux's `execve` (`fs/exec.c`'s `copy_strings`) guarantees `argv[0]`
+    /// sits at the lowest address of the combined `argv`+`envp` string-data block, and libc/libuv
+    /// code relies on that guarantee to compute how much room is available for
+    /// `prctl(PR_SET_NAME)`-adjacent process-title rewriting (`available = envp[last]string_end -
+    /// argv[0]`) -- pushing in forward order here put `vals[0]` at the HIGHEST address within its
+    /// own block instead (adjacent to the *next* pushed block, e.g. `argv[0]` ending up right next
+    /// to `envp`'s own strings rather than at the true start of the whole region), so that
+    /// subtraction could come out small or even negative depending on individual string lengths.
+    /// Confirmed live: Node's own `uv_setup_args` (called once, early, walking `argv[0]` and the
+    /// last `envp` entry to cache this exact span) computed a small negative "available space",
+    /// and a later `uv_set_process_title("npm")` call's `memset` used that negative value
+    /// (implicitly widened to a near-`u64::MAX` byte count after `>> 3`) as a `rep stosq` count,
+    /// writing far past the end of its buffer into `ld-musl`'s own read-only first segment --
+    /// `STATUS_ACCESS_VIOLATION` on a `PAGE_READONLY` page, reproducible via `npm --version`.
     fn push_cstrings(&mut self, vals: &[CString]) -> Option<Vec<usize>> {
-        let mut envp = Vec::with_capacity(vals.len());
-        for val in vals {
+        let mut offsets = alloc::vec![0usize; vals.len()];
+        for (i, val) in vals.iter().enumerate().rev() {
             self.push_cstring(val)?;
-            envp.push(self.pos);
+            offsets[i] = self.pos;
         }
-        Some(envp)
+        Some(offsets)
     }
 
     /// Push a vector of stack pointers to the stack.
