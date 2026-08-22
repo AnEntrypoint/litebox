@@ -52,6 +52,10 @@ extern crate alloc;
 // Thread-local storage for FS base state
 thread_local! {
     static THREAD_FS_BASE: Cell<usize> = const { Cell::new(0) };
+    /// This thread's real Windows TEB pointer (`GS_BASE`), captured once, early, via
+    /// [`WindowsUserland::init_thread_gs_base`] -- see that function's doc comment for why a
+    /// cached value is needed at all, given `GS_BASE` is normally Windows' own to manage.
+    static THREAD_GS_BASE: Cell<usize> = const { Cell::new(0) };
 }
 
 /// The userland Windows platform.
@@ -119,6 +123,45 @@ impl WindowsUserland {
     /// Initialize FS base state for a new thread
     fn init_thread_fs_base() {
         Self::set_thread_fs_base(0);
+    }
+
+    /// Captures this thread's real TEB pointer (`GS_BASE`) once, early in the thread's life, so
+    /// [`Self::restore_thread_gs_base_if_cleared`] has a known-good value to repair back to later.
+    ///
+    /// # Why this exists
+    ///
+    /// `GS_BASE` is normally entirely Windows' own to manage (it always points at this thread's
+    /// TEB, e.g. `ntdll`'s own code depends on it) -- litebox never legitimately writes it the
+    /// way it does `FS_BASE` (the guest's own TLS base, fully owned and set via `arch_prctl`).
+    /// But the exact same "Windows clears this thread's segment-base MSR back to 0 under
+    /// scheduling pressure" behavior already documented and repaired for `FS_BASE` (see
+    /// `restore_thread_fs_base`'s callers in `vectored_exception_handler`) plausibly affects
+    /// `GS_BASE` too -- both are non-standard x86_64 MSRs from the CPU's perspective, and this
+    /// platform's own `vectored_exception_handler_entry` fast path (`gs:[r8*8 +
+    /// TEB_TLS_SLOTS_OFFSET]`) already depends on `GS_BASE` being correct at one of the hottest,
+    /// earliest-in-exception-dispatch code paths in the whole crate. Investigated live while
+    /// chasing a reliably reproducible `EXCEPTION_ACCESS_VIOLATION` INSIDE `ntdll.dll` itself
+    /// (`is_in_guest=false`, a NULL-pointer read, looping forever at the identical instruction
+    /// under nested `vfork()`'s added kernel-transition pressure) -- this repair alone did not
+    /// resolve that specific crash (its true cause is still open, see FINDINGS.txt), but is a
+    /// real, independently-justified defense against the documented FS_BASE-reset behavior
+    /// plausibly extending to `GS_BASE`, confirmed harmless (no regression across repeated runs
+    /// of the existing single-`vfork()` repro) and kept on that basis.
+    fn init_thread_gs_base() {
+        let gs_base = unsafe { litebox_common_linux::rdgsbase() };
+        THREAD_GS_BASE.set(gs_base);
+    }
+
+    /// Restores this thread's `GS_BASE` from the value [`Self::init_thread_gs_base`] captured, if
+    /// the CPU currently reads back a cleared (`0`) value. A no-op if `init_thread_gs_base` was
+    /// never called on this thread (`THREAD_GS_BASE` still `0`) -- matches
+    /// `restore_thread_fs_base`'s own "never repair to a value we don't actually trust"
+    /// discipline.
+    fn restore_thread_gs_base_if_cleared() {
+        let saved = THREAD_GS_BASE.get();
+        if saved != 0 && unsafe { litebox_common_linux::rdgsbase() } == 0 {
+            unsafe { litebox_common_linux::wrgsbase(saved) };
+        }
     }
 }
 
@@ -354,6 +397,15 @@ fn faulting_instruction_has_fs_override(rip: usize) -> bool {
 unsafe extern "system" fn vectored_exception_handler(
     exception_info: *mut EXCEPTION_POINTERS,
 ) -> i32 {
+    // See `WindowsUserland::init_thread_gs_base`'s doc comment: the same "Windows clears a
+    // non-standard segment-base MSR under scheduling pressure" behavior already known and
+    // repaired for `FS_BASE` plausibly affects `GS_BASE` too, and `GS_BASE` backs Windows' OWN
+    // TEB access (`ntdll`, `TlsGetValue` below, this thread's exception dispatch machinery
+    // itself). A no-op when `GS_BASE` already reads back correctly; cheap enough to check
+    // unconditionally, this early, before anything in this handler (including `get_tls_ptr`'s own
+    // `TlsGetValue` call, which depends on a working TEB) risks running with it wrong.
+    WindowsUserland::restore_thread_gs_base_if_cleared();
+
     let Some(tls) = get_tls_ptr() else {
         // TLS slot not initialized yet; cannot be in guest
         return EXCEPTION_CONTINUE_SEARCH;
@@ -2439,6 +2491,10 @@ impl ThreadHandle {
     fn run_with_handle<R>(tls: &TlsState, f: impl FnOnce() -> R) -> R {
         // Safety: `tls_state` lives for the duration of this call.
         unsafe { install_tls(tls) };
+
+        // Capture this thread's own real GS_BASE (TEB pointer) now, while it is still known-good
+        // -- see `init_thread_gs_base`'s doc comment for why this repair exists at all.
+        WindowsUserland::init_thread_gs_base();
 
         let handle = Self::for_current_thread(tls);
         ACTIVE_THREADS.lock().unwrap().push(handle.clone());
