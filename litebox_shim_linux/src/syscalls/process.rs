@@ -62,6 +62,7 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
         vforked: bool,
         parent: Option<Weak<Process<Platform>>>,
         shared_pending: Arc<Mutex<Platform, super::signal::PendingSignals>>,
+        exit_signal: Option<i32>,
     ) -> Self {
         let remote = Arc::new(ThreadRemote::new());
         Self {
@@ -73,6 +74,7 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
                 vforked,
                 parent,
                 shared_pending,
+                exit_signal,
             )),
             remote,
             attached_tid: Cell::new(Some(pid)),
@@ -250,6 +252,14 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     /// (see `do_kill`'s remote-child case), which needs no signal-specific plumbing at all --
     /// `ThreadRemote::interrupt` and `has_pending_signals` already existed for exactly this.
     pub(crate) shared_pending: Arc<Mutex<Platform, super::signal::PendingSignals>>,
+    /// The signal to deliver to this process's parent when this process's last thread exits --
+    /// real Linux's `clone()`'s low byte of `flags` / `clone3`'s `exit_signal` field, already
+    /// validated (bounded by `MAX_SIGNAL_NUMBER`) but previously discarded by `do_clone`. Almost
+    /// always `SIGCHLD` (17) for a plain `fork()`/`vfork()`; `0` is real Linux's own encoding for
+    /// "no signal on exit" (some raw `clone()` callers, e.g. a pthread-style thread-creation
+    /// helper, pass this) and is never delivered. `None` only for the bootstrap process, which has
+    /// no parent to notify.
+    exit_signal: Option<i32>,
 }
 
 pub(crate) struct Alarm<Platform: ShimPlatform> {
@@ -377,6 +387,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
         vforked: bool,
         parent: Option<Weak<Process<Platform>>>,
         shared_pending: Arc<Mutex<Platform, super::signal::PendingSignals>>,
+        exit_signal: Option<i32>,
     ) -> Self {
         let nr_threads = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
         nr_threads.underlying_atomic().store(1, Ordering::Relaxed);
@@ -404,6 +415,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
             vfork_done,
             pgid: core::sync::atomic::AtomicI32::new(pid),
             shared_pending,
+            exit_signal,
         }
     }
 
@@ -1504,6 +1516,48 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     target.adopt_children(orphans);
                 }
             }
+
+            // Deliver this process's `exit_signal` (almost always `SIGCHLD`) to its still-live
+            // parent, exactly as real Linux's `do_exit()` does via `do_notify_parent()`. Real
+            // Linux's default disposition for `SIGCHLD` is `SIG_IGN` -- correctly modeled already
+            // (`litebox_common_linux::signal`'s disposition table) -- so merely queuing it is safe
+            // even for a parent that never installed a handler; a parent that DOES install one
+            // (every real event-loop runtime -- libuv's `child_process`/`uv_signal_t` included)
+            // needs exactly this wakeup to know it is time to call `wait4()`/`waitpid()` and reap
+            // the child.
+            //
+            // Confirmed live via LITEBOX_LOG debug tracing: without this, a `fork()`+`execve()`+
+            // `exit()` child that completes correctly and quickly at the syscall level (clone,
+            // execve, exit_group, full teardown, all observed to finish in well under 100ms) is
+            // never observed by a Node.js parent's `child_process.spawn()` `exit` callback at
+            // all -- libuv's own `SIGCHLD` handler, which is what actually triggers its reaping
+            // loop, has nothing to wake it, so the callback simply never fires no matter how long
+            // the parent waits. This is the root cause of `npx`-based tools (which spawn helper
+            // processes and wait on their completion) hanging indefinitely even after the
+            // fork_verify livelock fixes elsewhere in this investigation.
+            //
+            // Uses the exact same `shared_pending.push` + `interrupt_all_threads` pattern
+            // `do_kill`'s `deliver_to_child` closure already uses for the opposite direction (a
+            // live parent signaling a child) -- no new signal-delivery mechanism, just the
+            // existing one wired to a new trigger point. A no-op for the bootstrap process (no
+            // parent) or a raw `clone()` caller that explicitly passed `exit_signal == 0` (real
+            // Linux's own "no signal on exit" encoding -- see `Process::exit_signal`'s doc
+            // comment).
+            if let Some(exit_signal) = self.process().exit_signal
+                && let Ok(signal) = litebox_common_linux::signal::Signal::try_from(exit_signal)
+                && let Some(parent) = self
+                    .process()
+                    .live_parent()
+                    .or_else(|| self.global.bootstrap_process.get().cloned())
+                && !Arc::ptr_eq(&parent, self.process())
+            {
+                parent.shared_pending.lock().push(
+                    &parent.limits,
+                    signal,
+                    super::signal::siginfo_kill(signal),
+                );
+                parent.interrupt_all_threads();
+            }
         }
         if notify {
             self.process().notify_detached();
@@ -2010,6 +2064,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 vforked,
                 Some(Arc::downgrade(self.process())),
                 child_shared_pending.clone(),
+                // `0` is real Linux's own encoding for "no signal on exit" -- only a genuine
+                // nonzero signal number (validated above, `exit_signal <= MAX_SIGNAL_NUMBER`, which
+                // is far below `i32::MAX`) is ever delivered to the parent (see
+                // `Process::exit_signal`'s doc comment).
+                (exit_signal != 0).then_some(i32::try_from(exit_signal).unwrap_or(0)),
             );
             // Real fork() inherits the parent's current rlimits rather than resetting to
             // program-start defaults (see `ResourceLimits::copy_from`'s doc comment).
