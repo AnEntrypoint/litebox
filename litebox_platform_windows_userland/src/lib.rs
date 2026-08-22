@@ -2471,6 +2471,140 @@ thread_local! {
 /// track its own thread list.
 static ACTIVE_THREADS: Mutex<alloc::vec::Vec<ThreadHandle>> = Mutex::new(alloc::vec::Vec::new());
 
+/// One entry in [`CLAIMED_RANGES`]: a host address range and the [`std::thread::ThreadId`] of the
+/// guest process that owns it. `None` means the slot is empty.
+type ClaimSlot = Option<(core::ops::Range<usize>, std::thread::ThreadId)>;
+
+/// How many concurrently-live guest processes can each hold a `Replace`-mode claim at once (see
+/// [`CLAIMED_RANGES`]'s doc comment). A fixed, generous upper bound rather than a growable
+/// collection deliberately: `BTreeMap`/`Vec::push` route through this process's own
+/// `#[global_allocator]` (`SafeZoneAllocator`, a `spin::SpinMutex`-protected slab/buddy
+/// allocator, `litebox/src/mm/allocator.rs`), and calling into it from `allocate_pages`'s already
+/// timing-sensitive `Replace` path was found live to make an existing, pre-existing, still-not-
+/// fully-understood class of Windows scheduling/segment-MSR instability (see the FS_BASE/GS_BASE
+/// repair sites above) fire far more often -- a fixed-size array sidesteps the allocator (and
+/// its spinlock) entirely for this registry's own bookkeeping. 64 is far more than the number of
+/// guest processes any real workload in this architecture holds alive at once via nested
+/// `vfork()` (each level is one more live process; a handful of levels is already an extreme
+/// case) -- exhaustion silently degrades to "claim not recorded" (see `claim_range`), which only
+/// gives up this registry's OWN collision defense, never correctness of anything else.
+const MAX_CLAIMS: usize = 64;
+
+/// Host address ranges currently claimed by a live guest "process" (a real OS thread), see
+/// [`ClaimSlot`]/[`MAX_CLAIMS`] for the storage shape and why it is a fixed array.
+///
+/// # Why this exists
+///
+/// Every guest "process" in this architecture is a real OS thread sharing ONE real Windows
+/// process (see this module's top-level doc comment) -- there is no per-process address space
+/// isolation the way real Linux `fork()`/`execve()` gets for free. `Vmem::insert_mapping`'s
+/// `FixedAddressBehavior::Replace` path (real `MAP_FIXED`, used for every ELF segment of a
+/// non-PIE/`ET_EXEC` binary, which loads at a fixed, non-negotiable address baked into the ELF
+/// itself -- `gcc`, `cc1`, and most Alpine/musl binaries) can only see ITS OWN guest-level
+/// `Vmem` bookkeeping plus the platform's raw `VirtualQuery` state; neither can distinguish "this
+/// committed range is a stale leftover from MY OWN prior `execve()` on this same thread, safe to
+/// overwrite" from "this committed range is another guest process's CURRENTLY LIVE memory" --
+/// e.g. a `vfork()`-blocked parent's own image, still fully intact and about to resume. Two
+/// non-PIE binaries loaded at the same address (extremely common: EVERY `ET_EXEC` binary with
+/// the same link-time base, e.g. `0x400000`, collides with every other) that happen to be alive
+/// at the same real moment -- a `vfork()`-ing child that itself `vfork()`s again, e.g. `gcc`
+/// (still blocked, waiting on its own child) `vfork()`ing `cc1` -- silently clobber each other's
+/// real memory with no error, no page fault, and no guest-visible signal: confirmed live via a
+/// Windows minidump showing a `ret` faulting on a `rsp` that no longer pointed at valid committed
+/// memory, because a sibling process's fixed-address ELF load had silently decommitted and
+/// recommitted straight over top of it.
+///
+/// This registry closes that gap: every successful [`WindowsUserland::allocate_pages`] call whose
+/// `fixed_address_behavior` is [`FixedAddressBehavior::Replace`] (the only mode with no existing
+/// collision defense -- `Hint`/`NoReplace` already refuse to build on a real `MEM_COMMIT` via
+/// `has_committed_page`) records its range here under the CALLING thread's own
+/// [`std::thread::ThreadId`] (stable for a guest process's entire lifetime -- `execve` reuses the
+/// same real OS thread, never spawning a new one). Deliberately consulted and updated ONLY on
+/// this already-rare, already-`VirtualQuery`-scanning `Replace` path -- NOT on every
+/// `allocate_pages` call -- so ordinary `Hint`-mode allocation (guest heap/stack/mmap growth, the
+/// overwhelming majority of calls) pays no additional cost at all.
+static CLAIMED_RANGES: Mutex<[ClaimSlot; MAX_CLAIMS]> = Mutex::new([const { None }; MAX_CLAIMS]);
+
+/// Returns the (range, owner) of any claimed range overlapping `range` whose owner is NOT
+/// `exclude_owner`, if one exists.
+fn find_foreign_claim(
+    range: core::ops::Range<usize>,
+    exclude_owner: std::thread::ThreadId,
+) -> Option<(core::ops::Range<usize>, std::thread::ThreadId)> {
+    CLAIMED_RANGES.lock().unwrap().iter().find_map(|slot| {
+        slot.as_ref().and_then(|(claimed, owner)| {
+            (*owner != exclude_owner && claimed.start < range.end && claimed.end > range.start)
+                .then(|| (claimed.clone(), *owner))
+        })
+    })
+}
+
+/// Records that the calling thread now owns `range`, superseding any of ITS OWN prior entries
+/// that overlap it (a re-`execve` or a `Replace` over one's own stale leftover legitimately
+/// changes what this thread owns at that address) but leaving every other thread's entries
+/// untouched. Called only for a `Replace`-mode allocation (see [`CLAIMED_RANGES`]'s doc comment
+/// for why `Hint`/the fresh-address path do not also call this).
+///
+/// Silently drops the claim if every slot is already in use by some OTHER thread's own ranges
+/// (see [`MAX_CLAIMS`] -- this only gives up this registry's own collision defense for the
+/// dropped claim, never a hard error).
+fn claim_range(range: core::ops::Range<usize>) {
+    if range.is_empty() {
+        return;
+    }
+    let owner = std::thread::current().id();
+    let mut claims = CLAIMED_RANGES.lock().unwrap();
+    // Drop this thread's own prior entries that overlap the new range -- they are being
+    // superseded, not merged with.
+    for slot in claims.iter_mut() {
+        if let Some((claimed, o)) = slot
+            && *o == owner
+            && claimed.start < range.end
+            && claimed.end > range.start
+        {
+            *slot = None;
+        }
+    }
+    if let Some(empty_slot) = claims.iter_mut().find(|s| s.is_none()) {
+        *empty_slot = Some((range, owner));
+    }
+}
+
+/// Removes every range owned by the calling thread. Called once, from
+/// [`ThreadHandle::run_with_handle`]'s teardown guard, when a guest process's real OS thread
+/// itself exits -- see [`CLAIMED_RANGES`]'s doc comment for why `execve` alone must not do this.
+fn release_all_claims_for_current_thread() {
+    let owner = std::thread::current().id();
+    for slot in CLAIMED_RANGES.lock().unwrap().iter_mut() {
+        if matches!(slot, Some((_, o)) if *o == owner) {
+            *slot = None;
+        }
+    }
+}
+
+/// Removes `range` from the calling thread's own claims (called on `deallocate_pages`/`munmap`).
+/// Unlike a growable map, a fixed-array slot that only PARTIALLY overlaps `range` is dropped
+/// whole rather than split/shrunk (splitting would need a second slot, which may not be
+/// available) -- a rare, always-safe-to-be-conservative-about approximation: the untouched
+/// remainder of that slot's original range simply stops being defended by this registry until
+/// this thread's own next `Replace` allocation re-claims it, which is no worse than this
+/// registry not existing at all for that sliver.
+fn release_claim_range_for_current_thread(range: core::ops::Range<usize>) {
+    if range.is_empty() {
+        return;
+    }
+    let owner = std::thread::current().id();
+    for slot in CLAIMED_RANGES.lock().unwrap().iter_mut() {
+        if let Some((claimed, o)) = slot
+            && *o == owner
+            && claimed.start < range.end
+            && claimed.end > range.start
+        {
+            *slot = None;
+        }
+    }
+}
+
 impl ThreadHandle {
     /// Creates a [`ThreadHandle`] referencing the calling OS thread.
     fn for_current_thread(tls: &TlsState) -> ThreadHandle {
@@ -2512,6 +2646,7 @@ impl ThreadHandle {
                 .lock()
                 .unwrap()
                 .retain(|h| !Arc::ptr_eq(&h.0, &current.0));
+            release_all_claims_for_current_thread();
             *current.0.lock().unwrap() = None;
             uninstall_tls();
         });
@@ -3390,6 +3525,17 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 && fixed_address_behavior == FixedAddressBehavior::NoReplace
             {
                 return Err(AllocationError::AddressInUse);
+            } else if has_committed_page
+                && fixed_address_behavior == FixedAddressBehavior::Replace
+                && find_foreign_claim(suggested_range.clone(), std::thread::current().id())
+                    .is_some()
+            {
+                // See `CLAIMED_RANGES`'s doc comment: a committed range here that this thread
+                // does not itself own is another still-live guest process's real memory (most
+                // commonly two `ET_EXEC` binaries sharing the same link-time base address while
+                // both alive via nested `vfork()`), never a stale leftover safe to clobber.
+                // Relocate to a fresh address instead of decommitting/recommitting over it.
+                base_addr = core::ptr::null_mut();
             } else {
                 process_memory_range_by_regions(
                     suggested_range,
@@ -3450,6 +3596,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     },
                 )
                 .unwrap();
+                if fixed_address_behavior == FixedAddressBehavior::Replace {
+                    claim_range(base_addr as usize..(base_addr as usize + size));
+                }
                 return Ok(UserMutPtr::from_ptr(base_addr.cast()));
             }
         }
@@ -3467,6 +3616,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         if populate_pages_immediately {
             do_prefetch_on_range(ptr as usize, size);
         }
+        if fixed_address_behavior == FixedAddressBehavior::Replace {
+            claim_range(ptr as usize..(ptr as usize + size));
+        }
         Ok(UserMutPtr::from_ptr(ptr.cast::<u8>()))
     }
 
@@ -3476,7 +3628,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
         debug_assert_alignment!(range, ALIGN);
         process_memory_range_by_regions(
-            range,
+            range.clone(),
             |r, state| -> Result<bool, std::convert::Infallible> {
                 debug_assert_ne!(
                     state,
@@ -3491,6 +3643,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             },
         )
         .expect("deallocate_pages failed");
+        // Release this thread's own claim (see `CLAIMED_RANGES`'s doc comment), if any -- an
+        // explicit `munmap` genuinely relinquishes the range, unlike `execve` (which leaves an
+        // old claim standing until superseded by the new image's own `Replace` allocations, or
+        // this thread itself exits).
+        release_claim_range_for_current_thread(range);
         Ok(())
     }
 
