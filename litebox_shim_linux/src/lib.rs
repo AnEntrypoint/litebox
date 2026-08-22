@@ -879,7 +879,47 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         })
                 },
             );
-            let _ = self.do_close(raw_fd);
+            // A still-connected TCP socket must not be closed via the ordinary `do_close` path
+            // here: that path (`GlobalState::close_socket`) performs a *graceful* close by
+            // default (waiting, with no timeout at all when the socket has no `SO_LINGER` set,
+            // for the peer to send its own FIN/`Events::HUP`) -- correct for a guest's own
+            // explicit `close(2)` call, where blocking the calling thread is exactly what real
+            // Linux's default (non-`SO_LINGER`) close semantics already do, but wrong here: real
+            // Linux's kernel does NOT block an *exiting* process waiting for a graceful TCP
+            // close -- it tears the socket down and lets the kernel finish the FIN/RST exchange
+            // asynchronously in the background, so the exiting process's `exit()`/`exit_group()`
+            // never blocks on it. Confirmed live: `node -e "...connect then process.exit(0)..."`
+            // hung forever here (this exact wait, no timeout, for a HUP the remote server has no
+            // reason to send first) even though the guest had already unconditionally committed
+            // to exiting. Close immediately instead, mirroring the same escape hatch
+            // `close_socket`'s own `WaitError::TimedOut` fallback already uses.
+            let is_network_fd = files
+                .run_on_raw_fd(
+                    raw_fd,
+                    |_| false,
+                    |_| true,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                )
+                .unwrap_or(false);
+            if is_network_fd {
+                let mut rds = files.raw_descriptor_store.write();
+                if let Ok(fd) =
+                    rds.fd_consume_raw_integer::<litebox::net::Network<Platform>>(raw_fd)
+                {
+                    drop(rds);
+                    let _ = self
+                        .global
+                        .net
+                        .lock()
+                        .close(&fd, litebox::net::CloseBehavior::Immediate);
+                }
+            } else {
+                let _ = self.do_close(raw_fd);
+            }
             if let Ok(Some(pair)) = slave_pair {
                 self.global.hangup_slave(&pair);
             }
