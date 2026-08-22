@@ -551,12 +551,26 @@ impl From<litebox::fs::FileStatus> for Statx {
             owner: litebox::fs::UserInfo { user, group },
             node_info: litebox::fs::NodeInfo { dev, ino, rdev },
             blksize,
+            atime,
+            mtime,
             ..
         } = value;
         let dev = dev as u64;
         let rdev = rdev.map_or(0u64, |r| r.get() as u64);
         Self {
-            stx_mask: StatxMask::STATX_BASIC_FILLED.bits(),
+            // `STATX_BASIC_STATS` (not `STATX_BASIC_FILLED`, which deliberately excludes the
+            // timestamp bits -- see its own doc comment) matches every field this conversion
+            // actually fills in below, including the timestamps: an earlier version of this
+            // conversion silently dropped `atime`/`mtime` from its destructuring (`..`) and
+            // relied on `..Default::default()` for every timestamp field, always producing an
+            // all-zero `stx_mtime` -- confirmed live to be the exact cause of `npx`'s own
+            // lock-integrity check (`libnpmexec`'s `with-lock.js`) seeing a permanently-epoch
+            // `mtime` from Node's `fs.statSync` (which uses `statx`, routing through exactly this
+            // conversion) despite the underlying filesystem layer already computing the correct
+            // value -- a separate, sibling `From<FileStat> for Statx` conversion a few lines below
+            // already populates timestamps correctly and was never the one actually exercised by
+            // this call path.
+            stx_mask: StatxMask::STATX_BASIC_STATS.bits(),
             stx_blksize: blksize.trunc(),
             stx_nlink: 1,
             stx_uid: u32::from(user),
@@ -565,6 +579,12 @@ impl From<litebox::fs::FileStatus> for Statx {
             stx_ino: ino as u64,
             stx_size: size as u64,
             stx_blocks: 0,
+            stx_atime: statx_timestamp(atime.sec, i64::from(atime.nsec)),
+            // LiteBox doesn't track a separate change-time (`ctime`); mirroring `mtime` (as
+            // several minimal/embedded filesystems do) matches the sibling `From<FileStat> for
+            // Statx` conversion's own precedent just below.
+            stx_ctime: statx_timestamp(mtime.sec, i64::from(mtime.nsec)),
+            stx_mtime: statx_timestamp(mtime.sec, i64::from(mtime.nsec)),
             stx_rdev_major: dev_major(rdev),
             stx_rdev_minor: dev_minor(rdev),
             stx_dev_major: dev_major(dev),
