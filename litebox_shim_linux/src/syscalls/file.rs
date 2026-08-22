@@ -1204,11 +1204,41 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     fn do_mkdir(&self, pathname: impl path::Arg, mode: Mode) -> Result<(), Errno> {
         let mode = mode & !self.get_umask();
+        let pathname = pathname.to_c_str().map_err(|_| Errno::EINVAL)?.into_owned();
         self.files
             .borrow()
             .fs
-            .mkdir(pathname, mode)
-            .map_err(Errno::from)
+            .mkdir(pathname.clone(), mode)
+            .map_err(Errno::from)?;
+        // `FileSystem::mkdir` (and every other creation path across its backends) has no clock of
+        // its own -- it is a deliberately storage-only trait (see `Timestamp`'s own doc comment:
+        // "callers ... are responsible for resolving current time"), so a freshly-created
+        // directory is left with `Timestamp::default()` (the Unix epoch, `mtime=0`) instead of a
+        // real creation time. Real Linux always stamps a new directory with the actual creation
+        // time; npm's own lock-integrity check (`libnpmexec`'s `with-lock.js`, used by every
+        // `npx`/`npm exec` invocation) relies on this -- it `stat()`s its lock directory twice a
+        // moment apart and aborts (or, in the `forever: true` retry path used by `npx <spec>`,
+        // loops FOREVER) if the `mtime` looks tampered with, which an always-zero `mtime` trivially
+        // triggers on every single check. Confirmed live: this was the root cause of `npx
+        // github:AnEntrypoint/casey` hanging indefinitely in a genuine non-terminating native loop
+        // inside npm's own retry logic, and of a real `npx cowsay` invocation failing outright with
+        // `ECOMPROMISED`. Immediately stamping the real current time here, through the same
+        // already-correct `set_times` path `utimensat(2)` uses, fixes every creation path that
+        // funnels through `do_mkdir` (all of `mkdir`/`mkdirat`) without touching the `FileSystem`
+        // trait's `mkdir` signature or any of its many backends -- `set_times` alone already
+        // has this deliberately storage-only contract satisfied correctly by its own real caller
+        // (`sys_utimensat`), so reusing it here needs no new plumbing at all.
+        let now = self.real_time_as_duration_since_epoch();
+        let now = litebox::fs::Timestamp {
+            sec: now.as_secs().reinterpret_as_signed(),
+            nsec: now.subsec_nanos(),
+        };
+        let _ = self
+            .files
+            .borrow()
+            .fs
+            .set_times(pathname, Some(now), Some(now));
+        Ok(())
     }
 
     /// Handle syscall `mkdirat`
