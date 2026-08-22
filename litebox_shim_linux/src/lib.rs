@@ -399,6 +399,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                     false,
                     None,
                     bootstrap_shared_pending.clone(),
+                    None,
                 ),
                 wait_state: wait::WaitState::new(self.0.platform),
                 pid,
@@ -560,6 +561,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                     false,
                     None,
                     shared_pending.clone(),
+                    None,
                 ),
                 wait_state: wait::WaitState::new(self.0.platform),
                 pid,
@@ -1941,6 +1943,7 @@ mod test_utils {
                     false,
                     None,
                     shared_pending.clone(),
+                    None,
                 ),
                 pid,
                 ppid: 0,
@@ -2010,6 +2013,7 @@ mod test_utils {
                 false,
                 Some(Arc::downgrade(self.process())),
                 shared_pending.clone(),
+                Some(litebox_common_linux::signal::Signal::SIGCHLD.as_i32()),
             );
             let child = Task {
                 wait_state: wait::WaitState::new(self.global.platform),
