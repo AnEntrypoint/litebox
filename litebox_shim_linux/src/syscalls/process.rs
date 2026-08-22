@@ -529,13 +529,17 @@ impl<Platform: ShimPlatform> Process<Platform> {
 
     /// Waits for all threads in this process to exit, returning the exit code.
     pub fn wait_for_exit(&self) -> ExitStatus {
+        litebox_util_log::debug!("DIAG wait_for_exit: entry");
         loop {
             let n = self.nr_threads.underlying_atomic().load(Ordering::Acquire);
+            litebox_util_log::debug!(n:% = n; "DIAG wait_for_exit: loaded n");
             if n == 0 {
                 break;
             }
             let _ = self.nr_threads.block(n);
+            litebox_util_log::debug!("DIAG wait_for_exit: woke from block");
         }
+        litebox_util_log::debug!("DIAG wait_for_exit: loop done");
         self.inner.lock().exit_status
     }
 
@@ -720,6 +724,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             assert!(!inner.group_exit);
             inner.exit_status = status;
             inner.group_exit = true;
+            // Widens `detach_thread`'s own `notify` condition to also fire at `new_count == 1`
+            // (not just `0`), exactly as `kill_other_threads` already relies on -- see this
+            // function's own wait loop below for why `exit_group` now needs that same wake.
+            inner.is_killing_other_threads = true;
             for thread in inner.threads.values() {
                 thread.is_exiting.store(true, Ordering::Relaxed);
             }
@@ -734,6 +742,33 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             thread.interrupt();
         }
         litebox_util_log::debug!(tid:% = self.tid; "sys_exit_group: done interrupting siblings");
+        // Wait for every interrupted sibling to actually finish exiting (their own
+        // `sys_exit`/`Task::drop` unwind all the way through `Task::prepare_for_exit`) before
+        // returning -- mirroring `kill_other_threads`'s own identical wait loop below, which
+        // exists for exactly the same reason (see its doc comment). Without this, the caller
+        // (`sys_exit_group`) unwinds straight into ITS OWN `prepare_for_exit` immediately after
+        // this function returns, and if this happens to be the thread whose `detach_thread` call
+        // observes `nr_threads` reaching zero first, it proceeds to
+        // `close_all_fds_on_process_exit` -- reading and mutating the process's shared
+        // `FilesState` -- while an interrupted sibling is STILL concurrently mid-unwind through
+        // its own `prepare_for_exit`, racing on the same shared state. Confirmed live via
+        // `LITEBOX_LOG=debug` against a trivial `node -e "console.log(...); setImmediate(() =>
+        // process.exit(0))"`: `sys_exit_group`'s own trace line ("done interrupting siblings")
+        // was immediately followed by TWO DIFFERENT threads' `prepare_for_exit: entry` lines
+        // essentially simultaneously, with no ordering between them -- exactly this race, and the
+        // process hung forever immediately afterward with no further log output at all.
+        loop {
+            let n = self
+                .thread
+                .process
+                .nr_threads
+                .underlying_atomic()
+                .load(Ordering::Acquire);
+            if n <= 1 {
+                break;
+            }
+            let _ = self.thread.process.nr_threads.block(n);
+        }
     }
 
     /// Kills all other threads in the process, waiting for them to exit.
@@ -1439,7 +1474,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // closure and child reparenting are independent cleanup steps. It MUST, however,
             // happen before `notify_detached` below -- see this function's comment above.
             self.close_all_fds_on_process_exit();
+            litebox_util_log::debug!(tid:% = self.tid; "DIAG prepare_for_exit: close_all_fds done");
             let orphans = self.process().take_children();
+            litebox_util_log::debug!(tid:% = self.tid, n_orphans:% = orphans.len(); "DIAG prepare_for_exit: take_children done");
             if !orphans.is_empty() {
                 let target = self
                     .process()
@@ -1455,8 +1492,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if notify {
             self.process().notify_detached();
         }
+        litebox_util_log::debug!(tid:% = self.tid; "DIAG prepare_for_exit: notify_detached done");
 
         if let Some(clear_child_tid) = self.thread.clear_child_tid.take() {
+            litebox_util_log::debug!(tid:% = self.tid; "DIAG prepare_for_exit: clear_child_tid futex wake start");
             // Clear the child TID if requested
             // TODO: if we are the last thread, we don't need to clear it
             let _ = clear_child_tid.write_at_offset::<Platform>(0, 0);
@@ -1467,10 +1506,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 flags: litebox_common_linux::FutexFlags::PRIVATE,
                 count: 1,
             });
+            litebox_util_log::debug!(tid:% = self.tid; "DIAG prepare_for_exit: clear_child_tid futex wake done");
         }
+        litebox_util_log::debug!(tid:% = self.tid; "DIAG prepare_for_exit: about to check robust_list");
         if let Some(robust_list) = self.thread.robust_list.take() {
+            litebox_util_log::debug!(tid:% = self.tid; "DIAG prepare_for_exit: wake_robust_list start");
             let _ = self.wake_robust_list(robust_list);
+            litebox_util_log::debug!(tid:% = self.tid; "DIAG prepare_for_exit: wake_robust_list done");
         }
+        litebox_util_log::debug!(tid:% = self.tid; "DIAG prepare_for_exit: exiting fn");
     }
 
     pub(crate) fn sys_exit(&self, status: i32) {
