@@ -728,10 +728,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // (not just `0`), exactly as `kill_other_threads` already relies on -- see this
             // function's own wait loop below for why `exit_group` now needs that same wake.
             inner.is_killing_other_threads = true;
+            // Every thread (including the caller) must be marked exiting so no other syscall
+            // path treats this process as still alive, but `remotes` (below) must EXCLUDE the
+            // caller -- mirroring `kill_other_threads`'s own `tid != self.tid` filter. Calling
+            // `ThreadHandle::interrupt` (an OS-level `SuspendThread`-based primitive) ON THE
+            // CALLING THREAD ITSELF is unsafe: a thread cannot cleanly suspend itself this way,
+            // and doing so was confirmed live to crash the whole process with an uncaught
+            // exception (`KERNELBASE.dll`, `0xE06D7363`) rather than the guest-visible signal
+            // (e.g. a genuine `SIGSEGV`) this function was actually trying to report -- reliably
+            // reproduced via `npx --version`'s heavier, multi-threaded startup, where the
+            // crashing thread's own `exit_group` (called from signal delivery, not a normal
+            // `exit_group` syscall) included itself in the interrupt loop.
             for thread in inner.threads.values() {
                 thread.is_exiting.store(true, Ordering::Relaxed);
             }
-            inner.threads.values().cloned().collect()
+            inner
+                .threads
+                .iter()
+                .filter(|&(&tid, _)| tid != self.tid)
+                .map(|(_, thread)| thread.clone())
+                .collect()
         };
         litebox_util_log::debug!(
             tid:% = self.tid,
