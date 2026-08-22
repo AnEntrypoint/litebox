@@ -2329,6 +2329,68 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     let _ = slot.write_at_offset::<Platform>(0, child_fs_base);
                 }
 
+                // musl's `struct pthread` embeds `prev`/`next` fields (at TCB offsets 0x10/0x18 on
+                // x86_64, confirmed against musl's own `pthread_impl.h`) forming a circular
+                // doubly-linked list of every live thread in the process, with the calling thread's
+                // own TCB reachable via `self->next`/`self->prev`. musl's `fork()` (`src/process/
+                // fork.c`) relies on a very specific post-fork invariant to reset that list for the
+                // child: `for (pthread_t td = self->next; td != self; td = td->next) td->tid = -1;`
+                // -- i.e. it walks forward from `self->next` invalidating every OTHER thread's `tid`
+                // until the walk loops back around to `self` itself. On real Linux this terminates
+                // immediately for a process that was single-threaded at `fork()` time (`self->next
+                // == self`, so the loop body never runs) and otherwise walks a SHORT, real,
+                // correctly-closed list, since the child gets the exact same virtual addresses the
+                // parent had -- the list's own topology needs no repair at all.
+                //
+                // LiteBox cannot preserve that: only the calling thread's own memory group is ever
+                // duplicated into the child (matching real Linux's actual semantics -- every other
+                // thread ceases to exist in the child, full stop), so `self->prev`/`self->next`,
+                // copied verbatim from the parent's memory, still point at OTHER, sibling threads'
+                // TCBs -- structures that were never copied into the child's address space at all
+                // (a genuinely multi-threaded parent, e.g. any real Node.js process with its libuv
+                // thread pool and V8 background threads, is the common case, not an edge case).
+                // Musl's list-reset loop above then walks through addresses that belong to memory
+                // the child never received a copy of, and has no way to ever loop back around to
+                // `self`'s own (relocated) address -- an unbounded walk through stale, foreign
+                // memory. Confirmed live via `LITEBOX_VEH_TRACE=1` against a minimal `node -e
+                // "require('child_process').spawn('/bin/true')"` repro (a plain, non-`CLONE_VFORK`
+                // `fork()`): the child's very first `#DB` single-step trap after `fork()` returns is
+                // already inside a loop of exactly this shape (`mov dword ptr [r13+0x30],
+                // 0xffffffff; mov r13, [r13+0x18]; cmp r13, rcx; jne ...`, TCB offset 0x30 being
+                // `tid`, an `int`, confirmed against musl's own struct layout) -- part of what makes
+                // `npx cowsay` spend minutes pegging one thread's CPU.
+                //
+                // The fix restores the one invariant the child is actually entitled to rely on: a
+                // freshly-`fork()`'d process has exactly one thread, so its thread list must be a
+                // single-node circular list pointing to itself -- `self->next == self->prev ==
+                // self`, unconditionally, regardless of how many siblings the PARENT had. This is
+                // not a guess or a heuristic scan; it is restoring an ABI-mandated data-structure
+                // invariant for a known, fixed pair of fields, exactly as the `%fs:0` self-pointer
+                // fix above restores a different ABI-mandated invariant on the same TCB. Gated on
+                // `child_fs_base != parent_fs_base` in the same way the `%fs:0` write above is: a
+                // no-op whenever the TCB was not actually relocated (the write would already be a
+                // correct no-op even without the guard, since `prev`/`next` already equal `self` in
+                // that case, but skipping it avoids two needless writes on the common case).
+                //
+                // NOTE: confirmed via the same live repro that this alone does not fully resolve the
+                // `npx cowsay` hang -- after this fix, the *same-shaped* loop still recurs with `rcx`
+                // (musl's `self` argument at this call site) holding a value that is neither this
+                // thread's own (now-correctly-self-referential) TCB nor any address in any tracked
+                // relocation range, meaning at least one more stale-pointer source feeding into this
+                // same musl code path remains unidentified. This fix is real and independently
+                // correct (the invariant it restores is unconditionally required regardless of what
+                // else is wrong), but is not, by itself, proven sufficient to end the hang.
+                if child_fs_base != parent_fs_base {
+                    const TCB_PREV_OFFSET: usize = 0x10;
+                    const TCB_NEXT_OFFSET: usize = 0x18;
+                    let prev_slot =
+                        UserPtrMut::<usize>::from_usize(child_fs_base + TCB_PREV_OFFSET);
+                    let next_slot =
+                        UserPtrMut::<usize>::from_usize(child_fs_base + TCB_NEXT_OFFSET);
+                    let _ = prev_slot.write_at_offset::<Platform>(0, child_fs_base);
+                    let _ = next_slot.write_at_offset::<Platform>(0, child_fs_base);
+                }
+
                 child_fs_base
             };
             #[cfg(not(target_arch = "x86_64"))]
