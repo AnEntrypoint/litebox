@@ -137,17 +137,38 @@ const MAX_INSTRUCTION_LEN: usize = 15;
 /// child verified against an IDENTITY (`AddressRelocations::is_identity`) relocation map before
 /// ending verification proactively, rather than re-arming `EFLAGS.TF` forever.
 ///
-/// See the comment at this constant's use site in [`on_single_step`] for why this is scoped to
-/// identity relocations only (the cross-process fork mechanism) and never applied to the
-/// THREAD-based fork path. Chosen generously relative to the size of a `fork()`-to-`execve()`
-/// unwind (observed live, `scratchpad/jqrepro/FINDINGS.txt` pass 150, to be on the order of tens
-/// of instructions for apk/busybox's own post-`fork()` cleanup) while staying far short of the
-/// tens of thousands of traps a real interpreter's (CPython's) full post-`fork()` run would take
-/// to single-step to completion (pass 151: 76768+ traps observed before the child was killed,
-/// still climbing) -- i.e. large enough to never cut off genuine early-`fork()` healing, small
-/// enough that hitting it is itself strong evidence execution has moved well past any pointer
-/// that could plausibly still be stale.
+/// See the comment at this constant's use site in [`on_single_step`]. Chosen generously relative
+/// to the size of a `fork()`-to-`execve()` unwind (observed live, `scratchpad/jqrepro/
+/// FINDINGS.txt` pass 150, to be on the order of tens of instructions for apk/busybox's own
+/// post-`fork()` cleanup) while staying far short of the tens of thousands of traps a real
+/// interpreter's (CPython's) full post-`fork()` run would take to single-step to completion (pass
+/// 151: 76768+ traps observed before the child was killed, still climbing) -- i.e. large enough to
+/// never cut off genuine early-`fork()` healing, small enough that hitting it is itself strong
+/// evidence execution has moved well past any pointer that could plausibly still be stale.
 const MAX_IDENTITY_VERIFICATION_STEPS: u64 = 4096;
+
+/// The same kind of proactive step bound as [`MAX_IDENTITY_VERIFICATION_STEPS`], but for the
+/// THREAD-based `fork()` path (non-identity relocations). Originally this path had NO bound at
+/// all: the reasoning was that `is_in_source(rip)` hits are rare there (disjoint source/destination
+/// ranges by construction), so the trap count would naturally stay low. That reasoning conflated
+/// two different things -- `is_in_source` hits ARE rare, but [`on_single_step`] re-arms `TF` and
+/// takes a trap on *every* instruction the child executes while `is_verifying` is true, not just on
+/// `is_in_source` hits. A child whose pre-`execve()` code runs a long, unrelated loop with zero
+/// stale-pointer hits the entire time (confirmed live: `node`'s `child_process.spawn()` ->
+/// `posix_spawn`, a plain `fork()` with no `CLONE_VFORK`, spins through a ~4-instruction loop --
+/// never once hitting `is_in_source`/`HEAL`, confirmed via `LITEBOX_VEH_TRACE=1` -- for what is, by
+/// the evidence gathered so far, an unrelated bug the loop's own data is corrupted independent of
+/// verification: ending verification early here does NOT make that loop terminate, only removes
+/// the *additional* per-instruction Windows exception overhead verification was adding on top of
+/// it) pays a full Windows exception round-trip per instruction for as long as verification stays
+/// armed. Unlike the identity path's genuine post-fork stale-pointer-fixup work (bounded by real
+/// call-stack unwind depth, hence a strict, comfortably-sized bound), THREAD-path verification's
+/// job here is done as soon as the small, deterministic set of stale pointers from the moment of
+/// `fork()` have been walked -- observed live (pass 150) to be on the order of tens to low hundreds
+/// of instructions. This bound exists so verification cannot itself compound an unrelated hang (or
+/// any other unexpectedly long post-fork run) with per-instruction single-step overhead on top of
+/// it, not because it is known to fully resolve any specific hang on its own.
+const MAX_THREAD_VERIFICATION_STEPS: u64 = 16384;
 
 /// The minimum alignment a genuine heap/allocator-owned pointer is guaranteed to have under musl's
 /// mallocng (this investigation's only allocator of interest -- see `AddressRelocations::
@@ -498,12 +519,24 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
     // `is_in_source`/`is_in_destination` cover the SAME address range (source == destination by
     // design), so case (1) below fires on essentially every instruction the child executes, not
     // just genuine stale pre-`fork()` pointers -- unconditionally re-arming `TF` on every such
-    // `Continue` (as this function always has, correctly, for the THREAD-based path, where
-    // `is_in_source` is a rare, meaningful signal) turns the child's ENTIRE remaining execution
-    // into a permanent, one-instruction-at-a-time trace. For a real workload with a long post-
-    // `fork()` run before `execve`/`exit`/`exit_group` (confirmed live: any CPython `os.fork()`,
-    // with or without a following `execv()`) that is not merely slow, it is functionally an
-    // indefinite hang (`scratchpad/jqrepro/FINDINGS.txt` pass 151).
+    // `Continue` turns the child's ENTIRE remaining execution into a permanent, one-instruction-
+    // at-a-time trace. For a real workload with a long post-`fork()` run before
+    // `execve`/`exit`/`exit_group` (confirmed live: any CPython `os.fork()`, with or without a
+    // following `execv()`) that is not merely slow, it is functionally an indefinite hang
+    // (`scratchpad/jqrepro/FINDINGS.txt` pass 151).
+    //
+    // The THREAD-based path is not immune to the same shape either, just via a different mechanism:
+    // its `is_in_source` hits genuinely are rare (disjoint source/destination ranges by
+    // construction), but [`on_single_step`] takes a trap -- and re-arms `TF` -- on every single
+    // instruction the child executes while verification is active, hit or no hit. A child whose
+    // pre-`execve` code runs a long loop with zero stale-pointer hits the entire time (confirmed
+    // live: `node`'s `child_process.spawn()` -> `posix_spawn`, a plain `fork()`, spinning through a
+    // ~4-instruction loop -- never once hitting `is_in_source`/`HEAL`) pays a full Windows exception
+    // round-trip per instruction for as long as verification stays armed on top of whatever that
+    // loop's own runtime already is. This bound exists to stop verification from being an
+    // *additional* source of slowdown on top of an unrelated hang, not because ending verification
+    // early is known to make such a loop itself terminate (see [`MAX_THREAD_VERIFICATION_STEPS`]'s
+    // doc comment).
     //
     // The staleness this module exists to catch is inherently front-loaded: it comes from
     // pointers that were sitting in memory at the *moment* `fork()` was called (return addresses
@@ -516,26 +549,29 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
     // thread* is exceeded, any further staleness this module could still catch is far less likely
     // than the risk of single-stepping the child forever -- end verification proactively (exactly
     // the same teardown `end()` performs) instead of re-arming `TF` again, rather than requiring
-    // the child to reach `execve`/`exit`/`exit_group` on its own to escape the trace.
-    //
-    // Scoped to identity relocations only: the THREAD-based path's own `is_in_source` is already
-    // rare (disjoint ranges by construction), so this bound is never expected to matter there, and
-    // is deliberately not applied there to leave that path's own behavior completely unchanged.
-    if relocations.is_identity() {
-        let steps = tls.fork_verify_step_count.get() + 1;
-        tls.fork_verify_step_count.set(steps);
-        if steps > MAX_IDENTITY_VERIFICATION_STEPS {
-            if crate::veh_trace_enabled() {
-                eprintln!(
-                    "[fork_verify] tid={:?} on_single_step: identity relocations, step bound {MAX_IDENTITY_VERIFICATION_STEPS} exceeded at rip={rip:#x}, ending verification early",
-                    std::thread::current().id(),
-                );
-            }
-            drop(borrow);
-            context.EFlags &= !eflags_tf;
-            *tls.fork_verify.borrow_mut() = None;
-            return StepOutcome::Continue;
+    // the child to reach `execve`/`exit`/`exit_group` on its own to escape the trace. The
+    // THREAD-based bound is set much higher than the identity one (see
+    // [`MAX_THREAD_VERIFICATION_STEPS`]'s doc comment) since real THREAD-path post-fork work can
+    // legitimately include ordinary interpreter/libc loops the narrower identity bound never needs
+    // to accommodate.
+    let step_bound = if relocations.is_identity() {
+        MAX_IDENTITY_VERIFICATION_STEPS
+    } else {
+        MAX_THREAD_VERIFICATION_STEPS
+    };
+    let steps = tls.fork_verify_step_count.get() + 1;
+    tls.fork_verify_step_count.set(steps);
+    if steps > step_bound {
+        if crate::veh_trace_enabled() {
+            eprintln!(
+                "[fork_verify] tid={:?} on_single_step: step bound {step_bound} exceeded at rip={rip:#x}, ending verification early",
+                std::thread::current().id(),
+            );
         }
+        drop(borrow);
+        context.EFlags &= !eflags_tf;
+        *tls.fork_verify.borrow_mut() = None;
+        return StepOutcome::Continue;
     }
 
     if crate::veh_trace_enabled() {
