@@ -4634,12 +4634,26 @@ unsafe extern "C-unwind" fn exception_handler(
         let group_ptr = fork_verify::read_stack_word_for_diagnostics(rdi.wrapping_sub(0x10));
         let self_slot_addr = rax.wrapping_add(0x10);
         let self_slot_value = fork_verify::read_stack_word_for_diagnostics(self_slot_addr);
+        // Pass N: this trap is mallocng's basic 16-byte pointer-alignment check on `rdi` itself
+        // (`test dil, 0xf` right before the `hlt`), not the `free()` self-pointer check this
+        // block's own doc comment above describes -- `rdi & 0xf` is the actual failing
+        // condition. Reverse-translate `rdi` (a CHILD/dest-space address, since this trap fires
+        // on a fork() child under active verification) back to the PARENT's own pre-fork address
+        // to determine whether the misalignment already existed before `fork()` duplicated this
+        // memory (a genuine guest-side issue) or was introduced by litebox's own duplication/
+        // healing (a litebox bug) -- must run before `end_fork_child_verification()` clears the
+        // relocation map this needs.
+        let rdi_source = get_tls_ptr()
+            .and_then(|tls| fork_verify::reverse_translate_and_read_for_diagnostics(unsafe { &*tls }, rdi));
         eprintln!(
-            "[diag-mallocng] tid={:?} rdi={rdi:#x} rax={rax:#x} rcx={rcx:#x} \
+            "[diag-mallocng] tid={:?} rdi={rdi:#x} rdi&0xf={:#x} rax={rax:#x} rcx={rcx:#x} \
              [rdi-0x10]={group_ptr:#x?} self_slot_addr(rax+0x10)={self_slot_addr:#x} \
-             self_slot_value={self_slot_value:#x?} expected(rcx)={rcx:#x} match={}",
+             self_slot_value={self_slot_value:#x?} expected(rcx)={rcx:#x} match={} \
+             rdi_source_addr={:#x?}",
             std::thread::current().id(),
+            rdi & 0xf,
             self_slot_value == Some(rcx),
+            rdi_source.map(|(source_addr, _)| source_addr),
         );
     }
     let (exception, error_code, cr2) = match exception_record.ExceptionCode {
