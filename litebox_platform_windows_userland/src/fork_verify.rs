@@ -960,6 +960,19 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
         && relocations.is_in_destination(load_address)
         && !relocations.is_in_destination_heap_range(load_address)
         && let Some(stale_value) = read_usize_fault_tolerant(load_address)
+        // Case (2c)/(2d) both already require the loaded value to satisfy `MIN_POINTER_ALIGN`
+        // before trusting `relocations.translate` -- this case never did, despite reading a value
+        // out of memory the exact same way and having the exact same "an ordinary integer happens
+        // to numerically fall in a tracked range" false-positive risk this constant exists to
+        // close. Confirmed live (a separate `execve` argv-corruption repro, `node`
+        // `child_process.spawn()` with 2+ arguments): a short C string's own trailing bytes,
+        // reached via SOME indirect call/jmp target slot elsewhere on the stack, satisfied every
+        // existing condition here (a real destination address, non-heap, `translate` succeeding)
+        // while being an ordinary, misaligned, non-pointer value -- getting healed and destroying
+        // the string. `MIN_POINTER_ALIGN` costs nothing for the genuine case this branch exists
+        // for (every real GOT/PLT-style code pointer this allocator or linker ever hands out is at
+        // least this aligned) and rejects exactly this shape of coincidental match.
+        && stale_value.is_multiple_of(MIN_POINTER_ALIGN)
         && let Some(translated) = relocations.translate(stale_value)
     {
         if crate::veh_trace_enabled() {
