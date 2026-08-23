@@ -4730,6 +4730,14 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         fork_verify::end();
     }
 
+    fn diagnostic_reverse_translate_fork_child_addr(&self, dest_addr: usize) -> Option<usize> {
+        let tls = get_tls_ptr()?;
+        // SAFETY: `get_tls_ptr` returns this thread's live `TlsState`.
+        let tls = unsafe { &*tls };
+        fork_verify::reverse_translate_and_read_for_diagnostics(tls, dest_addr)
+            .map(|(source_addr, _bytes)| source_addr)
+    }
+
     fn diagnostic_process_fork_probe(
         &self,
         relocations: &litebox::mm::AddressRelocations,
