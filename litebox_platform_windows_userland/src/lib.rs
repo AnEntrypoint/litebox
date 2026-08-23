@@ -4624,16 +4624,22 @@ unsafe extern "C-unwind" fn exception_handler(
         let rdi = ctx.rdi;
         let rax = ctx.rax;
         let rcx = ctx.rcx;
-        let group_ptr =
-            unsafe { core::ptr::read_unaligned((rdi.wrapping_sub(0x10)) as *const u64) };
+        // `rdi`/`rax` are ordinary guest register values at trap time, not guaranteed to hold a
+        // valid pointer (confirmed live: `rax == 0` for one crash this diagnostic was used to
+        // investigate, making the un-guarded `rax + 0x10` dereference below itself crash the
+        // diagnostic pass with an unrelated access violation). Use the same fault-tolerant
+        // primitive `fork_verify`'s own diagnostics already rely on instead of a raw
+        // dereference, so a not-pointer-shaped register value reports as `None` here rather than
+        // taking down the process the diagnostic was trying to observe.
+        let group_ptr = fork_verify::read_stack_word_for_diagnostics(rdi.wrapping_sub(0x10));
         let self_slot_addr = rax.wrapping_add(0x10);
-        let self_slot_value = unsafe { core::ptr::read_unaligned(self_slot_addr as *const u64) };
+        let self_slot_value = fork_verify::read_stack_word_for_diagnostics(self_slot_addr);
         eprintln!(
             "[diag-mallocng] tid={:?} rdi={rdi:#x} rax={rax:#x} rcx={rcx:#x} \
-             [rdi-0x10]={group_ptr:#x} self_slot_addr(rax+0x10)={self_slot_addr:#x} \
-             self_slot_value={self_slot_value:#x} expected(rcx)={rcx:#x} match={}",
+             [rdi-0x10]={group_ptr:#x?} self_slot_addr(rax+0x10)={self_slot_addr:#x} \
+             self_slot_value={self_slot_value:#x?} expected(rcx)={rcx:#x} match={}",
             std::thread::current().id(),
-            self_slot_value == rcx as u64,
+            self_slot_value == Some(rcx),
         );
     }
     let (exception, error_code, cr2) = match exception_record.ExceptionCode {
