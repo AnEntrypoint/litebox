@@ -1485,7 +1485,32 @@ struct TlsState {
 /// `interrupt_callback`) reads `thread_ctx` back via `[rsp]`, so `Rsp` is always set to
 /// `host_sp` itself, unmodified; the exception record lives in this separate reserve instead
 /// of overlapping the `Rsp` landing spot.
-const EXCEPTION_RECORD_RESERVE: usize = 4096;
+///
+/// Must ALSO stay clear of `exception_handler`'s own stack frame: `exception_callback` sets
+/// `Rsp = host_sp` before calling it (see above), so `exception_handler`'s locals grow downward
+/// from the exact same address this reserve is computed relative to. A too-small reserve here
+/// lets that frame's own stack usage overlap and overwrite the just-written record before
+/// `exception_handler` ever reads it. Confirmed live (root-caused via a write-then-immediate-
+/// readback diagnostic in `vectored_exception_handler`, matching the written code, paired with a
+/// diagnostic at `exception_handler`'s own first line reading back a DIFFERENT code at the exact
+/// same address, with no intervening exception dispatch and `EFLAGS.TF` confirmed clear the
+/// whole time -- ruling out re-entrancy, leaving frame-overlap as the only remaining
+/// explanation): `/bin/sh` executing a script FILE (not `-c "..."`, which never reproduced this)
+/// drives `fork_verify`'s single-step verification deep enough, combined with a debug-build
+/// (unoptimized, larger-than-release) `exception_handler` frame -- itself containing a sizeable
+/// `LITEBOX_DIAG_MALLOCNG`-gated diagnostic block with several local buffers plus the full
+/// exception-dispatch `match` -- to exceed the previous 4096-byte reserve and corrupt
+/// `ExceptionCode` before it was read, surfacing as a spurious "Unhandled Win32 exception code"
+/// panic for what was actually a legitimate, already-handled `STATUS_PRIVILEGED_INSTRUCTION`
+/// mallocng trap.
+///
+/// Widened generously (16x) rather than heap-allocating the record: this scratch write happens
+/// on the exception-dispatch hot path, potentially while the guest's own allocator lock is held
+/// (the mallocng trap this bug was found via is itself an allocator-internal assertion) --
+/// allocating here risks reentering a possibly-already-locked allocator. A fixed, generously-
+/// sized stack-relative reserve avoids that risk entirely; `exception_handler`'s frame is a
+/// fraction of 64KiB even accounting for every diagnostic branch's locals.
+const EXCEPTION_RECORD_RESERVE: usize = 65536;
 
 impl TlsState {
     /// Creates a new `TlsState` with all fields zeroed / defaulted.
