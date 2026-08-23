@@ -1454,12 +1454,40 @@ fn fixup_stale_stack_pointers<Platform: ShimPlatform>(
 fn fixup_stale_elf_data_pointers<Platform: ShimPlatform>(
     relocations: &litebox::mm::AddressRelocations,
 ) {
+    // The minimum alignment a genuine relocated pointer (an `R_X86_64_RELATIVE`/`RELR` GOT-style
+    // slot, or an ordinary global pointer variable the linker/compiler placed) is guaranteed to
+    // have -- mirrors `fork_verify::MIN_POINTER_ALIGN` (`litebox_platform_windows_userland`, not
+    // shared across the crate boundary) and the identical guard already applied to
+    // `fixup_stale_stack_pointers`'s heap-range branch and `fork_verify`'s case (2c)/(2d)/(3) for
+    // the SAME false-positive reason each of those already documents at length: `relocations.
+    // translate` succeeding only proves a raw value falls within SOME tracked source range, not
+    // that it is actually a pointer -- an ordinary small/packed integer sitting in `.data`/`.bss`
+    // can coincidentally satisfy that with no relation to a real relocation at all.
+    //
+    // Confirmed live as a real, distinct instance of this exact class (not a hypothetical): the
+    // same `execve` argv-corruption investigation that motivated the `fixup_stale_stack_pointers`
+    // fix found `argv[0]`'s own string buffer -- a completely separate allocation from the
+    // `pathname` buffer that fix already covers -- corrupted the identical way (a short C string's
+    // NUL terminator plus adjacent padding bytes, read together as one `usize`, translating
+    // successfully purely by numeric coincidence) via THIS function specifically: the raw value at
+    // the corrupted slot was `0x7feffea60065`, 5 bytes past a 16-byte boundary, definitively not a
+    // pointer this platform's allocator or linker could ever have produced.
+    //
+    // This is deliberately NOT the range-narrowing this function's own doc comment (above) warns
+    // is unsafe to attempt again without a genuinely deeper reactive-healing improvement -- it adds
+    // no exclusion to WHICH ranges get scanned (every range `private_data_ranges` already covers
+    // is still scanned in full), only a value-SHAPE check on what gets healed within them, the
+    // exact same kind of change the doc comment's own "second attempt" section already confirms is
+    // real, sound, and independently safe (that is precisely how case (2c)'s own soundness gap was
+    // closed, with no reopening of the range-narrowing livelock the third attempt hit).
+    const MIN_POINTER_ALIGN: usize = 16;
     for (source_range, dest_base) in relocations.private_data_ranges() {
         let mut addr = dest_base;
         let dest_top = dest_base + source_range.len();
         while addr < dest_top {
             let slot = UserPtrMut::<usize>::from_usize(addr);
             if let Some(value) = slot.read_at_offset::<Platform>(0)
+                && value.is_multiple_of(MIN_POINTER_ALIGN)
                 && let Some(translated) = relocations.translate(value)
             {
                 let _ = slot.write_at_offset::<Platform>(0, translated);
