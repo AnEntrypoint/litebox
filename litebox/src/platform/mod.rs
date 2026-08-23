@@ -643,6 +643,27 @@ pub trait ForkChildVerificationProvider {
         let _ = full_translated_gprs;
     }
 
+    /// Diagnostic-only: if the calling thread is still a `fork()` child under active
+    /// [`Self::begin_fork_child_verification`] tracking, reverse-translates `dest_addr` (an
+    /// address in this thread's own, post-`fork()`-relocated DESTINATION address space) back to
+    /// the corresponding SOURCE (pre-`fork()`, parent-space) address, per the same
+    /// `AddressRelocations` map [`begin_fork_child_verification`](Self::begin_fork_child_verification)
+    /// was armed with. Returns `None` if this thread has no active verification, or if
+    /// `dest_addr` does not fall within any tracked destination range.
+    ///
+    /// Exists so a caller elsewhere in the shim (which does not itself have access to the
+    /// platform's private `AddressRelocations` bookkeeping) can determine a memory location's
+    /// TRUE pre-fork identity -- e.g. distinguishing a value that lives in the ELF's static
+    /// `.bss` segment from one that lives in the dynamically-grown heap, which requires comparing
+    /// against the parent's own address space, not the child's relocated copy. Must be called
+    /// before [`Self::end_fork_child_verification`] clears the tracked relocation map for this
+    /// thread. The default implementation (every platform without a relocating `fork()`) always
+    /// returns `None`.
+    fn diagnostic_reverse_translate_fork_child_addr(&self, dest_addr: usize) -> Option<usize> {
+        let _ = dest_addr;
+        None
+    }
+
     /// Blocks the calling thread until the real OS process identified by `handle` (opaque,
     /// platform-defined -- see [`CrossProcessChildHandle`]'s doc comment) terminates, then returns
     /// its raw OS exit code.
