@@ -850,6 +850,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                 tid:% = self.tid;
                                 "fatal signal: terminating task"
                             );
+                            // `sys_exit`/`sys_exit_group` both tear down fork-child single-step
+                            // verification (`end_fork_child_verification`) before calling into
+                            // `exit_group`/`exit_thread` -- this path terminates a task the exact
+                            // same way but is reached from a fatal *signal* (delivered via a
+                            // hardware trap through `handle_exception_request`, e.g. a mallocng
+                            // heap-corruption `SIGILL`) rather than a guest `exit`/`exit_group`
+                            // syscall, so it bypassed that teardown entirely: a `fork()` child
+                            // still under active single-step verification (`EFLAGS.TF` armed,
+                            // `fork_verify`'s per-thread state still live) when it dies from an
+                            // unhandled fatal signal reached `exit_group`'s sibling-thread
+                            // suspend/interrupt machinery with verification still active --
+                            // untested territory that crashed the host process with a second,
+                            // unrelated access violation instead of cleanly reporting the guest's
+                            // `SIGILL`. Mirror the same teardown here, unconditionally: a no-op
+                            // when verification isn't active (the overwhelmingly common case for
+                            // a fatal signal), exactly like the syscall paths' own calls.
+                            self.global.platform.end_fork_child_verification();
                             self.exit_group(ExitStatus::Signal(signal));
                         }
                         SignalDisposition::Ignore => {}
