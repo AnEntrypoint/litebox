@@ -1240,6 +1240,18 @@ fn fixup_stale_stack_pointers<Platform: ShimPlatform>(
     // narrower window misses is still caught reactively by `fork_verify`'s single-step healing
     // (see that module's doc comment) for the remainder of the fork()-to-execve() window.
     const STACK_SCAN_MARGIN: usize = 4 * 1024;
+    // The minimum alignment a genuine heap/allocator-owned pointer is guaranteed to have under
+    // musl's mallocng (mirrors `fork_verify`'s own `MIN_POINTER_ALIGN` in
+    // `litebox_platform_windows_userland`, not shared across the crate boundary -- see that
+    // constant's doc comment for the full false-positive history this same guard closes here).
+    // Required before trusting a slot's raw value as a genuine heap pointer purely because its
+    // *translated* form happens to land in `is_in_destination_heap_range`: an ordinary non-pointer
+    // integer sitting in a stack slot (confirmed live -- a short C string's own NUL-terminator-
+    // plus-padding bytes, read as one `usize`, translated to a heap-range-shaped destination
+    // address purely by numeric coincidence) would otherwise get silently "healed" into that
+    // address, destroying the real data that was there. A misaligned raw value is never a value
+    // this allocator actually handed out, so it is never a real pointer needing repair here.
+    const MIN_POINTER_ALIGN: usize = 16;
     for (source_range, dest_base) in relocations.ranges() {
         let dest_base = *dest_base;
         let dest_top = dest_base + source_range.len();
@@ -1302,10 +1314,26 @@ fn fixup_stale_stack_pointers<Platform: ShimPlatform>(
                 // fork()-in-progress call chain is actively using (allocator bookkeeping among
                 // them) or nothing at all; ordinary integers this shallow in the unwind have no
                 // reason to coincide with a live heap object's address any more than a return
-                // address coincides with code by chance.
+                // address coincides with code by chance -- EXCEPT that the *destination* side of
+                // a numeric coincidence is exactly as capable of landing in the (typically large)
+                // heap range as any other wide range, so this branch alone was not actually as
+                // narrow as reasoned above: confirmed live, a short C string's own trailing NUL
+                // terminator plus the following bytes of ordinary stack padding, read together as
+                // one raw `usize`, both (a) fell within some OTHER tracked source range by pure
+                // coincidence and (b) translated to a destination address inside the heap range,
+                // getting "healed" and destroying the string's own NUL terminator -- root cause of
+                // a long-investigated `execve`/`spawn()` argv corruption. `MIN_POINTER_ALIGN`
+                // (mirroring `fork_verify`'s own guard for the identical false-positive class)
+                // closes this: a genuine allocator-owned heap pointer is always 16-byte aligned
+                // under mallocng, so requiring the RAW (untranslated) slot value to already satisfy
+                // that alignment before ever trusting its translated form rejects exactly this
+                // shape of coincidental match, without narrowing the genuine spilled-heap-pointer
+                // case this branch exists for at all (every pointer mallocng could have spilled
+                // here already satisfies it).
                 && (relocations.is_in_destination_executable_range(translated)
                     || (dest_base..dest_top).contains(&translated)
-                    || relocations.is_in_destination_heap_range(translated))
+                    || (value.is_multiple_of(MIN_POINTER_ALIGN)
+                        && relocations.is_in_destination_heap_range(translated)))
             {
                 let _ = slot.write_at_offset::<Platform>(0, translated);
             }
