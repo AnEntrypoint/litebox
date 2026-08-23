@@ -497,10 +497,19 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> IOPollable for ReadE
     fn check_io_events(&self) -> Events {
         let rb = self.endpoint.rb.lock();
         let mut events = Events::empty();
-        if self.is_peer_shutdown() {
+        let peer_shutdown = self.is_peer_shutdown();
+        if peer_shutdown {
             events |= Events::HUP;
         }
-        if !self.is_shutdown() && !rb.is_empty() {
+        // Real Linux's pipe read side (`fs/pipe.c`'s `pipe_poll`) reports `EPOLLIN` once the
+        // write end has closed even when the ring buffer is already empty, not just `EPOLLHUP`
+        // alone: a `read()` on this fd will not block anymore -- it returns `0` (EOF)
+        // immediately -- so `EPOLLIN`'s own contract ("a `read()` will not block") already holds.
+        // libuv's stream-close machinery (`uv__stream_io`) relies on seeing `POLLIN` to issue the
+        // final zero-byte `read()` that observes EOF and completes the stream's `close` sequence;
+        // reporting `HUP` alone left that final `read()` never issued, so `child_process.spawn()`
+        // with piped stdio got a correct `exit` event but never a `close` event, hanging forever.
+        if !self.is_shutdown() && (!rb.is_empty() || peer_shutdown) {
             events |= Events::IN;
         }
         events

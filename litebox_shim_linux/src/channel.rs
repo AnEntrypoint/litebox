@@ -79,6 +79,18 @@ pub(crate) struct ReadEnd<Platform: ShimPlatform, T> {
     peer: alloc::sync::Weak<EndPointer<Platform, ringbuf::HeapProd<T>>>,
 }
 
+impl<Platform: ShimPlatform, T> Drop for ReadEnd<Platform, T> {
+    fn drop(&mut self) {
+        // Mirrors `litebox::pipes::WriteEnd`/`ReadEnd`'s own `Drop` impls: without this, a
+        // `UnixConnectedStream` (built on this channel for `socketpair()`-based stdio, e.g.
+        // Node's `child_process.spawn()` piped stdio on some code paths) never notifies its
+        // peer when the last handle to this end goes out of scope, so a peer blocked polling
+        // for `HUP`/`IN` after the writer exits waits forever even though `is_peer_shutdown()`
+        // would already report `true` if it re-checked live state.
+        self.shutdown();
+    }
+}
+
 impl<Platform: ShimPlatform, T> ReadEnd<Platform, T> {
     fn update_pollee(&self) {
         if let Some(peer) = self.peer.upgrade() {
@@ -127,6 +139,21 @@ impl<Platform: ShimPlatform, T> ReadEnd<Platform, T> {
 pub(crate) struct WriteEnd<Platform: ShimPlatform, T> {
     endpoint: alloc::sync::Arc<EndPointer<Platform, ringbuf::HeapProd<T>>>,
     peer: alloc::sync::Weak<EndPointer<Platform, ringbuf::HeapCons<T>>>,
+}
+
+impl<Platform: ShimPlatform, T> Drop for WriteEnd<Platform, T> {
+    fn drop(&mut self) {
+        // `WriteEnd` is `Clone` (each raw fd `dup()`'d from a `socketpair()` write end holds
+        // its own `WriteEnd` value sharing the same underlying `endpoint` `Arc`), so only the
+        // clone that drops the LAST reference to `endpoint` represents the real close of the
+        // underlying open file description -- shutting down on every clone's drop would signal
+        // EOF to the peer while sibling fds referencing the same write end are still open.
+        // Mirrors `litebox::pipes::WriteEnd`/`ReadEnd`'s own `Drop` impls, which don't need this
+        // guard since that module's `WriteEnd`/`ReadEnd` aren't `Clone`.
+        if alloc::sync::Arc::strong_count(&self.endpoint) == 1 {
+            self.shutdown();
+        }
+    }
 }
 
 impl<Platform: ShimPlatform, T> Clone for WriteEnd<Platform, T> {
