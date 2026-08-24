@@ -3977,7 +3977,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         pc: load_info.entry_point,
                         pstate: 0,
                         orig_x0: 0,
-                        syscallno: 0,
+                        // No syscall is in flight on entry -- real Linux's own
+                        // `pt_regs.syscallno` sentinel for this, matched here so
+                        // a value of `0` is never misread as a trapped syscall
+                        // #0.
+                        syscallno: -1,
                         unused2: 0,
                     };
                 }
