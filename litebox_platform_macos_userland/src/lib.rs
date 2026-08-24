@@ -234,6 +234,14 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
     /// inside any plausible limit.
     const TASK_ADDR_MAX: usize = 0x0000_4000_0000_0000;
 
+    /// Real cross-process shared memory isn't implemented yet -- `allocate_pages`
+    /// below already rejects a `SHARED` mapping outright, so the default
+    /// `create_shared_memory`/etc. bodies (returning `UnsupportedByPlatform`)
+    /// are never actually exercised and this type is never constructed. See
+    /// this trait item's own doc comment for why `()` is the correct choice
+    /// for a platform that doesn't support this yet.
+    type SharedMemoryHandle = ();
+
     fn allocate_pages(
         &self,
         suggested_range: core::ops::Range<usize>,
@@ -594,6 +602,22 @@ impl litebox::platform::StdioProvider for MacOsUserland {
 
     fn is_a_tty(&self, stream: litebox::platform::StdioStream) -> bool {
         self.stdio_is_tty[stream as usize]
+    }
+
+    fn stdin_ready(&self) -> bool {
+        // A real `poll(2)` on the actual inherited stdin fd with a zero timeout: the host
+        // kernel already implements this readiness query directly against the real fd, no
+        // emulation required -- see `litebox_platform_linux_userland`'s identical rationale for
+        // its own `stdin_ready`.
+        let mut pfd = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pfd` is a single valid `pollfd`, `nfds` matches, and a zero timeout makes
+        // this call non-blocking.
+        let ret = unsafe { libc::poll(&raw mut pfd, 1, 0) };
+        ret > 0
     }
 }
 

@@ -12,7 +12,7 @@ exe="$script_dir/litebox_runner_linux_userland"
 rootfs_tar="$script_dir/alpine-rootfs.tar"
 
 if [ "$#" -eq 0 ]; then
-    exec "$exe" --initial-files "$rootfs_tar" /bin/sh
+    exec "$exe" --unstable --initial-files "$rootfs_tar" /bin/sh
 fi
 
 case "$1" in
@@ -20,4 +20,4 @@ case "$1" in
     *) program="/bin/$1" ;;
 esac
 shift
-exec "$exe" --initial-files "$rootfs_tar" "$program" "$@"
+exec "$exe" --unstable --initial-files "$rootfs_tar" "$program" "$@"
