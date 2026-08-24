@@ -1,0 +1,161 @@
+name: Release Linux Alpine Bundle
+
+permissions:
+  contents: write
+  packages: write
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build_base_image:
+    name: Build Alpine base image
+    uses: ./.github/workflows/build-alpine-base-image.yml
+    permissions:
+      contents: read
+      packages: write
+    secrets: inherit
+
+  build_linux_runner:
+    name: Build Linux runner
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v6
+      - name: Set up Rust
+        run: |
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --target x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-linux-runner
+      - name: Build litebox_runner_linux_userland (release)
+        run: cargo build --locked --release -p litebox_runner_linux_userland
+      - name: Upload runner binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-runner-bin
+          path: target/release/litebox_runner_linux_userland
+          if-no-files-found: error
+
+  build_alpine_rootfs:
+    name: Build Alpine rootfs tar
+    needs: [build_base_image]
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v6
+      - name: Set up Rust
+        run: |
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --target x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-litebox-packager
+      - name: Build litebox_packager (release)
+        run: cargo build --locked --release -p litebox_packager
+      - name: Package Alpine rootfs (BusyBox + nodejs + python)
+        run: |
+          ./target/release/litebox_packager --oci-image ${{ needs.build_base_image.outputs.image }} -o alpine-rootfs.tar --verbose
+      - name: Upload rootfs tar
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-alpine-rootfs-tar
+          path: alpine-rootfs.tar
+          if-no-files-found: error
+
+  smoke_test:
+    name: Smoke test runner against rootfs
+    needs: [build_linux_runner, build_alpine_rootfs]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download runner binary
+        uses: actions/download-artifact@v6
+        with:
+          name: linux-runner-bin
+          path: smoke
+      - name: Download rootfs tar
+        uses: actions/download-artifact@v6
+        with:
+          name: linux-alpine-rootfs-tar
+          path: smoke
+      - name: Make runner executable
+        working-directory: smoke
+        run: chmod +x litebox_runner_linux_userland
+      - name: Run /bin/true against the rootfs
+        working-directory: smoke
+        run: ./litebox_runner_linux_userland --initial-files alpine-rootfs.tar /bin/true
+      - name: Run busybox echo against the rootfs
+        working-directory: smoke
+        run: ./litebox_runner_linux_userland --initial-files alpine-rootfs.tar /bin/busybox echo smoke-test-ok
+      # No TUN/networking step here (that needs root and a real TUN device --
+      # see litebox_platform_linux_userland/scripts/tun-setup.sh) -- networking
+      # is opt-in at the API level, not required for basic guest execution, and
+      # is already exercised by the main CI workflow's own test suite.
+      - name: Verify baked-in agent-sandbox tooling (git, bash, curl, ssh) needs no apk add
+        working-directory: smoke
+        run: ./litebox_runner_linux_userland --initial-files alpine-rootfs.tar /bin/bash -c 'set -e; git --version; curl --version; ssh -V'
+      - name: Verify tzdata is baked in (Python zoneinfo needs no apk add)
+        working-directory: smoke
+        run: ./litebox_runner_linux_userland --initial-files alpine-rootfs.tar /bin/sh -c 'test -f /usr/share/zoneinfo/America/New_York && echo tzdata-ok'
+      - name: Run node and python inside the guest
+        working-directory: smoke
+        run: |
+          ./litebox_runner_linux_userland --initial-files alpine-rootfs.tar /usr/bin/node -e "console.log('node-smoke-ok')"
+          ./litebox_runner_linux_userland --initial-files alpine-rootfs.tar /usr/bin/python3 -c "print('python-smoke-ok')"
+      - name: Resume from an exported writable layer
+        working-directory: smoke
+        run: |
+          ./litebox_runner_linux_userland --initial-files alpine-rootfs.tar --export-writable-layer session.tar /bin/sh -c "echo instance-ok > /tmp/marker; cat /tmp/marker"
+          ./litebox_runner_linux_userland --initial-files alpine-rootfs.tar --resume-from session.tar /bin/sh -c 'cat /tmp/marker'
+
+  bundle:
+    name: Bundle release tarball
+    needs: [build_linux_runner, build_alpine_rootfs, smoke_test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v6
+      - name: Download runner binary
+        uses: actions/download-artifact@v6
+        with:
+          name: linux-runner-bin
+          path: bundle
+      - name: Download rootfs tar
+        uses: actions/download-artifact@v6
+        with:
+          name: linux-alpine-rootfs-tar
+          path: bundle
+      - name: Assemble bundle
+        run: |
+          chmod +x bundle/litebox_runner_linux_userland
+          cp dist_tools/run-alpine.sh bundle/
+          chmod +x bundle/run-alpine.sh
+          cp dist_tools/README-linux.md bundle/README.md
+          tar -C bundle -czf litebox-linux-alpine.tar.gz .
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: litebox-linux-alpine
+          path: litebox-linux-alpine.tar.gz
+          if-no-files-found: error
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: litebox-linux-alpine.tar.gz
+          generate_release_notes: true

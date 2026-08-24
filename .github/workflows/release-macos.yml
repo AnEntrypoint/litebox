@@ -1,0 +1,82 @@
+name: Release macOS Build Verification
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build_macos:
+    name: Build macOS (Apple Silicon) platform crates
+    # `macos-14` and later are AArch64 runners. LiteBox runs guest instructions
+    # natively, so an Apple Silicon host is only useful to an AArch64 guest --
+    # there is deliberately no x86-64 macOS configuration.
+    runs-on: macos-14
+    env:
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v6
+      - name: Set up Rust
+        run: |
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --target aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-macos
+      - name: Build litebox_platform_macos_userland (release)
+        run: cargo build --locked --release -p litebox_platform_macos_userland
+      - name: Build litebox_syscall_rewriter (release, AArch64 support)
+        run: cargo build --locked --release -p litebox_syscall_rewriter
+      - name: Build litebox_packager (release, arch-matched OCI pulls)
+        run: cargo build --locked --release -p litebox_packager
+      - name: Assemble build-verification bundle
+        run: |
+          mkdir -p bundle
+          cp target/release/litebox_syscall_rewriter bundle/
+          cp target/release/litebox_packager bundle/
+          cp docs/macos.md bundle/README.md
+          # litebox_platform_macos_userland has no binary of its own (it's a
+          # library the not-yet-existing macOS runner will link against) -- its
+          # presence here is proven by this job succeeding, not by a shipped
+          # artifact.
+          tar -C bundle -czf litebox-macos-build-verification.tar.gz .
+      - name: Upload build-verification artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: litebox-macos-build-verification
+          path: litebox-macos-build-verification.tar.gz
+          if-no-files-found: error
+      # No smoke test: per docs/macos.md's own "Remaining work" section, guest
+      # entry (the actual host<->guest context switch) is not implemented yet,
+      # so there is no way to run a guest program on this platform today. This
+      # job exists to prove the port compiles and links for real on real
+      # Apple Silicon hardware -- not to ship something end-users can run guest
+      # code with. Revisit once guest entry lands (see docs/macos.md).
+      - name: Publish GitHub release (build-verification artifact only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: litebox-macos-build-verification.tar.gz
+          append_body: true
+          body: |
+
+            ---
+            **`litebox-macos-build-verification.tar.gz` is a build-verification artifact, not a functional release.**
+            Guest entry (the host<->guest context switch) is not yet implemented
+            for macOS/Apple Silicon -- see `docs/macos.md`'s "Remaining work"
+            section. This artifact proves the macOS platform port compiles and
+            links on real Apple Silicon hardware; it cannot run guest programs
+            yet.
