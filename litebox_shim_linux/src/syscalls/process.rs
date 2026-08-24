@@ -1230,6 +1230,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 fn fixup_stale_stack_pointers<Platform: ShimPlatform>(
     relocations: &litebox::mm::AddressRelocations,
     child_rsp: usize,
+    child_fs_base: Option<usize>,
 ) {
     // Upper bound on how deep libc's own fork()/clone() unwind reads stale spilled
     // registers/return addresses from -- musl's _Fork -> fork -> caller is a handful of stack
@@ -1259,10 +1260,30 @@ fn fixup_stale_stack_pointers<Platform: ShimPlatform>(
         // ever scanned, and only the bounded window near `rsp` within it. See this function's
         // top-level doc comment for why every other region (a sibling TCB/guard-page entry
         // included) is excluded even though `duplicate()` may place the real TCB in a sibling
-        // entry of the same relocation group: the self-referential `%fs:0` TCB pointer this pass
-        // would otherwise also fix up there is already independently corrected by `sys_clone`'s
-        // own `fs_base` translation (see this function's caller), which is exact rather than
-        // heuristic, so this pass narrowing to the stack alone does not reopen that case.
+        // entry of the same relocation group: the self-referential `%fs:0` TCB pointer ITSELF is
+        // already independently corrected by `sys_clone`'s own `fs_base` translation (see this
+        // function's caller). That correction only ever touches the ONE canonical `%fs:0` slot,
+        // though -- it does NOT cover a COPY of that same self-pointer value musl's own calling
+        // convention spills onto the STACK (confirmed live: `mov [rsp+8],rcx` saving the result of
+        // an earlier `mov rcx,fs:0x0` across a run of `call`s, then `mov rcx,[rsp+8]` restoring it
+        // -- a completely ordinary register-spill pattern, not TCB-specific in any way the compiler
+        // marks). Such a spilled copy sits well within this scan's own bounded window (a handful
+        // of libc unwind frames) but was previously invisible to every one of this pass's three
+        // healing-shape guards below: not executable, not itself the exact `dest_base..dest_top`
+        // stack range (it translates to a TCB/TLS address, a DIFFERENT tracked region), and only
+        // 8-byte (not the required 16-byte) aligned since it is a struct-field/register spill, not
+        // a `malloc()`-returned pointer -- so the scan correctly computed a valid translation for
+        // it (`relocations.translate` succeeded) yet never healed it, silently leaving the child
+        // with a permanently stale self-pointer copy at that one stack slot. Confirmed live as the
+        // root cause of a real hang: musl's post-`fork()` thread-list-reset loop (already partially
+        // repaired by the `%fs:0`/`prev`/`next` TCB fixup below, see that fixup's own doc comment)
+        // reads exactly this spilled copy back as its loop terminator, which -- being permanently
+        // wrong -- can never compare equal to the correctly-translated cursor value the loop
+        // computes on each iteration, spinning forever. `child_fs_base` (the SAME already-computed,
+        // exact, non-heuristic translation the `%fs:0` fixup below uses) closes this precisely: a
+        // slot whose translated value is EXACTLY the child's own self-pointer is unambiguously safe
+        // to heal regardless of alignment or which tracked region it happens to translate into,
+        // since there is no other value a genuine self-pointer copy could ever legitimately hold.
         if !(dest_base..dest_top).contains(&child_rsp) {
             continue;
         }
@@ -1333,7 +1354,12 @@ fn fixup_stale_stack_pointers<Platform: ShimPlatform>(
                 && (relocations.is_in_destination_executable_range(translated)
                     || (dest_base..dest_top).contains(&translated)
                     || (value.is_multiple_of(MIN_POINTER_ALIGN)
-                        && relocations.is_in_destination_heap_range(translated)))
+                        && relocations.is_in_destination_heap_range(translated))
+                    // See this function's doc comment above (the `child_fs_base` parameter):
+                    // a slot that translates to EXACTLY the child's own self-pointer is a spilled
+                    // copy of `%fs:0`, unconditionally safe to heal -- no alignment or range guard
+                    // needed, since no other value could ever legitimately equal it.
+                    || child_fs_base == Some(translated))
             {
                 let _ = slot.write_at_offset::<Platform>(0, translated);
             }
@@ -2242,7 +2268,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // duplicated regions: fix them up here, once, before the child ever executes an
                 // instruction, exactly the same way the FS-base self-pointer below is fixed up
                 // for the same reason.
-                fixup_stale_stack_pointers::<Platform>(&relocations, child_ctx.rsp);
+                // Computed here (rather than only at its other use site below, near the `%fs:0`
+                // self-pointer fixup) so `fixup_stale_stack_pointers` can also recognize a spilled
+                // COPY of this same self-pointer sitting in the stack scan's own window -- see that
+                // function's `child_fs_base` parameter doc comment for the exact gap this closes.
+                #[cfg(target_arch = "x86_64")]
+                let child_fs_base_for_stack_scan = self
+                    .global
+                    .platform
+                    .get_arch_specific_register(&ArchSpecificRegister::FsBase)
+                    .ok()
+                    .map(|parent_fs_base| {
+                        relocations
+                            .translate(parent_fs_base)
+                            .unwrap_or(parent_fs_base)
+                    });
+                #[cfg(not(target_arch = "x86_64"))]
+                let child_fs_base_for_stack_scan: Option<usize> = None;
+                fixup_stale_stack_pointers::<Platform>(
+                    &relocations,
+                    child_ctx.rsp,
+                    child_fs_base_for_stack_scan,
+                );
                 fixup_stale_elf_data_pointers::<Platform>(&relocations);
             }
 
