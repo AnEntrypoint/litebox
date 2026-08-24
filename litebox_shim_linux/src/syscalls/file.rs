@@ -1978,13 +1978,54 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<T, Errno> {
         let normalized_path = pathname.normalized()?;
         let path = if follow_symlink {
-            self.do_readlink(normalized_path.as_str())
-                .unwrap_or(normalized_path)
+            self.resolve_final_symlinks(normalized_path)?
         } else {
             normalized_path
         };
         let status = self.files.borrow().fs.file_status(path)?;
         Ok(T::from(status))
+    }
+
+    /// Given an already-normalized absolute path, transparently follow the *final* path
+    /// component if it names a symlink, repeatedly, up to `MAX_SYMLINK_HOPS` times -- matching
+    /// real Linux `stat()`/`ELOOP` semantics.
+    ///
+    /// `do_readlink` (the syscall-level `readlink()` primitive) correctly returns a symlink's raw
+    /// target string verbatim, per POSIX -- but `do_stat`'s `follow_symlink=true` path previously
+    /// passed that raw string straight into `fs.file_status()` as if it were already a resolvable
+    /// path. For an ABSOLUTE target that happens to work by coincidence; for the far more common
+    /// RELATIVE target (e.g. npm's own `.bin/<name> -> ../<pkg>/cli.js` symlinks) it is wrong: a
+    /// relative symlink target must be resolved relative to the directory CONTAINING the symlink,
+    /// never passed through as-is. Confirmed live: `stat()` on `node_modules/.bin/cowsay` (a
+    /// symlink to `../cowsay/cli.js`) kept reporting the symlink's OWN metadata (size 16, mode
+    /// `lrwxrwxrwx`) instead of the target file's -- Node's own CJS module resolver relies on a
+    /// working `stat()`-follows-symlinks to recognize `.bin/cowsay` as a real, requireable file,
+    /// so every `npx`/direct `node node_modules/.bin/<pkg>` invocation of an npm-installed binary
+    /// failed with `MODULE_NOT_FOUND`, even though the symlink itself, `readlink()`, and `cat`
+    /// (plain `open()`+`read()`, which doesn't need the target's `stat()` shape) all worked fine.
+    ///
+    /// Mirrors `litebox::fs::in_mem::FileSystem::resolve_final_symlinks`'s already-correct
+    /// algorithm (absolute-vs-relative target handling, hop limit, `ELOOP` on overflow) -- that
+    /// version is private to the writable in-memory layer and not reachable from this shim crate,
+    /// so this duplicates the same proven-correct shape at the syscall layer instead of changing
+    /// its visibility.
+    fn resolve_final_symlinks(&self, path: String) -> Result<String, Errno> {
+        const MAX_SYMLINK_HOPS: u32 = 8;
+        let mut current = path;
+        for _ in 0..MAX_SYMLINK_HOPS {
+            let Ok(target) = self.do_readlink(current.as_str()) else {
+                // Not a symlink (or unreadable as one): `current` is the final answer, whatever
+                // it is -- `fs.file_status` below will surface the real error if it doesn't exist.
+                return Ok(current);
+            };
+            current = if target.starts_with('/') {
+                target.normalized()?
+            } else {
+                let dir = current.rsplit_once('/').map_or("", |(dir, _)| dir);
+                alloc::format!("{dir}/{target}").normalized()?
+            };
+        }
+        Err(Errno::ELOOP)
     }
 
     /// Handle syscall `stat`
