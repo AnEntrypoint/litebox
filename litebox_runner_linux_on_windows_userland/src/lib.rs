@@ -9,6 +9,15 @@ extern crate alloc;
 
 pub mod session_cli;
 
+/// The standard Linux executable search path, prepended to a forwarded `PATH` in `main` below.
+/// Without this, `--forward-env` handing the guest a purely Windows-flavored PATH means the
+/// guest's own `/bin`, `/usr/bin`, etc. are never searched at all -- confirmed live: a top-level
+/// program given as an absolute path (e.g. `/usr/bin/npm`) runs fine, but that same program's OWN
+/// internal PATH-relative lookups (a shell script's `npx`, `npx`'s own `cowsay`) fail with `not
+/// found` even though the binaries are genuinely present, because nothing in the guest's PATH
+/// ever pointed at the directories they live in.
+const LINUX_DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use litebox_platform_windows_userland::WindowsUserland as Platform;
@@ -318,8 +327,35 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let envp = if cli_args.forward_environment_variables {
         envp.into_iter()
             .chain(std::env::vars().map(|(k, v)| {
-                std::ffi::CString::new(k.bytes().chain(*b"=").chain(v.bytes()).collect::<Vec<u8>>())
+                // Windows' own env var names are case-insensitive but reported with whatever
+                // original casing was set -- notably `Path` (mixed case), never `PATH`. Linux
+                // env var lookups (including the guest's own PATH-based executable search) are
+                // case-SENSITIVE, so forwarding `Path` verbatim reaches the guest as a completely
+                // different, useless variable while the `PATH` Linux tools actually look up is
+                // never set at all -- confirmed live: `sh: <cmd>: not found` for any locally-
+                // installed binary (e.g. after `npm install`) despite the install itself
+                // succeeding, because the guest's `execve`/shell PATH search had nothing to
+                // search. Normalize this one, specific, known-mismatched name rather than
+                // case-folding every forwarded variable, which could needlessly collide two
+                // differently-cased Windows variables that mean different things on Linux.
+                //
+                // Also prepend the standard Linux search path (see `LINUX_DEFAULT_PATH` above):
+                // the forwarded value is the HOST's Windows `Path`, whose `C:\...` entries are
+                // meaningless to the guest -- without this prefix, forwarding PATH at all is
+                // strictly worse than not forwarding it, since it shadows the guest's own
+                // otherwise-implicit default search locations with a value that matches nothing.
+                if k.eq_ignore_ascii_case("PATH") {
+                    let v = format!("{LINUX_DEFAULT_PATH}:{v}");
+                    std::ffi::CString::new(
+                        "PATH".bytes().chain(*b"=").chain(v.bytes()).collect::<Vec<u8>>(),
+                    )
                     .unwrap()
+                } else {
+                    std::ffi::CString::new(
+                        k.bytes().chain(*b"=").chain(v.bytes()).collect::<Vec<u8>>(),
+                    )
+                    .unwrap()
+                }
             }))
             .collect()
     } else {
