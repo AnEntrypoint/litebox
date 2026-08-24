@@ -21,34 +21,12 @@ env:
 
 jobs:
   build_base_image:
-    name: Build and publish Alpine base image (nodejs + python)
-    runs-on: ubuntu-latest
-    outputs:
-      image: ${{ steps.image_ref.outputs.image }}
-    steps:
-      - name: Check out repo
-        uses: actions/checkout@v6
-      - name: Compute lowercase image ref
-        id: image_ref
-        run: |
-          owner="${GITHUB_REPOSITORY_OWNER,,}"
-          echo "image=ghcr.io/${owner}/litebox-alpine-base:latest" >> "$GITHUB_OUTPUT"
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push base image
-        uses: docker/build-push-action@v6
-        with:
-          context: dist_tools/base-image
-          push: true
-          tags: ${{ steps.image_ref.outputs.image }}
-      # Package visibility (public) is set once, manually, in the GHCR package
-      # settings -- GITHUB_TOKEN cannot flip org-package visibility (404s: it
-      # lacks org-admin package scope), and that scope is intentionally not
-      # granted here via a PAT to avoid a standing high-privilege secret.
+    name: Build Alpine base image
+    uses: ./.github/workflows/build-alpine-base-image.yml
+    permissions:
+      contents: read
+      packages: write
+    secrets: inherit
 
   build_windows_runner:
     name: Build Windows runner
