@@ -635,6 +635,10 @@ impl From<litebox::pipes::errors::ReadError> for Errno {
             litebox::pipes::errors::ReadError::ClosedFd => Errno::EBADFD,
             litebox::pipes::errors::ReadError::NotForReading => Errno::EINVAL,
             litebox::pipes::errors::ReadError::WouldBlock => Errno::EWOULDBLOCK,
+            litebox::pipes::errors::ReadError::WaitError(e) => match e {
+                litebox::event::wait::WaitError::Interrupted => Errno::EINTR,
+                litebox::event::wait::WaitError::TimedOut => Errno::ETIMEDOUT,
+            },
             _ => todo!(),
         }
     }
@@ -647,6 +651,10 @@ impl From<litebox::pipes::errors::WriteError> for Errno {
             litebox::pipes::errors::WriteError::ReadEndClosed => Errno::EPIPE,
             litebox::pipes::errors::WriteError::NotForWriting => Errno::EINVAL,
             litebox::pipes::errors::WriteError::WouldBlock => Errno::EWOULDBLOCK,
+            litebox::pipes::errors::WriteError::WaitError(e) => match e {
+                litebox::event::wait::WaitError::Interrupted => Errno::EINTR,
+                litebox::event::wait::WaitError::TimedOut => Errno::ETIMEDOUT,
+            },
             _ => todo!(),
         }
     }
