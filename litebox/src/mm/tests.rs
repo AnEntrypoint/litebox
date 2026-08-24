@@ -37,6 +37,12 @@ impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
     const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     const TASK_ADDR_MAX: usize = 0xFFFF_FFFF_F000; // 48-bit VA space
+    // An arm64 Mach-O process reserves the first 4 GiB as `__PAGEZERO`.
+    #[cfg(target_vendor = "apple")]
+    const TASK_ADDR_MIN: usize = 0x1_0000_0000;
+    // Matches `litebox_platform_macos_userland`'s deliberately conservative bound.
+    #[cfg(target_vendor = "apple")]
+    const TASK_ADDR_MAX: usize = 0x0000_4000_0000_0000;
 
     type SharedMemoryHandle = ();
 

@@ -194,4 +194,11 @@ impl Exception {
     pub const DATA_ABORT_CURRENT_EL: Self = Self(0x25);
     /// Data abort taken from a lower exception level.
     pub const DATA_ABORT_LOWER_EL: Self = Self(0x24);
+    /// Unknown reason. This is the class an undefined instruction raises, among
+    /// other unattributable traps.
+    pub const UNKNOWN: Self = Self(0x00);
+    /// Trapped `MSR`/`MRS`/system-instruction access from AArch64 state.
+    pub const SYSTEM_REGISTER_TRAP: Self = Self(0x18);
+    /// Trapped floating-point exception taken from AArch64 state.
+    pub const FP_EXCEPTION_A64: Self = Self(0x2c);
 }
