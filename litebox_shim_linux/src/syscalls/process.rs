@@ -1456,13 +1456,12 @@ fn fixup_stale_elf_data_pointers<Platform: ShimPlatform>(
 ) {
     // The minimum alignment a genuine relocated pointer (an `R_X86_64_RELATIVE`/`RELR` GOT-style
     // slot, or an ordinary global pointer variable the linker/compiler placed) is guaranteed to
-    // have -- mirrors `fork_verify::MIN_POINTER_ALIGN` (`litebox_platform_windows_userland`, not
-    // shared across the crate boundary) and the identical guard already applied to
-    // `fixup_stale_stack_pointers`'s heap-range branch and `fork_verify`'s case (2c)/(2d)/(3) for
-    // the SAME false-positive reason each of those already documents at length: `relocations.
-    // translate` succeeding only proves a raw value falls within SOME tracked source range, not
-    // that it is actually a pointer -- an ordinary small/packed integer sitting in `.data`/`.bss`
-    // can coincidentally satisfy that with no relation to a real relocation at all.
+    // have -- the identical guard already applied to `fixup_stale_stack_pointers`'s heap-range
+    // branch and `fork_verify`'s case (2c)/(2d)/(3) for the SAME false-positive reason each of
+    // those already documents at length: `relocations.translate` succeeding only proves a raw
+    // value falls within SOME tracked source range, not that it is actually a pointer -- an
+    // ordinary small/packed integer sitting in `.data`/`.bss` can coincidentally satisfy that with
+    // no relation to a real relocation at all.
     //
     // Confirmed live as a real, distinct instance of this exact class (not a hypothetical): the
     // same `execve` argv-corruption investigation that motivated the `fixup_stale_stack_pointers`
@@ -1480,7 +1479,23 @@ fn fixup_stale_elf_data_pointers<Platform: ShimPlatform>(
     // exact same kind of change the doc comment's own "second attempt" section already confirms is
     // real, sound, and independently safe (that is precisely how case (2c)'s own soundness gap was
     // closed, with no reopening of the range-narrowing livelock the third attempt hit).
-    const MIN_POINTER_ALIGN: usize = 16;
+    //
+    // 8, not 16: BusyBox `ash`'s script-file-read buffer pointer (`g_parsefile->buf`, allocated via
+    // `ckmalloc`/`malloc`, freed by `forkchild()`'s `closescript()` immediately after every real
+    // `fork()`, before the child's own `execve()`) is a genuine, real, correctly-translatable
+    // pointer that is only 8-byte aligned, not 16 -- confirmed live via a targeted diagnostic: the
+    // slot holding it (at the exact address the crashing `free()`'s `rdi` register was loaded from
+    // moments later) read a value that `relocations.translate()` resolves to precisely the
+    // destination address that ends up in `rdi`, yet a 16-byte guard skipped healing it, leaving
+    // the child with the STALE, untranslated (parent-space) pointer, which `free()` then dereferenced
+    // as if it were valid child-space memory -- landing on unrelated mallocng metadata and tripping
+    // its `assert(!(p&15))` chunk-pointer sanity check. 8 bytes is the true minimum alignment
+    // guaranteed to ANY pointer on this platform (the ABI's own minimum for a 64-bit-addressable
+    // type); it still correctly rejects the argv[0] false positive documented above (`0x65 & 7 ==
+    // 5`, not even 8-aligned) while no longer incorrectly rejecting a genuine pointer that merely
+    // isn't a fresh 16-byte-aligned mallocng chunk start (e.g. a pointer stored inside a struct
+    // field, as this one is, rather than a malloc() return value used directly).
+    const MIN_POINTER_ALIGN: usize = 8;
     for (source_range, dest_base) in relocations.private_data_ranges() {
         let mut addr = dest_base;
         let dest_top = dest_base + source_range.len();
