@@ -98,30 +98,30 @@ jobs:
         run: chmod +x litebox_runner_linux_userland
       - name: Run /bin/true against the rootfs
         working-directory: smoke
-        run: ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar /bin/true
+        run: ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar --program-from-tar /bin/true
       - name: Run busybox echo against the rootfs
         working-directory: smoke
-        run: ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar /bin/busybox echo smoke-test-ok
+        run: ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar --program-from-tar /bin/busybox echo smoke-test-ok
       # No TUN/networking step here (that needs root and a real TUN device --
       # see litebox_platform_linux_userland/scripts/tun-setup.sh) -- networking
       # is opt-in at the API level, not required for basic guest execution, and
       # is already exercised by the main CI workflow's own test suite.
       - name: Verify baked-in agent-sandbox tooling (git, bash, curl, ssh) needs no apk add
         working-directory: smoke
-        run: ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar /bin/bash -c 'set -e; git --version; curl --version; ssh -V'
+        run: ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar --program-from-tar /bin/bash -c 'set -e; git --version; curl --version; ssh -V'
       - name: Verify tzdata is baked in (Python zoneinfo needs no apk add)
         working-directory: smoke
-        run: ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar /bin/sh -c 'test -f /usr/share/zoneinfo/America/New_York && echo tzdata-ok'
+        run: ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar --program-from-tar /bin/sh -c 'test -f /usr/share/zoneinfo/America/New_York && echo tzdata-ok'
       - name: Run node and python inside the guest
         working-directory: smoke
         run: |
-          ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar /usr/bin/node -e "console.log('node-smoke-ok')"
-          ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar /usr/bin/python3 -c "print('python-smoke-ok')"
+          ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar --program-from-tar /usr/bin/node -e "console.log('node-smoke-ok')"
+          ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar --program-from-tar /usr/bin/python3 -c "print('python-smoke-ok')"
       - name: Resume from an exported writable layer
         working-directory: smoke
         run: |
-          ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar --export-writable-layer session.tar /bin/sh -c "echo instance-ok > /tmp/marker; cat /tmp/marker"
-          ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar --resume-from session.tar /bin/sh -c 'cat /tmp/marker'
+          ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar --program-from-tar --export-writable-layer session.tar /bin/sh -c "echo instance-ok > /tmp/marker; cat /tmp/marker"
+          ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar --program-from-tar --resume-from session.tar /bin/sh -c 'cat /tmp/marker'
 
   bundle:
     name: Bundle release tarball
