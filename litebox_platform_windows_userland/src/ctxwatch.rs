@@ -290,11 +290,34 @@ pub(super) fn arm_fixed_on_current_thread() {
         return;
     }
     unsafe {
+        // The `GetCurrentThread()` pseudo-handle (`-2`) cannot be used with
+        // `Get`/`SetThreadContext` for `CONTEXT_DEBUG_REGISTERS` on the thread's own
+        // currently-executing context -- confirmed live (`ERROR_NOACCESS`/998 from both calls)
+        // rather than assumed from documentation, since this exact self-arm path had never
+        // previously been confirmed to succeed in any historical trace. A real handle opened via
+        // `OpenThread` on the thread's own OS thread id does not have this restriction.
+        let real_handle = windows_sys::Win32::System::Threading::OpenThread(
+            windows_sys::Win32::System::Threading::THREAD_ALL_ACCESS,
+            0,
+            windows_sys::Win32::System::Threading::GetCurrentThreadId(),
+        );
+        if real_handle.is_null() {
+            eprintln!(
+                "[ctxwatch-fixed] tid={:?} OpenThread(self) failed: {}",
+                std::thread::current().id(),
+                std::io::Error::last_os_error(),
+            );
+            return;
+        }
+        let _close_guard = litebox::utils::defer(|| {
+            windows_sys::Win32::Foundation::CloseHandle(real_handle);
+        });
+
         let mut context = CONTEXT {
             ContextFlags: CONTEXT_DEBUG_REGISTERS_AMD64,
             ..core::mem::zeroed()
         };
-        if GetThreadContext(GetCurrentThread(), &raw mut context) == 0 {
+        if GetThreadContext(real_handle, &raw mut context) == 0 {
             eprintln!(
                 "[ctxwatch-fixed] tid={:?} GetThreadContext failed: {}",
                 std::thread::current().id(),
@@ -310,7 +333,7 @@ pub(super) fn arm_fixed_on_current_thread() {
         let rw1_write: u64 = 0b01;
         let len1_8bytes: u64 = 0b10;
         context.Dr7 |= (1 << 2) | (rw1_write << 20) | (len1_8bytes << 22) | (1 << 10);
-        if SetThreadContext(GetCurrentThread(), &raw const context) == 0 {
+        if SetThreadContext(real_handle, &raw const context) == 0 {
             eprintln!(
                 "[ctxwatch-fixed] tid={:?} SetThreadContext (arm Dr1) failed: {}",
                 std::thread::current().id(),
