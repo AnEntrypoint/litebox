@@ -4643,8 +4643,9 @@ unsafe extern "C-unwind" fn exception_handler(
         // memory (a genuine guest-side issue) or was introduced by litebox's own duplication/
         // healing (a litebox bug) -- must run before `end_fork_child_verification()` clears the
         // relocation map this needs.
-        let rdi_source = get_tls_ptr()
-            .and_then(|tls| fork_verify::reverse_translate_and_read_for_diagnostics(unsafe { &*tls }, rdi));
+        let rdi_source = get_tls_ptr().and_then(|tls| {
+            fork_verify::reverse_translate_and_read_for_diagnostics(unsafe { &*tls }, rdi)
+        });
         eprintln!(
             "[diag-mallocng] tid={:?} rdi={rdi:#x} rdi&0xf={:#x} rax={rax:#x} rcx={rcx:#x} \
              [rdi-0x10]={group_ptr:#x?} self_slot_addr(rax+0x10)={self_slot_addr:#x} \
