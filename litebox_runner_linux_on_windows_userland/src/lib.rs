@@ -347,7 +347,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 if k.eq_ignore_ascii_case("PATH") {
                     let v = format!("{LINUX_DEFAULT_PATH}:{v}");
                     std::ffi::CString::new(
-                        "PATH".bytes().chain(*b"=").chain(v.bytes()).collect::<Vec<u8>>(),
+                        "PATH"
+                            .bytes()
+                            .chain(*b"=")
+                            .chain(v.bytes())
+                            .collect::<Vec<u8>>(),
                     )
                     .unwrap()
                 } else {

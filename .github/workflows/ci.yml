@@ -142,15 +142,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # `litebox_runner_lvbs` and `litebox_runner_snp` are freestanding images
       # built for custom targets; they are not built for a hosted target on any
-      # platform.
-      - run: cargo clippy --locked --verbose --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp --exclude litebox_runner_optee_on_linux_userland
-      - run: cargo build --locked --verbose --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp --exclude litebox_runner_optee_on_linux_userland
+      # platform. `litebox_platform_linux_userland` (transitively:
+      # `litebox_runner_linux_userland`, `litebox_platform_multiplex` via its
+      # own default feature, and `litebox_shim_optee`/
+      # `litebox_runner_optee_on_linux_userland` via --all-features enabling
+      # their own platform_linux_userland feature) depends on `seccompiler`,
+      # which needs real Linux seccomp `libc` bindings that don't exist on
+      # macOS -- confirmed fine on real Linux (the ubuntu-latest `Build and
+      # Test` job above builds this same --all-features closure without
+      # excluding any of these), so this exclusion list is macOS-specific.
+      - run: cargo clippy --locked --verbose --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp --exclude litebox_runner_optee_on_linux_userland --exclude litebox_platform_linux_userland --exclude litebox_runner_linux_userland --exclude litebox_platform_multiplex --exclude litebox_shim_optee
+      - run: cargo build --locked --verbose --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp --exclude litebox_runner_optee_on_linux_userland --exclude litebox_platform_linux_userland --exclude litebox_runner_linux_userland --exclude litebox_platform_multiplex --exclude litebox_shim_optee
       # The 9p tests need `diod`, which has no macOS package.
       - run: cargo nextest run --locked --profile ci -p litebox -p litebox_common_linux -E 'not test(nine_p)'
       - run: cargo nextest run --locked --profile ci -p litebox_shim_linux
       - run: cargo test --locked --verbose --doc -p litebox -p litebox_common_linux -p litebox_platform_macos_userland
       - name: Build documentation (fail on warnings)
-        run: cargo doc --locked --verbose --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp
+        run: cargo doc --locked --verbose --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp --exclude litebox_runner_optee_on_linux_userland --exclude litebox_platform_linux_userland --exclude litebox_runner_linux_userland --exclude litebox_platform_multiplex --exclude litebox_shim_optee
 
   build_and_test_lvbs:
     name: Build and Test LVBS
