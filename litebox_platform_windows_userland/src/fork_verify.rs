@@ -1649,7 +1649,7 @@ pub(crate) fn on_codewatch_write(record: &EXCEPTION_RECORD, context: &mut CONTEX
     unsafe extern "C" {
         safe static __ImageBase: core::ffi::c_void;
     }
-    if !codewatch::enabled() {
+    if !codewatch::enabled() && !watchaddr_data_enabled() {
         return false;
     }
     // `ExceptionInformation[0]` is the access type (0 read / 1 write / 8 execute) and `[1]` the
@@ -1765,7 +1765,7 @@ pub(crate) fn describe_crash_page_for_diagnostics(rip: usize) {
 /// when that step lands in *host* code (`is_in_guest == false`), where [`on_single_step`] is never
 /// reached. Returns whether the step was the watchpoint's.
 pub(crate) fn on_codewatch_step(context: &mut CONTEXT) -> bool {
-    if !codewatch::enabled() || !codewatch::on_single_step_rearm() {
+    if (!codewatch::enabled() && !watchaddr_data_enabled()) || !codewatch::on_single_step_rearm() {
         return false;
     }
     #[allow(clippy::cast_possible_truncation)]
@@ -1810,6 +1810,51 @@ fn arm_codewatch(relocations: &litebox::mm::AddressRelocations) {
     }
 }
 
+/// Diagnostic-only: arms the SAME software (`VirtualProtect`-based) write watchpoint
+/// `arm_codewatch` uses, but on the single 8-byte-aligned 4KiB page containing
+/// `LITEBOX_DIAG_WATCHADDR` (a child-side absolute address, hex, no `0x` prefix -- reuses
+/// `ctxwatch`'s own env-var parsing convention). Exists because `ctxwatch::arm_fixed_on_current_thread`
+/// (the hardware `Dr1`-register self-arm path) was confirmed live to always fail with
+/// `ERROR_NOACCESS`/998 from both `GetThreadContext`/`SetThreadContext` on the calling thread's own
+/// context, real handle (via `OpenThread`) or pseudo-handle alike -- Windows does not allow a
+/// thread to read or write its OWN debug registers while it is the one running, full stop; only a
+/// DIFFERENT (suspending) thread can do it via `arm_on_handle`, which is unavailable for a
+/// fork()-child's brand-new host thread before its very first guest instruction without new
+/// suspend-before-start plumbing. `VirtualProtect`-based page protection has no such restriction
+/// since it is not CPU debug state at all, so this reuses `arm_codewatch`'s machinery instead of
+/// building that cross-thread plumbing. Same env var also gates `ctxwatch`'s Dr1 mechanism, which
+/// harmlessly still tries and fails to arm (logged, non-fatal) alongside this.
+fn watchaddr_data_enabled() -> bool {
+    std::env::var_os("LITEBOX_DIAG_WATCHADDR").is_some()
+}
+
+fn arm_watchaddr_data() {
+    let Some(addr) = std::env::var("LITEBOX_DIAG_WATCHADDR")
+        .ok()
+        .and_then(|s| usize::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .filter(|&a| a != 0)
+    else {
+        return;
+    };
+    let page = addr & !0xfff;
+    let end = page + 0x1000;
+    let armed = codewatch::arm(page, end);
+    let (mtype, protect, alloc_base) = codewatch::describe(page);
+    // DIAG: read the raw content of `addr` at the exact moment the watch arms (immediately
+    // after fork()'s memory duplication, before execve() has run) to see whether it is ALREADY
+    // zero at this earliest observable point, or whether it holds real content that later
+    // becomes zero (which the watch not trapping would otherwise leave ambiguous -- a watch
+    // that never traps proves "no WRITE instruction touched it while armed", not "it was never
+    // zero", since it could have been zero from before the watch armed at all).
+    let mut buf = [0u8; 8];
+    let n = read_code_bytes_for_diagnostics(addr, &mut buf);
+    eprintln!(
+        "[codewatch-data] tid={:?} arm page=[{page:#x},{end:#x}) for watchaddr={addr:#x} ok={armed} type={mtype:#x} protect={protect:#x} alloc_base={alloc_base:#x} content_at_arm({n})={:02x?}",
+        std::thread::current().id(),
+        &buf[..n],
+    );
+}
+
 /// Per-thread arm/disarm entry points, called through
 /// [`litebox::platform::ForkChildVerificationProvider`].
 pub(crate) fn begin(relocations: alloc::sync::Arc<litebox::mm::AddressRelocations>) {
@@ -1824,6 +1869,7 @@ pub(crate) fn begin(relocations: alloc::sync::Arc<litebox::mm::AddressRelocation
         );
     }
     arm_codewatch(&relocations);
+    arm_watchaddr_data();
     if let Some(tls) = crate::get_tls_ptr() {
         // SAFETY: `get_tls_ptr` returns this thread's live `TlsState`.
         let tls = unsafe { &*tls };
