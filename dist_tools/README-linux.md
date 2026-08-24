@@ -23,7 +23,7 @@ Contents:
 Or directly:
 
 ```sh
-./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar /bin/busybox ls /
+./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar --program-from-tar /bin/busybox ls /
 ```
 
 A bare command name (e.g. `busybox`) passed to the launcher script is
@@ -72,10 +72,10 @@ runner exits. Two flags make a session's on-disk state durable and
 resumable:
 
 ```sh
-./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar \
+./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar --program-from-tar \
   --export-writable-layer session.tar /bin/sh -c "npm install -g some-tool"
 
-./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar \
+./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar --program-from-tar \
   --resume-from session.tar /bin/sh -c "some-tool --version"
 ```
 
