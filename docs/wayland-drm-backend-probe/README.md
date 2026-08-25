@@ -100,6 +100,38 @@ against litebox's `PollSet`/`Observer` registration to find where a repeated
 `dispatch()` call fails to re-arm interest in an already-registered nested
 epoll fd.
 
+**Phase 6 (this pass): the basic nested-epoll re-arming mechanism itself was
+tested directly and RULED OUT as the cause** (`litebox_shim_linux/src/
+syscalls/epoll.rs`'s new `test_nested_epoll_readiness_rechecked_across_
+separate_waits` test, kept as a permanent regression test). Built a minimal,
+self-contained reproduction using the crate's own existing `TestPlatform`
+test harness (no musl/zig/guest-process pipeline needed): one `EpollFile`
+nested inside another via `EPOLL_CTL_ADD` (exactly `calloop`'s own pattern),
+an eventfd registered on the inner epoll, and TWO SEPARATE `wait()` calls
+(matching real `epoll_wait()`/`dispatch()` semantics -- not one continuous
+wait) with the eventfd fired fresh between them. **This passes cleanly**:
+the outer epoll correctly observes the nested epoll's readiness on BOTH the
+first AND the second, independent wait call. This rules out the simplest
+hypothesis (a fundamentally broken observer re-registration or re-arming
+mechanism in the core nested-epoll code from phase 3) -- the basic
+mechanism genuinely works for a plain eventfd source across repeated,
+separate waits, with or without draining the inner epoll's own ready queue
+in between.
+
+**This means the real bug is more specific to calloop's actual usage
+pattern** than the core mechanism -- candidates not yet tested: (a) whether
+calloop issues `EPOLL_CTL_MOD` (not just the original `ADD`) to re-arm its
+own interest each cycle, and whether `mod_interest`'s observer
+re-registration has a subtle difference from `add_interest`'s; (b) whether
+the specific fd kind that becomes ready inside the real compositor's inner
+epoll (a `Unix` socket fd, not a plain eventfd) has a readiness-reporting
+quirk `EpollDescriptor::poll`'s `Unix` arm doesn't share with `Eventfd`;
+(c) a genuine timing/threading race specific to the real combined
+client+compositor-on-separate-threads process shape that a single-threaded
+unit test can't reproduce. Whoever continues this should extend the new
+test to substitute a `Unix` socket fd for the eventfd (closer to the real
+compositor's shape) before re-attempting a live guest-process reproduction.
+
 ## Reproducing the type-check only
 
 ```sh

@@ -951,6 +951,151 @@ mod test {
             .unwrap();
     }
 
+    /// Reproduces the real Wayland-compositor-track finding: after the first ready observation, a
+    /// nested epoll fd (`EPOLL_CTL_ADD`ing one `EpollFile` as a member of another's interest set,
+    /// exactly the pattern `calloop` -- Smithay's event-loop crate -- relies on) stops being
+    /// noticed as ready on later, SEPARATE `epoll_wait()` calls, even though its own underlying fd
+    /// becomes ready again each time. Mimics `calloop`'s real usage shape: repeated, independent
+    /// `wait()` calls (not one continuous wait), with a fresh readiness-producing event fired
+    /// between each one -- matching real `epoll_wait()`/`dispatch()` semantics, where readiness is
+    /// re-evaluated from scratch on every call.
+    #[test]
+    fn test_nested_epoll_readiness_rechecked_across_separate_waits() {
+        let (task, outer) = setup_epoll();
+        let inner = EpollFile::<TestPlatform, crate::DefaultFS<TestPlatform>>::new();
+        let inner_typed = task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<super::EpollSubsystem<TestPlatform, crate::DefaultFS<TestPlatform>>>(inner);
+        let eventfd = crate::syscalls::eventfd::EventFile::new(0, EfdFlags::empty());
+        let eventfd_typed = task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<crate::syscalls::eventfd::EventfdSubsystem<TestPlatform>>(eventfd);
+
+        let files = Arc::new(FilesState::new(task.files.borrow().fs.clone()));
+        let Ok(eventfd_raw) = files.insert_raw_fd(eventfd_typed) else {
+            unreachable!()
+        };
+        let Ok(inner_raw) = files.insert_raw_fd(inner_typed) else {
+            unreachable!()
+        };
+
+        // Register the eventfd on the INNER epoll (matches calloop registering its own real fd
+        // sources on its own epoll instance).
+        let eventfd_descriptor = super::EpollDescriptor::try_from(&files, eventfd_raw).unwrap();
+        {
+            let inner_typed = files
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<super::EpollSubsystem<TestPlatform, crate::DefaultFS<TestPlatform>>>(inner_raw)
+                .unwrap();
+            task.global
+                .litebox
+                .descriptor_table()
+                .with_entry(&inner_typed, |inner_entry| {
+                    inner_entry
+                        .add_interest(
+                            &task.global,
+                            20,
+                            &eventfd_descriptor,
+                            EpollEvent {
+                                events: Events::IN.bits(),
+                                data: 0,
+                            },
+                        )
+                        .unwrap();
+                });
+        }
+
+        // Register the INNER epoll fd on the OUTER epoll (matches calloop's own epoll fd being
+        // added as a member of litebox's compositor-level outer epoll set).
+        let inner_descriptor = super::EpollDescriptor::try_from(&files, inner_raw).unwrap();
+        outer
+            .add_interest(
+                &task.global,
+                10,
+                &inner_descriptor,
+                EpollEvent {
+                    events: Events::IN.bits(),
+                    data: 0,
+                },
+            )
+            .unwrap();
+
+        let write_eventfd = || {
+            let global = task.global.clone();
+            let files = Arc::clone(&files);
+            std::thread::spawn(move || {
+                std::thread::sleep(core::time::Duration::from_millis(20));
+                let typed = files
+                    .raw_descriptor_store
+                    .read()
+                    .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem<TestPlatform>>(eventfd_raw)
+                    .unwrap();
+                let _ = global
+                    .litebox
+                    .descriptor_table()
+                    .with_entry(&typed, |entry| {
+                        entry.write(&WaitState::new(platform()).context(), 1)
+                    });
+            })
+            .join()
+            .unwrap();
+        };
+
+        // First wait: the outer epoll must observe the nested epoll's readiness once the eventfd
+        // fires -- this much already worked before this test (matches phase-3's own commit).
+        write_eventfd();
+        let events = outer
+            .wait(&task.global, &WaitState::new(platform()).context(), 1024)
+            .unwrap();
+        assert_eq!(events.len(), 1, "first wait should observe the nested epoll ready");
+
+        // Deliberately do NOT drain the inner epoll's own ready entry here -- real `calloop` never
+        // directly `epoll_wait()`s its own nested epoll fd (that's the whole point of nesting it
+        // inside litebox's outer epoll instead); it relies entirely on the OUTER epoll's own
+        // readiness reporting. Draining the byte directly (without going through the inner epoll's
+        // `wait()`) mimics calloop reading the eventfd itself once notified, without touching the
+        // inner `EpollFile`'s own ready-queue machinery at all.
+        {
+            let eventfd_typed = files
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem<TestPlatform>>(eventfd_raw)
+                .unwrap();
+            let _ = task
+                .global
+                .litebox
+                .descriptor_table()
+                .with_entry(&eventfd_typed, |entry| {
+                    entry.read(&WaitState::new(platform()).context())
+                });
+        }
+
+        // Second, SEPARATE wait call (a fresh `epoll_wait()`/`dispatch()`, matching real usage):
+        // fire the eventfd again and confirm the outer epoll notices the nested epoll is ready
+        // AGAIN. This is the exact real-world symptom: prior to a fix, this call times out because
+        // the outer epoll's readiness for the nested fd is only ever checked once.
+        write_eventfd();
+        let events = outer
+            .wait(
+                &task.global,
+                &WaitState::new(platform())
+                    .context()
+                    .with_timeout(core::time::Duration::from_secs(2)),
+                1024,
+            )
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "second, separate wait call should ALSO observe the nested epoll ready again"
+        );
+    }
+
     #[test]
     fn test_epoll_with_pipe() {
         let (task, epoll) = setup_epoll();
