@@ -573,6 +573,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     crate::StdioStatusFlags(flags & OFlags::STATUS_FLAGS_MASK),
                 );
         }
+        // See `EvdevFd`'s own doc comment for why this tag exists: `poll`/`select`/`epoll_wait`
+        // readiness for this fd needs it, the same structural reason the `StdioStream` tagging
+        // above exists for `/dev/stdin`.
+        if let Some(path) = &path
+            && is_evdev_path(path)
+        {
+            let _ = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .set_entry_metadata(&file, EvdevFd);
+        }
         let files = self.files.borrow();
         let raw_fd = files.insert_raw_fd(file).map_err(|file| {
             files.fs.close(&file).unwrap();
@@ -1190,6 +1202,22 @@ fn stdio_stream_for_path(path: &CString) -> Option<StdioStream> {
         "/dev/stderr" => Some(StdioStream::Stderr),
         _ => None,
     }
+}
+
+/// Marker metadata tagged onto an `/dev/input/event0` fd at `open()` time -- see this metadata's
+/// consumer, `syscalls::epoll::EpollDescriptor::poll`'s `File` arm, for why this exists:
+/// `poll`/`select`/`epoll_wait` readiness for a plain filesystem-backed fd is computed there from
+/// `global`+the fd handle alone (no `FS`/`FilesState` reachable at that call site), the exact same
+/// structural gap `StdioStream` metadata already works around for `/dev/stdin`'s genuinely
+/// non-blocking-vs-not readiness -- an evdev fd needs the identical treatment so a guest's
+/// `select()`/`poll()` loop can observe `EvdevSubsystem::has_pending()` becoming true, rather than
+/// falling into that `File` arm's untagged-fd default (`Events::OUT`, permanently "not readable").
+#[derive(Clone, Copy)]
+pub(crate) struct EvdevFd;
+
+/// Mirrors [`stdio_stream_for_path`]'s shape for the one evdev device path this shim exposes.
+fn is_evdev_path(path: &CString) -> bool {
+    path.to_str() == Ok("/dev/input/event0")
 }
 
 const SEEK_SET: i16 = 0;

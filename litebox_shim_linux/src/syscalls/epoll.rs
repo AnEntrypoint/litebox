@@ -142,6 +142,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
             }
             EpollDescriptor::Epoll(_file) => unimplemented!(),
             EpollDescriptor::File(file) => {
+                // An evdev fd (tagged at `open()` time, see `syscalls::file::EvdevFd`'s doc
+                // comment for why this metadata check exists) reports `Events::IN` exactly when
+                // `EvdevSubsystem` actually has a queued event -- checked BEFORE the `StdioStream`
+                // match below (an evdev fd carries no `StdioStream` tag, so it would otherwise
+                // fall into that match's `Err(_)` arm and be reported permanently unreadable,
+                // exactly as confirmed live: a guest's `select()`/`poll()` loop waiting on
+                // `/dev/input/event0` never woke for a real, successfully-queued input event).
+                if global
+                    .litebox
+                    .descriptor_table()
+                    .with_metadata(file, |_: &crate::syscalls::file::EvdevFd| ())
+                    .is_ok()
+                {
+                    let events = if global.evdev.has_pending() {
+                        Events::IN
+                    } else {
+                        Events::empty()
+                    };
+                    return Some(events & mask);
+                }
                 // Stdout/stderr are always immediately writable from the guest's perspective (the
                 // platform's `write_to` is a plain, always-completing `WriteFile`/`write(2)`), so
                 // those still report a fixed `Events::OUT`. Stdin, however, must consult the
@@ -728,21 +748,36 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
         cx: &WaitContext<'_, Platform>,
         files: &FilesState<Platform, FS>,
     ) -> Result<(), WaitError> {
-        // Determine up front whether this set contains a stdin fd at all, independent of whether
-        // it happens to be ready right now: `has_unwakeable_wait` is only known accurately *after*
-        // a `scan_once` call, but that call happens *inside* `wait_until`'s closure, which is too
-        // late to decide `wait_until`'s own deadline for its very first (and, in the always-ready
-        // fast path, only) invocation. Without this preliminary check, a set that starts out
-        // ready-immediately-but-then-goes-not-ready-again would take the unbounded fast path below
-        // and never re-visit this decision once inside a single `wait_until` call, hanging forever
-        // exactly like the original bug this fix addresses -- confirmed live via the ConPTY harness
-        // (see this fix's commit message for the repro).
-        let has_stdin_fd = self.entries.iter().any(|entry| {
+        // Determine up front whether this set contains an unwakeable-wait fd at all (stdin or
+        // evdev -- see below), independent of whether it happens to be ready right now:
+        // `has_unwakeable_wait` is only known accurately *after* a `scan_once` call, but that call
+        // happens *inside* `wait_until`'s closure, which is too late to decide `wait_until`'s own
+        // deadline for its very first (and, in the always-ready fast path, only) invocation.
+        // Without this preliminary check, a set that starts out ready-immediately-but-then-goes-
+        // not-ready-again would take the unbounded fast path below and never re-visit this decision
+        // once inside a single `wait_until` call, hanging forever exactly like the original bug
+        // this fix addresses -- confirmed live via the ConPTY harness (see this fix's commit
+        // message for the repro).
+        //
+        // An evdev fd (`/dev/input/event0`) has the exact same shape as stdin here: its `poll()`
+        // arm above answers from `EvdevSubsystem::has_pending()` but never registers a real
+        // `Observer` (there is no OS-level async notification for "host pushed an input event" this
+        // codebase's `Waker` machinery can hook into, same as stdin's console-input case) -- so
+        // without joining this same bounded-repoll path, a `select()`/`poll()` waiting solely on
+        // an evdev fd takes the fast, single-`wait_until` path below, blocks on a condvar that
+        // evdev can never signal, and misses every event pushed during that sleep, confirmed live:
+        // real `CursorMoved`-driven `push_input_rel` calls landing mid-wait with a guest `select()`
+        // loop that never woke for them despite retrying every 0.5s.
+        let has_unwakeable_fd = self.entries.iter().any(|entry| {
             entry.fd >= 0
                 && EpollDescriptor::try_from(files, entry.fd.reinterpret_as_unsigned() as usize)
                     .is_ok_and(|desc| {
                         matches!(&desc, EpollDescriptor::File(file)
-                        if matches!(
+                        if global.litebox.descriptor_table().with_metadata(
+                            file,
+                            |_: &crate::syscalls::file::EvdevFd| (),
+                        ).is_ok()
+                        || matches!(
                             global.litebox.descriptor_table().with_metadata(
                                 file,
                                 |stream: &litebox::platform::StdioStream| *stream,
@@ -752,21 +787,22 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
                     })
         });
         let mut register = true;
-        if !has_stdin_fd {
-            // Fast/common path: no stdin fd in the set at all, so wait exactly as before -- a
+        if !has_unwakeable_fd {
+            // Fast/common path: no stdin/evdev fd in the set at all, so wait exactly as before -- a
             // single `wait_until` call using the caller's own context and deadline unmodified,
             // woken only by real `Observer` notifications.
             return cx.wait_until(|| self.scan_once(global, files, register.then_some(cx.waker())));
         }
         loop {
-            // At least one entry is a stdin fd, which never registers a real wakeup observer
-            // inside `scan_once` (see its doc comment): there is no OS-level async notification
-            // this codebase's `Waker`/`Observer` machinery can hook into for "new console input
-            // arrived". Bound this iteration's sleep to a short repoll interval so the loop comes
-            // back around and re-checks `stdin_ready()` on a short cadence instead of sleeping on
-            // a condvar that would otherwise never be signaled. `with_timeout` composes with
-            // (takes the min of) any caller-supplied deadline, so the caller's real timeout still
-            // fires on schedule instead of being silently overridden.
+            // At least one entry is a stdin or evdev fd, neither of which ever registers a real
+            // wakeup observer inside `scan_once` (see its doc comment): there is no OS-level async
+            // notification this codebase's `Waker`/`Observer` machinery can hook into for "new
+            // console input arrived" or "host pushed an input event". Bound this iteration's sleep
+            // to a short repoll interval so the loop comes back around and re-checks
+            // `stdin_ready()`/`EvdevSubsystem::has_pending()` on a short cadence instead of
+            // sleeping on a condvar that would otherwise never be signaled. `with_timeout` composes
+            // with (takes the min of) any caller-supplied deadline, so the caller's real timeout
+            // still fires on schedule instead of being silently overridden.
             match cx
                 .with_timeout(STDIN_REPOLL_INTERVAL)
                 .wait_until(|| self.scan_once(global, files, register.then_some(cx.waker())))
