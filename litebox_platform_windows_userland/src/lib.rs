@@ -793,10 +793,8 @@ unsafe extern "system" fn vectored_exception_handler(
             // check. Report whether `rip` was even readable as its own field so a future
             // investigator sees "unreadable, inconclusive" rather than a false "not FS-relative".
             let mut probe = [0u8; 4];
-            let rip_readable = fork_verify::read_code_bytes_for_diagnostics(
-                context.Rip.trunc(),
-                &mut probe,
-            ) > 0;
+            let rip_readable =
+                fork_verify::read_code_bytes_for_diagnostics(context.Rip.trunc(), &mut probe) > 0;
             eprintln!(
                 "[diag-avfull] tid={:?} rip={:#x} fsbase={:#x} fault_addr={:#x} rip_readable={} has_fs_override={}",
                 std::thread::current().id(),

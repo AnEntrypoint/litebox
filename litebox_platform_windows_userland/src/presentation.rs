@@ -39,7 +39,9 @@ use std::sync::mpsc;
 
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
+use winit::event_loop::{
+    ActiveEventLoop, ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy,
+};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::platform::windows::EventLoopBuilderExtWindows;
 use winit::window::{Window, WindowId};
@@ -72,6 +74,9 @@ pub enum InputSignal {
 /// covered). `None` for any key outside that covered set -- silently dropped by the caller,
 /// matching how a real keyboard simply has no key to send for a code this device doesn't map.
 fn winit_keycode_to_evdev(key: KeyCode) -> Option<u16> {
+    // Enumerating all ~80 `KEY_*` constants by name would hurt readability far more than it helps
+    // -- matches this crate family's own `#[allow]`-on-deliberate-exception convention elsewhere.
+    #[allow(clippy::wildcard_imports)]
     use litebox_common_linux::*;
     Some(match key {
         KeyCode::Escape => KEY_ESC,
@@ -426,19 +431,21 @@ impl ApplicationHandler for PresenterApp {
         let Ok(surface) = instance.create_surface(window.clone()) else {
             return;
         };
-        let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-        })) else {
+        let Ok(adapter) =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            }))
+        else {
             return;
         };
-        let Ok((device, queue)) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
+        let Ok((device, queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("litebox-presenter"),
                 ..Default::default()
-            },
-        )) else {
+            }))
+        else {
             return;
         };
         let size = window.inner_size();
@@ -479,10 +486,10 @@ impl ApplicationHandler for PresenterApp {
         // never here directly) -- without this, a guest whose first page-flip lands early keeps a
         // permanently blank window until its NEXT flip, which may be much later or may never come
         // for a single-frame guest program.
-        if self.last_frame.is_some() {
-            if let Some(state) = &self.state {
-                state.window.request_redraw();
-            }
+        if self.last_frame.is_some()
+            && let Some(state) = &self.state
+        {
+            state.window.request_redraw();
         }
     }
 
@@ -572,7 +579,12 @@ impl ApplicationHandler for PresenterApp {
                 // the delta is derived here against the last-seen position, matching what a real
                 // mouse's own relative-motion sensor would have reported for the same movement.
                 if let Some((last_x, last_y)) = self.last_cursor_pos {
+                    // A real mouse's per-event motion never approaches a delta anywhere near
+                    // `i32`'s range, so this narrowing is exact in practice, not a real precision
+                    // loss to guard against.
+                    #[allow(clippy::cast_possible_truncation)]
                     let dx = (position.x - last_x) as i32;
+                    #[allow(clippy::cast_possible_truncation)]
                     let dy = (position.y - last_y) as i32;
                     if dx != 0 {
                         consumer(InputSignal::Rel(litebox_common_linux::REL_X, dx));
@@ -593,6 +605,9 @@ impl ApplicationHandler for PresenterApp {
                 // `PixelDelta` (high-resolution trackpad/precision-scroll input) has no clean
                 // 1:1 mapping to discrete evdev wheel steps and is dropped rather than guessed at.
                 if let winit::event::MouseScrollDelta::LineDelta(_, y) = delta {
+                    // A real wheel's single-event step count is always tiny; see `dx`/`dy`'s
+                    // identical rationale just above.
+                    #[allow(clippy::cast_possible_truncation)]
                     let steps = y as i32;
                     if steps != 0 {
                         consumer(InputSignal::Rel(litebox_common_linux::REL_WHEEL, steps));
