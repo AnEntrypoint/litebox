@@ -105,6 +105,22 @@ where
                 Ok(()) => {}
                 Err(_) => unreachable!(),
             }
+            // Without this, `127.0.0.1` matches none of the interface's own
+            // addresses, so smoltcp's route lookup falls through to the
+            // default route and sends loopback traffic out to the real NAT
+            // gateway instead of handing it straight to a local listening
+            // socket -- the gateway then tries to open a REAL Windows socket
+            // to `127.0.0.1`, which nothing is actually listening on (the
+            // guest's own listening socket lives entirely inside this
+            // process's smoltcp stack, never a real Windows socket), so the
+            // connection just hangs until the guest's own connect timeout.
+            match ip_addrs.push(smoltcp::wire::IpCidr::new(
+                smoltcp::wire::IpAddress::Ipv4(Ipv4Addr::LOCALHOST),
+                8,
+            )) {
+                Ok(()) => {}
+                Err(_) => unreachable!(),
+            }
         });
         match interface
             .routes_mut()

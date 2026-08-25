@@ -723,11 +723,24 @@ pub(crate) fn send_ip_packet(
     packet: &[u8],
 ) -> Result<(), litebox::platform::SendError> {
     let gw = gateway(slot);
-    gw.queue
-        .lock()
-        .unwrap()
-        .to_gateway
-        .push_back(packet.to_vec());
+    // A packet addressed to `127.0.0.0/8` (or back to the guest's own
+    // interface address) must never reach the NAT gateway thread: the
+    // gateway only knows how to proxy to REAL external destinations via
+    // REAL Windows sockets, and nothing is ever listening on a real Windows
+    // `127.0.0.1` socket on the guest's behalf -- the guest's own listening
+    // socket lives entirely inside this same process's smoltcp stack.
+    // Loop it straight back into the guest's own receive queue instead,
+    // exactly as a real kernel's loopback device would.
+    let is_loopback = Ipv4Packet::new_checked(packet)
+        .is_ok_and(|p| p.dst_addr().is_loopback() || p.dst_addr() == GUEST_IP_ADDR);
+    let mut queue = gw.queue.lock().unwrap();
+    if is_loopback {
+        queue.to_guest.push_back(packet.to_vec());
+        drop(queue);
+        gw.notify.notify_all();
+    } else {
+        queue.to_gateway.push_back(packet.to_vec());
+    }
     Ok(())
 }
 
