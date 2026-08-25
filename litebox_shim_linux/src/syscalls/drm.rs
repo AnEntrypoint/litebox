@@ -43,10 +43,11 @@ use litebox::mm::linux::PAGE_SIZE;
 use litebox::platform::RawConstPointer;
 use litebox_common_linux::{
     DRM_CAP_DUMB_BUFFER, DRM_EVENT_FLIP_COMPLETE, DRM_MODE_CONNECTOR_VIRTUAL,
-    DRM_MODE_ENCODER_VIRTUAL, DRM_MODE_PAGE_FLIP_EVENT, DrmEvent, DrmEventVblank, DrmGetCap,
-    DrmModeCardRes, DrmModeCreateDumb, DrmModeCrtc, DrmModeCrtcPageFlip, DrmModeDestroyDumb,
-    DrmModeFbCmd2, DrmModeGetConnector, DrmModeGetEncoder, DrmModeGetPlane, DrmModeGetPlaneRes,
-    DrmModeMapDumb, DrmModeModeinfo, DrmModeSetPlane, DrmVersion, errno::Errno,
+    DRM_MODE_ENCODER_VIRTUAL, DRM_MODE_OBJECT_CONNECTOR, DRM_MODE_PAGE_FLIP_EVENT, DrmEvent,
+    DrmEventVblank, DrmGetCap, DrmModeCardRes, DrmModeCreateDumb, DrmModeCrtc,
+    DrmModeCrtcPageFlip, DrmModeDestroyDumb, DrmModeFbCmd2, DrmModeGetConnector, DrmModeGetEncoder,
+    DrmModeGetPlane, DrmModeGetPlaneRes, DrmModeGetProperty, DrmModeMapDumb, DrmModeModeinfo,
+    DrmModeObjGetProperties, DrmModeSetPlane, DrmVersion, errno::Errno,
 };
 use zerocopy::IntoBytes;
 
@@ -530,6 +531,37 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         self.is_master
             .store(false, core::sync::atomic::Ordering::Relaxed);
         Ok(0)
+    }
+
+    /// `DRM_IOCTL_MODE_OBJ_GETPROPERTIES` -- discovered missing via a real libdrm client
+    /// (`smithay`'s `backend_drm`, `docs/wayland-drm-backend-probe/`) failing outright on this
+    /// exact call immediately after `GETCONNECTOR` succeeded: unimplemented before this, every
+    /// real client following the standard connector-properties-query sequence failed before
+    /// reaching any further DRM work. This device has no dynamic KMS properties for a connector
+    /// (no DPMS, no EDID blob, nothing a hardware driver would register) -- `count_props = 0` is
+    /// the real kernel's own well-defined answer for an object with a genuinely empty property
+    /// list, not a truncation.
+    pub(crate) fn obj_get_properties(
+        &self,
+        ptr: UserPtrMut<DrmModeObjGetProperties>,
+    ) -> Result<u32, Errno> {
+        let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        if req.obj_type == DRM_MODE_OBJECT_CONNECTOR && req.obj_id != VIRTUAL_CONNECTOR_ID {
+            return Err(Errno::ENOENT);
+        }
+        req.count_props = 0;
+        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        Ok(0)
+    }
+
+    /// `DRM_IOCTL_MODE_GETPROPERTY` -- resolve a property ID's name/values. Since
+    /// [`Self::obj_get_properties`] always reports zero properties, no real client following the
+    /// standard `OBJ_GETPROPERTIES` -> per-ID `GETPROPERTY` sequence ever has an ID to pass here;
+    /// implemented so a client calling this directly with any ID still gets a real `ENOENT`
+    /// (unknown property) rather than an `ENOTTY` that would look like a missing driver.
+    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
+    pub(crate) fn get_property(&self, _ptr: UserPtrMut<DrmModeGetProperty>) -> Result<u32, Errno> {
+        Err(Errno::ENOENT)
     }
 
     pub(crate) fn create_dumb(

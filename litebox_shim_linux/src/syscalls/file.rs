@@ -3258,7 +3258,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             | IoctlArg::DrmVersion(..)
             | IoctlArg::DrmGetCap(..)
             | IoctlArg::DrmSetMaster
-            | IoctlArg::DrmDropMaster => files.run_on_raw_fd(
+            | IoctlArg::DrmDropMaster
+            | IoctlArg::DrmModeObjGetProperties(..)
+            | IoctlArg::DrmModeGetProperty(..) => files.run_on_raw_fd(
                 desc,
                 |fd| {
                     if self.is_dri_device(&files.fs, fd)? {
@@ -3308,6 +3310,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             IoctlArg::DrmGetCap(ptr) => self.global.drm.get_cap(*ptr),
             IoctlArg::DrmSetMaster => self.global.drm.set_master(),
             IoctlArg::DrmDropMaster => self.global.drm.drop_master(),
+            IoctlArg::DrmModeObjGetProperties(ptr) => self.global.drm.obj_get_properties(*ptr),
+            IoctlArg::DrmModeGetProperty(ptr) => self.global.drm.get_property(*ptr),
             _ => unreachable!("drm_ioctl called with a non-DRM IoctlArg"),
         }
     }
