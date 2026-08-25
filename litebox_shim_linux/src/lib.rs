@@ -308,6 +308,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Clone for LinuxShim<Platform, FS> {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
+    /// Install (or replace) the host-side callback invoked on every real DRM page-flip (see
+    /// [`syscalls::drm::DrmSubsystem::set_flip_callback`]'s doc comment for the exact contract and
+    /// why it deliberately takes plain pixel bytes rather than a platform-specific handle) -- the
+    /// sole public entry point into the shim's own `/dev/dri/card0` emulation, since
+    /// `DrmSubsystem` itself stays a private implementation detail. A runner binary that depends
+    /// on a concrete presentation layer (e.g. `litebox_platform_windows_userland`'s wgpu-backed
+    /// `Presenter`) calls this once, right after [`LinuxShimBuilder::build`], to make flipped
+    /// frames actually visible; a runner target with no GUI story simply never calls it.
+    pub fn set_drm_flip_callback(
+        &self,
+        callback: impl Fn(&[u8], u32, u32, u32, u32) + Send + Sync + 'static,
+    ) {
+        self.0.drm.set_flip_callback(callback);
+    }
+
     /// Loads the program at `path` as the shim's initial task, returning the
     /// initial register state.
     pub fn load_program(

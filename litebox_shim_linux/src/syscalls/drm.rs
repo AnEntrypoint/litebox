@@ -40,6 +40,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use litebox::mm::linux::PAGE_SIZE;
+use litebox::platform::RawConstPointer;
 use litebox_common_linux::{
     DRM_EVENT_FLIP_COMPLETE, DRM_MODE_CONNECTOR_VIRTUAL, DRM_MODE_ENCODER_VIRTUAL,
     DRM_MODE_PAGE_FLIP_EVENT, DrmEvent, DrmEventVblank, DrmModeCardRes, DrmModeCrtc,
@@ -149,6 +150,27 @@ pub(crate) struct DrmSubsystem<Platform: ShimPlatform> {
     /// plain incrementing counter, matching real Linux's own semantics closely enough for that
     /// use even though this device has no real vblank interrupt driving it.
     next_vblank_sequence: AtomicU32,
+    /// Host-side hook, invoked synchronously at the end of every successful [`Self::page_flip`]
+    /// with the now-scanned-out framebuffer's own pixel bytes (a plain, already-copied-out `&[u8]`
+    /// -- not the platform-specific shared-memory handle, deliberately: a `Box<dyn Fn(...)>`
+    /// capturing `Platform::SharedMemoryHandle` (an associated type projected off
+    /// `PageManagementProvider<{PAGE_SIZE}>`) hits a real rustc limitation resolving that
+    /// associated type's well-formedness behind a trait object even though `ShimPlatform` already
+    /// implies the bound for every concrete use of this struct -- confirmed live, `cargo build`
+    /// error `E0277` naming the bound as unsatisfied even on this `impl` block's own untouched
+    /// existing methods. Staying byte-based sidesteps that entirely and is also the more honest
+    /// interface: a presentation layer only ever needed the pixels, never the handle) plus
+    /// `(width, height, pitch, pixel_format)`. `litebox_shim_linux` is platform-agnostic and
+    /// cannot depend on a concrete presentation layer (e.g.
+    /// `litebox_platform_windows_userland`'s wgpu-backed `Presenter`), so this stays a generic
+    /// callback set post-construction (see [`Self::set_flip_callback`]) by whichever runner
+    /// binary DOES depend on both crates and wants to actually display flipped frames -- a runner
+    /// that never calls the setter (or a non-GUI runner target) simply never invokes it, at zero
+    /// cost beyond one extra `Option` check per flip.
+    flip_callback: litebox::sync::Mutex<
+        Platform,
+        Option<alloc::boxed::Box<dyn Fn(&[u8], u32, u32, u32, u32) + Send + Sync>>,
+    >,
 }
 
 impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
@@ -165,7 +187,22 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             crtc_fb: litebox::sync::Mutex::new(None),
             pending_flip_events: litebox::sync::Mutex::new(VecDeque::new()),
             next_vblank_sequence: AtomicU32::new(0),
+            flip_callback: litebox::sync::Mutex::new(None),
         }
+    }
+
+    /// Install (or replace) the host-side flip callback -- see [`Self::flip_callback`]'s doc
+    /// comment for when/why a runner calls this, and why it takes plain pixel bytes rather than
+    /// the platform-specific shared-memory handle. Not part of [`Self::new`] itself since
+    /// `litebox_shim_linux` has no presentation layer of its own to default to; a runner that
+    /// wants flipped frames actually displayed calls this once, right after
+    /// [`crate::LinuxShimBuilder::build`], with a closure that forwards the bytes to its own
+    /// window/GPU-surface presentation code.
+    pub fn set_flip_callback(
+        &self,
+        callback: impl Fn(&[u8], u32, u32, u32, u32) + Send + Sync + 'static,
+    ) {
+        *self.flip_callback.lock() = Some(alloc::boxed::Box::new(callback));
     }
 
     /// Pop the oldest pending flip-completion event, if any, encoded as the exact bytes a real
@@ -430,15 +467,73 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         Ok(0)
     }
 
-    pub(crate) fn page_flip(&self, ptr: UserPtr<DrmModeCrtcPageFlip>) -> Result<u32, Errno> {
+    pub(crate) fn page_flip(
+        &self,
+        platform: &Platform,
+        ptr: UserPtr<DrmModeCrtcPageFlip>,
+    ) -> Result<u32, Errno> {
         let req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         if req.crtc_id != VIRTUAL_CRTC_ID {
             return Err(Errno::ENOENT);
         }
-        if !self.framebuffers.lock().contains_key(&req.fb_id) {
-            return Err(Errno::ENOENT);
-        }
+        let flip_buffer_info = {
+            let framebuffers = self.framebuffers.lock();
+            let fb = framebuffers.get(&req.fb_id).ok_or(Errno::ENOENT)?;
+            let buffers = self.buffers.lock();
+            let buffer = buffers
+                .get(&fb.handle)
+                .expect("add_fb2 only ever records a handle that exists in self.buffers, and destroy_dumb never removes an fb referencing a destroyed buffer (see destroy_dumb's own doc comment: real Linux leaves dangling fb references, matched deliberately)");
+            (
+                buffer.handle,
+                buffer.size,
+                fb.width,
+                fb.height,
+                buffer.pitch,
+                fb.pixel_format,
+            )
+        };
         *self.crtc_fb.lock() = Some(req.fb_id);
+        // Only pay for a host mapping + copy when a callback is actually installed (a non-GUI
+        // runner, or one that never called `set_flip_callback`, never touches the platform
+        // shared-memory machinery at all here).
+        if self.flip_callback.lock().is_some() {
+            let (handle, size, width, height, pitch, pixel_format) = flip_buffer_info;
+            // A short-lived HOST-side mapping of the same shared-memory object the guest's own
+            // `mmap()` (see `sys_mmap`'s DRI-fd branch) maps into ITS address space -- this is a
+            // SECOND, independent mapping of the identical real memory, not a copy of a copy: the
+            // callback receives the exact bytes the guest most recently wrote. `Hint` (not a
+            // fixed address) since this mapping is purely a transient host-side read window, torn
+            // down again before this function returns.
+            match platform.map_shared_memory(
+                handle,
+                0..size,
+                litebox::platform::page_mgmt::MemoryRegionPermissions::READ,
+                litebox::platform::page_mgmt::FixedAddressBehavior::Hint,
+            ) {
+                Ok(mapped_ptr) => {
+                    let addr = mapped_ptr.as_usize();
+                    // SAFETY: `map_shared_memory` just returned this exact `addr`/`size` as a
+                    // freshly established, readable mapping of `handle`'s real backing storage;
+                    // nothing else in this function (or reachable from the callback, which only
+                    // receives a `&[u8]` slice, not the address) can invalidate it before the
+                    // `unmap_shared_memory` call immediately below.
+                    let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, size) };
+                    if let Some(callback) = self.flip_callback.lock().as_ref() {
+                        callback(bytes, width, height, pitch, pixel_format);
+                    }
+                    // SAFETY: `addr..addr+size` is exactly the range just mapped above, and the
+                    // callback (the only other holder of a reference into it) has already
+                    // returned by this point -- no other code can still be reading through it.
+                    let _ = unsafe { platform.unmap_shared_memory(addr..addr + size) };
+                }
+                Err(_) => {
+                    // A host-side presentation window failing to see one frame is not a reason to
+                    // fail the guest's own page-flip ioctl -- the guest's own view of the flip
+                    // (the CRTC's now-attached framebuffer, the completion event below) is
+                    // unaffected either way; only the optional host visualization is skipped.
+                }
+            }
+        }
         // This device has no real vsync/vblank interrupt to wait for, so the flip is complete
         // (in the sense a client cares about -- the CRTC now scans out the new framebuffer) the
         // instant this ioctl returns; if the guest asked to be told, queue the completion event

@@ -3227,7 +3227,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 self.global.drm.destroy_dumb(self.global.platform, *ptr)
             }
             IoctlArg::DrmModeAddFb2(ptr) => self.global.drm.add_fb2(*ptr),
-            IoctlArg::DrmModePageFlip(ptr) => self.global.drm.page_flip(*ptr),
+            IoctlArg::DrmModePageFlip(ptr) => {
+                self.global.drm.page_flip(self.global.platform, *ptr)
+            }
             _ => unreachable!("drm_ioctl called with a non-DRM IoctlArg"),
         }
     }
