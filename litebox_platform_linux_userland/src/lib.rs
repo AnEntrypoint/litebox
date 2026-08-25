@@ -34,6 +34,11 @@ use zerocopy::{FromBytes, IntoBytes};
 
 extern crate alloc;
 
+/// GUI application support (DRM/KMS dumb-buffer emulation's host-side presentation layer). See the
+/// module's own doc comment for the full design and how it differs from `litebox_platform_windows_
+/// userland::presentation`, the reference implementation this was ported from.
+pub mod presentation;
+
 // ---------------------------------------------------------------------------
 // TLS (`.tbss`) access helpers
 //

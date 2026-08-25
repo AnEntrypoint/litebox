@@ -2171,9 +2171,12 @@ dependencies = [
  "litebox",
  "litebox_common_linux",
  "litebox_common_optee",
+ "pollster",
  "seccompiler",
  "spin 0.9.8",
  "syscalls",
+ "wgpu",
+ "winit",
  "zerocopy",
 ]
 

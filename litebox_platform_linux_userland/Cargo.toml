@@ -15,6 +15,17 @@ spin = "0.9.8"
 syscalls = { version = "0.6", default-features = false }
 zerocopy = { version = "0.8", default-features = false }
 seccompiler = { version = "0.5.0" }
+# GUI application support (DRM/KMS dumb-buffer emulation's host-side presentation layer, see
+# `src/presentation.rs`): ports `litebox_platform_windows_userland`'s presentation module to real
+# Linux userland. Unlike Windows, `winit`'s event loop runs on its own dedicated OS thread here for
+# the same reason (X11/Wayland, like Win32 message loops, are not tied to the process's first/main
+# thread the way macOS' Cocoa is), and `wgpu`'s default backend set (Vulkan on Linux) is used as-is
+# -- no Windows-style forced-backend workaround is known to be needed here, unverified live on real
+# Linux windowing (no `DISPLAY`/Xvfb available in this repo's own dev environment; see
+# `presentation.rs`'s module doc comment).
+wgpu = "27"
+winit = "0.30"
+pollster = "0.4"
 
 [features]
 default = ["linux_syscall"]
