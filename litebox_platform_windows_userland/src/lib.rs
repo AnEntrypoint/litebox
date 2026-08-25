@@ -775,6 +775,18 @@ unsafe extern "system" fn vectored_exception_handler(
         // via `apk add --no-cache nodejs` against a freshly packaged `alpine-rootfs.tar`) rather
         // than being folded into this fix.
         if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
+            && std::env::var_os("LITEBOX_DIAG_AVFULL").is_some()
+        {
+            eprintln!(
+                "[diag-avfull] tid={:?} rip={:#x} fsbase={:#x} fault_addr={:#x} has_fs_override={}",
+                std::thread::current().id(),
+                context.Rip,
+                unsafe { litebox_common_linux::rdfsbase() },
+                exception_record.ExceptionInformation[1],
+                faulting_instruction_has_fs_override(context.Rip.trunc()),
+            );
+        }
+        if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
             && unsafe { litebox_common_linux::rdfsbase() } == 0
             // A zero `Rip` is not a real FS_BASE-reset fault: the FS_BASE-reset repair's whole
             // premise is that the guest/host instruction at `Rip` is genuine and merely read/wrote
