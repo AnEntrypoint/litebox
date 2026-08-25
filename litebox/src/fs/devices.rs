@@ -415,3 +415,287 @@ where
         Err(SetTimesError::ReadOnlyFileSystem)
     }
 }
+
+/// Node info for `/dev/dri/card0` (major=226, the real Linux DRM primary-node major).
+const DRI_CARD0_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 10,
+    // major=226, minor=0
+    rdev: core::num::NonZeroUsize::new(0xE200),
+};
+/// Node info for `/dev/dri/renderD128` (major=226, minor=128, the real Linux DRM
+/// render-node convention -- render nodes start at minor 128).
+const DRI_RENDERD128_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 11,
+    // major=226, minor=128
+    rdev: core::num::NonZeroUsize::new(0xE280),
+};
+
+/// A DRM device node -- `card0` (the control/modeset node) or `renderD128` (the
+/// render-only node). Real DRM devices always ship at least the control node; a render
+/// node is only meaningful once real GPU-accelerated rendering (as opposed to the
+/// dumb-buffer path) is implemented, but is included now since userspace libraries
+/// (`libdrm`) commonly probe for it and quietly skip it if absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriDevice {
+    Card0,
+    RenderD128,
+}
+
+impl DriDevice {
+    const ALL: &'static [(&'static str, DriDevice)] =
+        &[("card0", DriDevice::Card0), ("renderD128", DriDevice::RenderD128)];
+
+    fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.iter().find(|(n, _)| *n == name).map(|(_, d)| *d)
+    }
+
+    fn file_status(self) -> FileStatus {
+        let node_info = match self {
+            DriDevice::Card0 => DRI_CARD0_NODE_INFO,
+            DriDevice::RenderD128 => DRI_RENDERD128_NODE_INFO,
+        };
+        FileStatus {
+            file_type: FileType::CharacterDevice,
+            // Real DRM nodes are `crw-rw----`, group `video` -- litebox's own guest
+            // identity always runs as root (see `initialize_root_in_mem_layer`'s doc
+            // comment elsewhere in this codebase), so group-readable is sufficient for
+            // every guest process to open this node without needing a real group-membership
+            // model.
+            mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP,
+            size: 0,
+            owner: UserInfo::ROOT,
+            node_info,
+            blksize: NULL_BLOCK_SIZE,
+            atime: Timestamp::default(),
+            mtime: Timestamp::default(),
+        }
+    }
+}
+
+/// A [`super::backend::Backend`] exposing `/dev/dri/{card0,renderD128}` -- the DRM
+/// device nodes a "dumb buffer" software display client opens to enumerate a virtual
+/// display, allocate a pixel buffer, and page-flip it. Mounted as its own nested backend
+/// at `/dev/dri` (see the composer's nested-mount support), separate from [`Devices`]
+/// at `/dev`, since [`Devices`]' own `walk_directories` is a flat, single-level
+/// namespace with no subdirectory support.
+///
+/// This backend only handles the filesystem-visible SHAPE of the device nodes (open,
+/// stat, permissions, directory listing) -- the actual DRM ioctl protocol (buffer
+/// allocation, mode-setting, page-flip) is handled by `litebox_shim_linux`'s
+/// `DrmSubsystem`, reached once a guest has successfully `open()`ed one of these nodes,
+/// mirroring how `Devices`' own stdio entries are thin filesystem shells around state
+/// that actually lives in the shim layer.
+pub struct DriDevices<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    _litebox: LiteBox<Platform>,
+    root_inode: NodeInfo,
+    _alloc: InodeAllocator,
+}
+
+impl<Platform> DriDevices<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    /// Construct a new `DriDevices` backend.
+    #[must_use]
+    pub fn new(litebox: &LiteBox<Platform>, allocator: InodeAllocator) -> Self {
+        let root_inode = allocator.next();
+        Self {
+            _litebox: litebox.clone(),
+            root_inode,
+            _alloc: allocator,
+        }
+    }
+}
+
+/// Owned file handle; identifies which DRI device node backs this fd.
+#[derive(Debug, Clone, Copy)]
+pub struct DriDeviceFileHandle {
+    device: DriDevice,
+}
+
+/// Directory handle, reused for both walking and owned dir handles (no borrows needed).
+#[derive(Debug, Clone, Copy)]
+pub struct DriDeviceDirHandle;
+
+impl<Platform> super::backend::private::Sealed for DriDevices<Platform> where
+    Platform: RawSyncPrimitivesProvider + 'static
+{
+}
+
+impl<Platform> BackendHandles for DriDevices<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    type WalkingDirHandle<'a> = DriDeviceDirHandle;
+    type FileHandle = DriDeviceFileHandle;
+    type DirHandle = DriDeviceDirHandle;
+}
+
+impl<Platform> Backend for DriDevices<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    fn root(&self) -> WalkingDirHandle<'_> {
+        WalkingDirHandle::from_typed::<Self>(DriDeviceDirHandle)
+    }
+
+    fn walk_directories<'a>(
+        &'a self,
+        from: WalkingDirHandle<'a>,
+        components: &[&str],
+    ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError> {
+        let from = from.into_typed::<Self>();
+        if let Some(&component) = components.first() {
+            if DriDevice::from_name(component).is_some() {
+                return Ok(WalkOutcome {
+                    components: vec![],
+                    last: WalkingDirHandle::from_typed::<Self>(from),
+                    stop_reason: WalkStopReason::StoppedAtNonDirectory,
+                });
+            }
+            return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
+        }
+        Ok(WalkOutcome {
+            components: vec![],
+            last: WalkingDirHandle::from_typed::<Self>(from),
+            stop_reason: WalkStopReason::CompleteDirectory,
+        })
+    }
+
+    fn owned_dir_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        _flags: OFlags,
+    ) -> Result<DirHandle, OpenError> {
+        Ok(DirHandle::from_typed::<Self>(dir.into_typed::<Self>()))
+    }
+
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<WalkingDirHandle<'a>> {
+        Some(WalkingDirHandle::from_typed::<Self>(
+            *dir.get_typed::<Self>(),
+        ))
+    }
+
+    fn open_file_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        name: &str,
+        flags: OFlags,
+    ) -> Result<Permissioned<FileHandle>, OpenError> {
+        let _dir = dir.into_typed::<Self>();
+        let device = DriDevice::from_name(name)
+            .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+
+        if flags.contains(OFlags::DIRECTORY) {
+            return Err(OpenError::PathError(PathError::ComponentNotADirectory));
+        }
+
+        Ok(Permissioned {
+            item: FileHandle::from_typed::<Self>(DriDeviceFileHandle { device }),
+            permissions: PermissionCheck::ByBackend,
+        })
+    }
+
+    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
+        let _handle = handle.into_typed::<Self>();
+        Ok(DriDevice::ALL
+            .iter()
+            .map(|(n, d)| DirEntry {
+                name: String::from(*n),
+                file_type: FileType::CharacterDevice,
+                ino_info: Some(d.file_status().node_info),
+            })
+            .collect())
+    }
+
+    fn read(&self, _h: &FileHandle, _buf: &mut [u8], _offset: usize) -> Result<usize, ReadError> {
+        // Real Linux DRM device nodes DO support read() -- it delivers queued
+        // DRM_EVENT_FLIP_COMPLETE/DRM_EVENT_VBLANK events (struct drm_event), not raw pixel
+        // bytes. That event-delivery path isn't implemented yet (page-flip completion is a
+        // stub in this pass -- see DrmSubsystem's own doc comment), so reads are rejected
+        // outright for now rather than silently returning zero bytes as if no event were
+        // ever pending, which would be a worse lie: a real client polling for flip
+        // completion would spin forever instead of failing loudly.
+        Err(ReadError::NotForReading)
+    }
+
+    fn write(&self, _h: &FileHandle, _buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
+        Err(WriteError::NotForWriting)
+    }
+
+    fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {
+        Err(TruncateError::IsTerminalDevice)
+    }
+
+    fn seek_behavior(&self, _h: &FileHandle) -> SeekBehavior {
+        SeekBehavior::NonSeekable
+    }
+
+    fn file_status(&self, h: &FileHandle) -> Result<FileStatus, FileStatusError> {
+        Ok(h.get_typed::<Self>().device.file_status())
+    }
+
+    fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
+        let _h = h.get_typed::<Self>();
+        Ok(FileStatus {
+            file_type: FileType::Directory,
+            mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+            size: super::DEFAULT_DIRECTORY_SIZE,
+            owner: UserInfo::ROOT,
+            node_info: self.root_inode.clone(),
+            blksize: super::DEFAULT_DIRECTORY_SIZE,
+            atime: Timestamp::default(),
+            mtime: Timestamp::default(),
+        })
+    }
+
+    fn create_file_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _mode: Mode,
+    ) -> Result<FileHandle, OpenError> {
+        Err(OpenError::ReadOnlyFileSystem)
+    }
+
+    fn mkdir_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<DirHandle, MkdirError> {
+        Err(MkdirError::ReadOnlyFileSystem)
+    }
+
+    fn unlink_at(&self, _dir: DirHandle, _name: &str) -> Result<(), UnlinkError> {
+        Err(UnlinkError::ReadOnlyFileSystem)
+    }
+
+    fn rmdir_at(&self, _dir: DirHandle, _name: &str) -> Result<(), RmdirError> {
+        Err(RmdirError::ReadOnlyFileSystem)
+    }
+
+    fn chmod_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
+    fn chown_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _user: Option<u16>,
+        _group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        Err(ChownError::ReadOnlyFileSystem)
+    }
+
+    fn set_times_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _atime: Option<Timestamp>,
+        _mtime: Option<Timestamp>,
+    ) -> Result<(), SetTimesError> {
+        Err(SetTimesError::ReadOnlyFileSystem)
+    }
+}

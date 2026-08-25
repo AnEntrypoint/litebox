@@ -769,6 +769,256 @@ pub struct Winsize {
     pub ypixel: u16,
 }
 
+/// DRM (Direct Rendering Manager) mode-setting ioctl request numbers, `include/uapi/drm/drm.h`'s
+/// `DRM_IOWR(nr, type)` = `_IOWR(DRM_IOCTL_BASE='d', nr, type)` encoding. Verified live against
+/// the real kernel header (see `docs/drm-dumb-buffer-ioctl-reference.md`), not guessed -- these
+/// are stable kernel UAPI values, unchanged since DRM's KMS API was introduced.
+// Each value below was computed (never hand-guessed) via the real `_IOWR` encoding
+// (`(3 << 30) | (size_of::<Struct>() << 16) | ('d' << 8) | nr`) applied to this exact file's
+// own struct definitions below, cross-checked against the fetched kernel `nr` values recorded
+// in `docs/drm-dumb-buffer-ioctl-reference.md`. A struct layout change here without recomputing
+// these constants silently breaks the encoded ioctl number -- see that doc for the derivation.
+pub const DRM_IOCTL_MODE_GETRESOURCES: u32 = 0xC040_64A0;
+pub const DRM_IOCTL_MODE_GETCRTC: u32 = 0xC068_64A1;
+pub const DRM_IOCTL_MODE_SETCRTC: u32 = 0xC068_64A2;
+pub const DRM_IOCTL_MODE_GETENCODER: u32 = 0xC014_64A6;
+pub const DRM_IOCTL_MODE_GETCONNECTOR: u32 = 0xC050_64A7;
+pub const DRM_IOCTL_MODE_CREATE_DUMB: u32 = 0xC020_64B2;
+pub const DRM_IOCTL_MODE_MAP_DUMB: u32 = 0xC010_64B3;
+pub const DRM_IOCTL_MODE_DESTROY_DUMB: u32 = 0xC004_64B4;
+pub const DRM_IOCTL_MODE_GETPLANERESOURCES: u32 = 0xC010_64B5;
+pub const DRM_IOCTL_MODE_GETPLANE: u32 = 0xC020_64B6;
+pub const DRM_IOCTL_MODE_SETPLANE: u32 = 0xC030_64B7;
+pub const DRM_IOCTL_MODE_ADDFB2: u32 = 0xC068_64B8;
+pub const DRM_IOCTL_MODE_PAGE_FLIP: u32 = 0xC018_64B0;
+
+/// `struct drm_mode_create_dumb` -- allocate a CPU-writable, linear, no-GPU pixel buffer.
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmModeCreateDumb {
+    pub height: u32,
+    pub width: u32,
+    pub bpp: u32,
+    pub flags: u32,
+    pub handle: u32,
+    pub pitch: u32,
+    pub size: u64,
+}
+
+/// `struct drm_mode_map_dumb` -- get an mmap-able fake offset for a dumb buffer.
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmModeMapDumb {
+    pub handle: u32,
+    pub pad: u32,
+    pub offset: u64,
+}
+
+/// `struct drm_mode_destroy_dumb` -- free a dumb buffer.
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmModeDestroyDumb {
+    pub handle: u32,
+}
+
+/// `struct drm_mode_fb_cmd2` -- attach a buffer as a scanout framebuffer (up to 4 planes; a
+/// single-plane dumb buffer only ever populates index 0).
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmModeFbCmd2 {
+    pub fb_id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub pixel_format: u32,
+    pub flags: u32,
+    pub handles: [u32; 4],
+    pub pitches: [u32; 4],
+    pub offsets: [u32; 4],
+    /// Compiler-inserted alignment padding before `modifier` (8-byte aligned) that the C ABI
+    /// also inserts here -- made explicit so `zerocopy`'s `IntoBytes` derive (which refuses
+    /// implicit padding, since writing it back to guest memory would leak uninitialized host
+    /// bytes) can verify the layout has none.
+    _pad: u32,
+    pub modifier: [u64; 4],
+}
+
+/// `struct drm_mode_modeinfo` -- one display-mode timing description.
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmModeModeinfo {
+    pub clock: u32,
+    pub hdisplay: u16,
+    pub hsync_start: u16,
+    pub hsync_end: u16,
+    pub htotal: u16,
+    pub hskew: u16,
+    pub vdisplay: u16,
+    pub vsync_start: u16,
+    pub vsync_end: u16,
+    pub vtotal: u16,
+    pub vscan: u16,
+    pub vrefresh: u32,
+    pub flags: u32,
+    pub r#type: u32,
+    pub name: [u8; 32],
+}
+
+/// `struct drm_mode_card_res` -- top-level resource enumeration (`DRM_IOCTL_MODE_GETRESOURCES`).
+/// Two-call pattern: caller zeroes `count_*`/pointers to learn sizes, then calls again with
+/// `*_ptr` fields pointing at pre-allocated arrays.
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmModeCardRes {
+    pub fb_id_ptr: u64,
+    pub crtc_id_ptr: u64,
+    pub connector_id_ptr: u64,
+    pub encoder_id_ptr: u64,
+    pub count_fbs: u32,
+    pub count_crtcs: u32,
+    pub count_connectors: u32,
+    pub count_encoders: u32,
+    pub min_width: u32,
+    pub max_width: u32,
+    pub min_height: u32,
+    pub max_height: u32,
+}
+
+/// `struct drm_mode_get_connector` (`DRM_IOCTL_MODE_GETCONNECTOR`), same two-call pattern.
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmModeGetConnector {
+    pub encoders_ptr: u64,
+    pub modes_ptr: u64,
+    pub props_ptr: u64,
+    pub prop_values_ptr: u64,
+    pub count_modes: u32,
+    pub count_props: u32,
+    pub count_encoders: u32,
+    pub encoder_id: u32,
+    pub connector_id: u32,
+    pub connector_type: u32,
+    pub connector_type_id: u32,
+    pub connection: u32,
+    pub mm_width: u32,
+    pub mm_height: u32,
+    pub subpixel: u32,
+    pub pad: u32,
+}
+
+/// `DRM_MODE_CONNECTOR_VIRTUAL` -- the connector type for a software-only virtual display with
+/// no real physical connector to claim.
+pub const DRM_MODE_CONNECTOR_VIRTUAL: u32 = 15;
+/// `DRM_MODE_ENCODER_VIRTUAL` -- the matching encoder type.
+pub const DRM_MODE_ENCODER_VIRTUAL: u32 = 5;
+
+/// `struct drm_mode_get_encoder` (`DRM_IOCTL_MODE_GETENCODER`).
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmModeGetEncoder {
+    pub encoder_id: u32,
+    pub encoder_type: u32,
+    pub crtc_id: u32,
+    pub possible_crtcs: u32,
+    pub possible_clones: u32,
+}
+
+/// `struct drm_mode_crtc` (`DRM_IOCTL_MODE_GETCRTC` / `DRM_IOCTL_MODE_SETCRTC`).
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmModeCrtc {
+    pub set_connectors_ptr: u64,
+    pub count_connectors: u32,
+    pub crtc_id: u32,
+    pub fb_id: u32,
+    pub x: u32,
+    pub y: u32,
+    pub gamma_size: u32,
+    pub mode_valid: u32,
+    pub mode: DrmModeModeinfo,
+}
+
+/// `struct drm_mode_get_plane_res` (`DRM_IOCTL_MODE_GETPLANERESOURCES`).
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmModeGetPlaneRes {
+    pub plane_id_ptr: u64,
+    pub count_planes: u32,
+    /// Compiler-inserted trailing padding (the struct's own size must be a multiple of its
+    /// 8-byte alignment) -- see [`DrmModeFbCmd2`]'s `_pad` field doc comment for why this is
+    /// made explicit rather than left implicit.
+    _pad: u32,
+}
+
+/// `struct drm_mode_get_plane` (`DRM_IOCTL_MODE_GETPLANE`).
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmModeGetPlane {
+    pub plane_id: u32,
+    pub crtc_id: u32,
+    pub fb_id: u32,
+    pub possible_crtcs: u32,
+    pub gamma_size: u32,
+    pub count_format_types: u32,
+    pub format_type_ptr: u64,
+}
+
+/// `struct drm_mode_set_plane` (`DRM_IOCTL_MODE_SETPLANE`).
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmModeSetPlane {
+    pub plane_id: u32,
+    pub crtc_id: u32,
+    pub fb_id: u32,
+    pub flags: u32,
+    pub crtc_x: i32,
+    pub crtc_y: i32,
+    pub crtc_w: u32,
+    pub crtc_h: u32,
+    pub src_x: u32,
+    pub src_y: u32,
+    pub src_h: u32,
+    pub src_w: u32,
+}
+
+/// `struct drm_mode_crtc_page_flip` (`DRM_IOCTL_MODE_PAGE_FLIP`).
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmModeCrtcPageFlip {
+    pub crtc_id: u32,
+    pub fb_id: u32,
+    pub flags: u32,
+    pub reserved: u32,
+    pub user_data: u64,
+}
+
+/// `DRM_MODE_PAGE_FLIP_EVENT` flag bit -- caller wants a `DRM_EVENT_FLIP_COMPLETE` event queued
+/// for delivery via `read()` on the DRM device fd once the flip completes.
+pub const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
+
+/// `struct drm_event` -- the common header of every event `read()` from a DRM device fd.
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmEvent {
+    pub r#type: u32,
+    pub length: u32,
+}
+
+/// `struct drm_event_vblank` -- the page-flip-completion event body (follows a [`DrmEvent`]
+/// header whose `type` is [`DRM_EVENT_FLIP_COMPLETE`]).
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmEventVblank {
+    pub base: DrmEvent,
+    pub user_data: u64,
+    pub tv_sec: u32,
+    pub tv_usec: u32,
+    pub sequence: u32,
+    pub crtc_id: u32,
+}
+
+/// `DRM_EVENT_FLIP_COMPLETE` -- `DrmEvent::type` value for a completed page-flip.
+pub const DRM_EVENT_FLIP_COMPLETE: u32 = 0x02;
+
 pub const TCGETS: u32 = 0x5401;
 pub const TCSETS: u32 = 0x5402;
 pub const TCSETSW: u32 = 0x5403;
@@ -829,6 +1079,27 @@ pub enum IoctlArg {
     FIONBIO(UserPtr<i32>),
     /// Set close on exec
     FIOCLEX,
+    /// `DRM_IOCTL_MODE_GETRESOURCES` -- enumerate the virtual card's fb/CRTC/connector/encoder
+    /// object IDs (two-call size-probe pattern, see [`DrmModeCardRes`]'s doc comment).
+    DrmModeGetResources(UserPtrMut<DrmModeCardRes>),
+    /// `DRM_IOCTL_MODE_GETCRTC`.
+    DrmModeGetCrtc(UserPtrMut<DrmModeCrtc>),
+    /// `DRM_IOCTL_MODE_SETCRTC`.
+    DrmModeSetCrtc(UserPtr<DrmModeCrtc>),
+    /// `DRM_IOCTL_MODE_GETENCODER`.
+    DrmModeGetEncoder(UserPtrMut<DrmModeGetEncoder>),
+    /// `DRM_IOCTL_MODE_GETCONNECTOR` (two-call size-probe pattern).
+    DrmModeGetConnector(UserPtrMut<DrmModeGetConnector>),
+    /// `DRM_IOCTL_MODE_CREATE_DUMB` -- allocate a CPU-writable dumb pixel buffer.
+    DrmModeCreateDumb(UserPtrMut<DrmModeCreateDumb>),
+    /// `DRM_IOCTL_MODE_MAP_DUMB` -- get an mmap-able offset for a dumb buffer.
+    DrmModeMapDumb(UserPtrMut<DrmModeMapDumb>),
+    /// `DRM_IOCTL_MODE_DESTROY_DUMB`.
+    DrmModeDestroyDumb(UserPtr<DrmModeDestroyDumb>),
+    /// `DRM_IOCTL_MODE_ADDFB2` -- attach a dumb buffer as a scanout framebuffer.
+    DrmModeAddFb2(UserPtrMut<DrmModeFbCmd2>),
+    /// `DRM_IOCTL_MODE_PAGE_FLIP`.
+    DrmModePageFlip(UserPtr<DrmModeCrtcPageFlip>),
     Raw {
         cmd: u32,
         arg: UserPtrMut<u8>,
@@ -2807,6 +3078,26 @@ impl SyscallRequest {
                         TIOCSPGRP => IoctlArg::TIOCSPGRP(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
                         FIOCLEX => IoctlArg::FIOCLEX,
+                        DRM_IOCTL_MODE_GETRESOURCES => {
+                            IoctlArg::DrmModeGetResources(ctx.sys_req_ptr(2))
+                        }
+                        DRM_IOCTL_MODE_GETCRTC => IoctlArg::DrmModeGetCrtc(ctx.sys_req_ptr(2)),
+                        DRM_IOCTL_MODE_SETCRTC => IoctlArg::DrmModeSetCrtc(ctx.sys_req_ptr(2)),
+                        DRM_IOCTL_MODE_GETENCODER => {
+                            IoctlArg::DrmModeGetEncoder(ctx.sys_req_ptr(2))
+                        }
+                        DRM_IOCTL_MODE_GETCONNECTOR => {
+                            IoctlArg::DrmModeGetConnector(ctx.sys_req_ptr(2))
+                        }
+                        DRM_IOCTL_MODE_CREATE_DUMB => {
+                            IoctlArg::DrmModeCreateDumb(ctx.sys_req_ptr(2))
+                        }
+                        DRM_IOCTL_MODE_MAP_DUMB => IoctlArg::DrmModeMapDumb(ctx.sys_req_ptr(2)),
+                        DRM_IOCTL_MODE_DESTROY_DUMB => {
+                            IoctlArg::DrmModeDestroyDumb(ctx.sys_req_ptr(2))
+                        }
+                        DRM_IOCTL_MODE_ADDFB2 => IoctlArg::DrmModeAddFb2(ctx.sys_req_ptr(2)),
+                        DRM_IOCTL_MODE_PAGE_FLIP => IoctlArg::DrmModePageFlip(ctx.sys_req_ptr(2)),
                         _ => IoctlArg::Raw {
                             cmd,
                             arg: ctx.sys_req_ptr(2),

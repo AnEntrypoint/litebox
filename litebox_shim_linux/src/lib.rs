@@ -294,6 +294,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             daemon_pty_masters: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
             next_pty_id: core::sync::atomic::AtomicU32::new(0),
             next_unix_autobind_id: core::sync::atomic::AtomicU32::new(0),
+            drm: syscalls::drm::DrmSubsystem::new(),
         });
         LinuxShim(global)
     }
@@ -692,6 +693,9 @@ fn default_fs<Platform: ShimPlatform>(
         litebox::fs::composer::Composer::builder()
             .mount("/dev", |allocator| {
                 litebox::fs::devices::Devices::new(litebox, allocator)
+            })
+            .mount("/dev/dri", |allocator| {
+                litebox::fs::devices::DriDevices::new(litebox, allocator)
             })
             .build()
             .unwrap(),
@@ -1879,6 +1883,12 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// `litebox_runner_snp`'s kernel-context page-fault handler) that have no `Task` in scope and
     /// only ever run a single bootstrap process, exposed via [`LinuxShim::page_manager`].
     bootstrap_process: once_cell::race::OnceBox<Arc<syscalls::process::Process<Platform>>>,
+    /// The one virtual DRM/KMS device's state (`/dev/dri/card0`). Shim-wide, not per-process,
+    /// since real DRM device state (allocated buffers, current mode/framebuffer) is genuinely
+    /// global -- any process holding a fd to the card sees the same connector/CRTC/buffers, just
+    /// like real Linux's `struct drm_device` is one kernel-wide object regardless of how many
+    /// processes have it open.
+    drm: syscalls::drm::DrmSubsystem<Platform>,
 }
 
 struct Task<Platform: ShimPlatform, FS: ShimFS> {
