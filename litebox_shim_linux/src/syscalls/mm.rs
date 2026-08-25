@@ -1272,6 +1272,7 @@ mod tests {
 
     use crate::syscalls::tests::TestPlatform as Platform;
     use crate::{UserPtrMut, syscalls::tests::init_platform};
+    use litebox::mm::linux::PAGE_SIZE;
 
     #[test]
     fn test_anonymous_mmap() {
@@ -1592,11 +1593,19 @@ mod tests {
     fn test_map_shared_anonymous() {
         let task = init_platform(None);
 
+        // Two pages: `sys_mmap` itself always rounds a requested length up to
+        // `PAGE_SIZE`, but every later `sys_mprotect`/`sys_munmap` call below
+        // passes its length straight through, unrounded -- an arbitrary
+        // literal like `0x2000` is only page-aligned by coincidence on a 4
+        // KiB-page platform, and silently becomes an invalid, non-aligned
+        // range on macOS's 16 KiB pages.
+        let len = 2 * PAGE_SIZE;
+
         // MAP_SHARED | MAP_ANON with PROT_READ should succeed
         let addr = task
             .sys_mmap(
                 0,
-                0x2000,
+                len,
                 ProtFlags::PROT_READ,
                 MapFlags::MAP_ANON | MapFlags::MAP_SHARED,
                 -1,
@@ -1608,19 +1617,18 @@ mod tests {
         let _val: u8 = addr.read_at_offset::<Platform>(0).unwrap();
 
         // Anonymous shared mappings allow permission changes including write
-        task.sys_mprotect(addr, 0x2000, ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+        task.sys_mprotect(addr, len, ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
             .unwrap();
         addr.write_slice_at_offset::<Platform>(0, &[0xab; 0x10])
             .unwrap();
         assert_eq!(addr.read_at_offset::<Platform>(0).unwrap(), 0xab_u8);
 
         // mprotect to read-only or read-exec should also succeed
-        task.sys_mprotect(addr, 0x2000, ProtFlags::PROT_READ)
-            .unwrap();
-        task.sys_mprotect(addr, 0x2000, ProtFlags::PROT_READ_EXEC)
+        task.sys_mprotect(addr, len, ProtFlags::PROT_READ).unwrap();
+        task.sys_mprotect(addr, len, ProtFlags::PROT_READ_EXEC)
             .unwrap();
 
-        task.sys_munmap(addr, 0x2000).unwrap();
+        task.sys_munmap(addr, len).unwrap();
     }
 
     #[test]
@@ -1710,9 +1718,16 @@ mod tests {
         let fd = i32::try_from(fd).unwrap();
         assert_eq!(task.sys_write(fd, content, None).unwrap(), content.len());
 
+        // `sys_mmap` itself always rounds a requested length up to `PAGE_SIZE`,
+        // but the later `sys_mprotect`/`sys_munmap` calls below pass their
+        // length straight through, unrounded -- `0x1000` is only page-aligned
+        // by coincidence on a 4 KiB-page platform, and silently becomes an
+        // invalid, non-aligned range on macOS's 16 KiB pages.
+        let len = PAGE_SIZE;
+
         // MAP_SHARED with PROT_READ on a file should succeed
         let addr = task
-            .sys_mmap(0, 0x1000, ProtFlags::PROT_READ, MapFlags::MAP_SHARED, fd, 0)
+            .sys_mmap(0, len, ProtFlags::PROT_READ, MapFlags::MAP_SHARED, fd, 0)
             .unwrap();
 
         // Data should match
@@ -1725,11 +1740,11 @@ mod tests {
 
         // mprotect to add write permission should fail
         let err = task
-            .sys_mprotect(addr, 0x1000, ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+            .sys_mprotect(addr, len, ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
             .unwrap_err();
         assert_eq!(err, Errno::EACCES);
 
-        task.sys_munmap(addr, 0x1000).unwrap();
+        task.sys_munmap(addr, len).unwrap();
         task.sys_close(fd).unwrap();
     }
 

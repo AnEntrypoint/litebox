@@ -64,7 +64,7 @@ mod net;
 
 use darwin::{
     KERN_NO_SPACE, KERN_SUCCESS, MAP_JIT, VM_FLAGS_FIXED, mach_task_self, mach_vm_allocate,
-    mach_vm_region_iter, ulock_wait, ulock_wake,
+    mach_vm_deallocate, mach_vm_region_iter, ulock_wait, ulock_wake,
 };
 
 /// The host signal LiteBox reserves for interrupting a thread out of guest
@@ -299,6 +299,24 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                     return Err(AllocationError::OutOfMemory);
                 }
             }
+            // The reservation above only exists to atomically prove the range
+            // was free (a real Darwin `mmap(MAP_FIXED)` over a *live*
+            // `mach_vm_allocate` object -- as opposed to over nothing, or over
+            // another `mmap`-created mapping -- has been observed to fail with
+            // `ENOMEM`). Release it immediately so the `mmap` below, a couple
+            // of instructions later, creates the real mapping fresh rather
+            // than replacing this reservation in place.
+            //
+            // SAFETY: this range was just reserved by the successful
+            // `mach_vm_allocate` call above and nothing else in this
+            // single-threaded sequence could have touched it yet.
+            unsafe {
+                mach_vm_deallocate(
+                    mach_task_self(),
+                    suggested_range.start as u64,
+                    suggested_range.len() as u64,
+                )
+            };
         }
 
         let mut flags = libc::MAP_PRIVATE | libc::MAP_ANON;
@@ -497,6 +515,22 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 KERN_NO_SPACE => return Err(SharedMemoryError::AddressInUse),
                 _ => return Err(SharedMemoryError::OutOfMemory),
             }
+            // See `allocate_pages`'s matching deallocate-before-mmap comment:
+            // the reservation only exists to atomically prove the range was
+            // free, and a real `mmap(MAP_FIXED)` over a still-live
+            // `mach_vm_allocate` object has been observed to fail with
+            // `ENOMEM`.
+            //
+            // SAFETY: this range was just reserved by the successful
+            // `mach_vm_allocate` call above and nothing else in this
+            // single-threaded sequence could have touched it yet.
+            unsafe {
+                mach_vm_deallocate(
+                    mach_task_self(),
+                    suggested_range.start as u64,
+                    suggested_range.len() as u64,
+                )
+            };
         }
 
         let mut flags = libc::MAP_SHARED;
