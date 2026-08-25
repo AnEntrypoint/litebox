@@ -9,8 +9,8 @@
 //! Close the window (or wait ~5s) to exit.
 
 fn main() {
-    let presenter =
-        litebox_platform_windows_userland::presentation::Presenter::new().expect("create presenter");
+    let presenter = litebox_platform_windows_userland::presentation::Presenter::new()
+        .expect("create presenter");
     let sender = presenter.sender();
 
     std::thread::spawn(move || {
@@ -21,10 +21,15 @@ fn main() {
         for y in 0..height {
             for x in 0..width {
                 let idx = (y * pitch + x * 4) as usize;
-                // BGRA8/XRGB8888 byte order: a horizontal red ramp, vertical green ramp, fixed blue.
+                // BGRA8/XRGB8888 byte order: a horizontal red ramp, vertical green ramp, fixed
+                // blue. `* 255 / height`/`* 255 / width` are always in 0..=255, exact by
+                // construction, so the narrowing cast below is not a real precision loss.
                 bytes[idx] = 128; // B
-                bytes[idx + 1] = (y * 255 / height) as u8; // G
-                bytes[idx + 2] = (x * 255 / width) as u8; // R
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    bytes[idx + 1] = (y * 255 / height) as u8; // G
+                    bytes[idx + 2] = (x * 255 / width) as u8; // R
+                }
                 bytes[idx + 3] = 255; // X/A
             }
         }
