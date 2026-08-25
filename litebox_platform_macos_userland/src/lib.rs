@@ -923,6 +923,14 @@ impl litebox::platform::DerivedKeyProvider for MacOsUserland {
 static PENDING_SIGNALS: AtomicU64 = AtomicU64::new(0);
 
 unsafe extern "C" fn async_signal_handler(signum: libc::c_int) {
+    // TEMPORARY (macOS CI investigation, test_timer_delivers_correct_signal):
+    // confirm whether this handler runs at all for SIGUSR1, and with what
+    // signal number, before the guest ever observes PENDING_SIGNALS. Signal
+    // handlers may only call async-signal-safe functions; `libc::write` to
+    // stderr's raw fd is, unlike `eprintln!`/`std::io`. Remove once
+    // root-caused.
+    let msg = b"async_signal_handler fired\n";
+    unsafe { libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len()) };
     if let Ok(bit) = u32::try_from(signum - 1) {
         PENDING_SIGNALS.fetch_or(1u64 << bit, Ordering::Relaxed);
     }
@@ -962,6 +970,12 @@ impl litebox::platform::SignalProvider for MacOsUserland {
 
     fn take_pending_signals(&self, mut f: impl FnMut(Self::Signal)) {
         let mut pending = PENDING_SIGNALS.swap(0, Ordering::Relaxed);
+        // TEMPORARY (macOS CI investigation, test_timer_delivers_correct_signal):
+        // confirm what this call actually observes in PENDING_SIGNALS. Remove
+        // once root-caused.
+        if pending != 0 {
+            std::eprintln!("take_pending_signals: drained {pending:#x}");
+        }
         while pending != 0 {
             let bit = pending.trailing_zeros();
             pending &= !(1u64 << bit);
