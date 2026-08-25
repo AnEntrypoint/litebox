@@ -38,8 +38,9 @@
 use std::sync::mpsc;
 
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::platform::windows::EventLoopBuilderExtWindows;
 use winit::window::{Window, WindowId};
 
@@ -52,6 +53,122 @@ pub struct Frame {
     pub height: u32,
     pub pitch: u32,
     pub bytes: Vec<u8>,
+}
+
+/// One real keyboard/mouse-button transition or relative-motion event, already translated into
+/// Linux evdev's own `(type, code, value)` shape (see `litebox_common_linux`'s `EV_*`/`KEY_*`/
+/// `BTN_*`/`REL_*` constants) -- the caller (`litebox_runner_linux_on_windows_userland`) forwards
+/// these directly into `LinuxShim::push_input_key`/`push_input_rel` with no further translation.
+pub enum InputSignal {
+    /// `(code, value)` for an `EV_KEY` event -- a keyboard key or mouse button, `value` 1
+    /// (pressed) or 0 (released).
+    Key(u16, i32),
+    /// `(code, value)` for an `EV_REL` event -- relative motion, `value` the signed delta.
+    Rel(u16, i32),
+}
+
+/// Translate a `winit` physical key into its Linux evdev `KEY_*` code, where a real, verified
+/// mapping exists (see `litebox_common_linux`'s own `KEY_*` constants for which keys are
+/// covered). `None` for any key outside that covered set -- silently dropped by the caller,
+/// matching how a real keyboard simply has no key to send for a code this device doesn't map.
+fn winit_keycode_to_evdev(key: KeyCode) -> Option<u16> {
+    use litebox_common_linux::*;
+    Some(match key {
+        KeyCode::Escape => KEY_ESC,
+        KeyCode::Digit1 => KEY_1,
+        KeyCode::Digit2 => KEY_2,
+        KeyCode::Digit3 => KEY_3,
+        KeyCode::Digit4 => KEY_4,
+        KeyCode::Digit5 => KEY_5,
+        KeyCode::Digit6 => KEY_6,
+        KeyCode::Digit7 => KEY_7,
+        KeyCode::Digit8 => KEY_8,
+        KeyCode::Digit9 => KEY_9,
+        KeyCode::Digit0 => KEY_0,
+        KeyCode::Minus => KEY_MINUS,
+        KeyCode::Equal => KEY_EQUAL,
+        KeyCode::Backspace => KEY_BACKSPACE,
+        KeyCode::Tab => KEY_TAB,
+        KeyCode::KeyQ => KEY_Q,
+        KeyCode::KeyW => KEY_W,
+        KeyCode::KeyE => KEY_E,
+        KeyCode::KeyR => KEY_R,
+        KeyCode::KeyT => KEY_T,
+        KeyCode::KeyY => KEY_Y,
+        KeyCode::KeyU => KEY_U,
+        KeyCode::KeyI => KEY_I,
+        KeyCode::KeyO => KEY_O,
+        KeyCode::KeyP => KEY_P,
+        KeyCode::BracketLeft => KEY_LEFTBRACE,
+        KeyCode::BracketRight => KEY_RIGHTBRACE,
+        KeyCode::Enter => KEY_ENTER,
+        KeyCode::ControlLeft => KEY_LEFTCTRL,
+        KeyCode::KeyA => KEY_A,
+        KeyCode::KeyS => KEY_S,
+        KeyCode::KeyD => KEY_D,
+        KeyCode::KeyF => KEY_F,
+        KeyCode::KeyG => KEY_G,
+        KeyCode::KeyH => KEY_H,
+        KeyCode::KeyJ => KEY_J,
+        KeyCode::KeyK => KEY_K,
+        KeyCode::KeyL => KEY_L,
+        KeyCode::Semicolon => KEY_SEMICOLON,
+        KeyCode::Quote => KEY_APOSTROPHE,
+        KeyCode::Backquote => KEY_GRAVE,
+        KeyCode::ShiftLeft => KEY_LEFTSHIFT,
+        KeyCode::Backslash => KEY_BACKSLASH,
+        KeyCode::KeyZ => KEY_Z,
+        KeyCode::KeyX => KEY_X,
+        KeyCode::KeyC => KEY_C,
+        KeyCode::KeyV => KEY_V,
+        KeyCode::KeyB => KEY_B,
+        KeyCode::KeyN => KEY_N,
+        KeyCode::KeyM => KEY_M,
+        KeyCode::Comma => KEY_COMMA,
+        KeyCode::Period => KEY_DOT,
+        KeyCode::Slash => KEY_SLASH,
+        KeyCode::ShiftRight => KEY_RIGHTSHIFT,
+        KeyCode::AltLeft => KEY_LEFTALT,
+        KeyCode::Space => KEY_SPACE,
+        KeyCode::CapsLock => KEY_CAPSLOCK,
+        KeyCode::F1 => KEY_F1,
+        KeyCode::F2 => KEY_F2,
+        KeyCode::F3 => KEY_F3,
+        KeyCode::F4 => KEY_F4,
+        KeyCode::F5 => KEY_F5,
+        KeyCode::F6 => KEY_F6,
+        KeyCode::F7 => KEY_F7,
+        KeyCode::F8 => KEY_F8,
+        KeyCode::F9 => KEY_F9,
+        KeyCode::F10 => KEY_F10,
+        KeyCode::F11 => KEY_F11,
+        KeyCode::F12 => KEY_F12,
+        KeyCode::ControlRight => KEY_RIGHTCTRL,
+        KeyCode::AltRight => KEY_RIGHTALT,
+        KeyCode::Home => KEY_HOME,
+        KeyCode::ArrowUp => KEY_UP,
+        KeyCode::PageUp => KEY_PAGEUP,
+        KeyCode::ArrowLeft => KEY_LEFT,
+        KeyCode::ArrowRight => KEY_RIGHT,
+        KeyCode::End => KEY_END,
+        KeyCode::ArrowDown => KEY_DOWN,
+        KeyCode::PageDown => KEY_PAGEDOWN,
+        KeyCode::Insert => KEY_INSERT,
+        KeyCode::Delete => KEY_DELETE,
+        _ => return None,
+    })
+}
+
+/// Translate a `winit` mouse button into its Linux evdev `BTN_*` code. `None` for any button
+/// outside the common three (a real mouse can report more, e.g. `BTN_SIDE`/`BTN_EXTRA` for back/
+/// forward buttons -- out of scope for this pass).
+fn winit_mouse_button_to_evdev(button: MouseButton) -> Option<u16> {
+    match button {
+        MouseButton::Left => Some(litebox_common_linux::BTN_LEFT),
+        MouseButton::Right => Some(litebox_common_linux::BTN_RIGHT),
+        MouseButton::Middle => Some(litebox_common_linux::BTN_MIDDLE),
+        _ => None,
+    }
 }
 
 /// The sending half of the frame channel: clone and hand out to whatever produces frames (in a
@@ -88,6 +205,7 @@ pub struct Presenter {
     event_loop: EventLoop<()>,
     frames_rx: mpsc::Receiver<Frame>,
     sender: FrameSender,
+    input_consumer: Option<Box<dyn Fn(InputSignal) + Send>>,
 }
 
 impl Presenter {
@@ -114,6 +232,7 @@ impl Presenter {
             event_loop,
             frames_rx,
             sender,
+            input_consumer: None,
         })
     }
 
@@ -124,6 +243,20 @@ impl Presenter {
         self.sender.clone()
     }
 
+    /// Register `consumer` to be called, on the presenter's own event-loop thread, with every
+    /// real keyboard/mouse event this window observes from [`Self::run`]'s call onward. Call
+    /// before [`Self::run`] -- there is no queue-until-registered semantics (unlike [`Frame`]
+    /// delivery): a real input device produces events whether or not anything is listening, and
+    /// keyboard/mouse events are far higher-frequency than page-flips, so unbounded queuing
+    /// before a slow-to-register consumer would be a real memory-growth risk. `consumer` runs
+    /// inline on the event-loop thread (not its own spawned thread) since real callers (see
+    /// `litebox_runner_linux_on_windows_userland`) only ever do a cheap, non-blocking
+    /// `LinuxShim::push_input_key`/`push_input_rel` call here -- a caller doing real work should
+    /// spawn its own thread/queue internally rather than blocking this window's own event pump.
+    pub fn set_input_consumer(&mut self, consumer: impl Fn(InputSignal) + Send + 'static) {
+        self.input_consumer = Some(Box::new(consumer));
+    }
+
     /// Run the event loop on the calling thread until the window is closed. See this module's
     /// doc comment for why the calling thread must NOT be the guest-execution thread.
     pub fn run(self) -> Result<(), winit::error::EventLoopError> {
@@ -132,6 +265,8 @@ impl Presenter {
             frames_rx: self.frames_rx,
             state: None,
             last_frame: None,
+            input_consumer: self.input_consumer,
+            last_cursor_pos: None,
         };
         self.event_loop.run_app(&mut app)
     }
@@ -161,6 +296,13 @@ struct PresenterApp {
     /// setup completes, and every future frame keeps updating it the same way `RedrawRequested`'s
     /// resize-driven re-presents already needed to survive a surface reconfigure.
     last_frame: Option<Frame>,
+    /// See [`Presenter::set_input_consumer`]'s doc comment -- `None` for a caller that never
+    /// registered one (a presenter-only use with no guest input wiring, e.g. `presenter_smoke`),
+    /// in which case keyboard/mouse events are observed by `winit` but simply have nowhere to go.
+    input_consumer: Option<Box<dyn Fn(InputSignal) + Send>>,
+    /// The cursor's last-seen position, for deriving `EV_REL` deltas from `winit`'s
+    /// absolute-position `CursorMoved` events -- see `window_event`'s own handler.
+    last_cursor_pos: Option<(f64, f64)>,
 }
 
 impl PresenterApp {
@@ -384,6 +526,77 @@ impl ApplicationHandler for PresenterApp {
                 if let Some(frame) = self.last_frame.take() {
                     self.present(&frame);
                     self.last_frame = Some(frame);
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                let Some(consumer) = &self.input_consumer else {
+                    return;
+                };
+                let PhysicalKey::Code(code) = event.physical_key else {
+                    return;
+                };
+                let Some(evdev_code) = winit_keycode_to_evdev(code) else {
+                    return;
+                };
+                let value = match event.state {
+                    // `winit` collapses OS-level auto-repeat into repeated `Pressed` events with
+                    // `event.repeat == true` set, unlike real evdev's own three-state
+                    // (0=released/1=pressed/2=repeat) `value` -- map that flag onto evdev's
+                    // actual repeat value rather than sending a second, indistinguishable "press".
+                    ElementState::Pressed if event.repeat => 2,
+                    ElementState::Pressed => 1,
+                    ElementState::Released => 0,
+                };
+                consumer(InputSignal::Key(evdev_code, value));
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                let Some(consumer) = &self.input_consumer else {
+                    return;
+                };
+                let Some(evdev_code) = winit_mouse_button_to_evdev(button) else {
+                    return;
+                };
+                let value = match state {
+                    ElementState::Pressed => 1,
+                    ElementState::Released => 0,
+                };
+                consumer(InputSignal::Key(evdev_code, value));
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let Some(consumer) = &self.input_consumer else {
+                    return;
+                };
+                // Real evdev `EV_REL` motion is a signed DELTA since the last event, not an
+                // absolute position (that's `EV_ABS`, not emitted by this pass -- see the module
+                // doc comment). `winit`'s own `CursorMoved` reports the new absolute position, so
+                // the delta is derived here against the last-seen position, matching what a real
+                // mouse's own relative-motion sensor would have reported for the same movement.
+                if let Some((last_x, last_y)) = self.last_cursor_pos {
+                    let dx = (position.x - last_x) as i32;
+                    let dy = (position.y - last_y) as i32;
+                    if dx != 0 {
+                        consumer(InputSignal::Rel(litebox_common_linux::REL_X, dx));
+                    }
+                    if dy != 0 {
+                        consumer(InputSignal::Rel(litebox_common_linux::REL_Y, dy));
+                    }
+                }
+                self.last_cursor_pos = Some((position.x, position.y));
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let Some(consumer) = &self.input_consumer else {
+                    return;
+                };
+                // Real `REL_WHEEL` steps are small signed integers (one physical detent = 1);
+                // `winit`'s `LineDelta` already reports in that same unit on Windows (one visible
+                // notch of a real mouse wheel = 1.0), so a straight cast (not a scale) is correct.
+                // `PixelDelta` (high-resolution trackpad/precision-scroll input) has no clean
+                // 1:1 mapping to discrete evdev wheel steps and is dropped rather than guessed at.
+                if let winit::event::MouseScrollDelta::LineDelta(_, y) = delta {
+                    let steps = y as i32;
+                    if steps != 0 {
+                        consumer(InputSignal::Rel(litebox_common_linux::REL_WHEEL, steps));
+                    }
                 }
             }
             _ => {}

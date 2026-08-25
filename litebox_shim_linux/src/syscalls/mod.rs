@@ -6,6 +6,7 @@
 pub(crate) mod drm;
 pub(crate) mod epoll;
 pub(crate) mod eventfd;
+pub(crate) mod evdev;
 pub mod file;
 pub(crate) mod misc;
 pub(crate) mod mm;

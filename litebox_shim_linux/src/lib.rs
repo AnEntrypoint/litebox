@@ -295,6 +295,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             next_pty_id: core::sync::atomic::AtomicU32::new(0),
             next_unix_autobind_id: core::sync::atomic::AtomicU32::new(0),
             drm: syscalls::drm::DrmSubsystem::new(),
+            evdev: syscalls::evdev::EvdevSubsystem::new(),
         });
         LinuxShim(global)
     }
@@ -321,6 +322,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         callback: impl Fn(&[u8], u32, u32, u32, u32) + Send + Sync + 'static,
     ) {
         self.0.drm.set_flip_callback(callback);
+    }
+
+    /// Push a real keyboard/mouse-button transition into the shim's `/dev/input/event0` queue --
+    /// see [`syscalls::evdev::EvdevSubsystem::push_key`]'s doc comment for the `code`/`value`
+    /// contract. The sole public entry point into the shim's own evdev emulation, mirroring
+    /// [`Self::set_drm_flip_callback`]'s role for DRM; a runner binary with a concrete
+    /// presentation/input layer (e.g. `litebox_platform_windows_userland`'s winit-backed window)
+    /// calls this from its own keyboard/mouse-button event handler.
+    pub fn push_input_key(&self, code: u16, value: i32) {
+        self.0.evdev.push_key(code, value);
+    }
+
+    /// Push a real relative mouse-motion or wheel event into the shim's `/dev/input/event0`
+    /// queue -- see [`syscalls::evdev::EvdevSubsystem::push_rel`]'s doc comment for the
+    /// `code`/`value` contract.
+    pub fn push_input_rel(&self, code: u16, value: i32) {
+        self.0.evdev.push_rel(code, value);
     }
 
     /// Loads the program at `path` as the shim's initial task, returning the
@@ -1904,6 +1922,11 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// like real Linux's `struct drm_device` is one kernel-wide object regardless of how many
     /// processes have it open.
     drm: syscalls::drm::DrmSubsystem<Platform>,
+    /// The one virtual evdev keyboard+mouse device's state (`/dev/input/event0`). Shim-wide for
+    /// the same reason `drm` is: real input-device state (queued events) is genuinely global,
+    /// matching how a real kernel input device is one object regardless of how many processes
+    /// have it open.
+    evdev: syscalls::evdev::EvdevSubsystem<Platform>,
 }
 
 struct Task<Platform: ShimPlatform, FS: ShimFS> {
