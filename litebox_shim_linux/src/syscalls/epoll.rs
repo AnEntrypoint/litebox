@@ -969,11 +969,11 @@ mod test {
             .descriptor_table_mut()
             .insert::<super::EpollSubsystem<TestPlatform, crate::DefaultFS<TestPlatform>>>(inner);
         let eventfd = crate::syscalls::eventfd::EventFile::new(0, EfdFlags::empty());
-        let eventfd_typed = task
-            .global
-            .litebox
-            .descriptor_table_mut()
-            .insert::<crate::syscalls::eventfd::EventfdSubsystem<TestPlatform>>(eventfd);
+        let eventfd_typed =
+            task.global
+                .litebox
+                .descriptor_table_mut()
+                .insert::<crate::syscalls::eventfd::EventfdSubsystem<TestPlatform>>(eventfd);
 
         let files = Arc::new(FilesState::new(task.files.borrow().fs.clone()));
         let Ok(eventfd_raw) = files.insert_raw_fd(eventfd_typed) else {
@@ -1052,7 +1052,11 @@ mod test {
         let events = outer
             .wait(&task.global, &WaitState::new(platform()).context(), 1024)
             .unwrap();
-        assert_eq!(events.len(), 1, "first wait should observe the nested epoll ready");
+        assert_eq!(
+            events.len(),
+            1,
+            "first wait should observe the nested epoll ready"
+        );
 
         // Deliberately do NOT drain the inner epoll's own ready entry here -- real `calloop` never
         // directly `epoll_wait()`s its own nested epoll fd (that's the whole point of nesting it
@@ -1064,7 +1068,9 @@ mod test {
             let eventfd_typed = files
                 .raw_descriptor_store
                 .read()
-                .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem<TestPlatform>>(eventfd_raw)
+                .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem<TestPlatform>>(
+                    eventfd_raw,
+                )
                 .unwrap();
             let _ = task
                 .global
@@ -1093,6 +1099,180 @@ mod test {
             events.len(),
             1,
             "second, separate wait call should ALSO observe the nested epoll ready again"
+        );
+    }
+
+    /// Variant of [`test_nested_epoll_readiness_rechecked_across_separate_waits`] substituting a
+    /// real Unix domain socketpair fd (`EpollDescriptor::Unix`, going through
+    /// `crate::syscalls::unix::UnixSocketSubsystem`) for the eventfd as the inner epoll's ready
+    /// source -- the real compositor's own inner epoll holds Unix socket fds (its client
+    /// connections), never an eventfd, so this tests a genuinely different `IOPollable`
+    /// implementation than the eventfd variant already ruled out as the cause of the real
+    /// `calloop` stall.
+    #[test]
+    fn test_nested_epoll_readiness_rechecked_across_separate_waits_unix_socket() {
+        let (task, outer) = setup_epoll();
+        let inner = EpollFile::<TestPlatform, crate::DefaultFS<TestPlatform>>::new();
+        let inner_typed = task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<super::EpollSubsystem<TestPlatform, crate::DefaultFS<TestPlatform>>>(inner);
+
+        let (receiver_sock, writer_sock) = crate::syscalls::unix::UnixSocket::<
+            TestPlatform,
+            crate::DefaultFS<TestPlatform>,
+        >::new_connected_pair(
+            litebox_common_linux::SockType::Stream,
+            litebox_common_linux::SockFlags::empty(),
+        )
+        .unwrap();
+        let receiver_typed = task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<crate::syscalls::unix::UnixSocketSubsystem<
+            TestPlatform,
+            crate::DefaultFS<TestPlatform>,
+        >>(receiver_sock);
+        let writer_typed = task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<crate::syscalls::unix::UnixSocketSubsystem<
+            TestPlatform,
+            crate::DefaultFS<TestPlatform>,
+        >>(writer_sock);
+
+        let files = Arc::new(FilesState::new(task.files.borrow().fs.clone()));
+        let Ok(receiver_raw) = files.insert_raw_fd(receiver_typed) else {
+            unreachable!()
+        };
+        let Ok(writer_raw) = files.insert_raw_fd(writer_typed) else {
+            unreachable!()
+        };
+        let Ok(inner_raw) = files.insert_raw_fd(inner_typed) else {
+            unreachable!()
+        };
+
+        // Register the receiving socket (becomes readable when the writer sends) on the INNER
+        // epoll, matching how calloop registers its own real fd sources.
+        let receiver_descriptor = super::EpollDescriptor::try_from(&files, receiver_raw).unwrap();
+        {
+            let inner_typed = files
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<super::EpollSubsystem<TestPlatform, crate::DefaultFS<TestPlatform>>>(inner_raw)
+                .unwrap();
+            task.global
+                .litebox
+                .descriptor_table()
+                .with_entry(&inner_typed, |inner_entry| {
+                    inner_entry
+                        .add_interest(
+                            &task.global,
+                            20,
+                            &receiver_descriptor,
+                            EpollEvent {
+                                events: Events::IN.bits(),
+                                data: 0,
+                            },
+                        )
+                        .unwrap();
+                });
+        }
+
+        // Register the INNER epoll fd on the OUTER epoll, matching calloop's own epoll fd being
+        // added as a member of litebox's compositor-level outer epoll set.
+        let inner_descriptor = super::EpollDescriptor::try_from(&files, inner_raw).unwrap();
+        outer
+            .add_interest(
+                &task.global,
+                10,
+                &inner_descriptor,
+                EpollEvent {
+                    events: Events::IN.bits(),
+                    data: 0,
+                },
+            )
+            .unwrap();
+
+        // Unlike the eventfd variant, a Unix socket write needs a real `&Task` (`sendto`'s own
+        // signature) -- done synchronously on this same thread rather than a spawned writer,
+        // since a socketpair write is not itself a blocking operation here.
+        let send_from_writer = || {
+            let writer_typed = files
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<crate::syscalls::unix::UnixSocketSubsystem<
+                    TestPlatform,
+                    crate::DefaultFS<TestPlatform>,
+                >>(writer_raw)
+                .unwrap();
+            let _ = task
+                .global
+                .litebox
+                .descriptor_table()
+                .with_entry(&writer_typed, |entry| {
+                    entry.sendto(&task, b"x", litebox_common_linux::SendFlags::empty(), None)
+                })
+                .unwrap();
+        };
+
+        // First wait: matches the eventfd variant, already known to work.
+        send_from_writer();
+        let events = outer
+            .wait(&task.global, &WaitState::new(platform()).context(), 1024)
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "first wait should observe the nested epoll ready via the socket"
+        );
+
+        // Deliberately do NOT drain the receiver's own byte via the inner epoll's wait() -- read
+        // it directly, mimicking calloop reading its own registered fd once notified, without
+        // touching the inner EpollFile's ready-queue machinery.
+        {
+            let receiver_typed = files
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<crate::syscalls::unix::UnixSocketSubsystem<
+                    TestPlatform,
+                    crate::DefaultFS<TestPlatform>,
+                >>(receiver_raw)
+                .unwrap();
+            let mut buf = [0u8; 1];
+            let _ = task
+                .global
+                .litebox
+                .descriptor_table()
+                .with_entry(&receiver_typed, |entry| {
+                    entry.recvfrom(
+                        &task.wait_cx(),
+                        &mut buf,
+                        litebox_common_linux::ReceiveFlags::empty(),
+                        None,
+                    )
+                });
+        }
+
+        // Second, SEPARATE wait call: send again and confirm the outer epoll notices the nested
+        // epoll is ready AGAIN. This is the exact real-world symptom under investigation.
+        send_from_writer();
+        let events = outer
+            .wait(
+                &task.global,
+                &WaitState::new(platform())
+                    .context()
+                    .with_timeout(core::time::Duration::from_secs(2)),
+                1024,
+            )
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "second, separate wait call should ALSO observe the nested epoll ready again via the socket"
         );
     }
 
