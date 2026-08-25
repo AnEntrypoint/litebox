@@ -1328,10 +1328,21 @@ mod tests {
     fn test_mremap() {
         let task = init_platform(None);
 
+        // `old_size`/`new_size` must round up to genuinely DIFFERENT sizes
+        // regardless of platform page size, or `sys_mremap`'s own rounding
+        // (`old_size`/`new_size` each round up to a multiple of `PAGE_SIZE`)
+        // collapses this into a same-size no-op that trivially succeeds
+        // instead of exercising the in-place-growth-conflict path this test
+        // means to check: a raw literal like `0x1000`/`0x2000` is only two
+        // DIFFERENT page counts by coincidence on a 4 KiB-page platform --
+        // both round up to the SAME single 16 KiB page on macOS.
+        let old_size = PAGE_SIZE;
+        let new_size = 2 * PAGE_SIZE;
+
         let addr = task
             .sys_mmap(
                 0,
-                0x2000,
+                new_size,
                 ProtFlags::PROT_READ,
                 MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
                 -1,
@@ -1342,8 +1353,8 @@ mod tests {
         assert!(matches!(
             task.sys_mremap(
                 addr,
-                0x1000,
-                0x2000,
+                old_size,
+                new_size,
                 litebox_common_linux::MRemapFlags::empty(),
                 0
             ),
@@ -1352,14 +1363,14 @@ mod tests {
         let new_addr = task
             .sys_mremap(
                 addr,
-                0x1000,
-                0x2000,
+                old_size,
+                new_size,
                 litebox_common_linux::MRemapFlags::MREMAP_MAYMOVE,
                 0,
             )
             .unwrap();
-        task.sys_munmap(addr, 0x2000).unwrap();
-        task.sys_munmap(new_addr, 0x2000).unwrap();
+        task.sys_munmap(addr, new_size).unwrap();
+        task.sys_munmap(new_addr, new_size).unwrap();
     }
 
     #[test]
