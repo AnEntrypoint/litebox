@@ -87,6 +87,13 @@ pub struct CliArgs {
     /// from an empty upper layer.
     #[arg(long = "resume-from", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath)]
     pub resume_from: Option<PathBuf>,
+    /// Open a real host window (X11 or Wayland, via `winit`/`wgpu`) that displays whatever the
+    /// guest draws into `/dev/dri/card0`'s DRM dumb-buffer framebuffer, and forwards real
+    /// keyboard/mouse events from that window into the guest's `/dev/input/event0`. See
+    /// `litebox_platform_linux_userland::presentation`'s module doc comment for the design and
+    /// this platform's own open verification gaps.
+    #[arg(long = "gui")]
+    pub gui: bool,
 }
 
 struct MmappedFile {
@@ -345,6 +352,53 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     let shim = shim_builder.build();
 
+    // `--gui`: open a real host window and wire the guest's DRM page-flips into it. Mirrors
+    // `litebox_runner_linux_on_windows_userland`'s identical wiring -- see `presentation.rs`'s
+    // module doc comment (in `litebox_platform_linux_userland`) for why this needs its own
+    // dedicated OS thread the same way Windows does, and for what remains genuinely unverified on
+    // real Linux windowing in this port. Uses `spawn_host_thread` (not raw `std::thread::spawn`)
+    // like every other background thread in this runner, so the presenter thread also gets guest
+    // signals blocked -- it is a host-only thread that must never receive one of LiteBox's own
+    // guest-directed signals (e.g. the timer/interrupt signals `LinuxUserland` installs handlers
+    // for), exactly like `net_worker` below.
+    let gui_presenter_thread = cli_args.gui.then(|| {
+        let (sender_tx, sender_rx) = std::sync::mpsc::channel();
+        let input_shim = shim.clone();
+        let handle = litebox_platform_linux_userland::spawn_host_thread(move || {
+            let mut presenter =
+                match litebox_platform_linux_userland::presentation::Presenter::new() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        litebox_util_log::warn!(error:? = e; "failed to create GUI presenter");
+                        return;
+                    }
+                };
+            presenter.set_input_consumer(move |signal| match signal {
+                litebox_platform_linux_userland::presentation::InputSignal::Key(code, value) => {
+                    input_shim.push_input_key(code, value);
+                }
+                litebox_platform_linux_userland::presentation::InputSignal::Rel(code, value) => {
+                    input_shim.push_input_rel(code, value);
+                }
+            });
+            let _ = sender_tx.send(presenter.sender());
+            if let Err(e) = presenter.run() {
+                litebox_util_log::warn!(error:? = e; "GUI presenter event loop exited with an error");
+            }
+        });
+        if let Ok(sender) = sender_rx.recv() {
+            shim.set_drm_flip_callback(move |bytes, width, height, pitch, _pixel_format| {
+                sender.send(litebox_platform_linux_userland::presentation::Frame {
+                    width,
+                    height,
+                    pitch,
+                    bytes: bytes.to_vec(),
+                });
+            });
+        }
+        handle
+    });
+
     let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
     let net_worker = if cli_args.tun_device_name.is_some() {
         let shim = shim.clone();
@@ -438,6 +492,14 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
         net_worker.join().unwrap();
     }
+
+    // `--gui`: keep the process (and its window) alive until the user closes it -- see
+    // `litebox_runner_linux_on_windows_userland`'s identical join for the full rationale (a real
+    // GUI stays on screen after the program that drew into it exits).
+    if let Some(handle) = gui_presenter_thread {
+        let _ = handle.join();
+    }
+
     std::process::exit(exit_code)
 }
 
