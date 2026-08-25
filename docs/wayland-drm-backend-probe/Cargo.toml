@@ -1,0 +1,12 @@
+[workspace]
+
+[package]
+name = "wayland-probe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+smithay = { version = "0.7", default-features = false, features = ["backend_drm"] }
+
+[profile.dev]
+opt-level = 0
