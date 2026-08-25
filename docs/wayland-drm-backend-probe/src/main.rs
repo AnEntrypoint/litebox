@@ -131,6 +131,7 @@ impl CompositorHandler for Compositor {
                 height,
                 stride
             );
+            flush_stdout();
             if push_to_drm_dumb_buffer(&self.drm, &pixels, width as u32, height as u32, stride as u32) {
                 self.committed_once = true;
             }
@@ -205,6 +206,15 @@ fn push_to_drm_dumb_buffer(drm: &DrmDevice, pixels: &[u8], width: u32, height: u
     }
 }
 
+/// See `client.rs`'s identical helper for why this is needed: stdout is fully buffered (not
+/// line-buffered) whenever it isn't a real TTY, which litebox's guest stdout is not -- without
+/// an explicit flush after every print, this process's real progress stays invisible to a
+/// parent/host reading its output until process exit, making genuinely-working code look hung.
+fn flush_stdout() {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+}
+
 fn main() {
     let fd = open("/dev/dri/card0", OFlags::RDWR, FsMode::empty()).expect("open /dev/dri/card0");
     let drm_fd = DrmDeviceFd::new(fd.into());
@@ -234,6 +244,7 @@ fn main() {
     let listener = std::os::unix::net::UnixListener::bind(socket_path).expect("bind wayland socket");
     listener.set_nonblocking(true).expect("set_nonblocking");
     println!("LISTENING path={socket_path}");
+    flush_stdout();
 
     // `DisplayHandle` is a cheap, cloneable handle (an internal Arc) -- captured directly by the
     // accept closure below rather than stored on `Compositor` itself (which would need a
@@ -253,6 +264,7 @@ fn main() {
                                 println!("INSERT_CLIENT_FAILED {e:?}");
                             } else {
                                 println!("CLIENT_ACCEPTED");
+                            flush_stdout();
                             }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -282,6 +294,7 @@ fn main() {
         .expect("insert display source");
 
     println!("RUNNING");
+    flush_stdout();
     // Bounded run: this is a probe, not a long-lived service -- exit once a real client has
     // connected AND committed a real buffer (success), or after a generous timeout (no client
     // showed up -- still real information, printed below, not silently swallowed).
