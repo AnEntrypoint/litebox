@@ -641,6 +641,18 @@ impl litebox::platform::SystemInfoProvider for MacOsUserland {
 }
 
 // ---------------------------------------------------------------------------
+// Fork-child verification
+// ---------------------------------------------------------------------------
+
+// Guest entry (the host<->guest context switch) is not implemented yet -- see
+// docs/macos.md's "Remaining work" -- so there is no real fork()ed guest
+// execution for this platform to verify. The default (no-op) trait methods
+// are correct here, matching litebox_platform_linux_userland's own empty
+// impl; only litebox_platform_windows_userland's real relocation-verification
+// machinery needs to override these.
+impl litebox::platform::ForkChildVerificationProvider for MacOsUserland {}
+
+// ---------------------------------------------------------------------------
 // Thread-local storage
 // ---------------------------------------------------------------------------
 
