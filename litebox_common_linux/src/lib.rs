@@ -1222,6 +1222,13 @@ pub enum IoctlArg {
     DrmModeAddFb2(UserPtrMut<DrmModeFbCmd2>),
     /// `DRM_IOCTL_MODE_PAGE_FLIP`.
     DrmModePageFlip(UserPtr<DrmModeCrtcPageFlip>),
+    /// `DRM_IOCTL_MODE_GETPLANERESOURCES` -- enumerate the virtual card's plane object IDs
+    /// (two-call size-probe pattern, see [`DrmModeGetPlaneRes`]'s doc comment).
+    DrmModeGetPlaneResources(UserPtrMut<DrmModeGetPlaneRes>),
+    /// `DRM_IOCTL_MODE_GETPLANE` (two-call size-probe pattern for `format_type_ptr`).
+    DrmModeGetPlane(UserPtrMut<DrmModeGetPlane>),
+    /// `DRM_IOCTL_MODE_SETPLANE` -- attach a framebuffer directly to a plane.
+    DrmModeSetPlane(UserPtr<DrmModeSetPlane>),
     Raw {
         cmd: u32,
         arg: UserPtrMut<u8>,
@@ -3220,6 +3227,11 @@ impl SyscallRequest {
                         }
                         DRM_IOCTL_MODE_ADDFB2 => IoctlArg::DrmModeAddFb2(ctx.sys_req_ptr(2)),
                         DRM_IOCTL_MODE_PAGE_FLIP => IoctlArg::DrmModePageFlip(ctx.sys_req_ptr(2)),
+                        DRM_IOCTL_MODE_GETPLANERESOURCES => {
+                            IoctlArg::DrmModeGetPlaneResources(ctx.sys_req_ptr(2))
+                        }
+                        DRM_IOCTL_MODE_GETPLANE => IoctlArg::DrmModeGetPlane(ctx.sys_req_ptr(2)),
+                        DRM_IOCTL_MODE_SETPLANE => IoctlArg::DrmModeSetPlane(ctx.sys_req_ptr(2)),
                         _ => IoctlArg::Raw {
                             cmd,
                             arg: ctx.sys_req_ptr(2),

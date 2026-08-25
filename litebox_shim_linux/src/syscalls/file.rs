@@ -3251,7 +3251,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             | IoctlArg::DrmModeMapDumb(..)
             | IoctlArg::DrmModeDestroyDumb(..)
             | IoctlArg::DrmModeAddFb2(..)
-            | IoctlArg::DrmModePageFlip(..) => files.run_on_raw_fd(
+            | IoctlArg::DrmModePageFlip(..)
+            | IoctlArg::DrmModeGetPlaneResources(..)
+            | IoctlArg::DrmModeGetPlane(..)
+            | IoctlArg::DrmModeSetPlane(..) => files.run_on_raw_fd(
                 desc,
                 |fd| {
                     if self.is_dri_device(&files.fs, fd)? {
@@ -3294,6 +3297,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             IoctlArg::DrmModePageFlip(ptr) => {
                 self.global.drm.page_flip(self.global.platform, *ptr)
             }
+            IoctlArg::DrmModeGetPlaneResources(ptr) => self.global.drm.get_plane_resources(*ptr),
+            IoctlArg::DrmModeGetPlane(ptr) => self.global.drm.get_plane(*ptr),
+            IoctlArg::DrmModeSetPlane(ptr) => self.global.drm.set_plane(*ptr),
             _ => unreachable!("drm_ioctl called with a non-DRM IoctlArg"),
         }
     }

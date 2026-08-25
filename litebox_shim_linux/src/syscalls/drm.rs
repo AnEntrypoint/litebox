@@ -45,7 +45,8 @@ use litebox_common_linux::{
     DRM_EVENT_FLIP_COMPLETE, DRM_MODE_CONNECTOR_VIRTUAL, DRM_MODE_ENCODER_VIRTUAL,
     DRM_MODE_PAGE_FLIP_EVENT, DrmEvent, DrmEventVblank, DrmModeCardRes, DrmModeCrtc,
     DrmModeCrtcPageFlip, DrmModeCreateDumb, DrmModeDestroyDumb, DrmModeFbCmd2, DrmModeGetConnector,
-    DrmModeGetEncoder, DrmModeMapDumb, DrmModeModeinfo, errno::Errno,
+    DrmModeGetEncoder, DrmModeGetPlane, DrmModeGetPlaneRes, DrmModeMapDumb, DrmModeModeinfo,
+    DrmModeSetPlane, errno::Errno,
 };
 use zerocopy::IntoBytes;
 
@@ -66,6 +67,19 @@ const VIRTUAL_REFRESH_HZ: u32 = 60;
 const VIRTUAL_CONNECTOR_ID: u32 = 1;
 const VIRTUAL_ENCODER_ID: u32 = 2;
 const VIRTUAL_CRTC_ID: u32 = 3;
+/// The one virtual primary plane this device exposes, tied to [`VIRTUAL_CRTC_ID`] -- matching
+/// how the kernel's own `drm/vkms` software driver exposes exactly one primary plane per CRTC.
+/// Added alongside [`DrmSubsystem::get_plane_resources`]/[`DrmSubsystem::get_plane`]/
+/// [`DrmSubsystem::set_plane`]; some real KMS-using toolkits query the plane API even for a
+/// single-plane use case (checking plane capabilities before deciding how to render).
+const VIRTUAL_PLANE_ID: u32 = 4;
+
+/// `DRM_FORMAT_XRGB8888` -- the fourcc-code encoding (`'X' | 'R'<<8 | '2'<<16 | '4'<<24`, per
+/// `drm_fourcc.h`'s `fourcc_code` macro) for the one pixel format this device's dumb buffers
+/// support (see `create_dumb`'s `bpp == 32` case elsewhere in this file). Not independently
+/// fetched from `drm_fourcc.h` this pass (see `docs/drm-dumb-buffer-ioctl-reference.md`'s "gaps"
+/// section); this is the standard, well-known fourcc encoding for that format.
+const DRM_FORMAT_XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
 
 fn virtual_mode() -> DrmModeModeinfo {
     let mut name = [0u8; 32];
@@ -138,6 +152,13 @@ pub(crate) struct DrmSubsystem<Platform: ShimPlatform> {
     /// The framebuffer currently attached to the virtual CRTC (via `SETCRTC` or `PAGE_FLIP`),
     /// `None` until the guest sets one.
     crtc_fb: litebox::sync::Mutex<Platform, Option<u32>>,
+    /// The framebuffer currently attached to [`VIRTUAL_PLANE_ID`] via `SETPLANE`, `None` until
+    /// the guest sets one. Deliberately independent of `crtc_fb` (a real primary plane's `fb_id`
+    /// and its CRTC's own `fb_id` are two separate pieces of driver state that a real client can
+    /// observe diverge, e.g. right after a `SETPLANE` before any `PAGE_FLIP`/`SETCRTC` call) --
+    /// this device does not attempt to keep them synchronized, matching real KMS semantics rather
+    /// than inventing a coupling the UAPI doesn't promise.
+    plane_fb: litebox::sync::Mutex<Platform, Option<u32>>,
     /// Completed-but-not-yet-`read()` page-flip events, in completion order -- popped one at a
     /// time by `read()` on the DRM device fd (see `litebox_shim_linux::syscalls::file::do_read`'s
     /// DRI-fd branch). Only ever grows from [`Self::page_flip`] when the guest requested
@@ -185,6 +206,7 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             buffers: litebox::sync::Mutex::new(BTreeMap::new()),
             framebuffers: litebox::sync::Mutex::new(BTreeMap::new()),
             crtc_fb: litebox::sync::Mutex::new(None),
+            plane_fb: litebox::sync::Mutex::new(None),
             pending_flip_events: litebox::sync::Mutex::new(VecDeque::new()),
             next_vblank_sequence: AtomicU32::new(0),
             flip_callback: litebox::sync::Mutex::new(None),
@@ -350,6 +372,70 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             return Err(Errno::ENOENT);
         }
         *self.crtc_fb.lock() = if req.fb_id == 0 { None } else { Some(req.fb_id) };
+        Ok(0)
+    }
+
+    pub(crate) fn get_plane_resources(
+        &self,
+        ptr: UserPtrMut<DrmModeGetPlaneRes>,
+    ) -> Result<u32, Errno> {
+        let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        // Two-call size-probe pattern, same as `get_resources`: this device has exactly one
+        // plane, so a short-sized caller buffer can never actually truncate.
+        if req.count_planes > 0 && req.plane_id_ptr != 0 {
+            let out = UserPtrMut::<u32>::from_usize(req.plane_id_ptr as usize);
+            out.write_at_offset::<Platform>(0, VIRTUAL_PLANE_ID)
+                .ok_or(Errno::EFAULT)?;
+        }
+        req.count_planes = 1;
+        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        Ok(0)
+    }
+
+    pub(crate) fn get_plane(&self, ptr: UserPtrMut<DrmModeGetPlane>) -> Result<u32, Errno> {
+        let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        if req.plane_id != 0 && req.plane_id != VIRTUAL_PLANE_ID {
+            return Err(Errno::ENOENT);
+        }
+        // Two-call size-probe pattern for `format_type_ptr`, same shape as `get_connector`'s
+        // `modes_ptr`/`encoders_ptr` handling. This device's plane only ever carries the one
+        // format its dumb buffers support.
+        if req.count_format_types > 0 && req.format_type_ptr != 0 {
+            let out = UserPtrMut::<u32>::from_usize(req.format_type_ptr as usize);
+            out.write_at_offset::<Platform>(0, DRM_FORMAT_XRGB8888)
+                .ok_or(Errno::EFAULT)?;
+        }
+        let plane_fb = *self.plane_fb.lock();
+        req.plane_id = VIRTUAL_PLANE_ID;
+        req.crtc_id = plane_fb.map_or(0, |_| VIRTUAL_CRTC_ID);
+        req.fb_id = plane_fb.unwrap_or(0);
+        // Bit 0 set = "can be attached to CRTC index 0", the only CRTC this device has.
+        req.possible_crtcs = 0b1;
+        req.gamma_size = 0;
+        req.count_format_types = 1;
+        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        Ok(0)
+    }
+
+    pub(crate) fn set_plane(&self, ptr: UserPtr<DrmModeSetPlane>) -> Result<u32, Errno> {
+        let req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        if req.plane_id != VIRTUAL_PLANE_ID {
+            return Err(Errno::ENOENT);
+        }
+        // `fb_id == 0` is the real-DRM-defined way to disable a plane (detach whatever
+        // framebuffer it currently shows); any other `fb_id` must name a real framebuffer object,
+        // same validation `set_crtc` already applies to its own `fb_id` field.
+        if req.fb_id == 0 {
+            *self.plane_fb.lock() = None;
+            return Ok(0);
+        }
+        if req.crtc_id != VIRTUAL_CRTC_ID {
+            return Err(Errno::ENOENT);
+        }
+        if !self.framebuffers.lock().contains_key(&req.fb_id) {
+            return Err(Errno::ENOENT);
+        }
+        *self.plane_fb.lock() = Some(req.fb_id);
         Ok(0)
     }
 
