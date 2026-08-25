@@ -48,6 +48,12 @@ unsafe extern "C" {
         flags: libc::c_int,
     ) -> KernReturn;
 
+    /// # Safety
+    ///
+    /// `address`/`size` must describe a range this task actually owns (e.g.
+    /// one just reserved by [`mach_vm_allocate`]).
+    pub(crate) fn mach_vm_deallocate(target: MachPort, address: u64, size: u64) -> KernReturn;
+
     fn mach_vm_region(
         target: MachPort,
         address: *mut u64,
