@@ -61,6 +61,11 @@ extern crate alloc;
 mod darwin;
 mod guest;
 mod net;
+/// GUI application support (DRM/KMS dumb-buffer emulation's host-side presentation layer). See the
+/// module's own doc comment for the full design, why its threading architecture is inverted from
+/// `litebox_platform_windows_userland::presentation` (the reference implementation this was ported
+/// from), and what remains before it can be wired into a real runner.
+pub mod presentation;
 
 use darwin::{
     KERN_NO_SPACE, KERN_SUCCESS, MAP_JIT, VM_FLAGS_FIXED, mach_task_self, mach_vm_allocate,

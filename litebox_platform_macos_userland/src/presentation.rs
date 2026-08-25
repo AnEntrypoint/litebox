@@ -1,69 +1,88 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Host-side GUI presentation: a real Linux (X11 or Wayland) window, backed by `wgpu`, that
+//! Host-side GUI presentation: a real macOS (Cocoa/AppKit) window, backed by `wgpu`, that
 //! displays pixel buffers a guest DRM client has drawn into (see `litebox_shim_linux::syscalls::
 //! drm`'s `DrmSubsystem`). Ported from `litebox_platform_windows_userland::presentation` -- see
-//! that module's doc comment for the shared design this mirrors; only the genuinely
-//! platform-specific pieces (noted below) differ.
+//! that module's doc comment for the shared design this mirrors; the threading architecture below
+//! is the one genuinely platform-specific piece that does NOT carry over unchanged.
 //!
-//! # Why a dedicated OS thread (same answer as Windows, different reason)
+//! # Why this crate's threading arrangement is the INVERSE of Windows/Linux userland
 //!
-//! `litebox_runner_linux_userland`'s own main thread calls
-//! `litebox_platform_linux_userland::run_thread` directly to execute the guest, blocking until it
-//! exits -- there is no spare "main loop" slot for `winit`'s own event loop to share, exactly as on
-//! Windows. Unlike macOS' Cocoa (which imposes a HARD OS-level requirement that all windowing/UI
-//! code run on the process' first/main thread -- `winit` cannot work around this on that platform),
-//! neither X11 nor Wayland's own client libraries impose any such constraint: an X11 display
-//! connection or a Wayland client connection is an ordinary socket-backed handle usable from any
-//! thread. `winit`'s default refusal to build an `EventLoop` off the main thread on these backends
-//! (`EventLoopBuilderExtX11`/`EventLoopBuilderExtWayland`'s `with_any_thread`, both gate the exact
-//! same underlying `any_thread` flag) is a conservative cross-platform-compatibility guard, not a
-//! reflection of a real X11/Wayland constraint -- confirmed by reading `winit` 0.30.13's own source
-//! (`src/platform/x11.rs`, `src/platform/wayland.rs`): both extension traits' doc comments say so
-//! explicitly ("to make platform compatibility easier"), matching this crate's Windows counterpart
-//! exactly. So, as on Windows, `winit`'s `EventLoop` runs correctly on a plain spawned thread here.
+//! On Windows and Linux userland, the runner's own main thread calls `run_thread` (guest
+//! execution) directly and blocking, so the presenter's `winit` event loop gets its own dedicated
+//! background thread instead -- safe on those platforms because neither a Win32 message loop nor
+//! an X11/Wayland client connection is tied to the process's first/main thread (confirmed by
+//! reading `winit`'s own `EventLoopBuilderExtWindows`/`EventLoopBuilderExtX11`/
+//! `EventLoopBuilderExtWayland` source, each exposing a `with_any_thread` escape hatch whose own
+//! doc comments describe the main-thread-only default as a conservative cross-platform
+//! compatibility guard, not a real constraint on those backends).
 //!
-//! # What is NOT yet independently verified (honest limitation, unlike the Windows module)
+//! Cocoa/AppKit is different in kind, not degree: `winit`'s own macOS backend has NO
+//! `with_any_thread` equivalent at all (confirmed by reading `winit` 0.30.13's
+//! `src/platform/macos.rs`: unlike the Windows/X11/Wayland platform modules, it defines no such
+//! trait, and its `EventLoop` construction path asserts a real `objc2_foundation::
+//! MainThreadMarker` -- Apple's own compile-time/runtime witness that the calling code is
+//! genuinely on the process's first thread, which cannot be fabricated off that thread). This is
+//! documented Apple platform behavior, not a `winit` limitation to work around: AppKit's own
+//! `NSApplication`/`NSWindow`/run-loop machinery is specified to require the main thread, and
+//! violating it produces real, silent corruption or crashes on real hardware, not a catchable
+//! error `winit` could report instead.
 //!
-//! This port has no real X11/Wayland display available in the environment it was written in (no
-//! `DISPLAY`, no Wayland socket, no `Xvfb` installed) -- so, unlike `litebox_platform_windows_
-//! userland::presentation` (independently screenshot-verified live, twice, with two different
-//! solid colors), this module is build-verified only (`cargo check --target x86_64-unknown-linux-
-//! gnu`), not run-verified. Two specific things the Windows module needed a live fix for that this
-//! port has NOT been able to confirm one way or the other on real Linux windowing:
+//! **The consequence for this module's own API is the inverse of `litebox_platform_windows_
+//! userland::presentation::Presenter`: [`Presenter::run`] must be called from the actual process
+//! main thread (the same thread `fn main()` starts on), and whatever this platform's own
+//! `run_thread` (guest execution) is must move to a background thread instead** -- the opposite of
+//! how `litebox_runner_linux_on_windows_userland`/`litebox_runner_linux_userland` are structured
+//! today. A future macOS runner (see this module's own "What this pass does NOT do" section below)
+//! would need a shape like:
 //!
-//! 1. Whether `wgpu`'s default backend set (`Backends::all()`, which on Linux normally resolves to
-//!    Vulkan) has any equivalent to the Windows module's forced-DX12 workaround for a
-//!    `Surface::get_current_texture()` hang. No such issue is documented against `wgpu`'s Vulkan
-//!    backend on Linux, and forcing a backend without a reproduced problem to justify it would be
-//!    exactly the kind of unverified guess this project's own discipline forbids -- so this port
-//!    deliberately leaves `wgpu::Instance::default()` (every backend `wgpu` can find) rather than
-//!    copying Windows' `Backends::DX12` override. If a real Linux host later reproduces a similar
-//!    hang, narrow the backend set the same way, with the same live-repro rigor.
-//! 2. Whether presenting only from `RedrawRequested` (never directly from `user_event`) is
-//!    necessary here the way it was on Windows. It is kept anyway: it is correct on every winit
-//!    backend by the crate's own contract (`RedrawRequested` is the only point every backend
-//!    guarantees a presentable surface), not a Windows-only workaround, so there is no reason to
-//!    special-case it away pending Linux-specific verification.
+//! ```ignore
+//! // Illustrative only -- no macOS runner crate exists yet to actually call this.
+//! let presenter = Presenter::new();
+//! let sender = presenter.sender();
+//! std::thread::spawn(move || {
+//!     // Guest execution moves here, off the main thread -- the inverse of the Windows/Linux
+//!     // userland runners, where run_thread stays on main and the presenter gets the background
+//!     // thread.
+//!     unsafe { litebox_platform_macos_userland::guest::run_thread(shim, ctx) };
+//! });
+//! presenter.run().expect("run presenter event loop"); // blocks the real main thread
+//! ```
 //!
-//! Both are flagged in the `gui-macos-linux-presentation-port` PRD row's follow-up rather than
-//! silently assumed identical to Windows.
+//! # What this pass does NOT do (honest scope limit, distinct from the Linux userland port)
+//!
+//! This module is written and type-checked (`cargo check --target aarch64-apple-darwin`,
+//! genuinely exercises the full type checker, not just a syntax parse -- confirmed working in this
+//! environment even without a linked-binary macOS toolchain) but:
+//!
+//! 1. **There is no macOS runner crate to wire it into.** Unlike `litebox_runner_linux_on_windows_
+//!    userland` and `litebox_runner_linux_userland`, no `litebox_runner_linux_on_macos_userland`
+//!    (or similarly named) crate exists in this workspace that constructs a `LinuxShimBuilder`,
+//!    loads a guest program, and calls a `run_thread`. This module cannot be wired to a real `--gui`
+//!    CLI flag the way the Linux userland port was, because there is nothing to add that flag to.
+//! 2. **Guest entry itself is not implemented on this platform.** `litebox_platform_macos_
+//!    userland::guest::run_thread` (see that module's own doc comment and `docs/macos.md`'s
+//!    "Remaining work" section) is a documented stub that logs an error and returns without
+//!    executing any guest code -- the aarch64 context-switch/trampoline/TPIDR_EL0-anchor work is
+//!    real, separate, unstarted work, unrelated to GUI presentation. So even with a runner crate,
+//!    there is currently no guest execution on this platform for a page-flip to ever originate
+//!    from.
+//! 3. **No real macOS host is available in this environment to run-verify against**, and no
+//!    `codesign`/JIT-entitlement tooling either (`docs/macos.md`'s W^X section) -- both would be
+//!    required even once (1) and (2) are done.
+//!
+//! This module therefore ports exactly what is genuinely portable today (the `wgpu`/pixel-upload/
+//! input-translation logic, which is platform-agnostic, and the `Presenter` API shape, adapted to
+//! Cocoa's real main-thread constraint) and stops there, rather than fabricating a runner wiring
+//! that cannot actually run. See the `gui-macos-linux-presentation-port` PRD row's own follow-up.
 
 use std::sync::mpsc;
 
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
-use winit::event_loop::{
-    ActiveEventLoop, ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy,
-};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
-// Either `EventLoopBuilderExtX11` or `EventLoopBuilderExtWayland` would do here -- both traits
-// gate the exact same underlying `EventLoopBuilder::platform_specific.any_thread` field (confirmed
-// by reading winit's own source, see this module's doc comment), so importing one is sufficient
-// regardless of which backend is actually selected at runtime. The X11 trait is used since it is
-// the one built even on distros/CI images with no Wayland compositor at all.
-use winit::platform::x11::EventLoopBuilderExtX11;
 use winit::window::{Window, WindowId};
 
 /// One frame's worth of pixel content to present: raw bytes in `BGRA8`/`XRGB8888` byte order
@@ -90,8 +109,7 @@ pub enum InputSignal {
 
 /// Translate a `winit` physical key into its Linux evdev `KEY_*` code. Identical mapping table to
 /// `litebox_platform_windows_userland::presentation::winit_keycode_to_evdev` -- `winit`'s
-/// `KeyCode` is itself platform-independent (based on the physical-key standard, not a native
-/// scancode), so the same table is correct on every host, not just the one it was written against.
+/// `KeyCode` is itself platform-independent, so the same table is correct on every host.
 fn winit_keycode_to_evdev(key: KeyCode) -> Option<u16> {
     // Enumerating all ~80 `KEY_*` constants by name would hurt readability far more than it helps
     // -- matches this crate's own `#[allow]`-on-deliberate-exception convention elsewhere.
@@ -194,8 +212,8 @@ fn winit_mouse_button_to_evdev(button: MouseButton) -> Option<u16> {
 }
 
 /// The sending half of the frame channel: clone and hand out to whatever produces frames
-/// (`DrmSubsystem::page_flip`, via `litebox_runner_linux_userland`'s `--gui` wiring). Sending
-/// after the presenter's window has closed is a silent no-op.
+/// (`DrmSubsystem::page_flip`, once a real macOS runner exists to wire it). Sending after the
+/// presenter's window has closed is a silent no-op.
 #[derive(Clone)]
 pub struct FrameSender {
     frames: mpsc::Sender<Frame>,
@@ -213,8 +231,15 @@ impl FrameSender {
 }
 
 /// Owns the real window, the `wgpu` presentation state, and runs `winit`'s event loop until the
-/// window is closed. Call [`Presenter::run`] on a dedicated thread (see this module's doc comment
-/// for why); it blocks for the window's entire lifetime.
+/// window is closed.
+///
+/// # Main-thread requirement (the one real difference from the Windows/Linux userland API)
+///
+/// Both [`Presenter::new`] and [`Presenter::run`] must be called from the process's actual main
+/// thread -- see this module's own doc comment for why Cocoa allows no exception to this, unlike
+/// every other platform this project targets. There is deliberately no `with_any_thread`-style
+/// escape hatch here: `winit` itself provides none for this backend (confirmed by reading its
+/// source), so this API does not pretend to offer one either.
 pub struct Presenter {
     event_loop: EventLoop<()>,
     frames_rx: mpsc::Receiver<Frame>,
@@ -224,13 +249,17 @@ pub struct Presenter {
 
 impl Presenter {
     /// Build a not-yet-shown presenter and its window. Real `winit`/OS window/event-loop resources
-    /// are not created until [`Self::run`] is called on the thread that will own them.
+    /// are not created until [`Self::run`] is called.
     ///
-    /// `with_any_thread(true)`: see this module's doc comment for why this is safe on X11/Wayland
-    /// (a conservative `winit` default, not a real host constraint), unlike the identical-looking
-    /// call on macOS, which cannot use this escape hatch at all.
+    /// # Panics
+    ///
+    /// `winit`'s own `EventLoop::new()` panics (via its internal `MainThreadMarker` assertion) if
+    /// called off the process's actual main thread -- there is no way for this function to turn
+    /// that into a recoverable `Result` the way `Presenter::new`'s Windows/Linux-userland
+    /// counterparts can with `with_any_thread(false)`'s ordinary error path, because Cocoa's
+    /// violation is a real precondition failure, not a configurable policy.
     pub fn new() -> Result<Self, winit::error::EventLoopError> {
-        let event_loop = EventLoopBuilder::default().with_any_thread(true).build()?;
+        let event_loop = EventLoop::new()?;
         let wake = event_loop.create_proxy();
         let (frames_tx, frames_rx) = mpsc::channel();
         let sender = FrameSender {
@@ -245,22 +274,29 @@ impl Presenter {
         })
     }
 
-    /// A cloneable handle to push frames into this presenter from any other thread, valid for the
-    /// presenter's whole lifetime.
+    /// A cloneable handle to push frames into this presenter from any other thread (including the
+    /// background thread guest execution has to move to on this platform -- see this module's own
+    /// doc comment), valid for the presenter's whole lifetime.
     pub fn sender(&self) -> FrameSender {
         self.sender.clone()
     }
 
-    /// Register `consumer` to be called, on the presenter's own event-loop thread, with every real
-    /// keyboard/mouse event this window observes from [`Self::run`]'s call onward. See
+    /// Register `consumer` to be called, on the presenter's own main-thread event loop, with every
+    /// real keyboard/mouse event this window observes from [`Self::run`]'s call onward. See
     /// `litebox_platform_windows_userland::presentation::Presenter::set_input_consumer`'s doc
-    /// comment for the full rationale (identical here).
+    /// comment for the full rationale (identical here); call before [`Self::run`].
     pub fn set_input_consumer(&mut self, consumer: impl Fn(InputSignal) + Send + 'static) {
         self.input_consumer = Some(Box::new(consumer));
     }
 
-    /// Run the event loop on the calling thread until the window is closed. See this module's doc
-    /// comment for why the calling thread must NOT be the guest-execution thread.
+    /// Run the event loop on the calling thread until the window is closed.
+    ///
+    /// # Panics
+    ///
+    /// Must be called from the process's actual main thread -- see this module's own doc comment
+    /// and [`Self::new`]'s panic section. Unlike Windows/Linux userland, this is NOT the thread a
+    /// macOS runner's guest execution (`run_thread`) should run on; guest execution has to move to
+    /// a dedicated background thread instead, the inverse of those runners' arrangement.
     pub fn run(self) -> Result<(), winit::error::EventLoopError> {
         self.event_loop.set_control_flow(ControlFlow::Wait);
         let mut app = PresenterApp {
@@ -286,10 +322,8 @@ struct PresenterApp {
     frames_rx: mpsc::Receiver<Frame>,
     state: Option<GpuState>,
     /// See `litebox_platform_windows_userland::presentation::PresenterApp::last_frame`'s doc
-    /// comment -- the same `resumed()`-vs-first-page-flip race is possible on this platform too
-    /// (nothing about it is Windows-specific: it is a race between this thread's own async window
-    /// setup and whatever other thread produces the first frame), so the same replay-on-resume
-    /// handling is kept.
+    /// comment -- the same `resumed()`-vs-first-page-flip race is possible on this platform too, so
+    /// the same replay-on-resume handling is kept.
     last_frame: Option<Frame>,
     input_consumer: Option<Box<dyn Fn(InputSignal) + Send>>,
     last_cursor_pos: Option<(f64, f64)>,
@@ -384,9 +418,10 @@ impl ApplicationHandler for PresenterApp {
             return;
         };
         let window = std::sync::Arc::new(window);
-        // `wgpu::Instance::default()`, not a forced backend: see this module's doc comment for why
-        // Windows' `Backends::DX12` override is deliberately NOT copied here without a reproduced
-        // problem to justify it.
+        // `wgpu::Instance::default()`: on macOS this resolves to the Metal backend, `wgpu`'s only
+        // real backend on this platform (its Vulkan support there is itself a MoltenVK/Vulkan-on-
+        // Metal translation layer `wgpu` does not select by default) -- no Windows-style forced-
+        // backend override is applicable or needed here.
         let instance = wgpu::Instance::default();
         let Ok(surface) = instance.create_surface(window.clone()) else {
             return;
@@ -446,9 +481,8 @@ impl ApplicationHandler for PresenterApp {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
         // See `litebox_platform_windows_userland::presentation::PresenterApp::user_event`'s doc
-        // comment for why presentation is deferred to `RedrawRequested` rather than happening
-        // directly here -- that reasoning is winit's own cross-backend contract, not specific to
-        // the Windows backend that motivated documenting it.
+        // comment for why presentation is deferred to `RedrawRequested` -- winit's own cross-
+        // backend contract, not Windows-specific.
         let mut latest = None;
         while let Ok(frame) = self.frames_rx.try_recv() {
             latest = Some(frame);
