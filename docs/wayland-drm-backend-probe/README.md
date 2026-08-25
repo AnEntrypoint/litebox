@@ -44,6 +44,62 @@ Live-verified against this exact probe: re-running it now prints `LISTENING`
 available in this environment to actually connect and commit a buffer --
 that remains the concrete next step for whoever has one).
 
+**Phase 4** (`src/client.rs`/`src/combined.rs`, commit `05b386d`) built a REAL
+`wayland-client`-based client (not a hand-rolled protocol simulation) and got
+it genuinely `CONNECTED` + the compositor `CLIENT_ACCEPTED` (the raw
+Unix-socket handshake works) before hitting a real litebox gap:
+`litebox_shim_linux::syscalls::net`'s `do_sendmsg`/`do_recvmsg` unconditionally
+rejected ANY `msg_controllen != 0` (`SCM_RIGHTS` ancillary data) with `EINVAL`
+-- not Wayland-specific, any guest program passing fds over a Unix socket hits
+this.
+
+**Phase 5** (this pass) implements genuine `SCM_RIGHTS` fd-passing:
+`litebox_shim_linux/src/syscalls/unix.rs`'s `Message` now carries an
+`AnyDupFd` batch (one variant per litebox fd-enabled subsystem, since a raw
+cmsg `int` fd has no type information of its own) delivered atomically with
+the message's own first byte, exactly matching real Linux semantics; the
+sender resolves + `Descriptors::duplicate`s each donated fd via the same
+`run_on_raw_fd` dispatch `dup()`/`fork()` already use, and the receiver
+inserts each into ITS OWN fd table via the same `insert_raw_fd` primitive
+`socketpair()` already uses. `MSG_CMSG_CLOEXEC` is honored end-to-end.
+`net.rs`'s `sys_recvmsg`/`unix.rs`'s `UnixSocket::recvmsg` both needed their
+`supported_flags` masks widened to actually accept this flag once it started
+being genuinely honored (`wayland-client`'s own `rcv_msg` always sets it,
+independent of whether it expects fds on that particular read).
+
+**Live-verified against this exact probe, independently re-verified twice**
+(a baseline re-test with the fix reverted reproduced the OLD failure --
+immediate `EINVAL` right after `CLIENT_ACCEPTED` -- confirming the fix is
+what changed the behavior, not something else): with the fix, the client's
+FIRST `recvmsg` (reading the compositor's reply to `get_registry`) now
+genuinely succeeds -- 24 real bytes delivered, `MSG_CMSG_CLOEXEC` accepted,
+no `EINVAL` -- real forward progress past where every prior pass stopped.
+
+**A second, SEPARATE, pre-existing gap was isolated (not fixed) in getting
+this far**: after that first successful exchange, the compositor's
+`calloop` event loop never processes anything more, timing out 20s later
+even though the client has follow-up requests queued. Root-caused via a
+temporary diagnostic on `EpollFile::check_io_events` (phase 3's own nested-
+epoll fix): it is called exactly ONCE more after the first exchange (going
+`empty=false` then `empty=true`), then NEVER AGAIN for the remaining ~19.5s
+despite `event_loop.dispatch()` being called roughly 200 times (every
+100ms) -- the nested epoll's readiness is checked once, correctly reflects
+"nothing pending" at that instant, and is then never re-checked even though
+`calloop` keeps calling `dispatch()`. This means phase 3's fix answers "is
+the inner epoll ready right now" correctly, but something in how `calloop`'s
+own polling loop re-arms/re-registers its interest in the nested epoll fd
+across repeated `dispatch()` calls isn't triggering a fresh check -- worth
+investigating `register_observer`'s interaction with repeated `poll()` calls
+using a FRESH observer each time (real `epoll_wait` semantics: readiness is
+re-evaluated from scratch on every call, not just the first). This is
+NOT a regression from phase 5 -- confirmed via the same before/after
+comparison above, phase 5's fix change is what let the client get far enough
+to exercise this path at all; it was structurally unreachable before.
+**Concrete next step**: trace `calloop`'s own `Poll`/registration lifecycle
+against litebox's `PollSet`/`Observer` registration to find where a repeated
+`dispatch()` call fails to re-arm interest in an already-registered nested
+epoll fd.
+
 ## Reproducing the type-check only
 
 ```sh

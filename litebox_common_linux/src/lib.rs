@@ -2444,6 +2444,8 @@ bitflags::bitflags! {
     impl ReceiveFlags: u32 {
         /// `MSG_CMSG_CLOEXEC`: close-on-exec for the associated file descriptor
         const CMSG_CLOEXEC = 0x40000000;
+        /// `MSG_CTRUNC`: control data (ancillary data / `SCM_RIGHTS`) was truncated
+        const CTRUNC = 0x8;
         /// `MSG_DONTWAIT`: non-blocking operation
         const DONTWAIT = 0x40;
         /// `MSG_ERRQUEUE`: destination for error messages

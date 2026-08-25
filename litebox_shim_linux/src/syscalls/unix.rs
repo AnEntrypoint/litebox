@@ -467,20 +467,87 @@ impl<FS: ShimFS> AddrView<FS> {
     }
 }
 
+/// A file descriptor donated via `SCM_RIGHTS` ancillary data, tagged with which of litebox's
+/// seven fd-enabled subsystems it belongs to -- `sendmsg`'s cmsg payload is just raw `int` fd
+/// values with no type information of its own, so the sender resolves each one against its own
+/// [`crate::FilesState::run_on_raw_fd`] (the same per-subsystem dispatch `dup()`/`fork()` already
+/// use) and carries the *result* here, since the receiver has no way to re-discover which
+/// subsystem a bare `TypedFd` belongs to once it's already been duplicated out of that dispatch.
+pub(super) enum AnyDupFd<Platform: ShimPlatform, FS: ShimFS> {
+    Fs(litebox::fd::TypedFd<FS>),
+    Net(litebox::fd::TypedFd<litebox::net::Network<Platform>>),
+    Pipes(litebox::fd::TypedFd<litebox::pipes::Pipes<Platform>>),
+    Eventfd(litebox::fd::TypedFd<crate::syscalls::eventfd::EventfdSubsystem<Platform>>),
+    Epoll(litebox::fd::TypedFd<crate::syscalls::epoll::EpollSubsystem<Platform, FS>>),
+    Unix(litebox::fd::TypedFd<UnixSocketSubsystem<Platform, FS>>),
+    Pty(litebox::fd::TypedFd<crate::syscalls::pty::PtySubsystem<Platform>>),
+}
+
+/// A batch of `SCM_RIGHTS`-donated fds, as returned alongside a message's byte payload.
+pub(super) type AnyDupFds<Platform, FS> = Vec<AnyDupFd<Platform, FS>>;
+
+impl<Platform: ShimPlatform, FS: ShimFS> AnyDupFd<Platform, FS> {
+    /// Inserts this fd into `files`' own raw fd table, allocating a fresh raw fd number --
+    /// exactly [`crate::FilesState::insert_raw_fd`]'s existing per-subsystem shape, used
+    /// elsewhere for `socketpair()`'s own two freshly-inserted descriptors. `cloexec` sets
+    /// `FD_CLOEXEC` on the new fd first (`MSG_CMSG_CLOEXEC`'s own contract), using the typed fd
+    /// still on hand here -- the same `set_fd_metadata` primitive `dup()`/`fork()` already use,
+    /// since once this becomes a bare raw fd number there is no way to recover which subsystem it
+    /// belongs to in order to look it back up.
+    pub(super) fn insert_into(
+        self,
+        litebox: &litebox::LiteBox<Platform>,
+        files: &crate::syscalls::file::FilesState<Platform, FS>,
+        cloexec: bool,
+    ) -> Result<usize, Errno> {
+        fn go<Platform: ShimPlatform, FS: ShimFS, S: FdEnabledSubsystem>(
+            litebox: &litebox::LiteBox<Platform>,
+            files: &crate::syscalls::file::FilesState<Platform, FS>,
+            fd: litebox::fd::TypedFd<S>,
+            cloexec: bool,
+        ) -> Result<usize, ()> {
+            if cloexec {
+                let old = litebox
+                    .descriptor_table_mut()
+                    .set_fd_metadata(&fd, litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC);
+                debug_assert!(old.is_none());
+            }
+            files.insert_raw_fd(fd).map_err(|_| ())
+        }
+        let res = match self {
+            AnyDupFd::Fs(fd) => go(litebox, files, fd, cloexec),
+            AnyDupFd::Net(fd) => go(litebox, files, fd, cloexec),
+            AnyDupFd::Pipes(fd) => go(litebox, files, fd, cloexec),
+            AnyDupFd::Eventfd(fd) => go(litebox, files, fd, cloexec),
+            AnyDupFd::Epoll(fd) => go(litebox, files, fd, cloexec),
+            AnyDupFd::Unix(fd) => go(litebox, files, fd, cloexec),
+            AnyDupFd::Pty(fd) => go(litebox, files, fd, cloexec),
+        };
+        // `insert_raw_fd` only fails once the *receiver's* own `RLIMIT_NOFILE` is exceeded --
+        // matches real Linux's `recvmsg` behavior of closing an over-limit donated fd and
+        // reporting `MSG_CTRUNC` rather than failing the whole read (the byte payload the fd was
+        // sent alongside has already been legitimately delivered by this point).
+        res.map_err(|()| Errno::EMFILE)
+    }
+}
+
 /// A message sent over a Unix socket.
-struct Message {
+struct Message<Platform: ShimPlatform, FS: ShimFS> {
     data: Vec<u8>,
-    // TODO: add control messages
-    // cmsgs: Option<Vec<Cmsg>>,
+    /// Fds donated via `SCM_RIGHTS`, delivered atomically with this message's own first byte
+    /// (matching real Linux: a `recvmsg` that doesn't read up to and past the start of this
+    /// message's data never sees these fds at all -- see `do_recvmsg`'s own delivery-on-first-
+    /// byte logic in `net.rs`).
+    fds: Vec<AnyDupFd<Platform, FS>>,
 }
 
 /// Represents a connected Unix stream socket.
 struct UnixConnectedStream<Platform: ShimPlatform, FS: ShimFS> {
     addr: AddrView<FS>,
     /// The read end of the local socket's channel for receiving messages.
-    recv_channel: crate::channel::ReadEnd<Platform, Message>,
+    recv_channel: crate::channel::ReadEnd<Platform, Message<Platform, FS>>,
     /// The write end of the connected peer socket for sending messages.
-    connected_send_channel: crate::channel::WriteEnd<Platform, Message>,
+    connected_send_channel: crate::channel::WriteEnd<Platform, Message<Platform, FS>>,
     pollee: Arc<Pollee<Platform>>,
 }
 
@@ -540,15 +607,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         }
     }
 
-    fn try_sendto(&self, msg: Message) -> Result<(), (Message, Errno)> {
+    fn try_sendto(
+        &self,
+        msg: Message<Platform, FS>,
+    ) -> Result<(), (Message<Platform, FS>, Errno)> {
         // TODO: write partial data?
         self.connected_send_channel.try_write_one(msg)
     }
 
-    fn try_recvfrom(&self, mut buf: &mut [u8]) -> Result<usize, TryOpError<Errno>> {
+    /// Reads up to `buf.len()` bytes, same message-boundary-spanning behavior as before, plus any
+    /// `SCM_RIGHTS` fds attached to a message this call reads the FIRST byte of (a message whose
+    /// `data` is already partially drained by an earlier call had its fds delivered on that
+    /// earlier call already, matching real Linux: ancillary data rides with the start of the
+    /// datagram/record it was sent alongside, never repeated on a later partial read of the same
+    /// message's remaining bytes).
+    fn try_recvfrom(
+        &self,
+        mut buf: &mut [u8],
+    ) -> Result<(usize, AnyDupFds<Platform, FS>), TryOpError<Errno>> {
         let mut total_read = 0;
+        let mut fds = Vec::new();
         while !buf.is_empty() {
             let n = match self.recv_channel.peek_and_consume_one(|msg| {
+                // `Vec::append` empties `msg.fds`, so a later partial read of this same
+                // (already-drained-of-fds) message correctly appends nothing further.
+                fds.append(&mut msg.fds);
                 if buf.len() >= msg.data.len() {
                     buf[..msg.data.len()].copy_from_slice(&msg.data);
                     Ok((true, msg.data.len()))
@@ -572,7 +655,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             total_read += n;
             buf = &mut buf[n..];
         }
-        Ok(total_read)
+        Ok((total_read, fds))
     }
 
     fn check_io_events(&self) -> Events {
@@ -797,8 +880,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         buf: &[u8],
         is_nonblocking: bool,
         addr: Option<UnixSocketAddr>,
+        fds: Vec<AnyDupFd<Platform, FS>>,
     ) -> Result<usize, Errno> {
-        let mut msg = Some(Message { data: buf.to_vec() });
+        let mut msg = Some(Message {
+            data: buf.to_vec(),
+            fds,
+        });
         cx.with_timeout(timeout)
             .wait_on_events(
                 is_nonblocking,
@@ -839,7 +926,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         buf: &mut [u8],
         is_nonblocking: bool,
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
-    ) -> Result<usize, Errno> {
+    ) -> Result<(usize, AnyDupFds<Platform, FS>), Errno> {
         let res = cx
             .with_timeout(timeout)
             .wait_on_events(
@@ -1412,6 +1499,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         flags: SendFlags,
         addr: Option<UnixSocketAddr>,
     ) -> Result<usize, Errno> {
+        self.sendmsg(task, buf, flags, addr, Vec::new())
+    }
+
+    /// `sendto`'s own superset: also carries `SCM_RIGHTS` fds (empty for the plain `sendto`/
+    /// `sendmsg`-with-no-cmsg case). Datagram sockets don't support ancillary data at all yet
+    /// (matches `Message`'s own stream-only `fds` field -- `DatagramMessage` is untouched); a
+    /// non-empty `fds` there is silently dropped rather than erroring, since litebox has no
+    /// datagram-socket-based real client using SCM_RIGHTS to notice the difference (Wayland, the
+    /// motivating use case, uses `SOCK_STREAM`).
+    pub(super) fn sendmsg(
+        &self,
+        task: &Task<Platform, FS>,
+        buf: &[u8],
+        flags: SendFlags,
+        addr: Option<UnixSocketAddr>,
+        fds: Vec<AnyDupFd<Platform, FS>>,
+    ) -> Result<usize, Errno> {
         let supported_flags = SendFlags::DONTWAIT | SendFlags::NOSIGNAL;
         if flags.intersects(supported_flags.complement()) {
             log_unsupported!("Unsupported sendto flags: {:?}", flags);
@@ -1422,7 +1526,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         let timeout = self.options.lock().send_timeout;
         match &self.inner {
             UnixSocketInner::Stream(stream) => {
-                stream.sendto(&task.wait_cx(), timeout, buf, is_nonblocking, addr)
+                stream.sendto(&task.wait_cx(), timeout, buf, is_nonblocking, addr, fds)
             }
             UnixSocketInner::Datagram(datagram) => {
                 datagram.sendto(task, timeout, buf, is_nonblocking, addr)
@@ -1437,7 +1541,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<usize, Errno> {
-        let supported_flags = ReceiveFlags::DONTWAIT | ReceiveFlags::TRUNC;
+        self.recvmsg(cx, buf, flags, source_addr).map(|(n, _)| n)
+    }
+
+    /// `recvfrom`'s own superset: also returns any `SCM_RIGHTS` fds delivered alongside the data
+    /// read (always empty for a datagram socket or a message with no attached fds).
+    pub(super) fn recvmsg(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        buf: &mut [u8],
+        flags: ReceiveFlags,
+        source_addr: Option<&mut Option<UnixSocketAddr>>,
+    ) -> Result<(usize, AnyDupFds<Platform, FS>), Errno> {
+        // CMSG_CLOEXEC is meaningless for plain recvfrom (no ancillary data ever flows there) but
+        // harmless to accept -- net.rs's do_recvmsg is what actually honors it.
+        let supported_flags =
+            ReceiveFlags::DONTWAIT | ReceiveFlags::TRUNC | ReceiveFlags::CMSG_CLOEXEC;
         if flags.intersects(supported_flags.complement()) {
             log_unsupported!("Unsupported recvfrom flags: {:?}", flags);
             return Err(Errno::EINVAL);
@@ -1449,12 +1568,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
             UnixSocketInner::Stream(stream) => {
                 stream.recvfrom(cx, timeout, buf, is_nonblocking, source_addr)
             }
-            UnixSocketInner::Datagram(datagram) => {
-                datagram.recvfrom(cx, timeout, buf, is_nonblocking, source_addr)
-            }
+            UnixSocketInner::Datagram(datagram) => datagram
+                .recvfrom(cx, timeout, buf, is_nonblocking, source_addr)
+                .map(|n| (n, Vec::new())),
         };
         match ret {
-            Err(Errno::ESHUTDOWN) => Ok(0),
+            Err(Errno::ESHUTDOWN) => Ok((0, Vec::new())),
             other => other,
         }
     }
