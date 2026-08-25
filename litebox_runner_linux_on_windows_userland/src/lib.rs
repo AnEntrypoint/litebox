@@ -316,15 +316,28 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         // the other way, via a one-shot channel, so `set_drm_flip_callback` below can be wired up
         // on the main thread without blocking on the presenter thread's own startup.
         let (sender_tx, sender_rx) = std::sync::mpsc::channel();
+        let input_shim = shim.clone();
         let handle = std::thread::spawn(move || {
-            let presenter = match litebox_platform_windows_userland::presentation::Presenter::new()
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    litebox_util_log::warn!(error:? = e; "failed to create GUI presenter");
-                    return;
+            let mut presenter =
+                match litebox_platform_windows_userland::presentation::Presenter::new() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        litebox_util_log::warn!(error:? = e; "failed to create GUI presenter");
+                        return;
+                    }
+                };
+            // Forward real keyboard/mouse events captured by winit into the guest's
+            // `/dev/input/event0` queue, exactly mirroring how DRM page-flips are forwarded the
+            // other way (guest -> host) via `set_drm_flip_callback` below. This is what makes a
+            // `--gui` guest genuinely interactive rather than render-only.
+            presenter.set_input_consumer(move |signal| match signal {
+                litebox_platform_windows_userland::presentation::InputSignal::Key(code, value) => {
+                    input_shim.push_input_key(code, value);
                 }
-            };
+                litebox_platform_windows_userland::presentation::InputSignal::Rel(code, value) => {
+                    input_shim.push_input_rel(code, value);
+                }
+            });
             let _ = sender_tx.send(presenter.sender());
             if let Err(e) = presenter.run() {
                 litebox_util_log::warn!(error:? = e; "GUI presenter event loop exited with an error");

@@ -860,6 +860,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         out[..n].copy_from_slice(&event_bytes[..n]);
                         return Ok(n);
                     }
+                    // An evdev device fd's `read()` delivers queued `struct input_event`
+                    // records, handled the same way as the DRI-fd branch immediately above --
+                    // `litebox::fs::devices::InputDevices`'s own `read` deliberately rejects
+                    // every read outright (it has no reach into `EvdevSubsystem`'s event queue,
+                    // a higher-crate-layer state `litebox` cannot depend on), so intercept here.
+                    if self.is_input_device(&files.fs, fd)? {
+                        let Some(event_bytes) = self.global.evdev.pop_event_bytes() else {
+                            // Real Linux blocks a blocking-mode `read()` here until an event
+                            // arrives; this shim has no real blocking-wait wired for evdev yet
+                            // (see `EvdevSubsystem`'s own doc comment's "what this pass does not
+                            // implement" list), so a genuinely empty queue reports `EAGAIN`
+                            // regardless of the fd's blocking mode -- a client polling in a loop
+                            // (the common shape for a GUI toolkit's input thread) works
+                            // correctly; a client that truly blocks forever waiting for the
+                            // first event would hang, a known, disclosed gap.
+                            return Err(Errno::EAGAIN);
+                        };
+                        let mut out = buf.borrow_mut();
+                        let n = event_bytes.len().min(out.len());
+                        out[..n].copy_from_slice(&event_bytes[..n]);
+                        return Ok(n);
+                    }
                     files
                         .fs
                         .read(fd, &mut buf.borrow_mut(), offset)
@@ -2945,6 +2967,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(status) => {
                 let major = status.node_info.rdev.map_or(0, |v| v.get() >> 8);
                 Ok(major == 226 && status.file_type == litebox::fs::FileType::CharacterDevice)
+            }
+            Err(litebox::fs::errors::FileStatusError::ClosedFd) => Err(Errno::EBADF),
+            Err(_) => unimplemented!(),
+        }
+    }
+
+    /// Whether `fd` refers to an evdev input device node (`/dev/input/event0`, major 13 -- see
+    /// `litebox::fs::devices::InputDevice`'s node-info constants), mirroring
+    /// [`Self::is_dri_device`]'s identical major-number-check shape.
+    pub(crate) fn is_input_device(&self, fs: &FS, fd: &TypedFd<FS>) -> Result<bool, Errno> {
+        match fs.fd_file_status(fd) {
+            Ok(status) => {
+                let major = status.node_info.rdev.map_or(0, |v| v.get() >> 8);
+                Ok(major == 13 && status.file_type == litebox::fs::FileType::CharacterDevice)
             }
             Err(litebox::fs::errors::FileStatusError::ClosedFd) => Err(Errno::EBADF),
             Err(_) => unimplemented!(),

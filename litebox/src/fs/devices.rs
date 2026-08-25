@@ -699,3 +699,275 @@ where
         Err(SetTimesError::ReadOnlyFileSystem)
     }
 }
+
+/// Node info for `/dev/input/event0` (major=13 "Input core", minor=64 "First event
+/// queue" -- both confirmed against the kernel's own
+/// `Documentation/admin-guide/devices.txt` registry, not guessed).
+const INPUT_EVENT0_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 12,
+    // major=13, minor=64
+    rdev: core::num::NonZeroUsize::new(0x0D40),
+};
+
+/// An evdev input device node -- only `event0` (one virtual keyboard+mouse device) is
+/// exposed in this pass; a real system typically has one event node per physical input
+/// device, but a single combined node is a real, valid evdev shape (e.g. a USB
+/// keyboard-with-trackpad reports both `EV_KEY` and `EV_REL` on one node) and is
+/// sufficient for a single virtual display with one virtual input source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputDevice {
+    Event0,
+}
+
+impl InputDevice {
+    const ALL: &'static [(&'static str, InputDevice)] = &[("event0", InputDevice::Event0)];
+
+    fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.iter().find(|(n, _)| *n == name).map(|(_, d)| *d)
+    }
+
+    fn file_status(self) -> FileStatus {
+        let InputDevice::Event0 = self;
+        FileStatus {
+            file_type: FileType::CharacterDevice,
+            // Real evdev nodes are `crw-r-----`, group `input` -- same rationale as
+            // `DriDevice::file_status`: litebox's guest identity is always root, so
+            // group-readable is enough for every guest process to open this node.
+            mode: Mode::RUSR | Mode::WUSR | Mode::RGRP,
+            size: 0,
+            owner: UserInfo::ROOT,
+            node_info: INPUT_EVENT0_NODE_INFO,
+            blksize: NULL_BLOCK_SIZE,
+            atime: Timestamp::default(),
+            mtime: Timestamp::default(),
+        }
+    }
+}
+
+/// A [`super::backend::Backend`] exposing `/dev/input/event0` -- the evdev node a guest
+/// keyboard/mouse-driven GUI toolkit reads raw `struct input_event` records from.
+/// Mounted as its own nested backend at `/dev/input`, mirroring [`DriDevices`] at
+/// `/dev/dri` (see that type's own doc comment for why a nested mount is needed instead
+/// of adding directly to the flat, single-level [`Devices`] namespace).
+///
+/// This backend only handles the filesystem-visible SHAPE of the device node (open,
+/// stat, permissions, directory listing) -- the actual evdev protocol (capability-query
+/// ioctls, and the real `input_event` byte stream) is handled by `litebox_shim_linux`'s
+/// `EvdevSubsystem`, reached once a guest has successfully `open()`ed this node,
+/// mirroring how [`DriDevices`] hands off to `litebox_shim_linux`'s `DrmSubsystem`.
+pub struct InputDevices<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    _litebox: LiteBox<Platform>,
+    root_inode: NodeInfo,
+    _alloc: InodeAllocator,
+}
+
+impl<Platform> InputDevices<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    /// Construct a new `InputDevices` backend.
+    #[must_use]
+    pub fn new(litebox: &LiteBox<Platform>, allocator: InodeAllocator) -> Self {
+        let root_inode = allocator.next();
+        Self {
+            _litebox: litebox.clone(),
+            root_inode,
+            _alloc: allocator,
+        }
+    }
+}
+
+/// Owned file handle; identifies which input device node backs this fd (currently
+/// always [`InputDevice::Event0`], kept as a field rather than a unit struct so a
+/// second event node is a non-breaking addition later).
+#[derive(Debug, Clone, Copy)]
+pub struct InputDeviceFileHandle {
+    device: InputDevice,
+}
+
+/// Directory handle, reused for both walking and owned dir handles (no borrows needed).
+#[derive(Debug, Clone, Copy)]
+pub struct InputDeviceDirHandle;
+
+impl<Platform> super::backend::private::Sealed for InputDevices<Platform> where
+    Platform: RawSyncPrimitivesProvider + 'static
+{
+}
+
+impl<Platform> BackendHandles for InputDevices<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    type WalkingDirHandle<'a> = InputDeviceDirHandle;
+    type FileHandle = InputDeviceFileHandle;
+    type DirHandle = InputDeviceDirHandle;
+}
+
+impl<Platform> Backend for InputDevices<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    fn root(&self) -> WalkingDirHandle<'_> {
+        WalkingDirHandle::from_typed::<Self>(InputDeviceDirHandle)
+    }
+
+    fn walk_directories<'a>(
+        &'a self,
+        from: WalkingDirHandle<'a>,
+        components: &[&str],
+    ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError> {
+        let from = from.into_typed::<Self>();
+        if let Some(&component) = components.first() {
+            if InputDevice::from_name(component).is_some() {
+                return Ok(WalkOutcome {
+                    components: vec![],
+                    last: WalkingDirHandle::from_typed::<Self>(from),
+                    stop_reason: WalkStopReason::StoppedAtNonDirectory,
+                });
+            }
+            return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
+        }
+        Ok(WalkOutcome {
+            components: vec![],
+            last: WalkingDirHandle::from_typed::<Self>(from),
+            stop_reason: WalkStopReason::CompleteDirectory,
+        })
+    }
+
+    fn owned_dir_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        _flags: OFlags,
+    ) -> Result<DirHandle, OpenError> {
+        Ok(DirHandle::from_typed::<Self>(dir.into_typed::<Self>()))
+    }
+
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<WalkingDirHandle<'a>> {
+        Some(WalkingDirHandle::from_typed::<Self>(
+            *dir.get_typed::<Self>(),
+        ))
+    }
+
+    fn open_file_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        name: &str,
+        flags: OFlags,
+    ) -> Result<Permissioned<FileHandle>, OpenError> {
+        let _dir = dir.into_typed::<Self>();
+        let device = InputDevice::from_name(name)
+            .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+
+        if flags.contains(OFlags::DIRECTORY) {
+            return Err(OpenError::PathError(PathError::ComponentNotADirectory));
+        }
+
+        Ok(Permissioned {
+            item: FileHandle::from_typed::<Self>(InputDeviceFileHandle { device }),
+            permissions: PermissionCheck::ByBackend,
+        })
+    }
+
+    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
+        let _handle = handle.into_typed::<Self>();
+        Ok(InputDevice::ALL
+            .iter()
+            .map(|(n, d)| DirEntry {
+                name: String::from(*n),
+                file_type: FileType::CharacterDevice,
+                ino_info: Some(d.file_status().node_info),
+            })
+            .collect())
+    }
+
+    fn read(&self, _h: &FileHandle, _buf: &mut [u8], _offset: usize) -> Result<usize, ReadError> {
+        // Real evdev reads deliver queued `struct input_event` records, handled by
+        // `litebox_shim_linux`'s `EvdevSubsystem` (reached once the guest has opened this
+        // node) rather than this filesystem-shape-only backend -- see this type's own doc
+        // comment. Rejecting outright here (rather than silently returning zero bytes) is
+        // deliberate: `EvdevSubsystem` intercepts `read()` on this fd before this method is
+        // ever reached in practice (mirroring `DriDevices::read`'s identical rationale), so
+        // reaching this specific code path means something bypassed that interception.
+        Err(ReadError::NotForReading)
+    }
+
+    fn write(&self, _h: &FileHandle, _buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
+        Err(WriteError::NotForWriting)
+    }
+
+    fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {
+        Err(TruncateError::IsTerminalDevice)
+    }
+
+    fn seek_behavior(&self, _h: &FileHandle) -> SeekBehavior {
+        SeekBehavior::NonSeekable
+    }
+
+    fn file_status(&self, h: &FileHandle) -> Result<FileStatus, FileStatusError> {
+        Ok(h.get_typed::<Self>().device.file_status())
+    }
+
+    fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
+        let _h = h.get_typed::<Self>();
+        Ok(FileStatus {
+            file_type: FileType::Directory,
+            mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+            size: super::DEFAULT_DIRECTORY_SIZE,
+            owner: UserInfo::ROOT,
+            node_info: self.root_inode.clone(),
+            blksize: super::DEFAULT_DIRECTORY_SIZE,
+            atime: Timestamp::default(),
+            mtime: Timestamp::default(),
+        })
+    }
+
+    fn create_file_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _mode: Mode,
+    ) -> Result<FileHandle, OpenError> {
+        Err(OpenError::ReadOnlyFileSystem)
+    }
+
+    fn mkdir_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<DirHandle, MkdirError> {
+        Err(MkdirError::ReadOnlyFileSystem)
+    }
+
+    fn unlink_at(&self, _dir: DirHandle, _name: &str) -> Result<(), UnlinkError> {
+        Err(UnlinkError::ReadOnlyFileSystem)
+    }
+
+    fn rmdir_at(&self, _dir: DirHandle, _name: &str) -> Result<(), RmdirError> {
+        Err(RmdirError::ReadOnlyFileSystem)
+    }
+
+    fn chmod_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
+    fn chown_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _user: Option<u16>,
+        _group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        Err(ChownError::ReadOnlyFileSystem)
+    }
+
+    fn set_times_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _atime: Option<Timestamp>,
+        _mtime: Option<Timestamp>,
+    ) -> Result<(), SetTimesError> {
+        Err(SetTimesError::ReadOnlyFileSystem)
+    }
+}
+
