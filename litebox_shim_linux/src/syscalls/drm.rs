@@ -118,8 +118,14 @@ fn virtual_mode() -> DrmModeModeinfo {
 /// (in a later pass) the host-side wgpu presentation code reading the flipped framebuffer's
 /// content directly, with no explicit copy between guest writes and host reads.
 struct DumbBuffer<Platform: ShimPlatform> {
+    // Stored for the buffer's own record-keeping (e.g. a future `DESTROY_DUMB`/`MAP_DUMB` bounds
+    // or format-consistency check) even though nothing reads them back yet -- `pitch`/`size` are
+    // the derived values everything downstream actually uses.
+    #[allow(dead_code)]
     width: u32,
+    #[allow(dead_code)]
     height: u32,
+    #[allow(dead_code)]
     bpp: u32,
     pitch: u32,
     size: usize,
