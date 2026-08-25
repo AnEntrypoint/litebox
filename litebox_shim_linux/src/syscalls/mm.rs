@@ -1368,12 +1368,19 @@ mod tests {
         // First, create an initial mapping at a specific address away from boundaries.
         // 256 MiB is a safe middle ground on platforms with no low-address
         // reservation; on Apple Silicon the first 4 GiB is the permanently
-        // unmapped `__PAGEZERO` segment (see `MacOsUserland::TASK_ADDR_MIN`),
-        // so this picks the lowest address above that reservation instead.
+        // unmapped `__PAGEZERO` segment (see `MacOsUserland::TASK_ADDR_MIN`), so
+        // this needs an address above that reservation instead. `TASK_ADDR_MIN`
+        // itself is too close to it in practice: dyld and the shared cache load
+        // low in the address space too (see `read_memory_maps`'s doc comment),
+        // and a `MAP_FIXED_NOREPLACE` request -- unlike an ordinary hint-based
+        // mmap -- is never checked against those before being handed to the
+        // platform, so a real collision there surfaces as a genuine allocation
+        // failure. A further 64 GiB of headroom above `TASK_ADDR_MIN` clears
+        // that low region while staying well inside `TASK_ADDR_MAX`.
         #[cfg(not(target_vendor = "apple"))]
         let base_addr = 0x1000_0000usize;
         #[cfg(target_vendor = "apple")]
-        let base_addr = 0x1_0000_0000usize;
+        let base_addr = 0x11_0000_0000usize;
         let addr1 = task
             .sys_mmap(
                 base_addr,

@@ -395,10 +395,18 @@ mod tests {
     // Must be loadable as-is (an `ET_EXEC` binary can't be relocated), so this
     // has to sit above `TASK_ADDR_MIN` on platforms where low addresses are
     // reserved -- see `crate::loader::DEFAULT_LOW_ADDR`'s own doc comment.
+    // `TASK_ADDR_MIN` itself is too close to that reservation in practice on
+    // Apple Silicon: dyld and the shared cache load low in the address space
+    // too (see `litebox_platform_macos_userland::read_memory_maps`'s doc
+    // comment), and loading an `ET_EXEC` binary at its exact linked address is
+    // a fixed placement that -- unlike an ordinary hint-based mmap -- is never
+    // checked against those before being handed to the platform. A further 64
+    // GiB of headroom above `TASK_ADDR_MIN` clears that low region while
+    // staying well inside `TASK_ADDR_MAX`.
     #[cfg(not(target_vendor = "apple"))]
     const EXEC_LOAD_ADDR: u64 = 0x400000;
     #[cfg(target_vendor = "apple")]
-    const EXEC_LOAD_ADDR: u64 = 0x1_0000_0000;
+    const EXEC_LOAD_ADDR: u64 = 0x11_0000_0000;
     const INTERP_PATH_OFFSET: usize = 0x200;
     const INTERP_PATH: &[u8] = b"/ld.so\0";
 
