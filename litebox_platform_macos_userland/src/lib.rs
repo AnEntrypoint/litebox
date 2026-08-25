@@ -414,7 +414,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
 
     /// A `shm_open` file descriptor -- Darwin's nearest equivalent of Linux's
     /// `memfd_create`. Cheap to copy (a raw fd, not the memory itself);
-    /// [`Self::close_shared_memory`] closes it.
+    /// `close_shared_memory` (below, in this same `impl` block) closes it.
     type SharedMemoryHandle = libc::c_int;
 
     fn create_shared_memory(
