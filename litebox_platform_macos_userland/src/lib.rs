@@ -919,19 +919,31 @@ impl litebox::platform::DerivedKeyProvider for MacOsUserland {
 
 /// Asynchronous host signals observed since the guest last drained them.
 ///
-/// Bit `n - 1` corresponds to signal number `n`, matching `SigSet`'s encoding.
+/// Bit `n - 1` corresponds to *guest* (Linux) signal number `n`, matching
+/// `SigSet`'s encoding -- NOT the raw host signal number `async_signal_handler`
+/// receives. Darwin and Linux agree on the numbering for `SIGINT`/`SIGALRM`/
+/// `SIGVTALRM`/`SIGPROF`, but not for `SIGUSR1` (10 on Linux, 30 on Darwin --
+/// see `unix/bsd/mod.rs` in the vendored `libc` crate), so the handler below
+/// translates the host number it actually received to the guest number
+/// before setting a bit, rather than assuming they're the same value.
 static PENDING_SIGNALS: AtomicU64 = AtomicU64::new(0);
 
 unsafe extern "C" fn async_signal_handler(signum: libc::c_int) {
-    // TEMPORARY (macOS CI investigation, test_timer_delivers_correct_signal):
-    // confirm whether this handler runs at all for SIGUSR1, and with what
-    // signal number, before the guest ever observes PENDING_SIGNALS. Signal
-    // handlers may only call async-signal-safe functions; `libc::write` to
-    // stderr's raw fd is, unlike `eprintln!`/`std::io`. Remove once
-    // root-caused.
-    let msg = b"async_signal_handler fired\n";
-    unsafe { libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len()) };
-    if let Ok(bit) = u32::try_from(signum - 1) {
+    // Translate the HOST signal number this handler actually received to the
+    // GUEST (Linux) number `PENDING_SIGNALS`/`take_pending_signals` use --
+    // see this static's own doc comment for why they can differ. Every
+    // signal `install_async_signal_handlers` installs this handler for must
+    // have an arm here.
+    use litebox_common_linux::signal::Signal;
+    let guest_signal = match signum {
+        libc::SIGINT => Signal::SIGINT,
+        libc::SIGALRM => Signal::SIGALRM,
+        libc::SIGVTALRM => Signal::SIGVTALRM,
+        libc::SIGPROF => Signal::SIGPROF,
+        libc::SIGUSR1 => Signal::SIGUSR1,
+        _ => return,
+    };
+    if let Ok(bit) = u32::try_from(guest_signal.as_i32() - 1) {
         PENDING_SIGNALS.fetch_or(1u64 << bit, Ordering::Relaxed);
     }
 }
@@ -942,9 +954,7 @@ unsafe extern "C" fn interrupt_signal_handler(_signum: libc::c_int) {}
 
 fn install_async_signal_handlers() {
     // SIGALRM/SIGVTALRM/SIGPROF/SIGUSR1 are the signals `create_timer` (below)
-    // can be asked to deliver -- Darwin and Linux agree on all of these
-    // numbers, matching this whole mechanism's own "host and guest signal
-    // numbers agree" assumption. SIGUSR2 is deliberately excluded: it is
+    // can be asked to deliver. SIGUSR2 is deliberately excluded: it is
     // reserved as `INTERRUPT_SIGNAL` below, for kicking a host thread out of
     // a blocking call, not for guest-requested timer delivery.
     for signum in [
@@ -970,17 +980,12 @@ impl litebox::platform::SignalProvider for MacOsUserland {
 
     fn take_pending_signals(&self, mut f: impl FnMut(Self::Signal)) {
         let mut pending = PENDING_SIGNALS.swap(0, Ordering::Relaxed);
-        // TEMPORARY (macOS CI investigation, test_timer_delivers_correct_signal):
-        // confirm what this call actually observes in PENDING_SIGNALS. Remove
-        // once root-caused.
-        if pending != 0 {
-            std::eprintln!("take_pending_signals: drained {pending:#x}");
-        }
         while pending != 0 {
             let bit = pending.trailing_zeros();
             pending &= !(1u64 << bit);
-            // Host and guest signal numbers agree for the small set of
-            // asynchronous signals handled here.
+            // The bit already encodes a GUEST signal number -- see
+            // `PENDING_SIGNALS`'s own doc comment -- so this is a plain
+            // decode, not a host-to-guest translation.
             if let Ok(signal) =
                 litebox_common_linux::signal::Signal::try_from(bit.cast_signed() + 1)
             {
