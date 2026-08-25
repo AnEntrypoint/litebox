@@ -55,7 +55,9 @@ fn ratchet_globals() -> Result<()> {
             // and signal-handler-safe (no allocation), which rules out anything but a `static`.
             ("litebox_platform_linux_userland/", 9),
             ("litebox_platform_lvbs/", 24),
-            ("litebox_platform_macos_userland/", 5),
+            // 6 rather than 5 for create_shared_memory's own COUNTER, used to
+            // build a unique shm_open name (Darwin has no SHM_ANON).
+            ("litebox_platform_macos_userland/", 6),
             ("litebox_platform_multiplex/", 1),
             // 11 rather than 10 for the single `LITEBOX_DIAG_WAIT4GATE` diagnostic thread-local,
             // which is inert unless that environment variable is set. It is deliberately one

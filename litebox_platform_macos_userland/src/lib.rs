@@ -50,7 +50,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use litebox::platform::page_mgmt::{
     AllocationError, DeallocationError, FixedAddressBehavior, MemoryRegionPermissions,
-    PermissionUpdateError,
+    PermissionUpdateError, SharedMemoryError,
 };
 use litebox::platform::{ImmediatelyWokenUp, UnblockedOrTimedOut};
 use litebox::utils::TruncateExt as _;
@@ -374,6 +374,144 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
 
     fn reserved_pages(&self) -> impl Iterator<Item = &core::ops::Range<usize>> {
         self.reserved_pages.iter()
+    }
+
+    /// A `shm_open` file descriptor -- Darwin's nearest equivalent of Linux's
+    /// `memfd_create`. Cheap to copy (a raw fd, not the memory itself);
+    /// [`Self::close_shared_memory`] closes it.
+    type SharedMemoryHandle = libc::c_int;
+
+    fn create_shared_memory(
+        &self,
+        size: usize,
+    ) -> Result<Self::SharedMemoryHandle, SharedMemoryError> {
+        // Darwin's `shm_open` has no `SHM_ANON`-style anonymous-object
+        // shortcut (that is a FreeBSD extension libc does not expose here),
+        // so this creates a real, uniquely-named object and unlinks it
+        // immediately: the standard portable way to get an "anonymous"
+        // shared-memory object from a `shm_open` that requires a name -- once
+        // unlinked, the name can never collide with another process, and the
+        // object itself is only released once every fd/mapping referencing
+        // it is gone, exactly like the never-linked-in-the-first-place
+        // `SHM_ANON` case on platforms that do have it.
+        static COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: `libc::getpid()` has no preconditions.
+        let pid = unsafe { libc::getpid() };
+        let name = std::ffi::CString::new(format!("/litebox-shm-{pid}-{id}"))
+            .expect("no interior NUL in a formatted PID/counter name");
+
+        // SAFETY: `name` is a valid NUL-terminated C string; `shm_open`'s
+        // variadic `mode` argument undergoes C's default argument promotion
+        // (any integer type narrower than `int` is promoted to `c_int`), so
+        // it is passed as `libc::c_int` here to match what the callee reads,
+        // not the `mode_t` (`u16`) the non-variadic call site's type suggests.
+        let fd = unsafe {
+            libc::shm_open(
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+                0o600 as libc::c_int,
+            )
+        };
+        if fd < 0 {
+            return Err(SharedMemoryError::OutOfMemory);
+        }
+        // SAFETY: `name` is the same string `shm_open` just created.
+        unsafe { libc::shm_unlink(name.as_ptr()) };
+        // SAFETY: `fd` was just opened above and `size` is the caller-provided
+        // byte length this object should hold.
+        let rc = unsafe { libc::ftruncate(fd, size.cast_signed() as libc::off_t) };
+        if rc != 0 {
+            // SAFETY: `fd` is still open and owned by this call.
+            unsafe { libc::close(fd) };
+            return Err(SharedMemoryError::OutOfMemory);
+        }
+        Ok(fd)
+    }
+
+    fn map_shared_memory(
+        &self,
+        handle: Self::SharedMemoryHandle,
+        suggested_range: core::ops::Range<usize>,
+        initial_permissions: MemoryRegionPermissions,
+        fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<Self::RawMutPointer<u8>, SharedMemoryError> {
+        if !suggested_range.start.is_multiple_of(ALIGN)
+            || !suggested_range.len().is_multiple_of(ALIGN)
+        {
+            return Err(SharedMemoryError::Unaligned);
+        }
+
+        // Same `MAP_FIXED_NOREPLACE`-emulation pattern as `allocate_pages`:
+        // Darwin has no such flag, so reserve the range through Mach first.
+        if fixed_address_behavior == FixedAddressBehavior::NoReplace {
+            let mut addr = suggested_range.start as u64;
+            // SAFETY: `mach_task_self()` names this process and the range is
+            // page-aligned.
+            let kr = unsafe {
+                mach_vm_allocate(
+                    mach_task_self(),
+                    &raw mut addr,
+                    suggested_range.len() as u64,
+                    VM_FLAGS_FIXED,
+                )
+            };
+            match kr {
+                KERN_SUCCESS => {}
+                KERN_NO_SPACE => return Err(SharedMemoryError::AddressInUse),
+                _ => return Err(SharedMemoryError::OutOfMemory),
+            }
+        }
+
+        let mut flags = libc::MAP_SHARED;
+        if fixed_address_behavior != FixedAddressBehavior::Hint {
+            flags |= libc::MAP_FIXED;
+        }
+
+        // SAFETY: `handle` is a valid fd from `create_shared_memory`, and
+        // `MAP_FIXED` only replaces a range the caller has told us it owns.
+        let ptr = unsafe {
+            libc::mmap(
+                suggested_range.start as *mut libc::c_void,
+                suggested_range.len(),
+                prot_flags(initial_permissions),
+                flags,
+                handle,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::EINVAL) => SharedMemoryError::Unaligned,
+                _ => SharedMemoryError::OutOfMemory,
+            });
+        }
+        Ok(UserMutPtr::from_ptr(ptr.cast::<u8>()))
+    }
+
+    unsafe fn unmap_shared_memory(
+        &self,
+        range: core::ops::Range<usize>,
+    ) -> Result<(), SharedMemoryError> {
+        // SAFETY: the caller guarantees these pages are not in active use.
+        let rc = unsafe { libc::munmap(range.start as *mut libc::c_void, range.len()) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(SharedMemoryError::Unaligned)
+        }
+    }
+
+    fn close_shared_memory(
+        &self,
+        handle: Self::SharedMemoryHandle,
+    ) -> Result<(), SharedMemoryError> {
+        // SAFETY: `handle` is a valid fd from `create_shared_memory`; closing
+        // it releases this holder's reference. The kernel keeps the object
+        // alive as long as any mapping of it (in this or another process)
+        // still exists.
+        unsafe { libc::close(handle) };
+        Ok(())
     }
 }
 
@@ -729,7 +867,19 @@ unsafe extern "C" fn async_signal_handler(signum: libc::c_int) {
 unsafe extern "C" fn interrupt_signal_handler(_signum: libc::c_int) {}
 
 fn install_async_signal_handlers() {
-    for signum in [libc::SIGINT, libc::SIGALRM] {
+    // SIGALRM/SIGVTALRM/SIGPROF/SIGUSR1 are the signals `create_timer` (below)
+    // can be asked to deliver -- Darwin and Linux agree on all of these
+    // numbers, matching this whole mechanism's own "host and guest signal
+    // numbers agree" assumption. SIGUSR2 is deliberately excluded: it is
+    // reserved as `INTERRUPT_SIGNAL` below, for kicking a host thread out of
+    // a blocking call, not for guest-requested timer delivery.
+    for signum in [
+        libc::SIGINT,
+        libc::SIGALRM,
+        libc::SIGVTALRM,
+        libc::SIGPROF,
+        libc::SIGUSR1,
+    ] {
         darwin::install_handler(signum, async_signal_handler as *const () as usize, false);
     }
     // `SA_RESTART` is deliberately absent: interrupting a blocking call is the
@@ -780,6 +930,15 @@ struct TimerState {
     deadline: Mutex<TimerCommand>,
     changed: Condvar,
     signal: libc::c_int,
+    /// The thread that created this timer, matching real POSIX `alarm`/
+    /// `setitimer` delivering to the thread that armed them. Raising `signal`
+    /// alone only sets a bit in `PENDING_SIGNALS` -- a thread already parked
+    /// in a blocking wait (e.g. `nanosleep`) never re-checks that bit on its
+    /// own, so this thread also has to be woken via the same
+    /// `ThreadHandle::interrupt` mechanism litebox's own cross-thread wakeups
+    /// use, or the signal is recorded but never observed until the blocked
+    /// call's own timeout independently expires.
+    owner: ThreadHandle,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -797,14 +956,21 @@ impl litebox::platform::TimerProvider for MacOsUserland {
         &self,
         signal: Self::Signal,
     ) -> Result<Self::TimerHandle, litebox::platform::TimerCreationError> {
-        // Only the signals with a host handler installed can be raised this way.
-        if signal != litebox_common_linux::signal::Signal::SIGALRM {
-            return Err(litebox::platform::TimerCreationError::Unsupported);
-        }
+        // Only the signals `install_async_signal_handlers` installed a host
+        // handler for can be raised this way.
+        use litebox_common_linux::signal::Signal;
+        let host_signal = match signal {
+            Signal::SIGALRM => libc::SIGALRM,
+            Signal::SIGVTALRM => libc::SIGVTALRM,
+            Signal::SIGPROF => libc::SIGPROF,
+            Signal::SIGUSR1 => libc::SIGUSR1,
+            _ => return Err(litebox::platform::TimerCreationError::Unsupported),
+        };
         let state = Arc::new(TimerState {
             deadline: Mutex::new(TimerCommand::Disarmed),
             changed: Condvar::new(),
-            signal: libc::SIGALRM,
+            signal: host_signal,
+            owner: ThreadHandle::current(),
         });
         let thread_state = Arc::clone(&state);
         std::thread::Builder::new()
@@ -831,6 +997,12 @@ fn timer_thread(state: &TimerState) {
                     // SAFETY: raising a signal at the process level is always
                     // well-defined; the handler is already installed.
                     unsafe { libc::raise(state.signal) };
+                    // Raising alone only sets a bit in `PENDING_SIGNALS`; the
+                    // owning thread must also be woken if it's currently
+                    // parked in a blocking wait, or it won't observe the
+                    // pending signal until that wait's own timeout expires on
+                    // its own (see `TimerState::owner`'s doc comment).
+                    state.owner.interrupt();
                     continue;
                 };
                 let (next, _) = state.changed.wait_timeout(command, remaining).unwrap();
