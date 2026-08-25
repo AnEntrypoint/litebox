@@ -460,13 +460,30 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             flags |= libc::MAP_FIXED;
         }
 
+        // The caller (`litebox`'s `Vmem::insert_mapping`) always requests
+        // `READ | WRITE | EXEC` here -- the widest permissions the mapping
+        // could ever need -- then narrows to the real target via
+        // `update_permissions` immediately after, to work around Windows'
+        // `MapViewOfFile3` fixing a view's MAXIMUM protection at map time.
+        // Darwin has no such ceiling (a later `mprotect` can freely widen or
+        // narrow an `mmap`'d region), but it does enforce W^X: `mmap` with
+        // `PROT_WRITE | PROT_EXEC` together fails outright without `MAP_JIT`
+        // (see `needs_jit`'s doc comment above). Since Darwin doesn't need
+        // the widest-permissions trick at all, request only `READ | WRITE`
+        // for the initial mapping -- `update_permissions` below still narrows
+        // (or, if a caller genuinely wants an executable shared mapping,
+        // widens) to the real target, and never has to add `WRITE` back to
+        // an already-executable page, so the W^X ceiling is never hit either
+        // way.
+        let map_permissions = initial_permissions - MemoryRegionPermissions::EXEC;
+
         // SAFETY: `handle` is a valid fd from `create_shared_memory`, and
         // `MAP_FIXED` only replaces a range the caller has told us it owns.
         let ptr = unsafe {
             libc::mmap(
                 suggested_range.start as *mut libc::c_void,
                 suggested_range.len(),
-                prot_flags(initial_permissions),
+                prot_flags(map_permissions),
                 flags,
                 handle,
                 0,

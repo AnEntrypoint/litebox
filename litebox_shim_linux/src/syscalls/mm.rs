@@ -1365,8 +1365,15 @@ mod tests {
     fn test_mmap_fixed_noreplace() {
         let task = init_platform(None);
 
-        // First, create an initial mapping at a specific address away from boundaries
-        let base_addr = 0x1000_0000usize; // 256 MiB - safe middle ground
+        // First, create an initial mapping at a specific address away from boundaries.
+        // 256 MiB is a safe middle ground on platforms with no low-address
+        // reservation; on Apple Silicon the first 4 GiB is the permanently
+        // unmapped `__PAGEZERO` segment (see `MacOsUserland::TASK_ADDR_MIN`),
+        // so this picks the lowest address above that reservation instead.
+        #[cfg(not(target_vendor = "apple"))]
+        let base_addr = 0x1000_0000usize;
+        #[cfg(target_vendor = "apple")]
+        let base_addr = 0x1_0000_0000usize;
         let addr1 = task
             .sys_mmap(
                 base_addr,
