@@ -1366,6 +1366,13 @@ mod tests {
     fn test_mmap_fixed_noreplace() {
         let task = init_platform(None);
 
+        // Every offset below is expressed in units of `page` (never a raw
+        // byte literal like `0x1000`): a literal that happens to be
+        // page-aligned on a 4 KiB-page platform is not necessarily aligned to
+        // macOS's 16 KiB pages, and every `MAP_FIXED_NOREPLACE` address below
+        // must be exactly page-aligned or `sys_mmap` rejects it with EINVAL.
+        let page = PAGE_SIZE;
+
         // First, create an initial mapping at a specific address away from
         // boundaries. No hardcoded literal is safe here on every platform: a
         // fixed-address `sys_mmap` IS checked against litebox's own tracked
@@ -1378,7 +1385,7 @@ mod tests {
         // actually runs. Get a genuinely free address instead: a hint-based
         // (non-fixed) mmap always avoids every existing mapping, host-reserved
         // or not.
-        let probe_len = 0x4000;
+        let probe_len = 4 * page;
         let base_addr = task
             .sys_mmap(
                 0,
@@ -1393,12 +1400,12 @@ mod tests {
         // Leave a page of headroom below `base_addr` for the "adjacent
         // mapping right before" sub-test later, so it can't undo the
         // just-freed probe region's own neighbors.
-        let base_addr = base_addr.as_usize() + 0x1000;
+        let base_addr = base_addr.as_usize() + page;
 
         let addr1 = task
             .sys_mmap(
                 base_addr,
-                0x2000,
+                2 * page,
                 ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
                 MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
                 -1,
@@ -1415,7 +1422,7 @@ mod tests {
         let err = task
             .sys_mmap(
                 addr1.as_usize(),
-                0x1000,
+                page,
                 ProtFlags::PROT_READ,
                 MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
                 -1,
@@ -1425,11 +1432,11 @@ mod tests {
         assert_eq!(err, Errno::EEXIST);
 
         // Test 2: Partial overlap at end - should fail with EEXIST
-        // Existing: [addr1, addr1 + 0x2000), New: [addr1 + 0x1000, addr1 + 0x3000)
+        // Existing: [addr1, addr1 + 2*page), New: [addr1 + page, addr1 + 3*page)
         let err = task
             .sys_mmap(
-                addr1.as_usize() + 0x1000,
-                0x2000,
+                addr1.as_usize() + page,
+                2 * page,
                 ProtFlags::PROT_READ,
                 MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
                 -1,
@@ -1439,11 +1446,11 @@ mod tests {
         assert_eq!(err, Errno::EEXIST);
 
         // Test 3: Partial overlap at start - should fail with EEXIST
-        // Existing: [addr1, addr1 + 0x2000), New: [addr1 - 0x1000, addr1 + 0x1000)
+        // Existing: [addr1, addr1 + 2*page), New: [addr1 - page, addr1 + page)
         let err = task
             .sys_mmap(
-                addr1.as_usize() - 0x1000,
-                0x2000,
+                addr1.as_usize() - page,
+                2 * page,
                 ProtFlags::PROT_READ,
                 MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
                 -1,
@@ -1455,35 +1462,35 @@ mod tests {
         // Test 4: Adjacent mapping (right after) - should succeed
         let addr2 = task
             .sys_mmap(
-                addr1.as_usize() + 0x2000,
-                0x1000,
+                addr1.as_usize() + 2 * page,
+                page,
                 ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
                 MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
                 -1,
                 0,
             )
             .unwrap();
-        assert_eq!(addr2.as_usize(), addr1.as_usize() + 0x2000);
+        assert_eq!(addr2.as_usize(), addr1.as_usize() + 2 * page);
 
         // Test 5: Adjacent mapping (right before) - should succeed
         let addr3 = task
             .sys_mmap(
-                addr1.as_usize() - 0x1000,
-                0x1000,
+                addr1.as_usize() - page,
+                page,
                 ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
                 MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
                 -1,
                 0,
             )
             .unwrap();
-        assert_eq!(addr3.as_usize(), addr1.as_usize() - 0x1000);
+        assert_eq!(addr3.as_usize(), addr1.as_usize() - page);
 
         // Test 6: Zero address with MAP_FIXED_NOREPLACE - should fail with EPERM
         // (matches Linux behavior where vm.mmap_min_addr prevents mapping at address 0)
         let err = task
             .sys_mmap(
                 0,
-                0x1000,
+                page,
                 ProtFlags::PROT_READ,
                 MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
                 -1,
@@ -1493,9 +1500,9 @@ mod tests {
         assert_eq!(err, Errno::EPERM);
 
         // Clean up
-        task.sys_munmap(addr3, 0x1000).unwrap();
-        task.sys_munmap(addr1, 0x2000).unwrap();
-        task.sys_munmap(addr2, 0x1000).unwrap();
+        task.sys_munmap(addr3, page).unwrap();
+        task.sys_munmap(addr1, 2 * page).unwrap();
+        task.sys_munmap(addr2, page).unwrap();
     }
 
     // Windows-only historically, but no longer applicable there: `WindowsUserland::alloc` (the
@@ -1636,10 +1643,25 @@ mod tests {
             .unwrap();
         assert_eq!(addr.read_at_offset::<Platform>(0).unwrap(), 0xab_u8);
 
-        // mprotect to read-only or read-exec should also succeed
+        // mprotect to read-only should also succeed
         task.sys_mprotect(addr, len, ProtFlags::PROT_READ).unwrap();
+
+        // ...but read-exec should NOT: Darwin's W^X enforcement permanently
+        // refuses to add PROT_EXEC to any mapping that was ever writable (see
+        // docs/macos.md's "W^X, MAP_JIT, and code signing" section) -- this
+        // mapping was made PROT_WRITE above, so on macOS this transition is
+        // rejected rather than silently degraded, matching the same
+        // "unimplemented rather than silently wrong" posture as this
+        // platform's other W^X-affected paths.
+        #[cfg(not(target_vendor = "apple"))]
         task.sys_mprotect(addr, len, ProtFlags::PROT_READ_EXEC)
             .unwrap();
+        #[cfg(target_vendor = "apple")]
+        assert_eq!(
+            task.sys_mprotect(addr, len, ProtFlags::PROT_READ_EXEC)
+                .unwrap_err(),
+            Errno::EACCES,
+        );
 
         task.sys_munmap(addr, len).unwrap();
     }
