@@ -234,14 +234,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
     /// inside any plausible limit.
     const TASK_ADDR_MAX: usize = 0x0000_4000_0000_0000;
 
-    /// Real cross-process shared memory isn't implemented yet -- `allocate_pages`
-    /// below already rejects a `SHARED` mapping outright, so the default
-    /// `create_shared_memory`/etc. bodies (returning `UnsupportedByPlatform`)
-    /// are never actually exercised and this type is never constructed. See
-    /// this trait item's own doc comment for why `()` is the correct choice
-    /// for a platform that doesn't support this yet.
-    type SharedMemoryHandle = ();
-
     fn allocate_pages(
         &self,
         suggested_range: core::ops::Range<usize>,
