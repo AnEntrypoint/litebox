@@ -370,6 +370,13 @@ pub enum PermissionUpdateError {
     Unaligned,
     #[error("provided range contains unallocated pages")]
     Unallocated,
+    /// The platform refused this exact permission transition, distinct from
+    /// the range simply being unallocated -- e.g. Darwin's W^X enforcement
+    /// permanently refusing to add `EXEC` to a mapping that was ever
+    /// writable (see `litebox_platform_macos_userland::needs_jit`'s doc
+    /// comment).
+    #[error("platform refused this permission transition")]
+    Denied,
 }
 
 /// Possible errors for [`PageManagementProvider::try_allocate_cow_pages`]

@@ -274,30 +274,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             };
             match kr {
                 KERN_SUCCESS => {}
-                KERN_NO_SPACE => {
-                    // TEMPORARY (macOS CI investigation): confirm a fixed-address
-                    // allocation failure at this range is a genuine collision
-                    // with something already in this process's address space,
-                    // not a bug -- see `update_permissions`'s matching temporary
-                    // diagnostic for why this can't just be a distinct `Errno`.
-                    // Remove once the low-address-collision investigation
-                    // (et_exec_interpreter_loads_top_down_above_low_heap /
-                    // test_mmap_fixed_noreplace) is root-caused.
-                    std::eprintln!(
-                        "mach_vm_allocate({:#x}, {:#x}) hit KERN_NO_SPACE",
-                        suggested_range.start,
-                        suggested_range.len()
-                    );
-                    return Err(AllocationError::AddressInUse);
-                }
-                _ => {
-                    std::eprintln!(
-                        "mach_vm_allocate({:#x}, {:#x}) failed with kern_return_t {kr}",
-                        suggested_range.start,
-                        suggested_range.len()
-                    );
-                    return Err(AllocationError::OutOfMemory);
-                }
+                KERN_NO_SPACE => return Err(AllocationError::AddressInUse),
+                _ => return Err(AllocationError::OutOfMemory),
             }
             // The reservation above only exists to atomically prove the range
             // was free (a real Darwin `mmap(MAP_FIXED)` over a *live*
@@ -407,22 +385,15 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         if rc == 0 {
             Ok(())
         } else {
-            // TEMPORARY (macOS CI investigation): `PermissionUpdateError` has no
-            // variant that preserves the real errno, so several genuinely
-            // different `mprotect` failures on `MAP_SHARED` memory all surface
-            // identically as `ENOMEM` to the caller. `eprintln!` (rather than
-            // `litebox_util_log`, which nextest doesn't capture by default) so
-            // the next CI run's failure output shows the real one instead of
-            // another guess. Remove once the `MAP_SHARED`-permission-widening
-            // investigation (test_map_shared_anonymous /
-            // test_map_shared_readonly_file) is root-caused.
-            std::eprintln!(
-                "mprotect({:#x}, {:#x}, {new_permissions:?}) failed: {}",
-                range.start,
-                range.len(),
-                std::io::Error::last_os_error()
-            );
-            Err(PermissionUpdateError::Unallocated)
+            // `EACCES` here means Darwin's W^X enforcement itself refused this
+            // exact transition (see this function's own `NOTE` above) --
+            // distinct from the range being unallocated, and a real, expected
+            // outcome for a mapping that was ever writable gaining `EXEC`, not
+            // a platform bug to work around.
+            Err(match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::EACCES) => PermissionUpdateError::Denied,
+                _ => PermissionUpdateError::Unallocated,
+            })
         }
     }
 

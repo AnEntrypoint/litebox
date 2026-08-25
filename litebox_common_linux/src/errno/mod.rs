@@ -378,6 +378,7 @@ impl From<litebox::platform::page_mgmt::PermissionUpdateError> for Errno {
         match value {
             litebox::platform::page_mgmt::PermissionUpdateError::Unaligned => Errno::EINVAL,
             litebox::platform::page_mgmt::PermissionUpdateError::Unallocated => Errno::ENOMEM,
+            litebox::platform::page_mgmt::PermissionUpdateError::Denied => Errno::EACCES,
             _ => unimplemented!(),
         }
     }
