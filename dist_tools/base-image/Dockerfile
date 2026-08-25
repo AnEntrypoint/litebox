@@ -20,3 +20,10 @@ RUN apk add --no-cache \
     curl \
     openssh-client \
     tzdata
+
+# litebox_runner_linux_userland runs the guest as UID/GID 1000 by default (a
+# security-conscious default -- unlike litebox_runner_linux_on_windows_userland,
+# which uses UID 0), so a real /etc/passwd entry for it is needed or any tool
+# that does an NSS lookup on the current UID (e.g. `ssh -V`: "No user exists
+# for uid 1000") fails even though the UID itself is correctly reported.
+RUN adduser -D -u 1000 -h /home/litebox litebox
