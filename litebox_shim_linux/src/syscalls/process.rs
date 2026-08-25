@@ -3902,7 +3902,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 tid:% = self.tid, path:% = path, error:? = e;
                 "sys_execve: load_program failed after point of no return, killing process with SIGSEGV"
             );
-            self.exit_group(ExitStatus::Signal(litebox_common_linux::signal::Signal::SIGSEGV));
+            self.exit_group(ExitStatus::Signal(
+                litebox_common_linux::signal::Signal::SIGSEGV,
+            ));
             // If this was a vfork child, the parent is still suspended waiting for this signal
             // (see `signal_vfork_done`'s call below on the success path, and its own doc comment)
             // -- a real vfork parent resumes once the child execs OR exits, not only on success, so
