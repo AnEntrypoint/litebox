@@ -878,6 +878,23 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                         // FUTURE: support this case, either by splitting this
                         // into multiple allocate calls or by separating VA
                         // allocation from page backing.
+                        //
+                        // Logged unconditionally (rare path, same rationale as
+                        // `get_unmmaped_area`'s own exhaustion log just below) -- a bare `ENOMEM`
+                        // with no further context has repeatedly cost real investigation time in
+                        // this exact area (see the `vfork-child-execve-large-elf-enomem` and
+                        // `vfork-parent-wakes-during-nested-child-execve` investigations).
+                        let overlapping_range = self
+                            .vmas
+                            .iter()
+                            .find(|(r, vma)| {
+                                r.start < end && r.end > start && !vma.flags.is_empty()
+                            })
+                            .map(|(r, _)| r.clone());
+                        litebox_util_log::warn!(
+                            target_start:% = start, target_end:% = end, overlapping:? = overlapping_range;
+                            "insert_mapping: MAP_FIXED target partially overlaps a real guest mapping, rejecting as AddressPartiallyInUse"
+                        );
                         return Err(AllocationError::AddressPartiallyInUse);
                     }
                     FixedAddressBehavior::Replace
