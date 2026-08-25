@@ -39,6 +39,7 @@
 use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use litebox::mm::linux::PAGE_SIZE;
 use litebox_common_linux::{
     DRM_MODE_CONNECTOR_VIRTUAL, DRM_MODE_ENCODER_VIRTUAL, DrmModeCardRes, DrmModeCrtc,
     DrmModeCrtcPageFlip, DrmModeCreateDumb, DrmModeDestroyDumb, DrmModeFbCmd2, DrmModeGetConnector,
@@ -91,14 +92,21 @@ fn virtual_mode() -> DrmModeModeinfo {
 }
 
 /// A single allocated dumb buffer's state.
-struct DumbBuffer {
+///
+/// Backed by a real platform shared-memory object (the same primitive `MAP_ANONYMOUS|MAP_SHARED`
+/// mmaps use, see [`litebox::platform::page_mgmt::PageManagementProvider::create_shared_memory`]),
+/// created eagerly at `CREATE_DUMB` time -- not a plain `Vec<u8>`. This is what makes the buffer's
+/// pixel content reachable from THREE independent places that must all observe the same bytes:
+/// the guest's own later `mmap()` of the `MAP_DUMB` offset (see `sys_mmap`'s DRI-fd branch), and
+/// (in a later pass) the host-side wgpu presentation code reading the flipped framebuffer's
+/// content directly, with no explicit copy between guest writes and host reads.
+struct DumbBuffer<Platform: ShimPlatform> {
     width: u32,
     height: u32,
     bpp: u32,
     pitch: u32,
-    /// Real, correctly-sized pixel storage. Not yet reachable via `mmap()` -- see this module's
-    /// doc comment.
-    storage: alloc::vec::Vec<u8>,
+    size: usize,
+    handle: Platform::SharedMemoryHandle,
     /// The fake `mmap` offset handed out by `DRM_IOCTL_MODE_MAP_DUMB`, if this buffer has been
     /// mapped at least once. Real DRM hands out a fresh, unique fake offset per `MAP_DUMB` call
     /// on the same handle; this device reuses the first one issued, which every real client
@@ -122,7 +130,7 @@ pub(crate) struct DrmSubsystem<Platform: ShimPlatform> {
     next_buffer_handle: AtomicU32,
     next_fb_id: AtomicU32,
     next_map_offset: AtomicU32,
-    buffers: litebox::sync::Mutex<Platform, BTreeMap<u32, DumbBuffer>>,
+    buffers: litebox::sync::Mutex<Platform, BTreeMap<u32, DumbBuffer<Platform>>>,
     framebuffers: litebox::sync::Mutex<Platform, BTreeMap<u32, Framebuffer>>,
     /// The framebuffer currently attached to the virtual CRTC (via `SETCRTC` or `PAGE_FLIP`),
     /// `None` until the guest sets one.
@@ -279,7 +287,11 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         Ok(0)
     }
 
-    pub(crate) fn create_dumb(&self, ptr: UserPtrMut<DrmModeCreateDumb>) -> Result<u32, Errno> {
+    pub(crate) fn create_dumb(
+        &self,
+        platform: &Platform,
+        ptr: UserPtrMut<DrmModeCreateDumb>,
+    ) -> Result<u32, Errno> {
         let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         if req.width == 0 || req.height == 0 || req.bpp == 0 || req.flags != 0 {
             return Err(Errno::EINVAL);
@@ -294,6 +306,14 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         let Ok(size_usize) = usize::try_from(size) else {
             return Err(Errno::ENOMEM);
         };
+        // Real shared-memory objects are only ever mapped/committed in whole pages; round the
+        // requested buffer size up so the later `mmap()` bridge (see `sys_mmap`'s DRI-fd branch)
+        // can map an exact whole-page range covering the buffer without any pages spilling past
+        // the object's own real size.
+        let page_aligned_size = size_usize.next_multiple_of(PAGE_SIZE);
+        let shared_handle = platform
+            .create_shared_memory(page_aligned_size)
+            .map_err(|_| Errno::ENOMEM)?;
         let handle = self.next_buffer_handle.fetch_add(1, Ordering::Relaxed);
         self.buffers.lock().insert(
             handle,
@@ -302,7 +322,8 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
                 height: req.height,
                 bpp: req.bpp,
                 pitch,
-                storage: alloc::vec![0u8; size_usize],
+                size: size_usize,
+                handle: shared_handle,
                 map_offset: None,
             },
         );
@@ -330,13 +351,22 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         Ok(0)
     }
 
-    pub(crate) fn destroy_dumb(&self, ptr: UserPtr<DrmModeDestroyDumb>) -> Result<u32, Errno> {
+    pub(crate) fn destroy_dumb(
+        &self,
+        platform: &Platform,
+        ptr: UserPtr<DrmModeDestroyDumb>,
+    ) -> Result<u32, Errno> {
         let req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         let mut buffers = self.buffers.lock();
-        if buffers.remove(&req.handle).is_none() {
+        let Some(buffer) = buffers.remove(&req.handle) else {
             return Err(Errno::ENOENT);
-        }
+        };
         drop(buffers);
+        // Best-effort: `close_shared_memory` is refcounted (see its own doc comment) and the
+        // buffer's storage is real host memory that must eventually be released, but a real
+        // Linux `DRM_IOCTL_MODE_DESTROY_DUMB` itself has no failure mode userspace can act on
+        // either -- match that by not surfacing a platform-level close failure as an ioctl error.
+        let _ = platform.close_shared_memory(buffer.handle);
         // A destroyed buffer's framebuffers become dangling references in real Linux too (the
         // kernel does not auto-remove a framebuffer when its backing buffer is destroyed;
         // userspace is responsible for removing the framebuffer first via
@@ -385,18 +415,27 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         // real and immediate; only the asynchronous completion NOTIFICATION is stubbed.
         Ok(0)
     }
-}
 
-/// Suppress unused-field warnings for state genuinely written but not yet read anywhere (the
-/// buffer dimensions/pitch and framebuffer format, tracked correctly now so the follow-up
-/// mmap-bridge and wgpu-presentation work has real data to read from, but not consumed by
-/// anything in this pass).
-#[allow(dead_code)]
-impl DumbBuffer {
-    fn dimensions(&self) -> (u32, u32, u32, u32) {
-        (self.width, self.height, self.bpp, self.pitch)
+    /// Look up a dumb buffer by the fake `mmap` offset a prior `MAP_DUMB` call handed out for
+    /// it, for `sys_mmap`'s DRI-fd branch to resolve a guest's own `mmap(fd, ..., offset)` call
+    /// against. Returns the buffer's real shared-memory handle and its exact byte size (NOT the
+    /// page-rounded allocation size -- the caller rounds up itself, matching how `create_dumb`
+    /// already rounds the underlying `create_shared_memory` request).
+    pub(crate) fn lookup_by_map_offset(
+        &self,
+        offset: u64,
+    ) -> Option<(Platform::SharedMemoryHandle, usize)> {
+        self.buffers
+            .lock()
+            .values()
+            .find(|b| b.map_offset == Some(offset))
+            .map(|b| (b.handle, b.size))
     }
 }
+
+/// Suppress an unused-field warning for state genuinely written but not yet read anywhere (the
+/// framebuffer format, tracked correctly now so the follow-up wgpu-presentation work has real
+/// data to read from, but not consumed by anything in this pass).
 #[allow(dead_code)]
 impl Framebuffer {
     fn info(&self) -> (u32, u32, u32, u32) {

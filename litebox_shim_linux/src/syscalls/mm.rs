@@ -350,6 +350,83 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         )
     }
 
+    /// If `fd` is a DRM device fd and `offset` is a fake offset a prior `DRM_IOCTL_MODE_MAP_DUMB`
+    /// call handed out, map the guest's requested range directly onto that dumb buffer's real
+    /// (host-backed) storage and return `Some(result)`. Returns `None` for any other `fd` (not a
+    /// DRI device, or a DRI device but `offset` doesn't match any known dumb buffer -- e.g. a
+    /// client's own bug, or an offset from a buffer already destroyed), so the caller falls
+    /// through to the ordinary file-backed-mapping path (which will itself reject it -- there is
+    /// nothing else valid to mmap a DRM fd at).
+    fn try_dri_dumb_buffer_mmap(
+        &self,
+        addr: usize,
+        len: usize,
+        prot: &ProtFlags,
+        flags: &MapFlags,
+        fd: i32,
+        offset: usize,
+    ) -> Option<Result<UserPtrMut<u8>, MappingError>> {
+        let raw_fd = u32::try_from(fd).ok().map(|v| v as usize)?;
+        let files = self.files.borrow();
+        let is_dri = files
+            .run_on_raw_fd(
+                raw_fd,
+                |typed_fd| self.is_dri_device(&files.fs, typed_fd).unwrap_or(false),
+                |_| false,
+                |_| false,
+                |_| false,
+                |_| false,
+                |_| false,
+                |_| false,
+            )
+            .unwrap_or(false);
+        if !is_dri {
+            return None;
+        }
+        let (shared_handle, buffer_size) = self
+            .global
+            .drm
+            .lookup_by_map_offset(offset as u64)?;
+        let aligned_len = align_up(len, PAGE_SIZE);
+        if aligned_len > buffer_size.next_multiple_of(PAGE_SIZE) {
+            // Guest asked to map more than the buffer actually holds -- real Linux rejects an
+            // out-of-range dumb-buffer mmap the same way (`SIGBUS`-on-access territory otherwise).
+            return Some(Err(MappingError::UnAligned));
+        }
+        let suggested_addr = if addr == 0 { None } else { Some(addr) };
+        let create_flags = {
+            let mut f = litebox::mm::linux::CreatePagesFlags::empty();
+            f.set(
+                litebox::mm::linux::CreatePagesFlags::FIXED_ADDR,
+                flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE),
+            );
+            f.set(
+                litebox::mm::linux::CreatePagesFlags::NOREPLACE,
+                flags.contains(MapFlags::MAP_FIXED_NOREPLACE),
+            );
+            f
+        };
+        let suggested_addr = match suggested_addr {
+            Some(a) => match litebox::mm::linux::NonZeroAddress::new(a) {
+                Some(n) => Some(n),
+                None => return Some(Err(MappingError::UnAligned)),
+            },
+            None => None,
+        };
+        let Some(length) = litebox::mm::linux::NonZeroPageSize::new(aligned_len) else {
+            return Some(Err(MappingError::UnAligned));
+        };
+        let _ = prot;
+        Some(
+            unsafe {
+                self.process()
+                    .pm
+                    .map_existing_shared_pages(suggested_addr, length, create_flags, shared_handle)
+            }
+            .map(UserPtrMut::from_platform_ptr::<Platform>),
+        )
+    }
+
     /// Handle syscall `mmap`
     pub(crate) fn sys_mmap(
         &self,
@@ -363,6 +440,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // check alignment
         if !offset.is_multiple_of(PAGE_SIZE) || !addr.is_multiple_of(PAGE_SIZE) || len == 0 {
             return Err(Errno::EINVAL);
+        }
+
+        // A DRM dumb-buffer `mmap()` (real clients always use `MAP_SHARED | PROT_WRITE` here --
+        // they need their pixel writes to reach the buffer the kernel/scanout also reads) is
+        // checked and resolved BEFORE the generic `MAP_SHARED|PROT_WRITE`-on-a-file rejection
+        // just below: unlike an ordinary file, a DRM device's `mmap()` has always genuinely
+        // supported writable shared mappings in real Linux (that rejection describes an actual
+        // limitation of THIS shim's generic file-backed-mapping path, not of DRM specifically).
+        if !flags.contains(MapFlags::MAP_ANONYMOUS)
+            && let Some(result) =
+                self.try_dri_dumb_buffer_mmap(addr, len, &prot, &flags, fd, offset)
+        {
+            return result.map_err(Errno::from);
         }
 
         // MAP_SHARED is partially supported:
