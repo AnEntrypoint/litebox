@@ -804,6 +804,33 @@ pub const DRM_IOCTL_GET_CAP: u32 = 0xC010_640C;
 pub const DRM_IOCTL_SET_MASTER: u32 = 0x0000_641E;
 /// `DRM_IOCTL_DROP_MASTER = DRM_IO(0x1f)`.
 pub const DRM_IOCTL_DROP_MASTER: u32 = 0x0000_641F;
+/// `DRM_IOCTL_MODE_GETPROPERTY = DRM_IOWR(0xaa, struct drm_mode_get_property)`, `size=64`
+/// (`nr`/struct shape fetched live from the real kernel `drm.h`; size independently re-verified
+/// via a standalone `size_of::<DrmModeGetProperty>()` compile: two `u64`s, two `u32`s, a 32-byte
+/// `name` array, two more `u32`s = 64 bytes exactly, no padding needed on the LP64 ABI litebox
+/// targets). Real libdrm's `drmModeObjectGetProperties` calls this once per property ID returned
+/// by `DRM_IOCTL_MODE_OBJ_GETPROPERTIES` to resolve each one's name/values -- this device reports
+/// zero properties from `OBJ_GETPROPERTIES` (see that ioctl's own doc comment), so no real client
+/// following the standard `OBJ_GETPROPERTIES` -> per-ID `GETPROPERTY` sequence will ever actually
+/// invoke this one; implemented anyway so a client that calls it directly with an unknown ID gets
+/// a real `ENOENT`, not an `ENOTTY` (unrecognized ioctl) that would look like a missing driver.
+pub const DRM_IOCTL_MODE_GETPROPERTY: u32 = 0xC040_64AA;
+/// `DRM_IOCTL_MODE_OBJ_GETPROPERTIES = DRM_IOWR(0xb9, struct drm_mode_obj_get_properties)`,
+/// `size=32` (three `u64`-then-`u32`-then-`u32`-then-`u32` fields -- `size_of::<
+/// DrmModeObjGetProperties>()` independently re-verified the same way as [`DRM_IOCTL_MODE_GETPROPERTY`]
+/// above). The gap this closes: a real libdrm client (confirmed live via `smithay`'s
+/// `backend_drm`, `docs/wayland-drm-backend-probe/`) calls this on the connector object
+/// immediately after `GETCONNECTOR` -- with this ioctl entirely unimplemented, that call fell
+/// through to `ENOTTY`/`EINVAL` and `DrmDevice::new` failed outright before any further DRM work
+/// (dumb buffers, page-flip) could even be attempted, regardless of how correct the rest of this
+/// device's ioctl coverage is.
+pub const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u32 = 0xC020_64B9;
+/// `DRM_MODE_OBJECT_CONNECTOR` -- the `obj_type` a real client passes when asking
+/// `DRM_IOCTL_MODE_OBJ_GETPROPERTIES` about a connector (as opposed to a CRTC, encoder, or
+/// plane). This device only tracks connector-object property queries today (the only object type
+/// [`DRM_IOCTL_MODE_OBJ_GETPROPERTIES`]'s real-world callers actually query on this device's
+/// current ioctl surface).
+pub const DRM_MODE_OBJECT_CONNECTOR: u32 = 0xc0c0_c0c0;
 /// `DRM_CAP_DUMB_BUFFER` -- the one capability this device's `DRM_IOCTL_GET_CAP` genuinely
 /// supports (see [`DrmGetCap`]'s doc comment).
 pub const DRM_CAP_DUMB_BUFFER: u64 = 0x1;
@@ -994,6 +1021,42 @@ pub struct DrmModeSetPlane {
     pub src_y: u32,
     pub src_h: u32,
     pub src_w: u32,
+}
+
+/// `struct drm_mode_obj_get_properties` (`DRM_IOCTL_MODE_OBJ_GETPROPERTIES`). This device reports
+/// `count_props = 0` unconditionally for the connector object (see `DrmSubsystem::obj_get_properties`)
+/// -- it has no dynamic KMS properties (no DPMS, no EDID blob, no rotation, none of the real
+/// per-connector property set a hardware driver would register) -- matching the real kernel's own
+/// behavior for an object with a genuinely empty property list, which is a normal, well-defined
+/// response real libdrm clients (including `smithay`'s `backend_drm`) handle without error, not a
+/// truncation or a fabricated answer.
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmModeObjGetProperties {
+    pub props_ptr: u64,
+    pub prop_values_ptr: u64,
+    pub count_props: u32,
+    pub obj_id: u32,
+    pub obj_type: u32,
+    /// Compiler-inserted trailing padding (28 bytes of real fields, rounded up to the next
+    /// 8-byte-aligned multiple) -- see [`DrmModeFbCmd2`]'s `_pad` field doc comment for why this
+    /// is made explicit rather than left implicit.
+    _pad: u32,
+}
+
+/// `struct drm_mode_get_property` (`DRM_IOCTL_MODE_GETPROPERTY`). See
+/// [`DRM_IOCTL_MODE_GETPROPERTY`]'s own doc comment for why this device's `OBJ_GETPROPERTIES`
+/// returning zero properties means no real client actually reaches this ioctl in practice.
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmModeGetProperty {
+    pub values_ptr: u64,
+    pub enum_blob_ptr: u64,
+    pub prop_id: u32,
+    pub flags: u32,
+    pub name: [u8; 32],
+    pub count_values: u32,
+    pub count_enum_blobs: u32,
 }
 
 /// `struct drm_version` (`DRM_IOCTL_VERSION`) -- the two-call size-probe pattern applies to the
@@ -1286,6 +1349,12 @@ pub enum IoctlArg {
     DrmSetMaster,
     /// `DRM_IOCTL_DROP_MASTER`.
     DrmDropMaster,
+    /// `DRM_IOCTL_MODE_OBJ_GETPROPERTIES` -- enumerate a KMS object's properties (two-call
+    /// size-probe pattern for `props_ptr`/`prop_values_ptr`, same shape as `get_resources`'s
+    /// object-ID arrays).
+    DrmModeObjGetProperties(UserPtrMut<DrmModeObjGetProperties>),
+    /// `DRM_IOCTL_MODE_GETPROPERTY` -- resolve a single property ID's name/values.
+    DrmModeGetProperty(UserPtrMut<DrmModeGetProperty>),
     Raw {
         cmd: u32,
         arg: UserPtrMut<u8>,
@@ -3293,6 +3362,12 @@ impl SyscallRequest {
                         DRM_IOCTL_GET_CAP => IoctlArg::DrmGetCap(ctx.sys_req_ptr(2)),
                         DRM_IOCTL_SET_MASTER => IoctlArg::DrmSetMaster,
                         DRM_IOCTL_DROP_MASTER => IoctlArg::DrmDropMaster,
+                        DRM_IOCTL_MODE_OBJ_GETPROPERTIES => {
+                            IoctlArg::DrmModeObjGetProperties(ctx.sys_req_ptr(2))
+                        }
+                        DRM_IOCTL_MODE_GETPROPERTY => {
+                            IoctlArg::DrmModeGetProperty(ctx.sys_req_ptr(2))
+                        }
                         _ => IoctlArg::Raw {
                             cmd,
                             arg: ctx.sys_req_ptr(2),

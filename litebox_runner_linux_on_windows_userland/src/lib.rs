@@ -317,7 +317,24 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         // on the main thread without blocking on the presenter thread's own startup.
         let (sender_tx, sender_rx) = std::sync::mpsc::channel();
         let input_shim = shim.clone();
-        let handle = std::thread::spawn(move || {
+        // Default `std::thread::spawn` stack (1 MiB on Windows) is not enough headroom for this
+        // thread's real work: `Presenter::new()`/`resumed()` create a real Win32 window plus a
+        // wgpu `Instance`/`Adapter`/`Device`/`Surface`, and `Presenter::run` then drives winit's
+        // event loop for the window's whole lifetime -- confirmed live as the actual overflowing
+        // thread (a genuine SEH stack-overflow crash reproduced with a real guest DRM client,
+        // `docs/wayland-drm-backend-probe/`, only with `--gui` set; the guest-execution thread
+        // itself was ruled out first by reproducing successfully with `--gui` OMITTED). This is a
+        // debug-build-specific cost (wgpu/winit's own deep, heavily-monomorphized generic call
+        // chains are dramatically more stack-hungry unoptimized -- confirmed live: a `--release`
+        // build never overflows even at 8 MiB, run repeatedly; a `dev` build still intermittently
+        // overflowed at 64 MiB before this larger budget), not an unbounded-growth bug -- 256 MiB
+        // is a deliberately generous fixed ceiling for a single always-present background thread,
+        // not a per-guest or per-frame cost that could ever compound.
+        const PRESENTER_THREAD_STACK_SIZE: usize = 256 * 1024 * 1024;
+        let handle = std::thread::Builder::new()
+            .name("litebox-gui-presenter".to_owned())
+            .stack_size(PRESENTER_THREAD_STACK_SIZE)
+            .spawn(move || {
             let mut presenter =
                 match litebox_platform_windows_userland::presentation::Presenter::new() {
                     Ok(p) => p,
@@ -342,7 +359,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             if let Err(e) = presenter.run() {
                 litebox_util_log::warn!(error:? = e; "GUI presenter event loop exited with an error");
             }
-        });
+        })
+            .expect("failed to spawn GUI presenter thread");
         if let Ok(sender) = sender_rx.recv() {
             shim.set_drm_flip_callback(move |bytes, width, height, pitch, _pixel_format| {
                 sender.send(litebox_platform_windows_userland::presentation::Frame {
