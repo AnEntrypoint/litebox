@@ -2910,6 +2910,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    /// Whether `fd` refers to a DRM device node (`/dev/dri/card0`/`renderD128`, major 226 --
+    /// see `litebox::fs::devices::DriDevice`'s node-info constants), mirroring [`Self::is_stdio`]'s
+    /// major-number check.
+    fn is_dri_device(&self, fs: &FS, fd: &TypedFd<FS>) -> Result<bool, Errno> {
+        match fs.fd_file_status(fd) {
+            Ok(status) => {
+                let major = status.node_info.rdev.map_or(0, |v| v.get() >> 8);
+                Ok(major == 226 && status.file_type == litebox::fs::FileType::CharacterDevice)
+            }
+            Err(litebox::fs::errors::FileStatusError::ClosedFd) => Err(Errno::EBADF),
+            Err(_) => unimplemented!(),
+        }
+    }
+
     /// Handle syscall `ioctl`
     pub fn sys_ioctl(&self, fd: i32, arg: IoctlArg) -> Result<u32, Errno> {
         let Ok(desc) = u32::try_from(fd).and_then(usize::try_from) else {
@@ -3137,10 +3151,53 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     handle.with_entry(|end| self.pty_ioctl(end, &arg))
                 },
             )?,
+            IoctlArg::DrmModeGetResources(..)
+            | IoctlArg::DrmModeGetCrtc(..)
+            | IoctlArg::DrmModeSetCrtc(..)
+            | IoctlArg::DrmModeGetEncoder(..)
+            | IoctlArg::DrmModeGetConnector(..)
+            | IoctlArg::DrmModeCreateDumb(..)
+            | IoctlArg::DrmModeMapDumb(..)
+            | IoctlArg::DrmModeDestroyDumb(..)
+            | IoctlArg::DrmModeAddFb2(..)
+            | IoctlArg::DrmModePageFlip(..) => files.run_on_raw_fd(
+                desc,
+                |fd| {
+                    if self.is_dri_device(&files.fs, fd)? {
+                        self.drm_ioctl(&arg)
+                    } else {
+                        Err(Errno::ENOTTY)
+                    }
+                },
+                |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
+            )?,
             _ => {
                 log_unsupported!("ioctl with arg {:?}", arg);
                 Err(Errno::EINVAL)
             }
+        }
+    }
+
+    /// Dispatch a `DRM_IOCTL_MODE_*` request (already confirmed to target a real DRI device fd
+    /// by the caller) to the shim-wide [`crate::syscalls::drm::DrmSubsystem`].
+    fn drm_ioctl(&self, arg: &IoctlArg) -> Result<u32, Errno> {
+        match arg {
+            IoctlArg::DrmModeGetResources(ptr) => self.global.drm.get_resources(*ptr),
+            IoctlArg::DrmModeGetCrtc(ptr) => self.global.drm.get_crtc(*ptr),
+            IoctlArg::DrmModeSetCrtc(ptr) => self.global.drm.set_crtc(*ptr),
+            IoctlArg::DrmModeGetEncoder(ptr) => self.global.drm.get_encoder(*ptr),
+            IoctlArg::DrmModeGetConnector(ptr) => self.global.drm.get_connector(*ptr),
+            IoctlArg::DrmModeCreateDumb(ptr) => self.global.drm.create_dumb(*ptr),
+            IoctlArg::DrmModeMapDumb(ptr) => self.global.drm.map_dumb(*ptr),
+            IoctlArg::DrmModeDestroyDumb(ptr) => self.global.drm.destroy_dumb(*ptr),
+            IoctlArg::DrmModeAddFb2(ptr) => self.global.drm.add_fb2(*ptr),
+            IoctlArg::DrmModePageFlip(ptr) => self.global.drm.page_flip(*ptr),
+            _ => unreachable!("drm_ioctl called with a non-DRM IoctlArg"),
         }
     }
 

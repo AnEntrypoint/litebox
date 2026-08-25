@@ -3,6 +3,7 @@
 
 //! Syscalls Handlers
 
+pub(crate) mod drm;
 pub(crate) mod epoll;
 pub(crate) mod eventfd;
 pub mod file;
