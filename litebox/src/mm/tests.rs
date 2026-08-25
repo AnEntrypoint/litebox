@@ -92,7 +92,7 @@ fn collect_mappings(vmm: &Vmem<DummyVmemBackend, PAGE_SIZE>) -> Vec<Range<usize>
 
 #[test]
 fn test_vmm_mapping() {
-    let start_addr: usize = 0x1_0000;
+    let start_addr: usize = DummyVmemBackend::TASK_ADDR_MIN;
     let range = PageRange::new(start_addr, start_addr + 12 * PAGE_SIZE).unwrap();
     let mut vmm = Vmem::new(&DummyVmemBackend);
 
