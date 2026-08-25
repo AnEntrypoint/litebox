@@ -228,7 +228,19 @@ pub unsafe fn jit_write_protect(executable: bool) {
 /// [`litebox::platform::PageManagementProvider::TASK_ADDR_MAX`] below (which
 /// can't reference this directly: it's an associated const on a trait
 /// generic over `ALIGN`, not reachable from the free function).
-const TASK_ADDR_MAX: usize = 0x0000_4000_0000_0000;
+///
+/// A 1 GiB safety margin is subtracted from the round 64 TiB figure: a
+/// mapping placed exactly at the ceiling (the top-down search's fast path
+/// naturally does this once nothing above `TASK_ADDR_MAX` is tracked as
+/// reserved -- see `read_memory_maps`) leaves a hint-based (non-`MAP_FIXED`)
+/// hand-off to a real Darwin `mmap` call, e.g. `fork()`'s shared-memory
+/// re-mapping, no room to round or pad the returned address even slightly
+/// without exceeding `TASK_ADDR_MAX` and tripping `insert_mapping`'s own
+/// `new_end <= TASK_ADDR_MAX` invariant (observed live: a `MAP_SHARED`
+/// mapping placed at the exact top-down ceiling in the parent, then
+/// hint-remapped during `Vmem::duplicate`, landed one page above it in the
+/// child).
+const TASK_ADDR_MAX: usize = 0x0000_4000_0000_0000 - 0x4000_0000;
 
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for MacOsUserland {
     /// The first 4 GiB of an arm64 Mach-O process is the `__PAGEZERO` segment:
