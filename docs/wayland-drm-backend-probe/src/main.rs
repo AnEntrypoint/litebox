@@ -25,21 +25,27 @@
 //! **Verification status (live-tested, not assumed)**: compiles AND links cleanly for
 //! `x86_64-unknown-linux-musl` (same zig-based recipe as phase 1.5, see `README.md`) -- a real
 //! statically-linked ELF64 binary. Run as a real guest process under
-//! `litebox_runner_linux_on_windows_userland.exe` (no client connected yet), it genuinely binds
-//! the Unix socket and prints `LISTENING path=/tmp/litebox-wayland-0` -- but then hits a REAL,
-//! previously-undiscovered litebox gap before any client can connect: `calloop`'s epoll backend
-//! registers an epoll fd as a member of another epoll set (nested `epoll_ctl(EPOLL_CTL_ADD)` on
-//! an epoll fd), which `litebox_shim_linux::syscalls::epoll::EpollDescriptor::poll`'s
-//! `EpollDescriptor::Epoll(_file) => unimplemented!()` arm panics on outright (confirmed via a
-//! live backtrace: `EpollEntry::poll` -> `DescriptorRef::Epoll`'s `file.poll(...)` -> that exact
-//! `unimplemented!()`). This is real, non-trivial work (correct nested-epoll semantics need
-//! recursive readiness aggregation across the inner epoll set's own members, with correct
-//! observer/wakeup propagation up through the outer epoll -- touches shared polling machinery
-//! every other litebox subsystem also depends on) -- NOT attempted as a rushed fix in this pass.
-//! Client-connect and pixel-commit verification (this file's actual `Compositor::commit`/
-//! `push_to_drm_dumb_buffer` logic) therefore remain unexercised against a real guest run until
-//! nested epoll support lands; see PRD row `gui-wayland-compositor-on-drm-future` for the
-//! concrete next step this blocks.
+//! `litebox_runner_linux_on_windows_userland.exe`, it genuinely binds the Unix socket and prints
+//! `LISTENING path=/tmp/litebox-wayland-0` -- and previously hit a REAL, previously-undiscovered
+//! litebox gap right after: `calloop`'s epoll backend registers an epoll fd as a member of another
+//! epoll set (nested `epoll_ctl(EPOLL_CTL_ADD)` on an epoll fd), which
+//! `litebox_shim_linux::syscalls::epoll::EpollDescriptor::poll`'s `EpollDescriptor::Epoll(_file)
+//! => unimplemented!()` arm panicked on outright.
+//!
+//! **Nested-epoll support has since landed and been live-verified against this exact probe**
+//! (`litebox_shim_linux::syscalls::epoll`'s `EpollFile` now implements `IOPollable` -- readiness
+//! delegates to the inner epoll's own `ready` set, which is exactly what a direct `epoll_wait`
+//! caller already polls, so an outer epoll registering an observer there gets woken by precisely
+//! the same `ReadySet::push`/`notify_observers` call a direct waiter would; no separate readiness
+//! or wakeup machinery needed). Re-running this exact probe now prints `LISTENING` -> `RUNNING`
+//! (the line that immediately follows registering the nested-epoll `calloop` source -- previously
+//! unreachable) and runs its full 30-second `event_loop.dispatch()` loop (repeatedly exercising
+//! the nested-epoll `poll()` path) with zero panic, correctly printing
+//! `NO_CLIENT_COMMIT_WITHIN_TIMEOUT` and exiting 1 once no real client connects within the bound
+//! -- exactly the expected outcome with no Wayland client available in this environment to
+//! connect. Client-connect and pixel-commit verification (this file's actual `Compositor::commit`/
+//! `push_to_drm_dumb_buffer` logic) remain the concrete next step for whoever has a real Wayland
+//! client to test against; see PRD row `gui-wayland-compositor-on-drm-future`.
 
 use std::sync::Arc;
 
