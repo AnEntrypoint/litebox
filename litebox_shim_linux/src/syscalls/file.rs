@@ -835,6 +835,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     if is_nonblocking_stdin && !self.global.platform.stdin_ready() {
                         return Err(Errno::EAGAIN);
                     }
+                    // A DRM device fd's `read()` delivers queued page-flip/vblank completion
+                    // events (`struct drm_event`-prefixed), never raw pixel bytes -- the
+                    // filesystem backend's own `read` (`litebox::fs::devices::DriDevices`)
+                    // deliberately rejects every read outright, since it has no reach into
+                    // `DrmSubsystem`'s event queue (a higher-crate-layer state, `litebox` cannot
+                    // depend on `litebox_shim_linux`). Intercept here instead, the same layer
+                    // that already special-cases DRI-fd `ioctl`/`mmap`.
+                    if self.is_dri_device(&files.fs, fd)? {
+                        let Some(event_bytes) = self.global.drm.pop_flip_event_bytes() else {
+                            // Real Linux blocks here until an event arrives; this device
+                            // completes every flip synchronously inside the PAGE_FLIP ioctl
+                            // itself (see `DrmSubsystem::page_flip`'s doc comment), so by the
+                            // time a client reads for a flip it requested, the event is already
+                            // queued -- an empty queue here means no flip was ever requested with
+                            // `DRM_MODE_PAGE_FLIP_EVENT`, which is a genuine client bug (blocking
+                            // for an event that will never come), not a timing race this device
+                            // needs to actually wait out. Fail fast with `EAGAIN` rather than
+                            // hanging the guest forever.
+                            return Err(Errno::EAGAIN);
+                        };
+                        let mut out = buf.borrow_mut();
+                        let n = event_bytes.len().min(out.len());
+                        out[..n].copy_from_slice(&event_bytes[..n]);
+                        return Ok(n);
+                    }
                     files
                         .fs
                         .read(fd, &mut buf.borrow_mut(), offset)

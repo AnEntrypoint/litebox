@@ -36,15 +36,17 @@
 //! - **wgpu-backed host presentation**: out of scope for this pass entirely (a separate PRD
 //!   row); no pixels drawn by a guest client are yet visible anywhere on the host.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use litebox::mm::linux::PAGE_SIZE;
 use litebox_common_linux::{
-    DRM_MODE_CONNECTOR_VIRTUAL, DRM_MODE_ENCODER_VIRTUAL, DrmModeCardRes, DrmModeCrtc,
+    DRM_EVENT_FLIP_COMPLETE, DRM_MODE_CONNECTOR_VIRTUAL, DRM_MODE_ENCODER_VIRTUAL,
+    DRM_MODE_PAGE_FLIP_EVENT, DrmEvent, DrmEventVblank, DrmModeCardRes, DrmModeCrtc,
     DrmModeCrtcPageFlip, DrmModeCreateDumb, DrmModeDestroyDumb, DrmModeFbCmd2, DrmModeGetConnector,
     DrmModeGetEncoder, DrmModeMapDumb, DrmModeModeinfo, errno::Errno,
 };
+use zerocopy::IntoBytes;
 
 use crate::{ShimPlatform, UserPtr, UserPtrMut};
 
@@ -135,6 +137,18 @@ pub(crate) struct DrmSubsystem<Platform: ShimPlatform> {
     /// The framebuffer currently attached to the virtual CRTC (via `SETCRTC` or `PAGE_FLIP`),
     /// `None` until the guest sets one.
     crtc_fb: litebox::sync::Mutex<Platform, Option<u32>>,
+    /// Completed-but-not-yet-`read()` page-flip events, in completion order -- popped one at a
+    /// time by `read()` on the DRM device fd (see `litebox_shim_linux::syscalls::file::do_read`'s
+    /// DRI-fd branch). Only ever grows from [`Self::page_flip`] when the guest requested
+    /// `DRM_MODE_PAGE_FLIP_EVENT`; this device completes every flip immediately (no real vsync
+    /// timing -- see this module's doc comment), so an event is always ready by the time a client
+    /// gets around to reading for it.
+    pending_flip_events: litebox::sync::Mutex<Platform, VecDeque<DrmEventVblank>>,
+    /// Monotonically increasing vblank sequence number, echoed into each flip-completion event's
+    /// `sequence` field -- real clients that track it purely to detect drops/reordering see a
+    /// plain incrementing counter, matching real Linux's own semantics closely enough for that
+    /// use even though this device has no real vblank interrupt driving it.
+    next_vblank_sequence: AtomicU32,
 }
 
 impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
@@ -149,7 +163,22 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             buffers: litebox::sync::Mutex::new(BTreeMap::new()),
             framebuffers: litebox::sync::Mutex::new(BTreeMap::new()),
             crtc_fb: litebox::sync::Mutex::new(None),
+            pending_flip_events: litebox::sync::Mutex::new(VecDeque::new()),
+            next_vblank_sequence: AtomicU32::new(0),
         }
+    }
+
+    /// Pop the oldest pending flip-completion event, if any, encoded as the exact bytes a real
+    /// `read()` on a DRM device fd would return (a [`DrmEvent`] header immediately followed by
+    /// its [`DrmEventVblank`] body -- real DRM's `read()` contract, one or more whole events per
+    /// call, never a partial one). `None` means no event is pending -- the caller (see
+    /// `syscalls::file::do_read`'s DRI-fd branch) is responsible for real Linux's actual
+    /// `read()`-with-nothing-pending behavior (blocks, or `EAGAIN` if the fd is non-blocking).
+    pub(crate) fn pop_flip_event_bytes(&self) -> Option<alloc::vec::Vec<u8>> {
+        let event = self.pending_flip_events.lock().pop_front()?;
+        let mut bytes = alloc::vec::Vec::with_capacity(size_of::<DrmEventVblank>());
+        bytes.extend_from_slice(event.as_bytes());
+        Some(bytes)
     }
 
     pub(crate) fn get_resources(&self, ptr: UserPtrMut<DrmModeCardRes>) -> Result<u32, Errno> {
@@ -410,9 +439,27 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             return Err(Errno::ENOENT);
         }
         *self.crtc_fb.lock() = Some(req.fb_id);
-        // See this module's doc comment: a real `DRM_MODE_PAGE_FLIP_EVENT` completion event is
-        // not queued here. The flip itself (updating which framebuffer the CRTC scans out) is
-        // real and immediate; only the asynchronous completion NOTIFICATION is stubbed.
+        // This device has no real vsync/vblank interrupt to wait for, so the flip is complete
+        // (in the sense a client cares about -- the CRTC now scans out the new framebuffer) the
+        // instant this ioctl returns; if the guest asked to be told, queue the completion event
+        // immediately rather than modeling any real timing delay.
+        if req.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
+            let sequence = self.next_vblank_sequence.fetch_add(1, Ordering::Relaxed);
+            self.pending_flip_events.lock().push_back(DrmEventVblank {
+                base: DrmEvent {
+                    r#type: DRM_EVENT_FLIP_COMPLETE,
+                    length: size_of::<DrmEventVblank>() as u32,
+                },
+                user_data: req.user_data,
+                // No real host clock is consulted for a software-only device with no genuine
+                // timing to report; real clients that care about wall-clock accuracy here are
+                // querying actual monitor vblank timing, which does not exist for this device.
+                tv_sec: 0,
+                tv_usec: 0,
+                sequence,
+                crtc_id: VIRTUAL_CRTC_ID,
+            });
+        }
         Ok(0)
     }
 
