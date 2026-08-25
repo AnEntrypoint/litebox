@@ -574,7 +574,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         let out_of_range = |p: *mut libc::c_void| {
             let start = p as usize;
             let end = start.wrapping_add(suggested_range.len());
-            start < Self::TASK_ADDR_MIN || end > TASK_ADDR_MAX
+            start < <Self as litebox::platform::PageManagementProvider<ALIGN>>::TASK_ADDR_MIN
+                || end > TASK_ADDR_MAX
         };
         if fixed_address_behavior == FixedAddressBehavior::Hint && out_of_range(ptr) {
             // SAFETY: this is exactly the mapping `mmap` just created above.
