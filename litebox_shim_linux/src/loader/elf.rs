@@ -392,7 +392,13 @@ mod tests {
     const PT_INTERP: u32 = 3;
     const PF_X: u32 = 1;
     const PF_R: u32 = 4;
+    // Must be loadable as-is (an `ET_EXEC` binary can't be relocated), so this
+    // has to sit above `TASK_ADDR_MIN` on platforms where low addresses are
+    // reserved -- see `crate::loader::DEFAULT_LOW_ADDR`'s own doc comment.
+    #[cfg(not(target_vendor = "apple"))]
     const EXEC_LOAD_ADDR: u64 = 0x400000;
+    #[cfg(target_vendor = "apple")]
+    const EXEC_LOAD_ADDR: u64 = 0x1_0000_0000;
     const INTERP_PATH_OFFSET: usize = 0x200;
     const INTERP_PATH: &[u8] = b"/ld.so\0";
 
