@@ -730,6 +730,9 @@ fn default_fs<Platform: ShimPlatform>(
             .mount("/dev/dri", |allocator| {
                 litebox::fs::devices::DriDevices::new(litebox, allocator)
             })
+            .mount("/dev/input", |allocator| {
+                litebox::fs::devices::InputDevices::new(litebox, allocator)
+            })
             .build()
             .unwrap(),
     );
