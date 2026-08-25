@@ -631,24 +631,21 @@ impl<
         });
         let entry = {
             let mut root = self.root.write();
-            match root.entries.get(&path) {
-                Some(existing) => {
-                    let existing = Arc::clone(existing);
-                    // Safe to drop `root`'s lock before closing: `our_entry` was never published,
-                    // so no other thread can observe or hold a reference to its fd.
-                    drop(root);
-                    let EntryX::Lower { fd } = Arc::into_inner(our_entry)
-                        .expect("our_entry was never shared, so this must be its sole owner")
-                    else {
-                        unreachable!("our_entry was constructed as EntryX::Lower above")
-                    };
-                    self.lower.close(&fd).unwrap();
-                    existing
-                }
-                None => {
-                    root.entries.insert(path.clone(), Arc::clone(&our_entry));
-                    our_entry
-                }
+            if let Some(existing) = root.entries.get(&path) {
+                let existing = Arc::clone(existing);
+                // Safe to drop `root`'s lock before closing: `our_entry` was never published,
+                // so no other thread can observe or hold a reference to its fd.
+                drop(root);
+                let EntryX::Lower { fd } = Arc::into_inner(our_entry)
+                    .expect("our_entry was never shared, so this must be its sole owner")
+                else {
+                    unreachable!("our_entry was constructed as EntryX::Lower above")
+                };
+                self.lower.close(&fd).unwrap();
+                existing
+            } else {
+                root.entries.insert(path.clone(), Arc::clone(&our_entry));
+                our_entry
             }
         };
         let fd = self.litebox.descriptor_table_mut().insert(Descriptor {
