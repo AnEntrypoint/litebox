@@ -2224,6 +2224,9 @@ dependencies = [
  "litebox",
  "litebox_common_linux",
  "litebox_util_log",
+ "pollster",
+ "wgpu",
+ "winit",
  "zerocopy",
 ]
 
