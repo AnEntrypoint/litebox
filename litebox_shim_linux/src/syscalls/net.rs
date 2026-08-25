@@ -33,13 +33,39 @@ use litebox_common_linux::{
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::syscalls::unix::{CSockUnixAddr, UnixSocket, UnixSocketAddr};
+use crate::syscalls::unix::{AnyDupFd, AnyDupFds, CSockUnixAddr, UnixSocket, UnixSocketAddr};
 use crate::{GlobalState, ShimFS, ShimPlatform, Task};
 use crate::{UserPtr, UserPtrMut, syscalls::signal};
 
 /// Linux's hard cap on the number of iovecs per `*msg`-style call, and on the
 /// number of entries per `sendmmsg`. See `UIO_MAXIOV` in `<uapi/linux/uio.h>`.
 const UIO_MAXIOV: usize = 1024;
+
+/// `SOL_SOCKET` (verified against the real kernel `include/uapi/asm-generic/socket.h`).
+const SOL_SOCKET: i32 = 1;
+/// `SCM_RIGHTS`: "access rights (array of int)" (verified against the real kernel
+/// `include/linux/socket.h`).
+const SCM_RIGHTS: i32 = 0x01;
+
+/// Linux's `struct cmsghdr` (verified against the real kernel `include/linux/socket.h`):
+/// `{ size_t cmsg_len; int cmsg_level; int cmsg_type; }`, 16 bytes on a 64-bit target with no
+/// padding (`size_t`+`int`+`int` = 8+4+4, already 8-aligned) -- the variable-length payload
+/// follows immediately, itself padded up to the next 8-byte boundary before the next `cmsghdr`
+/// (`CMSG_ALIGN`, POSIX 1003.1g table 5-14).
+// Field names deliberately match the real kernel struct's own names verbatim (readability of the
+// C-ABI correspondence outweighs the shared-prefix lint here).
+#[allow(clippy::struct_field_names)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+struct CmsgHdr {
+    cmsg_len: usize,
+    cmsg_level: i32,
+    cmsg_type: i32,
+}
+const CMSG_ALIGN: usize = size_of::<usize>();
+fn cmsg_align(len: usize) -> usize {
+    (len + CMSG_ALIGN - 1) & !(CMSG_ALIGN - 1)
+}
 
 macro_rules! convert_flags {
     ($src:expr, $src_type:ty, $dst_type:ty, $($flag:ident),+ $(,)?) => {
@@ -1513,6 +1539,94 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let msg = msg.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         self.do_sendmsg(fd, &msg, flags)
     }
+    /// Parses `SCM_RIGHTS` cmsgs out of a raw `msg_control` byte buffer (already copied in from
+    /// user memory), resolving each donated raw fd via the same per-subsystem
+    /// [`crate::FilesState::run_on_raw_fd`] dispatch `dup()`/`fork()` already use, then
+    /// [`litebox::fd::Descriptors::duplicate`]-ing it into a fresh global-table entry the sender
+    /// no longer owns exclusively -- exactly `dup()`'s own primitive, giving the eventual
+    /// receiver (a different `Task`, possibly a different process, with its own separate raw fd
+    /// table) an independent reference to the SAME underlying open file description, matching
+    /// real Linux `SCM_RIGHTS` semantics. Any cmsg that isn't `SOL_SOCKET`/`SCM_RIGHTS` is
+    /// ignored (Linux itself only interprets a handful of `SOL_SOCKET`-level cmsg types; none of
+    /// the others litebox doesn't otherwise support are safety-relevant to reject outright).
+    fn resolve_scm_rights_fds(&self, control: &[u8]) -> Result<AnyDupFds<Platform, FS>, Errno> {
+        let mut fds = alloc::vec::Vec::new();
+        let mut offset = 0usize;
+        while offset + size_of::<CmsgHdr>() <= control.len() {
+            let hdr = CmsgHdr::read_from_bytes(&control[offset..offset + size_of::<CmsgHdr>()])
+                .map_err(|_| Errno::EINVAL)?;
+            if hdr.cmsg_len < size_of::<CmsgHdr>() || offset + hdr.cmsg_len > control.len() {
+                return Err(Errno::EINVAL);
+            }
+            let payload = &control[offset + size_of::<CmsgHdr>()..offset + hdr.cmsg_len];
+            if hdr.cmsg_level == SOL_SOCKET && hdr.cmsg_type == SCM_RIGHTS {
+                for raw_fd_bytes in payload.chunks_exact(size_of::<i32>()) {
+                    let raw_fd = i32::from_ne_bytes(raw_fd_bytes.try_into().unwrap());
+                    let raw_fd = usize::try_from(raw_fd).map_err(|_| Errno::EBADF)?;
+                    let files = self.files.borrow();
+                    let any = files
+                        .run_on_raw_fd(
+                            raw_fd,
+                            |fd| {
+                                self.global
+                                    .litebox
+                                    .descriptor_table_mut()
+                                    .duplicate(fd)
+                                    .map(AnyDupFd::Fs)
+                            },
+                            |fd| {
+                                self.global
+                                    .litebox
+                                    .descriptor_table_mut()
+                                    .duplicate(fd)
+                                    .map(AnyDupFd::Net)
+                            },
+                            |fd| {
+                                self.global
+                                    .litebox
+                                    .descriptor_table_mut()
+                                    .duplicate(fd)
+                                    .map(AnyDupFd::Pipes)
+                            },
+                            |fd| {
+                                self.global
+                                    .litebox
+                                    .descriptor_table_mut()
+                                    .duplicate(fd)
+                                    .map(AnyDupFd::Eventfd)
+                            },
+                            |fd| {
+                                self.global
+                                    .litebox
+                                    .descriptor_table_mut()
+                                    .duplicate(fd)
+                                    .map(AnyDupFd::Epoll)
+                            },
+                            |fd| {
+                                self.global
+                                    .litebox
+                                    .descriptor_table_mut()
+                                    .duplicate(fd)
+                                    .map(AnyDupFd::Unix)
+                            },
+                            |fd| {
+                                self.global
+                                    .litebox
+                                    .descriptor_table_mut()
+                                    .duplicate(fd)
+                                    .map(AnyDupFd::Pty)
+                            },
+                        )
+                        .map_err(|_| Errno::EBADF)?
+                        .ok_or(Errno::EBADF)?;
+                    fds.push(any);
+                }
+            }
+            offset += cmsg_align(hdr.cmsg_len);
+        }
+        Ok(fds)
+    }
+
     fn do_sendmsg(
         &self,
         sockfd: u32,
@@ -1528,10 +1642,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         } else {
             None
         };
-        if msg.msg_controllen != 0 {
-            log_unsupported!("ancillary data is not supported");
-            return Err(Errno::EINVAL);
-        }
+        let control = if msg.msg_controllen == 0 {
+            alloc::vec::Vec::new()
+        } else {
+            msg.msg_control
+                .to_owned_slice::<Platform>(msg.msg_controllen)
+                .ok_or(Errno::EFAULT)?
+                .into_vec()
+        };
         if msg.msg_iovlen > UIO_MAXIOV {
             return Err(Errno::EMSGSIZE);
         }
@@ -1548,6 +1666,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             &self.global,
             sockfd,
             |fd| {
+                if !control.is_empty() {
+                    log_unsupported!("ancillary data is not supported on non-Unix sockets");
+                    return Err(Errno::EINVAL);
+                }
                 let sock_addr = sock_addr
                     .clone()
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
@@ -1562,7 +1684,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
                 let data = copy_iovs_to_vec::<Platform>(iovs.as_deref().unwrap_or_default())?;
-                file.sendto(self, &data, flags, unix_addr)
+                let fds = self.resolve_scm_rights_fds(&control)?;
+                file.sendmsg(self, &data, flags, unix_addr, fds)
             },
         );
         if let Err(Errno::EPIPE) = res
@@ -1726,6 +1849,55 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(size)
     }
 
+    /// `do_recvfrom`'s own superset for `recvmsg`: also returns any `SCM_RIGHTS` fds delivered
+    /// alongside the bytes read (always empty for a non-Unix socket, which never carries them).
+    fn do_recvfrom_with_fds(
+        &self,
+        sockfd: u32,
+        buf: &mut [u8],
+        flags: ReceiveFlags,
+        source_addr: Option<&mut Option<SocketAddress>>,
+    ) -> Result<(usize, AnyDupFds<Platform, FS>), Errno> {
+        let want_source = source_addr.is_some();
+        let files = self.files.borrow();
+        let raw_fd = usize::try_from(sockfd).or(Err(Errno::EBADF))?;
+        let (size, addr, fds) = {
+            let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
+            files.with_socket(
+                &self.global,
+                raw_fd.trunc(),
+                |fd| {
+                    let mut addr = None;
+                    let size = self.global.receive(
+                        &self.wait_cx(),
+                        fd,
+                        &mut buf.borrow_mut(),
+                        flags,
+                        if want_source { Some(&mut addr) } else { None },
+                    )?;
+                    let src_addr = addr.map(SocketAddress::Inet);
+                    Ok((size, src_addr, alloc::vec::Vec::new()))
+                },
+                |entry| {
+                    let mut addr = None;
+                    let (size, fds) = entry.recvmsg(
+                        &self.wait_cx(),
+                        &mut buf.borrow_mut(),
+                        flags,
+                        if want_source { Some(&mut addr) } else { None },
+                    )?;
+                    let src_addr = addr.map(SocketAddress::Unix);
+                    Ok((size, src_addr, fds))
+                },
+            )?
+        };
+
+        if let (Some(source_addr), Some(addr)) = (source_addr, addr) {
+            *source_addr = Some(addr);
+        }
+        Ok((size, fds))
+    }
+
     /// Handle syscall `recvmsg`
     pub(crate) fn sys_recvmsg(
         &self,
@@ -1737,7 +1909,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EBADF);
         };
 
-        let supported_flags = ReceiveFlags::DONTWAIT | ReceiveFlags::TRUNC;
+        // CMSG_CLOEXEC is honored: do_recvmsg sets FD_CLOEXEC on every SCM_RIGHTS fd it delivers
+        // when this flag is present (see AnyDupFd::insert_into's own cloexec parameter).
+        let supported_flags =
+            ReceiveFlags::DONTWAIT | ReceiveFlags::TRUNC | ReceiveFlags::CMSG_CLOEXEC;
         if flags.intersects(supported_flags.complement()) {
             log_unsupported!("Unsupported recvmsg flags: {:?}", flags);
             return Err(Errno::EINVAL);
@@ -1757,11 +1932,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let msg_name = msg.msg_name;
         let msg_iov = msg.msg_iov;
         let msg_iovlen = msg.msg_iovlen;
+        let msg_control = msg.msg_control;
         let msg_controllen = msg.msg_controllen;
 
-        if msg_controllen != 0 {
-            log_unsupported!("ancillary data is not supported");
-        }
         if msg_iovlen > UIO_MAXIOV {
             return Err(Errno::EMSGSIZE);
         }
@@ -1786,7 +1959,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .map_err(|_| Errno::ENOMEM)?;
         buffer.resize(total_iov_capacity, 0);
         let recv_buf = &mut buffer[..];
-        let size = self.do_recvfrom(
+        let (size, fds) = self.do_recvfrom_with_fds(
             sockfd,
             recv_buf,
             flags,
@@ -1842,14 +2015,54 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         }
 
-        // Ancillary data is not supported, so report that no control bytes were delivered.
+        // Deliver any SCM_RIGHTS fds: allocate each a fresh raw fd number in THIS (the
+        // receiving) task's own fd table -- `insert_into` is exactly `socketpair()`'s own
+        // per-subsystem `insert_raw_fd` dispatch, reused here for the cross-process-donation
+        // case. A fd that doesn't fit under the receiver's own RLIMIT_NOFILE is simply dropped
+        // (closed) rather than failing the whole read, matching real Linux: the byte payload it
+        // was sent alongside is still genuinely delivered.
+        let cloexec = flags.contains(ReceiveFlags::CMSG_CLOEXEC);
+        let mut written_fds = alloc::vec::Vec::new();
+        for fd in fds {
+            match fd.insert_into(&self.global.litebox, &self.files.borrow(), cloexec) {
+                Ok(raw_fd) => written_fds.push(raw_fd),
+                Err(Errno::EMFILE) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
         let controllen_offset =
             core::mem::offset_of!(litebox_common_linux::UserMsgHdr, msg_controllen);
         let controllen_ptr =
             UserPtrMut::<usize>::from_usize(msg_ptr.as_usize() + controllen_offset);
-        controllen_ptr
-            .write_at_offset::<Platform>(0, 0)
-            .ok_or(Errno::EFAULT)?;
+        if written_fds.is_empty() {
+            controllen_ptr
+                .write_at_offset::<Platform>(0, 0)
+                .ok_or(Errno::EFAULT)?;
+        } else {
+            let payload_len = written_fds.len() * size_of::<i32>();
+            let cmsg_len = size_of::<CmsgHdr>() + payload_len;
+            let hdr = CmsgHdr {
+                cmsg_len,
+                cmsg_level: SOL_SOCKET,
+                cmsg_type: SCM_RIGHTS,
+            };
+            let mut out = alloc::vec::Vec::with_capacity(cmsg_len);
+            out.extend_from_slice(hdr.as_bytes());
+            for raw_fd in &written_fds {
+                out.extend_from_slice(&i32::try_from(*raw_fd).unwrap_or(-1).to_ne_bytes());
+            }
+            let written = out.len().min(msg_controllen);
+            if written < out.len() {
+                ret_flags.insert(ReceiveFlags::CTRUNC);
+            }
+            UserPtrMut::<u8>::from_usize(msg_control.as_usize())
+                .copy_from_slice::<Platform>(0, &out[..written])
+                .ok_or(Errno::EFAULT)?;
+            controllen_ptr
+                .write_at_offset::<Platform>(0, written)
+                .ok_or(Errno::EFAULT)?;
+        }
 
         // Write back msg_flags with any status flags (e.g. MSG_TRUNC).
         let flags_offset = core::mem::offset_of!(litebox_common_linux::UserMsgHdr, msg_flags);
