@@ -219,6 +219,17 @@ pub unsafe fn jit_write_protect(executable: bool) {
     unsafe { darwin::pthread_jit_write_protect_np(libc::c_int::from(executable)) }
 }
 
+/// Deliberately conservative. The user half of an Apple Silicon address space
+/// is 47 bits wide, but the exact ceiling is a kernel implementation detail
+/// (`MACH_VM_MAX_ADDRESS`) rather than a stable interface, so this stops a bit
+/// below 2^46 -- 64 TiB of guest address space, comfortably inside any
+/// plausible limit. Also used by [`read_memory_maps`] to exclude host
+/// mappings the guest could never legally reach anyway, matching
+/// [`litebox::platform::PageManagementProvider::TASK_ADDR_MAX`] below (which
+/// can't reference this directly: it's an associated const on a trait
+/// generic over `ALIGN`, not reachable from the free function).
+const TASK_ADDR_MAX: usize = 0x0000_4000_0000_0000;
+
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for MacOsUserland {
     /// The first 4 GiB of an arm64 Mach-O process is the `__PAGEZERO` segment:
     /// reserved, unmapped, and impossible to map over. Every guest address has
@@ -227,12 +238,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
     /// its preferred address on this host.
     const TASK_ADDR_MIN: usize = 0x1_0000_0000;
 
-    /// Deliberately conservative. The user half of an Apple Silicon address
-    /// space is 47 bits wide, but the exact ceiling is a kernel implementation
-    /// detail (`MACH_VM_MAX_ADDRESS`) rather than a stable interface, so this
-    /// stops a bit below 2^46 -- 64 TiB of guest address space, comfortably
-    /// inside any plausible limit.
-    const TASK_ADDR_MAX: usize = 0x0000_4000_0000_0000;
+    const TASK_ADDR_MAX: usize = TASK_ADDR_MAX;
 
     fn allocate_pages(
         &self,
@@ -585,8 +591,24 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
 /// address that dyld, the shared cache or the host heap already owns.
 ///
 /// This is the Mach counterpart of the Windows platform's `VirtualQuery` walk.
+///
+/// Excludes anything at or above [`TASK_ADDR_MAX`]: real Darwin frameworks
+/// (Metal, `libdispatch`'s `MALLOC_NANO` zone, and others) commonly place
+/// large allocations extremely high in the address space -- observed up to
+/// `0x600020000000`, itself already above this platform's own 64 TiB guest
+/// ceiling -- and the guest can never legally be placed there anyway (every
+/// guest address is bounded by `TASK_ADDR_MAX`), so tracking those mappings
+/// serves no purpose. Worse, `Vmem::new`'s `last_range_value()` (the highest
+/// TRACKED mapping, used to pick the top-down search's fast path) would
+/// report one of these as the process's own "highest mapping" if they were
+/// included, permanently forcing every top-down placement onto the slower
+/// gap-search path instead -- which is exactly what was landing a
+/// newly-loaded `ET_EXEC` interpreter far lower than intended.
 fn read_memory_maps() -> alloc::vec::Vec<core::ops::Range<usize>> {
-    mach_vm_region_iter().collect()
+    mach_vm_region_iter()
+        .filter(|range| range.start < TASK_ADDR_MAX)
+        .map(|range| range.start..range.end.min(TASK_ADDR_MAX))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

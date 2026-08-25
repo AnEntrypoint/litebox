@@ -1757,18 +1757,6 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         debug_assert_eq!(Platform::TASK_ADDR_MIN % ALIGN, 0);
         debug_assert_eq!(Platform::TASK_ADDR_MAX % ALIGN, 0);
         let last_end = self.vmas.last_range_value().map_or(low_limit, |r| r.0.end);
-        // TEMPORARY (macOS CI investigation, et_exec_interpreter_loads_top_down_above_low_heap):
-        // confirm what's actually occupying the top of this process's tracked
-        // address space on the real CI runner when the fast top-down path is
-        // skipped. Remove once root-caused.
-        #[cfg(target_vendor = "apple")]
-        if last_end > high_limit {
-            extern crate std;
-            std::eprintln!(
-                "get_unmmaped_area: last_end={last_end:#x} > high_limit={high_limit:#x} (TASK_ADDR_MAX={:#x}), skipping fast top-down path",
-                Platform::TASK_ADDR_MAX
-            );
-        }
         if last_end <= high_limit {
             // A growsdown (stack) region must keep a guard gap below whatever is already
             // mapped above it -- gap #2 below already reserves this in the OTHER direction
