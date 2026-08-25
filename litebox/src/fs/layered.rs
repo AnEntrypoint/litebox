@@ -615,15 +615,42 @@ impl<
         }
         // Any errors from lower level now _must_ propagate up, so we can just invoke
         // the lower level and set up the relevant descriptor upon success.
-        let entry = Arc::new(EntryX::Lower {
+        //
+        // `self.lower.open` runs without holding `self.root`'s write lock (it can be slow, e.g. a
+        // real syscall/IO), so two threads opening the same not-yet-cached path concurrently can
+        // both reach here with their own freshly opened lower-level fd. Whichever thread's
+        // `entries.insert` below runs second must NOT blindly overwrite/duplicate the winner's
+        // entry (that previously asserted `old.is_none()`, which is not actually guaranteed under
+        // concurrency, and left a second live `Lower` fd untracked by `root.entries` -- exactly the
+        // divergence that corrupted later `close()`'s `Arc::ptr_eq` bookkeeping). Instead, the loser
+        // discards its own redundant fd and reuses the entry the winner already installed, matching
+        // the existing cache-hit fast path a few lines above for a path that was already resolved
+        // by an earlier, separate open.
+        let our_entry = Arc::new(EntryX::Lower {
             fd: self.lower.open(path.as_str(), flags, mode)?,
         });
-        let old = self
-            .root
-            .write()
-            .entries
-            .insert(path.clone(), Arc::clone(&entry));
-        assert!(old.is_none());
+        let entry = {
+            let mut root = self.root.write();
+            match root.entries.get(&path) {
+                Some(existing) => {
+                    let existing = Arc::clone(existing);
+                    // Safe to drop `root`'s lock before closing: `our_entry` was never published,
+                    // so no other thread can observe or hold a reference to its fd.
+                    drop(root);
+                    let EntryX::Lower { fd } = Arc::into_inner(our_entry)
+                        .expect("our_entry was never shared, so this must be its sole owner")
+                    else {
+                        unreachable!("our_entry was constructed as EntryX::Lower above")
+                    };
+                    self.lower.close(&fd).unwrap();
+                    existing
+                }
+                None => {
+                    root.entries.insert(path.clone(), Arc::clone(&our_entry));
+                    our_entry
+                }
+            }
+        };
         let fd = self.litebox.descriptor_table_mut().insert(Descriptor {
             path,
             flags: original_flags,
@@ -755,7 +782,7 @@ impl<
         // upper-level file, we don't actually need to worry about a desync; a write to lower-level
         // file will successfully be seen as just being an upper level file. Thus, it is sufficient
         // just to delegate this operation based whether the entry points to upper or lower layers.
-        let entry = self
+        let (entry, this_position) = self
             .litebox
             .descriptor_table()
             .with_entry(fd, |descriptor| {
@@ -763,24 +790,44 @@ impl<
                 if access_mode == OFlags::WRONLY {
                     Err(ReadError::NotForReading)
                 } else {
-                    Ok(Arc::clone(&descriptor.entry.entry))
+                    Ok((
+                        Arc::clone(&descriptor.entry.entry),
+                        descriptor.entry.position.load(SeqCst),
+                    ))
                 }
             })
             .ok_or(ReadError::ClosedFd)
             .flatten()?;
-        // Perform the actual operation
-        let num_bytes = match entry.as_ref() {
-            EntryX::Upper { fd } => self.upper.read(fd, buf, offset)?,
-            EntryX::Lower { fd } => self.lower.read(fd, buf, offset)?,
+        // A `Lower` entry's underlying fd is cached in `root.entries` and shared across every
+        // `open()` of the same path (see `open`'s cache-hit fast path and its race-loser fallback
+        // above) -- unlike an `Upper` fd, which is always a fresh, unshared fd per `open()` call.
+        // An implicit `offset: None` read is documented to use "the current file offset" (see this
+        // trait method's own doc comment), which for a shared `Lower` fd is NOT this specific
+        // layered `Descriptor`'s own position: two independent opens of the same lower-layer file
+        // would otherwise silently read from (and advance) one shared position, each stealing bytes
+        // the other expected to see from its own start-at-0. Resolve `None` to this descriptor's
+        // own tracked `position` explicitly before delegating, so every open of a `Lower` file keeps
+        // an independent read cursor, matching real POSIX per-open-fd offset semantics.
+        let resolved_offset = match entry.as_ref() {
+            EntryX::Upper { .. } => offset,
+            EntryX::Lower { .. } => Some(offset.unwrap_or(this_position)),
             EntryX::Tombstone => unreachable!(),
         };
-        self.litebox
-            .descriptor_table()
-            .get_entry(fd)
-            .ok_or(ReadError::ClosedFd)?
-            .entry
-            .position
-            .fetch_add(num_bytes, SeqCst);
+        // Perform the actual operation
+        let num_bytes = match entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.read(fd, buf, resolved_offset)?,
+            EntryX::Lower { fd } => self.lower.read(fd, buf, resolved_offset)?,
+            EntryX::Tombstone => unreachable!(),
+        };
+        if offset.is_none() {
+            self.litebox
+                .descriptor_table()
+                .get_entry(fd)
+                .ok_or(ReadError::ClosedFd)?
+                .entry
+                .position
+                .fetch_add(num_bytes, SeqCst);
+        }
         Ok(num_bytes)
     }
 

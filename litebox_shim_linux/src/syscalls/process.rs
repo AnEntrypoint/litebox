@@ -3888,8 +3888,34 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .set_arch_specific_register(&ArchSpecificRegister::TpidrEl0, 0)
             .expect("failed to clear guest TLS on execve");
 
-        self.load_program(loader, argv_vec, envp_vec)
-            .expect("TODO: terminate the process cleanly");
+        if let Err(e) = self.load_program(loader, argv_vec, envp_vec) {
+            // The old program image is already torn down (memory released, other threads killed,
+            // TLS cleared above) -- there is no program left to return an errno to, matching real
+            // Linux's own `execve`: once the kernel has committed to replacing the address space,
+            // a late failure (e.g. this specific case, confirmed live: `ENOMEM` mapping a large
+            // ELF's segments, as seen loading Alpine's ~42MB `cc1`) delivers `SIGSEGV` to the
+            // process rather than returning an error to a caller that no longer has code mapped to
+            // return to. Terminate the guest process the same way `sys_exit_group` does, rather
+            // than panicking the host runner thread (the prior `.expect()` here) -- a guest-side
+            // resource failure must stay a guest-side event, never take down the whole runner.
+            litebox_util_log::warn!(
+                tid:% = self.tid, path:% = path, error:? = e;
+                "sys_execve: load_program failed after point of no return, killing process with SIGSEGV"
+            );
+            self.exit_group(ExitStatus::Signal(litebox_common_linux::signal::Signal::SIGSEGV));
+            // If this was a vfork child, the parent is still suspended waiting for this signal
+            // (see `signal_vfork_done`'s call below on the success path, and its own doc comment)
+            // -- a real vfork parent resumes once the child execs OR exits, not only on success, so
+            // it must still be woken here or it would hang forever behind a child that can never
+            // finish setting up a new program to eventually reach the success-path wake. This
+            // thread itself is already marked exiting (via `exit_group` above) and will unwind to
+            // `prepare_for_exit` the next time the syscall dispatch loop observes `is_exiting()`,
+            // matching every other in-guest process-termination path in this module (see
+            // `exit_thread`'s doc comment) -- no register/stack setup for a new program is needed
+            // or possible, since there is no new program.
+            self.process().signal_vfork_done();
+            return Ok(0);
+        }
 
         self.init_thread_context(ctx);
 
