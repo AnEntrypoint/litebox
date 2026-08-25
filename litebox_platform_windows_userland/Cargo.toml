@@ -46,6 +46,22 @@ windows-sys = { version = "0.60.2", features = [
     "Win32_System_Pipes",
 ] }
 zerocopy = { version = "0.8", default-features = false }
+# GUI application support (DRM/KMS dumb-buffer emulation's host-side presentation layer, see
+# `src/presentation.rs`): `winit` opens the real host window and pumps its message loop on a
+# dedicated OS thread (Windows message loops are per-thread, not process-wide -- unlike macOS'
+# Cocoa, nothing on Windows requires this to be the process's first/main thread, so this coexists
+# with `litebox_runner_linux_on_windows_userland`'s own main thread running the guest via
+# `run_thread`); `wgpu` is the cross-platform (Vulkan/Metal/DX12/GL) presentation surface that
+# receives each DRM page-flip's dumb-buffer pixel content as a texture upload + blit, chosen
+# specifically so the SAME presentation code ports to macOS/Linux userland later (see the
+# `gui-macos-linux-presentation-port` PRD row) rather than needing three separate native
+# windowing/graphics implementations.
+wgpu = "27"
+winit = "0.30"
+# Blocks on wgpu's async adapter/device-request calls -- a tiny, dependency-free executor
+# (documented by wgpu's own examples as the standard way to do this outside a real async runtime,
+# which this crate does not otherwise pull in).
+pollster = "0.4"
 
 [lints]
 workspace = true
