@@ -42,11 +42,11 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use litebox::mm::linux::PAGE_SIZE;
 use litebox::platform::RawConstPointer;
 use litebox_common_linux::{
-    DRM_EVENT_FLIP_COMPLETE, DRM_MODE_CONNECTOR_VIRTUAL, DRM_MODE_ENCODER_VIRTUAL,
-    DRM_MODE_PAGE_FLIP_EVENT, DrmEvent, DrmEventVblank, DrmModeCardRes, DrmModeCrtc,
-    DrmModeCrtcPageFlip, DrmModeCreateDumb, DrmModeDestroyDumb, DrmModeFbCmd2, DrmModeGetConnector,
-    DrmModeGetEncoder, DrmModeGetPlane, DrmModeGetPlaneRes, DrmModeMapDumb, DrmModeModeinfo,
-    DrmModeSetPlane, errno::Errno,
+    DRM_CAP_DUMB_BUFFER, DRM_EVENT_FLIP_COMPLETE, DRM_MODE_CONNECTOR_VIRTUAL,
+    DRM_MODE_ENCODER_VIRTUAL, DRM_MODE_PAGE_FLIP_EVENT, DrmEvent, DrmEventVblank, DrmGetCap,
+    DrmModeCardRes, DrmModeCreateDumb, DrmModeCrtc, DrmModeCrtcPageFlip, DrmModeDestroyDumb,
+    DrmModeFbCmd2, DrmModeGetConnector, DrmModeGetEncoder, DrmModeGetPlane, DrmModeGetPlaneRes,
+    DrmModeMapDumb, DrmModeModeinfo, DrmModeSetPlane, DrmVersion, errno::Errno,
 };
 use zerocopy::IntoBytes;
 
@@ -171,6 +171,13 @@ pub(crate) struct DrmSubsystem<Platform: ShimPlatform> {
     /// plain incrementing counter, matching real Linux's own semantics closely enough for that
     /// use even though this device has no real vblank interrupt driving it.
     next_vblank_sequence: AtomicU32,
+    /// Whether this device fd currently holds "DRM master" status (`DRM_IOCTL_SET_MASTER`
+    /// granted, not yet released by `DRM_IOCTL_DROP_MASTER`). This virtual device has exactly one
+    /// possible client and no real multi-master contention to arbitrate (see [`Self::set_master`]/
+    /// [`Self::drop_master`]'s own doc comments), so this is bookkeeping only -- nothing currently
+    /// consults it to gate another ioctl, matching how mode-setting here already succeeds
+    /// regardless of master status.
+    is_master: core::sync::atomic::AtomicBool,
     /// Host-side hook, invoked synchronously at the end of every successful [`Self::page_flip`]
     /// with the now-scanned-out framebuffer's own pixel bytes (a plain, already-copied-out `&[u8]`
     /// -- not the platform-specific shared-memory handle, deliberately: a `Box<dyn Fn(...)>`
@@ -209,6 +216,7 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             plane_fb: litebox::sync::Mutex::new(None),
             pending_flip_events: litebox::sync::Mutex::new(VecDeque::new()),
             next_vblank_sequence: AtomicU32::new(0),
+            is_master: core::sync::atomic::AtomicBool::new(false),
             flip_callback: litebox::sync::Mutex::new(None),
         }
     }
@@ -436,6 +444,85 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             return Err(Errno::ENOENT);
         }
         *self.plane_fb.lock() = Some(req.fb_id);
+        Ok(0)
+    }
+
+    /// `DRM_IOCTL_VERSION` -- the first ioctl every real libdrm-based client calls (`drmOpen`
+    /// itself does this internally). Two-call size-probe pattern for the three trailing
+    /// `(len, ptr)` string pairs, same shape as `get_resources`'s object-ID arrays: a caller with
+    /// `name_len == 0` (or a null `name` pointer) only learns the true length; a caller with a
+    /// real buffer gets it filled, truncated to whichever is smaller (matching the real kernel's
+    /// own `drm_copy_field` behavior -- a short caller buffer is not an error).
+    pub(crate) fn version(&self, ptr: UserPtrMut<DrmVersion>) -> Result<u32, Errno> {
+        let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+
+        const NAME: &[u8] = b"litebox";
+        const DATE: &[u8] = b"20260101";
+        const DESC: &[u8] = b"litebox virtual DRM/KMS device";
+
+        fn fill_field<Platform: ShimPlatform>(
+            user_ptr: u64,
+            user_len: u64,
+            value: &[u8],
+        ) -> Result<u64, Errno> {
+            if user_len > 0 && user_ptr != 0 {
+                let n = (user_len as usize).min(value.len());
+                let out = UserPtrMut::<u8>::from_usize(user_ptr as usize);
+                out.write_slice_at_offset::<Platform>(0, &value[..n])
+                    .ok_or(Errno::EFAULT)?;
+            }
+            Ok(value.len() as u64)
+        }
+
+        req.version_major = 1;
+        req.version_minor = 0;
+        req.version_patchlevel = 0;
+        req.name_len = fill_field::<Platform>(req.name, req.name_len, NAME)?;
+        req.date_len = fill_field::<Platform>(req.date, req.date_len, DATE)?;
+        req.desc_len = fill_field::<Platform>(req.desc, req.desc_len, DESC)?;
+        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        Ok(0)
+    }
+
+    /// `DRM_IOCTL_GET_CAP` -- query a single capability. This device genuinely supports dumb
+    /// buffers (the only allocation path it has, see `create_dumb`), so `DRM_CAP_DUMB_BUFFER`
+    /// reports `1`; any other capability (dumb-buffer preferred-depth, async page-flip, atomic
+    /// modesetting, etc.) reports `0` (unsupported), the real kernel's own behavior for a
+    /// capability a driver never registered, rather than fabricating support this device does not
+    /// actually have.
+    pub(crate) fn get_cap(&self, ptr: UserPtrMut<DrmGetCap>) -> Result<u32, Errno> {
+        let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        req.value = if req.capability == DRM_CAP_DUMB_BUFFER {
+            1
+        } else {
+            0
+        };
+        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        Ok(0)
+    }
+
+    /// `DRM_IOCTL_SET_MASTER` -- real DRM enforces single-master-per-device for mode-setting
+    /// ioctls; this device has exactly one possible client (litebox has no concept of a second
+    /// concurrent guest process opening the same virtual `/dev/dri/card0` today) and does not
+    /// gate any of its own mode-setting ioctls on master status, so this always succeeds. Tracked
+    /// (`is_master`) purely so a client that queries its own master status back gets a consistent
+    /// answer, not because anything else currently depends on it.
+    // `Result<u32, Errno>` here always resolves to `Ok` (this virtual device has no real
+    // multi-master contention to reject a caller over) but matches every other handler's
+    // signature so `drm_ioctl`'s dispatch match stays uniform -- not a real "unnecessarily
+    // wrapped" case, just a shared interface.
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn set_master(&self) -> Result<u32, Errno> {
+        self.is_master
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+        Ok(0)
+    }
+
+    /// `DRM_IOCTL_DROP_MASTER`. See [`Self::set_master`]'s doc comment.
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn drop_master(&self) -> Result<u32, Errno> {
+        self.is_master
+            .store(false, core::sync::atomic::Ordering::Relaxed);
         Ok(0)
     }
 

@@ -791,6 +791,22 @@ pub const DRM_IOCTL_MODE_GETPLANE: u32 = 0xC020_64B6;
 pub const DRM_IOCTL_MODE_SETPLANE: u32 = 0xC030_64B7;
 pub const DRM_IOCTL_MODE_ADDFB2: u32 = 0xC068_64B8;
 pub const DRM_IOCTL_MODE_PAGE_FLIP: u32 = 0xC018_64B0;
+/// `DRM_IOCTL_VERSION = DRM_IOWR(0x00, struct drm_version)`. `nr`/struct shape fetched live from
+/// the real kernel `drm.h` (`torvalds/linux` master), not guessed; `size=64` is `sizeof(struct
+/// drm_version)` on the LP64 ABI litebox targets (3 `int`s + 4 bytes of compiler-inserted padding
+/// to the next 8-byte-aligned field, then 3 `(size_t, pointer)` pairs -- see [`DrmVersion`]'s own
+/// field layout, which this size must stay in sync with).
+pub const DRM_IOCTL_VERSION: u32 = 0xC040_6400;
+/// `DRM_IOCTL_GET_CAP = DRM_IOWR(0x0c, struct drm_get_cap)`, `size=16` (two `u64`s).
+pub const DRM_IOCTL_GET_CAP: u32 = 0xC010_640C;
+/// `DRM_IOCTL_SET_MASTER = DRM_IO(0x1e)` -- a plain `_IO()` (no argument struct: `dir=0`,
+/// `size=0`), unlike every other DRM ioctl this device implements.
+pub const DRM_IOCTL_SET_MASTER: u32 = 0x0000_641E;
+/// `DRM_IOCTL_DROP_MASTER = DRM_IO(0x1f)`.
+pub const DRM_IOCTL_DROP_MASTER: u32 = 0x0000_641F;
+/// `DRM_CAP_DUMB_BUFFER` -- the one capability this device's `DRM_IOCTL_GET_CAP` genuinely
+/// supports (see [`DrmGetCap`]'s doc comment).
+pub const DRM_CAP_DUMB_BUFFER: u64 = 0x1;
 
 /// `struct drm_mode_create_dumb` -- allocate a CPU-writable, linear, no-GPU pixel buffer.
 #[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
@@ -978,6 +994,37 @@ pub struct DrmModeSetPlane {
     pub src_y: u32,
     pub src_h: u32,
     pub src_w: u32,
+}
+
+/// `struct drm_version` (`DRM_IOCTL_VERSION`) -- the two-call size-probe pattern applies to the
+/// three trailing `(len, ptr)` string pairs the same way it does to `drm_mode_card_res`'s object
+/// arrays: a caller passes `name_len`/`date_len`/`desc_len` set to its buffer sizes (0 to just
+/// probe the true lengths), and gets the true lengths written back regardless of whether it
+/// supplied a buffer.
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmVersion {
+    pub version_major: i32,
+    pub version_minor: i32,
+    pub version_patchlevel: i32,
+    /// Compiler-inserted padding: the following `size_t`/pointer fields need 8-byte alignment on
+    /// the LP64 ABI litebox targets, so the three leading `i32`s (12 bytes) are padded to 16.
+    _pad: u32,
+    pub name_len: u64,
+    pub name: u64,
+    pub date_len: u64,
+    pub date: u64,
+    pub desc_len: u64,
+    pub desc: u64,
+}
+
+/// `struct drm_get_cap` (`DRM_IOCTL_GET_CAP`). `capability` is IN (a `DRM_CAP_*` constant,
+/// e.g. [`DRM_CAP_DUMB_BUFFER`]); `value` is OUT.
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmGetCap {
+    pub capability: u64,
+    pub value: u64,
 }
 
 /// `struct drm_mode_crtc_page_flip` (`DRM_IOCTL_MODE_PAGE_FLIP`).
@@ -1229,6 +1276,16 @@ pub enum IoctlArg {
     DrmModeGetPlane(UserPtrMut<DrmModeGetPlane>),
     /// `DRM_IOCTL_MODE_SETPLANE` -- attach a framebuffer directly to a plane.
     DrmModeSetPlane(UserPtr<DrmModeSetPlane>),
+    /// `DRM_IOCTL_VERSION` -- driver identification, the first ioctl every real libdrm-based
+    /// client calls (two-call size-probe pattern for the `name`/`date`/`desc` strings).
+    DrmVersion(UserPtrMut<DrmVersion>),
+    /// `DRM_IOCTL_GET_CAP` -- query a single `DRM_CAP_*` capability.
+    DrmGetCap(UserPtrMut<DrmGetCap>),
+    /// `DRM_IOCTL_SET_MASTER` -- a plain `_IO()` with no argument struct, so this fd's own file
+    /// descriptor (not a pointer) is the only state a handler needs.
+    DrmSetMaster,
+    /// `DRM_IOCTL_DROP_MASTER`.
+    DrmDropMaster,
     Raw {
         cmd: u32,
         arg: UserPtrMut<u8>,
@@ -3232,6 +3289,10 @@ impl SyscallRequest {
                         }
                         DRM_IOCTL_MODE_GETPLANE => IoctlArg::DrmModeGetPlane(ctx.sys_req_ptr(2)),
                         DRM_IOCTL_MODE_SETPLANE => IoctlArg::DrmModeSetPlane(ctx.sys_req_ptr(2)),
+                        DRM_IOCTL_VERSION => IoctlArg::DrmVersion(ctx.sys_req_ptr(2)),
+                        DRM_IOCTL_GET_CAP => IoctlArg::DrmGetCap(ctx.sys_req_ptr(2)),
+                        DRM_IOCTL_SET_MASTER => IoctlArg::DrmSetMaster,
+                        DRM_IOCTL_DROP_MASTER => IoctlArg::DrmDropMaster,
                         _ => IoctlArg::Raw {
                             cmd,
                             arg: ctx.sys_req_ptr(2),

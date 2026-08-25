@@ -3254,7 +3254,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             | IoctlArg::DrmModePageFlip(..)
             | IoctlArg::DrmModeGetPlaneResources(..)
             | IoctlArg::DrmModeGetPlane(..)
-            | IoctlArg::DrmModeSetPlane(..) => files.run_on_raw_fd(
+            | IoctlArg::DrmModeSetPlane(..)
+            | IoctlArg::DrmVersion(..)
+            | IoctlArg::DrmGetCap(..)
+            | IoctlArg::DrmSetMaster
+            | IoctlArg::DrmDropMaster => files.run_on_raw_fd(
                 desc,
                 |fd| {
                     if self.is_dri_device(&files.fs, fd)? {
@@ -3300,6 +3304,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             IoctlArg::DrmModeGetPlaneResources(ptr) => self.global.drm.get_plane_resources(*ptr),
             IoctlArg::DrmModeGetPlane(ptr) => self.global.drm.get_plane(*ptr),
             IoctlArg::DrmModeSetPlane(ptr) => self.global.drm.set_plane(*ptr),
+            IoctlArg::DrmVersion(ptr) => self.global.drm.version(*ptr),
+            IoctlArg::DrmGetCap(ptr) => self.global.drm.get_cap(*ptr),
+            IoctlArg::DrmSetMaster => self.global.drm.set_master(),
+            IoctlArg::DrmDropMaster => self.global.drm.drop_master(),
             _ => unreachable!("drm_ioctl called with a non-DRM IoctlArg"),
         }
     }
