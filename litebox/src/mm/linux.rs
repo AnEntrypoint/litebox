@@ -1690,6 +1690,40 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .map_err(MappingError::MapError)
     }
 
+    /// Map an ALREADY-EXISTING shared-memory object (from a prior [`Self::create_pages`] call's
+    /// own [`Self::create_pages`]-internal `create_shared_memory`, or any other handle this
+    /// platform's [`PageManagementProvider::create_shared_memory`] returned) into a second
+    /// address range in THIS SAME address space.
+    ///
+    /// Unlike [`Self::create_pages`]'s own `shared && !file_backed` branch (which always mints a
+    /// brand-new handle), this re-maps a handle the caller already holds -- the same underlying
+    /// physical pages become visible at a second, independent virtual address, with writes
+    /// through either mapping observed by both. This is the primitive a device emulation layer
+    /// needs when it allocates real backing storage for a virtual resource (e.g. a DRM dumb
+    /// buffer) at creation time, then later needs to expose THAT SAME storage to the guest via
+    /// `mmap()` at a guest-chosen address determined by a later, separate syscall -- re-using
+    /// [`Self::create_pages`] there would allocate a second, independent block of memory instead
+    /// of exposing the one already created.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::create_pages`]: if `suggested_new_address` is given with
+    /// [`CreatePagesFlags::FIXED_ADDR`] set, the caller must ensure any overlapping mappings are
+    /// not used by anyone else.
+    pub(super) unsafe fn map_existing_shared_pages(
+        &mut self,
+        suggested_new_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        flags: CreatePagesFlags,
+        perms: MemoryRegionPermissions,
+        shared_handle: Platform::SharedMemoryHandle,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
+        let vm_flags = VmFlags::from(perms) | VmFlags::may_flags_for_mapping(true, false);
+        let vma = VmArea::new_shared(vm_flags, false, shared_handle);
+        unsafe { self.create_mapping(suggested_new_address, length, vma, flags) }
+            .map_err(MappingError::MapError)
+    }
+
     /// Get the memory permissions of a given address range.
     ///
     /// `page_range` specifies the range of pages to check the memory permissions.

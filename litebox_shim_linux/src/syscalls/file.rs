@@ -2912,8 +2912,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Whether `fd` refers to a DRM device node (`/dev/dri/card0`/`renderD128`, major 226 --
     /// see `litebox::fs::devices::DriDevice`'s node-info constants), mirroring [`Self::is_stdio`]'s
-    /// major-number check.
-    fn is_dri_device(&self, fs: &FS, fd: &TypedFd<FS>) -> Result<bool, Errno> {
+    /// major-number check. `pub(crate)` (not module-private like `is_stdio`) so `syscalls::mm`'s
+    /// `sys_mmap` can also route a DRI-fd `mmap()` to the DRM dumb-buffer bridge instead of the
+    /// ordinary file-backed-mapping path.
+    pub(crate) fn is_dri_device(&self, fs: &FS, fd: &TypedFd<FS>) -> Result<bool, Errno> {
         match fs.fd_file_status(fd) {
             Ok(status) => {
                 let major = status.node_info.rdev.map_or(0, |v| v.get() >> 8);
@@ -3192,9 +3194,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             IoctlArg::DrmModeSetCrtc(ptr) => self.global.drm.set_crtc(*ptr),
             IoctlArg::DrmModeGetEncoder(ptr) => self.global.drm.get_encoder(*ptr),
             IoctlArg::DrmModeGetConnector(ptr) => self.global.drm.get_connector(*ptr),
-            IoctlArg::DrmModeCreateDumb(ptr) => self.global.drm.create_dumb(*ptr),
+            IoctlArg::DrmModeCreateDumb(ptr) => {
+                self.global.drm.create_dumb(self.global.platform, *ptr)
+            }
             IoctlArg::DrmModeMapDumb(ptr) => self.global.drm.map_dumb(*ptr),
-            IoctlArg::DrmModeDestroyDumb(ptr) => self.global.drm.destroy_dumb(*ptr),
+            IoctlArg::DrmModeDestroyDumb(ptr) => {
+                self.global.drm.destroy_dumb(self.global.platform, *ptr)
+            }
             IoctlArg::DrmModeAddFb2(ptr) => self.global.drm.add_fb2(*ptr),
             IoctlArg::DrmModePageFlip(ptr) => self.global.drm.page_flip(*ptr),
             _ => unreachable!("drm_ioctl called with a non-DRM IoctlArg"),

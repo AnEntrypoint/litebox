@@ -905,6 +905,33 @@ where
         unsafe { self.create_pages(suggested_address, length, flags, perms, perms, op) }
     }
 
+    /// Map an already-existing shared-memory handle (from a prior real allocation this platform
+    /// made, e.g. a device emulation layer's own backing storage for a virtual resource) into a
+    /// second, independent address range in this same address space -- read-write, no
+    /// content-initializing `op` callback, since the pages already hold real, meaningful content
+    /// from whichever earlier allocation created the handle.
+    ///
+    /// See [`crate::mm::linux::Vmem::map_existing_shared_pages`]'s doc comment for the exact
+    /// scenario this exists for and how it differs from [`Self::create_writable_pages`] (which
+    /// always mints a brand-new handle rather than re-exposing an existing one).
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::create_writable_pages`]: if the suggested start address is given
+    /// and `fixed_addr` is set in `flags`, the caller must ensure any overlapping mappings are
+    /// not used by anyone else.
+    pub unsafe fn map_existing_shared_pages(
+        &self,
+        suggested_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        flags: CreatePagesFlags,
+        shared_handle: Platform::SharedMemoryHandle,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
+        let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
+        let mut vmem = self.vmem.write();
+        unsafe { vmem.map_existing_shared_pages(suggested_address, length, flags, perms, shared_handle) }
+    }
+
     /// Create read-only pages.
     ///
     /// `suggested_address` is the hint address for where to create the pages if it is not `None`.
