@@ -140,7 +140,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
                 Some(handle.with_entry(|entry| poll(entry)))
             }
-            EpollDescriptor::Epoll(_file) => unimplemented!(),
+            // Nested epoll: real Linux lets one epoll fd be added as a member of another epoll
+            // set (`epoll_ctl(outer, EPOLL_CTL_ADD, inner, ...)`), reporting the inner set
+            // readable exactly when any of ITS OWN registered fds is ready -- `calloop` (the
+            // event-loop crate Smithay's Wayland compositor depends on) relies on exactly this
+            // pattern, confirmed live: a real guest-side Wayland compositor built on `backend_drm`
+            // panicked here on startup, before it could even accept a client connection (see
+            // `EpollFile`'s own `IOPollable` impl just below for the readiness/wakeup logic this
+            // delegates to).
+            EpollDescriptor::Epoll(fd) => {
+                let handle = global.litebox.descriptor_table().entry_handle(fd)?;
+                Some(handle.with_entry(|entry| poll(entry)))
+            }
             EpollDescriptor::File(file) => {
                 // An evdev fd (tagged at `open()` time, see `syscalls::file::EvdevFd`'s doc
                 // comment for why this metadata check exists) reports `Events::IN` exactly when
@@ -431,6 +442,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
     }
 
     super::common_functions_for_file_status!();
+}
+
+/// Lets one `EpollFile` be added as a member of another epoll set (nested epoll, see
+/// `EpollDescriptor::poll`'s `Epoll` arm). Readiness and wakeup both delegate straight to this
+/// epoll's own `ready` set: it is exactly the same set `EpollFile::wait`'s own `ready.pollee`
+/// already tracks for a directly-`epoll_wait`-ing caller, so an outer epoll registering an
+/// observer here gets woken by precisely the same `ReadySet::push`/`notify_observers` call a
+/// direct waiter would -- no separate readiness or wakeup machinery needed for the nested case.
+impl<Platform: ShimPlatform, FS: ShimFS> IOPollable for EpollFile<Platform, FS> {
+    fn register_observer(&self, observer: Weak<dyn Observer<Events>>, mask: Events) {
+        self.ready.pollee.register_observer(observer, mask);
+    }
+
+    fn check_io_events(&self) -> Events {
+        if self.ready.entries.lock().is_empty() {
+            Events::empty()
+        } else {
+            Events::IN
+        }
+    }
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
