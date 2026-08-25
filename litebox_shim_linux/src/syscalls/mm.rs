@@ -1366,22 +1366,35 @@ mod tests {
     fn test_mmap_fixed_noreplace() {
         let task = init_platform(None);
 
-        // First, create an initial mapping at a specific address away from boundaries.
-        // 256 MiB is a safe middle ground on platforms with no low-address
-        // reservation; on Apple Silicon the first 4 GiB is the permanently
-        // unmapped `__PAGEZERO` segment (see `MacOsUserland::TASK_ADDR_MIN`), so
-        // this needs an address above that reservation instead. `TASK_ADDR_MIN`
-        // itself is too close to it in practice: dyld and the shared cache load
-        // low in the address space too (see `read_memory_maps`'s doc comment),
-        // and a `MAP_FIXED_NOREPLACE` request -- unlike an ordinary hint-based
-        // mmap -- is never checked against those before being handed to the
-        // platform, so a real collision there surfaces as a genuine allocation
-        // failure. A further 64 GiB of headroom above `TASK_ADDR_MIN` clears
-        // that low region while staying well inside `TASK_ADDR_MAX`.
-        #[cfg(not(target_vendor = "apple"))]
-        let base_addr = 0x1000_0000usize;
-        #[cfg(target_vendor = "apple")]
-        let base_addr = 0x11_0000_0000usize;
+        // First, create an initial mapping at a specific address away from
+        // boundaries. No hardcoded literal is safe here on every platform: a
+        // fixed-address `sys_mmap` IS checked against litebox's own tracked
+        // mappings (which include a snapshot of the real host address space --
+        // see `PageManagementProvider::reserved_pages`'s doc comment -- taken
+        // at platform-construction time), but that snapshot can't account for
+        // memory the host allocator claims dynamically afterward (e.g. while
+        // this very test binary runs), so a literal picked to be free at
+        // snapshot time can still collide for real by the time this test
+        // actually runs. Get a genuinely free address instead: a hint-based
+        // (non-fixed) mmap always avoids every existing mapping, host-reserved
+        // or not.
+        let probe_len = 0x4000;
+        let base_addr = task
+            .sys_mmap(
+                0,
+                probe_len,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
+                -1,
+                0,
+            )
+            .unwrap();
+        task.sys_munmap(base_addr, probe_len).unwrap();
+        // Leave a page of headroom below `base_addr` for the "adjacent
+        // mapping right before" sub-test later, so it can't undo the
+        // just-freed probe region's own neighbors.
+        let base_addr = base_addr.as_usize() + 0x1000;
+
         let addr1 = task
             .sys_mmap(
                 base_addr,
