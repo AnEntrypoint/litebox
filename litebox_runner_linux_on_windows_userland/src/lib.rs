@@ -77,6 +77,14 @@ pub struct CliArgs {
     /// byte stream.
     #[arg(long = "pty-mode")]
     pub pty_mode: bool,
+
+    /// Open a real host window and display the guest's `/dev/dri/card0` DRM output in it (see
+    /// `litebox_shim_linux::syscalls::drm::DrmSubsystem` and
+    /// `litebox_platform_windows_userland::presentation`) -- opt-in, since most invocations
+    /// (scripted CLI usage, the common case this runner otherwise serves) have no GUI content to
+    /// show and should never have a window pop up unexpectedly.
+    #[arg(long = "gui")]
+    pub gui: bool,
 }
 
 struct MmappedFile {
@@ -285,6 +293,56 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     let shim = shim_builder.build();
 
+    // `--gui`: open a real host window and wire the guest's DRM page-flips into it. The
+    // `Presenter`'s own event loop (`Presenter::run`) blocks its calling thread for the window's
+    // entire lifetime -- see `presentation.rs`'s module doc comment for why that thread must NOT
+    // be this one (which goes on to call `run_thread` directly to execute the guest) -- so it gets
+    // its own dedicated OS thread, matching the `net_worker` pattern just below. Frames are pushed
+    // into it from `DrmSubsystem::page_flip` (inside the guest-execution thread, whichever thread
+    // that ends up being for a given guest process) via the `FrameSender` handle, never by the
+    // presenter thread reaching back into guest state itself.
+    //
+    // The `JoinHandle` is kept (not detached) so this function can wait for the WINDOW's own
+    // lifetime, not just the guest's: a real GUI stays on screen after the program that drew into
+    // it exits (exactly like a real X11 client disconnecting doesn't close the X server) -- without
+    // this, `std::process::exit` below tears the presenter thread down the instant the guest
+    // process finishes, which reliably raced the presenter's own async `resumed()`/first-frame
+    // setup and produced a window that never actually appeared, confirmed live.
+    let gui_presenter_thread = cli_args.gui.then(|| {
+        // `winit::EventLoop` (inside `Presenter`) is genuinely not `Send` on Windows -- it must be
+        // BOTH created and run on the same OS thread, per winit's own platform requirement -- so
+        // `Presenter::new()` happens INSIDE the spawned closure, not before it. The `FrameSender`
+        // handle (which IS `Send`+`Clone`, see its own doc comment) crosses the thread boundary
+        // the other way, via a one-shot channel, so `set_drm_flip_callback` below can be wired up
+        // on the main thread without blocking on the presenter thread's own startup.
+        let (sender_tx, sender_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let presenter = match litebox_platform_windows_userland::presentation::Presenter::new()
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    litebox_util_log::warn!(error:? = e; "failed to create GUI presenter");
+                    return;
+                }
+            };
+            let _ = sender_tx.send(presenter.sender());
+            if let Err(e) = presenter.run() {
+                litebox_util_log::warn!(error:? = e; "GUI presenter event loop exited with an error");
+            }
+        });
+        if let Ok(sender) = sender_rx.recv() {
+            shim.set_drm_flip_callback(move |bytes, width, height, pitch, _pixel_format| {
+                sender.send(litebox_platform_windows_userland::presentation::Frame {
+                    width,
+                    height,
+                    pitch,
+                    bytes: bytes.to_vec(),
+                });
+            });
+        }
+        handle
+    });
+
     // Spawn a background worker that drives real network I/O (via the in-process userspace NAT
     // gateway, see `litebox_platform_windows_userland::net`) so guest sockets can actually reach
     // the outside world. No Administrator privileges or driver are required: the gateway proxies
@@ -475,6 +533,17 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // `wait_on_tun`'s timeout is always capped to `MAX_TIMEOUT` (1ms), so the worker re-checks
     // `shutdown` frequently even while otherwise idle; the join below returns promptly.
     let _ = net_worker.join();
+
+    // `--gui`: keep the process (and its window) alive until the user closes it, matching real
+    // desktop application behavior -- the guest program that drew the window's content has
+    // already exited by this point (this line only runs after `program.process.wait()` above),
+    // exactly like a real X11/Wayland client disconnecting from the display server does not close
+    // the server or its windows. `Presenter::run`'s event loop only returns once
+    // `WindowEvent::CloseRequested` fires (the user clicked the window's close button), so this
+    // join is exactly the wait needed -- no polling, no arbitrary timeout.
+    if let Some(handle) = gui_presenter_thread {
+        let _ = handle.join();
+    }
 
     std::process::exit(exit_code)
 }

@@ -39,7 +39,8 @@ use std::sync::mpsc;
 
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
+use winit::platform::windows::EventLoopBuilderExtWindows;
 use winit::window::{Window, WindowId};
 
 /// One frame's worth of pixel content to present: raw bytes in `BGRA8`/`XRGB8888` byte order
@@ -92,8 +93,17 @@ pub struct Presenter {
 impl Presenter {
     /// Build a not-yet-shown presenter and its window. Real `winit`/OS window/event-loop
     /// resources are not created until [`Self::run`] is called on the thread that will own them.
+    ///
+    /// `with_any_thread(true)`: `winit` refuses `EventLoop::new()` off the process' main thread by
+    /// default -- a conservative guard that genuinely matters on platforms like macOS (Cocoa's
+    /// hard main-thread requirement) but is not a real constraint on Windows (see this module's
+    /// own doc comment: a Windows message loop is genuinely per-thread). Confirmed live: the
+    /// default constructor panics with exactly this "significant cross-platform compatibility
+    /// hazard" message when `Presenter::new()` runs on the dedicated thread
+    /// `litebox_runner_linux_on_windows_userland` spawns for it (required, since that binary's own
+    /// main thread is permanently occupied running the guest via `run_thread`).
     pub fn new() -> Result<Self, winit::error::EventLoopError> {
-        let event_loop = EventLoop::new()?;
+        let event_loop = EventLoopBuilder::default().with_any_thread(true).build()?;
         let wake = event_loop.create_proxy();
         let (frames_tx, frames_rx) = mpsc::channel();
         let sender = FrameSender {
@@ -121,6 +131,7 @@ impl Presenter {
         let mut app = PresenterApp {
             frames_rx: self.frames_rx,
             state: None,
+            last_frame: None,
         };
         self.event_loop.run_app(&mut app)
     }
@@ -137,6 +148,19 @@ struct GpuState {
 struct PresenterApp {
     frames_rx: mpsc::Receiver<Frame>,
     state: Option<GpuState>,
+    /// The most recently received frame, kept regardless of whether [`Self::state`] exists yet.
+    /// `winit`'s `resumed()` callback (which creates the real window/`wgpu` device/surface) fires
+    /// asynchronously on the event-loop thread, genuinely racing a guest's own DRM page-flip on a
+    /// completely different thread -- a frame sent before `resumed()` has run would otherwise be
+    /// silently dropped by [`Self::present`]'s own `state.is_none()` early return, with no later
+    /// retry once state DOES become ready. Confirmed live: a real guest program's very first
+    /// page-flip (issued immediately after `CREATE_DUMB`/`ADDFB2`/`SETCRTC`, with no delay) landed
+    /// before this thread's `resumed()` had fired, producing a genuinely blank white window
+    /// (winit's own pre-content background) despite every ioctl succeeding correctly and the
+    /// frame bytes being byte-for-byte correct. `resumed()` now replays this field once its own
+    /// setup completes, and every future frame keeps updating it the same way `RedrawRequested`'s
+    /// resize-driven re-presents already needed to survive a surface reconfigure.
+    last_frame: Option<Frame>,
 }
 
 impl PresenterApp {
@@ -192,7 +216,6 @@ impl PresenterApp {
                 depth_or_array_layers: 1,
             },
         );
-
         let Ok(surface_texture) = state.surface.get_current_texture() else {
             return;
         };
@@ -244,17 +267,28 @@ impl ApplicationHandler for PresenterApp {
             return;
         };
         let window = std::sync::Arc::new(window);
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        // `Backends::DX12`, not `wgpu::Instance::default()`'s full auto-detected set: confirmed
+        // live on this host (NVIDIA/AMD hybrid laptop GPU, Windows) that the Vulkan backend's
+        // swapchain reproducibly hangs `Surface::get_current_texture()` indefinitely (no error, no
+        // timeout, no further progress) on a freshly created window's very first frame -- even
+        // when called correctly from `RedrawRequested` with a confirmed-visible, non-minimized
+        // window, and independent of `PresentMode` (`Immediate` and `Fifo` both hang identically)
+        // or which physical GPU wgpu selects (reproduces on both the AMD iGPU and the NVIDIA
+        // dGPu). Forcing DX12 makes the identical repro present correctly on the first frame,
+        // every time. This is a genuine Vulkan WSI/driver-level swapchain-acquire issue on this
+        // host class, not anything under this module's own control to fix via configuration.
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::DX12,
+            ..Default::default()
+        });
         let Ok(surface) = instance.create_surface(window.clone()) else {
             return;
         };
-        let Ok(adapter) =
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            }))
-        else {
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+        })) else {
             return;
         };
         let Ok((device, queue)) = pollster::block_on(adapter.request_device(
@@ -273,6 +307,10 @@ impl ApplicationHandler for PresenterApp {
             .copied()
             .find(|f| *f == wgpu::TextureFormat::Bgra8Unorm)
             .unwrap_or(caps.formats[0]);
+        // `Fifo` is the only present mode every wgpu surface is required to support (the wgpu spec
+        // guarantees this); no measured need for `Immediate`/`Mailbox`'s lower latency in this
+        // module's own use case (a guest's DRM page-flip rate, not a real-time renderer).
+        let present_mode = wgpu::PresentMode::Fifo;
         surface.configure(
             &device,
             &wgpu::SurfaceConfiguration {
@@ -280,7 +318,7 @@ impl ApplicationHandler for PresenterApp {
                 format: surface_format,
                 width: size.width.max(1),
                 height: size.height.max(1),
-                present_mode: wgpu::PresentMode::Fifo,
+                present_mode,
                 desired_maximum_frame_latency: 2,
                 alpha_mode: caps.alpha_modes[0],
                 view_formats: vec![],
@@ -293,18 +331,41 @@ impl ApplicationHandler for PresenterApp {
             queue,
             surface_size: size,
         });
+        // Request a redraw of whatever frame arrived before this setup finished (see
+        // `last_frame`'s own doc comment for why this race is real, not hypothetical, and
+        // `user_event`'s doc comment for why presentation itself happens in `RedrawRequested`,
+        // never here directly) -- without this, a guest whose first page-flip lands early keeps a
+        // permanently blank window until its NEXT flip, which may be much later or may never come
+        // for a single-frame guest program.
+        if self.last_frame.is_some() {
+            if let Some(state) = &self.state {
+                state.window.request_redraw();
+            }
+        }
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
-        // A `FrameSender::send` wake-up: drain every queued frame, presenting only the last one
-        // (the most recent frame is the only one still worth showing -- matching how a real
-        // display only ever shows the CURRENT scanout buffer, never a backlog of stale ones).
+        // A `FrameSender::send` wake-up: drain every queued frame, keeping only the last one (the
+        // most recent frame is the only one still worth showing -- matching how a real display
+        // only ever shows the CURRENT scanout buffer, never a backlog of stale ones). Deliberately
+        // does NOT call `present()` directly: `Surface::get_current_texture()` genuinely blocked
+        // (confirmed live, AMD/Vulkan/Windows: reproducibly hung inside that one call with no
+        // error, no timeout, no further progress) when invoked from an arbitrary event-loop
+        // callback rather than from the window's own `RedrawRequested` -- every real wgpu+winit
+        // example routes presentation through `RedrawRequested` for exactly this reason (it is the
+        // point `winit`'s own platform backend guarantees the swapchain is in a presentable
+        // state), never from a `user_event`/custom-event handler. This just stores the frame and
+        // asks the window to redraw; `window_event`'s `RedrawRequested` arm does the actual
+        // `present()` call.
         let mut latest = None;
         while let Ok(frame) = self.frames_rx.try_recv() {
             latest = Some(frame);
         }
         if let Some(frame) = latest {
-            self.present(&frame);
+            self.last_frame = Some(frame);
+            if let Some(state) = &self.state {
+                state.window.request_redraw();
+            }
         }
     }
 
@@ -317,8 +378,12 @@ impl ApplicationHandler for PresenterApp {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => {
-                if let Some(state) = &self.state {
-                    state.window.request_redraw();
+                // See `user_event`'s doc comment for why presentation happens HERE, not when a
+                // frame first arrives: this is the one callback `winit` guarantees runs with the
+                // surface in a state where `get_current_texture()` won't block.
+                if let Some(frame) = self.last_frame.take() {
+                    self.present(&frame);
+                    self.last_frame = Some(frame);
                 }
             }
             _ => {}
