@@ -40,7 +40,10 @@ fn ratchet_globals() -> Result<()> {
     ratchet(
         &[
             ("dev_bench/", 1),
-            ("litebox/", 9),
+            // 10 rather than 9 for exception_table.rs's __dso_handle extern static, needed to
+            // locate this image's Mach-O header when looking up the exception table on Apple
+            // hosts (see that cfg(target_vendor = "apple") function's own doc comment).
+            ("litebox/", 10),
             ("litebox_platform_linux_kernel/", 6),
             // 9 rather than 5: AARCH64_SCRATCH_PTR/AARCH64_HOST_ONLY_SCRATCH/
             // AARCH64_GUEST_ALT_STACK_BASES were introduced by the aarch64 userland port
@@ -74,7 +77,13 @@ fn ratchet_globals() -> Result<()> {
             // count. Remove alongside the rest of the `ctxwatch` Dr1 diagnostic once the mallocng
             // `hlt` crash this investigation is now chasing (see `FINDINGS.txt` pass 49) is
             // root-caused and the diagnostic is deleted.
-            ("litebox_platform_windows_userland/", 15),
+            // 18 rather than 15: at least THREAD_GS_BASE (a GS_BASE-repair mirror of the existing
+            // THREAD_FS_BASE), REGISTER_KEY, and PLATFORM_TLS were introduced across earlier
+            // passes this multi-session investigation without bumping this count each time --
+            // this repo's own copy of dev_tests never actually ran against a real CI pipeline
+            // until this session's first push, so this drift went undetected for a while.
+            // Re-verified by direct line-count against the exact heuristic below.
+            ("litebox_platform_windows_userland/", 18),
             ("litebox_runner_lvbs/", 5),
             ("litebox_runner_snp/", 2),
             ("litebox_shim_linux/", 1),
