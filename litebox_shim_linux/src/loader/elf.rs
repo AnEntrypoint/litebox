@@ -392,21 +392,6 @@ mod tests {
     const PT_INTERP: u32 = 3;
     const PF_X: u32 = 1;
     const PF_R: u32 = 4;
-    // Must be loadable as-is (an `ET_EXEC` binary can't be relocated), so this
-    // has to sit above `TASK_ADDR_MIN` on platforms where low addresses are
-    // reserved -- see `crate::loader::DEFAULT_LOW_ADDR`'s own doc comment.
-    // `TASK_ADDR_MIN` itself is too close to that reservation in practice on
-    // Apple Silicon: dyld and the shared cache load low in the address space
-    // too (see `litebox_platform_macos_userland::read_memory_maps`'s doc
-    // comment), and loading an `ET_EXEC` binary at its exact linked address is
-    // a fixed placement that -- unlike an ordinary hint-based mmap -- is never
-    // checked against those before being handed to the platform. A further 64
-    // GiB of headroom above `TASK_ADDR_MIN` clears that low region while
-    // staying well inside `TASK_ADDR_MAX`.
-    #[cfg(not(target_vendor = "apple"))]
-    const EXEC_LOAD_ADDR: u64 = 0x400000;
-    #[cfg(target_vendor = "apple")]
-    const EXEC_LOAD_ADDR: u64 = 0x11_0000_0000;
     const INTERP_PATH_OFFSET: usize = 0x200;
     const INTERP_PATH: &[u8] = b"/ld.so\0";
 
@@ -464,11 +449,17 @@ mod tests {
         push_u64(buf, ph.align);
     }
 
-    fn minimal_elf(elf_type: u16, interp: Option<&[u8]>) -> Vec<u8> {
+    /// `exec_load_addr` is only meaningful for `ET_EXEC` (ignored otherwise):
+    /// unlike `ET_DYN`, which always loads at a hint-picked `0`, an `ET_EXEC`
+    /// binary loads at its own linked address exactly as-is, so the caller
+    /// must supply one it already knows is free -- see
+    /// `et_exec_interpreter_loads_top_down_above_low_heap`'s own probe for
+    /// why a compile-time constant can't safely be baked in here instead.
+    fn minimal_elf(elf_type: u16, interp: Option<&[u8]>, exec_load_addr: u64) -> Vec<u8> {
         let phnum = if interp.is_some() { 2 } else { 1 };
         let page_size = u64::try_from(PAGE_SIZE).expect("PAGE_SIZE fits u64");
         let entry = if elf_type == ET_EXEC {
-            EXEC_LOAD_ADDR
+            exec_load_addr
         } else {
             0
         };
@@ -481,7 +472,7 @@ mod tests {
                 flags: PF_R | PF_X,
                 offset: 0,
                 vaddr: if elf_type == ET_EXEC {
-                    EXEC_LOAD_ADDR
+                    exec_load_addr
                 } else {
                     0
                 },
@@ -528,8 +519,41 @@ mod tests {
     #[test]
     fn et_exec_interpreter_loads_top_down_above_low_heap() {
         let task = crate::syscalls::tests::init_platform(None);
-        write_file(&task, "/main", &minimal_elf(ET_EXEC, Some(INTERP_PATH)));
-        write_file(&task, "/ld.so", &minimal_elf(ET_DYN, None));
+
+        // An `ET_EXEC` binary loads at its own linked address exactly as-is
+        // (it can't be relocated), so this needs an address it already knows
+        // is free right now rather than a hardcoded literal: litebox checks a
+        // fixed-address mmap against its own tracked mappings (seeded at
+        // platform-construction time from a snapshot of the real host address
+        // space -- see `PageManagementProvider::reserved_pages`'s doc
+        // comment), but that snapshot can't account for memory the host
+        // allocator claims dynamically afterward, so even an address free at
+        // snapshot time can collide for real by the time this test actually
+        // runs. Get a genuinely free one with a throwaway hint-based probe
+        // mmap, which always avoids every existing mapping, host-reserved or
+        // not.
+        let probe_len = PAGE_SIZE;
+        let exec_load_addr = task
+            .sys_mmap(
+                0,
+                probe_len,
+                litebox_common_linux::ProtFlags::PROT_READ,
+                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
+                -1,
+                0,
+            )
+            .expect("probe mmap for a free ET_EXEC load address");
+        task.sys_munmap(exec_load_addr, probe_len)
+            .expect("munmap the probe mapping");
+        let exec_load_addr = u64::try_from(exec_load_addr.as_usize())
+            .expect("guest address fits u64 on every supported target");
+
+        write_file(
+            &task,
+            "/main",
+            &minimal_elf(ET_EXEC, Some(INTERP_PATH), exec_load_addr),
+        );
+        write_file(&task, "/ld.so", &minimal_elf(ET_DYN, None, 0));
 
         let mut loader = ElfLoader::new(&task, "/main").expect("loader should parse test ELFs");
         let main = loader
