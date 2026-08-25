@@ -132,6 +132,52 @@ unit test can't reproduce. Whoever continues this should extend the new
 test to substitute a `Unix` socket fd for the eventfd (closer to the real
 compositor's shape) before re-attempting a live guest-process reproduction.
 
+**Phase 7 (this pass): hypothesis (b), the `Unix`-socket-specific readiness
+path, was tested directly and ALSO RULED OUT** (`litebox_shim_linux/src/
+syscalls/epoll.rs`'s new
+`test_nested_epoll_readiness_rechecked_across_separate_waits_unix_socket`
+test, kept as a second permanent regression test alongside phase 6's
+eventfd version). Same exact scenario as phase 6, with a real Unix
+socketpair (`UnixSocket::new_connected_pair`, `EpollDescriptor::Unix`) as
+the inner epoll's ready source instead of an eventfd: nest the receiving
+socket inside the inner epoll via `EPOLL_CTL_ADD`, TWO SEPARATE `wait()`
+calls with a fresh `sendto` between them (not draining via the inner
+epoll's own `wait()`, mirroring how calloop itself reads its own fds
+directly). **This also passes cleanly** -- the outer epoll correctly
+observes the nested epoll's readiness via the socket on both the first and
+second, independent wait call. Validated as a real, sensitive test (not a
+false-passing one) by temporarily sabotaging `EpollFile::check_io_events`
+to always return `Events::empty()` and confirming BOTH the eventfd and
+socket variants then hang (blocking on a readiness event that never
+arrives) rather than silently passing -- reverted immediately after
+confirming, no code left in this state.
+
+**Two of the three candidates from phase 6 are now ruled out with hard
+evidence, and the third (`EPOLL_CTL_MOD`) is now also structurally
+unlikely.** Read `litebox_shim_linux/src/syscalls/epoll.rs`'s `mod_interest`
+directly (the `EPOLL_CTL_MOD` handler) side-by-side with `add_interest`
+(the `EPOLL_CTL_ADD` handler, already exercised cleanly by both passing
+tests): both call the exact same `file.poll(global, mask,
+Some(observer_weak))` re-registration step, with `mod_interest` additionally
+just updating the stored mask/flags/data first -- no structural difference
+in HOW the observer gets re-registered between `ADD` and `MOD`. This makes
+candidate (a) unlikely to be the real cause (not fully eliminated without
+tracing real `calloop` source or a live `EpollOp`-logging diagnostic against
+the combined probe, but no longer the most promising lead).
+
+**The remaining, now-primary suspect is candidate (c): a genuine multi-thread
+timing race** specific to the real client-and-compositor-on-separate-threads
+shape (`src/combined.rs`) that no single-threaded unit test (both of this
+pass's tests, and phase 6's, ran everything on one thread) can reproduce
+structurally. Whoever continues this should either (1) write a genuinely
+multi-threaded unit test -- two real `std::thread`s independently driving
+the outer `wait()` calls and the socket writes concurrently, with realistic
+interleaving/timing, rather than this session's fully sequential
+single-thread tests -- or (2) trace `combined.rs`'s exact thread-handoff
+points live (a temporary diagnostic logging exactly when the compositor
+thread's `dispatch()` calls happen relative to the client thread's writes)
+to look for a genuine missed-wakeup window between the two.
+
 ## Reproducing the type-check only
 
 ```sh
