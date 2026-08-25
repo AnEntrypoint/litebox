@@ -119,14 +119,10 @@ impl<Platform: ShimPlatform> EvdevSubsystem<Platform> {
         Some(bytes)
     }
 
-    /// Whether at least one event is queued -- used by `read()`'s non-blocking-fd branch to
-    /// decide between `EAGAIN` and an actual (empty) short read is never valid for evdev, so this
-    /// exists purely to let the caller choose the right error without popping speculatively.
-    #[expect(
-        dead_code,
-        reason = "kept for the follow-up poll()/epoll() readiness wiring, not yet connected -- \
-                   see this module's own doc comment's 'what this pass does not implement' list"
-    )]
+    /// Whether at least one event is queued -- consulted by `syscalls::epoll::EpollDescriptor`'s
+    /// `poll()` (so a guest's `select()`/`poll()`/`epoll_wait()` loop correctly wakes once real
+    /// input arrives) and available for a future `read()` non-blocking-fd branch that wants to
+    /// choose the right error without popping speculatively.
     pub(crate) fn has_pending(&self) -> bool {
         !self.pending_events.lock().is_empty()
     }
