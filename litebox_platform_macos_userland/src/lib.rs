@@ -339,14 +339,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             // `EINVAL` from `mmap` here means a misaligned address or length,
             // since every other argument is fixed by this function. Everything
             // else -- `ENOMEM` included -- is reported as exhaustion.
-            let os_err = std::io::Error::last_os_error();
-            // TEMPORARY (macOS CI investigation): see the diagnostics above.
-            std::eprintln!(
-                "mmap({:#x}, {:#x}, flags={flags:#x}) failed: {os_err}",
-                suggested_range.start,
-                suggested_range.len()
-            );
-            return Err(match os_err.raw_os_error() {
+            return Err(match std::io::Error::last_os_error().raw_os_error() {
                 Some(libc::EINVAL) => AllocationError::Unaligned,
                 _ => AllocationError::OutOfMemory,
             });
@@ -546,7 +539,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
 
         // SAFETY: `handle` is a valid fd from `create_shared_memory`, and
         // `MAP_FIXED` only replaces a range the caller has told us it owns.
-        let ptr = unsafe {
+        let mut ptr = unsafe {
             libc::mmap(
                 suggested_range.start as *mut libc::c_void,
                 suggested_range.len(),
@@ -558,17 +551,53 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         };
         if ptr == libc::MAP_FAILED {
             let os_err = std::io::Error::last_os_error();
-            // TEMPORARY (macOS CI investigation): see `update_permissions`'s
-            // matching diagnostic. Remove once root-caused.
-            std::eprintln!(
-                "mmap({:#x}, {:#x}, MAP_SHARED, handle={handle}) failed: {os_err}",
-                suggested_range.start,
-                suggested_range.len()
-            );
             return Err(match os_err.raw_os_error() {
                 Some(libc::EINVAL) => SharedMemoryError::Unaligned,
                 _ => SharedMemoryError::OutOfMemory,
             });
+        }
+        // A `Hint`-mode request (no `MAP_FIXED`) hands Darwin's own `mmap`
+        // complete freedom to place the mapping anywhere; unlike Linux/
+        // Windows, there is no way to pass Darwin an upper bound. If the
+        // hint address (a real guest address from an existing mapping, e.g.
+        // `Vmem::duplicate`'s "re-map the same MAP_SHARED handle at the
+        // parent's own address" request) is contended, Darwin can fall back
+        // to placing the mapping far outside this platform's own advertised
+        // TASK_ADDR_MAX ceiling -- observed live, tripping the caller's own
+        // `new_end <= TASK_ADDR_MAX` invariant. Retry once with NO hint
+        // (`addr=0`) so Darwin picks freely from its normal low/preferred
+        // region instead of wherever was contended near the original hint;
+        // `Hint` mode never promised the hint address would be honored, so a
+        // different final address here is a legal, ordinary outcome the
+        // caller (`Vmem::insert_mapping`) already tracks via this function's
+        // own return value, not a special case to plumb through.
+        let out_of_range = |p: *mut libc::c_void| {
+            let start = p as usize;
+            let end = start.wrapping_add(suggested_range.len());
+            start < Self::TASK_ADDR_MIN || end > TASK_ADDR_MAX
+        };
+        if fixed_address_behavior == FixedAddressBehavior::Hint && out_of_range(ptr) {
+            // SAFETY: this is exactly the mapping `mmap` just created above.
+            unsafe { libc::munmap(ptr, suggested_range.len()) };
+            // SAFETY: same as the original mapping attempt, minus the hint.
+            ptr = unsafe {
+                libc::mmap(
+                    core::ptr::null_mut(),
+                    suggested_range.len(),
+                    prot_flags(map_permissions),
+                    flags,
+                    handle,
+                    0,
+                )
+            };
+            if ptr == libc::MAP_FAILED {
+                return Err(SharedMemoryError::OutOfMemory);
+            }
+        }
+        if out_of_range(ptr) {
+            // SAFETY: this is exactly the mapping `mmap` just created above.
+            unsafe { libc::munmap(ptr, suggested_range.len()) };
+            return Err(SharedMemoryError::OutOfMemory);
         }
         Ok(UserMutPtr::from_ptr(ptr.cast::<u8>()))
     }
