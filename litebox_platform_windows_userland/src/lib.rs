@@ -777,12 +777,32 @@ unsafe extern "system" fn vectored_exception_handler(
         if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
             && std::env::var_os("LITEBOX_DIAG_AVFULL").is_some()
         {
+            // `has_fs_override` reads the instruction bytes AT `rip` -- when `rip` itself is a
+            // corrupted, unmapped address (the `rip=0x100000001`-class crash this diagnostic was
+            // built to characterize), there is no instruction to read at all, so
+            // `faulting_instruction_has_fs_override` correctly (and, per its own doc comment,
+            // intentionally) returns `false` as a safe false-negative for the FS_BASE-repair
+            // guard's purposes below. That same `false` is misleading read as a standalone
+            // diagnostic line, though: it looks identical to "confirmed not FS-relative" when the
+            // real state is "rip is unreadable, this tells us nothing" -- confirmed live this
+            // session, where a `has_fs_override=false` reading for a corrupted `rip` initially
+            // looked like it ruled out the FS-relative-canary-check pattern, until a gdb-attached
+            // repro of the same crash class showed the actual fault (before `rip` got corrupted
+            // further downstream) was a completely ordinary `sub %fs:0x28,%rax` stack-protector
+            // check. Report whether `rip` was even readable as its own field so a future
+            // investigator sees "unreadable, inconclusive" rather than a false "not FS-relative".
+            let mut probe = [0u8; 4];
+            let rip_readable = fork_verify::read_code_bytes_for_diagnostics(
+                context.Rip.trunc(),
+                &mut probe,
+            ) > 0;
             eprintln!(
-                "[diag-avfull] tid={:?} rip={:#x} fsbase={:#x} fault_addr={:#x} has_fs_override={}",
+                "[diag-avfull] tid={:?} rip={:#x} fsbase={:#x} fault_addr={:#x} rip_readable={} has_fs_override={}",
                 std::thread::current().id(),
                 context.Rip,
                 unsafe { litebox_common_linux::rdfsbase() },
                 exception_record.ExceptionInformation[1],
+                rip_readable,
                 faulting_instruction_has_fs_override(context.Rip.trunc()),
             );
         }
