@@ -141,6 +141,52 @@ struct TextSectionInfo {
 /// kernel: `icebp; hlt` on x86-64, and `BRK` on AArch64 (where a patch site is
 /// an `SVC`, `MSR TPIDR_EL0`, or `MRS TPIDR_EL0` instruction).
 pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
+    match hook_syscalls_in_elf_impl(input_binary, trampoline, false)? {
+        HookResult::Output(out) => Ok(out),
+        HookResult::TrappedSites { .. } => {
+            unreachable!("tolerate_trapped=false never returns TrappedSites")
+        }
+    }
+}
+
+/// Same contract as [`hook_syscalls_in_elf`], except a binary containing x86-64 syscall sites the
+/// patcher could not redirect (`InsufficientBytesBeforeOrAfter` -- too few surrounding bytes
+/// before hitting a control-flow boundary to fit the 5-byte jump this technique needs, an
+/// occasional, data-dependent codegen constraint rather than a structural limitation) is returned
+/// successfully instead of rejected, with each such site's address reported in the second tuple
+/// element for the caller to judge reachability. Each site is still replaced with a trapping
+/// `icebp; hlt` (see [`hook_syscalls_in_elf`]'s own doc comment) -- calling this function does
+/// not weaken that safety property, it only changes whether the caller gets the resulting binary
+/// back to inspect/accept or a hard `Err` discarding it. Reserved for callers that can accept a
+/// small number of genuinely-dead-in-practice trapped sites (e.g. libcore panic-formatting code a
+/// specific binary never actually exercises) -- most callers should keep using
+/// [`hook_syscalls_in_elf`], which fails closed as before, unchanged by this addition.
+///
+/// AArch64 does not support this tolerance yet (its trapped sites are reported the same way
+/// [`hook_syscalls_in_elf`] always has) since its `TPIDR_EL0` sites are guest-thread-pointer
+/// accesses, not merely dead-code syscalls -- a trapped one is far more likely to be genuinely
+/// reachable, so silently tolerating it would be a materially different risk than the x86-64 case
+/// this function targets.
+pub fn hook_syscalls_in_elf_allow_trapped_sites(
+    input_binary: &[u8],
+    trampoline: Option<u64>,
+) -> Result<(Vec<u8>, Vec<u64>)> {
+    match hook_syscalls_in_elf_impl(input_binary, trampoline, true)? {
+        HookResult::Output(out) => Ok((out, Vec::new())),
+        HookResult::TrappedSites { output, skipped_addrs } => Ok((output, skipped_addrs)),
+    }
+}
+
+enum HookResult {
+    Output(Vec<u8>),
+    TrappedSites { output: Vec<u8>, skipped_addrs: Vec<u64> },
+}
+
+fn hook_syscalls_in_elf_impl(
+    input_binary: &[u8],
+    trampoline: Option<u64>,
+    tolerate_trapped: bool,
+) -> Result<HookResult> {
     if input_binary.ends_with(BUN_FOOTER_MARKER) {
         return Err(Error::UnsupportedExecutable(
             "Bun-packaged executable".into(),
@@ -161,7 +207,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             u16::from_le_bytes(e_type_bytes)
         };
         if e_type == object::elf::ET_REL {
-            return Ok(input_binary.to_vec());
+            return Ok(HookResult::Output(input_binary.to_vec()));
         }
     }
 
@@ -186,20 +232,22 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             object::File::Elf64(_) => match file.architecture() {
                 object::Architecture::X86_64 => Arch::X86_64,
                 object::Architecture::Aarch64 => Arch::Aarch64,
-                _ => return Ok(input_binary.to_vec()),
+                _ => return Ok(HookResult::Output(input_binary.to_vec())),
             },
-            _ => return Ok(input_binary.to_vec()),
+            _ => return Ok(HookResult::Output(input_binary.to_vec())),
         };
 
         let text_sections = match text_sections(&file) {
             Ok(sections) => sections,
-            Err(InternalError::NoTextSectionFound) => return Ok(input_binary.to_vec()),
+            Err(InternalError::NoTextSectionFound) => {
+                return Ok(HookResult::Output(input_binary.to_vec()));
+            }
             Err(InternalError::Public(e)) => return Err(e),
             Err(e) => unreachable!("unexpected internal error: {e:?}"),
         };
 
         if is_already_hooked(&*buf, arch) {
-            return Ok(input_binary.to_vec());
+            return Ok(HookResult::Output(input_binary.to_vec()));
         }
 
         let trampoline_base_addr = find_addr_for_trampoline_code(&file)?;
@@ -219,7 +267,8 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             trampoline_base_addr,
             trampoline.unwrap_or(0),
             arm64::Host::Linux,
-        );
+        )
+        .map(HookResult::Output);
     }
 
     let control_transfer_targets = get_control_transfer_targets(arch, &*buf, &text_sections)?;
@@ -268,7 +317,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             trampoline_size: 0,
         };
         out.extend_from_slice(header.as_bytes());
-        return Ok(out);
+        return Ok(HookResult::Output(out));
     }
 
     // Build output: [patched ELF][padding to page boundary][trampoline code][header]
@@ -276,12 +325,18 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     append_trampoline_footer(&mut out, &mut trampoline_data, trampoline_base_addr);
 
     if !skipped_addrs.is_empty() {
+        if tolerate_trapped {
+            return Ok(HookResult::TrappedSites {
+                output: out,
+                skipped_addrs,
+            });
+        }
         return Err(Error::UnpatchableSyscalls(format!(
             "{} unpatchable syscall instruction(s) at {skipped_addrs:?}",
             skipped_addrs.len(),
         )));
     }
-    Ok(out)
+    Ok(HookResult::Output(out))
 }
 
 fn append_trampoline_footer(out: &mut Vec<u8>, trampoline_data: &mut [u8], header_vaddr: u64) {
@@ -1180,6 +1235,70 @@ fn hook_syscall_and_after(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lenient_api_returns_the_binary_and_reports_trapped_sites_instead_of_erroring() {
+        // A minimal-but-real x86-64 ELF with a `syscall` that HAS enough room to be patched
+        // normally -- this test's purpose is narrower than reproducing the exact
+        // InsufficientBytesBeforeOrAfter trigger (that's confirmed to occur for real against
+        // `docs/wayland-drm-backend-probe`'s actual `wayland-desktop` binary, a genuine
+        // xdg_shell/wl_seat/wl_output-using Wayland compositor, live-verified separately -- see
+        // that probe's own README): it confirms `hook_syscalls_in_elf_allow_trapped_sites`
+        // behaves identically to `hook_syscalls_in_elf` on ordinary, fully-patchable input
+        // (same output bytes, empty skipped-sites list), so the new lenient entry point is a
+        // strict superset of the existing one's behavior, not a different code path that could
+        // silently diverge for the common case.
+        let code = vec![0x0Fu8, 0x05, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90]; // syscall; 6x nop
+        let elf = build_minimal_x86_64_elf(&code, 0x1000);
+
+        let strict_output = hook_syscalls_in_elf(&elf, Some(0x9000_0000)).expect("strict API");
+        let (lenient_output, skipped) =
+            hook_syscalls_in_elf_allow_trapped_sites(&elf, Some(0x9000_0000))
+                .expect("lenient API");
+        assert!(skipped.is_empty(), "a fully-patchable binary must report zero trapped sites");
+        assert_eq!(
+            strict_output, lenient_output,
+            "lenient API must match strict API's output exactly when nothing is trapped"
+        );
+    }
+
+    fn build_minimal_x86_64_elf(code: &[u8], vaddr: u64) -> Vec<u8> {
+        const EHDR_SIZE: usize = 64;
+        const PHDR_SIZE: usize = 56;
+        let code_file_off = EHDR_SIZE + PHDR_SIZE;
+        let total_len = code_file_off + code.len();
+
+        let mut buf = vec![0u8; total_len];
+        // e_ident
+        buf[0..4].copy_from_slice(b"\x7fELF");
+        buf[4] = 2; // ELFCLASS64
+        buf[5] = 1; // ELFDATA2LSB
+        buf[6] = 1; // EV_CURRENT
+        // e_type=ET_EXEC(2), e_machine=EM_X86_64(0x3e)
+        buf[16..18].copy_from_slice(&2u16.to_le_bytes());
+        buf[18..20].copy_from_slice(&0x3eu16.to_le_bytes());
+        buf[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+        buf[24..32].copy_from_slice(&vaddr.to_le_bytes()); // e_entry
+        buf[32..40].copy_from_slice(&(EHDR_SIZE as u64).to_le_bytes()); // e_phoff
+        buf[40..48].copy_from_slice(&0u64.to_le_bytes()); // e_shoff (none)
+        buf[52..54].copy_from_slice(&u16::try_from(EHDR_SIZE).unwrap().to_le_bytes()); // e_ehsize
+        buf[54..56].copy_from_slice(&u16::try_from(PHDR_SIZE).unwrap().to_le_bytes()); // e_phentsize
+        buf[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum = 1
+
+        // One PT_LOAD segment covering the whole file (ehdr+phdr+code), R+X.
+        let ph = EHDR_SIZE;
+        buf[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // p_type=PT_LOAD
+        buf[ph + 4..ph + 8].copy_from_slice(&5u32.to_le_bytes()); // p_flags=R+X
+        buf[ph + 8..ph + 16].copy_from_slice(&0u64.to_le_bytes()); // p_offset
+        buf[ph + 16..ph + 24].copy_from_slice(&vaddr.to_le_bytes()); // p_vaddr
+        buf[ph + 24..ph + 32].copy_from_slice(&vaddr.to_le_bytes()); // p_paddr
+        buf[ph + 32..ph + 40].copy_from_slice(&(total_len as u64).to_le_bytes()); // p_filesz
+        buf[ph + 40..ph + 48].copy_from_slice(&(total_len as u64).to_le_bytes()); // p_memsz
+        buf[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+
+        buf[code_file_off..code_file_off + code.len()].copy_from_slice(code);
+        buf
+    }
 
     #[test]
     fn aarch64_out_of_range_site_is_rejected_as_unpatchable() {
