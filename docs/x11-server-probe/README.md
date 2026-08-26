@@ -357,3 +357,61 @@ probe's scope). A new, precisely-located blocker (DRI2 extension init
 SIGSEGV) is found for whoever continues toward a fully-serving Xorg display
 -- but reaching a real serving `:1` display is no longer the row's genuinely
 open question; the DRM-interaction question was.
+
+## Round 6: the DRI2 SIGSEGV is NOT a litebox bug -- root-caused precisely,
+## no fix needed or attempted
+
+Reused round 5's own leftover build (`/root/x11probe/` in WSL2: prebuilt
+`litebox_runner_linux_userland`, rewritten rootfs, `xorg-kms.conf` already
+pointed at `/dev/dri/card0`) and reproduced the DRI2 crash live, twice, with
+`-verbose 5` for full detail. `gdb` (installed fresh via `apt-get`) confirms
+the fault address (`0x8`, a near-null-pointer dereference) and that the crash
+happens entirely inside Xorg's own C code within the guest process -- not
+inside any litebox host-side syscall handler.
+
+**Determined definitively: this is case (b), an Xorg/`modesetting`-driver-
+side expectation, not a litebox correctness bug.** Two independent lines of
+evidence:
+
+1. **`litebox_shim_linux` has ZERO DRI2-related ioctl handling anywhere**
+   (grepped `litebox_shim_linux/src/syscalls/drm.rs` and
+   `litebox_common_linux/src/lib.rs` for `DRI2`/`DRM_IOCTL_GEM`/
+   `DRM_IOCTL_PRIME` -- no matches). Xorg's DRI2 extension init crashes
+   BEFORE it would ever reach a DRI2-specific ioctl call -- there is no
+   "litebox lied about ioctl success" mechanism available here at all, since
+   no such ioctl is ever issued. The crash is purely Xorg's own compiled-in
+   DRI2 extension code dereferencing an uninitialized driver-private struct
+   field.
+
+2. **The log's own preceding line names the real cause**: `(**) modeset(0):
+   Cannot use glamor with 24bpp packed fb` -- the `modesetting` driver
+   explicitly could not set up glamor (Xorg's GL-based acceleration layer,
+   which is what actually populates the `DRI2InfoRec` driver-private hooks
+   DRI2's extension-init code expects). Xorg's own core DRI2-init code does
+   not defensively check whether the active driver actually initialized
+   those hooks before dereferencing them -- a real upstream Xorg robustness
+   gap (crashing instead of cleanly skipping DRI2 when no accelerated driver
+   is present), triggered here because this probe's rootfs deliberately
+   excludes the entire `libGL`/mesa/glamor stack (the same weight round 1
+   originally flagged as the single biggest dependency-closure cost, and
+   rounds 2-5 deliberately worked around by using Ubuntu's non-glamor-
+   requiring packaging). Confirmed live: real `libGL.so.1`/`mesa-libgallium`/
+   `libgl1-mesa-dri` genuinely exist on the WSL2 host (used by WSLg itself)
+   but were never included in this probe's minimal rewritten rootfs -- their
+   absence is a deliberate, scope-preserving choice from round 2 onward, not
+   an oversight.
+
+**No litebox code change made or needed.** Pulling in a full glamor/mesa/
+libGL stack to give DRI2 a real driver to initialize against would re-open
+exactly the "15-25+ libraries, multi-session-scale" dependency closure round
+1 originally flagged and rounds 2-5 spent five rounds narrowing past --
+genuinely disproportionate scope for what would still only be software
+rendering (litebox's DRM device has no real GPU to accelerate for in the
+first place, so even a working DRI2 path would provide no functional benefit
+here, only compatibility with Xorg clients that specifically require it to
+be present rather than gracefully falling back). **This closes the X11
+track's remaining open question with a definitive, evidence-backed answer**:
+Xorg's core DRM mode-setting interaction with litebox (round 5's finding) is
+genuinely correct and complete; the DRI2 crash is upstream Xorg's own
+non-defensive behavior in a no-GL configuration, unrelated to litebox's own
+correctness.
