@@ -1,0 +1,64 @@
+name: Build debug-symboled musl (diagnostic tooling)
+
+# Manual-only: builds musl from source on a real Linux CI runner (real GCC, real
+# `musl-tools`, no Windows cross-compilation involved) with full debug info and
+# forced frame pointers, matching Alpine's real musl version as closely as
+# possible. This is diagnostic tooling for the long-standing fork()+execve()
+# mallocng `.meta=0` crash investigation (see project memory) -- the stock
+# Alpine musl binary has neither frame pointers nor debug info, which has
+# defeated every stack-walking/debugger-based technique tried so far. This
+# build is never meant to ship; it's a drop-in `/lib/ld-musl-x86_64.so.1`
+# replacement for a diagnostic litebox guest rootfs layer only.
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      musl_version:
+        description: "musl version to build (matching Alpine's shipped version)"
+        required: true
+        default: "1.2.6"
+
+jobs:
+  build_debug_musl:
+    name: Build instrumented musl
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential musl-tools curl
+
+      - name: Fetch musl source
+        run: |
+          curl -fL "https://musl.libc.org/releases/musl-${{ inputs.musl_version }}.tar.gz" -o musl.tar.gz \
+            || curl -fL "https://github.com/kraj/musl/archive/refs/tags/v${{ inputs.musl_version }}.tar.gz" -o musl.tar.gz
+          mkdir musl-src
+          tar -xzf musl.tar.gz -C musl-src --strip-components=1
+
+      - name: Configure and build with debug info + frame pointers
+        working-directory: musl-src
+        run: |
+          export CC=musl-gcc
+          export CFLAGS="-g -O0 -fno-omit-frame-pointer"
+          ./configure --target=x86_64-linux-musl --prefix="$GITHUB_WORKSPACE/musl-install" --disable-shared || \
+          ./configure --prefix="$GITHUB_WORKSPACE/musl-install"
+          make -j"$(nproc)"
+          make install
+
+      - name: Locate and verify build output
+        run: |
+          find "$GITHUB_WORKSPACE/musl-install" -type f \( -name "*.so*" -o -name "libc.so" \)
+          file "$GITHUB_WORKSPACE/musl-install"/lib/libc.so 2>/dev/null || true
+          # Confirm real frame-pointer prologues and debug info are present
+          objdump -d "$GITHUB_WORKSPACE/musl-install"/lib/libc.so 2>/dev/null | grep -m5 "push.*%rbp" || true
+          readelf -S "$GITHUB_WORKSPACE/musl-install"/lib/libc.so 2>/dev/null | grep -i debug || true
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: musl-${{ inputs.musl_version }}-debug
+          path: musl-install/
+          retention-days: 14
