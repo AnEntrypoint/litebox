@@ -1171,6 +1171,46 @@ mod tar_ro {
             .expect("lib entry should be present");
         assert_eq!(lib_entry.file_type, crate::fs::FileType::Symlink);
     }
+
+    /// Regression test for `Resolver::symlink_metadata` (backing `lstat(2)`): the FINAL path
+    /// component must not be followed even when it names a symlink -- unlike `file_status`
+    /// (backing `stat(2)`), which always follows it via `open()`.
+    #[test]
+    fn symlink_metadata_on_final_component_reports_symlink_not_target() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let fs = super::tar_ro_fs(&litebox, SYMLINK_TEST_TAR_FILE.into());
+
+        let status = fs
+            .symlink_metadata("lib")
+            .expect("lstat-equivalent on a real symlink must succeed");
+        assert_eq!(status.file_type, crate::fs::FileType::Symlink);
+        assert_eq!(status.size, "usr/lib".len());
+
+        // `file_status` (stat, follows) on the very same path must still resolve to the
+        // target directory -- confirming only the final-component behavior changed.
+        let followed = fs
+            .file_status("lib")
+            .expect("stat (follow) on the same path must resolve to the target");
+        assert_eq!(followed.file_type, crate::fs::FileType::Directory);
+    }
+
+    /// `symlink_metadata` must still transparently follow a symlink in an INTERMEDIATE (non-final)
+    /// path component -- only the final component is left unresolved.
+    #[test]
+    fn symlink_metadata_still_follows_intermediate_symlink_components() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let fs = super::tar_ro_fs(&litebox, SYMLINK_TEST_TAR_FILE.into());
+
+        let direct = fs
+            .symlink_metadata("usr/lib/libfoo.so.1")
+            .expect("real path must resolve");
+        let via_symlink = fs
+            .symlink_metadata("lib/libfoo.so.1")
+            .expect("must still walk through the intermediate `lib` symlink");
+        assert_eq!(direct.file_type, crate::fs::FileType::RegularFile);
+        assert_eq!(via_symlink.file_type, crate::fs::FileType::RegularFile);
+        assert_eq!(direct.size, via_symlink.size);
+    }
 }
 
 mod layered {

@@ -193,6 +193,24 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// Obtain the status of a file/directory/... on the file-system.
     fn file_status(&self, path: impl path::Arg) -> Result<FileStatus, FileStatusError>;
 
+    /// Equivalent to [`Self::file_status`], but does not follow a symlink named by the FINAL
+    /// path component (matching `lstat(2)`/`fstatat(AT_SYMLINK_NOFOLLOW)` semantics): if
+    /// `path`'s last component is itself a symlink, this returns the symlink's OWN metadata
+    /// (`file_type: FileType::Symlink`, `size` = the length of its target string) rather than
+    /// the metadata of whatever it points at -- including for a dangling symlink, which must
+    /// still succeed here even though the target does not exist.
+    ///
+    /// Every path component *before* the final one is still resolved normally (following any
+    /// intermediate symlinks), exactly like [`Self::file_status`].
+    ///
+    /// The default body preserves this trait's original, symlink-following behavior for any
+    /// implementer that has no real symlink concept of its own (or already returns correct
+    /// lstat-shaped data from `file_status`, e.g. [`in_mem::FileSystem`], whose own entries are
+    /// never transparently followed to begin with).
+    fn symlink_metadata(&self, path: impl path::Arg) -> Result<FileStatus, FileStatusError> {
+        self.file_status(path)
+    }
+
     /// Equivalent to [`Self::file_status`], but open an open `fd` instead.
     fn fd_file_status(&self, fd: &TypedFd<Self>) -> Result<FileStatus, FileStatusError>;
 
@@ -381,6 +399,39 @@ pub struct FileStatus {
     pub atime: Timestamp,
     /// Last modification time
     pub mtime: Timestamp,
+}
+
+impl FileStatus {
+    /// Build the [`FileStatus`] for a symlink itself (never the file/directory it points at) --
+    /// what [`FileSystem::symlink_metadata`] returns for a path whose final component is a
+    /// symlink. `target_len` is the byte length of the symlink's (unresolved) target string.
+    ///
+    /// Real Linux always reports a symlink's own mode as `lrwxrwxrwx`: the permission bits on a
+    /// symlink itself are meaningless (any access check follows the link instead), so this does
+    /// not take a `mode` parameter and always sets full `rwxrwxrwx` permission bits.
+    /// `owner`/`node_info`/`blksize`/`atime`/`mtime` are supplied by the caller, since a
+    /// filesystem backend without a first-class symlink-metadata store of its own can
+    /// reasonably approximate them from the containing directory's own status.
+    #[must_use]
+    pub fn symlink(
+        target_len: usize,
+        owner: UserInfo,
+        node_info: NodeInfo,
+        blksize: usize,
+        atime: Timestamp,
+        mtime: Timestamp,
+    ) -> Self {
+        Self {
+            file_type: FileType::Symlink,
+            mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+            size: target_len,
+            owner,
+            node_info,
+            blksize,
+            atime,
+            mtime,
+        }
+    }
 }
 
 /// A timestamp, expressed as a duration since the Unix epoch (1970-01-01T00:00:00Z).

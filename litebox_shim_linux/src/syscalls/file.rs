@@ -2188,12 +2188,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         follow_symlink: bool,
     ) -> Result<T, Errno> {
         let normalized_path = pathname.normalized()?;
-        let path = if follow_symlink {
-            self.resolve_final_symlinks(normalized_path)?
+        let status = if follow_symlink {
+            let path = self.resolve_final_symlinks(normalized_path)?;
+            self.files.borrow().fs.file_status(path)?
         } else {
-            normalized_path
+            self.files.borrow().fs.symlink_metadata(normalized_path)?
         };
-        let status = self.files.borrow().fs.file_status(path)?;
         Ok(T::from(status))
     }
 
@@ -4859,6 +4859,68 @@ mod tests {
             Errno::ENOENT
         );
     }
+
+    /// Regression test for `sys_lstat` on a real symlink served through the read-only
+    /// `Resolver<Composer>`-backed layer (`/sys/class/drm/card0/subsystem`, wired via
+    /// `SysClassDrm`) -- the exact path `find /sys/class/drm -type l` uses under the hood. Prior
+    /// to the fix, `lstat` on this path transparently followed the symlink (via `open()`'s
+    /// normal final-component-following behavior) and returned the TARGET's metadata
+    /// (`/sys/class/drm`, a directory) instead of the symlink's own, so no caller relying on
+    /// `S_ISLNK(lstat(...).st_mode)` could ever detect it as a symlink.
+    #[test]
+    fn lstat_on_a_real_symlink_returns_symlink_metadata_not_target_metadata() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        let target = task
+            .sys_readlink(
+                "/sys/class/drm/card0/subsystem",
+                &mut [0u8; 64],
+            )
+            .is_ok();
+        assert!(target, "test harness invariant: the symlink must exist");
+
+        let lstat = task.sys_lstat("/sys/class/drm/card0/subsystem").unwrap();
+        assert_eq!(
+            lstat.st_mode & litebox_common_linux::InodeType::SymLink as u32,
+            litebox_common_linux::InodeType::SymLink as u32,
+            "lstat on a symlink must report S_IFLNK, not the target's file type"
+        );
+
+        // A plain `stat` (follow) on the very same path must still resolve through to the
+        // target directory -- confirming this fix only changed `lstat`'s behavior, not `stat`'s.
+        let stat = task.sys_stat("/sys/class/drm/card0/subsystem").unwrap();
+        assert_eq!(
+            stat.st_mode & litebox_common_linux::InodeType::Dir as u32,
+            litebox_common_linux::InodeType::Dir as u32,
+            "stat (follow) on the same path must still resolve to the target directory"
+        );
+    }
+
+    /// `lstat` on a dangling symlink (target does not exist) must still succeed and report the
+    /// symlink's own metadata -- unlike `stat` (follow), which must fail with `ENOENT`. Uses a
+    /// symlink created on the writable upper (`in_mem`) layer, since only that layer supports
+    /// `symlink(2)`.
+    #[test]
+    fn lstat_on_dangling_symlink_succeeds_but_stat_returns_enoent() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        task.sys_symlinkat("/does/not/exist", litebox_common_linux::AT_FDCWD, "/dangling")
+            .unwrap();
+
+        let lstat = task.sys_lstat("/dangling").unwrap();
+        assert_eq!(
+            lstat.st_mode & litebox_common_linux::InodeType::SymLink as u32,
+            litebox_common_linux::InodeType::SymLink as u32
+        );
+
+        assert_eq!(task.sys_stat("/dangling").unwrap_err(), Errno::ENOENT);
+    }
+
+    // Coverage for `lstat` still following an INTERMEDIATE (non-final) symlink component lives
+    // in `litebox::fs::tests::tar_ro::symlink_metadata_still_follows_intermediate_symlink_components`,
+    // using the `lib -> usr/lib` fixture that is genuinely walkable (unlike this crate's own
+    // `TEST_TAR_FILE`/`/sys/class/drm` mount, whose one symlink is documented as
+    // non-independently-walkable, see `devices.rs`'s `read_link_at`).
 
     #[test]
     fn tcsetsw_and_tcsetsf_round_trip_through_tcgets() {

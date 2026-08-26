@@ -1713,6 +1713,102 @@ impl<
         })
     }
 
+    fn symlink_metadata(&self, path: impl crate::path::Arg) -> Result<FileStatus, FileStatusError> {
+        // Mirrors `file_status` above exactly, except the "not an already-open fd" fallback
+        // calls `symlink_metadata` (not `file_status`) on each layer, so a final-component
+        // symlink's own metadata is preserved instead of being transparently followed. An
+        // already-open fd can never be a symlink itself (`open()` always resolves through any
+        // final-component symlink to reach the fd it hands back), so that branch is unaffected
+        // and stays on `fd_file_status` like `file_status` does.
+        let path = self.absolute_path(path)?;
+        if let Some(entry) = self.root.read().entries.get(&path) {
+            let FileStatus {
+                file_type,
+                mode,
+                size,
+                owner,
+                node_info,
+                blksize,
+                atime,
+                mtime,
+            } = match entry.as_ref() {
+                EntryX::Upper { fd } => self.upper.fd_file_status(fd)?,
+                EntryX::Lower { fd } => self.lower.fd_file_status(fd)?,
+                EntryX::Tombstone => {
+                    return Err(PathError::NoSuchFileOrDirectory)?;
+                }
+            };
+            return Ok(FileStatus {
+                file_type,
+                mode,
+                size,
+                owner,
+                node_info: self.get_layered_nodeinfo(node_info),
+                blksize,
+                atime,
+                mtime,
+            });
+        }
+        match self.upper.symlink_metadata(&*path) {
+            Ok(FileStatus {
+                file_type,
+                mode,
+                size,
+                owner,
+                node_info,
+                blksize,
+                atime,
+                mtime,
+            }) => {
+                return Ok(FileStatus {
+                    file_type,
+                    mode,
+                    size,
+                    owner,
+                    node_info: self.get_layered_nodeinfo(node_info),
+                    blksize,
+                    atime,
+                    mtime,
+                });
+            }
+            Err(e) => match e {
+                FileStatusError::PathError(
+                    PathError::ComponentNotADirectory
+                    | PathError::InvalidPathname
+                    | PathError::NoSearchPerms { .. }
+                    | PathError::TooManySymlinkHops,
+                ) => {
+                    return Err(e);
+                }
+                FileStatusError::Io => return Err(e),
+                FileStatusError::PathError(
+                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                ) => {}
+                FileStatusError::ClosedFd => unreachable!(),
+            },
+        }
+        let FileStatus {
+            file_type,
+            mode,
+            size,
+            owner,
+            node_info,
+            blksize,
+            atime,
+            mtime,
+        } = self.lower.symlink_metadata(path)?;
+        Ok(FileStatus {
+            file_type,
+            mode,
+            size,
+            owner,
+            node_info: self.get_layered_nodeinfo(node_info),
+            blksize,
+            atime,
+            mtime,
+        })
+    }
+
     fn fd_file_status(
         &self,
         fd: &FileFd<Platform, Upper, Lower>,
