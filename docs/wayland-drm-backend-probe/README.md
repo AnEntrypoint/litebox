@@ -415,3 +415,91 @@ with `cargo zigbuild --target x86_64-unknown-linux-musl --bin <name>` (same
 recipe as above). `wayland-combined` run as a real guest process reproduces
 the `CONNECTED`/`CLIENT_ACCEPTED` success and the `sendmsg`/`EINVAL` failure
 directly -- no launcher/fork needed for this repro since it's single-process.
+
+## Phase 9: `xdg_shell`/`wl_seat`/`wl_output` added -- real window-creation protocol on top of the proven `wl_compositor`+`wl_shm` pixel-commit pipeline
+
+This phase's original goal (getting a real XFCE desktop session running via this compositor) was
+superseded mid-pass by a separate, much more direct discovery: `apk add xfce4 xfce4-terminal
+weston` installs and runs the ENTIRE real XFCE package stack (301 packages, including
+xfwm4/xfdesktop/xfce4-panel/xfce4-session/gtk+3.0/libxfce4ui) as ordinary unmodified guest
+binaries with ZERO manual `litebox_syscall_rewriter` pre-processing -- `litebox_shim_linux`'s
+existing on-the-fly trap-fallback (`syscalls/mm.rs`'s `apply_trap_fallback`, live-patches
+`syscall` instructions in freshly-mmap'd executable code at runtime) already handles binaries
+installed at guest runtime. See the `apk-native-install` investigation (separate track) for the
+full XFCE-launch attempt and the one real litebox bug it surfaced (a host allocator panic in
+`glib`'s post-install trigger, tracked separately).
+
+Given that, this phase's remaining value is narrower than originally scoped: extending
+`src/main.rs`'s minimal compositor (`wl_compositor`+`wl_shm` only) with the protocol surface ANY
+serious Wayland client -- desktop-shell or otherwise -- actually needs before attaching a buffer:
+`xdg_shell` (real toplevel windows), `wl_seat` (keyboard/pointer capability, required by
+`XdgShellHandler::grab`'s own signature), `wl_output` (screen geometry, advertising litebox's real
+`1920x1080@60` virtual mode exactly, matching `DrmSubsystem`'s own constants).
+
+**`src/desktop.rs`** (new binary `wayland-desktop`): `main.rs`'s compositor plus
+`XdgShellHandler`/`SeatHandler`/`OutputHandler` impls (`delegate_xdg_shell!`/`delegate_seat!`/
+`delegate_output!`), following Smithay's own documented minimal-wiring pattern (see that module's
+own doc comment example, `smithay-0.7.0/src/wayland/shell/xdg/mod.rs`). Deliberately omits
+`seat.add_keyboard()` -- it pulls in `xkbcommon`'s real C keymap-compilation code (FFI-bound, not
+pure Rust) whose codegen tripped a real, narrow `litebox_syscall_rewriter` limitation (see below);
+`wl_seat`'s pointer capability alone is enough to prove the protocol wiring works.
+
+**Real, live-verified**: built via the established `cargo zigbuild --target
+x86_64-unknown-linux-musl --release` recipe, rewritten, deployed into a fresh rootfs, and run as a
+real litebox guest process directly on bare Windows (`litebox_runner_linux_on_windows_userland.exe
+--gui`, NO WSL2/hypervisor -- per this project's standing constraint). Printed `LISTENING
+path=/tmp/litebox-wayland-0` then `RUNNING` with zero crash/panic, confirming the extended global
+set (`wl_compositor`+`wl_shm`+`xdg_wm_base`+`wl_seat`+`wl_output`) initializes and the event loop
+runs cleanly against litebox's real DRM device.
+
+**`src/desktop_client.rs`** (new binary `wayland-desktop-client`): extends `client.rs`'s
+already-proven `wl_compositor`+`wl_shm`+`memfd_create` pixel-commit client with a real
+`xdg_wm_base` bind, `xdg_surface`, `xdg_toplevel` -- the actual "ask for a real window" sequence
+(create surface -> get xdg_surface -> get xdg_toplevel -> commit -> wait for the compositor's
+`configure` event -> ack -> THEN attach a buffer), matching real desktop-client behavior instead
+of the bare-surface-commit `client.rs` uses. Compiles and links cleanly for musl via the same
+recipe (`wayland-protocols` crate, `client` feature, added to `Cargo.toml`). Not yet run
+end-to-end together with `desktop.rs` in a single combined process (the `combined.rs` pattern this
+would need -- compositor on one thread, client on another, no fork/execve -- was not built this
+pass given the XFCE goal's supersession; the compositor half's own live verification above and
+this client's clean build/link are the evidence landed this pass).
+
+**Real, narrow `litebox_syscall_rewriter` limitation found and worked around** (a genuine,
+occasional, data-dependent x86-64 codegen constraint, not a `desktop.rs`-specific bug): adding
+`xdg_shell`/`wl_seat`/`wl_output` pulled in enough additional code that one `syscall` instruction
+(landing inside libcore's own `unicode::printable::is_printable` table-lookup code -- confirmed via
+`nm` symbol lookup on the unpatched debug build, genuinely unreachable in this binary's actual
+runtime paths) had too little surrounding instruction-stream slack for the rewriter's redirect
+technique to patch (`InsufficientBytesBeforeOrAfter`) -- happened in BOTH debug and release
+builds, at different addresses each time, ruling out a codegen-flag workaround. `main.rs`/
+`combined.rs`'s smaller compiled surface never hit this.
+
+Rather than route around it silently, added `litebox_syscall_rewriter::hook_syscalls_in_elf_allow_trapped_sites`
+(and a matching `--allow-trapped-sites` CLI flag) as a real, narrowly-scoped, explicit opt-in
+extension to the shared rewriter tool: identical behavior to the existing
+`hook_syscalls_in_elf` (same trap-replacement safety property -- an unpatchable site is
+ALWAYS replaced with a trapping `icebp;hlt`, so a genuinely-reached one still faults cleanly
+rather than escaping to the host kernel) except the caller gets the resulting binary back
+(with each trapped site's address reported) instead of a hard `Err` discarding it. Two new
+unit tests (`lib.rs`) confirm: (1) the lenient API is byte-for-byte identical to the strict
+API on ordinary, fully-patchable input (a true superset, not a different code path that could
+silently diverge for the common case), and (2) the existing strict `hook_syscalls_in_elf` is
+completely unaffected by this addition (still fails closed as before). Full existing rewriter
+test suite (17 unit tests, 1 pre-existing intentionally-ignored) passes unchanged; the one
+pre-existing `snapshot_test_hello_world_x86_64` failure is confirmed via `git stash` to predate
+this change (a toolchain/snapshot-drift issue on this host, unrelated). Clippy clean (`-Dwarnings`,
+both `std` and `no_std` feature configurations).
+
+**Reproducing this phase**:
+```sh
+# Build (Windows host, zig-based musl cross-linker, see Phase 1's own recipe above):
+cargo zigbuild --release --bin wayland-desktop --target x86_64-unknown-linux-musl
+cargo zigbuild --release --bin wayland-desktop-client --target x86_64-unknown-linux-musl
+
+# Rewrite (tolerating the one real trapped site the compositor binary hits):
+litebox_syscall_rewriter.exe wayland-desktop -o wayland-desktop.hooked --allow-trapped-sites
+litebox_syscall_rewriter.exe wayland-desktop-client -o wayland-desktop-client.hooked
+
+# Deploy into a rootfs and run directly on bare Windows (NOT WSL2):
+litebox_runner_linux_on_windows_userland.exe --initial-files rootfs.tar --gui -- wayland-desktop
+```
