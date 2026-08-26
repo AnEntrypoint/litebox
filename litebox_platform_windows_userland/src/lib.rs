@@ -582,16 +582,18 @@ unsafe extern "system" fn vectored_exception_handler(
         // `get_meta()` never pushes to the stack before this crash point (confirmed via
         // disassembly of the real shipped musl -- it's a leaf-shaped assert-chain using only
         // `rdi`/`rax`/`rcx`/`rdx`/`rsi`/`r8`/`r9`), so `[rsp]` at crash time should still be the
-        // return address `get_meta()` will eventually `ret` to -- its caller. Dump 8 QWORDs from
-        // `[rsp]` upward to identify which real caller (musl's own `malloc`/`aligned_alloc` path,
-        // vs. `free()`'s real body at file offset 0x46a7d) reached this specific crash, something
-        // no prior pass in this investigation directly captured.
+        // return address `get_meta()` will eventually `ret` to -- its caller. Widened from an
+        // earlier 8-qword version: `free()`'s own prologue pushes `r14`/`rbx` and subtracts 0x18
+        // from `rsp` before reaching this crash point, so `free()`'s OWN return address (its
+        // caller -- the actual pixman/weston/libwayland call site that triggered this) sits
+        // further up the stack than the original dump's depth reached. Dump 32 QWORDs from
+        // `[rsp]` upward -- enough headroom to walk past free()'s frame and find its caller.
         #[allow(
             clippy::cast_possible_truncation,
             reason = "diagnostic-only; this platform is x86_64-only, rsp fits in usize"
         )]
         let rsp = context.Rsp as usize;
-        let mut stack_words = [0u8; 64];
+        let mut stack_words = [0u8; 256];
         let nsw = fork_verify::read_code_bytes_for_diagnostics(rsp, &mut stack_words);
         let words: Vec<u64> = stack_words[..nsw]
             .chunks_exact(8)
