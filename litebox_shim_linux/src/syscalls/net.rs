@@ -4,7 +4,6 @@
 //! Socket-related syscalls, e.g., socket, bind, listen, etc.
 
 use core::{
-    ffi::CStr,
     mem::{offset_of, size_of},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
 };
@@ -1191,10 +1190,21 @@ pub(crate) fn read_sockaddr_from_user<Platform: ShimPlatform>(
                     path[1..].to_vec(),
                 )));
             }
-            let s = CStr::from_bytes_until_nul(path).map_err(|_| Errno::EINVAL)?;
-            Ok(SocketAddress::Unix(UnixSocketAddr::Path(
-                s.to_string_lossy().to_string(),
-            )))
+            // Real Linux's `unix(7)` does NOT require `sun_path` to be NUL-terminated when
+            // `addrlen` is sized exactly to `offsetof(sockaddr_un, sun_path) + strlen(path)` (no
+            // trailing NUL byte at all) -- this is a legal, common pattern (confirmed live: real
+            // `dbus-daemon` binds this way, e.g. `/tmp/dbus-xK0Y6NnEUG`, addrlen giving exactly
+            // 20 bytes with no NUL anywhere in them). `CStr::from_bytes_until_nul` previously
+            // required a NUL to be present, incorrectly rejecting this legal form with EINVAL.
+            // Take the NUL-terminated prefix if one exists (the other legal form, a path shorter
+            // than `sun_path`'s buffer with the remainder zero-padded); otherwise the whole slice
+            // is the path verbatim, matching the exact-addrlen form.
+            let path_bytes = match path.iter().position(|&b| b == 0) {
+                Some(nul_pos) => &path[..nul_pos],
+                None => path,
+            };
+            let s = core::str::from_utf8(path_bytes).map_err(|_| Errno::EINVAL)?;
+            Ok(SocketAddress::Unix(UnixSocketAddr::Path(s.to_string())))
         }
         // `AddressFamily` is a closed, 4-variant enum (`UNIX`/`INET`/`INET6`/`NETLINK`) -- any
         // other wire value already fails the `try_from` above with `EAFNOSUPPORT`, so this arm
@@ -3994,5 +4004,62 @@ mod unix_tests {
             .unwrap();
         task.sys_unlinkat(-1, client_path, AtFlags::empty())
             .unwrap();
+    }
+
+    /// Regression test: a Unix-domain `sockaddr_un` with `sun_path` sized EXACTLY to
+    /// `offsetof(sockaddr_un, sun_path) + strlen(path)` -- no trailing NUL byte anywhere in the
+    /// address bytes at all -- used to fail with a spurious `EINVAL` (`read_sockaddr_from_user`
+    /// used `CStr::from_bytes_until_nul`, which requires a NUL to be present). This is a real,
+    /// legal `bind()`/`connect()` form real Linux's kernel accepts (`unix(7)`: `sun_path` need not
+    /// be NUL-terminated when `addrlen` is sized exactly) -- confirmed live: real `dbus-daemon
+    /// --session` binds its listening socket exactly this way (e.g. `/tmp/dbus-xK0Y6NnEUG`, 20 raw
+    /// bytes, zero NULs), blocking any D-Bus-using guest program (`xfce4-session` and the rest of a
+    /// real XFCE desktop among them) from starting.
+    #[test]
+    fn read_sockaddr_from_user_accepts_unix_path_with_no_nul_terminator() {
+        let path = b"/tmp/dbus-xK0Y6NnEUG";
+        assert!(
+            !path.contains(&0),
+            "test fixture itself must contain no NUL byte"
+        );
+        let offset = core::mem::offset_of!(super::CSockUnixAddr, path);
+        let mut buf = alloc::vec![0u8; offset + path.len()];
+        buf[..2].copy_from_slice(&(AddressFamily::UNIX as u16).to_ne_bytes());
+        buf[offset..].copy_from_slice(path);
+        let result = super::read_sockaddr_from_user::<crate::syscalls::tests::TestPlatform>(
+            UserPtr::from_usize(buf.as_ptr() as usize),
+            buf.len(),
+        );
+        assert_eq!(
+            result,
+            Ok(SocketAddress::Unix(UnixSocketAddr::Path(
+                core::str::from_utf8(path).unwrap().to_string()
+            ))),
+            "a sockaddr_un with no NUL terminator and addrlen sized exactly to the path length \
+             must be accepted, matching real Linux -- not rejected with a spurious EINVAL"
+        );
+    }
+
+    /// A `sun_path` shorter than its buffer, NUL-padded (the OTHER legal real-Linux form -- most
+    /// C code that fills a fixed-size `struct sockaddr_un` and passes `sizeof(sockaddr_un)` as
+    /// `addrlen` produces exactly this shape) must still resolve to just the pre-NUL prefix, not
+    /// the NUL byte(s) or anything after them.
+    #[test]
+    fn read_sockaddr_from_user_stops_unix_path_at_first_nul_when_padded() {
+        let path = b"/tmp/short\0\0\0\0\0\0\0\0\0\0";
+        let offset = core::mem::offset_of!(super::CSockUnixAddr, path);
+        let mut buf = alloc::vec![0u8; offset + path.len()];
+        buf[..2].copy_from_slice(&(AddressFamily::UNIX as u16).to_ne_bytes());
+        buf[offset..].copy_from_slice(path);
+        let result = super::read_sockaddr_from_user::<crate::syscalls::tests::TestPlatform>(
+            UserPtr::from_usize(buf.as_ptr() as usize),
+            buf.len(),
+        );
+        assert_eq!(
+            result,
+            Ok(SocketAddress::Unix(UnixSocketAddr::Path(
+                "/tmp/short".to_string()
+            )))
+        );
     }
 }
