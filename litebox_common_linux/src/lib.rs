@@ -829,6 +829,12 @@ pub const DRM_IOCTL_MODE_PAGE_FLIP: u32 = 0xC018_64B0;
 pub const DRM_IOCTL_VERSION: u32 = 0xC040_6400;
 /// `DRM_IOCTL_GET_CAP = DRM_IOWR(0x0c, struct drm_get_cap)`, `size=16` (two `u64`s).
 pub const DRM_IOCTL_GET_CAP: u32 = 0xC010_640C;
+/// `DRM_IOCTL_SET_CLIENT_CAP = DRM_IOW(0x0d, struct drm_set_client_cap)`, `size=16` (two `u64`s,
+/// identical layout to [`DrmGetCap`]/[`struct@DrmSetClientCap`], just write-only: `dir=1` not
+/// `dir=3`, the only difference from [`DRM_IOCTL_GET_CAP`]'s encoding). Verified live against the
+/// real kernel header, not guessed (see that constant's own doc comment for the shared
+/// derivation).
+pub const DRM_IOCTL_SET_CLIENT_CAP: u32 = 0x4010_640D;
 /// `DRM_IOCTL_SET_MASTER = DRM_IO(0x1e)` -- a plain `_IO()` (no argument struct: `dir=0`,
 /// `size=0`), unlike every other DRM ioctl this device implements.
 pub const DRM_IOCTL_SET_MASTER: u32 = 0x0000_641E;
@@ -861,9 +867,27 @@ pub const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u32 = 0xC020_64B9;
 /// [`DRM_IOCTL_MODE_OBJ_GETPROPERTIES`]'s real-world callers actually query on this device's
 /// current ioctl surface).
 pub const DRM_MODE_OBJECT_CONNECTOR: u32 = 0xc0c0_c0c0;
-/// `DRM_CAP_DUMB_BUFFER` -- the one capability this device's `DRM_IOCTL_GET_CAP` genuinely
-/// supports (see [`DrmGetCap`]'s doc comment).
+/// `DRM_CAP_DUMB_BUFFER` -- the one allocation-related capability this device's
+/// `DRM_IOCTL_GET_CAP` genuinely supports (see [`DrmGetCap`]'s doc comment).
 pub const DRM_CAP_DUMB_BUFFER: u64 = 0x1;
+/// `DRM_CLIENT_CAP_UNIVERSAL_PLANES` (`include/uapi/drm/drm.h`) -- the `capability` value a
+/// client passes to `DRM_IOCTL_SET_CLIENT_CAP` to opt into seeing primary/cursor planes (not just
+/// overlay planes) through `GETPLANERESOURCES`/`GETPLANE`. This device's plane API (see
+/// `DrmSubsystem::get_plane_resources`/`get_plane`) has no primary/overlay/cursor distinction at
+/// all -- its one virtual plane is unconditionally exposed regardless of this cap -- so enabling
+/// it changes nothing about this device's actual behavior; it exists purely so real clients that
+/// require it be *acknowledged* (weston's DRM backend refuses to initialize without it) get a
+/// real success response instead of failing at `DRM_IOCTL_SET_CLIENT_CAP` itself.
+pub const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 0x2;
+/// `DRM_CAP_TIMESTAMP_MONOTONIC` (`include/uapi/drm/drm.h`) -- tells a client which clock domain
+/// vblank/page-flip-completion event timestamps are expressed in: `1` means `CLOCK_MONOTONIC`,
+/// `0` (the deprecated legacy default) means `CLOCK_REALTIME`. This device's page-flip completion
+/// events carry a fixed `tv_sec:0, tv_usec:0` placeholder (no real vsync/vblank interrupt exists
+/// to time -- see `drm.rs`'s `page_flip`), which is a valid reading under either domain, so
+/// reporting the modern `1` is the correct choice: real compositors (weston's DRM backend
+/// included) require this capability to be present at all just to initialize, and `0` is legacy
+/// behavior no current driver actually exercises.
+pub const DRM_CAP_TIMESTAMP_MONOTONIC: u64 = 0x6;
 
 /// VT (virtual terminal) ioctl request numbers, `include/uapi/linux/vt.h`. Unlike the DRM
 /// ioctls above, these are plain legacy-style constants (not `_IOWR`-encoded) -- verified live
@@ -1164,6 +1188,17 @@ pub struct DrmGetCap {
     pub value: u64,
 }
 
+/// `struct drm_set_client_cap` (`DRM_IOCTL_SET_CLIENT_CAP`). Identical field layout to
+/// [`DrmGetCap`] but write-only: `capability` is IN (a `DRM_CLIENT_CAP_*` constant, e.g.
+/// [`DRM_CLIENT_CAP_UNIVERSAL_PLANES`]), `value` is IN (the value being set; nothing is written
+/// back).
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmSetClientCap {
+    pub capability: u64,
+    pub value: u64,
+}
+
 /// `struct drm_mode_crtc_page_flip` (`DRM_IOCTL_MODE_PAGE_FLIP`).
 #[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
 #[repr(C)]
@@ -1418,6 +1453,8 @@ pub enum IoctlArg {
     DrmVersion(UserPtrMut<DrmVersion>),
     /// `DRM_IOCTL_GET_CAP` -- query a single `DRM_CAP_*` capability.
     DrmGetCap(UserPtrMut<DrmGetCap>),
+    /// `DRM_IOCTL_SET_CLIENT_CAP` -- opt into a single `DRM_CLIENT_CAP_*` behavior.
+    DrmSetClientCap(UserPtr<DrmSetClientCap>),
     /// `DRM_IOCTL_SET_MASTER` -- a plain `_IO()` with no argument struct, so this fd's own file
     /// descriptor (not a pointer) is the only state a handler needs.
     DrmSetMaster,
@@ -3470,6 +3507,9 @@ impl SyscallRequest {
                         DRM_IOCTL_MODE_SETPLANE => IoctlArg::DrmModeSetPlane(ctx.sys_req_ptr(2)),
                         DRM_IOCTL_VERSION => IoctlArg::DrmVersion(ctx.sys_req_ptr(2)),
                         DRM_IOCTL_GET_CAP => IoctlArg::DrmGetCap(ctx.sys_req_ptr(2)),
+                        DRM_IOCTL_SET_CLIENT_CAP => {
+                            IoctlArg::DrmSetClientCap(ctx.sys_req_ptr(2))
+                        }
                         DRM_IOCTL_SET_MASTER => IoctlArg::DrmSetMaster,
                         DRM_IOCTL_DROP_MASTER => IoctlArg::DrmDropMaster,
                         DRM_IOCTL_MODE_OBJ_GETPROPERTIES => {
