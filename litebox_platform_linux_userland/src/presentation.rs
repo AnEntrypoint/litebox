@@ -24,31 +24,33 @@
 //! explicitly ("to make platform compatibility easier"), matching this crate's Windows counterpart
 //! exactly. So, as on Windows, `winit`'s `EventLoop` runs correctly on a plain spawned thread here.
 //!
-//! # What is NOT yet independently verified (honest limitation, unlike the Windows module)
+//! # Run-verified against a real X11 display (2026-08-26)
 //!
-//! This port has no real X11/Wayland display available in the environment it was written in (no
-//! `DISPLAY`, no Wayland socket, no `Xvfb` installed) -- so, unlike `litebox_platform_windows_
-//! userland::presentation` (independently screenshot-verified live, twice, with two different
-//! solid colors), this module is build-verified only (`cargo check --target x86_64-unknown-linux-
-//! gnu`), not run-verified. Two specific things the Windows module needed a live fix for that this
-//! port has NOT been able to confirm one way or the other on real Linux windowing:
+//! This Windows host has no native `DISPLAY`/`Xvfb`, but WSL2's Ubuntu instance runs WSLg (a real
+//! X11/Wayland bridge) with a genuine X11 socket and window manager already present. Built for real
+//! (not `cargo check`) via `cargo zigbuild --target x86_64-unknown-linux-gnu` (this session's own
+//! zig-based cross-linker, proven for musl targets and, here, glibc too), copied into WSL2, and run
+//! there directly. Result: `xwininfo -root -tree` showed a real X11 window --
+//! `"litebox virtual display"` at exactly `1920x1080`, matching `presenter_smoke`'s own synthetic
+//! gradient frame -- reproduced twice, identically. Full recipe and evidence in
+//! `docs/linux-presenter-run-probe/README.md`. Both items below are resolved: neither
+//! Windows-specific workaround needed a Linux-side equivalent; the code, written without live
+//! verification, was already correct.
 //!
-//! 1. Whether `wgpu`'s default backend set (`Backends::all()`, which on Linux normally resolves to
-//!    Vulkan) has any equivalent to the Windows module's forced-DX12 workaround for a
-//!    `Surface::get_current_texture()` hang. No such issue is documented against `wgpu`'s Vulkan
-//!    backend on Linux, and forcing a backend without a reproduced problem to justify it would be
-//!    exactly the kind of unverified guess this project's own discipline forbids -- so this port
-//!    deliberately leaves `wgpu::Instance::default()` (every backend `wgpu` can find) rather than
-//!    copying Windows' `Backends::DX12` override. If a real Linux host later reproduces a similar
-//!    hang, narrow the backend set the same way, with the same live-repro rigor.
-//! 2. Whether presenting only from `RedrawRequested` (never directly from `user_event`) is
-//!    necessary here the way it was on Windows. It is kept anyway: it is correct on every winit
-//!    backend by the crate's own contract (`RedrawRequested` is the only point every backend
-//!    guarantees a presentable surface), not a Windows-only workaround, so there is no reason to
-//!    special-case it away pending Linux-specific verification.
+//! 1. `wgpu`'s default backend set (`Backends::all()`, resolving to Vulkan here) showed no
+//!    equivalent to the Windows module's `Surface::get_current_texture()` hang -- the process ran
+//!    to completion across two full runs with no hang, so `wgpu::Instance::default()` is kept as-is
+//!    (no DX12-style forced-backend override needed on Linux).
+//! 2. Presenting only from `RedrawRequested` (never directly from `user_event`) caused no
+//!    rendering-related crash or hang -- kept as the correct, already-general implementation.
 //!
-//! Both are flagged in the `gui-macos-linux-presentation-port` PRD row's follow-up rather than
-//! silently assumed identical to Windows.
+//! Not independently screenshotted at the pixel level (no screenshot tool available in that WSL
+//! session) the way the Windows module's own verification captured real screen pixels -- window
+//! creation and a full error-free event-loop run is the verification level achieved here. The
+//! Wayland backend specifically (as opposed to X11) was not gotten working in this pass (WSLg's
+//! compositor did not respond to a non-interactive shell invocation) -- both backends share the
+//! same `Presenter`/`PresenterApp` code this X11 run already exercised, so this was not pursued
+//! further as a separate verification target.
 
 use std::sync::mpsc;
 

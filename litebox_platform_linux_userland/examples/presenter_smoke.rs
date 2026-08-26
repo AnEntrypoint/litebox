@@ -3,11 +3,10 @@
 
 //! Manual, visually-witnessed smoke check for `presentation::Presenter` -- run directly
 //! (`cargo run -p litebox_platform_linux_userland --example presenter_smoke`), mirroring
-//! `litebox_platform_windows_userland`'s identically-named example. NOT run in this port's own
-//! development environment (no `DISPLAY`/Wayland socket/Xvfb available -- see `presentation.rs`'s
-//! module doc comment); build-verified only via `cargo check --target x86_64-unknown-linux-gnu`.
-//! A real Linux desktop session should confirm a window titled "litebox virtual display" appears
-//! showing a red/green gradient, then close on its own or when the window is closed.
+//! `litebox_platform_windows_userland`'s identically-named example. Run-verified against a real
+//! X11 display (WSL2/WSLg, see `docs/linux-presenter-run-probe/README.md`) -- a real window titled
+//! "litebox virtual display" at 1920x1080 confirmed via `xwininfo`, reproduced twice. See
+//! `presentation.rs`'s module doc comment for the full verification record.
 
 fn main() {
     let presenter =
