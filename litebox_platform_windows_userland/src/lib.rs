@@ -578,6 +578,26 @@ unsafe extern "system" fn vectored_exception_handler(
             context.R14,
             context.R15,
         );
+        // Temporary diagnostic (DIAG-STACKWALK, mallocng .meta=0 investigation continuation):
+        // `get_meta()` never pushes to the stack before this crash point (confirmed via
+        // disassembly of the real shipped musl -- it's a leaf-shaped assert-chain using only
+        // `rdi`/`rax`/`rcx`/`rdx`/`rsi`/`r8`/`r9`), so `[rsp]` at crash time should still be the
+        // return address `get_meta()` will eventually `ret` to -- its caller. Dump 8 QWORDs from
+        // `[rsp]` upward to identify which real caller (musl's own `malloc`/`aligned_alloc` path,
+        // vs. `free()`'s real body at file offset 0x46a7d) reached this specific crash, something
+        // no prior pass in this investigation directly captured.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "diagnostic-only; this platform is x86_64-only, rsp fits in usize"
+        )]
+        let rsp = context.Rsp as usize;
+        let mut stack_words = [0u8; 64];
+        let nsw = fork_verify::read_code_bytes_for_diagnostics(rsp, &mut stack_words);
+        let words: Vec<u64> = stack_words[..nsw]
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap_or([0; 8])))
+            .collect();
+        eprintln!("[veh] DIAG-STACKWALK rsp={rsp:#x} qwords={words:#x?}");
     }
 
     // Diagnostic-only (`LITEBOX_CTXWATCH=1`): decisive aliasing-vs-overwrite check at the exact
