@@ -511,6 +511,23 @@ impl ApplicationHandler for PresenterApp {
                 let Some(consumer) = &self.input_consumer else {
                     return;
                 };
+                // Some X11 window managers (confirmed live: WSLg's Weston WM) deliver a
+                // `CursorMoved` with an implausible, wildly-negative position (observed:
+                // `(-32486, -32587)`, well outside any real screen) before the window is fully
+                // mapped -- likely an artifact of an `EnterNotify`/similar event reported in a
+                // not-yet-valid coordinate space. Treating that bogus first reading as a real
+                // `last_cursor_pos` baseline produces a spurious, huge `REL_X`/`REL_Y` delta on
+                // the NEXT (real) event -- confirmed live: a single genuine cursor move produced
+                // `dx=dy=32800`. Discard any position outside the window's own known client area
+                // instead of updating `last_cursor_pos` from it -- a real cursor position is
+                // always within `[0, surface_size)` on both axes.
+                let in_bounds = self.state.as_ref().is_none_or(|state| {
+                    (0.0..f64::from(state.surface_size.width)).contains(&position.x)
+                        && (0.0..f64::from(state.surface_size.height)).contains(&position.y)
+                });
+                if !in_bounds {
+                    return;
+                }
                 if let Some((last_x, last_y)) = self.last_cursor_pos {
                     // A real mouse's own relative-motion sensor cannot report a single-event
                     // delta anywhere near `i32`'s range, so this narrowing is exact in practice,
