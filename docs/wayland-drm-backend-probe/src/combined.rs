@@ -115,7 +115,7 @@ impl CompositorHandler for Compositor {
         });
 
         if let Some((pixels, width, height, stride)) = copied {
-            println!("COMMIT_SHM_OK bytes={} width={} height={} stride={}", pixels.len(), width, height, stride);
+            println!("COMMIT_SHM_OK bytes={} width={} height={} stride={} first4={:02X?}", pixels.len(), width, height, stride, &pixels[..4.min(pixels.len())]);
             flush_stdout();
             let _ = self.result_tx.send((pixels.len(), width as u32, height as u32, stride as u32));
             self.committed_once = true;

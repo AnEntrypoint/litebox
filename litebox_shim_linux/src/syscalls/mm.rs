@@ -8,7 +8,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use litebox::{
     mm::linux::{MappingError, PAGE_SIZE, PageRange},
     platform::{
-        PageManagementProvider, RawConstPointer,
+        PageManagementProvider, RawConstPointer, RawMutPointer,
         page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions},
     },
 };
@@ -23,6 +23,18 @@ use litebox::utils::TruncateExt as _;
 use object::elf::{ET_DYN, FileHeader64, PT_LOAD, ProgramHeader64};
 #[cfg(target_arch = "x86_64")]
 use object::endian::LittleEndian;
+
+/// Per-memfd real shared-memory state, keyed by the backing in-mem file's own `(dev, ino)` (see
+/// `GlobalState::memfds`'s doc comment for why this lives shim-wide, mirroring
+/// `syscalls::file::FlockRegistry`'s identical `(dev, ino)`-keying rationale).
+pub(crate) struct MemfdEntry<Platform: PageManagementProvider<{ litebox::mm::linux::PAGE_SIZE }>> {
+    pub(crate) handle: Platform::SharedMemoryHandle,
+    /// The size `ftruncate` last set this memfd to (NOT necessarily page-aligned; `mmap`
+    /// resolves against `size.next_multiple_of(PAGE_SIZE)`, matching `create_shared_memory`'s own
+    /// page-rounding).
+    pub(crate) size: usize,
+}
+pub(crate) type MemfdRegistry<Platform> = BTreeMap<(usize, usize), MemfdEntry<Platform>>;
 
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("ELF patching code assumes 64-bit pointers (u64 <-> usize is lossless)");
@@ -350,6 +362,119 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         )
     }
 
+    /// If `fd` is a `memfd_create`-backed fd, map the guest's requested range directly onto its
+    /// real (host-backed) shared-memory storage and return `Some(result)` -- mirrors
+    /// `try_dri_dumb_buffer_mmap` immediately below exactly, the same "an ordinary fs-kind fd
+    /// carries a real shared-memory handle on the side, keyed by `(dev, ino)` in
+    /// `GlobalState::memfds`" shape DRM already established, since a plain in-mem file's own
+    /// bytes (an ordinary `Vec<u8>`, see `in_mem::FileSystem::truncate`) are guest heap memory,
+    /// not a real OS-level shared-memory object `MAP_SHARED|PROT_WRITE` could safely alias.
+    /// Returns `None` for any fd that isn't a live memfd, so the caller falls through to the
+    /// ordinary file-backed-mapping path (which correctly rejects `MAP_SHARED|PROT_WRITE` on a
+    /// real file, since this shim has no write-back-to-file story for that case).
+    fn try_memfd_mmap(
+        &self,
+        addr: usize,
+        len: usize,
+        flags: &MapFlags,
+        fd: i32,
+        offset: usize,
+    ) -> Option<Result<UserPtrMut<u8>, MappingError>> {
+        let raw_fd = u32::try_from(fd).ok().map(|v| v as usize)?;
+        let files = self.files.borrow();
+        // Captures both the memfd identity key AND (if this fd is one) the file's CURRENT bytes
+        // in one lookup, so the sync step below never needs a second, separate fd resolution.
+        let (key, current_bytes) = files
+            .run_on_raw_fd(
+                raw_fd,
+                |typed_fd| {
+                    let status = files.fs.fd_file_status(typed_fd).ok()?;
+                    let key = (status.node_info.dev, status.node_info.ino);
+                    let mut buf = alloc::vec![0u8; status.size];
+                    let n = files.fs.read(typed_fd, &mut buf, Some(0)).unwrap_or(0);
+                    buf.truncate(n);
+                    Some((key, buf))
+                },
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()
+            .flatten()?;
+        let memfds = self.global.memfds.lock();
+        let entry = memfds.get(&key)?;
+        // A memfd's backing shared-memory object is exactly `entry.size` bytes (the last
+        // `ftruncate`'d size, rounded up to a whole page by `create_shared_memory` itself); a
+        // client mapping a stale offset/length past that (e.g. before ever calling `ftruncate`,
+        // or after shrinking it) gets a real `SIGBUS`-territory rejection, matching real Linux.
+        let aligned_len = align_up(len, PAGE_SIZE);
+        if offset != 0 || aligned_len > entry.size.next_multiple_of(PAGE_SIZE) {
+            return Some(Err(MappingError::UnAligned));
+        }
+        let handle = entry.handle;
+        drop(memfds);
+        drop(files);
+        // Sync in whatever bytes the guest already wrote via ordinary `write()`/`pwrite()` calls
+        // before ever mmapping (the real Wayland `wl_shm` pattern this bridges: `ftruncate` then
+        // `write()` the pixel data, THEN the peer -- typically a different process/thread, e.g.
+        // the compositor -- `mmap()`s the same fd to read it, see this function's own doc comment
+        // for why an ordinary in-mem file can't support `MAP_SHARED|PROT_WRITE` directly). A
+        // transient, private, exclusively-owned mapping the caller never observes -- copies bytes
+        // in and unmaps immediately, before returning the REAL mapping requested below.
+        if let Some(sync_len) = litebox::mm::linux::NonZeroPageSize::new(aligned_len) {
+            // SAFETY: a fresh, private, non-fixed mapping of `handle` -- no guest code has ever
+            // observed this address, so writing into it and unmapping it immediately after is
+            // sound; `handle` itself outlives this transient mapping (owned by `memfds`).
+            if let Ok(ptr) = unsafe {
+                self.process().pm.map_existing_shared_pages(
+                    None,
+                    sync_len,
+                    litebox::mm::linux::CreatePagesFlags::empty(),
+                    handle,
+                )
+            } {
+                let copy_len = current_bytes.len().min(aligned_len);
+                let _ = ptr.write_slice_at_offset(0, &current_bytes[..copy_len]);
+                let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
+                let _ = litebox_common_linux::mm::sys_munmap(&self.process().pm, user_ptr, aligned_len);
+            }
+        }
+        let suggested_addr = if addr == 0 { None } else { Some(addr) };
+        let create_flags = {
+            let mut f = litebox::mm::linux::CreatePagesFlags::empty();
+            f.set(
+                litebox::mm::linux::CreatePagesFlags::FIXED_ADDR,
+                flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE),
+            );
+            f.set(
+                litebox::mm::linux::CreatePagesFlags::NOREPLACE,
+                flags.contains(MapFlags::MAP_FIXED_NOREPLACE),
+            );
+            f
+        };
+        let suggested_addr = match suggested_addr {
+            Some(a) => match litebox::mm::linux::NonZeroAddress::new(a) {
+                Some(n) => Some(n),
+                None => return Some(Err(MappingError::UnAligned)),
+            },
+            None => None,
+        };
+        let Some(length) = litebox::mm::linux::NonZeroPageSize::new(aligned_len) else {
+            return Some(Err(MappingError::UnAligned));
+        };
+        Some(
+            unsafe {
+                self.process()
+                    .pm
+                    .map_existing_shared_pages(suggested_addr, length, create_flags, handle)
+            }
+            .map(UserPtrMut::from_platform_ptr::<Platform>),
+        )
+    }
+
     /// If `fd` is a DRM device fd and `offset` is a fake offset a prior `DRM_IOCTL_MODE_MAP_DUMB`
     /// call handed out, map the guest's requested range directly onto that dumb buffer's real
     /// (host-backed) storage and return `Some(result)`. Returns `None` for any other `fd` (not a
@@ -451,6 +576,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if !flags.contains(MapFlags::MAP_ANONYMOUS)
             && let Some(result) =
                 self.try_dri_dumb_buffer_mmap(addr, len, &prot, &flags, fd, offset)
+        {
+            return result.map_err(Errno::from);
+        }
+
+        // Same rationale as the DRI check just above, for `memfd_create` fds: a real
+        // `memfd_create` object has always genuinely supported writable shared mappings on real
+        // Linux (that's its entire purpose -- anonymous shared memory for exactly this use case,
+        // e.g. Wayland's `wl_shm.create_pool`), so it must be resolved before the generic
+        // file-backed-mapping rejection below, which describes a real limitation of THIS shim's
+        // ordinary-file path, not of memfd specifically.
+        if !flags.contains(MapFlags::MAP_ANONYMOUS)
+            && let Some(result) = self.try_memfd_mmap(addr, len, &flags, fd, offset)
         {
             return result.map_err(Errno::from);
         }
@@ -1708,6 +1845,129 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err, Errno::ENOMEM);
+    }
+
+    /// `memfd_create` + `ftruncate` + `MAP_SHARED|PROT_WRITE` must produce REAL shared memory,
+    /// not two independent copies: a write through one independent `mmap()` of the fd must be
+    /// visible through a SECOND, separate `mmap()` of the same fd -- exactly the same "two
+    /// independent mmaps observe each other's writes" proof this session's DRM dumb-buffer work
+    /// established live against a real running process (see `docs/drm-dumb-buffer-ioctl-
+    /// reference.md`'s history); this is the unit-test-level equivalent for `memfd_create`.
+    #[test]
+    fn test_memfd_create_shared_mapping_across_two_independent_mmaps() {
+        let task = init_platform(None);
+
+        let fd = task
+            .sys_memfd_create(litebox_common_linux::MfdFlags::empty())
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+
+        task.sys_ftruncate(fd, 0x1000).unwrap();
+
+        let addr1 = task
+            .sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_SHARED,
+                fd,
+                0,
+            )
+            .unwrap();
+        let addr2 = task
+            .sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_SHARED,
+                fd,
+                0,
+            )
+            .unwrap();
+        assert_ne!(addr1.as_usize(), addr2.as_usize());
+
+        addr1
+            .write_slice_at_offset::<Platform>(0, &[0xab; 0x10])
+            .unwrap();
+        assert_eq!(addr2.read_at_offset::<Platform>(0).unwrap(), 0xab_u8);
+
+        task.sys_munmap(addr1, 0x1000).unwrap();
+        task.sys_munmap(addr2, 0x1000).unwrap();
+        task.sys_close(fd).unwrap();
+    }
+
+    /// The REAL `wl_shm` client pattern this whole bridge exists for: `memfd_create`,
+    /// `ftruncate`, write pixel bytes via an ORDINARY `write()` (not through any `mmap()` of its
+    /// own), THEN a separate peer `mmap()`s the same fd -- it must see the bytes the writer put
+    /// there. Live-witnessed end-to-end against the real `docs/wayland-drm-backend-probe`
+    /// combined client+compositor probe (a genuine `wayland-client`/`smithay` pair, not a
+    /// simulation): before this sync existed, the compositor's `mmap()`ed view read back all
+    /// zero bytes despite the client's real `write()`s (`COMMIT_SHM_OK ... first4=[00, 00, 00,
+    /// 00]`, confirmed live via a temporary diagnostic, immediately reverted); after, this exact
+    /// unit-test shape passes.
+    #[test]
+    fn test_memfd_create_write_then_mmap_sees_the_written_bytes() {
+        let task = init_platform(None);
+
+        let fd = task
+            .sys_memfd_create(litebox_common_linux::MfdFlags::empty())
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+
+        task.sys_ftruncate(fd, 0x1000).unwrap();
+        let content = [0xDD_u8, 0xCC, 0xBB, 0xAA].repeat(4);
+        assert_eq!(
+            task.sys_write(fd, &content, None).unwrap(),
+            content.len()
+        );
+
+        let addr = task
+            .sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_SHARED,
+                fd,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            addr.to_owned_slice::<Platform>(content.len())
+                .unwrap()
+                .as_ref(),
+            content.as_slice(),
+        );
+
+        task.sys_munmap(addr, 0x1000).unwrap();
+        task.sys_close(fd).unwrap();
+    }
+
+    /// A fresh `memfd_create` fd (before any `ftruncate`) has no real shared-memory object
+    /// registered yet -- `mmap` on it must fall through to the ordinary file-backed path (which
+    /// correctly rejects `MAP_SHARED|PROT_WRITE` on a zero-length file), not panic or silently
+    /// succeed against stale/wrong state.
+    #[test]
+    fn test_memfd_create_mmap_before_ftruncate_does_not_panic() {
+        let task = init_platform(None);
+
+        let fd = task
+            .sys_memfd_create(litebox_common_linux::MfdFlags::CLOEXEC)
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+
+        let err = task
+            .sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_SHARED,
+                fd,
+                0,
+            )
+            .unwrap_err();
+        assert_eq!(err, Errno::ENODEV);
+
+        task.sys_close(fd).unwrap();
     }
 
     #[test]

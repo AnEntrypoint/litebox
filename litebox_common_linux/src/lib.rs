@@ -740,6 +740,23 @@ bitflags::bitflags! {
     }
 }
 
+bitflags::bitflags! {
+    /// `memfd_create(2)` flags. Values match the real kernel `uapi/linux/memfd.h` exactly.
+    #[derive(Debug, Clone, Copy)]
+    pub struct MfdFlags: core::ffi::c_uint {
+        const CLOEXEC = 0x0001;
+        /// Sealing (`fcntl(F_ADD_SEALS)`) is accepted here (so a client that unconditionally
+        /// passes this flag doesn't get a spurious EINVAL) but this shim does not implement real
+        /// seal enforcement -- no known Wayland/shm client actually relies on seals being
+        /// enforced, only on the flag itself being accepted.
+        const ALLOW_SEALING = 0x0002;
+        const HUGETLB = 0x0004;
+        const NOEXEC_SEAL = 0x0008;
+        const EXEC = 0x0010;
+        const _ = !0;
+    }
+}
+
 type cc_t = ::core::ffi::c_uchar;
 type tcflag_t = ::core::ffi::c_uint;
 #[repr(C)]
@@ -2992,6 +3009,12 @@ pub enum SyscallRequest {
         initval: u32,
         flags: EfdFlags,
     },
+    MemfdCreate {
+        /// Cosmetic name only (real Linux exposes it via `/proc/self/fd/<n> -> memfd:<name>`,
+        /// which this shim does not implement) -- read but not otherwise interpreted.
+        name: UserPtr<c_char>,
+        flags: MfdFlags,
+    },
     Pipe2 {
         pipefd: UserPtrMut<u32>,
         flags: litebox::fs::OFlags,
@@ -3720,6 +3743,7 @@ impl SyscallRequest {
                 flags: EfdFlags::empty(),
             },
             Sysno::eventfd2 => sys_req!(Eventfd2 { initval, flags }),
+            Sysno::memfd_create => sys_req!(MemfdCreate { name:*, flags }),
             Sysno::getrandom => sys_req!(GetRandom { buf:*,count,flags }),
             Sysno::clone => {
                 let args = CloneArgs {
@@ -4386,6 +4410,7 @@ reinterpret_truncated_from_usize_for! {
         ReceiveFlags,
         EpollCreateFlags,
         EfdFlags,
+        MfdFlags,
         RngFlags,
         TimerFlags,
         StatxMask,

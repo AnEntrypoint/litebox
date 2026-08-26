@@ -20,8 +20,8 @@ use litebox::{
 };
 use litebox_common_linux::{
     AccessFlags, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
-    InodeType, IoReadVec, IoWriteVec, IoctlArg, Statx, StatxMask, TimeParam, errno::Errno,
-    signal::Signal,
+    InodeType, IoReadVec, IoWriteVec, IoctlArg, MfdFlags, Statx, StatxMask, TimeParam,
+    errno::Errno, signal::Signal,
 };
 use thiserror::Error;
 
@@ -681,7 +681,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         files
             .run_on_raw_fd(
                 raw_fd,
-                |fd| files.fs.truncate(fd, length, false).map_err(Errno::from),
+                |fd| {
+                    files.fs.truncate(fd, length, false)?;
+                    // A `memfd_create` fd (tagged at creation, see `MemfdMarker`'s own doc
+                    // comment) additionally needs a real, page-aligned
+                    // `PageManagementProvider::create_shared_memory` object sized to match, so a
+                    // LATER `mmap(MAP_SHARED|PROT_WRITE)` has real OS-level shared memory to bind
+                    // to (see `syscalls::mm::try_memfd_mmap`) -- an ordinary regular file's own
+                    // `ftruncate` (untagged) only ever touches its in-mem byte vector, exactly as
+                    // before this change.
+                    if self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .with_metadata(fd, |_: &MemfdMarker| ())
+                        .is_ok()
+                    {
+                        self.resize_memfd_shared_backing(fd, length)?;
+                    }
+                    Ok(())
+                },
                 |_fd| todo!("net"),
                 |_fd| todo!("pipes"),
                 |_fd| Err(Errno::EINVAL),
@@ -690,6 +709,34 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::EINVAL),
             )
             .flatten()
+    }
+
+    /// Creates (or replaces, on a size change) the real shared-memory object backing a
+    /// `memfd_create` fd. Registered/updated in `GlobalState::memfds`, keyed by the file's own
+    /// `(dev, ino)` (stable across `dup()`/`fork()`, unlike the raw fd number).
+    ///
+    /// This handle starts independent of the in-mem file's own `Vec<u8>` bytes that ordinary
+    /// `write()`/`read()` on this same fd still go through (an ordinary regular file has no such
+    /// real shared-memory backing at all -- see `syscalls::mm::try_memfd_mmap`'s own doc comment
+    /// for why memfd needs one in the first place); `try_memfd_mmap` itself is what closes this
+    /// gap, by syncing the file's CURRENT bytes into the real handle at `mmap()` time, so a guest
+    /// that writes pixel bytes via plain `write()` and only later has a peer `mmap()` the same fd
+    /// (the real `wl_shm` pattern this exists to support) observes them correctly.
+    fn resize_memfd_shared_backing(&self, fd: &TypedFd<FS>, length: usize) -> Result<(), Errno> {
+        let files = self.files.borrow();
+        let status = files.fs.fd_file_status(fd).map_err(Errno::from)?;
+        let key = (status.node_info.dev, status.node_info.ino);
+        let page_aligned_size = length.next_multiple_of(PAGE_SIZE).max(PAGE_SIZE);
+        let handle = self
+            .global
+            .platform
+            .create_shared_memory(page_aligned_size)
+            .map_err(|_| Errno::ENOMEM)?;
+        self.global
+            .memfds
+            .lock()
+            .insert(key, super::mm::MemfdEntry { handle, size: length });
+        Ok(())
     }
 
     /// Handle syscall `mknodat` — create a filesystem node.
@@ -1214,6 +1261,15 @@ fn stdio_stream_for_path(path: &CString) -> Option<StdioStream> {
 /// falling into that `File` arm's untagged-fd default (`Events::OUT`, permanently "not readable").
 #[derive(Clone, Copy)]
 pub(crate) struct EvdevFd;
+
+/// Marker metadata tagged onto a `memfd_create` fd's underlying entry at creation time --
+/// distinguishes it from an ordinary regular file so `sys_ftruncate` knows to also
+/// create/resize the real backing `PageManagementProvider::create_shared_memory` object it needs
+/// for `MAP_SHARED|PROT_WRITE` (see `syscalls::mm::try_memfd_mmap`'s own doc comment for why an
+/// ordinary in-mem file can't support that directly). `ftruncate` on an UNTAGGED regular file
+/// must never register a `memfds` entry -- this tag is what keeps the two cases apart.
+#[derive(Clone, Copy)]
+pub(crate) struct MemfdMarker;
 
 /// Mirrors [`stdio_stream_for_path`]'s shape for the one evdev device path this shim exposes.
 fn is_evdev_path(path: &CString) -> bool {
@@ -2785,6 +2841,67 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Errno::EMFILE
         })?;
         Ok(raw_fd.try_into().unwrap())
+    }
+
+    /// Handle syscall `memfd_create` -- anonymous, unlinked, shared-memory-backed file.
+    ///
+    /// Real Linux backs this with a tmpfs inode that never appears in any directory listing
+    /// (only reachable via `/proc/self/fd/<n>`, which this shim does not implement -- no known
+    /// consumer needs it, they always keep the fd `memfd_create` itself returns). This shim
+    /// reproduces the same "no discoverable path" property via the standard fallback trick real
+    /// libc implementations use on kernels without the real syscall: create an ordinary file at
+    /// a private, guaranteed-unique path, then `unlink()` it immediately -- the already-open fd's
+    /// underlying `Entry` stays alive (see `in_mem::FileSystem::unlink`'s doc comment) exactly
+    /// like a real unlinked-while-open file, just with no name left to find it by.
+    ///
+    /// The file itself only provides `ftruncate`'s bookkeeping (real Linux `mmap`/`ftruncate`
+    /// both operate against the SAME backing store as a matter of course; this shim's ordinary
+    /// in-mem files are plain guest-heap bytes, not real OS shared memory, so `MAP_SHARED|
+    /// PROT_WRITE` needs a separate real `PageManagementProvider::create_shared_memory` object --
+    /// see `syscalls::mm::MemfdRegistry`/`try_memfd_mmap`, the same two-tier shape
+    /// `DrmSubsystem`'s dumb buffers already established). A fresh memfd is 0 bytes, matching
+    /// real Linux (nothing is mmapped until the client calls `ftruncate`); `sys_ftruncate`
+    /// creates/resizes the real handle lazily on first (or later) growth.
+    pub fn sys_memfd_create(&self, flags: MfdFlags) -> Result<u32, Errno> {
+        if flags.intersects(
+            (MfdFlags::CLOEXEC
+                | MfdFlags::ALLOW_SEALING
+                | MfdFlags::HUGETLB
+                | MfdFlags::NOEXEC_SEAL
+                | MfdFlags::EXEC)
+                .complement(),
+        ) {
+            return Err(Errno::EINVAL);
+        }
+        let id = self.global.next_memfd_id.fetch_add(1, Ordering::Relaxed);
+        // Root (not `/tmp`) so this never depends on a writable `/tmp` existing in every guest
+        // rootfs -- the path is unlinked immediately below regardless, so where it briefly lives
+        // is never guest-observable.
+        let path = alloc::format!("/.memfd:{id}");
+        let file = self.do_open(
+            path.as_str(),
+            OFlags::CREAT | OFlags::EXCL | OFlags::RDWR,
+            Mode::from_bits_truncate(0o600),
+        )?;
+        // Unlink immediately -- the fd stays valid (see this method's own doc comment), but the
+        // path is gone before any guest code could ever observe/race it.
+        let files = self.files.borrow();
+        files.fs.unlink(path.as_str()).map_err(|e| {
+            let _ = files.fs.close(&file);
+            Errno::from(e)
+        })?;
+        drop(files);
+
+        let mut dt = self.global.litebox.descriptor_table_mut();
+        if flags.contains(MfdFlags::CLOEXEC) {
+            let old = dt.set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC);
+            assert!(old.is_none());
+        }
+        let old = dt.set_entry_metadata(&file, MemfdMarker);
+        assert!(old.is_none());
+        drop(dt);
+
+        self.insert_raw_file_fd_with_path(file, OFlags::empty(), None)
     }
 
     /// Handle a `TCGETS`/`TCSETS`/`TCSETSW`/`TCSETSF`/`TIOCGWINSZ` ioctl on a stdio fd.

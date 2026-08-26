@@ -294,8 +294,10 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             daemon_pty_masters: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
             next_pty_id: core::sync::atomic::AtomicU32::new(0),
             next_unix_autobind_id: core::sync::atomic::AtomicU32::new(0),
+            next_memfd_id: core::sync::atomic::AtomicU64::new(0),
             drm: syscalls::drm::DrmSubsystem::new(),
             evdev: syscalls::evdev::EvdevSubsystem::new(),
+            memfds: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
         });
         LinuxShim(global)
     }
@@ -1691,6 +1693,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::Eventfd2 { initval, flags } => {
                 syscall!(sys_eventfd2(initval, flags))
             }
+            SyscallRequest::MemfdCreate { name, flags } => {
+                // The name is cosmetic only (see `sys_memfd_create`'s own doc comment) but a bad
+                // pointer must still surface as a real `EFAULT`, matching real Linux, rather than
+                // being silently ignored.
+                name.to_cstring::<Platform>()
+                    .map_or(Err(Errno::EFAULT), |_name| syscall!(sys_memfd_create(flags)))
+            }
             SyscallRequest::Pipe2 { pipefd, flags } => {
                 self.sys_pipe2(flags).and_then(|(read_fd, write_fd)| {
                     pipefd
@@ -1909,6 +1918,10 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// autobind calls within one shim instance's lifetime (wraps at 2^20, matching the same
     /// 5-hex-digit range Linux itself uses).
     next_unix_autobind_id: core::sync::atomic::AtomicU32,
+    /// Next id to mint a unique, private path for a `memfd_create` fd's backing in-mem file
+    /// (see `Task::sys_memfd_create`) -- guarantees two concurrent calls never collide on the
+    /// same path even with an identical (or empty) guest-supplied name.
+    next_memfd_id: core::sync::atomic::AtomicU64,
     /// The first process created by [`LinuxShim::load_program`], set once and kept for the
     /// lifetime of the shim.
     ///
@@ -1930,6 +1943,12 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// matching how a real kernel input device is one object regardless of how many processes
     /// have it open.
     evdev: syscalls::evdev::EvdevSubsystem<Platform>,
+    /// Real shared-memory state for every live `memfd_create` fd, keyed by the backing in-mem
+    /// file's own `(dev, ino)` -- shim-wide for the same `(dev, ino)`-keying rationale as
+    /// `flock_registry` (any fd sharing the same underlying open file description, e.g. via
+    /// `dup()`/`fork()`, must resolve to the SAME real shared-memory handle, not a fresh one per
+    /// fd number). See `syscalls::mm::MemfdRegistry`'s own doc comment for the full shape.
+    memfds: litebox::sync::Mutex<Platform, syscalls::mm::MemfdRegistry<Platform>>,
 }
 
 struct Task<Platform: ShimPlatform, FS: ShimFS> {
