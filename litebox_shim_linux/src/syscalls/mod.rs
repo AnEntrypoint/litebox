@@ -16,6 +16,7 @@ pub mod process;
 pub(crate) mod pty;
 pub(crate) mod signalfd;
 pub(crate) mod unix;
+pub(crate) mod vt;
 
 pub(crate) mod signal;
 #[cfg(test)]

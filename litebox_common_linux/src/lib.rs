@@ -865,6 +865,50 @@ pub const DRM_MODE_OBJECT_CONNECTOR: u32 = 0xc0c0_c0c0;
 /// supports (see [`DrmGetCap`]'s doc comment).
 pub const DRM_CAP_DUMB_BUFFER: u64 = 0x1;
 
+/// VT (virtual terminal) ioctl request numbers, `include/uapi/linux/vt.h`. Unlike the DRM
+/// ioctls above, these are plain legacy-style constants (not `_IOWR`-encoded) -- verified live
+/// against the real kernel header (`torvalds/linux` master), not guessed. `seatd` (see
+/// `common/terminal.c`/`seatd/seat.c`) uses exactly these four to determine which VT is
+/// currently active (`VT_GETSTATE`) and to claim/release process-controlled VT switching
+/// (`VT_SETMODE`) around granting a client DRM device access; the remaining `VT_*` numbers
+/// (`VT_ACTIVATE`, `VT_WAITACTIVE`, ...) exist in the real kernel but are not on seatd's
+/// single-seat, no-real-hardware-switching call path and so are not implemented here.
+pub const VT_GETSTATE: u32 = 0x5603;
+pub const VT_SETMODE: u32 = 0x5602;
+/// KD (keyboard/display mode) ioctl request numbers, `include/uapi/linux/kd.h`.
+pub const KDSETMODE: u32 = 0x4B3A;
+pub const KDSKBMODE: u32 = 0x4B45;
+/// `KD_GRAPHICS` -- the mode value `seatd`'s `terminal_set_graphics(fd, true)` passes to
+/// `KDSETMODE` once a client is granted the VT (see `vt_open` in `seatd/seat.c`).
+pub const KD_GRAPHICS: i32 = 0x01;
+/// `KD_TEXT` -- the mode value restored on VT release (`terminal_set_graphics(fd, false)`).
+pub const KD_TEXT: i32 = 0x00;
+
+/// `struct vt_stat` (`VT_GETSTATE`) -- `v_active` is the 1-based number of the currently active
+/// VT; `v_signal`/`v_state` are a legacy signal-mask/console-bitmask pair no caller on seatd's
+/// call path reads.
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct VtStat {
+    pub v_active: u16,
+    pub v_signal: u16,
+    pub v_state: u16,
+}
+
+/// `struct vt_mode` (`VT_SETMODE`) -- requests process-controlled (`VT_PROCESS`) or
+/// kernel-automatic (`VT_AUTO`) VT switching. This device has no real hardware VT to switch
+/// away from, so the mode/signal values themselves are accepted and stored without altering any
+/// actual switching behavior (see [`crate`]-level VT device doc comment).
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct VtMode {
+    pub mode: u8,
+    pub waitv: u8,
+    pub relsig: i16,
+    pub acqsig: i16,
+    pub frsig: i16,
+}
+
 /// `struct drm_mode_create_dumb` -- allocate a CPU-writable, linear, no-GPU pixel buffer.
 #[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
 #[repr(C)]
@@ -1385,6 +1429,19 @@ pub enum IoctlArg {
     DrmModeObjGetProperties(UserPtrMut<DrmModeObjGetProperties>),
     /// `DRM_IOCTL_MODE_GETPROPERTY` -- resolve a single property ID's name/values.
     DrmModeGetProperty(UserPtrMut<DrmModeGetProperty>),
+    /// `VT_GETSTATE` -- report which VT is currently active. `seatd`'s `seat_update_vt` (see
+    /// `seatd/seat.c`) calls this on `/dev/tty0` to learn which per-VT device (`/dev/tty<N>`)
+    /// to subsequently open for a connecting client.
+    VtGetState(UserPtrMut<VtStat>),
+    /// `VT_SETMODE` -- claim (or release) process-controlled VT switching. `seatd`'s `vt_open`
+    /// calls this on the client's assigned `/dev/tty<N>` once it grants the client the VT.
+    VtSetMode(UserPtr<VtMode>),
+    /// `KDSETMODE` -- switch a VT between text (`KD_TEXT`) and graphics (`KD_GRAPHICS`) mode.
+    /// The third `ioctl()` argument is the mode value itself, not a pointer to one.
+    KdSetMode(i32),
+    /// `KDSKBMODE` -- switch a VT's keyboard translation mode. Same argument shape as
+    /// `KDSETMODE`: a plain scalar, not a pointer.
+    KdSkbMode(i32),
     Raw {
         cmd: u32,
         arg: UserPtrMut<u8>,
@@ -3421,6 +3478,10 @@ impl SyscallRequest {
                         DRM_IOCTL_MODE_GETPROPERTY => {
                             IoctlArg::DrmModeGetProperty(ctx.sys_req_ptr(2))
                         }
+                        VT_GETSTATE => IoctlArg::VtGetState(ctx.sys_req_ptr(2)),
+                        VT_SETMODE => IoctlArg::VtSetMode(ctx.sys_req_ptr(2)),
+                        KDSETMODE => IoctlArg::KdSetMode(ctx.sys_req_arg(2)),
+                        KDSKBMODE => IoctlArg::KdSkbMode(ctx.sys_req_arg(2)),
                         _ => IoctlArg::Raw {
                             cmd,
                             arg: ctx.sys_req_ptr(2),
