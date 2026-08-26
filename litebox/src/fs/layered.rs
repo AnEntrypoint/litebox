@@ -15,9 +15,9 @@ use crate::path::Arg;
 use crate::sync;
 
 use super::errors::{
-    ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, ReadLinkError, RenameError, RmdirError, SeekError, SetTimesError,
-    SymlinkError, TruncateError, UnlinkError, WriteError,
+    ChmodError, ChownError, CloseError, FileStatusError, LinkError, MkdirError, OpenError,
+    PathError, ReadDirError, ReadError, ReadLinkError, RenameError, RmdirError, SeekError,
+    SetTimesError, SymlinkError, TruncateError, UnlinkError, WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence};
 
@@ -1304,6 +1304,52 @@ impl<
             self.root.write().entries.remove(&to);
         }
         Ok(())
+    }
+
+    fn link(
+        &self,
+        oldpath: impl crate::path::Arg,
+        newpath: impl crate::path::Arg,
+    ) -> Result<(), LinkError> {
+        let oldpath = self.absolute_path(oldpath)?;
+        let newpath = self.absolute_path(newpath)?;
+        // Scoped to the common case this exists to support (Xorg-style atomic lock-file
+        // acquisition: link a temp file the caller just wrote into the writable upper layer to
+        // its final name) -- same rationale, and the exact same restriction, as `rename` above:
+        // `oldpath` must already live purely in the upper layer, or this is real Linux `EXDEV`
+        // territory.
+        if self.ensure_lower_contains(&oldpath).is_ok() {
+            return Err(LinkError::CrossDevice);
+        }
+        // Fail if anything already exists at `newpath`, in either layer -- matches Linux
+        // `link(2)`'s `EEXIST`, and mirrors `symlink`'s identical check just below.
+        if self.file_status(newpath.as_str()).is_ok() {
+            return Err(LinkError::AlreadyExists);
+        }
+        // `newpath`'s parent directory may only exist in the read-only lower layer so far --
+        // mirror `symlink`'s own identical fallback: on a missing-component error, check whether
+        // the lower layer has the parent directory, migrate the ancestor chain up to the upper
+        // layer if so, and retry.
+        match self.upper.link(&oldpath, newpath.as_str()) {
+            Ok(()) => Ok(()),
+            Err(LinkError::PathError(PathError::MissingComponent)) => {
+                let dirname = newpath.rsplit_once('/').unwrap().0;
+                if let Ok(FileType::Directory) = self.ensure_lower_contains(dirname) {
+                    self.mkdir_migrating_ancestor_dirs(&newpath)
+                        .map_err(|e| match e {
+                            MkdirError::NoWritePerms => LinkError::NoWritePerms,
+                            MkdirError::ReadOnlyFileSystem => LinkError::ReadOnlyFileSystem,
+                            MkdirError::Io => LinkError::Io,
+                            MkdirError::AlreadyExists => unreachable!(),
+                            MkdirError::PathError(e) => LinkError::PathError(e),
+                        })?;
+                    self.upper.link(oldpath, newpath)
+                } else {
+                    Err(LinkError::PathError(PathError::MissingComponent))
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn symlink(

@@ -823,6 +823,34 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .map_err(Errno::from)
     }
 
+    /// Handle syscall `linkat`
+    pub(crate) fn sys_linkat(
+        &self,
+        olddirfd: i32,
+        oldpath: impl path::Arg,
+        newdirfd: i32,
+        newpath: impl path::Arg,
+        flags: AtFlags,
+    ) -> Result<(), Errno> {
+        // `AT_EMPTY_PATH`/`AT_SYMLINK_FOLLOW` are real, valid `linkat(2)` flags, but no known
+        // guest use of `link`/`linkat` in this codebase needs them (Xorg's own lock-file
+        // acquisition -- the concrete use case this exists for -- calls plain `link(2)`, which is
+        // `linkat(AT_FDCWD, old, AT_FDCWD, new, 0)`) -- reject rather than silently ignore a
+        // semantic the caller explicitly asked for, matching `sys_renameat`'s handling of
+        // unsupported flags.
+        if !flags.is_empty() {
+            return Err(Errno::EINVAL);
+        }
+
+        let old_path = self.resolve_path_at(olddirfd, oldpath)?;
+        let new_path = self.resolve_path_at(newdirfd, newpath)?;
+        self.files
+            .borrow()
+            .fs
+            .link(old_path, new_path)
+            .map_err(Errno::from)
+    }
+
     /// Handle syscall `symlinkat`
     pub(crate) fn sys_symlinkat(
         &self,
@@ -4356,6 +4384,134 @@ mod tests {
             "mknodat created the file before returning {result:?}"
         );
         assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn linkat_creates_a_genuinely_shared_hard_link() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        let fd = task
+            .sys_open(
+                "/original",
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+        task.sys_write(fd, b"hello", None).unwrap();
+        task.sys_close(fd).unwrap();
+
+        task.sys_linkat(
+            litebox_common_linux::AT_FDCWD,
+            "/original",
+            litebox_common_linux::AT_FDCWD,
+            "/linked",
+            AtFlags::empty(),
+        )
+        .unwrap();
+
+        // Same inode on both paths (genuine shared identity, not a copy).
+        let orig_ino = task.sys_stat("/original").unwrap().st_ino;
+        let linked_ino = task.sys_stat("/linked").unwrap().st_ino;
+        assert_eq!(orig_ino, linked_ino);
+
+        // A write through the NEW path is visible through the ORIGINAL path.
+        let fd = task
+            .sys_open("/linked", OFlags::WRONLY, Mode::empty())
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+        task.sys_write(fd, b"world", None).unwrap();
+        task.sys_close(fd).unwrap();
+
+        let fd = task
+            .sys_open("/original", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+        let mut buf = [0u8; 5];
+        assert_eq!(task.sys_read(fd, &mut buf, None).unwrap(), 5);
+        task.sys_close(fd).unwrap();
+        assert_eq!(&buf, b"world");
+
+        // Unlinking one path leaves the other intact and still readable with the same content.
+        task.sys_unlinkat(
+            litebox_common_linux::AT_FDCWD,
+            "/original",
+            AtFlags::empty(),
+        )
+        .unwrap();
+        assert_eq!(task.sys_stat("/original").unwrap_err(), Errno::ENOENT);
+
+        let fd = task
+            .sys_open("/linked", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+        let mut buf = [0u8; 5];
+        assert_eq!(task.sys_read(fd, &mut buf, None).unwrap(), 5);
+        task.sys_close(fd).unwrap();
+        assert_eq!(&buf, b"world");
+    }
+
+    #[test]
+    fn linkat_rejects_directories_and_existing_destinations() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        task.sys_mkdirat(litebox_common_linux::AT_FDCWD, "/a_dir", 0o755)
+            .unwrap();
+        // Hard-linking a directory is `EPERM` on real Linux, never allowed.
+        assert_eq!(
+            task.sys_linkat(
+                litebox_common_linux::AT_FDCWD,
+                "/a_dir",
+                litebox_common_linux::AT_FDCWD,
+                "/a_dir_link",
+                AtFlags::empty(),
+            )
+            .unwrap_err(),
+            Errno::EPERM
+        );
+
+        let fd = task
+            .sys_open(
+                "/existing_a",
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        task.sys_close(i32::try_from(fd).unwrap()).unwrap();
+        let fd = task
+            .sys_open(
+                "/existing_b",
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        task.sys_close(i32::try_from(fd).unwrap()).unwrap();
+
+        // Linking onto an already-existing destination path is `EEXIST`.
+        assert_eq!(
+            task.sys_linkat(
+                litebox_common_linux::AT_FDCWD,
+                "/existing_a",
+                litebox_common_linux::AT_FDCWD,
+                "/existing_b",
+                AtFlags::empty(),
+            )
+            .unwrap_err(),
+            Errno::EEXIST
+        );
+
+        // A nonexistent `oldpath` is `ENOENT`.
+        assert_eq!(
+            task.sys_linkat(
+                litebox_common_linux::AT_FDCWD,
+                "/does_not_exist",
+                litebox_common_linux::AT_FDCWD,
+                "/new_link",
+                AtFlags::empty(),
+            )
+            .unwrap_err(),
+            Errno::ENOENT
+        );
     }
 
     #[test]

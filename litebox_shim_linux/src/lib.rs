@@ -1145,6 +1145,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 | SyscallRequest::Symlinkat { .. }
                 | SyscallRequest::Ftruncate { .. }
                 | SyscallRequest::Unlinkat { .. }
+                | SyscallRequest::Linkat { .. }
                 | SyscallRequest::Write { .. }
                 | SyscallRequest::Writev { .. }
                 | SyscallRequest::Read { .. }
@@ -1574,6 +1575,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .to_cstring::<Platform>()
                 .map_or(Err(Errno::EFAULT), |path| {
                     syscall!(sys_unlinkat(dirfd, path, flags))
+                }),
+            SyscallRequest::Linkat {
+                olddirfd,
+                oldpath,
+                newdirfd,
+                newpath,
+                flags,
+            } => oldpath
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |oldpath| {
+                    newpath
+                        .to_cstring::<Platform>()
+                        .map_or(Err(Errno::EFAULT), |newpath| {
+                            syscall!(sys_linkat(olddirfd, oldpath, newdirfd, newpath, flags))
+                        })
                 }),
             SyscallRequest::Renameat {
                 olddirfd,

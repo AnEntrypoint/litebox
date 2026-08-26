@@ -8,6 +8,13 @@ scope" without actually attempting a build. This round uses WSL2's native
 tractable and *more precise* path -- and got Xorg itself running as a real
 litebox guest process, further than round 1 got.
 
+**Round 3 note**: `link`/`linkat` are now implemented (see that section
+below) -- round 2's lock-file blocker, reproduced in this file's own "What
+was done"/"Result" sections below, is fixed on current `main`. Re-running
+this exact recipe now progresses further, into a different, real blocker
+(`_XSERVTransmkdir`'s `euid != 0` check, then a hard panic on `O_PATH`) --
+see the round 3 section for the precise, live-verified detail.
+
 ## What was done
 
 1. **Real Ubuntu 24.04 Xorg installed via `apt-get install xserver-xorg-core
@@ -114,16 +121,85 @@ tar --owner=0 --group=0 -cf rootfs.tar <rootfs dir contents>
 DISPLAY=:0 ./litebox_runner_linux_userland -Z --forward-env --initial-files rootfs.tar --program-from-tar --gui -- /usr/lib/xorg/Xorg -config /etc/xorg-kms.conf -novtswitch -sharevts -noreset -logfile /tmp/xorg.log :1
 ```
 
-## Updated scoping vs. round 1
+## Round 3: `linkat`/`link` implemented, the lock-file blocker is genuinely gone, a real new blocker found further in
 
-Round 1's "15-25+ shared libraries, multi-session-scale" conclusion is
-**partially refined, not overturned**: the real rewrite surface (15 files,
-not 15-25+) is smaller and more precisely bounded than estimated, and Xorg
-itself now genuinely runs and initializes as a litebox guest process --
-further than round 1 got. But a real, concrete new blocker (`linkat`
-unimplemented) now stands between here and a working display, and there may
-be more blockers beyond it (font loading -- no font packages were installed
-in this pass -- and actual DRM master/mode-setting interaction, the row's
-real load-bearing question, were never reached). Still genuinely multi-pass
-work, but with a precise, evidence-based next step instead of a vague
-estimate.
+Implemented `linkat`/`link` for real -- not a stub -- in `litebox`'s core
+filesystem layer: a new `FileSystem::link` trait method, a real
+`in_mem::FileSystem::link` implementation (clones the existing path's
+`Entry::File`'s `Arc`, so the new path genuinely shares the same underlying
+`FileX`/`unique_id` -- a write through either path is visible through the
+other, matching real Linux hard-link semantics, not a copy), pass-through
+implementations in `layered::FileSystem` (mirrors `rename`'s existing
+upper-layer-only + missing-parent-migration pattern) and
+`resolver::Resolver<Composer>`/`nine_p` (mirror `symlink`'s existing
+`ReadOnlyFileSystem`/`Io` stubs, since neither backend can meaningfully
+support it), a new `LinkError` type, `Errno` conversion (`EPERM` for
+directories matching real Linux, `EEXIST`, `EXDEV` for cross-layer), and
+`sys_linkat`/the `SyscallRequest::Linkat` wiring (mirroring
+`sys_unlinkat`/`sys_renameat`'s established pattern, `link` routes through
+the same `linkat`-with-`AT_FDCWD` handler `unlink`/`rename` already use, no
+separate wrapper needed). Two new permanent regression tests in
+`litebox_shim_linux/src/syscalls/file.rs`: one confirms genuine shared
+identity (same `st_ino`, a write through the new path is visible through the
+old path, unlinking one leaves the other intact and readable), one confirms
+the real Linux error cases (`EPERM` for a directory, `EEXIST` for an
+existing destination, `ENOENT` for a missing source). Full `litebox` and
+`litebox_shim_linux` test suites pass unchanged (confirmed against baseline
+`main` via `git stash` that the one pre-existing `litebox --lib` test
+failure and the one pre-existing `test_mremap` flake both predate this
+change).
+
+**Live-verified against the exact same rootfs/recipe this file already
+documents**: re-ran the identical reproduction steps below with the new
+`link`/`linkat` support built in. The lock-file error is confirmed
+GENUINELY GONE -- grepping the full run's output for `lock`/`linking`
+returns zero matches, where round 2's run showed
+`(EE) Linking lock file (/tmp/.X1-lock) in place failed: Function not
+implemented` at this exact point every time.
+
+Xorg now progresses meaningfully further, through two more real steps,
+before hitting a genuinely NEW, different, and precisely diagnosed blocker:
+
+```
+_XSERVTransmkdir: ERROR: euid != 0,directory /tmp/.X11-unix will not be created.
+_XSERVTransSocketCreateListener: failed to bind listener
+_XSERVTransSocketUNIXCreateListener: ...SocketCreateListener() failed
+_XSERVTransMakeAllCOTSServerListeners: failed to create listener for unix
+
+thread 'main' (1223) panicked at litebox\src\fs\layered.rs:483:13:
+not implemented: OFlags(NOFOLLOW | PATH)
+```
+
+Two separate things visible here, not fully disentangled this pass:
+1. Xorg's own `_XSERVTransmkdir` euid check believes it isn't running as
+   UID 0 and refuses to create `/tmp/.X11-unix` itself (pre-creating the
+   directory in the rootfs ahead of time, with `chmod 1777`, did NOT avoid
+   this -- the check is about the process's own perceived euid, not the
+   directory's existence) -- likely a real, separate question about how
+   litebox's guest `uid`/`euid` emulation answers `geteuid()` for this
+   process, not investigated further this pass.
+2. Immediately after, a hard `unimplemented!()` PANIC (not a clean errno
+   return) on `OFlags(NOFOLLOW | PATH)` -- `litebox/src/fs/layered.rs`'s
+   `open()` only supports a fixed allow-list of `OFlags`
+   (`CREAT`/`RDONLY`/`WRONLY`/`RDWR`/`EXCL`/`TRUNC`/`NOCTTY`/`DIRECTORY`/
+   `NONBLOCK`/`LARGEFILE`/`NOFOLLOW`/`APPEND`) and panics outright on
+   anything else, rather than returning `EINVAL`/`ENOSYS`. `O_PATH` (open a
+   path-only reference with no read/write access, used to safely probe a
+   path's existence/type -- likely from Xorg's own socket-directory
+   validation, or a library in its dependency chain such as `libselinux`)
+   is not in that allow-list.
+
+## Updated scoping vs. rounds 1-2
+
+Round 1's "15-25+ shared libraries, multi-session-scale" conclusion
+continues to be refined, not overturned. Round 2 got Xorg loading and
+initializing; round 3 closes the `linkat` gap it found and gets Xorg
+genuinely further -- past lock-file acquisition into socket-listener setup
+-- before hitting a real, different, and now precisely diagnosed pair of
+gaps (a `geteuid()`-adjacent question, and a hard panic on `O_PATH` rather
+than a clean error return). The general pattern across all three rounds
+holds: each pass gets meaningfully further and leaves a precise, actionable
+next step rather than a vague estimate, but a fully working Xorg display
+remains real, multi-pass work -- there is no evidence yet that this is the
+LAST blocker before DRM master/mode-setting interaction (the row's actual
+load-bearing question), only that it is the next one.
