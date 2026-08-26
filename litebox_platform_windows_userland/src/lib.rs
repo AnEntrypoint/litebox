@@ -57,6 +57,42 @@ thread_local! {
     /// [`WindowsUserland::init_thread_gs_base`] -- see that function's doc comment for why a
     /// cached value is needed at all, given `GS_BASE` is normally Windows' own to manage.
     static THREAD_GS_BASE: Cell<usize> = const { Cell::new(0) };
+    /// Set while this thread is inside [`vectored_exception_handler`]'s
+    /// `diag_fataldump_enabled()` diagnostic block (mallocng `.meta=0` investigation, 2026-08-26).
+    /// That block does real work (`Vec`/`String`/`format!`, i.e. host heap allocation) from a VEH
+    /// callback; a live investigation pass caught it re-faulting recursively at the SAME
+    /// `memmove` instruction 7 times in a row on the exact same thread -- a second exception
+    /// raised *while already inside* this diagnostic code re-entering the identical diagnostic
+    /// path, obscuring the original guest fault entirely. Per-thread (not a global `AtomicBool`)
+    /// because a VEH handler can legitimately run concurrently on unrelated threads and a global
+    /// guard would falsely suppress diagnostics for a genuinely separate, simultaneous crash.
+    static IN_VEH_DIAG_BLOCK: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII guard: sets [`IN_VEH_DIAG_BLOCK`] on construction, clears it on drop (including on an
+/// early return or a panic unwinding through the diagnostic block), so a second, nested entry
+/// into the diagnostic block on the SAME thread can detect it's already running and skip straight
+/// past the re-entrant work instead of recursing into the same crash-prone code again.
+struct VehDiagBlockGuard {
+    already_active: bool,
+}
+
+impl VehDiagBlockGuard {
+    fn enter() -> Self {
+        let already_active = IN_VEH_DIAG_BLOCK.with(Cell::get);
+        if !already_active {
+            IN_VEH_DIAG_BLOCK.with(|c| c.set(true));
+        }
+        Self { already_active }
+    }
+}
+
+impl Drop for VehDiagBlockGuard {
+    fn drop(&mut self) {
+        if !self.already_active {
+            IN_VEH_DIAG_BLOCK.with(|c| c.set(false));
+        }
+    }
 }
 
 /// The userland Windows platform.
@@ -521,7 +557,13 @@ unsafe extern "system" fn vectored_exception_handler(
                 && !(unsafe { litebox_common_linux::rdfsbase() } == 0
                     && context.Rip != 0
                     && WindowsUserland::get_thread_fs_base() != 0)))
+        // A second exception raised while this thread is ALREADY inside this diagnostic block
+        // (see `IN_VEH_DIAG_BLOCK`'s doc comment) means the diagnostic code itself is the thing
+        // that just faulted -- skip straight past it and let the exception propagate normally
+        // instead of recursing into the identical crash-prone path again.
+        && !IN_VEH_DIAG_BLOCK.with(Cell::get)
     {
+        let _veh_diag_guard = VehDiagBlockGuard::enter();
         #[allow(
             clippy::cast_possible_truncation,
             reason = "diagnostic-only; this platform is x86_64-only, rip fits in usize"
