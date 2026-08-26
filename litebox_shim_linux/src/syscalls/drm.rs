@@ -42,12 +42,13 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use litebox::mm::linux::PAGE_SIZE;
 use litebox::platform::RawConstPointer;
 use litebox_common_linux::{
-    DRM_CAP_DUMB_BUFFER, DRM_EVENT_FLIP_COMPLETE, DRM_MODE_CONNECTOR_VIRTUAL,
-    DRM_MODE_ENCODER_VIRTUAL, DRM_MODE_OBJECT_CONNECTOR, DRM_MODE_PAGE_FLIP_EVENT, DrmEvent,
-    DrmEventVblank, DrmGetCap, DrmModeCardRes, DrmModeCreateDumb, DrmModeCrtc,
-    DrmModeCrtcPageFlip, DrmModeDestroyDumb, DrmModeFbCmd2, DrmModeGetConnector, DrmModeGetEncoder,
-    DrmModeGetPlane, DrmModeGetPlaneRes, DrmModeGetProperty, DrmModeMapDumb, DrmModeModeinfo,
-    DrmModeObjGetProperties, DrmModeSetPlane, DrmVersion, errno::Errno,
+    DRM_CAP_DUMB_BUFFER, DRM_CAP_TIMESTAMP_MONOTONIC, DRM_CLIENT_CAP_UNIVERSAL_PLANES,
+    DRM_EVENT_FLIP_COMPLETE, DRM_MODE_CONNECTOR_VIRTUAL, DRM_MODE_ENCODER_VIRTUAL,
+    DRM_MODE_OBJECT_CONNECTOR, DRM_MODE_PAGE_FLIP_EVENT, DrmEvent, DrmEventVblank, DrmGetCap,
+    DrmModeCardRes, DrmModeCreateDumb, DrmModeCrtc, DrmModeCrtcPageFlip, DrmModeDestroyDumb,
+    DrmModeFbCmd2, DrmModeGetConnector, DrmModeGetEncoder, DrmModeGetPlane, DrmModeGetPlaneRes,
+    DrmModeGetProperty, DrmModeMapDumb, DrmModeModeinfo, DrmModeObjGetProperties, DrmModeSetPlane,
+    DrmSetClientCap, DrmVersion, errno::Errno,
 };
 use zerocopy::IntoBytes;
 
@@ -493,19 +494,39 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
 
     /// `DRM_IOCTL_GET_CAP` -- query a single capability. This device genuinely supports dumb
     /// buffers (the only allocation path it has, see `create_dumb`), so `DRM_CAP_DUMB_BUFFER`
-    /// reports `1`; any other capability (dumb-buffer preferred-depth, async page-flip, atomic
-    /// modesetting, etc.) reports `0` (unsupported), the real kernel's own behavior for a
-    /// capability a driver never registered, rather than fabricating support this device does not
-    /// actually have.
+    /// reports `1`. It also reports `DRM_CAP_TIMESTAMP_MONOTONIC` (see that constant's own doc
+    /// comment) -- real compositors including weston's DRM backend require this capability to be
+    /// present just to initialize at all. Any other capability (dumb-buffer preferred-depth,
+    /// async page-flip, atomic modesetting, etc.) reports `0` (unsupported), the real kernel's own
+    /// behavior for a capability a driver never registered, rather than fabricating support this
+    /// device does not actually have.
     pub(crate) fn get_cap(&self, ptr: UserPtrMut<DrmGetCap>) -> Result<u32, Errno> {
         let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-        req.value = if req.capability == DRM_CAP_DUMB_BUFFER {
+        req.value = if req.capability == DRM_CAP_DUMB_BUFFER
+            || req.capability == DRM_CAP_TIMESTAMP_MONOTONIC
+        {
             1
         } else {
             0
         };
         ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
         Ok(0)
+    }
+
+    /// `DRM_IOCTL_SET_CLIENT_CAP` -- opt into a single `DRM_CLIENT_CAP_*` behavior. This device's
+    /// plane API has no primary/overlay/cursor distinction and always exposes its one virtual
+    /// plane regardless (see [`DRM_CLIENT_CAP_UNIVERSAL_PLANES`]'s own doc comment), so there is
+    /// no actual state to track for that capability: it is accepted unconditionally. Every other
+    /// `DRM_CLIENT_CAP_*` (atomic modesetting, stereo 3D, etc.) reports `EINVAL`, the real
+    /// kernel's response to a capability the driver never registered -- this device's mode-setting
+    /// is the legacy `SETCRTC`/`PAGE_FLIP` API only, so claiming e.g. atomic support here would be
+    /// a lie a client could act on (calling `DRM_IOCTL_MODE_ATOMIC`, which does not exist here).
+    pub(crate) fn set_client_cap(&self, ptr: UserPtr<DrmSetClientCap>) -> Result<u32, Errno> {
+        let req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        match req.capability {
+            DRM_CLIENT_CAP_UNIVERSAL_PLANES => Ok(0),
+            _ => Err(Errno::EINVAL),
+        }
     }
 
     /// `DRM_IOCTL_SET_MASTER` -- real DRM enforces single-master-per-device for mode-setting

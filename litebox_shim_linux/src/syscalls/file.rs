@@ -3575,6 +3575,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             | IoctlArg::DrmModeSetPlane(..)
             | IoctlArg::DrmVersion(..)
             | IoctlArg::DrmGetCap(..)
+            | IoctlArg::DrmSetClientCap(..)
             | IoctlArg::DrmSetMaster
             | IoctlArg::DrmDropMaster
             | IoctlArg::DrmModeObjGetProperties(..)
@@ -3657,6 +3658,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             IoctlArg::DrmModeSetPlane(ptr) => self.global.drm.set_plane(*ptr),
             IoctlArg::DrmVersion(ptr) => self.global.drm.version(*ptr),
             IoctlArg::DrmGetCap(ptr) => self.global.drm.get_cap(*ptr),
+            IoctlArg::DrmSetClientCap(ptr) => self.global.drm.set_client_cap(*ptr),
             IoctlArg::DrmSetMaster => self.global.drm.set_master(),
             IoctlArg::DrmDropMaster => self.global.drm.drop_master(),
             IoctlArg::DrmModeObjGetProperties(ptr) => self.global.drm.obj_get_properties(*ptr),
