@@ -222,6 +222,75 @@ implemented in litebox at all -- `MEMFD_FAILED Function not implemented (os
 error 38)`. This is genuinely separate future work (a whole syscall
 implementation) for whoever continues this row.
 
+## Phase 9: `memfd_create` implemented -- THIS IS THE TRUE END-TO-END CLOSE OF
+## THE ENTIRE WAYLAND INITIATIVE
+
+Implements `memfd_create(2)` for real in litebox: an ordinary in-mem file
+created at a private root-level path and immediately `unlink()`ed (the
+standard fallback trick real libc implementations use, reproducing "no
+discoverable path" without needing a real tmpfs), tagged with a new
+`MemfdMarker` so `ftruncate` on it (and ONLY it -- an ordinary regular
+file's `ftruncate` is untouched) also creates a real
+`PageManagementProvider::create_shared_memory` object sized to match,
+registered in a new `GlobalState::memfds` map keyed by `(dev, ino)` (stable
+across `dup()`/`fork()`, mirroring `FlockRegistry`'s own established
+`(dev, ino)`-keying rationale). `syscalls::mm::try_memfd_mmap` (mirroring
+`try_dri_dumb_buffer_mmap`'s exact shape) resolves a real
+`mmap(MAP_SHARED|PROT_WRITE)` on a memfd fd onto this real handle via
+`map_existing_shared_pages`, checked BEFORE the generic file-backed-mapping
+path's existing `MAP_SHARED|PROT_WRITE` rejection -- exactly the same
+"an ordinary fs-kind fd carries a real shared-memory handle on the side"
+two-tier shape DRM's dumb buffers already established, reused rather than
+reinvented.
+
+**A real correctness gap was found and fixed during live verification, not
+silently left as a caveat**: an initial version left `write()`/`read()` on a
+memfd fd going through the in-mem file's own `Vec<u8>` independently of the
+real shared-memory handle -- structurally correct (no crash, no EINVAL) but
+WRONG content, confirmed live via a temporary diagnostic
+(`COMMIT_SHM_OK ... first4=[00, 00, 00, 00]` -- zero bytes instead of the
+client's real `[0xDD, 0xCC, 0xBB, 0xAA]` pixel data) rather than assumed
+correct from "the pipeline completed". Fixed by having `try_memfd_mmap`
+itself sync the file's CURRENT bytes into the real handle at `mmap()` time
+(a transient, private mapping copies bytes in via the same safe
+`write_slice_at_offset` API this crate's own regression tests already use,
+then unmaps via `litebox_common_linux::mm::sys_munmap`) -- correctly
+handles the real `wl_shm` pattern (`ftruncate` then plain `write()`, THEN a
+different peer/thread `mmap()`s the same fd later).
+
+**Live-verified end-to-end, the diagnostic kept as permanent evidence**: the
+exact same combined client+compositor probe now prints
+`COMMIT_SHM_OK bytes=64 width=4 height=4 stride=16 first4=[DD, CC, BB, AA]`
+-- the compositor's own independent `mmap()` of the client's memfd reads
+back the EXACT bytes the client wrote via plain `write()`, byte-for-byte
+correct, followed by `RESULT_OK bytes=64 width=4 height=4 stride=16` and a
+clean `COMBINED_DONE`. This is a real, unmodified `wayland-client`
+connecting to a real, unmodified-shape Wayland compositor built on
+litebox's DRM emulation, completing a full `wl_shm` pixel-buffer commit
+round-trip -- the concrete goal this entire multi-phase, multi-session
+Wayland track was working toward.
+
+Three new permanent regression tests added
+(`litebox_shim_linux/src/syscalls/mm.rs`):
+`test_memfd_create_shared_mapping_across_two_independent_mmaps` (real OS-
+level sharing, not two copies -- the same "two independent mmaps observe
+each other's writes" proof this session's DRM work established live),
+`test_memfd_create_write_then_mmap_sees_the_written_bytes` (the exact real
+`wl_shm` pattern that was broken and is now fixed), and
+`test_memfd_create_mmap_before_ftruncate_does_not_panic` (a fresh memfd
+correctly falls through to the ordinary file-backed-mapping rejection, not
+a panic or stale-state bug). All pass; full `litebox_shim_linux` test suite
+(153 tests, `test_mremap`'s pre-existing stack-overflow flakiness excluded)
+passes unchanged; clippy clean on every touched file.
+
+**What remains for Wayland after this**: nothing litebox-side is known
+broken. The remaining work is entirely protocol/compositor-feature breadth
+(this probe implements only `wl_compositor`+`wl_subcompositor`+`wl_shm`,
+enough for one buffer commit -- a production compositor needs far more:
+`xdg_shell` for real window management, `wl_seat`/input forwarding to
+litebox's already-working evdev layer, damage tracking, multi-surface/
+multi-client support) rather than any further litebox syscall gap.
+
 ## Reproducing the type-check only
 
 ```sh
