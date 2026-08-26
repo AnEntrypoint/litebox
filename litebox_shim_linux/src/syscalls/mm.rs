@@ -119,7 +119,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
     ) -> Result<UserPtrMut<u8>, MappingError> {
         litebox_common_linux::mm::do_mmap(
-            &self.process().pm,
+            &self.process().pm(),
             suggested_addr,
             len,
             prot,
@@ -285,7 +285,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // SAFETY: ptr is the freshly CoW-mapped region of exactly `len` bytes with
                 // `permissions`.
                 unsafe {
-                    self.process().pm.register_existing_mapping(
+                    self.process().pm().register_existing_mapping(
                         range,
                         permissions,
                         true,
@@ -429,7 +429,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // observed this address, so writing into it and unmapping it immediately after is
             // sound; `handle` itself outlives this transient mapping (owned by `memfds`).
             if let Ok(ptr) = unsafe {
-                self.process().pm.map_existing_shared_pages(
+                self.process().pm().map_existing_shared_pages(
                     None,
                     sync_len,
                     litebox::mm::linux::CreatePagesFlags::empty(),
@@ -439,7 +439,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let copy_len = current_bytes.len().min(aligned_len);
                 let _ = ptr.write_slice_at_offset(0, &current_bytes[..copy_len]);
                 let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
-                let _ = litebox_common_linux::mm::sys_munmap(&self.process().pm, user_ptr, aligned_len);
+                let _ =
+                    litebox_common_linux::mm::sys_munmap(&self.process().pm(), user_ptr, aligned_len);
             }
         }
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
@@ -468,7 +469,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Some(
             unsafe {
                 self.process()
-                    .pm
+                    .pm()
                     .map_existing_shared_pages(suggested_addr, length, create_flags, handle)
             }
             .map(UserPtrMut::from_platform_ptr::<Platform>),
@@ -545,7 +546,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Some(
             unsafe {
                 self.process()
-                    .pm
+                    .pm()
                     .map_existing_shared_pages(suggested_addr, length, create_flags, shared_handle)
             }
             .map(UserPtrMut::from_platform_ptr::<Platform>),
@@ -673,7 +674,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// patching logic to avoid deadlocks (the patch path holds elf_patch_cache).
     #[inline]
     fn sys_munmap_raw(&self, addr: UserPtrMut<u8>, len: usize) -> Result<(), Errno> {
-        litebox_common_linux::mm::sys_munmap(&self.process().pm, addr, len)
+        litebox_common_linux::mm::sys_munmap(&self.process().pm(), addr, len)
     }
 
     /// Clear `file_mappings` entries for any segments that overlap the
@@ -726,7 +727,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         len: usize,
         prot: ProtFlags,
     ) -> Result<(), Errno> {
-        litebox_common_linux::mm::sys_mprotect(&self.process().pm, addr, len, prot)
+        litebox_common_linux::mm::sys_mprotect(&self.process().pm(), addr, len, prot)
     }
 
     #[inline]
@@ -739,7 +740,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         new_addr: usize,
     ) -> Result<UserPtrMut<u8>, Errno> {
         litebox_common_linux::mm::sys_mremap(
-            &self.process().pm,
+            &self.process().pm(),
             old_addr,
             old_size,
             new_size,
@@ -751,7 +752,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `brk`
     #[inline]
     pub(crate) fn sys_brk(&self, addr: UserPtrMut<u8>) -> Result<usize, Errno> {
-        let result = litebox_common_linux::mm::sys_brk(&self.process().pm, addr);
+        let result = litebox_common_linux::mm::sys_brk(&self.process().pm(), addr);
         // Temporary (see FINDINGS.txt PASS 128): trace every brk() call's requested and
         // returned break address, mirroring PASS 48's sys_mmap trace above, to determine
         // whether the ~10.2MB region containing the mallocng meta-slot bug (BUG B,
@@ -773,7 +774,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         len: usize,
         advice: litebox_common_linux::MadviseBehavior,
     ) -> Result<(), Errno> {
-        litebox_common_linux::mm::sys_madvise(&self.process().pm, addr, len, advice)
+        litebox_common_linux::mm::sys_madvise(&self.process().pm(), addr, len, advice)
     }
 
     // ── Runtime ELF syscall patching ─────────────────────────────────────
@@ -2077,7 +2078,7 @@ mod tests {
 
         // Simulate the address-space duplication `fork()` performs.
         let (_child_pm, relocations) =
-            unsafe { task.process().pm.duplicate(&task.global.litebox) }.unwrap();
+            unsafe { task.process().pm().duplicate(&task.global.litebox) }.unwrap();
         let child_addr: UserPtrMut<u8> =
             UserPtrMut::from_usize(relocations.translate(addr.as_usize()).unwrap());
 

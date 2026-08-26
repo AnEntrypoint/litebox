@@ -58,7 +58,7 @@ unsafe impl<Platform: ShimPlatform> Send for ThreadState<Platform> {}
 impl<Platform: ShimPlatform> ThreadState<Platform> {
     pub fn new_process(
         pid: i32,
-        pm: litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
+        pm: Arc<litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>>,
         vforked: bool,
         parent: Option<Weak<Process<Platform>>>,
         shared_pending: Arc<Mutex<Platform, super::signal::PendingSignals>>,
@@ -193,10 +193,28 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     /// Process-wide alarm timer.
     pub(crate) alarm_timer: Mutex<Platform, Alarm<Platform>>,
     /// This process's virtual address space. Shared by every thread in this process
-    /// (`CloneFlags::VM`); a forked child process gets its own independent
+    /// (`CloneFlags::VM`); a forked child process normally gets its own independent
     /// [`litebox::mm::PageManager`] (see [`litebox::mm::PageManager::duplicate`]) rather than
     /// referencing this one.
-    pub(crate) pm: litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
+    ///
+    /// `Mutex<Arc<PageManager>>` (rather than owned directly) specifically so a `CLONE_VFORK`
+    /// child can, for the narrow window between `clone()` and its own `execve`/`_exit`, hold a
+    /// clone of the SAME `Arc` as its parent instead of an eagerly-duplicated copy -- matching
+    /// real Linux's own `CLONE_VM` vfork semantics (genuine address-space sharing, not a
+    /// lookalike copy) and eliminating the `vfork-parent-wakes-during-nested-child-execve`
+    /// collision class at the root (a duplicated child's own execve landing on link-time-fixed
+    /// addresses that happen to numerically overlap the parent's still-live, eagerly-relocated
+    /// copy -- impossible when there is only one real address space to begin with). See
+    /// `do_clone`'s `CLONE_VFORK` branch for where the `Arc` is cloned instead of the
+    /// `PageManager` being duplicated, and `sys_execve`'s vfork-detach step for where a
+    /// vforked-and-still-sharing child gets a BRAND NEW `PageManager` at `execve` time (swapped
+    /// in under this lock), before any of the new image's segments are mapped or the old ones
+    /// released -- matching real Linux's own `execve` semantics (always a fresh address space,
+    /// with or without a prior `vfork`) and never touching the parent's live memory. The `Mutex`
+    /// itself is uncontended in the overwhelmingly common case (no vfork in flight, or the
+    /// process's own thread doing its own detach): use [`Self::pm`] to read the current `Arc`
+    /// (a lock + cheap `Arc::clone`, exactly as cheap as `self.process()` itself already is).
+    pm: Mutex<Platform, Arc<litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>>>,
     /// This process's parent, set once at creation (`do_clone`'s process-clone branch) and never
     /// changed afterward -- a `Weak` reference since the parent may exit (and be fully dropped,
     /// once reaped) before this process does.
@@ -383,7 +401,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
     fn new(
         pid: i32,
         remote: Arc<ThreadRemote<Platform>>,
-        pm: litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
+        pm: Arc<litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>>,
         vforked: bool,
         parent: Option<Weak<Process<Platform>>>,
         shared_pending: Arc<Mutex<Platform, super::signal::PendingSignals>>,
@@ -408,7 +426,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
                 handle: None,
                 deadline: None,
             }),
-            pm,
+            pm: Mutex::new(pm),
             parent,
             children: Mutex::new(alloc::vec::Vec::new()),
             cross_process_children: Mutex::new(alloc::vec::Vec::new()),
@@ -532,6 +550,49 @@ impl<Platform: ShimPlatform> Process<Platform> {
         {
             self.vfork_done.wake_all();
         }
+    }
+
+    /// Returns a clone of this process's current address-space handle. Cheap (a lock + `Arc`
+    /// clone) -- the overwhelmingly common case is an uncontended lock, since only a
+    /// `CLONE_VFORK` child transiently shares this `Mutex`'s contents with a live parent, and
+    /// only [`Self::detach_pm_for_vfork_execve`] ever writes to it.
+    pub(crate) fn pm(
+        &self,
+    ) -> Arc<litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>> {
+        Arc::clone(&self.pm.lock())
+    }
+
+    /// If this process is still a `CLONE_VFORK` child sharing its `Arc<PageManager>` with a live
+    /// parent (i.e. [`Self::vfork_done`]'s underlying flag is still set -- see
+    /// [`Self::wait_for_vfork_done`]'s doc comment), atomically swaps in a BRAND NEW, empty
+    /// `PageManager`, detaching this process from the shared address space before returning the
+    /// OLD (still-shared) `Arc`. A no-op returning `None` for a plain `fork()`ed or
+    /// already-detached process (the overwhelmingly common case).
+    ///
+    /// Called at the very start of `sys_execve`'s point-of-no-return section, strictly BEFORE
+    /// anything reads or mutates the process's address space (`release_memory`, then the new
+    /// ELF's own mapping calls) -- this is what makes `CLONE_VM`-style vfork sharing safe despite
+    /// `execve`'s existing code having no fresh-`PageManager`-swap step of its own: by the time
+    /// `release_memory`/`ElfLoader::load` run, `self.pm()` already returns a fresh, empty
+    /// `PageManager` that shares nothing with the parent, so neither call can ever touch the
+    /// parent's live memory -- matching real Linux's own `execve` semantics (always a brand-new
+    /// address space, whether or not the calling process arrived via `vfork()`). The parent's own
+    /// `Arc<PageManager>` (still held via ITS `Process.pm`, untouched by this swap) remains fully
+    /// valid and exclusively its own once this returns, exactly as if the two processes had never
+    /// shared anything at all.
+    pub(crate) fn detach_pm_for_vfork_execve(
+        &self,
+        litebox: &litebox::LiteBox<Platform>,
+    ) -> Option<Arc<litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>>> {
+        if self.vfork_done.underlying_atomic().load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let mut guard = self.pm.lock();
+        let old = core::mem::replace(
+            &mut *guard,
+            Arc::new(litebox::mm::PageManager::new(litebox)),
+        );
+        Some(old)
     }
 
     /// Returns the current number of threads in this process.
@@ -2118,14 +2179,53 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
 
         let (thread, init_state, pid, ppid, child_shared_pending) = if is_process_clone {
-            // Real `fork()`/`vfork()`: build a brand-new `Process` (new thread group) whose
-            // address space is an eager duplicate of the parent's -- writes made by either the
-            // parent or the child after this point are independent.
-            let (dest_pm, relocations) =
-                unsafe { self.process().pm.duplicate(&self.global.litebox) }.map_err(|err| {
+            // Real `fork()`: build a brand-new `Process` (new thread group) whose address space
+            // is an eager duplicate of the parent's -- writes made by either the parent or the
+            // child after this point are independent.
+            //
+            // Real `vfork()` (`CLONE_VFORK`, with or without `CLONE_VM` set alongside it -- see
+            // this function's own doc comment on why `CLONE_VFORK` always routes here) instead
+            // genuinely SHARES the parent's `Arc<PageManager>` for the narrow window until the
+            // child's own `execve`/`_exit`, matching real Linux's `CLONE_VM` vfork semantics --
+            // NOT a duplicate, the literal same address space, eliminating the
+            // `vfork-parent-wakes-during-nested-child-execve` collision class at the root (a
+            // duplicated child's own execve landing on link-time-fixed addresses that happen to
+            // numerically overlap the parent's still-live, eagerly-relocated copy is categorically
+            // impossible when there is only one real address space to begin with). Safe because:
+            // (1) the parent is unconditionally blocked on `wait_for_vfork_done` for this entire
+            // window (see below), so there is no concurrent access to race against; (2)
+            // `ElfLoader::load`'s vfork-detach step (see its own doc comment) gives a vforked
+            // child a BRAND NEW `PageManager` at `execve` time, before any of the new image's
+            // segments are mapped, so the child's own execve never touches the parent's live
+            // memory -- matching real Linux's own execve semantics (always a fresh address space)
+            // rather than the earlier-considered, actively-unsafe "child execve's new ELF directly
+            // onto the still-shared `pm`" shape. Register relocation is correspondingly a genuine
+            // no-op below (an empty `AddressRelocations`, `translate()` returns `None`
+            // everywhere): no addresses moved, because nothing was duplicated.
+            let vforked = flags.contains(CloneFlags::VFORK);
+            let (dest_pm, relocations) = if vforked {
+                (
+                    self.process().pm(),
+                    litebox::mm::AddressRelocations::from_raw_parts_for_diagnostic(
+                        alloc::vec::Vec::new(),
+                        alloc::vec::Vec::new(),
+                        alloc::vec::Vec::new(),
+                        alloc::vec::Vec::new(),
+                        0,
+                        alloc::vec::Vec::new(),
+                        alloc::vec::Vec::new(),
+                    ),
+                )
+            } else {
+                let (dest_pm, relocations) = unsafe {
+                    self.process().pm().duplicate(&self.global.litebox)
+                }
+                .map_err(|err| {
                     litebox_util_log::error!(err:% = err; "failed to duplicate address space for fork()");
                     Errno::ENOMEM
                 })?;
+                (Arc::new(dest_pm), relocations)
+            };
             // Diagnostic-only (pass 111, `LITEBOX_DIAG_PROCESS_FORK_SPAWN=1`, off by default): a
             // no-op on every platform except `litebox_platform_windows_userland`, and a no-op
             // there too unless the env var is set. Runs on the PARENT's own thread, right after
@@ -2150,7 +2250,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     beyond_stdio,
                 }
             };
-            let vforked = flags.contains(CloneFlags::VFORK);
             // Created once here and threaded into both the new `Process` (below) and the new
             // `Task`'s `SignalState` (see `clone_for_new_task`'s call site further down) -- they
             // must end up sharing the exact same `Arc`, not two independently allocated queues.
@@ -3861,6 +3960,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EBUSY);
         }
 
+        // If this process is still a `CLONE_VFORK` child sharing its address space with a live,
+        // suspended parent (see `Process::detach_pm_for_vfork_execve`'s doc comment), detach it
+        // onto a brand-new, empty `PageManager` FIRST -- strictly before `release_memory` below
+        // or any of the new ELF's own mapping calls, both of which must never be allowed to touch
+        // the parent's live memory. The old, still-shared `Arc` is simply dropped here: the
+        // parent holds its own independent clone via its own `Process.pm`, unaffected by this
+        // swap, and nothing else in this now-execve'ing child needs the old address space's
+        // contents (real vfork's own POSIX contract already requires the child not to rely on
+        // anything it wrote there surviving past this point).
+        let _ = self.process().detach_pm_for_vfork_execve(&self.global.litebox);
+
         // Close CLOEXEC descriptors
         self.close_on_exec();
 
@@ -3874,7 +3984,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         // Don't release reserved mappings.
         let release = |_r: Range<usize>, vm: VmFlags| !vm.is_empty();
-        unsafe { self.process().pm.release_memory(release) }
+        unsafe { self.process().pm().release_memory(release) }
             .expect("failed to release memory mappings");
 
         #[cfg(target_arch = "x86_64")]

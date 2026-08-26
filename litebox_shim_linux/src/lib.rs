@@ -194,7 +194,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
             if unsafe {
                 self.task
                     .process()
-                    .pm
+                    .pm()
                     .handle_page_fault(fault_addr, error_code)
             }
             .is_ok()
@@ -431,7 +431,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 global: self.0.clone(),
                 thread: syscalls::process::ThreadState::new_process(
                     pid,
-                    PageManager::new(&self.0.litebox),
+                    Arc::new(PageManager::new(&self.0.litebox)),
                     false,
                     None,
                     bootstrap_shared_pending.clone(),
@@ -593,7 +593,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 global: self.0.clone(),
                 thread: syscalls::process::ThreadState::new_process(
                     pid,
-                    pm,
+                    Arc::new(pm),
                     false,
                     None,
                     shared_pending.clone(),
@@ -630,13 +630,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
     /// page-fault handler, which has no `Task` in scope): does not generalize to targets with
     /// multiple processes (real `fork()`), which each have their own independent page manager
     /// reachable only via a `Task`.
-    pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
-        &self
-            .0
+    pub fn page_manager(&self) -> Arc<PageManager<Platform, PAGE_SIZE>> {
+        self.0
             .bootstrap_process
             .get()
             .expect("load_program has not been called yet")
-            .pm
+            .pm()
     }
 
     /// Perform queued network interactions with the outside world.
@@ -2009,7 +2008,7 @@ mod test_utils {
                 wait_state: wait::WaitState::new(self.platform),
                 thread: syscalls::process::ThreadState::new_process(
                     pid,
-                    PageManager::new(&self.litebox),
+                    Arc::new(PageManager::new(&self.litebox)),
                     false,
                     None,
                     shared_pending.clone(),
@@ -2079,7 +2078,7 @@ mod test_utils {
             ));
             let thread = syscalls::process::ThreadState::new_process(
                 pid,
-                PageManager::new(&self.global.litebox),
+                Arc::new(PageManager::new(&self.global.litebox)),
                 false,
                 Some(Arc::downgrade(self.process())),
                 shared_pending.clone(),
