@@ -925,6 +925,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         })
                 },
                 |_| None,
+                |_| None,
             );
             // A still-connected TCP socket must not be closed via the ordinary `do_close` path
             // here: that path (`GlobalState::close_socket`) performs a *graceful* close by
@@ -945,6 +946,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     raw_fd,
                     |_| false,
                     |_| true,
+                    |_| false,
                     |_| false,
                     |_| false,
                     |_| false,
@@ -988,6 +990,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS
         unix: impl FnOnce(&TypedFd<syscalls::unix::UnixSocketSubsystem<Platform, FS>>) -> R,
         pty: impl FnOnce(&TypedFd<syscalls::pty::PtySubsystem<Platform>>) -> R,
         signalfd: impl FnOnce(&TypedFd<syscalls::signalfd::SignalfdSubsystem<Platform>>) -> R,
+        timerfd: impl FnOnce(&TypedFd<syscalls::timerfd::TimerfdSubsystem<Platform>>) -> R,
     ) -> Result<R, Errno> {
         let rds = self.raw_descriptor_store.read();
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
@@ -1021,6 +1024,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
             return Ok(signalfd(&fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(timerfd(&fd));
         }
         Err(Errno::EBADF)
     }
@@ -1725,6 +1732,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 flags,
             } => {
                 syscall!(sys_signalfd4(fd, mask, sizemask, flags))
+            }
+            SyscallRequest::TimerfdCreate { flags } => {
+                syscall!(sys_timerfd_create(flags))
+            }
+            SyscallRequest::TimerfdSettime {
+                fd,
+                flags,
+                new_value,
+                old_value,
+            } => syscall!(sys_timerfd_settime(fd, flags, new_value, old_value)),
+            SyscallRequest::TimerfdGettime { fd, curr_value } => {
+                syscall!(sys_timerfd_gettime(fd, curr_value))
             }
             SyscallRequest::MemfdCreate { name, flags } => {
                 // The name is cosmetic only (see `sys_memfd_create`'s own doc comment) but a bad
