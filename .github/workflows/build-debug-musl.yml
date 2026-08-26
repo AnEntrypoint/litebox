@@ -42,8 +42,9 @@ jobs:
         working-directory: musl-src
         run: |
           export CC=musl-gcc
+          export AR=ar
+          export RANLIB=ranlib
           export CFLAGS="-g -O0 -fno-omit-frame-pointer"
-          ./configure --target=x86_64-linux-musl --prefix="$GITHUB_WORKSPACE/musl-install" --disable-shared || \
           ./configure --prefix="$GITHUB_WORKSPACE/musl-install"
           make -j"$(nproc)"
           make install
