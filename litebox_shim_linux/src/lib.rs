@@ -924,6 +924,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             })
                         })
                 },
+                |_| None,
             );
             // A still-connected TCP socket must not be closed via the ordinary `do_close` path
             // here: that path (`GlobalState::close_socket`) performs a *graceful* close by
@@ -944,6 +945,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     raw_fd,
                     |_| false,
                     |_| true,
+                    |_| false,
                     |_| false,
                     |_| false,
                     |_| false,
@@ -985,6 +987,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS
         epoll: impl FnOnce(&TypedFd<syscalls::epoll::EpollSubsystem<Platform, FS>>) -> R,
         unix: impl FnOnce(&TypedFd<syscalls::unix::UnixSocketSubsystem<Platform, FS>>) -> R,
         pty: impl FnOnce(&TypedFd<syscalls::pty::PtySubsystem<Platform>>) -> R,
+        signalfd: impl FnOnce(&TypedFd<syscalls::signalfd::SignalfdSubsystem<Platform>>) -> R,
     ) -> Result<R, Errno> {
         let rds = self.raw_descriptor_store.read();
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
@@ -1014,6 +1017,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
             return Ok(pty(&fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(signalfd(&fd));
         }
         Err(Errno::EBADF)
     }
@@ -1710,6 +1717,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             SyscallRequest::Eventfd2 { initval, flags } => {
                 syscall!(sys_eventfd2(initval, flags))
+            }
+            SyscallRequest::Signalfd4 {
+                fd,
+                mask,
+                sizemask,
+                flags,
+            } => {
+                syscall!(sys_signalfd4(fd, mask, sizemask, flags))
             }
             SyscallRequest::MemfdCreate { name, flags } => {
                 // The name is cosmetic only (see `sys_memfd_create`'s own doc comment) but a bad
