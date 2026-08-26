@@ -131,3 +131,75 @@ wsl -e bash -c 'tar --owner=0 --group=0 -rf rootfs.tar drmgui.hooked --transform
 wsl -e bash -c 'unset WAYLAND_DISPLAY; export DISPLAY=:0; export DRMGUI_COLOR=0,255,0
   ./litebox_runner_linux_userland -Z --forward-env --initial-files rootfs.tar --program-from-tar --gui -- /tmp/drmgui.hooked'
 ```
+
+## evdev input injection, run-verified natively on Linux (`drmgui_input.c`)
+
+Extends the same DRM pipeline with a real `select()`+`read()` loop on
+`/dev/input/event0`, matching the exact live-witness discipline this session
+already used to verify evdev input on Windows -- closing the platform-parity
+gap between the two runners' `--gui` input support.
+
+### A real, previously-undiscovered litebox bug found and fixed
+
+The very first `WindowEvent::CursorMoved` winit delivers on this X11/WSLg
+setup reports an implausible position (observed, reproducibly:
+`(-32486, -32587)`, nowhere near any real screen coordinate) -- likely an
+`EnterNotify`-adjacent quirk of WSLg's Weston window manager reporting a
+position before the window is fully mapped. `presentation.rs`'s cursor-delta
+code treated that bogus reading as a legitimate `last_cursor_pos` baseline,
+producing a spurious `REL_X`/`REL_Y` delta of `32800` on the very next (real)
+`CursorMoved` -- confirmed live via a temporary diagnostic printing the raw
+`last`/`new` coordinate pair, then reverted. A guest program watching
+`/dev/input/event0` for real input would see this fake event before any
+input was actually sent, indistinguishable from genuine motion.
+
+**Fixed** (`litebox_platform_linux_userland/src/presentation.rs`): a
+`CursorMoved` position outside the window's own known client area
+(`[0, surface_size.width) x [0, surface_size.height)`, already tracked in
+`GpuState`) is discarded rather than accepted as a new `last_cursor_pos`
+baseline -- a real cursor position is always within the window's own bounds,
+so this correctly filters the pre-map garbage reading without introducing a
+fragile magic-number threshold. Live-reproduced before the fix (identical
+`32800` delta on every run, deterministic) and confirmed resolved after
+(rebuilt, reran -- no more implausible deltas; legitimate window-manager-driven
+motion, e.g. from `xdotool windowactivate`'s own cursor warp, still passes
+through correctly since it's a real in-bounds coordinate).
+
+### Live-verified: real X11-injected keyboard input reaches the guest
+
+`drmgui_input.c` runs the identical DRM setup as `drmgui.c`, then opens
+`/dev/input/event0` and waits for a real `EV_KEY` event (window-manager-driven
+`EV_REL` cursor motion is deliberately NOT treated as the awaited signal --
+only a deliberately-injected keypress counts, avoiding a false-positive early
+exit before real injected input arrives). Following this session's own
+established lesson about guest boot-latency races (see the wgpu/GUI-support
+project memory's "always insert a real settle delay" note), input was
+injected via `xdotool key --window <id> a` a few seconds after launch, once
+the window was confirmed present and activated.
+
+**Result**: `EVENT type=EV_KEY(1) code=30 value=1` -- `KEY_A` (Linux keycode
+30), press (`value=1`), exactly matching what was sent, followed by its
+`SYN_REPORT` and a clean exit. Real, unmodified-shape guest code correctly
+decoding a real X11-injected keypress delivered through litebox's evdev
+emulation, on native Linux -- the same rigor as the session's original
+Windows `SendInput`-based evdev verification.
+
+### Reproducing the evdev test
+
+```sh
+wsl -e bash -c "musl-gcc -static -O0 -o drmgui_input docs/linux-native-drm-gui-probe/drmgui_input.c"
+./target/release/litebox_syscall_rewriter.exe drmgui_input -o drmgui_input.hooked
+wsl -e bash -c 'tar --owner=0 --group=0 -rf rootfs.tar drmgui_input.hooked --transform="s,^,tmp/,"'
+
+# Launch in the background of one wsl invocation, inject from a second concurrent one --
+# backgrounding the runner INSIDE one wsl -e bash -c script (via `&`) reliably trips a real,
+# unrelated environment quirk (a spurious "signal 2 handler already installed" panic, seen even
+# on a fresh WSL instance) that a separate concurrent `wsl -e bash -c` invocation avoids.
+wsl -e bash -c 'unset WAYLAND_DISPLAY; export DISPLAY=:0
+  timeout 25 ./litebox_runner_linux_userland -Z --forward-env --initial-files rootfs.tar --program-from-tar --gui -- /tmp/drmgui_input.hooked' &
+sleep 6
+wsl -e bash -c 'unset WAYLAND_DISPLAY; export DISPLAY=:0
+  WINID=$(xdotool search --name "litebox virtual display" | head -1)
+  xdotool windowactivate --sync "$WINID"; sleep 1; xdotool key --window "$WINID" a'
+wait
+```
