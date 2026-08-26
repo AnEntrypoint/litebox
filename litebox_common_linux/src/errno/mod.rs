@@ -291,9 +291,9 @@ impl From<litebox::fs::errors::WriteError> for Errno {
 impl From<litebox::fs::errors::SeekError> for Errno {
     fn from(value: litebox::fs::errors::SeekError) -> Self {
         match value {
-            litebox::fs::errors::SeekError::NotAFile | litebox::fs::errors::SeekError::ClosedFd => {
-                Errno::EBADF
-            }
+            litebox::fs::errors::SeekError::NotAFile
+            | litebox::fs::errors::SeekError::ClosedFd
+            | litebox::fs::errors::SeekError::PathOnlyFd => Errno::EBADF,
             litebox::fs::errors::SeekError::InvalidOffset => Errno::EINVAL,
             litebox::fs::errors::SeekError::NonSeekable => Errno::ESPIPE,
             litebox::fs::errors::SeekError::Io => Errno::EIO,
@@ -627,6 +627,7 @@ impl From<litebox::fs::errors::ReadDirError> for Errno {
     fn from(value: litebox::fs::errors::ReadDirError) -> Self {
         match value {
             litebox::fs::errors::ReadDirError::NotADirectory => Errno::ENOTDIR,
+            litebox::fs::errors::ReadDirError::PathOnlyFd => Errno::EBADF,
             _ => unimplemented!(),
         }
     }
@@ -697,7 +698,8 @@ impl From<litebox::fs::errors::TruncateError> for Errno {
             litebox::fs::errors::TruncateError::IsDirectory => Errno::EISDIR,
             litebox::fs::errors::TruncateError::NotForWriting => Errno::EACCES,
             litebox::fs::errors::TruncateError::IsTerminalDevice => Errno::EINVAL,
-            litebox::fs::errors::TruncateError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::TruncateError::ClosedFd
+            | litebox::fs::errors::TruncateError::PathOnlyFd => Errno::EBADF,
             litebox::fs::errors::TruncateError::Io => Errno::EIO,
         }
     }

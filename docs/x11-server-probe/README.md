@@ -189,17 +189,85 @@ Two separate things visible here, not fully disentangled this pass:
    validation, or a library in its dependency chain such as `libselinux`)
    is not in that allow-list.
 
-## Updated scoping vs. rounds 1-2
+## Round 4: `O_PATH` implemented for real across all three `FileSystem` backends, the panic is genuinely gone
+
+Round 3 found a hard `unimplemented!()` panic on `OFlags(NOFOLLOW | PATH)` in
+`litebox/src/fs/layered.rs`'s `open()`. Investigating it live turned up that
+this was not one bug but THREE separate, independent gaps stacked on top of
+each other -- `litebox::fs::FileSystem` has three real implementations in the
+guest's actual fs stack (`resolver.rs`'s `Resolver<Composer>`, `layered.rs`'s
+`FileSystem<Upper, Lower>`, and `in_mem.rs`'s `FileSystem`, in that call
+order), and each one independently rejects `OFlags` via its own hand-written
+allow-list -- `resolver.rs`'s already included `OFlags::PATH` (a real,
+already-working `path_only` mechanism existed one layer down), but
+`layered.rs`'s and `in_mem.rs`'s did not, so the panic Xorg hit was actually
+the SECOND of the three layers (`layered.rs`), and fixing only that would
+have immediately hit the identical panic one layer further in
+(`in_mem.rs`) -- confirmed live via `gdb`+`RUST_BACKTRACE=1` catching each
+panic's exact message and call site in turn, not assumed.
+
+Fixed all three, plus a related but genuinely separate correctness bug found
+along the way: `in_mem.rs`'s own `read_allowed`/`write_allowed` computation
+derives from `access_mode = flags & (WRONLY | RDWR)`, which for a bare
+`O_PATH` open (no other access-mode bit set) numerically equals `O_RDONLY`
+(value 0) -- meaning a pre-fix `O_PATH` open would have silently granted
+`read_allowed = true`, letting `read()`/`write()` succeed on a supposedly
+path-only fd instead of correctly failing with `EBADF`. This was never
+reached in practice (the panic fired first, every time), but is a genuine
+distinct bug, not just a missing-flag oversight -- fixed by explicitly
+forcing both flags false whenever `O_PATH` is set, in all three backends
+that independently track this (`resolver.rs`'s `path_only` field already did
+this correctly; `in_mem.rs` did not).
+
+Three new `PathOnlyFd` error variants added (`SeekError`, `TruncateError`,
+`ReadDirError` -- `ReadError`/`WriteError` already had exactly the right
+existing `NotForReading`/`NotForWriting` variants, reused rather than
+duplicated), all mapping to `EBADF` (matching real Linux's actual behavior
+for I/O attempts on an `O_PATH` fd) except where an existing catch-all
+already handled it. A new permanent regression test,
+`o_path_fd_permits_stat_and_dirfd_use_but_rejects_read_write`
+(`litebox_shim_linux/src/syscalls/file.rs`), confirms: `O_PATH` open
+succeeds even with no meaningful access-mode bit; `fstat` on the resulting
+fd works; `read`/`write`/`lseek`/`ftruncate` all correctly fail with `EBADF`
+(not panic); the original, normally-opened fd for the same file is
+completely unaffected. Full `litebox_shim_linux` test suite (157 tests, one
+new + 156 baseline) and `litebox` clippy both clean; the one pre-existing
+`litebox --lib` compile failure (missing `PageManagementProvider` trait
+items in a test mock, confirmed via `git stash` to predate this change) and
+`test_mremap`'s flake are both untouched by this fix.
+
+**Live-verified against a freshly rebuilt copy of the exact rootfs/recipe
+this file already documents** (round 3's own rootfs was not preserved per
+this project's own "don't check in reconstructible artifacts" convention, so
+this was rebuilt from scratch via the same `ldd`+`objdump`+
+`litebox_syscall_rewriter` steps): re-ran the identical
+`Xorg -config /etc/xorg-kms.conf -novtswitch -sharevts -noreset -logfile
+/tmp/xorg.log :1` invocation. **The `O_PATH` panic is confirmed completely
+gone** -- grepping the full run's output for `path`/`panic`/`unimplemented`
+returns zero matches, reproduced twice. Xorg now runs its FULL startup
+sequence with no crash at all: prints its version banner (`Current Operating
+System: LiteBox litebox ...`), hits the pre-existing, separately-documented
+`_XSERVTransmkdir: euid != 0` question (unrelated to this fix, not
+attempted), and then fails cleanly with `(EE) no screens found` -- a
+genuine, expected next-step error (this WSL2 environment's own real X11
+socket is not litebox's actual DRM device; Xorg correctly can't find a KMS
+screen through it), not a crash or hang.
+
+## Updated scoping vs. rounds 1-3
 
 Round 1's "15-25+ shared libraries, multi-session-scale" conclusion
 continues to be refined, not overturned. Round 2 got Xorg loading and
-initializing; round 3 closes the `linkat` gap it found and gets Xorg
-genuinely further -- past lock-file acquisition into socket-listener setup
--- before hitting a real, different, and now precisely diagnosed pair of
-gaps (a `geteuid()`-adjacent question, and a hard panic on `O_PATH` rather
-than a clean error return). The general pattern across all three rounds
-holds: each pass gets meaningfully further and leaves a precise, actionable
-next step rather than a vague estimate, but a fully working Xorg display
-remains real, multi-pass work -- there is no evidence yet that this is the
-LAST blocker before DRM master/mode-setting interaction (the row's actual
-load-bearing question), only that it is the next one.
+initializing; round 3 found and diagnosed (but did not fix) the `O_PATH`
+panic; round 4 fixes it for real across all three `FileSystem` backends and
+confirms live that Xorg's startup sequence now runs with zero panics. The
+general pattern across all four rounds holds: each pass gets meaningfully
+further and leaves a precise, actionable next step rather than a vague
+estimate. Remaining, not attempted this pass: the `_XSERVTransmkdir`
+`geteuid()`-adjacent question (does litebox's guest UID/EUID emulation
+answer `geteuid()` correctly for this specific process, or does Xorg have
+its own separate expectation this doesn't satisfy), and -- the row's actual
+load-bearing question -- whether Xorg's `modesetting` driver can be pointed
+at litebox's REAL virtual `/dev/dri/card0` (rather than WSLg's own host X11
+socket, used here only as a convenient, already-working real X11 display to
+verify Xorg itself starts cleanly) to reach real DRM master/mode-setting
+interaction.

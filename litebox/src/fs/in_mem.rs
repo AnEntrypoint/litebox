@@ -274,10 +274,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             | OFlags::NONBLOCK
             | OFlags::LARGEFILE
             | OFlags::NOFOLLOW
-            | OFlags::APPEND;
+            | OFlags::APPEND
+            | OFlags::PATH;
         if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!("{flags:?}")
         }
+        let path_only = flags.contains(OFlags::PATH);
         let path = self.absolute_path(path)?;
         // Transparently follow a final-component symlink (e.g. dynamic-linker resolution of a
         // shared-library symlink), unless the caller explicitly asked not to (`O_NOFOLLOW`) or is
@@ -339,7 +341,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             (entry, false)
         };
         let access_mode = flags & (OFlags::WRONLY | OFlags::RDWR);
-        let read_allowed = if access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR {
+        // `O_PATH` opens the fd purely for path resolution -- it must never grant read/write
+        // access, regardless of what `access_mode` numerically computes to (`O_PATH` alone
+        // leaves `access_mode` at its zero/`O_RDONLY` value, which would otherwise look
+        // identical to a real read-only open). Also skip the permission check below: a real
+        // `O_PATH` open succeeds even without read/write permission on the target, matching real
+        // Linux (only the path needs to resolve).
+        let read_allowed = if path_only {
+            false
+        } else if access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR {
             if !created && !self.current_user.can_read(&entry.perms()) {
                 return Err(OpenError::AccessNotAllowed);
             }
@@ -347,7 +357,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         } else {
             false
         };
-        let write_allowed = if access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR {
+        let write_allowed = if path_only {
+            false
+        } else if access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR {
             if !created && !self.current_user.can_write(&entry.perms()) {
                 return Err(OpenError::AccessNotAllowed);
             }
@@ -499,8 +511,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let descriptor_table = self.litebox.descriptor_table();
         let Descriptor::File {
             file,
-            read_allowed: _,
-            write_allowed: _,
+            read_allowed,
+            write_allowed,
             position,
             append_mode: _,
         } = &mut descriptor_table
@@ -510,6 +522,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         else {
             return Err(SeekError::NotAFile);
         };
+        // `resolver.rs`'s equivalent path rejects `seek` on an `O_PATH` fd outright (matching a
+        // conservative reading of the real Linux contract); keep both backends consistent rather
+        // than letting `O_PATH`-ness be observable via which backend happens to serve a path.
+        if !*read_allowed && !*write_allowed {
+            return Err(SeekError::PathOnlyFd);
+        }
         let file_len = file.read().data.len();
         let base = match whence {
             SeekWhence::RelativeToBeginning => 0,
@@ -536,7 +554,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let descriptor_table = self.litebox.descriptor_table();
         let Descriptor::File {
             file,
-            read_allowed: _,
+            read_allowed,
             write_allowed,
             position,
             append_mode: _,
@@ -547,6 +565,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         else {
             return Err(TruncateError::IsDirectory);
         };
+        // Both flags false only happens for an `O_PATH` fd (a real read-only-but-not-`O_PATH`
+        // open always leaves `read_allowed` true) -- distinguish it from the ordinary
+        // opened-without-write-access case so the caller gets the real Linux `EBADF`, not
+        // `NotForWriting`'s `EACCES`.
+        if !*read_allowed && !*write_allowed {
+            return Err(TruncateError::PathOnlyFd);
+        }
         if !*write_allowed {
             return Err(TruncateError::NotForWriting);
         }
