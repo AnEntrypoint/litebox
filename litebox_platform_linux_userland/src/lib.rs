@@ -664,6 +664,20 @@ impl LinuxUserland {
             (libc::SYS_readlinkat, vec![]),
             #[cfg(not(target_arch = "aarch64"))]
             (libc::SYS_fstat, vec![]),
+            // `memfd_create`/`ftruncate`: real host syscalls `create_shared_memory` (below) issues
+            // directly to back a `memfd_create`-fd-backed guest mapping (see `try_memfd_mmap` in
+            // `litebox_shim_linux::syscalls::mm`) and DRM dumb buffers with real shared memory --
+            // never guest-reachable directly, same reasoning as `close`/`dup`/`fstat` above (a
+            // GUEST's own `memfd_create()`/`ftruncate()` calls are litebox-emulated via
+            // `SyscallRequest::MemfdCreate`/`Ftruncate` and never reach these raw syscall numbers
+            // on x86_64, intercepted by the ELF-patched fast-path trampoline first). Confirmed
+            // live: litebox_runner_linux_userland's own `--gui` DRM dumb-buffer pipeline SIGSYS'd
+            // on `memfd_create` (syscall 319) before this was added, since nothing on native Linux
+            // had exercised `create_shared_memory`'s real-memfd path until a real `--gui` run.
+            #[cfg(not(target_arch = "aarch64"))]
+            (libc::SYS_memfd_create, vec![]),
+            #[cfg(not(target_arch = "aarch64"))]
+            (libc::SYS_ftruncate, vec![]),
         ];
         let rule_map: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
             rules.into_iter().collect();
@@ -3442,7 +3456,7 @@ fn set_signal_return(
     reason = "raw 64-bit register values round-tripped bit-for-bit through usize, not semantically-bounded numbers"
 )]
 fn aarch64_proxy_host_syscall_if_applicable(context: &mut libc::ucontext_t) -> bool {
-    const PROXIED: [i64; 12] = [
+    const PROXIED: [i64; 14] = [
         libc::SYS_close,
         libc::SYS_dup,
         libc::SYS_clock_gettime,
@@ -3455,6 +3469,10 @@ fn aarch64_proxy_host_syscall_if_applicable(context: &mut libc::ucontext_t) -> b
         libc::SYS_tgkill,
         libc::SYS_rt_sigaction,
         libc::SYS_rt_sigprocmask,
+        // Same host-only `create_shared_memory` real-memfd backing as the x86_64 allow-list rules
+        // just above -- see that comment for the full rationale.
+        libc::SYS_memfd_create,
+        libc::SYS_ftruncate,
     ];
     let sysno = context.uc_mcontext.regs[8].cast_signed();
     // openat is proxied too, but only for RDONLY opens (matching the flags-argument condition
