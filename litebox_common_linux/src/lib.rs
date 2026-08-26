@@ -754,6 +754,31 @@ bitflags::bitflags! {
 }
 
 bitflags::bitflags! {
+    /// `timerfd_create(2)` flags -- `TFD_CLOEXEC`/`TFD_NONBLOCK` are defined in the real kernel
+    /// UAPI as aliases of `O_CLOEXEC`/`O_NONBLOCK` (`include/uapi/linux/timerfd.h`), same pattern
+    /// as `EfdFlags`/`SfdFlags` above.
+    #[derive(Debug, Clone, Copy)]
+    pub struct TfdFlags: core::ffi::c_uint {
+        const CLOEXEC = litebox::fs::OFlags::CLOEXEC.bits();
+        const NONBLOCK = litebox::fs::OFlags::NONBLOCK.bits();
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+bitflags::bitflags! {
+    /// `timerfd_settime(2)`'s own `flags` argument (distinct from the fd-creation flags above).
+    /// Values match the real kernel `uapi/linux/timerfd.h` exactly.
+    #[derive(Debug, Clone, Copy)]
+    pub struct TfdSettimeFlags: core::ffi::c_uint {
+        const TIMER_ABSTIME = 1 << 0;
+        const TIMER_CANCEL_ON_SET = 1 << 1;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+bitflags::bitflags! {
     /// `memfd_create(2)` flags. Values match the real kernel `uapi/linux/memfd.h` exactly.
     #[derive(Debug, Clone, Copy)]
     pub struct MfdFlags: core::ffi::c_uint {
@@ -1648,7 +1673,7 @@ cfg_if::cfg_if! {
 }
 
 /// timespec from [Linux](https://elixir.bootlin.com/linux/v5.19.17/source/include/uapi/linux/time_types.h#L7)
-#[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, FromBytes, IntoBytes, Default)]
+#[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, FromBytes, IntoBytes, Default, Immutable)]
 #[repr(C)]
 pub struct Timespec {
     /// Seconds.
@@ -1750,6 +1775,19 @@ impl ItimerVal {
     pub fn it_value(&self) -> TimeVal {
         self.value
     }
+}
+
+/// `itimerspec` from [Linux](https://elixir.bootlin.com/linux/v5.19.17/source/include/uapi/linux/time_types.h)
+/// -- the `timerfd_settime(2)`/`timerfd_gettime(2)` ABI struct, a pair of [`Timespec`]s rather
+/// than [`ItimerVal`]'s pair of [`TimeVal`]s (nanosecond, not microsecond, resolution).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+pub struct ItimerSpec {
+    /// Timer interval; zero means "single-shot, do not repeat".
+    pub it_interval: Timespec,
+    /// Current value (initial expiration, or time remaining when read back via
+    /// `timerfd_gettime`).
+    pub it_value: Timespec,
 }
 
 impl TryFrom<TimeVal> for Duration {
@@ -3131,6 +3169,19 @@ pub enum SyscallRequest {
         sizemask: usize,
         flags: SfdFlags,
     },
+    TimerfdCreate {
+        flags: TfdFlags,
+    },
+    TimerfdSettime {
+        fd: i32,
+        flags: TfdSettimeFlags,
+        new_value: UserPtr<ItimerSpec>,
+        old_value: Option<UserPtrMut<ItimerSpec>>,
+    },
+    TimerfdGettime {
+        fd: i32,
+        curr_value: UserPtrMut<ItimerSpec>,
+    },
     MemfdCreate {
         /// Cosmetic name only (real Linux exposes it via `/proc/self/fd/<n> -> memfd:<name>`,
         /// which this shim does not implement) -- read but not otherwise interpreted.
@@ -3897,6 +3948,14 @@ impl SyscallRequest {
                 flags: SfdFlags::empty(),
             },
             Sysno::signalfd4 => sys_req!(Signalfd4 { fd, mask:*, sizemask, flags }),
+            Sysno::timerfd_create => sys_req!(TimerfdCreate { flags }),
+            Sysno::timerfd_settime => sys_req!(TimerfdSettime {
+                fd,
+                flags,
+                new_value:*,
+                old_value:*,
+            }),
+            Sysno::timerfd_gettime => sys_req!(TimerfdGettime { fd, curr_value:* }),
             Sysno::memfd_create => sys_req!(MemfdCreate { name:*, flags }),
             Sysno::getrandom => sys_req!(GetRandom { buf:*,count,flags }),
             Sysno::clone => {
@@ -4566,6 +4625,8 @@ reinterpret_truncated_from_usize_for! {
         EfdFlags,
         SfdFlags,
         MfdFlags,
+        TfdFlags,
+        TfdSettimeFlags,
         RngFlags,
         TimerFlags,
         StatxMask,

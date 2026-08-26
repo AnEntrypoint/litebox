@@ -14,13 +14,14 @@ use litebox::{
     fs::{Mode, OFlags, SeekWhence},
     mm::linux::PAGE_SIZE,
     path::{self, Arg as _},
-    platform::{StdioStream, TimeProvider},
+    platform::{Instant as _, StdioStream, TimeProvider},
     sync::RawSyncPrimitivesProvider,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
     AccessFlags, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
-    InodeType, IoReadVec, IoWriteVec, IoctlArg, MfdFlags, SfdFlags, Statx, StatxMask, TimeParam,
+    InodeType, IoReadVec, IoWriteVec, IoctlArg, ItimerSpec, MfdFlags, SfdFlags, TfdFlags,
+    TfdSettimeFlags, Statx, StatxMask, TimeParam,
     errno::Errno,
     signal::{Signal, SigSet},
 };
@@ -718,6 +719,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
             )
             .flatten()
     }
@@ -1059,6 +1061,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     espipe_for_non_seekable_offset(offset)?;
                     handle.with_entry(|file| file.read(&self.wait_cx(), &mut buf.borrow_mut()))
                 },
+                |fd| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    espipe_for_non_seekable_offset(offset)?;
+                    handle.with_entry(|file| {
+                        let buf = &mut buf.borrow_mut();
+                        if buf.len() < size_of::<u64>() {
+                            return Err(Errno::EINVAL);
+                        }
+                        let value = file.read()?;
+                        buf[..size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
+                        Ok(size_of::<u64>())
+                    })
+                },
             )
             .flatten()?;
         // For datagrams, the returned size represents the actual size of the message,
@@ -1138,6 +1158,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     handle.with_entry(|end| end.write(&self.wait_cx(), buf))
                 },
                 |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
             )
             .flatten();
         if let Err(Errno::EPIPE) = res {
@@ -1175,6 +1196,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .map(|_| ())
                         .map_err(Errno::from)
                 },
+                |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
@@ -1230,6 +1252,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .run_on_raw_fd(
                         in_raw_fd,
                         |fd| files.fs.read(fd, buf_slice, cur_off).map_err(Errno::from),
+                        |_fd| Err(non_fs_err),
                         |_fd| Err(non_fs_err),
                         |_fd| Err(non_fs_err),
                         |_fd| Err(non_fs_err),
@@ -1378,6 +1401,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     }
                     Err(e) => Err(Errno::from(e)),
                 },
+                |_| Err(Errno::ESPIPE),
                 |_| Err(Errno::ESPIPE),
                 |_| Err(Errno::ESPIPE),
                 |_| Err(Errno::ESPIPE),
@@ -2113,6 +2137,12 @@ where
                     0,
                 )))
             },
+            |_fd| {
+                Ok(T::from(synthetic(
+                    litebox_common_linux::InodeType::CharDevice as u32 | rw_user_mode,
+                    0,
+                )))
+            },
         )
         .flatten()
 }
@@ -2144,6 +2174,7 @@ pub(crate) fn get_file_descriptor_flags<Platform: ShimPlatform, FS: ShimFS>(
         |fd| get_flags(global, fd),
         |fd| get_flags(global, fd),
         |fd| get_flags(global, fd),
+        |fd| get_flags(global, fd),
     )
 }
 
@@ -2166,6 +2197,7 @@ fn set_file_descriptor_flags<Platform: ShimPlatform, FS: ShimFS>(
 
     files.run_on_raw_fd(
         raw_fd,
+        |fd| set_flags(global, fd, flags),
         |fd| set_flags(global, fd, flags),
         |fd| set_flags(global, fd, flags),
         |fd| set_flags(global, fd, flags),
@@ -2489,6 +2521,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         |fd| getfl_from_handle!(fd),
                         |fd| getfl_from_handle!(fd),
                         |fd| getfl_from_handle!(fd),
+                        |fd| getfl_from_handle!(fd),
                     )
                     .flatten()?
                     .bits())
@@ -2598,6 +2631,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         toggle_flags!(fd);
                         Ok(())
                     },
+                    |fd| {
+                        toggle_flags!(fd);
+                        Ok(())
+                    },
                 )??;
                 Ok(0)
             }
@@ -2632,6 +2669,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
+                        |_fd| Err(Errno::EBADF),
                     )
                     .flatten()
             }
@@ -2651,6 +2689,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         },
                         |_fd| Err(Errno::EINVAL),
                         |_fd| Err(Errno::EINVAL),
+                        |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
@@ -2722,6 +2761,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // `flock()` on a non-regular-file fd (socket/pipe/eventfd/epoll/unix socket) is
                 // rejected with `EINVAL`, matching Linux (only regular files, directories, and a
                 // handful of special files support `flock()`; none of LiteBox's other fd kinds do).
+                |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
@@ -2976,6 +3016,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             Ok(())
                         })
                     },
+                    |_fd| Err(Errno::EINVAL),
                 )
                 .flatten()?;
             Ok(fd.try_into().unwrap())
@@ -3007,6 +3048,153 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Errno::EMFILE
         })?;
         Ok(raw_fd.try_into().unwrap())
+    }
+
+    /// Handle syscall `timerfd_create`. See `syscalls::timerfd`'s module doc comment for the
+    /// scope of what this shim's timerfd support actually covers.
+    pub fn sys_timerfd_create(&self, flags: TfdFlags) -> Result<u32, Errno> {
+        if flags.intersects((TfdFlags::CLOEXEC | TfdFlags::NONBLOCK).complement()) {
+            return Err(Errno::EINVAL);
+        }
+
+        let timerfd = super::timerfd::TimerfdFile::new(self.global.platform, flags);
+        let mut dt = self.global.litebox.descriptor_table_mut();
+        let typed = dt.insert::<super::timerfd::TimerfdSubsystem<Platform>>(timerfd);
+        if flags.contains(TfdFlags::CLOEXEC) {
+            let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
+            assert!(old.is_none());
+        }
+        drop(dt);
+        let files = self.files.borrow();
+        let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
+            self.global
+                .litebox
+                .descriptor_table_mut()
+                .remove(&typed)
+                .unwrap();
+            Errno::EMFILE
+        })?;
+        Ok(raw_fd.try_into().unwrap())
+    }
+
+    /// Handle syscall `timerfd_settime`.
+    pub fn sys_timerfd_settime(
+        &self,
+        fd: i32,
+        flags: TfdSettimeFlags,
+        new_value: UserPtr<ItimerSpec>,
+        old_value: Option<UserPtrMut<ItimerSpec>>,
+    ) -> Result<(), Errno> {
+        if flags.intersects((TfdSettimeFlags::TIMER_ABSTIME | TfdSettimeFlags::TIMER_CANCEL_ON_SET).complement())
+        {
+            return Err(Errno::EINVAL);
+        }
+        let new = new_value.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        let interval = core::time::Duration::try_from(new.it_interval)?;
+        let value = core::time::Duration::try_from(new.it_value)?;
+
+        let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
+            return Err(Errno::EBADF);
+        };
+        let files = self.files.borrow();
+        let (prev_interval, prev_remaining) = files
+            .run_on_raw_fd(
+                raw_fd,
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |timerfd| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(timerfd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|file| {
+                        let now = self.global.platform.now();
+                        let deadline = if value.is_zero() {
+                            None
+                        } else if flags.contains(TfdSettimeFlags::TIMER_ABSTIME) {
+                            // `value` is an absolute deadline since the epoch (real
+                            // `timerfd_settime`'s `TFD_TIMER_ABSTIME`, measured against whichever
+                            // clockid the fd was created with -- this shim, like every other
+                            // narrow real-time-vs-monotonic distinction in this crate, only
+                            // tracks monotonic time). Convert by comparing against the current
+                            // wall-clock reading and applying the same offset to `now`.
+                            let wall_now = self.real_time_as_duration_since_epoch();
+                            if value > wall_now {
+                                now.checked_add(value - wall_now)
+                            } else {
+                                Some(now)
+                            }
+                        } else {
+                            now.checked_add(value)
+                        };
+                        Ok(file.set_time(deadline, interval))
+                    })
+                },
+            )
+            .flatten()?;
+
+        if let Some(out) = old_value {
+            out.write_at_offset::<Platform>(
+                0,
+                ItimerSpec {
+                    it_interval: prev_interval.into(),
+                    it_value: prev_remaining.into(),
+                },
+            )
+            .ok_or(Errno::EFAULT)?;
+        }
+        Ok(())
+    }
+
+    /// Handle syscall `timerfd_gettime`.
+    pub fn sys_timerfd_gettime(
+        &self,
+        fd: i32,
+        curr_value: UserPtrMut<ItimerSpec>,
+    ) -> Result<(), Errno> {
+        let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
+            return Err(Errno::EBADF);
+        };
+        let files = self.files.borrow();
+        let (interval, remaining) = files
+            .run_on_raw_fd(
+                raw_fd,
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |timerfd| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(timerfd)
+                        .ok_or(Errno::EBADF)?;
+                    Ok(handle.with_entry(super::timerfd::TimerfdFile::get_time))
+                },
+            )
+            .flatten()?;
+        curr_value
+            .write_at_offset::<Platform>(
+                0,
+                ItimerSpec {
+                    it_interval: interval.into(),
+                    it_value: remaining.into(),
+                },
+            )
+            .ok_or(Errno::EFAULT)
     }
 
     /// Handle syscall `memfd_create` -- anonymous, unlinked, shared-memory-backed file.
@@ -3429,6 +3617,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             });
                             Ok(())
                         },
+                        |fd| {
+                            let handle = self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .entry_handle(fd)
+                                .ok_or(Errno::EBADF)?;
+                            handle.with_entry(|file| {
+                                file.set_status(OFlags::NONBLOCK, val != 0);
+                            });
+                            Ok(())
+                        },
                     )
                     .flatten()?;
                 Ok(0)
@@ -3449,6 +3649,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // of fd this is -- unlike `net`/`pipes` above, which used to panic
                     // (`todo!()`) here despite `set_fd_metadata` working the same way for them
                     // as for every other fd type in this match.
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                    Ok(0)
+                },
+                |fd| {
                     let _old = self
                         .global
                         .litebox
@@ -3559,6 +3767,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     handle.with_entry(|end| self.pty_ioctl(end, &arg))
                 },
                 |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
             )?,
             IoctlArg::DrmModeGetResources(..)
             | IoctlArg::DrmModeGetCrtc(..)
@@ -3595,6 +3804,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
             )?,
             IoctlArg::VtGetState(..)
             | IoctlArg::VtSetMode(..)
@@ -3608,6 +3818,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         Err(Errno::ENOTTY)
                     }
                 },
+                |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
@@ -4131,6 +4342,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |fd| dup(self, &files, fd, close_on_exec, target),
                 |fd| dup(self, &files, fd, close_on_exec, target),
                 |fd| dup(self, &files, fd, close_on_exec, target),
+                |fd| dup(self, &files, fd, close_on_exec, target),
             )
             .map_err(|_| DupFdError::BadFd)?
     }
@@ -4287,6 +4499,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .set_fd_metadata(file, Diroff(dir_off));
                 Ok(nbytes)
             },
+            |_fd| Err(Errno::ENOTDIR),
             |_fd| Err(Errno::ENOTDIR),
             |_fd| Err(Errno::ENOTDIR),
             |_fd| Err(Errno::ENOTDIR),

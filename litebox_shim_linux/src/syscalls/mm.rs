@@ -229,6 +229,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_| None,
                 |_| None,
                 |_| None,
+                |_| None,
             )
             .ok()??;
 
@@ -403,6 +404,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_| None,
                 |_| None,
                 |_| None,
+                |_| None,
             )
             .ok()
             .flatten()?;
@@ -500,6 +502,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .run_on_raw_fd(
                 raw_fd,
                 |typed_fd| self.is_dri_device(&files.fs, typed_fd).unwrap_or(false),
+                |_| false,
                 |_| false,
                 |_| false,
                 |_| false,
