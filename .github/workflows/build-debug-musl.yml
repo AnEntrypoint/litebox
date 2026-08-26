@@ -20,6 +20,10 @@ on:
         description: "musl version to build (matching Alpine's shipped version)"
         required: true
         default: "1.2.6"
+      opt_level:
+        description: "optimization level (Alpine's real musl aport uses -Os)"
+        required: true
+        default: "-Os"
 
 jobs:
   build_debug_musl:
@@ -44,7 +48,7 @@ jobs:
           export CC=musl-gcc
           export AR=ar
           export RANLIB=ranlib
-          export CFLAGS="-g -O0 -fno-omit-frame-pointer"
+          export CFLAGS="-g ${{ inputs.opt_level }} -fno-omit-frame-pointer"
           ./configure --prefix="$GITHUB_WORKSPACE/musl-install"
           make -j"$(nproc)"
           make install
@@ -60,6 +64,6 @@ jobs:
       - name: Upload build output
         uses: actions/upload-artifact@v4
         with:
-          name: musl-${{ inputs.musl_version }}-debug
+          name: musl-${{ inputs.musl_version }}-debug-${{ inputs.opt_level }}
           path: musl-install/
           retention-days: 14
