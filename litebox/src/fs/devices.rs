@@ -5,6 +5,7 @@
 //!
 //! Provides `{stdin,stdout,null,urandom,...}` entries, intended to be mounted at `/dev`.
 
+use alloc::format;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -14,7 +15,7 @@ use crate::sync::RawSyncPrimitivesProvider;
 
 use super::backend::{
     Backend, BackendHandles, DirHandle, FileHandle, PermissionCheck, Permissioned, SeekBehavior,
-    WalkOutcome, WalkStopReason, WalkingDirHandle,
+    WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -971,3 +972,435 @@ where
     }
 }
 
+
+/// A leaf file inside `/sys/class/drm/{card0,renderD128}/` -- the minimal set a real
+/// `libudev`/`libdrm` device-enumeration walk actually reads:
+/// `udev_enumerate_scan_devices()` opens `uevent` (to populate `udev_device` properties)
+/// and reads the `dev`/`subsystem` attributes via `sysattr` lookups that fall back to
+/// reading these same files directly when no udev database is present (as is always the
+/// case here, since litebox has no `udevd`/`/run/udev` database at all). This matches the
+/// real, stable shape every Linux kernel has shipped under `/sys/class/drm/cardN/` since
+/// DRM's sysfs class was added -- not a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SysDrmFile {
+    /// `MAJOR=`/`MINOR=`/`DEVNAME=`/`SUBSYSTEM=` key=value lines, the same content the
+    /// kernel writes to the real uevent file and that `udevadm`/`libudev` parse to
+    /// populate a `udev_device`'s properties without needing a running `udevd`.
+    Uevent,
+    /// `MAJOR:MINOR` (e.g. `226:0`), the standard sysfs device-node attribute.
+    Dev,
+    /// Symlink to the (synthetic) `drm` subsystem directory -- `libudev` reads this
+    /// link's target basename to populate `udev_device_get_subsystem()`.
+    Subsystem,
+}
+
+impl SysDrmFile {
+    const ALL: &'static [(&'static str, SysDrmFile)] = &[
+        ("uevent", SysDrmFile::Uevent),
+        ("dev", SysDrmFile::Dev),
+        ("subsystem", SysDrmFile::Subsystem),
+    ];
+
+    fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.iter().find(|(n, _)| *n == name).map(|(_, f)| *f)
+    }
+}
+
+/// Node info for the `/sys/class/drm/card0` directory itself (distinct from
+/// `/dev/dri/card0`'s own [`DRI_CARD0_NODE_INFO`] -- sysfs directories and the device
+/// nodes they describe are always separate inodes on real Linux too).
+const SYS_DRM_CARD0_DIR_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 13,
+    rdev: None,
+};
+/// Node info for the `/sys/class/drm/renderD128` directory itself.
+const SYS_DRM_RENDERD128_DIR_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 14,
+    rdev: None,
+};
+
+impl DriDevice {
+    /// The `MAJOR`/`MINOR`/`DEVNAME` values this device reports under
+    /// `/sys/class/drm/<name>/`, reusing the exact same major/minor numbers already
+    /// established for the real `/dev/dri/<name>` node so the two stay consistent.
+    fn major_minor_devname(self) -> (u32, u32, &'static str) {
+        match self {
+            DriDevice::Card0 => (226, 0, "dri/card0"),
+            DriDevice::RenderD128 => (226, 128, "dri/renderD128"),
+        }
+    }
+
+    fn sys_dir_node_info(self) -> NodeInfo {
+        match self {
+            DriDevice::Card0 => SYS_DRM_CARD0_DIR_NODE_INFO,
+            DriDevice::RenderD128 => SYS_DRM_RENDERD128_DIR_NODE_INFO,
+        }
+    }
+}
+
+/// A [`super::backend::Backend`] exposing the minimal `/sys/class/drm/{card0,renderD128}/`
+/// subtree a real `libudev`-based DRM client (e.g. `weston`'s `drm-backend.so`) needs to
+/// enumerate litebox's one emulated DRM device. This is deliberately NOT a general
+/// procfs/sysfs emulation -- only the exact files real `udev_enumerate_scan_devices()` +
+/// `udev_device_new_from_syspath()` calls read (`uevent`, `dev`, `subsystem`) are served,
+/// for exactly the two DRM nodes [`DriDevices`] already exposes at `/dev/dri`. Mounted at
+/// `/sys/class/drm`; the composer's virtual-directory auto-synthesis (see
+/// `super::composer::ComposerBuilder::build`) creates the `/sys` and `/sys/class` ancestor
+/// directories automatically, so this backend only needs to handle its own two-level
+/// subtree (`card0`/`renderD128`, each containing `uevent`/`dev`/`subsystem`).
+pub struct SysClassDrm<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    _litebox: LiteBox<Platform>,
+    root_inode: NodeInfo,
+    _alloc: InodeAllocator,
+}
+
+impl<Platform> SysClassDrm<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    /// Construct a new `SysClassDrm` backend.
+    #[must_use]
+    pub fn new(litebox: &LiteBox<Platform>, allocator: InodeAllocator) -> Self {
+        let root_inode = allocator.next();
+        Self {
+            _litebox: litebox.clone(),
+            root_inode,
+            _alloc: allocator,
+        }
+    }
+}
+
+/// Directory handle: either the backend's mount root (`/sys/class/drm` itself) or inside
+/// one specific device's subdirectory (`/sys/class/drm/<name>`).
+#[derive(Debug, Clone, Copy)]
+pub enum SysDrmDirHandle {
+    Root,
+    Device(DriDevice),
+}
+
+/// Owned file handle; identifies which device's which sysfs attribute file backs this fd.
+#[derive(Debug, Clone, Copy)]
+pub struct SysDrmFileHandle {
+    device: DriDevice,
+    file: SysDrmFile,
+}
+
+impl<Platform> super::backend::private::Sealed for SysClassDrm<Platform> where
+    Platform: RawSyncPrimitivesProvider + 'static
+{
+}
+
+impl<Platform> BackendHandles for SysClassDrm<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    type WalkingDirHandle<'a> = SysDrmDirHandle;
+    type FileHandle = SysDrmFileHandle;
+    type DirHandle = SysDrmDirHandle;
+}
+
+impl<Platform> Backend for SysClassDrm<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    fn root(&self) -> WalkingDirHandle<'_> {
+        WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Root)
+    }
+
+    fn walk_directories<'a>(
+        &'a self,
+        from: WalkingDirHandle<'a>,
+        components: &[&str],
+    ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError> {
+        let from = from.into_typed::<Self>();
+        match from {
+            SysDrmDirHandle::Root => {
+                let Some(&component) = components.first() else {
+                    return Ok(WalkOutcome {
+                        components: vec![],
+                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Root),
+                        stop_reason: WalkStopReason::CompleteDirectory,
+                    });
+                };
+                let Some(device) = DriDevice::from_name(component) else {
+                    return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
+                };
+                // Walked one real directory level (`card0`/`renderD128`) -- the resolver
+                // uses `components.len()` both to check per-level permissions and, via
+                // `walk_path_following_symlinks`, to know how many of the caller's path
+                // components were consumed as directories, so this MUST be populated
+                // (unlike the flat `DriDevices`/`Devices` backends, which never walk past
+                // their mount root and so correctly leave this empty).
+                let walked = vec![WalkedComponent {
+                    permissions: PermissionCheck::ByBackend,
+                }];
+                if components.len() == 1 {
+                    return Ok(WalkOutcome {
+                        components: walked,
+                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(
+                            device,
+                        )),
+                        stop_reason: WalkStopReason::CompleteDirectory,
+                    });
+                }
+                // Second component: must name one of this device's leaf files: stop here
+                // (a leaf file is never a directory), leaving the resolver/caller to
+                // resolve the final component itself (matching `TarRo`'s own convention).
+                if components.len() == 2 && SysDrmFile::from_name(components[1]).is_some() {
+                    return Ok(WalkOutcome {
+                        components: walked,
+                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(
+                            device,
+                        )),
+                        stop_reason: WalkStopReason::StoppedAtNonDirectory,
+                    });
+                }
+                Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
+            }
+            SysDrmDirHandle::Device(device) => {
+                // Re-entering with a handle already inside a device directory (e.g. via
+                // `walking_dir_at` after `openat(dirfd, ...)`): behave identically to the
+                // fresh-root walk above, just without re-consuming the device-name
+                // component (it was already consumed to produce this handle).
+                let Some(&component) = components.first() else {
+                    return Ok(WalkOutcome {
+                        components: vec![],
+                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(
+                            device,
+                        )),
+                        stop_reason: WalkStopReason::CompleteDirectory,
+                    });
+                };
+                if SysDrmFile::from_name(component).is_some() {
+                    return Ok(WalkOutcome {
+                        components: vec![],
+                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(
+                            device,
+                        )),
+                        stop_reason: WalkStopReason::StoppedAtNonDirectory,
+                    });
+                }
+                Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
+            }
+        }
+    }
+
+    fn owned_dir_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        _flags: OFlags,
+    ) -> Result<DirHandle, OpenError> {
+        Ok(DirHandle::from_typed::<Self>(dir.into_typed::<Self>()))
+    }
+
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<WalkingDirHandle<'a>> {
+        Some(WalkingDirHandle::from_typed::<Self>(
+            *dir.get_typed::<Self>(),
+        ))
+    }
+
+    fn open_file_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        name: &str,
+        flags: OFlags,
+    ) -> Result<Permissioned<FileHandle>, OpenError> {
+        let dir = dir.into_typed::<Self>();
+        let SysDrmDirHandle::Device(device) = dir else {
+            return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
+        };
+        let file = SysDrmFile::from_name(name)
+            .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+
+        if flags.contains(OFlags::DIRECTORY) {
+            return Err(OpenError::PathError(PathError::ComponentNotADirectory));
+        }
+
+        Ok(Permissioned {
+            item: FileHandle::from_typed::<Self>(SysDrmFileHandle { device, file }),
+            permissions: PermissionCheck::ByBackend,
+        })
+    }
+
+    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
+        let handle = handle.into_typed::<Self>();
+        match handle {
+            SysDrmDirHandle::Root => Ok(DriDevice::ALL
+                .iter()
+                .map(|(n, d)| DirEntry {
+                    name: String::from(*n),
+                    file_type: FileType::Directory,
+                    ino_info: Some(d.sys_dir_node_info()),
+                })
+                .collect()),
+            SysDrmDirHandle::Device(_) => Ok(SysDrmFile::ALL
+                .iter()
+                .map(|(n, f)| DirEntry {
+                    name: String::from(*n),
+                    file_type: if matches!(f, SysDrmFile::Subsystem) {
+                        FileType::Symlink
+                    } else {
+                        FileType::RegularFile
+                    },
+                    ino_info: None,
+                })
+                .collect()),
+        }
+    }
+
+    fn read_link_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        name: &str,
+    ) -> Result<Option<String>, OpenError> {
+        let dir = dir.into_typed::<Self>();
+        let SysDrmDirHandle::Device(_) = dir else {
+            return Ok(None);
+        };
+        let Some(SysDrmFile::Subsystem) = SysDrmFile::from_name(name) else {
+            return Ok(None);
+        };
+        // Real sysfs `subsystem` links are relative, e.g. `../../../../class/drm`,
+        // resolving back up to the `drm` class directory -- `libudev` only reads the
+        // link target's basename (`drm`) to populate `udev_device_get_subsystem()`, so
+        // the exact number of `../` hops does not matter as long as the final basename
+        // is right (litebox's `/sys/class/drm` mount is itself a virtual directory with
+        // no real sibling classes, so this link is illustrative rather than
+        // independently walkable -- matching real udev's own basename-only usage).
+        Ok(Some(String::from("../../../class/drm")))
+    }
+
+    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
+        let h = h.get_typed::<Self>();
+        let (major, minor, devname) = h.device.major_minor_devname();
+        let content = match h.file {
+            SysDrmFile::Uevent => {
+                format!("MAJOR={major}\nMINOR={minor}\nDEVNAME={devname}\nSUBSYSTEM=drm\n")
+            }
+            SysDrmFile::Dev => format!("{major}:{minor}\n"),
+            SysDrmFile::Subsystem => return Err(ReadError::NotForReading),
+        };
+        let bytes = content.as_bytes();
+        let start = offset.min(bytes.len());
+        let end = bytes.len();
+        let len = (end - start).min(buf.len());
+        buf[..len].copy_from_slice(&bytes[start..start + len]);
+        Ok(len)
+    }
+
+    fn write(&self, _h: &FileHandle, _buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
+        Err(WriteError::NotForWriting)
+    }
+
+    fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {
+        Err(TruncateError::NotForWriting)
+    }
+
+    fn seek_behavior(&self, _h: &FileHandle) -> SeekBehavior {
+        SeekBehavior::PositionBased
+    }
+
+    fn file_status(&self, h: &FileHandle) -> Result<FileStatus, FileStatusError> {
+        let h = h.get_typed::<Self>();
+        let (major, minor, _devname) = h.device.major_minor_devname();
+        let size = match h.file {
+            SysDrmFile::Uevent => {
+                format!("MAJOR={major}\nMINOR={minor}\nDEVNAME=...\nSUBSYSTEM=drm\n").len()
+            }
+            SysDrmFile::Dev => format!("{major}:{minor}\n").len(),
+            SysDrmFile::Subsystem => 0,
+        };
+        Ok(FileStatus {
+            // Real sysfs attribute files report as regular files (`lstat` on the
+            // `subsystem` symlink itself is handled by the resolver via `read_link_at`,
+            // never reaching here for a plain, symlink-following `open()`/`stat()`).
+            file_type: FileType::RegularFile,
+            mode: Mode::RUSR | Mode::RGRP | Mode::ROTH,
+            size,
+            owner: UserInfo::ROOT,
+            node_info: NodeInfo {
+                dev: 5,
+                ino: match (h.device, h.file) {
+                    (DriDevice::Card0, SysDrmFile::Uevent) => 15,
+                    (DriDevice::Card0, SysDrmFile::Dev) => 16,
+                    (DriDevice::Card0, SysDrmFile::Subsystem) => 17,
+                    (DriDevice::RenderD128, SysDrmFile::Uevent) => 18,
+                    (DriDevice::RenderD128, SysDrmFile::Dev) => 19,
+                    (DriDevice::RenderD128, SysDrmFile::Subsystem) => 20,
+                },
+                rdev: None,
+            },
+            blksize: 0x1000,
+            atime: Timestamp::default(),
+            mtime: Timestamp::default(),
+        })
+    }
+
+    fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
+        let h = h.get_typed::<Self>();
+        let node_info = match h {
+            SysDrmDirHandle::Root => self.root_inode.clone(),
+            SysDrmDirHandle::Device(device) => device.sys_dir_node_info(),
+        };
+        Ok(FileStatus {
+            file_type: FileType::Directory,
+            mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+            size: super::DEFAULT_DIRECTORY_SIZE,
+            owner: UserInfo::ROOT,
+            node_info,
+            blksize: super::DEFAULT_DIRECTORY_SIZE,
+            atime: Timestamp::default(),
+            mtime: Timestamp::default(),
+        })
+    }
+
+    fn create_file_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _mode: Mode,
+    ) -> Result<FileHandle, OpenError> {
+        Err(OpenError::ReadOnlyFileSystem)
+    }
+
+    fn mkdir_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<DirHandle, MkdirError> {
+        Err(MkdirError::ReadOnlyFileSystem)
+    }
+
+    fn unlink_at(&self, _dir: DirHandle, _name: &str) -> Result<(), UnlinkError> {
+        Err(UnlinkError::ReadOnlyFileSystem)
+    }
+
+    fn rmdir_at(&self, _dir: DirHandle, _name: &str) -> Result<(), RmdirError> {
+        Err(RmdirError::ReadOnlyFileSystem)
+    }
+
+    fn chmod_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
+    fn chown_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _user: Option<u16>,
+        _group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        Err(ChownError::ReadOnlyFileSystem)
+    }
+
+    fn set_times_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _atime: Option<Timestamp>,
+        _mtime: Option<Timestamp>,
+    ) -> Result<(), SetTimesError> {
+        Err(SetTimesError::ReadOnlyFileSystem)
+    }
+}
