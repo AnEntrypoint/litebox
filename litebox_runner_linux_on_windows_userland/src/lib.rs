@@ -18,6 +18,28 @@ pub mod session_cli;
 /// ever pointed at the directories they live in.
 const LINUX_DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+/// Stack size for the OS thread that runs the FIRST guest program's initial (`execve`-time)
+/// thread. Must match `litebox_platform_windows_userland`'s own `GUEST_THREAD_STACK_SIZE` (the
+/// size every LATER `clone()`-spawned guest thread already gets via
+/// `std::thread::Builder::stack_size`, per that constant's doc comment: "Guest code... runs
+/// directly on this real Windows thread's own stack -- there is no separate emulated guest-stack
+/// region", so host-side call frames incurred while emulating the guest -- not just the guest's
+/// own `rsp`-addressed memory, which is separately and correctly sized by
+/// `litebox_shim_linux::loader::DEFAULT_STACK_SIZE` -- share this same real, native stack).
+///
+/// Without this, the very first guest program's initial thread ran inline on whatever OS thread
+/// called [`run`] below -- for a normal (non-`--session-daemon`) invocation, that is this
+/// process's own main thread, whose real stack is Rust's ~1 MiB Windows default, not 8 MiB.
+/// Confirmed live: `weston --backend=drm-backend.so --use-pixman` crashes with a genuine host
+/// `STATUS_STACK_OVERFLOW` (Rust's own "thread '<unknown>' has overflowed its stack" message)
+/// immediately after selecting its Pixman renderer, on the main thread specifically -- zero
+/// `clone()` syscalls occur before the crash, ruling out the already-correctly-sized spawned-
+/// thread path entirely. This mirrors an identical, already-fixed bug in this exact crate for the
+/// `--gui` presenter thread (see `PRESENTER_THREAD_STACK_SIZE` below) -- winit/wgpu's stack-hungry
+/// call chains overflowed that thread's default 1 MiB budget the same way pixman's own stack-
+/// hungry initialization overflows this one.
+const INITIAL_GUEST_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
+
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use litebox_platform_windows_userland::WindowsUserland as Platform;
@@ -274,8 +296,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
     let litebox = shim_builder.litebox();
 
-    // The program path is a Unix-style path inside the tar archive.
-    let prog_path = &cli_args.program_and_arguments[0];
+    // The program path is a Unix-style path inside the tar archive. Owned (not a borrow of
+    // `cli_args`) so it can cross into the spawned initial-guest-thread closures below (see
+    // `INITIAL_GUEST_THREAD_STACK_SIZE`'s doc comment) with a `'static` bound.
+    let prog_path = cli_args.program_and_arguments[0].clone();
 
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
@@ -461,15 +485,37 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         .then(|| initial_file_system.clone());
 
     let exit_code = if cli_args.pty_mode {
-        let (program, pty_id) = shim
-            .load_program_attach_pty(
-                initial_file_system,
-                platform.init_task(),
-                prog_path,
-                argv,
-                envp,
-            )
-            .unwrap();
+        let init_task = platform.init_task();
+
+        // `LinuxShimEntrypoints` is deliberately `!Send` (see its own doc comment: "The task
+        // should not be moved once it's bound to a platform thread so that we preserve the
+        // ability to use TLS in the future") -- so `load_program_attach_pty` (which produces it)
+        // must run on the SAME thread that goes on to call `run_thread` with it, not before a
+        // thread hop. See `INITIAL_GUEST_THREAD_STACK_SIZE`'s doc comment for why that thread
+        // must not be this function's caller: on a normal invocation that's this process's own
+        // main thread, whose real stack is Rust's ~1 MiB Windows default, not the 8 MiB a guest
+        // program is entitled to assume. `pty_id` is sent back out over a channel as soon as it's
+        // known, so the two forwarding threads below can start without waiting for the guest to
+        // finish running.
+        let (pty_id_tx, pty_id_rx) = std::sync::mpsc::channel();
+        let inner_shim = shim.clone();
+        let guest_thread = std::thread::Builder::new()
+            .stack_size(INITIAL_GUEST_THREAD_STACK_SIZE)
+            .spawn(move || {
+                let (program, pty_id) = inner_shim
+                    .load_program_attach_pty(initial_file_system, init_task, &prog_path, argv, envp)
+                    .unwrap();
+                pty_id_tx.send(pty_id).expect("receiver dropped");
+                unsafe {
+                    litebox_platform_windows_userland::run_thread(
+                        program.entrypoints,
+                        &mut litebox_common_linux::PtRegs::default(),
+                    );
+                }
+                program.process.wait()
+            })
+            .expect("failed to spawn initial guest thread");
+        let pty_id = pty_id_rx.recv().expect("guest thread dropped pty_id sender");
 
         // Two forwarding threads, mirroring `net_worker`'s existing "background thread pumping
         // shim-internal I/O" pattern above: one drains the pty master's output to this process's
@@ -514,13 +560,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             }
         });
 
-        unsafe {
-            litebox_platform_windows_userland::run_thread(
-                program.entrypoints,
-                &mut litebox_common_linux::PtRegs::default(),
-            );
-        }
-        let exit_code = program.process.wait();
+        let exit_code = guest_thread.join().expect("initial guest thread panicked");
 
         // The guest has exited: its slave-side fds are gone, so the pty's real Linux hangup
         // semantics (`PtyEnd::drop`/`GlobalState::hangup_slave`, already exercised by this
@@ -536,22 +576,27 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
         exit_code
     } else {
-        let program = shim
-            .load_program(
-                initial_file_system,
-                platform.init_task(),
-                prog_path,
-                argv,
-                envp,
-            )
-            .unwrap();
-        unsafe {
-            litebox_platform_windows_userland::run_thread(
-                program.entrypoints,
-                &mut litebox_common_linux::PtRegs::default(),
-            );
-        }
-        program.process.wait()
+        let init_task = platform.init_task();
+        // See `INITIAL_GUEST_THREAD_STACK_SIZE`'s doc comment: `load_program` (which produces the
+        // deliberately `!Send` `LinuxShimEntrypoints`) must run on the SAME thread that goes on to
+        // call `run_thread` with it -- so both happen inside the spawned thread, not before it.
+        std::thread::Builder::new()
+            .stack_size(INITIAL_GUEST_THREAD_STACK_SIZE)
+            .spawn(move || {
+                let program = shim
+                    .load_program(initial_file_system, init_task, &prog_path, argv, envp)
+                    .unwrap();
+                unsafe {
+                    litebox_platform_windows_userland::run_thread(
+                        program.entrypoints,
+                        &mut litebox_common_linux::PtRegs::default(),
+                    );
+                }
+                program.process.wait()
+            })
+            .expect("failed to spawn initial guest thread")
+            .join()
+            .expect("initial guest thread panicked")
     };
 
     if let Some(export_path) = &cli_args.export_writable_layer {
