@@ -741,6 +741,19 @@ bitflags::bitflags! {
 }
 
 bitflags::bitflags! {
+    /// `signalfd4(2)` flags -- `SFD_CLOEXEC`/`SFD_NONBLOCK` are defined in the real kernel UAPI
+    /// as aliases of `O_CLOEXEC`/`O_NONBLOCK` (`include/uapi/linux/signalfd.h`), same pattern as
+    /// `EfdFlags` above.
+    #[derive(Debug, Clone, Copy)]
+    pub struct SfdFlags: core::ffi::c_uint {
+        const CLOEXEC = litebox::fs::OFlags::CLOEXEC.bits();
+        const NONBLOCK = litebox::fs::OFlags::NONBLOCK.bits();
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+bitflags::bitflags! {
     /// `memfd_create(2)` flags. Values match the real kernel `uapi/linux/memfd.h` exactly.
     #[derive(Debug, Clone, Copy)]
     pub struct MfdFlags: core::ffi::c_uint {
@@ -3016,6 +3029,14 @@ pub enum SyscallRequest {
         initval: u32,
         flags: EfdFlags,
     },
+    Signalfd4 {
+        /// `-1` means "create a new signalfd"; otherwise the fd of an existing signalfd whose
+        /// mask this call replaces (real Linux `signalfd(2)`/`signalfd4(2)` semantics).
+        fd: i32,
+        mask: UserPtr<SigSet>,
+        sizemask: usize,
+        flags: SfdFlags,
+    },
     MemfdCreate {
         /// Cosmetic name only (real Linux exposes it via `/proc/self/fd/<n> -> memfd:<name>`,
         /// which this shim does not implement) -- read but not otherwise interpreted.
@@ -3768,6 +3789,13 @@ impl SyscallRequest {
                 flags: EfdFlags::empty(),
             },
             Sysno::eventfd2 => sys_req!(Eventfd2 { initval, flags }),
+            Sysno::signalfd => SyscallRequest::Signalfd4 {
+                fd: ctx.sys_req_arg(0),
+                mask: ctx.sys_req_ptr(1),
+                sizemask: ctx.sys_req_arg(2),
+                flags: SfdFlags::empty(),
+            },
+            Sysno::signalfd4 => sys_req!(Signalfd4 { fd, mask:*, sizemask, flags }),
             Sysno::memfd_create => sys_req!(MemfdCreate { name:*, flags }),
             Sysno::getrandom => sys_req!(GetRandom { buf:*,count,flags }),
             Sysno::clone => {
@@ -4435,6 +4463,7 @@ reinterpret_truncated_from_usize_for! {
         ReceiveFlags,
         EpollCreateFlags,
         EfdFlags,
+        SfdFlags,
         MfdFlags,
         RngFlags,
         TimerFlags,

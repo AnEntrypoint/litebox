@@ -468,7 +468,7 @@ impl<FS: ShimFS> AddrView<FS> {
 }
 
 /// A file descriptor donated via `SCM_RIGHTS` ancillary data, tagged with which of litebox's
-/// seven fd-enabled subsystems it belongs to -- `sendmsg`'s cmsg payload is just raw `int` fd
+/// eight fd-enabled subsystems it belongs to -- `sendmsg`'s cmsg payload is just raw `int` fd
 /// values with no type information of its own, so the sender resolves each one against its own
 /// [`crate::FilesState::run_on_raw_fd`] (the same per-subsystem dispatch `dup()`/`fork()` already
 /// use) and carries the *result* here, since the receiver has no way to re-discover which
@@ -481,6 +481,7 @@ pub(super) enum AnyDupFd<Platform: ShimPlatform, FS: ShimFS> {
     Epoll(litebox::fd::TypedFd<crate::syscalls::epoll::EpollSubsystem<Platform, FS>>),
     Unix(litebox::fd::TypedFd<UnixSocketSubsystem<Platform, FS>>),
     Pty(litebox::fd::TypedFd<crate::syscalls::pty::PtySubsystem<Platform>>),
+    Signalfd(litebox::fd::TypedFd<crate::syscalls::signalfd::SignalfdSubsystem<Platform>>),
 }
 
 /// A batch of `SCM_RIGHTS`-donated fds, as returned alongside a message's byte payload.
@@ -522,6 +523,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> AnyDupFd<Platform, FS> {
             AnyDupFd::Epoll(fd) => go(litebox, files, fd, cloexec),
             AnyDupFd::Unix(fd) => go(litebox, files, fd, cloexec),
             AnyDupFd::Pty(fd) => go(litebox, files, fd, cloexec),
+            AnyDupFd::Signalfd(fd) => go(litebox, files, fd, cloexec),
         };
         // `insert_raw_fd` only fails once the *receiver's* own `RLIMIT_NOFILE` is exceeded --
         // matches real Linux's `recvmsg` behavior of closing an over-limit donated fd and

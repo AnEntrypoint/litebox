@@ -1626,6 +1626,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                     .duplicate(fd)
                                     .map(AnyDupFd::Pty)
                             },
+                            |fd| {
+                                self.global
+                                    .litebox
+                                    .descriptor_table_mut()
+                                    .duplicate(fd)
+                                    .map(AnyDupFd::Signalfd)
+                            },
                         )
                         .map_err(|_| Errno::EBADF)?
                         .ok_or(Errno::EBADF)?;

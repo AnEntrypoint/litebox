@@ -236,7 +236,7 @@ impl PendingSignals {
         }
     }
 
-    fn next(&self, blocked: SigSet) -> Option<Signal> {
+    pub(crate) fn next(&self, blocked: SigSet) -> Option<Signal> {
         const EXCEPTION_SIGNALS: SigSet = SigSet::empty()
             .with(Signal::SIGSEGV)
             .with(Signal::SIGBUS)
@@ -255,7 +255,25 @@ impl PendingSignals {
         Some(next)
     }
 
-    fn remove(&mut self, signal: Signal) -> Siginfo {
+    /// Like [`Self::next`], but for `signalfd` consumption: selects the lowest-numbered pending
+    /// signal that IS in `mask` (the signalfd's own registered mask) instead of one that is NOT
+    /// in `blocked` -- a signalfd reads signals the caller deliberately routed to it, the inverse
+    /// selection criterion from normal handler-based delivery. No exception-signal prioritization
+    /// here: `signalfd` has no notion of "must be delivered with the faulting user context",
+    /// that's specific to synchronous delivery via [`Self::next`]/`process_signals`.
+    pub(crate) fn next_matching(&self, mask: SigSet) -> Option<Signal> {
+        (self.pending & mask).lowest_set()
+    }
+
+    /// Read-only peek (no dequeue) of whether any pending signal is in `mask` -- the `signalfd`
+    /// `check_io_events` readiness check, which (unlike [`Self::next_matching`], used by an actual
+    /// `read()`) must not consume anything since it may run speculatively (e.g. every `epoll_wait`
+    /// poll of a registered signalfd).
+    pub(crate) fn pending_matching(&self, mask: SigSet) -> bool {
+        !(self.pending & mask).is_empty()
+    }
+
+    pub(crate) fn remove(&mut self, signal: Signal) -> Siginfo {
         // Find the entry.
         let pos = self
             .queue
@@ -898,6 +916,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         }
     }
+
 
     /// Check whether the process-wide alarm deadline has passed and, if so,
     /// enqueue `SIGALRM`.
