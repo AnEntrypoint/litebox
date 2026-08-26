@@ -3298,6 +3298,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    /// Whether `fd` refers to a VT device node (`/dev/tty0`/`/dev/tty1`, major 4 -- see
+    /// `litebox::fs::devices::Device::Tty0`/`Tty1`'s node-info constants), mirroring
+    /// [`Self::is_dri_device`]'s identical major-number-check shape.
+    pub(crate) fn is_vt_device(&self, fs: &FS, fd: &TypedFd<FS>) -> Result<bool, Errno> {
+        match fs.fd_file_status(fd) {
+            Ok(status) => {
+                let major = status.node_info.rdev.map_or(0, |v| v.get() >> 8);
+                Ok(major == 4 && status.file_type == litebox::fs::FileType::CharacterDevice)
+            }
+            Err(litebox::fs::errors::FileStatusError::ClosedFd) => Err(Errno::EBADF),
+            Err(_) => unimplemented!(),
+        }
+    }
+
     /// Handle syscall `ioctl`
     pub fn sys_ioctl(&self, fd: i32, arg: IoctlArg) -> Result<u32, Errno> {
         let Ok(desc) = u32::try_from(fd).and_then(usize::try_from) else {
@@ -3581,10 +3595,42 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
             )?,
+            IoctlArg::VtGetState(..)
+            | IoctlArg::VtSetMode(..)
+            | IoctlArg::KdSetMode(..)
+            | IoctlArg::KdSkbMode(..) => files.run_on_raw_fd(
+                desc,
+                |fd| {
+                    if self.is_vt_device(&files.fs, fd)? {
+                        self.vt_ioctl(&arg)
+                    } else {
+                        Err(Errno::ENOTTY)
+                    }
+                },
+                |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
+            )?,
             _ => {
                 log_unsupported!("ioctl with arg {:?}", arg);
                 Err(Errno::EINVAL)
             }
+        }
+    }
+
+    /// Dispatch a `VT_*`/`KD*` request (already confirmed to target a real VT device fd by the
+    /// caller) to [`crate::syscalls::vt`].
+    fn vt_ioctl(&self, arg: &IoctlArg) -> Result<u32, Errno> {
+        match arg {
+            IoctlArg::VtGetState(ptr) => crate::syscalls::vt::get_state::<Platform>(*ptr),
+            IoctlArg::VtSetMode(ptr) => crate::syscalls::vt::set_mode::<Platform>(*ptr),
+            IoctlArg::KdSetMode(mode) => crate::syscalls::vt::set_mode_kd(*mode),
+            IoctlArg::KdSkbMode(mode) => crate::syscalls::vt::set_kbmode(*mode),
+            _ => unreachable!("vt_ioctl only ever called for VT/KD ioctl variants"),
         }
     }
 
@@ -5461,5 +5507,95 @@ mod tests {
         // pipes) used to unconditionally panic (todo!("O_DIRECT not supported")).
         let task = crate::syscalls::tests::init_platform(None);
         assert_eq!(task.sys_pipe2(OFlags::DIRECT).unwrap_err(), Errno::EINVAL);
+    }
+
+    /// Regression/live-protocol test for the VT device gap that blocked `seatd` from granting a
+    /// client (e.g. `weston`) DRM device access: `seatd`'s real `seat_update_vt`/`vt_open` call
+    /// sequence (`common/terminal.c`/`seatd/seat.c` in the real `seatd` source) is exercised
+    /// verbatim here -- open `/dev/tty0`, `VT_GETSTATE` to learn the active VT, open
+    /// `/dev/tty<v_active>`, then `VT_SETMODE`/`KDSKBMODE`/`KDSETMODE(KD_GRAPHICS)` on it, exactly
+    /// what `vt_open` in `seatd/seat.c` does once a client is granted its VT. Before this fix,
+    /// `/dev/tty0` did not exist at all (`ENOENT`), matching the real error this session
+    /// live-reproduced: `Could not open target tty: No such file or directory`.
+    #[test]
+    fn seatd_vt_handshake_sequence_succeeds() {
+        use litebox_common_linux::{KD_GRAPHICS, VtMode, VtStat};
+
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // -- seat_update_vt: open /dev/tty0, VT_GETSTATE to learn the active VT --
+        let tty0_fd = task
+            .sys_open("/dev/tty0", OFlags::RDWR, Mode::empty())
+            .expect("/dev/tty0 must exist and be openable, matching seatd's terminal_open(0)");
+        let tty0_fd = i32::try_from(tty0_fd).unwrap();
+
+        let mut st = VtStat {
+            v_active: 0,
+            v_signal: 0,
+            v_state: 0,
+        };
+        let st_ptr = UserPtrMut::from_usize((&raw mut st).expose_provenance());
+        assert_eq!(
+            task.sys_ioctl(tty0_fd, IoctlArg::VtGetState(st_ptr)),
+            Ok(0)
+        );
+        assert_ne!(st.v_active, 0, "VT_GETSTATE must report a real (non-zero) active VT");
+        task.sys_close(tty0_fd).unwrap();
+
+        // -- vt_open(cur_vt): open /dev/tty<cur_vt>, VT_SETMODE + KDSKBMODE + KDSETMODE --
+        let vt_path = alloc::format!("/dev/tty{}", st.v_active);
+        let vt_fd = task
+            .sys_open(&vt_path, OFlags::RDWR, Mode::empty())
+            .unwrap_or_else(|_| panic!("{vt_path} (the VT_GETSTATE-reported active VT) must exist and be openable"));
+        let vt_fd = i32::try_from(vt_fd).unwrap();
+
+        let mode = VtMode {
+            mode: 1, // VT_PROCESS
+            waitv: 0,
+            relsig: 10,
+            acqsig: 12,
+            frsig: 0,
+        };
+        let mode_ptr = UserPtr::from_usize((&raw const mode).expose_provenance());
+        assert_eq!(task.sys_ioctl(vt_fd, IoctlArg::VtSetMode(mode_ptr)), Ok(0));
+        assert_eq!(task.sys_ioctl(vt_fd, IoctlArg::KdSkbMode(4)), Ok(0)); // K_OFF
+        assert_eq!(
+            task.sys_ioctl(vt_fd, IoctlArg::KdSetMode(KD_GRAPHICS)),
+            Ok(0)
+        );
+        task.sys_close(vt_fd).unwrap();
+    }
+
+    #[test]
+    fn kdsetmode_rejects_unrecognized_mode_value() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let fd = task
+            .sys_open("/dev/tty1", OFlags::RDWR, Mode::empty())
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+        assert_eq!(
+            task.sys_ioctl(fd, IoctlArg::KdSetMode(999)).unwrap_err(),
+            Errno::EINVAL
+        );
+    }
+
+    #[test]
+    fn vt_ioctl_on_a_non_vt_fd_returns_enotty() {
+        // A VT ioctl issued against an unrelated fd (a real file, not /dev/tty0 or /dev/tty1)
+        // must be rejected as ENOTTY, matching real Linux -- not silently succeed or panic.
+        let task = crate::syscalls::tests::init_platform(None);
+        let fd = task
+            .sys_open(
+                "/tmp_notvt.txt",
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+        assert_eq!(
+            task.sys_ioctl(fd, IoctlArg::KdSetMode(litebox_common_linux::KD_TEXT))
+                .unwrap_err(),
+            Errno::ENOTTY
+        );
     }
 }

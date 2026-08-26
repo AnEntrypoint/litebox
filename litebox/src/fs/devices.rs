@@ -58,6 +58,25 @@ const URANDOM_NODE_INFO: NodeInfo = NodeInfo {
     // major=1, minor=9
     rdev: core::num::NonZeroUsize::new(0x109),
 };
+/// Node info for `/dev/tty0` (major=4, minor=0 -- the real Linux "current VT" console device;
+/// see `Documentation/admin-guide/devices.txt`). `seatd`'s `seat_update_vt` opens exactly this
+/// path and calls `VT_GETSTATE` on it to learn which numbered VT (`/dev/tty<N>`) is active.
+const TTY0_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 21,
+    // major=4, minor=0
+    rdev: core::num::NonZeroUsize::new(0x0400),
+};
+/// Node info for `/dev/tty1` (major=4, minor=1 -- the first real numbered VT). This virtual
+/// device always reports VT 1 as active (see [`super::super::syscalls::vt`]'s doc comment, or
+/// this module's own [`Device::Tty0`]/[`Device::Tty1`] pairing), so `/dev/tty1` is the one
+/// `seatd`'s `vt_open`/`vt_close` subsequently open once `VT_GETSTATE` on `/dev/tty0` names it.
+const TTY1_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 22,
+    // major=4, minor=1
+    rdev: core::num::NonZeroUsize::new(0x0401),
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Device {
@@ -66,6 +85,11 @@ enum Device {
     Stderr,
     Null,
     URandom,
+    /// `/dev/tty0` -- the "currently active VT" console device (see [`TTY0_NODE_INFO`]).
+    Tty0,
+    /// `/dev/tty1` -- the one numbered VT this virtual device ever reports as active (see
+    /// [`TTY1_NODE_INFO`]).
+    Tty1,
 }
 
 impl Device {
@@ -75,6 +99,8 @@ impl Device {
         ("stderr", Device::Stderr),
         ("null", Device::Null),
         ("urandom", Device::URandom),
+        ("tty0", Device::Tty0),
+        ("tty1", Device::Tty1),
     ];
 
     fn from_name(name: &str) -> Option<Self> {
@@ -110,6 +136,23 @@ impl Device {
                 owner: UserInfo::ROOT,
                 node_info: URANDOM_NODE_INFO,
                 blksize: URANDOM_BLOCK_SIZE,
+                atime: Timestamp::default(),
+                mtime: Timestamp::default(),
+            },
+            Device::Tty0 | Device::Tty1 => FileStatus {
+                file_type: FileType::CharacterDevice,
+                // Real VT device nodes are `crw--w----`, group `tty` -- litebox's guest
+                // identity always runs as root (see `DriDevice::file_status`'s identical
+                // rationale), so group-writable is sufficient for every guest process.
+                mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
+                size: 0,
+                owner: UserInfo::ROOT,
+                node_info: if self == Device::Tty0 {
+                    TTY0_NODE_INFO
+                } else {
+                    TTY1_NODE_INFO
+                },
+                blksize: STDIO_BLOCK_SIZE,
                 atime: Timestamp::default(),
                 mtime: Timestamp::default(),
             },
@@ -311,6 +354,14 @@ where
                 self.litebox.x.platform.fill_bytes_crng(buf);
                 Ok(buf.len())
             }
+            // Real Linux VT devices support read()/write() (raw keyboard/console I/O); no
+            // caller on this codebase's actual VT usage path (`seatd`'s open + VT_GETSTATE/
+            // VT_SETMODE/KDSETMODE/KDSKBMODE ioctls, see `litebox_shim_linux`'s VT subsystem)
+            // ever reads or writes these nodes, so this deliberately rejects rather than
+            // silently returning zero bytes -- matching `DriDevices::read`'s identical
+            // "fail loud, not silently wrong" rationale for a device-node shape this backend
+            // does not implement the full byte-stream protocol for.
+            Device::Tty0 | Device::Tty1 => Err(ReadError::NotForReading),
         }
     }
 
@@ -331,6 +382,8 @@ where
                 // /dev/urandom here.
                 return Ok(buf.len());
             }
+            // See `Device::Tty0 | Device::Tty1`'s identical rationale in `read` above.
+            Device::Tty0 | Device::Tty1 => return Err(WriteError::NotForWriting),
         };
         self.litebox
             .x
@@ -348,7 +401,9 @@ where
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior {
         let h = h.get_typed::<Self>();
         match h.device {
-            Device::Stdin | Device::Stdout | Device::Stderr => SeekBehavior::NonSeekable,
+            Device::Stdin | Device::Stdout | Device::Stderr | Device::Tty0 | Device::Tty1 => {
+                SeekBehavior::NonSeekable
+            }
             Device::Null | Device::URandom => SeekBehavior::ZeroPosition,
         }
     }
