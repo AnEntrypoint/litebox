@@ -420,6 +420,38 @@ unsafe extern "system" fn vectored_exception_handler(
     }
 
     if veh_trace_enabled() {
+        // DIAG-REALSTACK (mallocng .meta=0 investigation continuation): reads the REAL host
+        // TEB's StackBase/StackLimit/DeallocationStack directly via inline asm to check whether a
+        // crashing thread's real Windows-backing stack reservation is genuinely the expected 8
+        // MiB (`GUEST_THREAD_STACK_SIZE`) or something smaller -- e.g. because it's a `sh -c "...
+        // ; weston ..."` tail-call `execve()` reusing an OS thread that was never spawned with
+        // that size in the first place (`execve()` never calls `Platform::spawn_thread`, unlike
+        // `fork()`/`clone()`). `StackLimit` alone is NOT sufficient here -- it tracks only the
+        // currently-COMMITTED floor, which grows on demand and looks deceptively small early in a
+        // thread's life; `DeallocationStack` (TEB+0x1478) is the true bottom of the whole
+        // reservation, set once at thread creation, and is what actually answers the question.
+        #[allow(clippy::cast_possible_truncation, reason = "diagnostic-only; x86_64 only")]
+        let rsp_now = context.Rsp;
+        let stack_base: u64;
+        let stack_limit: u64;
+        let dealloc_stack: u64;
+        unsafe {
+            core::arch::asm!(
+                "mov {0}, gs:[0x08]",
+                "mov {1}, gs:[0x10]",
+                "mov {2}, gs:[0x1478]",
+                out(reg) stack_base,
+                out(reg) stack_limit,
+                out(reg) dealloc_stack,
+            );
+        }
+        eprintln!(
+            "[veh] DIAG-REALSTACK exc_code={:#x} rsp={rsp_now:#x} stack_base={stack_base:#x} stack_limit={stack_limit:#x} dealloc_stack={dealloc_stack:#x} committed={:#x} total_reserved={:#x} remaining_to_dealloc={}",
+            exception_record.ExceptionCode,
+            stack_base.wrapping_sub(stack_limit),
+            stack_base.wrapping_sub(dealloc_stack),
+            i64::try_from(rsp_now.wrapping_sub(dealloc_stack)).unwrap_or(-1),
+        );
         unsafe extern "C" {
             safe static __ImageBase: c_void;
         }
