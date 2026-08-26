@@ -15,16 +15,33 @@
 //! sidesteps it entirely: no fork, no execve, just `std::thread::spawn`, already proven safe and
 //! working elsewhere in this project (e.g. `--gui`'s own presenter thread).
 //!
-//! **Verification status**: run as a real guest process, the client genuinely `CONNECTED` and the
-//! compositor genuinely printed `CLIENT_ACCEPTED` -- the raw Unix-socket handshake works. The
-//! client's first real protocol round-trip then hit a real litebox gap: `sendmsg`'s
-//! ancillary-data (`SCM_RIGHTS`) path is unconditionally rejected with `EINVAL`
-//! (`litebox_shim_linux::syscalls::net`'s `do_sendmsg`/`do_recvmsg`) -- `wl_shm.create_pool`
-//! needs this to pass its memfd. See `README.md`'s "Phase 4" section for the full finding and the
-//! precise scope of what a real fix needs; not attempted here (real, safety-critical shared
-//! infrastructure work, not a quick patch). This file deliberately omits the DRM dumb-buffer push
-//! (`main.rs`'s `push_to_drm_dumb_buffer`, unreachable here since no commit is ever received) to
-//! keep this specific repro minimal and focused on the client-connect question.
+//! **Verification status (updated, see "phase 8" in `README.md` for the full story)**: run as a
+//! real guest process, the client genuinely `CONNECTED` and the compositor genuinely printed
+//! `CLIENT_ACCEPTED` -- the raw Unix-socket handshake works. `sendmsg`'s `SCM_RIGHTS` gap (real,
+//! previously found here) is now fixed in litebox itself (`litebox_shim_linux::syscalls::net`,
+//! commit `1a2470c4`). What looked like a SEPARATE, deeper litebox epoll bug after that fix
+//! landed ("the outer epoll's readiness for the nested compositor epoll is checked once, then
+//! never again, even though `calloop` keeps calling `dispatch()`") turned out NOT to be a litebox
+//! bug at all: this file's own `display` source callback called `dispatch_clients` but never
+//! `flush_clients` -- `dispatch_clients` only processes requests already read off the wire, it
+//! never itself writes the server's own queued REPLIES back out. The client's `roundtrip()`
+//! legitimately blocked forever on bytes the server had silently buffered and never sent; once
+//! the compositor's own 20s timeout elapsed and its thread exited, the client saw a genuine
+//! `Broken pipe`. Confirmed live via a temporary diagnostic (fully reverted): the display source
+//! fired exactly once (`dispatch_clients` returned `Ok(2)`), never again across ~191 further
+//! `dispatch()` calls over 20s -- adding `flush_clients()` after `dispatch_clients()` resolved
+//! this completely; the client now reaches `ROUNDTRIP_1_DONE` and the three real globals
+//! (`wl_compositor`/`wl_subcompositor`/`wl_shm`) are received correctly.
+//!
+//! **Current real blocker** (confirmed live, a genuinely NEW gap, not a re-tread): `memfd_create`
+//! (via raw `SYS_memfd_create`, `wl_shm.create_pool`'s own buffer-backing mechanism) is not
+//! implemented in litebox at all -- `MEMFD_FAILED Function not implemented (os error 38)`. This
+//! is real, separate future work (a whole syscall implementation, not a quick patch layered onto
+//! everything else this row has already covered) -- not attempted here.
+//!
+//! This file deliberately omits the DRM dumb-buffer push (`main.rs`'s `push_to_drm_dumb_buffer`,
+//! unreachable here since no commit is ever received) to keep this specific repro minimal and
+//! focused on the client-connect/protocol-roundtrip question.
 
 use std::sync::mpsc;
 
@@ -174,6 +191,17 @@ fn run_compositor(result_tx: mpsc::Sender<(usize, u32, u32, u32)>) {
             |_, display, data: &mut Compositor| {
                 unsafe {
                     display.get_mut().dispatch_clients(data).ok();
+                    // Real fix (was the actual "readiness never re-checked" root cause, see this
+                    // file's own doc comment): `dispatch_clients` only processes requests already
+                    // read off the socket -- it never itself writes queued REPLIES back out.
+                    // Without this call, the server silently buffers its own responses forever;
+                    // the client's `roundtrip()` blocks on bytes that were never sent, and once
+                    // the compositor's own timeout elapses and the thread exits, the client sees a
+                    // `Broken pipe`. This looked exactly like a litebox epoll bug (readiness
+                    // checked once then never again) because the SYMPTOM was identical -- the
+                    // client legitimately has nothing more to receive, so nothing on litebox's own
+                    // socket-readiness side was ever actually wrong.
+                    display.get_mut().flush_clients().ok();
                 }
                 Ok(PostAction::Continue)
             },

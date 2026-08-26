@@ -1276,6 +1276,209 @@ mod test {
         );
     }
 
+    /// Phase 8: reproduces the real `combined.rs` shape directly -- a dedicated OS thread
+    /// repeatedly calling the OUTER epoll's `wait()` in a short-timeout polling loop (matching
+    /// `calloop::EventLoop::dispatch`'s own `100ms`-bounded-wait, call-again cadence) while a
+    /// SEPARATE thread independently sends messages on the inner epoll's socket with realistic,
+    /// uncoordinated timing -- unlike every prior test in this file (phases 6/7), which drove the
+    /// outer `wait()` sequentially from a single thread with the writer only ever running to
+    /// completion (via `.join()`) BEFORE the next `wait()` call. This is the one candidate
+    /// (`docs/wayland-drm-backend-probe/README.md`'s "phase 7" conclusion) no single-threaded test
+    /// could structurally exercise: a message arriving in the gap BETWEEN two `wait()` calls
+    /// (while the dispatcher thread is not blocked in `wait()` at all), a lost-wakeup shape a
+    /// join()-before-next-wait test can never hit.
+    #[test]
+    fn test_nested_epoll_readiness_rechecked_under_concurrent_dispatch() {
+        let (task, outer) = setup_epoll();
+        let outer = Arc::new(outer);
+        let inner = EpollFile::<TestPlatform, crate::DefaultFS<TestPlatform>>::new();
+        let inner_typed = task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<super::EpollSubsystem<TestPlatform, crate::DefaultFS<TestPlatform>>>(inner);
+
+        let (receiver_sock, writer_sock) = crate::syscalls::unix::UnixSocket::<
+            TestPlatform,
+            crate::DefaultFS<TestPlatform>,
+        >::new_connected_pair(
+            litebox_common_linux::SockType::Stream,
+            litebox_common_linux::SockFlags::empty(),
+        )
+        .unwrap();
+        let receiver_typed = task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<crate::syscalls::unix::UnixSocketSubsystem<
+            TestPlatform,
+            crate::DefaultFS<TestPlatform>,
+        >>(receiver_sock);
+        let writer_typed = task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<crate::syscalls::unix::UnixSocketSubsystem<
+            TestPlatform,
+            crate::DefaultFS<TestPlatform>,
+        >>(writer_sock);
+
+        let files = Arc::new(FilesState::new(task.files.borrow().fs.clone()));
+        let Ok(receiver_raw) = files.insert_raw_fd(receiver_typed) else {
+            unreachable!()
+        };
+        let Ok(writer_raw) = files.insert_raw_fd(writer_typed) else {
+            unreachable!()
+        };
+        let Ok(inner_raw) = files.insert_raw_fd(inner_typed) else {
+            unreachable!()
+        };
+
+        let receiver_descriptor = super::EpollDescriptor::try_from(&files, receiver_raw).unwrap();
+        {
+            let inner_typed = files
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<super::EpollSubsystem<TestPlatform, crate::DefaultFS<TestPlatform>>>(inner_raw)
+                .unwrap();
+            task.global
+                .litebox
+                .descriptor_table()
+                .with_entry(&inner_typed, |inner_entry| {
+                    inner_entry
+                        .add_interest(
+                            &task.global,
+                            20,
+                            &receiver_descriptor,
+                            EpollEvent {
+                                events: Events::IN.bits(),
+                                data: 0,
+                            },
+                        )
+                        .unwrap();
+                });
+        }
+
+        let inner_descriptor = super::EpollDescriptor::try_from(&files, inner_raw).unwrap();
+        outer
+            .add_interest(
+                &task.global,
+                10,
+                &inner_descriptor,
+                EpollEvent {
+                    events: Events::IN.bits(),
+                    data: 0,
+                },
+            )
+            .unwrap();
+
+        const N: usize = 30;
+        let received = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+
+        // Dispatcher thread: mimics `calloop::EventLoop::dispatch(Duration::from_millis(100), ..)`
+        // called in a loop -- a SHORT-timeout wait, repeated many times, draining the receiver on
+        // every ready observation (mimicking calloop reading its own registered fd directly, never
+        // touching the inner epoll's own `wait()` -- same as phases 6/7).
+        let dispatcher = {
+            let global = task.global.clone();
+            let outer = Arc::clone(&outer);
+            let files = Arc::clone(&files);
+            let received = Arc::clone(&received);
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while received.load(core::sync::atomic::Ordering::Relaxed) < N
+                    && std::time::Instant::now() < deadline
+                {
+                    let Ok(events) = outer.wait(
+                        &global,
+                        &WaitState::new(platform())
+                            .context()
+                            .with_timeout(core::time::Duration::from_millis(20)),
+                        1024,
+                    ) else {
+                        continue;
+                    };
+                    if events.is_empty() {
+                        continue;
+                    }
+                    // Drain every byte currently available on the receiver, exactly like calloop's
+                    // real generic fd source reading everything ready before returning to the loop.
+                    loop {
+                        let receiver_typed = files
+                            .raw_descriptor_store
+                            .read()
+                            .fd_from_raw_integer::<crate::syscalls::unix::UnixSocketSubsystem<
+                                TestPlatform,
+                                crate::DefaultFS<TestPlatform>,
+                            >>(receiver_raw)
+                            .unwrap();
+                        let mut buf = [0u8; 1];
+                        let n = global.litebox.descriptor_table().with_entry(
+                            &receiver_typed,
+                            |entry| {
+                                entry.recvfrom(
+                                    &WaitState::new(platform())
+                                        .context()
+                                        .with_timeout(core::time::Duration::from_millis(0)),
+                                    &mut buf,
+                                    litebox_common_linux::ReceiveFlags::empty(),
+                                    None,
+                                )
+                            },
+                        );
+                        match n {
+                            Some(Ok(1)) => {
+                                received.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+            })
+        };
+
+        // Writer thread: sends N messages with realistic, UNCOORDINATED timing relative to the
+        // dispatcher's own wait/drain cycle -- deliberately not synchronized to land inside vs.
+        // between `wait()` calls, so some sends land while the dispatcher is blocked in `wait()`
+        // and some land in the gap between one `wait()` returning and the next one starting
+        // (exactly the window a lost-wakeup bug would need).
+        let writer = {
+            let task = task.clone_for_test().unwrap();
+            let files = Arc::clone(&files);
+            std::thread::spawn(move || {
+                for _ in 0..N {
+                    std::thread::sleep(core::time::Duration::from_millis(7));
+                    let writer_typed = files
+                        .raw_descriptor_store
+                        .read()
+                        .fd_from_raw_integer::<crate::syscalls::unix::UnixSocketSubsystem<
+                            TestPlatform,
+                            crate::DefaultFS<TestPlatform>,
+                        >>(writer_raw)
+                        .unwrap();
+                    let _ = task
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .with_entry(&writer_typed, |entry| {
+                            entry.sendto(&task, b"x", litebox_common_linux::SendFlags::empty(), None)
+                        })
+                        .unwrap();
+                }
+            })
+        };
+
+        writer.join().unwrap();
+        dispatcher.join().unwrap();
+
+        assert_eq!(
+            received.load(core::sync::atomic::Ordering::Relaxed),
+            N,
+            "dispatcher thread should observe ALL {N} sends across repeated, concurrent wait() \
+             calls -- a lower count means a real message was lost between dispatch cycles"
+        );
+    }
+
     #[test]
     fn test_epoll_with_pipe() {
         let (task, epoll) = setup_epoll();

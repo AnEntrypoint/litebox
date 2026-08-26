@@ -178,6 +178,50 @@ points live (a temporary diagnostic logging exactly when the compositor
 thread's `dispatch()` calls happen relative to the client thread's writes)
 to look for a genuine missed-wakeup window between the two.
 
+**Phase 8: candidate (c) was ALSO ruled out, and the real cause found --
+NOT a litebox bug at all.** A genuinely concurrent unit test
+(`test_nested_epoll_readiness_rechecked_under_concurrent_dispatch`, a third
+permanent regression test) drives the outer `wait()` from a dedicated
+dispatcher thread in a real 20ms-timeout polling loop (mirroring
+`calloop::EventLoop::dispatch`'s own cadence) while a separate writer
+thread sends 30 messages with UNCOORDINATED timing (no `.join()` before the
+next wait, unlike every prior test) -- validated as sensitive via the same
+sabotage technique (a broken `check_io_events` reliably fails it). **This
+also passes cleanly**, ruling out a genuine core-mechanism timing race too.
+
+With all three candidates from litebox's own polling machinery exhausted,
+the investigation moved to live-tracing the REAL guest process instead of
+more unit tests: built `wayland-combined` fresh (zig + cargo-zigbuild,
+recipe below), ran it as a real guest process under `--gui`, and added a
+temporary diagnostic (fully reverted) directly to the `display` source's
+callback. **Found the actual cause**: the callback called
+`display.dispatch_clients()` but never `display.flush_clients()` --
+`dispatch_clients` only processes requests already read off the wire; it
+does NOT itself write the server's own queued REPLIES back to the client.
+Confirmed live: the display source fired exactly ONCE (`dispatch_clients`
+returned `Ok(2)`, correctly processing 2 requests), then never fired again
+across ~191 further `dispatch()` calls over 20s -- not because litebox's
+epoll readiness tracking was broken, but because the client's `roundtrip()`
+was legitimately, correctly blocked on bytes the compositor had silently
+buffered and never sent. Adding `display.flush_clients()` immediately after
+`dispatch_clients()` in `src/combined.rs` resolved this completely, live-
+verified: the client now reaches `ROUNDTRIP_1_DONE` with the three real
+globals (`wl_compositor`/`wl_subcompositor`/`wl_shm`) received correctly.
+
+**This was a bug in the PROBE's own compositor code, not in litebox** --
+seven prior forks across two sessions correctly, rigorously ruled out every
+litebox-side hypothesis with real regression tests before this was finally
+found by live-tracing the actual guest process; the three regression tests
+(phases 6/7/8) remain valuable permanent coverage for litebox's real nested-
+epoll mechanism regardless.
+
+**New real blocker found immediately after, confirmed live, NOT a re-tread**:
+`memfd_create` (raw `SYS_memfd_create`, `wl_shm.create_pool`'s own buffer-
+backing mechanism -- every real Wayland client needs this) is not
+implemented in litebox at all -- `MEMFD_FAILED Function not implemented (os
+error 38)`. This is genuinely separate future work (a whole syscall
+implementation) for whoever continues this row.
+
 ## Reproducing the type-check only
 
 ```sh
