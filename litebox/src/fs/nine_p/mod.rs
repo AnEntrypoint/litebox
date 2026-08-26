@@ -19,9 +19,9 @@ use thiserror::Error;
 use crate::fs::OFlags;
 use crate::fs::Timestamp;
 use crate::fs::errors::{
-    ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, ReadLinkError, RenameError, RmdirError, SeekError, SetTimesError, SymlinkError,
-    TruncateError, UnlinkError, WriteError,
+    ChmodError, ChownError, FileStatusError, LinkError, MkdirError, OpenError, PathError,
+    ReadDirError, ReadError, ReadLinkError, RenameError, RmdirError, SeekError, SetTimesError,
+    SymlinkError, TruncateError, UnlinkError, WriteError,
 };
 use crate::fs::nine_p::fcall::Rlerror;
 use crate::path::Arg;
@@ -944,6 +944,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         self.client.clunk(to_parent_fid);
 
         result.map_err(RenameError::from)
+    }
+
+    fn link(
+        &self,
+        oldpath: impl crate::path::Arg,
+        newpath: impl crate::path::Arg,
+    ) -> Result<(), LinkError> {
+        // The 9P client (`client.rs`) does not implement `Tlink`; wiring that up would mean
+        // implementing a new raw 9P protocol message from scratch, which is out of scope here.
+        // No current use of this filesystem needs to create hard links over 9P.
+        let _ = (oldpath, newpath);
+        Err(LinkError::Io)
     }
 
     fn symlink(

@@ -193,6 +193,34 @@ pub enum RenameError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`FileSystem::link`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum LinkError {
+    /// A parent directory (of `oldpath` or `newpath`) does not allow write permission.
+    #[error("a parent directory does not allow write permission")]
+    NoWritePerms,
+    /// `oldpath` names a directory. Hard-linking a directory is never valid, matching Linux's
+    /// `link(2)` (`EPERM`).
+    #[error("cannot hard-link a directory")]
+    IsADirectory,
+    /// `newpath` already exists.
+    #[error("file already exists")]
+    AlreadyExists,
+    /// `oldpath` and `newpath` are not both resolvable within the same filesystem/layer (e.g.
+    /// `oldpath` only exists in a read-only lower layer). Matches Linux's `EXDEV` for
+    /// cross-filesystem hard links, same rationale as [`RenameError::CrossDevice`].
+    #[error("cross-device hard link is not supported")]
+    CrossDevice,
+    /// The named file resides on a read-only filesystem.
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
 /// Possible errors from [`FileSystem::symlink`]
 #[non_exhaustive]
 #[derive(Error, Debug)]

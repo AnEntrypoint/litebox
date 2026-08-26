@@ -12,9 +12,9 @@ use crate::path::Arg;
 use crate::{LiteBox, fd::TypedFd, sync};
 
 use super::errors::{
-    ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, ReadLinkError, RenameError, RmdirError, SeekError, SetTimesError,
-    SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
+    ChmodError, ChownError, CloseError, FileStatusError, LinkError, MkdirError, OpenError,
+    PathError, ReadDirError, ReadError, ReadLinkError, RenameError, RmdirError, SeekError,
+    SetTimesError, SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::{
     FileType, Mode, OFlags, Timestamp,
@@ -804,6 +804,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         // filesystem, never a `Resolver<Composer>`.
         let _ = (from, to);
         Err(RenameError::ReadOnlyFileSystem)
+    }
+
+    fn link(&self, oldpath: impl Arg, newpath: impl Arg) -> Result<(), LinkError> {
+        // Same rationale as `rename` above: every current use of `Resolver<Composer>` mounts
+        // either a genuinely read-only backend (`tar_ro`) or a device backend (`devices`, `/dev`),
+        // neither of which can meaningfully support creating a new hard link.
+        let _ = (oldpath, newpath);
+        Err(LinkError::ReadOnlyFileSystem)
     }
 
     fn symlink(&self, target: impl Arg, linkpath: impl Arg) -> Result<(), SymlinkError> {

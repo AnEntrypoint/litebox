@@ -167,6 +167,22 @@ impl From<litebox::fs::errors::RenameError> for Errno {
     }
 }
 
+impl From<litebox::fs::errors::LinkError> for Errno {
+    fn from(value: litebox::fs::errors::LinkError) -> Self {
+        match value {
+            litebox::fs::errors::LinkError::NoWritePerms => Errno::EACCES,
+            // Matches real Linux `link(2)`: hard-linking a directory is `EPERM`, not `EISDIR`.
+            litebox::fs::errors::LinkError::IsADirectory => Errno::EPERM,
+            litebox::fs::errors::LinkError::AlreadyExists => Errno::EEXIST,
+            litebox::fs::errors::LinkError::CrossDevice => Errno::EXDEV,
+            litebox::fs::errors::LinkError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::LinkError::Io => Errno::EIO,
+            litebox::fs::errors::LinkError::PathError(path_error) => path_error.into(),
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::fs::errors::SymlinkError> for Errno {
     fn from(value: litebox::fs::errors::SymlinkError) -> Self {
         match value {

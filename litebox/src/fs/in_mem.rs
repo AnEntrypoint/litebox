@@ -14,9 +14,9 @@ use crate::path::Arg;
 use crate::sync;
 
 use super::errors::{
-    ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, ReadLinkError, RenameError, RmdirError, SeekError, SetTimesError,
-    SymlinkError, TruncateError, UnlinkError, WriteError,
+    ChmodError, ChownError, CloseError, FileStatusError, LinkError, MkdirError, OpenError,
+    PathError, ReadDirError, ReadError, ReadLinkError, RenameError, RmdirError, SeekError,
+    SetTimesError, SymlinkError, TruncateError, UnlinkError, WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, SeekWhence, UserInfo};
 
@@ -801,6 +801,53 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let moved = root.entries.remove(&from).unwrap();
         root.entries.insert(to, moved);
 
+        Ok(())
+    }
+
+    fn link(
+        &self,
+        oldpath: impl crate::path::Arg,
+        newpath: impl crate::path::Arg,
+    ) -> Result<(), LinkError> {
+        let oldpath = self.absolute_path(oldpath)?;
+        let newpath = self.absolute_path(newpath)?;
+        let mut root = self.root.write();
+
+        // Resolve `oldpath` first: it must name an existing regular file (never a directory,
+        // matching Linux's own `EPERM` restriction here -- kept acyclic filesystem trees).
+        let (_, old_entry) = root.parent_and_entry(&oldpath, self.current_user)?;
+        let Some(old_entry) = old_entry else {
+            return Err(PathError::NoSuchFileOrDirectory)?;
+        };
+        let Entry::File(file) = old_entry else {
+            return Err(LinkError::IsADirectory);
+        };
+        // `parent_and_entry` already hands back an owned `Entry` (cloning only the `Arc`, not the
+        // underlying `FileX` -- `Entry: Clone` clones each variant's `Arc` field). Both paths then
+        // genuinely share the same data/`unique_id` (`stat`'s `ino`), exactly like a real hard
+        // link: a write through one path is visible through the other, and the content only
+        // actually goes away once every linking path has been unlinked.
+
+        let (new_parent, new_entry) = root.parent_and_entry(&newpath, self.current_user)?;
+        if new_entry.is_some() {
+            return Err(LinkError::AlreadyExists);
+        }
+        let Some((_, new_parent)) = new_parent else {
+            // Only `/` does not have a parent; `/` always already exists, so `new_entry.is_some()`
+            // above would already have returned `AlreadyExists`. Thus, this is unreachable.
+            unreachable!()
+        };
+        let mut new_parent = new_parent.write();
+        if !self.current_user.can_write(&new_parent.perms) {
+            return Err(LinkError::NoWritePerms);
+        }
+        let old = new_parent.children.insert(
+            newpath.components().unwrap().last().unwrap().into(),
+            FileType::RegularFile,
+        );
+        assert!(old.is_none());
+        let old = root.entries.insert(newpath, Entry::File(file));
+        assert!(old.is_none());
         Ok(())
     }
 

@@ -29,9 +29,9 @@ pub mod tar_ro;
 mod tests;
 
 use errors::{
-    ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, ReadDirError,
-    ReadError, ReadLinkError, RenameError, RmdirError, SeekError, SetTimesError, SymlinkError,
-    TruncateError, UnlinkError, WriteError,
+    ChmodError, ChownError, CloseError, FileStatusError, LinkError, MkdirError, OpenError,
+    ReadDirError, ReadError, ReadLinkError, RenameError, RmdirError, SeekError, SetTimesError,
+    SymlinkError, TruncateError, UnlinkError, WriteError,
 };
 
 /// A private module, to help support writing sealed traits. This module should _itself_ never be
@@ -151,6 +151,19 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// [`RenameError::CrossDevice`] for a cross-layer attempt, e.g. renaming a file that currently
     /// only exists in a read-only layer of a [`layered`] filesystem).
     fn rename(&self, from: impl path::Arg, to: impl path::Arg) -> Result<(), RenameError>;
+
+    /// Create a hard link at `newpath` referring to the same underlying file as `oldpath`.
+    ///
+    /// Both paths independently refer to the SAME file content and metadata afterward (a write
+    /// through one path is visible through the other, matching Linux's `link(2)`); the
+    /// underlying file is only actually removed once every linking path has been unlinked.
+    /// `oldpath` must name a regular file, never a directory (Linux's `link(2)` returns `EPERM`
+    /// for a directory; this is the same restriction real Linux enforces to keep the filesystem
+    /// tree acyclic). This exists to support the common "atomic lock-file acquisition" pattern
+    /// (create a uniquely-named temp file, then `link()` it to the real lock path -- an
+    /// `EEXIST`-if-already-locked check with no TOCTOU window a plain `open(O_CREAT|O_EXCL)`
+    /// alone doesn't give across NFS-like semantics), e.g. Xorg's own lock-file handling.
+    fn link(&self, oldpath: impl path::Arg, newpath: impl path::Arg) -> Result<(), LinkError>;
 
     /// Create a symbolic link at `linkpath` pointing to `target`.
     ///

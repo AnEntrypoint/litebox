@@ -2979,6 +2979,13 @@ pub enum SyscallRequest {
         pathname: UserPtr<c_char>,
         flags: AtFlags,
     },
+    Linkat {
+        olddirfd: i32,
+        oldpath: UserPtr<c_char>,
+        newdirfd: i32,
+        newpath: UserPtr<c_char>,
+        flags: AtFlags,
+    },
     Renameat {
         olddirfd: i32,
         oldpath: UserPtr<c_char>,
@@ -3679,6 +3686,24 @@ impl SyscallRequest {
                     dirfd: AT_FDCWD,
                     pathname: ctx.sys_req_ptr(0),
                     flags: AtFlags::AT_REMOVEDIR,
+                }
+            }
+            Sysno::linkat => sys_req!(Linkat {
+                olddirfd,
+                oldpath:*,
+                newdirfd,
+                newpath:*,
+                flags
+            }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::link => {
+                // link is equivalent to linkat with olddirfd/newdirfd AT_FDCWD and flags 0
+                SyscallRequest::Linkat {
+                    olddirfd: AT_FDCWD,
+                    oldpath: ctx.sys_req_ptr(0),
+                    newdirfd: AT_FDCWD,
+                    newpath: ctx.sys_req_ptr(1),
+                    flags: AtFlags::empty(),
                 }
             }
             Sysno::renameat => {
