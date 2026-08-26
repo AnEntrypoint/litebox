@@ -1137,6 +1137,7 @@ mod test {
             TestPlatform,
             crate::DefaultFS<TestPlatform>,
         >::new_connected_pair(
+            &task,
             litebox_common_linux::SockType::Stream,
             litebox_common_linux::SockFlags::empty(),
         )
@@ -1316,6 +1317,7 @@ mod test {
             TestPlatform,
             crate::DefaultFS<TestPlatform>,
         >::new_connected_pair(
+            &task,
             litebox_common_linux::SockType::Stream,
             litebox_common_linux::SockFlags::empty(),
         )

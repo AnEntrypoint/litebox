@@ -3557,6 +3557,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.credentials.egid
     }
 
+    /// This task's own real credentials, as reported to a peer via `SO_PEERCRED` on a
+    /// connected Unix socket -- matches real Linux, which reports the *effective* uid/gid
+    /// (not the real uid/gid) of the connecting/listening process, plus its pid.
+    pub(crate) fn peer_cred(&self) -> litebox_common_linux::Ucred {
+        litebox_common_linux::Ucred {
+            pid: self.pid as u32,
+            uid: self.credentials.euid,
+            gid: self.credentials.egid,
+        }
+    }
+
     /// Handle syscall `setuid`.
     ///
     /// LiteBox does not support real privilege separation (there is exactly one, fixed set of

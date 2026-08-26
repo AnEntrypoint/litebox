@@ -27,7 +27,7 @@ use litebox::{
 };
 use litebox_common_linux::{
     IpOption, ReceiveFlags, SendFlags, ShutdownHow, SockFlags, SockType, SocketOption,
-    SocketOptionName, errno::Errno,
+    SocketOptionName, Ucred, errno::Errno,
 };
 
 use crate::{
@@ -253,6 +253,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixInitStream<Platform, FS> {
     /// * `backlog` - Maximum number of pending connections to queue
     fn listen(
         self,
+        task: &Task<Platform, FS>,
         backlog: u16,
         global: &Arc<GlobalState<Platform, FS>>,
     ) -> Result<UnixListenStream<Platform, FS>, (Self, Errno)> {
@@ -260,7 +261,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixInitStream<Platform, FS> {
             return Err((self, Errno::EINVAL));
         };
         let key = addr.to_key();
-        let backlog = Arc::new(Backlog::new(addr, backlog, self.pollee));
+        let cred = task.peer_cred();
+        let backlog = Arc::new(Backlog::new(addr, backlog, self.pollee, cred));
         global
             .unix_addr_table
             .write()
@@ -272,9 +274,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixInitStream<Platform, FS> {
     }
 
     /// Converts this initial socket into a connected stream pair.
+    ///
+    /// `client_cred` is the real, live credentials of the connecting task; `server_cred`
+    /// is the credentials the listening socket's owner captured at `listen(2)` time. Each
+    /// returned stream stores the *other* side's credentials as its `SO_PEERCRED` value.
     fn into_connected(
         self,
         peer_addr: Arc<UnixBoundSocketAddr<FS>>,
+        client_cred: Ucred,
+        server_cred: Ucred,
     ) -> (
         UnixConnectedStream<Platform, FS>,
         UnixConnectedStream<Platform, FS>,
@@ -291,6 +299,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixInitStream<Platform, FS> {
             Some(peer_addr),
             read_shutdown.load(Ordering::Acquire),
             write_shutdown.load(Ordering::Acquire),
+            client_cred,
+            server_cred,
         )
     }
 }
@@ -303,6 +313,9 @@ struct Backlog<Platform: ShimPlatform, FS: ShimFS> {
     addr: Arc<UnixBoundSocketAddr<FS>>,
     state: Mutex<Platform, BacklogState<Platform, FS>>,
     pollee: Pollee<Platform>,
+    /// Real credentials of the task that called `listen(2)` on this socket, captured at
+    /// that time -- reported to connecting clients as their `SO_PEERCRED` peer identity.
+    listener_cred: Ucred,
 }
 
 struct BacklogState<Platform: ShimPlatform, FS: ShimFS> {
@@ -313,7 +326,12 @@ struct BacklogState<Platform: ShimPlatform, FS: ShimFS> {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Backlog<Platform, FS> {
-    fn new(addr: UnixBoundSocketAddr<FS>, backlog: u16, pollee: Pollee<Platform>) -> Self {
+    fn new(
+        addr: UnixBoundSocketAddr<FS>,
+        backlog: u16,
+        pollee: Pollee<Platform>,
+        listener_cred: Ucred,
+    ) -> Self {
         Self {
             addr: Arc::new(addr),
             state: litebox::sync::Mutex::new(BacklogState {
@@ -322,6 +340,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Backlog<Platform, FS> {
                 is_shutdown: false,
             }),
             pollee,
+            listener_cred,
         }
     }
 
@@ -334,6 +353,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Backlog<Platform, FS> {
     fn try_connect(
         &self,
         init: UnixInitStream<Platform, FS>,
+        client_cred: Ucred,
     ) -> Result<UnixConnectedStream<Platform, FS>, (UnixInitStream<Platform, FS>, Errno)> {
         let mut state = self.state.lock();
         if state.is_shutdown {
@@ -344,7 +364,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Backlog<Platform, FS> {
             return Err((init, Errno::EAGAIN));
         }
 
-        let (client, server) = init.into_connected(self.addr.clone());
+        let (client, server) =
+            init.into_connected(self.addr.clone(), client_cred, self.listener_cred);
         state.sockets.push_back(server);
 
         self.pollee.notify_observers(Events::IN);
@@ -551,6 +572,9 @@ struct UnixConnectedStream<Platform: ShimPlatform, FS: ShimFS> {
     /// The write end of the connected peer socket for sending messages.
     connected_send_channel: crate::channel::WriteEnd<Platform, Message<Platform, FS>>,
     pollee: Arc<Pollee<Platform>>,
+    /// Real credentials (pid/uid/gid) of the *peer* task, as of connection
+    /// establishment -- what `getsockopt(SO_PEERCRED)` reports to this side.
+    peer_cred: Ucred,
 }
 
 const UNIX_BUF_SIZE: usize = 65536;
@@ -560,12 +584,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
     /// `read_shutdown` and `write_shutdown` half-close the corresponding sides of the
     /// *first* returned socket only (used to carry pre-connect shutdown flags from
     /// `UnixInitStream` across `connect(2)` into the connected state).
+    ///
+    /// `first_cred`/`second_cred` are each side's own real credentials -- stored as the
+    /// *other* side's `peer_cred`, matching `SO_PEERCRED`'s peer-identity semantics.
     fn new_pair(
         addr: Option<Arc<UnixBoundSocketAddr<FS>>>,
         pollee: Option<Arc<Pollee<Platform>>>,
         peer: Option<Arc<UnixBoundSocketAddr<FS>>>,
         read_shutdown: bool,
         write_shutdown: bool,
+        first_cred: Ucred,
+        second_cred: Ucred,
     ) -> (Self, Self) {
         let (addr1, addr2) = AddrView::new_pair(addr, peer);
         let pollee1 = pollee.unwrap_or(Arc::new(Pollee::new()));
@@ -579,12 +608,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             recv_channel,
             connected_send_channel: send_channel_peer,
             pollee: pollee1,
+            peer_cred: second_cred,
         };
         let second = UnixConnectedStream {
             addr: addr2,
             recv_channel: recv_channel_peer,
             connected_send_channel: send_channel,
             pollee: pollee2,
+            peer_cred: first_cred,
         };
         if read_shutdown {
             first.recv_channel.shutdown();
@@ -764,11 +795,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         })
     }
 
-    fn listen(&self, backlog: u16, global: &Arc<GlobalState<Platform, FS>>) -> Result<(), Errno> {
+    fn listen(
+        &self,
+        task: &Task<Platform, FS>,
+        backlog: u16,
+        global: &Arc<GlobalState<Platform, FS>>,
+    ) -> Result<(), Errno> {
         self.with_state(|state| {
             let ret = match state {
                 UnixStreamState::Init(init) => {
-                    return match init.listen(backlog, global) {
+                    return match init.listen(task, backlog, global) {
                         Ok(listen) => (UnixStreamState::Listen(listen), Ok(())),
                         Err((init, err)) => (UnixStreamState::Init(init), Err(err)),
                     };
@@ -800,9 +836,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
             UnixEntryInner::Datagram(_) => Err(Errno::EPROTOTYPE),
         }
     }
-    fn try_connect(&self, backlog: &Backlog<Platform, FS>) -> Result<(), TryOpError<Errno>> {
+    fn try_connect(
+        &self,
+        backlog: &Backlog<Platform, FS>,
+        client_cred: Ucred,
+    ) -> Result<(), TryOpError<Errno>> {
         self.with_state(|state| match state {
-            UnixStreamState::Init(init) => match backlog.try_connect(init) {
+            UnixStreamState::Init(init) => match backlog.try_connect(init, client_cred) {
                 Ok(connected) => (UnixStreamState::Connected(connected), Ok(())),
                 Err((init, err)) => (UnixStreamState::Init(init), Err(err)),
             },
@@ -823,6 +863,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         let backlog = self.lookup(task, &addr)?;
         // check if we can bind to the address
         let _ = addr.bind(task, false)?;
+        let client_cred = task.peer_cred();
         task.wait_cx()
             .wait_on_events(
                 is_nonblocking,
@@ -831,7 +872,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                     backlog.pollee.register_observer(observer, mask);
                     Ok(())
                 },
-                || self.try_connect(&backlog),
+                || self.try_connect(&backlog, client_cred),
             )
             .map_err(Errno::from)
     }
@@ -1452,11 +1493,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
 
     pub(super) fn listen(
         &self,
+        task: &Task<Platform, FS>,
         backlog: u16,
         global: &Arc<GlobalState<Platform, FS>>,
     ) -> Result<(), Errno> {
         match &self.inner {
-            UnixSocketInner::Stream(stream) => stream.listen(backlog, global),
+            UnixSocketInner::Stream(stream) => stream.listen(task, backlog, global),
             UnixSocketInner::Datagram(_) => Err(Errno::EOPNOTSUPP),
         }
     }
@@ -1594,12 +1636,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
     }
 
     pub(super) fn new_connected_pair(
+        task: &Task<Platform, FS>,
         ty: SockType,
         flags: SockFlags,
     ) -> Option<(UnixSocket<Platform, FS>, UnixSocket<Platform, FS>)> {
         match ty {
             SockType::Stream => {
-                let (conn1, conn2) = UnixConnectedStream::new_pair(None, None, None, false, false);
+                // Both ends of a socketpair(2) are created by the same task, so each
+                // reports the creating task's own real credentials as its peer's identity
+                // -- matching real Linux's symmetric behavior for socketpair-created socks.
+                let cred = task.peer_cred();
+                let (conn1, conn2) =
+                    UnixConnectedStream::new_pair(None, None, None, false, false, cred, cred);
                 Some((
                     UnixSocket::new_with_inner(
                         UnixSocketInner::Stream(UnixStream::new(UnixStreamState::Connected(conn1))),
@@ -1737,16 +1785,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                 SocketOption::RCVBUF | SocketOption::SNDBUF => UNIX_BUF_SIZE.trunc(),
                 SocketOption::PEERCRED => match &self.inner {
                     UnixSocketInner::Stream(stream) => {
-                        let ucred = stream.with_state_ref(|state| match state {
-                            UnixStreamState::Connected(_) => {
-                                log_unsupported!("get PEERCRED for unix socket");
-                                Err(Errno::EOPNOTSUPP)
+                        let ucred = stream.with_state_ref(|state| -> Result<Ucred, Errno> {
+                            match state {
+                                UnixStreamState::Connected(conn) => Ok(conn.peer_cred),
+                                _ => Ok(litebox_common_linux::Ucred {
+                                    pid: 0,
+                                    uid: u32::MAX,
+                                    gid: u32::MAX,
+                                }),
                             }
-                            _ => Ok(litebox_common_linux::Ucred {
-                                pid: 0,
-                                uid: u32::MAX,
-                                gid: u32::MAX,
-                            }),
                         })?;
                         return super::write_to_user::<_, Platform>(ucred, optval, len);
                     }
