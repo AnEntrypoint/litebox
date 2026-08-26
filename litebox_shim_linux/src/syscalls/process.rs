@@ -1742,6 +1742,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let _ = self.wake_robust_list(robust_list);
             litebox_util_log::debug!(tid:% = self.tid; "DIAG prepare_for_exit: wake_robust_list done");
         }
+        if process_exited {
+            // Real Linux's own `do_exit()` -> `exit_mm()` releases the whole address space once
+            // the last thread of a process exits, exactly like `execve()` already does via
+            // `release_memory` (`process.rs`'s own `sys_execve`, above). This shim's ordinary
+            // `exit`/`exit_group` path never did the same -- a real, confirmed gap: an exited
+            // guest process's ENTIRE host-committed memory footprint (litebox runs guest
+            // "processes" as real Windows threads sharing ONE host address space) survived
+            // forever, invisible to any later, unrelated guest process's own `mmap()`
+            // bookkeeping. Traced live to be the root cause of the long-standing fork()+execve()
+            // mallocng `.meta=0` crash: a later allocation's `get_unmmaped_area`-computed
+            // "soft-reserved" tail space (see `create_mapping`'s `DEFAULT_RESERVED_SPACE_SIZE`
+            // doc comment) walks straight through this leaked, still-committed memory without
+            // any real Windows fault to signal it, so stale mallocng group headers from the
+            // exited process's own heap survive into what a brand-new allocation's neighbor
+            // believes is untouched space.
+            //
+            // Placed at the very END of this function, after `clear_child_tid`'s futex wake and
+            // `wake_robust_list` -- both genuinely read/write guest memory and must run first.
+            // Matches `sys_execve`'s own `release_memory` closure exactly (`!vm.is_empty()`):
+            // don't release reserved/placeholder mappings, only real, populated guest memory.
+            let release = |_r: Range<usize>, vm: VmFlags| !vm.is_empty();
+            if let Err(err) = unsafe { self.process().pm().release_memory(release) } {
+                litebox_util_log::warn!(tid:% = self.tid, err:? = err; "prepare_for_exit: release_memory failed");
+            }
+        }
         litebox_util_log::debug!(tid:% = self.tid; "DIAG prepare_for_exit: exiting fn");
     }
 
