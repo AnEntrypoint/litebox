@@ -478,7 +478,8 @@ impl<
             | OFlags::NONBLOCK
             | OFlags::LARGEFILE
             | OFlags::NOFOLLOW
-            | OFlags::APPEND;
+            | OFlags::APPEND
+            | OFlags::PATH;
         if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!("{flags:?}")
         }
@@ -561,6 +562,7 @@ impl<
                     | TruncateError::NotForWriting
                     | TruncateError::IsTerminalDevice
                     | TruncateError::ClosedFd
+                    | TruncateError::PathOnlyFd
                     | TruncateError::Io,
                 )
                 | OpenError::PathError(
@@ -996,6 +998,7 @@ impl<
                                 Err(TruncateError::IsTerminalDevice) => {
                                     Err(TruncateError::IsTerminalDevice)
                                 }
+                                Err(TruncateError::PathOnlyFd) => Err(TruncateError::PathOnlyFd),
                                 Err(TruncateError::NotForWriting) => {
                                     // We must actually migrate this file up, and keep it truncated.
                                     //
@@ -1492,7 +1495,11 @@ impl<
         };
         let entries = match self.read_dir(&dir_fd) {
             Ok(entries) => entries,
-            Err(ReadDirError::ClosedFd | ReadDirError::NotADirectory) => unreachable!(),
+            Err(
+                ReadDirError::ClosedFd | ReadDirError::NotADirectory | ReadDirError::PathOnlyFd,
+            ) => {
+                unreachable!()
+            }
             Err(ReadDirError::Io) => return Err(RmdirError::Io),
         };
         self.close(&dir_fd).expect("close dir fd failed");

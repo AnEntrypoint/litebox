@@ -732,10 +732,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .platform
             .create_shared_memory(page_aligned_size)
             .map_err(|_| Errno::ENOMEM)?;
-        self.global
-            .memfds
-            .lock()
-            .insert(key, super::mm::MemfdEntry { handle, size: length });
+        self.global.memfds.lock().insert(
+            key,
+            super::mm::MemfdEntry {
+                handle,
+                size: length,
+            },
+        );
         Ok(())
     }
 
@@ -3445,9 +3448,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 self.global.drm.destroy_dumb(self.global.platform, *ptr)
             }
             IoctlArg::DrmModeAddFb2(ptr) => self.global.drm.add_fb2(*ptr),
-            IoctlArg::DrmModePageFlip(ptr) => {
-                self.global.drm.page_flip(self.global.platform, *ptr)
-            }
+            IoctlArg::DrmModePageFlip(ptr) => self.global.drm.page_flip(self.global.platform, *ptr),
             IoctlArg::DrmModeGetPlaneResources(ptr) => self.global.drm.get_plane_resources(*ptr),
             IoctlArg::DrmModeGetPlane(ptr) => self.global.drm.get_plane(*ptr),
             IoctlArg::DrmModeSetPlane(ptr) => self.global.drm.set_plane(*ptr),
@@ -4449,6 +4450,63 @@ mod tests {
         assert_eq!(task.sys_read(fd, &mut buf, None).unwrap(), 5);
         task.sys_close(fd).unwrap();
         assert_eq!(&buf, b"world");
+    }
+
+    #[test]
+    fn o_path_fd_permits_stat_and_dirfd_use_but_rejects_read_write() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        let fd = task
+            .sys_open(
+                "/target",
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+        task.sys_write(fd, b"hello", None).unwrap();
+        task.sys_close(fd).unwrap();
+
+        // A real O_PATH open succeeds even though no read/write access mode bit is meaningful
+        // for it (matching real Linux: the path only needs to RESOLVE, not be openable for I/O).
+        let path_fd = task
+            .sys_open("/target", OFlags::PATH, Mode::empty())
+            .unwrap();
+        let path_fd = i32::try_from(path_fd).unwrap();
+
+        // fstat works and reports the real file's info.
+        let stat = task.sys_fstat(path_fd).unwrap();
+        let st_size = stat.st_size;
+        assert_eq!(st_size, 5);
+
+        // Real I/O operations are rejected with EBADF, exactly like real Linux -- not silently
+        // allowed, and not a panic.
+        let mut buf = [0u8; 5];
+        assert_eq!(
+            task.sys_read(path_fd, &mut buf, None).unwrap_err(),
+            Errno::EBADF
+        );
+        assert_eq!(
+            task.sys_write(path_fd, b"world", None).unwrap_err(),
+            Errno::EBADF
+        );
+        assert_eq!(
+            task.sys_lseek(path_fd, 0, SeekWhence::RelativeToBeginning)
+                .unwrap_err(),
+            Errno::EBADF
+        );
+        assert_eq!(task.sys_ftruncate(path_fd, 0).unwrap_err(), Errno::EBADF);
+
+        task.sys_close(path_fd).unwrap();
+
+        // The original fd (opened for real I/O) is unaffected by the O_PATH fd's restrictions.
+        let fd = task
+            .sys_open("/target", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+        let mut buf = [0u8; 5];
+        assert_eq!(task.sys_read(fd, &mut buf, None).unwrap(), 5);
+        assert_eq!(&buf, b"hello");
     }
 
     #[test]

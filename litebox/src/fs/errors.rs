@@ -79,6 +79,8 @@ pub enum SeekError {
     InvalidOffset,
     #[error("non-seekable file")]
     NonSeekable,
+    #[error("operation not permitted on an O_PATH file descriptor")]
+    PathOnlyFd,
     #[error("I/O error")]
     Io,
 }
@@ -94,6 +96,8 @@ pub enum TruncateError {
     NotForWriting,
     #[error("file descriptor points to a terminal device")]
     IsTerminalDevice,
+    #[error("operation not permitted on an O_PATH file descriptor")]
+    PathOnlyFd,
     #[error("I/O error")]
     Io,
 }
@@ -299,6 +303,8 @@ pub enum ReadDirError {
     ClosedFd,
     #[error("fd does not point to a directory")]
     NotADirectory,
+    #[error("operation not permitted on an O_PATH file descriptor")]
+    PathOnlyFd,
     #[error("I/O error")]
     Io,
 }
