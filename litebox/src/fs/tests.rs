@@ -2430,6 +2430,40 @@ mod layered_stdio {
             .expect("Failed to close /dev/stdin");
     }
 
+    /// Regression test/repro: `default_fs` mounts `/dev/dri` as a NESTED mount under `/dev`
+    /// (see `litebox_shim_linux::default_fs`) through a `layered::FileSystem` wrapping the
+    /// composer. Confirm that listing `/dev` through the FULL layered stack (not the composer
+    /// directly) still reports the nested `/dev/dri` mount point as a child.
+    #[test]
+    fn layered_list_dir_reports_nested_mount_child() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let layered_fs = layered::FileSystem::new(
+            &litebox,
+            in_mem::FileSystem::new(&litebox),
+            Resolver::new(
+                &litebox,
+                crate::fs::composer::Composer::builder()
+                    .mount("/dev", |allocator| Devices::new(&litebox, allocator))
+                    .mount("/dev/dri", |allocator| Devices::new(&litebox, allocator))
+                    .build()
+                    .unwrap(),
+            ),
+            LayeringSemantics::LowerLayerWritableFiles,
+        );
+
+        let fd = layered_fs
+            .open("/dev", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open /dev");
+        let entries = layered_fs.read_dir(&fd).expect("Failed to read /dev");
+        layered_fs.close(&fd).expect("Failed to close /dev");
+
+        let names: alloc::vec::Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"dri"),
+            "expected /dev listing to include nested mount 'dri', got: {names:?}"
+        );
+    }
+
     #[test]
     fn layered_write_to_non_dev() {
         let litebox = LiteBox::new(MockPlatform::new());
