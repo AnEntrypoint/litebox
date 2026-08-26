@@ -937,6 +937,61 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         status
     }
 
+    fn symlink_metadata(&self, path: impl Arg) -> Result<super::FileStatus, FileStatusError> {
+        // `open()` (and therefore `file_status` above) always transparently follows a
+        // final-component symlink -- backends never see one reach their own `open_file_at`, by
+        // design (see `Backend::read_link_at`'s doc comment). So check the final component
+        // directly via the same `read_link_at` primitive `Self::read_link` uses, *before* ever
+        // calling `open()`/`file_status`: a dangling symlink's target need not exist for this to
+        // succeed, whereas routing through `file_status` would incorrectly surface `ENOENT`.
+        let context = default_context_pre_context_management_changes();
+        let resolved = context.resolve(path)?;
+        let Some((parent, name)) = self.parent_dir_and_name(&context, &resolved).map_err(
+            |error| match error {
+                WalkError::Io => FileStatusError::Io,
+                WalkError::PathError(error) => error.into(),
+            },
+        )?
+        else {
+            // The root itself was requested; it is always a directory, never a symlink.
+            return self.file_status("/");
+        };
+        match self.backend.read_link_at(parent, name) {
+            Ok(Some(target)) => {
+                // Reuse the containing directory's own status for the fields a symlink has no
+                // independent, meaningful value for (owner/timestamps/block size) -- matching
+                // this crate's existing precedent of approximating metadata a backend doesn't
+                // track natively rather than inventing an unrelated placeholder.
+                let Some((parent_components, _)) = resolved.parent_and_name() else {
+                    unreachable!("a symlink can never be the root");
+                };
+                let dir_path = alloc::format!("/{}", parent_components.join("/"));
+                let dir_status = self.file_status(dir_path)?;
+                Ok(super::FileStatus::symlink(
+                    target.len(),
+                    dir_status.owner,
+                    dir_status.node_info,
+                    dir_status.blksize,
+                    dir_status.atime,
+                    dir_status.mtime,
+                ))
+            }
+            Ok(None) => {
+                let full_path = alloc::format!("/{}", resolved.components.join("/"));
+                self.file_status(full_path)
+            }
+            Err(OpenError::PathError(error)) => Err(error.into()),
+            Err(
+                OpenError::Io
+                | OpenError::AccessNotAllowed
+                | OpenError::NoWritePerms
+                | OpenError::ReadOnlyFileSystem
+                | OpenError::AlreadyExists
+                | OpenError::TruncateError(_),
+            ) => Err(FileStatusError::Io),
+        }
+    }
+
     fn fd_file_status(&self, fd: &TypedFd<Self>) -> Result<super::FileStatus, FileStatusError> {
         let entry = self
             .litebox
