@@ -1115,8 +1115,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let (desc1, desc2) = match domain {
             AddressFamily::UNIX => {
                 let _ = UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
-                let (sock1, sock2) =
-                    UnixSocket::new_connected_pair(ty, flags).ok_or(Errno::ESOCKTNOSUPPORT)?;
+                let (sock1, sock2) = UnixSocket::new_connected_pair(self, ty, flags)
+                    .ok_or(Errno::ESOCKTNOSUPPORT)?;
                 let files = self.files.borrow();
                 let mut dt = self.global.litebox.descriptor_table_mut();
                 let typed1 =
@@ -1479,7 +1479,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             &self.global,
             sockfd,
             |fd| self.global.listen(fd, backlog),
-            |file| file.listen(backlog, &self.global),
+            |file| file.listen(self, backlog, &self.global),
         )
     }
 
@@ -3486,6 +3486,100 @@ mod unix_tests {
             close_socket(&task, client_fd);
             task.sys_unlinkat(-1, addr, AtFlags::empty()).unwrap();
         }
+    }
+
+    #[test]
+    fn so_peercred_on_a_connected_unix_stream_socket_reports_real_credentials() {
+        // Regression test: getsockopt(SOL_SOCKET, SO_PEERCRED) on a connected Unix stream
+        // socket used to unconditionally return EOPNOTSUPP ("Not supported"), which is
+        // exactly what real daemons like seatd use to authenticate a connecting client
+        // before servicing it -- seatd's own server-side accept() fails outright without
+        // this. Real Linux returns the peer task's actual (pid, euid, egid) here.
+        let task = init_platform(None);
+        let addr = "/so_peercred_unix_stream.sock";
+        let server_fd = create_unix_server_socket(&task, addr, SockFlags::empty()).unwrap();
+        let client_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
+        task.do_connect(
+            client_fd,
+            SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
+        )
+        .unwrap();
+        let server_conn = task.do_accept(server_fd, None, SockFlags::empty()).unwrap();
+
+        let expected = task.peer_cred();
+
+        let mut client_cred = litebox_common_linux::Ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let optval_out = UserPtrMut::from_usize((&raw mut client_cred).cast::<u8>() as usize);
+        task.do_getsockopt(
+            client_fd,
+            SocketOptionName::Socket(SocketOption::PEERCRED),
+            optval_out,
+            core::mem::size_of::<litebox_common_linux::Ucred>() as u32,
+        )
+        .expect("getsockopt(SO_PEERCRED) on connected client socket must succeed");
+        assert_eq!(client_cred.pid, expected.pid);
+        assert_eq!(client_cred.uid, expected.uid);
+        assert_eq!(client_cred.gid, expected.gid);
+
+        let mut server_cred = litebox_common_linux::Ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let optval_out = UserPtrMut::from_usize((&raw mut server_cred).cast::<u8>() as usize);
+        task.do_getsockopt(
+            server_conn,
+            SocketOptionName::Socket(SocketOption::PEERCRED),
+            optval_out,
+            core::mem::size_of::<litebox_common_linux::Ucred>() as u32,
+        )
+        .expect("getsockopt(SO_PEERCRED) on accepted server socket must succeed");
+        assert_eq!(server_cred.pid, expected.pid);
+        assert_eq!(server_cred.uid, expected.uid);
+        assert_eq!(server_cred.gid, expected.gid);
+
+        close_socket(&task, server_conn);
+        close_socket(&task, client_fd);
+        close_socket(&task, server_fd);
+        task.sys_unlinkat(-1, addr, AtFlags::empty()).unwrap();
+    }
+
+    #[test]
+    fn so_peercred_on_a_socketpair_reports_the_creating_tasks_own_credentials() {
+        // Regression test companion: socketpair(2) sockets are symmetric -- both ends are
+        // created by the same task, so real Linux reports that one task's own credentials
+        // as the peer identity on *both* ends.
+        let task = init_platform(None);
+        let (sock1, sock2) = task
+            .do_socketpair(AddressFamily::UNIX, SockType::Stream, SockFlags::empty(), 0)
+            .expect("socketpair failed");
+
+        let expected = task.peer_cred();
+        for fd in [sock1, sock2] {
+            let mut cred = litebox_common_linux::Ucred {
+                pid: 0,
+                uid: 0,
+                gid: 0,
+            };
+            let optval_out = UserPtrMut::from_usize((&raw mut cred).cast::<u8>() as usize);
+            task.do_getsockopt(
+                fd,
+                SocketOptionName::Socket(SocketOption::PEERCRED),
+                optval_out,
+                core::mem::size_of::<litebox_common_linux::Ucred>() as u32,
+            )
+            .expect("getsockopt(SO_PEERCRED) on socketpair fd must succeed");
+            assert_eq!(cred.pid, expected.pid);
+            assert_eq!(cred.uid, expected.uid);
+            assert_eq!(cred.gid, expected.gid);
+        }
+
+        close_socket(&task, sock1);
+        close_socket(&task, sock2);
     }
 
     #[test]
