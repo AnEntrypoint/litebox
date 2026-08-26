@@ -1886,27 +1886,73 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // Unlike the blocking path, a `WNOHANG` poll must NOT remove the child from our children
         // list unless it has actually already exited -- otherwise a later real wait for that
         // same child would incorrectly see `ECHILD`.
-        let (child_pid, child_process) = {
-            let children = process.children.lock();
-            let idx = if pid > 0 {
-                children.iter().position(|(p, _)| *p == pid)
-            } else {
-                children.first().map(|_| 0)
-            };
-            let Some(idx) = idx else {
+        //
+        // For `pid == -1` ("any child"), a blocking wait must NOT commit to a single specific
+        // child up front (e.g. `children.first()`) and then block on exactly that one via
+        // `Process::wait_for_exit()` -- that child may not be the one that exits first. A shell
+        // backgrounding a long-running job before a short foreground one (`sleep 30 & sleep 1`)
+        // forks the long-running job FIRST, so it lands at `children[0]`; blocking on
+        // `children.first()` specifically then hangs the shell's foreground reap until the
+        // *background* job exits, not the foreground one -- live-reproduced (the shell's own
+        // `echo DONE` after `sleep 1` did not print until the unrelated `sleep 30` finished ~30s
+        // later). Real Linux's `wait4(-1, ...)` reaps whichever child changes state first.
+        // Instead, poll every child's already-exited status each time this thread wakes (either
+        // because a child's exit pushed `SIGCHLD` and interrupted us -- see
+        // `Task::prepare_for_exit`'s unconditional `parent.interrupt_all_threads()` -- or because
+        // of an unrelated signal, which `ready()` below simply reports not-ready-yet and loops
+        // again).
+        let (child_pid, exit_status) = if pid == -1 {
+            if process.children.lock().is_empty() {
                 return Err(Errno::ECHILD);
+            }
+            let mut found = None;
+            let mut poll_once = || {
+                let children = process.children.lock();
+                for (p, c) in children.iter() {
+                    if let Some(status) = c.try_wait_for_exit() {
+                        found = Some((*p, status));
+                        return true;
+                    }
+                }
+                false
             };
-            let (child_pid, child_process) = &children[idx];
-            (*child_pid, child_process.clone())
-        };
-
-        let exit_status = if no_hang {
-            let Some(exit_status) = child_process.try_wait_for_exit() else {
-                return Ok(0);
-            };
-            exit_status
+            if no_hang {
+                if !poll_once() {
+                    return Ok(0);
+                }
+            } else {
+                match self.wait_cx().wait_until(poll_once) {
+                    Ok(()) => {}
+                    Err(litebox::event::wait::WaitError::Interrupted) => {
+                        // No child had exited yet when the interrupt was observed.
+                        return Err(Errno::EINTR);
+                    }
+                    Err(litebox::event::wait::WaitError::TimedOut) => unreachable!(
+                        "wait_until with no deadline never returns WaitError::TimedOut"
+                    ),
+                }
+            }
+            found.expect("poll_once only returns true after `found` is set")
         } else {
-            child_process.wait_for_exit()
+            let (child_pid, child_process) = {
+                let children = process.children.lock();
+                let idx = children.iter().position(|(p, _)| *p == pid);
+                let Some(idx) = idx else {
+                    return Err(Errno::ECHILD);
+                };
+                let (child_pid, child_process) = &children[idx];
+                (*child_pid, child_process.clone())
+            };
+
+            let exit_status = if no_hang {
+                let Some(exit_status) = child_process.try_wait_for_exit() else {
+                    return Ok(0);
+                };
+                exit_status
+            } else {
+                child_process.wait_for_exit()
+            };
+            (child_pid, exit_status)
         };
 
         // The child has exited (or we were willing to block until it did) -- now it's safe to
