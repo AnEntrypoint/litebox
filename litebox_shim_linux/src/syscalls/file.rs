@@ -633,7 +633,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         mode: Mode,
     ) -> Result<u32, Errno> {
         let path = self.resolve_path_at(dirfd, pathname)?;
-        self.do_open_resolved(path, flags, mode)
+        let result = self.do_open_resolved(path.clone(), flags, mode);
+        // Matches `sys_mmap`/`sys_munmap`'s own debug-log pattern (added the same investigation
+        // session): without this, no trace can ever map an `init_elf_patch_state`/`sys_mmap`
+        // log line's numeric `fd` back to the real file it refers to, blocking correlation of a
+        // crashing memory region against which shared library/ELF actually backs it.
+        litebox_util_log::debug!(
+            path:% = path.to_string_lossy(), fd:? = result.as_ref().ok();
+            "sys_openat"
+        );
+        result
     }
 
     /// Open an already-resolved absolute `path`, routing `/dev/ptmx` and `/dev/pts/<id>` to the
