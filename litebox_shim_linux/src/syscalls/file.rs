@@ -2117,11 +2117,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         buf: &mut [u8],
     ) -> Result<usize, Errno> {
         let pathname = self.resolve_path_at(dirfd, pathname)?;
-        let path = self.do_readlink(pathname.to_str().map_err(|_| Errno::EINVAL)?)?;
-        let bytes = path.as_bytes();
-        let min_len = core::cmp::min(buf.len(), bytes.len());
-        buf[..min_len].copy_from_slice(&bytes[..min_len]);
-        Ok(min_len)
+        litebox_util_log::debug!(tid:% = self.tid, path:? = pathname; "sys_readlinkat: entry");
+        let result = (|| {
+            let path = self.do_readlink(pathname.to_str().map_err(|_| Errno::EINVAL)?)?;
+            let bytes = path.as_bytes();
+            let min_len = core::cmp::min(buf.len(), bytes.len());
+            buf[..min_len].copy_from_slice(&bytes[..min_len]);
+            Ok::<_, Errno>((min_len, path))
+        })();
+        match &result {
+            Ok((len, target)) => {
+                litebox_util_log::debug!(tid:% = self.tid, len:% = len, target:? = target; "sys_readlinkat: returning");
+            }
+            Err(e) => {
+                litebox_util_log::debug!(tid:% = self.tid, errno:? = e; "sys_readlinkat: error");
+            }
+        }
+        result.map(|(len, _)| len)
     }
 }
 
