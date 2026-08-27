@@ -670,6 +670,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     #[inline]
     pub(crate) fn sys_munmap(&self, addr: UserPtrMut<u8>, len: usize) -> Result<(), Errno> {
         let result = self.sys_munmap_raw(addr, len);
+        // Mirrors `sys_mmap`'s own "returned"/traced-addr debug log (see its comment): without
+        // this, no munmap event ever appears in a `LITEBOX_LOG=debug` trace, making it impossible
+        // to correlate a later use-after-free's own faulting address against "what was this
+        // memory's last known lifecycle event" -- confirmed a real, previously-undocumented gap
+        // while investigating the mallocng `.meta=0` use-after-free (a group pointer's crashing
+        // address had zero matches anywhere in an otherwise-complete debug trace).
+        litebox_util_log::debug!(
+            addr:% = addr.as_usize(), len:% = len, ok:% = result.is_ok();
+            "sys_munmap"
+        );
         if result.is_ok() {
             self.clear_file_mappings_for_range(addr.as_usize(), len);
         }
