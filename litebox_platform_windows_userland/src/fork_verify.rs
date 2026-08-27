@@ -505,11 +505,13 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
     if crate::veh_trace_enabled() {
         #[allow(clippy::cast_possible_truncation)]
         let diag_rip = context.Rip as usize;
+        #[allow(clippy::cast_possible_truncation)]
+        let diag_rdi = context.Rdi as usize;
         DIAG_RING.with_borrow_mut(|ring| {
             if ring.len() >= 128 {
                 ring.pop_front();
             }
-            ring.push_back(diag_rip);
+            ring.push_back((diag_rip, diag_rdi));
         });
     }
 
@@ -1899,7 +1901,7 @@ pub(crate) fn begin(relocations: alloc::sync::Arc<litebox::mm::AddressRelocation
 }
 
 std::thread_local! {
-    static DIAG_RING: core::cell::RefCell<alloc::collections::VecDeque<usize>> =
+    static DIAG_RING: core::cell::RefCell<alloc::collections::VecDeque<(usize, usize)>> =
         const { core::cell::RefCell::new(alloc::collections::VecDeque::new()) };
 }
 
@@ -1911,7 +1913,7 @@ pub(crate) fn end() {
         eprintln!("[fork_verify] tid={:?} end", std::thread::current().id());
         DIAG_RING.with_borrow(|ring| {
             eprintln!(
-                "[DIAG-RING] tid={:?} last {} rips: {:x?}",
+                "[DIAG-RING] tid={:?} last {} (rip,rdi) pairs: {:x?}",
                 std::thread::current().id(),
                 ring.len(),
                 ring
