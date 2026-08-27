@@ -1171,18 +1171,36 @@ pub(crate) fn read_stack_word_for_diagnostics(addr: usize) -> Option<usize> {
 }
 
 fn read_code_bytes(rip: usize, buf: &mut [u8]) -> usize {
+    // This function's original premise ("the CPU already fetched the instruction at `rip`, so at
+    // minimum its own page is readable") only holds when `rip` really is the address the CPU just
+    // faulted/trapped at. Every diagnostic call site in `vectored_exception_handler`'s
+    // `LITEBOX_VEH_TRACE`/`diag_fataldump_enabled` block instead passes an arbitrary COMPUTED
+    // address (`rdi.wrapping_sub(0x10)` as a guest `meta_slot`, `context.Rsp`, a reverse-
+    // translated fork_verify source address, ...) that the CPU never touched at all -- for those,
+    // the old code skipped straight to `copy_nonoverlapping` whenever the read fit within the
+    // remainder of `rip`'s containing page, with no check that `rip` itself was even mapped.
+    // Confirmed live: a guest NULL-pointer dereference (`rdi == 0`) reaching this diagnostic block
+    // computed `meta_slot = 0usize.wrapping_sub(0x10) == 0xfffffffffffffff0`, whose "page
+    // remainder" (0x10 bytes) happened to exceed the 8-byte read length, so the missing check let
+    // an unconditional `copy_nonoverlapping` dereference that wild pointer -- crashing a second
+    // time *inside the exception handler itself*, with no exception frame set up to cleanly
+    // recover, cascading into a garbage-register/stack-overflow crash of the whole host process
+    // instead of the guest's original fault ever reaching the shim as an ordinary SIGSEGV.
+    if buf.is_empty() || !is_readable(rip) {
+        return 0;
+    }
     let page_size = 0x1000usize;
-    // The CPU already fetched the instruction at `rip`, so at minimum the bytes up to the end of
-    // `rip`'s own page are readable. Never read past that boundary unless the next page is
-    // demonstrably part of the same committed region.
+    // `rip` itself is now confirmed readable. Bytes up to the end of `rip`'s own page are
+    // therefore readable too; never read past that boundary unless the next page is demonstrably
+    // part of the same committed region.
     let to_page_end = page_size - (rip & (page_size - 1));
     let readable = if to_page_end >= buf.len() || is_readable(rip + to_page_end) {
         buf.len()
     } else {
         to_page_end
     };
-    // SAFETY: `rip` is the address the CPU just fetched an instruction from, so `readable` bytes
-    // starting there are mapped and readable per the check above.
+    // SAFETY: `rip` was just shown to be readable, and `readable` bytes starting there stay within
+    // the same committed region per the checks above.
     unsafe {
         core::ptr::copy_nonoverlapping(rip as *const u8, buf.as_mut_ptr(), readable);
     }
