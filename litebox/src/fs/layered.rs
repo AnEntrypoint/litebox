@@ -69,6 +69,14 @@ pub struct FileSystem<
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
     node_info_lookup: sync::RwLock<Platform, HashMap<NodeInfo, usize>>,
+    // Serializes `migrate_file_up` end-to-end: that function reads `self.root` under a lock,
+    // releases it, then later re-derives state (`Arc::strong_count`) it assumes is still valid
+    // when it swaps the descriptor-table entry over to the upper layer. Two threads racing to
+    // migrate the SAME path concurrently (e.g. two guest threads independently opening the same
+    // shared library or executable for the first time) can interleave in that gap and violate
+    // the swap's own `Arc::ptr_eq` invariant. Migrations are rare (first-open-for-write per file
+    // only), so serializing the whole function is a correctness fix with no meaningful cost.
+    migrate_lock: sync::Mutex<Platform, ()>,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower: super::FileSystem>
@@ -92,6 +100,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             current_working_dir: "/".into(),
             layering_semantics,
             node_info_lookup,
+            migrate_lock: sync::Mutex::new(()),
         }
     }
 
@@ -192,6 +201,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
     /// makes the upper file empty (similar to a truncate). Generally speaking, you want to use
     /// `true` for `copy_data`.
     fn migrate_file_up(&self, path: &str, copy_data: bool) -> Result<(), MigrationError> {
+        // Serialize the entire migration end-to-end (see `migrate_lock`'s own doc comment): two
+        // threads racing to migrate the SAME path concurrently can otherwise interleave between
+        // this function's own `self.root` read and its later `Arc`-based swap, violating that
+        // swap's `Arc::ptr_eq` invariant. Held for the whole call, not just the swap, since the
+        // race exists across the full open-lower/open-upper/copy/swap sequence, not just its tail.
+        let _migrate_guard = self.migrate_lock.lock();
+
         // This function's mechanics (open-for-read on `self.lower`, open/write on `self.upper`)
         // are agnostic to `self.layering_semantics` -- both `write`'s and `truncate`'s
         // `LowerLayerWritableFiles` branches now call this directly as a fallback when their own
