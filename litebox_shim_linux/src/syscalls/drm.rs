@@ -44,11 +44,12 @@ use litebox::platform::RawConstPointer;
 use litebox_common_linux::{
     DRM_CAP_DUMB_BUFFER, DRM_CAP_TIMESTAMP_MONOTONIC, DRM_CLIENT_CAP_UNIVERSAL_PLANES,
     DRM_EVENT_FLIP_COMPLETE, DRM_MODE_CONNECTOR_VIRTUAL, DRM_MODE_ENCODER_VIRTUAL,
-    DRM_MODE_OBJECT_CONNECTOR, DRM_MODE_PAGE_FLIP_EVENT, DrmEvent, DrmEventVblank, DrmGetCap,
-    DrmModeCardRes, DrmModeCreateDumb, DrmModeCrtc, DrmModeCrtcPageFlip, DrmModeDestroyDumb,
-    DrmModeFbCmd2, DrmModeGetConnector, DrmModeGetEncoder, DrmModeGetPlane, DrmModeGetPlaneRes,
-    DrmModeGetProperty, DrmModeMapDumb, DrmModeModeinfo, DrmModeObjGetProperties, DrmModeSetPlane,
-    DrmSetClientCap, DrmVersion, errno::Errno,
+    DRM_MODE_OBJECT_CONNECTOR, DRM_MODE_OBJECT_PLANE, DRM_MODE_PAGE_FLIP_EVENT, DRM_MODE_PROP_ENUM,
+    DrmEvent, DrmEventVblank, DrmGetCap, DrmModeCardRes, DrmModeCreateDumb, DrmModeCrtc,
+    DrmModeCrtcPageFlip, DrmModeDestroyDumb, DrmModeFbCmd2, DrmModeGetConnector, DrmModeGetEncoder,
+    DrmModeGetPlane, DrmModeGetPlaneRes, DrmModeGetProperty, DrmModeMapDumb, DrmModeModeinfo,
+    DrmModeObjGetProperties, DrmModePropertyEnum, DrmModeSetPlane, DrmSetClientCap, DrmVersion,
+    VIRTUAL_PLANE_TYPE_PROP_ID, VIRTUAL_PLANE_TYPE_VALUE, errno::Errno,
 };
 use zerocopy::IntoBytes;
 
@@ -562,6 +563,14 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     /// (no DPMS, no EDID blob, nothing a hardware driver would register) -- `count_props = 0` is
     /// the real kernel's own well-defined answer for an object with a genuinely empty property
     /// list, not a truncation.
+    ///
+    /// The plane object DOES report one real property (`type` = `"Primary"`, see
+    /// [`Self::get_property`]'s own doc comment): real legacy (non-atomic) universal-planes
+    /// clients -- including weston's `drm-backend.so`, per `drm_output_find_special_plane` in
+    /// `libweston/backend-drm/drm.c` -- discard any plane whose `type` property can't be
+    /// resolved to `WDRM_PLANE_TYPE_PRIMARY`, so a plane reporting zero properties (this
+    /// device's prior behavior) was silently invisible to that discovery path even though
+    /// `GETPLANE`/`GETPLANERESOURCES` correctly enumerated it.
     pub(crate) fn obj_get_properties(
         &self,
         ptr: UserPtrMut<DrmModeObjGetProperties>,
@@ -570,19 +579,76 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         if req.obj_type == DRM_MODE_OBJECT_CONNECTOR && req.obj_id != VIRTUAL_CONNECTOR_ID {
             return Err(Errno::ENOENT);
         }
+        if req.obj_type == DRM_MODE_OBJECT_PLANE {
+            if req.obj_id != VIRTUAL_PLANE_ID {
+                return Err(Errno::ENOENT);
+            }
+            // Two-call size-probe pattern, same shape as `get_plane_resources`: this plane has
+            // exactly one property, so a short-sized caller buffer can never actually truncate.
+            if req.count_props > 0 && req.props_ptr != 0 && req.prop_values_ptr != 0 {
+                UserPtrMut::<u32>::from_usize(req.props_ptr as usize)
+                    .write_at_offset::<Platform>(0, VIRTUAL_PLANE_TYPE_PROP_ID)
+                    .ok_or(Errno::EFAULT)?;
+                UserPtrMut::<u64>::from_usize(req.prop_values_ptr as usize)
+                    .write_at_offset::<Platform>(0, VIRTUAL_PLANE_TYPE_VALUE)
+                    .ok_or(Errno::EFAULT)?;
+            }
+            req.count_props = 1;
+            ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+            return Ok(0);
+        }
         req.count_props = 0;
         ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
         Ok(0)
     }
 
-    /// `DRM_IOCTL_MODE_GETPROPERTY` -- resolve a property ID's name/values. Since
-    /// [`Self::obj_get_properties`] always reports zero properties, no real client following the
-    /// standard `OBJ_GETPROPERTIES` -> per-ID `GETPROPERTY` sequence ever has an ID to pass here;
-    /// implemented so a client calling this directly with any ID still gets a real `ENOENT`
-    /// (unknown property) rather than an `ENOTTY` that would look like a missing driver.
-    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
-    pub(crate) fn get_property(&self, _ptr: UserPtrMut<DrmModeGetProperty>) -> Result<u32, Errno> {
-        Err(Errno::ENOENT)
+    /// `DRM_IOCTL_MODE_GETPROPERTY` -- resolve a property ID's name/values.
+    ///
+    /// This device's plane object reports one real property via [`Self::obj_get_properties`]:
+    /// `type` (id [`VIRTUAL_PLANE_TYPE_PROP_ID`]), an enum property whose one real,
+    /// on-the-wire value ([`VIRTUAL_PLANE_TYPE_VALUE`]) resolves to the `"Primary"` enum
+    /// name -- matching real weston's `plane_type_enums[WDRM_PLANE_TYPE_PRIMARY].name` in
+    /// `libweston/backend-drm/kms.c`, which is the exact string real clients compare against
+    /// (`drm_property_info_populate`'s `strcmp(prop->enums[l].name, info[j].enum_values[k].name)`
+    /// loop), not the raw numeric value. Every other property ID this device could ever be
+    /// asked about (there are none, since [`Self::obj_get_properties`] never reports any other
+    /// ID) gets a real `ENOENT` (unknown property) rather than an `ENOTTY` that would look like
+    /// a missing driver.
+    pub(crate) fn get_property(&self, ptr: UserPtrMut<DrmModeGetProperty>) -> Result<u32, Errno> {
+        let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        if req.prop_id != VIRTUAL_PLANE_TYPE_PROP_ID {
+            return Err(Errno::ENOENT);
+        }
+        const NAME: &[u8] = b"type";
+        req.name = [0u8; 32];
+        req.name[..NAME.len()].copy_from_slice(NAME);
+        req.flags = DRM_MODE_PROP_ENUM;
+        // Two-call size-probe pattern for `values_ptr`/`enum_blob_ptr`, same shape as every
+        // other variable-length query this device implements: this property has exactly one
+        // legacy value slot and one enum entry, so a short-sized caller buffer never truncates.
+        if req.count_values > 0 && req.values_ptr != 0 {
+            UserPtrMut::<u64>::from_usize(req.values_ptr as usize)
+                .write_at_offset::<Platform>(0, VIRTUAL_PLANE_TYPE_VALUE)
+                .ok_or(Errno::EFAULT)?;
+        }
+        if req.count_enum_blobs > 0 && req.enum_blob_ptr != 0 {
+            const ENUM_NAME: &[u8] = b"Primary";
+            let mut name = [0u8; 32];
+            name[..ENUM_NAME.len()].copy_from_slice(ENUM_NAME);
+            UserPtrMut::<DrmModePropertyEnum>::from_usize(req.enum_blob_ptr as usize)
+                .write_at_offset::<Platform>(
+                    0,
+                    DrmModePropertyEnum {
+                        value: VIRTUAL_PLANE_TYPE_VALUE,
+                        name,
+                    },
+                )
+                .ok_or(Errno::EFAULT)?;
+        }
+        req.count_values = 1;
+        req.count_enum_blobs = 1;
+        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        Ok(0)
     }
 
     pub(crate) fn create_dumb(

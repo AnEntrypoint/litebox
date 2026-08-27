@@ -912,6 +912,26 @@ pub const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u32 = 0xC020_64B9;
 /// [`DRM_IOCTL_MODE_OBJ_GETPROPERTIES`]'s real-world callers actually query on this device's
 /// current ioctl surface).
 pub const DRM_MODE_OBJECT_CONNECTOR: u32 = 0xc0c0_c0c0;
+/// `DRM_MODE_OBJECT_PLANE` (real kernel `drm_mode.h` value) -- used by
+/// [`DrmSubsystem::obj_get_properties`]/[`DrmSubsystem::get_property`] to report the plane's
+/// `type` property, which real legacy (non-atomic) DRM clients using universal planes --
+/// including weston's `drm-backend.so`, per `libweston/backend-drm/drm.c`'s
+/// `drm_output_find_special_plane` -- query to find the primary plane before enabling an output.
+pub const DRM_MODE_OBJECT_PLANE: u32 = 0xeeee_eeee;
+/// `DRM_MODE_PROP_ENUM` (`1<<3`, real kernel `drm_mode.h` value) -- marks a property as an
+/// enumerated type with named values, resolved by [`DrmSubsystem::get_property`]'s `type`
+/// property response.
+pub const DRM_MODE_PROP_ENUM: u32 = 1 << 3;
+/// A fixed, arbitrary, non-zero object ID for the plane's one `type` property -- real DRM
+/// property IDs are driver-internal opaque values from userspace's perspective (see
+/// [`VIRTUAL_CONNECTOR_ID`]-style constants' own doc comments for the same reasoning).
+pub const VIRTUAL_PLANE_TYPE_PROP_ID: u32 = 100;
+/// The real, on-the-wire numeric value this device's plane reports for its `type` property.
+/// Real DRM clients (weston's `drm_property_info_populate`) resolve an enum property's meaning
+/// by matching THIS raw value against the matching `struct drm_mode_property_enum`'s own
+/// `value` field, then reading that entry's `name` string (`"Primary"`) -- the raw number
+/// itself is driver-chosen and opaque, so any fixed, non-zero, mutually-distinct value is valid.
+pub const VIRTUAL_PLANE_TYPE_VALUE: u64 = 1;
 /// `DRM_CAP_DUMB_BUFFER` -- the one allocation-related capability this device's
 /// `DRM_IOCTL_GET_CAP` genuinely supports (see [`DrmGetCap`]'s doc comment).
 pub const DRM_CAP_DUMB_BUFFER: u64 = 0x1;
@@ -1210,6 +1230,16 @@ pub struct DrmModeGetProperty {
     pub name: [u8; 32],
     pub count_values: u32,
     pub count_enum_blobs: u32,
+}
+
+/// `struct drm_mode_property_enum` -- one named enum entry, as served through
+/// [`DrmModeGetProperty`]'s `enum_blob_ptr` array for an enum/bitmask-flagged property (e.g. the
+/// plane `type` property's `"Primary"`/`"Overlay"`/`"Cursor"` entries).
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmModePropertyEnum {
+    pub value: u64,
+    pub name: [u8; 32],
 }
 
 /// `struct drm_version` (`DRM_IOCTL_VERSION`) -- the two-call size-probe pattern applies to the
