@@ -33,6 +33,8 @@ fn main() -> anyhow::Result<()> {
     // through unaffected.
     litebox_runner_linux_on_windows_userland::session_cli::dispatch(&raw_args);
 
+    litebox_platform_windows_userland::install_memcpy_watch_from_env();
+
     if litebox_platform_windows_userland::process_fork::is_wait4_probe_child() {
         litebox_platform_windows_userland::process_fork::run_wait4_probe_child();
     }

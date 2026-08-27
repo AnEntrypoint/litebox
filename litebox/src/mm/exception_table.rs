@@ -71,6 +71,51 @@ macro_rules! ex_table_entry {
 /// Represents a fault during a fallible memory operation.
 pub struct Fault;
 
+// TEMPORARY diagnostic (litebox investigation: XFCE/weston mallocng heap-corruption
+// bug hunt) -- logs any `memcpy_fallible` write whose destination range overlaps a
+// configurable watch window, to determine whether the corrupting write to a specific
+// guest heap address ever goes through this crate's own fallible-write path (as
+// opposed to a raw guest-code memory store that never calls into litebox at all).
+// Remove once the investigation concludes.
+static WATCH_RANGE_START: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static WATCH_RANGE_END: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static WATCH_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Configures the address range `[start, end)` that [`memcpy_fallible`] watches for
+/// overlapping writes, and the raw callback invoked when a write overlaps it. `hook`
+/// receives `(dst, size)` of the overlapping write. Pass `start == end` to disable.
+///
+/// # Safety
+/// `hook`, if non-null, must be safely callable from any thread at any time (including
+/// from within a signal/exception handler context), and must not itself perform a
+/// memory access that could recurse into `memcpy_fallible`.
+pub unsafe fn set_memcpy_watch_range(start: usize, end: usize, hook: Option<fn(usize, usize)>) {
+    use core::sync::atomic::Ordering;
+    WATCH_RANGE_START.store(start, Ordering::SeqCst);
+    WATCH_RANGE_END.store(end, Ordering::SeqCst);
+    WATCH_HOOK.store(hook.map_or(0, |f| f as usize), Ordering::SeqCst);
+}
+
+#[inline]
+fn check_memcpy_watch(dst: *mut u8, size: usize) {
+    use core::sync::atomic::Ordering;
+    let start = WATCH_RANGE_START.load(Ordering::SeqCst);
+    let end = WATCH_RANGE_END.load(Ordering::SeqCst);
+    if start == end {
+        return;
+    }
+    let dst = dst as usize;
+    let dst_end = dst.saturating_add(size);
+    if dst < end && dst_end > start {
+        let hook = WATCH_HOOK.load(Ordering::SeqCst);
+        if hook != 0 {
+            let f: fn(usize, usize) = unsafe { core::mem::transmute(hook) };
+            f(dst, size);
+        }
+    }
+}
+
 /// Copies `size` bytes from `src` to `dst` in a fallible manner.
 ///
 /// This function can recover from memory access exceptions (e.g., page faults,
@@ -83,6 +128,7 @@ pub struct Fault;
 /// `dst` and `src` must be valid for reads and writes of `size` bytes, or
 /// pointers that are guaranteed to be in non-Rust memory.
 pub unsafe fn memcpy_fallible(dst: *mut u8, src: *const u8, size: usize) -> Result<(), Fault> {
+    check_memcpy_watch(dst, size);
     #[cfg(target_arch = "x86_64")]
     unsafe {
         // `rep movsb` alone is byte-granularity for the ENTIRE copy -- correct, but far slower
