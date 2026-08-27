@@ -4024,7 +4024,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // (matching what `push_key`/`push_rel` actually accept), and an all-zero
                 // bitmask for every other event type: a real, correct "device supports none of
                 // these" answer per libevdev's own source, not a stub.
-                let mut bits = vec![0u8; 32];
+                let mut bits = vec![0u8; 96];
                 let set_bit = |bits: &mut [u8], code: u16| {
                     let code = usize::from(code);
                     if let Some(byte) = bits.get_mut(code / 8) {
