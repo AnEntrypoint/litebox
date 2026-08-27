@@ -1199,6 +1199,32 @@ unsafe extern "system" fn vectored_exception_handler(
         .cast::<EXCEPTION_RECORD>()
         .wrapping_byte_sub(EXCEPTION_RECORD_RESERVE);
     assert!(exception_record_ptr.is_aligned());
+    // Explicitly `VirtualAlloc(MEM_COMMIT)` the target page before writing, rather than relying on
+    // Windows' automatic guard-page stack growth: this single `write()` lands up to
+    // `EXCEPTION_RECORD_RESERVE` (64 KiB) below `host_sp`, far past the thread's actual committed
+    // stack depth in every captured crash this bug has ever produced (`committed=0x4000`, 16 KiB,
+    // is the consistent real-world figure across dozens of `DIAG-REALSTACK` captures in this
+    // investigation's history) -- a single write that far past the guard page does not reliably
+    // trigger the normal one-page-at-a-time stack-growth fault Windows expects `__chkstk`-style
+    // sequential probing to drive; it can instead raise `STATUS_STACK_OVERFLOW` on this exact
+    // instruction, which VEH re-enters as a SECOND, nested exception on a thread already mid-
+    // dispatch of the first one -- matching this investigation's own long-documented, previously
+    // unexplained `rsp=0x1`/`code=0x1e` garbage second-exception signature exactly. This is
+    // deliberately NOT another "probe more stack ahead of time" attempt (two prior variants of
+    // that family were tried and refuted) -- it explicitly commits precisely the one page this
+    // write needs, at the moment it needs it, via the OS's own allocation API rather than a
+    // touch-and-hope memory access.
+    unsafe {
+        let commit_page = exception_record_ptr
+            .cast::<u8>()
+            .map_addr(|addr| addr & !0xFFF);
+        let _ = windows_sys::Win32::System::Memory::VirtualAlloc(
+            commit_page.cast(),
+            4096,
+            windows_sys::Win32::System::Memory::MEM_COMMIT,
+            windows_sys::Win32::System::Memory::PAGE_READWRITE,
+        );
+    }
     unsafe { exception_record_ptr.write(*exception_record) };
 
     // Ensure that `run_thread_arch` is linked in so that `exception_callback` is visible.
