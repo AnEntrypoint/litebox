@@ -1564,6 +1564,25 @@ pub enum IoctlArg {
         len: u32,
         arg: UserPtrMut<u8>,
     },
+    /// `EVIOCGNAME(len)` -- report the device's human-readable name string. Mandatory for
+    /// `libevdev_new_from_fd()`: unlike `EVIOCGPHYS`/`EVIOCGUNIQ` (tolerated on failure, real
+    /// devices without a physical-location/unique-ID string return `ENOENT`), a failure here
+    /// unconditionally aborts device creation (`libevdev.c`'s `libevdev_set_fd()`: `rc = ioctl(fd,
+    /// EVIOCGNAME(...), buf); if (rc < 0) goto out;`, no error-code exemption). Like `EVIOCGBIT`,
+    /// this is a *variable-length* ioctl (`_IOC(_IOC_READ, 'E', 0x06, len)`) -- the caller's
+    /// buffer length is encoded in the ioctl number itself, decoded from the raw `cmd` at
+    /// dispatch time rather than matched as a fixed constant.
+    EvdevGetName {
+        len: u32,
+        arg: UserPtrMut<u8>,
+    },
+    /// `EVIOCGPHYS(len)`/`EVIOCGUNIQ(len)` -- report the device's physical-location/unique-ID
+    /// strings. Unlike `EVIOCGNAME`, `libevdev_new_from_fd()` tolerates these failing (`if (rc <
+    /// 0) { if (errno != ENOENT) goto out; }`) -- a real device without one, like litebox's
+    /// synthetic evdev, correctly returns `ENOENT`, matching real uinput's own behavior for the
+    /// same reason. Same variable-length encoding as `EVIOCGBIT`/`EVIOCGNAME`
+    /// (`_IOC(_IOC_READ, 'E', 0x07 or 0x08, len)`), decoded from the raw `cmd` at dispatch time.
+    EvdevGetPhysOrUniq,
     Raw {
         cmd: u32,
         arg: UserPtrMut<u8>,
@@ -3646,6 +3665,21 @@ impl SyscallRequest {
                                 len: (cmd >> 16) & 0x3fff,
                                 arg: ctx.sys_req_ptr(2),
                             }
+                        }
+                        _ if (cmd >> 8) & 0xff == u32::from(b'E')
+                            && (cmd & 0xff) == 0x06
+                            && (cmd >> 30) & 0x3 == 0x2 =>
+                        {
+                            IoctlArg::EvdevGetName {
+                                len: (cmd >> 16) & 0x3fff,
+                                arg: ctx.sys_req_ptr(2),
+                            }
+                        }
+                        _ if (cmd >> 8) & 0xff == u32::from(b'E')
+                            && ((cmd & 0xff) == 0x07 || (cmd & 0xff) == 0x08)
+                            && (cmd >> 30) & 0x3 == 0x2 =>
+                        {
+                            IoctlArg::EvdevGetPhysOrUniq
                         }
                         _ => IoctlArg::Raw {
                             cmd,
