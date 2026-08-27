@@ -4112,6 +4112,33 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // specifically tolerates, not a stub.
                 Err(Errno::ENOENT)
             }
+            IoctlArg::EvdevGetProp { len, arg: ptr } => {
+                files.run_on_raw_fd(
+                    desc,
+                    |fd| {
+                        if self.is_input_device(&files.fs, fd)? {
+                            Ok(())
+                        } else {
+                            Err(Errno::ENOTTY)
+                        }
+                    },
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                )??;
+                // A plain keyboard+mouse device has no `INPUT_PROP_*` bits set (only
+                // touchpads/pointing-sticks/direct-input devices set any) -- an all-zero
+                // bitmap is the correct, real answer for this synthetic device, not a stub.
+                let bits = vec![0u8; usize::try_from(len).unwrap_or(0)];
+                ptr.write_slice_at_offset::<Platform>(0, &bits)
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
             _ => {
                 log_unsupported!("ioctl with arg {:?}", arg);
                 Err(Errno::EINVAL)

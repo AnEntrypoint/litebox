@@ -1583,6 +1583,17 @@ pub enum IoctlArg {
     /// same reason. Same variable-length encoding as `EVIOCGBIT`/`EVIOCGNAME`
     /// (`_IOC(_IOC_READ, 'E', 0x07 or 0x08, len)`), decoded from the raw `cmd` at dispatch time.
     EvdevGetPhysOrUniq,
+    /// `EVIOCGPROP(len)` -- report the bitmask of `INPUT_PROP_*` device properties (e.g.
+    /// `INPUT_PROP_POINTER`/`INPUT_PROP_BUTTONPAD`). `libevdev_new_from_fd()` tolerates this
+    /// failing (its real source only aborts on `EVIOCGBIT`/`EVIOCGNAME`/`EVIOCGID`/
+    /// `EVIOCGVERSION` failures) -- a plain keyboard+mouse device correctly has zero properties
+    /// set, matching what a real generic HID device reports. Same variable-length encoding as
+    /// `EVIOCGBIT`/`EVIOCGNAME` (`_IOC(_IOC_READ, 'E', 0x09, len)`), decoded from the raw `cmd`
+    /// at dispatch time.
+    EvdevGetProp {
+        len: u32,
+        arg: UserPtrMut<u8>,
+    },
     Raw {
         cmd: u32,
         arg: UserPtrMut<u8>,
@@ -3680,6 +3691,15 @@ impl SyscallRequest {
                             && (cmd >> 30) & 0x3 == 0x2 =>
                         {
                             IoctlArg::EvdevGetPhysOrUniq
+                        }
+                        _ if (cmd >> 8) & 0xff == u32::from(b'E')
+                            && (cmd & 0xff) == 0x09
+                            && (cmd >> 30) & 0x3 == 0x2 =>
+                        {
+                            IoctlArg::EvdevGetProp {
+                                len: (cmd >> 16) & 0x3fff,
+                                arg: ctx.sys_req_ptr(2),
+                            }
                         }
                         _ => IoctlArg::Raw {
                             cmd,
