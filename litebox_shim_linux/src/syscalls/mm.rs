@@ -726,6 +726,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         len: usize,
         prot: ProtFlags,
     ) -> Result<(), Errno> {
+        litebox_util_log::debug!(
+            tid:% = self.tid, addr:% = addr.as_usize(), len:% = len, prot:? = prot;
+            "sys_mprotect: entry"
+        );
         // Intercept transitions to PROT_EXEC: patch unpatched file mappings.
         if prot.contains(ProtFlags::PROT_EXEC) {
             let syscall_entry = self.global.platform.get_syscall_entry_point();
@@ -733,7 +737,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 self.maybe_patch_on_mprotect_exec(addr, len, syscall_entry);
             }
         }
-        self.sys_mprotect_raw(addr, len, prot)
+        let result = self.sys_mprotect_raw(addr, len, prot);
+        litebox_util_log::debug!(
+            tid:% = self.tid, ok:% = result.is_ok();
+            "sys_mprotect: returned"
+        );
+        result
     }
 
     /// Raw mprotect without exec interception — used internally by the
