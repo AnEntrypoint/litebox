@@ -3866,6 +3866,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
             )?,
+            IoctlArg::EvdevRevoke => files.run_on_raw_fd(
+                desc,
+                |fd| {
+                    if self.is_input_device(&files.fs, fd)? {
+                        // See `IoctlArg::EvdevRevoke`'s own doc comment: a correct no-op for
+                        // litebox's single-client, static-device-set model.
+                        Ok(0)
+                    } else {
+                        Err(Errno::ENOTTY)
+                    }
+                },
+                |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
+            )?,
             _ => {
                 log_unsupported!("ioctl with arg {:?}", arg);
                 Err(Errno::EINVAL)

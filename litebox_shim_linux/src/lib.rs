@@ -737,6 +737,12 @@ fn default_fs<Platform: ShimPlatform>(
             .mount("/sys/class/drm", |allocator| {
                 litebox::fs::devices::SysClassDrm::new(litebox, allocator)
             })
+            .mount("/sys/class/input", |allocator| {
+                litebox::fs::devices::SysClassInput::new(litebox, allocator)
+            })
+            .mount("/run/udev/data", |allocator| {
+                litebox::fs::devices::UdevDb::new(litebox, allocator)
+            })
             .build()
             .unwrap(),
     );

@@ -930,6 +930,9 @@ pub const KDSKBMODE: u32 = 0x4B45;
 /// `KD_GRAPHICS` -- the mode value `seatd`'s `terminal_set_graphics(fd, true)` passes to
 /// `KDSETMODE` once a client is granted the VT (see `vt_open` in `seatd/seat.c`).
 pub const KD_GRAPHICS: i32 = 0x01;
+/// `EVIOCREVOKE`, `_IOW('E', 0x91, int)` per the real kernel's `include/uapi/linux/input.h` --
+/// `(_IOC_WRITE << 30) | (size_of::<i32>() << 16) | ('E' << 8) | 0x91`.
+pub const EVIOCREVOKE: u32 = 0x4004_4591;
 /// `KD_TEXT` -- the mode value restored on VT release (`terminal_set_graphics(fd, false)`).
 pub const KD_TEXT: i32 = 0x00;
 
@@ -1504,6 +1507,17 @@ pub enum IoctlArg {
     /// `KDSKBMODE` -- switch a VT's keyboard translation mode. Same argument shape as
     /// `KDSETMODE`: a plain scalar, not a pointer.
     KdSkbMode(i32),
+    /// `EVIOCREVOKE` (`_IOW('E', 0x91, int)`) -- revoke a process's access to an evdev input
+    /// device, so a later `read()`/`write()`/most other `ioctl()`s on this fd return `ENODEV`.
+    /// `seatd`'s `seat_close_device` calls this on every evdev fd it hands back on VT-switch-away
+    /// or client disconnect, as a defense-in-depth measure so a revoked client can't keep reading
+    /// input events behind the (now-inactive) seat's back -- real evdev honors it even though the
+    /// fd itself stays open. litebox's device set never actually switches seats away from the one
+    /// client each guest process runs as, so honoring this is a real, correct no-op for now (see
+    /// `EvdevSubsystem`'s own doc comment on why litebox's device set is static per-run) rather
+    /// than a shortcut -- there is no OTHER client this could ever need to actually revoke access
+    /// from.
+    EvdevRevoke,
     Raw {
         cmd: u32,
         arg: UserPtrMut<u8>,
@@ -3573,6 +3587,7 @@ impl SyscallRequest {
                         VT_SETMODE => IoctlArg::VtSetMode(ctx.sys_req_ptr(2)),
                         KDSETMODE => IoctlArg::KdSetMode(ctx.sys_req_arg(2)),
                         KDSKBMODE => IoctlArg::KdSkbMode(ctx.sys_req_arg(2)),
+                        EVIOCREVOKE => IoctlArg::EvdevRevoke,
                         _ => IoctlArg::Raw {
                             cmd,
                             arg: ctx.sys_req_ptr(2),
