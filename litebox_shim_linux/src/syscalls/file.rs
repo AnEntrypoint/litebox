@@ -899,7 +899,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Ok(raw_fd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
-        self.do_read(raw_fd, buf, offset)
+        let result = self.do_read(raw_fd, buf, offset);
+        litebox_util_log::debug!(
+            fd:% = fd,
+            len:% = buf.len(),
+            offset:? = offset,
+            result:? = result.as_ref().map(|n| *n);
+            "sys_read"
+        );
+        result
     }
     pub(crate) fn do_read(
         &self,
