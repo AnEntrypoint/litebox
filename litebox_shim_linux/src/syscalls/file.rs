@@ -1530,6 +1530,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Pty(alloc::sync::Arc<TypedFd<super::pty::PtySubsystem<Platform>>>),
             Signalfd(alloc::sync::Arc<TypedFd<super::signalfd::SignalfdSubsystem<Platform>>>),
             Timerfd(alloc::sync::Arc<TypedFd<super::timerfd::TimerfdSubsystem<Platform>>>),
+            Netlink(alloc::sync::Arc<TypedFd<super::netlink::NetlinkSocketSubsystem>>),
         }
 
         let files = self.files.borrow();
@@ -1582,6 +1583,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     )
                 {
                     ConsumedFd::Timerfd(fd)
+                } else if let Ok(fd) =
+                    rds.fd_consume_raw_integer::<super::netlink::NetlinkSocketSubsystem>(raw_fd)
+                {
+                    ConsumedFd::Netlink(fd)
                 } else {
                     unreachable!("all subsystems covered")
                 }
@@ -1663,6 +1668,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(())
             }
             ConsumedFd::Timerfd(fd) => {
+                let entry = {
+                    let mut dt = self.global.litebox.descriptor_table_mut();
+                    dt.remove(&fd)
+                };
+                // do not hold any locks while dropping the entry
+                drop(entry);
+                Ok(())
+            }
+            ConsumedFd::Netlink(fd) => {
                 let entry = {
                     let mut dt = self.global.litebox.descriptor_table_mut();
                     dt.remove(&fd)
