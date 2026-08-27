@@ -52,6 +52,7 @@ pub(crate) enum EpollDescriptor<Platform: ShimPlatform, FS: ShimFS> {
     Pty(Arc<TypedFd<super::pty::PtySubsystem<Platform>>>),
     Signalfd(Arc<TypedFd<super::signalfd::SignalfdSubsystem<Platform>>>),
     Timerfd(Arc<TypedFd<super::timerfd::TimerfdSubsystem<Platform>>>),
+    Netlink(Arc<TypedFd<super::netlink::NetlinkSocketSubsystem>>),
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
@@ -92,6 +93,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
         {
             return Ok(EpollDescriptor::Timerfd(fd));
         }
+        if let Ok(fd) = rds.fd_from_raw_integer::<super::netlink::NetlinkSocketSubsystem>(raw_fd) {
+            return Ok(EpollDescriptor::Netlink(fd));
+        }
         Err(Errno::EBADF)
     }
 }
@@ -106,6 +110,7 @@ enum DescriptorRef<Platform: ShimPlatform, FS: ShimFS> {
     Pty(Weak<TypedFd<super::pty::PtySubsystem<Platform>>>),
     Signalfd(Weak<TypedFd<super::signalfd::SignalfdSubsystem<Platform>>>),
     Timerfd(Weak<TypedFd<super::timerfd::TimerfdSubsystem<Platform>>>),
+    Netlink(Weak<TypedFd<super::netlink::NetlinkSocketSubsystem>>),
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> DescriptorRef<Platform, FS> {
@@ -120,6 +125,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> DescriptorRef<Platform, FS> {
             EpollDescriptor::Pty(pty) => Self::Pty(Arc::downgrade(pty)),
             EpollDescriptor::Signalfd(fd) => Self::Signalfd(Arc::downgrade(fd)),
             EpollDescriptor::Timerfd(fd) => Self::Timerfd(Arc::downgrade(fd)),
+            EpollDescriptor::Netlink(fd) => Self::Netlink(Arc::downgrade(fd)),
         }
     }
 
@@ -134,6 +140,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> DescriptorRef<Platform, FS> {
             DescriptorRef::Pty(pty) => pty.upgrade().map(EpollDescriptor::Pty),
             DescriptorRef::Signalfd(fd) => fd.upgrade().map(EpollDescriptor::Signalfd),
             DescriptorRef::Timerfd(fd) => fd.upgrade().map(EpollDescriptor::Timerfd),
+            DescriptorRef::Netlink(fd) => fd.upgrade().map(EpollDescriptor::Netlink),
         }
     }
 }
@@ -243,6 +250,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
                 Some(handle.with_entry(|entry| poll(entry)))
             }
             EpollDescriptor::Timerfd(fd) => {
+                let handle = global.litebox.descriptor_table().entry_handle(fd)?;
+                Some(handle.with_entry(|entry| poll(entry)))
+            }
+            EpollDescriptor::Netlink(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
                 Some(handle.with_entry(|entry| poll(entry)))
             }
@@ -507,6 +518,7 @@ impl EpollEntryKey {
             EpollDescriptor::Pty(pty) => Arc::as_ptr(pty).addr(),
             EpollDescriptor::Signalfd(fd) => Arc::as_ptr(fd).addr(),
             EpollDescriptor::Timerfd(fd) => Arc::as_ptr(fd).addr(),
+            EpollDescriptor::Netlink(fd) => Arc::as_ptr(fd).addr(),
         };
         Self(fd, ptr)
     }
