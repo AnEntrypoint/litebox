@@ -564,6 +564,25 @@ unsafe extern "system" fn vectored_exception_handler(
         && !IN_VEH_DIAG_BLOCK.with(Cell::get)
     {
         let _veh_diag_guard = VehDiagBlockGuard::enter();
+        // Pass (2026-08-27 XFCE session): print the raw crash registers FIRST, before any other
+        // diagnostic call in this block runs -- prior runs showed this block can itself re-fault
+        // partway through (nested exception, caught by `IN_VEH_DIAG_BLOCK` above but only AFTER
+        // losing this fault's own diagnostics), so whichever fault reaches this line first now
+        // always gets its registers on record even if everything after this print is lost to a
+        // nested fault. Explicitly tagged FIRST/NESTED so a log with multiple faults in one
+        // cascade is unambiguous about which fault produced which dump -- this exact ambiguity
+        // (conflating a later cascading fault's dump with the real first fault's) cost an entire
+        // prior investigation pass.
+        eprintln!(
+            "[veh-regs] ENTRY tid={:?} rip={:#x} rdi={:#x} rsi={:#x} rdx={:#x} rax={:#x} rsp={:#x}",
+            std::thread::current().id(),
+            context.Rip,
+            context.Rdi,
+            context.Rsi,
+            context.Rdx,
+            context.Rax,
+            context.Rsp,
+        );
         #[allow(
             clippy::cast_possible_truncation,
             reason = "diagnostic-only; this platform is x86_64-only, rip fits in usize"
