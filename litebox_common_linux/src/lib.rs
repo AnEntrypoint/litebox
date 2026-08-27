@@ -3400,6 +3400,16 @@ pub enum SyscallRequest {
     Setgid {
         gid: u32,
     },
+    Setresuid {
+        ruid: u32,
+        euid: u32,
+        suid: u32,
+    },
+    Setresgid {
+        rgid: u32,
+        egid: u32,
+        sgid: u32,
+    },
     Getgroups {
         size: i32,
         list: UserPtrMut<u32>,
@@ -3896,6 +3906,8 @@ impl SyscallRequest {
             Sysno::getegid => SyscallRequest::Getegid,
             Sysno::setuid => sys_req!(Setuid { uid }),
             Sysno::setgid => sys_req!(Setgid { gid }),
+            Sysno::setresuid => sys_req!(Setresuid { ruid, euid, suid }),
+            Sysno::setresgid => sys_req!(Setresgid { rgid, egid, sgid }),
             Sysno::getgroups => sys_req!(Getgroups { size, list:* }),
             Sysno::setgroups => sys_req!(Setgroups { size, list:* }),
             Sysno::epoll_ctl => sys_req!(EpollCtl { epfd, op:?, fd, event:* }),

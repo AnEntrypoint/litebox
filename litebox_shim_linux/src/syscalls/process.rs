@@ -3660,6 +3660,39 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    /// Handle syscall `setresuid`. See [`Self::sys_setuid`] for the same no-op-if-unchanged
+    /// rationale -- `u32::MAX` (real Linux's `-1` passed as `uid_t`) means "leave this one
+    /// unchanged", matching real `setresuid(2)` semantics.
+    pub(crate) fn sys_setresuid(&self, ruid: u32, euid: u32, suid: u32) -> Result<(), Errno> {
+        let keep_or_matches = |requested: u32, current: u32| {
+            requested == u32::MAX || requested == current
+        };
+        if keep_or_matches(ruid, self.credentials.uid)
+            && keep_or_matches(euid, self.credentials.euid)
+            && keep_or_matches(suid, self.credentials.uid)
+        {
+            Ok(())
+        } else {
+            Err(Errno::EPERM)
+        }
+    }
+
+    /// Handle syscall `setresgid`. See [`Self::sys_setresuid`] for the same no-op-if-unchanged
+    /// rationale.
+    pub(crate) fn sys_setresgid(&self, rgid: u32, egid: u32, sgid: u32) -> Result<(), Errno> {
+        let keep_or_matches = |requested: u32, current: u32| {
+            requested == u32::MAX || requested == current
+        };
+        if keep_or_matches(rgid, self.credentials.gid)
+            && keep_or_matches(egid, self.credentials.egid)
+            && keep_or_matches(sgid, self.credentials.gid)
+        {
+            Ok(())
+        } else {
+            Err(Errno::EPERM)
+        }
+    }
+
     /// Handle syscall `getgroups`.
     ///
     /// LiteBox has no real supplementary-group model (see [`Self::sys_setuid`]'s single-fixed-
