@@ -3545,6 +3545,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EBADF);
         };
 
+        litebox_util_log::debug!(fd:% = fd, arg:? = arg; "sys_ioctl: entry");
         let files = self.files.borrow();
         match arg {
             IoctlArg::FIONBIO(arg) => {
@@ -3886,6 +3887,57 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
             )?,
+            IoctlArg::EvdevGetVersion(ptr) => {
+                files.run_on_raw_fd(
+                    desc,
+                    |fd| {
+                        if self.is_input_device(&files.fs, fd)? {
+                            Ok(())
+                        } else {
+                            Err(Errno::ENOTTY)
+                        }
+                    },
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                )??;
+                ptr.write_at_offset::<Platform>(0, litebox_common_linux::EV_VERSION)
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::EvdevGetId(ptr) => {
+                files.run_on_raw_fd(
+                    desc,
+                    |fd| {
+                        if self.is_input_device(&files.fs, fd)? {
+                            Ok(())
+                        } else {
+                            Err(Errno::ENOTTY)
+                        }
+                    },
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                )??;
+                let id = litebox_common_linux::InputId {
+                    bustype: litebox_common_linux::BUS_VIRTUAL,
+                    vendor: 0,
+                    product: 0,
+                    version: 0,
+                };
+                ptr.write_at_offset::<Platform>(0, id).ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
             _ => {
                 log_unsupported!("ioctl with arg {:?}", arg);
                 Err(Errno::EINVAL)
