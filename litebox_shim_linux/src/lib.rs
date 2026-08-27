@@ -1827,6 +1827,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::Getegid => Ok(self.sys_getegid() as usize),
             SyscallRequest::Setuid { uid } => syscall!(sys_setuid(uid)),
             SyscallRequest::Setgid { gid } => syscall!(sys_setgid(gid)),
+            SyscallRequest::Setresuid { ruid, euid, suid } => {
+                syscall!(sys_setresuid(ruid, euid, suid))
+            }
+            SyscallRequest::Setresgid { rgid, egid, sgid } => {
+                syscall!(sys_setresgid(rgid, egid, sgid))
+            }
             SyscallRequest::Getgroups { size, list } => syscall!(sys_getgroups(size, list)),
             SyscallRequest::Setgroups { size, list } => syscall!(sys_setgroups(size, list)),
             SyscallRequest::Sysinfo { buf } => {
