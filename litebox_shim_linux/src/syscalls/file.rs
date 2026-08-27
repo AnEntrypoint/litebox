@@ -3549,7 +3549,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         match fs.fd_file_status(fd) {
             Ok(status) => {
                 let major = status.node_info.rdev.map_or(0, |v| v.get() >> 8);
-                Ok(major == 13 && status.file_type == litebox::fs::FileType::CharacterDevice)
+                let is_input =
+                    major == 13 && status.file_type == litebox::fs::FileType::CharacterDevice;
+                litebox_util_log::debug!(
+                    rdev:? = status.node_info.rdev.map(|v| (v.get() >> 8, v.get() & 0xff)),
+                    file_type:? = status.file_type,
+                    is_input:% = is_input;
+                    "is_input_device: checked"
+                );
+                Ok(is_input)
             }
             Err(litebox::fs::errors::FileStatusError::ClosedFd) => Err(Errno::EBADF),
             Err(_) => unimplemented!(),

@@ -1467,6 +1467,23 @@ const UDEV_DB_EVENT0_NODE_INFO: NodeInfo = NodeInfo {
     rdev: None,
 };
 
+/// Real eudev per-device-database `E:` property lines this backend serves for
+/// `/run/udev/data/c13:64` -- each parsed by `udev_device_read_db()`
+/// (`src/libudev/libudev-device.c`) into a real udev property via
+/// `udev_device_add_property_from_string()`. libinput's `evdev_configure_device()`
+/// (`src/evdev.c`) reads these SPECIFIC property names (`ID_INPUT`/`ID_INPUT_MOUSE`/
+/// `ID_INPUT_KEYBOARD`, matched against `evdev_udev_tag_matches[]`) to decide whether a
+/// device is tagged as supported input at all -- a device with NO `ID_INPUT` property
+/// hits `evdev_configure_device`'s very first check (`(udev_tags &
+/// EVDEV_UDEV_TAG_INPUT) == 0`) and is rejected with "not tagged as supported input
+/// device", logged by the caller as "not using input device". This is NOT read from any
+/// ioctl or sysfs attribute -- real udev normally derives these properties at boot via
+/// `hwdb`/`udev` rules matching the device's real evdev capabilities, which litebox has no
+/// equivalent of; serving them directly here is the correct, faithful substitute for
+/// litebox's one static, known-shape virtual device (a keyboard+mouse-capable device,
+/// matching [`EvdevSubsystem`]'s real `push_key`/`push_rel` capability range).
+const UDEV_DB_EVENT0_CONTENT: &[u8] = b"E:ID_INPUT=1\nE:ID_INPUT_MOUSE=1\nE:ID_INPUT_KEYBOARD=1\n";
+
 /// A [`super::backend::Backend`] exposing `/run/udev/data/c13:64` -- real eudev's
 /// per-device database file (`udev_device_read_db()`, `src/libudev/libudev-device.c`):
 /// merely being ABLE TO OPEN this file (any content, even empty) is what real eudev
@@ -1476,8 +1493,8 @@ const UDEV_DB_EVENT0_NODE_INFO: NodeInfo = NodeInfo {
 /// `udev_device_get_is_initialized()` is false ("skip unconfigured input device") --
 /// litebox has no real `udevd` ever running to create this file, so without it, the one
 /// virtual input device [`SysClassInput`]/[`InputDevices`] otherwise correctly exposes is
-/// silently rejected by libinput's own enumeration filter, even though every sysfs
-/// attribute it reads (`uevent`, `dev`, `subsystem`) is already served correctly. This is
+/// silently rejected by libinput's own enumeration filter. Beyond mere openability, the
+/// file's CONTENT also matters -- see [`UDEV_DB_EVENT0_CONTENT`]'s own doc comment. This is
 /// deliberately NOT a general `/run/udev/data` emulation -- exactly one, fixed file is
 /// served, matching litebox's one static virtual input device; a real system's device
 /// database has one entry per real device and is written by `udevd` at boot, which
@@ -1603,15 +1620,18 @@ where
         }])
     }
 
-    fn read(&self, _h: &FileHandle, _buf: &mut [u8], _offset: usize) -> Result<usize, ReadError> {
-        // Real eudev's db file can carry `S:`/`E:`/`G:`/etc. lines (devlinks, extra
-        // properties, tags) but merely opening the file successfully is all
-        // `udev_device_get_is_initialized()` actually checks -- see this backend's own
-        // doc comment. An always-empty read is correct, faithful behavior here, not a
-        // shortcut: litebox has no extra devlinks/tags/properties to report for its one
-        // static virtual input device beyond what `SysClassInput`'s own `uevent` file
-        // already provides.
-        Ok(0)
+    fn read(&self, _h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
+        // See `UDEV_DB_EVENT0_CONTENT`'s own doc comment: these `E:` property lines are
+        // what makes libinput's `evdev_configure_device()` tag this device as supported
+        // input at all, not just "openable".
+        let content = UDEV_DB_EVENT0_CONTENT;
+        if offset >= content.len() {
+            return Ok(0);
+        }
+        let remaining = &content[offset..];
+        let n = remaining.len().min(buf.len());
+        buf[..n].copy_from_slice(&remaining[..n]);
+        Ok(n)
     }
 
     fn write(&self, _h: &FileHandle, _buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
@@ -1630,7 +1650,7 @@ where
         Ok(FileStatus {
             file_type: FileType::RegularFile,
             mode: Mode::RUSR | Mode::RGRP | Mode::ROTH,
-            size: 0,
+            size: UDEV_DB_EVENT0_CONTENT.len(),
             owner: UserInfo::ROOT,
             node_info: UDEV_DB_EVENT0_NODE_INFO,
             blksize: 0x1000,
