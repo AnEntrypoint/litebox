@@ -4697,6 +4697,36 @@ fn fmt_usize_hex(mut n: usize, buf: &mut [u8; 20]) -> &[u8] {
 /// `eprintln!`/`format!`, which can recurse into it via the host Rust I/O stack). Deliberately
 /// skips `STDERR_WRITE_LOCK` -- interleaving with other stderr writers is an acceptable, purely
 /// cosmetic risk for this temporary, allocation-free diagnostic.
+// TEMPORARY diagnostic (litebox investigation: XFCE/weston mallocng heap-corruption bug
+// hunt) -- wires up `litebox::mm::exception_table`'s memcpy-write watch range from the
+// `LITEBOX_MEMCPY_WATCH=<start_hex>-<end_hex>` env var, logging any overlapping write via
+// the same raw, allocation-free `diag_raw_print` mechanism the VEH diagnostics use. Lets a
+// repro determine whether a specific guest heap address is ever written to via litebox's
+// own fallible-memory-write path (any syscall copying host data into guest memory), as
+// opposed to a raw guest-code store that never goes through litebox at all. Remove once the
+// investigation concludes.
+pub fn install_memcpy_watch_from_env() {
+    let Some(spec) = std::env::var_os("LITEBOX_MEMCPY_WATCH") else {
+        return;
+    };
+    let Some(spec) = spec.to_str() else { return };
+    let Some((start_str, end_str)) = spec.split_once('-') else {
+        return;
+    };
+    let (Ok(start), Ok(end)) = (
+        usize::from_str_radix(start_str.trim_start_matches("0x"), 16),
+        usize::from_str_radix(end_str.trim_start_matches("0x"), 16),
+    ) else {
+        return;
+    };
+    fn hook(dst: usize, size: usize) {
+        diag_raw_print(b"[memcpy-watch] dst=0x", dst, b" size=0x", size);
+    }
+    unsafe {
+        litebox::mm::exception_table::set_memcpy_watch_range(start, end, Some(hook));
+    }
+}
+
 fn diag_raw_print(prefix: &[u8], a: usize, mid: &[u8], b: usize) {
     let mut line = [0u8; 128];
     let mut pos = 0usize;
