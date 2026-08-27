@@ -1459,3 +1459,604 @@ where
         Err(SetTimesError::ReadOnlyFileSystem)
     }
 }
+
+/// Node info for the one file this backend serves, `/run/udev/data/c13:64`.
+const UDEV_DB_EVENT0_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 25,
+    rdev: None,
+};
+
+/// A [`super::backend::Backend`] exposing `/run/udev/data/c13:64` -- real eudev's
+/// per-device database file (`udev_device_read_db()`, `src/libudev/libudev-device.c`):
+/// merely being ABLE TO OPEN this file (any content, even empty) is what real eudev
+/// treats as "this device has a database entry" -> `udev_device->is_initialized = true`.
+/// `libinput_udev_create_context()`'s own device-enumeration walk
+/// (`udev_input_add_devices()`, `src/udev-seat.c`) explicitly skips any device where
+/// `udev_device_get_is_initialized()` is false ("skip unconfigured input device") --
+/// litebox has no real `udevd` ever running to create this file, so without it, the one
+/// virtual input device [`SysClassInput`]/[`InputDevices`] otherwise correctly exposes is
+/// silently rejected by libinput's own enumeration filter, even though every sysfs
+/// attribute it reads (`uevent`, `dev`, `subsystem`) is already served correctly. This is
+/// deliberately NOT a general `/run/udev/data` emulation -- exactly one, fixed file is
+/// served, matching litebox's one static virtual input device; a real system's device
+/// database has one entry per real device and is written by `udevd` at boot, which
+/// litebox has no equivalent of (correctly -- see [`EvdevSubsystem`]'s doc comment on why
+/// litebox's device set is intentionally static per-run).
+pub struct UdevDb<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    _litebox: LiteBox<Platform>,
+    root_inode: NodeInfo,
+    _alloc: InodeAllocator,
+}
+
+impl<Platform> UdevDb<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    /// Construct a new `UdevDb` backend.
+    #[must_use]
+    pub fn new(litebox: &LiteBox<Platform>, allocator: InodeAllocator) -> Self {
+        let root_inode = allocator.next();
+        Self {
+            _litebox: litebox.clone(),
+            root_inode,
+            _alloc: allocator,
+        }
+    }
+}
+
+/// Owned file handle; only one file exists, so no fields are needed.
+#[derive(Debug, Clone, Copy)]
+pub struct UdevDbFileHandle;
+
+/// Directory handle, reused for both walking and owned dir handles (no borrows needed).
+#[derive(Debug, Clone, Copy)]
+pub struct UdevDbDirHandle;
+
+impl<Platform> super::backend::private::Sealed for UdevDb<Platform> where
+    Platform: RawSyncPrimitivesProvider + 'static
+{
+}
+
+impl<Platform> BackendHandles for UdevDb<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    type WalkingDirHandle<'a> = UdevDbDirHandle;
+    type FileHandle = UdevDbFileHandle;
+    type DirHandle = UdevDbDirHandle;
+}
+
+impl<Platform> Backend for UdevDb<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    fn root(&self) -> WalkingDirHandle<'_> {
+        WalkingDirHandle::from_typed::<Self>(UdevDbDirHandle)
+    }
+
+    fn walk_directories<'a>(
+        &'a self,
+        from: WalkingDirHandle<'a>,
+        components: &[&str],
+    ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError> {
+        let from = from.into_typed::<Self>();
+        if let Some(&component) = components.first() {
+            if component == "c13:64" {
+                return Ok(WalkOutcome {
+                    components: vec![],
+                    last: WalkingDirHandle::from_typed::<Self>(from),
+                    stop_reason: WalkStopReason::StoppedAtNonDirectory,
+                });
+            }
+            return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
+        }
+        Ok(WalkOutcome {
+            components: vec![],
+            last: WalkingDirHandle::from_typed::<Self>(from),
+            stop_reason: WalkStopReason::CompleteDirectory,
+        })
+    }
+
+    fn owned_dir_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        _flags: OFlags,
+    ) -> Result<DirHandle, OpenError> {
+        Ok(DirHandle::from_typed::<Self>(dir.into_typed::<Self>()))
+    }
+
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<WalkingDirHandle<'a>> {
+        Some(WalkingDirHandle::from_typed::<Self>(
+            *dir.get_typed::<Self>(),
+        ))
+    }
+
+    fn open_file_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        name: &str,
+        flags: OFlags,
+    ) -> Result<Permissioned<FileHandle>, OpenError> {
+        let _dir = dir.into_typed::<Self>();
+        if name != "c13:64" {
+            return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
+        }
+        if flags.contains(OFlags::DIRECTORY) {
+            return Err(OpenError::PathError(PathError::ComponentNotADirectory));
+        }
+        Ok(Permissioned {
+            item: FileHandle::from_typed::<Self>(UdevDbFileHandle),
+            permissions: PermissionCheck::ByBackend,
+        })
+    }
+
+    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
+        let _handle = handle.into_typed::<Self>();
+        Ok(vec![DirEntry {
+            name: String::from("c13:64"),
+            file_type: FileType::RegularFile,
+            ino_info: Some(UDEV_DB_EVENT0_NODE_INFO),
+        }])
+    }
+
+    fn read(&self, _h: &FileHandle, _buf: &mut [u8], _offset: usize) -> Result<usize, ReadError> {
+        // Real eudev's db file can carry `S:`/`E:`/`G:`/etc. lines (devlinks, extra
+        // properties, tags) but merely opening the file successfully is all
+        // `udev_device_get_is_initialized()` actually checks -- see this backend's own
+        // doc comment. An always-empty read is correct, faithful behavior here, not a
+        // shortcut: litebox has no extra devlinks/tags/properties to report for its one
+        // static virtual input device beyond what `SysClassInput`'s own `uevent` file
+        // already provides.
+        Ok(0)
+    }
+
+    fn write(&self, _h: &FileHandle, _buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
+        Err(WriteError::NotForWriting)
+    }
+
+    fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {
+        Err(TruncateError::NotForWriting)
+    }
+
+    fn seek_behavior(&self, _h: &FileHandle) -> SeekBehavior {
+        SeekBehavior::PositionBased
+    }
+
+    fn file_status(&self, _h: &FileHandle) -> Result<FileStatus, FileStatusError> {
+        Ok(FileStatus {
+            file_type: FileType::RegularFile,
+            mode: Mode::RUSR | Mode::RGRP | Mode::ROTH,
+            size: 0,
+            owner: UserInfo::ROOT,
+            node_info: UDEV_DB_EVENT0_NODE_INFO,
+            blksize: 0x1000,
+            atime: Timestamp::default(),
+            mtime: Timestamp::default(),
+        })
+    }
+
+    fn dir_status(&self, _h: &DirHandle) -> Result<FileStatus, FileStatusError> {
+        Ok(FileStatus {
+            file_type: FileType::Directory,
+            mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+            size: super::DEFAULT_DIRECTORY_SIZE,
+            owner: UserInfo::ROOT,
+            node_info: self.root_inode.clone(),
+            blksize: super::DEFAULT_DIRECTORY_SIZE,
+            atime: Timestamp::default(),
+            mtime: Timestamp::default(),
+        })
+    }
+
+    fn create_file_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _mode: Mode,
+    ) -> Result<FileHandle, OpenError> {
+        Err(OpenError::ReadOnlyFileSystem)
+    }
+
+    fn mkdir_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<DirHandle, MkdirError> {
+        Err(MkdirError::ReadOnlyFileSystem)
+    }
+
+    fn unlink_at(&self, _dir: DirHandle, _name: &str) -> Result<(), UnlinkError> {
+        Err(UnlinkError::ReadOnlyFileSystem)
+    }
+
+    fn rmdir_at(&self, _dir: DirHandle, _name: &str) -> Result<(), RmdirError> {
+        Err(RmdirError::ReadOnlyFileSystem)
+    }
+
+    fn chmod_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
+    fn chown_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _user: Option<u16>,
+        _group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        Err(ChownError::ReadOnlyFileSystem)
+    }
+
+    fn set_times_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _atime: Option<Timestamp>,
+        _mtime: Option<Timestamp>,
+    ) -> Result<(), SetTimesError> {
+        Err(SetTimesError::ReadOnlyFileSystem)
+    }
+}
+
+/// A leaf file inside `/sys/class/input/event0/` -- the minimal set a real
+/// `libudev`-based input client (`libinput_udev_create_context()`'s
+/// `udev_enumerate_scan_devices()` walk) needs: `uevent` (populates `udev_device`
+/// properties without a running `udevd`) and `subsystem` (a symlink whose basename
+/// `udev_device_get_subsystem()` reads). Mirrors [`SysDrmFile`]'s exact shape, scoped to
+/// litebox's one virtual input device (`/dev/input/event0`, see [`InputDevice::Event0`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SysInputFile {
+    /// `MAJOR=`/`MINOR=`/`DEVNAME=`/`SUBSYSTEM=` key=value lines.
+    Uevent,
+    /// `MAJOR:MINOR` (e.g. `13:64`), the standard sysfs device-node attribute.
+    Dev,
+    /// Symlink to the (synthetic) `input` subsystem directory.
+    Subsystem,
+}
+
+impl SysInputFile {
+    const ALL: &'static [(&'static str, SysInputFile)] = &[
+        ("uevent", SysInputFile::Uevent),
+        ("dev", SysInputFile::Dev),
+        ("subsystem", SysInputFile::Subsystem),
+    ];
+
+    fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.iter().find(|(n, _)| *n == name).map(|(_, f)| *f)
+    }
+}
+
+/// Node info for the `/sys/class/input/event0` directory itself (distinct from
+/// `/dev/input/event0`'s own [`INPUT_EVENT0_NODE_INFO`] -- sysfs directories and the
+/// device nodes they describe are always separate inodes on real Linux too).
+const SYS_INPUT_EVENT0_DIR_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 21,
+    rdev: None,
+};
+
+/// A [`super::backend::Backend`] exposing the minimal `/sys/class/input/event0/` subtree
+/// a real `libudev`-based input client needs to enumerate litebox's one emulated evdev
+/// device. Deliberately NOT a general procfs/sysfs emulation -- only the exact files real
+/// `udev_enumerate_scan_devices()` + `udev_device_new_from_syspath()` calls read
+/// (`uevent`, `dev`, `subsystem`) are served, for the one node [`InputDevices`] already
+/// exposes at `/dev/input/event0`. Mounted at `/sys/class/input`; the composer's virtual-
+/// directory auto-synthesis creates the `/sys` and `/sys/class` ancestor directories
+/// automatically, so this backend only needs to handle its own one-level subtree
+/// (`event0`, containing `uevent`/`dev`/`subsystem`). Only one device exists, so unlike
+/// [`SysClassDrm`] this backend has no device-selector enum to match on.
+pub struct SysClassInput<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    _litebox: LiteBox<Platform>,
+    root_inode: NodeInfo,
+    _alloc: InodeAllocator,
+}
+
+impl<Platform> SysClassInput<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    /// Construct a new `SysClassInput` backend.
+    #[must_use]
+    pub fn new(litebox: &LiteBox<Platform>, allocator: InodeAllocator) -> Self {
+        let root_inode = allocator.next();
+        Self {
+            _litebox: litebox.clone(),
+            root_inode,
+            _alloc: allocator,
+        }
+    }
+}
+
+/// Directory handle: either the backend's mount root (`/sys/class/input` itself) or
+/// inside the one device's subdirectory (`/sys/class/input/event0`).
+#[derive(Debug, Clone, Copy)]
+pub enum SysInputDirHandle {
+    Root,
+    Device,
+}
+
+/// Owned file handle; identifies which sysfs attribute file backs this fd (only one
+/// device exists, so no device selector is needed alongside the file kind).
+#[derive(Debug, Clone, Copy)]
+pub struct SysInputFileHandle {
+    file: SysInputFile,
+}
+
+impl<Platform> super::backend::private::Sealed for SysClassInput<Platform> where
+    Platform: RawSyncPrimitivesProvider + 'static
+{
+}
+
+impl<Platform> BackendHandles for SysClassInput<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    type WalkingDirHandle<'a> = SysInputDirHandle;
+    type FileHandle = SysInputFileHandle;
+    type DirHandle = SysInputDirHandle;
+}
+
+impl<Platform> Backend for SysClassInput<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    fn root(&self) -> WalkingDirHandle<'_> {
+        WalkingDirHandle::from_typed::<Self>(SysInputDirHandle::Root)
+    }
+
+    fn walk_directories<'a>(
+        &'a self,
+        from: WalkingDirHandle<'a>,
+        components: &[&str],
+    ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError> {
+        let from = from.into_typed::<Self>();
+        match from {
+            SysInputDirHandle::Root => {
+                let Some(&component) = components.first() else {
+                    return Ok(WalkOutcome {
+                        components: vec![],
+                        last: WalkingDirHandle::from_typed::<Self>(SysInputDirHandle::Root),
+                        stop_reason: WalkStopReason::CompleteDirectory,
+                    });
+                };
+                if component != "event0" {
+                    return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
+                }
+                let walked = vec![WalkedComponent {
+                    permissions: PermissionCheck::ByBackend,
+                }];
+                if components.len() == 1 {
+                    return Ok(WalkOutcome {
+                        components: walked,
+                        last: WalkingDirHandle::from_typed::<Self>(SysInputDirHandle::Device),
+                        stop_reason: WalkStopReason::CompleteDirectory,
+                    });
+                }
+                if components.len() == 2 && SysInputFile::from_name(components[1]).is_some() {
+                    return Ok(WalkOutcome {
+                        components: walked,
+                        last: WalkingDirHandle::from_typed::<Self>(SysInputDirHandle::Device),
+                        stop_reason: WalkStopReason::StoppedAtNonDirectory,
+                    });
+                }
+                Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
+            }
+            SysInputDirHandle::Device => {
+                let Some(&component) = components.first() else {
+                    return Ok(WalkOutcome {
+                        components: vec![],
+                        last: WalkingDirHandle::from_typed::<Self>(SysInputDirHandle::Device),
+                        stop_reason: WalkStopReason::CompleteDirectory,
+                    });
+                };
+                if SysInputFile::from_name(component).is_some() {
+                    return Ok(WalkOutcome {
+                        components: vec![],
+                        last: WalkingDirHandle::from_typed::<Self>(SysInputDirHandle::Device),
+                        stop_reason: WalkStopReason::StoppedAtNonDirectory,
+                    });
+                }
+                Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
+            }
+        }
+    }
+
+    fn owned_dir_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        _flags: OFlags,
+    ) -> Result<DirHandle, OpenError> {
+        Ok(DirHandle::from_typed::<Self>(dir.into_typed::<Self>()))
+    }
+
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<WalkingDirHandle<'a>> {
+        Some(WalkingDirHandle::from_typed::<Self>(
+            *dir.get_typed::<Self>(),
+        ))
+    }
+
+    fn open_file_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        name: &str,
+        flags: OFlags,
+    ) -> Result<Permissioned<FileHandle>, OpenError> {
+        let dir = dir.into_typed::<Self>();
+        let SysInputDirHandle::Device = dir else {
+            return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
+        };
+        let file = SysInputFile::from_name(name)
+            .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+
+        if flags.contains(OFlags::DIRECTORY) {
+            return Err(OpenError::PathError(PathError::ComponentNotADirectory));
+        }
+
+        Ok(Permissioned {
+            item: FileHandle::from_typed::<Self>(SysInputFileHandle { file }),
+            permissions: PermissionCheck::ByBackend,
+        })
+    }
+
+    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
+        let handle = handle.into_typed::<Self>();
+        match handle {
+            SysInputDirHandle::Root => Ok(vec![DirEntry {
+                name: String::from("event0"),
+                file_type: FileType::Directory,
+                ino_info: Some(SYS_INPUT_EVENT0_DIR_NODE_INFO),
+            }]),
+            SysInputDirHandle::Device => Ok(SysInputFile::ALL
+                .iter()
+                .map(|(n, f)| DirEntry {
+                    name: String::from(*n),
+                    file_type: if matches!(f, SysInputFile::Subsystem) {
+                        FileType::Symlink
+                    } else {
+                        FileType::RegularFile
+                    },
+                    ino_info: None,
+                })
+                .collect()),
+        }
+    }
+
+    fn read_link_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        name: &str,
+    ) -> Result<Option<String>, OpenError> {
+        let dir = dir.into_typed::<Self>();
+        let SysInputDirHandle::Device = dir else {
+            return Ok(None);
+        };
+        let Some(SysInputFile::Subsystem) = SysInputFile::from_name(name) else {
+            return Ok(None);
+        };
+        Ok(Some(String::from("../../../class/input")))
+    }
+
+    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
+        let h = h.get_typed::<Self>();
+        let content = match h.file {
+            SysInputFile::Uevent => {
+                String::from("MAJOR=13\nMINOR=64\nDEVNAME=input/event0\nSUBSYSTEM=input\n")
+            }
+            SysInputFile::Dev => String::from("13:64\n"),
+            SysInputFile::Subsystem => return Err(ReadError::NotForReading),
+        };
+        let bytes = content.as_bytes();
+        let start = offset.min(bytes.len());
+        let end = bytes.len();
+        let len = (end - start).min(buf.len());
+        buf[..len].copy_from_slice(&bytes[start..start + len]);
+        Ok(len)
+    }
+
+    fn write(&self, _h: &FileHandle, _buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
+        Err(WriteError::NotForWriting)
+    }
+
+    fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {
+        Err(TruncateError::NotForWriting)
+    }
+
+    fn seek_behavior(&self, _h: &FileHandle) -> SeekBehavior {
+        SeekBehavior::PositionBased
+    }
+
+    fn file_status(&self, h: &FileHandle) -> Result<FileStatus, FileStatusError> {
+        let h = h.get_typed::<Self>();
+        let size = match h.file {
+            SysInputFile::Uevent => {
+                "MAJOR=13\nMINOR=64\nDEVNAME=input/event0\nSUBSYSTEM=input\n".len()
+            }
+            SysInputFile::Dev => "13:64\n".len(),
+            SysInputFile::Subsystem => 0,
+        };
+        Ok(FileStatus {
+            file_type: FileType::RegularFile,
+            mode: Mode::RUSR | Mode::RGRP | Mode::ROTH,
+            size,
+            owner: UserInfo::ROOT,
+            node_info: NodeInfo {
+                dev: 5,
+                ino: match h.file {
+                    SysInputFile::Uevent => 22,
+                    SysInputFile::Dev => 23,
+                    SysInputFile::Subsystem => 24,
+                },
+                rdev: None,
+            },
+            blksize: 0x1000,
+            atime: Timestamp::default(),
+            mtime: Timestamp::default(),
+        })
+    }
+
+    fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
+        let h = h.get_typed::<Self>();
+        let node_info = match h {
+            SysInputDirHandle::Root => self.root_inode.clone(),
+            SysInputDirHandle::Device => SYS_INPUT_EVENT0_DIR_NODE_INFO,
+        };
+        Ok(FileStatus {
+            file_type: FileType::Directory,
+            mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+            size: super::DEFAULT_DIRECTORY_SIZE,
+            owner: UserInfo::ROOT,
+            node_info,
+            blksize: super::DEFAULT_DIRECTORY_SIZE,
+            atime: Timestamp::default(),
+            mtime: Timestamp::default(),
+        })
+    }
+
+    fn create_file_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _mode: Mode,
+    ) -> Result<FileHandle, OpenError> {
+        Err(OpenError::ReadOnlyFileSystem)
+    }
+
+    fn mkdir_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<DirHandle, MkdirError> {
+        Err(MkdirError::ReadOnlyFileSystem)
+    }
+
+    fn unlink_at(&self, _dir: DirHandle, _name: &str) -> Result<(), UnlinkError> {
+        Err(UnlinkError::ReadOnlyFileSystem)
+    }
+
+    fn rmdir_at(&self, _dir: DirHandle, _name: &str) -> Result<(), RmdirError> {
+        Err(RmdirError::ReadOnlyFileSystem)
+    }
+
+    fn chmod_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
+    fn chown_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _user: Option<u16>,
+        _group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        Err(ChownError::ReadOnlyFileSystem)
+    }
+
+    fn set_times_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _atime: Option<Timestamp>,
+        _mtime: Option<Timestamp>,
+    ) -> Result<(), SetTimesError> {
+        Err(SetTimesError::ReadOnlyFileSystem)
+    }
+}
