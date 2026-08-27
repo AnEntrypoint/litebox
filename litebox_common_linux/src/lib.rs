@@ -824,6 +824,26 @@ pub struct Winsize {
     pub ypixel: u16,
 }
 
+/// `struct input_id` (`include/uapi/linux/input.h`) -- `EVIOCGID`'s result, a device's
+/// bus/vendor/product/version identity. `BUS_VIRTUAL = 0x06` (see `input-event-codes.h`) is the
+/// correct, real-kernel-convention bus type for litebox's synthetic evdev device -- vendor/
+/// product/version are left `0`, matching how real virtual/synthetic input devices (e.g. the
+/// kernel's own `uinput`-created ones with no vendor identity supplied) commonly report.
+#[derive(Debug, Clone, Default, FromBytes, IntoBytes)]
+#[repr(C)]
+pub struct InputId {
+    pub bustype: u16,
+    pub vendor: u16,
+    pub product: u16,
+    pub version: u16,
+}
+
+/// `BUS_VIRTUAL`, `include/uapi/linux/input.h`.
+pub const BUS_VIRTUAL: u16 = 0x06;
+/// `EV_VERSION`, `include/uapi/linux/input.h` -- the evdev protocol version `EVIOCGVERSION`
+/// reports, unchanged since its introduction.
+pub const EV_VERSION: i32 = 0x01_0001;
+
 /// DRM (Direct Rendering Manager) mode-setting ioctl request numbers, `include/uapi/drm/drm.h`'s
 /// `DRM_IOWR(nr, type)` = `_IOWR(DRM_IOCTL_BASE='d', nr, type)` encoding. Verified live against
 /// the real kernel header (see `docs/drm-dumb-buffer-ioctl-reference.md`), not guessed -- these
@@ -933,6 +953,13 @@ pub const KD_GRAPHICS: i32 = 0x01;
 /// `EVIOCREVOKE`, `_IOW('E', 0x91, int)` per the real kernel's `include/uapi/linux/input.h` --
 /// `(_IOC_WRITE << 30) | (size_of::<i32>() << 16) | ('E' << 8) | 0x91`.
 pub const EVIOCREVOKE: u32 = 0x4004_4591;
+/// `EVIOCGVERSION`, `_IOR('E', 0x01, int)` -- `(_IOC_READ << 30) | (size_of::<i32>() << 16) |
+/// ('E' << 8) | 0x01`. The first ioctl libevdev's `libevdev_new_from_fd()` issues; failure here
+/// is fatal to device creation, matching real Linux's `EVIOC_VERSION` = `0x010001`.
+pub const EVIOCGVERSION: u32 = 0x8004_4501;
+/// `EVIOCGID`, `_IOR('E', 0x02, struct input_id)` -- `(_IOC_READ << 30) | (size_of::<InputId>()
+/// << 16) | ('E' << 8) | 0x02`. Also mandatory/fatal for `libevdev_new_from_fd()`.
+pub const EVIOCGID: u32 = 0x8008_4502;
 /// `KD_TEXT` -- the mode value restored on VT release (`terminal_set_graphics(fd, false)`).
 pub const KD_TEXT: i32 = 0x00;
 
@@ -1518,6 +1545,12 @@ pub enum IoctlArg {
     /// than a shortcut -- there is no OTHER client this could ever need to actually revoke access
     /// from.
     EvdevRevoke,
+    /// `EVIOCGVERSION` -- report the evdev protocol version. Mandatory for
+    /// `libevdev_new_from_fd()`; failure aborts device creation.
+    EvdevGetVersion(UserPtrMut<i32>),
+    /// `EVIOCGID` -- report the device's bus/vendor/product/version identity. Mandatory for
+    /// `libevdev_new_from_fd()`; failure aborts device creation.
+    EvdevGetId(UserPtrMut<InputId>),
     Raw {
         cmd: u32,
         arg: UserPtrMut<u8>,
@@ -3588,6 +3621,8 @@ impl SyscallRequest {
                         KDSETMODE => IoctlArg::KdSetMode(ctx.sys_req_arg(2)),
                         KDSKBMODE => IoctlArg::KdSkbMode(ctx.sys_req_arg(2)),
                         EVIOCREVOKE => IoctlArg::EvdevRevoke,
+                        EVIOCGVERSION => IoctlArg::EvdevGetVersion(ctx.sys_req_ptr(2)),
+                        EVIOCGID => IoctlArg::EvdevGetId(ctx.sys_req_ptr(2)),
                         _ => IoctlArg::Raw {
                             cmd,
                             arg: ctx.sys_req_ptr(2),
