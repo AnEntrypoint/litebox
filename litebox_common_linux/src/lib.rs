@@ -3948,7 +3948,9 @@ impl SyscallRequest {
                 flags: SfdFlags::empty(),
             },
             Sysno::signalfd4 => sys_req!(Signalfd4 { fd, mask:*, sizemask, flags }),
-            Sysno::timerfd_create => sys_req!(TimerfdCreate { flags }),
+            Sysno::timerfd_create => SyscallRequest::TimerfdCreate {
+                flags: ctx.sys_req_arg(1),
+            },
             Sysno::timerfd_settime => sys_req!(TimerfdSettime {
                 fd,
                 flags,
