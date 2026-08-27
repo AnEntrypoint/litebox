@@ -4917,6 +4917,24 @@ unsafe extern "C" {
 }
 
 unsafe extern "C-unwind" fn init_handler(thread_ctx: &mut ThreadContext<'_>) {
+    // Pre-commit the real Windows stack pages below `host_sp` that
+    // `vectored_exception_handler`'s `EXCEPTION_RECORD_RESERVE`-relative scratch write later
+    // depends on. Guest threads have been observed reaching their first exception with as
+    // little as 12KB of their 8MiB stack reservation actually committed, letting that write
+    // land outside committed memory (`INVALID_POINTER_WRITE_c0000005_VCRUNTIME140.dll!memcpy`).
+    // Touching each page here (before any guest code runs) forces Windows to commit it.
+    {
+        let host_sp = thread_ctx.tls.host_sp.get().cast::<u8>();
+        let page_size = 4096usize;
+        let mut offset = page_size;
+        while offset <= EXCEPTION_RECORD_RESERVE {
+            let probe_addr = host_sp.wrapping_byte_sub(offset);
+            unsafe {
+                core::ptr::write_volatile(probe_addr, core::ptr::read_volatile(probe_addr));
+            }
+            offset += page_size;
+        }
+    }
     thread_ctx.call_shim(|shim, ctx, _interrupt| shim.init(ctx));
 }
 
