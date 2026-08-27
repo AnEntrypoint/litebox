@@ -3905,7 +3905,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Handle syscall `epoll_create` and `epoll_create1`
     pub fn sys_epoll_create(&self, flags: EpollCreateFlags) -> Result<u32, Errno> {
+        litebox_util_log::debug!(flags:? = flags; "sys_epoll_create: entry");
         if flags.intersects(EpollCreateFlags::EPOLL_CLOEXEC.complement()) {
+            litebox_util_log::debug!("sys_epoll_create: EINVAL, bad flags");
             return Err(Errno::EINVAL);
         }
 
@@ -3924,8 +3926,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .descriptor_table_mut()
                 .remove(&typed)
                 .unwrap();
+            litebox_util_log::debug!("sys_epoll_create: EMFILE");
             Errno::EMFILE
         })?;
+        litebox_util_log::debug!(raw_fd:% = raw_fd; "sys_epoll_create: returning");
         Ok(raw_fd.try_into().unwrap())
     }
 
