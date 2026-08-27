@@ -2313,7 +2313,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `stat`
     pub fn sys_stat(&self, pathname: impl path::Arg) -> Result<FileStat, Errno> {
         let pathname = self.resolve_path(pathname)?;
-        self.do_stat(pathname, true)
+        litebox_util_log::debug!(path:? = pathname; "sys_stat: entry");
+        let result: Result<FileStat, Errno> = self.do_stat(pathname, true);
+        match &result {
+            Ok(st) => {
+                let (mode, rdev) = (st.st_mode, st.st_rdev);
+                litebox_util_log::debug!(mode:% = mode, rdev:% = rdev; "sys_stat: returning");
+            }
+            Err(e) => litebox_util_log::debug!(errno:? = e; "sys_stat: error"),
+        }
+        result
     }
 
     /// Handle syscall `lstat`
@@ -2328,10 +2337,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Handle syscall `fstat`
     pub fn sys_fstat(&self, fd: i32) -> Result<FileStat, Errno> {
+        litebox_util_log::debug!(fd:% = fd; "sys_fstat: entry");
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
-        descriptor_stat(raw_fd, self)
+        let result: Result<FileStat, Errno> = descriptor_stat(raw_fd, self);
+        match &result {
+            Ok(st) => {
+                let (mode, rdev) = (st.st_mode, st.st_rdev);
+                litebox_util_log::debug!(mode:% = mode, rdev:% = rdev; "sys_fstat: returning");
+            }
+            Err(e) => litebox_util_log::debug!(errno:? = e; "sys_fstat: error"),
+        }
+        result
     }
 
     fn do_fstatat<T>(
@@ -2377,7 +2395,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EINVAL);
         }
 
-        self.do_fstatat(dirfd, pathname, flags)
+        litebox_util_log::debug!(
+            dirfd:% = dirfd, flags:? = flags; "sys_newfstatat: entry"
+        );
+        let result: Result<FileStat, Errno> = self.do_fstatat(dirfd, pathname, flags);
+        match &result {
+            Ok(st) => {
+                let (mode, rdev) = (st.st_mode, st.st_rdev);
+                litebox_util_log::debug!(
+                    mode:% = mode, rdev:% = rdev; "sys_newfstatat: returning"
+                );
+            }
+            Err(e) => litebox_util_log::debug!(errno:? = e; "sys_newfstatat: error"),
+        }
+        result
     }
 
     /// Handle syscall `statx`
@@ -3936,6 +3967,64 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     version: 0,
                 };
                 ptr.write_at_offset::<Platform>(0, id).ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::EvdevGetBits { ev, len, arg: ptr } => {
+                files.run_on_raw_fd(
+                    desc,
+                    |fd| {
+                        if self.is_input_device(&files.fs, fd)? {
+                            Ok(())
+                        } else {
+                            Err(Errno::ENOTTY)
+                        }
+                    },
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                )??;
+                // The device only ever emits `EV_KEY`/`EV_REL` events (see
+                // `EvdevSubsystem::push_key`/`push_rel`) -- report exactly that supported-types
+                // set for `ev == 0`, the real code ranges for `EV_KEY`/`EV_REL` themselves
+                // (matching what `push_key`/`push_rel` actually accept), and an all-zero
+                // bitmask for every other event type: a real, correct "device supports none of
+                // these" answer per libevdev's own source, not a stub.
+                let mut bits = vec![0u8; 32];
+                let set_bit = |bits: &mut [u8], code: u16| {
+                    let code = usize::from(code);
+                    if let Some(byte) = bits.get_mut(code / 8) {
+                        *byte |= 1 << (code % 8);
+                    }
+                };
+                match ev {
+                    0 => {
+                        set_bit(&mut bits, litebox_common_linux::EV_SYN);
+                        set_bit(&mut bits, litebox_common_linux::EV_KEY);
+                        set_bit(&mut bits, litebox_common_linux::EV_REL);
+                    }
+                    ev if ev == u32::from(litebox_common_linux::EV_KEY) => {
+                        for code in 1..=111u16 {
+                            set_bit(&mut bits, code);
+                        }
+                        set_bit(&mut bits, litebox_common_linux::BTN_LEFT);
+                        set_bit(&mut bits, litebox_common_linux::BTN_RIGHT);
+                        set_bit(&mut bits, litebox_common_linux::BTN_MIDDLE);
+                    }
+                    ev if ev == u32::from(litebox_common_linux::EV_REL) => {
+                        set_bit(&mut bits, litebox_common_linux::REL_X);
+                        set_bit(&mut bits, litebox_common_linux::REL_Y);
+                        set_bit(&mut bits, litebox_common_linux::REL_WHEEL);
+                    }
+                    _ => {}
+                }
+                let write_len = usize::try_from(len).unwrap_or(0).min(bits.len());
+                ptr.write_slice_at_offset::<Platform>(0, &bits[..write_len])
+                    .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
             _ => {
