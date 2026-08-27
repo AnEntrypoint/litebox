@@ -3660,6 +3660,24 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             assert!(suggested_range.end <= <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::
                                                             TASK_ADDR_MAX);
 
+            // Hold `ALLOCATE_PAGES_FIXED_ADDR_LOCK` across the ENTIRE check-then-act sequence
+            // below (the `has_committed_page` query through the final `VirtualAlloc2`/`VirtualFree`
+            // calls) -- without this, a real TOCTOU race exists: `has_committed_page` can observe
+            // a range as free, but before this thread's own subsequent allocation call actually
+            // reserves/commits it, a DIFFERENT concurrently-running guest process's thread could
+            // allocate into the exact same real address (confirmed real and unfixed via direct
+            // code review: the existing `assert_eq!(fixed_address_behavior, Replace, "raced with
+            // another memory allocator")` a few lines below is a pre-existing, already-known,
+            // still-live acknowledgment of this exact gap, previously marked only with a
+            // `// TODO: handle this race condition properly` comment). Real Linux's kernel-level
+            // `mmap()` is atomic against concurrent sibling-process mmaps; this two-Windows-API-
+            // call reimplementation was not, until now. Scoped to only the fixed-address path
+            // (`suggested_range.start != 0`) -- the OS-picks-any-address path (`start == 0`) has
+            // no equivalent race, since `VirtualAlloc2` with no address hint is itself atomic.
+            let _fixed_addr_guard = ALLOCATE_PAGES_FIXED_ADDR_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+
             let has_committed_page =
                 process_memory_range_by_regions(suggested_range.clone(), |_r, state| {
                     if state == Win32_Memory::MEM_COMMIT {
@@ -4421,6 +4439,16 @@ static STDERR_WRITE_LOCK: Mutex<()> = Mutex::new(());
 /// call itself, so the two paths can never observe or produce a torn intermediate protection state
 /// on a shared page.
 pub(crate) static VIRTUAL_PROTECT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Serializes `allocate_pages`'s fixed-address (`suggested_range.start != 0`) check-then-act
+/// sequence -- see that call site's own comment for the real TOCTOU race this closes: without a
+/// lock spanning the ENTIRE query-then-allocate span, two concurrently-running guest processes'
+/// own OS threads could both observe the same real address range as free and then both allocate
+/// into it, silently aliasing each other's memory with no error, no page fault, and no
+/// guest-visible signal -- the exact same class of gap `CLAIMED_RANGES`'s own doc comment
+/// documents for a DIFFERENT, already-defended case (fixed-address `Replace`-mode reuse); this
+/// lock closes the general case for every `fixed_address_behavior` variant.
+static ALLOCATE_PAGES_FIXED_ADDR_LOCK: Mutex<()> = Mutex::new(());
 
 fn write_to_raw_handle(
     handle: windows_sys::Win32::Foundation::HANDLE,
