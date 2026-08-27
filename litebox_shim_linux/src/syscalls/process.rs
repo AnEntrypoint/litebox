@@ -2288,6 +2288,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     ),
                 )
             } else {
+                // Temporary (fork/brk timing-gap investigation): timestamp the exact moment the
+                // proactive address-space-duplication sweep runs, so a full trace can be checked
+                // for whether a given `sys_brk` growth event (see `sys_brk`'s own "sys_brk:
+                // returned" debug log in `mm.rs`) landed BEFORE this point (the sweep should have
+                // seen it) or AFTER it (the sweep genuinely could not have seen it).
+                litebox_util_log::debug!(
+                    tid:% = self.tid;
+                    "do_clone: about to duplicate address space for fork()"
+                );
                 let (dest_pm, relocations) = unsafe {
                     self.process().pm().duplicate(&self.global.litebox)
                 }
