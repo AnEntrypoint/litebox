@@ -274,6 +274,51 @@ fn diag_watchaddr_target() -> usize {
 /// removes that overhead while preserving the exact guarantee the original comment wanted: the
 /// watch is still set before the first guest instruction ever runs on this thread, because the
 /// one-shot arm below still happens on this thread's very first `Resume`.
+/// Arms a `Dr1` 8-byte write watchpoint on `addr` on an ALREADY-SUSPENDED thread handle. Mirrors
+/// [`arm_on_handle`]'s cross-thread pattern but targets breakpoint 1 (`Dr1`/`L1`) instead of
+/// breakpoint 0 (`Dr0`/`L0`), and preserves whatever `Dr0`/`L0` config is already present (ORs in
+/// the `L1` bits rather than overwriting `Dr7` wholesale) -- same reasoning as the inline comment
+/// this replaced in `arm_fixed_on_current_thread`.
+///
+/// # Safety
+/// `handle` must be a valid, currently-suspended thread handle with `THREAD_SET_CONTEXT` /
+/// `THREAD_GET_CONTEXT` access.
+unsafe fn arm_dr1_on_suspended_handle(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    addr: usize,
+) -> bool {
+    // SAFETY: caller guarantees `handle` is valid and the thread is suspended.
+    unsafe {
+        let mut context = CONTEXT {
+            ContextFlags: CONTEXT_DEBUG_REGISTERS_AMD64,
+            ..core::mem::zeroed()
+        };
+        if GetThreadContext(handle, &raw mut context) == 0 {
+            eprintln!(
+                "[ctxwatch-fixed] helper: GetThreadContext failed: {}",
+                std::io::Error::last_os_error(),
+            );
+            return false;
+        }
+        context.Dr1 = addr as u64;
+        // Dr7: bit 2 (L1) local-enable for breakpoint 1; bits 20-21 (R/W1) = 01 write-only;
+        // bits 22-23 (LEN1) = 10 (8 bytes). Preserve whatever L0/Dr0 config (the separate
+        // `ctxwatch` Dr0 mechanism) is already present in `context.Dr7`/`context.Dr0` from the
+        // `GetThreadContext` read above -- this only ORs in the L1 bits, never clears L0.
+        let rw1_write: u64 = 0b01;
+        let len1_8bytes: u64 = 0b10;
+        context.Dr7 |= (1 << 2) | (rw1_write << 20) | (len1_8bytes << 22) | (1 << 10);
+        if SetThreadContext(handle, &raw const context) == 0 {
+            eprintln!(
+                "[ctxwatch-fixed] helper: SetThreadContext (arm Dr1) failed: {}",
+                std::io::Error::last_os_error(),
+            );
+            return false;
+        }
+    }
+    true
+}
+
 pub(super) fn arm_fixed_on_current_thread() {
     let addr = diag_watchaddr_target();
     if addr == 0 {
@@ -289,57 +334,68 @@ pub(super) fn arm_fixed_on_current_thread() {
     }) {
         return;
     }
+    // CONFIRMED LIVE (this pass, superseding the previous comment here): a REAL `OpenThread`
+    // handle on one's OWN currently-executing thread id still fails `Get`/`SetThreadContext` for
+    // `CONTEXT_DEBUG_REGISTERS` with `ERROR_NOACCESS`/998, identically to the `GetCurrentThread()`
+    // pseudo-handle. The previous comment's claim that a real handle "does not have this
+    // restriction" was never actually verified to succeed by a live trace -- it was inferred from
+    // documentation. Root cause: Windows cannot read/write a live thread's register state (debug
+    // registers included) while that thread is the one making the call and still running --  the
+    // thread must be SUSPENDED first, from a DIFFERENT thread, exactly like `arm_on_handle`'s
+    // existing cross-thread path already requires of its callers. Fixed here by spawning a tiny,
+    // short-lived helper OS thread that does the suspend/arm/resume itself, so
+    // `arm_fixed_on_current_thread` keeps its simple "call this and it's armed when it returns"
+    // contract for its own caller.
     unsafe {
-        // The `GetCurrentThread()` pseudo-handle (`-2`) cannot be used with
-        // `Get`/`SetThreadContext` for `CONTEXT_DEBUG_REGISTERS` on the thread's own
-        // currently-executing context -- confirmed live (`ERROR_NOACCESS`/998 from both calls)
-        // rather than assumed from documentation, since this exact self-arm path had never
-        // previously been confirmed to succeed in any historical trace. A real handle opened via
-        // `OpenThread` on the thread's own OS thread id does not have this restriction.
-        let real_handle = windows_sys::Win32::System::Threading::OpenThread(
-            windows_sys::Win32::System::Threading::THREAD_ALL_ACCESS,
+        let mut pseudo_handle: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+        let current_process = windows_sys::Win32::System::Threading::GetCurrentProcess();
+        let current_thread_pseudo = windows_sys::Win32::System::Threading::GetCurrentThread();
+        if windows_sys::Win32::Foundation::DuplicateHandle(
+            current_process,
+            current_thread_pseudo,
+            current_process,
+            &raw mut pseudo_handle,
             0,
-            windows_sys::Win32::System::Threading::GetCurrentThreadId(),
-        );
-        if real_handle.is_null() {
+            0,
+            windows_sys::Win32::Foundation::DUPLICATE_SAME_ACCESS,
+        ) == 0
+        {
             eprintln!(
-                "[ctxwatch-fixed] tid={:?} OpenThread(self) failed: {}",
+                "[ctxwatch-fixed] tid={:?} DuplicateHandle(self) failed: {}",
                 std::thread::current().id(),
                 std::io::Error::last_os_error(),
             );
             return;
         }
-        let _close_guard = litebox::utils::defer(|| {
-            windows_sys::Win32::Foundation::CloseHandle(real_handle);
+        // `pseudo_handle` is now a real, waitable/suspendable handle to the calling thread, safe
+        // to hand to a different OS thread (unlike the `GetCurrentThread()` pseudo-handle itself,
+        // which is only meaningful when used BY the thread it names).
+        let target = pseudo_handle as usize;
+        let joiner = std::thread::spawn(move || -> bool {
+            let handle = target as windows_sys::Win32::Foundation::HANDLE;
+            if windows_sys::Win32::System::Threading::SuspendThread(handle) == u32::MAX {
+                eprintln!(
+                    "[ctxwatch-fixed] helper: SuspendThread failed: {}",
+                    std::io::Error::last_os_error(),
+                );
+                windows_sys::Win32::Foundation::CloseHandle(handle);
+                return false;
+            }
+            let ok = arm_dr1_on_suspended_handle(handle, addr);
+            windows_sys::Win32::System::Threading::ResumeThread(handle);
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+            ok
         });
-
-        let mut context = CONTEXT {
-            ContextFlags: CONTEXT_DEBUG_REGISTERS_AMD64,
-            ..core::mem::zeroed()
-        };
-        if GetThreadContext(real_handle, &raw mut context) == 0 {
-            eprintln!(
-                "[ctxwatch-fixed] tid={:?} GetThreadContext failed: {}",
-                std::thread::current().id(),
-                std::io::Error::last_os_error(),
-            );
-            return;
-        }
-        context.Dr1 = addr as u64;
-        // Dr7: bit 2 (L1) local-enable for breakpoint 1; bits 20-21 (R/W1) = 01 write-only;
-        // bits 22-23 (LEN1) = 10 (8 bytes). Preserve whatever L0/Dr0 config (the separate
-        // `ctxwatch` Dr0 mechanism) is already present in `context.Dr7`/`context.Dr0` from the
-        // `GetThreadContext` read above -- this only ORs in the L1 bits, never clears L0.
-        let rw1_write: u64 = 0b01;
-        let len1_8bytes: u64 = 0b10;
-        context.Dr7 |= (1 << 2) | (rw1_write << 20) | (len1_8bytes << 22) | (1 << 10);
-        if SetThreadContext(real_handle, &raw const context) == 0 {
-            eprintln!(
-                "[ctxwatch-fixed] tid={:?} SetThreadContext (arm Dr1) failed: {}",
-                std::thread::current().id(),
-                std::io::Error::last_os_error(),
-            );
-            return;
+        match joiner.join() {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(_) => {
+                eprintln!(
+                    "[ctxwatch-fixed] tid={:?} helper thread panicked while arming",
+                    std::thread::current().id(),
+                );
+                return;
+            }
         }
     }
     eprintln!(
