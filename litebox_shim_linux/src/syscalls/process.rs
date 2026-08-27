@@ -2680,7 +2680,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // corresponding page is a separate, but byte-identical-until-this-write, physical
                 // mapping) -- so writing it here, on the parent's thread, before the child process
                 // is ever resumed, is exactly as correct as it is for the thread-based case.
-                if child_fs_base != parent_fs_base {
+                // `translate()`'s `dest_base` comes from `insert_mapping(Hint)`, which falls back
+                // to an OS-picked address (no relative bias) whenever the group's own suggested
+                // address is already committed elsewhere -- that fallback carries no guarantee of
+                // avoiding memory the process already uses for something else. A live hardware
+                // watchpoint capture caught `child_fs_base` landing exactly on a live mallocng
+                // `struct meta`, so these repair writes corrupted its `prev`/`mem`/`avail_mask`
+                // fields (bytes 0x00-0x1f; NOT an offset coincidence with `struct pthread` --
+                // musl v1.2.6's `mallocng/meta.h` puts `meta.prev`/`meta.next` at 0x00/0x08, not
+                // 0x10/0x18). `is_in_destination` re-checks `child_fs_base` against the ranges this
+                // duplication call actually produced before trusting it as the child's own TCB.
+                let child_fs_base_verified_in_destination =
+                    child_fs_base != parent_fs_base && relocations.is_in_destination(child_fs_base);
+                if child_fs_base_verified_in_destination {
                     let slot = UserPtrMut::<usize>::from_usize(child_fs_base);
                     let _ = slot.write_at_offset::<Platform>(0, child_fs_base);
                 }
@@ -2736,7 +2748,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // same musl code path remains unidentified. This fix is real and independently
                 // correct (the invariant it restores is unconditionally required regardless of what
                 // else is wrong), but is not, by itself, proven sufficient to end the hang.
-                if child_fs_base != parent_fs_base {
+                if child_fs_base_verified_in_destination {
                     const TCB_PREV_OFFSET: usize = 0x10;
                     const TCB_NEXT_OFFSET: usize = 0x18;
                     let prev_slot =
