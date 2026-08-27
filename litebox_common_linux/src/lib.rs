@@ -1551,6 +1551,19 @@ pub enum IoctlArg {
     /// `EVIOCGID` -- report the device's bus/vendor/product/version identity. Mandatory for
     /// `libevdev_new_from_fd()`; failure aborts device creation.
     EvdevGetId(UserPtrMut<InputId>),
+    /// `EVIOCGBIT(ev, len)` -- report the bitmask of codes the device supports for event type
+    /// `ev` (or, when `ev == 0`, the bitmask of event TYPES the device supports at all). This is
+    /// a *variable-length* ioctl family (`_IOC(_IOC_READ, 'E', 0x20 + ev, len)`): the ioctl
+    /// NUMBER itself encodes both `ev` and the caller-requested buffer length `len`, so it can't
+    /// be matched as a single fixed constant the way `EVIOCGID`/`EVIOCGVERSION` are -- `ev`/`len`
+    /// are decoded directly from the raw `cmd` value at dispatch time. Non-fatal on failure
+    /// (`libevdev_new_from_fd()` tolerates `EINVAL` here per its own real source), but a
+    /// zero/wrong bitmask makes libinput misclassify the device's actual capabilities.
+    EvdevGetBits {
+        ev: u32,
+        len: u32,
+        arg: UserPtrMut<u8>,
+    },
     Raw {
         cmd: u32,
         arg: UserPtrMut<u8>,
@@ -3623,6 +3636,17 @@ impl SyscallRequest {
                         EVIOCREVOKE => IoctlArg::EvdevRevoke,
                         EVIOCGVERSION => IoctlArg::EvdevGetVersion(ctx.sys_req_ptr(2)),
                         EVIOCGID => IoctlArg::EvdevGetId(ctx.sys_req_ptr(2)),
+                        _ if (cmd >> 8) & 0xff == u32::from(b'E')
+                            && (cmd & 0xff) >= 0x20
+                            && (cmd & 0xff) < 0x40
+                            && (cmd >> 30) & 0x3 == 0x2 =>
+                        {
+                            IoctlArg::EvdevGetBits {
+                                ev: (cmd & 0xff) - 0x20,
+                                len: (cmd >> 16) & 0x3fff,
+                                arg: ctx.sys_req_ptr(2),
+                            }
+                        }
                         _ => IoctlArg::Raw {
                             cmd,
                             arg: ctx.sys_req_ptr(2),

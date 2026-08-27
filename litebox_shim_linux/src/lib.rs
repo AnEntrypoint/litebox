@@ -743,6 +743,9 @@ fn default_fs<Platform: ShimPlatform>(
             .mount("/run/udev/data", |allocator| {
                 litebox::fs::devices::UdevDb::new(litebox, allocator)
             })
+            .mount("/sys/dev/char", |allocator| {
+                litebox::fs::devices::SysDevChar::new(litebox, allocator)
+            })
             .build()
             .unwrap(),
     );
