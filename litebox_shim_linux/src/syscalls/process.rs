@@ -1639,6 +1639,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// resolution.
     pub(crate) fn prepare_for_exit(&mut self) {
         litebox_util_log::debug!(tid:% = self.tid; "prepare_for_exit: entry (Task dropping)");
+        // Snapshot + detach BEFORE `detach_from_process_deferred()` below: that call's own
+        // `detach_thread` unconditionally calls `signal_vfork_done()` when it observes the last
+        // thread exiting, clearing the `vfork_done` flag `detach_pm_for_vfork_execve` itself
+        // gates on -- calling the detach AFTER that point (as an earlier version of this fix
+        // did) always observed an already-cleared flag and silently no-op'd, never actually
+        // swapping the `PageManager`. Detaching here, first, is safe and idempotent regardless
+        // of whether this turns out to be the last thread: a non-last-thread exit is always a
+        // plain `pthread_exit`-style thread exit within an already-`execve`'d (or never-vforked)
+        // process, for which this is already a guaranteed no-op (`vfork_done` is only ever
+        // nonzero for a `CLONE_VFORK` child's OWN initial thread, between `clone()` and its own
+        // first `execve`/`exit`).
+        let _ = self.process().detach_pm_for_vfork_execve(&self.global.litebox);
         // Deferred: do NOT wake `wait4`/`wait_for_exit` waiters yet. See
         // `Process::detach_thread`'s doc comment -- a parent's `wait4()` must never be allowed to
         // return before this process's fds are released below, mirroring real Linux's `do_exit()`
@@ -1762,6 +1774,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // `wake_robust_list` -- both genuinely read/write guest memory and must run first.
             // Matches `sys_execve`'s own `release_memory` closure exactly (`!vm.is_empty()`):
             // don't release reserved/placeholder mappings, only real, populated guest memory.
+            //
+            // The `detach_pm_for_vfork_execve` call at this function's own top (before
+            // `detach_from_process_deferred` can clear `vfork_done`) already ensured
+            // `self.process().pm()` below is a private, freshly-detached `PageManager` for a
+            // `CLONE_VFORK` child that never successfully `execve`'d -- see that call's own doc
+            // comment for the full history (a real, confirmed, racy SIGSEGV this fixes: a
+            // `vfork()`ed child exiting via the ordinary exit path, not `execve`, previously
+            // released the STILL-SHARED address space out from under its live, suspended
+            // parent).
             let release = |_r: Range<usize>, vm: VmFlags| !vm.is_empty();
             if let Err(err) = unsafe { self.process().pm().release_memory(release) } {
                 litebox_util_log::warn!(tid:% = self.tid, err:? = err; "prepare_for_exit: release_memory failed");
