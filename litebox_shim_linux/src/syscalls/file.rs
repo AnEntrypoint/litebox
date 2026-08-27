@@ -639,7 +639,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // log line's numeric `fd` back to the real file it refers to, blocking correlation of a
         // crashing memory region against which shared library/ELF actually backs it.
         litebox_util_log::debug!(
-            path:% = path.to_string_lossy(), fd:? = result.as_ref().ok();
+            tid:% = self.tid, path:% = path.to_string_lossy(), fd:? = result.as_ref().ok();
             "sys_openat"
         );
         result
@@ -901,6 +901,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         let result = self.do_read(raw_fd, buf, offset);
         litebox_util_log::debug!(
+            tid:% = self.tid,
             fd:% = fd,
             len:% = buf.len(),
             offset:? = offset,
@@ -2321,14 +2322,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `stat`
     pub fn sys_stat(&self, pathname: impl path::Arg) -> Result<FileStat, Errno> {
         let pathname = self.resolve_path(pathname)?;
-        litebox_util_log::debug!(path:? = pathname; "sys_stat: entry");
+        litebox_util_log::debug!(tid:% = self.tid, path:? = pathname; "sys_stat: entry");
         let result: Result<FileStat, Errno> = self.do_stat(pathname, true);
         match &result {
             Ok(st) => {
                 let (mode, rdev) = (st.st_mode, st.st_rdev);
-                litebox_util_log::debug!(mode:% = mode, rdev:% = rdev; "sys_stat: returning");
+                litebox_util_log::debug!(tid:% = self.tid, mode:% = mode, rdev:% = rdev; "sys_stat: returning");
             }
-            Err(e) => litebox_util_log::debug!(errno:? = e; "sys_stat: error"),
+            Err(e) => litebox_util_log::debug!(tid:% = self.tid, errno:? = e; "sys_stat: error"),
         }
         result
     }
@@ -2345,7 +2346,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Handle syscall `fstat`
     pub fn sys_fstat(&self, fd: i32) -> Result<FileStat, Errno> {
-        litebox_util_log::debug!(fd:% = fd; "sys_fstat: entry");
+        litebox_util_log::debug!(tid:% = self.tid, fd:% = fd; "sys_fstat: entry");
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
@@ -2353,9 +2354,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         match &result {
             Ok(st) => {
                 let (mode, rdev) = (st.st_mode, st.st_rdev);
-                litebox_util_log::debug!(mode:% = mode, rdev:% = rdev; "sys_fstat: returning");
+                litebox_util_log::debug!(tid:% = self.tid, mode:% = mode, rdev:% = rdev; "sys_fstat: returning");
             }
-            Err(e) => litebox_util_log::debug!(errno:? = e; "sys_fstat: error"),
+            Err(e) => litebox_util_log::debug!(tid:% = self.tid, errno:? = e; "sys_fstat: error"),
         }
         result
     }
@@ -2404,17 +2405,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         litebox_util_log::debug!(
-            dirfd:% = dirfd, flags:? = flags; "sys_newfstatat: entry"
+            tid:% = self.tid, dirfd:% = dirfd, flags:? = flags; "sys_newfstatat: entry"
         );
         let result: Result<FileStat, Errno> = self.do_fstatat(dirfd, pathname, flags);
         match &result {
             Ok(st) => {
                 let (mode, rdev) = (st.st_mode, st.st_rdev);
                 litebox_util_log::debug!(
-                    mode:% = mode, rdev:% = rdev; "sys_newfstatat: returning"
+                    tid:% = self.tid, mode:% = mode, rdev:% = rdev; "sys_newfstatat: returning"
                 );
             }
-            Err(e) => litebox_util_log::debug!(errno:? = e; "sys_newfstatat: error"),
+            Err(e) => litebox_util_log::debug!(tid:% = self.tid, errno:? = e; "sys_newfstatat: error"),
         }
         result
     }
@@ -3560,6 +3561,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let is_input =
                     major == 13 && status.file_type == litebox::fs::FileType::CharacterDevice;
                 litebox_util_log::debug!(
+                    tid:% = self.tid,
                     rdev:? = status.node_info.rdev.map(|v| (v.get() >> 8, v.get() & 0xff)),
                     file_type:? = status.file_type,
                     is_input:% = is_input;
@@ -3592,7 +3594,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EBADF);
         };
 
-        litebox_util_log::debug!(fd:% = fd, arg:? = arg; "sys_ioctl: entry");
+        litebox_util_log::debug!(tid:% = self.tid, fd:% = fd, arg:? = arg; "sys_ioctl: entry");
         let files = self.files.borrow();
         match arg {
             IoctlArg::FIONBIO(arg) => {
@@ -4042,6 +4044,61 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 ptr.write_slice_at_offset::<Platform>(0, &bits[..write_len])
                     .ok_or(Errno::EFAULT)?;
                 Ok(0)
+            }
+            IoctlArg::EvdevGetName { len, arg: ptr } => {
+                files.run_on_raw_fd(
+                    desc,
+                    |fd| {
+                        if self.is_input_device(&files.fs, fd)? {
+                            Ok(())
+                        } else {
+                            Err(Errno::ENOTTY)
+                        }
+                    },
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                )??;
+                // `EVIOCGNAME` failing is unconditionally fatal to `libevdev_new_from_fd()`
+                // (unlike `EVIOCGPHYS`/`EVIOCGUNIQ`, which tolerate `ENOENT`) -- a real,
+                // non-empty name string is mandatory, not optional. The kernel does NOT
+                // NUL-terminate if the name fills the whole buffer; callers size their own
+                // buffer and rely on the returned byte count, so truncate to fit without
+                // requiring a trailing NUL.
+                const NAME: &[u8] = b"litebox virtual input";
+                let write_len = usize::try_from(len).unwrap_or(0).min(NAME.len());
+                ptr.write_slice_at_offset::<Platform>(0, &NAME[..write_len])
+                    .ok_or(Errno::EFAULT)?;
+                Ok(u32::try_from(write_len).unwrap_or(0))
+            }
+            IoctlArg::EvdevGetPhysOrUniq => {
+                files.run_on_raw_fd(
+                    desc,
+                    |fd| {
+                        if self.is_input_device(&files.fs, fd)? {
+                            Ok(())
+                        } else {
+                            Err(Errno::ENOTTY)
+                        }
+                    },
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                )??;
+                // This synthetic device has no physical-location/unique-ID string, matching real
+                // uinput/virtual-device behavior -- `ENOENT` here is what `libevdev_new_from_fd()`
+                // specifically tolerates, not a stub.
+                Err(Errno::ENOENT)
             }
             _ => {
                 log_unsupported!("ioctl with arg {:?}", arg);
