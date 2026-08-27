@@ -998,6 +998,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
 
         litebox_util_log::debug!(
+            guest_tid:? = self.sys_gettid(),
             fd:? = fd, mapped_addr:? = mapped_addr, base_addr:? = base_addr,
             pre_patched:? = pre_patched, tramp_file_size:? = tramp_file_size,
             trampoline_vaddr:? = trampoline_vaddr;

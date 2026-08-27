@@ -455,6 +455,41 @@ unsafe extern "system" fn vectored_exception_handler(
         context = &mut *info.ContextRecord;
     }
 
+    // Pass (2026-08-27 XFCE session, take 2): call the raw, allocation-free, lock-free
+    // `diag_raw_regdump` (WriteFile-on-stack, same mechanism the global allocator's own
+    // diagnostics use) as the UNCONDITIONAL, LITERAL FIRST thing this handler does with
+    // `exception_record`/`context` in hand -- before `veh_trace_enabled()`'s own `eprintln!`
+    // calls below, before `diag_fataldump_enabled()`'s gated block, before `IN_VEH_DIAG_BLOCK`.
+    // Live captures this pass showed the real, causative first fault (`is_in_guest=true`,
+    // `addr=usize::MAX`) reaches the `veh_trace_enabled()` block below and its `eprintln!` calls,
+    // but that block's own formatting/allocation/stdio-lock machinery re-faults on this thread
+    // (whose heap/lock state is already corrupted by the very bug being diagnosed) BEFORE those
+    // prints complete -- permanently losing this fault's registers behind whatever LATER fault in
+    // the same cascade happens to reach a working print first (previously misidentified as "the"
+    // crash across three retracted hypotheses: `0x4e12c0`, `0xfefefefefefefeff`, "-libcalls" --
+    // all three were actually a downstream, already-corrupted-execution-state artifact fault, not
+    // the real bug). `eprintln!` is fundamentally not safe to call first on a thread in this
+    // state; only a raw `WriteFile` with no allocation and no lock is trustworthy here.
+    if veh_trace_enabled() || diag_fataldump_enabled() {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "diagnostic-only; this platform is x86_64-only, register values fit in usize"
+        )]
+        diag_raw_regdump(
+            exception_record.ExceptionCode.cast_unsigned(),
+            exception_record.ExceptionInformation[1],
+            context.Rip as usize,
+            context.Rax as usize,
+            context.Rbx as usize,
+            context.Rcx as usize,
+            context.Rdx as usize,
+            context.Rsi as usize,
+            context.Rdi as usize,
+            context.Rsp as usize,
+            context.Rbp as usize,
+        );
+    }
+
     if veh_trace_enabled() {
         // DIAG-REALSTACK (mallocng .meta=0 investigation continuation): reads the REAL host
         // TEB's StackBase/StackLimit/DeallocationStack directly via inline asm to check whether a
@@ -4676,6 +4711,87 @@ fn diag_raw_print(prefix: &[u8], a: usize, mid: &[u8], b: usize) {
     push(mid, &mut line, &mut pos);
     let mut hexbuf2 = [0u8; 20];
     push(fmt_usize_hex(b, &mut hexbuf2), &mut line, &mut pos);
+    push(b"\n", &mut line, &mut pos);
+    unsafe {
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
+        let handle = GetStdHandle(STD_ERROR_HANDLE);
+        if !handle.is_null() && handle != Win32_Foundation::INVALID_HANDLE_VALUE {
+            let mut written: u32 = 0;
+            windows_sys::Win32::Storage::FileSystem::WriteFile(
+                handle,
+                line.as_ptr(),
+                u32::try_from(pos).unwrap_or(u32::MAX),
+                &raw mut written,
+                core::ptr::null_mut(),
+            );
+        }
+    }
+}
+
+/// Raw, allocation-free, lock-free dump of the fault's full register set plus the exception
+/// code/faulting address, via the same `WriteFile`-on-stack mechanism as [`diag_raw_print`].
+/// Exists because `eprintln!`/`format!` (used by the `[veh-regs] ENTRY` print a few lines below
+/// this call site) do real host heap allocation and take the stdio lock -- both were caught this
+/// pass re-faulting on a thread whose heap/lock state is already corrupted by the same bug this
+/// diagnostic exists to observe, silently losing the first, real, causative fault's own register
+/// state behind a second "fault-in-the-fault-handler" (a non-standard `code=0x6` host-side
+/// exception) every time it happened. Called as the LITERAL FIRST operation once the fatal-dump
+/// gate is true, before even `VehDiagBlockGuard::enter()` -- if thread-local access or heap
+/// allocation is what's re-faulting, guarding against re-entrancy after already attempting one of
+/// those is too late.
+#[allow(clippy::too_many_arguments, reason = "raw diagnostic dump, one field per register")]
+fn diag_raw_regdump(
+    code: u32,
+    addr: usize,
+    rip: usize,
+    rax: usize,
+    rbx: usize,
+    rcx: usize,
+    rdx: usize,
+    rsi: usize,
+    rdi: usize,
+    rsp: usize,
+    rbp: usize,
+) {
+    let mut line = [0u8; 512];
+    let mut pos = 0usize;
+    let push = |bytes: &[u8], line: &mut [u8; 512], pos: &mut usize| {
+        let n = bytes.len().min(line.len().saturating_sub(*pos));
+        line[*pos..*pos + n].copy_from_slice(&bytes[..n]);
+        *pos += n;
+    };
+    let push_hex = |v: usize, line: &mut [u8; 512], pos: &mut usize| {
+        let mut hexbuf = [0u8; 20];
+        push(fmt_usize_hex(v, &mut hexbuf), line, pos);
+    };
+    push(b"[veh] RAWREGS tid=", &mut line, &mut pos);
+    push_hex(
+        unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() } as usize,
+        &mut line,
+        &mut pos,
+    );
+    push(b" code=", &mut line, &mut pos);
+    push_hex(code as usize, &mut line, &mut pos);
+    push(b" addr=", &mut line, &mut pos);
+    push_hex(addr, &mut line, &mut pos);
+    push(b" rip=", &mut line, &mut pos);
+    push_hex(rip, &mut line, &mut pos);
+    push(b" rax=", &mut line, &mut pos);
+    push_hex(rax, &mut line, &mut pos);
+    push(b" rbx=", &mut line, &mut pos);
+    push_hex(rbx, &mut line, &mut pos);
+    push(b" rcx=", &mut line, &mut pos);
+    push_hex(rcx, &mut line, &mut pos);
+    push(b" rdx=", &mut line, &mut pos);
+    push_hex(rdx, &mut line, &mut pos);
+    push(b" rsi=", &mut line, &mut pos);
+    push_hex(rsi, &mut line, &mut pos);
+    push(b" rdi=", &mut line, &mut pos);
+    push_hex(rdi, &mut line, &mut pos);
+    push(b" rsp=", &mut line, &mut pos);
+    push_hex(rsp, &mut line, &mut pos);
+    push(b" rbp=", &mut line, &mut pos);
+    push_hex(rbp, &mut line, &mut pos);
     push(b"\n", &mut line, &mut pos);
     unsafe {
         use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
