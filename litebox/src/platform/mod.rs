@@ -91,6 +91,17 @@ pub trait ThreadProvider: RawPointerProvider {
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
         f()
     }
+
+    /// Returns the host OS's own thread identifier for the current thread, for
+    /// diagnostic correlation with host-level crash dumps (which report an
+    /// OS thread id, not litebox's own guest-space `Task::tid`). Purely
+    /// diagnostic -- no functional code should depend on this value.
+    ///
+    /// Default implementation returns 0 (unavailable); platforms that can
+    /// cheaply expose a real host thread id should override this.
+    fn host_debug_tid(&self) -> u64 {
+        0
+    }
 }
 
 #[non_exhaustive]

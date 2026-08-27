@@ -2351,6 +2351,10 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
         let tls = TlsState::new();
         ThreadHandle::run_with_handle(&tls, f)
     }
+
+    fn host_debug_tid(&self) -> u64 {
+        u64::from(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() })
+    }
 }
 
 impl litebox::platform::TimerProvider for WindowsUserland {

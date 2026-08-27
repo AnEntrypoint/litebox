@@ -659,6 +659,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // later when something dereferences the resulting bad pointer.
         if let Ok(r) = &result {
             litebox_util_log::debug!(
+                tid:% = self.tid, host_tid:% = self.global.platform.host_debug_tid(),
                 addr:% = addr, len:% = aligned_len, returned:% = r.as_usize();
                 "sys_mmap: returned"
             );
@@ -677,6 +678,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // while investigating the mallocng `.meta=0` use-after-free (a group pointer's crashing
         // address had zero matches anywhere in an otherwise-complete debug trace).
         litebox_util_log::debug!(
+            tid:% = self.tid, host_tid:% = self.global.platform.host_debug_tid(),
             addr:% = addr.as_usize(), len:% = len, ok:% = result.is_ok();
             "sys_munmap"
         );
