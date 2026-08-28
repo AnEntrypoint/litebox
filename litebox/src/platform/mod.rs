@@ -102,6 +102,36 @@ pub trait ThreadProvider: RawPointerProvider {
     fn host_debug_tid(&self) -> u64 {
         0
     }
+
+    /// Declares the guest-space process id (`Task::pid`) that the NEXT thread
+    /// spawned via [`spawn_thread`](Self::spawn_thread) on this calling
+    /// thread will belong to.
+    ///
+    /// A platform that tracks host address ranges per real OS thread as a
+    /// proxy for "which guest process owns this memory" (because every guest
+    /// process here is really just an OS thread sharing one host process, see
+    /// e.g. `litebox_platform_windows_userland`'s `CLAIMED_RANGES`) cannot
+    /// otherwise distinguish "a brand-new pthread within the SAME guest
+    /// process" from "an entirely unrelated guest process" -- both show up as
+    /// a new, distinct OS `ThreadId` with no inherent relationship to the
+    /// spawning thread's own `ThreadId`. Calling this immediately before
+    /// [`spawn_thread`](Self::spawn_thread) lets such a platform propagate
+    /// the correct guest-pid onto the newly-spawned thread at spawn time,
+    /// so both threads are recognized as the same owner.
+    ///
+    /// The shim calls this with the CHILD's own eventual `Task::pid` right
+    /// before every [`spawn_thread`](Self::spawn_thread) call: for an
+    /// ordinary same-process thread clone this is identical to the calling
+    /// thread's own pid (an ordinary pthread `clone()`); for a `fork()`
+    /// (process clone) it is the freshly-allocated child pid, correctly
+    /// giving the child its own, distinct identity from the moment it starts
+    /// running, not a false "same guest process as the parent" merge.
+    ///
+    /// Default implementation does nothing; platforms with no such
+    /// per-thread guest-process bookkeeping can ignore this entirely.
+    fn set_next_spawned_thread_guest_pid(&self, pid: i32) {
+        let _ = pid;
+    }
 }
 
 #[non_exhaustive]
