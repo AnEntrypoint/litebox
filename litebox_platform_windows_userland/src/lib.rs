@@ -2775,11 +2775,25 @@ fn find_foreign_claim(
     })
 }
 
-/// Records that the calling thread now owns `range`, superseding any of ITS OWN prior entries
-/// that overlap it (a re-`execve` or a `Replace` over one's own stale leftover legitimately
-/// changes what this thread owns at that address) but leaving every other thread's entries
-/// untouched. Called only for a `Replace`-mode allocation (see [`CLAIMED_RANGES`]'s doc comment
-/// for why `Hint`/the fresh-address path do not also call this).
+/// Records that the calling thread now owns `range`, coalescing it into any of ITS OWN prior
+/// entries that overlap OR are immediately adjacent to it (a re-`execve` or a `Replace` over
+/// one's own stale leftover legitimately changes what this thread owns at that address; ordinary
+/// contiguous heap/mmap growth on the SAME thread should extend one bounding entry rather than
+/// consume a fresh slot per call) but leaving every other thread's entries untouched.
+///
+/// Originally called only for `Replace`-mode allocations; now also called for `Hint`-mode ones
+/// (see `allocate_pages`'s own call sites) -- a `Hint`-mode allocation (e.g. an ordinary guest
+/// `mmap(NULL, ...)`) commits real, live host memory just as much as a `Replace`-mode one does,
+/// and a DIFFERENT thread's LATER `Replace`-mode fixed-address allocation (e.g. that thread's own
+/// `brk()` growth) can land on this exact real address with no page fault or guest-visible signal
+/// if this range was never claimed -- confirmed live via a weston + weston-desktop-shell repro
+/// where the child's freshly-`brk()`'d heap landed exactly on the parent's own live, unclaimed
+/// `mmap(NULL, 4096)` region, and `find_foreign_claim` returning `None` for it let the `Replace`
+/// path decommit-and-recommit straight over the parent's still-live memory. The merge-into-one-
+/// bounding-entry behavior (rather than the strict supersede-only behavior this function used
+/// before `Hint` calls started reaching it) keeps the fixed-size registry from being exhausted by
+/// ordinary, frequent, mostly-contiguous heap/mmap growth, which `Replace`-only callers never
+/// produced enough of to matter.
 ///
 /// Silently drops the claim if every slot is already in use by some OTHER thread's own ranges
 /// (see [`MAX_CLAIMS`] -- this only gives up this registry's own collision defense for the
@@ -2790,19 +2804,24 @@ fn claim_range(range: core::ops::Range<usize>) {
     }
     let owner = std::thread::current().id();
     let mut claims = CLAIMED_RANGES.lock().unwrap();
-    // Drop this thread's own prior entries that overlap the new range -- they are being
-    // superseded, not merged with.
+    // Absorb this thread's own prior entries that overlap OR touch (are immediately adjacent
+    // to) the new range into one merged bound, rather than dropping them outright -- this is
+    // what keeps ordinary sequential heap/mmap growth on one thread from consuming a fresh slot
+    // per call.
+    let mut merged = range;
     for slot in claims.iter_mut() {
         if let Some((claimed, o)) = slot
             && *o == owner
-            && claimed.start < range.end
-            && claimed.end > range.start
+            && claimed.start <= merged.end
+            && claimed.end >= merged.start
         {
+            merged.start = merged.start.min(claimed.start);
+            merged.end = merged.end.max(claimed.end);
             *slot = None;
         }
     }
     if let Some(empty_slot) = claims.iter_mut().find(|s| s.is_none()) {
-        *empty_slot = Some((range, owner));
+        *empty_slot = Some((merged, owner));
     }
 }
 
@@ -3781,8 +3800,16 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 return Err(AllocationError::AddressInUse);
             } else if has_committed_page
                 && fixed_address_behavior == FixedAddressBehavior::Replace
-                && find_foreign_claim(suggested_range.clone(), std::thread::current().id())
-                    .is_some()
+                && {
+                    let fc =
+                        find_foreign_claim(suggested_range.clone(), std::thread::current().id());
+                    litebox_util_log::debug!(
+                        start:% = suggested_range.start, end:% = suggested_range.end,
+                        found:% = fc.is_some();
+                        "allocate_pages: Replace-mode committed-range foreign-claim check"
+                    );
+                    fc.is_some()
+                }
             {
                 // See `CLAIMED_RANGES`'s doc comment: a committed range here that this thread
                 // does not itself own is another still-live guest process's real memory (most
@@ -3870,9 +3897,17 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         if populate_pages_immediately {
             do_prefetch_on_range(ptr as usize, size);
         }
-        if fixed_address_behavior == FixedAddressBehavior::Replace {
-            claim_range(ptr as usize..(ptr as usize + size));
-        }
+        // Claim unconditionally here (unlike the fixed-address branch above, which only claims
+        // for `Replace`): this is the OS-picks-any-address path, taken by every ordinary guest
+        // `mmap(NULL, ...)` (`Hint` mode) in addition to the unconstrained `Replace`/`NoReplace`
+        // case where `suggested_range.start == 0`. See `claim_range`'s doc comment for why a
+        // `Hint`-mode commit needs to be visible to a later, different thread's `Replace`-mode
+        // collision check.
+        litebox_util_log::debug!(
+            start:% = ptr as usize, end:% = (ptr as usize + size);
+            "allocate_pages: claiming fresh-address (start==0 path) range"
+        );
+        claim_range(ptr as usize..(ptr as usize + size));
         Ok(UserMutPtr::from_ptr(ptr.cast::<u8>()))
     }
 
