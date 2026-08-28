@@ -4081,6 +4081,18 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         range: core::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
         debug_assert_alignment!(range, ALIGN);
+        // Hold `ALLOCATE_PAGES_FIXED_ADDR_LOCK` across this entire query-then-decommit walk, for
+        // the same reason `allocate_pages`'s fixed-address path holds it (see that call site's own
+        // doc comment): `process_memory_range_by_regions`'s `VirtualQuery`-then-act loop has no
+        // atomicity guarantee against a concurrently-running guest thread's own `VirtualFree`/
+        // `VirtualAlloc2` call on the same or an adjacent region -- Windows' own VAD tree can
+        // coalesce/split nodes spanning a query boundary, so an unlocked reader here could act on
+        // a state that's already stale by the time it does. `deallocate_pages` previously took no
+        // lock at all here, an asymmetry with `allocate_pages`'s own already-locked fixed-address
+        // path -- closing it so both allocate and deallocate are serialized against each other.
+        let _fixed_addr_guard = ALLOCATE_PAGES_FIXED_ADDR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         process_memory_range_by_regions(
             range.clone(),
             |r, state| -> Result<bool, std::convert::Infallible> {
