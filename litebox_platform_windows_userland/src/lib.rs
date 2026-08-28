@@ -3852,24 +3852,37 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 && fixed_address_behavior == FixedAddressBehavior::NoReplace
             {
                 return Err(AllocationError::AddressInUse);
-            } else if has_committed_page
-                && fixed_address_behavior == FixedAddressBehavior::Replace
+            } else if fixed_address_behavior == FixedAddressBehavior::Replace
                 && {
+                    // Checked regardless of `has_committed_page`: a foreign claim can cover a
+                    // range Windows currently reports as MEM_FREE or MEM_RESERVE (not yet
+                    // MEM_COMMIT) when the owning thread reserved-but-hasn't-yet-committed it, or
+                    // when this thread's own view of "committed" raced with the owner's. Only
+                    // checking `has_committed_page && Replace` (the prior condition) let a
+                    // `Replace`-mode caller's `MEM_FREE`/`MEM_RESERVE` branch below commit
+                    // straight over another thread's still-live claim with zero foreign-claim
+                    // check at all -- confirmed live via a weston + weston-desktop-shell repro:
+                    // one thread's own already-committed `mmap(NULL, 4096)` region was corrupted
+                    // by a sibling thread's `brk()`-driven `Replace`-mode growth landing on it,
+                    // because `has_committed_page` observed the target range as not-yet-MEM_COMMIT
+                    // at the moment this thread queried it, skipping this check entirely under the
+                    // old `has_committed_page &&` gate.
                     let fc =
                         find_foreign_claim(suggested_range.clone(), std::thread::current().id());
                     litebox_util_log::debug!(
                         start:% = suggested_range.start, end:% = suggested_range.end,
-                        found:% = fc.is_some();
-                        "allocate_pages: Replace-mode committed-range foreign-claim check"
+                        found:% = fc.is_some(), has_committed_page:% = has_committed_page;
+                        "allocate_pages: Replace-mode foreign-claim check"
                     );
                     fc.is_some()
                 }
             {
-                // See `CLAIMED_RANGES`'s doc comment: a committed range here that this thread
+                // See `CLAIMED_RANGES`'s doc comment: a claimed range here that this thread
                 // does not itself own is another still-live guest process's real memory (most
                 // commonly two `ET_EXEC` binaries sharing the same link-time base address while
                 // both alive via nested `vfork()`), never a stale leftover safe to clobber.
-                // Relocate to a fresh address instead of decommitting/recommitting over it.
+                // Relocate to a fresh address instead of decommitting/recommitting/committing
+                // over it.
                 base_addr = core::ptr::null_mut();
             } else {
                 process_memory_range_by_regions(
