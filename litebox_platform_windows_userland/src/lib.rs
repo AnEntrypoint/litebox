@@ -1684,6 +1684,14 @@ struct TlsState {
     ctxwatch: ctxwatch::State,
 }
 
+// SAFETY: `TlsState` is always constructed on one thread and handed to another via
+// `spawn_thread` (built on the spawning thread so a fault during construction is diagnosable,
+// see `thread_start`'s doc comment), then used exclusively by that new thread from
+// `run_with_handle` onward -- its `Cell`/raw-pointer fields are never accessed concurrently by
+// two threads at once, matching `install_tls`'s own safety contract that `tls` remains valid and
+// single-threaded-owned for the duration of its use.
+unsafe impl Send for TlsState {}
+
 /// Scratch space (in bytes) reserved below `host_sp` for the `EXCEPTION_RECORD` that
 /// `vectored_exception_handler` writes when redirecting to `exception_callback`. Must be
 /// large enough to hold a full `EXCEPTION_RECORD` (152 bytes on x86_64) plus alignment slack,
@@ -2294,8 +2302,17 @@ fn thread_start(
         dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
     >,
     mut ctx: litebox_common_linux::PtRegs,
+    tls_state: TlsState,
 ) {
-    let tls_state = TlsState::new();
+    // `tls_state` is constructed by the SPAWNING thread (see `spawn_thread`), not here: any
+    // fault during `TlsState::new()` -- including the heap allocation inside
+    // `continue_context: Box::default()` -- would otherwise run on this brand-new OS thread
+    // BEFORE `install_tls` (called by `run_with_handle` below) has populated this thread's own
+    // Windows TLS slot, hitting the exact same silently-undiagnosable window this function's own
+    // `init_thread.init()` comment below already documents for a different call -- confirmed live
+    // as a 100%-reproducible whole-host-process crash (`labwc`'s own fontconfig-cache pthread
+    // spawn, no `[veh]` trace lines at all) that a fresh `LITEBOX_DIAG_FATALDUMP=1` capture could
+    // not explain until this construction-ordering gap was found by direct code reading.
     tls_state
         .guest_context_top
         .set(std::ptr::from_mut(&mut ctx).wrapping_add(1));
@@ -2358,6 +2375,12 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
         // for this spawn -- the new thread then falls back to its own `ThreadId`, same as before
         // this mechanism existed.
         let guest_pid = NEXT_SPAWNED_THREAD_GUEST_PID.take();
+        // Constructed HERE, on the spawning thread (which already has a valid, installed TLS
+        // slot and is fully protected by `vectored_exception_handler_entry`), not inside the new
+        // thread's own closure -- see `thread_start`'s doc comment for why any fault during this
+        // construction (in particular `continue_context`'s `Box::default()` heap allocation) must
+        // never run on the new thread before `install_tls` has had a chance to run.
+        let tls_state = TlsState::new();
         // TODO: do we need to wait for the handle in the main thread?
         let _handle = std::thread::Builder::new()
             .stack_size(GUEST_THREAD_STACK_SIZE)
@@ -2365,7 +2388,7 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
                 if let Some(pid) = guest_pid {
                     CURRENT_GUEST_PID.set(Some(pid));
                 }
-                thread_start(init_thread, ctx);
+                thread_start(init_thread, ctx, tls_state);
             })?;
 
         Ok(())
