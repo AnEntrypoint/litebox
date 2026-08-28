@@ -317,9 +317,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         //
         // Perf: this does a full scan over all open descriptors: if a process has a HUGE number of
         // open descriptors, this could be slow.
+        //
+        // This lock is held across the ENTIRE migration loop below (collection through the final
+        // `Arc::strong_count` check and swap), not just released after collecting `to_migrate`.
+        // `open()`'s `EntryX::Lower` fast path (which `Arc::clone`s this same path's entry into a
+        // brand-new descriptor-table slot, bumping its strong count) takes `self.root.read()` --
+        // holding the write lock here for the full duration genuinely excludes that racing path,
+        // closing the window where a concurrent `open()` could invalidate the strong-count
+        // invariant the swap below assumes still holds after `to_migrate` was collected.
+        let mut root_guard = self.root.write();
         let RootDir {
             entries: root_entries,
-        } = &mut *self.root.write();
+        } = &mut *root_guard;
         // First we figure out which entries need to be moved up. These entries are arc-cloned into
         // a `Vec` so that we can release the lock the file descriptor table when setting things up
         // within the upper layer.
@@ -369,21 +378,60 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             // Then we check up on replacing entries
             match Arc::strong_count(&entry) {
                 0..=2 => {
-                    // We are holding one, and also there must be an entry in `root` and the file
-                    // descriptor table.
-                    unreachable!()
+                    // Normally unreachable: while `to_migrate` was being collected, this count
+                    // was guaranteed to be >=3 (our own local `entry` clone here, `root_entries`'s
+                    // own reference, and the descriptor-table slot's own reference). But
+                    // `to_migrate`'s collection only holds the descriptor table's OWN lock (not
+                    // `self.root`'s, which THIS loop holds for its whole duration) -- a concurrent
+                    // `close()` on this exact `internal_fd`, racing between that collection and
+                    // this check, can drop the descriptor-table-side reference in the meantime,
+                    // observably reducing the count below 3 by the time we get here. `entry` and
+                    // `root_entries`'s own reference are still safely intact either way (the write
+                    // lock this loop holds on `self.root` for its whole duration guarantees
+                    // `root_entries` itself is untouched); there's simply nothing left in the
+                    // descriptor table for THIS `internal_fd` to migrate anymore -- skip it, the
+                    // close already tore down whatever it referenced. `upper_entry` was never
+                    // installed anywhere else in this branch, so it's still the sole owner of
+                    // `upper_fd`; unwrap it back out to close it rather than leaking the fd.
+                    let EntryX::Upper { fd: upper_fd } = Arc::into_inner(upper_entry).unwrap()
+                    else {
+                        unreachable!()
+                    };
+                    self.upper.close(&upper_fd).ok();
+                    continue;
                 }
                 3 => {
                     // Perfect amount to trigger a `close` on the lower level, and remove
                     // the underlying root entry, since further syncing is no longer
                     // necessary.
-                    let old_entry = self
-                        .litebox
-                        .descriptor_table()
-                        .with_entry_mut_via_internal_fd::<Self, _, _>(internal_fd, |entry| {
-                            core::mem::replace(&mut entry.entry.entry, upper_entry)
-                        })
-                        .expect("nothing should have changed the existing entry");
+                    //
+                    // `internal_fd` was captured while iterating the descriptor table under its
+                    // own, separate lock (dropped before this loop runs) -- a concurrent `close`
+                    // (possibly racing with a `dup` reusing the freed slot for an unrelated file)
+                    // on this exact slot between that iteration and now would otherwise make
+                    // `with_entry_mut_via_internal_fd` silently swap out a DIFFERENT entry that
+                    // now happens to live at the same index, violating the `Arc::ptr_eq` invariant
+                    // below without any actual correctness problem for `path`'s own migration --
+                    // that slot no longer holds anything referencing `path` at all. Compare-and-
+                    // skip instead of blindly swapping: `with_entry_mut_via_internal_fd` only
+                    // performs the replace if the closure's own check (comparing against `entry`
+                    // first) confirms this is still genuinely the same `Arc` we collected earlier.
+                    let old_entry = self.litebox.descriptor_table().with_entry_mut_via_internal_fd::<Self, _, _>(
+                        internal_fd,
+                        |slot| {
+                            if Arc::ptr_eq(&slot.entry.entry, &entry) {
+                                Some(core::mem::replace(&mut slot.entry.entry, upper_entry))
+                            } else {
+                                None
+                            }
+                        },
+                    );
+                    let Some(Some(old_entry)) = old_entry else {
+                        // The slot was closed and/or reused for an unrelated file by a concurrent
+                        // `close`/`open` between collection and this replace -- nothing of `path`'s
+                        // migration remains to do for this `internal_fd`; move on to the next one.
+                        continue;
+                    };
                     assert!(Arc::ptr_eq(&old_entry, &entry));
                     drop(entry);
                     let root_entry = root_entries.remove(path).unwrap();
@@ -400,13 +448,23 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 _ => {
                     // Other FDs are open with the same file too. We'll handle the open one
                     // here locally, and a future FD will take care of the relevant closing.
-                    let old_entry = self
-                        .litebox
-                        .descriptor_table()
-                        .with_entry_mut_via_internal_fd::<Self, _, _>(internal_fd, |entry| {
-                            core::mem::replace(&mut entry.entry.entry, upper_entry)
-                        })
-                        .expect("nothing should have changed the existing entry");
+                    //
+                    // Same compare-and-skip rationale as the `3 =>` arm above: `internal_fd` may
+                    // have been closed and its slot reused by a concurrent `close`/`open` since
+                    // `to_migrate` was collected.
+                    let old_entry = self.litebox.descriptor_table().with_entry_mut_via_internal_fd::<Self, _, _>(
+                        internal_fd,
+                        |slot| {
+                            if Arc::ptr_eq(&slot.entry.entry, &entry) {
+                                Some(core::mem::replace(&mut slot.entry.entry, upper_entry))
+                            } else {
+                                None
+                            }
+                        },
+                    );
+                    let Some(Some(old_entry)) = old_entry else {
+                        continue;
+                    };
                     assert!(Arc::ptr_eq(&old_entry, &entry));
                 }
             }
