@@ -1772,8 +1772,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             //
             // Placed at the very END of this function, after `clear_child_tid`'s futex wake and
             // `wake_robust_list` -- both genuinely read/write guest memory and must run first.
-            // Matches `sys_execve`'s own `release_memory` closure exactly (`!vm.is_empty()`):
-            // don't release reserved/placeholder mappings, only real, populated guest memory.
+            // Matches `sys_execve`'s own `release_memory` closure exactly: don't release
+            // reserved/foreign-host-placeholder mappings (bare `VmFlags::empty()`), but DO
+            // release this process's own leaked fork-group padding (`VM_OWN_FORK_PADDING`) --
+            // see that flag's own doc comment for why the two must be distinguished, and why
+            // conflating them (both previously bare `VmFlags::empty()`) was the actual root
+            // cause of the crash this comment already describes above.
             //
             // The `detach_pm_for_vfork_execve` call at this function's own top (before
             // `detach_from_process_deferred` can clear `vfork_done`) already ensured
@@ -1783,7 +1787,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // `vfork()`ed child exiting via the ordinary exit path, not `execve`, previously
             // released the STILL-SHARED address space out from under its live, suspended
             // parent).
-            let release = |_r: Range<usize>, vm: VmFlags| !vm.is_empty();
+            let release =
+                |_r: Range<usize>, vm: VmFlags| !vm.is_empty() || vm.contains(VmFlags::VM_OWN_FORK_PADDING);
             if let Err(err) = unsafe { self.process().pm().release_memory(release) } {
                 litebox_util_log::warn!(tid:% = self.tid, err:? = err; "prepare_for_exit: release_memory failed");
             }
@@ -4139,8 +4144,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         self.signals.reset_for_exec();
 
-        // Don't release reserved mappings.
-        let release = |_r: Range<usize>, vm: VmFlags| !vm.is_empty();
+        // Don't release reserved/foreign-host-placeholder mappings (bare `VmFlags::empty()`,
+        // from `Vmem::new_excluding`) -- but DO release this process's own leaked fork-group
+        // padding (`VM_OWN_FORK_PADDING`, from `Vmem::duplicate`): real, committed memory that
+        // belongs to no live guest mapping, previously indistinguishable from foreign host state
+        // by `VmFlags::empty()` alone. See `VM_OWN_FORK_PADDING`'s own doc comment for the full
+        // history -- this was the confirmed root cause of the long-standing fork()+execve()
+        // mallocng `.meta=0` crash.
+        let release =
+            |_r: Range<usize>, vm: VmFlags| !vm.is_empty() || vm.contains(VmFlags::VM_OWN_FORK_PADDING);
         unsafe { self.process().pm().release_memory(release) }
             .expect("failed to release memory mappings");
 
