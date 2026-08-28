@@ -1178,6 +1178,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 | SyscallRequest::Readv { .. }
                 | SyscallRequest::Ioctl { .. }
                 | SyscallRequest::Ppoll { .. }
+                | SyscallRequest::Socket { .. }
+                | SyscallRequest::Socketpair { .. }
+                | SyscallRequest::Dup { .. }
+                | SyscallRequest::Fcntl { .. }
         ) {
             litebox_util_log::trace!(request:? = request; "syscall");
         }
