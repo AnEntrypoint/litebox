@@ -2348,10 +2348,25 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
         // crates use instead of being duplicated here once one exists.
         const GUEST_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
         let ctx = ctx.clone();
+        // Take (clearing) whatever guest-pid the shim declared via
+        // `set_next_spawned_thread_guest_pid` for the thread about to be spawned -- read on
+        // THIS, the spawning thread, since the new thread's own `thread_local!`s start out
+        // completely fresh/`None` and cannot see this thread's own state. Propagated into the
+        // new thread's own `CURRENT_GUEST_PID` inside `thread_start`, before it registers itself
+        // via `run_with_handle` (so every `CLAIMED_RANGES` operation on the new thread, from its
+        // very first one, already sees the correct owner). `None` if the shim never called it
+        // for this spawn -- the new thread then falls back to its own `ThreadId`, same as before
+        // this mechanism existed.
+        let guest_pid = NEXT_SPAWNED_THREAD_GUEST_PID.take();
         // TODO: do we need to wait for the handle in the main thread?
         let _handle = std::thread::Builder::new()
             .stack_size(GUEST_THREAD_STACK_SIZE)
-            .spawn(move || thread_start(init_thread, ctx))?;
+            .spawn(move || {
+                if let Some(pid) = guest_pid {
+                    CURRENT_GUEST_PID.set(Some(pid));
+                }
+                thread_start(init_thread, ctx);
+            })?;
 
         Ok(())
     }
@@ -2380,6 +2395,10 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
 
     fn host_debug_tid(&self) -> u64 {
         u64::from(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() })
+    }
+
+    fn set_next_spawned_thread_guest_pid(&self, pid: i32) {
+        NEXT_SPAWNED_THREAD_GUEST_PID.set(Some(pid));
     }
 }
 
@@ -2697,6 +2716,39 @@ thread_local! {
     static CURRENT_THREAD_HANDLE: RefCell<Option<ThreadHandle>> = const { RefCell::new(None) };
 }
 
+thread_local! {
+    /// This thread's own guest-space process id, if one has ever been assigned -- see
+    /// [`ThreadProvider::set_next_spawned_thread_guest_pid`]'s doc comment for why this exists
+    /// and how it propagates from a spawning thread to the thread it spawns.
+    ///
+    /// `None` on a thread that never went through this propagation (the very first/initial
+    /// guest thread of a fresh `litebox_runner` invocation, or a host-only test thread) -- such
+    /// a thread's own `std::thread::ThreadId` is already a correct, unique-enough proxy for its
+    /// guest-process identity on its own, since it has no sibling thread within the same guest
+    /// process to be confused with.
+    static CURRENT_GUEST_PID: Cell<Option<i32>> = const { Cell::new(None) };
+}
+
+thread_local! {
+    /// Set by [`WindowsUserland::set_next_spawned_thread_guest_pid`] on the SPAWNING thread,
+    /// immediately before its own call to [`ThreadProvider::spawn_thread`]; read and cleared by
+    /// that same call (on the SAME, spawning thread, never the new one) to capture the value to
+    /// propagate into the new thread's own [`CURRENT_GUEST_PID`].
+    static NEXT_SPAWNED_THREAD_GUEST_PID: Cell<Option<i32>> = const { Cell::new(None) };
+}
+
+/// Returns the calling thread's own guest-process identity for [`CLAIMED_RANGES`] ownership
+/// purposes: its propagated [`CURRENT_GUEST_PID`] if one was ever assigned (recognizing sibling
+/// pthreads of the SAME guest process as the SAME owner), falling back to the real
+/// [`std::thread::ThreadId`] for a thread that never went through that propagation (see
+/// [`CURRENT_GUEST_PID`]'s doc comment).
+fn current_claim_owner() -> ClaimOwner {
+    match CURRENT_GUEST_PID.get() {
+        Some(pid) => ClaimOwner::GuestPid(pid),
+        None => ClaimOwner::ThreadId(std::thread::current().id()),
+    }
+}
+
 /// Global registry of all active managed thread handles.
 ///
 /// Threads are registered in [`ThreadHandle::run_with_handle`] and
@@ -2707,11 +2759,26 @@ thread_local! {
 /// track its own thread list.
 static ACTIVE_THREADS: Mutex<alloc::vec::Vec<ThreadHandle>> = Mutex::new(alloc::vec::Vec::new());
 
-/// One entry in [`CLAIMED_RANGES`]: a host address range, the [`std::thread::ThreadId`] of the
-/// guest process that owns it, and a monotonically-increasing insertion sequence number used to
-/// find the single oldest entry for eviction when the registry is full (see `claim_range`).
-/// `None` means the slot is empty.
-type ClaimSlot = Option<(core::ops::Range<usize>, std::thread::ThreadId, u64)>;
+/// The owner of a [`ClaimSlot`]: either a real host [`std::thread::ThreadId`] (a thread that
+/// never had a guest-pid propagated onto it, see [`CURRENT_GUEST_PID`]) or a guest-space process
+/// id shared by every one of that guest process's own OS threads (see
+/// `ThreadProvider::set_next_spawned_thread_guest_pid`'s doc comment) -- two claims sharing the
+/// SAME guest pid are the SAME guest process's own memory, even when their real OS `ThreadId`s
+/// differ (e.g. a guest process's own additional pthread, not a `fork()`ed sibling process).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ClaimOwner {
+    ThreadId(std::thread::ThreadId),
+    GuestPid(i32),
+}
+
+/// One entry in [`CLAIMED_RANGES`]: a host address range, the [`ClaimOwner`] of the guest
+/// process that owns it (for collision/coalescing checks -- shared across every OS thread of the
+/// same guest process), the real [`std::thread::ThreadId`] of the SPECIFIC thread that inserted
+/// it (for release-on-thread-exit, which must only drop THIS thread's own entries, never a
+/// still-live sibling thread's -- see `release_all_claims_for_current_thread`'s doc comment), and
+/// a monotonically-increasing insertion sequence number used to find the single oldest entry for
+/// eviction when the registry is full (see `claim_range`). `None` means the slot is empty.
+type ClaimSlot = Option<(core::ops::Range<usize>, ClaimOwner, std::thread::ThreadId, u64)>;
 
 /// How many concurrently-live guest processes can each hold a `Replace`-mode claim at once (see
 /// [`CLAIMED_RANGES`]'s doc comment). A fixed, generous upper bound rather than a growable
@@ -2785,8 +2852,8 @@ static NEXT_CLAIM_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 /// `exclude_owner`, if one exists.
 fn find_foreign_claim(
     range: core::ops::Range<usize>,
-    exclude_owner: std::thread::ThreadId,
-) -> Option<(core::ops::Range<usize>, std::thread::ThreadId)> {
+    exclude_owner: ClaimOwner,
+) -> Option<(core::ops::Range<usize>, ClaimOwner)> {
     let claims = CLAIMED_RANGES.lock().unwrap();
     let occupied = claims.iter().filter(|s| s.is_some()).count();
     litebox_util_log::debug!(
@@ -2795,7 +2862,7 @@ fn find_foreign_claim(
         "allocate_pages: DIAG find_foreign_claim occupancy"
     );
     claims.iter().find_map(|slot| {
-        slot.as_ref().and_then(|(claimed, owner, _seq)| {
+        slot.as_ref().and_then(|(claimed, owner, _tid, _seq)| {
             (*owner != exclude_owner && claimed.start < range.end && claimed.end > range.start)
                 .then(|| (claimed.clone(), *owner))
         })
@@ -2829,19 +2896,22 @@ fn claim_range(range: core::ops::Range<usize>) {
     if range.is_empty() {
         return;
     }
-    let owner = std::thread::current().id();
+    let owner = current_claim_owner();
+    let tid = std::thread::current().id();
     litebox_util_log::debug!(
         start:% = range.start, end:% = range.end, owner:? = owner;
         "allocate_pages: DIAG claim_range"
     );
     let mut claims = CLAIMED_RANGES.lock().unwrap();
-    // Absorb this thread's own prior entries that overlap OR touch (are immediately adjacent
-    // to) the new range into one merged bound, rather than dropping them outright -- this is
-    // what keeps ordinary sequential heap/mmap growth on one thread from consuming a fresh slot
-    // per call.
+    // Absorb this GUEST PROCESS's own prior entries (matched by `ClaimOwner`, shared across
+    // every one of its own OS threads -- not just this specific thread's own `ThreadId`) that
+    // overlap OR touch (are immediately adjacent to) the new range into one merged bound, rather
+    // than dropping them outright -- this is what keeps ordinary sequential heap/mmap growth on
+    // one thread from consuming a fresh slot per call, and now ALSO coalesces a sibling
+    // pthread's own overlapping claim into the same guest process's own bound.
     let mut merged = range;
     for slot in claims.iter_mut() {
-        if let Some((claimed, o, _seq)) = slot
+        if let Some((claimed, o, _tid, _seq)) = slot
             && *o == owner
             && claimed.start <= merged.end
             && claimed.end >= merged.start
@@ -2853,7 +2923,7 @@ fn claim_range(range: core::ops::Range<usize>) {
     }
     let seq = NEXT_CLAIM_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if let Some(empty_slot) = claims.iter_mut().find(|s| s.is_none()) {
-        *empty_slot = Some((merged, owner, seq));
+        *empty_slot = Some((merged, owner, tid, seq));
     } else {
         // Registry genuinely full even after this thread's own coalescing -- evict the single
         // OLDEST entry (lowest sequence number) across the WHOLE registry, regardless of owner,
@@ -2862,7 +2932,7 @@ fn claim_range(range: core::ops::Range<usize>) {
         let oldest_idx = claims
             .iter()
             .enumerate()
-            .filter_map(|(i, s)| s.as_ref().map(|(_, _, seq)| (i, *seq)))
+            .filter_map(|(i, s)| s.as_ref().map(|(_, _, _tid, seq)| (i, *seq)))
             .min_by_key(|(_, seq)| *seq)
             .map(|(i, _)| i);
         if let Some(idx) = oldest_idx {
@@ -2870,18 +2940,24 @@ fn claim_range(range: core::ops::Range<usize>) {
                 start:% = merged.start, end:% = merged.end, owner:? = owner;
                 "allocate_pages: DIAG claim_range evicting oldest entry (registry full)"
             );
-            claims[idx] = Some((merged, owner, seq));
+            claims[idx] = Some((merged, owner, tid, seq));
         }
     }
 }
 
-/// Removes every range owned by the calling thread. Called once, from
+/// Removes every range inserted BY THE CALLING THREAD ITSELF. Called once, from
 /// [`ThreadHandle::run_with_handle`]'s teardown guard, when a guest process's real OS thread
 /// itself exits -- see [`CLAIMED_RANGES`]'s doc comment for why `execve` alone must not do this.
+///
+/// Deliberately matches on the real [`std::thread::ThreadId`] that INSERTED each entry, never
+/// the (possibly-shared-across-threads) [`ClaimOwner`] -- a guest process's own additional
+/// pthread exiting must only release THAT THREAD's own claims, never a still-live sibling
+/// thread's (e.g. the SAME guest process's main thread) claims that happen to share the same
+/// `ClaimOwner::GuestPid`.
 fn release_all_claims_for_current_thread() {
-    let owner = std::thread::current().id();
+    let tid = std::thread::current().id();
     for slot in CLAIMED_RANGES.lock().unwrap().iter_mut() {
-        if matches!(slot, Some((_, o, _)) if *o == owner) {
+        if matches!(slot, Some((_, _owner, t, _seq)) if *t == tid) {
             *slot = None;
         }
     }
@@ -2898,9 +2974,9 @@ fn release_claim_range_for_current_thread(range: core::ops::Range<usize>) {
     if range.is_empty() {
         return;
     }
-    let owner = std::thread::current().id();
+    let owner = current_claim_owner();
     for slot in CLAIMED_RANGES.lock().unwrap().iter_mut() {
-        if let Some((claimed, o, _seq)) = slot
+        if let Some((claimed, o, _tid, _seq)) = slot
             && *o == owner
             && claimed.start < range.end
             && claimed.end > range.start
@@ -3867,8 +3943,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     // because `has_committed_page` observed the target range as not-yet-MEM_COMMIT
                     // at the moment this thread queried it, skipping this check entirely under the
                     // old `has_committed_page &&` gate.
-                    let fc =
-                        find_foreign_claim(suggested_range.clone(), std::thread::current().id());
+                    let fc = find_foreign_claim(suggested_range.clone(), current_claim_owner());
                     litebox_util_log::debug!(
                         start:% = suggested_range.start, end:% = suggested_range.end,
                         found:% = fc.is_some(), has_committed_page:% = has_committed_page;

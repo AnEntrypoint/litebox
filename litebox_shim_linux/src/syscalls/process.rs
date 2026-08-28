@@ -2915,6 +2915,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let vfork_child_process =
             (is_process_clone && flags.contains(CloneFlags::VFORK)).then(|| thread.process.clone());
 
+        // Declare the new thread's own guest-pid BEFORE spawning it, so a platform that tracks
+        // host-memory ownership per real OS thread (see `ThreadProvider::
+        // set_next_spawned_thread_guest_pid`'s doc comment) can correctly recognize a same-
+        // process thread clone's new OS thread as belonging to the SAME guest process as this
+        // one (an ordinary pthread, `pid == self.pid`), and a `fork()`'s new OS thread as its
+        // own, distinct guest process (`pid` freshly allocated above) from the moment it starts
+        // running -- never a false "still the parent's own memory" merge in either direction.
+        self.global.platform.set_next_spawned_thread_guest_pid(pid);
+
         let r = unsafe {
             self.global.platform.spawn_thread(
                 ctx,
