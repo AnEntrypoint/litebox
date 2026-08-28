@@ -1103,7 +1103,7 @@ where
         if let Some(range) = PageRange::<ALIGN>::new(old_brk, new_brk) {
             let (suggested_address, length) = range.start_and_length();
             let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
-            unsafe {
+            let placed = unsafe {
                 vmem.create_pages(
                     Some(suggested_address),
                     length,
@@ -1111,6 +1111,35 @@ where
                     perms,
                 )
             }?;
+            // `create_pages`'s `FIXED_ADDR` request is `FixedAddressBehavior::Replace`, which the
+            // platform is allowed to silently RELOCATE away from the requested address (e.g. when
+            // a sibling guest process's live claim occupies the target range -- see
+            // `allocate_pages`'s own foreign-claim relocation, added to fix a real cross-process
+            // heap-corruption bug live-confirmed via a weston + weston-desktop-shell repro: one
+            // thread's heap growth silently landed on and corrupted a DIFFERENT, unrelated
+            // thread's already-committed memory). `brk()`'s own contract requires CONTIGUOUS
+            // growth from the existing break -- a relocated placement is unusable as heap space
+            // (the guest's own allocator tracks a single linear break address, not a scattered set
+            // of regions), so silently accepting a relocated placement and reporting success at
+            // the ORIGINAL requested address (as this code previously did) leaves the guest
+            // believing memory it never actually got is live, heap-immediately-adjacent memory --
+            // exactly the same class of silent corruption the foreign-claim check exists to catch,
+            // just surfacing here instead of at the allocation site itself. Treat a relocation as
+            // an allocation failure: release the misplaced pages and fail the whole `brk()` call
+            // rather than accepting it.
+            if placed.as_usize() != suggested_address.as_usize() {
+                unsafe {
+                    vmem.remove_mapping(
+                        PageRange::new(
+                            placed.as_usize(),
+                            placed.as_usize() + length.as_usize(),
+                        )
+                        .ok_or(MappingError::UnAligned)?,
+                    )
+                }
+                .ok();
+                return Err(MappingError::OutOfMemory);
+            }
         }
         vmem.brk = brk;
         Ok(brk)
