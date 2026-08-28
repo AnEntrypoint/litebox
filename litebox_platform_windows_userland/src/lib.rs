@@ -1866,23 +1866,40 @@ unsafe extern "C-unwind" fn run_thread_arch(thread_ctx: &mut ThreadContext, tls_
     // contain rflags if the syscall instruction had actually been issued).
     .globl  syscall_callback
 syscall_callback:
-    // Clear EFLAGS.TF in the live CPU flags before anything else runs. The guest reaches here
-    // via a call (the syscall rewriter's trampoline for every guest syscall instruction, not a
-    // real syscall), which is itself the next instruction a fork() child under fork_verify
-    // single-step verification was stepped through -- so if TF was armed, it is still live in
-    // the CPU's real flags register at this point, and every subsequent host instruction here
-    // (the register spills below, the call into the syscall handler, ...) would otherwise raise
-    // its own single-step trap while is_in_guest is about to be (or has just been) cleared, i.e.
-    // exactly the state vectored_exception_handler does not have a fork_verify handler for -- an
-    // unhandled EXCEPTION_SINGLE_STEP (STATUS_SINGLE_STEP, 0x80000004) that tears down the whole
-    // host process instead of just the child. pushfq/and/popfq on a scratch stack slot clears it
-    // without disturbing any register (rax/rcx/r11 are all still live guest state here).
+    // Get the TLS state from the TLS slot, save the guest's own rsp into TlsState, and switch
+    // rsp to the host-owned guest-context stack BEFORE touching the real stack pointer in any
+    // way (no push/pop, no [rsp]-relative access of any kind up to this point). This ordering
+    // is load-bearing: a guest thread that just munmap'd its own stack as the last step of
+    // musl's `pthread_exit`/`__unmapself` idiom (real Linux's own version of this idiom
+    // deliberately touches zero stack bytes between the munmap and its own exit syscall, which
+    // is what makes it safe there) reaches this trampoline for that immediately-following exit
+    // syscall with `rsp` still pointing into the region it just unmapped -- any push/pop before
+    // this switch (the previous code had `pushfq`/`and`/`popfq` here first) writes into freed,
+    // decommitted memory and raises an unhandled, VEH-invisible access violation. Every
+    // instruction below, up to and including the `mov rsp, ...`, is register/memory-operand
+    // only (`[r11 + ...]`, `[rip + ...]`, `gs:[...]`) and never dereferences `[rsp]` itself, so
+    // it is safe regardless of whether the guest's own stack is still mapped.
+    mov     r11d, DWORD PTR [rip + {TLS_INDEX}]
+    mov     r11, QWORD PTR gs:[r11 * 8 + TEB_TLS_SLOTS_OFFSET]
+    mov     QWORD PTR [r11 + {SCRATCH}], rsp
+    mov     rsp, QWORD PTR [r11 + {GUEST_CONTEXT_TOP}]
+
+    // Clear EFLAGS.TF in the live CPU flags. The guest reaches here via a call (the syscall
+    // rewriter's trampoline for every guest syscall instruction, not a real syscall), which is
+    // itself the next instruction a fork() child under fork_verify single-step verification was
+    // stepped through -- so if TF was armed, it is still live in the CPU's real flags register
+    // at this point, and every subsequent host instruction here (the register spills below, the
+    // call into the syscall handler, ...) would otherwise raise its own single-step trap while
+    // is_in_guest is about to be (or has just been) cleared, i.e. exactly the state
+    // vectored_exception_handler does not have a fork_verify handler for -- an unhandled
+    // EXCEPTION_SINGLE_STEP (STATUS_SINGLE_STEP, 0x80000004) that tears down the whole host
+    // process instead of just the child. pushfq/and/popfq now runs on the host-owned stack
+    // (rsp was already switched above), so it is always safe regardless of the guest stack's
+    // state.
     pushfq
     and     QWORD PTR [rsp], 0xfffffffffffffeff
     popfq
-    // Get the TLS state from the TLS slot and clear the in-guest flag.
-    mov     r11d, DWORD PTR [rip + {TLS_INDEX}]
-    mov     r11, QWORD PTR gs:[r11 * 8 + TEB_TLS_SLOTS_OFFSET]
+    // Clear the in-guest flag.
     mov     BYTE PTR [r11 + {IS_IN_GUEST}], 0
     // Save the guest's caller-saved xmm0-xmm5 into TlsState before any other host code (which
     // is free to clobber them) runs. xmm6-xmm15 are already protected for the whole guest-thread
@@ -1894,9 +1911,6 @@ syscall_callback:
     movups  XMMWORD PTR [r11 + {GUEST_XMM0_5} + 3*16], xmm3
     movups  XMMWORD PTR [r11 + {GUEST_XMM0_5} + 4*16], xmm4
     movups  XMMWORD PTR [r11 + {GUEST_XMM0_5} + 5*16], xmm5
-    // Set rsp to the top of the guest context.
-    mov     QWORD PTR [r11 + {SCRATCH}], rsp
-    mov     rsp, QWORD PTR [r11 + {GUEST_CONTEXT_TOP}]
 
     // Save caller-saved registers
     push    0x2b       // pt_regs->ss = __USER_DS
