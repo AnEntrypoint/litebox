@@ -48,6 +48,37 @@ Two hypotheses tested and refuted so far:
   "sys_socket"), then re-run the repro and check honestly whether the netlink socket call
   is actually happening or not.
 
+## Linux-leg status update (2026-08-28, after the above hypotheses)
+
+The native Linux build/test baseline (this workspace is on Linux) is now **fully green**:
+`cargo test -p litebox_shim_linux --lib -- --skip test_mremap --skip tun` passes
+`186 passed; 0 failed` both single-threaded AND parallel (16 filtered = `test_mremap` + the
+`tun` tests, which can't run here: container has no `/dev/net/tun`). The earlier parallel
+SIGSEGV is gone too. Two real bugs were root-caused and fixed in litebox's own source:
+
+1. **`register_exception_handlers` panicked at startup under any backgrounded/nohup/supervised
+   launch** (`litebox_platform_linux_userland/src/lib.rs:~3023`): it `assert_eq!(old_sa.sa_sigaction,
+   SIG_DFL)` for SIGINT/SIGALRM, but POSIX makes a backgrounded process inherit SIGINT=SIG_IGN,
+   so litebox poisoned its `Once` and failed to start in exactly the non-interactive contexts
+   that matter. Fixed: tolerate `SIG_DFL | SIG_IGN` (still assert a genuine custom handler is a
+   conflict). Verified live with both serial and parallel detached runs.
+2. **Stale netlink regression test** (`litebox_shim_linux/src/syscalls/net.rs`):
+   `read_sockaddr_from_user_rejects_unsupported_families_instead_of_panicking` still asserted
+   `AF_NETLINK` must be rejected with `EAFNOSUPPORT`, contradicting the netlink support (the
+   udev `NETLINK_KOBJECT_UEVENT` shim) that was added later. Split it: `AF_INET6` remains a
+   reject-as-unsupported guard; added
+   `read_sockaddr_from_user_parses_supported_netlink_family` asserting `AF_NETLINK` parses to
+   `SocketAddress::Netlink { pid, groups }`. 
+
+Net effect for the current blocker: the netlink sockaddr path the udev shim depends on is
+confirmed real and non-panicking, so the "Bad file descriptor" investigation should focus on
+*downstream* fd handling (what fd the netlink socket got, then what happens to it before
+`session.c:289`: dup/fcntl/close/fork-inheritance in litebox's fd table) rather than on the
+netlink parse. The full labwc/DRM repro still needs the Windows host (this container has no
+`/dev/dri`/`/dev/net/tun`); the two fixes above are uncommitted working-tree changes
+(`git diff` shows only `litebox_platform_linux_userland/src/lib.rs` +
+`litebox_shim_linux/src/syscalls/net.rs`).
+
 ## Concrete next step
 
 1. Reuse `.wfgy/xfce-build/xfce-layer15.tar` + `alpine-pinned2.tar` (already has eudev
