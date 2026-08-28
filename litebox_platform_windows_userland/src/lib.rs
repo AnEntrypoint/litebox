@@ -2707,9 +2707,11 @@ thread_local! {
 /// track its own thread list.
 static ACTIVE_THREADS: Mutex<alloc::vec::Vec<ThreadHandle>> = Mutex::new(alloc::vec::Vec::new());
 
-/// One entry in [`CLAIMED_RANGES`]: a host address range and the [`std::thread::ThreadId`] of the
-/// guest process that owns it. `None` means the slot is empty.
-type ClaimSlot = Option<(core::ops::Range<usize>, std::thread::ThreadId)>;
+/// One entry in [`CLAIMED_RANGES`]: a host address range, the [`std::thread::ThreadId`] of the
+/// guest process that owns it, and a monotonically-increasing insertion sequence number used to
+/// find the single oldest entry for eviction when the registry is full (see `claim_range`).
+/// `None` means the slot is empty.
+type ClaimSlot = Option<(core::ops::Range<usize>, std::thread::ThreadId, u64)>;
 
 /// How many concurrently-live guest processes can each hold a `Replace`-mode claim at once (see
 /// [`CLAIMED_RANGES`]'s doc comment). A fixed, generous upper bound rather than a growable
@@ -2719,12 +2721,25 @@ type ClaimSlot = Option<(core::ops::Range<usize>, std::thread::ThreadId)>;
 /// timing-sensitive `Replace` path was found live to make an existing, pre-existing, still-not-
 /// fully-understood class of Windows scheduling/segment-MSR instability (see the FS_BASE/GS_BASE
 /// repair sites above) fire far more often -- a fixed-size array sidesteps the allocator (and
-/// its spinlock) entirely for this registry's own bookkeeping. 64 is far more than the number of
-/// guest processes any real workload in this architecture holds alive at once via nested
-/// `vfork()` (each level is one more live process; a handful of levels is already an extreme
-/// case) -- exhaustion silently degrades to "claim not recorded" (see `claim_range`), which only
-/// gives up this registry's OWN collision defense, never correctness of anything else.
-const MAX_CLAIMS: usize = 64;
+/// its spinlock) entirely for this registry's own bookkeeping.
+///
+/// Originally 64, sized only for "a handful of nested `vfork()` levels" -- confirmed live via a
+/// weston repro to be a real under-count once `Hint`-mode calls started reaching `claim_range`
+/// (see that function's own doc comment): a single guest process doing ordinary DRM/GL/dynamic-
+/// library `mmap(NULL,...)` churn produces hundreds of small, mutually non-adjacent ranges in
+/// well under a second (633 real, logged `claim_range DROPPED (registry full)` events observed
+/// in one 30-second repro), silently evicting a DIFFERENT, still-live guest process's own
+/// legitimate claim -- exactly the collision this registry exists to prevent. Raised to 512
+/// (8x) to absorb realistic single-process churn between two collision-relevant checks, combined
+/// with genuine LRU eviction (below) as the correctness backstop for whatever churn volume still
+/// exceeds this: exhaustion now evicts the single OLDEST entry (by insertion sequence, tracked in
+/// `ClaimSlot`) rather than silently dropping the NEWEST one -- the newest claim is, by
+/// construction, the one about to be relevant to an imminent collision check, while an entry old
+/// enough to be the least-recently-inserted across the WHOLE registry is far more likely to
+/// belong to memory that's since been superseded or released. This only gives up this registry's
+/// own collision defense for whichever single entry loses the eviction race, never correctness
+/// of anything else.
+const MAX_CLAIMS: usize = 512;
 
 /// Host address ranges currently claimed by a live guest "process" (a real OS thread), see
 /// [`ClaimSlot`]/[`MAX_CLAIMS`] for the storage shape and why it is a fixed array.
@@ -2761,14 +2776,26 @@ const MAX_CLAIMS: usize = 64;
 /// overwhelming majority of calls) pays no additional cost at all.
 static CLAIMED_RANGES: Mutex<[ClaimSlot; MAX_CLAIMS]> = Mutex::new([const { None }; MAX_CLAIMS]);
 
+/// Monotonically-increasing insertion counter for [`ClaimSlot`]'s sequence field, guarded by the
+/// same [`CLAIMED_RANGES`] lock (never accessed independently) -- used only to find the single
+/// oldest entry when the registry is full and a new claim needs a slot (see `claim_range`).
+static NEXT_CLAIM_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Returns the (range, owner) of any claimed range overlapping `range` whose owner is NOT
 /// `exclude_owner`, if one exists.
 fn find_foreign_claim(
     range: core::ops::Range<usize>,
     exclude_owner: std::thread::ThreadId,
 ) -> Option<(core::ops::Range<usize>, std::thread::ThreadId)> {
-    CLAIMED_RANGES.lock().unwrap().iter().find_map(|slot| {
-        slot.as_ref().and_then(|(claimed, owner)| {
+    let claims = CLAIMED_RANGES.lock().unwrap();
+    let occupied = claims.iter().filter(|s| s.is_some()).count();
+    litebox_util_log::debug!(
+        occupied:% = occupied, max:% = MAX_CLAIMS, range_start:% = range.start,
+        range_end:% = range.end, exclude_owner:? = exclude_owner;
+        "allocate_pages: DIAG find_foreign_claim occupancy"
+    );
+    claims.iter().find_map(|slot| {
+        slot.as_ref().and_then(|(claimed, owner, _seq)| {
             (*owner != exclude_owner && claimed.start < range.end && claimed.end > range.start)
                 .then(|| (claimed.clone(), *owner))
         })
@@ -2803,6 +2830,10 @@ fn claim_range(range: core::ops::Range<usize>) {
         return;
     }
     let owner = std::thread::current().id();
+    litebox_util_log::debug!(
+        start:% = range.start, end:% = range.end, owner:? = owner;
+        "allocate_pages: DIAG claim_range"
+    );
     let mut claims = CLAIMED_RANGES.lock().unwrap();
     // Absorb this thread's own prior entries that overlap OR touch (are immediately adjacent
     // to) the new range into one merged bound, rather than dropping them outright -- this is
@@ -2810,7 +2841,7 @@ fn claim_range(range: core::ops::Range<usize>) {
     // per call.
     let mut merged = range;
     for slot in claims.iter_mut() {
-        if let Some((claimed, o)) = slot
+        if let Some((claimed, o, _seq)) = slot
             && *o == owner
             && claimed.start <= merged.end
             && claimed.end >= merged.start
@@ -2820,8 +2851,27 @@ fn claim_range(range: core::ops::Range<usize>) {
             *slot = None;
         }
     }
+    let seq = NEXT_CLAIM_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if let Some(empty_slot) = claims.iter_mut().find(|s| s.is_none()) {
-        *empty_slot = Some((merged, owner));
+        *empty_slot = Some((merged, owner, seq));
+    } else {
+        // Registry genuinely full even after this thread's own coalescing -- evict the single
+        // OLDEST entry (lowest sequence number) across the WHOLE registry, regardless of owner,
+        // rather than silently dropping this brand-new claim. See `MAX_CLAIMS`'s doc comment for
+        // why the newest claim is the one worth keeping when a choice must be made.
+        let oldest_idx = claims
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.as_ref().map(|(_, _, seq)| (i, *seq)))
+            .min_by_key(|(_, seq)| *seq)
+            .map(|(i, _)| i);
+        if let Some(idx) = oldest_idx {
+            litebox_util_log::debug!(
+                start:% = merged.start, end:% = merged.end, owner:? = owner;
+                "allocate_pages: DIAG claim_range evicting oldest entry (registry full)"
+            );
+            claims[idx] = Some((merged, owner, seq));
+        }
     }
 }
 
@@ -2831,7 +2881,7 @@ fn claim_range(range: core::ops::Range<usize>) {
 fn release_all_claims_for_current_thread() {
     let owner = std::thread::current().id();
     for slot in CLAIMED_RANGES.lock().unwrap().iter_mut() {
-        if matches!(slot, Some((_, o)) if *o == owner) {
+        if matches!(slot, Some((_, o, _)) if *o == owner) {
             *slot = None;
         }
     }
@@ -2850,7 +2900,7 @@ fn release_claim_range_for_current_thread(range: core::ops::Range<usize>) {
     }
     let owner = std::thread::current().id();
     for slot in CLAIMED_RANGES.lock().unwrap().iter_mut() {
-        if let Some((claimed, o)) = slot
+        if let Some((claimed, o, _seq)) = slot
             && *o == owner
             && claimed.start < range.end
             && claimed.end > range.start
@@ -3782,7 +3832,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
 
             let has_committed_page =
-                process_memory_range_by_regions(suggested_range.clone(), |_r, state| {
+                process_memory_range_by_regions(suggested_range.clone(), |r, state| {
+                    litebox_util_log::debug!(
+                        start:% = r.start, end:% = r.end, state:? = state;
+                        "allocate_pages: DIAG region state at has_committed_page check"
+                    );
                     if state == Win32_Memory::MEM_COMMIT {
                         Err(())
                     } else {
