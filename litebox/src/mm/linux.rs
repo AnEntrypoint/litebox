@@ -74,6 +74,26 @@ bitflags::bitflags! {
         /// The area can grow downward upon page fault.
         const VM_GROWSDOWN = 1 << 8;
 
+        /// Marks a placeholder range inserted by [`Vmem::duplicate`] to reserve a whole
+        /// coherent-relocation group's address span in the CHILD (`dest`) -- real, genuinely
+        /// committed host memory (via `insert_mapping`'s underlying platform reservation), but
+        /// with no individually-tracked guest content of its own (the actual guest regions
+        /// placed within the group via `Replace` get their own, separate, non-empty-flagged
+        /// `vmas` entries covering their own sub-ranges).
+        ///
+        /// Bytes covered by a `VM_OWN_FORK_PADDING` range but NOT overwritten by any subsequent
+        /// `Replace` (inter-region alignment/coherent-group padding within the group's span) stay
+        /// tracked under this flag for the lifetime of the process. Without a distinct tag, such
+        /// a range is indistinguishable, by `VmFlags` alone, from [`Vmem::new_excluding`]'s own
+        /// placeholders -- which represent OTHER, foreign host-reserved memory this process must
+        /// never touch. Confusing the two here was the confirmed root cause of the long-standing
+        /// fork()+execve() mallocng `.meta=0` crash: `release_memory`'s `!vm.is_empty()`
+        /// predicate had to treat ALL empty-flagged ranges alike, so this process's own leaked
+        /// group padding was never released across `execve()`/process exit, silently surviving
+        /// as real, still-committed memory a later, unrelated allocation's neighbor believed was
+        /// untouched -- see `release_memory`'s own callers for the fix built on this flag.
+        const VM_OWN_FORK_PADDING = 1 << 9;
+
         const VM_ACCESS_FLAGS = Self::VM_READ.bits()
             | Self::VM_WRITE.bits()
             | Self::VM_EXEC.bits();
@@ -1133,7 +1153,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             // individual regions placed within it via `Replace` below are tracked in `dest.vmas`
             // (each `insert_mapping` call replaces this placeholder's tracking for its own
             // sub-range).
-            let placeholder_vma = VmArea::<DestPlatform, ALIGN>::new(VmFlags::empty(), false);
+            let placeholder_vma =
+                VmArea::<DestPlatform, ALIGN>::new(VmFlags::VM_OWN_FORK_PADDING, false);
             let base_ptr = unsafe {
                 dest.insert_mapping(
                     span_page_range,
