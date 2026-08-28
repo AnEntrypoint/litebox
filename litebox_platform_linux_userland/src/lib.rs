@@ -3020,9 +3020,15 @@ fn register_exception_handlers() {
                 libc::sigaddset(&raw mut sa.sa_mask, interrupt_signal);
                 let mut old_sa = core::mem::zeroed();
                 sigaction(sig, Some(&sa), &mut old_sa);
-                assert_eq!(
-                    old_sa.sa_sigaction,
-                    libc::SIG_DFL,
+                // litebox owns the guest's signal dispositions, so it must install its interrupt
+                // handler over whatever the process inherited. SIG_DFL and SIG_IGN are both benign
+                // inherited dispositions (POSIX: a backgrounded/nohup/supervised process inherits
+                // SIGINT under SIG_IGN -- panicking on that would make litebox unable to start in
+                // any non-interactive launch context). Only a genuine pre-existing custom handler
+                // is a conflict worth surfacing.
+                assert!(
+                    old_sa.sa_sigaction == libc::SIG_DFL
+                        || old_sa.sa_sigaction == libc::SIG_IGN,
                     "signal {sig} handler already installed",
                 );
             }

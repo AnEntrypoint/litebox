@@ -2512,7 +2512,7 @@ mod tests {
     use crate::{
         UserPtr, UserPtrMut,
         syscalls::{
-            net::{CSockInetAddr, read_sockaddr_from_user},
+            net::{CSockInetAddr, CSockNetlinkAddr, read_sockaddr_from_user},
             tests::init_platform,
         },
     };
@@ -2532,32 +2532,47 @@ mod tests {
     const SERVER_PORT: u16 = 8080;
     const CLIENT_PORT: u16 = 8081;
 
-    /// Regression test: a sockaddr with `sa_family` set to `AF_INET6` or `AF_NETLINK` used to
-    /// unconditionally panic (`todo!("unsupported family {family:?}")`) in
-    /// `read_sockaddr_from_user`, crashing the whole runner -- reachable from any guest
-    /// `connect`/`bind`/`sendto`/`sendmsg` call, independent of which family the fd itself was
-    /// created with (e.g. IPv6 being the default result of DNS resolution on many systems, or a
-    /// mismatched sockaddr passed to an unrelated fd). `AddressFamily` is a closed, 4-variant
-    /// enum (any other wire value already correctly fails with `EAFNOSUPPORT` one line above the
-    /// old panic site), so `INET6`/`NETLINK` are the only two values that could ever reach it.
+    /// Regression test: a sockaddr with `sa_family` set to `AF_INET6` used to unconditionally
+    /// panic (`todo!("unsupported family {family:?}")`) in `read_sockaddr_from_user`, crashing
+    /// the whole runner -- reachable from any guest `connect`/`bind`/`sendto`/`sendmsg` call,
+    /// independent of which family the fd itself was created with (e.g. IPv6 being the default
+    /// result of DNS resolution on many systems, or a mismatched sockaddr passed to an unrelated
+    /// fd). `AddressFamily` is a closed, 4-variant enum (any other wire value already correctly
+    /// fails with `EAFNOSUPPORT` above the old panic site), so `INET6` is the only variant that
+    /// reaches the shim but is genuinely unimplemented; it must fail cleanly with `EAFNOSUPPORT`,
+    /// not panic.
     #[test]
     fn read_sockaddr_from_user_rejects_unsupported_families_instead_of_panicking() {
-        for (name, code) in [
-            ("AF_INET6", AddressFamily::INET6 as u16),
-            ("AF_NETLINK", AddressFamily::NETLINK as u16),
-        ] {
-            let mut buf = [0u8; core::mem::size_of::<CSockInetAddr>()];
-            buf[..2].copy_from_slice(&code.to_ne_bytes());
-            let result = read_sockaddr_from_user::<crate::syscalls::tests::TestPlatform>(
-                UserPtr::from_usize(buf.as_ptr() as usize),
-                buf.len(),
-            );
-            assert_eq!(
-                result.unwrap_err(),
-                Errno::EAFNOSUPPORT,
-                "family {name} must fail cleanly, not panic"
-            );
-        }
+        let mut buf = [0u8; core::mem::size_of::<CSockInetAddr>()];
+        buf[..2].copy_from_slice(&(AddressFamily::INET6 as u16).to_ne_bytes());
+        let result = read_sockaddr_from_user::<crate::syscalls::tests::TestPlatform>(
+            UserPtr::from_usize(buf.as_ptr() as usize),
+            buf.len(),
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            Errno::EAFNOSUPPORT,
+            "AF_INET6 must fail cleanly, not panic"
+        );
+    }
+
+    /// `AF_NETLINK` is a genuinely supported family (the udev `NETLINK_KOBJECT_UEVENT` shim in
+    /// `netlink.rs` routes `socket`/`bind`/`getsockname` through here), so `read_sockaddr_from_user`
+    /// must parse a `sockaddr_nl` into `SocketAddress::Netlink { pid, groups }` -- not reject it
+    /// (and never panic). Guards against regressing the netlink support added for the XFCE/udev
+    /// session binder.
+    #[test]
+    fn read_sockaddr_from_user_parses_supported_netlink_family() {
+        let mut buf = [0u8; core::mem::size_of::<CSockNetlinkAddr>()];
+        buf[..2].copy_from_slice(&(AddressFamily::NETLINK as u16).to_ne_bytes());
+        let result = read_sockaddr_from_user::<crate::syscalls::tests::TestPlatform>(
+            UserPtr::from_usize(buf.as_ptr() as usize),
+            buf.len(),
+        );
+        assert_eq!(
+            result.expect("AF_NETLINK must parse, not reject or panic"),
+            SocketAddress::Netlink { pid: 0, groups: 0 }
+        );
     }
 
     /// Regression test: `socket(AF_INET, ...)` used to unconditionally panic
