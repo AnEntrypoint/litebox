@@ -326,6 +326,7 @@ pub extern "C" fn sandbox_tun_read_write() {
 }
 
 /// This function is called on panic.
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     let msg = info.message();
