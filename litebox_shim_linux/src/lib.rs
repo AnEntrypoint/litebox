@@ -935,6 +935,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 },
                 |_| None,
                 |_| None,
+                |_| None,
             );
             // A still-connected TCP socket must not be closed via the ordinary `do_close` path
             // here: that path (`GlobalState::close_socket`) performs a *graceful* close by
@@ -955,6 +956,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     raw_fd,
                     |_| false,
                     |_| true,
+                    |_| false,
                     |_| false,
                     |_| false,
                     |_| false,
@@ -1000,6 +1002,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS
         pty: impl FnOnce(&TypedFd<syscalls::pty::PtySubsystem<Platform>>) -> R,
         signalfd: impl FnOnce(&TypedFd<syscalls::signalfd::SignalfdSubsystem<Platform>>) -> R,
         timerfd: impl FnOnce(&TypedFd<syscalls::timerfd::TimerfdSubsystem<Platform>>) -> R,
+        netlink: impl FnOnce(&TypedFd<syscalls::netlink::NetlinkSocketSubsystem>) -> R,
     ) -> Result<R, Errno> {
         let rds = self.raw_descriptor_store.read();
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
@@ -1037,6 +1040,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
             return Ok(timerfd(&fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(netlink(&fd));
         }
         Err(Errno::EBADF)
     }

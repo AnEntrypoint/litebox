@@ -159,4 +159,20 @@ mod tests {
         let sock = super::NetlinkSocket::new(SockFlags::empty());
         assert_eq!(sock.send(128), Ok(128));
     }
+
+    #[test]
+    fn sys_dup_on_netlink_socket_succeeds() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let sock = super::NetlinkSocket::new(SockFlags::empty());
+        let typed = task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<super::NetlinkSocketSubsystem>(sock);
+        let raw_fd = task.files.borrow().insert_raw_fd(typed).ok().unwrap();
+        let dup_fd = task
+            .sys_dup(i32::try_from(raw_fd).unwrap(), None, None)
+            .expect("sys_dup on netlink socket must succeed");
+        assert_ne!(dup_fd, raw_fd as u32);
+    }
 }

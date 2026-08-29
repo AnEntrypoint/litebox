@@ -1740,6 +1740,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                     .duplicate(fd)
                                     .map(AnyDupFd::Timerfd)
                             },
+                            |fd| {
+                                self.global
+                                    .litebox
+                                    .descriptor_table_mut()
+                                    .duplicate(fd)
+                                    .map(AnyDupFd::Netlink)
+                            },
                         )
                         .map_err(|_| Errno::EBADF)?
                         .ok_or(Errno::EBADF)?;
