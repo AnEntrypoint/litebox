@@ -373,7 +373,20 @@ fn run_python(args: &[&str]) -> String {
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn python_runner(unique_name: &str) -> Runner {
-    let python_path = run_which("python3");
+    let raw_python_path = run_which("python3");
+    let python_path = if let Ok(pyenv_path) = std::process::Command::new("pyenv")
+        .args(["which", "python3"])
+        .output()
+    {
+        let path_str = String::from_utf8_lossy(&pyenv_path.stdout).trim().to_string();
+        if !path_str.is_empty() && Path::new(&path_str).exists() {
+            PathBuf::from(path_str)
+        } else {
+            raw_python_path
+        }
+    } else {
+        raw_python_path
+    };
     let python_guest_dir = python_path.parent().unwrap().to_str().unwrap().to_string();
 
     let python_home = run_python(&["-c", "import sys; print(sys.prefix);"]);
