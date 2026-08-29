@@ -504,6 +504,7 @@ pub(super) enum AnyDupFd<Platform: ShimPlatform, FS: ShimFS> {
     Pty(litebox::fd::TypedFd<crate::syscalls::pty::PtySubsystem<Platform>>),
     Signalfd(litebox::fd::TypedFd<crate::syscalls::signalfd::SignalfdSubsystem<Platform>>),
     Timerfd(litebox::fd::TypedFd<crate::syscalls::timerfd::TimerfdSubsystem<Platform>>),
+    Netlink(litebox::fd::TypedFd<crate::syscalls::netlink::NetlinkSocketSubsystem>),
 }
 
 /// A batch of `SCM_RIGHTS`-donated fds, as returned alongside a message's byte payload.
@@ -547,6 +548,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> AnyDupFd<Platform, FS> {
             AnyDupFd::Pty(fd) => go(litebox, files, fd, cloexec),
             AnyDupFd::Signalfd(fd) => go(litebox, files, fd, cloexec),
             AnyDupFd::Timerfd(fd) => go(litebox, files, fd, cloexec),
+            AnyDupFd::Netlink(fd) => go(litebox, files, fd, cloexec),
         };
         // `insert_raw_fd` only fails once the *receiver's* own `RLIMIT_NOFILE` is exceeded --
         // matches real Linux's `recvmsg` behavior of closing an over-limit donated fd and
