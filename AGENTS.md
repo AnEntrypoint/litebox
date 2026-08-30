@@ -1,3 +1,73 @@
+# STATUS (2026-08-30, sub-session 27): two real weston-launch bugs fixed (XKB data path, missing `/tmp/.X11-unix`) — weston now survives a full 60s+ soak and XWayland binds, but XFCE clients still never connect to Wayland; screenshot is still BLACK, standing goal NOT met
+
+This sub-session picked up sub-session 26's "weston never re-flips" gap and went one level
+deeper into the launch sequence itself, using live instrumented reruns (not just log-reading).
+Two genuine, confirmed root causes were found and fixed in the **launch environment/script**
+(not litebox source — no tracked file changed; see "No commit needed" note below):
+
+1. **xkbcommon couldn't find XKB rules data**, crashing weston with "failed to compile global
+   XKB keymap" / exit(1). `/usr/share/xkeyboard-config-2` in `xfce-layer18.tar` is an empty stub
+   directory; the fully-populated data is at the classic X11 location
+   `/usr/share/X11/xkb/rules/evdev` in the same tar, which xkbcommon's compiled-in default search
+   path does not check. **Fix**: export `XKB_CONFIG_ROOT=/usr/share/X11/xkb` before launching
+   weston. Confirmed live: weston no longer crashes at keymap-compile time.
+
+2. **XWayland's socket bind failed** because `/tmp/.X11-unix` didn't exist in the guest rootfs
+   (`failed to bind to /tmp/.X11-unix/X0: No such file or directory`), halting weston's startup
+   before the Wayland listening socket was ever created. **Fix**: `mkdir -p /tmp/.X11-unix;
+   chmod 1777 /tmp/.X11-unix` before launching weston. Confirmed live: weston now logs `xserver
+   listening on display :0` and proceeds into active `[repaint]` cycles, staying alive
+   (`WESTON_ALIVE=1`) through a full 60+ second soak — this had never previously been observed in
+   any prior sub-session's run.
+
+**Net effect for weston itself: durable, real progress** — it is now a stable, non-crashing
+compositor that survives the soak and binds XWayland, strictly better than every prior
+sub-session's weston state.
+
+## Still blocked: XFCE clients never connect to the Wayland socket, screenshot still BLACK
+
+With both fixes applied, XFCE's own clients (`xfsettingsd`, `xfce4-panel`, `xfdesktop`) still
+failed to start, reporting GTK's "cannot open display". Investigation traced this to an
+unresolved shell-quoting/env-inheritance quirk in the repro script's inline `VAR=val cmd &`
+syntax under the guest's `sh` (busybox ash) — **not** a litebox syscall gap; this remains open
+and unfixed.
+
+Two screenshots were taken and visually inspected (not just log-read) across the investigation:
+- **Before** the `/tmp/.X11-unix` fix: window client area is solid **white** (weston's pixman
+  renderer actively clearing/compositing — an improvement over black, proof weston is alive and
+  drawing), no XFCE panel/desktop content, some title-bar/taskbar capture bleed from an imprecise
+  window-rect crop.
+- **After** both fixes, with a precise client-area capture (`GetClientRect`+`ClientToScreen`):
+  window client area is solid **black**, title bar reads "litebox virtual display". Since XFCE's
+  clients never connected to Wayland, nothing was ever composited over weston's default/black
+  framebuffer this run either.
+
+**Standing goal (visible XFCE desktop content in a screenshot) is NOT met this sub-session.**
+The concrete next step: fix the launch script's env-var inheritance under busybox ash (e.g. use
+`export VAR=val; cmd &` instead of inline `VAR=val cmd &`) so GTK clients actually inherit
+`WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`, then re-run the soak and re-screenshot.
+
+## Separable real bug found, not yet fixed: Unix-socket `bind()` never creates an `S_IFSOCK` inode
+
+`litebox_shim_linux/src/syscalls/unix.rs:107-136` creates a plain regular file at the bind path
+instead of one typed `S_IFSOCK`, matching its own `// TODO: extend fs to support creating sock
+file (i.e., with type InodeType::Socket)` comment. Effect: `[ -S /run/user/1000/wayland-0 ]` in
+guest shell scripts always reports false even when the Wayland socket is fully functional and
+accepting real connections — any guest script gating on `test -S` for a Unix socket path will
+hang/misbehave. Repro scripts should use `[ -e ... ]` instead of `[ -S ... ]` as a workaround.
+This is a real, worthwhile litebox fix for a future sub-session; it was not blocking this
+sub-session's XFCE-connect investigation once worked around.
+
+**No tracked-file changes this sub-session** — every edit was to untracked `.wfgy/xfce-build/*.ps1`
+scratch repro scripts (`.wfgy` is gitignored), so no commit was needed or made for the launch-script
+fixes themselves; only this AGENTS.md status update is a tracked-file change.
+
+Working repro script (both fixes applied): `.wfgy/xfce-build/run_repro_fix_apply.ps1`.
+Logs: `.wfgy/xfce-build/repro-fix-apply-run3.log` (weston-alive proof), `run5.log` (XFCE-connect
+investigation).
+
+---
+
 # STATUS (2026-08-30, sub-session 26): real screenshot taken, window renders BLACK — a genuine, precisely-narrowed compositing gap found, one real infra bug fixed along the way
 
 The user asked to prove XFCE running "normal" by actually screenshotting the `--gui` window's
