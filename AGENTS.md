@@ -1,4 +1,4 @@
-# AGENTS.md — handoff note (2026-08-30, sub-session 18)
+# AGENTS.md — handoff note (2026-08-30, sub-session 19)
 
 ## Active standing goal (session-scoped Stop hook on the originating machine)
 
@@ -9,9 +9,56 @@ chronological detail of every prior sub-session's investigation, ruled-out hypot
 fixes lives in gm's memory store (`recall`/`codesearch` against this project) as resolved
 mutables — do not re-derive from scratch; query the recall store first (e.g. search
 "fork_verify AV path stale pointer", "DRM PRIME handle", "wlroots shm keymap",
-"D-Bus session bus export").
+"D-Bus session bus export", "step bound exhaustion").
 
-## Current state (as of sub-session 18)
+## Current state (as of sub-session 19)
+
+**Sub-session 19 root-caused (but did NOT fix — proven unsafe naive fixes, see below) the
+dbus-daemon real-daemon fork-child (tid=10, Windows `ThreadId(14)`) SIGSEGV at
+`rip=fault_addr=0x8b7f024` that sub-session 13 left needing binary disassembly.** No
+disassembly was actually needed — this is NOT a new decode-pattern gap in `fork_verify`'s AV-path
+healing. Fresh `LITEBOX_DIAG_FATALDUMP=1 LITEBOX_VEH_TRACE=1` capture (exact AGENTS.md repro)
+shows the crash is caused by `fork_verify.rs`'s own deliberate
+`MAX_THREAD_VERIFICATION_STEPS = 16384` proactive cutoff (line ~171) firing mid-flight WHILE
+genuine stale-pointer healing was still actively occurring: the literal log line immediately
+preceding the fatal RAWREGS crash is
+`[fork_verify] tid=ThreadId(14) on_single_step: step bound 16384 exceeded at rip=0x931c23f,
+ending verification early`, and the very next VEH event on that thread shows `is_verifying=false`
+taking a raw `c0000005` AV at `rip=0x8b7f024` completely unverified — both AV-path healers
+(`translate_stale_source_rip`/`translate_stale_source_memory_operand_registers`, fixes #8/#9,
+already landed and correct) are gated on `is_verifying(tls)`, which is now false, so neither ever
+gets a chance to fire on this exact fault. This directly contradicts the constant's own doc
+comment claiming post-fork staleness is "front-loaded": stale-pointer WARN healing lines are
+still firing right up to a fraction of a second (~t=25.92s) before the bound trips and the crash
+happens (~t=26.30s) — verification was doing real necessary work when cut off, not idling through
+an unrelated hang.
+
+**TRIED AND REVERTED — proven unsafe, do not retry a bare bound increase.** Raised
+`MAX_THREAD_VERIFICATION_STEPS` to 262144 (16x): the tid=10 crash was avoided, but a DIFFERENT
+and WORSE **host-level** crash appeared elsewhere in the same run (real Windows segfault, process
+exit 139, `rip=0x2`, a `.meta=0`-shaped null-deref pattern:
+`[codewatch] crash page rip=0x2 ... alloc_base=0x0`). Retried at a much more conservative 32768
+(2x) — the SAME worse host-crash still reproduced, with byte-identical stackwalk magic values
+(`0xc0000100` / `0x826429fee6489d13`) both times, proving this is a real, deterministic
+consequence of extending verification duration, not a fluke. This is the exact same "broad
+blanket-extend of fork_verify coverage/duration causes a worse regression" class sub-session 13
+already proved twice for other dimensions (the reverted register-to-register-mov-propagation
+patch, the six-syscall-ABI-register attempt) — now proven a THIRD time, for the step-bound
+dimension specifically. Reverted cleanly to 16384 (`git status --porcelain` clean, confirmed).
+
+**Two real, targeted (not blanket) follow-up mechanisms identified, neither attempted yet** (see
+gm mutable `dbus-daemon-tid10-crash-is-step-bound-exhaustion-not-decode-gap` for full detail):
+(a) an adaptive/decaying bound — extend the cutoff only while stale-pointer WARN hits keep
+occurring within a short recent step window, cut off once they go quiet for N steps, matching
+what "front-loaded staleness" actually requires instead of a fixed count; or (b) keep the AV-path
+healers callable for a bounded grace window of instructions past the point `is_verifying` flips
+false, without re-arming full single-step `TF` tracing for that window (the expensive per-
+instruction trap is what the bound is actually guarding against — not the healing check itself).
+Needs its own focused prototyping-and-test session (raise well past this exact failure point,
+confirm the worse host-crash reproduces or does not, same method this session used) — do not
+attempt a third bare bound-value guess.
+
+## Prior state (as of sub-session 18)
 
 **Sub-session 18 fixed and verified live the nested-fork (fork-of-a-fork) grandparent-generation
 staleness gap sub-session 17 root-caused but deliberately did not fix.** Landed (commit to
