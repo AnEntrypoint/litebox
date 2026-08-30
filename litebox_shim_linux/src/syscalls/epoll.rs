@@ -198,6 +198,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
                     };
                     return Some(events & mask);
                 }
+                // See `DriFd`'s own doc comment for why this check exists -- identical structural
+                // shape to the `EvdevFd` check just above, for `DrmSubsystem::pending_flip_events`
+                // instead of `EvdevSubsystem`'s own queue.
+                if global
+                    .litebox
+                    .descriptor_table()
+                    .with_metadata(file, |_: &crate::syscalls::file::DriFd| ())
+                    .is_ok()
+                {
+                    let events = if global.drm.has_pending_flip_events() {
+                        Events::IN
+                    } else {
+                        Events::empty()
+                    };
+                    return Some(events & mask);
+                }
                 // Stdout/stderr are always immediately writable from the guest's perspective (the
                 // platform's `write_to` is a plain, always-completing `WriteFile`/`write(2)`), so
                 // those still report a fixed `Events::OUT`. Stdin, however, must consult the

@@ -596,6 +596,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .descriptor_table_mut()
                 .set_entry_metadata(&file, EvdevFd);
         }
+        // See `DriFd`'s own doc comment for why this tag exists -- identical structural need to
+        // `EvdevFd` just above, for `/dev/dri/card0` instead of `/dev/input/event0`.
+        if let Some(path) = &path
+            && is_dri_path(path)
+        {
+            let _ = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .set_entry_metadata(&file, DriFd);
+        }
         let files = self.files.borrow();
         let raw_fd = files.insert_raw_fd(file).map_err(|file| {
             files.fs.close(&file).unwrap();
@@ -1528,6 +1539,14 @@ fn stdio_stream_for_path(path: &CString) -> Option<StdioStream> {
 #[derive(Clone, Copy)]
 pub(crate) struct EvdevFd;
 
+/// Marker metadata tagged onto a `/dev/dri/card0` fd at `open()` time -- mirrors [`EvdevFd`]'s
+/// identical role and identical reason for existing: a plain filesystem-backed fd's
+/// `poll`/`select`/`epoll_wait` readiness (`syscalls::epoll::EpollDescriptor::poll`'s `File` arm)
+/// is computed from `global`+the fd handle alone, with no reach into `DrmSubsystem`'s own
+/// `pending_flip_events` queue without this tag identifying which fd to check.
+#[derive(Clone, Copy)]
+pub(crate) struct DriFd;
+
 /// Marker metadata tagged onto a `memfd_create` fd's underlying entry at creation time --
 /// distinguishes it from an ordinary regular file so `sys_ftruncate` knows to also
 /// create/resize the real backing `PageManagementProvider::create_shared_memory` object it needs
@@ -1554,6 +1573,11 @@ pub(crate) struct DrmPrimeFdMarker {
 /// Mirrors [`stdio_stream_for_path`]'s shape for the one evdev device path this shim exposes.
 fn is_evdev_path(path: &CString) -> bool {
     path.to_str() == Ok("/dev/input/event0")
+}
+
+/// Mirrors [`is_evdev_path`]'s shape for the one DRM device path this shim exposes.
+fn is_dri_path(path: &CString) -> bool {
+    path.to_str() == Ok("/dev/dri/card0")
 }
 
 const SEEK_SET: i16 = 0;

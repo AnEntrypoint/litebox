@@ -1,4 +1,110 @@
-# STATUS (2026-08-30, sub-session 27): two real weston-launch bugs fixed (XKB data path, missing `/tmp/.X11-unix`) — weston now survives a full 60s+ soak and XWayland binds, but XFCE clients still never connect to Wayland; screenshot is still BLACK, standing goal NOT met
+# STATUS (2026-08-30, sub-session 28, updated): DRM epoll-readiness gap FOUND AND FIXED (real, landed), but re-verification shows it was NOT the actual blocker -- weston still repaints exactly once even with the fix in place; the true remaining gap is one level deeper, in the Wayland protocol traffic between weston and its clients (Xwayland/XFCE), not in DRM readiness signaling
+
+**Real fix landed this sub-session** (kept, verified, not reverted): `DrmSubsystem::pending_flip_events`
+had zero `epoll`/`poll` readiness wiring -- a real, structural gap, not a guess. Added
+`DrmSubsystem::has_pending_flip_events()`, a `DriFd` marker mirroring the existing `EvdevFd`
+pattern (tagged onto `/dev/dri/card0` at `open()` time in `syscalls::file`), and wired it into
+`syscalls::epoll::EpollDescriptor::poll`'s `File` arm exactly the same way `EvdevFd`/
+`EvdevSubsystem::has_pending` already works -- a genuinely idiomatic, in-tree-precedented fix, not
+invented from nothing. `cargo test -p litebox_shim_linux --lib -- --skip test_mremap`: 177/177
+(unchanged from baseline, confirmed both before and after this edit). This closes a real DRM-fd
+readiness gap regardless of the finding below, and should stay landed.
+
+**However, re-running the full XFCE repro with this fix in place shows NO CHANGE in weston's own
+repaint behavior**: all three XFCE components again genuinely `sys_execve` (confirmed via debug
+trace), zero fatal signals, weston stays alive -- but `DrmModeSetCrtc`/`DrmModePageFlip` ioctl
+count is STILL exactly 2 (weston's own single startup modeset+flip), even well after all three
+XFCE processes are alive and running. **The DRM-readiness hypothesis is refuted by this direct
+re-test** -- fixing the readiness signal did not change weston's own decision about whether to
+schedule a new frame, meaning the actual blocker is upstream of DRM entirely: weston never decides
+new content needs painting in the first place, regardless of whether it would correctly observe a
+flip-complete event if it looked.
+
+**New, more precise finding, not yet fixed**: grepped the same run's full log for any Wayland
+socket connect/traffic activity involving `wayland-0` -- found ZERO matches. Despite weston
+successfully creating the Wayland listening socket, launching Xwayland as its own child, and all
+three XFCE GTK/X11 applications staying alive and running real syscalls, **no evidence exists in
+this session's logs that Xwayland (or anything else) ever actually establishes real Wayland
+protocol traffic with weston as a client** -- which would fully explain zero further repaints:
+weston has nothing to composite because nothing new is actually arriving over the Wayland
+protocol, not because of any DRM-emulation gap. This narrows the investigation to a genuinely
+different layer than every hypothesis tried so far this multi-session investigation (labwc-style
+output-management stall, missing XKB data, missing `/tmp/.X11-unix`, DRM epoll readiness) --
+whoever continues should trace whether Xwayland's own `wl_display_connect()`/registry-bind
+sequence to weston's Wayland socket ever completes at all (a real AF_UNIX `connect()`/`sys_write`
+trace on the `wayland-0` socket path specifically, not just its listening `bind()`), since this
+session's evidence suggests it may not be reaching that point despite Xwayland itself staying
+alive as a process.
+
+---
+
+*Everything below this line is sub-session 28's original (partially superseded) write-up,
+preserved for the detailed evidence trail it still documents correctly (the readiness gap's
+precise code-level root cause, the exact `EpollDescriptor`/`IOPollable` architecture read this
+session) -- only its CONCLUSION (that fixing DRM readiness would resolve the black-window symptom)
+is now known to be incomplete, per the update above.*
+
+Sub-session 27's own Fix-phase agent iterated its way to a working set of launch-env fixes
+(`XKB_CONFIG_ROOT=/usr/share/X11/xkb`, pre-creating `/tmp/.X11-unix`) but its OWN repro script had
+regressed relative to this project's long-established working command -- it dropped the D-Bus
+SESSION bus entirely (only `dbus-daemon --system` was started, no `--session`), which xfsettingsd/
+xfce4-panel genuinely need. That is why its final screenshot was still black and its report
+concluded "XFCE clients still fail to connect to Wayland" -- a real symptom, but from a broken
+repro, not a persisting litebox/weston defect.
+
+**Re-ran the ORIGINAL, long-proven-working repro command** (documented throughout this file,
+`dbus-daemon --nofork --session` with an explicit `DBUS_SESSION_BUS_ADDRESS`) with sub-session 27's
+two real fixes folded in (`XKB_CONFIG_ROOT`, pre-created `/tmp/.X11-unix`) at `LITEBOX_LOG=debug`:
+
+- All three XFCE components genuinely `sys_execve` (`xfsettingsd` tid=21 t=17.71s, `xfce4-panel`
+  tid=22 t=17.72s, `xfdesktop` tid=23 t=17.73s).
+- Weston (`tid=1000`) is confirmed alive for the ENTIRE run -- grepped every `sys_exit_group` in a
+  1,039,308-line capture; weston's own tid never appears among them.
+- Zero `fatal signal` lines, zero `cannot open display` lines, anywhere in the full capture.
+- **Grepped the entire run for `DrmModeSetCrtc`/`DrmModePageFlip` ioctls: exactly TWO calls total,
+  both at t=14.47s -- one `SetCrtc` immediately followed by one `PageFlip` -- and NOTHING else for
+  the rest of the run, including the ~3+ seconds AFTER all three XFCE clients had already
+  `sys_execve`'d and presumably created real Wayland surfaces.** Weston composites its own initial
+  empty-desktop frame exactly once, at startup, and never repaints again -- not because of a
+  crash, not because of a config-apply-triggered stall, but because weston's own repaint scheduler
+  genuinely never decides to schedule a second frame, regardless of live client windows existing.
+
+**Root cause, precisely isolated by reading `litebox_shim_linux/src/syscalls/drm.rs` and
+`file.rs`'s DRM-fd read dispatch together**: `DrmSubsystem::pending_flip_events` (the queue a
+`DRM_MODE_PAGE_FLIP_EVENT`-flagged flip pushes a completion event into, so a client can `read()`
+its own DRM fd to learn a flip finished) has **zero `IOPollable`/readiness-notification wiring** --
+no `register_observer`, no `ReadySet`, no `check_io_events` implementation anywhere in `drm.rs`.
+The read-path comment at `file.rs`'s DRI-fd branch (~line 1129-1153) explicitly documents that a
+*synchronous* `read()` right after issuing a flip works fine (the event is already queued by the
+time a client reads for the flip it just made) -- but this says nothing about whether the fd is
+correctly reported READY to an `epoll_wait()`/`poll()` call made from a DIFFERENT point in a
+client's event loop, which is exactly the pattern a real Wayland compositor's repaint scheduler
+uses: register the DRM fd with the main event loop, wait for it to become readable, THEN read the
+flip-complete event and use that as the trigger to schedule/issue the NEXT frame's `PAGE_FLIP`.
+Without readiness wiring, an `epoll_wait()` covering the DRM fd would never report it ready after
+the first flip completes, so weston's own event loop would have no signal telling it "the previous
+frame finished, it's safe to schedule the next one" -- exactly matching the observed symptom (one
+successful flip, then permanent silence) far more precisely than any of this investigation's
+earlier hypotheses (labwc-style output-management stall, missing XKB data, missing `/tmp/.X11-unix`
+-- all real, all now fixed or ruled out, none of them this).
+
+**This is a real, well-scoped, NOT-yet-fixed litebox gap** -- exactly the same shape of bug already
+fixed once this session for `xfce4-panel`/similar readiness-wiring gaps found earlier in different
+subsystems (e.g. the nested-epoll fix for `EpollFile` documented earlier in this file's own
+history). The fix path is analogous: implement `litebox::event::IOPollable` (or whatever the
+current trait/registration surface is named -- re-check against the codebase, this file's history
+shows the pattern has been refined more than once) for the DRM subsystem's flip-event queue, so a
+push into `pending_flip_events` correctly notifies any epoll/poll waiter registered on that DRM fd
+-- mirroring `EpollFile`'s own `register_observer`/`check_io_events` implementation as the nearest
+in-tree precedent. **NOT attempted this session** -- this is real, additional litebox_shim_linux
+subsystem work (not a launch-script/environment fix, unlike every other gap closed in sub-sessions
+26-27) that deserves its own focused implementation-and-verification pass rather than a
+same-session bolt-on after an already-long investigation. Whoever picks this up: implement the
+readiness wiring, then re-run the exact repro documented above (with `LITEBOX_LOG=debug` to confirm
+via `DrmModePageFlip` ioctl count that weston now issues MORE than the initial two calls once XFCE
+clients are live) and take a REAL screenshot to confirm actual composited content -- this is the
+single most concrete, precisely-targeted next step this entire multi-session investigation has
+produced.
 
 This sub-session picked up sub-session 26's "weston never re-flips" gap and went one level
 deeper into the launch sequence itself, using live instrumented reruns (not just log-reading).

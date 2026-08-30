@@ -255,6 +255,22 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         Some(bytes)
     }
 
+    /// Whether a flip-completion event is currently queued for a DRM device fd's `read()` to pop
+    /// -- the readiness half of the same fact [`Self::pop_flip_event_bytes`] consumes. Exists so
+    /// `syscalls::epoll::EpollDescriptor::poll`'s `File` arm can report a DRM fd `Events::IN`
+    /// exactly when this device genuinely has something to deliver, mirroring
+    /// `EvdevSubsystem::has_pending`'s identical role for `/dev/input/event0`. Without this, a
+    /// real compositor's own event loop -- which registers the DRM fd with `epoll`/`poll` and
+    /// waits for it to become readable BEFORE calling `read()`, rather than reading unconditionally
+    /// right after issuing a flip -- never observes a flip-complete notification for any repaint
+    /// after its first, since nothing ever marks the fd ready: confirmed live (litebox-xfce-1,
+    /// sub-session 28) against a real `weston --backend=drm-backend.so` run, which issued exactly
+    /// one `SETCRTC`+`PAGE_FLIP` pair at startup and never repainted again for the rest of a 60+
+    /// second run with three live Wayland/X11 client applications attached the entire time.
+    pub(crate) fn has_pending_flip_events(&self) -> bool {
+        !self.pending_flip_events.lock().is_empty()
+    }
+
     pub(crate) fn get_resources(&self, ptr: UserPtrMut<DrmModeCardRes>) -> Result<u32, Errno> {
         let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
 
