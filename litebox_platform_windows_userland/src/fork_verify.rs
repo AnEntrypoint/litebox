@@ -835,6 +835,117 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
         return StepOutcome::Continue;
     }
 
+    // (1b) Register-to-register propagation of a stale CODE/DATA pointer: a plain `mov reg, reg`
+    // (or `movzx`/`movsx`-shaped move) with NO memory operand at all copies a stale source-range
+    // value straight from one GPR into another. None of cases (2)/(2b)/(2c)/(2d)/(3)/(4) below
+    // ever see this: every one of them is gated on `explicit_memory_operand_address`/
+    // `memory_write_address` returning `Some`, which requires an `OpKind::Memory` operand to exist
+    // on the instruction -- a bare two-register `mov` has none. Confirmed live (litebox-xfce-1,
+    // dbus-daemon fork-child SIGSEGV): case (1) above translates `rip` (and, as a bonus, `rbp`)
+    // when `rip` itself lands in the source range, but a `mov rdi, rbx`-shaped instruction executed
+    // a few steps earlier in the SAME trapped run had already copied a still-untranslated
+    // source-range value from `rbx` into `rdi` with no memory operand to trip any other case --
+    // `rdi` was then dereferenced by a LATER (post-translation) instruction and faulted on the
+    // real access violation this case exists to prevent. This also explains a delayed-by-real-
+    // execution-time SIGSEGV (as opposed to one immediately following a logged heal, e.g. the
+    // ~944ms gap between the last logged heal and `xfsettingsd`'s SIGSEGV in sub-session 23's
+    // Run B): the stale register can sit unused for an arbitrary number of real instructions
+    // between the propagating `mov` and the eventual dereference, since nothing about holding a
+    // stale value in a register is itself observable without a case in this file re-checking it.
+    //
+    // Narrow and safe for the identical reason case (1)'s register translation is: fixing a live
+    // register to the exact value `sys_clone`'s own `translate_reg!` would have produced for it is
+    // not a guess, it is the same relocation map already proven correct for every other register at
+    // fork-resume time. Restricted to a genuine data-movement mnemonic (`Mov`/`Movzx`/`Movsx` --
+    // NOT `Test`/`Cmp`/`Xor`/etc, which merely happen to read a GPR operand that decodes the same
+    // way `op0`/`OpKind::Register` does but carry no "this value becomes a live pointer" semantics;
+    // an earlier draft of this case fired on those too and would have "translated" ordinary
+    // comparison/flag operands that only coincidentally fall in the tracked source range, exactly
+    // the false-positive shape every other case in this file already guards against). Also requires
+    // the source value to be `MIN_POINTER_ALIGN`-aligned, the same tagged-integer guard case
+    // (2c)/(2d) use, and no memory operand anywhere on the instruction (so this can never
+    // double-fire alongside a case below that already handles the memory-operand form).
+    //
+    // Only `op1` (the sole source register for this narrow `dest, src` shape) is ever inspected or
+    // translated here -- NEVER `op0`. `op0` is the write-only DESTINATION: reading its
+    // pre-instruction value and "translating" it would translate whatever garbage happened to be
+    // sitting in the destination register before this instruction overwrites it, corrupting an
+    // unrelated register with no relationship to the actual stale pointer being propagated. An
+    // earlier draft of this case iterated every `OpKind::Register` operand including `op0` and hit
+    // exactly this: it silently truncated/corrupted a destination register's value on a `mov r32,
+    // r32` reached with an incidentally source-range-shaped `op0`, an entirely different failure
+    // than the one this case exists to fix, manifesting downstream as a host-level
+    // `STATUS_ACCESS_VIOLATION` inside LiteBox's own syscall dispatch (not the guest's ordinary
+    // signal path) -- confirmed live and reverted before landing this narrower version.
+    if matches!(
+        instruction.mnemonic(),
+        iced_x86::Mnemonic::Mov | iced_x86::Mnemonic::Movzx | iced_x86::Mnemonic::Movsx
+    ) && instruction.op_count() == 2
+        && instruction.op0_kind() == OpKind::Register
+        && instruction.op1_kind() == OpKind::Register
+        && qualifying_gpr(instruction.op0_register()).is_some()
+        && let Some(src_reg) = qualifying_gpr(instruction.op1_register())
+        && let Some(value) = register_value(src_reg, context)
+        && relocations.is_in_source(value)
+        && value.is_multiple_of(MIN_POINTER_ALIGN)
+        && let Some(translated) = relocations.translate(value)
+    {
+        litebox_util_log::warn!(
+            rip:? = rip, mnemonic:? = instruction.mnemonic();
+            "fork_verify: stale CODE/DATA pointer detected in register-to-register move, translating source register and retrying"
+        );
+        write_register_value(src_reg, translated, context);
+        // Do not advance rip: retry the same instruction now that its source register holds the
+        // translated value -- the CPU then performs the actual `dest <- src` copy/zero-extend
+        // itself with correct semantics for the instruction's real operand width, exactly as if
+        // the source register had never gone stale.
+        return StepOutcome::Continue;
+    }
+
+    // (1c) `lea dest, [base+disp]` computing a new stale-range pointer from a stale base register.
+    // `lea` never actually reads or writes memory (confirmed via `iced_x86`'s own
+    // `InstructionInfoFactory::used_memory()`, which reports no access for it), so
+    // `memory_write_address` below (which requires a real memory access) always returns `None` for
+    // it, and case (2b)'s own gate -- `relocations.is_in_source(read_address)`, where
+    // `read_address` is the COMPUTED `base+disp` result, not the base register's raw value --
+    // silently fails to fire whenever `disp` is nonzero even though `base` itself is genuinely
+    // stale: `base+disp` need not itself land in a tracked source range even when `base` does,
+    // since `AddressRelocations`' source ranges are the parent's real pre-`fork()` mappings, not an
+    // unbounded contiguous span, and a `disp` large enough to walk `base` out of its own mapping
+    // (a common shape: `lea rdi, [rbx+0x18]` indexing into a struct field) breaks the false premise
+    // that the destination address should be checked instead of the source register. Confirmed as
+    // the specific remaining gap behind sub-session 23's `xfsettingsd` SIGSEGV surviving case
+    // (1b) above: the repeating `rip=419518714`/`419518956` heal-storm pair immediately preceding
+    // every observed crash never appeared as a "stale DATA pointer" WARN (case (2b)'s own log
+    // line), ruling out case (2b) firing at all for this instruction.
+    //
+    // Narrow and safe for the same reason as case (1b): only the named base register is ever read
+    // or translated, gated on the BASE register's own raw value (not any derived address) being a
+    // genuine, aligned `is_in_source` hit -- never a guess. No index register handling: `lea`
+    // shapes carrying a stale pointer in the index position rather than the base have not been
+    // observed and would need independent justification before adding.
+    if instruction.mnemonic() == iced_x86::Mnemonic::Lea
+        && instruction.op_count() == 2
+        && instruction.op0_kind() == OpKind::Register
+        && instruction.op1_kind() == OpKind::Memory
+        && qualifying_gpr(instruction.op0_register()).is_some()
+        && let base_reg = instruction.memory_base()
+        && !matches!(base_reg, Register::None | Register::RIP | Register::EIP)
+        && let Some(base_value) = register_value(base_reg, context)
+        && relocations.is_in_source(base_value)
+        && base_value.is_multiple_of(MIN_POINTER_ALIGN)
+        && let Some(translated_base) = relocations.translate(base_value)
+    {
+        litebox_util_log::warn!(
+            rip:? = rip, base_value:? = base_value, translated_base:? = translated_base;
+            "fork_verify: stale CODE/DATA pointer detected as lea base register, translating and retrying"
+        );
+        write_register_value(base_reg, translated_base, context);
+        // Do not advance rip: retry so the CPU recomputes `base+disp` from the now-translated base,
+        // producing the correctly-relocated destination value itself.
+        return StepOutcome::Continue;
+    }
+
     let Some(address) = memory_write_address(&instruction, context) else {
         // (2b) The same stale-base-register case as (2) below, but for an instruction that only
         // READS through the stale pointer. `memory_write_address` deliberately reports only

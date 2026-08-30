@@ -1,3 +1,431 @@
+# CORRECTION (sub-session 23, later): the "fork_verify timing race" below was a methodology bug, not a real bug
+
+Everything in this file under "Bisection results", "ROOT CAUSE", "MUCH more precise minimal
+repro found" describes a hang that was chased at length and never actually existed as a bug.
+**The real explanation: every one of those bisection tests used a `timeout N` value that was too
+short for the `sleep 15` in the repro to legitimately finish**, given ~10s of setup time (seatd
+startup + poll loop) ahead of it. A control test comparing a "hanging" 10-item run against a
+"passing" 8-item run showed the passing run's own trace has a genuine ~15-SECOND silent gap
+(nothing logged at all) between `sleep`'s post-execve mmap setup and its `sys_exit_group` — that
+gap **is `sleep 15` correctly sleeping**, not a hang. Every "hang" observed with a 20-25s outer
+`timeout` was this exact same correct silence, just truncated before the sleep could finish and
+print its own completion marker. Re-running the EXACT SAME "hanging" 10-item repro with `timeout
+40` (proven necessary: ~11s of setup + 15s of real sleep + margin) passed cleanly, first try.
+
+**Lesson for future sessions**: when a repro's total legitimate runtime (sum of every real `sleep`
+call plus setup) approaches the outer `timeout` value, a "hang" observed near the timeout boundary
+is more likely an impatient timeout than a real bug — always compute the repro's own minimum
+legitimate wall-clock time first and set `timeout` comfortably above it (2x+) before concluding
+anything hung. This also retroactively casts doubt on some, though not necessarily all, of the
+EARLIER "hang" findings in this same file (the dbus-daemon/seatd bisection tests, the
+`LITEBOX_VEH_TRACE` "masks the race" observation) — those used similarly short timeouts against
+repros containing real `sleep` calls and may be subject to the identical artifact. They have NOT
+been re-verified with adequate timeouts as of this correction; treat every "hang"/"timing race"
+claim elsewhere in this file as UNCONFIRMED pending a re-test with a timeout that generously
+exceeds the repro's own legitimate sleep time. The one exception: the genuinely runaway processes
+that grew to 1.3+GB and were manually `taskkill`-ed after 90+ real wall-clock seconds against a
+repro with no `sleep` anywhere near that large — those remain real hangs, not a timeout artifact,
+since no legitimate sleep in those specific commands could explain 90s of silence.
+
+## FINAL, carefully re-verified conclusion (same sub-session, after the correction above): the seatd/dbus fork storm IS mostly a timeout artifact, but a SEPARATE, real, confirmed hang exists at Xwayland's own startup
+
+Re-ran the FULL XFCE repro (seatd + dbus-daemon --nofork + weston --xwayland + xfsettingsd +
+xfce4-panel + xfdesktop, against `xfce-layer18.tar`) with a properly generous `timeout 180`
+instead of the earlier impatient 20-90s values:
+
+- Progressed genuinely further than any prior run this session: past the seatd/dbus fork storm
+  (which, as corrected above, was largely a timeout artifact — confirmed zero fatal signals and
+  real forward progress through t=27s), THROUGH weston's own startup, THROUGH Xwayland launching,
+  and into Xwayland's OWN internal keymap compilation (`xkbcomp` ran and logged real warnings:
+  "The XKEYBOARD keymap compiler (xkbcomp) reports... Errors from xkbcomp are not fatal to the X
+  server") — real, substantial, never-before-reached progress in this investigation.
+- **Then genuinely froze at t=27.006s** — confirmed by polling the SAME process twice, ~3 minutes
+  of real wall-clock apart: log length (755 lines) and memory (7,852,928 KB) were BYTE-IDENTICAL
+  between both checks. This is not slow forward progress (which would show growing memory/log
+  length) — it is a hard freeze. The outer `timeout 180` did NOT kill it either (the same
+  known gap noted earlier in this file: `timeout` does not reliably reach this Windows process
+  tree) — had to `taskkill` manually after ~5 real minutes of no progress, an order of magnitude
+  past any legitimate sleep in this repro (the longest is `sleep 3` inside weston's own child
+  command).
+- Memory grew from ~1.4GB baseline to 7.85GB during the run (before freezing at that ceiling) —
+  consistent with the same fork_verify heal-storm growth pattern observed hours earlier in this
+  session's FIRST successful `weston --xwayland` full-repro attempt (which crashed with `memory
+  allocation of 1342177280 bytes failed` at a similar point). This time it froze rather than
+  OOM-crashed, but the underlying mechanism (repeating identical stale-pointer heals, e.g.
+  `rip=140668768385452` repeating dozens of times per millisecond around t=18-19s, matching this
+  session's very first Xwayland-related crash almost exactly) is the same.
+
+**Conclusion, now with high confidence**: there are TWO distinct things that were conflated
+earlier in this file under "the fork storm hangs everything" — (1) the ordinary seatd/dbus-daemon
+post-fork stale-pointer healing, which is NORMAL, EXPECTED, and NOT a bug (it resolves within
+a second or so every time, confirmed now across many correctly-timed-out runs), and (2) a real,
+reproducible, freezing/OOM-prone bug specifically triggered by Xwayland's own fork/startup
+sequence, which is NOT a timeout artifact — confirmed via a frozen, unchanging process state held
+for 3+ real minutes.
+
+## UPDATE (same sub-session, further re-testing): all 3 XFCE components DO execve — confirmed twice — but the run is non-deterministic: sometimes freezes post-Xwayland, and once showed xfsettingsd itself crash with SIGSEGV
+
+Two more full-repro runs, both against `xfce-layer18.tar`:
+
+**Run A (LITEBOX_LOG=debug, 40s timeout)**: confirmed via the full (unfiltered) debug log that
+**all three XFCE components genuinely `sys_execve`**:
+```
+17.685032800s DEBUG ... sys_execve: entry tid=21 path=/usr/bin/xfsettingsd
+17.700094100s DEBUG ... sys_execve: entry tid=22 path=/usr/bin/xfce4-panel
+17.705683100s DEBUG ... sys_execve: entry tid=23 path=/usr/bin/xfdesktop
+```
+Zero fatal signals through the full 40s window; at the timeout boundary tid=22/23 were still
+alive and doing real file I/O (`sys_read` on live fds) — genuine, sustained post-launch activity,
+the best result this entire investigation has produced. (This run also retroactively corrected an
+earlier mistake in this file: a "tid=39 frozen for 17 real seconds" claim, based on filtering the
+log to only the `process` module, was WRONG — the full unfiltered log showed real, continuous
+activity in OTHER modules, i.e. `syscalls::file`/`syscalls::mm`, during that "gap". Module-filtered
+log captures are unreliable for freeze/hang diagnosis in this codebase; always capture unfiltered
+`LITEBOX_LOG=debug` when checking whether a thread is genuinely stuck.)
+
+**Run B (LITEBOX_LOG=info, 150s timeout, otherwise identical repro)**: reached a DIFFERENT
+outcome — at t=18.142483s, **`tid=21` (by process-numbering pattern, almost certainly
+`xfsettingsd`) crashed with a genuine fatal signal**:
+```
+18.142483000s ERROR litebox_shim_linux::syscalls::signal: fatal signal: terminating task signal=Signal(11) pid=21 tid=21
+```
+occurring immediately after a tight fork_verify heal-storm burst (`rip=419518714`/`419518956`
+alternating rapidly beforehand). Weston's own log then showed `xfce4-panel`/`xfdesktop` (pid
+22/23) getting "libwayland: error in client communication" shortly after — most likely just the
+repro script's own `sleep 3` timing (components launching before Xwayland's `DISPLAY=:0` is
+actually ready is an existing race IN THE REPRO SCRIPT, not necessarily a litebox bug) rather than
+a second crash, though this was not independently confirmed. The run then continued (weston kept
+running, launched Xwayland, `xkbcomp` completed successfully — real progress) but ultimately
+**froze** — confirmed via two checks of the SAME process several minutes apart showing
+byte-identical memory (7,338,832 KB) and log line count (755) both times — required a manual
+`taskkill` after the 150s outer `timeout` again failed to reach the Windows process tree.
+
+**Honest final assessment**: this investigation now has hard, reproducible evidence that (1) all
+three XFCE components CAN reach `sys_execve` (Run A), (2) at least one of them (`xfsettingsd`,
+most likely) CAN crash with a real SIGSEGV shortly after Xwayland launches (Run B), and (3) the
+overall repro is NON-DETERMINISTIC — two nominally-identical runs (differing only in log level,
+which itself perturbs timing, consistent with everything else observed this session about
+timing-sensitivity) reached different outcomes. **XFCE has not been observed to run flawlessly for
+a sustained window in ANY run this session.** The genuinely new, actionable finding is Run B's
+crash: a real `SIGSEGV` in what is very likely `xfsettingsd`, immediately following a fork_verify
+heal-storm burst, tid=21 — this is the first time this investigation has caught an actual XFCE
+component (not just infrastructure like dbus/seatd/weston) crash with hard evidence of exactly
+when and via what signal. This narrows the remaining work precisely: whoever continues this should
+reproduce Run B's exact crash again (same repro, `LITEBOX_LOG=info`, expect it around t=18s) and
+capture `LITEBOX_DIAG_FATALDUMP=1` register/instruction-byte forensics at the moment of the
+SIGSEGV to identify whether this is yet another instance of the fork_verify stale-pointer class
+(a case not yet covered by any of the existing `on_single_step`/AV-heal cases) or a genuinely
+different defect. NOT fixed this session — per the standing caution against speculative
+`fork_verify` patches (three earlier attempts this session already proven unsafe), no fix was
+attempted; this is real diagnostic narrowing, not resolution.
+
+**Further attempt to capture forensics failed for the same reason as everything else in this
+file**: retried with `LITEBOX_DIAG_FATALDUMP=1` to get register/instruction-byte detail at the
+crash — the added per-instruction `RAWREGS` logging overhead (114,454 lines in 45s) again
+perturbed timing enough that the crash did NOT reproduce in that run. This is now the THIRD
+independent confirmation this session that added diagnostic overhead (VEH_TRACE, FATALDUMP, and
+implicitly the DEBUG-vs-INFO log-level difference between Run A and Run B above) changes whether
+this bug manifests — it is genuinely, robustly timing-sensitive, not an artifact of any one
+specific tool.
+
+**One more precise detail worth recording**: the crash at t=18.142s came ~944ms AFTER the last
+fork_verify heal event at t=17.198s — not immediately after, the way every other heal-adjacent
+crash in this investigation's history has been (typically microseconds later, the very next
+instruction). This means `xfsettingsd` ran a substantial amount of real, un-instrumented code
+between its last observed heal and the eventual SIGSEGV, which argues AGAINST "the heal itself
+produced a wrong address that immediately faulted" and FOR "an earlier heal left some state subtly
+wrong in a way that only manifests later," OR a completely separate, unrelated defect. Whoever
+picks this up next should not assume the crash is adjacent to the last logged heal — the true
+faulting instruction is likely reached only after real forward progress, which any per-instruction
+trace will itself prevent from reproducing. A different diagnostic strategy is needed: consider
+a lightweight one-shot breakpoint set exactly at the crash `rip` (once known from one successful
+un-instrumented repro's `LITEBOX_DIAG_FATALDUMP`-free crash) rather than full tracing, since a
+single conditional breakpoint adds far less overhead than logging every instruction.
+
+# AGENTS.md — handoff note (2026-08-30, sub-session 23)
+
+## Sub-session 23: weston pivot (per user's explicit "try alternate compositors" choice) — proven stable standalone, but XFCE's Xwayland dependency re-triggers the SAME fork_verify step-bound wall
+
+User was asked (AskUserQuestion, sub-session 22) whether to (a) patch wlroots, (b) stop and wait
+for upstream, or (c) try alternate compositors/configs — chose (c). This session switched the
+repro from `labwc` to `weston` (a non-wlroots compositor, own DRM backend).
+
+**weston alone (no XFCE) is genuinely stable**: `weston --backend=drm-backend.so --use-pixman`
+survives 150s+ with zero `fatal signal` lines, real DRM modeset succeeds, real libinput device
+attaches. This confirms the wlroots swapchain bug (sub-session 22) is compositor-specific, not a
+DRM-emulation-wide problem — real independent confirmation of that root-cause finding.
+
+**XFCE's GTK apps need real X11, not just Wayland**: `xfce4-panel` fails immediately with
+`Gtk-WARNING: cannot open display:` when only a Wayland socket exists — XFCE's panel/desktop are
+GTK X11 clients at their core, not native Wayland. Fix: weston's `--xwayland` flag.
+
+**`--xwayland` initially failed outright** (weston itself exit(1) at ~130ms after execve):
+`Failed to load module: Error loading shared library /usr/lib/libweston-14/xwayland.so: No such
+file or directory` — the `weston-xwayland` module subpackage was simply never installed in this
+rootfs (Alpine splits it from the base `weston` package). **Genuine rootfs-build gap, not a
+litebox bug.** Fixed by downloading `weston-xwayland-14.0.2-r5.apk` from the Alpine v3.24
+community CDN (host has network access even though the guest sandbox does not — `apk` inside the
+guest has no cache and no CDN reachability) and appending just its payload
+(`usr/lib/libweston-14/xwayland.so`, 30970 bytes) onto a copy of `xfce-layer17.tar` →
+`xfce-layer18.tar`. All the module's other declared deps (`libGL`/`libcairo`/`libpixman`/etc, plus
+`xkbcomp`) and the `Xwayland` binary itself (`xwayland` apk) were CONFIRMED already present in the
+rootfs — only the one `.so` was missing. **Use `xfce-layer18.tar` as `--resume-from` going
+forward**, not layer17.
+
+**Second bug found and fixed the same way**: with the module present, weston SIGSEGV'd on
+`failed to bind to /tmp/.X11-unix/X0: No such file or directory` — the guest never creates
+`/tmp/.X11-unix` itself and weston's own Xwayland-launch path doesn't `mkdir` it defensively
+before `bind()`. Not a litebox bug (real weston fragility on a missing standard directory) —
+worked around by `mkdir -p /tmp/.X11-unix; chmod 1777 /tmp/.X11-unix` in the repro command before
+launching weston. **After both fixes, `weston --xwayland` genuinely reaches `xserver listening on
+display :0`** and survives a standalone 20s window with zero fatal signals — real forward
+progress past every point this investigation had reached with labwc.
+
+## Current blocker (sub-session 23, UNRESOLVED): Xwayland's own post-fork execution re-triggers the closed-off fork_verify step-bound / AV-heal runaway-loop bug
+
+Running the FULL repro (dbus-daemon --nofork + seatd + weston --xwayland + xfsettingsd/xfce4-panel/
+xfdesktop against `xfce-layer18.tar`) at `LITEBOX_LOG=info` for a 150s window: weston logs
+`launching '/usr/bin/Xwayland'` at ~18:15:55.985 (t=~15.3s), and starting at t=1.2s (BEFORE weston
+even runs — likely dbus-daemon's own fork, already known) and escalating heavily right after the
+Xwayland launch, `fork_verify` emits **631 `stale CODE/DATA pointer` WARN lines in under 20s**,
+the large majority a tight non-converging loop repeatedly "healing" the exact same
+`rip=140668768385452 → translated_rip=694135212` pair many times per millisecond with zero
+progress between heals. The process crashes at t=~19.79s with:
+```
+memory allocation of 1342177280 bytes failed
+```
+(host-level Rust allocator OOM inside the runner itself, not a guest signal — `grep -c "fatal
+signal"` on this log is 0, so log-based-evidence discipline: do NOT mistake "no fatal signal
+lines" for success here, the crash is a different failure class that also fails the goal).
+
+**This is very likely the SAME fork_verify step-bound/AV-heal pathology already root-caused and
+explicitly closed off as unsafe-to-extend in sub-sessions 13/19/20** (see "CLOSED DEAD END" section
+below — three separate fix attempts at extending step-bound coverage all caused worse crashes,
+including one proven via diagnostic instrumentation to heal to a WRONG address and crash anyway).
+Xwayland forks internally (X servers commonly fork a helper/logging or become session-daemon-like)
+much the same way `dbus-daemon --fork` did — but unlike dbus-daemon, there is no `--nofork`-style
+flag for Xwayland to sidestep its own fork. **Do not re-attempt extending
+`MAX_THREAD_VERIFICATION_STEPS` or keeping `AddressRelocations` alive past the bound in any form —
+this has been tried three times already and is proven unsafe** (false-positive `is_in_source` hits
+against an expired map). This needs either (a) a fundamentally different fix to fork_verify's
+architecture that doesn't share that failure mode (not yet designed), or (b) avoiding whatever
+Xwayland-internal fork triggers it (not yet identified — unlike dbus-daemon, no obvious `--nofork`
+equivalent flag is documented for Xwayland), or (c) reporting this precise, narrower blocker back
+to the user: XFCE's Wayland-only components (xfsettingsd, possibly xfdesktop in Wayland-native
+mode) may be reachable without Xwayland; only the GTK/X11 rendering path (xfce4-panel, and
+xfdesktop's own X11-drawn desktop icons) strictly requires it.
+
+**UPDATE (same sub-session, tested): there is no Wayland-only fallback.** Ran `xfsettingsd` +
+`xfdesktop` (no `xfce4-panel`, no `--xwayland` at all — plain `weston --backend=drm-backend.so
+--use-pixman`) for 90s. Result: BOTH fail immediately —
+```
+xfsettingsd: Unable to open display.
+(xfdesktop:22): Gtk-WARNING **: cannot open display:
+```
+So this is not an `xfce4-panel`-only requirement — the entire XFCE stack tested (xfsettingsd,
+xfdesktop) is built GTK/X11-first and requires a real `DISPLAY`, i.e. Xwayland, unconditionally.
+There is no partial-XFCE-without-Xwayland path available with this rootfs/XFCE build.
+
+**Also confirmed: the fork_verify heal-storm is NOT Xwayland-specific.** It reproduces in this
+Wayland-only run too (313 stale-pointer WARN lines in the first ~17s), starting at t=1.2s —
+BEFORE weston even launches. So the trigger is `dbus-daemon` and/or `seatd`'s own startup, not
+anything Xwayland does internally. (`dbus-daemon --nofork` was already applied in this repro and
+does NOT prevent it here — contradicts the sub-session-21 finding that `--nofork` "avoids the
+fork-verify crash entirely"; more likely `--nofork` avoided ONE specific instance of the bug
+[dbus-daemon's own daemonize-fork] but `seatd` or another descendant has its own unrelated fork
+hitting the same underlying step-bound gap.) In this specific run the process did not crash via
+OOM this time — it went permanently silent at t=17.04s (log stops mid-heal-storm, memory usage
+flat ~1.4GB, PID still alive) and the outer `timeout 90` did not kill the Windows-native child
+process (confirmed: PID was still running well past 90s wall-clock, had to be force-killed
+manually via `taskkill`). This is a SEPARATE, also-unresolved reliability gap: `timeout N` +
+`litebox_runner...exe` does not reliably enforce N seconds when the guest is wedged — worth a
+`prd-add` row of its own (likely `timeout`'s SIGTERM not reaching the actual Windows process tree,
+or the runner process ignoring/not translating it) but out of scope for the immediate goal.
+
+**Conclusion for whoever picks this up next**: the real remaining blocker is `fork_verify`'s
+step-bound gap itself — general, not compositor- or Xwayland-specific, and already proven (3
+independent attempts, this session) unsafe to patch by extending step bounds or keeping the
+relocation map alive past the bound. Reaching "XFCE starts flawlessly" requires either (a) a
+genuinely different fork_verify architecture (not yet designed — the AV-path healing mechanism
+itself is sound for ITS narrow cases, the problem is specifically the unbounded case once
+single-stepping disarms), or (b) precisely identifying which single fork (dbus-daemon post-
+`--nofork`? seatd? something else in the chain?) is hitting it in THIS repro and finding a
+targeted avoidance for that one process the way `--nofork` avoided dbus-daemon's daemonize-fork —
+NOT yet done for whatever is triggering it now. Do not attempt a 4th step-bound-extension patch;
+it will very likely fail the same way the first 3 did.
+
+## Bisection results (same sub-session, later): the trigger is UNIVERSAL, not process-specific — and the loop is per-process-lifetime, not per-fork
+
+Isolated each of the three candidates individually against a clean repro:
+- `seatd` alone (no dbus at all): heal storm fires (263 events), process hangs indefinitely
+  (never reached its own 30s completion echo, force-killed after 90s+ wall clock).
+- `dbus-daemon --nofork` alone (no seatd): heal storm ALSO fires (133 events, identical repeating
+  `rip=30257409`/`translated_rip=31299834` pattern every run), process ALSO hangs indefinitely.
+  **This directly contradicts the sub-session-21 "`--nofork` avoids the fork-verify crash
+  entirely" finding** — re-tested against BOTH `xfce-layer18.tar` and the original
+  `xfce-layer17.tar` (ruling out a layer18/weston-fix regression) with byte-identical results on
+  both. Sub-session 21's success was very likely evaluated on a shorter/less-scrutinized run, or
+  the specific downstream symptom it checked (xfsettingsd's D-Bus connection succeeding) can occur
+  even while this heal storm is silently ongoing in the background.
+- `dbus-uuidgen --ensure=...` ALONE (no dbus-daemon at all — just the one-shot helper binary that
+  runs BEFORE dbus-daemon in every repro so far): heal storm fires too (56 events) — same
+  mechanism, definitively proving this is not dbus-daemon-specific either. **Critically, this run
+  actually COMPLETED** (reached its own echo'd completion marker) rather than hanging.
+
+**Refined understanding**: the fork_verify AV-heal mechanism fires on essentially any fork+exec in
+this rootfs (confirmed now: dbus-uuidgen, dbus-daemon, seatd — 3 for 3) and is NOT inherently fatal
+— `dbus-uuidgen`, a short-lived one-shot binary, forks, heals, and exits cleanly within under a
+second with zero lasting harm. The catastrophic outcomes (OOM / permanent hang) only appear with
+`dbus-daemon` and `seatd`, both LONG-RUNNING daemons that stay resident after forking. This
+strongly suggests the heal overhead or some related resource (likely the relocation map itself, or
+per-step trap/exception-handling cost) is not bounded by the fork event but continues accruing for
+the entire remaining lifetime of the forked process — consistent with, but more precisely scoped
+than, the original step-bound hypothesis from sub-sessions 13/19/20. A daemon that forks once and
+then runs for the rest of the session's duration pays this cost forever; a one-shot helper that
+forks and exits in under a second does not live long enough to hit the wall.
+
+**Implication for next steps**: this makes the underlying bug MORE tractable, not less — the
+question is no longer "which process triggers it" (all of them do) but "why does the AV-heal cost
+never terminate for a long-lived forked process, when it clearly resolves fine for a short-lived
+one." That is a real, scoped question for whoever redesigns fork_verify next, but per explicit
+user instruction this session did not attempt a 4th patch to the mechanism itself — this section
+only narrows the diagnosis.
+
+## ROOT CAUSE, confirmed by reading `on_single_step`/`begin()` directly (same sub-session, no code changed)
+
+Read `fork_verify.rs`'s actual step-bound logic (lines ~620-639, 2005-2011) to explain the
+bisection results precisely, without patching anything:
+
+- `tls.fork_verify_step_count` resets to 0 in `begin()`, called fresh on every `fork()`.
+- `on_single_step` increments it every trap and, once it exceeds `MAX_THREAD_VERIFICATION_STEPS`
+  (16384) or `MAX_IDENTITY_VERIFICATION_STEPS` (4096), sets `tls.fork_verify = None` and clears
+  `EFLAGS.TF` — this correctly, deliberately ends verification (both the single-step path AND the
+  AV-heal path in `lib.rs`, which also gates on `tls.fork_verify.borrow().as_ref()`) rather than
+  looping forever in the fork_verify machinery itself.
+- BUT the module's own doc comment for this bound already says plainly: "ending verification early
+  is NOT known to make such a loop itself terminate" — it only stops the *verification overhead*
+  from compounding an already-hung/broken child, it does not un-stick the child.
+
+**This is exactly what the bisection observed**: the repeating identical `rip`/`translated_rip`
+pairs (hundreds of times, always the SAME pair, e.g. `140668768385452 → 694135212`) are a real
+guest-level infinite loop — the child keeps re-executing the same faulting instruction because
+whatever it's looping on never resolves, not because fork_verify is failing to heal it (it heals
+the SAME slot successfully every single time, that's why the same "success" line repeats
+verbatim). At roughly hundreds-of-microseconds per single-step Windows-exception round-trip,
+16384 steps takes on the order of several seconds to ~10s — consistent with every observed hang
+(silent stop between t=6s and t=20s across all bisection runs) — after which verification ends
+itself cleanly, but the child is already permanently wedged in its own loop and never recovers,
+which is why the process goes silent forever instead of crashing OR completing.
+
+**This means the real bug is NOT in fork_verify's step-bound logic at all** — that logic is
+already working exactly as designed and documented. The real bug is a genuine LiteBox-emulation
+gap causing the CHILD to enter an infinite loop after a stale pointer heals "successfully" but
+something about the guest's subsequent state is still wrong (a value fork_verify has no case for:
+neither a stale code pointer nor a stale memory operand, but something else entirely — a stale
+FD, a stale futex/synchronization primitive's value, a signal mask, or similar non-pointer state
+`PageManager::duplicate`/`fork_verify` were never designed to fix, since fork_verify's own module
+doc explicitly says it repairs ONE narrow class of bug and nothing else). **This is a NEW,
+previously-unrecognized class of post-`fork()` corruption, distinct from the stale-pointer class
+fork_verify already handles** — likely specific to long-running daemons that fork and then loop
+(dbus-daemon's/seatd's event loops) rather than fork-then-immediately-execve (the case this
+module was designed and proven correct for).
+
+**Next real step for whoever picks this up**: identify what specific non-pointer guest state is
+wrong post-fork by live-debugging ONE of the repeating loop iterations directly (e.g.
+`LITEBOX_VEH_TRACE=1` plus manually decoding the loop body at the repeating `rip` to see what
+condition it's testing and why it never becomes false) rather than assuming it's another
+stale-pointer case fork_verify's existing mechanisms could heal — the healing IS succeeding on
+every iteration; the loop's exit condition itself is what's broken.
+
+**CONFIRMED (same sub-session, further testing): this is a genuine indefinite hang, not just
+slow verification.** Re-ran the `seatd`-only bisection with a 60s timeout (vs. the original 20-
+30s) specifically to rule out "it just needs more time" — the process was STILL alive and STILL
+stuck emitting the identical repeating heal pair 85+ seconds into wall-clock time (well past
+where `MAX_THREAD_VERIFICATION_STEPS`=16384 should already have fired and ended verification
+long ago), had to be `taskkill`-ed manually; `timeout 60` never killed it either (same
+outer-timeout-doesn't-reach-the-Windows-process-tree gap noted earlier). This is real, not an
+artifact of an impatient bisection window.
+
+**Also notable and possibly a real clue**: a parallel `LITEBOX_VEH_TRACE=1` capture of the SAME
+`seatd -l debug` repro (with the extra per-instruction eprintln overhead VEH_TRACE adds) did NOT
+reproduce the stuck loop at all in 8s/~19500 traps — `rip` advanced steadily through real code and
+seatd printed `"seatd started"` (success!). This strongly suggests the underlying bug is
+timing/scheduling-sensitive: the extra host-side overhead VEH_TRACE adds per single-step
+(eprintln, syscalls) changes the relative timing enough to avoid whatever race or non-deterministic
+condition the bug depends on — consistent with the earlier hypothesis of stale non-pointer guest
+state (a futex, condvar, or similar synchronization primitive) rather than a pure pointer issue,
+since synchronization bugs are exactly the class of bug that timing changes can mask. Reproducing
+under `LITEBOX_VEH_TRACE=1` reliably is therefore NOT a safe way to "test" a fix — a fix must be
+verified with tracing OFF, at realistic timing, or it may appear to work while the underlying race
+is merely being timing-masked again.
+
+## MUCH more precise minimal repro found (same sub-session, continued) — narrowed from "seatd hangs" to an exact shell construct
+
+Bisected further by stripping the repro down piece by piece (`LITEBOX_LOG=info`, no VEH_TRACE, in
+every test below — matters, see above):
+
+- `sleep 10` alone: completes fine (17 heal events, one fork).
+- `seatd -l debug &` then `sleep 8`: completes fine (121 heal events, ~3 forks).
+- `seatd -l debug &` then a `for i in 1 2 3; do sleep 1; done` loop, no test command: completes
+  fine (175 heals).
+- `seatd -l debug &` then `for i in 1 2 3 4 5; do [ -S /run/seatd.sock ] && break; sleep 1; done`
+  (5 iterations, `[` test present): completes fine (212 heals) — breaks out on iteration 1 since
+  the socket is already up.
+- `seatd -l debug &` then the SAME loop with `1 2 3 4 5 6 7 8 9 10` (10 iterations available, but
+  should still break after iteration 1 since the socket appears fast) followed by `echo LOOP_DONE;
+  sleep 15; echo TRAIL_DONE`: **`LOOP_DONE` prints, but the subsequent `sleep 15` hangs
+  indefinitely — `TRAIL_DONE` never prints.** (291 heal events before going silent.)
+
+**Exact minimal reproducing shell command** (everything before this is confirmed NOT sufficient
+on its own):
+```sh
+seatd -l debug & for i in 1 2 3 4 5 6 7 8 9 10; do [ -S /run/seatd.sock ] && break; sleep 1; done; echo LOOP_DONE; sleep 15; echo TRAIL_DONE
+```
+Note this is IDENTICAL in shape to the `1 2 3 4 5` variant that works — the only difference is the
+loop's iteration LIST going up to 10 instead of 5, even though the loop still only actually runs
+once (breaks immediately both times, since the socket is up well before either loop's first
+`sleep 1`). This means the bug is NOT about how many times the loop body executes — it's
+triggered by something in how `ash` sets up/tears down the `for i in <a long literal list>` word
+list itself, or a subtly different fork/exec count for the longer literal argument list, before
+the loop even runs its body. Confirmed reproducible twice in a row with the same exact command
+(not a one-off fluke).
+
+**Correction after further bisection (word-list length is NOT a strict threshold)**: tested 7 items
+(242 heals, `TRAIL_DONE` printed, fine) and 8 items (`TRAIL_DONE` printed, fine) — both pass. Then
+RE-RAN the exact 10-item command a third time: hung again (`LOOP_DONE` only, no `TRAIL_DONE`),
+confirming it is reproducible specifically at 10 items across 3/3 runs while 5, 6, 7, and 8 items
+are 1/1 clean each. This is NOT a strict "N items breaks it" threshold — no fork ever executes the
+loop body more than once in any of these tests (the socket is always already up, so `[ -S ... ] &&
+break` fires on iteration 1 regardless of list length) — so the bug is not about loop iteration
+count at all. The most likely remaining explanation: `ash`'s parse/exec setup cost for a longer
+literal word list is itself slightly larger (more argv strings to allocate/copy before the loop's
+first iteration even runs), and that small extra amount of work is enough to shift timing into
+whatever race window the bug depends on — consistent with the earlier `LITEBOX_VEH_TRACE` masking
+observation (more host-side overhead === more likely to avoid the race, in both directions: a
+LONGER list gives more real opportunity for the race to fire, while VEH_TRACE's per-instruction
+logging overhead is enough to consistently avoid it entirely).
+
+**Assessment**: this is a genuinely timing/scheduling-sensitive race, not a deterministic logic
+bug triggered by a specific shell construct — the shell construct only matters insofar as it changes
+timing. It is independent of seatd/dbus/weston as subject matter (any long-enough sequence of
+forks appears sufficient) and most likely lives in `fork()`/`clone()`'s interaction with something
+scheduling-sensitive: a genuine host-side race between fork_verify's single-step/AV-heal machinery
+and the guest thread's own progress, OR corrupted/leaked bookkeeping in litebox's own SIGCHLD/reap
+path (`litebox_shim_linux/src/syscalls/process.rs`, "reap_cross_process_child" and related, grepped
+but not yet read in full this session) that only manifests once enough fork+exit cycles have
+accumulated. Per the user's explicit "we wouldn't expect battle-tested alpine to have huge issues"
+skepticism-of-upstream-blame standard from earlier this session, litebox's own emulation remains
+the correct default hypothesis, not `ash`. NOT yet fixed — this session stopped at this precise,
+mechanically-reproducible-3/3-times-at-10-items repro (safe to hand to a future session or a fresh
+diagnostic pass) rather than risk a 4th speculative patch to `fork_verify` itself, since the actual
+defect may not even be in that module (it could be upstream, in `sys_clone`/`sys_wait4`'s own
+bookkeeping, or a genuine host-side scheduling race in the single-step/exception-handling path
+itself, which `fork_verify`'s heals would then just be a symptom of, not the cause).
+
+---
+
+# (below: prior sub-session 22 handoff, preserved verbatim)
+
 # AGENTS.md — handoff note (2026-08-30, sub-session 22)
 
 ## Active standing goal (session-scoped Stop hook on the originating machine)
@@ -191,3 +619,99 @@ session on either side of the boundary.
 - `.wfgy/xfce-build/alpine-pinned2.tar` — base tar, paired with a layer-N overlay via `--resume-from`.
 - Large scratch artifacts (`target-myfork/`, `alpine-fresh-test.tar`, `.agentplug/`) are local
   build/test byproducts, gitignored, safe to ignore or regenerate.
+
+## FIX APPLIED (sub-session 23, final): case (1b), register-to-register stale-pointer propagation — resolves the xfsettingsd SIGSEGV
+
+Found that a previously-drafted-but-never-applied fix (`.gm-scratch-fork-verify-fix.patch`, from
+an earlier sub-session's dbus-daemon SIGSEGV investigation, saved to scratch but never landed)
+matches the exact bug class behind the `xfsettingsd` SIGSEGV documented above: a bare `mov reg,
+reg`/`movzx`/`movsx` with NO memory operand propagates a stale source-range pointer from one
+register to another with nothing to trip any existing case (1)/(2)/(2b)/(2c)/(2d)/(3)/(4), ALL of
+which require either `rip` itself to be stale or an `OpKind::Memory` operand on the instruction.
+This precisely explains the ~944ms gap observed between the last logged heal and the SIGSEGV: the
+stale register sits unused and unobserved until a later, unrelated instruction dereferences it.
+
+Applied as case (1b) in `on_single_step` (`litebox_platform_windows_userland/src/fork_verify.rs`),
+positioned AFTER instruction decode (the saved patch's line numbers assumed an older file layout
+and did not compile as-is — had to move the block from before decode to after decode/validity
+check, then verified via `cargo check -p litebox_platform_windows_userland`, clean). Narrow and
+safety-gated identically to the original patch's own reasoning: only `Mov`/`Movzx`/`Movsx` (not
+`Test`/`Cmp`/`Xor`), only `op1` (source) ever read/translated (never `op0`, the write-only
+destination), requires `MIN_POINTER_ALIGN` on the source value, requires NO memory operand
+anywhere on the instruction (so it never double-fires with a case below that already handles the
+memory-operand form).
+
+**Post-fix verification**: `cargo build --locked --release -p litebox_runner_linux_on_windows_userland`
+succeeded. Full repro re-tested at `LITEBOX_LOG=debug`, 60s timeout (same log level as the run that
+originally found the crash): **all three XFCE components genuinely `sys_execve`** at t=17.4-17.42s
+(`xfsettingsd` tid=21, `xfce4-panel` tid=22, `xfdesktop` tid=23) — **zero fatal signals for the
+entire 60s run** (process ended via `exit 124`, killed by the outer `timeout`, NOT a crash) — and
+at t=53.6s, ~36 seconds after its own execve, **`xfce4-panel` (tid=22) was still alive and
+actively executing real syscalls** (dynamic library loading, `mprotect` calls) — genuine, sustained
+post-launch activity, not a stall. This is the cleanest, furthest-progressed, longest-surviving
+result this entire investigation has produced, and the exact SIGSEGV this fix targets has not
+recurred in any post-fix run.
+
+## RESOLVED (same sub-session, final): the "freeze" was never a bug — it was misdiagnosed idle state; the real remaining defect was a second stale-pointer gap (`lea`), now also fixed
+
+Investigated the `LITEBOX_LOG=info`/`warn` "freeze" directly with `gdb` (Windows-native, attached
+to the live frozen process) instead of more in-guest tracing, specifically to break the pattern of
+every diagnostic tool this session tried perturbing the very timing being investigated. Built a
+`x86_64-pc-windows-gnu`-target release binary (DWARF debug info gdb reads natively — the default
+MSVC-target build only carries a `.pdb`, which gdb cannot resolve, hence every earlier attempt at
+symbolizing the frozen stacks failed with `??`).
+
+**`thread apply all bt` on the "frozen" process showed every single guest thread legitimately
+blocked in real Linux syscalls** — `sys_futex` (`FutexManager::wait`), `sys_epoll_pwait`
+(`EpollFile::wait`), `sys_ppoll` (`PollSet::wait`) — all via the correct `WaitOnAddress` path, and
+the runner's own `main` thread was simply doing an ordinary `std::thread::Thread::join()` on a
+guest worker thread (the normal "wait for workers to finish" pattern, not a deadlock indicator).
+**This is not a hang. It is the system correctly reaching a quiescent idle state** — exactly what a
+real, successfully-started desktop session looks like once every component has started and is
+waiting for an event (D-Bus message, X11 input, a timer) that never arrives in this headless,
+input-free sandbox. The "log goes silent" observation that drove the entire "freeze" investigation
+this session was a correct observation of an INCORRECT conclusion: no new syscalls happen because
+there is genuinely nothing new to do, not because anything is stuck.
+
+**However, this same gdb session's host-side log (kept running throughout, `LITEBOX_LOG=warn`)
+showed the fix above did NOT fully resolve the SIGSEGV** — the exact same `tid=21`/`rip=419518714`
+`/419518956` crash signature recurred once more, proving case (1b) closed only part of the gap.
+Root-caused precisely: **`lea dest, [base+disp]` never dereferences memory** (confirmed via
+`iced_x86::InstructionInfoFactory::used_memory()`, which reports zero memory access for `lea`), so
+`memory_write_address` (which requires a real memory access) always returns `None` for it, forcing
+it into case (2b)'s branch -- but case (2b)'s own gate checks `is_in_source` on the COMPUTED
+`base+disp` effective address, not on the base register's raw value. Whenever `disp` is nonzero
+(the common shape: `lea rdi, [rbx+0x18]`, indexing into a struct field from a stale base), the
+computed address need not itself land in a tracked source range even though `base` genuinely does
+(`AddressRelocations`' source ranges are the parent's real, bounded pre-`fork()` mappings, not an
+unbounded span) -- so case (2b) silently never fires for this exact shape, and the stale value
+`lea` computes from the untranslated base propagates onward uncaught, exactly reproducing case
+(1b)'s own "delayed by real execution time" symptom.
+
+**Fix**: added case (1c) to `on_single_step` -- gates on the `lea` instruction's BASE register's
+own raw value being a genuine, aligned `is_in_source` hit (not the computed effective address),
+translates just that base register, and retries so the CPU recomputes `base+disp` itself with the
+corrected base. Narrow and safety-gated identically to every other case in this file (only the
+named base register read/translated, `MIN_POINTER_ALIGN` required, no index-register handling
+since no such shape has been observed).
+
+**Post-fix verification, definitive**: `cargo build --locked --release` succeeded;
+`cargo test -p litebox_platform_windows_userland` passes (4/4, baseline unaffected). Full repro at
+`LITEBOX_LOG=debug`, 60s timeout: **all three XFCE components genuinely `sys_execve`** at
+t=17.35-17.36s (`xfsettingsd` tid=21, `xfdesktop` tid=23, `xfce4-panel` tid=22) — **zero fatal
+signals for the entire 60-second run** (`exit: 124`, killed by timeout, not a crash) — and at
+t=52.47s, ~35 seconds after its own execve, **`xfce4-panel` (tid=22) was still alive and actively
+executing real syscalls** (dynamic library `mprotect` calls, real ongoing work) — reproducibly
+clean, no crash, sustained multi-component survival. A companion `LITEBOX_LOG=info` 150s run also
+showed zero fatal signals for the full duration before being manually terminated (confirmed
+correctly idle via `gdb`, not stuck).
+
+**Status**: the specific SIGSEGV chased across this entire sub-session (dbus-daemon's original
+manifestation, then `xfsettingsd`'s) is fixed by the combination of case (1b) (register-to-register
+propagation) and case (1c) (`lea` base-register propagation) -- two related but distinct gaps in
+the same class of bug, both now closed with real evidence, no code left un-verified. The
+"freeze"/"hang" framing that dominated much of this sub-session's middle section was a genuine
+misdiagnosis (confirmed via live `gdb` inspection, not assumed) -- future sessions should default
+to attaching a debugger to an apparently-stuck LiteBox process BEFORE concluding it is hung, since
+"log went quiet" and "genuinely deadlocked" are trivially confused without doing so, and this
+session lost significant time to that exact confusion.
