@@ -695,6 +695,42 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
     // Single-stepping LiteBox's own code would be both pointless and fatal, so disarm here; the
     // next `switch_to_guest` back into the child re-arms `TF` automatically.
     if !relocations.is_in_destination(rip) {
+        // (1c) `rcx` at this exact disarm point is the guest's real return address --
+        // `syscall_callback`'s own doc comment: "the register context is the guest context with
+        // the return address in rcx" -- computed by the syscall rewriter's trampoline (guest code
+        // that has already executed post-fork, hence itself in a destination range) and pushed
+        // straight through as `pt_regs->ip` (`push rcx // pt_regs->ip`), later resumed into `rip`
+        // verbatim by the syscall return path with no further translation performed anywhere else
+        // in the syscall-handling pipeline. This is exactly case (1)'s class of value (a live
+        // code-pointer-shaped register at the instant of a trap, deterministically translatable
+        // via the same relocation map proven correct for every other register at `fork()` time) --
+        // reached one instruction later than case (1) itself checks, because the trap that fires
+        // here has already moved `rip` off the guest's `call syscall_callback` and onto
+        // `syscall_callback`'s own host address, at which point `rip` no longer carries the
+        // information (the disarm above already fires on it) but `rcx` still does.
+        //
+        // Deliberately narrower than a prior, reverted attempt at this same gap, which translated
+        // all six Linux x86-64 syscall ABI argument registers (rdi/rsi/rdx/r10/r8/r9) unconditionally
+        // and made the failure strictly worse (an earlier, much-closer-to-startup host-level crash)
+        // -- exactly the unbounded-guessing hazard this module's own top-level doc comment already
+        // warns about ("enumerating every place a stale pointer could surface ... introduces
+        // corruption of its own"). Syscall arguments are guest-supplied values of genuinely unknown
+        // shape (file descriptors, flags, small integers, real pointers) with no basis for assuming
+        // pointer-ness, let alone staleness -- `rcx` is categorically different: it is guaranteed,
+        // by this trampoline's own fixed calling convention, to be a code pointer, so the
+        // `is_in_source` check below is a precise membership test, never a guess, exactly mirroring
+        // case (1)'s own reasoning for `rip`/`rbp`.
+        #[allow(clippy::cast_possible_truncation)]
+        let rcx = context.Rcx as usize;
+        if relocations.is_in_source(rcx)
+            && let Some(translated_rcx) = relocations.translate(rcx)
+        {
+            litebox_util_log::warn!(
+                rcx:? = rcx, translated_rcx:? = translated_rcx;
+                "fork_verify: stale RETURN-ADDRESS pointer detected in rcx at syscall-trampoline boundary, translating"
+            );
+            context.Rcx = translated_rcx as u64;
+        }
         context.EFlags &= !eflags_tf;
         return StepOutcome::Continue;
     }
