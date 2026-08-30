@@ -1,3 +1,98 @@
+# STATUS (2026-08-30, sub-session 24): goal NOT met — new blocking gap found (corrupted tar artifact); GUI/wgpu path independently confirmed real but not yet witnessed end-to-end for the same reason
+
+Two independent verification passes were run against the standing goal ("XFCE starting flawlessly
+with the DRM-to-wgpu mapping working"): a soak-stability run of the full XFCE repro, and a
+dedicated witness of the `--gui`/wgpu presentation path. Neither fully closes the goal; each
+surfaced/re-confirmed the same single blocking defect from a different angle.
+
+## Soak test: could not run — blocked by a corrupted rootfs tar, not a litebox runtime bug
+
+`.wfgy/xfce-build/xfce-layer18.tar` (the tar sub-session 23 built and validated as
+`--resume-from`) was found, on this pass, to contain exactly one malformed POSIX header:
+
+```
+-rw-r--r-- user/197121   67600 2026-04-28 21:38 usr/lib/libweston-14/xwayland.so
+```
+
+Every other entry in the archive carries the guest-side owner `1000/1000`; only this one carries
+`197121` — a Windows-side uid (matching this session's own Windows user SID mapping), not a valid
+Linux numeric uid representable in the tar header's octal field. This crashes the runner
+immediately at mount time, before any process executes:
+
+```
+thread 'main' (19172) panicked at litebox\src\fs\tar_ro.rs:701:44:
+called `Result::unwrap()` on an `Err` value: ParseIntError { kind: PosOverflow }
+...
+thread 'main' (19172) has overflowed its stack
+EXIT_CODE=139
+```
+
+This is precisely xwayland's own weston plugin — the exact component the XFCE repro's
+`--xwayland` flag needs — so the corrupted tar cannot be substituted or worked around; it is
+unusable for this soak test as-is. Root cause: the file was almost certainly patched into the tar
+directly on Windows (e.g. `tar --update` or a Windows tar tool appending/replacing that one
+member) rather than rebuilt inside the Linux build environment, corrupting only that one member's
+header. **Not fixed this pass** (rebuilding the tar is a build-pipeline task outside "run the
+repro," and the tar was not modified or patched around). No fatal-signal count, execve
+confirmation, or ongoing-syscall metrics apply — zero guest execution occurred before the panic.
+**Next step required before any soak test can run again**: regenerate
+`usr/lib/libweston-14/xwayland.so`'s tar member (and audit the rest of the archive for other
+post-hoc Windows-side edits) from inside the proper Linux build environment so every entry carries
+consistent `1000/1000` ownership.
+
+The previously-reported sub-session 23 result ("zero fatal signals through the full 60s window,
+all three XFCE components execve, xfce4-panel still alive and doing real syscalls 35s+ after its
+own launch") stands as a valid result against whatever tar was in place at that time — it does not
+describe the tar currently on disk, which has since been corrupted and is not currently
+re-verifiable.
+
+## `--gui`/wgpu witness: the DRM-to-wgpu wiring is real and independently confirmed, but full end-to-end (real compositor frame → wgpu present) was NOT observed this pass — same blocker
+
+`presentation.rs` and its wiring were confirmed to be real, not a paper module, by direct reading
+and live execution:
+
+- `Presenter::new()`/`run()` create a genuine `winit` window + `wgpu::Instance` (forced
+  `Backends::DX12`) + `Device`/`Queue`/`Surface`.
+- `litebox_runner_linux_on_windows_userland/src/lib.rs` (lines 320–399) genuinely spawns this on
+  its own 256 MiB-stack thread when `--gui` is passed, registers `shim.set_drm_flip_callback` so
+  `DrmSubsystem::page_flip` pushes real guest framebuffer bytes into the `FrameSender` channel,
+  wires real keyboard/mouse input back into the guest, and blocks process exit on the window's own
+  close event (lines 613–622) — end-to-end wired code, confirmed by reading it, not merely
+  "exists in isolation."
+- Live run 2 (isolated `--gui` + trivial `sleep 60` guest, no weston) confirmed via OS process
+  enumeration (`tasklist`/`Get-Process`, PID 11752) a real Win32 window exists:
+  **`MainWindowTitle = "litebox virtual display"`** — the exact string `Presenter::resumed()`
+  sets — independent of any guest content, plus a real `wgpu` DX12 `Device`/`Queue` init (2
+  `wgpu_hal::dx12::device` Naga/Compute INFO lines at t≈1.2s).
+- Live run 1 (full XFCE/weston soak under `--gui`) confirmed weston genuinely reached
+  `initializing drm backend`, loaded `gl-renderer.so`, detected DRM head `Virtual-1`, and loaded
+  `xwayland.so` — but hit the **same pre-existing `fork_verify` stale-pointer runaway-loop wall
+  documented in sub-session 23** (894 stale-pointer WARN lines by t=31.9s) before Xwayland actually
+  launched an X server, so `xfsettingsd`/`xfce4-panel` failed with `cannot open display: :0` and no
+  guest `DrmSubsystem::page_flip` ever occurred.
+
+**Conclusion: CONFIRMED** — `--gui` creates a real Windows window backed by a real `wgpu`
+`Device`/`Queue` on DX12, and the code path `DrmSubsystem::page_flip` → `FrameSender` →
+`Presenter::present()`'s texture-copy-to-surface is genuinely wired in source. **NOT CONFIRMED**
+this pass — an actual DRM buffer flip from a real running compositor reaching the Presenter and
+producing a `surface.get_current_texture()`/`present()` call, because guest execution hit the same
+blocker as the soak test before Xwayland ever launched an X server. This is a guest-execution
+correctness/environment issue, not a deficiency in `presentation.rs` or its wiring.
+
+## Overall verdict: standing goal NOT met yet
+
+The standing goal ("XFCE starting flawlessly with the DRM-to-wgpu mapping") is **not** met as of
+this status. The wgpu/DRM presentation plumbing is real, wired, and independently confirmed
+functional up to the point where a guest frame would reach it. What blocks full end-to-end
+demonstration is now narrowed to two concrete, disjoint items: (1) a corrupted
+`xfce-layer18.tar` (`usr/lib/libweston-14/xwayland.so` header, Windows-uid artifact) that must be
+rebuilt from the Linux build environment before either test can even mount the rootfs, and (2) the
+already-documented (sub-session 23) `fork_verify` Xwayland-post-fork stale-pointer wall, which
+this pass re-confirmed independently via the `--gui` witness run and which remains open per the
+"do not re-attempt extending `MAX_*_VERIFICATION_STEPS`" caution below. Neither item is new in
+kind; (1) is a newly discovered artifact-corruption gap, (2) is the same open item sub-session 23
+already left unresolved.
+
 # CORRECTION (sub-session 23, later): the "fork_verify timing race" below was a methodology bug, not a real bug
 
 Everything in this file under "Bisection results", "ROOT CAUSE", "MUCH more precise minimal
