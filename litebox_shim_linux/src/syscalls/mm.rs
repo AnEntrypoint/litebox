@@ -516,10 +516,38 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if !is_dri {
             return None;
         }
-        let (shared_handle, buffer_size) = self
-            .global
-            .drm
-            .lookup_by_map_offset(offset as u64)?;
+        // A `DRM_IOCTL_PRIME_HANDLE_TO_FD`-exported fd (see `DrmPrimeFdMarker`'s own doc comment,
+        // `syscalls::file`) carries the exported buffer's fake `MAP_DUMB` offset as PER-FD
+        // metadata -- real PRIME/dma-buf fds are always mapped at offset 0 by the caller (there
+        // is no second offset namespace the way the original DRM device fd's `MAP_DUMB` has one),
+        // so this resolves the buffer from the fd's own tag rather than from the guest-supplied
+        // `offset` argument, which is expected to be `0` here.
+        let prime_map_offset = files
+            .run_on_raw_fd(
+                raw_fd,
+                |typed_fd| {
+                    self.global
+                        .litebox
+                        .descriptor_table()
+                        .with_metadata(typed_fd, |m: &crate::syscalls::file::DrmPrimeFdMarker| {
+                            m.map_offset
+                        })
+                        .ok()
+                },
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()
+            .flatten();
+        let effective_offset = prime_map_offset.unwrap_or(offset as u64);
+        let (shared_handle, buffer_size) = self.global.drm.lookup_by_map_offset(effective_offset)?;
         let aligned_len = align_up(len, PAGE_SIZE);
         if aligned_len > buffer_size.next_multiple_of(PAGE_SIZE) {
             // Guest asked to map more than the buffer actually holds -- real Linux rejects an

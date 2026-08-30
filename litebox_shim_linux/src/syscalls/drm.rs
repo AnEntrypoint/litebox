@@ -512,9 +512,11 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         } else if req.capability == DRM_CAP_PRIME {
             // wlroots' `check_drm_features()` treats neither import nor export bit set as
             // fatal (see `DRM_CAP_PRIME`'s own doc comment) -- report both so backend
-            // creation proceeds, even though no actual PRIME fd-to-handle/handle-to-fd
-            // ioctl is implemented (litebox never reaches a code path that would exercise
-            // real dma-buf import/export on this virtual device).
+            // creation proceeds. `DRM_PRIME_CAP_EXPORT` is now backed by a real
+            // `DRM_IOCTL_PRIME_HANDLE_TO_FD` handler (see [`Self::prime_export_offset`]);
+            // `DRM_PRIME_CAP_IMPORT` stays aspirational (no `DRM_IOCTL_PRIME_FD_TO_HANDLE`
+            // ioctl is implemented, since litebox never reaches a code path -- client-side
+            // dma-buf import -- that would exercise it).
             DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT
         } else {
             0
@@ -761,6 +763,24 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         Ok(0)
     }
 
+    /// `DRM_IOCTL_PRIME_HANDLE_TO_FD` support: validate `handle` names a live dumb buffer and
+    /// return its fake `mmap` offset (allocating one via the same lazy `get_or_insert_with` path
+    /// [`Self::map_dumb`] uses, if this buffer has never been `MAP_DUMB`'d before -- a real
+    /// client always maps a dumb buffer before/around exporting it, but nothing in the UAPI
+    /// actually requires that ordering, so this covers the export-first case too). The caller
+    /// (`syscalls::file`'s ioctl dispatch) uses this offset to tag the freshly opened PRIME fd so
+    /// [`crate::syscalls::mm::Task::try_dri_dumb_buffer_mmap`] resolves an `mmap()` of that new fd
+    /// back onto this SAME buffer's real shared-memory handle -- see that function's own doc
+    /// comment for the tag-then-resolve mechanism.
+    pub(crate) fn prime_export_offset(&self, handle: u32) -> Result<u64, Errno> {
+        let mut buffers = self.buffers.lock();
+        let buffer = buffers.get_mut(&handle).ok_or(Errno::ENOENT)?;
+        let offset = *buffer.map_offset.get_or_insert_with(|| {
+            u64::from(self.next_map_offset.fetch_add(1, Ordering::Relaxed)) << 12
+        });
+        Ok(offset)
+    }
+
     pub(crate) fn destroy_dumb(
         &self,
         platform: &Platform,
@@ -916,6 +936,47 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             .values()
             .find(|b| b.map_offset == Some(offset))
             .map(|b| (b.handle, b.size))
+    }
+
+    /// `DRM_IOCTL_PRIME_FD_TO_HANDLE` support: given a real Linux dma-buf fd, real Linux resolves
+    /// (or, for a genuinely foreign fd, imports) it to a driver-local GEM handle. This device has
+    /// no real dma-buf subsystem (see [`Self::prime_export_offset`]'s own doc comment) and no
+    /// foreign-fd import path -- the only fds ever presented back here are ones this SAME
+    /// device's own [`Self::prime_export_offset`] most recently exported (confirmed live: wlroots'
+    /// `drm_dumb.c` calls `PRIME_HANDLE_TO_FD` then immediately `PRIME_FD_TO_HANDLE` on the fd it
+    /// just received, to obtain a GEM handle for the newly-imported buffer object, matching the
+    /// real kernel's own self-import round-trip). Given the exported fd's own tagged `map_offset`
+    /// (looked up by the caller via [`DrmPrimeFdMarker`] in `syscalls::file`, mirroring
+    /// `try_dri_dumb_buffer_mmap`'s identical resolution), this returns the SAME original
+    /// dumb-buffer handle the export started from -- correct for a self-import, since there is
+    /// only ever one buffer object involved, not a fresh second one.
+    pub(crate) fn lookup_handle_by_map_offset(&self, offset: u64) -> Option<u32> {
+        self.buffers
+            .lock()
+            .iter()
+            .find(|(_, b)| b.map_offset == Some(offset))
+            .map(|(handle, _)| *handle)
+    }
+
+    /// `DRM_IOCTL_GEM_CLOSE` -- release the CALLER's local reference to a GEM handle. On real
+    /// Linux this decrements a per-open-file GEM handle refcount, only actually freeing the
+    /// underlying object once every fd-local reference AND every driver-internal reference
+    /// (framebuffer attachment, active scanout, ...) drops to zero. This device tracks exactly
+    /// one refcount-free handle table (`self.buffers`, indexed by the same handle
+    /// `CREATE_DUMB`/`PRIME_FD_TO_HANDLE` hand out) with a single, explicit teardown entry point
+    /// (`DRM_IOCTL_MODE_DESTROY_DUMB`, see [`Self::destroy_dumb`]) -- real refcounting has nothing
+    /// to model here since there is exactly one client and one reference per handle ever created.
+    /// A real no-op success for any handle that currently exists is therefore accurate (the
+    /// buffer stays alive exactly as long as it always would -- until `DESTROY_DUMB`), matching
+    /// how real GEM_CLOSE on a still-multiply-referenced handle is *also* a no-op from the
+    /// caller's observable perspective (the object doesn't disappear underneath a sibling
+    /// reference either). An unknown handle still gets a real `ENOENT`, not a fabricated success.
+    pub(crate) fn gem_close(&self, handle: u32) -> Result<u32, Errno> {
+        if self.buffers.lock().contains_key(&handle) {
+            Ok(0)
+        } else {
+            Err(Errno::ENOENT)
+        }
     }
 }
 

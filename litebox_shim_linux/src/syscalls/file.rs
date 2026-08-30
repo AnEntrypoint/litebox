@@ -19,9 +19,9 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
-    AccessFlags, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
-    InodeType, IoReadVec, IoWriteVec, IoctlArg, ItimerSpec, MfdFlags, SfdFlags, TfdFlags,
-    TfdSettimeFlags, Statx, StatxMask, TimeParam,
+    AccessFlags, AtFlags, DrmPrimeHandle, EfdFlags, EpollCreateFlags, FcntlArg,
+    FileDescriptorFlags, FileStat, InodeType, IoReadVec, IoWriteVec, IoctlArg, ItimerSpec,
+    MfdFlags, SfdFlags, TfdFlags, TfdSettimeFlags, Statx, StatxMask, TimeParam,
     errno::Errno,
     signal::{Signal, SigSet},
 };
@@ -1536,6 +1536,20 @@ pub(crate) struct EvdevFd;
 /// must never register a `memfds` entry -- this tag is what keeps the two cases apart.
 #[derive(Clone, Copy)]
 pub(crate) struct MemfdMarker;
+
+/// Per-fd metadata (see [`litebox::fd::Descriptors::set_fd_metadata`]'s fd-vs-entry distinction)
+/// tagged onto a fd freshly opened by `DRM_IOCTL_PRIME_HANDLE_TO_FD` -- carries the fake
+/// `MAP_DUMB`-style offset of the dumb buffer this PRIME fd exports, so `syscalls::mm`'s
+/// `try_dri_dumb_buffer_mmap` can resolve a real client's `mmap(prime_fd, ..., MAP_SHARED, 0)`
+/// (real PRIME/dma-buf fds are always mapped at offset 0 -- there is no second offset namespace
+/// the way `MAP_DUMB` has one for the original DRM device fd) back onto the SAME underlying
+/// dumb-buffer shared-memory handle, without requiring the caller to know or replay the
+/// `MAP_DUMB` offset itself. See `DRM_IOCTL_PRIME_HANDLE_TO_FD`'s own doc comment
+/// (`litebox_common_linux`) for why a real dma-buf subsystem is unnecessary here.
+#[derive(Clone, Copy)]
+pub(crate) struct DrmPrimeFdMarker {
+    pub(crate) map_offset: u64,
+}
 
 /// Mirrors [`stdio_stream_for_path`]'s shape for the one evdev device path this shim exposes.
 fn is_evdev_path(path: &CString) -> bool {
@@ -4123,7 +4137,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             | IoctlArg::DrmGetMagic(..)
             | IoctlArg::DrmAuthMagic(..)
             | IoctlArg::DrmModeObjGetProperties(..)
-            | IoctlArg::DrmModeGetProperty(..) => files.run_on_raw_fd(
+            | IoctlArg::DrmModeGetProperty(..)
+            | IoctlArg::DrmPrimeHandleToFd(..)
+            | IoctlArg::DrmPrimeFdToHandle(..)
+            | IoctlArg::DrmGemClose(..) => files.run_on_raw_fd(
                 desc,
                 |fd| {
                     if self.is_dri_device(&files.fs, fd)? {
@@ -4509,8 +4526,99 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             IoctlArg::DrmAuthMagic(ptr) => self.global.drm.auth_magic(*ptr),
             IoctlArg::DrmModeObjGetProperties(ptr) => self.global.drm.obj_get_properties(*ptr),
             IoctlArg::DrmModeGetProperty(ptr) => self.global.drm.get_property(*ptr),
+            IoctlArg::DrmPrimeHandleToFd(ptr) => self.drm_prime_handle_to_fd(*ptr),
+            IoctlArg::DrmPrimeFdToHandle(ptr) => self.drm_prime_fd_to_handle(*ptr),
+            IoctlArg::DrmGemClose(ptr) => {
+                let req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                self.global.drm.gem_close(req.handle)
+            }
             _ => unreachable!("drm_ioctl called with a non-DRM IoctlArg"),
         }
+    }
+
+    /// `DRM_IOCTL_PRIME_HANDLE_TO_FD` -- see [`litebox_common_linux::DRM_IOCTL_PRIME_HANDLE_TO_FD`]'s
+    /// own doc comment for why this device hands back a second real fd onto the same dumb-buffer
+    /// storage instead of implementing a real dma-buf subsystem.
+    ///
+    /// Opens a fresh fd on `/dev/dri/card0` itself (real `DRM_IOCTL_GET_CAP`-style access, not a
+    /// synthetic type) -- reopening the real device node keeps every existing DRI-fd check
+    /// (`is_dri_device`'s major-number match, this same `drm_ioctl` dispatch on the new fd)
+    /// automatically correct for the returned fd with zero new fd-kind plumbing, matching how a
+    /// real client's own `open("/dev/dri/card0")` produces an ordinary DRI fd too. Tags the new
+    /// fd (not its underlying entry -- see [`DrmPrimeFdMarker`]'s own doc comment) with the
+    /// exported buffer's fake `MAP_DUMB` offset so `syscalls::mm::try_dri_dumb_buffer_mmap`
+    /// resolves the guest's later `mmap(new_fd, ..., 0)` back onto the identical shared-memory
+    /// handle the original `CREATE_DUMB`/`MAP_DUMB` path already established.
+    fn drm_prime_handle_to_fd(&self, ptr: UserPtrMut<DrmPrimeHandle>) -> Result<u32, Errno> {
+        let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        let map_offset = self.global.drm.prime_export_offset(req.handle)?;
+        let file = self.do_open(
+            "/dev/dri/card0",
+            OFlags::RDWR,
+            Mode::from_bits_truncate(0o600),
+        )?;
+        let mut dt = self.global.litebox.descriptor_table_mut();
+        let old = dt.set_fd_metadata(&file, DrmPrimeFdMarker { map_offset });
+        assert!(old.is_none());
+        drop(dt);
+        // `DRM_CLOEXEC` (bit 0, real kernel `drm.h`) is the one `flags` bit real clients actually
+        // set here (mirroring `O_CLOEXEC`'s own real-Linux meaning) -- honored the same way
+        // `sys_memfd_create`'s `MfdFlags::CLOEXEC` handling is, immediately above in this file.
+        let new_fd = self.insert_raw_file_fd_with_path(
+            file,
+            if req.flags & 1 != 0 {
+                OFlags::CLOEXEC
+            } else {
+                OFlags::empty()
+            },
+            None,
+        )?;
+        req.fd = i32::try_from(new_fd).map_err(|_| Errno::EMFILE)?;
+        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        Ok(0)
+    }
+
+    /// `DRM_IOCTL_PRIME_FD_TO_HANDLE` -- the reverse of [`Self::drm_prime_handle_to_fd`]. See
+    /// [`litebox_common_linux::DRM_IOCTL_PRIME_FD_TO_HANDLE`]'s own doc comment for why this is a
+    /// same-handle self-import round-trip on this single-client device rather than a real
+    /// cross-device dma-buf import.
+    fn drm_prime_fd_to_handle(&self, ptr: UserPtrMut<DrmPrimeHandle>) -> Result<u32, Errno> {
+        let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        let raw_fd = u32::try_from(req.fd)
+            .map(|v| v as usize)
+            .map_err(|_| Errno::EBADF)?;
+        let files = self.files.borrow();
+        let map_offset = files
+            .run_on_raw_fd(
+                raw_fd,
+                |typed_fd| {
+                    self.global
+                        .litebox
+                        .descriptor_table()
+                        .with_metadata(typed_fd, |m: &DrmPrimeFdMarker| m.map_offset)
+                        .ok()
+                },
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .map_err(|_| Errno::EBADF)?
+            .ok_or(Errno::EINVAL)?;
+        drop(files);
+        let handle = self
+            .global
+            .drm
+            .lookup_handle_by_map_offset(map_offset)
+            .ok_or(Errno::ENOENT)?;
+        req.handle = handle;
+        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        Ok(0)
     }
 
     /// Handle syscall `epoll_create` and `epoll_create1`

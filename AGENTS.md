@@ -1,4 +1,4 @@
-# AGENTS.md — handoff note (2026-08-30, sub-session 7)
+# AGENTS.md — handoff note (2026-08-30, sub-session 8)
 
 ## Active standing goal (session-scoped Stop hook on the originating machine)
 
@@ -42,23 +42,39 @@ mutables — do not re-derive from scratch; query the recall store first (e.g. s
    memfd real-shared-memory-backing machinery (`try_memfd_mmap`/`resize_memfd_shared_backing`)
    cover it with zero changes to `sys_mmap` itself. Commit: see `git log` (this sub-session).
 
-**Current blocker (NEW, only reachable now that #6 above is fixed — labwc gets much further
-than ever before)**: `render/allocator/drm_dumb.c:90 Failed to get PRIME handle from GEM handle:
-Invalid argument`, twice, immediately followed by `types/output/swapchain.c:109 Swapchain for
-output 'Virtual-1' failed test` and a fatal `Assertion failed: width > 0 && height > 0
-(render/swapchain.c: wlr_swapchain_create: 21)` → SIGABRT at ~29.5s, well before
-`xfsettingsd`/`xfce4-panel`/`xfdesktop` are ever `sys_execve`'d. Root cause confirmed by direct
-code read: `litebox_common_linux/src/lib.rs`'s `DRM_CAP_PRIME` handling unconditionally reports
-BOTH `DRM_PRIME_CAP_IMPORT` and `DRM_PRIME_CAP_EXPORT` set via `DRM_IOCTL_GET_CAP` (to satisfy
-wlroots' backend-creation-time capability gate), but no `DRM_IOCTL_PRIME_HANDLE_TO_FD` ioctl is
-actually implemented in `litebox_shim_linux/src/syscalls/drm.rs` — previously believed
-unreachable (per that code's own now-stale doc comment), now proven reachable live: wlroots'
-`render/allocator/drm_dumb.c` calls it for real once buffer allocation is attempted, gets
-rejected by the generic ioctl catch-all, and the whole swapchain-buffer-acquire path fails.
-PRD row `drm-prime-handle-to-fd-not-implemented-blocks-xfce-launch` has full detail and a
-concrete fix sketch (implement a real handler near `map_dumb`, `drm.rs` ~line 747, handing back
-an fd over the same dumb-buffer host memory `CREATE_DUMB`/`MAP_DUMB` already backs). NOT
-attempted this sub-session (a new ioctl surface needs its own design+verification pass).
+7. **`DRM_IOCTL_PRIME_HANDLE_TO_FD`/`DRM_IOCTL_PRIME_FD_TO_HANDLE`/`DRM_IOCTL_GEM_CLOSE` — sub-
+   session 8, FULLY FIXED AND LIVE-VERIFIED**: the swapchain-buffer-acquire SIGABRT (`render/
+   allocator/drm_dumb.c:90 Failed to get PRIME handle from GEM handle: Invalid argument` →
+   `Assertion failed: width > 0 && height > 0` → SIGABRT ~29.5s) is gone. Implemented three real
+   ioctl handlers in `litebox_shim_linux/src/syscalls/drm.rs`/`file.rs` (consts/structs/`IoctlArg`
+   variants in `litebox_common_linux/src/lib.rs`): `DRM_IOCTL_PRIME_HANDLE_TO_FD` (`0xc00c642d`)
+   re-opens `/dev/dri/card0` for a fresh real fd and tags it (new per-fd `DrmPrimeFdMarker`,
+   `file.rs`) with the exported dumb buffer's `MAP_DUMB` offset, so `syscalls::mm::
+   try_dri_dumb_buffer_mmap` resolves the guest's later `mmap(prime_fd, ..., 0)` back onto the
+   SAME real shared-memory handle the original `CREATE_DUMB` established (no real dma-buf
+   subsystem needed — single-client device, see the new code's own doc comments);
+   `DRM_IOCTL_PRIME_FD_TO_HANDLE` (`0xc00c642e`) resolves the tagged fd back to the originating
+   GEM handle (same-handle self-import round-trip); `DRM_IOCTL_GEM_CLOSE` (`0x40086409`) is a
+   real no-op-success for any still-live handle (this device has no per-handle refcounting — real
+   teardown stays solely `DRM_IOCTL_MODE_DESTROY_DUMB`'s job). All three were discovered
+   sequentially via live iteration against the real repro (each fixed gap unmasked the next
+   `Raw{cmd:...}` ioctl fallthrough down the same real wlroots call chain). Commit: see `git log`
+   (this sub-session).
+
+**Current state**: labwc now survives past ALL of DRM backend creation, keyboard/keymap setup,
+AND swapchain/output buffer allocation — `xfsettingsd` genuinely `sys_execve`'s at ~27.2s (real
+log line: `sys_execve: entry tid=19 path=/usr/bin/xfsettingsd`) and runs for ~1.3s (reads its own
+ELF/shared libs, real `sys_read`/`sys_fstat` activity, no fault) before exiting cleanly via
+`sys_exit_group status=Exit(1)` — an ordinary application-level exit(1), NOT a signal/crash/
+assertion (confirmed: no `fatal signal:`, no `Assertion failed`, no `[ERROR]` line anywhere
+between its execve and its exit in a full `LITEBOX_LOG=debug` capture). `xfce4-panel`/`xfdesktop`
+are never observed to launch in this run — labwc's `-s` session command only ever spawned the one
+`xfsettingsd` process, never the `& xfce4-panel & xfdesktop &` continuation, in this capture.
+**This is a NEW blocker outside this sub-session's DRM/PRIME scope** — not yet root-caused (likely
+either xfsettingsd itself failing on a missing D-Bus/config dependency, or labwc's `-s` argument
+shell not actually chaining the three `&`-joined commands the way `/bin/sh -c` would) — left for
+the next sub-session. PRD row `drm-prime-handle-to-fd-not-implemented-blocks-xfce-launch` is
+RESOLVED; this new gap needs its own fresh PRD row and investigation.
 
 ## Repro command (unchanged shape, current known-good)
 
@@ -69,18 +85,20 @@ with `LITEBOX_LOG=debug` (add `LITEBOX_DIAG_FATALDUMP=1` for crash register/inst
 capture), `MSYS_NO_PATHCONV=1` in Git Bash. Rebuild
 `cargo build --locked --release -p litebox_runner_linux_on_windows_userland` first. Regression
 suite: `cargo test -p litebox_shim_linux --lib -- --skip test_mremap` (177/177 pass as of
-sub-session 7) and `cargo test -p litebox_platform_windows_userland` (4/4 pass).
+sub-session 8) and `cargo test -p litebox_platform_windows_userland` (4/4 pass).
 
 ## Completion criterion (unchanged, NOT YET MET)
 
 labwc's own `-s "xfsettingsd & xfce4-panel & xfdesktop &"` session targets launch (real
 `sys_execve` log lines) and survive a 90-150+ second window with no `fatal signal:`/
 `sys_exit_group` in a `LITEBOX_LOG=debug` capture — log-based evidence only, never
-`busybox kill -0` (confirmed unreliable in this rootfs). As of sub-session 7, labwc itself now
-survives past DRM backend creation AND past keyboard/keymap setup (previously the wall) but
-still SIGABRTs during output/swapchain buffer allocation (see "Current blocker" above) before
-ever `sys_execve`-ing `xfsettingsd`/`xfce4-panel`/`xfdesktop` — closer than any prior
-sub-session, but the session targets have still never actually launched in a captured run.
+`busybox kill -0` (confirmed unreliable in this rootfs). As of sub-session 8, labwc itself now
+survives past DRM backend creation, keyboard/keymap setup, AND output/swapchain buffer allocation
+(all three previously-fatal walls); `xfsettingsd` genuinely `sys_execve`'s and runs briefly before
+its own clean (non-signal) `exit(1)`, and `xfce4-panel`/`xfdesktop` are never observed to launch
+in the same run — closer than any prior sub-session (the DRM buffer-allocation SIGABRT that
+previously ended every run before ANY session target could execve is now fully gone), but the
+full three-process session still has not survived a 90-150s window in a captured run.
 
 ## Hard constraints (non-negotiable, apply on any machine)
 

@@ -995,9 +995,72 @@ pub const DRM_CAP_PRIME: u64 = 0x5;
 /// `DRM_IOCTL_PRIME_FD_TO_HANDLE` ioctl is implemented, since litebox never reaches a code
 /// path (client-side dma-buf import) that would exercise it.
 pub const DRM_PRIME_CAP_IMPORT: u64 = 0x1;
-/// `DRM_PRIME_CAP_EXPORT` bit within [`DRM_CAP_PRIME`]'s reported value -- same rationale
-/// as [`DRM_PRIME_CAP_IMPORT`]; no `DRM_IOCTL_PRIME_HANDLE_TO_FD` ioctl is implemented.
+/// `DRM_PRIME_CAP_EXPORT` bit within [`DRM_CAP_PRIME`]'s reported value -- see
+/// [`DRM_IOCTL_PRIME_HANDLE_TO_FD`] for the real handler this capability bit now backs.
 pub const DRM_PRIME_CAP_EXPORT: u64 = 0x2;
+/// `DRM_IOCTL_PRIME_HANDLE_TO_FD = DRM_IOWR(0x2d, struct drm_prime_handle)`, `size=12`
+/// (`nr`/struct shape from the real kernel `drm.h`; `struct drm_prime_handle { __u32 handle;
+/// __u32 flags; __s32 fd; }` is exactly 12 bytes, independently re-verified via a standalone
+/// `size_of::<DrmPrimeHandle>()` compile, no padding needed on the LP64 ABI litebox targets).
+/// wlroots' `render/allocator/drm_dumb.c` (`drmPrimeHandleToFD`) calls this once per dumb-buffer
+/// allocation to obtain a dma-buf fd it can hand to its renderer/swapchain machinery -- proven
+/// live-reachable (see `drm-prime-handle-to-fd-not-implemented-blocks-xfce-launch`'s own
+/// investigation): with this unimplemented, the call fell through to the generic ioctl
+/// catch-all's `EINVAL`, `allocator_buffer_create` failed, and `labwc` `SIGABRT`ed on the
+/// resulting `wlr_swapchain_create` assertion. litebox's virtual device has exactly one possible
+/// client (see [`DRM_IOCTL_SET_MASTER`]'s own doc comment on this device's single-client
+/// simplifications), so a real dma-buf subsystem is unnecessary: the handler hands back a second,
+/// real fd onto the SAME real host-backed shared memory the originating dumb buffer's
+/// `CREATE_DUMB`/`MAP_DUMB` path already established, satisfying every real client's actual use
+/// (mmap the fd, or pass it to another local subsystem for a shared read) without implementing
+/// dma-buf import/export semantics this single-client device never needs.
+pub const DRM_IOCTL_PRIME_HANDLE_TO_FD: u32 = 0xC00C_642D;
+/// `DRM_IOCTL_PRIME_FD_TO_HANDLE = DRM_IOWR(0x2e, struct drm_prime_handle)` -- the reverse
+/// direction of [`DRM_IOCTL_PRIME_HANDLE_TO_FD`] (same 12-byte `struct drm_prime_handle`, `nr`
+/// one higher per the real kernel `drm.h`). Confirmed live-reachable immediately after every
+/// `PRIME_HANDLE_TO_FD` call in this device's own real client traffic: wlroots'
+/// `render/allocator/drm_dumb.c` self-imports the fd it just exported to obtain a GEM handle for
+/// the new buffer object it constructs around it -- see [`DrmSubsystem::lookup_handle_by_map_offset`]
+/// (`litebox_shim_linux`) for why this device's single-client, no-real-dma-buf model makes that
+/// self-import a same-handle round-trip rather than needing genuine cross-device import.
+pub const DRM_IOCTL_PRIME_FD_TO_HANDLE: u32 = 0xC00C_642E;
+/// `DRM_IOCTL_GEM_CLOSE = DRM_IOW(0x09, struct drm_gem_close)`, `size=8` (`struct drm_gem_close {
+/// __u32 handle; __u32 pad; }`, real kernel `drm.h`). Confirmed live-reachable: wlroots'
+/// `backend/drm/fb.c` (`drmCloseBufferHandle`, called right after `ADDFB2` on the GEM handle
+/// [`DRM_IOCTL_PRIME_FD_TO_HANDLE`] just returned) calls this to release ITS local reference to
+/// an imported buffer object -- with this unimplemented the ioctl catch-all's `EINVAL` surfaced
+/// as wlroots' own logged "drmCloseBufferHandle failed: Invalid argument" (non-fatal in wlroots,
+/// but a real, silently-broken ioctl surface). This device has no per-handle GEM refcounting (a
+/// dumb-buffer handle's real lifetime is governed entirely by `DRM_IOCTL_MODE_DESTROY_DUMB`, see
+/// that ioctl's own handler) -- [`DrmSubsystem::gem_close`]'s own doc comment (`litebox_shim_linux`)
+/// explains why a real no-op-success is the correct, non-fabricated answer here rather than
+/// something requiring genuine reference-count bookkeeping.
+pub const DRM_IOCTL_GEM_CLOSE: u32 = 0x4008_6409;
+/// `struct drm_gem_close`. See [`DRM_IOCTL_GEM_CLOSE`]'s own doc comment.
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmGemClose {
+    pub handle: u32,
+    pub pad: u32,
+}
+/// `struct drm_prime_handle` (`DRM_IOCTL_PRIME_HANDLE_TO_FD`/`DRM_IOCTL_PRIME_FD_TO_HANDLE`). See
+/// [`DRM_IOCTL_PRIME_HANDLE_TO_FD`]'s own doc comment.
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmPrimeHandle {
+    /// Input: the `CREATE_DUMB`-issued dumb-buffer handle to export as an fd.
+    pub handle: u32,
+    /// Input: real Linux accepts `DRM_CLOEXEC`/`DRM_RDWR` here; this device does not need to
+    /// distinguish them (the returned fd is always readable/writable, matching the underlying
+    /// dumb buffer's own real host-backed memory, and `DRM_CLOEXEC` is honored -- see the
+    /// handler's own doc comment), so the field is accepted but only `DRM_CLOEXEC` (bit 0) is
+    /// actually consulted.
+    pub flags: u32,
+    /// Output: the new fd referencing the same buffer, or left untouched (`-1` on a real kernel's
+    /// own uninitialized-on-error convention, not relied upon here since a real error always
+    /// short-circuits before this field would be written) on failure.
+    pub fd: i32,
+}
 /// `DRM_CAP_CRTC_IN_VBLANK_EVENT` (`include/uapi/drm/drm.h`) -- asks whether this driver's
 /// `DRM_IOCTL_MODE_PAGE_FLIP`/vblank-wait completion events populate `crtc_id` in the
 /// `struct drm_event_vblank` payload (kernels/drivers predating this cap only fill it in for
@@ -1620,6 +1683,15 @@ pub enum IoctlArg {
     DrmModeObjGetProperties(UserPtrMut<DrmModeObjGetProperties>),
     /// `DRM_IOCTL_MODE_GETPROPERTY` -- resolve a single property ID's name/values.
     DrmModeGetProperty(UserPtrMut<DrmModeGetProperty>),
+    /// `DRM_IOCTL_PRIME_HANDLE_TO_FD` -- export a dumb-buffer handle as a real fd onto the same
+    /// backing memory. See [`DRM_IOCTL_PRIME_HANDLE_TO_FD`]'s own doc comment.
+    DrmPrimeHandleToFd(UserPtrMut<DrmPrimeHandle>),
+    /// `DRM_IOCTL_PRIME_FD_TO_HANDLE` -- resolve a (self-exported) PRIME fd back to its
+    /// originating GEM handle. See [`DRM_IOCTL_PRIME_FD_TO_HANDLE`]'s own doc comment.
+    DrmPrimeFdToHandle(UserPtrMut<DrmPrimeHandle>),
+    /// `DRM_IOCTL_GEM_CLOSE` -- release a local reference to a GEM handle. See
+    /// [`DRM_IOCTL_GEM_CLOSE`]'s own doc comment.
+    DrmGemClose(UserPtr<DrmGemClose>),
     /// `VT_GETSTATE` -- report which VT is currently active. `seatd`'s `seat_update_vt` (see
     /// `seatd/seat.c`) calls this on `/dev/tty0` to learn which per-VT device (`/dev/tty<N>`)
     /// to subsequently open for a connecting client.
@@ -3824,6 +3896,13 @@ impl SyscallRequest {
                         DRM_IOCTL_MODE_GETPROPERTY => {
                             IoctlArg::DrmModeGetProperty(ctx.sys_req_ptr(2))
                         }
+                        DRM_IOCTL_PRIME_HANDLE_TO_FD => {
+                            IoctlArg::DrmPrimeHandleToFd(ctx.sys_req_ptr(2))
+                        }
+                        DRM_IOCTL_PRIME_FD_TO_HANDLE => {
+                            IoctlArg::DrmPrimeFdToHandle(ctx.sys_req_ptr(2))
+                        }
+                        DRM_IOCTL_GEM_CLOSE => IoctlArg::DrmGemClose(ctx.sys_req_ptr(2)),
                         VT_GETSTATE => IoctlArg::VtGetState(ctx.sys_req_ptr(2)),
                         VT_SETMODE => IoctlArg::VtSetMode(ctx.sys_req_ptr(2)),
                         KDSETMODE => IoctlArg::KdSetMode(ctx.sys_req_arg(2)),
