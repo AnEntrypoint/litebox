@@ -645,6 +645,31 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
             if let Some(translated_rbp) = relocations.translate(rbp) {
                 context.Rbp = translated_rbp as u64;
             }
+            // `rdi` carries the first argument in the SysV ABI this trampoline's rewritten
+            // indirect calls (GOT/PLT-slot function pointers, the common shape here) still
+            // follow -- a stale value reaching it has the identical origin as the stale `rip`
+            // this case already exists to heal (both were live registers at the moment
+            // `fork()` was called, copied verbatim into the child), just propagated through an
+            // intervening register-to-register `mov` this module has no general case for
+            // (see the module's own doc comments on why a blanket register-to-register-mov
+            // sweep is unsafe -- it fires on every such instruction regardless of whether the
+            // value is actually stale-and-about-to-be-used, corrupting legitimate values that
+            // only coincidentally overlap the tracked source range for identity-mapped
+            // children). This is narrower and safe for the same reason `rbp` above is: it only
+            // ever fires at THIS specific, well-understood transition (an indirect call landing
+            // on a translated destination address, the same trap `rip` itself is being healed
+            // at), translating a register whose failure mode (a stale argument reaching the
+            // freshly-resumed target function) was confirmed live via
+            // `LITEBOX_DIAG_FATALDUMP=1`: `rip=0x92bcffa`'s indirect `call` landed on an
+            // in-source `rip` (correctly healed by this case), and the very next instruction at
+            // the healed destination dereferenced a still-stale `rdi`, faulting
+            // (`STATUS_ACCESS_VIOLATION`, `addr` matching the stale `rdi` value plus a small
+            // offset) -- confirmed a real, previously-uncovered gap, not a guess.
+            #[allow(clippy::cast_possible_truncation)]
+            let rdi = context.Rdi as usize;
+            if let Some(translated_rdi) = relocations.translate(rdi) {
+                context.Rdi = translated_rdi as u64;
+            }
             // This trap fires *after* the CPU has already fetched (and, for a `ret`, already
             // popped) the stale value into `rip` -- fixing only the live register here repairs
             // this one execution but leaves the stack slot the value was read from still holding
