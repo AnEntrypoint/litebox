@@ -1,4 +1,43 @@
-# AGENTS.md — handoff note (2026-08-30, sub-session 12)
+# AGENTS.md — handoff note (2026-08-30, sub-session 13)
+
+## Sub-session 13: exact crash site root-caused, NOT fixed (no unsafe fix attempted)
+
+Fresh `LITEBOX_DIAG_FATALDUMP=1` + `LITEBOX_VEH_TRACE=1` capture using the exact repro below
+pinpointed the precise instruction sequence causing the dbus-daemon fork-child SIGSEGV that
+survives the `rcx` fix (commit `8ec32c4b`):
+
+- `rip=0x92bcfec` (`push r12`): `rdi` already holds a stale (untranslated, source-range) value —
+  never healed by any existing case before this point.
+- `rip=0x92bcff2`: `mov rbp, rdi` — a bare register-to-register move with **no memory operand**,
+  copying the stale value into `rbp` too. Confirmed via a temporary diagnostic `eprintln!` dumping
+  the decoded mnemonic/operands at this exact `rip` (`Mov op0=RBP op1=RDI`, no `OpKind::Memory` on
+  either operand). This is structurally identical to the reverted "(1b)" register-to-register-mov
+  propagation case.
+- `rip=0x92bcff5`: `add rdi, imm8to64` — offsets `rdi` further. `LastLoad`-chain-shaped, but no
+  chain exists for `rdi` because its origin was a register `mov`, not `mov reg,[mem]`, so
+  `advance_last_load` never started tracking it.
+- `rip=0x92bcffa`: `call [rip+0x92ddfb8]` (GOT/PLT-slot indirect call, unrelated to `rdi`), landing
+  at `rip=0x8b7aa88`, which **is** in-source — case (1) fires, correctly translates `rip` and `rbp`
+  (`rbp: 0x8bc29e0 -> 0x9c029e0`).
+- The very next instruction at the *translated* `rip` dereferences `[rdi]` — `rdi` was never
+  touched by case (1) (which only heals `rip`/`rbp`) — and faults:
+  `[veh] code=c0000005 addr=0x8bc2a38 rip=0x9bbaa88 ... rdi=0x8bc2a38`, immediately followed by
+  `fatal signal: terminating task signal=Signal(11) pid=10 tid=10`.
+
+**Why no fix was attempted this session**: this is the exact target shape of the already-reverted
+"(1b)" patch (preserved at `%TEMP%\claude\...\scratchpad\xfce-repro-logs\
+.gm-scratch-fork-verify-fix.patch`), independently re-tested in sub-session 11 and found to cause
+an EARLIER, WORSE host-level `STATUS_ACCESS_VIOLATION` (exit 139 at ~1.3s) when applied broadly.
+This gap has now caused real regressions via TWO different broad-translate attempts ((1b) and the
+six-syscall-ABI-register attempt) — a third speculative variant without strong independent safety
+evidence would repeat the same mistake pattern. A genuinely safe fix likely needs either (a)
+extending case (1)'s heal to trace the register dependency graph across the few instructions
+between a `mov`-from-stale and the eventual `call`, rather than a blanket per-trap sweep, or (b)
+widening the PROACTIVE `fixup_stale_stack_pointers` scan (in `litebox_shim_linux`) to catch
+register-to-register-mov-derived staleness before the child ever resumes. Both are substantial
+follow-up investigations. Tracked in gm mutable `mut-1788106550382`.
+
+## Prior handoff (2026-08-30, sub-session 12)
 
 ## Active standing goal (session-scoped Stop hook on the originating machine)
 
