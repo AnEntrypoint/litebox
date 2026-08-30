@@ -1,4 +1,4 @@
-# AGENTS.md — handoff note (2026-08-30, sub-session 14)
+# AGENTS.md — handoff note (2026-08-30, sub-session 15)
 
 ## Active standing goal (session-scoped Stop hook on the originating machine)
 
@@ -44,16 +44,48 @@ generically. Fixes #6/#7 each closed ONE specific register at ONE specific trans
 thread hitting the SAME general pattern via a DIFFERENT register pairing (`rbp`/`rcx` both
 holding a stale value, likely from an unrelated `mov rbp, rcx`-shaped instruction elsewhere).
 
-**Recommended next approach — SUCCESSIVE per-register/per-site patches have diminishing
-returns; there is likely an unbounded number of distinct sites.** The more scalable fix is
-almost certainly PROACTIVE, not reactive: strengthen `fixup_stale_stack_pointers` (in
-`litebox_shim_linux`, runs ONCE at `fork()`-resume time, before the child executes anything)
-to catch register-to-register-mov-derived staleness patterns before the child ever resumes,
-rather than continuing to add one more reactive per-trap case to `fork_verify.rs` for each
-newly-discovered site. A genuinely different investigation angle than sub-sessions 10-14's
-incremental case-by-case approach is needed here — read `fixup_stale_stack_pointers`'s current
-implementation and doc comments first to understand what it already proactively scans and
-why, before deciding how to extend it.
+**Sub-session 15 finding: the PROACTIVE `fixup_stale_stack_pointers` angle was investigated in
+full and does NOT close the remaining gap — a genuinely DIFFERENT, more fundamental gap was
+found and precisely traced instead.** `fixup_stale_stack_pointers` (`litebox_shim_linux/src/
+syscalls/process.rs` ~1180-1432, read in full this session) only ever writes healed values into
+a bounded 4KB stack window above `child_rsp`, ONCE, at the exact instant `fork()` resumes. It
+structurally cannot help with a value first produced by an instruction that runs AFTER resume
+(a register-to-register `mov`, or any live CPU register at a later point) — that class is, by
+design, `fork_verify.rs`'s job, not this proactive pass's. Widening this scan's own heuristics
+would not touch the `rbp`/`rcx` register-propagation gap sub-14 flagged.
+
+**The real, previously-undocumented gap found via a fresh repro + backward trace
+(`LITEBOX_LOG=debug LITEBOX_DIAG_FATALDUMP=1 LITEBOX_VEH_TRACE=1`, AGENTS.md's repro command,
+100s window against `xfce-layer17.tar`): a stale, in-source-range `rip` can land on a
+genuinely UNMAPPED page in the child, raising `EXCEPTION_ACCESS_VIOLATION` (`0xC0000005`)
+BEFORE the CPU ever delivers the `EXCEPTION_SINGLE_STEP` (`0x80000004`) trap
+`fork_verify::on_single_step` depends on entirely.** Traced live: thread `tid=4d38`
+(`ThreadId(13)`) single-steps cleanly at `rip=0x59b98f3` (`rcx=0x59fa5a0`, `rbp=0`), the CPU
+executes an instruction there that sets `rip=0x59af1ab`, and the VERY NEXT event on that
+thread is `ExceptionCode=0xC0000005` with `ExceptionInformation[1]==rip==0x59af1ab` (an
+EXECUTE fault at `rip` itself) — not `0x80000004`. The same run logged
+`fatal signal: terminating task signal=Signal(11)` at `tid=9` (14.699907100s) and `tid=10`
+(22.883461400s), both during the `dbus-launch`/`dbus-daemon` fork()-heavy phase. Confirmed by
+reading `litebox_platform_windows_userland/src/lib.rs`'s `vectored_exception_handler` top to
+bottom: `fork_verify::on_single_step` is reached ONLY when
+`exception_record.ExceptionCode == EXCEPTION_SINGLE_STEP` (~line 1121); `grep -c is_in_source
+lib.rs` = 0 everywhere else in the file. Whether a stale source-range address raises `#DB`
+(page still resident — the case `fork_verify` already handles) or `#PF`/AV (page not resident)
+is incidental Windows paging state at that instant, not something `fork_verify`'s design
+distinguishes — so this gap is not specific to one register pairing; ANY of the already-fixed
+reactive cases could in principle surface as a raw AV instead of a `#DB` on a different run.
+
+PRD row added (`fork-verify-av-path-stale-rip-bypasses-single-step-heal`) with full evidence
+and the concrete next step: add a new `relocations.is_in_source(context.Rip)` check-and-
+translate-or-kill branch inside `vectored_exception_handler`'s guest-mode
+`EXCEPTION_ACCESS_VIOLATION` handling (after the FS_BASE repair at ~1113, before the
+single-step block at 1121), mirroring case (1)'s exact-membership-only contract — a NEW call
+site outside `fork_verify.rs`'s own `#DB`-triggered paths. NOT attempted this session
+(deliberately, per this project's standing caution against unverified `fork_verify`-adjacent
+changes): needs its own narrow design pass (does the executable-range false-positive guard
+`fixup_stale_stack_pointers` needed also apply here? does healing `rip` in a raw `#PF` risk
+resuming into a half-decoded instruction differently than the `#DB` path does?) and full
+isolated live-verification (multiple repro runs + regression suite) before landing.
 
 **Also landed, safe and independently useful**: `mesa-dri-gallium` (software rasterizer)
 installed into `.wfgy/xfce-build/xfce-layer17.tar` (a full resumable overlay on
