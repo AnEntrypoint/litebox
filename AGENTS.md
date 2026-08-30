@@ -1,4 +1,4 @@
-# AGENTS.md — handoff note (2026-08-30, sub-session 16)
+# AGENTS.md — handoff note (2026-08-30, sub-session 17)
 
 ## Active standing goal (session-scoped Stop hook on the originating machine)
 
@@ -11,7 +11,78 @@ mutables — do not re-derive from scratch; query the recall store first (e.g. s
 "fork_verify AV path stale pointer", "DRM PRIME handle", "wlroots shm keymap",
 "D-Bus session bus export").
 
-## Current state (as of sub-session 16)
+## Current state (as of sub-session 17)
+
+**Sub-session 17 classified the mixed crash population sub-session 16 found (no code fix landed
+— this is a genuine new architectural gap, not a narrow decode-pattern extension safe to force
+this session).** Re-added the temporary `[veh-diag]` AV-path eprintln (removed again before this
+commit — see git history if needed), rebuilt, and captured 3 fresh runs with
+`LITEBOX_LOG=debug LITEBOX_VEH_TRACE=1`:
+
+- Run 1: `rip=fault_addr=0x59b0801`, `rbp=0x1`, `rdi=0x2` (tiny-integer register shape).
+- Run 2 and Run 3: **byte-identical** `rip=fault_addr=0x59b98f3 rax=0x4 rbx=0x7866b28
+  rcx=0x59fa5a0 rdx=0x4 rsi=0x77a7008 rdi=0x8 rbp=0x0 rsp=0x806f868 r8=0x9=0x0 r10=0x0 r11=0x246
+  r12=0x0 r13=0x1 r14=0x0 r15=0x0` — fully deterministic across runs, not the non-determinism
+  sub-session 16 hypothesized (it's deterministic per-instance; the mix comes from which of two
+  known code sites the run happens to reach first).
+
+**Root-caused run 2/3's crash precisely** by correlating the crashing thread's own
+`[fork_verify] tid=ThreadId(13) begin: ranges=...` dump against the guest's `sys_mmap`/
+`sys_execve`/`clone` log lines around it: the crashing thread is guest `tid=9`
+(`fatal signal: ... pid=9 tid=9`), forked from guest `tid=7` (`dbus-launch`'s own **second**
+`fork()` — `tid=6` execve's `/usr/bin/dbus-launch`, forks once to `tid=7` at `t=7.227s`, and
+`tid=7` forks *again* to `tid=8`/`tid=9` at `t=7.297s`/`t=7.888s` — i.e. this is a **fork-of-a-
+fork**, a grandchild, not a direct child). `ThreadId(13)`'s (tid=9's) own tracked source ranges
+start at `102760448` and go up to `114073600` — these are `tid=7`'s own **destination** (already-
+translated) addresses from `tid=7`'s own earlier fork, confirmed by cross-referencing
+`ThreadId(11)`'s (tid=7's) begin-ranges dump, which shows source `93732864..94097408` (dbus-
+launch's `.text`, confirmed via `tid=6`'s `sys_mmap: returned tid=6 ... addr=93732864
+len=364544`) translating to destination `102973440`. The crashing `rip=0x59b98f3` (94083315)
+falls squarely inside `93732864..94097408` — i.e. it is **`tid=6`'s (the grandparent's) original,
+pre-translation address**, not `tid=7`'s (the immediate parent's) translated one. `is_in_source`
+against `tid=9`'s own relocation map (which only knows about `tid=7`'s single most-recent
+generation) correctly returns `false` for this value, because it belongs to a generation the
+child's relocation map has no visibility into at all.
+
+**This is a real, previously-unknown class of gap: `AddressRelocations::duplicate` composes a
+relocation map only from the immediate parent's CURRENT (already possibly-once-translated)
+vmem state (`litebox/src/mm/mod.rs`'s `PageManager::duplicate`, confirmed by reading it) — it has
+no mechanism to chain back through an ancestor generation's own relocation map.** A value that
+was already stale *before* the immediate parent's own fork_verify pass ever healed it (e.g. it
+sat untouched in memory or a register the whole time, exactly the shape case (1)/(2)/(2b)/(2c)/
+(2d) exist to catch for ONE generation) and survives verbatim into a grandchild fork is invisible
+to every one of those cases, because they all gate on `is_in_source` against the child's own
+single-generation map. Confirmed via `git log -p` reading of `litebox/src/mm/mod.rs`'s
+`duplicate()` doc comment and body — this is architecture, not a decode gap in
+`fork_verify.rs`'s instruction-pattern matching.
+
+**Deliberately NOT fixed this session.** This is not a narrow, well-understood single-register/
+single-transition-point extension of the kind fixes #6-9 were (this module's own doc comments and
+`AGENTS.md`'s "fork_verify caution" section both call out that two prior broad-fix attempts at
+this general bug family caused real regressions) — it requires an actual design decision about
+how (or whether) to chain relocation maps across nested fork generations, which needs its own
+focused session: e.g. (a) have `duplicate()` accept and fold in the parent's own inherited
+relocation map (if any) so a grandchild's map covers every ancestor generation transitively, or
+(b) something narrower scoped only to the AV-path healing functions. Registered as gm mutable/PRD
+row `fork-verify-nested-fork-grandparent-generation-staleness-gap` (session
+`litebox-xfce-1-sub17`) for a dedicated follow-up session — do not attempt a quick patch without
+re-reading this section and `litebox/src/mm/mod.rs`'s `duplicate()`/`AddressRelocations` in full
+first.
+
+**Run 1's `rbp=0x1`/`rdi=0x2`/`rip=fault_addr=0x59b0801` capture is the SAME class** (a different
+call site inside the same grandparent-generation dbus-launch `.text` region, `93732864..
+94097408` — `0x59b0801` = 94046209 also falls inside it), not a separate root cause. Sub-session
+16's "mixed/non-deterministic" framing was itself imprecise: each individual instance is fully
+deterministic (run 2 and run 3 are byte-identical); the appearance of a "mix" was two different
+call sites within the same one architectural gap, reached in different visitation order run to
+run, not two different bug classes.
+
+**Regression suite verified clean after the diagnostic was added, used, and fully removed again**
+(worktree diff on `lib.rs` is empty relative to HEAD): `cargo test -p litebox_shim_linux --lib --
+--skip test_mremap` (177/177) and `cargo test -p litebox_platform_windows_userland` (4/4), both
+passing, matching the pre-existing baseline exactly.
+
+## Prior state (as of sub-session 16)
 
 **Fixed and pushed, verified live, in order** (every one of this chain that initially looked
 like it might be an "upstream" bug turned out to be litebox's own gap — keep defaulting to
