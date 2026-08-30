@@ -1,4 +1,4 @@
-# AGENTS.md — handoff note (2026-08-30, sub-session 20)
+# AGENTS.md — handoff note (2026-08-30, sub-session 21)
 
 ## Active standing goal (session-scoped Stop hook on the originating machine)
 
@@ -8,108 +8,82 @@ This is being worked via `/goal` on litebox-main, gm session_id `litebox-xfce-1`
 chronological detail of every prior sub-session's investigation, ruled-out hypotheses, and
 fixes lives in gm's memory store (`recall`/`codesearch` against this project) as resolved
 mutables — do not re-derive from scratch; query the recall store first (e.g. search
-"fork_verify AV path stale pointer", "DRM PRIME handle", "wlroots shm keymap",
-"step bound exhaustion", "keep relocations alive false positive").
+"fork_verify AV path stale pointer", "DRM PRIME handle", "wlroots shm keymap", "step bound
+exhaustion", "keep relocations alive false positive", "dbus-daemon nofork").
 
-## DEFINITIVE finding on the step-bound gap (same session as sub-session 20, follow-up)
+## MAJOR FINDING (sub-session 21): `dbus-daemon --nofork` avoids the fork-verify crash entirely
 
-The "keep relocations alive past the bound" approach was re-tested WITH direct diagnostic
-instrumentation (temporary, added and removed same pass) unconditionally logging every AV-path
-heal attempt. It caught the crash red-handed:
-`[av-heal-diag] tid=ThreadId(14) rip=0x8b7f024 fault_addr=0x8b7f024 healed=true past_bound=true`
-— the AV-path healing code fired, `is_in_source`/`translate()` both matched, execution resumed
-at the "healed" address via `EXCEPTION_CONTINUE_EXECUTION` — and the process still crashed at
-the host level immediately after. **This proves the relocation map's `is_in_source` membership
-test itself becomes a FALSE-POSITIVE generator once kept alive far past its original narrow
-post-fork window**: `0x8b7f024` coincidentally fell within a tracked source range long after
-that range's translation had stopped being meaningful, because the guest's own legitimate
-execution had evolved the address space enough (thousands of steps, real mmaps/allocations) to
-create a coincidental overlap that never existed during the map's intended tens-to-low-hundreds-
-of-instruction validity window (see `MAX_THREAD_VERIFICATION_STEPS`'s own doc comment for that
-expected window size).
+The step-bound-exhaustion crash blocking D-Bus (see the extensive investigation trail below,
+sub-sessions 13/19/20) is a real, still-unfixed litebox gap in `fork_verify`. But it is
+**entirely avoidable at the repro-command level**: `dbus-daemon`'s crash only happens in its
+own daemonizing self-fork (the `--fork` path, its default without an explicit flag). Running
+`dbus-daemon --nofork` (stay in the foreground, no self-fork at all) sidesteps the whole bug
+class — confirmed live, a full run with `--nofork` shows **zero** `fatal signal` lines from
+`dbus-daemon` or its descendants, and **`xfsettingsd` genuinely connects to D-Bus for the first
+time this entire investigation** (no more "Could not connect: Connection refused" for
+`xfsettingsd` itself), spawning real children (`at-spi-bus-launcher`, `xfconfd`).
 
-**Conclusion: "keep the map alive" is unsafe in ANY form, not just the specific mechanisms tried
-(raise the bound 2x/16x, keep alive passively without re-arming `TF`).** The map's precision is
-inherently time/step-bounded; three attempts across two sessions confirm this from different
-angles. **A genuinely safe fix must instead either (a) tolerate the crash this specific case
-represents as out of scope (the current, committed state — `tls.fork_verify` is cleared exactly
-at the bound, matching every fix in this investigation except this one gap), or (b) implement a
-MUCH shorter secondary grace window (tens of steps, matching the doc-commented expected
-window, not the current 16384) for AV-path-only reactive healing before unconditionally
-clearing — untested this session, but the shorter window is the only remaining design point not
-yet ruled out empirically.** Do not attempt "keep alive indefinitely" again in any form.
+**Use `--nofork` in the repro command going forward** (see updated repro command below). The
+underlying `fork_verify` step-bound bug remains open and real (a genuine litebox limitation
+that will resurface for any OTHER guest program that daemonizes via a long-running
+post-`fork()` self-fork) but is no longer the immediate blocker for THIS goal.
 
-## Current state (as of sub-session 20)
+## NEW blocker found with `--nofork` (sub-session 21, not yet fixed)
 
-**Fixed and pushed, verified live** (every one of this chain that initially looked like it
-might be an "upstream" bug turned out to be litebox's own gap — keep defaulting to that
-hypothesis for anything new):
+With the D-Bus blocker sidestepped, execution progresses much further and hits a genuinely new
+crash: labwc itself (`tid=1000`) aborts with
+```
+Assertion failed: width > 0 && height > 0 (render/swapchain.c: wlr_swapchain_create: 21)
+```
+(`fatal signal: ... signal=Signal(6)` — SIGABRT, not SIGSEGV) at ~25.8s, BEFORE either
+`xfce4-panel` or `xfdesktop` ever `sys_execve`. This happens right after `at-spi-bus-launcher`
+and `xfconfd` are spawned (real D-Bus service activation now working) — likely labwc trying to
+create a swapchain for a NEW output or internal surface with a zero/uninitialized size, not yet
+investigated. Also observed in the same run: `at-spi-bus-launcher` (`tid=34`) itself took
+`signal=5` (SIGTRAP) and a separate process `tid=35` took `signal=9` (SIGKILL) shortly before
+labwc's abort — worth checking whether these are related or separate issues. **Concrete next
+step: reproduce with `LITEBOX_LOG=debug` and trace what output/surface labwc is trying to
+create a swapchain for at this exact point** (likely correlates with a `DRM_IOCTL_MODE_*` call
+sequence or an `sys_ioctl`/`sys_mmap` right before the assertion — check the log immediately
+preceding it for the relevant DRM/output-resize context).
+
+## Prior fixed-and-pushed chain (verified live, in order)
+
+Every one of this chain that initially looked like it might be an "upstream" bug turned out to
+be litebox's own gap — keep defaulting to that hypothesis for anything new:
 1. mallocng `.meta=0` crash — commit `b4a40e3d`.
 2. libinput evdev rejection, missing `fallocate`, `migrate_file_up` panic — commit `5458d74c`.
 3. Full DRM sysfs subtree, `DRM_CAP_*`, `DRM_IOCTL_GET_MAGIC`/`AUTH_MAGIC` — commits `1f51bf4a`,
    `024d704f`. labwc's wlroots DRM backend creates successfully.
 4. `fchmod`-on-unlinked-fd + `mmap(MAP_SHARED)` on unlink-based shm files — commit `61c97e9f`.
-5. `DRM_IOCTL_PRIME_HANDLE_TO_FD`/`FD_TO_HANDLE`/`GEM_CLOSE` — commit `17312da4`. Got
-   `xfsettingsd` to genuinely `sys_execve` for the first time.
+5. `DRM_IOCTL_PRIME_HANDLE_TO_FD`/`FD_TO_HANDLE`/`GEM_CLOSE` — commit `17312da4`.
 6-9. Four fork_verify AV-bypass/register-healing extensions (`rcx`, `rdi`, AV-path CODE `rip`,
    AV-path DATA memory-operand registers) — commits `8ec32c4b`, `c3182da7`, `4bf0acac`,
    `a9895bec`.
-10. fork_verify: chain ancestor relocations across NESTED fork generations (a real architecture
-    gap — a grandchild fork's map only covered its immediate parent, not the grandparent) —
-    commit `ca7408e0`. This got `xfsettingsd` to genuinely reach its D-Bus `connect()` attempt,
-    the furthest this whole investigation has ever gotten.
+10. fork_verify: chain ancestor relocations across NESTED fork generations — commit `ca7408e0`.
 
-**Current blocker**: `xfsettingsd` still fails ("Could not connect: Connection refused")
-because `dbus-daemon`'s real long-running daemon (a SINGLE-generation fork child of the
-`--fork` parent, confirmed via `clone: spawned new task parent_tid=<dbus-daemon>`) crashes
-before it ever calls `bind()`/`listen()` on its Unix socket — confirmed via `ls -la` on the
-socket path showing a plain empty regular file (`-rwxrwxrwx ... 0 ...`), never an actual
-listening socket.
+**Unfixed, real, open litebox limitation (do not re-attempt blindly)**: `fork_verify`'s
+`MAX_THREAD_VERIFICATION_STEPS` bound (16384) disarms verification (and clears the relocation
+map) for a long-running post-fork thread, and a stale pointer reaching an unverified path after
+that point can crash the guest task. THREE independent attempts to extend coverage past the
+bound (raise it 2x, raise it 16x, keep the relocation map alive passively without re-arming
+`TF`) have all failed — the first two caused a DIFFERENT worse host-level crash; the third was
+caught in the act via direct diagnostic instrumentation producing a FALSE-POSITIVE `is_in_source`
+hit (a coincidental address-range overlap that only becomes possible once the guest's own
+legitimate memory layout has evolved far past the map's original narrow validity window) that
+"healed" to a wrong address and crashed anyway. **Do not attempt "keep the map alive" again in
+any form** — the map's precision is fundamentally time-bounded. A grace window shorter than
+16384 (tens of steps, matching the doc-commented expected real staleness window) is the one
+remaining untested design point, but is now moot for THIS specific blocker since `--nofork`
+avoids it entirely; it would still be worth fixing properly for other programs that hit it.
 
-**Root cause, precisely confirmed (sub-session 19)**: this is `MAX_THREAD_VERIFICATION_STEPS`
-(16384, `fork_verify.rs`) tripping — the step bound that stops continuous single-stepping on a
-long-running post-fork thread. Live `LITEBOX_VEH_TRACE=1` capture showed the exact sequence:
-stale-pointer healing WARN lines firing right up until `"step bound 16384 exceeded ... ending
-verification early"`, then the SAME thread taking an unverified, unhealed raw
-`EXCEPTION_ACCESS_VIOLATION` moments later — disproving the bound's own doc-comment claim that
-post-fork staleness is front-loaded (it can still occur well past 16384 steps on a real,
-long-running daemon).
-
-**THREE independent fix attempts for extending coverage past the bound have now failed,
-across two sessions — do not attempt a fourth mechanical variant without first understanding
-WHY extending coverage specifically breaks things:**
-1. Raise `MAX_THREAD_VERIFICATION_STEPS` 2x (32768) — avoided this crash, caused a DIFFERENT,
-   worse host-level segfault (exit 139, `rip=0x2`, `.meta=0`-shaped null-deref).
-2. Raise it 16x (262144) — same worse host-level segfault, identical signature.
-3. (Sub-session 20, this session) Keep `tls.fork_verify`'s `Arc<AddressRelocations>` alive past
-   the bound (so the already-landed, already-proven-safe AV-path reactive healing could still
-   fire), while adding a SEPARATE flag to stop `entry_eflags_tf` from re-arming `TF` — i.e. zero
-   additional single-stepping cost, purely a passive safety net. This ALSO caused a host-level
-   segfault (exit 139) on the full repro. Reverted cleanly (`git status` clean, baseline tests
-   177/4 pass).
-
-**Leading hypothesis for #3's failure, NOT yet verified**: keeping the relocation map's `Arc`
-alive indefinitely past the bound may let the AV-path healing incorrectly fire on a LATER,
-UNRELATED fault whose address coincidentally satisfies `is_in_source` against a now-very-stale
-map — the tracked source ranges were captured at ONE `fork()` moment; by the time a daemon has
-run thousands of steps past the bound, the guest's OWN legitimate memory layout may have grown
-enough (new mmaps, stack growth, etc.) that a coincidental range overlap becomes newly possible
-in a way it never was during case (1)/(2)'s originally-designed narrow window. **Needs
-verification via minimal diagnostic instrumentation (log every AV-path heal attempt's address
-and whether it was a genuine hit) BEFORE any further fix attempt, not another mechanical
-variant.**
-
-**Also landed, safe and independently useful**: the corrected D-Bus repro command
-(`dbus-launch --exit-with-session`, not `--print-address`) and `mesa-dri-gallium` installed
-into `.wfgy/xfce-build/xfce-layer17.tar`.
-
-## Repro command (current known-good)
+## Repro command (current known-good, sub-session 21: `--nofork`)
 
 ```
-target/release/litebox_runner_linux_on_windows_userland.exe --initial-files .wfgy/xfce-build/alpine-pinned2.tar --resume-from .wfgy/xfce-build/xfce-layer17.tar -- /bin/sh -c "mkdir -p /run/user/1000 /dev/shm /var/lib/dbus; chmod 700 /run/user/1000; chmod 1777 /dev/shm; export XDG_RUNTIME_DIR=/run/user/1000; export XKB_CONFIG_ROOT=/usr/share/X11/xkb; export WLR_RENDERER=pixman; dbus-uuidgen --ensure=/var/lib/dbus/machine-id 2>&1 || true; eval \$(dbus-launch --sh-syntax --exit-with-session) 2>&1; export DBUS_SESSION_BUS_ADDRESS; seatd -l debug & for i in 1 2 3 4 5 6 7 8 9 10; do [ -S /run/seatd.sock ] && break; sleep 1; done; labwc -s \"xfsettingsd & xfce4-panel & xfdesktop &\""
+target/release/litebox_runner_linux_on_windows_userland.exe --initial-files .wfgy/xfce-build/alpine-pinned2.tar --resume-from .wfgy/xfce-build/xfce-layer17.tar -- /bin/sh -c "mkdir -p /run/user/1000 /dev/shm /var/lib/dbus; chmod 700 /run/user/1000; chmod 1777 /dev/shm; export XDG_RUNTIME_DIR=/run/user/1000; export XKB_CONFIG_ROOT=/usr/share/X11/xkb; export WLR_RENDERER=pixman; dbus-uuidgen --ensure=/var/lib/dbus/machine-id 2>&1 || true; export DBUS_SESSION_BUS_ADDRESS='unix:path=/tmp/mybus'; dbus-daemon --nofork --nopidfile --nosyslog --address=\"\$DBUS_SESSION_BUS_ADDRESS\" --session & sleep 2; seatd -l debug & for i in 1 2 3 4 5 6 7 8 9 10; do [ -S /run/seatd.sock ] && break; sleep 1; done; labwc -s \"xfsettingsd & xfce4-panel & xfdesktop &\""
 ```
 with `LITEBOX_LOG=debug` (add `LITEBOX_DIAG_FATALDUMP=1 LITEBOX_VEH_TRACE=1` for crash register
-capture and step-by-step trace), `MSYS_NO_PATHCONV=1` in Git Bash. Rebuild
+capture), `MSYS_NO_PATHCONV=1` in Git Bash. Rebuild
 `cargo build --locked --release -p litebox_runner_linux_on_windows_userland` first. Strip ANSI
 color codes before grepping (`sed 's/\x1b\[[0-9;]*m//g' logfile > clean.log`). Regression
 suite: `cargo test -p litebox_shim_linux --lib -- --skip test_mremap` (177/177) and
@@ -120,7 +94,9 @@ suite: `cargo test -p litebox_shim_linux --lib -- --skip test_mremap` (177/177) 
 labwc's own `-s "xfsettingsd & xfce4-panel & xfdesktop &"` session targets launch (real
 `sys_execve` log lines) and survive a 90-150+ second window with no `fatal signal:`/
 `sys_exit_group` (Signal) in a `LITEBOX_LOG=debug` capture — log-based evidence only, never
-`busybox kill -0` (confirmed unreliable in this rootfs).
+`busybox kill -0` (confirmed unreliable in this rootfs). As of sub-session 21, execution reaches
+real D-Bus service activation (further than ever) but labwc itself aborts on a swapchain
+assertion before `xfce4-panel`/`xfdesktop` ever launch.
 
 ## Hard constraints (non-negotiable, apply on any machine)
 
@@ -135,16 +111,9 @@ labwc's own `-s "xfsettingsd & xfce4-panel & xfdesktop &"` session targets launc
 - **Evidentiary discipline**: every claim must be backed by real, quoted tool output. Never
   invent a fix, a passing test, or a "confirmed running" claim. Report honest negative results.
 - **Push safety**: stage ONLY the specific files you changed (never `git add -A`/`.`).
-- **fork_verify's `MAX_*_VERIFICATION_STEPS` bound is load-bearing in a way not yet fully
-  understood.** THREE independent attempts to extend coverage past it (raise the bound 2x, 16x,
-  or keep the relocation map passively alive without re-arming `TF`) have all caused a
-  DIFFERENT, worse host-level crash than the one being fixed. Do not attempt a fourth mechanical
-  variant without first adding diagnostic instrumentation to understand exactly why extending
-  coverage breaks things (leading hypothesis: a stale relocation map's `is_in_source` producing
-  false-positive hits against the guest's own legitimately-evolved later memory layout — see
-  "Current blocker" above for detail). Every OTHER fix in this investigation (#6-10 above) was
-  narrow, single-register/single-transition-point, and safe — this specific step-bound gap is
-  the one exception that has resisted three honest attempts.
+- **fork_verify's `MAX_*_VERIFICATION_STEPS` bound is load-bearing.** See "Unfixed, real, open
+  litebox limitation" above — three independent extension attempts all failed for related but
+  distinct reasons. Do not attempt a fourth without new diagnostic evidence.
 
 ## Rootfs/artifact locations
 
