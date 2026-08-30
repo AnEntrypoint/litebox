@@ -1,4 +1,4 @@
-# AGENTS.md — handoff note (2026-08-30, sub-session 11)
+# AGENTS.md — handoff note (2026-08-30, sub-session 12)
 
 ## Active standing goal (session-scoped Stop hook on the originating machine)
 
@@ -107,10 +107,18 @@ correctness gap worth having fixed for whenever GL/DRI-dependent rendering paths
 eventually exercised. **Use `xfce-layer17.tar` as the `--resume-from` target going forward**
 (same shape as `xfce-layer16.tar`, just with real mesa DRI drivers present).
 
-## Repro command (current known-good, includes the D-Bus fix from (a) above)
+## Repro command (current known-good, sub-session 12: correct D-Bus session-bus export)
+
+**IMPORTANT correction from sub-session 12**: the previously-documented
+`dbus-daemon --session --fork --print-address` approach is WRONG — it prints the bus address
+to stdout and discards it; nothing exports `DBUS_SESSION_BUS_ADDRESS`, so `xfsettingsd`/labwc
+never see the already-running bus and instead each independently try to autolaunch their OWN
+session bus via `dbus-launch`, spawning MORE fork children that also hit the fork_verify gap
+below — compounding the problem. Use `dbus-launch --sh-syntax --exit-with-session` with `eval`
+instead, which correctly sets and exports the address in the current shell:
 
 ```
-target/release/litebox_runner_linux_on_windows_userland.exe --initial-files .wfgy/xfce-build/alpine-pinned2.tar --resume-from .wfgy/xfce-build/xfce-layer17.tar -- /bin/sh -c "mkdir -p /run/user/1000 /dev/shm /var/lib/dbus; chmod 700 /run/user/1000; chmod 1777 /dev/shm; export XDG_RUNTIME_DIR=/run/user/1000; export XKB_CONFIG_ROOT=/usr/share/X11/xkb; export WLR_RENDERER=pixman; dbus-uuidgen --ensure=/var/lib/dbus/machine-id 2>&1 || true; dbus-daemon --session --fork --print-address 2>&1 || true; seatd -l debug & for i in 1 2 3 4 5 6 7 8 9 10; do [ -S /run/seatd.sock ] && break; sleep 1; done; labwc -s \"xfsettingsd & xfce4-panel & xfdesktop &\""
+target/release/litebox_runner_linux_on_windows_userland.exe --initial-files .wfgy/xfce-build/alpine-pinned2.tar --resume-from .wfgy/xfce-build/xfce-layer17.tar -- /bin/sh -c "mkdir -p /run/user/1000 /dev/shm /var/lib/dbus; chmod 700 /run/user/1000; chmod 1777 /dev/shm; export XDG_RUNTIME_DIR=/run/user/1000; export XKB_CONFIG_ROOT=/usr/share/X11/xkb; export WLR_RENDERER=pixman; dbus-uuidgen --ensure=/var/lib/dbus/machine-id 2>&1 || true; eval \$(dbus-launch --sh-syntax --exit-with-session) 2>&1; export DBUS_SESSION_BUS_ADDRESS; seatd -l debug & for i in 1 2 3 4 5 6 7 8 9 10; do [ -S /run/seatd.sock ] && break; sleep 1; done; labwc -s \"xfsettingsd & xfce4-panel & xfdesktop &\""
 ```
 with `LITEBOX_LOG=debug` (add `LITEBOX_DIAG_FATALDUMP=1` for crash register/instruction-byte
 capture), `MSYS_NO_PATHCONV=1` in Git Bash. Rebuild
@@ -121,14 +129,34 @@ embedded in colored lines otherwise (confirmed this session). Regression suite:
 `cargo test -p litebox_shim_linux --lib -- --skip test_mremap` (177/177 pass as of last
 commit) and `cargo test -p litebox_platform_windows_userland` (4/4 pass).
 
+## Current blocker (sub-session 12): fork_verify gap NARROWED but not fully closed
+
+With the corrected D-Bus repro above, `xfsettingsd` genuinely tries to connect over the
+properly-exported bus, but still fails (`Could not connect: Connection refused`) because
+`dbus-daemon`'s own daemonizing fork (the real daemon process's `--fork` self-detach, not a
+per-connection worker) still SIGSEGVs at guest level after a DENSE burst of `fork_verify`
+"stale pointer, translating" WARN lines that all otherwise succeed — the already-landed `rcx`
+fix (commit `8ec32c4b`) IS helping (many more pointers get healed than before), but at least
+one case still slips through. This is a NARROWER instance of the exact same bug class fix
+commit `8ec32c4b` already fixed one instance of — not a new, unrelated bug. Leading suspect
+(not yet safely confirmed): the register-to-register-mov-propagation case (the reverted
+"(1b)" patch from sub-session 10, re-tested and found unsafe in isolation by sub-session 11)
+may still be the real remaining gap and need a genuinely safe reformulation neither prior
+attempt found — full detail in gm mutable `dbus-daemon-fork-child-still-sigsegv-after-rcx-fix`.
+**Read `litebox_platform_windows_userland/src/fork_verify.rs`'s FULL module doc comment before
+attempting anything here — this is delicate, high-risk platform code with a real history of
+well-intentioned fixes causing worse regressions (host-level process crashes instead of
+guest-level ones). Test every change in isolation, never batch.**
+
 ## Completion criterion (unchanged, NOT YET MET)
 
 labwc's own `-s "xfsettingsd & xfce4-panel & xfdesktop &"` session targets launch (real
 `sys_execve` log lines) and survive a 90-150+ second window with no `fatal signal:`/
 `sys_exit_group` (Signal) in a `LITEBOX_LOG=debug` capture — log-based evidence only, never
-`busybox kill -0` (confirmed unreliable in this rootfs). As of sub-session 10, `xfsettingsd`
-genuinely `sys_execve`'s (real progress) but exits(1) or crashes (via its dbus-daemon fork
-children's SIGSEGV) before `xfce4-panel`/`xfdesktop` ever launch.
+`busybox kill -0` (confirmed unreliable in this rootfs). As of sub-session 12, `xfsettingsd`
+genuinely `sys_execve`'s and attempts a real D-Bus connection (closer than ever) but still
+fails to connect because the D-Bus daemon it depends on keeps crashing via the fork_verify
+gap above, before `xfce4-panel`/`xfdesktop` ever launch.
 
 ## Hard constraints (non-negotiable, apply on any machine)
 
