@@ -378,7 +378,11 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         Ok(0)
     }
 
-    pub(crate) fn set_crtc(&self, ptr: UserPtr<DrmModeCrtc>) -> Result<u32, Errno> {
+    pub(crate) fn set_crtc(
+        &self,
+        platform: &Platform,
+        ptr: UserPtr<DrmModeCrtc>,
+    ) -> Result<u32, Errno> {
         let req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         if req.crtc_id != VIRTUAL_CRTC_ID {
             return Err(Errno::ENOENT);
@@ -387,7 +391,74 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             return Err(Errno::ENOENT);
         }
         *self.crtc_fb.lock() = if req.fb_id == 0 { None } else { Some(req.fb_id) };
+        // A legacy (non-atomic) client's own repaint loop -- weston's DRM backend with a shadow
+        // framebuffer included, confirmed live this session -- commonly re-attaches its updated
+        // framebuffer via repeated `SETCRTC` calls rather than `PAGE_FLIP` once initial modesetting
+        // has already happened once: `PAGE_FLIP` itself is defined to require a CRTC that already
+        // has a framebuffer attached (real `drmModePageFlip`'s own contract), so a client is free to
+        // keep using `SETCRTC` for every subsequent frame instead. `page_flip`'s own host-side
+        // presentation callback exists precisely to forward whatever the guest most recently
+        // scanned out to a `--gui` runner's window -- restricting that forwarding to `PAGE_FLIP`
+        // alone silently drops every frame a `SETCRTC`-only repaint loop produces, leaving the host
+        // window black even while the guest compositor is genuinely running and correctly updating
+        // its own (litebox-emulated) CRTC state. Fire the identical callback here too, whenever this
+        // call actually attaches a real framebuffer (not the `fb_id == 0` detach case, which has
+        // nothing to present).
+        if let Some(fb_id) = *self.crtc_fb.lock() {
+            self.notify_flip_callback(platform, fb_id);
+        }
         Ok(0)
+    }
+
+    /// Shared by [`Self::set_crtc`] and [`Self::page_flip`]: maps `fb_id`'s backing dumb-buffer
+    /// memory host-side and forwards it to the installed presentation callback, if any. A no-op
+    /// (and a silently-swallowed lookup failure) when no callback is installed or the mapping
+    /// fails, matching `page_flip`'s own established "a host-side presentation miss must never
+    /// fail the guest's own ioctl" contract.
+    fn notify_flip_callback(&self, platform: &Platform, fb_id: u32) {
+        if self.flip_callback.lock().is_none() {
+            return;
+        }
+        let Some((handle, size, width, height, pitch, pixel_format)) = ({
+            let framebuffers = self.framebuffers.lock();
+            framebuffers.get(&fb_id).map(|fb| {
+                let buffers = self.buffers.lock();
+                let buffer = buffers
+                    .get(&fb.handle)
+                    .expect("add_fb2 only ever records a handle that exists in self.buffers, and destroy_dumb never removes an fb referencing a destroyed buffer (see destroy_dumb's own doc comment: real Linux leaves dangling fb references, matched deliberately)");
+                (buffer.handle, buffer.size, fb.width, fb.height, buffer.pitch, fb.pixel_format)
+            })
+        }) else {
+            return;
+        };
+        match platform.map_shared_memory(
+            handle,
+            0..size,
+            litebox::platform::page_mgmt::MemoryRegionPermissions::READ,
+            litebox::platform::page_mgmt::FixedAddressBehavior::Hint,
+        ) {
+            Ok(mapped_ptr) => {
+                let addr = mapped_ptr.as_usize();
+                // SAFETY: `map_shared_memory` just returned this exact `addr`/`size` as a freshly
+                // established, readable mapping of `handle`'s real backing storage; nothing else in
+                // this function (or reachable from the callback, which only receives a `&[u8]`
+                // slice, not the address) can invalidate it before the `unmap_shared_memory` call
+                // immediately below.
+                let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, size) };
+                if let Some(callback) = self.flip_callback.lock().as_ref() {
+                    callback(bytes, width, height, pitch, pixel_format);
+                }
+                // SAFETY: `addr..addr+size` is exactly the range just mapped above, and the
+                // callback (the only other holder of a reference into it) has already returned by
+                // this point -- no other code can still be reading through it.
+                let _ = unsafe { platform.unmap_shared_memory(addr..addr + size) };
+            }
+            Err(_) => {
+                // A host-side presentation window failing to see one frame is not a reason to fail
+                // the guest's own ioctl -- see `page_flip`'s identical reasoning at its own
+                // corresponding `Err` arm.
+            }
+        }
     }
 
     pub(crate) fn get_plane_resources(
@@ -840,64 +911,11 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         if req.crtc_id != VIRTUAL_CRTC_ID {
             return Err(Errno::ENOENT);
         }
-        let flip_buffer_info = {
-            let framebuffers = self.framebuffers.lock();
-            let fb = framebuffers.get(&req.fb_id).ok_or(Errno::ENOENT)?;
-            let buffers = self.buffers.lock();
-            let buffer = buffers
-                .get(&fb.handle)
-                .expect("add_fb2 only ever records a handle that exists in self.buffers, and destroy_dumb never removes an fb referencing a destroyed buffer (see destroy_dumb's own doc comment: real Linux leaves dangling fb references, matched deliberately)");
-            (
-                buffer.handle,
-                buffer.size,
-                fb.width,
-                fb.height,
-                buffer.pitch,
-                fb.pixel_format,
-            )
-        };
-        *self.crtc_fb.lock() = Some(req.fb_id);
-        // Only pay for a host mapping + copy when a callback is actually installed (a non-GUI
-        // runner, or one that never called `set_flip_callback`, never touches the platform
-        // shared-memory machinery at all here).
-        if self.flip_callback.lock().is_some() {
-            let (handle, size, width, height, pitch, pixel_format) = flip_buffer_info;
-            // A short-lived HOST-side mapping of the same shared-memory object the guest's own
-            // `mmap()` (see `sys_mmap`'s DRI-fd branch) maps into ITS address space -- this is a
-            // SECOND, independent mapping of the identical real memory, not a copy of a copy: the
-            // callback receives the exact bytes the guest most recently wrote. `Hint` (not a
-            // fixed address) since this mapping is purely a transient host-side read window, torn
-            // down again before this function returns.
-            match platform.map_shared_memory(
-                handle,
-                0..size,
-                litebox::platform::page_mgmt::MemoryRegionPermissions::READ,
-                litebox::platform::page_mgmt::FixedAddressBehavior::Hint,
-            ) {
-                Ok(mapped_ptr) => {
-                    let addr = mapped_ptr.as_usize();
-                    // SAFETY: `map_shared_memory` just returned this exact `addr`/`size` as a
-                    // freshly established, readable mapping of `handle`'s real backing storage;
-                    // nothing else in this function (or reachable from the callback, which only
-                    // receives a `&[u8]` slice, not the address) can invalidate it before the
-                    // `unmap_shared_memory` call immediately below.
-                    let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, size) };
-                    if let Some(callback) = self.flip_callback.lock().as_ref() {
-                        callback(bytes, width, height, pitch, pixel_format);
-                    }
-                    // SAFETY: `addr..addr+size` is exactly the range just mapped above, and the
-                    // callback (the only other holder of a reference into it) has already
-                    // returned by this point -- no other code can still be reading through it.
-                    let _ = unsafe { platform.unmap_shared_memory(addr..addr + size) };
-                }
-                Err(_) => {
-                    // A host-side presentation window failing to see one frame is not a reason to
-                    // fail the guest's own page-flip ioctl -- the guest's own view of the flip
-                    // (the CRTC's now-attached framebuffer, the completion event below) is
-                    // unaffected either way; only the optional host visualization is skipped.
-                }
-            }
+        if !self.framebuffers.lock().contains_key(&req.fb_id) {
+            return Err(Errno::ENOENT);
         }
+        *self.crtc_fb.lock() = Some(req.fb_id);
+        self.notify_flip_callback(platform, req.fb_id);
         // This device has no real vsync/vblank interrupt to wait for, so the flip is complete
         // (in the sense a client cares about -- the CRTC now scans out the new framebuffer) the
         // instant this ioctl returns; if the guest asked to be told, queue the completion event

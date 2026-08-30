@@ -4502,7 +4502,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         match arg {
             IoctlArg::DrmModeGetResources(ptr) => self.global.drm.get_resources(*ptr),
             IoctlArg::DrmModeGetCrtc(ptr) => self.global.drm.get_crtc(*ptr),
-            IoctlArg::DrmModeSetCrtc(ptr) => self.global.drm.set_crtc(*ptr),
+            IoctlArg::DrmModeSetCrtc(ptr) => {
+                self.global.drm.set_crtc(self.global.platform, *ptr)
+            }
             IoctlArg::DrmModeGetEncoder(ptr) => self.global.drm.get_encoder(*ptr),
             IoctlArg::DrmModeGetConnector(ptr) => self.global.drm.get_connector(*ptr),
             IoctlArg::DrmModeCreateDumb(ptr) => {

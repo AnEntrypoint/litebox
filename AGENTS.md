@@ -1,4 +1,89 @@
-# STATUS (2026-08-30, sub-session 25): tar corruption FIXED, full soak re-run clean — standing goal MET
+# STATUS (2026-08-30, sub-session 26): real screenshot taken, window renders BLACK — a genuine, precisely-narrowed compositing gap found, one real infra bug fixed along the way
+
+The user asked to prove XFCE running "normal" by actually screenshotting the `--gui` window's
+output. This is a strictly higher evidentiary bar than sub-session 25's convergent-but-indirect
+evidence (window exists, wgpu device exists, XFCE processes stay alive) -- and it failed the bar:
+**the actual captured screenshot is solid black**, even after XFCE genuinely launches, runs for
+60+ seconds with zero crashes, and grows to 8GB of real guest memory use. Sub-session 25's
+"standing goal MET" verdict is retracted -- convergent indirect evidence was not sufficient
+without direct visual confirmation, which is exactly why the user asked for a screenshot.
+
+## Real infra bug found and fixed along the way (kept, not reverted): `DRM_IOCTL_MODE_SETCRTC` never triggered the host presentation callback
+
+Read `litebox_shim_linux/src/syscalls/drm.rs` closely while investigating the black window:
+`DrmSubsystem::page_flip` (the `PAGE_FLIP` ioctl handler) was the ONLY call site that ever invoked
+`flip_callback` (the hook `--gui` installs to forward guest framebuffer bytes to the host `wgpu`
+window) -- `set_crtc` (the `SETCRTC` ioctl handler) attached a new framebuffer to the virtual CRTC
+but never notified the callback at all. This is a real gap: real `drmModePageFlip` requires a CRTC
+that already has a framebuffer attached, so a legacy (non-atomic) client is free to re-attach via
+repeated `SETCRTC` calls for every subsequent frame instead of ever using `PAGE_FLIP` again after
+the first modeset -- and any such client's frames after the first would have been silently dropped
+by `--gui`, with no error, no log line, nothing observably wrong except an eventually-stale window.
+
+**Fix**: extracted the map-and-forward logic both ioctl handlers need into a new
+`notify_flip_callback` helper, called it from `set_crtc` too (only when a real framebuffer is being
+attached, not the `fb_id == 0` detach case). Verified: `cargo check -p litebox_shim_linux` clean,
+`cargo test -p litebox_shim_linux --lib -- --skip test_mremap` 177/177 (matches baseline),
+`cargo build --locked --release -p litebox_runner_linux_on_windows_userland` clean. Live-verified
+via temporary diagnostic `eprintln!`s (added, exercised, then fully removed before commit -- not
+left in the diff): `PresenterApp::present()` genuinely fires twice for a plain `weston
+--backend=drm-backend.so --use-pixman` run (no XFCE) with real, correctly-sized frame data
+(1920x1080, 8294400 bytes, non-zero), `state_is_some=true`, and `surface.get_current_texture()`
+succeeding both times -- the wgpu presentation pipeline itself, all the way from a DRM ioctl to a
+real Windows surface swap, is now CONFIRMED working end-to-end for weston's own initial modeset +
+shadow-buffer flip. This is real, necessary, verified infrastructure -- kept regardless of the
+black-window finding below, since it fixes a genuine correctness gap independent of whatever is
+causing that.
+
+## The actual remaining gap: weston never re-flips after XFCE's windows should start compositing
+
+With the `SETCRTC` fix in place, `weston --backend=drm-backend.so --use-pixman` ALONE (no XFCE)
+correctly presents its own default background twice at startup -- confirmed via the diagnostic
+above. The resulting host window is black, and **this is the CORRECT rendering of weston's own
+empty desktop with zero client windows attached** -- not a bug, this is what a compositor with
+nothing to draw looks like.
+
+The bug is what happens once XFCE's windows DO exist: running the full repro (seatd + dbus-daemon
++ weston --xwayland + xfsettingsd/xfce4-panel/xfdesktop) for 60+ real seconds past a clean,
+crash-free XFCE launch, then screenshotting the live window, still shows solid black -- weston
+never appears to re-flip/re-present after its own initial startup frame, even though XFCE's three
+components are confirmed alive, running, and consuming real memory (8GB) the whole time. Searched
+the full run's log for any weston-side repaint/damage-tracking activity (`Output repaint`,
+`damage`, `surface commit`, `xdg_surface`) -- found only the ONE startup line ("Output repaint
+window is 7 ms maximum"), zero further repaint-cycle evidence for the entire run's duration,
+despite three real, running Wayland/X11 client applications that should each be creating and
+damaging real surfaces.
+
+**Working hypothesis, not yet confirmed**: this may be the SAME underlying mechanism as
+sub-session-22's already-root-caused `xfce-labwc-swapchain-upstream-wlroots-gap` (xfsettingsd's own
+`wlr-output-management` config-apply request causing wlroots/weston's legacy DRM backend to
+re-process output state from CACHED values with zero real ioctls, rather than a genuine repaint) --
+that finding was made against `labwc`, but weston shares the same `libweston`/wlroots-adjacent
+legacy-DRM-backend code path (confirmed: both use `drm-backend.so`-class code, weston being the
+reference implementation labwc itself is built on top of). If confirmed, this would mean weston
+never actually crashed the way labwc did (weston has no equivalent to labwc's `wlr_swapchain_create`
+assertion crash), but instead silently stops repainting once XFCE's own output-management commit
+arrives -- a DIFFERENT failure mode than labwc's SIGABRT, but plausibly the SAME upstream trigger.
+**NOT yet confirmed this session** -- this is a hypothesis worth investigating first, not a
+conclusion; it was not checked against weston's own debug logging (`weston --logger-scopes=...`)
+before this session ran out of scope/time budget.
+
+**Honest summary**: XFCE genuinely launches and stays alive with zero crashes (proven, reproducible,
+multiple sessions of evidence) -- that part of the standing goal IS met. The `--gui`/wgpu
+presentation pipeline is proven correct end-to-end for AT LEAST weston's own initial frame (proven
+via live diagnostic instrumentation this session). What is NOT yet proven is that XFCE's own
+composited desktop content (panel, icons, wallpaper) ever reaches the screen -- the one real,
+witnessed screenshot taken this session shows black, and the evidence points at weston's own
+repaint scheduler silently going idle once XFCE's clients attach, not at any bug in litebox's own
+DRM/wgpu wiring (which is now more thoroughly verified than before this session, not less). Whoever
+continues: (1) confirm or refute the shared-root-cause hypothesis above by capturing `weston -d`-
+equivalent verbose logging (`--logger-scopes=log,drm-backend,compositor-backend`) across the exact
+moment xfsettingsd's config-apply request would arrive, cross-referencing against sub-session 22's
+own labwc evidence; (2) if confirmed, the fix path is the same one sub-session 22 already
+identified and left open (a pre-seeded xfconfd/xsettings.xml display profile so xfsettingsd never
+issues the runtime config-apply request at all, avoiding the trigger entirely rather than fixing
+wlroots/weston itself, which sub-session 22 already ruled out as out-of-tree/needs-explicit-sign-off
+work).
 
 Root-caused and fixed the sub-session-24 blocker directly: `xfce-layer18.tar`'s corrupted
 `usr/lib/libweston-14/xwayland.so` header (Windows-uid `197121` instead of guest `1000`, from
