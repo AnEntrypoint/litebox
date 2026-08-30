@@ -1,4 +1,4 @@
-# AGENTS.md — handoff note (2026-08-30, sub-session 15)
+# AGENTS.md — handoff note (2026-08-30, sub-session 16)
 
 ## Active standing goal (session-scoped Stop hook on the originating machine)
 
@@ -8,10 +8,10 @@ This is being worked via `/goal` on litebox-main, gm session_id `litebox-xfce-1`
 chronological detail of every prior sub-session's investigation, ruled-out hypotheses, and
 fixes lives in gm's memory store (`recall`/`codesearch` against this project) as resolved
 mutables — do not re-derive from scratch; query the recall store first (e.g. search
-"fork_verify stale pointer rcx rdi", "DRM PRIME handle", "wlroots shm keymap",
-"D-Bus session bus export", "proactive fixup_stale_stack_pointers").
+"fork_verify AV path stale pointer", "DRM PRIME handle", "wlroots shm keymap",
+"D-Bus session bus export").
 
-## Current state (as of sub-session 14)
+## Current state (as of sub-session 16)
 
 **Fixed and pushed, verified live, in order** (every one of this chain that initially looked
 like it might be an "upstream" bug turned out to be litebox's own gap — keep defaulting to
@@ -25,72 +25,50 @@ that hypothesis for anything new):
    `xfsettingsd` to genuinely `sys_execve` for the first time.
 6. fork_verify: stale `rcx` (return address) at the syscall-trampoline disarm boundary —
    commit `8ec32c4b`.
-7. fork_verify: stale `rdi` (first-arg register) at the same case-(1) indirect-call-landing
-   boundary — commit `c3182da7`. Narrowed the remaining dbus-daemon fork-child crash further.
+7. fork_verify: stale `rdi` (first-arg register) at case-(1)'s indirect-call-landing boundary
+   — commit `c3182da7`.
+8. fork_verify: stale CODE `rip` reaching a raw `EXCEPTION_ACCESS_VIOLATION` instead of the
+   `EXCEPTION_SINGLE_STEP` trap case (1) depends on — commit `4bf0acac`.
+9. fork_verify: stale DATA-pointer memory-operand registers, same AV-bypass problem as #8 but
+   for case (2)/(2b)'s data-pointer healing — commit `a9895bec`.
 
-**Non-code fix, but real and necessary**: the repro command must use `dbus-launch --sh-syntax
+**Non-code fix, real and necessary**: the repro command must use `dbus-launch --sh-syntax
 --exit-with-session` + `eval` + explicit `export DBUS_SESSION_BUS_ADDRESS` — `dbus-daemon
---print-address` alone discards the address, causing every D-Bus client to autolaunch its own
-session bus (compounding fork_verify crash exposure). See repro command below.
+--print-address` alone discards the address. See repro command below.
 
 **Current blocker**: `xfsettingsd` genuinely attempts its D-Bus connection but still fails
-(`Could not connect: Connection refused`) because `dbus-daemon`'s own daemonizing self-fork
-(and other, unrelated forked threads, e.g. `dbus-launch`'s own children) still occasionally
-SIGSEGV at guest level (litebox handles these cleanly — no host crash) via the SAME bug class
-as fixes #6/#7 above: a stale pointer copied between registers by a plain `mov`-shaped
-instruction with no memory operand, which none of fork_verify's existing per-trap cases cover
-generically. Fixes #6/#7 each closed ONE specific register at ONE specific transition point
-(the case-(1) indirect-call-landing trap); fresh forensics after landing #7 show a DIFFERENT
-thread hitting the SAME general pattern via a DIFFERENT register pairing (`rbp`/`rcx` both
-holding a stale value, likely from an unrelated `mov rbp, rcx`-shaped instruction elsewhere).
+(`Could not connect: Connection refused`) because a dbus-daemon-adjacent forked thread still
+occasionally SIGSEGVs at guest level (litebox handles these cleanly — no host crash, all nine
+fixes above verified zero-regression). **Fixes #6-9 form a genuinely reusable AV-path-healing
+mechanism now (`fork_verify::translate_stale_source_rip` /
+`translate_stale_source_memory_operand_registers`, both callable from
+`vectored_exception_handler`'s new AV branch in `lib.rs`) — but the specific remaining crash
+signature has proven durable across ALL of them**, and sub-session 16's direct diagnostic
+capture (temporary instrumentation, not committed) showed the crash signature is actually
+NON-DETERMINISTIC across runs (one capture showed `rip=fault_addr` with `rbp=0x23`, a clearly
+unrelated/different fault shape from the earlier `rbp=rcx=0x62c4080` signature that recurred
+identically across several EARLIER runs before fixes #8/#9 landed) — meaning the crash
+population is a MIX of distinct root causes, not one single remaining gap. Confirmed this
+thread genuinely IS under `fork_verify` (`is_verifying(tls)` was true) when the diagnostic
+fired, so the gap is a decode/coverage miss in the healing logic itself (case (b) from
+sub-session 15's hypothesis), not a step-bound exhaustion (case (a), ruled out this session).
 
-**Sub-session 15 finding: the PROACTIVE `fixup_stale_stack_pointers` angle was investigated in
-full and does NOT close the remaining gap — a genuinely DIFFERENT, more fundamental gap was
-found and precisely traced instead.** `fixup_stale_stack_pointers` (`litebox_shim_linux/src/
-syscalls/process.rs` ~1180-1432, read in full this session) only ever writes healed values into
-a bounded 4KB stack window above `child_rsp`, ONCE, at the exact instant `fork()` resumes. It
-structurally cannot help with a value first produced by an instruction that runs AFTER resume
-(a register-to-register `mov`, or any live CPU register at a later point) — that class is, by
-design, `fork_verify.rs`'s job, not this proactive pass's. Widening this scan's own heuristics
-would not touch the `rbp`/`rcx` register-propagation gap sub-14 flagged.
-
-**The real, previously-undocumented gap found via a fresh repro + backward trace
-(`LITEBOX_LOG=debug LITEBOX_DIAG_FATALDUMP=1 LITEBOX_VEH_TRACE=1`, AGENTS.md's repro command,
-100s window against `xfce-layer17.tar`): a stale, in-source-range `rip` can land on a
-genuinely UNMAPPED page in the child, raising `EXCEPTION_ACCESS_VIOLATION` (`0xC0000005`)
-BEFORE the CPU ever delivers the `EXCEPTION_SINGLE_STEP` (`0x80000004`) trap
-`fork_verify::on_single_step` depends on entirely.** Traced live: thread `tid=4d38`
-(`ThreadId(13)`) single-steps cleanly at `rip=0x59b98f3` (`rcx=0x59fa5a0`, `rbp=0`), the CPU
-executes an instruction there that sets `rip=0x59af1ab`, and the VERY NEXT event on that
-thread is `ExceptionCode=0xC0000005` with `ExceptionInformation[1]==rip==0x59af1ab` (an
-EXECUTE fault at `rip` itself) — not `0x80000004`. The same run logged
-`fatal signal: terminating task signal=Signal(11)` at `tid=9` (14.699907100s) and `tid=10`
-(22.883461400s), both during the `dbus-launch`/`dbus-daemon` fork()-heavy phase. Confirmed by
-reading `litebox_platform_windows_userland/src/lib.rs`'s `vectored_exception_handler` top to
-bottom: `fork_verify::on_single_step` is reached ONLY when
-`exception_record.ExceptionCode == EXCEPTION_SINGLE_STEP` (~line 1121); `grep -c is_in_source
-lib.rs` = 0 everywhere else in the file. Whether a stale source-range address raises `#DB`
-(page still resident — the case `fork_verify` already handles) or `#PF`/AV (page not resident)
-is incidental Windows paging state at that instant, not something `fork_verify`'s design
-distinguishes — so this gap is not specific to one register pairing; ANY of the already-fixed
-reactive cases could in principle surface as a raw AV instead of a `#DB` on a different run.
-
-PRD row added (`fork-verify-av-path-stale-rip-bypasses-single-step-heal`) with full evidence
-and the concrete next step: add a new `relocations.is_in_source(context.Rip)` check-and-
-translate-or-kill branch inside `vectored_exception_handler`'s guest-mode
-`EXCEPTION_ACCESS_VIOLATION` handling (after the FS_BASE repair at ~1113, before the
-single-step block at 1121), mirroring case (1)'s exact-membership-only contract — a NEW call
-site outside `fork_verify.rs`'s own `#DB`-triggered paths. NOT attempted this session
-(deliberately, per this project's standing caution against unverified `fork_verify`-adjacent
-changes): needs its own narrow design pass (does the executable-range false-positive guard
-`fixup_stale_stack_pointers` needed also apply here? does healing `rip` in a raw `#PF` risk
-resuming into a half-decoded instruction differently than the `#DB` path does?) and full
-isolated live-verification (multiple repro runs + regression suite) before landing.
+**Recommended next step**: add BACK the temporary diagnostic (see the exact `eprintln!` block
+removed at the end of sub-session 16 — full register + fault-address dump, right after both
+AV-path healing attempts fail in `vectored_exception_handler`, `litebox_platform_windows_
+userland/src/lib.rs`) and capture SEVERAL fresh instances (the crash population is mixed, so
+one capture is not enough) to determine whether each instance is: (a) a genuinely NEW register-
+propagation pattern the existing `translate_memory_operand_registers` decode doesn't recognize
+(e.g. a `lea`, an indexed addressing mode, a stale value reaching a register via something
+other than a direct `mov`), or (b) an unrelated, real guest-level bug with no connection to
+fork() staleness at all (plausible for the `rbp=0x23`/`rax=0`/`rdx=0` signature, which looks
+like ordinary small-integer/null-pointer guest state, not a stale-source-range value). Do NOT
+assume every remaining dbus-daemon-adjacent crash is fork_verify's fault — verify each capture
+independently against `is_in_source` before extending the healing logic further.
 
 **Also landed, safe and independently useful**: `mesa-dri-gallium` (software rasterizer)
 installed into `.wfgy/xfce-build/xfce-layer17.tar` (a full resumable overlay on
-`xfce-layer16.tar`). Not the cause of any current crash, but a real correctness gap fixed for
-whenever GL/DRI-dependent paths are exercised. Use `xfce-layer17.tar` as `--resume-from`.
+`xfce-layer16.tar`). Use `xfce-layer17.tar` as `--resume-from`.
 
 ## Repro command (current known-good)
 
@@ -131,11 +109,13 @@ labwc's own `-s "xfsettingsd & xfce4-panel & xfdesktop &"` session targets launc
   `.wfgyxfce-*.ps1`.
 - **fork_verify caution**: deep, carefully-reasoned platform-layer code. A broad/blanket fix
   (e.g. translating every register-to-register mov unconditionally) has been tried twice and
-  found unsafe both times (trades a recoverable guest crash for a worse host-level process
-  crash, or crashes even earlier). Every safe fix landed so far (`rcx`, `rdi`) was narrow: one
-  specific, well-understood register, at one specific, well-understood transition point, using
-  the same proven `is_in_source`+`translate()` pattern case (1) already established. Read the
-  FULL module doc comment before attempting anything; test every change in isolation.
+  found unsafe both times. Every safe fix landed so far (#6-9) was narrow: one specific,
+  well-understood register or decode case, at one specific, well-understood transition point,
+  using the same proven `is_in_source`+`translate()` pattern case (1) already established. Not
+  every crash is fork_verify's fault, either — verify `is_in_source` on the actual fault value
+  before assuming a new healing case is needed (sub-session 16's diagnostic found the crash
+  population is a MIX of real fork-staleness and possibly-unrelated guest bugs). Read the FULL
+  module doc comment before attempting anything; test every change in isolation.
 
 ## Rootfs/artifact locations
 
