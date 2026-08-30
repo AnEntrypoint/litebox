@@ -1117,6 +1117,50 @@ unsafe extern "system" fn vectored_exception_handler(
         }
     }
 
+    // A stale, untranslated source-range `rip` (the exact class of value case (1) in
+    // `fork_verify::on_single_step` already exists to heal -- see that function's own doc
+    // comment) does not always announce itself as `EXCEPTION_SINGLE_STEP`: whether Windows
+    // delivers a clean `#DB` trap (the page the stale address names is still resident, so the
+    // CPU can fetch and execute it under `TF` before this handler ever sees it) or a raw
+    // `EXCEPTION_ACCESS_VIOLATION` (the page is not resident at all) is incidental paging state
+    // at that instant, not something the single-step-only dispatch below distinguishes.
+    // Confirmed live (litebox-xfce-1, dbus-daemon fork-child investigation,
+    // `LITEBOX_DIAG_FATALDUMP=1`/`LITEBOX_VEH_TRACE=1`): a thread single-stepping cleanly under
+    // verification set `rip` to a source-range value via an ordinary instruction, and the VERY
+    // NEXT event on that thread was a raw `EXCEPTION_ACCESS_VIOLATION` with the fault address
+    // equal to that same `rip` -- an execute fault reaching this handler entirely outside the
+    // `EXCEPTION_SINGLE_STEP` branch below, so `fork_verify::on_single_step`'s case (1) never
+    // ran at all. This mirrors case (1) exactly (translate via the same relocation map already
+    // proven correct for every other register at `fork()` time, resume at the translated
+    // address) rather than reimplementing it: only fires for a genuinely `is_verifying` thread,
+    // only on an EXECUTE-shaped guest-mode AV whose fault address is a real, exact
+    // `is_in_source` membership hit (never a coincidental numeric overlap), and never touches
+    // any other register or memory -- the narrowest fix this specific gap admits, matching the
+    // same bounded, deterministic shape every safe fix in `fork_verify.rs` itself already uses.
+    if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
+        && fork_verify::is_verifying(tls)
+    {
+        #[allow(clippy::cast_possible_truncation)]
+        let rip = context.Rip as usize;
+        if let Some(translated_rip) = fork_verify::translate_stale_source_rip(tls, rip) {
+            if veh_trace_enabled() {
+                eprintln!(
+                    "[veh] tid={:?} AV-path stale rip healed rip={rip:#x} translated={translated_rip:#x}",
+                    std::thread::current().id(),
+                );
+            }
+            litebox_util_log::warn!(
+                rip:? = rip, translated_rip:? = translated_rip;
+                "fork_verify: stale CODE pointer detected via raw access violation (no #DB delivered), translating and resuming"
+            );
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                context.Rip = translated_rip as u64;
+            }
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+
     let mut synthesized_record = None;
     if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_SINGLE_STEP {
         match fork_verify::on_single_step(tls, context) {

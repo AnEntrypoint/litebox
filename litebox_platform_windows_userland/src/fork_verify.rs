@@ -459,6 +459,23 @@ pub(crate) fn is_verifying(tls: &TlsState) -> bool {
     tls.fork_verify.borrow().is_some()
 }
 
+/// Translate `rip` through this thread's relocation map iff it is an exact, genuine
+/// `is_in_source` hit -- the same membership-gated primitive case (1) in [`on_single_step`]
+/// uses, exposed for `vectored_exception_handler`'s AV-path healing (see its call site's own
+/// doc comment for why a stale `rip` can reach that path instead of `on_single_step`). Returns
+/// `None` for a non-verifying thread or a `rip` that is not a real relocation-map hit, so the
+/// caller's fallback (the normal single-step/exception dispatch) is exactly as safe as if this
+/// function had never been called.
+pub(crate) fn translate_stale_source_rip(tls: &TlsState, rip: usize) -> Option<usize> {
+    let borrow = tls.fork_verify.borrow();
+    let relocations = borrow.as_ref()?;
+    if relocations.is_in_source(rip) {
+        relocations.translate(rip)
+    } else {
+        None
+    }
+}
+
 /// The `EFLAGS` bits to add when entering guest mode on this thread: `TF` if this thread is a
 /// `fork()` child under verification, nothing otherwise.
 pub(crate) fn entry_eflags_tf(tls: &TlsState) -> usize {
