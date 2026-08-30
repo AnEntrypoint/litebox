@@ -2087,18 +2087,33 @@ where
 enum SysDevCharEntry {
     /// `13:64` -- the virtual input device, target `../../class/input/event0`.
     Input,
+    /// `226:0` -- the virtual DRM primary node, target `../../class/drm/card0`. Needed by
+    /// `wlroots`' DRM backend (`drmGetDeviceNameFromFd2()`, used by labwc/sway): unlike
+    /// weston's DRM backend, which opens `/dev/dri/card0` by its already-known path and
+    /// never re-derives it via this reverse lookup, wlroots calls `fstat()` on the fd then
+    /// resolves this symlink to canonicalize the device name -- without it,
+    /// `drmGetDeviceNameFromFd2()` fails with ENOENT and wlroots aborts backend creation
+    /// before ever reaching DRM_IOCTL_MODE_GETRESOURCES, confirmed live (weston's DRM
+    /// backend works fine against the same virtual card with this entry absent; labwc's does
+    /// not).
+    Drm,
 }
 
 impl SysDevCharEntry {
-    const ALL: &'static [(&'static str, SysDevCharEntry)] = &[("13:64", SysDevCharEntry::Input)];
+    const ALL: &'static [(&'static str, SysDevCharEntry)] = &[
+        ("13:64", SysDevCharEntry::Input),
+        ("226:0", SysDevCharEntry::Drm),
+    ];
 
     fn from_name(name: &str) -> Option<Self> {
         Self::ALL.iter().find(|(n, _)| *n == name).map(|(_, e)| *e)
     }
 
     fn target(self) -> &'static str {
-        let SysDevCharEntry::Input = self;
-        "../../class/input/event0"
+        match self {
+            SysDevCharEntry::Input => "../../class/input/event0",
+            SysDevCharEntry::Drm => "../../class/drm/card0",
+        }
     }
 }
 
@@ -2106,6 +2121,13 @@ impl SysDevCharEntry {
 const SYS_DEV_CHAR_INPUT_NODE_INFO: NodeInfo = NodeInfo {
     dev: 5,
     ino: 26,
+    rdev: None,
+};
+
+/// Node info for the `226:0` entry.
+const SYS_DEV_CHAR_DRM_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 27,
     rdev: None,
 };
 
@@ -2117,11 +2139,12 @@ const SYS_DEV_CHAR_INPUT_NODE_INFO: NodeInfo = NodeInfo {
 /// seatd's device-open sequence silently fails and immediately closes the just-opened fd
 /// (confirmed live: `sys_stat` on `/sys/dev/char/13:64` returns `ENOENT` immediately before
 /// seatd's own `"Closing device"` log line, with zero error in between). Deliberately NOT a
-/// general sysfs `dev/char` emulation -- only the one entry litebox's one static virtual
-/// input device (see [`SysClassInput`]) needs; a real DRM device would need its own entry
-/// too, but DRM's own device-open path does not appear to depend on this lookup succeeding
-/// (its own `/sys/dev/char/<major>:<minor>/device/...` sub-path lookups already fail today,
-/// tolerated by mesa's loader) so it is out of scope here.
+/// general sysfs `dev/char` emulation -- only the two entries litebox's static virtual
+/// device set needs (see [`SysClassInput`]/[`SysClassDrm`]): weston's DRM backend opens
+/// `/dev/dri/card0` by its already-known path and never re-derives it via this reverse
+/// lookup, but wlroots' DRM backend (labwc/sway) calls `drmGetDeviceNameFromFd2()`, which
+/// does depend on this lookup succeeding -- confirmed live, `226:0` was originally omitted
+/// on the (wrong, weston-only) assumption that no DRM consumer needed it.
 pub struct SysDevChar<Platform>
 where
     Platform: RawSyncPrimitivesProvider + 'static,
@@ -2285,6 +2308,7 @@ where
             owner: UserInfo::ROOT,
             node_info: match h.entry {
                 SysDevCharEntry::Input => SYS_DEV_CHAR_INPUT_NODE_INFO,
+                SysDevCharEntry::Drm => SYS_DEV_CHAR_DRM_NODE_INFO,
             },
             blksize: 0x1000,
             atime: Timestamp::default(),

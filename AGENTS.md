@@ -1,3 +1,74 @@
+# AGENTS.md — handoff note (2026-08-30, sub-session 3)
+
+## Session update (2026-08-30, sub-session 3): labwc DRM backend blocker found, partial fix
+
+Picked up sub-session 2's remaining gap directly: found `xfce-layer16.tar` (via `tar -tf`) is
+the layer tar that actually ships a real `usr/bin/labwc` binary (`xfce-layer-FINAL.tar`, used
+by prior sessions, does not -- only labwc config files). Ran the full documented repro
+(`alpine-pinned2.tar` + `--resume-from xfce-layer16.tar`, `seatd -l debug &` then
+`labwc -s "xfsettingsd & xfce4-panel & xfdesktop &"`, `XKB_CONFIG_ROOT=/usr/share/X11/xkb` set)
+against the now-fixed libinput/fallocate/migrate_file_up path from sub-session 2.
+
+**New blocker found**: labwc uses `wlroots`' DRM backend (distinct from weston's own DRM
+backend code, which was already proven stable in sub-session 2) -- wlroots calls
+`drmGetDeviceNameFromFd2()` which litebox failed with `No such file or directory`, aborting
+backend creation before any DRM ioctl. Root cause: litebox's `/sys/dev/char/<major>:<minor>`
+reverse-lookup backend (`SysDevChar` in `litebox/src/fs/devices.rs`) only had an entry for the
+virtual input device (`13:64`), not the DRM device (`226:0`) -- its own doc comment explicitly
+(and, it turns out, wrongly) scoped DRM as unnecessary, reasoning weston's DRM backend doesn't
+need this reverse lookup. wlroots does.
+
+**Partial fix applied and committed** (this session): added a `226:0 -> ../../class/drm/card0`
+entry to `SysDevCharEntry`/`SysDevChar` (same pattern as the existing `13:64` entry). Verified
+live this DOES fix the shallow lookup -- `sys_readlinkat`/`sys_stat` on
+`/sys/dev/char/226:0` itself now succeed and correctly resolve into `/sys/class/drm/card0`
+(confirmed via fresh `LITEBOX_LOG=debug` capture).
+
+**Still blocking, NOT yet fixed**: immediately after that shallow resolution succeeds,
+wlroots' `drmGetDeviceNameFromFd2()` (or a related libdrm call inside it -- exact function not
+isolated, no local libdrm/wlroots source was available this session to cross-reference like
+sub-session 2 had for libinput) does `sys_stat` on the DEEPER path
+`/sys/dev/char/226:0/device/drm` and gets `ENOENT`, which is immediately followed by the
+`drmGetDeviceNameFromFd2() failed` error and backend abort. `SysDevChar`'s backend design is a
+flat namespace (`walk_directories` stops at any single-component match,
+`WalkStopReason::StoppedAtNonDirectory`, confirmed in its own source) -- it has no support for
+resolving a further path component past the symlink target, so this deeper `device/drm`
+sub-path can never resolve today regardless of what `226:0` points to.
+
+Real kernel sysfs shape being emulated: `/sys/class/drm/card0/device` is normally a symlink to
+the card's parent PCI device directory, which itself contains a `drm/` subdirectory listing
+sibling DRM nodes (`card0`, `renderD128`, etc) -- i.e. `/sys/dev/char/226:0/device/drm/card0`
+resolves back to the same `card0` directory via a real device's actual PCI topology. litebox's
+virtual DRM device has no real PCI parent to model, so this needs a synthetic self-referencing
+structure: `SysClassDrm`'s `card0` entry needs a `device` sub-entry (symlink to a synthetic
+device directory) which itself needs a `drm` sub-entry (directory containing `card0`, symlinked
+or directory-listed back to the real `/sys/class/drm/card0` this whole tree originates from).
+
+**Concrete next step**: extend either `SysDevChar` to support nested walks past its symlink
+targets (bigger, more general fix), or more narrowly, extend `SysClassDrm`'s existing
+`card0`/`renderD128` subtree to serve a `device/drm/card0` (and `device/drm/renderD128`)
+sub-path that resolves back to itself, then re-test whether `sys_stat` on
+`/sys/dev/char/226:0/device/drm` succeeding is sufficient to unblock
+`drmGetDeviceNameFromFd2()`, or whether a further sub-path is needed after that (iterate: fix
+one level, re-run the exact repro below, read the next `sys_stat`/`sys_openat`/`sys_readlinkat`
+call immediately preceding the next error, if any). `WLR_RENDERER=pixman labwc` (labwc's own
+suggested software-rendering fallback, printed in its own error output) was TRIED and TESTED
+LIVE this session -- does NOT help, identical `drmGetDeviceNameFromFd2()` failure, since that
+call happens during DRM device OPENING, before renderer selection is ever reached. Do not
+re-try this as a shortcut; the sysfs `device/drm` sub-path fix is the only real path forward.
+
+Repro command (unchanged shape from sub-session 2, just swap the layer tar and drop
+`udevd --daemon` which sub-session 2's own AGENTS.md section below already confirmed makes zero
+difference):
+```
+target/release/litebox_runner_linux_on_windows_userland.exe --initial-files .wfgy/xfce-build/alpine-pinned2.tar --resume-from .wfgy/xfce-build/xfce-layer16.tar -- /bin/sh -c "mkdir -p /run/user/1000; chmod 700 /run/user/1000; export XDG_RUNTIME_DIR=/run/user/1000; export XKB_CONFIG_ROOT=/usr/share/X11/xkb; seatd -l debug & for i in 1 2 3 4 5 6 7 8 9 10; do [ -S /run/seatd.sock ] && break; sleep 1; done; labwc -s \"xfsettingsd & xfce4-panel & xfdesktop &\""
+```
+with `LITEBOX_LOG=debug`, `MSYS_NO_PATHCONV=1` in Git Bash. Rebuild
+`cargo build --locked --release -p litebox_runner_linux_on_windows_userland` first.
+
+Regression-tested: `cargo test -p litebox_shim_linux --lib -- --skip test_mremap` 177/177 pass
+after the `226:0` addition.
+
 # AGENTS.md — handoff note (2026-08-30, sub-session 2)
 
 ## Session update (2026-08-30, sub-session 2): libinput EVDEV_UNHANDLED_DEVICE blocker CONFIRMED FIXED
