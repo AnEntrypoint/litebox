@@ -1624,6 +1624,40 @@ pub enum IoctlArg {
         len: u32,
         arg: UserPtrMut<u8>,
     },
+    /// `EVIOCGKEY(len)` -- report the bitmask of currently-pressed `EV_KEY` codes.
+    /// `libevdev_new_from_fd()`'s `sync_key_state()` issues this during device setup to seed its
+    /// internal key-state cache; unlike `EVIOCGPHYS`/`EVIOCGUNIQ`/`EVIOCGPROP`, a failure here is
+    /// NOT tolerated -- `sync_state()`'s error propagates straight out of `libevdev_new_from_fd()`,
+    /// which returns non-zero to `evdev_device_create()`, which `goto err`s before the udev-tag
+    /// check or `evdev_configure_device()` ever run (confirmed by direct source read of
+    /// `evdev_device_create()`, `libinput-1.31.3/src/evdev.c` lines 2314-2316). This previously
+    /// fell through to the `Raw` catch-all's `EINVAL`, which is exactly this failure -- an
+    /// unpressed device correctly has zero key bits set, matching real hardware at attach time.
+    /// Same variable-length encoding as `EVIOCGBIT`/`EVIOCGPROP` (`_IOC(_IOC_READ, 'E', 0x18,
+    /// len)`), decoded from the raw `cmd` at dispatch time.
+    EvdevGetKey {
+        len: u32,
+        arg: UserPtrMut<u8>,
+    },
+    /// `EVIOCGLED(len)` -- report the bitmask of currently-lit `EV_LED` indicators (caps lock,
+    /// num lock, ...). Same `sync_state()` propagation as `EVIOCGKEY` (see that variant's doc
+    /// comment) -- `libevdev_new_from_fd()`'s internal sync calls `EVIOCGKEY` then `EVIOCGLED`
+    /// then `EVIOCGSW` in sequence, any one of which failing aborts the whole sync and hence
+    /// `libevdev_new_from_fd()` itself. A device with no LEDs lit at attach time correctly
+    /// reports an all-zero bitmap. Same variable-length encoding, `_IOC(_IOC_READ, 'E', 0x19,
+    /// len)`.
+    EvdevGetLed {
+        len: u32,
+        arg: UserPtrMut<u8>,
+    },
+    /// `EVIOCGSW(len)` -- report the bitmask of currently-active `EV_SW` switches. Same
+    /// `sync_state()` propagation as `EVIOCGKEY`/`EVIOCGLED` (see their doc comments). A device
+    /// with no switches active at attach time correctly reports an all-zero bitmap. Same
+    /// variable-length encoding, `_IOC(_IOC_READ, 'E', 0x1b, len)`.
+    EvdevGetSwitch {
+        len: u32,
+        arg: UserPtrMut<u8>,
+    },
     Raw {
         cmd: u32,
         arg: UserPtrMut<u8>,
@@ -3233,6 +3267,26 @@ pub enum SyscallRequest {
         fd: i32,
         length: usize,
     },
+    /// `fallocate(fd, mode, offset, len)` -- ensure `[offset, offset+len)` is allocated.
+    /// litebox only ever needs to support `mode == 0` (the default allocate-and-grow mode,
+    /// which is exactly what `posix_fallocate()` translates to -- glibc/musl's
+    /// `posix_fallocate()` is a thin wrapper around this syscall, not a separate one). This is
+    /// the syscall weston's real `os_create_anonymous_file()` (`shared/os-compat.c`) calls
+    /// immediately after a successful `memfd_create()`, before ever seeing the fd -- unlike
+    /// `ftruncate`, its absence was previously silently swallowed as `ENOSYS` with a
+    /// `debug_assertions`-gated warning invisible in release builds (see `log_unsupported_fmt`),
+    /// making every `memfd_create`-backed shared-memory setup this path is used for (Wayland
+    /// keymap sharing, `wl_shm` buffers via `posix_fallocate`-using clients) fail with no visible
+    /// diagnostic at all in a release build -- confirmed live via added `sys_memfd_create`
+    /// tracing: `memfd_create` itself always returned success, yet weston's very next line was
+    /// "failed to create anonymous file for keymap", which is only possible if the syscall
+    /// immediately following it (`fallocate`) is unimplemented and returns `ENOSYS`.
+    Fallocate {
+        fd: i32,
+        mode: i32,
+        offset: i64,
+        len: i64,
+    },
     Mknodat {
         dirfd: i32,
         pathname: UserPtr<c_char>,
@@ -3741,6 +3795,33 @@ impl SyscallRequest {
                                 arg: ctx.sys_req_ptr(2),
                             }
                         }
+                        _ if (cmd >> 8) & 0xff == u32::from(b'E')
+                            && (cmd & 0xff) == 0x18
+                            && (cmd >> 30) & 0x3 == 0x2 =>
+                        {
+                            IoctlArg::EvdevGetKey {
+                                len: (cmd >> 16) & 0x3fff,
+                                arg: ctx.sys_req_ptr(2),
+                            }
+                        }
+                        _ if (cmd >> 8) & 0xff == u32::from(b'E')
+                            && (cmd & 0xff) == 0x19
+                            && (cmd >> 30) & 0x3 == 0x2 =>
+                        {
+                            IoctlArg::EvdevGetLed {
+                                len: (cmd >> 16) & 0x3fff,
+                                arg: ctx.sys_req_ptr(2),
+                            }
+                        }
+                        _ if (cmd >> 8) & 0xff == u32::from(b'E')
+                            && (cmd & 0xff) == 0x1b
+                            && (cmd >> 30) & 0x3 == 0x2 =>
+                        {
+                            IoctlArg::EvdevGetSwitch {
+                                len: (cmd >> 16) & 0x3fff,
+                                arg: ctx.sys_req_ptr(2),
+                            }
+                        }
                         _ => IoctlArg::Raw {
                             cmd,
                             arg: ctx.sys_req_ptr(2),
@@ -4100,6 +4181,7 @@ impl SyscallRequest {
                 }
             }
             Sysno::ftruncate => sys_req!(Ftruncate { fd, length }),
+            Sysno::fallocate => sys_req!(Fallocate { fd, mode, offset, len }),
             #[cfg(target_arch = "x86_64")]
             Sysno::newfstatat => sys_req!(Newfstatat { dirfd,pathname:*,buf:*,flags }),
             #[cfg(target_arch = "aarch64")]

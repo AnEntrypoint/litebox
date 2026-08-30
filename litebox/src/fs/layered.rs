@@ -280,13 +280,23 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     }
                 }
                 Err(e) => match e {
-                    ReadError::NotAFile => {
+                    // `NotForReading` is real and reachable here, not merely theoretical: `path`
+                    // opened successfully `RDONLY` above (a directory opens fine RDONLY on every
+                    // backend in this codebase), but a directory cannot actually be streamed via
+                    // `read()` -- confirmed live via a real weston/litebox repro where a
+                    // Lower-classified fd's `path` resolved to a directory, not a regular file,
+                    // and hit exactly this arm instead of `NotAFile` (whichever earlier stage
+                    // classified this path as needing migration did not itself verify it names a
+                    // regular file). Treat it the same as `NotAFile` -- both mean "this isn't a
+                    // stream of file bytes to migrate", the same real-world condition by two
+                    // different backends' error taxonomies, not two different bugs.
+                    ReadError::NotAFile | ReadError::NotForReading => {
                         // We can only have this happen the first time around
                         assert!(upper_fd.is_none());
                         // In which case we quit early
                         return Err(MigrationError::NotAFile);
                     }
-                    ReadError::ClosedFd | ReadError::NotForReading => unreachable!(),
+                    ReadError::ClosedFd => unreachable!(),
                     ReadError::Io => return Err(MigrationError::Io),
                 },
             }
@@ -653,7 +663,21 @@ impl<
                 {
                     // We must check if the lower layer contains all the directories; if it does, we
                     // can create the same directories and then re-trigger the open.
-                    let dirname = path.rsplit_once('/').unwrap().0;
+                    //
+                    // A top-level path (e.g. `/.memfd:17`) splits into an EMPTY `dirname` here
+                    // (`rsplit_once('/')` on `/.memfd:17` yields `("", ".memfd:17")`), which is not
+                    // itself a valid path `ensure_lower_contains`/`file_status` accepts -- it must be
+                    // normalized to root `/` first, exactly like every other path this method
+                    // receives already goes through `self.absolute_path()`. Without this, a brand-new
+                    // top-level file whose Upper root directory doesn't exist yet silently falls
+                    // through to the Lower-layer open path below instead of creating the directory and
+                    // retrying on Upper -- the new file is then classified as `EntryX::Lower`, and any
+                    // later `truncate`/`fallocate`/write on it hits `migrate_file_up`'s read-side
+                    // `unreachable!()` (`ReadError::NotForReading`) instead of writing normally.
+                    let dirname = match path.rsplit_once('/').unwrap().0 {
+                        "" => "/",
+                        d => d,
+                    };
                     if let Ok(FileType::Directory) = self.ensure_lower_contains(dirname) {
                         // We must migrate the directories above, and then re-trigger the open
                         self.mkdir_migrating_ancestor_dirs(&path).unwrap();

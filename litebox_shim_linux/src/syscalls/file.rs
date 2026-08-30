@@ -733,6 +733,69 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .flatten()
     }
 
+    /// Handle syscall `fallocate` -- ensure `[offset, offset+len)` is allocated in `fd`.
+    ///
+    /// litebox only supports `mode == 0` (the default allocate-and-grow mode; every real caller
+    /// this shim needs to support -- `posix_fallocate()`, and weston's `os_create_anonymous_file()`
+    /// via it -- uses exactly this mode). Real `fallocate(mode=0)` never shrinks the file even if
+    /// `offset+len` is smaller than the current size, unlike `ftruncate`; this only grows.
+    pub(crate) fn sys_fallocate(
+        &self,
+        fd: i32,
+        mode: i32,
+        offset: i64,
+        len: i64,
+    ) -> Result<(), Errno> {
+        litebox_util_log::debug!(fd:% = fd, mode:% = mode, offset:% = offset, len:% = len; "sys_fallocate: entry");
+        if mode != 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        if offset < 0 || len <= 0 {
+            return Err(Errno::EINVAL);
+        }
+        let target_len = usize::try_from(offset)
+            .ok()
+            .and_then(|o| usize::try_from(len).ok().and_then(|l| o.checked_add(l)))
+            .ok_or(Errno::EFBIG)?;
+        let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
+            return Err(Errno::EBADF);
+        };
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |fd| {
+                    let current_len = files.fs.fd_file_status(fd).map_err(Errno::from)?.size;
+                    litebox_util_log::debug!(current_len:% = current_len, target_len:% = target_len; "sys_fallocate: pre-truncate");
+                    if target_len <= current_len {
+                        return Ok(());
+                    }
+                    files.fs.truncate(fd, target_len, false)?;
+                    // Same real-shared-memory-backing follow-up `sys_ftruncate` performs for a
+                    // `memfd_create` fd -- see its own doc comment on why this is needed.
+                    if self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .with_metadata(fd, |_: &MemfdMarker| ())
+                        .is_ok()
+                    {
+                        self.resize_memfd_shared_backing(fd, target_len)?;
+                    }
+                    Ok(())
+                },
+                |_fd| todo!("net"),
+                |_fd| todo!("pipes"),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL))
+            .flatten()
+    }
+
     /// Creates (or replaces, on a size change) the real shared-memory object backing a
     /// `memfd_create` fd. Registered/updated in `GlobalState::memfds`, keyed by the file's own
     /// `(dev, ino)` (stable across `dup()`/`fork()`, unlike the raw fd number).
@@ -3318,6 +3381,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// real Linux (nothing is mmapped until the client calls `ftruncate`); `sys_ftruncate`
     /// creates/resizes the real handle lazily on first (or later) growth.
     pub fn sys_memfd_create(&self, flags: MfdFlags) -> Result<u32, Errno> {
+        litebox_util_log::debug!(flags:? = flags; "sys_memfd_create: entry");
         if flags.intersects(
             (MfdFlags::CLOEXEC
                 | MfdFlags::ALLOW_SEALING
@@ -3326,6 +3390,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 | MfdFlags::EXEC)
                 .complement(),
         ) {
+            litebox_util_log::debug!("sys_memfd_create: EINVAL, bad flags");
             return Err(Errno::EINVAL);
         }
         let id = self.global.next_memfd_id.fetch_add(1, Ordering::Relaxed);
@@ -3333,16 +3398,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // rootfs -- the path is unlinked immediately below regardless, so where it briefly lives
         // is never guest-observable.
         let path = alloc::format!("/.memfd:{id}");
-        let file = self.do_open(
-            path.as_str(),
-            OFlags::CREAT | OFlags::EXCL | OFlags::RDWR,
-            Mode::from_bits_truncate(0o600),
-        )?;
+        let file = self
+            .do_open(
+                path.as_str(),
+                OFlags::CREAT | OFlags::EXCL | OFlags::RDWR,
+                Mode::from_bits_truncate(0o600),
+            )
+            .inspect_err(|e| {
+                litebox_util_log::debug!(err:? = e; "sys_memfd_create: do_open failed");
+            })?;
         // Unlink immediately -- the fd stays valid (see this method's own doc comment), but the
         // path is gone before any guest code could ever observe/race it.
         let files = self.files.borrow();
         files.fs.unlink(path.as_str()).map_err(|e| {
             let _ = files.fs.close(&file);
+            litebox_util_log::debug!(err:? = e; "sys_memfd_create: unlink failed");
             Errno::from(e)
         })?;
         drop(files);
@@ -3356,7 +3426,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         assert!(old.is_none());
         drop(dt);
 
-        self.insert_raw_file_fd_with_path(file, OFlags::empty(), None)
+        let result = self.insert_raw_file_fd_with_path(file, OFlags::empty(), None);
+        litebox_util_log::debug!(result:? = result; "sys_memfd_create: returning");
+        result
     }
 
     /// Handle a `TCGETS`/`TCSETS`/`TCSETSW`/`TCSETSF`/`TIOCGWINSZ` ioctl on a stdio fd.
@@ -4172,6 +4244,86 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .ok_or(Errno::EFAULT)?;
                 // See `EvdevGetBits`'s matching fix: real `EVIOCGPROP` also returns the byte
                 // count written, not a bare success code.
+                Ok(u32::try_from(bits.len()).unwrap_or(0))
+            }
+            IoctlArg::EvdevGetKey { len, arg: ptr } => {
+                files.run_on_raw_fd(
+                    desc,
+                    |fd| {
+                        if self.is_input_device(&files.fs, fd)? {
+                            Ok(())
+                        } else {
+                            Err(Errno::ENOTTY)
+                        }
+                    },
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY))??;
+                // No keys are currently held down on this synthetic device -- an all-zero
+                // bitmap is the correct, real answer, matching real hardware at attach time.
+                // Real `EVIOCGKEY` returns the byte count written, same as `EVIOCGBIT`/
+                // `EVIOCGPROP`.
+                let bits = vec![0u8; usize::try_from(len).unwrap_or(0)];
+                ptr.write_slice_at_offset::<Platform>(0, &bits)
+                    .ok_or(Errno::EFAULT)?;
+                Ok(u32::try_from(bits.len()).unwrap_or(0))
+            }
+            IoctlArg::EvdevGetLed { len, arg: ptr } => {
+                files.run_on_raw_fd(
+                    desc,
+                    |fd| {
+                        if self.is_input_device(&files.fs, fd)? {
+                            Ok(())
+                        } else {
+                            Err(Errno::ENOTTY)
+                        }
+                    },
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY))??;
+                // No LEDs are lit on this synthetic device -- an all-zero bitmap is the
+                // correct, real answer, matching real hardware at attach time.
+                let bits = vec![0u8; usize::try_from(len).unwrap_or(0)];
+                ptr.write_slice_at_offset::<Platform>(0, &bits)
+                    .ok_or(Errno::EFAULT)?;
+                Ok(u32::try_from(bits.len()).unwrap_or(0))
+            }
+            IoctlArg::EvdevGetSwitch { len, arg: ptr } => {
+                files.run_on_raw_fd(
+                    desc,
+                    |fd| {
+                        if self.is_input_device(&files.fs, fd)? {
+                            Ok(())
+                        } else {
+                            Err(Errno::ENOTTY)
+                        }
+                    },
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY))??;
+                // No switches are active on this synthetic device -- an all-zero bitmap is
+                // the correct, real answer, matching real hardware at attach time.
+                let bits = vec![0u8; usize::try_from(len).unwrap_or(0)];
+                ptr.write_slice_at_offset::<Platform>(0, &bits)
+                    .ok_or(Errno::EFAULT)?;
                 Ok(u32::try_from(bits.len()).unwrap_or(0))
             }
             _ => {
