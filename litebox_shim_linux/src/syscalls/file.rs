@@ -4083,7 +4083,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let write_len = usize::try_from(len).unwrap_or(0).min(bits.len());
                 ptr.write_slice_at_offset::<Platform>(0, &bits[..write_len])
                     .ok_or(Errno::EFAULT)?;
-                Ok(0)
+                // Real `EVIOCGBIT` returns the number of bytes actually written, not a bare
+                // success code -- `libevdev_new_from_fd`'s capability sync reads this return
+                // value to know how many bytes of the bitmask are valid, so returning 0 here
+                // told libevdev every event type had zero capability bytes regardless of what
+                // was actually written to the buffer.
+                Ok(u32::try_from(write_len).unwrap_or(0))
             }
             IoctlArg::EvdevGetName { len, arg: ptr } => {
                 files.run_on_raw_fd(
@@ -4165,7 +4170,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let bits = vec![0u8; usize::try_from(len).unwrap_or(0)];
                 ptr.write_slice_at_offset::<Platform>(0, &bits)
                     .ok_or(Errno::EFAULT)?;
-                Ok(0)
+                // See `EvdevGetBits`'s matching fix: real `EVIOCGPROP` also returns the byte
+                // count written, not a bare success code.
+                Ok(u32::try_from(bits.len()).unwrap_or(0))
             }
             _ => {
                 log_unsupported!("ioctl with arg {:?}", arg);

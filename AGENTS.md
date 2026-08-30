@@ -1,3 +1,71 @@
+# AGENTS.md — handoff note (2026-08-30)
+
+## Session update (2026-08-30): mallocng blocker CONFIRMED FIXED, new blocker found
+
+The `.meta=0` mallocng crash blocking npx/casey/weston is confirmed fixed on current HEAD
+(commit `b4a40e3d`, `syscall_callback` stack-switch-before-pushfq fix) -- verified live this
+session via the documented repro (`alpine-pinned2.tar` + `xfce-layer-FINAL.tar` via
+`--resume-from`, `seatd -l debug & weston --backend=drm-backend.so --use-pixman`). No crash;
+seatd session negotiation succeeds cleanly through to opening `/dev/dri/card0` and
+`/dev/input/event0`.
+
+**New blocker, next in the critical path**: weston's `libinput` backend logs
+`event0 - not using input device '/dev/input/event0'` -> `warning: no input devices on
+entering Weston` -> `failed to create input devices` -> `fatal: failed to create compositor
+backend`. seatd opens then immediately closes both devices in the same tick (this is
+`libinput_udev_create_context`'s own `device_added()` in `src/udev-seat.c` calling
+`close_restricted` after `evdev_device_create()` returns `EVDEV_UNHANDLED_DEVICE`, not a
+litebox-side close race -- confirmed by full libinput 1.31.3 source cross-reference at
+`.wfgy/xfce-build/libinput-src/libinput-1.31.3/`).
+
+Root cause NOT yet found despite exhaustive static tracing against the real libinput source:
+- `evdev_device_create()` returns `EVDEV_UNHANDLED_DEVICE` specifically when
+  `device->seat_caps == EVDEV_DEVICE_NO_CAPABILITIES` after configuration (`evdev.c:2380`).
+  This can happen via TWO different code paths that produce the IDENTICAL log line, and the
+  log capture so far cannot distinguish which one fires:
+  1. The udev-tag gate at `evdev.c:2354` (`(udev_tags & EVDEV_UDEV_TAG_INPUT) == 0 ||
+     (udev_tags & ~EVDEV_UDEV_TAG_INPUT) == 0`) rejecting the device outright before any
+     capability configuration -- would ALSO log "not tagged as supported input device" via
+     `evdev_log_info`, which was NEVER observed in any repro run's captured output. This
+     absence is evidence AGAINST this path, but not proof (that specific log line's
+     visibility through weston's own log forwarding was not independently confirmed).
+  2. `evdev_configure_device()` running fully (tag check passes) but ending up with zero
+     `seat_caps` bits set anyway -- would ALSO log "is tagged by udev as: ..." (`evdev.c:1608`),
+     which was ALSO never observed. Same ambiguity.
+- Verified CORRECT by direct source read (litebox's own, real semantics match real kernel):
+  `litebox/src/fs/devices.rs`'s `UdevDb` backend content (`E:ID_INPUT=1\nE:ID_INPUT_MOUSE=1\n
+  E:ID_INPUT_KEYBOARD=1\n`, exactly 54 bytes, confirmed read in full via live log
+  `sys_read fd=16 ... result=Ok(54)`), `SysClassInput`'s `uevent` content
+  (`MAJOR=13\nMINOR=64\nDEVNAME=input/event0\nSUBSYSTEM=input\n`), `is_input_device`'s rdev
+  match (`rdev=Some((13,64))` confirmed live), and the full `EvdevGetBits`/`GetId`/`GetName`/
+  `GetVersion`/`GetProp` ioctl sequence (all succeed, all return real, correctly-shaped data
+  matching a keyboard+mouse device per `litebox_common_linux`'s real `EV_KEY`/`EV_REL`/
+  `BTN_LEFT` etc constant values).
+- TESTED AND RULED OUT this session: (a) an `I:0\n` initialization-timestamp line prepended to
+  the udev db content -- no behavior change, reverted; (b) `EVIOCGBIT`/`EVIOCGPROP` returning
+  a bare `Ok(0)` success code instead of the real-kernel byte-count return value -- this WAS a
+  genuine bug (real `ioctl(EVIOCGBIT)` returns bytes written, litebox was returning a bare 0)
+  and IS FIXED AND COMMITTED (`litebox_shim_linux/src/syscalls/file.rs`,
+  `IoctlArg::EvdevGetBits`/`EvdevGetProp` handlers), confirmed correct by kernel semantics and
+  177/177 `litebox_shim_linux` tests still passing -- but empirically confirmed via identical
+  ioctl-call-count before/after (15 calls both runs) that libinux/libevdev does not even
+  consult this specific return value in its actual code path taken here, so this fix, while
+  real and worth keeping, is NOT what's blocking the input-device rejection.
+
+**Concrete next step for whoever picks this up**: get direct evidence of WHICH of the two
+`EVDEV_UNHANDLED_DEVICE` code paths fires -- either patch a local libinput build with extra
+eprintf tracing at `evdev.c:2354` and `evdev.c:2380` and get it into the guest rootfs (real
+source modification of a LOCAL DEBUG BUILD, not the shipped Alpine package -- keep separate
+from the guest's real `/usr/lib/weston/libinput.so.10`), or set `WESTON_LOG_LEVEL`/build
+weston+libinput with `-Ddebug-gui=true`/`meson -Dbuildtype=debug` for real per-line source
+tracing, then re-run the exact repro in `.wfgy/xfce-build/run_repro_final.ps1`-style invocation
+documented below. Once the exact rejection line is captured, the fix is almost certainly a
+small, targeted litebox change (either the udev tag properties need a currently-missing
+property libinput's tag table doesn't obviously require based on source alone, e.g. a stray
+different property name check earlier in `evdev_configure_device` that gates BEFORE reaching
+the `EVDEV_UDEV_TAG_KEYBOARD`/`MOUSE` branches, or the sysfs/`is_input_device` check has a
+subtle real-vs-litebox mismatch not caught by this session's source-level comparison).
+
 # AGENTS.md — handoff note (2026-08-28)
 
 ## Active standing goal (session-scoped Stop hook on the originating machine)
