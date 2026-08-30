@@ -1,4 +1,65 @@
-# AGENTS.md — handoff note (2026-08-30)
+# AGENTS.md — handoff note (2026-08-30, sub-session 2)
+
+## Session update (2026-08-30, sub-session 2): libinput EVDEV_UNHANDLED_DEVICE blocker CONFIRMED FIXED
+
+The libinput/evdev blocker documented in the section immediately below (mallocng-fix session)
+is now root-caused and fixed, commit `5458d74c` (pushed to `main`). Real cause: `libevdev_new_from_fd()`
+itself was failing during `evdev_device_create()` (`evdev.c:2314-2316`), BEFORE the udev-tag
+classification code the prior session was staring at ever ran -- which is exactly why neither
+candidate diagnostic log line ("not tagged as supported input device" / "is tagged by udev as")
+ever appeared: both are downstream of a call that never happened. `libevdev`'s internal
+`sync_key_state()`/`sync_led_state()`/`sync_switch_state()` issue `EVIOCGKEY`/`EVIOCGLED`/`EVIOCGSW`
+during setup; litebox implemented none of the three, so they fell through to the `Raw` ioctl
+catch-all's `EINVAL`. That catch-all's own warning (`log_unsupported_fmt` in
+`litebox_shim_linux/src/lib.rs`) is gated by `cfg!(debug_assertions)` and is silently swallowed in
+every `--release` build -- which is the real reason this failure produced zero diagnostic output
+across many prior sessions' repro runs, independent of which of the two evdev.c branches anyone
+was trying to disambiguate. Fixed by implementing all three ioctls as real all-zero-bitmap
+responses (`litebox_common_linux/src/lib.rs`, `litebox_shim_linux/src/syscalls/file.rs`).
+
+That unblocked device creation but surfaced weston's next real, previously-unreached dependency:
+`fallocate(2)` was completely unimplemented (same silent-`ENOSYS`-in-release gap), breaking
+`os_create_anonymous_file()`'s `posix_fallocate()` call for the shared Wayland keymap memfd.
+Implemented `fallocate` (`mode=0` grow-only, the only mode litebox needs to support) by reusing
+the existing truncate/memfd-shared-backing-resize machinery.
+
+`fallocate`'s truncate call then exposed a genuine, unrelated, previously-unreached panic in
+litebox core: `litebox/src/fs/layered.rs`'s `write()`/`truncate()` migration path
+(`migrate_file_up`) treated `ReadError::NotForReading` on a Lower-layer fd as `unreachable!()`,
+when it's a real condition -- reachable whenever a path classified `Lower` for migration turns out
+to name a directory rather than a regular file. Folded it into the existing `NotAFile` handling,
+which every caller already handles as a real, non-panicking error, instead of adding a new panic
+class.
+
+**Verified live**: with all three fixes, `weston --backend=drm-backend.so --use-pixman
+--shell=kiosk-shell.so` (this rootfs ships `kiosk-shell.so`, not `desktop-shell.so` -- the bare
+`weston` invocation with no `--shell` flag fails to load the default shell module and exits, a
+separate, expected, non-litebox packaging gap, not a bug) reaches stable DRM page-flip rendering
+(`DrmModeSetCrtc`/`DrmModePageFlip` succeed) and holds with **no fatal/panic through 150+ seconds**
+of a real repro run, confirmed twice. Also needed: `XKB_CONFIG_ROOT=/usr/share/X11/xkb` in the
+launch env -- this rootfs ships `xkeyboard-config` data at the legacy X11 path, not
+`/usr/share/xkeyboard-config-2` where xkbcommon looks by default; without it weston fails XKB
+keymap compilation before ever reaching the memfd/fallocate code path.
+
+Regression-tested: `cargo test -p litebox_shim_linux --lib -- --skip test_mremap` 177/177 pass;
+`cargo test -p litebox_platform_windows_userland` all pass. (`cargo test -p litebox --lib` has
+TWO PRE-EXISTING, UNRELATED compile errors on Windows host -- `litebox/src/fs/nine_p/tests.rs`
+uses `std::os::unix` directly, and `litebox/src/mm/tests.rs`'s `DummyVmemBackend` is missing
+`TASK_ADDR_MIN`/`TASK_ADDR_MAX` trait items -- confirmed via `git diff --stat` that neither file
+was touched this session; do not attribute these to the fix above.)
+
+**Next step for whoever picks this up**: the standing goal is XFCE (not bare weston) starting
+flawlessly. This session's repro used `--shell=kiosk-shell.so` with no client apps launched, which
+only proves the compositor itself is stable -- it does NOT launch labwc/xfsettingsd/xfce4-panel/
+xfdesktop. Two gaps to close next: (1) `.wfgy/xfce-build/xfce-layer-FINAL.tar` has no `labwc`
+binary in it at all (only `usr/share/xfce4/labwc/*` config files) -- confirm which layer tar
+actually ships a real `labwc` binary (check `xfce-layer15.tar`/`xfce-layer16.tar`, named in the
+2026-08-28 section below as already having labwc installed) and re-run the FULL documented
+`labwc -s "xfsettingsd & xfce4-panel & xfdesktop &"` command through this now-fixed libinput/
+fallocate/migrate_file_up path; (2) re-verify the mallocng fix (`b4a40e3d`) and this session's
+three fixes all coexist cleanly against whichever layer tar actually has labwc, since none of
+that combination has been tested together yet -- this session only tested against
+`xfce-layer-FINAL.tar` (which has the XKB/DRM/libinput fixes' prerequisites but not labwc itself).
 
 ## Session update (2026-08-30): mallocng blocker CONFIRMED FIXED, new blocker found
 
