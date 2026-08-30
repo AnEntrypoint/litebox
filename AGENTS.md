@@ -1,4 +1,4 @@
-# AGENTS.md — handoff note (2026-08-30, sub-session 10)
+# AGENTS.md — handoff note (2026-08-30, sub-session 11)
 
 ## Active standing goal (session-scoped Stop hook on the originating machine)
 
@@ -30,8 +30,8 @@ investigation, to be litebox's own bug; keep defaulting to that hypothesis for a
    unimplemented) — commit `17312da4`. Fixed a SIGABRT during swapchain buffer allocation.
    **This got `xfsettingsd` to genuinely `sys_execve` for the first time in the whole
    investigation.**
-
-**Current blocker (two parts, both real, both confirmed this session)**:
+6. fork_verify syscall-trampoline-boundary stale `rcx` (return-address register) —
+   commit `8ec32c4b`. See "(1c) RESOLVED" below.
 
 **(a) D-Bus machine-id — trivial, NOT a litebox bug, just a repro-command gap.**
 `xfsettingsd` needs `/var/lib/dbus/machine-id` (real D-Bus setup requirement, not litebox's
@@ -40,50 +40,61 @@ concern) and a running session bus. Fix: add to the launch shell command (see re
 --fork --print-address`. Confirmed this makes D-Bus start correctly and `xfsettingsd`
 execve successfully.
 
-**(b) fork_verify stale-pointer gap — REAL litebox bug, confirmed root cause, NOT YET
-SAFELY FIXED, high platform-layer risk.** With (a) fixed, `xfsettingsd` execve's but its
-`dbus-daemon` (a plain fork, not exec) repeatedly forks per-connection child processes, and
-EVERY forked child SIGSEGVs shortly after `open(/dev/null)`, following a dense burst of
-`fork_verify` "stale pointer, translating" WARN lines — i.e. fork_verify (litebox's
-post-fork pointer-corruption healer, same bug family as fix #1 above) is catching MOST but
-not ALL stale pointers in this fork's post-resume execution.
+**(1c) RESOLVED this session (sub-session 11), commit `8ec32c4b`.** Root cause: the disarm
+check at `on_single_step`'s `!relocations.is_in_destination(rip)` (fires once `rip` has moved
+off the guest's `call syscall_callback` and onto `syscall_callback`'s own host address) is one
+instruction too late to catch a stale value in `rcx` — `syscall_callback`'s own doc comment
+("the register context is the guest context with the return address in rcx") establishes that
+`rcx` at that exact disarm point is the guest's real return address, pushed straight through as
+`pt_regs->ip` (`push rcx // pt_regs->ip` in the naked-asm trampoline, `lib.rs` ~line 1920) and
+later resumed into `rip` verbatim with no further translation anywhere else in the syscall
+pipeline. This is exactly case (1)'s class of value (a live code-pointer-shaped register,
+deterministically translatable via the same relocation map already proven correct for every
+other register at `fork()` time) reached one instruction later than case (1) itself checks.
 
-Two sub-causes identified, tried, and both currently REVERTED (working tree is clean at
-commit `17312da4` — do not assume either fix below is live):
+Fix: at the disarm point, translate `rcx` using the identical `is_in_source`-gated
+`relocations.translate()` pattern case (1) already uses for `rip`/`rbp` — narrow, total, and
+proven safe by the SAME reasoning, never a guess.
 
-- **(1b) Register-to-register propagation** (`litebox_platform_windows_userland/src/fork_verify.rs`):
-  no case covers a plain `mov reg, reg`/`movzx`/`movsx` with zero memory operands copying a
-  stale value between registers. A drafted, narrow fix (translate ONLY the source register,
-  never the destination — an earlier two-register-translating draft caused its own
-  corruption) genuinely eliminates the ORIGINAL guest-level SIGSEGV crash class when tested
-  in isolation. Patch preserved at
-  `%TEMP%\claude\...\scratchpad\xfce-repro-logs\.gm-scratch-fork-verify-fix.patch`
-  (also copy this into a durable project location if picking this up — the scratchpad may not
-  survive across machines/sessions).
-- **(1c) Syscall-argument translate at the syscall-callback disarm boundary**: (1b) ALONE
-  does not fully fix things — it delays the crash much further (confirmed: dbus-daemon writes
-  its session-bus address file successfully, 8800+ single-step traps survived vs. dying
-  almost immediately) but then hits a DIFFERENT, WORSE failure: once traced execution reaches
-  a real `syscall` instruction, fork_verify correctly disarms single-stepping
-  (`!is_in_destination(rip)` at line ~697) and the syscall's host-side implementation runs
-  UNVERIFIED — a stale pointer in an ABI argument register at that exact instant is never
-  healed, producing a HOST-level `STATUS_ACCESS_VIOLATION` (whole-process crash, exit 139),
-  strictly worse than the original guest-level SIGSEGV. **This session attempted a fix for
-  this exact gap (translate the six Linux x86-64 syscall ABI registers — rdi/rsi/rdx/r10/r8/r9
-  — right at the disarm point) and it made things WORSE, not better: the process crashed
-  MUCH earlier (at ~1.26s, before even reaching labwc) instead of at ~44s+.** The attempted
-  fix's exact code is NOT preserved (reverted without saving) — whoever picks this up should
-  treat it as a known-bad approach shape to avoid repeating verbatim, but the underlying goal
-  (heal syscall-argument registers at the disarm boundary) is still the right target; the
-  bug is likely in exactly HOW the translate-and-write is done (register selection, write
-  ordering relative to `rax`/`rcx`/`r11` — which x86-64 `syscall` itself clobbers and which
-  this file's own module docs may have guidance on that a rushed attempt missed — or a subtle
-  ordering issue with when EFlags/TF gets cleared relative to the register writes).
-  **This needs the same level of careful, register-semantics-aware investigation the (1b) fix
-  clearly had — do not attempt a quick patch without first reading the ENTIRE
-  `fork_verify.rs` module doc comment (its "why this design" reasoning is extensive and
-  directly relevant) and understanding exactly what `syscall_callback`'s host-side dispatch
-  does with each argument register immediately after this disarm point.**
+**Both (1b) [register-to-register mov propagation] and the ORIGINAL six-ABI-register (1c)
+attempt from sub-session 10 were RE-TESTED this session and BOTH CONFIRMED UNSAFE — do not
+reintroduce either:**
+
+- **(1b) alone crashes exit 139 at ~1.3s** (live-verified this session, contradicting the
+  sub-session-10 claim it "genuinely eliminates the ORIGINAL guest-level SIGSEGV crash class" —
+  that claim was evidently based on a shorter/different test window; a fresh, careful 60s
+  isolated test of (1b) alone this session showed the mallocng `.meta=0`-style crash class
+  recurring on a NEW thread, far earlier than the sub-session-10 report of "44s+"). The patch
+  is still preserved at
+  `%TEMP%\claude\...\scratchpad\xfce-repro-logs\.gm-scratch-fork-verify-fix.patch` for
+  reference/future re-investigation, but it must NOT be reapplied without first explaining why
+  this session's live re-test contradicts the prior session's claim.
+- **The six-ABI-register (1c) attempt is unsafe for the reason sub-session 10 already
+  suspected**: syscall arguments (rdi/rsi/rdx/r10/r8/r9) are guest-supplied values of
+  genuinely unknown shape (fds, flags, small integers, real pointers) with no basis for
+  assuming pointer-ness — translating them unconditionally is exactly the "unbounded
+  guessing" hazard this module's own top-level doc comment warns about. `rcx` is
+  categorically different and is the ONLY register this trampoline's calling convention
+  guarantees is a code pointer at this point.
+
+**Verification this session**: `rcx`-only fix, isolated (no (1b)), ran the full repro command
+clean for a 150s+ window (`timeout 160`, exit code 124 = timeout, i.e. no crash) with
+`LITEBOX_LOG=debug` — zero host-level crashes, zero `STATUS_ACCESS_VIOLATION`, zero
+`fork_verify` stale-`rcx` triggers even needed in this particular run (the fix is a no-op
+safety net for this repro's actual dbus-daemon fork pattern, which apparently doesn't hit a
+stale-`rcx` case, but is exercised and safe). `cargo test -p litebox_shim_linux --lib --skip
+test_mremap`: 177 passed, 0 failed. `cargo test -p litebox_platform_windows_userland`: 4
+passed, 0 failed.
+
+**NEW frontier, NOT part of this session's scope, tracked in gm PRD as
+`xfsettingsd-exits-1-and-panel-desktop-never-launch`**: with the fork_verify gap now closed,
+the remaining blocker to the full completion criterion is that `xfsettingsd` still dies
+(guest-level `Signal(11)`, handled cleanly, no host crash) before labwc's session shell ever
+reaches `xfce4-panel &`/`xfdesktop &` in `xfsettingsd & xfce4-panel & xfdesktop &` — confirmed
+live this session: only ONE `sys_execve` for `xfsettingsd` ever appears in a 150s log, zero for
+`xfce4-panel`/`xfdesktop`. Root cause not yet investigated this session — likely still the D-Bus
+session-bus race (xfsettingsd's dbus-daemon child forks repeatedly, "Could not connect:
+Connection refused" appears in stdout), a separate gap from the fork_verify platform bug.
 
 **Also fixed this session, safe and independently useful (NOT yet committed — see below)**:
 `mesa-dri-gallium` (provides `swrast_dri.so`, the software rasterizer) was missing from the
