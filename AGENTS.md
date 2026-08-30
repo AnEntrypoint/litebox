@@ -1,4 +1,79 @@
-# AGENTS.md — handoff note (2026-08-30, sub-session 4)
+# AGENTS.md — handoff note (2026-08-30, sub-session 5)
+
+## Session update (2026-08-30, sub-session 5): keymap shm double-openat exonerated as correct wlroots behavior; real gap is ftruncate never reached, root cause still unresolved (guest-side, not litebox FS layer)
+
+Picked up sub-session 4's exact stated blocker: past DRM backend creation, wlroots SIGSEGVs with
+`[ERROR] [types/wlr_keyboard.c:222] Failed to allocate shm file for keymap` after two back-to-back
+successful `openat` calls on the identical `/dev/shm/wlroots-<random6>` path, with sub-session 4
+flagging this double-open as suspicious (real `O_CREAT|O_EXCL` retry-loop shape expects the second
+open of the same name to fail EEXIST).
+
+**Root-caused the double-open as NOT a bug.** Fetched the real upstream wlroots source
+(`util/shm.c`'s `allocate_shm_file_pair()`/`excl_shm_open()`, `types/wlr_keyboard.c`'s
+`wlr_keyboard_set_keymap()`) live via WebFetch. Confirmed wlroots 0.20's real, current
+implementation legitimately opens the SAME shm path twice by design: first
+`O_RDWR|O_CREAT|O_EXCL` (the "rw_fd", for writing the keymap), then immediately `O_RDONLY` on the
+identical path with no CREAT/EXCL (the "ro_fd", handed to Wayland clients via `wl_keyboard.keymap`
+so they can only ever mmap it read-only) — then `shm_unlink()`s the name (its return value is
+NOT checked in real wlroots) and finally `ftruncate(rw_fd, size)`. Verified live via
+`LITEBOX_LOG=debug` (temporarily instrumented `sys_openat`'s existing debug log with the actual
+`OFlags` value, permanently kept — see below) that litebox's two real opens carry EXACTLY these
+two flag sets: call 1 `RDWR|CLOEXEC|CREAT|EXCL|LARGEFILE|NOFOLLOW|NDELAY`, call 2
+`CLOEXEC|LARGEFILE|NOFOLLOW|NDELAY` (i.e. plain O_RDONLY, no CREAT/EXCL) — an exact match for
+the real rw/ro dual-fd idiom, not a retry loop. Litebox's `O_EXCL` enforcement is doing exactly
+the right thing here (correctly allowing the second RDONLY-no-EXCL open of an existing file to
+succeed) and is not the bug sub-session 4 suspected.
+
+**New, more precise finding: `ftruncate` is never invoked at all, immediately after `unlink`
+succeeds, with no crash-indicating syscall in between.** Added a second, permanent debug-log
+instrumentation point (`sys_unlinkat`, previously silent) and confirmed via a fresh live repro
+that: `openat` (rw, fd 18) succeeds -> `openat` (ro, fd 19) succeeds -> `unlinkat` on the same
+path succeeds (`ok=true`) -- exactly matching real wlroots' `shm_unlink(name)` call -- and then,
+within about 54 microseconds, wlroots' own error-logging code fires (`sys_ioctl
+TIOCGWINSZ` immediately before the printed `[ERROR] ... Failed to allocate shm file for keymap`
+line is `wlr_log`'s own terminal-width probe before formatting/printing, not a real keymap-related
+syscall). A third instrumentation point was added at `sys_ftruncate`'s entry (previously silent)
+specifically to catch this -- **it never fires** in this whole sequence, confirmed across three
+separate fresh live captures. This means real wlroots' `do { ret = ftruncate(rw_fd, size); }
+while (...)` loop body is never reached/executed at all after `shm_unlink()` returns, in guest
+code -- litebox's own `Ftruncate` syscall variant IS correctly wired end-to-end (confirmed by
+reading `litebox_shim_linux/src/lib.rs`'s syscall dispatch match arm, `SyscallRequest::Ftruncate
+{ fd, length } => syscall!(sys_ftruncate(fd, length))`, present and routed identically to every
+other working syscall) -- there is no missing/broken plumbing on litebox's side to explain the gap.
+
+**Exhaustively verified NOT a litebox filesystem bug**, contrary to sub-session 4's suspicion:
+manually traced `litebox/src/fs/layered.rs::open()`'s `O_CREAT|O_EXCL` pre-check (lines 570-576,
+a `file_status`-then-act check with no lock held across the gap -- a real, narrow, still-unfixed
+TOCTOU race under genuine multi-threaded/multi-process concurrent access, but NOT reachable by
+this single-threaded, sequential two-call repro) and `litebox/src/fs/in_mem.rs::open()`'s actual
+leaf-level CREAT+EXCL enforcement (lines 293-300, provably atomic -- single `self.root.write()`
+lock held across both the existence check and the insert) and `unlink()` (lines 714-747, provably
+correct POSIX unlink-while-open semantics: removes the path->entry mapping from `root.entries`
+but the already-open fd keeps its own `Arc` clone of the underlying `FileX`, so data is not
+destroyed and the fd stays valid, matching real Unix "delete while open" behavior) -- none of
+these can explain a syscall the guest never even attempts to issue. Also confirmed `/dev/shm` is
+served through `litebox::fs::layered::FileSystem<Platform, Upper, Lower>` (the only
+`layered::FileSystem` construction site referenced in `litebox_runner_linux_on_windows_userland`,
+confirming sub-session 4's finding that no dedicated `devices.rs` backend exists for `/dev/shm`).
+
+**Where this leaves the investigation**: the gap between a successful `unlink()` return and
+`ftruncate()` never being dispatched is real, live-verified, and reproducible, but its root cause
+is now conclusively narrowed to guest-side code (musl libc's `shm_open`/`shm_unlink`/`ftruncate`
+wrappers, or wlroots' own `allocate_shm_file_pair`/`wlr_keyboard_set_keymap` control flow) --
+NOT litebox's syscall dispatch or filesystem layer, which is exhaustively confirmed correct and
+fully wired for every syscall this sequence needs. Further progress needs either real musl source
+(this session does not have local access to the exact musl build/version in this rootfs) to rule
+in/out a musl-specific bug in this environment, or guest-side debugging (a gdb/strace-equivalent
+attached to the guest process, which litebox does not currently expose) to see the actual
+post-unlink, pre-crash control flow directly rather than inferring it from syscall absence.
+Registered as gm mutable (see `.gm/mutables.yml`) rather than declared fixed or abandoned.
+`WLR_RENDERER=pixman`, `/dev/shm` pre-creation, and all of sub-session 4's DRM-backend-creation
+fixes remain valid and unaffected -- this session made no functional code changes, only added
+three permanent, low-cost debug-log instrumentation points (`sys_openat`'s existing log gained an
+`OFlags` field; `sys_unlinkat` and `sys_ftruncate` gained their own entry/result debug logs,
+matching the file's existing per-syscall debug-log convention) to `litebox_shim_linux/src/
+syscalls/file.rs`, verified via `cargo test -p litebox_shim_linux --lib -- --skip test_mremap`
+(177 passed) and `cargo test -p litebox_platform_windows_userland` (4 passed), both clean.
 
 ## Session update (2026-08-30, sub-session 4): labwc DRM backend now creates successfully; new blocker in wlroots keymap shm allocation
 

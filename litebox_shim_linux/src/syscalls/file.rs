@@ -639,7 +639,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // log line's numeric `fd` back to the real file it refers to, blocking correlation of a
         // crashing memory region against which shared library/ELF actually backs it.
         litebox_util_log::debug!(
-            tid:% = self.tid, path:% = path.to_string_lossy(), fd:? = result.as_ref().ok();
+            tid:% = self.tid, path:% = path.to_string_lossy(), fd:? = result.as_ref().ok(), flags:? = flags;
             "sys_openat"
         );
         result
@@ -694,6 +694,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Handle syscall `ftruncate`
     pub(crate) fn sys_ftruncate(&self, fd: i32, length: usize) -> Result<(), Errno> {
+        litebox_util_log::debug!(
+            tid:% = self.tid, fd:% = fd, length:% = length;
+            "sys_ftruncate: entry"
+        );
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
@@ -879,11 +883,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         let path = self.resolve_path_at(dirfd, pathname)?;
-        if flags.contains(AtFlags::AT_REMOVEDIR) {
-            self.files.borrow().fs.rmdir(path).map_err(Errno::from)
+        let result = if flags.contains(AtFlags::AT_REMOVEDIR) {
+            self.files.borrow().fs.rmdir(path.clone()).map_err(Errno::from)
         } else {
-            self.files.borrow().fs.unlink(path).map_err(Errno::from)
-        }
+            self.files.borrow().fs.unlink(path.clone()).map_err(Errno::from)
+        };
+        litebox_util_log::debug!(
+            tid:% = self.tid, path:% = path.to_string_lossy(), ok:? = result.is_ok(), err:? = result.as_ref().err();
+            "sys_unlinkat"
+        );
+        result
     }
 
     /// Handle syscall `renameat`/`renameat2`
