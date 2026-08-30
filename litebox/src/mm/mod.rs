@@ -417,6 +417,53 @@ impl AddressRelocations {
         self.executable[index]
     }
 
+    /// Folds `ancestor`'s own tracked ranges into `self`, producing a map that transitively
+    /// covers every earlier fork generation `ancestor` itself already covered -- the fix for the
+    /// nested-fork (fork-of-a-fork) grandparent-generation staleness gap: a grandchild's own
+    /// `AddressRelocations` (built fresh by [`PageManager::duplicate`] at ITS fork call) only
+    /// knows about its immediate parent's current address space, with no visibility into
+    /// generations the parent inherited from ITS OWN parent in turn. `self` is the map this
+    /// fork's own `duplicate()` call just produced (child-relative-to-parent); `ancestor` is the
+    /// PARENT's own currently-active relocation map (parent-relative-to-grandparent, and so on
+    /// transitively -- already folded by this SAME method when the parent's own fork happened, if
+    /// the parent was itself a fork descendant under verification).
+    ///
+    /// Each `ancestor` range is carried forward one of two ways:
+    /// - If its `dest_base` (the address it lives at IN THE PARENT, which is also where it lives
+    ///   in the freshly-forked child right up until this fork's own duplication may have moved
+    ///   it) falls inside one of `self`'s own SOURCE ranges, that address was itself relocated
+    ///   again by this fork -- translate it through `self` so the ancestor's entry ends up
+    ///   pointing at its CURRENT destination in the new child, not a now-stale mid-generation one.
+    /// - Otherwise that ancestor-owned memory was untouched by this specific fork (it is not part
+    ///   of what `duplicate()` just relocated) and is still valid at its old translated location
+    ///   -- appended as-is.
+    ///
+    /// A range translated through `self` this way keeps its ORIGINAL (oldest-known) source range
+    /// and its now-current destination base, so `is_in_source`/`translate` continue to recognize
+    /// the value in whatever ancestor-generation form it might still appear in verbatim, exactly
+    /// as they already do for `self`'s own one-generation ranges. All parallel per-range
+    /// metadata (`executable`/`private_data`/`is_file_backed`/`flags`) is carried over verbatim
+    /// from `ancestor`, preserving the index-alignment invariant `is_executable_range` and
+    /// friends depend on. `group_relocations` and `heap_top` are left as `self`'s own (the
+    /// current fork's own group/heap-top bookkeeping remains authoritative for this generation;
+    /// ancestor groups are not currently consumed by any caller that would need them chained).
+    #[must_use]
+    pub fn merge_ancestor_ranges(mut self, ancestor: &Self) -> Self {
+        for (i, (ancestor_source_range, ancestor_dest_base)) in
+            ancestor.ranges.iter().enumerate()
+        {
+            let dest_base = self
+                .translate(*ancestor_dest_base)
+                .unwrap_or(*ancestor_dest_base);
+            self.ranges.push((ancestor_source_range.clone(), dest_base));
+            self.executable.push(ancestor.executable[i]);
+            self.private_data.push(ancestor.private_data[i]);
+            self.is_file_backed.push(ancestor.is_file_backed[i]);
+            self.flags.push(ancestor.flags[i]);
+        }
+        self
+    }
+
     /// Returns whether `addr` falls within a DESTINATION range that was executable (`VM_EXEC`) in
     /// the SOURCE address space at the moment of duplication -- i.e. `addr` is inside the child's
     /// own relocated copy of guest code.

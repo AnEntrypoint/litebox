@@ -2330,6 +2330,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     litebox_util_log::error!(err:% = err; "failed to duplicate address space for fork()");
                     Errno::ENOMEM
                 })?;
+                // Nested-fork (fork-of-a-fork) coverage: if the calling thread (this fork's
+                // PARENT) is itself a fork descendant still under verification, its own
+                // relocation map only covers ranges relative to ITS parent (the new child's
+                // grandparent) -- fold those ancestor ranges into this fork's fresh map so the
+                // new child transitively inherits full ancestor coverage, not just this one
+                // generation. See `ForkChildVerificationProvider::current_thread_fork_relocations`
+                // and `AddressRelocations::merge_ancestor_ranges` for the full mechanism.
+                let relocations = match self.global.platform.current_thread_fork_relocations() {
+                    Some(ancestor) => relocations.merge_ancestor_ranges(&ancestor),
+                    None => relocations,
+                };
                 (Arc::new(dest_pm), relocations)
             };
             // Diagnostic-only (pass 111, `LITEBOX_DIAG_PROCESS_FORK_SPAWN=1`, off by default): a

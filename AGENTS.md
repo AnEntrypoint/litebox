@@ -1,4 +1,4 @@
-# AGENTS.md — handoff note (2026-08-30, sub-session 17)
+# AGENTS.md — handoff note (2026-08-30, sub-session 18)
 
 ## Active standing goal (session-scoped Stop hook on the originating machine)
 
@@ -11,7 +11,53 @@ mutables — do not re-derive from scratch; query the recall store first (e.g. s
 "fork_verify AV path stale pointer", "DRM PRIME handle", "wlroots shm keymap",
 "D-Bus session bus export").
 
-## Current state (as of sub-session 17)
+## Current state (as of sub-session 18)
+
+**Sub-session 18 fixed and verified live the nested-fork (fork-of-a-fork) grandparent-generation
+staleness gap sub-session 17 root-caused but deliberately did not fix.** Landed (commit to
+follow, `litebox`/`litebox_shim_linux`/`litebox_platform_windows_userland`, all three crates
+this gap spans):
+
+1. `litebox::mm::AddressRelocations::merge_ancestor_ranges` (`litebox/src/mm/mod.rs`) — folds an
+   ancestor generation's own `(range, dest_base)` pairs into `self`, re-translating each
+   `dest_base` through `self`'s own map wherever this fork's own `duplicate()` call relocated it
+   again, appending as-is otherwise; carries all parallel per-range metadata
+   (`executable`/`private_data`/`is_file_backed`/`flags`) index-aligned.
+2. `litebox::platform::ForkChildVerificationProvider::current_thread_fork_relocations` (new trait
+   method, default `None`) — lets `do_clone` (running on the PARENT's own thread) ask the
+   platform for the calling thread's own currently-active relocation map, if the parent is
+   itself a fork descendant still under verification. Implemented in
+   `litebox_platform_windows_userland/src/lib.rs` by reading `tls.fork_verify` on the current
+   thread.
+3. Wired into `litebox_shim_linux/src/syscalls/process.rs`'s `do_clone`, immediately after
+   `PageManager::duplicate()`: if the parent has ancestor relocations, merge them into this
+   fork's fresh map before it is handed to the new child's `begin_fork_child_verification` — so a
+   grandchild (and any further descendant) transitively inherits full ancestor coverage, not just
+   its immediate parent's single generation.
+
+**Verified live** against the exact repro (`LITEBOX_LOG=debug`, 150s window,
+`.wfgy/xfce-build/xfce-layer17.tar` `--resume-from`): the dbus-launch nested-fork chain
+(`tid=6` execve's `dbus-launch`, forks to `tid=7`, `tid=7` forks AGAIN to `tid=8`/`tid=9` — the
+exact grandchild pattern sub-session 17 root-caused) now completes with **zero fatal signals on
+either grandchild**: `tid=8` (`dbus-daemon`, execve'd from `tid=7`'s first fork) exits cleanly
+(`Exit(0)` at 2.067s); `tid=9` (`tid=7`'s second, nested fork — the grandchild) also exits
+cleanly (`Exit(1)`, not a crash, at 5.202s). Full log:
+`grep -n "fatal signal" .gm/scratch-repro-sub18.clean.log` finds exactly ONE fatal signal in the
+whole 150s run, on `tid=10` at `2.225551200s` — a DIFFERENT, single-generation clone
+(`parent_tid=8 child_tid=10`, not nested), confirmed pre-existing and unrelated to this fix (see
+AGENTS.md's own fork_verify caution: "not every crash is fork_verify's fault"). Regression
+suite: `cargo test -p litebox_shim_linux --lib -- --skip test_mremap` (177/177) and
+`cargo test -p litebox_platform_windows_userland` (4/4), both clean, matching baseline.
+
+**Current blocker (pre-existing, unaffected by this fix, tracked separately as
+`xfsettingsd-exits-1-and-panel-desktop-never-launch`)**: `xfsettingsd` still fails to connect to
+D-Bus (`Could not connect: Connection refused`) and exits with status 1 before `xfce4-panel`/
+`xfdesktop` ever execve — the same gap sub-session 8 already registered. This is NOT the nested-
+fork gap (which is now fixed and verified); it is a separate, still-open D-Bus-session-
+readiness issue. No `xfce4-panel`/`xfdesktop` `sys_execve` line appears anywhere in this run's
+log.
+
+## Prior state (as of sub-session 17)
 
 **Sub-session 17 classified the mixed crash population sub-session 16 found (no code fix landed
 — this is a genuine new architectural gap, not a narrow decode-pattern extension safe to force

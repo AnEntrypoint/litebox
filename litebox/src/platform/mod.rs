@@ -619,6 +619,25 @@ pub trait ForkChildVerificationProvider {
     /// Stop verifying the current thread's guest execution, if it was being verified.
     fn end_fork_child_verification(&self) {}
 
+    /// Returns the CALLING thread's own currently-active relocation map, if the calling thread
+    /// is itself a `fork()` descendant still under verification (i.e. `self` is running on a
+    /// thread that was itself a target of a prior [`begin_fork_child_verification`] call whose
+    /// matching [`end_fork_child_verification`] has not yet fired).
+    ///
+    /// Called on the PARENT's own thread from `do_clone`, immediately after this fork's own
+    /// `PageManager::duplicate` call, BEFORE the fresh relocation map is handed to the new
+    /// child's own [`begin_fork_child_verification`] -- lets a nested fork (a fork whose OWN
+    /// parent is itself a fork descendant, e.g. a grandchild) fold the calling thread's inherited
+    /// ancestor ranges into the grandchild's map via
+    /// [`crate::mm::AddressRelocations::merge_ancestor_ranges`], so the grandchild transitively
+    /// covers every ancestor generation instead of only its immediate parent's. `None` for a
+    /// thread that is not itself under verification (the common case: a top-level, non-nested
+    /// fork), which is exactly when no merge is needed. The default implementation returns
+    /// `None`, matching every other member's "correct-but-unverified" default.
+    fn current_thread_fork_relocations(&self) -> Option<alloc::sync::Arc<crate::mm::AddressRelocations>> {
+        None
+    }
+
     /// Diagnostic-only hook, called from `do_clone` immediately after a real `fork()`/`vfork()`
     /// duplicates the parent's address space (same call site as
     /// [`begin_fork_child_verification`](Self::begin_fork_child_verification), on the PARENT's

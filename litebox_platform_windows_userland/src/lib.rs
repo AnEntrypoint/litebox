@@ -5443,6 +5443,13 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         fork_verify::end();
     }
 
+    fn current_thread_fork_relocations(&self) -> Option<Arc<litebox::mm::AddressRelocations>> {
+        let tls = get_tls_ptr()?;
+        // SAFETY: `get_tls_ptr` returns this thread's live `TlsState`.
+        let tls = unsafe { &*tls };
+        tls.fork_verify.borrow().clone()
+    }
+
     fn diagnostic_reverse_translate_fork_child_addr(&self, dest_addr: usize) -> Option<usize> {
         let tls = get_tls_ptr()?;
         // SAFETY: `get_tls_ptr` returns this thread's live `TlsState`.
