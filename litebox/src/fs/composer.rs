@@ -696,6 +696,11 @@ impl Backend for Composer {
             .truncate(&h.handle, length)
     }
 
+    fn chmod(&self, h: &FileHandle, mode: Mode) -> Result<(), ChmodError> {
+        let h = h.get_typed::<Self>();
+        self.mounts[h.mount_index].backend.chmod(&h.handle, mode)
+    }
+
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior {
         let h = h.get_typed::<Self>();
         self.mounts[h.mount_index].backend.seek_behavior(&h.handle)

@@ -116,6 +116,21 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// Change the permissions of a file
     fn chmod(&self, path: impl path::Arg, mode: Mode) -> Result<(), ChmodError>;
 
+    /// Change the permissions of a file via an already-open file descriptor, matching the
+    /// semantics of `fchmod(2)`.
+    ///
+    /// This MUST NOT be implemented as `chmod` re-resolving `fd` back to a path and re-walking
+    /// the directory tree by name (the way `sys_fchmod` used to before this method existed) --
+    /// real `fchmod` operates on the fd's already-open inode, which real POSIX (and this file
+    /// system) keeps alive via the open handle even after the directory entry naming it has been
+    /// `unlink`ed (the fd's refcount on the underlying file/inode is exactly [`Self::truncate`]'s
+    /// own `fd: &TypedFd<Self>`-based design, which this mirrors). A caller that `unlink`s a file
+    /// and then `fchmod`s the still-open fd (e.g. wlroots' `util/shm.c` `allocate_shm_file_pair`:
+    /// open, open, unlink, fchmod, ftruncate, in that exact order) is relying on precisely this
+    /// -- a path-based re-resolution after the `unlink` would always fail with
+    /// `NoSuchFileOrDirectory`, which is the bug this method exists to avoid.
+    fn chmod_fd(&self, fd: &TypedFd<Self>, mode: Mode) -> Result<(), ChmodError>;
+
     /// Change the owner of a file
     fn chown(
         &self,

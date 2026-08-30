@@ -810,6 +810,33 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         Ok(())
     }
 
+    fn chmod_fd(
+        &self,
+        fd: &FileFd<Platform, T>,
+        mode: super::Mode,
+    ) -> Result<(), super::errors::ChmodError> {
+        // Unlike `chmod` below (path-based, `walk_to` + `clunk`), this reuses the fd's own
+        // already-open `fid` -- see [`super::FileSystem::chmod_fd`]'s doc comment on why a
+        // caller may `unlink` the file and then `fchmod` this same still-open fd, and why a
+        // fresh path walk would be the wrong thing to do here (9P `unlink` on the client-visible
+        // path does not invalidate a `fid` obtained before the unlink, matching Linux's own
+        // still-open-fd-survives-unlink semantics this whole method exists to preserve).
+        let fid = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |desc| desc.entry.fid.clone())
+            .ok_or(super::errors::ChmodError::Io)?;
+
+        let stat = fcall::SetAttr {
+            mode: mode.bits(),
+            ..Default::default()
+        };
+
+        self.client
+            .setattr(&fid, fcall::SetattrMask::MODE, stat)
+            .map_err(ChmodError::from)
+    }
+
     fn chmod(
         &self,
         path: impl crate::path::Arg,

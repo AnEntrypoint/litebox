@@ -886,13 +886,111 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let result = if flags.contains(AtFlags::AT_REMOVEDIR) {
             self.files.borrow().fs.rmdir(path.clone()).map_err(Errno::from)
         } else {
-            self.files.borrow().fs.unlink(path.clone()).map_err(Errno::from)
+            // Capture the about-to-be-unlinked file's `(dev, ino)` BEFORE calling `unlink` (the
+            // path won't resolve afterwards) so a successful unlink can tag any fd(s) still open
+            // on this same file (see `self.tag_unlinked_regular_file_as_shm_like` below) -- a
+            // failed lookup here (e.g. the path is a directory, or doesn't exist) just means
+            // there is nothing to tag; `unlink` itself still runs and reports its own real error.
+            let node_info = self
+                .files
+                .borrow()
+                .fs
+                .symlink_metadata(path.clone())
+                .ok()
+                .filter(|status| status.file_type == litebox::fs::FileType::RegularFile)
+                .map(|status| status.node_info);
+            let result = self.files.borrow().fs.unlink(path.clone()).map_err(Errno::from);
+            if result.is_ok()
+                && let Some(node_info) = node_info
+            {
+                self.tag_unlinked_regular_file_as_shm_like(node_info);
+            }
+            result
         };
         litebox_util_log::debug!(
             tid:% = self.tid, path:% = path.to_string_lossy(), ok:? = result.is_ok(), err:? = result.as_ref().err();
             "sys_unlinkat"
         );
         result
+    }
+
+    /// After a regular file at `node_info` has just been `unlink`ed, tag any fd(s) STILL OPEN on
+    /// it (in this process's own fd table) with [`MemfdMarker`] -- the same tag
+    /// `sys_memfd_create` applies at creation time -- so a later `ftruncate`/`fallocate` on that
+    /// fd goes through `resize_memfd_shared_backing` and gets real
+    /// `PageManagementProvider::create_shared_memory` backing (see `syscalls::mm::try_memfd_mmap`)
+    /// instead of `sys_mmap`'s `ENODEV` rejection of `MAP_SHARED|PROT_WRITE` on an ordinary file.
+    ///
+    /// This closes the real gap wlroots' (and weston's) `allocate_shm_file_pair`/
+    /// `os_create_anonymous_file` hit: both build their shm fd by hand with the EXACT SAME
+    /// `open` + `unlink` + `fchmod`/`ftruncate` recipe `sys_memfd_create` itself uses internally
+    /// (see that function's own doc comment) -- they just do it via plain `open`/`unlink` instead
+    /// of the `memfd_create` syscall, so the fd was never tagged. Structurally, "a regular file
+    /// whose directory entry is gone while a fd is still open on it" IS this shim's definition of
+    /// an anonymous/memfd-shaped file (`sys_memfd_create` has no other distinguishing state of
+    /// its own) -- there is no other real use of `unlink`-while-still-open in this codebase for
+    /// which becoming real-shared-memory-backed on a later `ftruncate` would be observably wrong:
+    /// an ordinary already-closed file's bytes stay exactly the in-mem `Vec<u8>` they always were
+    /// (an untagged fd's `ftruncate`/`fallocate` path is entirely unchanged, see their own doc
+    /// comments), and a still-open, never-mmapped-shared-write fd pays only a `symlink_metadata`
+    /// lookup here plus a bounded scan of this process's OWN (not global) alive fd table below --
+    /// never unbounded, since a real process holds at most a few hundred fds.
+    fn tag_unlinked_regular_file_as_shm_like(&self, node_info: litebox::fs::NodeInfo) {
+        let files = self.files.borrow();
+        let alive_fds: alloc::vec::Vec<usize> =
+            files.raw_descriptor_store.read().iter_alive().collect();
+        for raw_fd in alive_fds {
+            let matches = files
+                .run_on_raw_fd(
+                    raw_fd,
+                    |fd| {
+                        files
+                            .fs
+                            .fd_file_status(fd)
+                            .is_ok_and(|status| status.node_info == node_info)
+                    },
+                    |_fd| false,
+                    |_fd| false,
+                    |_fd| false,
+                    |_fd| false,
+                    |_fd| false,
+                    |_fd| false,
+                    |_fd| false,
+                    |_fd| false,
+                    |_fd| false,
+                )
+                .unwrap_or(false);
+            if matches {
+                // Best-effort: `run_on_raw_fd` above already proved this fd is currently a live
+                // `FS`-subsystem fd, but re-resolve it fresh here rather than threading a
+                // borrowed `TypedFd` out of the closure above (its lifetime is tied to the
+                // `raw_descriptor_store` read lock, which `set_entry_metadata` below cannot be
+                // called while holding, since it needs the litebox-wide descriptor table's own
+                // write lock instead). A fd closed concurrently between the two lookups just
+                // means `with_metadata`'s callers below silently observe the untagged/closed fd,
+                // same as any other close-race.
+                let _ = files.run_on_raw_fd(
+                    raw_fd,
+                    |fd| {
+                        let old = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .set_entry_metadata(fd, MemfdMarker);
+                        debug_assert!(old.is_none());
+                    },
+                    |_fd| {},
+                    |_fd| {},
+                    |_fd| {},
+                    |_fd| {},
+                    |_fd| {},
+                    |_fd| {},
+                    |_fd| {},
+                    |_fd| {},
+                    |_fd| {},
+                );
+            }
+        }
     }
 
     /// Handle syscall `renameat`/`renameat2`
@@ -1576,17 +1674,42 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Handle syscall `fchmod`.
     ///
-    /// Resolves the already-open file descriptor back to the absolute path it was opened at
-    /// (recorded by `do_open`, the same mechanism `fchdir`/`*at`-family dirfd resolution uses)
-    /// and applies the mode change through the same path-based `FileSystem::chmod` the fs layer
-    /// already implements.
+    /// Operates directly on the already-open file descriptor via `FileSystem::chmod_fd`,
+    /// mirroring `sys_ftruncate`'s `run_on_raw_fd`-based dispatch -- NOT by re-resolving `fd`
+    /// back to a path and calling the path-based `FileSystem::chmod` (as this used to before
+    /// `chmod_fd` existed). That re-resolution was a real, confirmed bug: a caller that
+    /// `unlink`s the file and then `fchmod`s the still-open fd (e.g. wlroots' `util/shm.c`
+    /// `allocate_shm_file_pair`, which does exactly `open`+`open`+`unlink`+`fchmod`+`ftruncate`
+    /// in that order to build its read-write/read-only shm fd pair) would always get `ENOENT`
+    /// from the path-based re-walk, since `unlink` immediately removes the directory entry --
+    /// silently breaking every `allocate_shm_file_pair` call (format-table and keymap shm
+    /// allocation both go through it) with no syscall-level error ever logged, because this
+    /// function previously had no `debug!` logging of its own to reveal it.
     pub(crate) fn sys_fchmod(&self, fd: u32, mode: u32) -> Result<(), Errno> {
-        let pathname = self.resolve_dirfd_path(fd)?;
-        self.files
-            .borrow()
-            .fs
-            .chmod(pathname, Mode::from_bits_retain(mode))
-            .map_err(Errno::from)
+        litebox_util_log::debug!(
+            tid:% = self.tid, fd:% = fd, mode:% = mode;
+            "sys_fchmod: entry"
+        );
+        let Ok(raw_fd) = usize::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+        let mode = Mode::from_bits_retain(mode);
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |fd| files.fs.chmod_fd(fd, mode).map_err(Errno::from),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+            )
+            .flatten()
     }
 
     pub(crate) fn do_close(&self, raw_fd: usize) -> Result<(), Errno> {

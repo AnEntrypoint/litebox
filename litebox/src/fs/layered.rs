@@ -1140,6 +1140,39 @@ impl<
         }
     }
 
+    fn chmod_fd(&self, fd: &FileFd<Platform, Upper, Lower>, mode: Mode) -> Result<(), ChmodError> {
+        // Mirrors `truncate` above (see [`super::FileSystem::chmod_fd`]'s doc comment on why
+        // this must operate on the already-open handle rather than re-resolving `fd` to a path
+        // -- the whole point is to keep working after the caller has `unlink`ed the path this fd
+        // was opened at).
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry))
+            .ok_or(ChmodError::Io)?;
+        match entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.chmod_fd(fd, mode),
+            EntryX::Lower { fd } => {
+                // A file opened purely from the lower (read-only-relative-to-this-layer, per
+                // `LayeringSemantics::LowerLayerReadOnly`) layer was never write-opened through
+                // *this* fs (an `O_CREAT`/write-opened path always migrates up at `open` time,
+                // matching `write`'s/`truncate`'s own upper-vs-lower split above) -- so a still-
+                // open fd resolving to `EntryX::Lower` here can only be a read-only fd, for which
+                // real `fchmod` is still valid on Linux (permission bits are independent of the
+                // fd's own read/write mode) but this bounded implementation has no upper-
+                // migration path for an *already-open, no-longer-path-addressable* fd (unlike
+                // `chmod`'s own path-based migrate-then-retry, which works because it re-resolves
+                // the path before the migrated file's fd would need to change). No real call site
+                // in this codebase (wlroots' shm-file dance, the only real `fchmod` caller,
+                // always operates on a freshly created-in-upper file) exercises this, so this
+                // stays a hard error rather than growing unverified migration logic.
+                let _ = fd;
+                Err(ChmodError::Io)
+            }
+            EntryX::Tombstone => unreachable!(),
+        }
+    }
+
     fn chmod(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), ChmodError> {
         let path = self.absolute_path(path)?;
         match self.upper.chmod(path.as_str(), mode) {

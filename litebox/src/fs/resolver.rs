@@ -699,6 +699,31 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         Ok(())
     }
 
+    fn chmod_fd(&self, fd: &TypedFd<Self>, mode: Mode) -> Result<(), ChmodError> {
+        // Mirrors `truncate` above (see [`super::FileSystem::chmod_fd`]'s doc comment on why
+        // this must operate on the already-open handle rather than re-resolving `fd` to a path)
+        // -- `Backend::chmod` is likewise scoped to `FileHandle` only, so a directory fd is
+        // rejected here the same way `truncate` rejects one, rather than silently no-op'ing.
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .entry_handle(fd)
+            .ok_or(ChmodError::Io)?;
+        let entry = entry.get_entry_mut();
+        let file = match &entry.entry.handle {
+            OwnedHandle::File(file) => file,
+            // `Backend::chmod` is scoped to `FileHandle` only (see its own doc comment) -- no
+            // backend in this codebase currently needs `fchmod` on a directory fd, matching
+            // `truncate`'s identical `OwnedHandle::Dir` handling just above (`TruncateError::
+            // IsDirectory`). Real Linux `fchmod` on a directory fd is valid, but nothing in this
+            // codebase's actual call sites (wlroots' shm-file dance, the only real `fchmod`
+            // caller) ever targets a directory fd, so this stays a hard error rather than
+            // growing `Backend`'s surface for an unexercised case.
+            OwnedHandle::Dir(_) => return Err(ChmodError::Io),
+        };
+        self.backend.chmod(file, mode)
+    }
+
     fn chmod(&self, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
         let context = default_context_pre_context_management_changes();
         let path = context.resolve(path)?;

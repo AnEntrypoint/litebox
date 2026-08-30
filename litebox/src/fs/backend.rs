@@ -144,6 +144,14 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
     /// adding `\0`s.
     fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError>;
 
+    /// Change the permissions of an already-open file handle, matching `fchmod(2)` -- see
+    /// [`super::FileSystem::chmod_fd`]'s doc comment for why this must operate on `h` directly
+    /// rather than re-resolving a path (a caller may `unlink` the directory entry naming this
+    /// file and then `fchmod` the still-open handle, e.g. wlroots' `util/shm.c`
+    /// `allocate_shm_file_pair`). Scoped to `FileHandle` only, matching [`Self::truncate`]'s own
+    /// scope -- no backend in this codebase currently needs `fchmod` on a directory fd.
+    fn chmod(&self, h: &FileHandle, mode: Mode) -> Result<(), ChmodError>;
+
     /// Describe seek behavior for an open file handle.
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior;
 

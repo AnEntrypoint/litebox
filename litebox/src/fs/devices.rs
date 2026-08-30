@@ -398,6 +398,10 @@ where
         Err(TruncateError::IsTerminalDevice)
     }
 
+    fn chmod(&self, _h: &FileHandle, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior {
         let h = h.get_typed::<Self>();
         match h.device {
@@ -688,6 +692,10 @@ where
         Err(TruncateError::IsTerminalDevice)
     }
 
+    fn chmod(&self, _h: &FileHandle, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
     fn seek_behavior(&self, _h: &FileHandle) -> SeekBehavior {
         SeekBehavior::NonSeekable
     }
@@ -957,6 +965,10 @@ where
 
     fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {
         Err(TruncateError::IsTerminalDevice)
+    }
+
+    fn chmod(&self, _h: &FileHandle, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
     }
 
     fn seek_behavior(&self, _h: &FileHandle) -> SeekBehavior {
@@ -1650,6 +1662,10 @@ where
         Err(TruncateError::NotForWriting)
     }
 
+    fn chmod(&self, _h: &FileHandle, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
     fn seek_behavior(&self, _h: &FileHandle) -> SeekBehavior {
         SeekBehavior::PositionBased
     }
@@ -1939,6 +1955,10 @@ where
 
     fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {
         Err(TruncateError::NotForWriting)
+    }
+
+    fn chmod(&self, _h: &FileHandle, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
     }
 
     fn seek_behavior(&self, _h: &FileHandle) -> SeekBehavior {
@@ -2283,6 +2303,10 @@ where
         Err(TruncateError::NotForWriting)
     }
 
+    fn chmod(&self, _h: &FileHandle, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
     fn seek_behavior(&self, _h: &FileHandle) -> SeekBehavior {
         SeekBehavior::PositionBased
     }
@@ -2614,6 +2638,10 @@ where
 
     fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {
         Err(TruncateError::NotForWriting)
+    }
+
+    fn chmod(&self, _h: &FileHandle, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
     }
 
     fn seek_behavior(&self, _h: &FileHandle) -> SeekBehavior {

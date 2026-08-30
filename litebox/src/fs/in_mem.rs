@@ -633,6 +633,41 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
     }
 
+    fn chmod_fd(&self, fd: &FileFd<Platform>, mode: super::Mode) -> Result<(), ChmodError> {
+        // Unlike `chmod` above (and unlike this same method's own path-based twin), this
+        // operates directly on the `Arc<RwLock<FileX|DirX>>` already held by the open
+        // descriptor -- never re-walking `root.entries`/`parent.children` by name. This is
+        // deliberate: a caller may `unlink` a file and then `fchmod` the still-open fd (see
+        // `FileSystem::chmod_fd`'s doc comment on the `Self` trait for the exact real-world
+        // sequence, wlroots' `allocate_shm_file_pair`, that depends on this), and by the time
+        // `fchmod` runs the directory entry naming the file is already gone -- a path-based
+        // re-resolution would always fail with `NoSuchFileOrDirectory` here, which is exactly
+        // the bug this method exists to avoid.
+        let descriptor_table = self.litebox.descriptor_table();
+        let entry = &descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(ChmodError::Io)?
+            .entry;
+        match entry {
+            Descriptor::File { file, .. } => {
+                let perms = &mut file.write().perms;
+                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                    return Err(ChmodError::NotTheOwner);
+                }
+                perms.mode = mode;
+                Ok(())
+            }
+            Descriptor::Dir { dir } => {
+                let perms = &mut dir.write().perms;
+                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                    return Err(ChmodError::NotTheOwner);
+                }
+                perms.mode = mode;
+                Ok(())
+            }
+        }
+    }
+
     fn chown(
         &self,
         path: impl crate::path::Arg,

@@ -230,6 +230,10 @@ impl super::backend::Backend for TarRo {
         Err(TruncateError::NotForWriting)
     }
 
+    fn chmod(&self, _h: &FileHandle, _mode: super::Mode) -> Result<(), super::errors::ChmodError> {
+        Err(super::errors::ChmodError::ReadOnlyFileSystem)
+    }
+
     fn seek_behavior(&self, _h: &FileHandle) -> super::backend::SeekBehavior {
         super::backend::SeekBehavior::PositionBased
     }
