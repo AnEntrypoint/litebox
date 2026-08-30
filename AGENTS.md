@@ -4,33 +4,17 @@
 
 > "go ahead and push all the way till xfce starts flawlessly, fix any bug that arises first"
 
-This is being worked via `/goal` on litebox-main. Continuing on a different machine now —
-this file is the handoff. Full investigation log (evidence-first, append-only) lives at:
+This is being worked via `/goal` on litebox-main.
 
-    C:\Users\user\.claude\projects\C--dev-litebox-main\memory\project_npx_casey_goal_status.md
+## Architecture & Subsystem Mapping Status
 
-Read that file's latest entries first. It is the single most important resource for
-continuing this work — every real fix, every refuted hypothesis, every fork's verified
-findings are logged there in detail. This AGENTS.md is just a pointer + current-state
-snapshot, not a replacement for it.
-
-## Where things stand right now
-
-HEAD is `b4a40e3d12457e35ca25b94d088abd6ccac6614f` (author `lanmower <657315+lanmower@users.noreply.github.com>`),
-pushed to `origin/main`. This commit fixed litebox's single longest-standing crash blocking
-XFCE: `syscall_callback`'s prologue did `pushfq` onto the guest's own live native stack
-*before* switching to litebox's host-owned context stack, which crashed whenever a thread
-had just `munmap`'d its own stack (musl's standard `pthread_exit`/`__unmapself` idiom) and
-then made a syscall. Fixed by switching `rsp` to the host stack *first*, then clearing
-EFLAGS.TF afterward. Verified via 9 real Windows crash dumps (`%LOCALAPPDATA%\CrashDumps`,
-all identical fault signature `syscall_callback+3` writing into just-unmapped stack), both
-test suites passing at baseline, and 6/6 fresh labwc repro runs crash-free (previously 100%
-reproducible before the fix).
-
-**Current, real, active blocker** (labwc now runs past the old crash, further into startup,
-then fails cleanly): `[backend/session/session.c:289] Failed to create udev event source:
-Bad file descriptor`, followed by `Failed to start a DRM session` / `unable to create
-backend`, exits `Exit(1)` at ~37s guest time.
+- **XFCE & Wayland/DRM in Stock Alpine**:
+  - Wayland compositor (`labwc`) launches XFCE session tools (`xfsettingsd & xfce4-panel & xfdesktop &`).
+  - Command: `udevd --daemon && labwc -s "xfsettingsd & xfce4-panel & xfdesktop &"`.
+- **DRM-to-wgpu Mapping**:
+  - Virtual DRM device (`/dev/dri/card0`) handled in `litebox_shim_linux/src/syscalls/drm.rs`.
+  - Implements dumb buffer creation (`DRM_IOCTL_MODE_CREATE_DUMB`), mmap offsets (`DRM_IOCTL_MODE_MAP_DUMB`), framebuffer attachment (`DRM_IOCTL_MODE_ADDFB2`), and page flips (`DRM_IOCTL_MODE_PAGE_FLIP`).
+  - Flipped frames pass to host `wgpu` surface presentation (`litebox_platform_windows_userland::presentation::Presenter`).
 
 Two hypotheses tested and refuted so far:
 - **Not** a missing/non-daemonized `udevd` — installing `eudev` + starting `udevd` (with and

@@ -1300,6 +1300,7 @@ fn find_ta_binary(ta_uuid: litebox_common_optee::TeeUuid) -> Option<&'static [u8
     None
 }
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     serial_println!("{}", info);

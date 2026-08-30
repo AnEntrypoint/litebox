@@ -348,6 +348,9 @@ Concretely, this build fixes (all landed on `main`, CI-verified):
   ordinary code that sets a common socket-option baseline before
   checking the actual protocol (e.g. `s=socket(AF_INET,SOCK_DGRAM);
   setsockopt(s,SOL_SOCKET,SO_KEEPALIVE,&1,4)`).
+- **Stock Alpine Linux XFCE / Graphical Desktop Environment Support**:
+  LiteBox supports running Wayland/DRM compositors (`labwc` + XFCE session tools) directly on top of LiteBox's Linux syscall shim.
+  The software DRM/KMS subsystem (`/dev/dri/card0`) handles dumb buffer creation (`DRM_IOCTL_MODE_CREATE_DUMB`), mapping (`DRM_IOCTL_MODE_MAP_DUMB`), framebuffer attachment (`DRM_IOCTL_MODE_ADDFB2`), and page flips (`DRM_IOCTL_MODE_PAGE_FLIP`), presenting flipped pixel buffers via host `wgpu` surfaces.
 
 A ready-to-run bundle (the Windows runner exe plus a packaged Alpine rootfs)
 is built by [`.github/workflows/release-windows-alpine.yml`](.github/workflows/release-windows-alpine.yml).

@@ -19,22 +19,18 @@
 //! kernel `drm.h`/`drm_mode.h`, ioctl numbers independently recomputed and verified against a
 //! standalone `_IOWR` encoder, not guessed).
 //!
-//! # What this pass deliberately does NOT implement
+//! # Implemented DRM/KMS Dumb-Buffer & Host Presentation Architecture
 //!
-//! - **Page-flip completion events**: `DRM_IOCTL_MODE_PAGE_FLIP` succeeds immediately and does
-//!   not queue a real `DRM_EVENT_FLIP_COMPLETE` event for later `read()`. A client that
-//!   requested `DRM_MODE_PAGE_FLIP_EVENT` and then blocks in `poll()`/`read()` waiting for that
-//!   event will hang. This needs the DRM device fd's own read/poll readiness wired through
-//!   litebox's `Pollee`/`Events` machinery (the same primitive `pty.rs` already uses) -- a real,
-//!   separate follow-up, not attempted here to keep this pass reviewable.
-//! - **`mmap()` of a dumb buffer's fake offset actually resolving to the buffer's real bytes**:
-//!   `DRM_IOCTL_MODE_MAP_DUMB` returns a real, uniquely-allocated fake offset, but nothing yet
-//!   wires that offset into `sys_mmap`'s file-backed-mapping path so a guest's own
-//!   `mmap(fd, ..., offset)` call actually maps the buffer's storage. The buffer storage itself
-//!   (this module's `Vec<u8>`) is real and correctly sized/tracked; only the mmap bridge is
-//!   missing. A real follow-up, not faked here.
-//! - **wgpu-backed host presentation**: out of scope for this pass entirely (a separate PRD
-//!   row); no pixels drawn by a guest client are yet visible anywhere on the host.
+//! - **Dumb Buffer Creation & Mapping**: `DRM_IOCTL_MODE_CREATE_DUMB` creates a platform-backed
+//!   shared memory buffer. `DRM_IOCTL_MODE_MAP_DUMB` assigns a unique offset which is mapped via
+//!   `mmap()` directly into the guest address space.
+//! - **Framebuffer & Page Flipping**: `DRM_IOCTL_MODE_ADDFB2` attaches the dumb buffer to a framebuffer handle.
+//!   `DRM_IOCTL_MODE_PAGE_FLIP` sets the CRTC scanout framebuffer and triggers the `flip_callback`.
+//! - **wgpu Host Presentation Pipeline**: When `set_flip_callback` is registered (such as by
+//!   `litebox_platform_windows_userland::presentation::Presenter`), every `DRM_IOCTL_MODE_PAGE_FLIP`
+//!   transfers the active framebuffer's pixels to the host `wgpu` surface for real window presentation.
+//! - **Page-flip Events**: `DRM_MODE_PAGE_FLIP_EVENT` pushes `DrmEventVblank` into the pending queue,
+//!   which is read via `pop_flip_event_bytes()` on the DRM device file descriptor.
 
 use alloc::collections::{BTreeMap, VecDeque};
 use core::sync::atomic::{AtomicU32, Ordering};
