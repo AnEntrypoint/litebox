@@ -1159,6 +1159,35 @@ unsafe extern "system" fn vectored_exception_handler(
             }
             return EXCEPTION_CONTINUE_EXECUTION;
         }
+        // `rip` itself was not stale -- the data-pointer counterpart to the code-pointer case
+        // just above. A raw AV whose fault address is explained by a stale base/index register
+        // in the faulting instruction's own memory operand (the register went stale earlier via
+        // an ordinary register-to-register `mov` this module has no general single-step case
+        // for) never reaches `on_single_step`'s case (2)/(2b) at all when it arrives as a raw AV
+        // rather than a clean `#DB` -- the identical AV-bypass problem the `rip` healing above
+        // exists for, just for a DATA pointer instead of a CODE pointer. Confirmed live
+        // (litebox-xfce-1, dbus-daemon fork-child investigation): a thread's `rbp` held a stale
+        // source-range value across a full single-step trap with no intervening healing
+        // opportunity (case (1) only fires when `rip` itself lands in-source; this `rbp` never
+        // did), then the next instruction dereferenced `[rbp+disp]` and faulted with the fault
+        // address exactly equal to the stale `rbp` plus that displacement. Mirrors case (2)/(2b)
+        // exactly (decode the instruction, translate its memory-operand registers through the
+        // same relocation map, retry) via `translate_stale_source_memory_operand_registers`,
+        // never advancing `rip` so the CPU re-executes the same instruction with the now-healed
+        // register.
+        if fork_verify::translate_stale_source_memory_operand_registers(tls, rip, context) {
+            if veh_trace_enabled() {
+                eprintln!(
+                    "[veh] tid={:?} AV-path stale data-pointer register healed at rip={rip:#x}",
+                    std::thread::current().id(),
+                );
+            }
+            litebox_util_log::warn!(
+                rip:? = rip;
+                "fork_verify: stale DATA pointer register detected via raw access violation (no #DB delivered), translating and retrying"
+            );
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
     }
 
     let mut synthesized_record = None;

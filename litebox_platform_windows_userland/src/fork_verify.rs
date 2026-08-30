@@ -476,6 +476,40 @@ pub(crate) fn translate_stale_source_rip(tls: &TlsState, rip: usize) -> Option<u
     }
 }
 
+/// Decode the instruction at `rip` and heal any of its memory-operand base/index registers that
+/// are a genuine `is_in_source` hit, exactly as case (2)/(2b) in [`on_single_step`] already does
+/// -- exposed for `vectored_exception_handler`'s AV-path healing, the data-pointer counterpart to
+/// [`translate_stale_source_rip`]'s code-pointer healing: a raw `EXCEPTION_ACCESS_VIOLATION` at a
+/// non-stale `rip` whose faulting memory operand is formed from a stale base/index register (the
+/// register itself went stale earlier -- via a register-to-register `mov` this module has no
+/// general single-step case for, mirroring case (1)'s own AV-bypass problem for `rip`/`rbp`) never
+/// reaches `on_single_step`'s case (2)/(2b) at all, since those are only ever invoked from the
+/// `EXCEPTION_SINGLE_STEP` branch. Returns `true` iff at least one register was healed (the caller
+/// should then retry the faulting instruction by NOT advancing `rip`, matching case (2)/(2b)'s own
+/// "do not advance rip: retry" contract) and `false` for a non-verifying thread, an undecodable
+/// instruction, or an instruction whose memory operand(s) hold no translatable register.
+pub(crate) fn translate_stale_source_memory_operand_registers(
+    tls: &TlsState,
+    rip: usize,
+    context: &mut CONTEXT,
+) -> bool {
+    let borrow = tls.fork_verify.borrow();
+    let Some(relocations) = borrow.as_ref() else {
+        return false;
+    };
+    let mut code = [0u8; MAX_INSTRUCTION_LEN];
+    let len = read_code_bytes(rip, &mut code);
+    if len == 0 {
+        return false;
+    }
+    let mut decoder = Decoder::with_ip(64, &code[..len], rip as u64, DecoderOptions::NONE);
+    let instruction = decoder.decode();
+    if instruction.is_invalid() {
+        return false;
+    }
+    translate_memory_operand_registers(&instruction, context, relocations)
+}
+
 /// The `EFLAGS` bits to add when entering guest mode on this thread: `TF` if this thread is a
 /// `fork()` child under verification, nothing otherwise.
 pub(crate) fn entry_eflags_tf(tls: &TlsState) -> usize {
