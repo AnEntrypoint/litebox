@@ -1,3 +1,111 @@
+# AGENTS.md — handoff note (2026-08-30, sub-session 4)
+
+## Session update (2026-08-30, sub-session 4): labwc DRM backend now creates successfully; new blocker in wlroots keymap shm allocation
+
+Picked up sub-session 3's exact next step (extend `SysClassDrm` to serve a synthetic
+`device/drm` subtree). Found the fix was already partially drafted uncommitted in the working
+tree at session start (`litebox/src/fs/devices.rs`'s `SysDrmDirHandle::DeviceOf`/`DeviceDrmOf`
+variants, `litebox_common_linux`'s `DRM_CAP_PRIME` constants) -- completed and extended it, then
+iterated live through FIVE further real, previously-unreached bugs one at a time (same
+read-log-find-next-failure discipline as prior sessions), each confirmed via a fresh
+`LITEBOX_LOG=debug` repro:
+
+1. **`device/drm/{card0,renderD128}` self-referencing synthetic subtree** -- completed the
+   pre-existing draft (`SysClassDrm`'s `DeviceOf`/`DeviceDrmOf` handle variants, proper
+   `NodeInfo` entries, `walk_directories`/`list_dir_at`/`dir_status` wiring). Fixed
+   `/sys/dev/char/226:0/device/drm` resolving.
+2. **`DRM_CAP_CRTC_IN_VBLANK_EVENT` wrong value** -- the uncommitted draft's `DRM_CAP_PRIME`
+   support was correct, but a fresh capability wlroots also queries
+   (`backend/drm/drm.c`'s `check_drm_features()`) needed adding. Initially guessed the real
+   kernel value as `0x9`; live capability-value tracing (added temporary debug logging,
+   removed after) showed the actual queried value was `18` (`0x12`), not `9` (`0x9` is
+   `DRM_CAP_CURSOR_HEIGHT`) -- corrected. This device's page-flip completion event already
+   always stamps `crtc_id`, so reporting `1` is simply true, not fabricated.
+3. **`DRM_CAP_PRIME` get_cap wiring incomplete** -- the constants existed uncommitted but
+   `drm.rs`'s `get_cap()` never actually checked for `DRM_CAP_PRIME` and returned the
+   import+export bitmask. Wired it.
+4. **`226:128` (render node) `/sys/dev/char` reverse lookup missing** -- `SysDevCharEntry`
+   only had `226:0`; wlroots' `types/wlr_drm.c`'s `drmGetDevice2()` opens the render node too
+   and needs its own reverse lookup for the identical reason `226:0`'s was needed. Added
+   `SysDevCharEntry::DrmRender` (`226:128 -> ../../class/drm/renderD128`).
+5. **`<card>/device/subsystem` and `<card>/device/uevent` missing at the synthetic `device`
+   level** (distinct from the already-existing `<card>/subsystem`/`<card>/uevent` one level
+   up) -- `drmGetDevice2()`'s bus-type classification reads `<device>/subsystem` (added as a
+   symlink to `../../../bus/platform`, since litebox's virtual DRM device has no real PCI/USB
+   parent -- `platform` is the real kernel's own choice for a DRM device with no discrete bus,
+   e.g. `simpledrm`/`vkms`) and `<device>/uevent` (added as a regular file, `DRIVER=litebox`).
+6. **`DRM_IOCTL_GET_MAGIC`/`DRM_IOCTL_AUTH_MAGIC` completely unimplemental** -- wlroots' render
+   allocator (`render/allocator/allocator.c`) does the legacy DRI `drmGetMagic()`/
+   `drmAuthMagic()` authentication handshake before allocating; unimplemented ioctls fell
+   through to `ENOTTY`->`EINVAL`, surfaced as `"drmGetMagic failed: Invalid argument"` ->
+   `"unable to create allocator"`. Implemented both (`struct drm_auth`, one `__u32 magic`
+   field) with a single fixed magic value -- this device has exactly one possible client, so
+   there is no real per-client auth state to track.
+
+**Verified live, cumulatively**: with all six fixes plus `WLR_RENDERER=pixman` (or
+`WLR_RENDERER_ALLOW_SOFTWARE=1`; litebox's GPU is virtual/software, and wlroots' own real gate
+refuses software rendering by default -- NOT a litebox bug, same category as the alread-tried
+`WLR_RENDERER=pixman` sub-session-3 attempt, except this time tried AFTER the DRM backend could
+actually open rather than before), labwc's DRM backend creation now fully succeeds:
+`DrmModeGetResources`/`GetCrtc`/`GetPlaneResources`/`GetPlane`/`ObjGetProperties`/`GetProperty`
+all resolve correctly, no more `"Failed to create DRM backend"`/`"Could not successfully create
+backend on any GPU"`/`"Failed to open any DRM device"`/`"unable to create backend"` -- this was
+the session's original stated blocker and it is now conclusively fixed.
+
+**New blocker found, NOT yet fixed**: past DRM backend creation, wlroots crashes with a real
+`SIGSEGV` (`signal=Signal(11)`) inside its own keymap-shm-allocation code path
+(`types/wlr_keyboard.c:222`, `"Failed to allocate shm file for keymap"`) shortly after. Also
+discovered along the way: `/dev/shm` does not exist by default in this rootfs and litebox has no
+synthetic tmpfs mount there -- `mkdir -p /dev/shm && chmod 1777 /dev/shm` in the launch shell
+command (added to the documented repro below) fixes that specific sub-gap for free (it is backed
+by the ordinary writable rootfs layer, not `devices.rs`, so a plain `mkdir` just works, no code
+change needed) and pushes the crash further (past an earlier, now-fixed `/dev/shm/wlroots-XXXXXX`
+open failure for the DRM format table). With `/dev/shm` pre-created, the SAME `openat` path
+(`/dev/shm/wlroots-<random6>`) is called TWICE for the keymap allocation and **both calls
+succeed** (`fd=Some(18)` then `fd=Some(19)`, identical filename, zero intervening
+`fcntl`/`ftruncate`/`mmap`/`unlink` syscalls logged) immediately before the error and crash --
+this is suspicious: real `os_create_anonymous_file()`'s `O_CREAT|O_EXCL` retry-loop shape expects
+a SECOND open of the SAME just-created name to fail `EEXIST` (prompting a new random suffix), not
+succeed silently. `sys_ftruncate` is fully implemented in litebox but is never actually invoked
+anywhere in this whole repro run (confirmed via full-log grep) -- meaning wlroots itself never
+gets far enough to call it, i.e. the crash happens between the second successful `open()` and
+whatever wlroots does next, entirely in guest userspace with no syscall trace to follow further
+without either real wlroots/musl `os_create_anonymous_file`/`allocate_shm_file` source to
+cross-reference the exact expected call sequence, or finer instrumentation than what
+`LITEBOX_LOG=debug` currently emits (e.g. a temporary trace on `sys_close`/`sys_write` too, or on
+litebox's own `O_EXCL` existence-check codepath in `do_open`/the core `fs` layer, to confirm
+whether the second `open()` really should have raced/collided and didn't). Registered as gm
+mutable `labwc-wlroots-shm-keymap-allocation-still-fails-after-dev-shm-fix` with full detail (see
+`.gm/mutables.yml` / gm's own recall) rather than abandoned silently.
+
+Repro command (extends sub-session 3's shape with `mkdir -p /dev/shm`/`chmod 1777` and
+`WLR_RENDERER=pixman`):
+```
+target/release/litebox_runner_linux_on_windows_userland.exe --initial-files .wfgy/xfce-build/alpine-pinned2.tar --resume-from .wfgy/xfce-build/xfce-layer16.tar -- /bin/sh -c "mkdir -p /run/user/1000 /dev/shm; chmod 700 /run/user/1000; chmod 1777 /dev/shm; export XDG_RUNTIME_DIR=/run/user/1000; export XKB_CONFIG_ROOT=/usr/share/X11/xkb; export WLR_RENDERER=pixman; seatd -l debug & for i in 1 2 3 4 5 6 7 8 9 10; do [ -S /run/seatd.sock ] && break; sleep 1; done; labwc -s \"xfsettingsd & xfce4-panel & xfdesktop &\""
+```
+with `LITEBOX_LOG=debug`, `MSYS_NO_PATHCONV=1` in Git Bash. Rebuild
+`cargo build --locked --release -p litebox_runner_linux_on_windows_userland` first.
+
+Regression-tested: `cargo test -p litebox_shim_linux --lib -- --skip test_mremap` 177/177 pass;
+`cargo test -p litebox_platform_windows_userland` all pass -- both clean after all six fixes
+above.
+
+**Next step for whoever picks this up**: isolate the exact guest-userspace failure between the
+second `open("/dev/shm/wlroots-XXXXXX")` success and the `"Failed to allocate shm file for
+keymap"` log line. Prime suspects in order of likelihood: (1) litebox's `O_CREAT|O_EXCL` open
+path in the core `fs` layer (not the shim) not actually rejecting a second open of a name that
+should already exist -- check `litebox/src/fs`'s `do_open`/equivalent for how `OFlags::EXCL` is
+enforced against an already-open (not yet closed/unlinked) name; (2) a `write()`/`pwrite64()` on
+the fd (Wayland keymap content is written before mmap in some wlroots versions) not being logged
+because `sys_write`'s own debug-log call is missing or gated differently than `sys_openat`'s; (3)
+an `mmap()` call on the shm fd silently failing (its own debug line might be filtered by a
+narrower grep than used this session -- re-check with an unfiltered full-file read around the
+exact line range, not a `grep` for `sys_mmap` which was checked and came up empty, but a raw
+`sed`/`Read` of a wider window is more reliable). Once fixed, verify per this session's own
+already-proven-working repro command above; then check for xfsettingsd/xfce4-panel/xfdesktop
+process launches (`sys_execve` log lines) and hold the window 90-150s+ per the standing
+completion criterion.
+
 # AGENTS.md — handoff note (2026-08-30, sub-session 3)
 
 ## Session update (2026-08-30, sub-session 3): labwc DRM backend blocker found, partial fix

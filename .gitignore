@@ -201,6 +201,12 @@ dev_bench/unixbench/*.zip
 ### Local tooling state ###
 .gm/
 .agentplug-kv/
+.agentplug/
+.wfgyxfce-*.ps1
+
+### Stray local build/test artifacts (not committed products) ###
+target-myfork/
+alpine-fresh-test.tar
 
 ### Test-generated artifacts ###
 litebox_runner_linux_on_windows_userland/tests/test-bins/*.hooked

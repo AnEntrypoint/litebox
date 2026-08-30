@@ -3988,6 +3988,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             | IoctlArg::DrmSetClientCap(..)
             | IoctlArg::DrmSetMaster
             | IoctlArg::DrmDropMaster
+            | IoctlArg::DrmGetMagic(..)
+            | IoctlArg::DrmAuthMagic(..)
             | IoctlArg::DrmModeObjGetProperties(..)
             | IoctlArg::DrmModeGetProperty(..) => files.run_on_raw_fd(
                 desc,
@@ -4371,6 +4373,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             IoctlArg::DrmSetClientCap(ptr) => self.global.drm.set_client_cap(*ptr),
             IoctlArg::DrmSetMaster => self.global.drm.set_master(),
             IoctlArg::DrmDropMaster => self.global.drm.drop_master(),
+            IoctlArg::DrmGetMagic(ptr) => self.global.drm.get_magic(*ptr),
+            IoctlArg::DrmAuthMagic(ptr) => self.global.drm.auth_magic(*ptr),
             IoctlArg::DrmModeObjGetProperties(ptr) => self.global.drm.obj_get_properties(*ptr),
             IoctlArg::DrmModeGetProperty(ptr) => self.global.drm.get_property(*ptr),
             _ => unreachable!("drm_ioctl called with a non-DRM IoctlArg"),

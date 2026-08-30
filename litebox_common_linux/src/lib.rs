@@ -885,6 +885,32 @@ pub const DRM_IOCTL_SET_CLIENT_CAP: u32 = 0x4010_640D;
 pub const DRM_IOCTL_SET_MASTER: u32 = 0x0000_641E;
 /// `DRM_IOCTL_DROP_MASTER = DRM_IO(0x1f)`.
 pub const DRM_IOCTL_DROP_MASTER: u32 = 0x0000_641F;
+/// `DRM_IOCTL_GET_MAGIC = DRM_IOR(0x02, struct drm_auth)`, `size=4` (one `__u32 magic`).
+/// wlroots' render allocator (`render/allocator/allocator.c`'s `allocator_autocreate_with_
+/// display()`, reached via the GBM allocator's `drmGetMagic()`/`drmAuthMagic()` legacy DRI
+/// client-authentication handshake) calls this on every render-node fd it opens, including
+/// the primary node when GBM falls back to it -- without a real implementation the ioctl
+/// falls through to this device's `ENOTTY` catch-all, which libdrm's `drmGetMagic()`
+/// surfaces as `EINVAL` ("Invalid argument"), confirmed live as the literal error text
+/// immediately preceding `render/allocator/allocator.c]"drmGetMagic failed"` /
+/// `../src/server.c]"unable to create allocator"`. This device has exactly one possible
+/// client (see [`DRM_IOCTL_SET_MASTER`]'s own doc comment on single-master semantics), so
+/// authentication has no real access-control decision to make -- a fixed non-zero magic
+/// value handed back here and trivially accepted by [`DRM_IOCTL_AUTH_MAGIC`] below is
+/// sufficient to satisfy the handshake's shape without modeling multi-client auth this
+/// device will never need.
+pub const DRM_IOCTL_GET_MAGIC: u32 = 0x8004_6402;
+/// `DRM_IOCTL_AUTH_MAGIC = DRM_IOW(0x11, struct drm_auth)`, `size=4`. The write half of the
+/// same legacy DRI authentication handshake [`DRM_IOCTL_GET_MAGIC`] starts -- a second
+/// client (or, as here, the same client re-authenticating a second fd against the same
+/// device) presents the magic value back to prove it can read what the first `GET_MAGIC`
+/// call returned. Always succeeds for the same single-client-device reason described on
+/// [`DRM_IOCTL_GET_MAGIC`].
+pub const DRM_IOCTL_AUTH_MAGIC: u32 = 0x4004_6411;
+/// The one fixed, arbitrary, non-zero magic value [`DRM_IOCTL_GET_MAGIC`] hands back and
+/// [`DRM_IOCTL_AUTH_MAGIC`] unconditionally accepts -- see those constants' own doc
+/// comments for why a real per-client-random value has nothing to protect here.
+pub const DRM_AUTH_MAGIC_VALUE: u32 = 0xd12d_0001;
 /// `DRM_IOCTL_MODE_GETPROPERTY = DRM_IOWR(0xaa, struct drm_mode_get_property)`, `size=64`
 /// (`nr`/struct shape fetched live from the real kernel `drm.h`; size independently re-verified
 /// via a standalone `size_of::<DrmModeGetProperty>()` compile: two `u64`s, two `u32`s, a 32-byte
@@ -953,6 +979,35 @@ pub const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 0x2;
 /// included) require this capability to be present at all just to initialize, and `0` is legacy
 /// behavior no current driver actually exercises.
 pub const DRM_CAP_TIMESTAMP_MONOTONIC: u64 = 0x6;
+/// `DRM_CAP_PRIME` (`include/uapi/drm/drm.h`) -- queried via `DRM_IOCTL_GET_CAP` to ask
+/// whether this device supports PRIME dma-buf import/export at all. wlroots' DRM backend
+/// (`backend/drm/drm.c`'s `check_drm_features()`, reached via `labwc`, distinct from
+/// weston's own DRM backend which never queries this) treats `DRM_CAP_PRIME` reporting
+/// neither [`DRM_PRIME_CAP_IMPORT`] nor [`DRM_PRIME_CAP_EXPORT`] set as fatal -- it logs
+/// "PRIME import not supported" and aborts backend creation entirely, since wlroots'
+/// renderer abstraction always needs to be able to import a dma-buf-backed buffer object
+/// for zero-copy client buffer handling. The value itself is a bitmask of the two
+/// capability bits below, not a boolean.
+pub const DRM_CAP_PRIME: u64 = 0x5;
+/// `DRM_PRIME_CAP_IMPORT` bit within [`DRM_CAP_PRIME`]'s reported value -- this device's
+/// `DRM_IOCTL_GET_CAP` unconditionally reports this bit set (see `DrmGetCap`'s doc
+/// comment) purely to satisfy wlroots' capability gate at backend-creation time; no actual
+/// `DRM_IOCTL_PRIME_FD_TO_HANDLE` ioctl is implemented, since litebox never reaches a code
+/// path (client-side dma-buf import) that would exercise it.
+pub const DRM_PRIME_CAP_IMPORT: u64 = 0x1;
+/// `DRM_PRIME_CAP_EXPORT` bit within [`DRM_CAP_PRIME`]'s reported value -- same rationale
+/// as [`DRM_PRIME_CAP_IMPORT`]; no `DRM_IOCTL_PRIME_HANDLE_TO_FD` ioctl is implemented.
+pub const DRM_PRIME_CAP_EXPORT: u64 = 0x2;
+/// `DRM_CAP_CRTC_IN_VBLANK_EVENT` (`include/uapi/drm/drm.h`) -- asks whether this driver's
+/// `DRM_IOCTL_MODE_PAGE_FLIP`/vblank-wait completion events populate `crtc_id` in the
+/// `struct drm_event_vblank` payload (kernels/drivers predating this cap only fill it in for
+/// multi-CRTC atomic setups). wlroots' `backend/drm/drm.c` (`check_drm_features()`) queries
+/// this right after `DRM_CAP_PRIME` and logs "DRM_CRTC_IN_VBLANK_EVENT unsupported" -- purely
+/// informational in real wlroots when unsupported (it falls back to matching the flip by fd
+/// instead of `crtc_id`), but litebox's page-flip completion event (`drm.rs`'s `page_flip`)
+/// already always stamps `crtc_id` with this device's one real CRTC, so reporting `1` here is
+/// simply true, not a fabrication -- no legacy no-`crtc_id` code path exists to preserve.
+pub const DRM_CAP_CRTC_IN_VBLANK_EVENT: u64 = 0x12;
 
 /// VT (virtual terminal) ioctl request numbers, `include/uapi/linux/vt.h`. Unlike the DRM
 /// ioctls above, these are plain legacy-style constants (not `_IOWR`-encoded) -- verified live
@@ -1273,6 +1328,16 @@ pub struct DrmGetCap {
     pub value: u64,
 }
 
+/// `struct drm_auth` (`DRM_IOCTL_GET_MAGIC`/`DRM_IOCTL_AUTH_MAGIC`) -- a single `__u32`
+/// magic value, OUT on `GET_MAGIC`, IN on `AUTH_MAGIC`. See [`DRM_IOCTL_GET_MAGIC`]'s doc
+/// comment for why this device's implementation always hands back/accepts the same fixed
+/// [`DRM_AUTH_MAGIC_VALUE`] rather than tracking real per-client state.
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmAuth {
+    pub magic: u32,
+}
+
 /// `struct drm_set_client_cap` (`DRM_IOCTL_SET_CLIENT_CAP`). Identical field layout to
 /// [`DrmGetCap`] but write-only: `capability` is IN (a `DRM_CLIENT_CAP_*` constant, e.g.
 /// [`DRM_CLIENT_CAP_UNIVERSAL_PLANES`]), `value` is IN (the value being set; nothing is written
@@ -1545,6 +1610,10 @@ pub enum IoctlArg {
     DrmSetMaster,
     /// `DRM_IOCTL_DROP_MASTER`.
     DrmDropMaster,
+    /// `DRM_IOCTL_GET_MAGIC` -- see that constant's own doc comment.
+    DrmGetMagic(UserPtrMut<DrmAuth>),
+    /// `DRM_IOCTL_AUTH_MAGIC` -- see [`DRM_IOCTL_GET_MAGIC`]'s doc comment.
+    DrmAuthMagic(UserPtr<DrmAuth>),
     /// `DRM_IOCTL_MODE_OBJ_GETPROPERTIES` -- enumerate a KMS object's properties (two-call
     /// size-probe pattern for `props_ptr`/`prop_values_ptr`, same shape as `get_resources`'s
     /// object-ID arrays).
@@ -3747,6 +3816,8 @@ impl SyscallRequest {
                         }
                         DRM_IOCTL_SET_MASTER => IoctlArg::DrmSetMaster,
                         DRM_IOCTL_DROP_MASTER => IoctlArg::DrmDropMaster,
+                        DRM_IOCTL_GET_MAGIC => IoctlArg::DrmGetMagic(ctx.sys_req_ptr(2)),
+                        DRM_IOCTL_AUTH_MAGIC => IoctlArg::DrmAuthMagic(ctx.sys_req_ptr(2)),
                         DRM_IOCTL_MODE_OBJ_GETPROPERTIES => {
                             IoctlArg::DrmModeObjGetProperties(ctx.sys_req_ptr(2))
                         }

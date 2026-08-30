@@ -38,14 +38,16 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use litebox::mm::linux::PAGE_SIZE;
 use litebox::platform::RawConstPointer;
 use litebox_common_linux::{
-    DRM_CAP_DUMB_BUFFER, DRM_CAP_TIMESTAMP_MONOTONIC, DRM_CLIENT_CAP_UNIVERSAL_PLANES,
-    DRM_EVENT_FLIP_COMPLETE, DRM_MODE_CONNECTOR_VIRTUAL, DRM_MODE_ENCODER_VIRTUAL,
-    DRM_MODE_OBJECT_CONNECTOR, DRM_MODE_OBJECT_PLANE, DRM_MODE_PAGE_FLIP_EVENT, DRM_MODE_PROP_ENUM,
-    DrmEvent, DrmEventVblank, DrmGetCap, DrmModeCardRes, DrmModeCreateDumb, DrmModeCrtc,
-    DrmModeCrtcPageFlip, DrmModeDestroyDumb, DrmModeFbCmd2, DrmModeGetConnector, DrmModeGetEncoder,
-    DrmModeGetPlane, DrmModeGetPlaneRes, DrmModeGetProperty, DrmModeMapDumb, DrmModeModeinfo,
-    DrmModeObjGetProperties, DrmModePropertyEnum, DrmModeSetPlane, DrmSetClientCap, DrmVersion,
-    VIRTUAL_PLANE_TYPE_PROP_ID, VIRTUAL_PLANE_TYPE_VALUE, errno::Errno,
+    DRM_AUTH_MAGIC_VALUE, DRM_CAP_CRTC_IN_VBLANK_EVENT, DRM_CAP_DUMB_BUFFER, DRM_CAP_PRIME,
+    DRM_CAP_TIMESTAMP_MONOTONIC, DRM_CLIENT_CAP_UNIVERSAL_PLANES, DRM_EVENT_FLIP_COMPLETE,
+    DRM_MODE_CONNECTOR_VIRTUAL, DRM_MODE_ENCODER_VIRTUAL, DRM_MODE_OBJECT_CONNECTOR,
+    DRM_MODE_OBJECT_PLANE, DRM_MODE_PAGE_FLIP_EVENT, DRM_MODE_PROP_ENUM, DRM_PRIME_CAP_EXPORT,
+    DRM_PRIME_CAP_IMPORT, DrmAuth, DrmEvent, DrmEventVblank, DrmGetCap, DrmModeCardRes,
+    DrmModeCreateDumb, DrmModeCrtc, DrmModeCrtcPageFlip, DrmModeDestroyDumb, DrmModeFbCmd2,
+    DrmModeGetConnector, DrmModeGetEncoder, DrmModeGetPlane, DrmModeGetPlaneRes,
+    DrmModeGetProperty, DrmModeMapDumb, DrmModeModeinfo, DrmModeObjGetProperties,
+    DrmModePropertyEnum, DrmModeSetPlane, DrmSetClientCap, DrmVersion, VIRTUAL_PLANE_TYPE_PROP_ID,
+    VIRTUAL_PLANE_TYPE_VALUE, errno::Errno,
 };
 use zerocopy::IntoBytes;
 
@@ -491,9 +493,12 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
 
     /// `DRM_IOCTL_GET_CAP` -- query a single capability. This device genuinely supports dumb
     /// buffers (the only allocation path it has, see `create_dumb`), so `DRM_CAP_DUMB_BUFFER`
-    /// reports `1`. It also reports `DRM_CAP_TIMESTAMP_MONOTONIC` (see that constant's own doc
-    /// comment) -- real compositors including weston's DRM backend require this capability to be
-    /// present just to initialize at all. Any other capability (dumb-buffer preferred-depth,
+    /// reports `1`. It also reports `DRM_CAP_TIMESTAMP_MONOTONIC` and
+    /// `DRM_CAP_CRTC_IN_VBLANK_EVENT` (see those constants' own doc comments) -- real
+    /// compositors including weston's and wlroots' DRM backends require these capabilities to
+    /// be present just to initialize at all, and `DRM_CAP_PRIME` (see its own doc comment,
+    /// handled separately below since its value is a bitmask, not a boolean). Any other
+    /// capability (dumb-buffer preferred-depth,
     /// async page-flip, atomic modesetting, etc.) reports `0` (unsupported), the real kernel's own
     /// behavior for a capability a driver never registered, rather than fabricating support this
     /// device does not actually have.
@@ -501,8 +506,16 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         req.value = if req.capability == DRM_CAP_DUMB_BUFFER
             || req.capability == DRM_CAP_TIMESTAMP_MONOTONIC
+            || req.capability == DRM_CAP_CRTC_IN_VBLANK_EVENT
         {
             1
+        } else if req.capability == DRM_CAP_PRIME {
+            // wlroots' `check_drm_features()` treats neither import nor export bit set as
+            // fatal (see `DRM_CAP_PRIME`'s own doc comment) -- report both so backend
+            // creation proceeds, even though no actual PRIME fd-to-handle/handle-to-fd
+            // ioctl is implemented (litebox never reaches a code path that would exercise
+            // real dma-buf import/export on this virtual device).
+            DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT
         } else {
             0
         };
@@ -551,6 +564,31 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         Ok(0)
     }
 
+    /// `DRM_IOCTL_GET_MAGIC` -- see [`DRM_IOCTL_GET_MAGIC`]'s own doc comment for why this
+    /// device always hands back the same fixed magic value rather than a real per-client
+    /// random one.
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn get_magic(&self, ptr: UserPtrMut<DrmAuth>) -> Result<u32, Errno> {
+        ptr.write_at_offset::<Platform>(
+            0,
+            DrmAuth {
+                magic: DRM_AUTH_MAGIC_VALUE,
+            },
+        )
+        .ok_or(Errno::EFAULT)?;
+        Ok(0)
+    }
+
+    /// `DRM_IOCTL_AUTH_MAGIC` -- see [`DRM_IOCTL_GET_MAGIC`]'s doc comment. Any magic value
+    /// is accepted: this device has exactly one possible client, so there is no real
+    /// mismatched-magic case to reject (real DRM's `EINVAL` here signals "no client is
+    /// authenticated under that magic," which cannot happen when `GET_MAGIC` unconditionally
+    /// returns the one fixed value this device will ever hand out).
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn auth_magic(&self, _ptr: UserPtr<DrmAuth>) -> Result<u32, Errno> {
+        Ok(0)
+    }
+
     /// `DRM_IOCTL_MODE_OBJ_GETPROPERTIES` -- discovered missing via a real libdrm client
     /// (`smithay`'s `backend_drm`, `docs/wayland-drm-backend-probe/`) failing outright on this
     /// exact call immediately after `GETCONNECTOR` succeeded: unimplemented before this, every
@@ -575,7 +613,19 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         if req.obj_type == DRM_MODE_OBJECT_CONNECTOR && req.obj_id != VIRTUAL_CONNECTOR_ID {
             return Err(Errno::ENOENT);
         }
-        if req.obj_type == DRM_MODE_OBJECT_PLANE {
+        // `DRM_MODE_OBJECT_ANY` (`0`, real kernel `drm_mode.h` value) lets a caller query an
+        // object's properties without knowing/caring which KMS object type it is -- wlroots'
+        // `backend/drm/drm.c` (`check_drm_features()`/`scan_drm_connectors()`) issues a second
+        // `OBJ_GETPROPERTIES` pass against the plane it already discovered via `GETPLANE` using
+        // this wildcard type rather than repeating `DRM_MODE_OBJECT_PLANE`, confirmed live: it
+        // silently treats the resulting empty property set as "primary plane not found" and
+        // aborts backend creation with no specific log line (`backend/backend.c`'s generic
+        // "Failed to create DRM backend"), which is why matching only the exact typed variant
+        // above previously made backend creation fail silently even though `DRM_MODE_OBJECT_
+        // PLANE`-typed queries for the same `obj_id` succeeded correctly.
+        if req.obj_type == DRM_MODE_OBJECT_PLANE
+            || (req.obj_type == 0 && req.obj_id == VIRTUAL_PLANE_ID)
+        {
             if req.obj_id != VIRTUAL_PLANE_ID {
                 return Err(Errno::ENOENT);
             }

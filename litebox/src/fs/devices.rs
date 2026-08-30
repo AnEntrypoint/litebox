@@ -1047,6 +1047,19 @@ pub enum SysDrmFile {
     /// Symlink to the (synthetic) `drm` subsystem directory -- `libudev` reads this
     /// link's target basename to populate `udev_device_get_subsystem()`.
     Subsystem,
+    /// `<name>/device/uevent` -- distinct from [`SysDrmFile::Uevent`] (which lives at
+    /// `<name>/uevent`, one level up): real libdrm's `drmGetDevice2()` (via
+    /// `drm_platform_device_alloc`/`drm_device_get_bustype`) reads the *device's own*
+    /// uevent file (not the DRM node's) to parse `DRIVER=`/`OF_*` key=value lines that
+    /// identify which kernel driver bound to the physical device -- confirmed live, a
+    /// failed `openat` on this exact path (`fd=None`) immediately precedes
+    /// `types/wlr_drm.c:217]"drmGetDevice2 failed"` once the shallower `device`/
+    /// `device/drm`/`device/subsystem` paths above it already resolve. Only reachable via
+    /// [`SysDrmDirHandle::DeviceOf`] (never listed in [`SysDrmFile::ALL`], which is scoped
+    /// to the real `<name>/` directory's own leaf files) -- kept as a `SysDrmFile` variant
+    /// purely to reuse the existing `SysDrmFileHandle { device, file }` read/status
+    /// plumbing rather than inventing a parallel handle shape for one file.
+    DeviceUevent,
 }
 
 impl SysDrmFile {
@@ -1076,6 +1089,33 @@ const SYS_DRM_RENDERD128_DIR_NODE_INFO: NodeInfo = NodeInfo {
     rdev: None,
 };
 
+/// Node info for the synthetic `/sys/class/drm/card0/device` directory (see
+/// [`SysDrmDirHandle::DeviceOf`] doc comment for why this exists).
+const SYS_DRM_CARD0_DEVICE_DIR_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 28,
+    rdev: None,
+};
+/// Node info for the synthetic `/sys/class/drm/renderD128/device` directory.
+const SYS_DRM_RENDERD128_DEVICE_DIR_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 29,
+    rdev: None,
+};
+/// Node info for the synthetic `/sys/class/drm/card0/device/drm` directory (see
+/// [`SysDrmDirHandle::DeviceDrmOf`] doc comment for why this exists).
+const SYS_DRM_CARD0_DEVICE_DRM_DIR_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 30,
+    rdev: None,
+};
+/// Node info for the synthetic `/sys/class/drm/renderD128/device/drm` directory.
+const SYS_DRM_RENDERD128_DEVICE_DRM_DIR_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 31,
+    rdev: None,
+};
+
 impl DriDevice {
     /// The `MAJOR`/`MINOR`/`DEVNAME` values this device reports under
     /// `/sys/class/drm/<name>/`, reusing the exact same major/minor numbers already
@@ -1093,6 +1133,22 @@ impl DriDevice {
             DriDevice::RenderD128 => SYS_DRM_RENDERD128_DIR_NODE_INFO,
         }
     }
+
+    /// Node info for this device's synthetic `<name>/device` directory.
+    fn sys_device_dir_node_info(self) -> NodeInfo {
+        match self {
+            DriDevice::Card0 => SYS_DRM_CARD0_DEVICE_DIR_NODE_INFO,
+            DriDevice::RenderD128 => SYS_DRM_RENDERD128_DEVICE_DIR_NODE_INFO,
+        }
+    }
+
+    /// Node info for this device's synthetic `<name>/device/drm` directory.
+    fn sys_device_drm_dir_node_info(self) -> NodeInfo {
+        match self {
+            DriDevice::Card0 => SYS_DRM_CARD0_DEVICE_DRM_DIR_NODE_INFO,
+            DriDevice::RenderD128 => SYS_DRM_RENDERD128_DEVICE_DRM_DIR_NODE_INFO,
+        }
+    }
 }
 
 /// A [`super::backend::Backend`] exposing the minimal `/sys/class/drm/{card0,renderD128}/`
@@ -1105,6 +1161,21 @@ impl DriDevice {
 /// `super::composer::ComposerBuilder::build`) creates the `/sys` and `/sys/class` ancestor
 /// directories automatically, so this backend only needs to handle its own two-level
 /// subtree (`card0`/`renderD128`, each containing `uevent`/`dev`/`subsystem`).
+///
+/// Also serves a third, synthetic level beneath each device: `<name>/device/drm/<name>`.
+/// On real hardware, `/sys/class/drm/cardN/device` is a symlink to the card's parent PCI
+/// device directory, which itself has its own `drm/` subdirectory listing every DRM node
+/// sharing that PCI device (`cardN`, `renderDxxx`) -- i.e. the path loops back around to a
+/// sibling of where it started, via the device's real bus topology. `libdrm`'s
+/// `drmGetDeviceNameFromFd2()` (called by wlroots' DRM backend, used by `labwc` -- distinct
+/// from weston's own DRM backend, which never walks this deep) `stat`s exactly this
+/// `device/drm` sub-path while resolving a DRM fd back to its sysfs device name, and fails
+/// hard (`ENOENT` -> "Failed to create DRM backend") if it is missing. litebox's virtual
+/// DRM device has no real PCI parent to model, so `<name>/device` and `<name>/device/drm`
+/// are synthesized as self-referencing directories: `<name>/device/drm/card0` and
+/// `<name>/device/drm/renderD128` both resolve straight back to the real, pre-existing
+/// `/sys/class/drm/card0` and `/sys/class/drm/renderD128` directories this whole tree
+/// originates from (see [`SysDrmDirHandle::DeviceOf`]/[`SysDrmDirHandle::DeviceDrmOf`]).
 pub struct SysClassDrm<Platform>
 where
     Platform: RawSyncPrimitivesProvider + 'static,
@@ -1130,12 +1201,21 @@ where
     }
 }
 
-/// Directory handle: either the backend's mount root (`/sys/class/drm` itself) or inside
-/// one specific device's subdirectory (`/sys/class/drm/<name>`).
+/// Directory handle: the backend's mount root (`/sys/class/drm` itself), inside one
+/// specific device's subdirectory (`/sys/class/drm/<name>`), inside that device's
+/// synthetic `device` subdirectory (`/sys/class/drm/<name>/device`), or inside that
+/// synthetic subdirectory's own `drm` subdirectory (`/sys/class/drm/<name>/device/drm`) --
+/// see the doc comment on [`SysClassDrm`] for why the latter two exist and what real
+/// sysfs shape they emulate.
 #[derive(Debug, Clone, Copy)]
 pub enum SysDrmDirHandle {
     Root,
     Device(DriDevice),
+    /// `/sys/class/drm/<name>/device` -- the `DriDevice` is the device this synthetic
+    /// directory hangs off of (i.e. whose `device` component was walked), not a target.
+    DeviceOf(DriDevice),
+    /// `/sys/class/drm/<name>/device/drm` -- same `DriDevice` semantics as `DeviceOf`.
+    DeviceDrmOf(DriDevice),
 }
 
 /// Owned file handle; identifies which device's which sysfs attribute file backs this fd.
@@ -1203,9 +1283,10 @@ where
                         stop_reason: WalkStopReason::CompleteDirectory,
                     });
                 }
-                // Second component: must name one of this device's leaf files: stop here
-                // (a leaf file is never a directory), leaving the resolver/caller to
-                // resolve the final component itself (matching `TarRo`'s own convention).
+                // Second component: must name one of this device's leaf files (stop here,
+                // a leaf file is never a directory, leaving the resolver/caller to resolve
+                // the final component itself, matching `TarRo`'s own convention), OR name
+                // the synthetic `device` subdirectory, in which case walking continues.
                 if components.len() == 2 && SysDrmFile::from_name(components[1]).is_some() {
                     return Ok(WalkOutcome {
                         components: walked,
@@ -1213,6 +1294,31 @@ where
                             device,
                         )),
                         stop_reason: WalkStopReason::StoppedAtNonDirectory,
+                    });
+                }
+                if components[1] == "device" {
+                    let mut outcome = self.walk_directories(
+                        WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::DeviceOf(device)),
+                        &components[2..],
+                    )?;
+                    // Prepend BOTH components this arm itself consumed -- the
+                    // `card0`/`renderD128` component (`walked`, already built above) AND
+                    // the `device` component itself (the delegated call above only knows
+                    // about components past `device`, so it never counts `device` in its
+                    // own returned `components`). The composer's own walk-length invariant
+                    // requires the returned `components` count to match the total path
+                    // components consumed when `stop_reason` is `CompleteDirectory`
+                    // (`composer.rs` asserts `walked_len == prefix_len`), so undercounting
+                    // here would trip that assertion one level up.
+                    let mut components_out = walked;
+                    components_out.push(WalkedComponent {
+                        permissions: PermissionCheck::ByBackend,
+                    });
+                    components_out.append(&mut outcome.components);
+                    return Ok(WalkOutcome {
+                        components: components_out,
+                        last: outcome.last,
+                        stop_reason: outcome.stop_reason,
                     });
                 }
                 Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
@@ -1240,7 +1346,133 @@ where
                         stop_reason: WalkStopReason::StoppedAtNonDirectory,
                     });
                 }
+                if component == "device" {
+                    let mut outcome = self.walk_directories(
+                        WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::DeviceOf(device)),
+                        &components[1..],
+                    )?;
+                    // Count the `device` component itself -- see the identical comment in
+                    // the `Root` arm's `"device"` branch above for why this is required.
+                    let mut components_out = vec![WalkedComponent {
+                        permissions: PermissionCheck::ByBackend,
+                    }];
+                    components_out.append(&mut outcome.components);
+                    return Ok(WalkOutcome {
+                        components: components_out,
+                        last: outcome.last,
+                        stop_reason: outcome.stop_reason,
+                    });
+                }
                 Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
+            }
+            SysDrmDirHandle::DeviceOf(device) => {
+                // Inside the synthetic `<name>/device` directory: only `drm` exists here
+                // (see `SysClassDrm`'s doc comment for why), and walking into it continues
+                // one more synthetic level.
+                let Some(&component) = components.first() else {
+                    return Ok(WalkOutcome {
+                        components: vec![],
+                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::DeviceOf(
+                            device,
+                        )),
+                        stop_reason: WalkStopReason::CompleteDirectory,
+                    });
+                };
+                if component == "drm" {
+                    let walked = vec![WalkedComponent {
+                        permissions: PermissionCheck::ByBackend,
+                    }];
+                    if components.len() == 1 {
+                        return Ok(WalkOutcome {
+                            components: walked,
+                            last: WalkingDirHandle::from_typed::<Self>(
+                                SysDrmDirHandle::DeviceDrmOf(device),
+                            ),
+                            stop_reason: WalkStopReason::CompleteDirectory,
+                        });
+                    }
+                    let mut outcome = self.walk_directories(
+                        WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::DeviceDrmOf(
+                            device,
+                        )),
+                        &components[1..],
+                    )?;
+                    // Prepend the `drm` component this arm consumed -- same walk-length
+                    // invariant as the `Root`/`"device"` case above.
+                    let mut components_out = walked;
+                    components_out.append(&mut outcome.components);
+                    return Ok(WalkOutcome {
+                        components: components_out,
+                        last: outcome.last,
+                        stop_reason: outcome.stop_reason,
+                    });
+                }
+                // `<name>/device/subsystem` -- same rationale as `Device(_)`'s own
+                // `subsystem` leaf (see `read_link_at`'s doc comment): real wlroots
+                // (`types/wlr_drm.c`'s `drmGetDevice2()`, via libdrm's
+                // `drm_device_get_subsystem_type`) reads this symlink to classify the
+                // *device's* bus (not the DRM node's own class, which is what the
+                // shallower `<name>/subsystem` link resolves) -- confirmed live, a
+                // `readlinkat` on this exact path immediately precedes
+                // `types/wlr_drm.c:217]"drmGetDevice2 failed"` when unhandled. This is a
+                // leaf (non-directory) stop, not a further walkable directory.
+                if component == "subsystem" || component == "uevent" {
+                    return Ok(WalkOutcome {
+                        components: vec![],
+                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::DeviceOf(
+                            device,
+                        )),
+                        stop_reason: WalkStopReason::StoppedAtNonDirectory,
+                    });
+                }
+                Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
+            }
+            SysDrmDirHandle::DeviceDrmOf(device) => {
+                // Inside the synthetic `<name>/device/drm` directory: entries here are
+                // `card0`/`renderD128`, each resolving straight back to the real, existing
+                // `/sys/class/drm/<name>` directory (this is the self-referencing loop the
+                // real PCI-topology-based sysfs shape produces on real hardware -- see
+                // `SysClassDrm`'s doc comment).
+                let Some(&component) = components.first() else {
+                    return Ok(WalkOutcome {
+                        components: vec![],
+                        last: WalkingDirHandle::from_typed::<Self>(
+                            SysDrmDirHandle::DeviceDrmOf(device),
+                        ),
+                        stop_reason: WalkStopReason::CompleteDirectory,
+                    });
+                };
+                let Some(target) = DriDevice::from_name(component) else {
+                    return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
+                };
+                let walked = vec![WalkedComponent {
+                    permissions: PermissionCheck::ByBackend,
+                }];
+                if components.len() == 1 {
+                    return Ok(WalkOutcome {
+                        components: walked,
+                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(
+                            target,
+                        )),
+                        stop_reason: WalkStopReason::CompleteDirectory,
+                    });
+                }
+                // Beyond this point (e.g. `.../drm/card0/uevent`), delegate straight into
+                // the real `Device(target)` walk logic -- looping back is exactly the
+                // point, so no separate handling is needed past here. Same walk-length
+                // invariant as above: prepend the `card0`/`renderD128` component this arm
+                // consumed to whatever the delegated call reports.
+                let mut outcome = self.walk_directories(
+                    WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(target)),
+                    &components[1..],
+                )?;
+                let mut components_out = walked;
+                components_out.append(&mut outcome.components);
+                Ok(WalkOutcome {
+                    components: components_out,
+                    last: outcome.last,
+                    stop_reason: outcome.stop_reason,
+                })
             }
         }
     }
@@ -1266,11 +1498,22 @@ where
         flags: OFlags,
     ) -> Result<Permissioned<FileHandle>, OpenError> {
         let dir = dir.into_typed::<Self>();
-        let SysDrmDirHandle::Device(device) = dir else {
-            return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
+        // `device/drm` is a synthetic directory with no leaf files of its own (only
+        // further directory entries, handled by `walk_directories`/`list_dir_at`), so
+        // opening a plain file inside it is always ENOENT. `device` itself has exactly
+        // one real leaf file (`uevent`, see [`SysDrmFile::DeviceUevent`]'s doc comment) --
+        // `subsystem` is a symlink, opened via `read_link_at` instead, never through here.
+        let (device, file) = match dir {
+            SysDrmDirHandle::Device(device) => {
+                let file = SysDrmFile::from_name(name)
+                    .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+                (device, file)
+            }
+            SysDrmDirHandle::DeviceOf(device) if name == "uevent" => {
+                (device, SysDrmFile::DeviceUevent)
+            }
+            _ => return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory)),
         };
-        let file = SysDrmFile::from_name(name)
-            .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
 
         if flags.contains(OFlags::DIRECTORY) {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
@@ -1305,6 +1548,31 @@ where
                     ino_info: None,
                 })
                 .collect()),
+            SysDrmDirHandle::DeviceOf(device) => Ok(vec![
+                DirEntry {
+                    name: String::from("drm"),
+                    file_type: FileType::Directory,
+                    ino_info: Some(device.sys_device_drm_dir_node_info()),
+                },
+                DirEntry {
+                    name: String::from("subsystem"),
+                    file_type: FileType::Symlink,
+                    ino_info: None,
+                },
+                DirEntry {
+                    name: String::from("uevent"),
+                    file_type: FileType::RegularFile,
+                    ino_info: None,
+                },
+            ]),
+            SysDrmDirHandle::DeviceDrmOf(_) => Ok(DriDevice::ALL
+                .iter()
+                .map(|(n, d)| DirEntry {
+                    name: String::from(*n),
+                    file_type: FileType::Directory,
+                    ino_info: Some(d.sys_dir_node_info()),
+                })
+                .collect()),
         }
     }
 
@@ -1314,20 +1582,39 @@ where
         name: &str,
     ) -> Result<Option<String>, OpenError> {
         let dir = dir.into_typed::<Self>();
-        let SysDrmDirHandle::Device(_) = dir else {
-            return Ok(None);
-        };
-        let Some(SysDrmFile::Subsystem) = SysDrmFile::from_name(name) else {
-            return Ok(None);
-        };
-        // Real sysfs `subsystem` links are relative, e.g. `../../../../class/drm`,
-        // resolving back up to the `drm` class directory -- `libudev` only reads the
-        // link target's basename (`drm`) to populate `udev_device_get_subsystem()`, so
-        // the exact number of `../` hops does not matter as long as the final basename
-        // is right (litebox's `/sys/class/drm` mount is itself a virtual directory with
-        // no real sibling classes, so this link is illustrative rather than
-        // independently walkable -- matching real udev's own basename-only usage).
-        Ok(Some(String::from("../../../class/drm")))
+        match dir {
+            SysDrmDirHandle::Device(_) => {
+                let Some(SysDrmFile::Subsystem) = SysDrmFile::from_name(name) else {
+                    return Ok(None);
+                };
+                // Real sysfs `subsystem` links are relative, e.g. `../../../../class/drm`,
+                // resolving back up to the `drm` class directory -- `libudev` only reads the
+                // link target's basename (`drm`) to populate `udev_device_get_subsystem()`, so
+                // the exact number of `../` hops does not matter as long as the final basename
+                // is right (litebox's `/sys/class/drm` mount is itself a virtual directory with
+                // no real sibling classes, so this link is illustrative rather than
+                // independently walkable -- matching real udev's own basename-only usage).
+                Ok(Some(String::from("../../../class/drm")))
+            }
+            SysDrmDirHandle::DeviceOf(_) => {
+                if name != "subsystem" {
+                    return Ok(None);
+                }
+                // `<name>/device/subsystem` -- real sysfs points this at the device's real
+                // bus subsystem directory (`../../../bus/pci` for a real PCI GPU). litebox's
+                // virtual DRM device has no real bus parent to model (see `SysClassDrm`'s
+                // doc comment on the synthetic `device` subtree), so this resolves to
+                // `platform` -- the real kernel's own choice for a DRM device with no
+                // discoverable discrete bus (e.g. `simpledrm`/`vkms`), and the value
+                // `drmGetDevice2()` (via libdrm's `drm_device_get_subsystem_type`) most
+                // readily recognizes as "not a proper PCI/USB/platform device to introspect
+                // further" without treating the lookup itself as an error -- confirmed live,
+                // this is the only remaining unresolved path in wlroots' render-node open
+                // sequence for `226:128` once `device`/`device/drm` themselves resolve.
+                Ok(Some(String::from("../../../bus/platform")))
+            }
+            SysDrmDirHandle::Root | SysDrmDirHandle::DeviceDrmOf(_) => Ok(None),
+        }
     }
 
     fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
@@ -1339,6 +1626,13 @@ where
             }
             SysDrmFile::Dev => format!("{major}:{minor}\n"),
             SysDrmFile::Subsystem => return Err(ReadError::NotForReading),
+            // `<name>/device/uevent` -- real platform-bus devices with no removable-media/
+            // module-alias properties worth reporting typically carry just `DRIVER=`
+            // (`drm_device_get_bustype()` only needs the file to exist and be readable; it
+            // does not require any specific key to be present to classify the device as
+            // platform-bus rather than PCI/USB, since bus classification already happened
+            // via the `subsystem` symlink read immediately before this).
+            SysDrmFile::DeviceUevent => String::from("DRIVER=litebox\n"),
         };
         let bytes = content.as_bytes();
         let start = offset.min(bytes.len());
@@ -1369,6 +1663,7 @@ where
             }
             SysDrmFile::Dev => format!("{major}:{minor}\n").len(),
             SysDrmFile::Subsystem => 0,
+            SysDrmFile::DeviceUevent => "DRIVER=litebox\n".len(),
         };
         Ok(FileStatus {
             // Real sysfs attribute files report as regular files (`lstat` on the
@@ -1387,6 +1682,8 @@ where
                     (DriDevice::RenderD128, SysDrmFile::Uevent) => 18,
                     (DriDevice::RenderD128, SysDrmFile::Dev) => 19,
                     (DriDevice::RenderD128, SysDrmFile::Subsystem) => 20,
+                    (DriDevice::Card0, SysDrmFile::DeviceUevent) => 33,
+                    (DriDevice::RenderD128, SysDrmFile::DeviceUevent) => 34,
                 },
                 rdev: None,
             },
@@ -1401,6 +1698,8 @@ where
         let node_info = match h {
             SysDrmDirHandle::Root => self.root_inode.clone(),
             SysDrmDirHandle::Device(device) => device.sys_dir_node_info(),
+            SysDrmDirHandle::DeviceOf(device) => device.sys_device_dir_node_info(),
+            SysDrmDirHandle::DeviceDrmOf(device) => device.sys_device_drm_dir_node_info(),
         };
         Ok(FileStatus {
             file_type: FileType::Directory,
@@ -2097,12 +2396,26 @@ enum SysDevCharEntry {
     /// backend works fine against the same virtual card with this entry absent; labwc's does
     /// not).
     Drm,
+    /// `226:128` -- the virtual DRM render node, target `../../class/drm/renderD128`. Same
+    /// rationale as [`SysDevCharEntry::Drm`], but reached from a *different* wlroots code
+    /// path: after the primary node's DRM backend is up, wlroots' `wlr_drm_backend` (via
+    /// `types/wlr_drm.c`'s `drmGetDevice2()`) opens the render node to build a GBM/EGL
+    /// renderer for client buffer allocation, and that call needs `226:128`'s own reverse
+    /// lookup for the identical reason `226:0`'s was needed for the primary node -- confirmed
+    /// live, `sys_stat` on `/sys/dev/char/226:128/device/drm` returning `ENOENT` immediately
+    /// precedes `types/wlr_drm.c:217]"drmGetDevice2 failed"` in a real repro capture, with the
+    /// shallower `/sys/dev/char/226:128` symlink itself already resolvable once this entry
+    /// exists (the deeper `device/drm` subtree it resolves into was already served for both
+    /// `card0` and `renderD128` by [`SysClassDrm`] -- only this reverse-lookup entry was
+    /// missing).
+    DrmRender,
 }
 
 impl SysDevCharEntry {
     const ALL: &'static [(&'static str, SysDevCharEntry)] = &[
         ("13:64", SysDevCharEntry::Input),
         ("226:0", SysDevCharEntry::Drm),
+        ("226:128", SysDevCharEntry::DrmRender),
     ];
 
     fn from_name(name: &str) -> Option<Self> {
@@ -2113,6 +2426,7 @@ impl SysDevCharEntry {
         match self {
             SysDevCharEntry::Input => "../../class/input/event0",
             SysDevCharEntry::Drm => "../../class/drm/card0",
+            SysDevCharEntry::DrmRender => "../../class/drm/renderD128",
         }
     }
 }
@@ -2128,6 +2442,13 @@ const SYS_DEV_CHAR_INPUT_NODE_INFO: NodeInfo = NodeInfo {
 const SYS_DEV_CHAR_DRM_NODE_INFO: NodeInfo = NodeInfo {
     dev: 5,
     ino: 27,
+    rdev: None,
+};
+
+/// Node info for the `226:128` entry.
+const SYS_DEV_CHAR_DRM_RENDER_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 32,
     rdev: None,
 };
 
@@ -2309,6 +2630,7 @@ where
             node_info: match h.entry {
                 SysDevCharEntry::Input => SYS_DEV_CHAR_INPUT_NODE_INFO,
                 SysDevCharEntry::Drm => SYS_DEV_CHAR_DRM_NODE_INFO,
+                SysDevCharEntry::DrmRender => SYS_DEV_CHAR_DRM_RENDER_NODE_INFO,
             },
             blksize: 0x1000,
             atime: Timestamp::default(),
