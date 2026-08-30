@@ -1,43 +1,4 @@
-# AGENTS.md — handoff note (2026-08-30, sub-session 13)
-
-## Sub-session 13: exact crash site root-caused, NOT fixed (no unsafe fix attempted)
-
-Fresh `LITEBOX_DIAG_FATALDUMP=1` + `LITEBOX_VEH_TRACE=1` capture using the exact repro below
-pinpointed the precise instruction sequence causing the dbus-daemon fork-child SIGSEGV that
-survives the `rcx` fix (commit `8ec32c4b`):
-
-- `rip=0x92bcfec` (`push r12`): `rdi` already holds a stale (untranslated, source-range) value —
-  never healed by any existing case before this point.
-- `rip=0x92bcff2`: `mov rbp, rdi` — a bare register-to-register move with **no memory operand**,
-  copying the stale value into `rbp` too. Confirmed via a temporary diagnostic `eprintln!` dumping
-  the decoded mnemonic/operands at this exact `rip` (`Mov op0=RBP op1=RDI`, no `OpKind::Memory` on
-  either operand). This is structurally identical to the reverted "(1b)" register-to-register-mov
-  propagation case.
-- `rip=0x92bcff5`: `add rdi, imm8to64` — offsets `rdi` further. `LastLoad`-chain-shaped, but no
-  chain exists for `rdi` because its origin was a register `mov`, not `mov reg,[mem]`, so
-  `advance_last_load` never started tracking it.
-- `rip=0x92bcffa`: `call [rip+0x92ddfb8]` (GOT/PLT-slot indirect call, unrelated to `rdi`), landing
-  at `rip=0x8b7aa88`, which **is** in-source — case (1) fires, correctly translates `rip` and `rbp`
-  (`rbp: 0x8bc29e0 -> 0x9c029e0`).
-- The very next instruction at the *translated* `rip` dereferences `[rdi]` — `rdi` was never
-  touched by case (1) (which only heals `rip`/`rbp`) — and faults:
-  `[veh] code=c0000005 addr=0x8bc2a38 rip=0x9bbaa88 ... rdi=0x8bc2a38`, immediately followed by
-  `fatal signal: terminating task signal=Signal(11) pid=10 tid=10`.
-
-**Why no fix was attempted this session**: this is the exact target shape of the already-reverted
-"(1b)" patch (preserved at `%TEMP%\claude\...\scratchpad\xfce-repro-logs\
-.gm-scratch-fork-verify-fix.patch`), independently re-tested in sub-session 11 and found to cause
-an EARLIER, WORSE host-level `STATUS_ACCESS_VIOLATION` (exit 139 at ~1.3s) when applied broadly.
-This gap has now caused real regressions via TWO different broad-translate attempts ((1b) and the
-six-syscall-ABI-register attempt) — a third speculative variant without strong independent safety
-evidence would repeat the same mistake pattern. A genuinely safe fix likely needs either (a)
-extending case (1)'s heal to trace the register dependency graph across the few instructions
-between a `mov`-from-stale and the eventual `call`, rather than a blanket per-trap sweep, or (b)
-widening the PROACTIVE `fixup_stale_stack_pointers` scan (in `litebox_shim_linux`) to catch
-register-to-register-mov-derived staleness before the child ever resumes. Both are substantial
-follow-up investigations. Tracked in gm mutable `mut-1788106550382`.
-
-## Prior handoff (2026-08-30, sub-session 12)
+# AGENTS.md — handoff note (2026-08-30, sub-session 14)
 
 ## Active standing goal (session-scoped Stop hook on the originating machine)
 
@@ -47,155 +8,77 @@ This is being worked via `/goal` on litebox-main, gm session_id `litebox-xfce-1`
 chronological detail of every prior sub-session's investigation, ruled-out hypotheses, and
 fixes lives in gm's memory store (`recall`/`codesearch` against this project) as resolved
 mutables — do not re-derive from scratch; query the recall store first (e.g. search
-"wlroots shm keymap crash", "DRM PRIME handle", "fork_verify stale pointer", "mallocng
-syscall_callback").
+"fork_verify stale pointer rcx rdi", "DRM PRIME handle", "wlroots shm keymap",
+"D-Bus session bus export", "proactive fixup_stale_stack_pointers").
 
-## Current state (as of sub-session 10)
+## Current state (as of sub-session 14)
 
-**Fixed and pushed, verified live, in order** (all real litebox emulation gaps — every one of
-this chain that initially looked like it might be an "upstream" bug turned out, on closer
-investigation, to be litebox's own bug; keep defaulting to that hypothesis for anything new):
-1. mallocng `.meta=0` crash (`syscall_callback` stack-switch-before-pushfq) — commit `b4a40e3d`.
-2. libinput evdev device rejection, missing `fallocate`, a `migrate_file_up` panic —
-   commit `5458d74c`. weston alone stable 150+s.
-3. Full DRM sysfs subtree (`/sys/dev/char/226:0`, `device/drm/{card0,renderD128}`,
-   `DRM_CAP_CRTC_IN_VBLANK_EVENT`/`PRIME`, `DRM_IOCTL_GET_MAGIC`/`AUTH_MAGIC`) — commits
-   `1f51bf4a`, `024d704f`. labwc's wlroots DRM backend creates successfully end-to-end.
-4. `fchmod`-on-unlinked-fd (re-resolved path instead of operating on the fd) and
-   `mmap(MAP_SHARED)` not recognizing wlroots' hand-rolled unlink-based shm files —
-   commit `61c97e9f`. Fixed the keymap-shm SIGSEGV that looked like an upstream wlroots
-   NULL-deref bug but wasn't.
-5. `DRM_IOCTL_PRIME_HANDLE_TO_FD`/`FD_TO_HANDLE`/`GEM_CLOSE` (all three completely
-   unimplemented) — commit `17312da4`. Fixed a SIGABRT during swapchain buffer allocation.
-   **This got `xfsettingsd` to genuinely `sys_execve` for the first time in the whole
-   investigation.**
-6. fork_verify syscall-trampoline-boundary stale `rcx` (return-address register) —
-   commit `8ec32c4b`. See "(1c) RESOLVED" below.
+**Fixed and pushed, verified live, in order** (every one of this chain that initially looked
+like it might be an "upstream" bug turned out to be litebox's own gap — keep defaulting to
+that hypothesis for anything new):
+1. mallocng `.meta=0` crash — commit `b4a40e3d`.
+2. libinput evdev rejection, missing `fallocate`, `migrate_file_up` panic — commit `5458d74c`.
+3. Full DRM sysfs subtree, `DRM_CAP_*`, `DRM_IOCTL_GET_MAGIC`/`AUTH_MAGIC` — commits `1f51bf4a`,
+   `024d704f`. labwc's wlroots DRM backend creates successfully.
+4. `fchmod`-on-unlinked-fd + `mmap(MAP_SHARED)` on unlink-based shm files — commit `61c97e9f`.
+5. `DRM_IOCTL_PRIME_HANDLE_TO_FD`/`FD_TO_HANDLE`/`GEM_CLOSE` — commit `17312da4`. Got
+   `xfsettingsd` to genuinely `sys_execve` for the first time.
+6. fork_verify: stale `rcx` (return address) at the syscall-trampoline disarm boundary —
+   commit `8ec32c4b`.
+7. fork_verify: stale `rdi` (first-arg register) at the same case-(1) indirect-call-landing
+   boundary — commit `c3182da7`. Narrowed the remaining dbus-daemon fork-child crash further.
 
-**(a) D-Bus machine-id — trivial, NOT a litebox bug, just a repro-command gap.**
-`xfsettingsd` needs `/var/lib/dbus/machine-id` (real D-Bus setup requirement, not litebox's
-concern) and a running session bus. Fix: add to the launch shell command (see repro below)
-`mkdir -p /var/lib/dbus; dbus-uuidgen --ensure=/var/lib/dbus/machine-id; dbus-daemon --session
---fork --print-address`. Confirmed this makes D-Bus start correctly and `xfsettingsd`
-execve successfully.
+**Non-code fix, but real and necessary**: the repro command must use `dbus-launch --sh-syntax
+--exit-with-session` + `eval` + explicit `export DBUS_SESSION_BUS_ADDRESS` — `dbus-daemon
+--print-address` alone discards the address, causing every D-Bus client to autolaunch its own
+session bus (compounding fork_verify crash exposure). See repro command below.
 
-**(1c) RESOLVED this session (sub-session 11), commit `8ec32c4b`.** Root cause: the disarm
-check at `on_single_step`'s `!relocations.is_in_destination(rip)` (fires once `rip` has moved
-off the guest's `call syscall_callback` and onto `syscall_callback`'s own host address) is one
-instruction too late to catch a stale value in `rcx` — `syscall_callback`'s own doc comment
-("the register context is the guest context with the return address in rcx") establishes that
-`rcx` at that exact disarm point is the guest's real return address, pushed straight through as
-`pt_regs->ip` (`push rcx // pt_regs->ip` in the naked-asm trampoline, `lib.rs` ~line 1920) and
-later resumed into `rip` verbatim with no further translation anywhere else in the syscall
-pipeline. This is exactly case (1)'s class of value (a live code-pointer-shaped register,
-deterministically translatable via the same relocation map already proven correct for every
-other register at `fork()` time) reached one instruction later than case (1) itself checks.
+**Current blocker**: `xfsettingsd` genuinely attempts its D-Bus connection but still fails
+(`Could not connect: Connection refused`) because `dbus-daemon`'s own daemonizing self-fork
+(and other, unrelated forked threads, e.g. `dbus-launch`'s own children) still occasionally
+SIGSEGV at guest level (litebox handles these cleanly — no host crash) via the SAME bug class
+as fixes #6/#7 above: a stale pointer copied between registers by a plain `mov`-shaped
+instruction with no memory operand, which none of fork_verify's existing per-trap cases cover
+generically. Fixes #6/#7 each closed ONE specific register at ONE specific transition point
+(the case-(1) indirect-call-landing trap); fresh forensics after landing #7 show a DIFFERENT
+thread hitting the SAME general pattern via a DIFFERENT register pairing (`rbp`/`rcx` both
+holding a stale value, likely from an unrelated `mov rbp, rcx`-shaped instruction elsewhere).
 
-Fix: at the disarm point, translate `rcx` using the identical `is_in_source`-gated
-`relocations.translate()` pattern case (1) already uses for `rip`/`rbp` — narrow, total, and
-proven safe by the SAME reasoning, never a guess.
+**Recommended next approach — SUCCESSIVE per-register/per-site patches have diminishing
+returns; there is likely an unbounded number of distinct sites.** The more scalable fix is
+almost certainly PROACTIVE, not reactive: strengthen `fixup_stale_stack_pointers` (in
+`litebox_shim_linux`, runs ONCE at `fork()`-resume time, before the child executes anything)
+to catch register-to-register-mov-derived staleness patterns before the child ever resumes,
+rather than continuing to add one more reactive per-trap case to `fork_verify.rs` for each
+newly-discovered site. A genuinely different investigation angle than sub-sessions 10-14's
+incremental case-by-case approach is needed here — read `fixup_stale_stack_pointers`'s current
+implementation and doc comments first to understand what it already proactively scans and
+why, before deciding how to extend it.
 
-**Both (1b) [register-to-register mov propagation] and the ORIGINAL six-ABI-register (1c)
-attempt from sub-session 10 were RE-TESTED this session and BOTH CONFIRMED UNSAFE — do not
-reintroduce either:**
+**Also landed, safe and independently useful**: `mesa-dri-gallium` (software rasterizer)
+installed into `.wfgy/xfce-build/xfce-layer17.tar` (a full resumable overlay on
+`xfce-layer16.tar`). Not the cause of any current crash, but a real correctness gap fixed for
+whenever GL/DRI-dependent paths are exercised. Use `xfce-layer17.tar` as `--resume-from`.
 
-- **(1b) alone crashes exit 139 at ~1.3s** (live-verified this session, contradicting the
-  sub-session-10 claim it "genuinely eliminates the ORIGINAL guest-level SIGSEGV crash class" —
-  that claim was evidently based on a shorter/different test window; a fresh, careful 60s
-  isolated test of (1b) alone this session showed the mallocng `.meta=0`-style crash class
-  recurring on a NEW thread, far earlier than the sub-session-10 report of "44s+"). The patch
-  is still preserved at
-  `%TEMP%\claude\...\scratchpad\xfce-repro-logs\.gm-scratch-fork-verify-fix.patch` for
-  reference/future re-investigation, but it must NOT be reapplied without first explaining why
-  this session's live re-test contradicts the prior session's claim.
-- **The six-ABI-register (1c) attempt is unsafe for the reason sub-session 10 already
-  suspected**: syscall arguments (rdi/rsi/rdx/r10/r8/r9) are guest-supplied values of
-  genuinely unknown shape (fds, flags, small integers, real pointers) with no basis for
-  assuming pointer-ness — translating them unconditionally is exactly the "unbounded
-  guessing" hazard this module's own top-level doc comment warns about. `rcx` is
-  categorically different and is the ONLY register this trampoline's calling convention
-  guarantees is a code pointer at this point.
-
-**Verification this session**: `rcx`-only fix, isolated (no (1b)), ran the full repro command
-clean for a 150s+ window (`timeout 160`, exit code 124 = timeout, i.e. no crash) with
-`LITEBOX_LOG=debug` — zero host-level crashes, zero `STATUS_ACCESS_VIOLATION`, zero
-`fork_verify` stale-`rcx` triggers even needed in this particular run (the fix is a no-op
-safety net for this repro's actual dbus-daemon fork pattern, which apparently doesn't hit a
-stale-`rcx` case, but is exercised and safe). `cargo test -p litebox_shim_linux --lib --skip
-test_mremap`: 177 passed, 0 failed. `cargo test -p litebox_platform_windows_userland`: 4
-passed, 0 failed.
-
-**NEW frontier, NOT part of this session's scope, tracked in gm PRD as
-`xfsettingsd-exits-1-and-panel-desktop-never-launch`**: with the fork_verify gap now closed,
-the remaining blocker to the full completion criterion is that `xfsettingsd` still dies
-(guest-level `Signal(11)`, handled cleanly, no host crash) before labwc's session shell ever
-reaches `xfce4-panel &`/`xfdesktop &` in `xfsettingsd & xfce4-panel & xfdesktop &` — confirmed
-live this session: only ONE `sys_execve` for `xfsettingsd` ever appears in a 150s log, zero for
-`xfce4-panel`/`xfdesktop`. Root cause not yet investigated this session — likely still the D-Bus
-session-bus race (xfsettingsd's dbus-daemon child forks repeatedly, "Could not connect:
-Connection refused" appears in stdout), a separate gap from the fork_verify platform bug.
-
-**Also fixed this session, safe and independently useful (NOT yet committed — see below)**:
-`mesa-dri-gallium` (provides `swrast_dri.so`, the software rasterizer) was missing from the
-rootfs (`/usr/lib/dri/` existed but was empty) — installed via `apk add --no-cache
-mesa-dri-gallium` inside a guest run with `--export-writable-layer`, producing
-`.wfgy/xfce-build/xfce-layer17.tar` (a full resumable overlay on top of `xfce-layer16.tar`).
-Confirmed NOT the cause of any currently-blocking crash (the crash reproduces identically
-with or without it, since `WLR_RENDERER=pixman` never touches DRI/GL), but a real
-correctness gap worth having fixed for whenever GL/DRI-dependent rendering paths are
-eventually exercised. **Use `xfce-layer17.tar` as the `--resume-from` target going forward**
-(same shape as `xfce-layer16.tar`, just with real mesa DRI drivers present).
-
-## Repro command (current known-good, sub-session 12: correct D-Bus session-bus export)
-
-**IMPORTANT correction from sub-session 12**: the previously-documented
-`dbus-daemon --session --fork --print-address` approach is WRONG — it prints the bus address
-to stdout and discards it; nothing exports `DBUS_SESSION_BUS_ADDRESS`, so `xfsettingsd`/labwc
-never see the already-running bus and instead each independently try to autolaunch their OWN
-session bus via `dbus-launch`, spawning MORE fork children that also hit the fork_verify gap
-below — compounding the problem. Use `dbus-launch --sh-syntax --exit-with-session` with `eval`
-instead, which correctly sets and exports the address in the current shell:
+## Repro command (current known-good)
 
 ```
 target/release/litebox_runner_linux_on_windows_userland.exe --initial-files .wfgy/xfce-build/alpine-pinned2.tar --resume-from .wfgy/xfce-build/xfce-layer17.tar -- /bin/sh -c "mkdir -p /run/user/1000 /dev/shm /var/lib/dbus; chmod 700 /run/user/1000; chmod 1777 /dev/shm; export XDG_RUNTIME_DIR=/run/user/1000; export XKB_CONFIG_ROOT=/usr/share/X11/xkb; export WLR_RENDERER=pixman; dbus-uuidgen --ensure=/var/lib/dbus/machine-id 2>&1 || true; eval \$(dbus-launch --sh-syntax --exit-with-session) 2>&1; export DBUS_SESSION_BUS_ADDRESS; seatd -l debug & for i in 1 2 3 4 5 6 7 8 9 10; do [ -S /run/seatd.sock ] && break; sleep 1; done; labwc -s \"xfsettingsd & xfce4-panel & xfdesktop &\""
 ```
 with `LITEBOX_LOG=debug` (add `LITEBOX_DIAG_FATALDUMP=1` for crash register/instruction-byte
 capture), `MSYS_NO_PATHCONV=1` in Git Bash. Rebuild
-`cargo build --locked --release -p litebox_runner_linux_on_windows_userland` first. When
-grepping the resulting log for specific `tid=`/`pid=` values, strip ANSI color codes first
-(`sed 's/\x1b\[[0-9;]*m//g' logfile > clean.log`) — plain grep silently misses matches
-embedded in colored lines otherwise (confirmed this session). Regression suite:
-`cargo test -p litebox_shim_linux --lib -- --skip test_mremap` (177/177 pass as of last
-commit) and `cargo test -p litebox_platform_windows_userland` (4/4 pass).
-
-## Current blocker (sub-session 12): fork_verify gap NARROWED but not fully closed
-
-With the corrected D-Bus repro above, `xfsettingsd` genuinely tries to connect over the
-properly-exported bus, but still fails (`Could not connect: Connection refused`) because
-`dbus-daemon`'s own daemonizing fork (the real daemon process's `--fork` self-detach, not a
-per-connection worker) still SIGSEGVs at guest level after a DENSE burst of `fork_verify`
-"stale pointer, translating" WARN lines that all otherwise succeed — the already-landed `rcx`
-fix (commit `8ec32c4b`) IS helping (many more pointers get healed than before), but at least
-one case still slips through. This is a NARROWER instance of the exact same bug class fix
-commit `8ec32c4b` already fixed one instance of — not a new, unrelated bug. Leading suspect
-(not yet safely confirmed): the register-to-register-mov-propagation case (the reverted
-"(1b)" patch from sub-session 10, re-tested and found unsafe in isolation by sub-session 11)
-may still be the real remaining gap and need a genuinely safe reformulation neither prior
-attempt found — full detail in gm mutable `dbus-daemon-fork-child-still-sigsegv-after-rcx-fix`.
-**Read `litebox_platform_windows_userland/src/fork_verify.rs`'s FULL module doc comment before
-attempting anything here — this is delicate, high-risk platform code with a real history of
-well-intentioned fixes causing worse regressions (host-level process crashes instead of
-guest-level ones). Test every change in isolation, never batch.**
+`cargo build --locked --release -p litebox_runner_linux_on_windows_userland` first. Strip ANSI
+color codes before grepping for `tid=`/`pid=` (`sed 's/\x1b\[[0-9;]*m//g' logfile > clean.log`)
+or plain grep silently misses matches. Regression suite:
+`cargo test -p litebox_shim_linux --lib -- --skip test_mremap` (177/177) and
+`cargo test -p litebox_platform_windows_userland` (4/4).
 
 ## Completion criterion (unchanged, NOT YET MET)
 
 labwc's own `-s "xfsettingsd & xfce4-panel & xfdesktop &"` session targets launch (real
 `sys_execve` log lines) and survive a 90-150+ second window with no `fatal signal:`/
 `sys_exit_group` (Signal) in a `LITEBOX_LOG=debug` capture — log-based evidence only, never
-`busybox kill -0` (confirmed unreliable in this rootfs). As of sub-session 12, `xfsettingsd`
-genuinely `sys_execve`'s and attempts a real D-Bus connection (closer than ever) but still
-fails to connect because the D-Bus daemon it depends on keeps crashing via the fork_verify
-gap above, before `xfce4-panel`/`xfdesktop` ever launch.
+`busybox kill -0` (confirmed unreliable in this rootfs).
 
 ## Hard constraints (non-negotiable, apply on any machine)
 
@@ -211,21 +94,22 @@ gap above, before `xfce4-panel`/`xfdesktop` ever launch.
   invent a fix, a passing test, or a "confirmed running" claim. Report honest negative results.
 - `busybox kill -0 $PID` is confirmed unreliable in this rootfs — use log-based liveness
   evidence instead.
-- **Push safety**: stage ONLY the specific files you changed (never `git add -A`/`.`) — a prior
-  sub-session's push hung badly after accidentally staging a 254MB scratch tar and a full
-  `target-myfork/` build-cache tree. `.gitignore` already covers `target-myfork/`,
-  `alpine-fresh-test.tar`, `.agentplug/`, `.wfgyxfce-*.ps1`.
-- **fork_verify caution**: this is deep, carefully-reasoned platform-layer code with a real
-  documented history of a previously-rejected overly-broad fix attempt (see the module's own
-  doc comments on case (1)). A wrong fix here can turn a recoverable guest-level crash into a
-  host-level process crash — strictly worse. Read the FULL module doc comment before
-  attempting any change, and always test in isolation before combining fixes.
+- **Push safety**: stage ONLY the specific files you changed (never `git add -A`/`.`).
+  `.gitignore` already covers `target-myfork/`, `alpine-fresh-test.tar`, `.agentplug/`,
+  `.wfgyxfce-*.ps1`.
+- **fork_verify caution**: deep, carefully-reasoned platform-layer code. A broad/blanket fix
+  (e.g. translating every register-to-register mov unconditionally) has been tried twice and
+  found unsafe both times (trades a recoverable guest crash for a worse host-level process
+  crash, or crashes even earlier). Every safe fix landed so far (`rcx`, `rdi`) was narrow: one
+  specific, well-understood register, at one specific, well-understood transition point, using
+  the same proven `is_in_source`+`translate()` pattern case (1) already established. Read the
+  FULL module doc comment before attempting anything; test every change in isolation.
 
 ## Rootfs/artifact locations
 
-- `.wfgy/xfce-build/xfce-layer17.tar` — current furthest-progressed rootfs (layer16 + real
-  mesa-dri-gallium installed). Use this as `--resume-from` going forward.
-- `.wfgy/xfce-build/xfce-layer16.tar` — prior layer, still has real `usr/bin/labwc`, no mesa DRI.
-- `.wfgy/xfce-build/alpine-pinned2.tar` — base tar, always paired with a layer-N overlay via `--resume-from`.
-- Large scratch artifacts in the working tree (`target-myfork/`, `alpine-fresh-test.tar`,
-  `.agentplug/`) are local build/test byproducts, gitignored, safe to ignore or regenerate.
+- `.wfgy/xfce-build/xfce-layer17.tar` — current furthest-progressed rootfs (layer16 + mesa DRI).
+  Use as `--resume-from`.
+- `.wfgy/xfce-build/xfce-layer16.tar` — prior layer, has real `usr/bin/labwc`, no mesa DRI.
+- `.wfgy/xfce-build/alpine-pinned2.tar` — base tar, paired with a layer-N overlay via `--resume-from`.
+- Large scratch artifacts (`target-myfork/`, `alpine-fresh-test.tar`, `.agentplug/`) are local
+  build/test byproducts, gitignored, safe to ignore or regenerate.
