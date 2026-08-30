@@ -9,7 +9,35 @@ chronological detail of every prior sub-session's investigation, ruled-out hypot
 fixes lives in gm's memory store (`recall`/`codesearch` against this project) as resolved
 mutables — do not re-derive from scratch; query the recall store first (e.g. search
 "fork_verify AV path stale pointer", "DRM PRIME handle", "wlroots shm keymap",
-"step bound exhaustion", "keep relocations alive").
+"step bound exhaustion", "keep relocations alive false positive").
+
+## DEFINITIVE finding on the step-bound gap (same session as sub-session 20, follow-up)
+
+The "keep relocations alive past the bound" approach was re-tested WITH direct diagnostic
+instrumentation (temporary, added and removed same pass) unconditionally logging every AV-path
+heal attempt. It caught the crash red-handed:
+`[av-heal-diag] tid=ThreadId(14) rip=0x8b7f024 fault_addr=0x8b7f024 healed=true past_bound=true`
+— the AV-path healing code fired, `is_in_source`/`translate()` both matched, execution resumed
+at the "healed" address via `EXCEPTION_CONTINUE_EXECUTION` — and the process still crashed at
+the host level immediately after. **This proves the relocation map's `is_in_source` membership
+test itself becomes a FALSE-POSITIVE generator once kept alive far past its original narrow
+post-fork window**: `0x8b7f024` coincidentally fell within a tracked source range long after
+that range's translation had stopped being meaningful, because the guest's own legitimate
+execution had evolved the address space enough (thousands of steps, real mmaps/allocations) to
+create a coincidental overlap that never existed during the map's intended tens-to-low-hundreds-
+of-instruction validity window (see `MAX_THREAD_VERIFICATION_STEPS`'s own doc comment for that
+expected window size).
+
+**Conclusion: "keep the map alive" is unsafe in ANY form, not just the specific mechanisms tried
+(raise the bound 2x/16x, keep alive passively without re-arming `TF`).** The map's precision is
+inherently time/step-bounded; three attempts across two sessions confirm this from different
+angles. **A genuinely safe fix must instead either (a) tolerate the crash this specific case
+represents as out of scope (the current, committed state — `tls.fork_verify` is cleared exactly
+at the bound, matching every fix in this investigation except this one gap), or (b) implement a
+MUCH shorter secondary grace window (tens of steps, matching the doc-commented expected
+window, not the current 16384) for AV-path-only reactive healing before unconditionally
+clearing — untested this session, but the shorter window is the only remaining design point not
+yet ruled out empirically.** Do not attempt "keep alive indefinitely" again in any form.
 
 ## Current state (as of sub-session 20)
 
