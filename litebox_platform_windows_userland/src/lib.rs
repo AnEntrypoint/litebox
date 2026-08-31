@@ -4087,7 +4087,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     let fc = find_foreign_claim(suggested_range.clone(), current_claim_owner());
                     litebox_util_log::debug!(
                         start:% = suggested_range.start, end:% = suggested_range.end,
-                        found:% = fc.is_some(), has_committed_page:% = has_committed_page;
+                        found:% = fc.is_some(), has_committed_page:% = has_committed_page,
+                        self_owner:? = current_claim_owner(),
+                        foreign_owner:? = fc.as_ref().map(|(_, owner)| *owner),
+                        foreign_range:? = fc.as_ref().map(|(r, _)| (r.start, r.end));
                         "allocate_pages: Replace-mode foreign-claim check"
                     );
                     fc.is_some()

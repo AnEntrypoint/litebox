@@ -93,7 +93,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox_common_linux::loader::MapMemory
             // platform honoring an out-of-range hint.
             0
         } else {
-            super::DEFAULT_LOW_ADDR
+            // `DEFAULT_LOW_ADDR` alone is a single fixed hint shared by every guest ET_DYN/PIE
+            // image load, with no randomization at all -- unlike real Linux's ASLR, which exists
+            // specifically to avoid two independent processes' preferred load addresses (or a
+            // process's own image and another thread's stack) crowding the same narrow address
+            // neighborhood under litebox's shared-real-address-space model. Salting with the
+            // guest PID (genuinely distinct per process) spreads successive PIE processes' preferred
+            // load addresses across a wider low-address band, real, low-risk hardening for actual
+            // `ET_DYN` binaries. NOTE: this does NOT address the specific `gcc`-under-litebox crash
+            // this investigation traced (see `AGENTS.md`) -- that crash's binary is `ET_EXEC` (not
+            // `ET_DYN`), which takes the OTHER branch of `loader.rs`'s `load()` (`base_addr = 0`,
+            // fixed addresses baked into the ELF, no hint, no reservation, this function's `hint`
+            // value never consulted for it) -- confirmed live: this fix compiles and is harmless,
+            // but the `ET_EXEC` collision class needs a different fix (in `allocate_pages`'s own
+            // foreign-claim/collision handling, not here) -- see `AGENTS.md` for the precise,
+            // still-open next step for that.
+            #[allow(
+                clippy::cast_sign_loss,
+                reason = "pid is always non-negative in practice"
+            )]
+            let pid_salt = (self.task.pid as usize).wrapping_mul(PAGE_SIZE * 64);
+            super::DEFAULT_LOW_ADDR + pid_salt
         };
         let mapping_ptr = self
             .task
