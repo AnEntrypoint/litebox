@@ -1,4 +1,79 @@
-# STATUS (2026-08-31, sub-session 29): root cause of the launch-script failure FOUND AND FIXED with hard, direct evidence (real `unix_connect`/`unix_accept` tracing added to litebox_shim_linux); XFCE clients now genuinely connect to weston's Wayland socket, but weston still never repaints past its first frame -- the gap is now precisely isolated to GTK's Wayland backend never writing a single byte to the connected socket after `connect()` succeeds
+# STATUS (2026-08-31, sub-session 30): INDEPENDENT VERIFICATION of a claimed `VirtualFree(DECOMMIT)`/xwayland.so-dlopen host-crash fix -- fix's own narrow claim (no panic) holds, but its headline "9 repaints, weston survives past the old crash point" evidence does NOT reproduce; exact-repro re-run this session shows repaint count 0 (not >1), DRM ioctl count back down to the pre-crash-era baseline of 2 (1 SetCrtc + 1 PageFlip), and the screenshot is still solid black -- XFCE desktop content is NOT confirmed onscreen
+
+A fix was submitted claiming to resolve the `litebox_platform_windows_userland/src/lib.rs`
+`allocate_pages` Replace-mode `VirtualFree(MEM_DECOMMIT)` panic (`ERROR_INVALID_PARAMETER`) that
+was crashing the host process while weston's musl `ld.so` `dlopen()`'d `xwayland.so`, via a new
+`decommit_bisecting` helper that retries in page-granularity halves on that specific error. The
+fix is present as an uncommitted working-tree change to `lib.rs` (57 lines, +50/-7), confirmed via
+`git diff --stat`. This session re-ran the exact repro this project's AGENTS.md documents as
+current-working (`.wfgy/xfce-build/xfce_launch.sh`, invoked as `sh /xfce_launch.sh` against
+`xfce-layer19.tar` -- the sub-session-29 fix for the PowerShell argv-quoting crash and the
+`bind()`-never-creates-`S_IFSOCK` gap, both already committed at `c56e405a`), rebuilt release,
+with `LITEBOX_LOG=debug` and `--gui`, full log at `.wfgy/xfce-build/verify_run1.log` (144,334 lines).
+
+**Verified TRUE (fix's narrow claim holds):**
+- `grep -c "panicked at"` -> 0. `grep -c "VirtualFree(DECOMMIT) failed"` -> 0. The host process does
+  not crash loading `xwayland.so` this run (`sys_openat .../xwayland.so` at t=15.99s, no panic
+  follows). This part of the fix-phase claim is genuine and reproducible.
+- `xfsettingsd` (tid=26), `xfce4-panel` (tid=27), `xfdesktop` (tid=28) all `sys_execve` successfully
+  at t=18.12/18.17/18.20s.
+- `TRACE unix_connect`/`TRACE unix_accept` (sub-session-29's instrumentation, already committed):
+  all 3 XFCE clients connect to `/run/user/1000/wayland-1` with `ok=true` at t=32.01s/32.26s/33.10s,
+  matched by 3 corresponding `TRACE unix_accept: result ok=true` on weston's side (plus one earlier
+  `ok=true` for `/run/seatd.sock` at t=15.51s) -- 4 total accepts, 4 total successful connects. This
+  item from the task's verification checklist is confirmed still holding.
+- `WESTON_ALIVE=1` at the scripted 60s liveness check; run reaches `DONE_SLEEPING` cleanly.
+- `sys_write` count from any tid, anywhere in the run: 0. Matches the fix-phase report's own stated
+  "next bug" -- XFCE clients still write zero Wayland protocol bytes after connecting.
+
+**Verified FALSE (the fix's headline repaint-progress claim does not reproduce):**
+- `grep -c "\[repaint\] Beginning repaint"` -> **0**, not the claimed 9. In fact the string
+  `repaint` (any case) appears **zero times anywhere in the entire 144K-line log**, despite
+  `--logger-scopes=log,drm-backend,compositor-backend,wayland-protocol,xwayland` being passed
+  (the same flag set the fix-phase claim says it used). Either weston's actual repaint-loop log
+  line differs from what was grepped for, or the repaint loop never runs multiple times this rerun
+  -- but the specific evidence cited (9 occurrences) is not reproducible as stated.
+- `DrmModeSetCrtc`/`DrmModePageFlip` ioctl count: exactly **2** total (1 SetCrtc + 1 PageFlip, both
+  at t=21.13s) -- this is the SAME count every prior sub-session back to sub-session 26 has measured
+  for "weston paints its own empty-desktop startup frame once and never repaints again," not an
+  improved count. No DRM ioctl activity occurs after XFCE's clients connect at t=32-33s.
+- Real screenshot taken this session (PowerShell `EnumWindows`+exact-title-match+`GetClientRect`+
+  `ClientToScreen`+`CopyFromScreen`, the documented working technique; a `PrintWindow`-based capture
+  was also tried as a cross-check but produced an unreliable half-black/half-white GDI artifact
+  typical of GPU-composited swapchain windows, and was discarded in favor of the `CopyFromScreen`
+  result). Pixel-sampled at 20px intervals across the window's own client-area bounds
+  (`GetWindowRect` confirmed L=554,T=12,R=1523,B=575; client capture origin (561,42) w=954 h=525 is
+  entirely inside those bounds): **728/756 sampled pixels are exactly RGB(0,0,0), the rest
+  (32,32,32)** -- uniform solid black. No XFCE panel, taskbar, desktop icons, wallpaper, or any
+  window content is visible. Screenshots: `.wfgy/xfce-build/verify_screenshot2.png` (CopyFromScreen,
+  trustworthy), `.wfgy/xfce-build/verify_printwindow.png` (PrintWindow, discarded/unreliable).
+
+**Verdict: the fix made a real, narrow, reproducible improvement (host no longer panics on
+`xwayland.so` dlopen) but did NOT make the progress its own report claimed (no repaint-count
+increase, no DRM ioctl-count increase, screenshot still solid black, same as every prior
+sub-session back to #26).** The standing goal -- XFCE rendering normal desktop content on screen --
+is NOT met. Two independent gaps remain open and unresolved: (1) weston's repaint scheduler still
+never fires a second frame even once all three XFCE clients are alive and Wayland-connected (this
+session found NO log evidence at all of weston's repaint-loop activity, worth re-checking whether
+`--logger-scopes` is actually taking effect, since its total absence rather than a stuck-at-1 count
+is itself a new, narrower observation this session adds); (2) `sys_write` from any XFCE client tid
+is still 0 -- no Wayland protocol bytes ever flow over the successfully-connected+accepted sockets
+in either direction, so weston has nothing to composite regardless of (1). Whoever continues:
+first re-check weston's actual `--logger-scopes` output format/line text against the litebox debug
+log (the total absence of any "repaint" string is a new, sharper anomaly than "stuck at 1" and may
+point at logger-scope wiring rather than the compositor's own scheduler); then resume the
+already-identified next step of tracing why GTK's Wayland client library never writes after
+`connect()` (SO_PEERCRED/getsockopt correctness on connected AF_UNIX sockets, and confirming
+`GDK_BACKEND`/`WAYLAND_DISPLAY` actually reach the child via `/proc/<pid>/environ` at the point of
+`execve`, not just the parent shell's own `env` output before forking).
+
+Repro used this session: `.wfgy/xfce-build/xfce_launch.sh` against `xfce-layer19.tar`, release
+binary rebuilt at 07:18 (already included the uncommitted `lib.rs` fix, `cargo build --locked
+--release -p litebox_runner_linux_on_windows_userland` reported "Finished" with no recompile
+needed). Full log: `.wfgy/xfce-build/verify_run1.log`.
+
+---
+
 
 **Two real, load-bearing bugs found and fixed this sub-session, both with direct before/after evidence (not log-absence inference):**
 

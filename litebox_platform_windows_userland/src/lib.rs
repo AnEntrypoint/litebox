@@ -4084,13 +4084,56 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                         FixedAddressBehavior::Replace,
                                         "raced with another memory allocator"
                                     );
-                                    let decommit_ok = unsafe {
-                                        VirtualFree(
-                                            r.start as *mut c_void,
-                                            r.len(),
-                                            Win32_Memory::MEM_DECOMMIT,
-                                        )
-                                    } != 0;
+                                    // `r` here is a single `VirtualQuery`/`MEMORY_BASIC_INFORMATION`
+                                    // region, i.e. a maximal run of pages sharing the same state
+                                    // and protection. Windows merges adjacent same-attribute
+                                    // regions from *distinct* `VirtualAlloc2` reservations into
+                                    // one reported region, so `r` can straddle an allocation-object
+                                    // boundary even though it looked like one region to us. A
+                                    // single `VirtualFree(MEM_DECOMMIT)` call cannot span more than
+                                    // one allocation object -- Windows rejects it wholesale with
+                                    // ERROR_INVALID_PARAMETER (87) rather than decommitting the
+                                    // part(s) it could -- confirmed live via a weston `dlopen()` of
+                                    // `xwayland.so`, whose fixed-address PT_LOAD placement landed
+                                    // exactly on such a merged-region boundary and crashed the host
+                                    // process. Recover by bisecting: on failure, split the range in
+                                    // half and decommit each half (recursively, in case a half still
+                                    // straddles another boundary) instead of asserting success on
+                                    // the whole range in one shot.
+                                    fn decommit_bisecting(range: core::ops::Range<usize>) -> bool {
+                                        if range.is_empty() {
+                                            return true;
+                                        }
+                                        let ok = unsafe {
+                                            VirtualFree(
+                                                range.start as *mut c_void,
+                                                range.len(),
+                                                Win32_Memory::MEM_DECOMMIT,
+                                            )
+                                        } != 0;
+                                        if ok {
+                                            return true;
+                                        }
+                                        // Only bisect on the specific "spans multiple allocation
+                                        // objects" error; any other failure should surface as-is.
+                                        if unsafe { GetLastError() } != windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER
+                                        {
+                                            return false;
+                                        }
+                                        // A single page can't be split further; nothing left to try.
+                                        // Use the fixed 4 KiB Windows page granularity here (not
+                                        // the outer `ALIGN` const, which nested `fn`s can't see) --
+                                        // any multiple of the true page size is a valid split point.
+                                        const PAGE: usize = 0x1000;
+                                        if range.len() <= PAGE {
+                                            return false;
+                                        }
+                                        let mid = range.start
+                                            + ((range.len() / 2) / PAGE).max(1) * PAGE;
+                                        decommit_bisecting(range.start..mid)
+                                            && decommit_bisecting(mid..range.end)
+                                    }
+                                    let decommit_ok = decommit_bisecting(r.clone());
                                     assert!(
                                         decommit_ok,
                                         "VirtualFree(DECOMMIT) failed: {}",
