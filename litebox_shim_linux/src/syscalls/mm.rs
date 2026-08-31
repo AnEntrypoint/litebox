@@ -598,6 +598,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         fd: i32,
         offset: usize,
     ) -> Result<UserPtrMut<u8>, Errno> {
+        litebox_util_log::debug!(
+            tid:% = self.tid, addr:% = addr, len:% = len, prot:? = prot, flags:? = flags,
+            fd:% = fd, offset:% = offset;
+            "DIAG sys_mmap: entry"
+        );
         // check alignment
         if !offset.is_multiple_of(PAGE_SIZE) || !addr.is_multiple_of(PAGE_SIZE) || len == 0 {
             return Err(Errno::EINVAL);
