@@ -4367,6 +4367,38 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // Set the child TID if requested.
                     let _ = child_tid_ptr.write_at_offset::<Platform>(0, self.tid);
                 }
+
+                // Diagnostic logging (pthread_create/clone stall investigation, sub-session 36),
+                // kept landed: narrow, targeted logging on the new thread's own execution path --
+                // runs ON the newly
+                // spawned OS thread itself, right before its very first guest instruction ever
+                // executes (this is the tail of `init_thread_context`'s `NewThread` arm, called
+                // from `init_handler` -> `handle_init_request`). Confirms (a) whether the new
+                // thread's `init_thread_context` is even reached at all for a given clone(), (b)
+                // whether `ctx.rip`/`ctx.rsp` look like sane guest addresses at that moment, and
+                // (c) whether the guest's own newly-set-up stack memory (mmap'd by musl's
+                // `pthread_create` BEFORE calling `clone()`, so it must already be fully committed
+                // and readable here) is genuinely readable from the host side right now -- a
+                // read-only probe, never a write, so it cannot itself corrupt anything. Cheap
+                // (single log line + single guest-memory read per clone()), unlike
+                // `LITEBOX_DIAG_FATALDUMP`/`LITEBOX_VEH_TRACE`'s full step-trace/fork_verify
+                // overhead, so safe to leave on for a full end-to-end XFCE repro.
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let stack_probe = stack.map(|sp| {
+                        UserPtr::<u64>::from_usize(sp)
+                            .read_at_offset::<Platform>(0)
+                            .is_some()
+                    });
+                    litebox_util_log::debug!(
+                        tid:% = self.tid,
+                        rip:% = alloc::format!("{:#x}", ctx.rip),
+                        rsp:% = alloc::format!("{:#x}", ctx.rsp),
+                        tls:? = tls.map(|t| t.as_usize()),
+                        stack_readable:? = stack_probe;
+                        "clone/NewThread: init_thread_context reached"
+                    );
+                }
             }
             ThreadInitState::ForkedChild(mut parent_ctx, fs_base, relocations) => {
                 #[cfg(target_arch = "x86_64")]

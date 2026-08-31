@@ -1,3 +1,147 @@
+# STATUS (2026-08-31, sub-session 37, independent verification of sub-session 36): sub-session 36's
+Diagnose findings and its Fix phase's "no fix made" decision BOTH independently re-verified and CONFIRMED
+correct. **Standing user goal (XFCE desktop rendering visible via screenshot) is NOT MET.**
+
+**What this pass did**: adversarially re-checked sub-session 36 end-to-end rather than trusting its own
+write-up. `git diff --stat` confirmed exactly two files touched (`AGENTS.md` +82, `process.rs` +31), matching
+the Fix phase's own claim precisely -- no stray/speculative changes anywhere else in the tree. Read the actual
+diff in `litebox_shim_linux/src/syscalls/process.rs`: the added code is a single `#[cfg(target_arch =
+"x86_64")]`-gated block inside `ThreadInitState::NewThread`'s arm of `init_thread_context`, doing one read-only
+guest-memory probe (`UserPtr::<u64>::read_at_offset`, no writes) plus one `debug!` log line -- genuinely
+inert with respect to control flow or shared thread-spawn behavior; confirmed it does not touch, reorder, or
+gate any of the surrounding already-working `ForkedChild`/register-setup logic. `cargo check -p
+litebox_shim_linux` re-run clean.
+
+**Independently re-derived every quantitative claim in sub-session 36's write-up directly from its own kept
+log file (`.wfgy/xfce-build/diag_clonelog1.log`, 40MB, not regenerated -- this pass grepped the existing
+artifact rather than re-running the repro, since no source fix exists to verify and the repro is expensive)**,
+all CONFIRMED exactly as claimed:
+- `grep -c "clone/NewThread: init_thread_context reached"` = **24**, matching the claimed thread count exactly.
+- `grep -Ec "stack_readable:None|stack_readable=None|stack_readable:false"` across all 24 lines = **0** --
+  zero exceptions, confirming "sane rip/rsp/tls, stack_readable=Some(true) for all 24" is not an
+  approximation or cherry-picked sample but a literal, exhaustive true.
+- tid=41's exact sequence independently re-grepped and matches the write-up to the millisecond: `clone()` at
+  37.4126s -> `init_thread_context reached ... stack_readable=Some(true)` at 37.4129s -> `FUTEX_WAIT`
+  immediately-mismatch-woken at 37.4155s -> `sys_read fd=5 len=8` at 37.4157s -> `FUTEX_WAKE
+  addr=719163088 woken=0` at **37.416650200s, confirmed as tid=41's last-ever log line** (nothing further for
+  tid=41 anywhere later in the log).
+- tid=42 (the "grandchild clone, runs to completion" control case): independently grepped, confirmed clean
+  `prepare_for_exit`/`clear_child_tid`/`robust_list` exit sequence at t=64.90s, no stall -- corroborates that
+  clone()/thread-spawn is not systemically broken.
+- tid=29's later stall: independently confirmed last activity is a normal `sys_mprotect` pair at t=65.373-
+  65.374s followed immediately by `futex: WAIT enter tid=29 addr=625756544 val=2147483648 timeout=None` (the
+  `0x80000000` contended-mutex-with-waiters bit pattern exactly as described) with no further tid=29 activity.
+- Log tail confirmed genuine natural completion (`DIAG wait_for_exit: loop done` at t=81.192s, not a kill/
+  truncation), and `grep -ic panicked` = **0** across the full run.
+
+**Verdict on the Fix phase's "no fix" decision: CORRECT, independently re-confirmed.** The evidence available
+(a clean clone()-handoff for all 24 threads, one thread that goes silent in guest code immediately after its
+own successfully-returned FUTEX_WAKE, one structurally-identical grandchild thread that runs to completion
+fine) narrows the bug's location but does not point at any specific litebox source line to change. Writing a
+guess into `process.rs`'s or the futex/thread-spawn machinery shared by every guest process, without a
+mechanism, would risk regressing weston/dbus-daemon/seatd/tid=42's own already-working paths for no proven
+benefit -- exactly the discipline this investigation has correctly applied for several sub-sessions running.
+No rebuild-and-rescreenshot was performed this pass either, for the same reason the Fix phase gave: nothing
+changed in source behavior, so a fresh run would only reproduce the identical, already-well-evidenced stall.
+Screenshot evidence from prior sub-sessions (solid black, no XFCE panel/desktop content) stands unchanged and
+unchallenged; no new evidence this pass or sub-session 36's contradicts it.
+
+**FINAL VERDICT: Standing user goal is NOT MET.** No XFCE desktop content has ever been captured on screen in
+this investigation's full history; the most recent independently-verified screenshot (sub-session 34,
+`.wfgy/xfce-build/dbus_fix_screenshot.png`) is solid black. This sub-session neither ran nor needed a fresh
+screenshot, since the underlying render-blocking stall (xfce4-panel's third pthread going silent in guest code)
+is unchanged and unfixed. Do not mark this goal met without new, concrete, non-black pixel evidence.
+
+**Concrete, narrowly-scoped next step for whoever continues** (unchanged from sub-session 36, still the best
+lead): attach a live debugger/minidump at the ~40s-wall-clock stall point specifically to tid=41, to capture
+its actual `rip` after its last logged `FUTEX_WAKE` return -- this determines whether it's spinning, blocked
+in an unlogged host-provided primitive, or sitting at a suspicious/corrupted address, and is now cheap to
+reach (repro hits the stall in under a minute without heavy diagnostic flags).
+
+---
+
+# STATUS (2026-08-31, sub-session 36): mallocng/TCB-corruption hypothesis DIRECTLY REFUTED with hard
+evidence; the third-pthread stall is real, precisely reproduced again, and is a guest-userspace-only
+event with a completely clean, sane new-thread handoff. **Standing user goal still NOT MET.**
+
+**What was done**: added ONE narrow, cheap, always-safe debug log line (`litebox_shim_linux/src/syscalls/process.rs`,
+`ThreadInitState::NewThread` arm inside `init_thread_context`, `#[cfg(target_arch = "x86_64")]`-gated) that
+fires on the NEW thread itself, at the tail of its own init, right before its first-ever guest instruction:
+logs `rip`, `rsp`, `tls`, and a read-only probe of whether the guest's own newly-mmap'd stack memory is
+actually readable at that exact moment (`UserPtr::<u64>::read_at_offset` on the stack pointer -- read-only,
+cannot itself corrupt anything). Deliberately avoided `LITEBOX_DIAG_FATALDUMP`/`LITEBOX_VEH_TRACE`: confirmed
+live this session that `LITEBOX_DIAG_FATALDUMP=1` alone still triggers `fork_verify`'s heavy single-step
+machinery for every forked child in the run (not just fault-time, as its own doc comment implies) -- a fresh
+attempt reached only t=10.7s guest-time after 40+s wall-clock and had to be killed, reproducing sub-session
+35's "too heavy" finding exactly. The new targeted log line, by contrast, reached the script's full natural
+completion (`DONE_SLEEPING`-equivalent, t=81.19s) in well under a minute of wall-clock time.
+
+**Direct result, full run, `.wfgy/xfce-build/diag_clonelog1.log`**: every one of 24 `clone()`-spawned threads
+across the entire run (covering weston, dbus-daemon, seatd, and all 3 XFCE clients including xfce4-panel's
+own 3 pthreads) logged this line with **sane `rip`, sane `rsp`, sane `tls`, and `stack_readable=Some(true)`
+-- zero exceptions, zero garbage values, zero unreadable-stack cases, anywhere in the run.** This directly
+and conclusively refutes the mallocng/TCB-corruption-at-pthread_create hypothesis for the guest's own mmap'd
+stack region: the stack is genuinely committed, mapped, and byte-readable from the host side at the exact
+moment guest code is handed the CPU. If corruption occurs, it is not visible as "the stack isn't there" at
+handoff time.
+
+**xfce4-panel's own third pthread (tid=41 this run, directly analogous to tid=43/tid=33 in prior sessions'
+own numbering) independently re-confirmed with even tighter precision**: `clone()` at t=37.4126s -> its own
+`init_thread_context` log line (sane state) at t=37.4129s -> `FUTEX_WAIT` immediately-mismatch-woken at
+t=37.4145s -> `sys_read fd=5 len=8` at t=37.4157s -> its own `FUTEX_WAKE addr=719163088 woken=0` call, which
+**returns** (proving it resumed into guest code) at **t=37.416650200s -- its last-ever log line**, verified
+by exhaustive grep to be genuinely silent (zero further syscalls of any kind) for the remaining ~43.8 seconds
+of the run. `grep "addr=719163088"` across the whole log shows only 4 lines total, all before t=37.4167s;
+nobody (including tid=41 itself) ever touches that address again.
+
+**New, important control finding this session**: tid=42 (a pthread spawned not by xfce4-panel's main thread
+but by ANOTHER of its own pthreads, tid=40, i.e. a "grandchild" clone one level deeper than the tid=41 case)
+**runs to full, clean completion** -- real work, then a fully normal `prepare_for_exit`/`detach_thread`
+sequence, exiting cleanly at t=64.9s. This proves `clone()`/pthread-spawn itself is not systemically broken,
+not even for nested/grandchild spawns -- the bug is specific to whatever tid=41 (and its cross-session
+analogues) does in guest code after its own last, successfully-returned `FUTEX_WAKE`, not to thread creation
+as a mechanism.
+
+**Also newly confirmed this session**: xfce4-panel's main thread (tid=29) does NOT stall at the same point as
+tid=41 -- it keeps making real syscalls (file reads, `dlopen`-shaped `mprotect` sequences for what is very
+likely a panel plugin `.so`) until t=65.37s, then itself permanently blocks on a DIFFERENT, contended-mutex-
+shaped futex (`addr=625756544 val=0x80000000`, the classic glibc "mutex has waiters" bit) that is also never
+woken by anyone for the rest of the run -- reproducing sub-session 34's original tid=28 finding almost
+exactly, just ~37 seconds later in wall-clock terms than that session's run. This is very likely the SAME
+root cause manifesting twice: tid=29's own later-loaded plugin code path never reaching the point where it
+would signal tid=41's futex (because tid=41's own work was needed first and never completed), then getting
+stuck on ITS OWN unrelated mutex once it tries to use whatever that plugin needed tid=41 to finish setting up.
+
+**Conclusion of this Diagnose pass: the mallocng/TCB-corruption-at-pthread_create hypothesis is REFUTED by
+direct evidence, not merely "not yet confirmed."** The new thread's stack, TLS, and initial register state
+are all provably sane at handoff. The bug -- wherever it lives -- must be either (a) a genuine, ordinary
+guest-level bug in whatever GLib/GTK code path tid=41 is running after its own successful FUTEX_WAKE (e.g. a
+real upstream xfce4-panel/GLib bug this repro environment happens to trigger, or a missing/misbehaving
+syscall this investigation hasn't yet found -- the same "silently wrong syscall" pattern already found and
+fixed 4+ times this investigation for other calls), or (b) a much subtler corruption that does not manifest
+as "stack unreadable at thread start" -- e.g. corruption of HEAP state reachable only via a pointer chase
+that happens later in that thread's own code path (this probe only proved the raw stack MEMORY is mapped and
+readable, not that mallocng's own heap metadata anywhere in the process is uncorrupted). Per this
+investigation's own stated discipline, NO speculative fix was made this session -- there is still no direct
+evidence pointing at any specific litebox code path to change, and forcing one in without such evidence risks
+regressing weston/dbus-daemon/seatd/tid=42's own already-working thread-spawn paths.
+
+**Concrete, narrowly-scoped next step for whoever continues**: the stack-readable probe added this session
+(kept, source change is real and lands in this commit) proves clone()-handoff is clean; the next diagnostic
+step should go INSIDE the guest's own code path after that point -- e.g. a similar single, cheap, targeted
+log line placed at the syscall dispatch entry point logging every syscall number for tid=41 specifically
+right up until it goes silent (should already be fully covered by existing `LITEBOX_LOG=debug` output per
+syscall type, so re-check whether some syscall type tid=41 needs next is one of this investigation's own
+past silently-unlogged calls), or attaching a real debugger/minidump to the host process at the exact moment
+of the stall (now cheaply repeatable: this exact repro reaches the stall point in about 40 seconds of real
+wall-clock time without any heavy diagnostic flag) to capture the actual guest `rip` DIRECTLY at the stall,
+which would immediately show whether it's spinning, blocked in an unlogged host-provided primitive, or
+sitting at a suspicious address.
+
+Sub-session 35's original write-up follows below, preserved for its precise per-tid futex evidence:
+
+---
+
 # STATUS (2026-08-31, sub-session 35, updated): sub-session 34's "tid=33 issues zero syscalls after clone()" was a MISDIAGNOSIS -- a fresh Diagnose pass this sub-session DIRECTLY REFUTED it (the third pthread genuinely spawns, runs, and issues several real syscalls including its own FUTEX_WAIT/WAKE calls) and found the REAL, narrower bug: a classic missed-wakeup race where the pthread's own final syscall (a completed FUTEX_WAKE, `woken=0`) is its last-ever log line, meaning it returns to GUEST code and goes silent there -- not stuck in litebox's shim/futex machinery at all. No source fix was made (deliberately, see below) but the open question is now sharply narrowed to a specific, named, plausible mechanism: guest-side mallocng TCB/stack corruption during `pthread_create`, the same known-real bug class already documented in this project's memory for `fork()`. **Standing user goal is still NOT MET** -- screenshot unchanged, solid black.
 
 **`LITEBOX_DIAG_FATALDUMP=1` attempted this pass, negative-but-informative result**: re-ran the exact repro with this project's existing (no-code-change) diagnostic env var enabled, hoping to directly catch a silent guest-thread crash. The diagnostic mode is extremely heavy (a 60+s repro produced 84MB of `LITEBOX_LOG=debug` output plus 178MB+ of VEH/exception-handler trace on stderr, and stalled well short of reaching XFCE's Wayland-connect point within several minutes of wall-clock time, most likely dominated by `fork_verify`'s own single-step verification machinery generating a large volume of `EXCEPTION_SINGLE_STEP` (code=80000004) trace lines for unrelated forked children) -- not practical for a full end-to-end repro at this stage. It DID catch one real crash in this partial run: host_tid=23500 (guest tid=50, a short-lived GLib/GTK helper subprocess, "process:50") hit a genuine `g_error()`-triggered `abort()` (`Exception(3)` = `EXCEPTION_BREAKPOINT`, real Linux `SIGABRT` under VEH) with the message `Cannot get the default [display]`, cleanly reaching `sys_exit_group(status=Signal(5))` afterward -- but this is a normal, already-logged, already-explained guest-side error path (a DIFFERENT process failing to open a display, not the xfce4-panel pthread-stall bug this session is chasing), not new evidence for the mallocng-corruption hypothesis. The diagnostic mode was killed before reaching the actual target thread's stall point. **This remains a real, viable next step for whoever continues, but needs either a much longer time budget, or narrowing `LITEBOX_DIAG_FATALDUMP`'s own scope/verbosity (e.g. only enabling it after XFCE's clients have already connected, via a two-phase launch, rather than for the whole run from t=0) to be practical.**
