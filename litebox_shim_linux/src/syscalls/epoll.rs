@@ -321,8 +321,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
             // fix also addresses (see `PollSet::wait`'s matching doc comment for the confirmed
             // live repro). Manually re-poll stdin on a short cadence and push it into the ready
             // set if it became readable, so `pop_multiple` picks it up on the next iteration.
-            let has_stdin_interest = self.has_unready_stdin_interest(global);
-            let iteration_cx = if has_stdin_interest {
+            //
+            // `TimerfdFile` (see its own module doc comment) is readiness-only in exactly the same
+            // way -- no push wakeup, `check_io_events` only compares now-vs-deadline when actually
+            // polled -- on the documented assumption that a real timerfd consumer always calls
+            // `epoll_wait` with a bounded timeout computed from its own earliest pending deadline.
+            // Confirmed live NOT to hold for weston's own repaint-timer usage: it calls
+            // `epoll_pwait` with `timeout=None` (unbounded) even with an armed repaint timerfd in
+            // its interest set, so a deadline that elapses with no OTHER fd's traffic to
+            // incidentally wake the same `epoll_wait` first is never re-observed -- confirmed as
+            // the root cause of a real reproducible freeze (weston repaints exactly once, then
+            // never again, leaving the guest's on-screen framebuffer permanently stuck). Folding
+            // armed timerfd interests into this same bounded-repoll mechanism fixes every timerfd
+            // consumer with this usage pattern, not just weston, mirroring the stdin fix's shape.
+            let has_bounded_repoll_interest = self.has_unready_stdin_or_armed_timerfd_interest(global);
+            let iteration_cx = if has_bounded_repoll_interest {
                 cx.with_timeout(STDIN_REPOLL_INTERVAL)
             } else {
                 cx.with_timeout(None)
@@ -340,45 +353,56 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
                 Ok(()) => return Ok(events),
                 Err(TryOpError::TryAgain) => unreachable!(),
                 Err(TryOpError::WaitError(WaitError::TimedOut)) => {
-                    if !has_stdin_interest
+                    if !has_bounded_repoll_interest
                         || (cx.deadline().is_some() && cx.remaining_timeout().is_none())
                     {
                         return Err(WaitError::TimedOut);
                     }
-                    // Only the bounded stdin-repoll interval elapsed, not the caller's own
-                    // deadline (if any): re-poll and loop back around.
-                    self.repoll_stdin_interests(global);
+                    // Only the bounded repoll interval elapsed, not the caller's own deadline (if
+                    // any): re-poll and loop back around.
+                    self.repoll_stdin_and_timerfd_interests(global);
                 }
                 Err(TryOpError::WaitError(e)) => return Err(e),
             }
         }
     }
 
-    /// Returns `true` if any current interest is a stdin fd that is not currently ready -- see
-    /// [`Self::wait`]'s doc comment for why this fd kind needs bounded periodic re-polling instead
-    /// of relying solely on the observer-notification wakeup every other fd kind gets.
-    fn has_unready_stdin_interest(&self, global: &GlobalState<Platform, FS>) -> bool {
+    /// Returns `true` if any current interest is either a stdin fd or an armed timerfd, not
+    /// currently ready -- see [`Self::wait`]'s doc comment for why both fd kinds need bounded
+    /// periodic re-polling instead of relying solely on the observer-notification wakeup every
+    /// other fd kind gets.
+    fn has_unready_stdin_or_armed_timerfd_interest(&self, global: &GlobalState<Platform, FS>) -> bool {
         self.interests.lock().values().any(|entry| {
-            !entry.is_ready.load(core::sync::atomic::Ordering::Relaxed)
-                && matches!(entry.desc.upgrade(), Some(EpollDescriptor::File(file))
-                if matches!(
+            if entry.is_ready.load(core::sync::atomic::Ordering::Relaxed) {
+                return false;
+            }
+            match entry.desc.upgrade() {
+                Some(EpollDescriptor::File(file)) => matches!(
                     global
                         .litebox
                         .descriptor_table()
                         .with_metadata(&file, |stream: &litebox::platform::StdioStream| *stream),
                     Ok(litebox::platform::StdioStream::Stdin)
-                ))
+                ),
+                Some(EpollDescriptor::Timerfd(_)) => true,
+                _ => false,
+            }
         })
     }
 
-    /// Re-polls every stdin interest and pushes it into the ready set if it has become readable.
-    /// Called after each bounded stdin-repoll interval elapses in [`Self::wait`].
-    fn repoll_stdin_interests(&self, global: &GlobalState<Platform, FS>) {
+    /// Re-polls every stdin and timerfd interest and pushes it into the ready set if it has
+    /// become readable. Called after each bounded repoll interval elapses in [`Self::wait`].
+    fn repoll_stdin_and_timerfd_interests(&self, global: &GlobalState<Platform, FS>) {
         let entries: alloc::vec::Vec<_> = self
             .interests
             .lock()
             .values()
-            .filter(|entry| matches!(entry.desc.upgrade(), Some(EpollDescriptor::File(_))))
+            .filter(|entry| {
+                matches!(
+                    entry.desc.upgrade(),
+                    Some(EpollDescriptor::File(_)) | Some(EpollDescriptor::Timerfd(_))
+                )
+            })
             .cloned()
             .collect();
         for entry in entries {
