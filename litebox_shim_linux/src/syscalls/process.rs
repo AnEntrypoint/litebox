@@ -2995,7 +2995,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 }
 
 // TODO: enforce the following limits:
-pub(crate) const RLIMIT_NOFILE_CUR: usize = 1024 * 1024;
+//
+// `RLIMIT_NOFILE_CUR` matches real Linux distros' typical unprivileged-process soft limit
+// (`ulimit -n`, commonly 1024) rather than the hard limit -- confirmed live as a real, previously
+// undiscovered bug: dbus-daemon's own startup fd-sanitization loop (`fcntl(F_GETFD)` on every fd
+// from 3 up to the soft `RLIMIT_NOFILE` to close anything a parent leaked across `exec()`) was
+// hanging for well over a million syscalls with the old 1024*1024 soft-limit default, stalling
+// the D-Bus session bus's own `bind()` indefinitely and, downstream, every XFCE client that
+// depends on it (`xfsettingsd`/`xfce4-panel`: "Could not connect: Connection refused" /
+// "Failed to initialize Xfconf"). The hard limit (`RLIMIT_NOFILE_MAX`) stays high so a guest that
+// explicitly raises its own soft limit via `setrlimit` still can.
+pub(crate) const RLIMIT_NOFILE_CUR: usize = 1024;
 const RLIMIT_NOFILE_MAX: usize = 1024 * 1024;
 
 /// Default `RLIMIT_SIGPENDING` cur/max, matching a typical unprivileged Linux
