@@ -2907,28 +2907,41 @@ type ClaimSlot = Option<(core::ops::Range<usize>, ClaimOwner, std::thread::Threa
 /// well under a second (633 real, logged `claim_range DROPPED (registry full)` events observed
 /// in one 30-second repro), silently evicting a DIFFERENT, still-live guest process's own
 /// legitimate claim -- exactly the collision this registry exists to prevent. Raised to 512
-/// (8x), then to 4096 (8x again): a full XFCE desktop session (weston + xfsettingsd + xfce4-panel
-/// + xfdesktop + xfconfd + dbus-daemon + at-spi-bus-launcher, ~20 real OS threads, each doing its
-/// own concurrent dynamic-library-loading churn during startup) was confirmed live to exhaust the
-/// 512-slot registry within ~20 seconds of the first few clients launching (844 real eviction
-/// events logged in one repro, `occupied=512 max=512` sustained thereafter) -- and unlike the
-/// single-process case 512 was tuned for, evictions here landed on STILL-LIVE, actively-loading
-/// sibling processes (`xfsettingsd`/`xfdesktop`, confirmed via the evicted entries' own logged
-/// `GuestPid` owners), not stale leftovers. Every one of those processes' every thread then
-/// permanently stalled in a genuine (non-corrupted, `cdb`-confirmed) `WaitOnAddress` a few
-/// seconds later with no wake ever arriving -- consistent with this doc comment's own described
-/// failure mode (a later `Replace`-mode allocation silently decommitting/recommitting straight
-/// over the evicted range's still-live memory, corrupting a live thread's own state with no
-/// crash, no page fault, and no guest-visible signal, only an unexplained later hang). Combined
-/// with genuine LRU eviction (below) as the correctness backstop for whatever churn volume still
-/// exceeds even 4096: exhaustion now evicts the single OLDEST entry (by insertion sequence,
-/// tracked in `ClaimSlot`) rather than silently dropping the NEWEST one -- the newest claim is,
-/// by construction, the one about to be relevant to an imminent collision check, while an entry
-/// old enough to be the least-recently-inserted across the WHOLE registry is far more likely to
+/// (8x): a full XFCE desktop session (weston + xfsettingsd + xfce4-panel + xfdesktop + xfconfd +
+/// dbus-daemon + at-spi-bus-launcher, ~20 real OS threads, each doing its own concurrent dynamic-
+/// library-loading churn during startup) was confirmed live to exhaust the 512-slot registry
+/// within ~20 seconds of the first few clients launching (844 real eviction events logged in one
+/// repro, `occupied=512 max=512` sustained thereafter) -- and unlike the single-process case 512
+/// was tuned for, evictions here landed on STILL-LIVE, actively-loading sibling processes
+/// (`xfsettingsd`/`xfdesktop`, confirmed via the evicted entries' own logged `GuestPid` owners),
+/// not stale leftovers. Every one of those processes' every thread then permanently stalled in a
+/// genuine (non-corrupted, `cdb`-confirmed) `WaitOnAddress` a few seconds later with no wake ever
+/// arriving -- consistent with this doc comment's own described failure mode (a later
+/// `Replace`-mode allocation silently decommitting/recommitting straight over the evicted range's
+/// still-live memory, corrupting a live thread's own state with no crash, no page fault, and no
+/// guest-visible signal, only an unexplained later hang).
+///
+/// First tried raising this to 4096 (8x again) -- confirmed live to be the WRONG fix on its own:
+/// both `claim_range`'s mandatory per-call coalescing scan and (before it was removed, see
+/// `find_foreign_claim`'s own doc comment) an unconditional debug-log-only occupancy count scaled
+/// linearly with `MAX_CLAIMS`, and at 4096 slots this cost enough extra latency across the ~9000
+/// `claim_range`/`find_foreign_claim` calls a full XFCE session's startup churn produces that
+/// weston's own timing-sensitive DRM initialization sequence never completed a single
+/// `DRM_IOCTL_MODE_SETCRTC` in a 108+ second repro (previously ~15-25s) -- trading the original
+/// hang for an even worse one. Settled on 2048 (4x, half the scan cost of the 4096 attempt) after
+/// also removing `find_foreign_claim`'s superfluous full-array occupancy scan (used only to
+/// populate a debug log field, paid unconditionally regardless of whether logging was even
+/// enabled) -- combined, these give real headroom over the ~900-1000 peak occupancy observed
+/// before eviction previously kicked in, without reintroducing the 4096 attempt's own regression.
+/// Genuine LRU eviction (below) remains the correctness backstop for whatever churn volume still
+/// exceeds 2048: exhaustion now evicts the single OLDEST entry (by insertion sequence, tracked in
+/// `ClaimSlot`) rather than silently dropping the NEWEST one -- the newest claim is, by
+/// construction, the one about to be relevant to an imminent collision check, while an entry old
+/// enough to be the least-recently-inserted across the WHOLE registry is far more likely to
 /// belong to memory that's since been superseded or released. This only gives up this registry's
 /// own collision defense for whichever single entry loses the eviction race, never correctness
 /// of anything else.
-const MAX_CLAIMS: usize = 4096;
+const MAX_CLAIMS: usize = 2048;
 
 /// Host address ranges currently claimed by a live guest "process" (a real OS thread), see
 /// [`ClaimSlot`]/[`MAX_CLAIMS`] for the storage shape and why it is a fixed array.
@@ -2972,17 +2985,18 @@ static NEXT_CLAIM_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 
 /// Returns the (range, owner) of any claimed range overlapping `range` whose owner is NOT
 /// `exclude_owner`, if one exists.
+///
+/// Deliberately does not also compute/log an occupancy count here -- an earlier version did, via
+/// an unconditional `claims.iter().filter(...).count()` purely to populate a debug-log field,
+/// paid on every call regardless of whether logging was even enabled. At `MAX_CLAIMS`'s current
+/// size that extra full-array scan, multiplied across the thousands of calls a real XFCE
+/// session's startup churn produces, was confirmed live to contribute real, measurable latency to
+/// this already-hot path -- see [`MAX_CLAIMS`]'s own doc comment for the full story.
 fn find_foreign_claim(
     range: core::ops::Range<usize>,
     exclude_owner: ClaimOwner,
 ) -> Option<(core::ops::Range<usize>, ClaimOwner)> {
     let claims = CLAIMED_RANGES.lock().unwrap();
-    let occupied = claims.iter().filter(|s| s.is_some()).count();
-    litebox_util_log::debug!(
-        occupied:% = occupied, max:% = MAX_CLAIMS, range_start:% = range.start,
-        range_end:% = range.end, exclude_owner:? = exclude_owner;
-        "allocate_pages: DIAG find_foreign_claim occupancy"
-    );
     claims.iter().find_map(|slot| {
         slot.as_ref().and_then(|(claimed, owner, _tid, _seq)| {
             (*owner != exclude_owner && claimed.start < range.end && claimed.end > range.start)
