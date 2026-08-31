@@ -502,9 +502,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         let guest_thread = std::thread::Builder::new()
             .stack_size(INITIAL_GUEST_THREAD_STACK_SIZE)
             .spawn(move || {
-                // See the identical call (and its doc comment) in the non-pty-mode branch below
-                // for why this is needed here, from inside the spawned closure, not before.
-                litebox_platform_windows_userland::set_current_thread_guest_pid(init_task.pid);
                 let (program, pty_id) = inner_shim
                     .load_program_attach_pty(initial_file_system, init_task, &prog_path, argv, envp)
                     .unwrap();
@@ -586,16 +583,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         std::thread::Builder::new()
             .stack_size(INITIAL_GUEST_THREAD_STACK_SIZE)
             .spawn(move || {
-                // Give this ROOT/initial guest process's own OS thread its `CURRENT_GUEST_PID`
-                // identity directly, from the thread itself (a `thread_local!`-based propagation
-                // like `spawn_thread` uses for later `clone()`-spawned threads cannot work here,
-                // since this thread is spawned directly via `std::thread::Builder`, never through
-                // that mechanism -- see `set_current_thread_guest_pid`'s doc comment for the full
-                // story and the confirmed-live bug this fixes: without it, this root process's own
-                // live memory claims were tagged under a raw host `ThreadId` fallback identity for
-                // its whole lifetime, later misidentified as a foreign process's memory by an
-                // unrelated child guest process's own fixed-address allocation).
-                litebox_platform_windows_userland::set_current_thread_guest_pid(init_task.pid);
                 let program = shim
                     .load_program(initial_file_system, init_task, &prog_path, argv, envp)
                     .unwrap();
