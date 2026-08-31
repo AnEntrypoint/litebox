@@ -1611,6 +1611,32 @@ fn ensure_tls_index() {
     });
 }
 
+/// Sets this (the CALLING, current) OS thread's own [`CURRENT_GUEST_PID`] directly. Unlike
+/// [`ThreadProvider::set_next_spawned_thread_guest_pid`] (a `thread_local!` read by the SPAWNED
+/// thread's own closure, captured by value across the thread hop -- see that function's and
+/// [`CURRENT_GUEST_PID`]'s doc comments for why a `thread_local!` set on the spawning thread is
+/// invisible to a plain `.take()` on the newly spawned thread, since each thread's own
+/// `thread_local!` storage starts fresh), this must be called FROM the thread whose identity is
+/// being set -- there is no cross-thread propagation here, just a direct same-thread set. Exists
+/// for the ROOT/initial guest process specifically: its OS thread is spawned directly by the
+/// runner crate via a plain `std::thread::Builder` call, entirely outside `spawn_thread`'s own
+/// propagation machinery, so without an explicit same-thread call like this one, that root
+/// process's `CURRENT_GUEST_PID` stayed `None` for its whole lifetime -- confirmed live via a real
+/// `gcc`-under-litebox crash: the root process's own genuinely-live memory claims, tagged under
+/// `allocate_pages`'s raw-`ThreadId` `ClaimOwner` fallback instead of `GuestPid`, were misidentified
+/// as belonging to a foreign process by an unrelated later guest process's own fixed-address
+/// allocation, forcing an unnecessary relocation that broke that later process's `ET_EXEC` binary
+/// load. Re-landed a second time after an earlier revert (`d5e2556f`) proved a net-negative
+/// regression WITHOUT this session's own later `LIVE_THREAD_STACKS` fix (`e1978f2c`) in place --
+/// that fix specifically defends against a live thread's real stack being wrongly overwritten by a
+/// colliding `MAP_FIXED` load, which is exactly the collision class this identity fix's own
+/// regression exposed (a formerly-masked `sh`/`weston` vs a later child collision). With both
+/// fixes together, re-verify carefully (the same live A/B methodology as the first attempt) before
+/// trusting this landed correctly.
+pub fn set_current_thread_guest_pid(pid: i32) {
+    CURRENT_GUEST_PID.set(Some(pid));
+}
+
 /// Runs a guest thread using the provided shim and the given initial context.
 ///
 /// This will run until the thread terminates.
