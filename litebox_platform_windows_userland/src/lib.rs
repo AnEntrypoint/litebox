@@ -2907,16 +2907,28 @@ type ClaimSlot = Option<(core::ops::Range<usize>, ClaimOwner, std::thread::Threa
 /// well under a second (633 real, logged `claim_range DROPPED (registry full)` events observed
 /// in one 30-second repro), silently evicting a DIFFERENT, still-live guest process's own
 /// legitimate claim -- exactly the collision this registry exists to prevent. Raised to 512
-/// (8x) to absorb realistic single-process churn between two collision-relevant checks, combined
+/// (8x), then to 4096 (8x again): a full XFCE desktop session (weston + xfsettingsd + xfce4-panel
+/// + xfdesktop + xfconfd + dbus-daemon + at-spi-bus-launcher, ~20 real OS threads, each doing its
+/// own concurrent dynamic-library-loading churn during startup) was confirmed live to exhaust the
+/// 512-slot registry within ~20 seconds of the first few clients launching (844 real eviction
+/// events logged in one repro, `occupied=512 max=512` sustained thereafter) -- and unlike the
+/// single-process case 512 was tuned for, evictions here landed on STILL-LIVE, actively-loading
+/// sibling processes (`xfsettingsd`/`xfdesktop`, confirmed via the evicted entries' own logged
+/// `GuestPid` owners), not stale leftovers. Every one of those processes' every thread then
+/// permanently stalled in a genuine (non-corrupted, `cdb`-confirmed) `WaitOnAddress` a few
+/// seconds later with no wake ever arriving -- consistent with this doc comment's own described
+/// failure mode (a later `Replace`-mode allocation silently decommitting/recommitting straight
+/// over the evicted range's still-live memory, corrupting a live thread's own state with no
+/// crash, no page fault, and no guest-visible signal, only an unexplained later hang). Combined
 /// with genuine LRU eviction (below) as the correctness backstop for whatever churn volume still
-/// exceeds this: exhaustion now evicts the single OLDEST entry (by insertion sequence, tracked in
-/// `ClaimSlot`) rather than silently dropping the NEWEST one -- the newest claim is, by
-/// construction, the one about to be relevant to an imminent collision check, while an entry old
-/// enough to be the least-recently-inserted across the WHOLE registry is far more likely to
+/// exceeds even 4096: exhaustion now evicts the single OLDEST entry (by insertion sequence,
+/// tracked in `ClaimSlot`) rather than silently dropping the NEWEST one -- the newest claim is,
+/// by construction, the one about to be relevant to an imminent collision check, while an entry
+/// old enough to be the least-recently-inserted across the WHOLE registry is far more likely to
 /// belong to memory that's since been superseded or released. This only gives up this registry's
 /// own collision defense for whichever single entry loses the eviction race, never correctness
 /// of anything else.
-const MAX_CLAIMS: usize = 512;
+const MAX_CLAIMS: usize = 4096;
 
 /// Host address ranges currently claimed by a live guest "process" (a real OS thread), see
 /// [`ClaimSlot`]/[`MAX_CLAIMS`] for the storage shape and why it is a fixed array.
