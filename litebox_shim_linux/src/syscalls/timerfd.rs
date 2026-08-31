@@ -165,8 +165,28 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> TimerfdFile<P
         state.deadline = deadline;
         state.interval = interval;
         state.accrued = 0;
+        // Re-check readiness against the NEW deadline before deciding whether to notify: an
+        // unconditional `notify_observers` here (the previous behavior) marks any registered
+        // `EpollEntry` observer as immediately "ready" via its `Observer::on_events` ->
+        // `ReadySet::push` -> `is_ready = true`, REGARDLESS of whether the new deadline is
+        // actually due yet. Confirmed live via a full XFCE repro trace
+        // (`.wfgy/xfce-build/epolldiag1_clean.log`): weston re-arms its own repaint timerfd with
+        // a legitimate near-future deadline (~9-14ms out), this spuriously marks the epoll
+        // interest `is_ready`, and `EpollFile::has_unready_stdin_or_armed_timerfd_interest`
+        // (which short-circuits `is_ready` entries as "already ready, no bounded repoll needed")
+        // then lets weston's own `epoll_pwait(timeout=None)` call commit to an UNBOUNDED wait --
+        // permanently, since nothing else was pending to wake it, and the real (not-yet-actually-
+        // ready) timerfd is never re-observed until some unrelated fd traffic happens to wake the
+        // same epoll instance first. Only notifying when the new deadline is ALREADY due (i.e.
+        // `resync` against `now` immediately finds it overdue) preserves the one case that
+        // legitimately needs an immediate wakeup, without falsely marking a genuinely-future
+        // deadline "ready".
+        state.resync(now);
+        let already_due = state.accrued > 0;
         drop(state);
-        self.pollee.notify_observers(Events::IN);
+        if already_due {
+            self.pollee.notify_observers(Events::IN);
+        }
         prev
     }
 

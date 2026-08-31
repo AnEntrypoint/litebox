@@ -4871,6 +4871,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     &self.global,
                     &self.wait_cx().with_timeout(timeout),
                     maxevents,
+                    self.tid,
+                    epfd,
                 ) {
                     Ok(epoll_events) => {
                         if !epoll_events.is_empty() {

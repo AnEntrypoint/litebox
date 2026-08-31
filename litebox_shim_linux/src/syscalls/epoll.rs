@@ -308,6 +308,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         global: &GlobalState<Platform, FS>,
         cx: &WaitContext<'_, Platform>,
         maxevents: usize,
+        diag_tid: i32,
+        diag_epfd: u32,
     ) -> Result<Vec<EpollEvent>, WaitError> {
         let mut events = Vec::new();
         let mut diag_iteration: u64 = 0;
@@ -338,6 +340,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
             // consumer with this usage pattern, not just weston, mirroring the stdin fix's shape.
             let has_bounded_repoll_interest = self.has_unready_stdin_or_armed_timerfd_interest(global);
             litebox_util_log::debug!(
+                tid:% = diag_tid,
+                epfd:% = diag_epfd,
                 iteration:% = diag_iteration,
                 has_bounded_repoll_interest:% = has_bounded_repoll_interest;
                 "DIAG EpollFile::wait: loop iteration"
@@ -367,7 +371,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
                     }
                     // Only the bounded repoll interval elapsed, not the caller's own deadline (if
                     // any): re-poll and loop back around.
-                    self.repoll_stdin_and_timerfd_interests(global);
+                    self.repoll_stdin_and_timerfd_interests(global, diag_tid, diag_epfd);
                 }
                 Err(TryOpError::WaitError(e)) => return Err(e),
             }
@@ -399,7 +403,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
 
     /// Re-polls every stdin and timerfd interest and pushes it into the ready set if it has
     /// become readable. Called after each bounded repoll interval elapses in [`Self::wait`].
-    fn repoll_stdin_and_timerfd_interests(&self, global: &GlobalState<Platform, FS>) {
+    fn repoll_stdin_and_timerfd_interests(
+        &self,
+        global: &GlobalState<Platform, FS>,
+        diag_tid: i32,
+        diag_epfd: u32,
+    ) {
         let entries: alloc::vec::Vec<_> = self
             .interests
             .lock()
@@ -412,6 +421,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
             })
             .cloned()
             .collect();
+        litebox_util_log::debug!(
+            tid:% = diag_tid,
+            epfd:% = diag_epfd,
+            n_entries:% = entries.len();
+            "DIAG repoll_stdin_and_timerfd_interests: entries to check"
+        );
         for entry in entries {
             if let Some((_, is_ready)) = entry.poll(global)
                 && is_ready
