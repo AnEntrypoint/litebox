@@ -38,6 +38,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use litebox::event::Events;
 use litebox::event::polling::Pollee;
 use litebox::mm::linux::PAGE_SIZE;
+use litebox::platform::Instant as _;
 use litebox::platform::RawConstPointer;
 use litebox_common_linux::{
     DRM_AUTH_MAGIC_VALUE, DRM_CAP_CRTC_IN_VBLANK_EVENT, DRM_CAP_DUMB_BUFFER, DRM_CAP_PRIME,
@@ -945,6 +946,7 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     pub(crate) fn page_flip(
         &self,
         platform: &Platform,
+        boot_time: &<Platform as litebox::platform::TimeProvider>::Instant,
         ptr: UserPtr<DrmModeCrtcPageFlip>,
     ) -> Result<u32, Errno> {
         let req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
@@ -962,17 +964,37 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         // immediately rather than modeling any real timing delay.
         if req.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
             let sequence = self.next_vblank_sequence.fetch_add(1, Ordering::Relaxed);
+            // Report the CURRENT guest-monotonic time (the same clock domain `CLOCK_MONOTONIC`
+            // reads via `gettime_as_duration`, i.e. `platform.now().duration_since(boot_time)`),
+            // not a fixed `0`/1970 epoch. Confirmed live via a full XFCE repro trace
+            // (`.wfgy/xfce-build/stackfix_debug1.log`): weston computes its own next repaint
+            // deadline FROM this timestamp (`vblank_time + refresh_interval`), and reported it as
+            // wildly, consistently "abnormal: -11541 msec" -- i.e. ~11 SECONDS in the past --
+            // exactly matching how far into its real monotonic uptime weston already was when a
+            // fixed `tv_sec=0` was compared against a genuine `now()` far past that. This silently
+            // starves weston's own frame-callback dispatch to clients (weston-desktop-shell's own
+            // startup path waits for its first `wl_callback.done` before drawing anything), which
+            // is the most likely explanation for the long-standing "desktop-shell never creates a
+            // `wl_surface`" symptom this session's own wire-level Wayland decoding independently
+            // found and left unresolved. This device still has no real vsync/vblank interrupt to
+            // model any genuine timing delay against (the flip is complete the instant this ioctl
+            // returns, same as before) -- only the REPORTED timestamp changes, not the timing
+            // model itself.
+            let elapsed = platform.now().duration_since(boot_time);
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "a guest uptime that overflows u32 seconds (~136 years) is not a real scenario"
+            )]
+            let tv_sec = elapsed.as_secs() as u32;
+            let tv_usec = elapsed.subsec_micros();
             self.pending_flip_events.lock().push_back(DrmEventVblank {
                 base: DrmEvent {
                     r#type: DRM_EVENT_FLIP_COMPLETE,
                     length: size_of::<DrmEventVblank>() as u32,
                 },
                 user_data: req.user_data,
-                // No real host clock is consulted for a software-only device with no genuine
-                // timing to report; real clients that care about wall-clock accuracy here are
-                // querying actual monitor vblank timing, which does not exist for this device.
-                tv_sec: 0,
-                tv_usec: 0,
+                tv_sec,
+                tv_usec,
                 sequence,
                 crtc_id: VIRTUAL_CRTC_ID,
             });

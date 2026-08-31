@@ -4616,7 +4616,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 self.global.drm.destroy_dumb(self.global.platform, *ptr)
             }
             IoctlArg::DrmModeAddFb2(ptr) => self.global.drm.add_fb2(*ptr),
-            IoctlArg::DrmModePageFlip(ptr) => self.global.drm.page_flip(self.global.platform, *ptr),
+            IoctlArg::DrmModePageFlip(ptr) => {
+                self.global
+                    .drm
+                    .page_flip(self.global.platform, &self.global.boot_time, *ptr)
+            }
             IoctlArg::DrmModeGetPlaneResources(ptr) => self.global.drm.get_plane_resources(*ptr),
             IoctlArg::DrmModeGetPlane(ptr) => self.global.drm.get_plane(*ptr),
             IoctlArg::DrmModeSetPlane(ptr) => self.global.drm.set_plane(*ptr),
