@@ -864,11 +864,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         addr: UnixSocketAddr,
         is_nonblocking: bool,
     ) -> Result<(), Errno> {
-        let backlog = self.lookup(task, &addr)?;
+        litebox_util_log::debug!(addr:? = addr; "TRACE unix_connect: entry");
+        let backlog = match self.lookup(task, &addr) {
+            Ok(b) => b,
+            Err(e) => {
+                litebox_util_log::debug!(addr:? = addr, err:? = e; "TRACE unix_connect: lookup failed");
+                return Err(e);
+            }
+        };
         // check if we can bind to the address
-        let _ = addr.bind(task, false)?;
+        let _ = addr.clone().bind(task, false)?;
         let client_cred = task.peer_cred();
-        task.wait_cx()
+        let result = task.wait_cx()
             .wait_on_events(
                 is_nonblocking,
                 Events::OUT,
@@ -878,7 +885,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                 },
                 || self.try_connect(&backlog, client_cred),
             )
-            .map_err(Errno::from)
+            .map_err(Errno::from);
+        litebox_util_log::debug!(addr:? = addr, ok:% = result.is_ok(); "TRACE unix_connect: result");
+        result
     }
 
     fn accept(
@@ -892,6 +901,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                 let listen = state.listen().ok_or(Errno::EINVAL)?;
                 Ok(listen.backlog.clone())
             })?;
+        litebox_util_log::debug!(nonblocking:% = is_nonblocking; "TRACE unix_accept: entry");
         let res = cx
             .wait_on_events(
                 is_nonblocking,
@@ -911,6 +921,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                 },
             )
             .map_err(Errno::from);
+        litebox_util_log::debug!(ok:% = res.is_ok(); "TRACE unix_accept: result");
         // accept on a shut-down listen: Linux returns EAGAIN for non-blocking, EINVAL
         // for blocking. try_accept signals shutdown via ESHUTDOWN; translate here.
         match res {
