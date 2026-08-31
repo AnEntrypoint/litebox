@@ -1,3 +1,120 @@
+# STATUS (2026-08-31, sub-session 33): INDEPENDENT VERIFICATION of the sub-session-33 Fix phase's claim
+("mremap ENOMEM fix verified working, remaining gap is D-Bus/$DISPLAY, unrelated to litebox"). **The mremap
+fix itself is confirmed real and stable (reproduces sub-session 32's own finding: 0 panics, 0 `sys_mremap`
+failures, full natural script completion). The D-Bus autolaunch failure is also confirmed real and
+independently reproduced verbatim. But the Fix phase's framing of it as "a separate downstream config issue
+unrelated to the mremap fix" understates what this session's own log shows: the D-Bus failure is not merely
+cosmetic -- it is immediately followed by `libwayland: failed to read client connection (pid 28)` and `(pid
+27)`, i.e. the clients' own Wayland connections then fail/close as a direct consequence. This is a second,
+still-live blocker in the same causal chain, not an independent footnote. Screenshot is solid black, same as
+every prior sub-session. The standing user goal is NOT MET.**
+
+**Repro used**: identical exact repro command from prior sessions, `.wfgy/xfce-build/xfce_launch.sh`
+(unmodified) via `--initial-files .wfgy/xfce-build/alpine-pinned2.tar --resume-from
+.wfgy/xfce-build/xfce-layer19.tar --gui -- /bin/sh /xfce_launch.sh`, `LITEBOX_LOG=debug`. Release binary
+rebuilt from scratch this session: the stale binary was locked by a leftover process from the Fix phase
+(`Access is denied` on `cargo build`), killed via `Stop-Process`, then `cargo build --locked --release -p
+litebox_runner_linux_on_windows_userland` showed genuine `Compiling` lines for all 5 touched/dependent
+crates (`litebox`, `litebox_common_linux`, `litebox_platform_windows_userland`, `litebox_shim_linux`,
+`litebox_runner_linux_on_windows_userland`), not an instant no-op "Finished" -- exe mtime confirmed advancing
+(09:13 -> 09:18). `git diff --stat` confirmed only 2 files touched (`litebox/src/mm/linux.rs`,
+`litebox_platform_windows_userland/src/lib.rs`, +117/-3), matching the Fix phase's own description exactly
+(this diff is the *same* mremap/`ERROR_MAPPED_ALIGNMENT` fix sub-session 32 already independently verified --
+this session re-verifies it held, and separately investigates the newly-claimed D-Bus finding). Own fresh
+log, launched via PowerShell `Start-Process -RedirectStandardOutput/-RedirectStandardError` (per sub-session
+32's own noted-reliable method): `.wfgy/xfce-build/adv3_run1.log` (700,168 lines) + `.log.err` (126 lines).
+
+**Verified TRUE (grepped directly from this session's own log):**
+- `panicked`: **0** hits. `sys_mremap: failed`: **0** hits, anywhere in the full 700K-line run --
+  reproduces sub-session 32's finding that the mremap fix holds.
+- `TRACE unix_connect`/`TRACE unix_accept` with `ok=true`: 18 hits total this run (more raw lines than
+  sub-session 32's 8 due to additional instrumentation context, but same semantic shape: seatd connect +
+  3 real XFCE Wayland connects, each with a matching accept).
+- `DrmModeSetCrtc`/`DrmModePageFlip`: **2** total (1 each) -- same single startup modeset+flip as every
+  prior sub-session back to #26, unchanged.
+- `repaint` (case-insensitive): **7** hits -- unchanged from every prior sub-session, one single repaint
+  cycle, never repeated.
+- `RESOLVED_WAYLAND_DISPLAY=wayland-1` (t=19.28s), `LIVENESS_CHECK`+`WESTON_ALIVE=1` (t=66.16s),
+  `DONE_SLEEPING` (t=81.54s) all reached -- **script ran to full natural completion**, matching sub-session
+  32's finding. Process continued afterward into the same slow `close_all_fds`-on-exit scan noted previously
+  (fd numbers observed up to 544,356+, log growing to t=130.5s/700K lines before the shell's own `kill -0`
+  cleanup logged `sh: can't kill pid 20: Invalid argument` -- a cosmetic exit-path artifact, not evaluated
+  further).
+- `cannot open display`/`Unable to open display`: **still occurs, all 3 clients**, confirming the Fix
+  phase's own honest disclosure was correct that this is NOT resolved:
+  - `(xfdesktop:29): xfdesktop-WARNING **: 07:19:25.720: xfdesktop: unable to connect to settings daemon:
+    Cannot autolaunch D-Bus without X11 $DISPLAY.  Defaults will be used`
+  - `(xfce4-panel:28): xfce4-panel-CRITICAL **: 07:19:28.832: Failed to initialize Xfconf: Cannot
+    autolaunch D-Bus without X11 $DISPLAY`
+  - `xfsettingsd: Cannot autolaunch D-Bus without X11 $DISPLAY.`
+  - This matches `xfce_launch.sh`'s own script content (read directly, unmodified): it sets
+    `GDK_BACKEND=wayland` and `WAYLAND_DISPLAY` for each client but never sets `$DISPLAY` or starts an
+    Xwayland-backed D-Bus session for them, so any client-side code path that still needs D-Bus falls
+    through to autolaunch, which requires X11 and fails.
+
+**CORRECTION to the Fix phase's framing (new evidence this session's log surfaces that the Fix phase's own
+report did not mention):** immediately after each D-Bus failure, the *Wayland* connection itself then dies:
+`[07:19:28.876] libwayland: failed to read client connection (pid 28)` (xfce4-panel, 4ms after its own
+D-Bus CRITICAL) and `[07:19:29.903] libwayland: failed to read client connection (pid 27)` (xfsettingsd,
+shortly after its own D-Bus message). (xfdesktop, pid 29, logs no matching "failed to read" line in this
+run -- unclear if it exits differently or the log line was elsewhere; not confirmed.) So the D-Bus failure
+is not an inert, side-channel warning as "Defaults will be used" might suggest for xfdesktop -- for at least
+2 of the 3 clients it is followed by the client's Wayland connection to weston being torn down entirely.
+Whether the D-Bus failure *causes* the Wayland disconnect (e.g. the client aborts init and closes its own
+fd) or the two are coincidentally sequenced was not established this session -- but the Fix phase's
+"separate downstream config issue unrelated to the mremap fix" framing undersells this: it is unrelated to
+mremap, but it is not obviously inert either, and is likely the actual proximate cause of the clients never
+drawing anything (consistent with the screenshot below: weston's own compositor loop is alive and repaints
+once, but no client ever gets far enough to attach a real surface).
+
+**Screenshot: taken independently this session with a materially more robust methodology than prior
+sub-sessions' `SetForegroundWindow`+`CopyFromScreen` approach.** A first attempt using the documented
+sub-session-32 technique (`SetWindowPos`+`AttachThreadInput`+`BringWindowToTop`+`SetForegroundWindow`, then
+`GetClientRect`+`ClientToScreen`+`CopyFromScreen`) **again silently captured the wrong window** --
+`GetForegroundWindow()` checked immediately before and after the capture both showed a *different* HWND
+than the confirmed-correct litebox HWND (mismatch logged explicitly both times), and the resulting image
+(`adv3_screenshot.png`, discarded) was visibly an unrelated browser tab (a Google-AI-Studio-style chat
+interface with a spreadsheet panel), not litebox -- the third consecutive sub-session (31, 32, now 33) to
+hit this exact `SetForegroundWindow`-silently-no-ops failure mode despite following the "documented working
+technique." **Fix this session: switched to `PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT)`**, which renders
+a specific HWND's content directly into a supplied device context regardless of z-order or actual foreground
+status -- no `SetForegroundWindow` race possible. `adv3_screenshot2.png`: 1638x1440 window rect,
+`PrintWindow` returned `true`, and the saved image visibly contains the litebox window's own title bar
+("litebox virtual display") baked into the captured pixels, unambiguously proving this is the correct
+window's own content, not a z-order mix-up. Pixel-sampled at a 20x20 grid (400 samples): **380/400 (95%)
+exactly RGB(0,0,0)**, remaining 20 samples RGB(32,32,32) (window-chrome/title-bar-adjacent gray, matching
+the title bar's own background, not compositor content). Only **2 unique colors** in the entire sample grid.
+No XFCE panel, taskbar, desktop icons, wallpaper, or any distinguishable window content visible anywhere.
+**Solid black, matching every prior sub-session, unchanged by the mremap fix or by anything else this
+session found.**
+
+**Verdict: the sub-session-33 Fix phase's own report is accurate on its central, falsifiable, previously-
+verified claim (mremap fix holds: 0 panics, 0 `sys_mremap` failures, full natural completion) and its D-Bus
+finding is real and independently reproduced verbatim. Its framing of the D-Bus issue as a clean, separate,
+inert footnote is not fully supported by this session's own log** -- for 2 of 3 clients the D-Bus failure is
+immediately followed by their Wayland connection itself dying, which is a more direct explanation for why no
+client ever draws anything than "the mremap bug is fixed, so it must just be D-Bus now" implies. **The
+standing user goal -- XFCE rendering visible, real desktop content, proven via screenshot -- is NOT MET.**
+**Concrete next blocker for whoever continues**: fix `xfce_launch.sh` (or the container's D-Bus/XDG session
+setup) so xfsettingsd/xfce4-panel/xfdesktop do not attempt X11 D-Bus autolaunch -- either start a proper
+`dbus-launch`/session-bus for them before exec (the script already runs `dbus-daemon --system`, which is not
+the same as a session bus these apps expect) or set `DBUS_SESSION_BUS_ADDRESS` explicitly to suppress
+autolaunch, then re-run this exact repro and check specifically whether `xfce4-panel`'s and `xfsettingsd`'s
+`libwayland: failed to read client connection` lines disappear and whether a second/third weston repaint
+cycle is ever triggered (the current fixed single-repaint-only behavior, unchanged since sub-session 26,
+strongly suggests no client has yet gotten far enough to attach a real surface for weston to composite).
+
+Raw evidence this session: `.wfgy/xfce-build/adv3_run1.log` (700,168 lines) + `.log.err` (126 lines),
+`.wfgy/xfce-build/adv3_screenshot2.png` (final correct capture via `PrintWindow`),
+`.wfgy/xfce-build/adv3_screenshot.png` (discarded -- wrong window, third recurrence of the
+`SetForegroundWindow` silent-no-op failure mode, kept as a methodology warning),
+`.wfgy/xfce-build/adv3_screenshot.ps1` / `adv3_screenshot2.ps1` (capture scripts; the `2` variant using
+`PrintWindow` is the one to reuse next time -- it is more robust than the `SetForegroundWindow` approach
+that has now failed 3 sessions running).
+
+---
+
+
 # STATUS (2026-08-31, sub-session 32): INDEPENDENT VERIFICATION of the sub-session-32 Fix phase's
 `mremap`/`VirtualFree(DECOMMIT)`-on-mapped-view claims (uncommitted working-tree diff touching
 `litebox_platform_windows_userland/src/lib.rs`, `litebox/src/mm/linux.rs`,

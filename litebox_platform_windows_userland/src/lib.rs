@@ -4464,9 +4464,23 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         }
         if view.Value.is_null() {
             let err = unsafe { GetLastError() };
+            litebox_util_log::debug!(
+                base_addr:% = base_addr as usize, len:% = suggested_range.len(),
+                fixed_address_behavior:? = fixed_address_behavior, win32_err:% = err;
+                "map_shared_memory: DIAG MapViewOfFile3 failed"
+            );
             if fixed_address_behavior == FixedAddressBehavior::NoReplace
-                && err == Win32_Foundation::ERROR_INVALID_ADDRESS
+                && (err == Win32_Foundation::ERROR_INVALID_ADDRESS
+                    || err == Win32_Foundation::ERROR_MAPPED_ALIGNMENT)
             {
+                // ERROR_MAPPED_ALIGNMENT (1132): MapViewOfFile3 requires any explicit
+                // fixed-address request to be allocation-granularity aligned (64 KiB), not
+                // just page aligned (4 KiB). A page-aligned-but-not-granularity-aligned
+                // target (e.g. an in-place shared-mapping expand target computed by
+                // `resize_mapping`) hits this, not ERROR_INVALID_ADDRESS. Treat it the same
+                // way: report it as an ordinary address-in-use collision so the caller's
+                // real retry/placement-search path (`move_mappings`) picks a fresh,
+                // granularity-valid address instead of this surfacing as a permanent ENOMEM.
                 return Err(SharedMemoryError::AddressInUse);
             }
             return Err(SharedMemoryError::OutOfMemory);

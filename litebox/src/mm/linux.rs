@@ -1518,11 +1518,21 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             // Try to extend the mapping. Although we checked that there are no
             // litebox mappings in this range, this may fail if there are
             // platform mappings in the way.
+            let (diag_cur_start, diag_cur_end, diag_is_shared) =
+                (cur_range.start, cur_range.end, cur_vma.shared_handle.is_some());
             match unsafe {
                 self.insert_mapping(range, *cur_vma, false, FixedAddressBehavior::NoReplace)
             } {
                 Ok(_) => {}
-                Err(AllocationError::OutOfMemory) => return Err(VmemResizeError::OutOfMemory),
+                Err(AllocationError::OutOfMemory) => {
+                    litebox_util_log::debug!(
+                        expand_start:% = range.start, expand_end:% = new_end,
+                        cur_range_start:% = diag_cur_start, cur_range_end:% = diag_cur_end,
+                        is_shared:% = diag_is_shared;
+                        "resize_mapping: DIAG in-place expand insert_mapping returned OutOfMemory"
+                    );
+                    return Err(VmemResizeError::OutOfMemory);
+                }
                 Err(
                     AllocationError::AddressInUse
                     | AllocationError::AddressInUseByPlatform
@@ -1576,6 +1586,85 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         if vma.is_file_backed() {
             unimplemented!("file-backed mapping move is not supported yet");
         }
+
+        // A `shared_handle` mapping (anonymous `MAP_SHARED`, e.g. weston's pixman
+        // shadow-framebuffer growing via `mremap`) must NOT go through the generic path below:
+        // that path calls `self.platform.remap_pages`, whose default implementation
+        // `allocate_pages`s brand-new PRIVATE pages at the destination and byte-copies into
+        // them -- it never touches `vma.shared_handle` at all. For a shared mapping this is
+        // simply wrong (the moved mapping silently stops being shared -- other holders of the
+        // same `shared_handle`, e.g. across a `fork()`, would no longer see writes through it),
+        // and separately it was observed live to fail outright: repeated
+        // `AllocationError::AddressInUse`/`AddressInUseByPlatform` collisions (surfaced up as
+        // `RemapError::AlreadyAllocated` -> `Errno::EFAULT`) exhausting all
+        // `MAX_PLACEMENT_RETRIES` attempts below, immediately following an unrelated
+        // `ERROR_MAPPED_ALIGNMENT` fix to `map_shared_memory`'s in-place-expand path in
+        // `resize_mapping` -- confirmed via `sys_mremap: failed ... err=Errno(14 = EFAULT)`
+        // replacing the prior `ENOMEM` for weston's exact shared shadow-fb growth. Route shared
+        // moves through `insert_mapping` instead (the same `map_shared_memory`-backed path
+        // `resize_mapping`'s in-place expand already uses), which re-maps a fresh VIEW of the
+        // SAME underlying shared object at the new address rather than allocating unrelated
+        // private memory -- no byte-copy is needed since the content lives in the shared object,
+        // not in either view.
+        if let Some(_shared_handle) = vma.shared_handle {
+            let vma: VmArea<Platform, ALIGN> = *vma;
+            // `insert_mapping` rejects `start < Platform::TASK_ADDR_MIN` unconditionally, even
+            // under `FixedAddressBehavior::Hint` -- unlike `allocate_pages`, it has no "0 means
+            // let the platform pick freely" convention of its own, so a literal 0 hint here
+            // would always bounce as `BelowMinAddress` (confirmed live: this previously
+            // surfaced as `sys_mremap: failed ... err=Errno(22 = EINVAL)` for every hint-less
+            // shared-mapping move). Get a real candidate address from the same free-gap search
+            // `get_unmmaped_area` for the non-shared path below, then retry with a fresh
+            // candidate (same bounded scheme as the non-shared path's own
+            // `MAX_PLACEMENT_RETRIES` loop) if the platform still rejects it as in-use --
+            // `map_shared_memory`'s own alignment/placement quirks (e.g. the
+            // `ERROR_MAPPED_ALIGNMENT` case fixed in `map_shared_memory` above) can still cause
+            // a first-pick collision.
+            const MAX_SHARED_MOVE_RETRIES: u32 = 8;
+            let mut next_hint = suggested_new_address;
+            let mut attempt = 0u32;
+            let new_ptr = loop {
+                let new_addr = self
+                    .get_unmmaped_area(
+                        next_hint,
+                        new_size,
+                        false,
+                        vma.flags.contains(VmFlags::VM_GROWSDOWN),
+                    )
+                    .ok_or(VmemMoveError::OutOfMemory)?;
+                let new_range =
+                    PageRange::<ALIGN>::new(new_addr, new_addr + new_size.as_usize())
+                        .ok_or(VmemMoveError::UnAligned)?;
+                match unsafe {
+                    self.insert_mapping(new_range, vma, false, FixedAddressBehavior::Hint)
+                } {
+                    Ok(ptr) => break ptr,
+                    Err(
+                        AllocationError::AddressInUse | AllocationError::AddressInUseByPlatform,
+                    ) if attempt < MAX_SHARED_MOVE_RETRIES => {
+                        attempt += 1;
+                        next_hint = None;
+                    }
+                    Err(AllocationError::OutOfMemory | AllocationError::AddressInUse
+                        | AllocationError::AddressInUseByPlatform
+                        | AllocationError::AddressPartiallyInUse) => {
+                        return Err(VmemMoveError::OutOfMemory);
+                    }
+                    Err(
+                        AllocationError::Unaligned
+                        | AllocationError::BelowMinAddress
+                        | AllocationError::AboveMaxAddress,
+                    ) => return Err(VmemMoveError::UnAligned),
+                }
+            };
+            // Drop the old view of the same shared object; this only unmaps the view (via
+            // `unmap_shared_memory`), it does not release the underlying shared-memory object,
+            // which the new mapping above still holds a live view of.
+            unsafe { self.remove_mapping(old_range) }
+                .map_err(|_| VmemMoveError::OutOfMemory)?;
+            return Ok(new_ptr);
+        }
+
         // `get_unmmaped_area` only consults litebox's own `self.vmas` tracker, which has no
         // visibility into memory the underlying platform holds outside litebox's control (on
         // Windows: the host process's own loaded modules, thread stacks, or later host-allocator
@@ -1620,13 +1709,24 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     return Ok(new_addr);
                 }
                 Err(RemapError::AlreadyAllocated) if attempt < MAX_PLACEMENT_RETRIES => {
+                    litebox_util_log::debug!(
+                        attempt:% = attempt, new_addr:% = new_addr, vmas_count:% = self.vmas.iter().count();
+                        "move_mappings: DIAG AlreadyAllocated, retrying with fresh placement"
+                    );
                     attempt += 1;
                     // Drop the hint on retry: a repeated collision at the same suggested address
                     // would just fail identically again, so fall through to the OS/tracker's own
                     // free-gap search for the next attempt.
                     next_hint = None;
                 }
-                Err(e) => return Err(VmemMoveError::RemapError(e)),
+                Err(e) => {
+                    litebox_util_log::debug!(
+                        attempt:% = attempt, new_addr:% = new_addr, vmas_count:% = self.vmas.iter().count(),
+                        err:? = &e;
+                        "move_mappings: DIAG non-retriable RemapError, giving up"
+                    );
+                    return Err(VmemMoveError::RemapError(e));
+                }
             }
         }
     }
