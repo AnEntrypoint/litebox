@@ -3858,7 +3858,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     count,
                     None,
                 )? as usize;
-                litebox_util_log::trace!(
+                litebox_util_log::debug!(
                     tid:% = self.tid,
                     addr:% = addr.as_usize(),
                     requested:% = count.get(),
@@ -3875,7 +3875,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             } => {
                 warn_shared_futex!(flags);
                 let timeout = timeout.read::<Platform>()?;
-                litebox_util_log::trace!(
+                litebox_util_log::debug!(
                     tid:% = self.tid,
                     addr:% = addr.as_usize(),
                     val:% = val,
@@ -3888,7 +3888,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     val,
                     None,
                 );
-                litebox_util_log::trace!(
+                litebox_util_log::debug!(
                     tid:% = self.tid,
                     addr:% = addr.as_usize(),
                     res:? = res;
