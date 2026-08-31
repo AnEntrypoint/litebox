@@ -1,3 +1,82 @@
+# STATUS (2026-08-31, sub-session 29): XFCE content NOT confirmed onscreen -- task's premise (Xwayland never fork/execve's) did not hold under fresh repro; true blocker turned out to be a pre-existing, already-documented litebox argv/stack-pointer corruption bug killing the parent shell right after `fork()`, before any XFCE/X11 client code runs at all
+
+This sub-session set out to fix "weston logs `xserver listening on display :0` then never
+fork/execve's Xwayland," per the standing task description. Reproducing with `LITEBOX_LOG=debug`
+and cleanly extracted, un-ANSI-mangled, tid-tracing logs showed that description was itself
+stale/wrong: the actual failure is one layer earlier and unrelated to Xwayland.
+
+**What actually happens, precisely traced:**
+- Parent shell `tid=1000` forks weston (`clone: spawned new task parent_tid=1000 child_tid=20`) at
+  t≈11.96s.
+- On the very next syscall, the **parent shell itself** hits `/bin/sh: syntax error: unterminated
+  quoted string` and calls `sys_exit_group(status=Exit(2))` -- the whole launch script dies right
+  there.
+- Every subsequent line of the repro script (the `WAYLAND_DISPLAY` discovery loop, `xfsettingsd`/
+  `xfce4-panel`/`xfdesktop` launches) never runs -- not because Xwayland's lazy-spawn wasn't
+  triggered, but because nothing downstream of weston's fork ever executes, XFCE's GTK/X11 clients
+  included. No X11 client connection attempt ever happens, so the earlier "no Xwayland fork/exec"
+  observation was a downstream symptom of this crash, not an Xwayland-layer cause.
+- Reproducible on 4 independent runs regardless of exact shell text used afterward (confirmed by
+  simplifying the socket-discovery loop to a trivial fixed-candidate `[ -S ]` check, and separately
+  by inserting `sleep 1` before the failing point) -- ruling out this session's own script edits as
+  the cause. The extracted embedded shell body passes `sh -n` cleanly outside litebox, ruling out
+  an actual shell syntax bug in the repro script itself.
+
+**Root cause: litebox's own pre-existing, extensively self-documented argv/stack-pointer
+corruption bug**, in `litebox_shim_linux/src/syscalls/process.rs`'s `fixup_stale_stack_pointers`
+(lines ~1188-1450+) and its Windows counterpart `litebox_platform_windows_userland/src/fork_verify.rs`.
+That code's own doc comments describe multiple already-fixed rounds of exactly this corruption
+class (a parent/child stack slot that numerically resembles a stale pointer gets misidentified and
+"healed," corrupting live shell-arena/argv string data -- previously root-caused to a mallocng
+heap-pointer misfire, "verified 40/40 clean" for short payload lengths 1-40). This session's repro
+hits the same symptom class (`ash`'s `stalloc` arena corrupted right after `fork()`) but at a
+scale/code path not fully bisected against those prior fixes -- most likely the corruption now
+strikes the **parent** thread's continuation after a heavier fork (weston, not the earlier
+lightweight `mkdir`/`chmod`/`seatd`/`dbus-daemon` forks that succeeded fine), a case the existing
+scan window (bounded to the **child's** `rsp`, per the code's own comments) does not cover.
+
+This is the same bug class already flagged as an open, cross-session blocker in project memory
+(`npx casey goal status`: "fork()+pre-execve mallocng `.meta=0` null-deref crash, proven
+litebox-specific"). It is materially different from, and deeper than, the Xwayland lazy-spawn
+framing this sub-session started from, and was judged not safely fixable as a narrow in-session
+change: the code's own history shows three prior narrowing attempts at this exact heuristic, each
+requiring precise live-repro-driven bisection before any constant/guard change, and explicitly
+warning against speculative edits without new pinned-down repro data. That bisection was not done
+this session.
+
+**What was actually changed:** `run_repro_fix_apply.ps1` -- replaced the hardcoded
+`WAYLAND_DISPLAY=wayland-0` assumption/polling with dynamic discovery of whichever `wayland-N`
+socket weston actually binds (confirmed real: no `wayland-0`/`wayland-1` baked into
+`xfce-layer18.tar`). This fix is applied and correct but its effect could not be observed, because
+the script now dies from the pre-existing corruption bug before ever reaching that code. No
+`litebox_shim_linux`/`litebox_runner_linux_on_windows_userland` source changes were made this
+sub-session -- no Xwayland-specific gap was found anywhere in litebox to fix; the real blocker sits
+one layer earlier, in already-existing, not-yet-fully-resolved core litebox fork/exec code.
+
+**Verification performed:** `cargo check -p litebox_shim_linux` clean; `cargo test -p
+litebox_shim_linux --lib -- --skip test_mremap` -> 177/177 passed (baseline maintained, no
+regression, since no shim code was touched this sub-session).
+
+**Screenshot taken during a live run:** solid black content area (1523x825px client area) under
+the "litebox virtual display" title bar -- matching weston's single `kiosk-shell-background` solid
+color surface, no XFCE panel/taskbar/desktop content visible. **XFCE content is NOT confirmed
+onscreen.**
+
+**Flip count:** `DrmModeSetCrtc`/`DrmModePageFlip` occurred exactly **once** in every run (original
+and all 4 re-runs) -- unchanged from prior sub-sessions' count of 2 total calls (1 SetCrtc + 1
+PageFlip = the single startup repaint). No repeated repainting observed, because the parent shell
+dies before any X11/XFCE client ever connects to trigger further compositor activity.
+
+**Concrete next step:** this needs its own dedicated, bisection-heavy investigation session against
+`fixup_stale_stack_pointers`/`fork_verify.rs`, using the same length-sweep/executable-range-filter
+methodology already used to fix the prior 3 rounds of this bug class, scoped specifically to the
+**parent** thread's post-fork continuation (not just the child's) -- an apparently-uncovered case.
+This is new, real scope beyond an Xwayland-specific fix and should be tracked as its own item
+rather than folded into further weston/DRM/Wayland-protocol work, none of which can be reached
+until the parent shell survives past `fork()`.
+
+---
+
 # STATUS (2026-08-30, sub-session 28, updated): DRM epoll-readiness gap FOUND AND FIXED (real, landed), but re-verification shows it was NOT the actual blocker -- weston still repaints exactly once even with the fix in place; the true remaining gap is one level deeper, in the Wayland protocol traffic between weston and its clients (Xwayland/XFCE), not in DRM readiness signaling
 
 **Real fix landed this sub-session** (kept, verified, not reverted): `DrmSubsystem::pending_flip_events`
