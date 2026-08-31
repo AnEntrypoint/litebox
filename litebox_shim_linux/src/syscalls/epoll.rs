@@ -191,6 +191,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
                     .with_metadata(file, |_: &crate::syscalls::file::EvdevFd| ())
                     .is_ok()
                 {
+                    if let Some(observer) = observer {
+                        global.evdev.register_observer(observer);
+                    }
                     let events = if global.evdev.has_pending() {
                         Events::IN
                     } else {

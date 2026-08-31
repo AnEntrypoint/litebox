@@ -32,6 +32,8 @@
 
 use alloc::collections::VecDeque;
 
+use litebox::event::Events;
+use litebox::event::polling::Pollee;
 use litebox_common_linux::{EV_SYN, InputEvent, SYN_REPORT};
 use zerocopy::IntoBytes;
 
@@ -48,13 +50,32 @@ const MAX_QUEUED_EVENTS: usize = 256;
 /// is and is not implemented in this pass.
 pub(crate) struct EvdevSubsystem<Platform: ShimPlatform> {
     pending_events: litebox::sync::Mutex<Platform, VecDeque<InputEvent>>,
+    /// Wakeup mechanism for a guest thread blocked in `poll`/`epoll_wait`/`select` on the evdev
+    /// fd waiting for input -- see `DrmSubsystem::flip_pollee`'s doc comment for the identical
+    /// bug shape this fixes: `EpollDescriptor::poll`'s `File` arm's `EvdevFd` branch previously
+    /// computed on-demand readiness via `has_pending()` but never registered an observer here,
+    /// so a client that registers this fd once via `epoll_ctl` and blocks in `epoll_wait` across
+    /// many iterations (rather than re-polling synchronously after every event) would never wake
+    /// for the second and later queued input events.
+    pollee: Pollee<Platform>,
 }
 
 impl<Platform: ShimPlatform> EvdevSubsystem<Platform> {
     pub(crate) fn new() -> Self {
         Self {
             pending_events: litebox::sync::Mutex::new(VecDeque::new()),
+            pollee: Pollee::new(),
         }
+    }
+
+    /// Register an observer for evdev fd readiness -- see [`Self::pollee`]'s doc comment. Called
+    /// from `syscalls::epoll::EpollDescriptor::poll`'s `File` arm's `EvdevFd` branch, exactly
+    /// where every other pollable fd kind (e.g. eventfd) registers its own observer.
+    pub(crate) fn register_observer(
+        &self,
+        observer: alloc::sync::Weak<dyn litebox::event::observer::Observer<Events>>,
+    ) {
+        self.pollee.register_observer(observer, Events::IN);
     }
 
     /// Push one real event into the queue, followed by a `SYN_REPORT` (real evdev clients expect
@@ -79,6 +100,8 @@ impl<Platform: ShimPlatform> EvdevSubsystem<Platform> {
             code: SYN_REPORT,
             value: 0,
         });
+        drop(events);
+        self.pollee.notify_observers(Events::IN);
     }
 
     /// Queue an `EV_KEY` event -- a keyboard key or mouse button transition. `value` is `1`
