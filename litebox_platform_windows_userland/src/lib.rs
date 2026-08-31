@@ -1601,6 +1601,26 @@ pub unsafe fn run_thread(
     run_thread_inner(&shim, ctx, None);
 }
 
+/// Sets this (the CALLING, current) OS thread's own [`CURRENT_GUEST_PID`] directly. Unlike
+/// [`ThreadProvider::set_next_spawned_thread_guest_pid`] (a `thread_local!` read by the SPAWNED
+/// thread's own closure, captured by value across the thread hop -- see that function's and
+/// [`CURRENT_GUEST_PID`]'s doc comments for why a `thread_local!` set on the spawning thread is
+/// invisible to a plain `.take()` on the newly spawned thread, since each thread's own
+/// `thread_local!` storage starts fresh), this must be called FROM the thread whose identity is
+/// being set -- there is no cross-thread propagation here, just a direct same-thread set. Exists
+/// for the ROOT/initial guest process specifically: its OS thread is spawned directly by the
+/// runner crate via a plain `std::thread::Builder` call, entirely outside `spawn_thread`'s own
+/// propagation machinery, so without an explicit same-thread call like this one, that root
+/// process's `CURRENT_GUEST_PID` stayed `None` for its whole lifetime -- confirmed live via a real
+/// `gcc`-under-litebox crash: the root process's own genuinely-live memory claims, tagged under
+/// `allocate_pages`'s raw-`ThreadId` `ClaimOwner` fallback instead of `GuestPid`, were misidentified
+/// as belonging to a foreign process by an unrelated later guest process's own fixed-address
+/// allocation, forcing an unnecessary relocation that broke that later process's `ET_EXEC` binary
+/// load.
+pub fn set_current_thread_guest_pid(pid: i32) {
+    CURRENT_GUEST_PID.set(Some(pid));
+}
+
 /// Identical to [`run_thread`], but additionally arms [`fork_verify`]'s post-fork stale-pointer
 /// single-step verification for this thread -- the cross-process fork() child's equivalent of what
 /// the thread-based fork path's own `ThreadInitState::ForkedChild` dispatch achieves via
