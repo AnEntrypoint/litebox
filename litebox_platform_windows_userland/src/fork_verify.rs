@@ -687,7 +687,7 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
         }
         if let Some(translated_rip) = relocations.translate(rip) {
             litebox_util_log::warn!(
-                rip:? = rip, translated_rip:? = translated_rip;
+                host_tid:? = std::thread::current().id(), rip:? = rip, translated_rip:? = translated_rip;
                 "fork_verify: stale CODE pointer detected, translating and resuming"
             );
             context.Rip = translated_rip as u64;
@@ -1207,6 +1207,7 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
             );
         }
         litebox_util_log::warn!(
+            host_tid:? = std::thread::current().id(),
             rip:? = rip, load_address:? = load_address, stale_value:? = stale_value,
             translated:? = translated, mnemonic:? = instruction.mnemonic();
             "fork_verify: stale CODE pointer in indirect call/jmp target slot detected, patching slot in place"
