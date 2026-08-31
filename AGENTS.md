@@ -1,4 +1,111 @@
-# STATUS (2026-08-31, sub-session 30): INDEPENDENT VERIFICATION of a claimed `VirtualFree(DECOMMIT)`/xwayland.so-dlopen host-crash fix -- fix's own narrow claim (no panic) holds, but its headline "9 repaints, weston survives past the old crash point" evidence does NOT reproduce; exact-repro re-run this session shows repaint count 0 (not >1), DRM ioctl count back down to the pre-crash-era baseline of 2 (1 SetCrtc + 1 PageFlip), and the screenshot is still solid black -- XFCE desktop content is NOT confirmed onscreen
+# STATUS (2026-08-31, sub-session 31): INDEPENDENT VERIFICATION of the sub-session-31-Fix-phase logging-instrumentation commit (`a7adf623`) -- its narrow claims about tracing coverage and `sys_write` count are TRUE and reproduced with a fresh, self-run 1.19M-line log, but its headline "GTK never writes after connect(), gap is on weston's receive side" framing is REFINED/PARTLY CORRECTED by this session's own data: clients DO write and DO get read (weston replies), the real failure is `GTK-WARNING: cannot open display` inside the client itself, seconds after a successful Wayland `sendmsg`. XFCE desktop content is STILL NOT confirmed onscreen -- solid black, same as every prior sub-session.
+
+**Repro used**: `.wfgy/xfce-build/xfce_launch.sh` (unmodified, already-committed script) run as
+`--initial-files .wfgy/xfce-build/alpine-pinned2.tar --resume-from .wfgy/xfce-build/xfce-layer19.tar
+--gui -- /bin/sh /xfce_launch.sh`, release binary at `target/release/litebox_runner_linux_on_windows_userland.exe`
+(built at 07:42, already contained the `a7adf623` shim tracing commit -- confirmed via `git log`/`git diff --stat`
+showing only `litebox_shim_linux/src/syscalls/{file.rs,net.rs}` touched, working tree otherwise clean),
+`LITEBOX_LOG=debug`, own fresh log never reused from the Fix phase:
+`.wfgy/xfce-build/adv_verify_run.log` (**1,193,008 lines**, run to natural completion at t=194.48s,
+i.e. reached `DONE_SLEEPING`/process self-exit, not killed early).
+
+**Verified TRUE (grepped directly from this session's own log, not the Fix phase's):**
+- `panicked`: **0** hits. `VirtualFree(DECOMMIT) failed`: **0** hits. No host crash this run, at any point
+  through the full 194s lifetime -- notably longer than either of the Fix phase's own two runs (13.16s
+  crash / 20.84s access-violation), so this run went substantially further than what the Fix phase itself
+  observed. (The `VirtualFree`/`MapViewOfFile3` platform bug the Fix phase root-caused is real and still
+  unfixed in the source, per `git diff --stat`, but did not trigger this particular run.)
+- `sys_execve` for all 3 XFCE binaries: confirmed at lines 45208/45642/45763, t=18.556s/18.625s/18.641s
+  (`xfsettingsd` tid=26, `xfce4-panel` tid=27, `xfdesktop` tid=28).
+- `TRACE unix_connect`/`TRACE unix_accept ok=true` on `/run/user/1000/wayland-1`: **4 pairs**, all `ok=true`
+  (1 earlier one for `/run/seatd.sock` at t=16.21s, then the 3 real XFCE-client Wayland connects at
+  t=38.574s/38.806s/39.269s, each immediately followed by a matching `unix_accept ok=true` on weston's side).
+- `sys_write` count, whole log: **144** (Fix phase claimed 123 on its own shorter run; this run is longer
+  and includes more startup/seatd/weston-log writes, so a higher absolute count is expected and consistent,
+  not contradictory).
+- `sys_sendmsg` from all 3 XFCE client tids on their Wayland fd (fd=3): confirmed real Wayland protocol
+  traffic -- each client sends **two** messages: a first `Ok(24)`-byte message (`wl_display.get_registry`-sized)
+  at t=38.646s/38.874s/39.331s, then a second `Ok(424)`-byte message at t=39.676s/39.915s/40.099s
+  (tid=27/26/28 respectively). This reproduces and slightly extends the Fix phase's own finding.
+- `DrmModeSetCrtc`/`DrmModePageFlip`: **1 each** (weston's single startup modeset+flip) -- same count as
+  every prior sub-session back to #26, unchanged.
+- `repaint` (case-insensitive), whole log: **7 hits**, all from a single real repaint cycle at t=25.537s-25.570s
+  (`[repaint] Beginning repaint (/dev/dri/card0); pending_state 0x1a`, `...preparing state for output
+  Virtual-1...`, `...could not build state with planes, trying renderer-on`, `...Using render-only state
+  composition`, `...view ... using renderer composition`, `[repaint] flushed (/dev/dri/card0) ...`, plus
+  one earlier unrelated `Output repaint window is 7 ms maximum` startup-config line at t=15.489s). This is
+  **exactly one repaint cycle**, not the sub-session-30 Fix-phase's claimed 9, and not the zero that
+  sub-session-30's own Verify phase found (that zero was itself an artifact of a shorter/differently-scoped
+  run, per that session's own honest write-up) -- this session's own number is 1, matching the DRM ioctl
+  count precisely (1 SetCrtc + 1 PageFlip = exactly the work one repaint cycle would do). No second repaint
+  is ever triggered, at any point up to t=194s, well after all 3 XFCE clients have connected, sent
+  Wayland messages, and self-terminated.
+
+**REFINEMENT to the Fix phase's own diagnosis (new data, not in the `a7adf623` report):** the Fix phase's
+commit message frames the gap as "no logged `sys_read`/`sys_recvfrom` from weston (tid=20) on that socket
+at all in between" its clients' `sendmsg` calls and weston's `error in client communication` log line --
+implying weston never reads what the clients sent. This session's fuller log shows that framing is not
+quite right: immediately after each client's real `sendmsg`, that same client itself (not weston) logs a
+GTK-level failure and gives up -- `sys_write tid=27 fd=2 ... "Gtk-WARNING **: ... cannot open dis[play]"`
+at t=39.698s (right after xfce4-panel's 424-byte `sendmsg` at t=39.676s), `sys_write tid=26 fd=2 ...
+"xfsettingsd: Unable to open display."` at t=39.930s, and `sys_write tid=28 fd=2 ... "Gtk-WARNING **: ...
+cannot open displ[ay]"` at t=40.107s. So the actual failure is inside the **client's own GTK/GDK
+display-open logic**, seconds after its Wayland socket-level handshake genuinely succeeded and genuinely
+exchanged real protocol bytes -- not a silent weston-side receive gap. This narrows, not just relocates,
+the open question the Fix phase left for "whoever continues": the next investigation should trace GTK's
+Wayland backend's own `wl_display_connect`/registry-bind failure path (why a real, successful low-level
+`sendmsg`/`recvmsg` round-trip still ends in "cannot open display" at the GDK layer), not weston's
+epoll/read path, which this session's data shows is not obviously implicated (weston did in fact reach and
+run one full repaint cycle at t=25.5s, well before the clients even connect at t=38.5s+, so weston's
+top-level loop is alive and functioning by the time the clients attempt to talk to it).
+
+**Screenshot: taken independently this session, with a materially harder-won methodology than prior
+sub-sessions documented.** The window (`litebox virtual display`, HWND confirmed via `GetWindowThreadProcessId`
+to belong to PID 19944, the exact same `litebox_runner_linux_on_windows_userland.exe` process running this
+repro) spans two monitors in the default multi-monitor layout here (DISPLAY1 0,0-1536x864 primary,
+DISPLAY10 1536,0-2816x720 secondary) and was, at capture time, z-order-covered by an unrelated Firefox
+window occupying the same screen coordinates -- two early capture attempts (`adv_screenshot.png`,
+`adv_screenshot2.png`) silently captured Firefox/YouTube content instead of the target window, because
+`CopyFromScreen` composites whatever is topmost on screen at the given coordinates regardless of which
+`HWND` supplied those coordinates; neither attempt errored or warned. Fix: `SetWindowPos` to relocate the
+litebox window to (0,0)-(1536,864) fully inside the primary monitor, then `BringWindowToTop`+
+`SetForegroundWindow` to guarantee it is actually topmost at those coordinates before capturing. Final,
+verified-correct capture (`adv_screenshot3.png`, 1521x826 client area, correctly showing the window's own
+title bar and no foreign window content): pixel-sampled at a 20x20 grid (400 samples) -- **355/400 (88.75%)
+exactly RGB(0,0,0)**, the remainder dark grays (32,32,32 / 44,44,44 / near-black gradients) plausibly
+antialiasing/compositor noise at the capture edges, plus one incidental "Task Manager" taskbar-hover tooltip
+overlapping the bottom-right corner (an unrelated host-OS UI element, not litebox content) and a thin
+bluish 1-2px vertical line at the left window border (window-chrome artifact, not interior content). No
+XFCE panel, taskbar, desktop icons, wallpaper, or any distinguishable window content is visible anywhere
+in the capture. **Solid black, matching every prior sub-session's finding, unchanged by this session's fix.**
+
+**Verdict: the `a7adf623` logging-instrumentation commit's own narrow claims (tracing added, panic did not
+recur this run, `sys_write`/`sys_sendmsg` counts are nonzero and real) are TRUE and independently reproduced
+here, with a materially longer and more complete log than either of the Fix phase's own two runs. Its
+"weston never reads" framing is corrected by this session's fuller data to "the client's own GTK display-open
+logic fails after a real successful low-level handshake" -- a real, useful, narrower finding for whoever
+continues. The standing user goal -- XFCE rendering visible, real desktop content, proven via screenshot --
+is NOT MET.** Repaint count is 1 (not the 9 falsely claimed by sub-session 30's Fix phase, and not the 0
+sub-session 30's own Verify phase measured on a different, shorter run -- this session's own number, from
+its own full run, is 1, unchanged from the pre-existing baseline going back to sub-session 26). DRM ioctl
+count is 2 (1+1), unchanged. Screenshot is solid black. **Next step for whoever continues**: trace GTK/GDK's
+Wayland-backend `wl_display_connect` / initial registry-bind path specifically for why it logs "cannot open
+display" immediately after a real, successful `sendmsg` of what appears to be a correctly-sized
+`wl_display.get_registry` request (24 bytes) and a second 424-byte message -- check whether weston's reply
+(the `wl_registry.global` events any correct compositor must send back) is ever actually written by weston
+onto that same fd, since this session did not find any `sys_write`/`sys_sendmsg` FROM weston (tid=20) TO
+any of fds shared with tid=26/27/28 after t=39s, which is the concrete, narrowed next-thing-to-check this
+session leaves behind, unverified either way.
+
+Raw evidence this session: `.wfgy/xfce-build/adv_verify_run.log` (1,193,008 lines),
+`.wfgy/xfce-build/adv_screenshot3.png` (final correct capture), `.wfgy/xfce-build/adv_screenshot.ps1`/
+`adv_screenshot3.ps1` (capture scripts, kept for methodology reference -- note `adv_screenshot3.ps1`'s
+window-repositioning approach is the one that actually worked and should be reused, not the naive
+`GetClientRect`+`ClientToScreen`+`CopyFromScreen` alone, which silently captures the wrong window content
+on any multi-monitor/overlapping-window host without an explicit bring-to-front step first).
+
+---
+
 
 A fix was submitted claiming to resolve the `litebox_platform_windows_userland/src/lib.rs`
 `allocate_pages` Replace-mode `VirtualFree(MEM_DECOMMIT)` panic (`ERROR_INVALID_PARAMETER`) that
