@@ -1395,6 +1395,30 @@ impl WindowsUserland {
 
         let reserved_pages = Self::read_memory_maps::<4096>();
 
+        // Pre-reserve the well-known low address band where common Alpine/musl `ET_EXEC` (non-
+        // PIE) binaries conventionally load (`gcc`'s own fixed base is `0x400000`; confirmed live
+        // via `DIAG sys_mmap: entry` evidence that its colliding segment needs up to roughly
+        // `0x618000`) -- BEFORE any guest OS thread gets spawned, so Windows' own default
+        // thread-stack-placement algorithm is forced to choose a different, non-colliding address
+        // for every guest thread stack from the very first one. Deliberately reserved AFTER
+        // `read_memory_maps` above, not before: `reserved_pages` feeds
+        // `PageManagementProvider::reserved_pages`, which litebox's OWN guest-address allocator
+        // treats as off-limits for guest allocations -- this reservation must stay invisible to
+        // that check, since a genuine `ET_EXEC` binary still needs to load at this EXACT address
+        // (real Linux gives it no other choice; `MAP_FIXED` `Replace`-mode already knows how to
+        // decommit-and-recommit over a plain `MEM_RESERVE`, see `allocate_pages`). This call only
+        // ever needs to keep a REAL OS thread's stack from landing here first; it is never
+        // committed, and a subsequent guest `MAP_FIXED` `Replace`-mode `mmap` simply reclaims it
+        // like any other free-but-reserved region.
+        unsafe {
+            windows_sys::Win32::System::Memory::VirtualAlloc(
+                0x0040_0000 as *const core::ffi::c_void,
+                0x0060_0000,
+                Win32_Memory::MEM_RESERVE,
+                Win32_Memory::PAGE_NOACCESS,
+            );
+        }
+
         let platform = Self {
             reserved_pages,
             sys_info: std::sync::RwLock::new(sys_info),
@@ -3005,6 +3029,76 @@ fn find_foreign_claim(
     })
 }
 
+/// Real host address ranges backing a live guest OS thread's own Windows stack reservation
+/// (`[DeallocationStack, StackBase)`, read once via the TEB at thread start -- see
+/// [`register_current_thread_stack`]).
+///
+/// [`CLAIMED_RANGES`] only ever records ranges that went through
+/// [`WindowsUserland::allocate_pages`] itself (guest heap/mmap growth); a thread's own real
+/// stack is placed directly by Windows at `std::thread::Builder::spawn` time and NEVER goes
+/// through `allocate_pages`, so it was never a "claim" `find_foreign_claim` could see. Confirmed
+/// live via the `gcc`/`ET_EXEC` compile crash this registry fixes: a non-PIE binary's fixed,
+/// non-negotiable ELF load address (e.g. `0x400000`) landing inside a DIFFERENT, currently-live
+/// guest thread's own real stack -- `allocate_pages`'s `Replace`-mode path saw `find_foreign_claim`
+/// return `None` (correctly -- nothing had "claimed" that address) and fell through to
+/// decommit-and-recommit directly over the other thread's live stack memory, corrupting it with
+/// no page fault or guest-visible signal. A small `Vec`, not a fixed array like `CLAIMED_RANGES`:
+/// entry count is bounded by the number of concurrently-live real OS threads (tens, not the
+/// thousands of heap/mmap claims `CLAIMED_RANGES` churns through), so the `MAX_CLAIMS`-tuning
+/// latency history that governs the fixed-array design there does not apply here.
+static LIVE_THREAD_STACKS: Mutex<alloc::vec::Vec<(core::ops::Range<usize>, std::thread::ThreadId)>> =
+    Mutex::new(alloc::vec::Vec::new());
+
+/// Records the CALLING thread's own real stack reservation into [`LIVE_THREAD_STACKS`], read via
+/// the TEB (`gs:[0x1478]` = `DeallocationStack`, the true bottom of the whole reservation;
+/// `gs:[0x08]` = `StackBase`, the top) -- the same offsets already used for the
+/// `LITEBOX_VEH_TRACE=1` `DIAG-REALSTACK` diagnostic elsewhere in this file. Must be called once,
+/// early, on every newly spawned guest OS thread (both `spawn_thread`'s `clone()`-spawned threads
+/// and the initial/root guest thread in the runner crate) -- BEFORE that thread ever runs guest
+/// code that could trigger a colliding `Replace`-mode `allocate_pages` call from ANOTHER thread.
+fn register_current_thread_stack() {
+    let stack_base: u64;
+    let dealloc_stack: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {0}, gs:[0x08]",
+            "mov {1}, gs:[0x1478]",
+            out(reg) stack_base,
+            out(reg) dealloc_stack,
+        );
+    }
+    let range = (dealloc_stack as usize)..(stack_base as usize);
+    if range.is_empty() {
+        return;
+    }
+    let tid = std::thread::current().id();
+    litebox_util_log::debug!(
+        start:% = range.start, end:% = range.end, tid:? = tid;
+        "register_current_thread_stack"
+    );
+    LIVE_THREAD_STACKS.lock().unwrap().push((range, tid));
+}
+
+/// Removes every range this thread registered via [`register_current_thread_stack`]. Called once,
+/// alongside [`unclaim_thread`], when a guest process's real OS thread is about to exit -- a dead
+/// thread's stack is no longer live memory and must stop being reported as a foreign collision.
+fn unregister_current_thread_stack() {
+    let tid = std::thread::current().id();
+    LIVE_THREAD_STACKS.lock().unwrap().retain(|(_, t)| *t != tid);
+}
+
+/// Returns the range of any OTHER live thread's own real stack reservation overlapping `range`,
+/// if one exists. See [`LIVE_THREAD_STACKS`]'s doc comment for why this check exists alongside,
+/// not instead of, [`find_foreign_claim`].
+fn find_live_stack_overlap(range: core::ops::Range<usize>) -> Option<core::ops::Range<usize>> {
+    let self_tid = std::thread::current().id();
+    let stacks = LIVE_THREAD_STACKS.lock().unwrap();
+    stacks.iter().find_map(|(stack, tid)| {
+        (*tid != self_tid && stack.start < range.end && stack.end > range.start)
+            .then(|| stack.clone())
+    })
+}
+
 /// Records that the calling thread now owns `range`, coalescing it into any of ITS OWN prior
 /// entries that overlap OR are immediately adjacent to it (a re-`execve` or a `Replace` over
 /// one's own stale leftover legitimately changes what this thread owns at that address; ordinary
@@ -3147,6 +3241,11 @@ impl ThreadHandle {
         // -- see `init_thread_gs_base`'s doc comment for why this repair exists at all.
         WindowsUserland::init_thread_gs_base();
 
+        // Record this thread's own real stack reservation so a DIFFERENT thread's later
+        // `Replace`-mode `allocate_pages` call (e.g. an `ET_EXEC` binary's fixed-address ELF
+        // load) can detect a collision with it -- see `LIVE_THREAD_STACKS`'s doc comment.
+        register_current_thread_stack();
+
         let handle = Self::for_current_thread(tls);
         ACTIVE_THREADS.lock().unwrap().push(handle.clone());
         CURRENT_THREAD_HANDLE.with_borrow_mut(|current| {
@@ -3164,6 +3263,7 @@ impl ThreadHandle {
                 .unwrap()
                 .retain(|h| !Arc::ptr_eq(&h.0, &current.0));
             release_all_claims_for_current_thread();
+            unregister_current_thread_stack();
             *current.0.lock().unwrap() = None;
             uninstall_tls();
         });
@@ -4085,15 +4185,17 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     // at the moment this thread queried it, skipping this check entirely under the
                     // old `has_committed_page &&` gate.
                     let fc = find_foreign_claim(suggested_range.clone(), current_claim_owner());
+                    let stack_overlap = find_live_stack_overlap(suggested_range.clone());
                     litebox_util_log::debug!(
                         start:% = suggested_range.start, end:% = suggested_range.end,
                         found:% = fc.is_some(), has_committed_page:% = has_committed_page,
                         self_owner:? = current_claim_owner(),
                         foreign_owner:? = fc.as_ref().map(|(_, owner)| *owner),
-                        foreign_range:? = fc.as_ref().map(|(r, _)| (r.start, r.end));
+                        foreign_range:? = fc.as_ref().map(|(r, _)| (r.start, r.end)),
+                        stack_overlap:? = stack_overlap.as_ref().map(|r| (r.start, r.end));
                         "allocate_pages: Replace-mode foreign-claim check"
                     );
-                    fc.is_some()
+                    fc.is_some() || stack_overlap.is_some()
                 }
             {
                 // See `CLAIMED_RANGES`'s doc comment: a claimed range here that this thread
