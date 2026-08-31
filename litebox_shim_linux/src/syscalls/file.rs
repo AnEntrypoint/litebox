@@ -632,7 +632,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `open`
     pub fn sys_open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
         let path = self.resolve_path(path)?;
-        self.do_open_resolved(path, flags, mode)
+        litebox_util_log::debug!(
+            tid:% = self.tid, path:% = path.to_string_lossy(), flags:? = flags;
+            "DIAG sys_open: resolved path"
+        );
+        let result = self.do_open_resolved(path, flags, mode);
+        litebox_util_log::debug!(
+            tid:% = self.tid, result:? = result;
+            "DIAG sys_open: result"
+        );
+        result
     }
 
     /// Handle syscall `openat`
@@ -4777,6 +4786,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         } else {
             Some(event.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?)
         };
+        litebox_util_log::debug!(
+            tid:% = self.tid,
+            epfd:% = epfd,
+            op:? = op,
+            fd:% = fd;
+            "DIAG sys_epoll_ctl: entry"
+        );
         let handle = self
             .global
             .litebox

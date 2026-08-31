@@ -430,10 +430,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
 
         let mask = Events::from_bits_truncate(event.events);
         let flags = EpollFlags::from_bits_truncate(event.events);
+        let event_data = event.data;
         litebox_util_log::debug!(
             fd:% = fd,
             mask:? = mask,
-            flags:? = flags;
+            flags:? = flags,
+            data:% = event_data;
             "EpollFile::add_interest"
         );
         let entry = EpollEntry::new(
@@ -588,6 +590,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollEntry<Platform, FS> {
         })
     }
 
+    fn data(&self) -> u64 {
+        self.inner.lock().data
+    }
+
     fn poll(&self, global: &GlobalState<Platform, FS>) -> Option<(Option<EpollEvent>, bool)> {
         let file = self.desc.upgrade()?;
         let inner = self.inner.lock();
@@ -692,6 +698,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> ReadySet<Platform, FS> {
                 // the entry is disabled or the associated file is closed
                 continue;
             };
+
+            litebox_util_log::debug!(
+                data:% = entry.data(),
+                has_event:% = event.is_some(),
+                is_still_ready:% = is_still_ready;
+                "DIAG ReadySet::pop_multiple: entry polled"
+            );
 
             if let Some(event) = event {
                 events.push(event);

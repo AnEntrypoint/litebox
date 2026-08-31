@@ -4031,11 +4031,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<(alloc::string::String, alloc::vec::Vec<alloc::ffi::CString>), Errno> {
         for _ in 0..SHEBANG_MAX_RECURSION {
             let full_path = self.resolve_path(&path)?;
-            let file = self.do_open(
+            litebox_util_log::debug!(
+                path:% = full_path.to_string_lossy();
+                "DIAG resolve_shebang: about to open"
+            );
+            let open_result = self.do_open(
                 full_path,
                 litebox::fs::OFlags::RDONLY,
                 litebox::fs::Mode::empty(),
-            )?;
+            );
+            litebox_util_log::debug!(
+                result:? = open_result.as_ref().map(|_| ());
+                "DIAG resolve_shebang: open result"
+            );
+            let file = open_result?;
             let mut header = [0u8; SHEBANG_MAX_LINE];
             let files = self.files.borrow();
             let n = match files.fs.read(&file, &mut header, Some(0)) {

@@ -2118,6 +2118,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EBADF);
         };
 
+        litebox_util_log::debug!(
+            tid:% = self.tid,
+            fd:% = sockfd,
+            flags:? = flags;
+            "DIAG sys_recvmsg: entry"
+        );
+
         // CMSG_CLOEXEC is honored: do_recvmsg sets FD_CLOEXEC on every SCM_RIGHTS fd it delivers
         // when this flag is present (see AnyDupFd::insert_into's own cloexec parameter).
         let supported_flags =
@@ -2127,7 +2134,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EINVAL);
         }
 
-        self.do_recvmsg(sockfd, msg_ptr, flags)
+        let result = self.do_recvmsg(sockfd, msg_ptr, flags);
+        litebox_util_log::debug!(
+            tid:% = self.tid,
+            fd:% = sockfd,
+            result:? = result;
+            "DIAG sys_recvmsg: returning"
+        );
+        result
     }
     fn do_recvmsg(
         &self,
