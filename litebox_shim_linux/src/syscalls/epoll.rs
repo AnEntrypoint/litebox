@@ -310,7 +310,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         maxevents: usize,
     ) -> Result<Vec<EpollEvent>, WaitError> {
         let mut events = Vec::new();
+        let mut diag_iteration: u64 = 0;
         loop {
+            diag_iteration += 1;
             // A stdin interest's initial `add_interest` registration (see its doc comment on the
             // `EpollDescriptor::File` arm of `EpollDescriptor::poll`) never gets a real wakeup
             // observer -- there is no OS-level async notification for "new console input arrived"
@@ -335,6 +337,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
             // armed timerfd interests into this same bounded-repoll mechanism fixes every timerfd
             // consumer with this usage pattern, not just weston, mirroring the stdin fix's shape.
             let has_bounded_repoll_interest = self.has_unready_stdin_or_armed_timerfd_interest(global);
+            litebox_util_log::debug!(
+                iteration:% = diag_iteration,
+                has_bounded_repoll_interest:% = has_bounded_repoll_interest;
+                "DIAG EpollFile::wait: loop iteration"
+            );
             let iteration_cx = if has_bounded_repoll_interest {
                 cx.with_timeout(STDIN_REPOLL_INTERVAL)
             } else {

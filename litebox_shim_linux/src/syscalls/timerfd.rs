@@ -68,7 +68,14 @@ impl<Instant: litebox::platform::Instant> TimerState<Instant> {
         let Some(deadline) = self.deadline else {
             return;
         };
-        let Some(overdue) = now.checked_duration_since(&deadline) else {
+        let overdue_opt = now.checked_duration_since(&deadline);
+        let remaining_opt = deadline.checked_duration_since(&now);
+        litebox_util_log::debug!(
+            overdue:? = overdue_opt,
+            remaining_if_future:? = remaining_opt;
+            "DIAG TimerState::resync"
+        );
+        let Some(overdue) = overdue_opt else {
             return; // deadline is still in the future
         };
         if self.interval.is_zero() {
