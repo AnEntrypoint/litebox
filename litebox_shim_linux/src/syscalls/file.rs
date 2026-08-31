@@ -4813,6 +4813,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .ok_or(Errno::EBADF)?
             }
         };
+        litebox_util_log::debug!(
+            tid:% = self.tid,
+            epfd:% = epfd,
+            maxevents:% = maxevents,
+            timeout:? = timeout;
+            "sys_epoll_pwait: entry"
+        );
         let do_wait = || {
             handle.with_entry(|epoll_file| {
                 match epoll_file.wait(
@@ -4833,11 +4840,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
             })
         };
-        if let Some(sigmask) = sigmask {
+        let result = if let Some(sigmask) = sigmask {
             self.with_temporary_signal_mask(sigmask, do_wait)
         } else {
             do_wait()
-        }
+        };
+        litebox_util_log::debug!(
+            tid:% = self.tid,
+            epfd:% = epfd,
+            result:? = result;
+            "sys_epoll_pwait: returning"
+        );
+        result
     }
 
     /// Handle syscall `ppoll`.

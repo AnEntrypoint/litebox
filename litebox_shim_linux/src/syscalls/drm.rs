@@ -35,6 +35,8 @@
 use alloc::collections::{BTreeMap, VecDeque};
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use litebox::event::Events;
+use litebox::event::polling::Pollee;
 use litebox::mm::linux::PAGE_SIZE;
 use litebox::platform::RawConstPointer;
 use litebox_common_linux::{
@@ -173,6 +175,17 @@ pub(crate) struct DrmSubsystem<Platform: ShimPlatform> {
     /// timing -- see this module's doc comment), so an event is always ready by the time a client
     /// gets around to reading for it.
     pending_flip_events: litebox::sync::Mutex<Platform, VecDeque<DrmEventVblank>>,
+    /// Wakeup mechanism for a guest thread blocked in `poll`/`epoll_wait`/`select` on the DRM
+    /// device fd waiting for a page-flip completion event. `page_flip` notifies this whenever it
+    /// pushes into [`Self::pending_flip_events`]; `syscalls::epoll::EpollDescriptor::poll`'s `File`
+    /// arm registers an observer here (mirroring every other pollable fd kind, e.g. eventfd) so a
+    /// compositor's own event loop -- which registers the DRM fd once via `epoll_ctl` and then
+    /// blocks in `epoll_wait` across many frames, rather than re-polling synchronously after every
+    /// flip -- actually wakes for the second and subsequent flips. Without this, the fd's readiness
+    /// was only ever computed on-demand (see [`Self::has_pending_flip_events`]'s doc comment for
+    /// the confirmed-live symptom this produced: exactly one `SETCRTC`+`PAGE_FLIP` pair at startup,
+    /// then no repaint ever again for the rest of the run).
+    flip_pollee: Pollee<Platform>,
     /// Monotonically increasing vblank sequence number, echoed into each flip-completion event's
     /// `sequence` field -- real clients that track it purely to detect drops/reordering see a
     /// plain incrementing counter, matching real Linux's own semantics closely enough for that
@@ -222,6 +235,7 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             crtc_fb: litebox::sync::Mutex::new(None),
             plane_fb: litebox::sync::Mutex::new(None),
             pending_flip_events: litebox::sync::Mutex::new(VecDeque::new()),
+            flip_pollee: Pollee::new(),
             next_vblank_sequence: AtomicU32::new(0),
             is_master: core::sync::atomic::AtomicBool::new(false),
             flip_callback: litebox::sync::Mutex::new(None),
@@ -269,6 +283,16 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     /// second run with three live Wayland/X11 client applications attached the entire time.
     pub(crate) fn has_pending_flip_events(&self) -> bool {
         !self.pending_flip_events.lock().is_empty()
+    }
+
+    /// Register an observer for DRM fd readiness -- see [`Self::flip_pollee`]'s doc comment.
+    /// Called from `syscalls::epoll::EpollDescriptor::poll`'s `File` arm's `DriFd` branch, exactly
+    /// where every other pollable fd kind (e.g. eventfd) registers its own observer.
+    pub(crate) fn register_flip_observer(
+        &self,
+        observer: alloc::sync::Weak<dyn litebox::event::observer::Observer<Events>>,
+    ) {
+        self.flip_pollee.register_observer(observer, Events::IN);
     }
 
     pub(crate) fn get_resources(&self, ptr: UserPtrMut<DrmModeCardRes>) -> Result<u32, Errno> {
@@ -952,6 +976,7 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
                 sequence,
                 crtc_id: VIRTUAL_CRTC_ID,
             });
+            self.flip_pollee.notify_observers(Events::IN);
         }
         Ok(0)
     }

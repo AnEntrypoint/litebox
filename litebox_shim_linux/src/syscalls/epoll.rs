@@ -154,7 +154,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
         mask: Events,
         observer: Option<Weak<dyn Observer<Events>>>,
     ) -> Option<Events> {
-        let poll = |iop: &dyn IOPollable| {
+        let poll = |iop: &dyn IOPollable, observer: Option<Weak<dyn Observer<Events>>>| {
             if let Some(observer) = observer {
                 iop.register_observer(observer, mask);
             }
@@ -163,7 +163,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
         match self {
             EpollDescriptor::Eventfd(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
-                Some(handle.with_entry(|entry| poll(entry)))
+                Some(handle.with_entry(|entry| poll(entry, observer)))
             }
             // Nested epoll: real Linux lets one epoll fd be added as a member of another epoll
             // set (`epoll_ctl(outer, EPOLL_CTL_ADD, inner, ...)`), reporting the inner set
@@ -175,7 +175,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
             // delegates to).
             EpollDescriptor::Epoll(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
-                Some(handle.with_entry(|entry| poll(entry)))
+                Some(handle.with_entry(|entry| poll(entry, observer)))
             }
             EpollDescriptor::File(file) => {
                 // An evdev fd (tagged at `open()` time, see `syscalls::file::EvdevFd`'s doc
@@ -207,6 +207,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
                     .with_metadata(file, |_: &crate::syscalls::file::DriFd| ())
                     .is_ok()
                 {
+                    if let Some(observer) = observer {
+                        global.drm.register_flip_observer(observer);
+                    }
                     let events = if global.drm.has_pending_flip_events() {
                         Events::IN
                     } else {
@@ -250,28 +253,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
                         return None;
                     }
                 };
-                Some(poll(&proxy))
+                Some(poll(&proxy, observer))
             }
-            EpollDescriptor::Pipe(fd) => global.with_linux_pipe_iopollable(fd, poll).ok(),
+            EpollDescriptor::Pipe(fd) => global
+                .with_linux_pipe_iopollable(fd, |iop| poll(iop, observer))
+                .ok(),
             EpollDescriptor::Unix(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
-                Some(handle.with_entry(|entry| poll(entry)))
+                Some(handle.with_entry(|entry| poll(entry, observer)))
             }
             EpollDescriptor::Pty(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
-                Some(handle.with_entry(|entry| entry.with_iopollable(poll)))
+                Some(handle.with_entry(|entry| entry.with_iopollable(|iop| poll(iop, observer))))
             }
             EpollDescriptor::Signalfd(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
-                Some(handle.with_entry(|entry| poll(entry)))
+                Some(handle.with_entry(|entry| poll(entry, observer)))
             }
             EpollDescriptor::Timerfd(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
-                Some(handle.with_entry(|entry| poll(entry)))
+                Some(handle.with_entry(|entry| poll(entry, observer)))
             }
             EpollDescriptor::Netlink(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
-                Some(handle.with_entry(|entry| poll(entry)))
+                Some(handle.with_entry(|entry| poll(entry, observer)))
             }
         }
     }
