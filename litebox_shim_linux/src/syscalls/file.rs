@@ -3424,12 +3424,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Handle syscall `timerfd_create`. See `syscalls::timerfd`'s module doc comment for the
     /// scope of what this shim's timerfd support actually covers.
-    pub fn sys_timerfd_create(&self, flags: TfdFlags) -> Result<u32, Errno> {
+    pub fn sys_timerfd_create(&self, clockid: i32, flags: TfdFlags) -> Result<u32, Errno> {
         if flags.intersects((TfdFlags::CLOEXEC | TfdFlags::NONBLOCK).complement()) {
             return Err(Errno::EINVAL);
         }
+        // Only CLOCK_REALTIME and CLOCK_MONOTONIC are meaningfully distinct here (see
+        // `TimerfdFile::new`'s `is_realtime` doc comment) -- every other real clockid
+        // (BOOTTIME, MONOTONIC_RAW, etc.) behaves like CLOCK_MONOTONIC for this shim's purposes
+        // (all backed by the same `Platform::Instant`), matching how `sys_clock_gettime` already
+        // narrows the same set of clockids elsewhere in this crate.
+        let is_realtime = clockid == i32::from(litebox_common_linux::ClockId::RealTime);
 
-        let timerfd = super::timerfd::TimerfdFile::new(self.global.platform, flags);
+        let timerfd = super::timerfd::TimerfdFile::new(self.global.platform, flags, is_realtime);
         let mut dt = self.global.litebox.descriptor_table_mut();
         let typed = dt.insert::<super::timerfd::TimerfdSubsystem<Platform>>(timerfd);
         if flags.contains(TfdFlags::CLOEXEC) {
@@ -3469,6 +3475,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let new = new_value.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         let interval = core::time::Duration::try_from(new.it_interval)?;
         let value = core::time::Duration::try_from(new.it_value)?;
+        litebox_util_log::debug!(
+            tid:% = self.tid,
+            fd:% = fd,
+            flags:? = flags,
+            interval:? = interval,
+            value:? = value;
+            "sys_timerfd_settime: entry"
+        );
 
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
@@ -3496,13 +3510,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         let now = self.global.platform.now();
                         let deadline = if value.is_zero() {
                             None
+                        } else if flags.contains(TfdSettimeFlags::TIMER_ABSTIME) && !file.is_realtime() {
+                            // `value` is an absolute deadline against this fd's own `CLOCK_MONOTONIC`
+                            // (or equivalent) domain -- i.e. a duration since the same monotonic
+                            // reference point `self.global.boot_time` anchors (see
+                            // `gettime_as_duration`'s identical `ClockId::Monotonic` handling).
+                            // Getting this branch wrong (previously: always treating `value` as a
+                            // realtime/wall-clock epoch timestamp regardless of the fd's real
+                            // clockid) meant a monotonic-relative deadline like "327s since boot"
+                            // compared as far in the past against a ~1.7-billion-second wall-clock
+                            // "now", firing the timer immediately instead of ~327s in the future --
+                            // see `TimerfdFile::is_realtime`'s doc comment for the confirmed-live
+                            // symptom this produced.
+                            self.global.boot_time.checked_add(value)
                         } else if flags.contains(TfdSettimeFlags::TIMER_ABSTIME) {
                             // `value` is an absolute deadline since the epoch (real
-                            // `timerfd_settime`'s `TFD_TIMER_ABSTIME`, measured against whichever
-                            // clockid the fd was created with -- this shim, like every other
-                            // narrow real-time-vs-monotonic distinction in this crate, only
-                            // tracks monotonic time). Convert by comparing against the current
-                            // wall-clock reading and applying the same offset to `now`.
+                            // `timerfd_settime`'s `TFD_TIMER_ABSTIME` against `CLOCK_REALTIME`).
+                            // Convert by comparing against the current wall-clock reading and
+                            // applying the same offset to `now`.
                             let wall_now = self.real_time_as_duration_since_epoch();
                             if value > wall_now {
                                 now.checked_add(value - wall_now)
@@ -4828,11 +4853,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     maxevents,
                 ) {
                     Ok(epoll_events) => {
-                        litebox_util_log::debug!(
-                            tid:% = self.tid,
-                            events:? = epoll_events.iter().map(|e| (e.events, e.data)).collect::<alloc::vec::Vec<_>>();
-                            "sys_epoll_pwait: got events"
-                        );
                         if !epoll_events.is_empty() {
                             events
                                 .copy_from_slice::<Platform>(0, &epoll_events)

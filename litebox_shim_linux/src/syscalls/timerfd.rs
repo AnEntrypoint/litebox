@@ -106,10 +106,24 @@ pub(crate) struct TimerfdFile<Platform: RawSyncPrimitivesProvider + TimeProvider
     /// File status flags (see [`OFlags::STATUS_FLAGS_MASK`])
     status: AtomicU32,
     pollee: Pollee<Platform>,
+    /// Whether this fd was created with `CLOCK_REALTIME` (`true`) rather than `CLOCK_MONOTONIC`
+    /// or one of its close cousins (`false`) -- set once at `timerfd_create(2)` time, consulted
+    /// by `sys_timerfd_settime`'s `TFD_TIMER_ABSTIME` handling to convert the guest's absolute
+    /// deadline into this platform's monotonic `Instant` domain against the RIGHT epoch. Getting
+    /// this wrong (previously: always assuming realtime, regardless of what the guest actually
+    /// requested) meant a `CLOCK_MONOTONIC`-based absolute deadline -- a small "seconds since some
+    /// monotonic reference point" value -- compared as smaller than wall-clock "now" (a ~1.7-billion-
+    /// second Unix timestamp), which unconditionally took the "already past" branch and armed the
+    /// timer to fire immediately. Confirmed live: this is exactly what starved weston's own
+    /// internal event-loop timerfd of ever legitimately expiring on its own schedule -- it fired
+    /// immediately on every arm, and because weston's dispatch callback for it never actually
+    /// needed to run yet, nothing called `read()`, leaving the fd stuck permanently
+    /// `Events::IN`-ready and its owning thread spinning in `epoll_wait` forever.
+    is_realtime: bool,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> TimerfdFile<Platform> {
-    pub(crate) fn new(platform: &'static Platform, flags: TfdFlags) -> Self {
+    pub(crate) fn new(platform: &'static Platform, flags: TfdFlags, is_realtime: bool) -> Self {
         let mut status = OFlags::RDONLY;
         status.set(OFlags::NONBLOCK, flags.contains(TfdFlags::NONBLOCK));
 
@@ -118,7 +132,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> TimerfdFile<P
             state: Mutex::new(TimerState::default()),
             status: AtomicU32::new(status.bits()),
             pollee: Pollee::new(),
+            is_realtime,
         }
+    }
+
+    /// Whether this fd was created with `CLOCK_REALTIME` -- see [`Self::is_realtime`]'s doc
+    /// comment. Consulted by `sys_timerfd_settime`'s `TFD_TIMER_ABSTIME` handling.
+    pub(crate) fn is_realtime(&self) -> bool {
+        self.is_realtime
     }
 
     /// Arms/disarms the timer per `timerfd_settime(2)` semantics. `value`/`interval` are already
@@ -210,7 +231,7 @@ mod tests {
     #[test]
     fn disarmed_timerfd_is_never_ready_and_read_returns_eagain() {
         let _task = crate::syscalls::tests::init_platform(None);
-        let tfd = super::TimerfdFile::new(platform(), TfdFlags::NONBLOCK);
+        let tfd = super::TimerfdFile::new(platform(), TfdFlags::NONBLOCK, false);
         assert_eq!(tfd.check_io_events(), Events::empty());
         assert_eq!(tfd.read(), Err(Errno::EAGAIN));
     }
@@ -218,7 +239,7 @@ mod tests {
     #[test]
     fn single_shot_timer_becomes_ready_and_reports_one_expiration() {
         let _task = crate::syscalls::tests::init_platform(None);
-        let tfd = super::TimerfdFile::new(platform(), TfdFlags::NONBLOCK);
+        let tfd = super::TimerfdFile::new(platform(), TfdFlags::NONBLOCK, false);
         let now = platform().now();
         let deadline = now.checked_add(core::time::Duration::from_millis(20));
         tfd.set_time(deadline, core::time::Duration::ZERO);
@@ -239,7 +260,7 @@ mod tests {
     #[test]
     fn periodic_timer_accrues_multiple_missed_expirations() {
         let _task = crate::syscalls::tests::init_platform(None);
-        let tfd = super::TimerfdFile::new(platform(), TfdFlags::NONBLOCK);
+        let tfd = super::TimerfdFile::new(platform(), TfdFlags::NONBLOCK, false);
         let now = platform().now();
         let interval = core::time::Duration::from_millis(10);
         let deadline = now.checked_add(interval);
@@ -260,7 +281,7 @@ mod tests {
     #[test]
     fn set_time_with_zero_value_disarms() {
         let _task = crate::syscalls::tests::init_platform(None);
-        let tfd = super::TimerfdFile::new(platform(), TfdFlags::NONBLOCK);
+        let tfd = super::TimerfdFile::new(platform(), TfdFlags::NONBLOCK, false);
         let now = platform().now();
         tfd.set_time(
             now.checked_add(core::time::Duration::from_millis(5)),
@@ -275,7 +296,7 @@ mod tests {
     #[test]
     fn blocking_read_without_nonblock_is_a_documented_narrow_gap() {
         let _task = crate::syscalls::tests::init_platform(None);
-        let tfd = super::TimerfdFile::new(platform(), TfdFlags::empty());
+        let tfd = super::TimerfdFile::new(platform(), TfdFlags::empty(), false);
         assert_eq!(tfd.read(), Err(Errno::EOPNOTSUPP));
     }
 }

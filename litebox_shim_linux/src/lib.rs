@@ -1759,8 +1759,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             } => {
                 syscall!(sys_signalfd4(fd, mask, sizemask, flags))
             }
-            SyscallRequest::TimerfdCreate { flags } => {
-                syscall!(sys_timerfd_create(flags))
+            SyscallRequest::TimerfdCreate { clockid, flags } => {
+                syscall!(sys_timerfd_create(clockid, flags))
             }
             SyscallRequest::TimerfdSettime {
                 fd,

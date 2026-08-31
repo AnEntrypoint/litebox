@@ -3485,6 +3485,7 @@ pub enum SyscallRequest {
         flags: SfdFlags,
     },
     TimerfdCreate {
+        clockid: i32,
         flags: TfdFlags,
     },
     TimerfdSettime {
@@ -4351,6 +4352,7 @@ impl SyscallRequest {
             },
             Sysno::signalfd4 => sys_req!(Signalfd4 { fd, mask:*, sizemask, flags }),
             Sysno::timerfd_create => SyscallRequest::TimerfdCreate {
+                clockid: ctx.sys_req_arg(0),
                 flags: ctx.sys_req_arg(1),
             },
             Sysno::timerfd_settime => sys_req!(TimerfdSettime {
