@@ -3301,6 +3301,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.global.close_linux_pipe(&reader).unwrap();
             Errno::EMFILE
         })?;
+        litebox_util_log::debug!(
+            tid:% = self.tid,
+            rd_fd:% = rd_raw_fd,
+            wr_fd:% = wr_raw_fd;
+            "sys_pipe2: created"
+        );
         Ok((rd_raw_fd.try_into().unwrap(), wr_raw_fd.try_into().unwrap()))
     }
 
@@ -3407,6 +3413,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .unwrap();
             Errno::EMFILE
         })?;
+        litebox_util_log::debug!(
+            tid:% = self.tid,
+            fd:% = raw_fd,
+            initval:% = initval;
+            "sys_eventfd2: created"
+        );
         Ok(raw_fd.try_into().unwrap())
     }
 
@@ -3434,6 +3446,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .unwrap();
             Errno::EMFILE
         })?;
+        litebox_util_log::debug!(
+            tid:% = self.tid,
+            fd:% = raw_fd;
+            "sys_timerfd_create: created"
+        );
         Ok(raw_fd.try_into().unwrap())
     }
 
@@ -4845,14 +4862,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let nfds_signed = isize::try_from(nfds).map_err(|_| Errno::EINVAL)?;
 
         let mut set = super::epoll::PollSet::with_capacity(nfds);
+        let mut diag_fds: alloc::vec::Vec<(i32, u32)> = alloc::vec::Vec::with_capacity(nfds);
         for i in 0..nfds_signed {
             let fd = fds.read_at_offset::<Platform>(i).ok_or(Errno::EFAULT)?;
 
             let events = litebox::event::Events::from_bits_truncate(
                 fd.events.reinterpret_as_unsigned().into(),
             );
+            diag_fds.push((fd.fd, events.bits()));
             set.add_fd(fd.fd, events);
         }
+        // Diagnostic logging (sys_ppoll had zero logging before this, the same
+        // silently-unlogged-syscall pattern this investigation has found repeatedly for other
+        // calls -- see AGENTS.md sub-session 39). Kept landed: cheap (one line per ppoll call),
+        // and directly shows which fds/events a GLib/GTK main loop is watching and what came back.
+        litebox_util_log::debug!(
+            tid:% = self.tid,
+            fds:? = diag_fds,
+            timeout:? = timeout;
+            "sys_ppoll: entry"
+        );
 
         let mut do_wait = || {
             set.wait(
@@ -4866,6 +4895,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         } else {
             do_wait()
         };
+        litebox_util_log::debug!(
+            tid:% = self.tid,
+            wait_result:? = wait_result;
+            "sys_ppoll: wait returned"
+        );
         match wait_result {
             Ok(()) => {}
             Err(WaitError::Interrupted) => {
@@ -4896,6 +4930,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 ready_count += 1;
             }
         }
+        litebox_util_log::debug!(
+            tid:% = self.tid,
+            ready_count:% = ready_count;
+            "sys_ppoll: returning"
+        );
         Ok(ready_count)
     }
 

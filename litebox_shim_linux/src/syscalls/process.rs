@@ -3860,6 +3860,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 )? as usize;
                 litebox_util_log::debug!(
                     tid:% = self.tid,
+                    host_tid:% = self.global.platform.host_debug_tid(),
                     addr:% = addr.as_usize(),
                     requested:% = count.get(),
                     woken:% = woken;
@@ -4392,6 +4393,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     });
                     litebox_util_log::debug!(
                         tid:% = self.tid,
+                        host_tid:% = self.global.platform.host_debug_tid(),
                         rip:% = alloc::format!("{:#x}", ctx.rip),
                         rsp:% = alloc::format!("{:#x}", ctx.rsp),
                         tls:? = tls.map(|t| t.as_usize()),
