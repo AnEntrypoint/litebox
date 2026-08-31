@@ -4828,6 +4828,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     maxevents,
                 ) {
                     Ok(epoll_events) => {
+                        litebox_util_log::debug!(
+                            tid:% = self.tid,
+                            events:? = epoll_events.iter().map(|e| (e.events, e.data)).collect::<alloc::vec::Vec<_>>();
+                            "sys_epoll_pwait: got events"
+                        );
                         if !epoll_events.is_empty() {
                             events
                                 .copy_from_slice::<Platform>(0, &epoll_events)

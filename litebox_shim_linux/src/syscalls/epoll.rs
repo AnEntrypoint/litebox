@@ -426,10 +426,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         // `insert` below will replace it with a new entry.
 
         let mask = Events::from_bits_truncate(event.events);
+        let flags = EpollFlags::from_bits_truncate(event.events);
+        litebox_util_log::debug!(
+            fd:% = fd,
+            mask:? = mask,
+            flags:? = flags;
+            "EpollFile::add_interest"
+        );
         let entry = EpollEntry::new(
+            fd,
             DescriptorRef::from(file),
             mask,
-            EpollFlags::from_bits_truncate(event.events),
+            flags,
             event.data,
             self.ready.clone(),
         );
@@ -546,6 +554,9 @@ impl EpollEntryKey {
 }
 
 struct EpollEntry<Platform: ShimPlatform, FS: ShimFS> {
+    /// The raw fd this entry watches, as passed to `epoll_ctl` -- kept solely for diagnostic
+    /// logging (see `ReadySet::pop_multiple`'s use of it); not consulted by any dispatch logic.
+    fd: u32,
     desc: DescriptorRef<Platform, FS>,
     inner: litebox::sync::Mutex<Platform, EpollEntryInner>,
     ready: Arc<ReadySet<Platform, FS>>,
@@ -562,6 +573,7 @@ struct EpollEntryInner {
 
 impl<Platform: ShimPlatform, FS: ShimFS> EpollEntry<Platform, FS> {
     fn new(
+        fd: u32,
         desc: DescriptorRef<Platform, FS>,
         mask: Events,
         flags: EpollFlags,
@@ -569,6 +581,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollEntry<Platform, FS> {
         ready: Arc<ReadySet<Platform, FS>>,
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak_self| EpollEntry {
+            fd,
             desc,
             inner: litebox::sync::Mutex::new(EpollEntryInner { mask, flags, data }),
             ready,
@@ -682,6 +695,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> ReadySet<Platform, FS> {
                 // the entry is disabled or the associated file is closed
                 continue;
             };
+
+            litebox_util_log::debug!(
+                entry_fd:% = entry.fd,
+                has_event:% = event.is_some(),
+                is_still_ready:% = is_still_ready;
+                "ReadySet::pop_multiple: entry polled"
+            );
 
             if let Some(event) = event {
                 events.push(event);
