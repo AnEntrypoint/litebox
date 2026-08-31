@@ -1,0 +1,547 @@
+  36.865366700s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=16384 returned=724828160
+  36.869646400s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=8192 returned=724959232
+  36.876008700s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=2121728 returned=725090304
+  36.876564900s DEBUG litebox_shim_linux::syscalls::mm: sys_mprotect: entry tid=27 addr=725098496 len=2113536 prot=ProtFlags(PROT_READ | PROT_WRITE)
+  36.878817300s DEBUG litebox_shim_linux::syscalls::mm: sys_mprotect: returned tid=27 ok=true
+  36.879479500s DEBUG litebox_shim_linux::syscalls::process: clone: spawned new task parent_tid=27 child_tid=31 flags=CloneFlags(4001536) is_process_clone=false
+  36.888805600s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=2121728 returned=727449600
+  36.889414400s DEBUG litebox_shim_linux::syscalls::mm: sys_mprotect: entry tid=27 addr=727457792 len=2113536 prot=ProtFlags(PROT_READ | PROT_WRITE)
+  36.891706500s DEBUG litebox_shim_linux::syscalls::mm: sys_mprotect: returned tid=27 ok=true
+  36.892685100s DEBUG litebox_shim_linux::syscalls::process: clone: spawned new task parent_tid=27 child_tid=32 flags=CloneFlags(4001536) is_process_clone=false
+  36.896630400s DEBUG litebox_shim_linux::syscalls::file: sys_write tid=27 fd=4 len=8 offset=None preview="\u{1}\0\0\0\0\0\0\0" result=Ok(8)
+  36.902525500s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=32768 returned=729743360
+  36.903212200s DEBUG litebox_shim_linux::syscalls::mm: sys_mprotect: entry tid=27 addr=729747456 len=4096 prot=ProtFlags(PROT_READ | PROT_WRITE)
+  36.903997500s DEBUG litebox_shim_linux::syscalls::mm: sys_mprotect: returned tid=27 ok=true
+  36.909036900s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=729808896
+  36.909993900s DEBUG litebox_shim_linux::syscalls::file: sys_stat: entry tid=27 path="/run/user/1000/bus"
+  36.910817700s DEBUG litebox_shim_linux::syscalls::file: sys_stat: error tid=27 errno=Errno(2 = ENOENT: No such file or directory)
+  36.911673000s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/var/lib/dbus/machine-id fd=Some(7) flags=OFlags(CLOEXEC | LARGEFILE)
+  36.912892600s DEBUG litebox_shim_linux::syscalls::file: sys_fcntl tid=27 fd=7 arg=SETFD(FileDescriptorFlags(FD_CLOEXEC)) result=Ok(0)
+  36.913956300s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=7
+  36.914953100s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  36.917520700s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=7 len=33 offset=None result=Ok(33)
+  36.917795900s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/glib-2.0/schemas/gschemas.compiled fd=None flags=OFlags(CLOEXEC | LARGEFILE)
+  36.919617100s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/local/share/glib-2.0/schemas/gschemas.compiled fd=None flags=OFlags(CLOEXEC | LARGEFILE)
+  36.925611400s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/etc/passwd fd=Some(7) flags=OFlags(CLOEXEC | LARGEFILE)
+  36.926435600s DEBUG litebox_shim_linux::syscalls::file: sys_fcntl tid=27 fd=7 arg=SETFD(FileDescriptorFlags(FD_CLOEXEC)) result=Ok(0)
+  36.929404700s DEBUG litebox_shim_linux::syscalls::file: sys_fcntl tid=27 fd=7 arg=SETFD(FileDescriptorFlags(FD_CLOEXEC)) result=Ok(0)
+  36.930733600s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=7 len=1024 offset=None result=Ok(702)
+  36.931061800s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/root/.local/share/glib-2.0/schemas/gschemas.compiled fd=None flags=OFlags(CLOEXEC | LARGEFILE)
+  36.933423000s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=730136576
+  36.934225000s DEBUG litebox_shim_linux::syscalls::file: sys_write tid=27 fd=6 len=8 offset=None preview="\u{1}\0\0\0\0\0\0\0" result=Ok(8)
+  36.935004800s DEBUG litebox_shim_linux::syscalls::net: sys_sendmsg tid=27 fd=3 preview=Some("[01, 00, 00, 00, 01, 00, 0c, 00, 02, 00, 00, 00, 01, 00, 00, 00, 00, 00, 0c, 00, 03, 00, 00, 00]") result=Ok(24)
+  36.938361200s DEBUG litebox_shim_linux::syscalls::file: sys_fcntl tid=27 fd=7 arg=DUPFD { cloexec: true, min_fd: 0 } result=Ok(8)
+  36.939105400s DEBUG litebox_shim_linux::syscalls::file: sys_fcntl tid=27 fd=8 arg=SETFD(FileDescriptorFlags(FD_CLOEXEC)) result=Ok(0)
+  36.939316800s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/icons/default/cursors/ fd=None flags=OFlags(CLOEXEC | DIRECTORY | LARGEFILE)
+  36.940252600s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/icons/default//index.theme fd=None flags=OFlags(LARGEFILE)
+  36.941024200s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/pixmaps/default/cursors/ fd=None flags=OFlags(CLOEXEC | DIRECTORY | LARGEFILE)
+  36.941682800s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/pixmaps/default//index.theme fd=None flags=OFlags(LARGEFILE)
+  36.947389300s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/cursors/xorg-x11/default/cursors/ fd=None flags=OFlags(CLOEXEC | DIRECTORY | LARGEFILE)
+  36.948207300s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/cursors/xorg-x11/default//index.theme fd=None flags=OFlags(LARGEFILE)
+  36.949287600s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/icons/default/cursors/ fd=None flags=OFlags(CLOEXEC | DIRECTORY | LARGEFILE)
+  36.950187400s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/icons/default//index.theme fd=None flags=OFlags(LARGEFILE)
+  36.955900600s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/icons/default/cursors/ fd=None flags=OFlags(CLOEXEC | DIRECTORY | LARGEFILE)
+  36.959812300s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/icons/default//index.theme fd=None flags=OFlags(LARGEFILE)
+  36.960570900s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/pixmaps/default/cursors/ fd=None flags=OFlags(CLOEXEC | DIRECTORY | LARGEFILE)
+  36.961198500s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/pixmaps/default//index.theme fd=None flags=OFlags(LARGEFILE)
+  36.961916700s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/cursors/xorg-x11/default/cursors/ fd=None flags=OFlags(CLOEXEC | DIRECTORY | LARGEFILE)
+  36.962812600s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/cursors/xorg-x11/default//index.theme fd=None flags=OFlags(LARGEFILE)
+  36.964539600s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/icons/default/cursors/ fd=None flags=OFlags(CLOEXEC | DIRECTORY | LARGEFILE)
+  36.965424200s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/icons/default//index.theme fd=None flags=OFlags(LARGEFILE)
+  36.968110300s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=730202112 len=2304 ok=true
+  36.969910300s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=730202112 len=5568 ok=true
+  36.972876900s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=730202112 len=12096 ok=true
+  36.982041700s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=730923008
+  36.984533400s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=730923008 len=4096 ok=true
+  36.987690200s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=730988544
+  36.988447100s DEBUG litebox_shim_linux::syscalls::file: sys_stat: entry tid=27 path="/etc/xkb"
+  36.989076300s DEBUG litebox_shim_linux::syscalls::file: sys_stat: error tid=27 errno=Errno(2 = ENOENT: No such file or directory)
+  36.989901600s DEBUG litebox_shim_linux::syscalls::file: sys_stat: entry tid=27 path="/usr/share/xkeyboard-config-2.d"
+  36.990656100s DEBUG litebox_shim_linux::syscalls::file: sys_stat: error tid=27 errno=Errno(2 = ENOENT: No such file or directory)
+  36.991535700s DEBUG litebox_shim_linux::syscalls::file: sys_stat: entry tid=27 path="/usr/share/xkeyboard-config.d"
+  36.992584300s DEBUG litebox_shim_linux::syscalls::file: sys_stat: error tid=27 errno=Errno(2 = ENOENT: No such file or directory)
+  36.994044500s DEBUG litebox_shim_linux::syscalls::file: sys_stat: entry tid=27 path="/usr/share/X11/xkb"
+  36.994802000s DEBUG litebox_shim_linux::syscalls::file: sys_stat: returning tid=27 mode=16877 rdev=0
+  36.995630500s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/rules/evdev fd=Some(10) flags=OFlags(LARGEFILE)
+  37.002282100s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/rules/evdev.pre fd=None flags=OFlags(LARGEFILE)
+  37.003069400s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=10
+  37.003940800s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.009689500s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(0) result=Ok(4096)
+  37.011593400s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(4096) result=Ok(4096)
+  37.013023200s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(8192) result=Ok(4096)
+  37.014295700s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(12288) result=Ok(4096)
+  37.015650400s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(16384) result=Ok(4096)
+  37.017224400s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(20480) result=Ok(4096)
+  37.018171500s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(24576) result=Ok(4096)
+  37.019626800s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(28672) result=Ok(4096)
+  37.021107700s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(32768) result=Ok(1732)
+  37.023144200s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(34500) result=Ok(0)
+  37.026444100s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=64 offset=Some(0) result=Ok(64)
+  37.027128400s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=36864 returned=731250688
+  37.030829000s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=731250688 len=34500 ok=true
+  37.031525400s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/rules/evdev.post fd=None flags=OFlags(LARGEFILE)
+  37.032204600s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=731054080 len=4096 ok=true
+  37.032872000s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=731578368 len=4096 ok=true
+  37.036152900s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=731447296 len=8192 ok=true
+  37.036873200s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/keycodes/evdev fd=Some(10) flags=OFlags(LARGEFILE)
+  37.037470900s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=10
+  37.038638800s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.041940400s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(0) result=Ok(4096)
+  37.042537800s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(4096) result=Ok(4096)
+  37.043716200s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(8192) result=Ok(4096)
+  37.044941600s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(12288) result=Ok(4096)
+  37.046297100s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(16384) result=Ok(4096)
+  37.047283200s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(20480) result=Ok(4096)
+  37.048251500s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(24576) result=Ok(1657)
+  37.049608600s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(26233) result=Ok(0)
+  37.050927400s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=64 offset=Some(0) result=Ok(64)
+  37.051605900s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=28672 returned=731709440
+  37.054405100s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=8192 returned=731971584
+  37.056756800s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=8192 returned=732037120
+  37.059086400s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=732102656
+  37.059636000s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=731971584 len=8192 ok=true
+  37.061894200s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=732168192
+  37.063152900s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=732037120 len=8192 ok=true
+  37.065707800s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=732364800
+  37.068243900s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=732430336
+  37.073530200s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=732561408
+  37.077311600s DEBUG litebox_shim_linux::syscalls::mm: sys_mprotect: entry tid=27 addr=729751552 len=4096 prot=ProtFlags(PROT_READ | PROT_WRITE)
+  37.078551300s DEBUG litebox_shim_linux::syscalls::mm: sys_mprotect: returned tid=27 ok=true
+  37.081569400s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=732692480
+  37.084538200s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=731709440 len=26233 ok=true
+  37.088986700s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=732823552
+  37.092406300s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=8192 returned=732889088
+  37.092930600s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=732823552 len=4096 ok=true
+  37.097982600s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=16384 returned=733020160
+  37.098661900s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=732889088 len=8192 ok=true
+  37.100492400s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=732430336 len=4096 ok=true
+  37.101145800s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=732561408 len=4096 ok=true
+  37.102870500s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=732692480 len=4096 ok=true
+  37.103490700s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/keycodes/aliases fd=Some(10) flags=OFlags(LARGEFILE)
+  37.104086800s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=10
+  37.105099800s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.109582600s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(0) result=Ok(2176)
+  37.110411100s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(2176) result=Ok(0)
+  37.111779600s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=64 offset=Some(0) result=Ok(64)
+  37.112504200s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=733151232
+  37.112671800s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=733151232 len=2176 ok=true
+  37.115691500s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=36864 returned=733216768
+  37.121413100s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=8192 returned=733413376
+  37.122199000s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=733020160 len=16384 ok=true
+  37.127006100s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/types/complete fd=Some(9) flags=OFlags(LARGEFILE)
+  37.132980700s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=733741056
+  37.134052800s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=9
+  37.134689900s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.137435600s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(0) result=Ok(179)
+  37.138226000s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(179) result=Ok(0)
+  37.139331400s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=64 offset=Some(0) result=Ok(64)
+  37.139950600s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=733806592
+  37.140744800s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=733806592 len=179 ok=true
+  37.141478000s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=733741056 len=4096 ok=true
+  37.142712400s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/types/basic fd=Some(9) flags=OFlags(LARGEFILE)
+  37.143450000s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=9
+  37.144775500s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.147761400s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(0) result=Ok(596)
+  37.149741600s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(596) result=Ok(0)
+  37.151587000s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=64 offset=Some(0) result=Ok(64)
+  37.152315500s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=733937664
+  37.152487900s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=733937664 len=596 ok=true
+  37.153089600s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/types/pc fd=Some(9) flags=OFlags(LARGEFILE)
+  37.153688600s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=9
+  37.154517700s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.159372800s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(0) result=Ok(2374)
+  37.160176100s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(2374) result=Ok(0)
+  37.162058200s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=64 offset=Some(0) result=Ok(64)
+  37.162706500s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=734134272
+  37.166129700s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=734265344
+  37.169577300s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=734724096
+  37.177622400s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=734920704
+  37.181056300s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=8192 returned=734986240
+  37.181224800s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=734134272 len=2374 ok=true
+  37.184219900s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=734265344 len=4096 ok=true
+  37.185669100s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=734920704 len=4096 ok=true
+  37.186279300s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/types/iso9995 fd=Some(9) flags=OFlags(LARGEFILE)
+  37.187060800s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=9
+  37.187185900s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.190677300s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(0) result=Ok(432)
+  37.191553700s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(432) result=Ok(0)
+  37.193007000s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=64 offset=Some(0) result=Ok(64)
+  37.193166800s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=735182848
+  37.193354400s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=735182848 len=432 ok=true
+  37.194069100s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/types/extra fd=Some(9) flags=OFlags(LARGEFILE)
+  37.194774100s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=9
+  37.195434000s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.200788400s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(0) result=Ok(4096)
+  37.202090100s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(4096) result=Ok(1101)
+  37.203884800s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(5197) result=Ok(0)
+  37.205277900s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=64 offset=Some(0) result=Ok(64)
+  37.206031900s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=8192 returned=735313920
+  37.208505600s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=8192 returned=735510528
+  37.210922300s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=8192 returned=735576064
+  37.213964900s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=8192 returned=735641600
+  37.214602400s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=735313920 len=5197 ok=true
+  37.215293800s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=735510528 len=8192 ok=true
+  37.215957200s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/types/level5 fd=Some(10) flags=OFlags(LARGEFILE)
+  37.216625700s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=10
+  37.217281300s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.220332200s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(0) result=Ok(4096)
+  37.221769300s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(4096) result=Ok(3587)
+  37.222602900s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(7683) result=Ok(0)
+  37.224236400s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=64 offset=Some(0) result=Ok(64)
+  37.225172500s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=8192 returned=735707136
+  37.231474600s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=8192 returned=735903744
+  37.240710800s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=16384 returned=736165888
+  37.254261500s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=16384 returned=736624640
+  37.255094500s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=735707136 len=7683 ok=true
+  37.258053900s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=736755712
+  37.259164800s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=736755712 len=4096 ok=true
+  37.260185600s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/types/numpad fd=Some(9) flags=OFlags(LARGEFILE)
+  37.261014300s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=9
+  37.262040200s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.266364200s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(0) result=Ok(1761)
+  37.268792800s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(1761) result=Ok(0)
+  37.270212300s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=64 offset=Some(0) result=Ok(64)
+  37.271548200s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=738983936
+  37.271786000s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=738983936 len=1761 ok=true
+  37.281010700s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/types/mousekeys fd=Some(9) flags=OFlags(LARGEFILE)
+  37.282237900s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=9
+  37.283429900s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.286272600s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(0) result=Ok(218)
+  37.288327100s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(218) result=Ok(0)
+  37.291827800s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=64 offset=Some(0) result=Ok(64)
+  37.292945500s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=739508224
+  37.294286400s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=739508224 len=218 ok=true
+  37.295366700s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/compat/complete fd=Some(9) flags=OFlags(LARGEFILE)
+  37.305935200s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=741998592
+  37.307822600s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=9
+  37.308540700s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.314093800s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(0) result=Ok(228)
+  37.316052600s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(228) result=Ok(0)
+  37.318279800s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=64 offset=Some(0) result=Ok(64)
+  37.318454000s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=742260736
+  37.320994000s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=742260736 len=228 ok=true
+  37.324734600s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/compat/basic fd=Some(9) flags=OFlags(LARGEFILE)
+  37.334215100s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=744816640
+  37.335213400s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=9
+  37.336097900s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.341035600s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(0) result=Ok(996)
+  37.343041500s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(996) result=Ok(0)
+  37.344273900s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=64 offset=Some(0) result=Ok(64)
+  37.345375800s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=744882176
+  37.346623800s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=744882176 len=996 ok=true
+  37.347428600s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=744816640 len=4096 ok=true
+  37.351758100s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=745078784
+  37.352508800s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/compat/ledcaps fd=Some(9) flags=OFlags(LARGEFILE)
+  37.357156300s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=745340928
+  37.357660200s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=9
+  37.358306700s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.363323800s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(0) result=Ok(469)
+  37.365810100s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(469) result=Ok(0)
+  37.367553300s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=64 offset=Some(0) result=Ok(64)
+  37.367698300s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=745472000
+  37.368602200s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=745472000 len=469 ok=true
+  37.369418400s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=745340928 len=4096 ok=true
+  37.370242400s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/compat/lednum fd=Some(9) flags=OFlags(LARGEFILE)
+  37.372505900s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=745799680
+  37.373215500s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=9
+  37.374068400s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.376505300s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(0) result=Ok(499)
+  37.377698400s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(499) result=Ok(0)
+  37.381248900s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=64 offset=Some(0) result=Ok(64)
+  37.381780900s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=745930752
+  37.385629700s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=745930752 len=499 ok=true
+  37.386466800s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/compat/iso9995 fd=Some(9) flags=OFlags(LARGEFILE)
+  37.388847900s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=746192896
+  37.389516500s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=9
+  37.390188200s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.392854700s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(0) result=Ok(1492)
+  37.394492700s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(1492) result=Ok(0)
+  37.396513300s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=64 offset=Some(0) result=Ok(64)
+  37.397185500s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=746323968
+  37.400206700s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=746323968 len=1492 ok=true
+  37.400937300s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=746192896 len=4096 ok=true
+  37.409557600s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/compat/mousekeys fd=Some(9) flags=OFlags(LARGEFILE)
+  37.410218500s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=9
+  37.410961100s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.416407600s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(0) result=Ok(4096)
+  37.418613500s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(4096) result=Ok(482)
+  37.420836400s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(4578) result=Ok(0)
+  37.421718300s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=64 offset=Some(0) result=Ok(64)
+  37.422504700s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=8192 returned=746913792
+  37.422844100s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=746913792 len=4578 ok=true
+  37.423475700s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=746651648 len=4096 ok=true
+  37.427186100s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=747241472
+  37.429188100s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=747307008
+  37.429880600s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=747241472 len=4096 ok=true
+  37.431928300s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=747307008 len=4096 ok=true
+  37.435746600s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=747700224
+  37.448049700s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=748224512
+  37.451212200s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=8192 returned=748355584
+  37.451650200s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=748224512 len=4096 ok=true
+  37.452839000s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=747700224 len=4096 ok=true
+  37.454104500s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/compat/accessx fd=Some(9) flags=OFlags(LARGEFILE)
+  37.456876600s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=748552192
+  37.457483100s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=9
+  37.458698500s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.463203600s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(0) result=Ok(1121)
+  37.464489000s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(1121) result=Ok(0)
+  37.467917200s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=64 offset=Some(0) result=Ok(64)
+  37.468469300s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=748683264
+  37.470753200s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=748683264 len=1121 ok=true
+  37.471303200s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=748552192 len=4096 ok=true
+  37.473384800s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=749142016
+  37.475585400s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=749273088
+  37.476195500s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=749142016 len=4096 ok=true
+  37.479339400s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=749273088 len=4096 ok=true
+  37.480170100s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/compat/misc fd=Some(9) flags=OFlags(LARGEFILE)
+  37.486667800s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=9
+  37.487376100s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.492615900s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(0) result=Ok(3113)
+  37.494045500s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(3113) result=Ok(0)
+  37.496792300s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=64 offset=Some(0) result=Ok(64)
+  37.497376900s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=749797376
+  37.498788700s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=749797376 len=3113 ok=true
+  37.500899000s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=750190592
+  37.501806600s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=750190592 len=4096 ok=true
+  37.502767900s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/compat/ledscroll fd=Some(9) flags=OFlags(LARGEFILE)
+  37.506636500s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=750321664
+  37.507329600s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=9
+  37.507968000s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.509957000s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(0) result=Ok(521)
+  37.510963800s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(521) result=Ok(0)
+  37.512684700s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=64 offset=Some(0) result=Ok(64)
+  37.512817700s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=750452736
+  37.513007100s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=750452736 len=521 ok=true
+  37.513906000s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=750321664 len=4096 ok=true
+  37.515404200s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/compat/misc fd=Some(9) flags=OFlags(LARGEFILE)
+  37.518500900s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=750583808
+  37.519198100s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=9
+  37.519776400s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.525184600s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(0) result=Ok(3113)
+  37.526590200s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(3113) result=Ok(0)
+  37.528377800s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=64 offset=Some(0) result=Ok(64)
+  37.529076400s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=750780416
+  37.533363900s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=750780416 len=3113 ok=true
+  37.534206700s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=750583808 len=4096 ok=true
+  37.535043500s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/compat/misc fd=Some(9) flags=OFlags(LARGEFILE)
+  37.540509800s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=9
+  37.542025500s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.547511000s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(0) result=Ok(3113)
+  37.549301800s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(3113) result=Ok(0)
+  37.551083500s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=64 offset=Some(0) result=Ok(64)
+  37.551987300s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=751566848
+  37.552305900s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=751566848 len=3113 ok=true
+  37.555470200s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=751304704 len=4096 ok=true
+  37.566074400s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/compat/xfree86 fd=Some(9) flags=OFlags(LARGEFILE)
+  37.589224800s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=752222208
+  37.595130300s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=9
+  37.596620200s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.600533500s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(0) result=Ok(1842)
+  37.606814000s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(1842) result=Ok(0)
+  37.622301700s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=64 offset=Some(0) result=Ok(64)
+  37.623484800s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=752484352
+  37.628731300s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=752484352 len=1842 ok=true
+  37.631389600s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=752222208 len=4096 ok=true
+  37.641500400s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=753008640
+  37.661974800s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=753205248
+  37.663792600s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=753008640 len=4096 ok=true
+  37.667534800s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=753205248 len=4096 ok=true
+  37.667772200s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/compat/level5 fd=Some(9) flags=OFlags(LARGEFILE)
+  37.674701300s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=753401856
+  37.677634000s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=9
+  37.694134900s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.714740600s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(0) result=Ok(1273)
+  37.716709900s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(1273) result=Ok(0)
+  37.719284300s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=64 offset=Some(0) result=Ok(64)
+  37.719483400s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=753795072
+  37.729682900s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=753795072 len=1273 ok=true
+  37.730991100s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/compat/caps fd=Some(9) flags=OFlags(LARGEFILE)
+  37.731159200s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=9
+  37.731371000s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.737427000s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(0) result=Ok(585)
+  37.739417300s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(585) result=Ok(0)
+  37.743181200s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=64 offset=Some(0) result=Ok(64)
+  37.743333500s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=754581504
+  37.743703600s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=754581504 len=585 ok=true
+  37.752773100s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=753401856 len=4096 ok=true
+  37.760940700s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=755040256
+  37.761506700s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=755040256 len=4096 ok=true
+  37.768601300s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=755367936
+  37.769649200s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=755367936 len=4096 ok=true
+  37.773442700s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=748355584 len=8192 ok=true
+  37.774278600s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/symbols/pc fd=Some(9) flags=OFlags(LARGEFILE)
+  37.777204100s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=755564544
+  37.779947600s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=9
+  37.780136900s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.786963000s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(0) result=Ok(2910)
+  37.794374700s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(2910) result=Ok(0)
+  37.798313100s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=64 offset=Some(0) result=Ok(64)
+  37.798517100s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=755826688
+  37.806977900s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=755826688 len=2910 ok=true
+  37.808498200s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=755564544 len=4096 ok=true
+  37.817792100s DEBUG litebox_shim_linux::syscalls::mm: sys_mprotect: entry tid=27 addr=729755648 len=4096 prot=ProtFlags(PROT_READ | PROT_WRITE)
+  37.819290100s DEBUG litebox_shim_linux::syscalls::mm: sys_mprotect: returned tid=27 ok=true
+  37.822487400s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=756809728
+  37.822750900s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/symbols/srvr_ctrl fd=Some(9) flags=OFlags(LARGEFILE)
+  37.824126900s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=9
+  37.824307200s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.827819400s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(0) result=Ok(1803)
+  37.829189800s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(1803) result=Ok(0)
+  37.831758700s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=64 offset=Some(0) result=Ok(64)
+  37.832854600s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=756940800
+  37.833446000s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=756940800 len=1803 ok=true
+  37.834443300s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=756482048 len=4096 ok=true
+  37.840630700s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=757202944
+  37.840841100s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/symbols/keypad fd=Some(9) flags=OFlags(LARGEFILE)
+  37.846475500s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=757399552
+  37.848179200s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=9
+  37.860739800s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.873121400s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(0) result=Ok(4096)
+  37.876837000s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(4096) result=Ok(4096)
+  37.878534200s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(8192) result=Ok(4096)
+  37.880425800s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(12288) result=Ok(4096)
+  37.882504700s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(16384) result=Ok(4096)
+  37.884624200s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(20480) result=Ok(3510)
+  37.886921800s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(23990) result=Ok(0)
+  37.887446700s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=64 offset=Some(0) result=Ok(64)
+  37.887648200s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=24576 returned=757661696
+  37.888881100s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=757661696 len=23990 ok=true
+  37.890088700s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/symbols/keypad fd=Some(9) flags=OFlags(LARGEFILE)
+  37.895013300s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=758317056
+  37.897223300s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=9
+  37.898978200s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.904693100s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(0) result=Ok(4096)
+  37.906881300s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(4096) result=Ok(4096)
+  37.908937900s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(8192) result=Ok(4096)
+  37.910675400s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(12288) result=Ok(4096)
+  37.912546000s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(16384) result=Ok(4096)
+  37.914788400s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(20480) result=Ok(3510)
+  37.917784200s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(23990) result=Ok(0)
+  37.922756700s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=64 offset=Some(0) result=Ok(64)
+  37.922931900s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=24576 returned=758579200
+  37.930588800s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=16384 returned=759300096
+  37.931848000s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=759300096 len=16384 ok=true
+  37.941973800s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=16384 returned=759431168
+  37.945694000s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=759431168 len=16384 ok=true
+  37.946808200s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=758579200 len=23990 ok=true
+  37.947092700s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=758317056 len=4096 ok=true
+  37.955894600s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=759627776
+  37.964926400s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=8192 returned=760020992
+  37.967451100s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=757202944 len=4096 ok=true
+  37.970686000s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=760217600
+  37.973305200s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/symbols/us fd=Some(10) flags=OFlags(LARGEFILE)
+  37.981018800s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=10
+  37.982972500s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  37.986988100s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(0) result=Ok(4096)
+  37.988539100s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(4096) result=Ok(4096)
+  37.989738200s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(8192) result=Ok(4096)
+  37.992262000s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(12288) result=Ok(4096)
+  37.993351900s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(16384) result=Ok(4096)
+  37.995327200s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(20480) result=Ok(4096)
+  37.997111700s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(24576) result=Ok(4096)
+  37.997977800s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(28672) result=Ok(4096)
+  37.999860000s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(32768) result=Ok(4096)
+  38.000486400s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(36864) result=Ok(4096)
+  38.001860700s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(40960) result=Ok(4096)
+  38.003334100s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(45056) result=Ok(4096)
+  38.004599000s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(49152) result=Ok(4096)
+  38.006178200s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(53248) result=Ok(4096)
+  38.007491900s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(57344) result=Ok(4096)
+  38.008750200s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(61440) result=Ok(4096)
+  38.009711600s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(65536) result=Ok(4096)
+  38.011122800s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(69632) result=Ok(4096)
+  38.011839500s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(73728) result=Ok(4096)
+  38.013229100s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(77824) result=Ok(4096)
+  38.014467100s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(81920) result=Ok(4096)
+  38.016153800s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(86016) result=Ok(4096)
+  38.017761700s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(90112) result=Ok(4096)
+  38.019054800s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(94208) result=Ok(4096)
+  38.020291400s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(98304) result=Ok(4096)
+  38.021085800s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(102400) result=Ok(4096)
+  38.022618000s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(106496) result=Ok(4096)
+  38.024151800s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(110592) result=Ok(3300)
+  38.024996500s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=4096 offset=Some(113892) result=Ok(0)
+  38.028033300s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=10 len=64 offset=Some(0) result=Ok(64)
+  38.028510900s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=114688 returned=760807424
+  38.035831000s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=760807424 len=113892 ok=true
+  38.041334800s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=762380288
+  38.046574400s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=762576896
+  38.049859400s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=762642432
+  38.051466700s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=762773504
+  38.052613600s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=762642432 len=4096 ok=true
+  38.053412400s DEBUG litebox_shim_linux::syscalls::file: sys_openat tid=27 path=/usr/share/X11/xkb/symbols/inet fd=Some(9) flags=OFlags(LARGEFILE)
+  38.054215500s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: entry tid=27 fd=9
+  38.054749700s DEBUG litebox_shim_linux::syscalls::file: sys_fstat: returning tid=27 mode=33188 rdev=0
+  38.058084000s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(0) result=Ok(4096)
+  38.059240500s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(4096) result=Ok(4096)
+  38.060568600s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(8192) result=Ok(4096)
+  38.061802700s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(12288) result=Ok(4096)
+  38.063294700s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(16384) result=Ok(4096)
+  38.064801500s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(20480) result=Ok(4096)
+  38.066533900s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(24576) result=Ok(4096)
+  38.068094700s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(28672) result=Ok(4096)
+  38.069761800s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(32768) result=Ok(4096)
+  38.070577200s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(36864) result=Ok(4096)
+  38.071824500s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(40960) result=Ok(4096)
+  38.073428100s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(45056) result=Ok(4096)
+  38.074745900s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(49152) result=Ok(4096)
+  38.076390500s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(53248) result=Ok(4096)
+  38.078103300s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(57344) result=Ok(4096)
+  38.079799800s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(61440) result=Ok(4096)
+  38.081284500s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(65536) result=Ok(4096)
+  38.082860500s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(69632) result=Ok(4096)
+  38.084092800s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(73728) result=Ok(4096)
+  38.084899000s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(77824) result=Ok(4096)
+  38.087121400s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(81920) result=Ok(4096)
+  38.088249600s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(86016) result=Ok(3548)
+  38.089191500s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=4096 offset=Some(89564) result=Ok(0)
+  38.090036400s DEBUG litebox_shim_linux::syscalls::file: sys_read tid=27 fd=9 len=64 offset=Some(0) result=Ok(64)
+  38.090173700s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=90112 returned=762904576
+  38.093979500s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=16384 returned=763822080
+  38.107994300s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=32768 returned=764018688
+  38.113331000s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=762904576 len=89564 ok=true
+  38.115893500s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=760479744 len=4096 ok=true
+  38.119438600s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=764346368
+  38.124423700s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=764477440
+  38.132294600s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=764674048
+  38.135271200s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=764805120
+  38.141836000s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=765067264
+  38.145404100s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=765198336
+  38.147155500s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=8192 returned=765263872
+  38.148669900s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=764805120 len=4096 ok=true
+  38.151661600s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=765394944
+  38.155327400s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=765460480
+  38.160120200s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=765591552
+  38.164193300s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=765657088
+  38.168895300s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=16384 returned=765788160
+  38.172053000s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=765263872 len=8192 ok=true
+  38.175810500s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=765984768
+  38.187265500s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=766181376
+  38.195112600s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=766443520
+  38.198327100s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=766574592
+  38.202023100s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=766705664
+  38.205497200s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=766836736
+  38.207852100s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=766967808
+  38.210517700s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=767033344
+  38.214730400s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=767164416
+  38.215631300s DEBUG litebox_shim_linux::syscalls::mm: sys_mprotect: entry tid=27 addr=729759744 len=4096 prot=ProtFlags(PROT_READ | PROT_WRITE)
+  38.216468600s DEBUG litebox_shim_linux::syscalls::mm: sys_mprotect: returned tid=27 ok=true
+  38.220966200s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=767295488
+  38.224430100s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=32768 returned=767361024
+  38.226186700s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=765788160 len=16384 ok=true
+  38.228851600s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=767492096
+  38.231065900s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=767557632
+  38.234076700s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=767688704
+  38.238206900s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=767819776
+  38.241630500s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=767950848
+  38.244664800s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=768081920
+  38.247376400s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=768212992
+  38.252668600s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=16384 returned=768475136
+  38.253366000s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=760020992 len=8192 ok=true
+  38.257570500s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=32768 returned=768606208
+  38.258024500s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=768475136 len=16384 ok=true
+  38.258970600s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=767361024 len=32768 ok=true
+  38.259511600s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=763822080 len=16384 ok=true
+  38.260233700s DEBUG litebox_shim_linux::syscalls::mm: sys_munmap tid=27 host_tid=2548 addr=768606208 len=32768 ok=true
+  38.262859900s DEBUG litebox_shim_linux::syscalls::mm: sys_mmap: returned tid=27 host_tid=2548 addr=0 len=4096 returned=768802816
+  38.263835200s DEBUG litebox_shim_linux::syscalls::net: sys_sendmsg tid=27 fd=3 preview=Some("[02, 00, 00, 00, 00, 00, 28, 00, 01, 00, 00, 00, 0e, 00, 00, 00, 77, 6c, 5f, 63, 6f, 6d, 70, 6f, 73, 69, 74, 6f, 72, 00, 00, 00, 03, 00, 00, 00, 04, 00, 00, 00, 02, 00, 00, 00, 00, 00, 2c, 00, 02, 00, 00, 00, 11, 00, 00, 00, 77, 6c, 5f, 73, 75, 62, 63, 6f]") result=Ok(424)

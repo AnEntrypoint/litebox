@@ -18,6 +18,7 @@ use crate::platform::page_mgmt::AllocationError;
 use crate::platform::page_mgmt::DeallocationError;
 use crate::platform::page_mgmt::FixedAddressBehavior;
 use crate::platform::page_mgmt::MemoryRegionPermissions;
+use crate::platform::page_mgmt::RemapError;
 use crate::platform::page_mgmt::SharedMemoryError;
 
 /// Page size in bytes.
@@ -1575,26 +1576,59 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         if vma.is_file_backed() {
             unimplemented!("file-backed mapping move is not supported yet");
         }
-        let new_addr = self
-            .get_unmmaped_area(
-                suggested_new_address,
-                new_size,
-                false,
-                vma.flags.contains(VmFlags::VM_GROWSDOWN),
-            )
-            .ok_or(VmemMoveError::OutOfMemory)?;
-        let new_range = PageRange::<ALIGN>::new(new_addr, new_addr + new_size.as_usize()).unwrap();
-        let new_addr = unsafe {
-            self.platform
-                .remap_pages(old_range.into(), new_range.into(), vma.flags.into())
+        // `get_unmmaped_area` only consults litebox's own `self.vmas` tracker, which has no
+        // visibility into memory the underlying platform holds outside litebox's control (on
+        // Windows: the host process's own loaded modules, thread stacks, or later host-allocator
+        // growth that postdates the one-time startup snapshot -- see
+        // `litebox_platform_windows_userland::read_memory_maps`'s own doc comment). So a placement
+        // this loop believes is free can still collide with real platform-owned memory, and
+        // `remap_pages` reports that back as `RemapError::AlreadyAllocated` rather than a
+        // genuine capacity failure -- confirmed live via a real Weston `mremap()` (its pixman
+        // shadow-framebuffer growth) landing on such an untracked Windows region and getting
+        // rejected, which Weston then reported to its Wayland client as a fatal "failed mremap"
+        // protocol error and disconnected it, cascading into every XFCE client's "cannot open
+        // display" failure. `AlreadyAllocated` at an explicit caller-suggested address is exactly
+        // the case a real Linux kernel would also just place elsewhere for (unless the caller
+        // required `MREMAP_FIXED`, which this function's caller never sets -- see `sys_mremap`'s
+        // own `MREMAP_FIXED` handling), so retry with a fresh OS/tracker-picked address instead of
+        // surfacing a permanent failure for what is really just a resolvable placement collision.
+        // Bounded (not unbounded) so a genuine, persistent AlreadyAllocated (e.g. every retry
+        // landing in the same crowded region) still terminates instead of looping forever.
+        const MAX_PLACEMENT_RETRIES: u32 = 8;
+        let mut next_hint = suggested_new_address;
+        let mut attempt = 0u32;
+        loop {
+            let new_addr = self
+                .get_unmmaped_area(
+                    next_hint,
+                    new_size,
+                    false,
+                    vma.flags.contains(VmFlags::VM_GROWSDOWN),
+                )
+                .ok_or(VmemMoveError::OutOfMemory)?;
+            let new_range =
+                PageRange::<ALIGN>::new(new_addr, new_addr + new_size.as_usize()).unwrap();
+            match unsafe {
+                self.platform
+                    .remap_pages(old_range.into(), new_range.into(), vma.flags.into())
+            } {
+                Ok(new_addr) => {
+                    let new_start = new_addr.as_usize();
+                    let new_end = new_start + new_size.as_usize();
+                    self.vmas.insert(new_start..new_end, *vma);
+                    self.vmas.remove(old_range.into());
+                    return Ok(new_addr);
+                }
+                Err(RemapError::AlreadyAllocated) if attempt < MAX_PLACEMENT_RETRIES => {
+                    attempt += 1;
+                    // Drop the hint on retry: a repeated collision at the same suggested address
+                    // would just fail identically again, so fall through to the OS/tracker's own
+                    // free-gap search for the next attempt.
+                    next_hint = None;
+                }
+                Err(e) => return Err(VmemMoveError::RemapError(e)),
+            }
         }
-        .map_err(VmemMoveError::RemapError)?;
-
-        let new_start = new_addr.as_usize();
-        let new_end = new_start + new_size.as_usize();
-        self.vmas.insert(new_start..new_end, *vma);
-        self.vmas.remove(old_range.into());
-        Ok(new_addr)
     }
 
     /// Change the permissions ([`VmFlags::VM_ACCESS_FLAGS`]) of a range in the virtual address space.

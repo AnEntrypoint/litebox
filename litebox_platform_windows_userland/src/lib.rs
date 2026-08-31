@@ -4019,8 +4019,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
 
             let has_committed_page =
                 process_memory_range_by_regions(suggested_range.clone(), |r, state| {
+                    let mbi_type = {
+                        let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+                        do_query_on_region(&mut mbi, r.start as *mut c_void);
+                        mbi.Type
+                    };
                     litebox_util_log::debug!(
-                        start:% = r.start, end:% = r.end, state:? = state;
+                        start:% = r.start, end:% = r.end, state:? = state, mbi_type:? = mbi_type;
                         "allocate_pages: DIAG region state at has_committed_page check"
                     );
                     if state == Win32_Memory::MEM_COMMIT {
@@ -4077,6 +4082,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                             // In case the region is already reserved, we just need to commit it.
                             // In case the region is already committed, decommit and recommit it.
                             Win32_Memory::MEM_RESERVE | Win32_Memory::MEM_COMMIT => {
+                                let mut was_mapped_view = false;
                                 if state == Win32_Memory::MEM_COMMIT {
                                     // TODO: handle this race condition properly.
                                     assert_eq!(
@@ -4100,56 +4106,118 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                     // half and decommit each half (recursively, in case a half still
                                     // straddles another boundary) instead of asserting success on
                                     // the whole range in one shot.
-                                    fn decommit_bisecting(range: core::ops::Range<usize>) -> bool {
-                                        if range.is_empty() {
-                                            return true;
-                                        }
-                                        let ok = unsafe {
-                                            VirtualFree(
-                                                range.start as *mut c_void,
-                                                range.len(),
-                                                Win32_Memory::MEM_DECOMMIT,
+                                    //
+                                    // A distinct, non-bisectable failure mode: `r` can be a
+                                    // `MEM_MAPPED` (or `MEM_IMAGE`) region -- a real
+                                    // `MapViewOfFile3`-backed view, e.g. litebox's own
+                                    // `map_shared_memory` (guest `MAP_SHARED`/`wl_shm` buffers) --
+                                    // rather than an ordinary `VirtualAlloc2`-committed `MEM_PRIVATE`
+                                    // region. `VirtualFree(MEM_DECOMMIT)` is documented by Microsoft
+                                    // to be invalid on a mapped view regardless of size (it fails
+                                    // with `ERROR_INVALID_PARAMETER` or, observed live,
+                                    // `ERROR_INVALID_HANDLE` (6)) -- bisecting it down to a single
+                                    // page still can't succeed, since the operation itself is
+                                    // categorically wrong for this region type, not merely
+                                    // mis-sized. Confirmed live: a real Weston `mremap()` (pixman
+                                    // shadow-framebuffer growth) placed a `Replace`-mode fixed
+                                    // allocation exactly on a `MEM_MAPPED` region and hit this same
+                                    // decommit path, panicking the host. The correct operation for a
+                                    // mapped view is `UnmapViewOfFileEx`, which drops the whole view
+                                    // (mapped views cannot be partially unmapped -- unlike
+                                    // `VirtualFree`, there is no sub-range form), after which the
+                                    // freed range is `MEM_FREE` again for `VirtualAlloc2` to commit
+                                    // fresh `MEM_PRIVATE` pages into, matching what a real Linux
+                                    // `mmap(MAP_FIXED)` replacing a `shmat`/file mapping does.
+                                    let mbi_type = {
+                                        let mut mbi =
+                                            Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+                                        do_query_on_region(&mut mbi, r.start as *mut c_void);
+                                        mbi.Type
+                                    };
+                                    was_mapped_view = mbi_type == Win32_Memory::MEM_MAPPED
+                                        || mbi_type == Win32_Memory::MEM_IMAGE;
+                                    let decommit_ok = if was_mapped_view {
+                                        (unsafe {
+                                            UnmapViewOfFileEx(
+                                                Win32_Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                                                    Value: r.start as *mut c_void,
+                                                },
+                                                0,
                                             )
-                                        } != 0;
-                                        if ok {
-                                            return true;
+                                        }) != 0
+                                    } else {
+                                        fn decommit_bisecting(range: core::ops::Range<usize>) -> bool {
+                                            if range.is_empty() {
+                                                return true;
+                                            }
+                                            let ok = unsafe {
+                                                VirtualFree(
+                                                    range.start as *mut c_void,
+                                                    range.len(),
+                                                    Win32_Memory::MEM_DECOMMIT,
+                                                )
+                                            } != 0;
+                                            if ok {
+                                                return true;
+                                            }
+                                            // Only bisect on the specific "spans multiple allocation
+                                            // objects" error; any other failure should surface as-is.
+                                            if unsafe { GetLastError() } != windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER
+                                            {
+                                                return false;
+                                            }
+                                            // A single page can't be split further; nothing left to try.
+                                            // Use the fixed 4 KiB Windows page granularity here (not
+                                            // the outer `ALIGN` const, which nested `fn`s can't see) --
+                                            // any multiple of the true page size is a valid split point.
+                                            const PAGE: usize = 0x1000;
+                                            if range.len() <= PAGE {
+                                                return false;
+                                            }
+                                            let mid = range.start
+                                                + ((range.len() / 2) / PAGE).max(1) * PAGE;
+                                            decommit_bisecting(range.start..mid)
+                                                && decommit_bisecting(mid..range.end)
                                         }
-                                        // Only bisect on the specific "spans multiple allocation
-                                        // objects" error; any other failure should surface as-is.
-                                        if unsafe { GetLastError() } != windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER
-                                        {
-                                            return false;
-                                        }
-                                        // A single page can't be split further; nothing left to try.
-                                        // Use the fixed 4 KiB Windows page granularity here (not
-                                        // the outer `ALIGN` const, which nested `fn`s can't see) --
-                                        // any multiple of the true page size is a valid split point.
-                                        const PAGE: usize = 0x1000;
-                                        if range.len() <= PAGE {
-                                            return false;
-                                        }
-                                        let mid = range.start
-                                            + ((range.len() / 2) / PAGE).max(1) * PAGE;
-                                        decommit_bisecting(range.start..mid)
-                                            && decommit_bisecting(mid..range.end)
+                                        decommit_bisecting(r.clone())
+                                    };
+                                    if !decommit_ok {
+                                        let mut mbi =
+                                            Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+                                        do_query_on_region(&mut mbi, r.start as *mut c_void);
+                                        litebox_util_log::debug!(
+                                            start:% = r.start, end:% = r.end,
+                                            mbi_type:? = mbi.Type, mbi_state:? = mbi.State,
+                                            mbi_protect:? = mbi.Protect;
+                                            "allocate_pages: DIAG decommit failed, dumping region info"
+                                        );
                                     }
-                                    let decommit_ok = decommit_bisecting(r.clone());
                                     assert!(
                                         decommit_ok,
                                         "VirtualFree(DECOMMIT) failed: {}",
                                         unsafe { GetLastError() }
                                     );
                                 }
-                                let ptr = unsafe {
-                                    VirtualAlloc2(
-                                        GetCurrentProcess(),
-                                        r.start as *mut c_void,
-                                        r.len(),
-                                        Win32_Memory::MEM_COMMIT,
-                                        prot_flags(initial_permissions),
-                                        core::ptr::null_mut(),
-                                        0,
-                                    )
+                                // `UnmapViewOfFileEx` (the `was_mapped_view` branch above) drops
+                                // the freed range straight to `MEM_FREE`, not `MEM_RESERVE` --
+                                // unlike `VirtualFree(MEM_DECOMMIT)`, which leaves the allocation
+                                // reserved. `VirtualAlloc2(MEM_COMMIT)` alone requires an existing
+                                // reservation, so a former mapped view needs the same
+                                // reserve-and-commit path as a genuinely free region.
+                                let ptr = if was_mapped_view {
+                                    reserve_and_commit(r.clone(), prot_flags(initial_permissions))
+                                } else {
+                                    unsafe {
+                                        VirtualAlloc2(
+                                            GetCurrentProcess(),
+                                            r.start as *mut c_void,
+                                            r.len(),
+                                            Win32_Memory::MEM_COMMIT,
+                                            prot_flags(initial_permissions),
+                                            core::ptr::null_mut(),
+                                            0,
+                                        )
+                                    }
                                 };
                                 !ptr.is_null()
                             }

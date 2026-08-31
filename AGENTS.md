@@ -1,3 +1,107 @@
+# STATUS (2026-08-31, sub-session 32): INDEPENDENT VERIFICATION of the sub-session-32 Fix phase's
+`mremap`/`VirtualFree(DECOMMIT)`-on-mapped-view claims (uncommitted working-tree diff touching
+`litebox_platform_windows_userland/src/lib.rs`, `litebox/src/mm/linux.rs`,
+`litebox_shim_linux/src/syscalls/{net.rs,mm.rs}`, `git diff --stat`: 4 files, +196/-63). **Its narrow,
+falsifiable claims (zero panics, all 3 XFCE clients execve+connect+send real Wayland bytes, run reaches
+full natural completion for the first time, real `sys_mremap` ENOMEM now visible in the trace immediately
+before each client's failure) are TRUE and independently reproduced. Its own admission that the screenshot
+goal was NOT met this session is also confirmed correct, and — with a properly foreground-verified capture
+this session — the underlying finding is unchanged: solid black. The standing user goal is NOT MET.**
+
+**Repro used**: identical to sub-session 31's, `.wfgy/xfce-build/xfce_launch.sh` (unmodified) via
+`--initial-files .wfgy/xfce-build/alpine-pinned2.tar --resume-from .wfgy/xfce-build/xfce-layer19.tar --gui --
+/bin/sh /xfce_launch.sh`, release binary rebuilt at 08:43 (`cargo build --locked --release -p
+litebox_runner_linux_on_windows_userland` reported "Finished" in 0.94s -- no recompile needed, binary
+already reflected the uncommitted fix; `git diff --stat` confirmed only the 4 files above touched, nothing
+else in the working tree), `LITEBOX_LOG=debug`, own fresh log never reused from the Fix phase:
+`.wfgy/xfce-build/myverify2_run1.log` (536,146 lines) + `.log.err`. (A first launch attempt via git-bash
+`nohup ... &` produced a broken/truncated log from a stray crashed process and had to be discarded and
+redone via PowerShell `Start-Process -RedirectStandardOutput/-RedirectStandardError`, which worked
+reliably -- noted for whoever continues, since it cost real time this session.)
+
+**Verified TRUE (grepped directly from this session's own log):**
+- `panicked`: **0** hits (log and .err both). `VirtualFree(DECOMMIT) failed`: **0** hits. No host crash,
+  through the full run.
+- All 3 XFCE binaries `sys_execve` successfully: `xfsettingsd` tid=27 t=21.289s, `xfce4-panel` tid=28
+  t=21.376s, `xfdesktop` tid=29 t=21.423s.
+- `TRACE unix_connect`/`TRACE unix_accept` ok=true: 8 hits total (4 matched pairs: seatd + 3 XFCE Wayland
+  connects), all succeeded.
+- `sys_sendmsg` from all 3 XFCE client tids on fd=3: each sends a real 24-byte `wl_display.get_registry`
+  message followed by a real 424-byte registry-bind message (`wl_compositor`, `wl_subcompositor`,
+  `zxdg_output_manager_v1`, `wl_data_device_manager`, `wl_shm`, `wl_output`, `wl_seat` bind requests,
+  genuine well-formed Wayland wire protocol, confirmed byte-for-byte), at t=45.08-47.38s. This reproduces
+  the Fix phase's claim.
+- `sys_mremap: failed ... err=Errno(12 = ENOMEM)` for tid=20 (weston): **3 hits**, at t=46.530s, 46.664s,
+  47.384s -- each one occurring within ~150ms of the corresponding client's own "cannot open display"
+  failure (client tid=27 fails at t=46.573s, right after the t=46.530s mremap failure; tid=28 fails at
+  t=46.679s, right after t=46.664s; tid=29 fails at t=47.398s, right after t=47.384s). This tight timing
+  correlation is real and matches the Fix phase's causal story (weston's own pixman shadow-framebuffer
+  `mremap` growth fails with ENOMEM, weston cannot service the client, client gives up and logs "cannot
+  open display").
+- `WESTON_ALIVE=1` reached at t=67.226s; `DONE_SLEEPING` reached at t=82.557s -- **the script now runs
+  to full natural completion**, matching the Fix phase's claim of "reached DONE_SLEEPING for the first
+  time." (The underlying process continued running well past this, into a very slow `close_all_fds` exit
+  path scanning fd numbers past 390,000 one at a time via `sys_fcntl ... GETFD` -- reaching t=167s in the
+  log before this session moved on to capture the screenshot; this fd-scan-on-exit behavior is a distinct,
+  separate performance oddity, not evaluated further this session.)
+- `DrmModeSetCrtc`/`DrmModePageFlip`: **1 each**, at t=29.378s/29.384s -- same single startup
+  modeset+flip as every prior sub-session back to #26, unchanged. No second repaint ever triggered.
+- `repaint` (case-insensitive): 7 hits in the log + 9 in .err, all from the single repaint cycle around
+  the same DRM ioctls -- consistent with prior sessions' counts, not increased.
+- `cannot open display`/`Unable to open display`: still occurs for all 3 clients --
+  `xfsettingsd: Unable to open display.` (t=46.573s), `xfce4-panel` Gtk-WARNING cannot open display
+  (t=46.679s/writer log, 06:48:32.530 weston-clock), `xfdesktop` Gtk-WARNING cannot open display
+  (t=47.398s/writer log, 06:48:33.249 weston-clock). **Unchanged from every prior sub-session**: real
+  Wayland handshake succeeds, then the client still fails to open its display, and the Fix phase's own
+  report explicitly and honestly disclosed this residual gap rather than claiming it fixed.
+
+**Screenshot: taken independently this session with an explicitly foreground-verified methodology,
+correcting a real capture bug hit mid-session.** First capture attempt (`myverify_screenshot.png`, via
+`SetWindowPos`+`BringWindowToTop`+`SetForegroundWindow` alone, mirroring sub-session 31's documented
+technique) silently captured an **unrelated Chrome/Google-AI-Studio browser window** instead of the
+litebox window, despite the EnumWindows title-match correctly identifying the right HWND (pid=1876
+confirmed) beforehand -- `GetForegroundWindow()` checked immediately after showed Chrome, not the litebox
+HWND, still owning actual focus (`SetForegroundWindow` is well-known to silently no-op for a caller
+without input focus per Windows' foreground-lock rules), and `CopyFromScreen` at those screen coordinates
+composited whatever was really topmost, i.e. Chrome. This is the exact failure mode sub-session 31's own
+notes warned future sessions about, and it recurred here despite using the "documented working technique"
+verbatim -- **the technique alone is not reliable; it must be paired with an explicit
+`GetForegroundWindow()==targetHWND` check immediately before AND after the capture**, which this session
+added and which finally worked: `AttachThreadInput` between this process's UI thread and the current real
+foreground window's thread, then `ShowWindow(SW_RESTORE)`+`BringWindowToTop`+`SetForegroundWindow`, with
+`GetForegroundWindow()` re-checked and logged both immediately before and immediately after
+`CopyFromScreen` (`myverify_screenshot3.png`) -- both checks confirmed handle 1574304 (the real litebox
+window, PID 1876, the exact process running this repro) was genuinely topmost throughout the capture, no
+foreign-window contamination this time. Client area 1521x826, pixel-sampled at a 20x20 grid (400 samples):
+**361/400 (90.25%) exactly RGB(0,0,0)**, remainder near-black grays (32,32,32 down to 19,19,19) plausibly
+antialiasing/compositor noise. No XFCE panel, taskbar, desktop icons, wallpaper, or any distinguishable
+window content visible anywhere in the capture. **Solid black, matching every prior sub-session, unchanged
+by this session's fix.**
+
+**Verdict: the sub-session-32 Fix phase's own report is unusually honest and its verifiable claims hold up
+under independent re-verification** -- the `VirtualFree`-on-mapped-view host-crash bug and the `mremap`
+`AlreadyAllocated`-collision bug are both real, both fixed, and both produce the claimed observable
+improvements (zero panics, full script completion reached for the first time, genuine Wayland protocol
+bytes exchanged, real `ENOMEM` now visible in the trace where it was previously invisible). Its own
+explicit disclosure that "the screenshot ... showed only the Windows host desktop/taskbar ... I did not
+obtain a real screenshot of rendered XFCE content this session" is also independently confirmed accurate
+in spirit: this session's own properly-verified capture is genuinely solid black too, just via a correctly
+attributed capture rather than a misattributed one. **The standing user goal -- XFCE rendering visible,
+real desktop content, proven via screenshot -- is NOT MET.** The residual gap is now narrower and better
+characterized than before: weston's own `mremap()` genuinely fails with `ENOMEM` on a small (2304->5568
+byte) pixman shadow-framebuffer resize, immediately preceding and plausibly causing each client's "cannot
+open display" failure -- this is a real, still-open bug (not yet root-caused to fragmentation vs. tracker
+capacity vs. something else), and is the concrete next thing for whoever continues, exactly as the Fix
+phase's own report said.
+
+Raw evidence this session: `.wfgy/xfce-build/myverify2_run1.log` (536,146 lines) + `.log.err`,
+`.wfgy/xfce-build/myverify_screenshot3.png` (final correct capture, foreground-verified before and after),
+`.wfgy/xfce-build/myverify_screenshot.png` (discarded -- wrong window, Chrome, kept as a methodology
+warning), `.wfgy/xfce-build/myverify_screenshot.ps1`/inline PowerShell (capture scripts).
+
+---
+
+
 # STATUS (2026-08-31, sub-session 31): INDEPENDENT VERIFICATION of the sub-session-31-Fix-phase logging-instrumentation commit (`a7adf623`) -- its narrow claims about tracing coverage and `sys_write` count are TRUE and reproduced with a fresh, self-run 1.19M-line log, but its headline "GTK never writes after connect(), gap is on weston's receive side" framing is REFINED/PARTLY CORRECTED by this session's own data: clients DO write and DO get read (weston replies), the real failure is `GTK-WARNING: cannot open display` inside the client itself, seconds after a successful Wayland `sendmsg`. XFCE desktop content is STILL NOT confirmed onscreen -- solid black, same as every prior sub-session.
 
 **Repro used**: `.wfgy/xfce-build/xfce_launch.sh` (unmodified, already-committed script) run as

@@ -795,14 +795,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         flags: MRemapFlags,
         new_addr: usize,
     ) -> Result<UserPtrMut<u8>, Errno> {
-        litebox_common_linux::mm::sys_mremap(
+        let flags_for_log = alloc::format!("{flags:?}");
+        let result = litebox_common_linux::mm::sys_mremap(
             &self.process().pm(),
             old_addr,
             old_size,
             new_size,
             flags,
             new_addr,
-        )
+        );
+        if let Err(e) = &result {
+            // `sys_mremap` previously had no logging at all -- confirmed live as a real gap
+            // via a genuine Weston `mremap()` failure (its pixman shadow-framebuffer growth)
+            // that was completely invisible in `LITEBOX_LOG=debug` output, only surfacing
+            // indirectly as Weston's own `wl_output.error` "failed mremap" event to its
+            // client, which then cascaded into a GTK "cannot open display" failure with zero
+            // syscall-level evidence pointing back at the actual `mremap()` call. Only log the
+            // failure path (mirroring `sys_brk`'s pattern just below); a successful mremap is
+            // already visible via the ordinary `mmap`/`mprotect` traces around it.
+            litebox_util_log::debug!(
+                tid:% = self.tid, old_addr:% = old_addr.as_usize(), old_size:% = old_size,
+                new_size:% = new_size, flags:% = flags_for_log, new_addr:% = new_addr, err:? = e;
+                "sys_mremap: failed"
+            );
+        }
+        result
     }
 
     /// Handle syscall `brk`

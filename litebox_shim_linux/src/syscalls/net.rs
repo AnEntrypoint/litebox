@@ -1674,10 +1674,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EBADF);
         };
         let msg = msg.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        let preview = msg
+            .msg_iov
+            .to_owned_slice::<Platform>(msg.msg_iovlen.min(UIO_MAXIOV))
+            .and_then(|iovs| copy_iovs_to_vec::<Platform>(&iovs).ok())
+            .map(|data| {
+                // Full-length hex dump (bounded at 4096B so a giant payload can't blow up the
+                // log line) -- a 64B preview silently hid a wire-protocol corruption past that
+                // offset in a real Wayland `wl_registry.bind` message (424B) that only manifested
+                // as a downstream "error in client communication" from the compositor; see the
+                // `sys_sendmsg`-preview investigation this comment documents.
+                let n = data.len().min(4096);
+                alloc::format!("{:02x?}", &data[..n])
+            });
         let result = self.do_sendmsg(fd, &msg, flags);
         litebox_util_log::debug!(
             tid:% = self.tid,
             fd:% = fd,
+            preview:? = preview,
             result:? = result;
             "sys_sendmsg"
         );
