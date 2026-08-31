@@ -1291,6 +1291,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// `offset` is an optional offset to write to. If `None`, it will write to the current file position.
     /// If `Some`, it will write to the specified offset without changing the current file position.
     pub fn sys_write(&self, fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Errno> {
+        let result = self.do_write(fd, buf, offset);
+        let preview_len = buf.len().min(64);
+        litebox_util_log::debug!(
+            tid:% = self.tid,
+            fd:% = fd,
+            len:% = buf.len(),
+            offset:? = offset,
+            preview:? = core::str::from_utf8(&buf[..preview_len]).unwrap_or("<binary>"),
+            result:? = result.as_ref().map(|n| *n);
+            "sys_write"
+        );
+        result
+    }
+    fn do_write(&self, fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Errno> {
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
@@ -2804,6 +2818,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     pub(crate) fn sys_fcntl(&self, fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
+        let arg_dbg = alloc::format!("{arg:?}");
+        let result = self.do_fcntl(fd, arg);
+        litebox_util_log::debug!(
+            tid:% = self.tid,
+            fd:% = fd,
+            arg:% = arg_dbg,
+            result:? = result;
+            "sys_fcntl"
+        );
+        result
+    }
+    fn do_fcntl(&self, fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
         let Ok(desc) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };

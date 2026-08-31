@@ -1039,6 +1039,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         type_and_flags: u32,
         protocol: u8,
     ) -> Result<u32, Errno> {
+        let result = self.do_sys_socket(domain, type_and_flags, protocol);
+        litebox_util_log::debug!(
+            tid:% = self.tid,
+            domain:% = domain,
+            type_and_flags:% = type_and_flags,
+            protocol:% = protocol,
+            result:? = result;
+            "sys_socket"
+        );
+        result
+    }
+    fn do_sys_socket(
+        &self,
+        domain: u32,
+        type_and_flags: u32,
+        protocol: u8,
+    ) -> Result<u32, Errno> {
         let (ty, flags) = parse_type_and_flags(type_and_flags)?;
         let domain = AddressFamily::try_from(domain).map_err(|_| {
             log_unsupported!("socket(domain = {domain})");
@@ -1600,7 +1617,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .map(|addr| read_sockaddr_from_user::<Platform>(addr, addrlen as usize))
             .transpose()?;
         let buf = buf.to_owned_slice::<Platform>(len).ok_or(Errno::EFAULT)?;
-        self.do_sendto(fd, &buf, flags, sockaddr)
+        let result = self.do_sendto(fd, &buf, flags, sockaddr);
+        let preview_len = buf.len().min(64);
+        litebox_util_log::debug!(
+            tid:% = self.tid,
+            fd:% = fd,
+            len:% = buf.len(),
+            preview:? = core::str::from_utf8(&buf[..preview_len]).unwrap_or("<binary>"),
+            result:? = result;
+            "sys_sendto"
+        );
+        result
     }
     fn do_sendto(
         &self,
@@ -1647,7 +1674,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EBADF);
         };
         let msg = msg.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-        self.do_sendmsg(fd, &msg, flags)
+        let result = self.do_sendmsg(fd, &msg, flags);
+        litebox_util_log::debug!(
+            tid:% = self.tid,
+            fd:% = fd,
+            result:? = result;
+            "sys_sendmsg"
+        );
+        result
     }
     /// Parses `SCM_RIGHTS` cmsgs out of a raw `msg_control` byte buffer (already copied in from
     /// user memory), resolving each donated raw fd via the same per-subsystem
@@ -1911,8 +1945,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             } else {
                 None
             },
-        )?;
+        );
+        let size = match size {
+            Ok(size) => size,
+            Err(e) => {
+                litebox_util_log::debug!(
+                    tid:% = self.tid,
+                    fd:% = fd,
+                    len:% = len,
+                    result:? = Err::<usize, _>(e);
+                    "sys_recvfrom"
+                );
+                return Err(e);
+            }
+        };
         let capped_size = size.min(recv_buf.len());
+        let preview_len = capped_size.min(64);
+        litebox_util_log::debug!(
+            tid:% = self.tid,
+            fd:% = fd,
+            len:% = len,
+            preview:? = core::str::from_utf8(&recv_buf[..preview_len]).unwrap_or("<binary>"),
+            result:? = Ok::<usize, Errno>(capped_size);
+            "sys_recvfrom"
+        );
         buf.copy_from_slice::<Platform>(0, &recv_buf[..capped_size])
             .ok_or(Errno::EFAULT)?;
         if let Some(src_addr) = source_addr
@@ -2379,7 +2435,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if len > i32::MAX as u32 {
             return Err(Errno::EINVAL);
         }
-        let new_len = self.do_getsockopt(sockfd, optname, optval, len)?;
+        let new_len = self.do_getsockopt(sockfd, optname, optval, len);
+        litebox_util_log::debug!(
+            tid:% = self.tid,
+            sockfd:% = sockfd,
+            optname:? = optname,
+            result:? = new_len;
+            "sys_getsockopt"
+        );
+        let new_len = new_len?;
         optlen
             .write_at_offset::<Platform>(0, new_len.trunc())
             .ok_or(Errno::EFAULT)?;
