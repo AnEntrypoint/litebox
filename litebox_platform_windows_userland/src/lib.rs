@@ -506,6 +506,9 @@ unsafe extern "system" fn vectored_exception_handler(
     std::thread_local! {
         static RECENT_FAULTS: RefCell<[(i32, u64, u64, bool); 4]> =
             const { RefCell::new([(0, 0, 0, false); 4]) };
+        // Ring of (faulting_rip, recover_fixup_addr) pairs for every exception-table recovery
+        // this thread has taken -- see the `context.Rip = recover` call site's own doc comment.
+        static RECOVERY_LOG: RefCell<[(u64, u64); 4]> = const { RefCell::new([(0, 0); 4]) };
     }
     {
         let code = unsafe { (*(*exception_info).ExceptionRecord).ExceptionCode };
@@ -1148,14 +1151,16 @@ unsafe extern "system" fn vectored_exception_handler(
                 litebox::mm::exception_table::search_exception_tables(context.Rip.trunc())
         {
             // Found a matching exception table entry.
-            if veh_trace_enabled() {
-                eprintln!(
-                    "[veh] tid={:?} host-mode exception-table recovery: rip={:#x} -> {:#x}",
-                    std::thread::current().id(),
-                    context.Rip,
-                    recover,
-                );
-            }
+            //
+            // Unconditional (not gated on `veh_trace_enabled()`): captures the EXACT `recover`
+            // (fixup) address the exception table redirects `Rip` to, so a future capture can
+            // directly disassemble it and check whether its own surrounding assumptions (register
+            // state, stack alignment) hold when entered via an injected `Rip` write rather than a
+            // normal in-function jump -- see this investigation's own "unified epilogue" finding.
+            RECOVERY_LOG.with_borrow_mut(|ring| {
+                ring.rotate_left(1);
+                ring[3] = (context.Rip, recover as u64);
+            });
             context.Rip = recover as u64;
             return EXCEPTION_CONTINUE_EXECUTION;
         } else {
@@ -1297,6 +1302,18 @@ unsafe extern "system" fn vectored_exception_handler(
                                 );
                             }
                         }
+                    }
+                });
+                RECOVERY_LOG.with_borrow(|ring| {
+                    for (i, (fault_rip, recover_addr)) in ring.iter().enumerate() {
+                        if *fault_rip == 0 && *recover_addr == 0 {
+                            continue;
+                        }
+                        eprintln!(
+                            "[diag-unrecov-av-recovery] [{i}] fault_rip={fault_rip:#x} rva={:#x} -> recover={recover_addr:#x} rva={:#x}",
+                            (*fault_rip as usize).wrapping_sub(module_base),
+                            (*recover_addr as usize).wrapping_sub(module_base),
+                        );
                     }
                 });
                 use std::io::Write;
