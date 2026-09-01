@@ -1646,11 +1646,16 @@ impl WindowsUserland {
         }
 
         // Register a console control handler to receive Ctrl+C / Ctrl+Break
-        unsafe {
-            windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
-                Some(ctrl_c_handler),
-                1, // TRUE — add the handler
-            );
+        // Diagnostic (temporary, this investigation pass): LITEBOX_DIAG_NO_CTRLC_HANDLER=1 skips
+        // registration entirely, to test whether Ctrl+C/Ctrl+Break event delivery is ever a
+        // factor in the still-open "silent host crash on the 3rd fork" bug.
+        if std::env::var_os("LITEBOX_DIAG_NO_CTRLC_HANDLER").is_none() {
+            unsafe {
+                windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
+                    Some(ctrl_c_handler),
+                    1, // TRUE — add the handler
+                );
+            }
         }
 
         // Watch for real console window resizes and deliver SIGWINCH. There is no Win32 resize
@@ -1670,11 +1675,16 @@ impl WindowsUserland {
         // `GUEST_THREAD_STACK_SIZE` headroom every other guest-work-capable thread gets, closing
         // that gap rather than leaving this one thread as the sole undersized exception.
         const GUEST_THREAD_STACK_SIZE: usize = 32 * 1024 * 1024;
-        std::thread::Builder::new()
-            .name("litebox-console-resize-watcher".to_owned())
-            .stack_size(GUEST_THREAD_STACK_SIZE)
-            .spawn(console_resize_watcher_thread_body)
-            .expect("failed to spawn console resize watcher thread");
+        // Diagnostic (temporary, this investigation pass): LITEBOX_DIAG_NO_RESIZE_WATCHER=1 skips
+        // spawning this thread entirely, to test whether it (or the SIGWINCH delivery it
+        // performs) is ever a factor in the still-open "silent host crash on the 3rd fork" bug.
+        if std::env::var_os("LITEBOX_DIAG_NO_RESIZE_WATCHER").is_none() {
+            std::thread::Builder::new()
+                .name("litebox-console-resize-watcher".to_owned())
+                .stack_size(GUEST_THREAD_STACK_SIZE)
+                .spawn(console_resize_watcher_thread_body)
+                .expect("failed to spawn console resize watcher thread");
+        }
 
         Box::leak(Box::new(platform))
     }
