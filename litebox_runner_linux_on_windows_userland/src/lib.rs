@@ -228,6 +228,8 @@ fn initialize_root_in_mem_layer<Platform: litebox::sync::RawSyncPrimitivesProvid
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
 pub fn run(cli_args: CliArgs) -> Result<()> {
+    litebox_platform_windows_userland::install_memcpy_watch_from_env();
+
     tracing_subscriber::fmt()
         .with_timer(tracing_subscriber::fmt::time::uptime())
         .with_level(true)
