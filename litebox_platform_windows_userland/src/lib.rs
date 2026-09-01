@@ -5383,6 +5383,25 @@ static STDERR_WRITE_LOCK: Mutex<()> = Mutex::new(());
 /// full read-modify-write span (query/flip, mutate, restore), not just around the `VirtualProtect`
 /// call itself, so the two paths can never observe or produce a torn intermediate protection state
 /// on a shared page.
+///
+/// This is the SAME lock as [`ALLOCATE_PAGES_FIXED_ADDR_LOCK`] (a `const` alias, not a second
+/// `Mutex`) -- they used to be two separate mutexes guarding the same underlying resource (the
+/// process's Windows VAD tree, read via `VirtualQuery` and mutated via `VirtualProtect`/
+/// `VirtualFree`/`VirtualAlloc2`), which meant a `VirtualProtect` here (from `update_permissions`
+/// or `fork_verify::write_usize_fault_tolerant`) had NO mutual exclusion at all against a
+/// concurrent `deallocate_pages`/`allocate_pages` region-walk on an overlapping or adjacent
+/// region, even though BOTH locks existed for the identical reason (a multi-step query-then-
+/// mutate span racing a concurrently-running guest thread's own VAD-mutating call). Confirmed
+/// live as the root cause of a real, reproducible `labwc` SIGSEGV that only manifested under
+/// concurrent multi-process load (`labwc` + `xfwm4` + `xfdesktop` running together, `xfwm4`'s own
+/// thread independently confirmed to be hitting `fork_verify`'s `write_usize_fault_tolerant`
+/// heavily and concurrently during the exact window `labwc`'s own `mmap`/`munmap` sequence
+/// crashed in) -- `labwc`'s own single-threaded repro was already fully fixed by two earlier,
+/// narrower locking fixes in this same file (see `process_memory_range_by_regions`'s and
+/// `allocate_pages`'s own doc comments/history), but this specific concurrent-load crash
+/// persisted through both, because neither closed the real remaining gap: TWO different locks
+/// protecting the SAME shared Windows resource is equivalent to no lock at all between the two
+/// code paths that each hold a different one.
 pub(crate) static VIRTUAL_PROTECT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Serializes `allocate_pages`'s fixed-address (`suggested_range.start != 0`) check-then-act
@@ -5393,7 +5412,14 @@ pub(crate) static VIRTUAL_PROTECT_LOCK: Mutex<()> = Mutex::new(());
 /// guest-visible signal -- the exact same class of gap `CLAIMED_RANGES`'s own doc comment
 /// documents for a DIFFERENT, already-defended case (fixed-address `Replace`-mode reuse); this
 /// lock closes the general case for every `fixed_address_behavior` variant.
-static ALLOCATE_PAGES_FIXED_ADDR_LOCK: Mutex<()> = Mutex::new(());
+///
+/// This is a `const` alias for [`VIRTUAL_PROTECT_LOCK`], not a second `Mutex` -- see that
+/// constant's own doc comment for why unifying the two was necessary: both guard the same
+/// underlying resource (the process's shared Windows VAD tree), and having them be separate
+/// mutexes meant `VirtualProtect` (protected only by `VIRTUAL_PROTECT_LOCK`) and
+/// `VirtualFree`/`VirtualAlloc2` region-walks (protected only by this lock) had zero mutual
+/// exclusion against each other despite both mutating/reading the same shared kernel structure.
+const ALLOCATE_PAGES_FIXED_ADDR_LOCK: &Mutex<()> = &VIRTUAL_PROTECT_LOCK;
 
 fn write_to_raw_handle(
     handle: windows_sys::Win32::Foundation::HANDLE,
