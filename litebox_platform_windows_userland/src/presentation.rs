@@ -46,6 +46,90 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::platform::windows::EventLoopBuilderExtWindows;
 use winit::window::{Window, WindowId};
 
+/// Debugging aid, gated behind `LITEBOX_DUMP_FRAMES`: writes every frame that reaches the
+/// presenter to a `.bmp` file plus a one-line stderr summary, so a `--gui` session's actual
+/// rendered content can be verified from a script/CI context without a working screen-capture
+/// tool (`screenshot-litebox.ps1`'s `SetWindowPos`+`PrintWindow` approach has repeatedly failed
+/// with GDI+ errors when the window/surface is in certain states, e.g. right after a guest crash
+/// leaves nothing valid painted -- this reads the SAME bytes the guest actually sent, bypassing
+/// the Windows window-capture path entirely). BMP (not PNG) because it needs no compression/CRC
+/// library -- a raw `BITMAPFILEHEADER`+`BITMAPINFOHEADER` plus the pixel bytes verbatim (already
+/// `BGRA8`, matching BMP's own native 32bpp row order once rows are flipped bottom-to-top).
+fn dump_frame_diagnostic(frame: &Frame) {
+    let width = frame.width as usize;
+    let height = frame.height as usize;
+    let pitch = frame.pitch as usize;
+    let mut non_black_pixels = 0usize;
+    let mut distinct_colors = std::collections::HashSet::new();
+    for row in 0..height {
+        let row_start = row * pitch;
+        for col in 0..width {
+            let px_start = row_start + col * 4;
+            let Some(px) = frame.bytes.get(px_start..px_start + 4) else {
+                continue;
+            };
+            if px != [0, 0, 0, 0] && px != [0, 0, 0, 255] {
+                non_black_pixels += 1;
+            }
+            if distinct_colors.len() < 64 {
+                distinct_colors.insert([px[0], px[1], px[2], px[3]]);
+            }
+        }
+    }
+    eprintln!(
+        "[LITEBOX_DUMP_FRAMES] frame {}x{} pitch={} non_black_pixels={} distinct_colors_capped64={}",
+        width,
+        height,
+        pitch,
+        non_black_pixels,
+        distinct_colors.len()
+    );
+
+    let out_path = std::env::var("LITEBOX_DUMP_FRAMES_PATH")
+        .unwrap_or_else(|_| "litebox_frame_dump.bmp".to_owned());
+    let row_bytes = width * 4;
+    let pixel_data_size = row_bytes * height;
+    let file_header_size = 14;
+    let info_header_size = 40;
+    let data_offset = file_header_size + info_header_size;
+    let file_size = data_offset + pixel_data_size;
+
+    let mut out = Vec::with_capacity(file_size);
+    // BITMAPFILEHEADER
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&(file_size as u32).to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&(data_offset as u32).to_le_bytes());
+    // BITMAPINFOHEADER
+    out.extend_from_slice(&(info_header_size as u32).to_le_bytes());
+    out.extend_from_slice(&(width as i32).to_le_bytes());
+    out.extend_from_slice(&(height as i32).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // planes
+    out.extend_from_slice(&32u16.to_le_bytes()); // bpp
+    out.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB, uncompressed
+    out.extend_from_slice(&(pixel_data_size as u32).to_le_bytes());
+    out.extend_from_slice(&2835i32.to_le_bytes()); // x ppm (~72 dpi)
+    out.extend_from_slice(&2835i32.to_le_bytes()); // y ppm
+    out.extend_from_slice(&0u32.to_le_bytes()); // colors used
+    out.extend_from_slice(&0u32.to_le_bytes()); // important colors
+    // BMP rows are stored bottom-to-top.
+    for row in (0..height).rev() {
+        let row_start = row * pitch;
+        let row_end = row_start + row_bytes;
+        if let Some(row_bytes_slice) = frame.bytes.get(row_start..row_end) {
+            out.extend_from_slice(row_bytes_slice);
+        } else {
+            out.extend(std::iter::repeat_n(0u8, row_bytes));
+        }
+    }
+    if let Err(e) = std::fs::write(&out_path, &out) {
+        eprintln!("[LITEBOX_DUMP_FRAMES] failed to write {out_path}: {e}");
+    } else {
+        eprintln!("[LITEBOX_DUMP_FRAMES] wrote {out_path} ({file_size} bytes)");
+    }
+}
+
 /// One frame's worth of pixel content to present: raw bytes in `BGRA8`/`XRGB8888` byte order
 /// (matching `DRM_FORMAT_XRGB8888`, the format `DrmSubsystem`'s virtual display advertises), row
 /// pitch already applied (i.e. `bytes.len() == pitch * height`, not necessarily `width * 4 *
@@ -511,6 +595,9 @@ impl ApplicationHandler for PresenterApp {
             latest = Some(frame);
         }
         if let Some(frame) = latest {
+            if std::env::var_os("LITEBOX_DUMP_FRAMES").is_some() {
+                dump_frame_diagnostic(&frame);
+            }
             self.last_frame = Some(frame);
             if let Some(state) = &self.state {
                 state.window.request_redraw();
