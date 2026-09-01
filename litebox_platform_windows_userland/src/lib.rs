@@ -1144,10 +1144,15 @@ unsafe extern "system" fn vectored_exception_handler(
             // access-violation-class fault racing a fork-heavy repro), so this diagnostic exists
             // specifically to survive on the fast/untraced path where the crash actually occurs.
             if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION {
+                unsafe extern "C" {
+                    safe static __ImageBase: c_void;
+                }
+                let module_base = (&raw const __ImageBase) as usize;
                 eprintln!(
-                    "[diag-unrecov-av] tid={:?} rip={:#x} addr={:#x} rsp={:#x} is_in_guest={} is_verifying={} -- no exception-table entry found",
+                    "[diag-unrecov-av] tid={:?} rip={:#x} rva={:#x} addr={:#x} rsp={:#x} is_in_guest={} is_verifying={} -- no exception-table entry found",
                     std::thread::current().id(),
                     context.Rip,
+                    (context.Rip as usize).wrapping_sub(module_base),
                     exception_record.ExceptionInformation[1],
                     context.Rsp,
                     tls.is_in_guest.get(),
