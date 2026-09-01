@@ -1660,8 +1660,19 @@ impl WindowsUserland {
         // event queue at all (unlike `ConsoleStdinReader`), so it cannot race with or steal
         // events from the existing stdin reader thread -- `GetConsoleScreenBufferInfo` reads the
         // *output* buffer's window-size state, a wholly separate API surface.
+        // Live cdb inspection of a real crash (`rsp` corrupted inside `ntdll!RtlDispatchException`,
+        // the same signature already root-caused to `exception_table::write_u8_fallible` failing to
+        // recover) showed OTHER real OS threads on this process whose call stacks read
+        // `console_resize_watcher_thread_body` -> ... -> `syscall_callback` -> `pty_ioctl` --
+        // i.e. a thread this closure spawned (with Rust's plain, unsized default stack, no
+        // `.stack_size()` call, unlike every properly-sized guest thread) is later reused to
+        // service a REAL guest syscall once its own polling loop returns/exits. Give it the same
+        // `GUEST_THREAD_STACK_SIZE` headroom every other guest-work-capable thread gets, closing
+        // that gap rather than leaving this one thread as the sole undersized exception.
+        const GUEST_THREAD_STACK_SIZE: usize = 32 * 1024 * 1024;
         std::thread::Builder::new()
             .name("litebox-console-resize-watcher".to_owned())
+            .stack_size(GUEST_THREAD_STACK_SIZE)
             .spawn(console_resize_watcher_thread_body)
             .expect("failed to spawn console resize watcher thread");
 
