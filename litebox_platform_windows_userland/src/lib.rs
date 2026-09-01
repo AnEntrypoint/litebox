@@ -4664,6 +4664,27 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         }
 
         debug_assert!(base_addr.is_null());
+        // Hold `ALLOCATE_PAGES_FIXED_ADDR_LOCK` here too, even though this specific
+        // `VirtualAlloc2` call is itself atomic at the OS level (the reason the fixed-address
+        // branch above's own doc comment gives for why this OS-picks-any-address path was
+        // originally left unlocked). That reasoning is only half the story: `deallocate_pages`'s
+        // own `VirtualQuery`-then-`VirtualFree` walk (see its doc comment) holds this SAME lock
+        // specifically because Windows' VAD tree is a shared, mutable structure that a
+        // concurrent `VirtualAlloc2` -- landing on the OS's own choice of address, not
+        // necessarily far from whatever `deallocate_pages` is walking -- can still coalesce/split
+        // nodes across. Leaving this path unlocked meant `deallocate_pages`'s own protection was
+        // only ever one-sided: it serialized against a concurrent FIXED-address `allocate_pages`
+        // call (which already took the lock) but never against this OS-picked-address path,
+        // which every ordinary guest `mmap(NULL, ...)` uses -- confirmed live as the likely cause
+        // of a real, reproducible `labwc` SIGSEGV under concurrent multi-process load (`labwc`,
+        // `xfwm4`, `xfdesktop` all allocating/freeing via `mmap(NULL, ...)`/`munmap()`
+        // concurrently): `labwc`'s own thread crashed immediately after its own successful
+        // `munmap()` of a fresh `mmap(NULL, ...)` allocation, with a concurrent OTHER thread's
+        // own heavy `mmap(NULL, ...)`/`munmap()` churn running at the exact same moment -- exactly
+        // the shape this lock exists to prevent, just missing from this one path.
+        let _fixed_addr_guard = ALLOCATE_PAGES_FIXED_ADDR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let ptr = reserve_and_commit(0..size, prot_flags(initial_permissions));
         assert!(
             !ptr.is_null(),
