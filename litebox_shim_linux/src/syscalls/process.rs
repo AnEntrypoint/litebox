@@ -1583,20 +1583,43 @@ fn fixup_stale_elf_data_pointers<Platform: ShimPlatform>(
     // isn't a fresh 16-byte-aligned mallocng chunk start (e.g. a pointer stored inside a struct
     // field, as this one is, rather than a malloc() return value used directly).
     const MIN_POINTER_ALIGN: usize = 8;
+    let mut ranges_seen = 0usize;
+    let mut healed_count = 0usize;
     for (source_range, dest_base) in relocations.private_data_ranges() {
+        ranges_seen += 1;
         let mut addr = dest_base;
         let dest_top = dest_base + source_range.len();
         while addr < dest_top {
             let slot = UserPtrMut::<usize>::from_usize(addr);
-            if let Some(value) = slot.read_at_offset::<Platform>(0)
-                && value.is_multiple_of(MIN_POINTER_ALIGN)
-                && let Some(translated) = relocations.translate(value)
-            {
-                let _ = slot.write_at_offset::<Platform>(0, translated);
+            if let Some(value) = slot.read_at_offset::<Platform>(0) {
+                // DIAG (this pass's `ctx.active[]` investigation): log every slot near the
+                // computed `ctx.active[]` destination address (0x1388b10, +/- 0x200 bytes) so
+                // whoever reads this can see exactly what this scan observed/did at that exact
+                // location, at this exact point in time (right after fork, before the child ever
+                // resumes).
+                const TARGET: usize = 0x1388bf8;
+                let dist = if addr >= TARGET { addr - TARGET } else { TARGET - addr };
+                if dist < 0x10 {
+                    litebox_util_log::error!(
+                        addr:% = addr, value:% = value,
+                        translated:? = relocations.translate(value);
+                        "diag: fixup_stale_elf_data_pointers slot near ctx.active[]"
+                    );
+                }
+                if value.is_multiple_of(MIN_POINTER_ALIGN)
+                    && let Some(translated) = relocations.translate(value)
+                {
+                    let _ = slot.write_at_offset::<Platform>(0, translated);
+                    healed_count += 1;
+                }
             }
             addr += core::mem::size_of::<usize>();
         }
     }
+    litebox_util_log::error!(
+        ranges_seen:% = ranges_seen, healed_count:% = healed_count;
+        "diag: fixup_stale_elf_data_pointers summary"
+    );
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {

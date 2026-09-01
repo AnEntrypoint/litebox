@@ -344,26 +344,62 @@ unsafe extern "system" fn vectored_exception_handler_entry(
         // registered host stack (`TlsState.host_sp`/`host_bp`) before calling the full handler, so
         // ITS much larger frame -- and everything it calls -- runs on real, guard-page-protected
         // memory instead of guest-address memory `__chkstk` cannot safely probe.
-        mov     r9, rsp
-        mov     r10, rbp
+        //
+        // REENTRANCY: this trampoline can fire again before a prior, still-live invocation on
+        // this SAME thread returns (confirmed live: a `LITEBOX_PROCESS_FORK=1` repro hit over
+        // 3000 nested reentries here before segfaulting -- see `TlsState::veh_depth`'s doc
+        // comment). A single FIXED `host_sp - 64` scratch slot is therefore unsafe: a nested
+        // invocation would overwrite the outer invocation's still-live saved guest rsp/rbp (and
+        // saved `r8`) right out from under it. Use `veh_depth` (`Cell<u32>`, already needed for
+        // the reentrancy diagnostic) to give each nesting level its own 64-byte slot instead:
+        // `host_sp - 64 - depth*64`, capped at `VEH_DEPTH_CAP` slots so a genuinely runaway
+        // cascade cannot walk this scratch region into the separately-reserved exception-record
+        // slots further down (see `VEH_DEPTH_CAP`'s own doc comment for the exact non-overlapping
+        // layout). Depth 0 (the overwhelming common, non-reentrant case) keeps today's exact
+        // `host_sp - 64` slot unchanged.
+        mov     r9d, DWORD PTR [r8 + {VEH_DEPTH}]
+        cmp     r9d, {VEH_DEPTH_CAP}
+        jae     .Lcall_here          // past the cap: give up on the swap, call on whatever stack
+                                      // is live (matches the pre-existing null-host_sp fallback
+                                      // above) rather than risk walking past committed memory.
+        inc     DWORD PTR [r8 + {VEH_DEPTH}]
+        imul    r9d, r9d, 64
+        mov     r9, r9               // zero-extend the 32-bit product into a usable 64-bit index
+
+        mov     r10, rsp
+        mov     rax, rbp
         mov     rbp, QWORD PTR [r8 + {HOST_BP}]
-        // Reserve 48 bytes on the host stack: 32 for the Win64 shadow space the callee is entitled
-        // to write into, plus 16 to save the original guest rsp/rbp across the call (rsp must also
-        // land 16-byte-aligned at the `call` below, per the Win64 ABI -- `host_sp` is a fresh,
-        // untouched stack top and 48 is a multiple of 16, so this holds as long as `host_sp`
-        // itself came in aligned, which `run_thread_arch`'s own prologue -- a normal `extern
-        // \"C-unwind\"` function the Win64 ABI already requires 16-byte-aligned entry for --
-        // guarantees).
-        lea     rsp, [r11 - 48]
-        mov     QWORD PTR [rsp + 32], r9
-        mov     QWORD PTR [rsp + 40], r10
+        // Reserve 64 bytes at this depth's own slot (still a multiple of 16, preserving the
+        // Win64 ABI's required alignment at the `call` below): 32 for the shadow space the
+        // callee is entitled to write into, 16 to save the original guest rsp/rbp across the
+        // call, and 16 more to save `r8` (this thread's `TlsState*`) itself -- `r8` is a
+        // CALLER-SAVED/volatile register per the Win64 ABI, so `vectored_exception_handler` (an
+        // ordinary Rust function, not obligated to preserve it) is free to clobber it, and this
+        // trampoline still needs a valid `r8` AFTER the call to `dec` the depth counter back
+        // down. Confirmed live: before this fix, `r8` was assumed to survive the call unchanged,
+        // and the resulting `dec DWORD PTR [r8 + VEH_DEPTH]` on a clobbered `r8` was ITSELF the
+        // faulting instruction in a real, reproduced crash (disassembly confirmed the fault `rip`
+        // landed exactly on that `dec`) -- not a pre-existing bug, but one this depth-tracking
+        // fix introduced and is corrected here in the same pass.
+        sub     r11, r9
+        lea     rsp, [r11 - 64]
+        mov     QWORD PTR [rsp + 32], r10
+        mov     QWORD PTR [rsp + 40], rax
+        mov     QWORD PTR [rsp + 48], r8
 
         call    {vectored_exception_handler}
 
-        mov     r9, QWORD PTR [rsp + 32]
-        mov     r10, QWORD PTR [rsp + 40]
-        mov     rsp, r9
-        mov     rbp, r10
+        // CRITICAL: eax/rax at this point holds the real return value from
+        // vectored_exception_handler and must reach this trampoline's own ret unmodified.
+        // Restore rsp/rbp/r8 via r9/r10 instead of reusing rax as scratch -- an earlier version
+        // of this trampoline clobbered rax with the saved rbp value here, silently discarding
+        // the real return value on every call.
+        mov     r8,  QWORD PTR [rsp + 48]
+        mov     r10, QWORD PTR [rsp + 32]
+        mov     r9,  QWORD PTR [rsp + 40]
+        mov     rsp, r10
+        mov     rbp, r9
+        dec     DWORD PTR [r8 + {VEH_DEPTH}]
         ret
 
     .Lcall_here:
@@ -385,6 +421,8 @@ unsafe extern "system" fn vectored_exception_handler_entry(
         GUEST_FS_BASE = const core::mem::offset_of!(TlsState, guest_fs_base),
         HOST_SP = const core::mem::offset_of!(TlsState, host_sp),
         HOST_BP = const core::mem::offset_of!(TlsState, host_bp),
+        VEH_DEPTH = const core::mem::offset_of!(TlsState, veh_depth),
+        VEH_DEPTH_CAP = const VEH_DEPTH_CAP,
         vectored_exception_handler = sym vectored_exception_handler,
     );
 }
@@ -443,11 +481,34 @@ unsafe extern "system" fn vectored_exception_handler(
     // `TlsGetValue` call, which depends on a working TEB) risks running with it wrong.
     WindowsUserland::restore_thread_gs_base_if_cleared();
 
+    // DIAG (LITEBOX_DIAG_ALLOC_VEC=1 investigation continuation): unconditional (no gate other
+    // than a call-count cap), allocation-free entry counter -- answers "is VEH even being
+    // entered again after the first single-step" directly, independent of every other diagnostic
+    // gate in this function (all of which run later and could themselves be skipped for reasons
+    // unrelated to whether VEH fired at all).
+    static VEH_ENTRY_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
+        let n = VEH_ENTRY_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < 10 {
+            let code = unsafe { (*(*exception_info).ExceptionRecord).ExceptionCode };
+            diag_raw_print(b"[diag_veh_entry] n=0x", n, b" code=0x", code as usize);
+        }
+    }
+
     let Some(tls) = get_tls_ptr() else {
         // TLS slot not initialized yet; cannot be in guest
         return EXCEPTION_CONTINUE_SEARCH;
     };
     let tls = unsafe { &*tls };
+    if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
+        let depth = tls.veh_depth.get();
+        if depth > 1 {
+            let rec = unsafe { &*(*exception_info).ExceptionRecord };
+            let ctx = unsafe { &*(*exception_info).ContextRecord };
+            diag_raw_print(b"[diag_veh_depth] REENTRANT depth=0x", depth as usize, b" code=0x", rec.ExceptionCode as usize);
+            diag_raw_print(b"[diag_veh_depth]   rip=0x", ctx.Rip as usize, b" fault_addr=0x", rec.ExceptionInformation[1]);
+        }
+    }
     let (info, exception_record, context);
     unsafe {
         info = *exception_info;
@@ -540,7 +601,24 @@ unsafe extern "system" fn vectored_exception_handler(
                 (context.Rip as usize).wrapping_sub(image_base)
             },
             exception_record.ExceptionInformation[1],
-            tls.is_in_guest.get(),
+            {
+                // DIAG (this pass's kiosk-shell/desktop-shell shared-crash investigation): dump
+                // instruction bytes at rip for large-fault-address ACCESS_VIOLATIONs too, not just
+                // the near-null-pointer shape `diag_fataldump_enabled`'s own gate targets -- lets
+                // this exact crash (a real, large, page-aligned fault address, e.g.
+                // `0x7feffaa5e000`) be symbolized via objdump byte-matching without needing the
+                // expensive full-trace mode.
+                if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
+                    && exception_record.ExceptionInformation[1] >= 0x1_0000
+                {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let crip = context.Rip as usize;
+                    let mut buf16 = [0u8; 16];
+                    let n = fork_verify::read_code_bytes_for_diagnostics(crip, &mut buf16);
+                    eprintln!("[diag_bigfault] rip bytes ({n}): {:02x?}", &buf16[..n]);
+                }
+                tls.is_in_guest.get()
+            },
             fork_verify::is_verifying(tls),
             unsafe { litebox_common_linux::rdfsbase() },
             WindowsUserland::get_thread_fs_base(),
@@ -706,6 +784,39 @@ unsafe extern "system" fn vectored_exception_handler(
             context.R14,
             context.R15,
         );
+        // DIAG (this pass's `ctx.active[]`-address investigation): `r9` at this exact crash site
+        // holds the runtime address of the table `nontrivial_free`'s own disassembly indexes
+        // into (a prior captured run's `r9` matched file offset 0xa4ac0 in the extracted guest
+        // libc.so). Read-only probe of two candidate `struct malloc_context.active[]` base
+        // hypotheses -- purely diagnostic, writes nothing.
+        if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
+            #[allow(clippy::cast_possible_truncation)]
+            let r9 = context.R9 as usize;
+            #[allow(clippy::cast_possible_truncation)]
+            let sc = context.Rdx as usize;
+            let candidate = r9.wrapping_add(0x50);
+            diag_raw_print(b"[diag_ctx_probe] r9=0x", r9, b" sc(rdx)=0x", sc);
+            #[allow(clippy::cast_possible_truncation)]
+            let r8 = context.R8 as usize;
+            diag_raw_print(b"[diag_ctx_probe] g(r8)=0x", r8, b" active_base=0x", candidate);
+            for i in sc.saturating_sub(2)..=(sc + 2) {
+                let addr = candidate.wrapping_add(i * 8);
+                let mut buf8 = [0u8; 8];
+                let n = fork_verify::read_code_bytes_for_diagnostics(addr, &mut buf8);
+                let value = if n == 8 { usize::from_le_bytes(buf8) } else { usize::MAX };
+                diag_raw_print(b"[diag_ctx_probe]   idx=0x", i, b" value=0x", value);
+            }
+            // Directly read g's own next/prev/mem/masks fields (struct meta layout: prev+0x0,
+            // next+0x8, mem+0x10, avail_mask+0x18, freed_mask+0x1c).
+            for (label_off, off) in [(0usize, 0usize), (1, 8), (2, 0x10), (3, 0x18)] {
+                let addr = r8.wrapping_add(off);
+                let mut buf8 = [0u8; 8];
+                let n = fork_verify::read_code_bytes_for_diagnostics(addr, &mut buf8);
+                let value = if n == 8 { usize::from_le_bytes(buf8) } else { usize::MAX };
+                diag_raw_print(b"[diag_ctx_probe] g_field off=0x", off, b" value=0x", value);
+                let _ = label_off;
+            }
+        }
         // Temporary diagnostic (DIAG-STACKWALK, mallocng .meta=0 investigation continuation):
         // `get_meta()` never pushes to the stack before this crash point (confirmed via
         // disassembly of the real shipped musl -- it's a leaf-shaped assert-chain using only
@@ -1142,7 +1253,9 @@ unsafe extern "system" fn vectored_exception_handler(
     {
         #[allow(clippy::cast_possible_truncation)]
         let rip = context.Rip as usize;
-        if let Some(translated_rip) = fork_verify::translate_stale_source_rip(tls, rip) {
+        #[allow(clippy::cast_possible_truncation)]
+        let rsp = context.Rsp as usize;
+        if let Some(translated_rip) = fork_verify::translate_stale_source_rip(tls, rip, rsp) {
             if veh_trace_enabled() {
                 eprintln!(
                     "[veh] tid={:?} AV-path stale rip healed rip={rip:#x} translated={translated_rip:#x}",
@@ -1188,13 +1301,84 @@ unsafe extern "system" fn vectored_exception_handler(
             );
             return EXCEPTION_CONTINUE_EXECUTION;
         }
+        // The GOT/PLT-style counterpart to the two cases above: `rip` itself is not stale (already
+        // ruled out above) and no memory-operand base/index register is stale either -- but `rip`
+        // may be an indirect `call [mem]`/`jmp [mem]` whose explicit memory operand slot itself
+        // holds a stale, untranslated CODE pointer (case (3) in `on_single_step`, exposed here for
+        // the identical AV-bypass reason the two cases above already are). Confirmed live: this
+        // exact gap is what let the SAME stale `rip`/`translated_rip` pair repeat unbounded even
+        // after the `[rsp-8]` `ret`-target healing above landed -- a GOT/PLT slot has no fixed
+        // offset from any register already in hand, so `[rsp-8]` never matched it, and the same
+        // instruction's own read re-faulted on the identical stale slot forever. Healing the slot
+        // in place here (not advancing `rip`) makes the CPU re-fetch through the now-correct
+        // pointer on retry, and every subsequent call through the same PLT-style slot reads the
+        // already-healed value directly.
+        if fork_verify::translate_stale_source_indirect_call_target(tls, rip, context) {
+            if veh_trace_enabled() {
+                eprintln!(
+                    "[veh] tid={:?} AV-path stale indirect call/jmp target slot healed at rip={rip:#x}",
+                    std::thread::current().id(),
+                );
+            }
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        // The register-indirect counterpart to the slot-based case just above: `rip` is a
+        // `call reg`/`jmp reg` whose target register was itself loaded from a stale slot one or
+        // more instructions earlier (no memory operand on THIS instruction for case (3) above to
+        // trace back to). Confirmed live as the actual remaining gap behind the identical
+        // `rip=0x9d90733`/`translated_rip=0xa800733` pair recurring across a driving `sh`,
+        // `xfwm4`, and `weston-desktop-shell` itself, even after every AV-path case above landed.
+        if fork_verify::translate_stale_source_register_indirect_call_target(tls, rip, context) {
+            if veh_trace_enabled() {
+                eprintln!(
+                    "[veh] tid={:?} AV-path stale register-indirect call/jmp target slot healed at rip={rip:#x}",
+                    std::thread::current().id(),
+                );
+            }
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
     }
 
     let mut synthesized_record = None;
     if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_SINGLE_STEP {
         match fork_verify::on_single_step(tls, context) {
-            fork_verify::StepOutcome::Continue => return EXCEPTION_CONTINUE_EXECUTION,
+            fork_verify::StepOutcome::Continue => {
+                if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let tf_armed = usize::from(context.EFlags & fork_verify::EFLAGS_TF as u32 != 0);
+                    diag_raw_print(
+                        b"[diag_tf] tf_armed=0x",
+                        tf_armed,
+                        b" steps=0x",
+                        tls.fork_verify_step_count.get() as usize,
+                    );
+                    #[allow(clippy::cast_possible_truncation)]
+                    let resume_rip = context.Rip as usize;
+                    let mut buf = [0u8; 16];
+                    let n = fork_verify::read_code_bytes_for_diagnostics(resume_rip, &mut buf);
+                    let mut b0 = 0usize;
+                    let mut b1 = 0usize;
+                    for (i, byte) in buf[..n].iter().enumerate() {
+                        if i < 8 {
+                            b0 |= (*byte as usize) << (i * 8);
+                        } else {
+                            b1 |= (*byte as usize) << ((i - 8) * 8);
+                        }
+                    }
+                    diag_raw_print(b"[diag_tf]   resume_rip=0x", resume_rip, b" bytes_lo=0x", b0);
+                    diag_raw_print(b"[diag_tf]   bytes_hi=0x", b1, b" eflags=0x", context.EFlags as usize);
+                }
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
             fork_verify::StepOutcome::StalePointer { address, is_write } => {
+                if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
+                    diag_raw_print(
+                        b"[diag_stale_ptr] is_write=0x",
+                        usize::from(is_write),
+                        b" address=0x",
+                        address,
+                    );
+                }
                 // Report it as a page fault on the offending address so the shim raises the same
                 // `SIGSEGV` on the child that real hardware would have raised.
                 synthesized_record = Some(fork_verify::access_violation_record(
@@ -1266,11 +1450,39 @@ unsafe extern "system" fn vectored_exception_handler(
     // `EXCEPTION_RECORD` (misinterpreted as `&mut ThreadContext`) rather than the real
     // `thread_ctx` pointer -- observed in practice as `ThreadContext` fields reading back as
     // null/garbage.
+    // REENTRANCY: this write target must NOT be a single fixed address. `vectored_exception_
+    // handler_entry`'s own scratch slot is already depth-aware (see `TlsState::veh_depth`'s doc
+    // comment and `VEH_DEPTH_CAP`) precisely because a nested exception can fire on this SAME
+    // thread before an outer invocation has finished using its own scratch space -- the identical
+    // hazard applies here: if a nested exception reaches this write while an outer invocation's
+    // `exception_record: &EXCEPTION_RECORD` reference (constructed from this SAME fixed address,
+    // just below) is still live, the nested write corrupts memory the outer call is still reading
+    // through, a real data race even though both invocations run on one thread (one is suspended
+    // partway through using the value when the other, nested, one runs). Confirmed live: before
+    // this fix, a `LITEBOX_PROCESS_FORK=1` repro showed the SAME faulting `rip`/address repeating
+    // for 3000+ nested VEH entries with real stack usage growing on every retry -- consistent with
+    // each nested dispatch corrupting the outer one's in-flight `EXCEPTION_RECORD`, producing a
+    // new, different-looking-but-caused-by-the-same-bug fault each time it resumed. Give each
+    // nesting level (`veh_depth`, already incremented by the trampoline before this Rust code
+    // ever runs) its own slice of the SAME already-committed `EXCEPTION_RECORD_RESERVE` (64 KiB)
+    // region below `host_sp`, sized so `VEH_DEPTH_CAP` levels' worth of `size_of::<EXCEPTION_
+    // RECORD>()`-sized slots fit comfortably under `EXCEPTION_RECORD_RESERVE` with room to spare
+    // (152 bytes * 512 = 77824... too large alone, so round each slot up to a fixed, generous,
+    // cache-line-friendly 128 bytes and cap how many levels get their own real slot; levels past
+    // that fall back to slot 0, matching this reserve's own pre-existing size headroom rather
+    // than growing the reservation itself, since a fault that deep already indicates a separate,
+    // still-open bug per `VEH_DEPTH_CAP`'s own doc comment, not a case worth optimizing for).
+    const EXC_RECORD_SLOT_SIZE: usize = 128;
+    const EXC_RECORD_SLOTS: usize = EXCEPTION_RECORD_RESERVE / EXC_RECORD_SLOT_SIZE / 2;
+    let depth = tls.veh_depth.get() as usize;
+    let slot = depth.min(EXC_RECORD_SLOTS.saturating_sub(1));
     let exception_record_ptr = tls
         .host_sp
         .get()
-        .cast::<EXCEPTION_RECORD>()
-        .wrapping_byte_sub(EXCEPTION_RECORD_RESERVE);
+        .cast::<u8>()
+        .wrapping_byte_sub(EXCEPTION_RECORD_RESERVE)
+        .wrapping_byte_add(slot * EXC_RECORD_SLOT_SIZE)
+        .cast::<EXCEPTION_RECORD>();
     assert!(exception_record_ptr.is_aligned());
     // Explicitly `VirtualAlloc(MEM_COMMIT)` the target page before writing, rather than relying on
     // Windows' automatic guard-page stack growth: this single `write()` lands up to
@@ -1745,6 +1957,11 @@ struct TlsState {
     /// without depending on `thread_local!`'s internal ABI.
     guest_fs_base: Cell<usize>,
     scratch: Cell<usize>,
+    /// Diagnostic-only (`LITEBOX_DIAG_ALLOC_VEC=1`): counts how many nested
+    /// `vectored_exception_handler_entry` invocations are currently live on this thread, to
+    /// directly witness whether the trampoline's fixed `host_sp - 48` scratch window (see that
+    /// function's doc comment) is ever reentered while a prior invocation is still using it.
+    veh_depth: Cell<u32>,
     is_in_guest: Cell<bool>,
     interrupt: Cell<bool>,
     continue_context:
@@ -1850,6 +2067,23 @@ unsafe impl Send for TlsState {}
 /// fraction of 64KiB even accounting for every diagnostic branch's locals.
 const EXCEPTION_RECORD_RESERVE: usize = 65536;
 
+/// Maximum nesting depth `vectored_exception_handler_entry`'s per-depth scratch slot (see that
+/// function's doc comment) will use before giving up on the host-stack swap and falling through
+/// to `.Lcall_here` instead. Each slot is 64 bytes; `VEH_DEPTH_CAP * 64` (32 KiB for 512 slots)
+/// must stay comfortably below, and clear of, `EXCEPTION_RECORD_RESERVE` (64 KiB) -- the region
+/// already committed below `host_sp` -- since `exception_callback`'s own dispatch path ALSO now
+/// uses a depth-indexed slice of that same reserve (see the `EXC_RECORD_SLOT_SIZE`/`EXC_RECORD_
+/// SLOTS` computation near `exception_record_ptr`'s definition): the trampoline's own slots occupy
+/// `[host_sp - 32832, host_sp - 64)` (512 * 64 bytes plus the depth-0 base offset) and the
+/// exception-record slots occupy `[host_sp - 65536, host_sp - 32768)` -- these two ranges do not
+/// overlap, with a small gap between them. A live `LITEBOX_PROCESS_FORK=1` repro was observed
+/// reaching depth ~3271 before segfaulting under the OLD single-fixed-slot bug this cap's sibling
+/// fix (per-depth slots) addresses -- 512 is deliberately far below that runaway figure, since a
+/// healthy handler should never need anywhere near that many nested entries for one guest fault;
+/// hitting this cap in practice would itself indicate a still-unexplained separate bug worth
+/// investigating on its own, not a ceiling to raise blindly.
+const VEH_DEPTH_CAP: u32 = 512;
+
 impl TlsState {
     /// Creates a new `TlsState` with all fields zeroed / defaulted.
     fn new() -> Self {
@@ -1860,6 +2094,7 @@ impl TlsState {
             guest_xmm0_5: Cell::new([0; 6]),
             guest_fs_base: Cell::new(0),
             scratch: 0.into(),
+            veh_depth: Cell::new(0),
             is_in_guest: false.into(),
             interrupt: false.into(),
             continue_context: Box::default(),
@@ -5550,6 +5785,21 @@ unsafe extern "C-unwind" fn init_handler(thread_ctx: &mut ThreadContext<'_>) {
 }
 
 unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext<'_>) {
+    // Repair `GS_BASE` here too, not only inside `vectored_exception_handler` (see
+    // `WindowsUserland::restore_thread_gs_base_if_cleared`'s doc comment and the investigation
+    // this call site is part of): every guest syscall is a guaranteed, high-frequency kernel
+    // round-trip on real host stack, running strictly BEFORE any GS-dependent Windows code this
+    // syscall's own handling might reach (heap allocation, `ntdll` calls, etc.) -- unlike the VEH
+    // path, which can only repair GS_BASE for exceptions Windows' OWN exception dispatcher
+    // successfully delivered, and that dispatcher itself needs a valid GS_BASE to locate the TEB
+    // and route to a registered handler at all (confirmed live: a `0xc000000d` crash inside
+    // `ntdll.dll` itself, at the `mov %gs:0x60, %rcx` TEB->PEB access, with none of litebox's own
+    // VEH-side diagnostics ever firing first -- the OS's own fault delivery broke before litebox's
+    // handler could run). Checking here closes that gap for the syscall path specifically: if
+    // GS_BASE is corrupted by the time a syscall is dispatched, this repairs it before this
+    // function calls into anything GS-dependent, rather than only reactively repairing after an
+    // exception Windows may not have been able to deliver in the first place.
+    WindowsUserland::restore_thread_gs_base_if_cleared();
     thread_ctx.call_shim(|shim, ctx, _interrupt| shim.syscall(ctx));
 }
 
