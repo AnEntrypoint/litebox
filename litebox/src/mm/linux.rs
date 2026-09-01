@@ -1125,7 +1125,21 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // parent (see this function's "Known deviation" doc section on why that specific
         // guarantee isn't available here). Regions in DIFFERENT groups (e.g. the stack vs. the
         // main ELF image) have no such relationship and may land anywhere independently.
-        let max_intra_group_gap: usize = 16 * ALIGN;
+        // 16 * ALIGN (64KiB) was too small for a real heap allocator's own layout: musl mallocng
+        // grows its heap via many separate `mmap()` calls over a process's lifetime (each malloc
+        // "group" plus its own lazily-allocated `meta_area`, from `alloc_meta()` in
+        // malloc/mallocng/meta.c), and consecutive calls are NOT guaranteed to land within 64KiB
+        // of each other once the heap has grown -- multi-MiB gaps between a group and its own
+        // meta_area are common in practice. When a gap split them into two independently-placed
+        // groups, any pointer arithmetic between them (e.g. mallocng's `get_meta()` computing a
+        // meta_area location relative to its group) computed a WRONG address in the child --
+        // landing on unrelated, legitimately-zeroed memory that read back exactly like mallocng's
+        // own real group-retirement poison pattern (`g->mem->meta = 0` in `free_group()`),
+        // matching this project's oldest, previously-unsolved cross-session mallocng NULL-deref
+        // crash. 16 MiB comfortably covers realistic single-process heap growth while still
+        // leaving the guest stack (placed far from the heap, with no RIP-relative relationship to
+        // it) in its own separate group.
+        let max_intra_group_gap: usize = 16 * 1024 * 1024;
         let mut sorted_non_shared: Vec<Range<usize>> = regions
             .iter()
             .filter(|(_, vma)| vma.shared_handle.is_none())
