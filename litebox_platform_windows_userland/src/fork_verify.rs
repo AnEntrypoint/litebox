@@ -492,7 +492,7 @@ pub(crate) fn is_verifying(tls: &TlsState) -> bool {
 pub(crate) fn translate_stale_source_rip(
     tls: &TlsState,
     rip: usize,
-    rsp: usize,
+    context: &mut CONTEXT,
 ) -> Option<usize> {
     let borrow = tls.fork_verify.borrow();
     let relocations = borrow.as_ref()?;
@@ -500,6 +500,8 @@ pub(crate) fn translate_stale_source_rip(
         return None;
     }
     let translated = relocations.translate(rip)?;
+    #[allow(clippy::cast_possible_truncation)]
+    let rsp = context.Rsp as usize;
     // Try `[rsp - 8]` first (the `ret`-just-popped case; see the doc comment above), then `[rsp]`
     // itself: confirmed live (the `weston-desktop-shell`/`xfwm4` repeating-loop repro) that a
     // `[rsp-8]`-only check leaves some instances of this exact loop unhealed -- the SAME stale
@@ -523,6 +525,45 @@ pub(crate) fn translate_stale_source_rip(
             && slot_value == rip
         {
             write_usize_fault_tolerant(candidate, translated);
+        }
+    }
+    // Heal every OTHER general-purpose register that currently holds the exact same stale value
+    // as `rip` itself. Confirmed live (a fresh, otherwise-clean stock-Alpine `labwc` repro,
+    // `LITEBOX_DIAG_FATALDUMP=1`): the `[rsp-8]`/`[rsp]` slot healing above still leaves a
+    // distinct instance of this exact repeating-loop bug unhealed -- 320,000+ identical faults at
+    // `rip=addr=0x9850733`, with `rax` ALSO exactly equal to `rip` at every single occurrence
+    // (`rax=0x9850733`), and `rbx` visibly decrementing by a fixed stride each iteration (a live
+    // loop counter, ruling out mere coincidental repetition). This is neither the `ret`-popped-
+    // return-address shape (`[rsp-8]`/`[rsp]` above) nor a memory-resident GOT/PLT slot (case
+    // (3)/(4), which require a genuine memory READ to trace back to a healable slot) -- `rax`
+    // here is a live register copy of the same stale value already established as a real,
+    // translatable `is_in_source` hit via `rip` itself, with no memory access involved at all, so
+    // the identical soundness argument that justifies healing `rip` (and `[rsp-8]`/`[rsp]` above)
+    // applies directly: a register that is, right now, byte-for-byte the value already proven
+    // stale is safe to correct to the same translated destination. `rsp` is excluded (it is never
+    // itself a code pointer, and rewriting it would corrupt the live stack) but every other GPR
+    // is checked and healed -- narrower cases (a single named register) were tried first in this
+    // investigation and did not generalize past this one repro's own `rax`/`rbx` pairing, so this
+    // checks the full GPR set rather than guessing which one(s) a future repro will use.
+    for register in [
+        Register::RAX,
+        Register::RBX,
+        Register::RCX,
+        Register::RDX,
+        Register::RSI,
+        Register::RDI,
+        Register::RBP,
+        Register::R8,
+        Register::R9,
+        Register::R10,
+        Register::R11,
+        Register::R12,
+        Register::R13,
+        Register::R14,
+        Register::R15,
+    ] {
+        if register_value(register, context) == Some(rip) {
+            write_register_value(register, translated, context);
         }
     }
     Some(translated)

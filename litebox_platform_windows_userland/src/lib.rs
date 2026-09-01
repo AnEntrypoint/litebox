@@ -1253,9 +1253,7 @@ unsafe extern "system" fn vectored_exception_handler(
     {
         #[allow(clippy::cast_possible_truncation)]
         let rip = context.Rip as usize;
-        #[allow(clippy::cast_possible_truncation)]
-        let rsp = context.Rsp as usize;
-        if let Some(translated_rip) = fork_verify::translate_stale_source_rip(tls, rip, rsp) {
+        if let Some(translated_rip) = fork_verify::translate_stale_source_rip(tls, rip, context) {
             if veh_trace_enabled() {
                 eprintln!(
                     "[veh] tid={:?} AV-path stale rip healed rip={rip:#x} translated={translated_rip:#x}",
