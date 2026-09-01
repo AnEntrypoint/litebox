@@ -1196,7 +1196,37 @@ unsafe extern "system" fn vectored_exception_handler(
                 // was committed then silently decommitted/relocated by another thread) despite
                 // the mapping call that should have committed it having already reported success.
                 {
-                    let fault_addr = exception_record.ExceptionInformation[1] as *mut c_void;
+                    // Identify which GPR (if any) exactly matches the fault address -- narrows
+                    // down which register carries the corrupted/wild value that produced this
+                    // fault, without needing full per-instruction register-history tracing.
+                    let fault_addr_val = exception_record.ExceptionInformation[1] as u64;
+                    let matches: alloc::vec::Vec<&str> = [
+                        ("rax", context.Rax),
+                        ("rbx", context.Rbx),
+                        ("rcx", context.Rcx),
+                        ("rdx", context.Rdx),
+                        ("rsi", context.Rsi),
+                        ("rdi", context.Rdi),
+                        ("rbp", context.Rbp),
+                        ("rsp", context.Rsp),
+                        ("r8", context.R8),
+                        ("r9", context.R9),
+                        ("r10", context.R10),
+                        ("r11", context.R11),
+                        ("r12", context.R12),
+                        ("r13", context.R13),
+                        ("r14", context.R14),
+                        ("r15", context.R15),
+                    ]
+                    .iter()
+                    .filter(|(_, v)| *v == fault_addr_val)
+                    .map(|(name, _)| *name)
+                    .collect();
+                    eprintln!(
+                        "[diag-unrecov-av-gprmatch] fault_addr={:#x} matching_gprs={:?}",
+                        fault_addr_val, matches,
+                    );
+                    let fault_addr = fault_addr_val as *mut c_void;
                     let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
                     let ok = unsafe {
                         Win32_Memory::VirtualQuery(
