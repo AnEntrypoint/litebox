@@ -4214,8 +4214,34 @@ where
     while !range.is_empty() {
         let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
         do_query_on_region(&mut mbi, range.start as *mut c_void);
-        debug_assert_eq!(range.start, mbi.BaseAddress as usize);
-        let len = mbi.RegionSize.min(range.len());
+        // `VirtualQuery` returns the region CONTAINING `range.start`, not necessarily one that
+        // BEGINS at `range.start` -- `range.start` can legitimately fall mid-region (e.g. a
+        // `munmap()`/`mprotect()` of a sub-range of a larger VAD node Windows hasn't split yet).
+        // The now-removed `debug_assert_eq!(range.start, mbi.BaseAddress)` assumed this could
+        // never happen and was compiled out entirely in release builds, silently hiding it rather
+        // than catching it -- and even in a debug build that only aborts loudly, it never fixed
+        // the actual bug below: `mbi.RegionSize` is measured from `mbi.BaseAddress`, not from
+        // `range.start`, so when the two diverge (`mbi.BaseAddress < range.start`), the OLD
+        // `len = mbi.RegionSize.min(range.len())` used the region's FULL size measured from its
+        // own earlier base -- overshooting past the region's real boundary (relative to
+        // `range.start`) by `range.start - mbi.BaseAddress` bytes, extending `len` into
+        // WHATEVER memory sits immediately after this region, decommitting/reprotecting/etc.
+        // pages the caller never asked to touch at all. This is exactly the shape of bug that
+        // would silently corrupt a neighboring allocation's memory right after an ordinary
+        // `munmap()` returns success -- the guest's own next access to that neighboring
+        // allocation then faults with no apparent cause, since nothing about the fault itself
+        // points back to an unrelated `munmap()` call that already returned and moved on.
+        let region_end_from_query_base = mbi.BaseAddress as usize + mbi.RegionSize;
+        let region_remaining_from_range_start = region_end_from_query_base.saturating_sub(range.start);
+        let len = region_remaining_from_range_start.min(range.len());
+        debug_assert!(
+            len > 0,
+            "process_memory_range_by_regions: computed a zero-length operation at {:p} \
+             (query base={:p}, region_size={:#x}) -- would loop forever",
+            range.start as *mut c_void,
+            mbi.BaseAddress,
+            mbi.RegionSize
+        );
         let success = operation(range.start..range.start + len, mbi.State)?;
         assert!(
             success,
