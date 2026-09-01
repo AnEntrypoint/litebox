@@ -504,18 +504,19 @@ unsafe extern "system" fn vectored_exception_handler(
     // is otherwise unrecoverable. `std::cell::Cell`-based thread_local, no heap allocation, no
     // locking -- safe to read/write even from deep inside exception handling.
     std::thread_local! {
-        static RECENT_FAULTS: RefCell<[(i32, u64, bool); 4]> =
-            const { RefCell::new([(0, 0, false); 4]) };
+        static RECENT_FAULTS: RefCell<[(i32, u64, u64, bool); 4]> =
+            const { RefCell::new([(0, 0, 0, false); 4]) };
     }
     {
         let code = unsafe { (*(*exception_info).ExceptionRecord).ExceptionCode };
         let rip = unsafe { (*(*exception_info).ContextRecord).Rip };
+        let rsp = unsafe { (*(*exception_info).ContextRecord).Rsp };
         let this_is_in_guest = get_tls_ptr()
             .map(|p| unsafe { (*p).is_in_guest.get() })
             .unwrap_or(false);
         RECENT_FAULTS.with_borrow_mut(|ring| {
             ring.rotate_left(1);
-            ring[3] = (code, rip, this_is_in_guest);
+            ring[3] = (code, rip, rsp, this_is_in_guest);
         });
     }
 
@@ -1211,11 +1212,27 @@ unsafe extern "system" fn vectored_exception_handler(
                 // more informative fault was already dispatched), the entries before the most
                 // recent one recover what that earlier fault actually was.
                 RECENT_FAULTS.with_borrow(|ring| {
-                    for (i, (code, rip, in_guest)) in ring.iter().enumerate() {
+                    for (i, (code, rip, fault_rsp, in_guest)) in ring.iter().enumerate() {
                         eprintln!(
-                            "[diag-unrecov-av-ring] [{i}] code={code:#x} rip={rip:#x} rva={:#x} is_in_guest={in_guest}",
+                            "[diag-unrecov-av-ring] [{i}] code={code:#x} rip={rip:#x} rva={:#x} rsp={fault_rsp:#x} is_in_guest={in_guest}",
                             (*rip as usize).wrapping_sub(module_base),
                         );
+                        // Dump this ring entry's own top-of-stack too, so the caller of a fault
+                        // like `write_u8_fallible` (a tiny leaf function with almost no prologue)
+                        // can be recovered even when it isn't the LAST fault in the ring.
+                        if *code == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION && *fault_rsp != 0
+                        {
+                            for j in 0..8usize {
+                                let addr = (*fault_rsp as usize).wrapping_add(j * 8);
+                                let val = unsafe { (addr as *const usize).read_volatile() };
+                                let in_module = val.wrapping_sub(module_base) < 0x0200_0000;
+                                eprintln!(
+                                    "[diag-unrecov-av-ring-stack] [{i}][rsp+{:#x}]={val:#x}{}",
+                                    j * 8,
+                                    if in_module { " (in-module)" } else { "" },
+                                );
+                            }
+                        }
                     }
                 });
                 use std::io::Write;
