@@ -2736,6 +2736,17 @@ fn thread_start(
         .guest_context_top
         .set(std::ptr::from_mut(&mut ctx).wrapping_add(1));
 
+    if std::env::var_os("LITEBOX_DIAG_TLS_ADDR").is_some() {
+        eprintln!(
+            "[diag-tls-addr] pid={} tid={:?} tls_state={:p} (thread_start)",
+            std::process::id(),
+            std::thread::current().id(),
+            &tls_state,
+        );
+        use std::io::Write;
+        let _ = std::io::stderr().flush();
+    }
+
     ThreadHandle::run_with_handle(&tls_state, || {
         // `init_thread.init()` -- which, for a `fork()` child, does real work capable of
         // faulting or arming `EFLAGS.TF` (`ThreadInitState::ForkedChild`'s `sys_arch_prctl`/
@@ -2750,6 +2761,19 @@ fn thread_start(
         // sequence forking a child): `LITEBOX_VEH_TRACE=1` showed zero `[veh]` trace lines
         // despite a real, dispatched exception, which is only possible via that early-return.
         let shim = init_thread.init();
+
+        #[cfg(target_arch = "x86_64")]
+        if std::env::var_os("LITEBOX_DIAG_TLS_ADDR").is_some() {
+            eprintln!(
+                "[diag-tls-addr] pid={} tid={:?} init_thread.init() returned, about to run_thread_arch rip={:#x} rsp={:#x}",
+                std::process::id(),
+                std::thread::current().id(),
+                ctx.rip,
+                ctx.rsp,
+            );
+            use std::io::Write;
+            let _ = std::io::stderr().flush();
+        }
 
         // Allow caller to run some code before we return to the new thread.
         let mut thread_ctx = ThreadContext {
