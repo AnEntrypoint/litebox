@@ -1123,10 +1123,39 @@ unsafe extern "system" fn vectored_exception_handler(
                 litebox::mm::exception_table::search_exception_tables(context.Rip.trunc())
         {
             // Found a matching exception table entry.
+            if veh_trace_enabled() {
+                eprintln!(
+                    "[veh] tid={:?} host-mode exception-table recovery: rip={:#x} -> {:#x}",
+                    std::thread::current().id(),
+                    context.Rip,
+                    recover,
+                );
+            }
             context.Rip = recover as u64;
             return EXCEPTION_CONTINUE_EXECUTION;
         } else {
             // Not one of our exceptions; let other handlers process it.
+            //
+            // Unconditional (not gated on `veh_trace_enabled()`, unlike the sibling recovery
+            // branch above): this is the rare, crash-relevant path -- a genuine unrecovered AV in
+            // host code -- and printing it costs nothing on the (overwhelmingly common) path
+            // where no exception ever fires. `LITEBOX_VEH_TRACE=1`'s own tracing overhead has
+            // been observed to change this bug's timing enough to mask it entirely (a real
+            // access-violation-class fault racing a fork-heavy repro), so this diagnostic exists
+            // specifically to survive on the fast/untraced path where the crash actually occurs.
+            if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION {
+                eprintln!(
+                    "[diag-unrecov-av] tid={:?} rip={:#x} addr={:#x} rsp={:#x} is_in_guest={} is_verifying={} -- no exception-table entry found",
+                    std::thread::current().id(),
+                    context.Rip,
+                    exception_record.ExceptionInformation[1],
+                    context.Rsp,
+                    tls.is_in_guest.get(),
+                    fork_verify::is_verifying(tls),
+                );
+                use std::io::Write;
+                let _ = std::io::stderr().flush();
+            }
             return EXCEPTION_CONTINUE_SEARCH;
         }
     }
