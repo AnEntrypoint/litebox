@@ -374,6 +374,14 @@ impl ElfParsedFile {
             .filter(|ph| ph.p_type == elf::abi::PT_LOAD)
     }
 
+    /// DIAG (investigation pass, see `elf.rs`'s `load_mapped` call site doc comment): exposes
+    /// [`Self::pt_loads`] publicly so a caller can inspect raw program-header fields immediately
+    /// before [`Self::load`] performs its BSS zero-fill writes, to check for a corrupted/torn read
+    /// as the root cause of a `write_u8_fallible` fault traced to that call.
+    pub fn pt_loads_diag(&self) -> impl Iterator<Item = elf::segment::ProgramHeader> + '_ {
+        self.pt_loads()
+    }
+
     /// Load the ELF file into memory.
     pub fn load<M: MapMemory>(
         &self,

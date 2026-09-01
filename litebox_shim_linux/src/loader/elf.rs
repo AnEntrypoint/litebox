@@ -255,6 +255,25 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
         } else {
             None
         };
+        // DIAG (this investigation pass): dump every PT_LOAD segment's raw header fields right
+        // before `load()` performs its BSS zero-fill writes -- a fatal, near-null/garbage-address
+        // `write_u8_fallible` fault has been traced (this session) to `ElfParsedFile::load`'s
+        // zero-fill call (`litebox_common_linux/src/loader.rs:466`), and the leading hypothesis is
+        // a corrupted/torn read of a program header (`p_vaddr`/`p_filesz`/`p_memsz`) under
+        // concurrent fork-heavy access to the same underlying file. If any of these values look
+        // implausible (`p_vaddr` far outside the binary's expected load range, `p_filesz >
+        // p_memsz` despite the loader's own guard, etc.) right before the crash, that confirms the
+        // hypothesis directly.
+        for ph in self.parsed.pt_loads_diag() {
+            litebox_util_log::warn!(
+                p_vaddr:% = alloc::format!("{:#x}", ph.p_vaddr),
+                p_filesz:% = alloc::format!("{:#x}", ph.p_filesz),
+                p_memsz:% = alloc::format!("{:#x}", ph.p_memsz),
+                p_offset:% = alloc::format!("{:#x}", ph.p_offset),
+                p_flags:% = ph.p_flags;
+                "DIAG elf_load: PT_LOAD segment"
+            );
+        }
         let result = self
             .parsed
             .load(&mut self.file, &mut &*platform, reserve, apply_relocations);
