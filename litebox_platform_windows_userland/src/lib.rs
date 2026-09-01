@@ -3640,6 +3640,30 @@ fn release_claim_range_for_current_thread(range: core::ops::Range<usize>) {
     }
 }
 
+/// Best-effort check: is `rip` inside (or very near) `SLAB_ALLOC`'s `GlobalAlloc::alloc`/
+/// `dealloc` implementation? Used by [`ThreadHandle::interrupt`] to avoid suspending a thread
+/// while it holds the global allocator's internal spinlock mid-mutation -- see that call site's
+/// own doc comment for the full hazard this guards against.
+///
+/// This is deliberately approximate rather than exact: without loading real debug symbols at
+/// runtime, there is no cheap way to get `alloc`/`dealloc`'s precise compiled extents. Instead,
+/// this checks whether `rip` falls within a generous fixed window around `<SafeZoneAllocator as
+/// GlobalAlloc>::alloc`'s own entry address -- wide enough to comfortably cover that function,
+/// `dealloc`, and their monomorphized/inlined callees (`slabmalloc`'s `ZoneAllocator::allocate`/
+/// `deallocate`, `refill`, the buddy allocator) as laid out by the compiler, at the cost of also
+/// covering some unrelated nearby code. A false positive here only costs a few extra retry
+/// iterations (capped, see `MAX_ALLOCATOR_SUSPEND_RETRIES`); a false negative just means this
+/// guard doesn't help for that particular call, matching today's un-guarded behavior exactly --
+/// so this heuristic can only make things safer or neutral, never worse.
+fn rip_in_global_allocator(rip: usize) -> bool {
+    // 512 KiB centered on `alloc`'s entry: comfortably covers a monomorphized slab/buddy
+    // allocator implementation (a few KiB of real code) with wide margin for compiler-chosen
+    // layout, while still being narrow enough to rarely false-positive against unrelated code.
+    const WINDOW: usize = 512 * 1024;
+    let alloc_addr = <litebox::mm::allocator::SafeZoneAllocator<'static, 34, WindowsUserland> as core::alloc::GlobalAlloc>::alloc as *const () as usize;
+    rip.abs_diff(alloc_addr) < WINDOW
+}
+
 impl ThreadHandle {
     /// Creates a [`ThreadHandle`] referencing the calling OS thread.
     fn for_current_thread(tls: &TlsState) -> ThreadHandle {
@@ -3757,9 +3781,53 @@ impl ThreadHandle {
             return;
         };
 
-        // Suspend the target thread.
-        unsafe {
-            windows_sys::Win32::System::Threading::SuspendThread(inner.handle.as_raw_handle());
+        // Suspend the target thread. Retry (resume, brief spin, re-suspend) if the target was
+        // caught with its `Rip` inside `SafeZoneAllocator::alloc`/`dealloc` -- `SLAB_ALLOC` is a
+        // single process-wide `spin::SpinMutex`-protected global allocator (see that type's own
+        // doc comment), and `SuspendThread` gives no atomicity guarantee with respect to arbitrary
+        // host-code instruction boundaries: catching a thread mid-mutation of shared allocator
+        // metadata (between reading and writing back an internal free-list/slab pointer) and later
+        // redirecting its `Rip` to `interrupt_callback` (see below) abandons that mutation
+        // partway, corrupting the allocator for every other thread. Investigated live (this
+        // session, a highly-reproducible `noseat`-repro capture) as the leading candidate
+        // explanation for an otherwise-unexplained fault landing inside `slabmalloc::zone::
+        // ZoneAllocator::allocate` with an already-corrupted return value. A thread genuinely
+        // running host allocator code is never expected to run there for more than a handful of
+        // instructions, so a short bounded retry loop (capped, to guarantee `interrupt` still
+        // makes forward progress even if this heuristic race-loses every time) is safe and cheap.
+        const MAX_ALLOCATOR_SUSPEND_RETRIES: u32 = 8;
+        let mut attempt = 0u32;
+        loop {
+            unsafe {
+                windows_sys::Win32::System::Threading::SuspendThread(inner.handle.as_raw_handle());
+            }
+            attempt += 1;
+            if attempt > MAX_ALLOCATOR_SUSPEND_RETRIES {
+                break;
+            }
+            let mut probe_context = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT {
+                ContextFlags: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64,
+                ..Default::default()
+            };
+            let probe_ok = unsafe {
+                windows_sys::Win32::System::Diagnostics::Debug::GetThreadContext(
+                    inner.handle.as_raw_handle(),
+                    &raw mut probe_context,
+                )
+            };
+            let rip = if probe_ok != 0 {
+                probe_context.Rip.trunc()
+            } else {
+                0
+            };
+            if probe_ok == 0 || !rip_in_global_allocator(rip) {
+                break;
+            }
+            // Caught mid-allocation: resume and give it a moment to finish, then retry.
+            unsafe {
+                windows_sys::Win32::System::Threading::ResumeThread(inner.handle.as_raw_handle());
+            }
+            std::thread::yield_now();
         }
         let _resume_guard = litebox::utils::defer(|| unsafe {
             windows_sys::Win32::System::Threading::ResumeThread(inner.handle.as_raw_handle());
