@@ -1149,15 +1149,39 @@ unsafe extern "system" fn vectored_exception_handler(
                 }
                 let module_base = (&raw const __ImageBase) as usize;
                 eprintln!(
-                    "[diag-unrecov-av] tid={:?} rip={:#x} rva={:#x} addr={:#x} rsp={:#x} is_in_guest={} is_verifying={} -- no exception-table entry found",
+                    "[diag-unrecov-av] tid={:?} rip={:#x} rva={:#x} addr={:#x} rsp={:#x} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x} is_in_guest={} is_verifying={} -- no exception-table entry found",
                     std::thread::current().id(),
                     context.Rip,
                     (context.Rip as usize).wrapping_sub(module_base),
                     exception_record.ExceptionInformation[1],
                     context.Rsp,
+                    context.Rax,
+                    context.Rbx,
+                    context.Rcx,
+                    context.Rdx,
+                    context.Rsi,
+                    context.Rdi,
+                    context.Rbp,
                     tls.is_in_guest.get(),
                     fork_verify::is_verifying(tls),
                 );
+                // Dump the top of this thread's real stack (module-relative RVAs where possible)
+                // to recover the call chain even though `rip` itself is a wild jump into
+                // non-code memory and cannot be symbolized or unwound normally.
+                {
+                    let rsp = context.Rsp as usize;
+                    for i in 0..32usize {
+                        let addr = rsp.wrapping_add(i * 8);
+                        let val = unsafe { (addr as *const usize).read_volatile() };
+                        let in_module = val.wrapping_sub(module_base) < 0x0200_0000;
+                        eprintln!(
+                            "[diag-unrecov-av-stack] [rsp+{:#x}]={:#x}{}",
+                            i * 8,
+                            val,
+                            if in_module { " (in-module)" } else { "" },
+                        );
+                    }
+                }
                 use std::io::Write;
                 let _ = std::io::stderr().flush();
             }
