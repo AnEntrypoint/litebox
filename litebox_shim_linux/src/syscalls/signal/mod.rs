@@ -713,7 +713,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     fn do_kill(&self, pid: Option<i32>, tid: Option<i32>, signal: i32) -> Result<usize, Errno> {
-        let signal = Signal::try_from(signal)?;
+        // Signal 0 is a documented POSIX special case (`kill(2)`: "if sig is 0, then no signal is
+        // sent, but existence and permission checks are still performed") -- the standard
+        // liveness-probe idiom, used directly by `kill -0 $pid` and indirectly by every shell's
+        // own job-control bookkeeping for a backgrounded job's `$!`. `Signal::try_from` rejects 0
+        // outright (`1..=64` only), so calling it unconditionally here made EVERY `kill(pid, 0)`
+        // fail with `EINVAL` before this function ever reached its own target-existence checks
+        // below -- i.e. `kill -0` on a genuinely live process reported `EINVAL` (which callers
+        // conventionally treat identically to "not found"/dead), not because the target doesn't
+        // exist, but because the null-signal probe itself was never a valid `Signal`. Confirmed
+        // live: `sleep 30 &`'s own real, live child PID, probed one second after backgrounding,
+        // returned `sh: can't kill pid N: Invalid argument` -- `sleep 30` cannot have exited that
+        // fast, proving this was misreporting a live process as inaccessible, not a real ESRCH.
+        // `None` here means "this is the null probe": skip actually enqueuing/delivering a signal
+        // to any target below, while still running every existence/reachability check exactly as
+        // for a real signal.
+        let signal = (signal != 0).then(|| Signal::try_from(signal)).transpose()?;
         if tid.is_some_and(|tid| tid != self.tid) {
             log_unsupported!("sys_tkill/sys_tgkill with a remote tid");
             return Err(Errno::ESRCH);
@@ -724,8 +739,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // on its own `Task`, unreachable from a `Process` handle alone) -- `process_signals`
         // already discards an ignored signal correctly once the child wakes and looks at its own
         // handlers, so this only costs the child one spurious EINTR on an ignored signal, never
-        // an incorrect delivery.
+        // an incorrect delivery. A `None` (null-probe) signal delivers nothing at all, per the
+        // doc comment above -- only the existence/reachability check that led here matters.
         let deliver_to_child = |child: &super::process::Process<Platform>| {
+            let Some(signal) = signal else { return };
             child
                 .shared_pending
                 .lock()
@@ -749,7 +766,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Some(p) => p.checked_neg().is_some_and(|group| group == self_pgid),
         };
         let mut delivered = targets_self;
-        if targets_self {
+        if targets_self && let Some(signal) = signal {
             self.send_signal(signal, siginfo_kill(signal));
         }
         // `tid.is_some()` (tkill/tgkill) always targets one specific thread and never carries
