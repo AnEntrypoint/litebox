@@ -1287,25 +1287,41 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
                 // match the most recently recorded memory load, and the slot it came from must be
                 // in the DESTINATION range (never the parent's own live memory) and not
                 // heap-resident (`is_in_destination_heap_range`), the identical exclusion case
-                // (3)/(4) apply, for the identical false-positive reason -- plus, unlike case (3)/
-                // (4), a `MIN_POINTER_ALIGN` check on the loaded value itself (see that constant's
-                // doc comment): case (3)/(4) are restricted to call/jmp targets, a context that on
-                // its own proves the value is meant to be a pointer, but case (2c) fires on any read
-                // through a stale-shaped base register with no equivalent proof, so an ordinary
-                // tagged/packed integer that merely coincides numerically with a tracked source
-                // range would otherwise get "healed" into an equally bogus, misaligned destination
-                // value -- observed live corrupting mallocng bookkeeping this exact way.
+                // (3)/(4) apply, for the identical false-positive reason -- plus, when `offset != 0`
+                // (the tracked register was advanced by `add`/`sub`/`lea` since the original load,
+                // see `LastLoad::offset`'s own doc comment), a `MIN_POINTER_ALIGN` check on the
+                // RAW loaded value itself (see that constant's doc comment): case (3)/(4) are
+                // restricted to call/jmp targets, a context that on its own proves the value is
+                // meant to be a pointer, but an OFFSET-CHAINED case (2c) hit only proves
+                // `chain.current_value()` (`loaded_value + offset`) is genuinely in-source -- the
+                // RAW `chain.loaded_value` on its own could still be an ordinary tagged/packed
+                // integer that merely coincides numerically with a tracked source range once the
+                // offset is added back in, so alignment on the raw value is the only guard against
+                // "healed" into an equally bogus, misaligned destination -- observed live
+                // corrupting mallocng bookkeeping this exact way.
+                //
+                // When `offset == 0`, `chain.loaded_value` and `chain.current_value()` (==
+                // `stale_value`, already required by the check above) are the IDENTICAL value --
+                // and `stale_value` itself was already established, at the OUTER case (2b) gate
+                // this block is nested inside, as a genuine `is_in_source` hit on the register the
+                // faulting instruction's own memory operand names as its base/index -- i.e. proof
+                // the value is actively being used as a pointer, strictly stronger evidence than
+                // the alignment heuristic exists to approximate. Requiring 16-byte alignment on
+                // top of that already-proven case only rejects genuine mid-buffer pointers (e.g. a
+                // running cursor into an `argv` string being copied byte-by-byte, never itself a
+                // fresh allocator-chunk start) -- confirmed live (the `dbus-launch`/`sleep 8`
+                // argv-corruption repro): 4 of 5 stale-DATA-pointer-read traps had a fully
+                // zero-offset matching chain (`chain.current_value() == stale_value`,
+                // `chain.offset == 0`) but were rejected purely on `MIN_POINTER_ALIGN`, leaving the
+                // slot never healed and the identical stale value reloaded on the loop's next
+                // byte-copy iteration. So the alignment gate now applies only when `offset != 0`,
+                // where `chain.loaded_value` alone genuinely lacks the outer proof.
                 if let Some(stale_value) = stale_value
                     && let Some(chain) = tls.fork_verify_last_load.get()
                     && chain.current_value() == stale_value
                     && relocations.is_in_destination(chain.load_address)
                     && !relocations.is_in_destination_heap_range(chain.load_address)
-                    // Require the loaded value to be at least as aligned as a genuine allocator-
-                    // owned pointer -- see `MIN_POINTER_ALIGN`'s doc comment for why this, and only
-                    // this, closes the soundness gap pass 69 found: an ordinary tagged/packed
-                    // integer that merely coincides numerically with a tracked source range is
-                    // rejected here without weakening the range-membership check itself.
-                    && chain.loaded_value.is_multiple_of(MIN_POINTER_ALIGN)
+                    && (chain.offset == 0 || chain.loaded_value.is_multiple_of(MIN_POINTER_ALIGN))
                     && let Some(translated) = relocations.translate(chain.loaded_value)
                 {
                     if crate::veh_trace_enabled() {
