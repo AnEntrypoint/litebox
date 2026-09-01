@@ -517,9 +517,19 @@ unsafe extern "system" fn vectored_exception_handler(
         let this_is_in_guest = get_tls_ptr()
             .map(|p| unsafe { (*p).is_in_guest.get() })
             .unwrap_or(false);
-        RECENT_FAULTS.with_borrow_mut(|ring| {
-            ring.rotate_left(1);
-            ring[3] = (code, rip, rsp, this_is_in_guest);
+        // A nested/re-entrant fault (this handler invoked again while an outer invocation still
+        // holds this same borrow -- e.g. a genuine secondary fault occurring while already inside
+        // this diagnostic block) must never panic here: `RefCell::borrow_mut`'s "already borrowed"
+        // panic would itself re-enter this exception path, and a panic raised from inside Windows'
+        // own exception dispatch has been observed live to loop indefinitely rather than
+        // terminate, turning a real crash into an unkillable hang. Silently skip the ring update
+        // on collision instead -- losing one diagnostic entry is far cheaper than masking the
+        // fault behind a hang.
+        RECENT_FAULTS.with(|cell| {
+            if let Ok(mut ring) = cell.try_borrow_mut() {
+                ring.rotate_left(1);
+                ring[3] = (code, rip, rsp, this_is_in_guest);
+            }
         });
     }
 
@@ -1157,9 +1167,13 @@ unsafe extern "system" fn vectored_exception_handler(
             // directly disassemble it and check whether its own surrounding assumptions (register
             // state, stack alignment) hold when entered via an injected `Rip` write rather than a
             // normal in-function jump -- see this investigation's own "unified epilogue" finding.
-            RECOVERY_LOG.with_borrow_mut(|ring| {
-                ring.rotate_left(1);
-                ring[3] = (context.Rip, recover as u64);
+            // `try_borrow_mut`: see the sibling `RECENT_FAULTS` update's comment above -- a
+            // nested/re-entrant fault must never panic on an already-held borrow here.
+            RECOVERY_LOG.with(|cell| {
+                if let Ok(mut ring) = cell.try_borrow_mut() {
+                    ring.rotate_left(1);
+                    ring[3] = (context.Rip, recover as u64);
+                }
             });
             context.Rip = recover as u64;
             return EXCEPTION_CONTINUE_EXECUTION;
@@ -1280,40 +1294,52 @@ unsafe extern "system" fn vectored_exception_handler(
                 // one (e.g. inside ntdll's own unwind machinery, reached only after an earlier,
                 // more informative fault was already dispatched), the entries before the most
                 // recent one recover what that earlier fault actually was.
-                RECENT_FAULTS.with_borrow(|ring| {
-                    for (i, (code, rip, fault_rsp, in_guest)) in ring.iter().enumerate() {
-                        eprintln!(
-                            "[diag-unrecov-av-ring] [{i}] code={code:#x} rip={rip:#x} rva={:#x} rsp={fault_rsp:#x} is_in_guest={in_guest}",
-                            (*rip as usize).wrapping_sub(module_base),
-                        );
-                        // Dump this ring entry's own top-of-stack too, so the caller of a fault
-                        // like `write_u8_fallible` (a tiny leaf function with almost no prologue)
-                        // can be recovered even when it isn't the LAST fault in the ring.
-                        if *code == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION && *fault_rsp != 0
-                        {
-                            for j in 0..8usize {
-                                let addr = (*fault_rsp as usize).wrapping_add(j * 8);
-                                let val = unsafe { (addr as *const usize).read_volatile() };
-                                let in_module = val.wrapping_sub(module_base) < 0x0200_0000;
-                                eprintln!(
-                                    "[diag-unrecov-av-ring-stack] [{i}][rsp+{:#x}]={val:#x}{}",
-                                    j * 8,
-                                    if in_module { " (in-module)" } else { "" },
-                                );
+                // `try_borrow` (not `with_borrow`): a nested/re-entrant fault reaching this print
+                // while an outer invocation still holds `RECENT_FAULTS`/`RECOVERY_LOG`'s borrow
+                // must never panic here -- that would re-enter this same exception path and has
+                // been observed live to loop indefinitely instead of terminating, turning the
+                // fault this code exists to diagnose into an unkillable hang. Skip printing this
+                // ring on collision instead of panicking.
+                RECENT_FAULTS.with(|cell| {
+                    if let Ok(ring) = cell.try_borrow() {
+                        for (i, (code, rip, fault_rsp, in_guest)) in ring.iter().enumerate() {
+                            eprintln!(
+                                "[diag-unrecov-av-ring] [{i}] code={code:#x} rip={rip:#x} rva={:#x} rsp={fault_rsp:#x} is_in_guest={in_guest}",
+                                (*rip as usize).wrapping_sub(module_base),
+                            );
+                            // Dump this ring entry's own top-of-stack too, so the caller of a
+                            // fault like `write_u8_fallible` (a tiny leaf function with almost no
+                            // prologue) can be recovered even when it isn't the LAST fault in the
+                            // ring.
+                            if *code == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
+                                && *fault_rsp != 0
+                            {
+                                for j in 0..8usize {
+                                    let addr = (*fault_rsp as usize).wrapping_add(j * 8);
+                                    let val = unsafe { (addr as *const usize).read_volatile() };
+                                    let in_module = val.wrapping_sub(module_base) < 0x0200_0000;
+                                    eprintln!(
+                                        "[diag-unrecov-av-ring-stack] [{i}][rsp+{:#x}]={val:#x}{}",
+                                        j * 8,
+                                        if in_module { " (in-module)" } else { "" },
+                                    );
+                                }
                             }
                         }
                     }
                 });
-                RECOVERY_LOG.with_borrow(|ring| {
-                    for (i, (fault_rip, recover_addr)) in ring.iter().enumerate() {
-                        if *fault_rip == 0 && *recover_addr == 0 {
-                            continue;
+                RECOVERY_LOG.with(|cell| {
+                    if let Ok(ring) = cell.try_borrow() {
+                        for (i, (fault_rip, recover_addr)) in ring.iter().enumerate() {
+                            if *fault_rip == 0 && *recover_addr == 0 {
+                                continue;
+                            }
+                            eprintln!(
+                                "[diag-unrecov-av-recovery] [{i}] fault_rip={fault_rip:#x} rva={:#x} -> recover={recover_addr:#x} rva={:#x}",
+                                (*fault_rip as usize).wrapping_sub(module_base),
+                                (*recover_addr as usize).wrapping_sub(module_base),
+                            );
                         }
-                        eprintln!(
-                            "[diag-unrecov-av-recovery] [{i}] fault_rip={fault_rip:#x} rva={:#x} -> recover={recover_addr:#x} rva={:#x}",
-                            (*fault_rip as usize).wrapping_sub(module_base),
-                            (*recover_addr as usize).wrapping_sub(module_base),
-                        );
                     }
                 });
                 use std::io::Write;
