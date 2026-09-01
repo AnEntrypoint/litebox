@@ -2733,7 +2733,19 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
         // Mirror the guest's own expected stack size here so an undersized real host stack is
         // never a needless bottleneck; TODO(perf): const should live at a shared layer both
         // crates use instead of being duplicated here once one exists.
-        const GUEST_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
+        // Bumped from 8 MiB (real Linux's own default `ulimit -s`) to 32 MiB: a real, reproducible
+        // `STATUS_STACK_OVERFLOW` was observed for `dbus-launch` specifically (confirmed via Rust's
+        // own unconditional "thread '<unknown>' has overflowed its stack" guard-page message, not
+        // gated behind any litebox diagnostic flag) when it runs on a real host OS thread after
+        // enough prior guest activity/relocation history has occurred on that thread -- matching
+        // the same underlying "host-side call frames while emulating the guest are real, heavier
+        // than the guest's own limit" cost class already fixed once for `weston --use-pixman`'s
+        // main-thread case (`INITIAL_GUEST_THREAD_STACK_SIZE`, this same 8->needs-more shape) and
+        // once for the `--gui` presenter thread (`PRESENTER_THREAD_STACK_SIZE`, 256 MiB). Kept at a
+        // modest 32 MiB (not the presenter's 256 MiB) since this applies to EVERY guest thread, not
+        // one always-present background thread -- a per-thread cost that could compound under many
+        // concurrent guest threads.
+        const GUEST_THREAD_STACK_SIZE: usize = 32 * 1024 * 1024;
         let ctx = ctx.clone();
         // Take (clearing) whatever guest-pid the shim declared via
         // `set_next_spawned_thread_guest_pid` for the thread about to be spawned -- read on

@@ -38,7 +38,7 @@ const LINUX_DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/
 /// `--gui` presenter thread (see `PRESENTER_THREAD_STACK_SIZE` below) -- winit/wgpu's stack-hungry
 /// call chains overflowed that thread's default 1 MiB budget the same way pixman's own stack-
 /// hungry initialization overflows this one.
-const INITIAL_GUEST_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
+const INITIAL_GUEST_THREAD_STACK_SIZE: usize = 32 * 1024 * 1024;
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
