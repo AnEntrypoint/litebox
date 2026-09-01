@@ -24,11 +24,73 @@ before a guest can actually execute.
 
 ```sh
 rustup target add aarch64-apple-darwin
-cargo build --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp
+cargo build --workspace --target aarch64-apple-darwin \
+  --exclude litebox_runner_lvbs --exclude litebox_runner_snp \
+  --exclude litebox_platform_linux_userland --exclude litebox_runner_linux_userland \
+  --exclude litebox_runner_optee_on_linux_userland \
+  --exclude litebox_platform_windows_userland --exclude litebox_runner_linux_on_windows_userland \
+  --exclude litebox_platform_multiplex --exclude litebox_shim_optee
 ```
 
-`litebox_runner_lvbs` and `litebox_runner_snp` are freestanding images for
-custom targets and are not built for a hosted target on any platform.
+Verified 2026-09-01 (`cargo check`, identical exclude list) to TYPE-CHECK
+clean for `aarch64-apple-darwin`. A full `cargo build`/`cargo zigbuild`
+(real linking, not just type-checking) was ALSO attempted the same day and
+gets further than `cargo check` alone can confirm, but is not fully clean in
+this environment: `litebox_session_daemon`/`litebox_syscall_rewriter`/
+`dev_bench` fail to LINK with the plain system `cc` (no `-arch`/`-mmacosx-
+version-min` support -- expected, this environment has no real Apple
+toolchain); switching to `cargo zigbuild` (the zig-based cross-linker this
+project's own memory already establishes as a working Windows-hosted
+cross-compiler, see `docs/wayland-drm-backend-probe/README.md` for the
+`pip install ziglang` + `cargo-zigbuild` setup) gets past that and compiles
+real Mach-O object code, but `litebox_packager` then fails at the final link
+step on two missing macOS SDK frameworks (`Security`, `CoreFoundation`) --
+zig ships minimal SDK stubs sufficient for AppKit/Metal/CoreFoundation
+symbol RESOLUTION (used successfully by `litebox_platform_macos_userland`
+itself in an earlier session, see `feedback_fork_verify_windows_only`'s
+sibling memory note / `project_wgpu_gui_support`), but apparently not every
+framework `litebox_packager`'s own OCI/network dependency chain needs -- a
+real, narrow, unexplored gap, NOT something this pass chased further since
+`litebox_packager` is unrelated to XFCE/guest-execution work specifically.
+The two crates that actually matter for GUI/XFCE/guest-syscall work --
+`litebox_shim_linux` (the entire DRM/input/filesystem guest-visible syscall
+surface) and `litebox_platform_macos_userland` (the presentation layer) --
+DO link cleanly end-to-end via `cargo zigbuild -p litebox_platform_macos_userland
+-p litebox_shim_linux --target aarch64-apple-darwin`, real object code, real
+Mach-O output, `Finished` with zero errors. Every excluded crate above is
+excluded for a real, verified reason, not a guess:
+
+- `litebox_runner_lvbs` and `litebox_runner_snp` are freestanding images for
+  custom targets and are not built for a hosted target on any platform.
+- `litebox_platform_linux_userland` (and the two runners built on it,
+  `litebox_runner_linux_userland`/`litebox_runner_optee_on_linux_userland`) is
+  a real Linux-only crate -- it unconditionally depends on `seccompiler`,
+  which needs Linux's own `SECCOMP_*`/`prctl` kernel interface and does not
+  compile against Darwin's `libc` at all, on ANY host (a genuine target
+  incompatibility, not something cross-compiling from a different host
+  changes).
+- `litebox_platform_windows_userland` and
+  `litebox_runner_linux_on_windows_userland` are Windows-only, for the
+  symmetric reason.
+- `litebox_platform_multiplex` and `litebox_shim_optee` are excluded not
+  because either is inherently platform-locked, but because
+  `litebox_platform_multiplex`'s OWN `default` Cargo feature
+  (`platform_linux_userland_with_linux_syscall`) unconditionally enables
+  `litebox_platform_linux_userland` as a dependency -- so anything that pulls
+  in `litebox_platform_multiplex` with its default features (as
+  `litebox_shim_optee` does) drags the same Linux-only `seccompiler` problem
+  back in transitively, even after excluding
+  `litebox_platform_linux_userland` itself directly. `--exclude` only removes
+  a crate as a top-level workspace check/build target, not as a transitive
+  dependency of something still included -- excluding EVERY crate in this
+  dependency chain, not just the one that literally fails to compile, is
+  required. `litebox_platform_multiplex --no-default-features` would be the
+  more surgical fix if a future consumer specifically needs it built for
+  macOS; not attempted here since nothing macOS-relevant currently needs it.
+
+Every other workspace crate this file's "What is in the tree" table lists
+(`litebox_platform_macos_userland`, `litebox` core, `litebox_shim_linux`,
+`litebox_syscall_rewriter`, `litebox_packager`) builds clean for this target.
 
 CI covers this in the `Build and Test macOS (Apple Silicon)` job.
 
