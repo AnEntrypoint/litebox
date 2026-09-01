@@ -495,6 +495,30 @@ unsafe extern "system" fn vectored_exception_handler(
         }
     }
 
+    // Always-on, allocation-free per-thread ring of the last few (code, rip, is_in_guest) fault
+    // triples seen by this handler on THIS thread -- added specifically because a secondary fault
+    // inside `ntdll!RtlpUnwindPrologue` (confirmed live, this investigation: a fault whose
+    // unwind-time crash is a downstream symptom, not the true root cause) means the diagnostics at
+    // the bottom of this function only ever see the LAST fault, by which point the actually
+    // informative FIRST fault that triggered Windows' own unwind has already been dispatched and
+    // is otherwise unrecoverable. `std::cell::Cell`-based thread_local, no heap allocation, no
+    // locking -- safe to read/write even from deep inside exception handling.
+    std::thread_local! {
+        static RECENT_FAULTS: RefCell<[(i32, u64, bool); 4]> =
+            const { RefCell::new([(0, 0, false); 4]) };
+    }
+    {
+        let code = unsafe { (*(*exception_info).ExceptionRecord).ExceptionCode };
+        let rip = unsafe { (*(*exception_info).ContextRecord).Rip };
+        let this_is_in_guest = get_tls_ptr()
+            .map(|p| unsafe { (*p).is_in_guest.get() })
+            .unwrap_or(false);
+        RECENT_FAULTS.with_borrow_mut(|ring| {
+            ring.rotate_left(1);
+            ring[3] = (code, rip, this_is_in_guest);
+        });
+    }
+
     let Some(tls) = get_tls_ptr() else {
         // TLS slot not initialized yet; cannot be in guest
         return EXCEPTION_CONTINUE_SEARCH;
@@ -1182,6 +1206,18 @@ unsafe extern "system" fn vectored_exception_handler(
                         );
                     }
                 }
+                // Print the ring of recent faults on THIS thread -- if this fault is a secondary
+                // one (e.g. inside ntdll's own unwind machinery, reached only after an earlier,
+                // more informative fault was already dispatched), the entries before the most
+                // recent one recover what that earlier fault actually was.
+                RECENT_FAULTS.with_borrow(|ring| {
+                    for (i, (code, rip, in_guest)) in ring.iter().enumerate() {
+                        eprintln!(
+                            "[diag-unrecov-av-ring] [{i}] code={code:#x} rip={rip:#x} rva={:#x} is_in_guest={in_guest}",
+                            (*rip as usize).wrapping_sub(module_base),
+                        );
+                    }
+                });
                 use std::io::Write;
                 let _ = std::io::stderr().flush();
             }
