@@ -466,14 +466,66 @@ pub(crate) fn is_verifying(tls: &TlsState) -> bool {
 /// `None` for a non-verifying thread or a `rip` that is not a real relocation-map hit, so the
 /// caller's fallback (the normal single-step/exception dispatch) is exactly as safe as if this
 /// function had never been called.
-pub(crate) fn translate_stale_source_rip(tls: &TlsState, rip: usize) -> Option<usize> {
+///
+/// Also heals the stack slot at `[rsp]`, if it still holds the identical stale (untranslated)
+/// `rip` value, the same "patch the slot in place" pattern [`on_single_step`]'s case (2d) already
+/// uses for a stale DATA pointer read off the stack. Without this, healing only the live register
+/// (as this function originally did) fixes the CPU's current fetch but leaves the stack slot the
+/// value was popped from (by the `ret` that produced this faulting `rip`) still holding the
+/// original, untranslated address -- confirmed live via `xfwm4`'s own post-fork execution
+/// (`LITEBOX_LOG=debug`, no `LITEBOX_VEH_TRACE` needed to see it): the identical
+/// `rip=0x9d90733`/`translated_rip=0xa800733` pair repeated **333,441 times** in a single run,
+/// one raw `EXCEPTION_ACCESS_VIOLATION` per iteration of what is evidently a tight `call`/`ret`
+/// loop (a shared helper or vtable-dispatch site called repeatedly, matching case (3)'s own doc
+/// comment on why a GOT/PLT-style slot needs in-place healing, not just in-register healing, to
+/// avoid this exact repeated-refault shape) -- burning CPU indefinitely without making forward
+/// progress, and without ever presenting as a normal, unhandled, terminating crash the way this
+/// same stale pointer did before AV-path healing was left armed past the single-step bound (see
+/// the caller's own `is_verifying`-lifetime fix). `[rsp]` is checked (not `[rsp-8]` or any other
+/// offset) because this handler observes `context.Rsp` exactly as the CPU left it after
+/// completing the faulting `ret`'s own pop -- `ret` decodes its target, pops the stack slot
+/// (advancing `rsp` past it), and only then attempts to fetch from the popped (stale) address,
+/// which is precisely where this AV-path healing intercepts it; the slot that produced the stale
+/// value is therefore the one immediately below the pre-pop `rsp`, i.e. `rsp - 8` relative to the
+/// CURRENT (post-pop) `rsp` this handler sees -- so `orig_rsp = rsp - size_of::<usize>()` is the
+/// address checked and healed, not `rsp` itself.
+pub(crate) fn translate_stale_source_rip(
+    tls: &TlsState,
+    rip: usize,
+    rsp: usize,
+) -> Option<usize> {
     let borrow = tls.fork_verify.borrow();
     let relocations = borrow.as_ref()?;
-    if relocations.is_in_source(rip) {
-        relocations.translate(rip)
-    } else {
-        None
+    if !relocations.is_in_source(rip) {
+        return None;
     }
+    let translated = relocations.translate(rip)?;
+    // Try `[rsp - 8]` first (the `ret`-just-popped case; see the doc comment above), then `[rsp]`
+    // itself: confirmed live (the `weston-desktop-shell`/`xfwm4` repeating-loop repro) that a
+    // `[rsp-8]`-only check leaves some instances of this exact loop unhealed -- the SAME stale
+    // `rip`/`translated_rip` pair (`0x9d90733`/`0xa800733`) kept recurring 333,000+ times even
+    // with the `[rsp-8]` fix in place, meaning the value driving this particular fault is not
+    // sitting at `[rsp-8]`. `[rsp]` covers the sibling case: an ordinary `call [mem]`/`jmp [mem]`
+    // (not a `ret`) whose own return address has already been correctly pushed (or is not
+    // involved at all, for a `jmp`) but whose CALL TARGET came from a stale GOT/PLT-style slot
+    // elsewhere -- for a `jmp`, `rsp` is unchanged by the transfer itself, so if the code at the
+    // destination immediately re-derives the same stale value from a slot reachable at `[rsp]`
+    // (e.g. its own first instruction reloads a saved pointer argument), healing that slot here
+    // closes the loop the same way `[rsp-8]` does for a `ret`. This does not attempt every
+    // possible addressing shape (case (3)/(4) exist for the general GOT/PLT-slot and
+    // register-indirect forms, exposed separately for the AV path) -- only these two fixed,
+    // well-understood, zero-ambiguity offsets relative to a register this handler already has.
+    for candidate in [
+        rsp.wrapping_sub(core::mem::size_of::<usize>()),
+        rsp,
+    ] {
+        if let Some(slot_value) = read_usize_fault_tolerant(candidate)
+            && slot_value == rip
+        {
+            write_usize_fault_tolerant(candidate, translated);
+        }
+    }
+    Some(translated)
 }
 
 /// Decode the instruction at `rip` and heal any of its memory-operand base/index registers that
@@ -508,6 +560,181 @@ pub(crate) fn translate_stale_source_memory_operand_registers(
         return false;
     }
     translate_memory_operand_registers(&instruction, context, relocations)
+}
+
+/// Decode the instruction at `rip` and, if it is an indirect `call [mem]`/`jmp [mem]` whose
+/// explicit memory operand holds a stale, untranslated SOURCE-range code pointer, heal that
+/// memory SLOT in place -- exactly case (3) in [`on_single_step`] already does (see its own doc
+/// comment for the full soundness argument: `MIN_POINTER_ALIGN`, `is_in_destination` +
+/// `!is_in_destination_heap_range` on the slot address itself, `relocations.translate` on the
+/// loaded value), exposed here for `vectored_exception_handler`'s AV-path healing for the same
+/// reason [`translate_stale_source_rip`]/[`translate_stale_source_memory_operand_registers`]
+/// already are: a GOT/PLT-style indirect call/jmp reading a stale target through a memory operand
+/// does not always announce itself as `EXCEPTION_SINGLE_STEP` (the loaded, stale SOURCE-range
+/// address may not be resident at all, producing a raw `EXCEPTION_ACCESS_VIOLATION` on the
+/// resulting instruction fetch instead, which never reaches `on_single_step`'s case (3) since
+/// that only ever runs from the `EXCEPTION_SINGLE_STEP` branch).
+///
+/// Unlike [`translate_stale_source_rip`] (which heals `[rsp-8]`, the one fixed, always-correct
+/// slot location for a `ret`), this case has no fixed offset from any register this handler
+/// already has -- the slot IS the instruction's own explicit memory operand, decoded from `rip`
+/// exactly as `on_single_step`'s case (3) does. Confirmed live as the SAME repeating stale-`rip`
+/// pair (`rip=0x9d90733`/`translated_rip=0xa800733`) observed in both the `xfwm4` AND (driving
+/// `sh`, before `weston-desktop-shell` is ever even spawned) `weston --shell=desktop-shell.so`
+/// repros persisting even after [`translate_stale_source_rip`]'s `[rsp-8]` healing landed: the
+/// `[rsp-8]` fix only covers a stale `ret` target, but this identical address pair kept repeating
+/// unbounded, meaning the true origin is a GOT/PLT-style slot elsewhere (this case), not a return
+/// address -- `[rsp-8]` never matched `rip` there, so the fix never fired for this instance,
+/// exactly the same infinite-refault shape as before, just from a different addressing mode.
+/// Returns `true` iff the slot was healed (the caller should retry the faulting instruction by
+/// NOT advancing `rip`, so the CPU re-fetches through the now-healed slot) and `false` for a
+/// non-verifying thread, an undecodable instruction, a non-indirect-call/jmp instruction, or one
+/// whose memory operand does not pass every soundness check case (3) already requires.
+pub(crate) fn translate_stale_source_indirect_call_target(
+    tls: &TlsState,
+    rip: usize,
+    context: &CONTEXT,
+) -> bool {
+    let borrow = tls.fork_verify.borrow();
+    let Some(relocations) = borrow.as_ref() else {
+        return false;
+    };
+    let mut code = [0u8; MAX_INSTRUCTION_LEN];
+    let len = read_code_bytes(rip, &mut code);
+    if len == 0 {
+        return false;
+    }
+    let mut decoder = Decoder::with_ip(64, &code[..len], rip as u64, DecoderOptions::NONE);
+    let instruction = decoder.decode();
+    if instruction.is_invalid() {
+        return false;
+    }
+    if !(instruction.is_call_near_indirect() || instruction.is_jmp_near_indirect()) {
+        return false;
+    }
+    let Some(load_address) = explicit_memory_operand_address(&instruction, context) else {
+        return false;
+    };
+    if !relocations.is_in_destination(load_address)
+        || relocations.is_in_destination_heap_range(load_address)
+    {
+        return false;
+    }
+    let Some(stale_value) = read_usize_fault_tolerant(load_address) else {
+        return false;
+    };
+    if !stale_value.is_multiple_of(MIN_POINTER_ALIGN) {
+        return false;
+    }
+    let Some(translated) = relocations.translate(stale_value) else {
+        return false;
+    };
+    if crate::veh_trace_enabled() {
+        eprintln!(
+            "[veh] AV-path HEAL case=3 load_address={load_address:#x} old={stale_value:#x} new={translated:#x} rip={rip:#x}",
+        );
+    }
+    litebox_util_log::warn!(
+        rip:? = rip, load_address:? = load_address, stale_value:? = stale_value,
+        translated:? = translated, mnemonic:? = instruction.mnemonic();
+        "fork_verify: stale CODE pointer in indirect call/jmp target slot detected via raw access violation (no #DB delivered), patching slot in place"
+    );
+    write_usize_fault_tolerant(load_address, translated);
+    true
+}
+
+/// Decode the instruction at `rip` and, if it is a REGISTER-indirect `call reg`/`jmp reg` whose
+/// target register's value was ITSELF just loaded from a stale, untranslated SOURCE-range memory
+/// slot (tracked via `tls.fork_verify_last_load`, the same load-chain `on_single_step`'s case (4)
+/// already relies on), heal that memory SLOT in place -- exactly case (4) already does for the
+/// single-step path (see its own doc comment for the full soundness argument this mirrors
+/// verbatim: the target register's CURRENT value must exactly match the chain's `current_value()`,
+/// the chain's `load_address` must be a genuine DESTINATION (never SOURCE/parent) address and
+/// never heap-resident, and the chain's `loaded_value` must translate through the relocation map).
+///
+/// Exposed here for `vectored_exception_handler`'s AV-path healing for the identical reason
+/// [`translate_stale_source_rip`] / [`translate_stale_source_memory_operand_registers`] /
+/// [`translate_stale_source_indirect_call_target`] already are: a register-indirect call/jmp
+/// through a stale target does not always announce itself as `EXCEPTION_SINGLE_STEP`.
+///
+/// Unlike those three siblings, this relies on `tls.fork_verify_last_load` -- a load-CHAIN built
+/// up by consecutive single-steps via `advance_last_load`, not something derivable from a single
+/// raw AV in isolation. This is sound here specifically because single-stepping runs CONTINUOUSLY
+/// on a verifying thread right up until either the step bound is hit or this exact kind of raw AV
+/// interrupts it -- so `tls.fork_verify_last_load` reflects a genuinely recent, correctly-ordered
+/// memory read from THIS SAME thread's own immediately-preceding single-stepped instructions, not
+/// stale leftover state from a different execution phase. Confirmed live as the actual remaining
+/// gap behind the SAME `rip=0x9d90733`/`translated_rip=0xa800733` pair recurring across three
+/// different threads/processes (a driving `sh`, `xfwm4`, and `weston-desktop-shell` itself, each
+/// hit right after their own early post-exec startup) even after [`translate_stale_source_rip`]'s
+/// `[rsp-8]`+`[rsp]` healing and [`translate_stale_source_indirect_call_target`]'s case-(3)
+/// healing both landed and were verified not to close it -- ruling out a `ret`-popped return
+/// address and a direct-memory-operand GOT/PLT slot, leaving this register-indirect,
+/// previously-loaded-elsewhere shape as the remaining candidate.
+///
+/// Returns `true` iff the slot was healed (the caller should retry the faulting instruction by
+/// NOT advancing `rip`) and `false` for a non-verifying thread, an undecodable instruction, a
+/// non-register-indirect-call/jmp instruction, no recorded load chain, or one that fails any of
+/// case (4)'s own soundness checks.
+pub(crate) fn translate_stale_source_register_indirect_call_target(
+    tls: &TlsState,
+    rip: usize,
+    context: &CONTEXT,
+) -> bool {
+    let borrow = tls.fork_verify.borrow();
+    let Some(relocations) = borrow.as_ref() else {
+        return false;
+    };
+    let mut code = [0u8; MAX_INSTRUCTION_LEN];
+    let len = read_code_bytes(rip, &mut code);
+    if len == 0 {
+        return false;
+    }
+    let mut decoder = Decoder::with_ip(64, &code[..len], rip as u64, DecoderOptions::NONE);
+    let instruction = decoder.decode();
+    if instruction.is_invalid() {
+        return false;
+    }
+    if !(instruction.is_call_near_indirect() || instruction.is_jmp_near_indirect()) {
+        return false;
+    }
+    if explicit_memory_operand_address(&instruction, context).is_some() {
+        // A direct memory operand is case (3)'s territory, not this one -- see that function.
+        return false;
+    }
+    if instruction.op0_kind() != OpKind::Register {
+        return false;
+    }
+    let Some(target_value) = register_value(instruction.op0_register(), context) else {
+        return false;
+    };
+    let Some(chain) = tls.fork_verify_last_load.get() else {
+        return false;
+    };
+    if chain.current_value() != target_value || !relocations.is_in_source(target_value) {
+        return false;
+    }
+    if !relocations.is_in_destination(chain.load_address)
+        || relocations.is_in_destination_heap_range(chain.load_address)
+    {
+        return false;
+    }
+    let Some(translated) = relocations.translate(chain.loaded_value) else {
+        return false;
+    };
+    if crate::veh_trace_enabled() {
+        eprintln!(
+            "[veh] AV-path HEAL case=4 load_address={:#x} old={:#x} new={translated:#x} rip={rip:#x}",
+            chain.load_address, chain.loaded_value,
+        );
+    }
+    litebox_util_log::warn!(
+        rip:? = rip, load_address:? = chain.load_address, stale_value:? = chain.loaded_value,
+        translated:? = translated, mnemonic:? = instruction.mnemonic();
+        "fork_verify: stale CODE pointer previously loaded from memory slot into register detected via raw access violation (no #DB delivered), patching slot in place"
+    );
+    write_usize_fault_tolerant(chain.load_address, translated);
+    true
 }
 
 /// The `EFLAGS` bits to add when entering guest mode on this thread: `TF` if this thread is a
@@ -628,13 +855,28 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
     if steps > step_bound {
         if crate::veh_trace_enabled() {
             eprintln!(
-                "[fork_verify] tid={:?} on_single_step: step bound {step_bound} exceeded at rip={rip:#x}, ending verification early",
+                "[fork_verify] tid={:?} on_single_step: step bound {step_bound} exceeded at rip={rip:#x}, ending single-step tracing early (AV-path healing stays armed)",
                 std::thread::current().id(),
             );
         }
         drop(borrow);
+        // Stop paying the per-instruction single-step cost, but deliberately do NOT clear
+        // `tls.fork_verify` (i.e. do NOT make `is_verifying` false) here. The staleness this
+        // module exists to catch is not always exercised before this bound is hit -- a value
+        // sitting in heap/BSS memory (e.g. a `struct`'s pointer-typed field) can be written by
+        // ordinary post-fork guest code well after this bound, then only later read back out and
+        // dereferenced, faulting far past where single-step tracing stopped (confirmed live: a
+        // `dbus-daemon` crash whose stale pointer -- symbolized via manual relocation-range
+        // cross-referencing -- was proven to still read `0` at fork time, i.e. it is written by
+        // the child's own code running after this exact point, so no bound increase here could
+        // ever have caught it via single-stepping alone). `vectored_exception_handler`'s AV-path
+        // healing (`translate_stale_source_rip` / `translate_stale_source_memory_operand_
+        // registers`, see their doc comments) is gated on `is_verifying`, not on `TF`/single-
+        // stepping being armed -- it costs nothing per-instruction and only ever runs on a
+        // genuine, already-occurring access violation, so leaving it armed indefinitely after
+        // ending the expensive trace is free and lets it catch exactly this later-surfacing case
+        // instead of leaving the child to crash unhealed.
         context.EFlags &= !eflags_tf;
-        *tls.fork_verify.borrow_mut() = None;
         return StepOutcome::Continue;
     }
 

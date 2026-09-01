@@ -4344,6 +4344,7 @@ impl SyscallRequest {
                 flags: EfdFlags::empty(),
             },
             Sysno::eventfd2 => sys_req!(Eventfd2 { initval, flags }),
+            #[cfg(target_arch = "x86_64")]
             Sysno::signalfd => SyscallRequest::Signalfd4 {
                 fd: ctx.sys_req_arg(0),
                 mask: ctx.sys_req_ptr(1),

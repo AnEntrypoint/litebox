@@ -1107,7 +1107,23 @@ pub fn spawn_process_fork_child(
         std::env::set_var(FORK_CHILD_VMA_LAYOUT_ENV_VAR, &relocations_line);
         std::env::set_var(FORK_CHILD_GPRS_ENV_VAR, serialize_full_gprs(&full_gprs));
     }
+    if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
+        eprintln!(
+            "[diag_alloc_vec] pre-spawn exe_wide len={} cap={} ptr={:p}",
+            exe_wide.len(),
+            exe_wide.capacity(),
+            exe_wide.as_ptr()
+        );
+    }
     let spawn_result = spawn_suspended(&mut exe_wide, false, false);
+    if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
+        eprintln!(
+            "[diag_alloc_vec] post-spawn exe_wide len={} cap={} ptr={:p}",
+            exe_wide.len(),
+            exe_wide.capacity(),
+            exe_wide.as_ptr()
+        );
+    }
     unsafe {
         std::env::remove_var(REEXEC_CHILD_ENV_VAR);
         std::env::remove_var("LITEBOX_DIAG_PROCESS_FORK_GLOBALSTATE");
@@ -1117,6 +1133,12 @@ pub fn spawn_process_fork_child(
         std::env::remove_var(FORK_CHILD_GPRS_ENV_VAR);
     }
     let (process, thread, pid, _stdout_read, _stdin_write) = spawn_result?;
+    if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
+        eprintln!(
+            "[diag_alloc_vec] spawned child pid={} process={:p} thread={:p}",
+            pid, process, thread
+        );
+    }
 
     // From here on, any early-return path must explicitly tear the child down itself -- there is
     // no `Drop` guard doing it implicitly, by design (see this function's doc comment).
@@ -1133,6 +1155,16 @@ pub fn spawn_process_fork_child(
     }
 
     for (source_group, dest_base) in group_relocations {
+        let process = core::hint::black_box(process);
+        if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
+            let process_addr = &process as *const _ as usize;
+            let dummy = 0u8;
+            let stack_addr = &dummy as *const _ as usize;
+            eprintln!(
+                "[diag_alloc_vec] pre-call process={:p} process_slot_addr={:#x} current_stack_addr={:#x} group={:#x}..{:#x}",
+                process, process_addr, stack_addr, source_group.start, source_group.end
+            );
+        }
         let result = copy_one_group(process, source_group, *dest_base, &mut read_source_bytes);
         if !result.succeeded {
             fail_teardown!(
@@ -1293,6 +1325,14 @@ pub fn spawn_process_fork_child(
     // wait/kill by pid) and hand the caller the process handle and pid, alive, un-terminated.
     unsafe {
         CloseHandle(thread);
+    }
+    if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
+        eprintln!(
+            "[diag_alloc_vec] pre-return exe_wide len={} cap={} ptr={:p}",
+            exe_wide.len(),
+            exe_wide.capacity(),
+            exe_wide.as_ptr()
+        );
     }
     Ok(Some((pid, process)))
 }
@@ -2863,6 +2903,12 @@ fn copy_one_group(
     _dest_base: usize,
     read_source_bytes: &mut impl FnMut(Range<usize>) -> Option<Vec<u8>>,
 ) -> GroupCopyResult {
+    if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
+        eprintln!(
+            "[diag_alloc_vec] copy_one_group ENTRY child={:p} group={:#x}..{:#x}",
+            child, source_group.start, source_group.end
+        );
+    }
     const PAGE_SIZE: usize = 4096;
     let len = source_group.len();
     let fail = |err: u32| GroupCopyResult {
@@ -2909,7 +2955,14 @@ fn copy_one_group(
         )
     };
     if reserved.is_null() {
-        return fail(unsafe { GetLastError() });
+        let err = unsafe { GetLastError() };
+        if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
+            eprintln!(
+                "[diag_alloc_vec] copy_one_group VirtualAlloc2 FAILED child={:p} group={:#x}..{:#x} len={:#x} err={}",
+                child, source_group.start, source_group.end, len, err
+            );
+        }
+        return fail(err);
     }
     if reserved as usize != source_group.start {
         // Should be unreachable given `MEM_ADDRESS_REQUIREMENTS` is a hard requirement (pass 109
@@ -2973,17 +3026,25 @@ fn copy_one_group(
             }
         }
         let mut written = 0usize;
+        let dest = (reserved as usize + (cursor - source_group.start)) as *mut c_void;
         let ok = unsafe {
             WriteProcessMemory(
                 child,
-                (reserved as usize + (cursor - source_group.start)) as *mut c_void,
+                dest,
                 bytes.as_ptr().cast::<c_void>(),
                 bytes.len(),
                 &raw mut written,
             )
         };
         if ok == 0 || written != bytes.len() {
-            return fail(unsafe { GetLastError() });
+            let err = unsafe { GetLastError() };
+            if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
+                eprintln!(
+                    "[diag_alloc_vec] copy_one_group WriteProcessMemory FAILED child={:p} addr={:#x} len={:#x} written={} err={}",
+                    child, reserved as usize + (cursor - source_group.start), bytes.len(), written, err
+                );
+            }
+            return fail(err);
         }
         cursor = page_end;
     }
