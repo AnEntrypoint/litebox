@@ -2981,10 +2981,15 @@ unsafe extern "system" fn ctrl_c_handler(ctrl_type: u32) -> i32 {
         _ => return 0, // FALSE — let the next handler deal with it
     };
 
-    // Pick one arbitrary thread to deliver the signal to.
-    let thread = ACTIVE_THREADS.lock().unwrap().first().cloned();
-
-    if let Some(thread) = thread {
+    // Previously delivered to `ACTIVE_THREADS.first()` only -- the same arbitrary-thread gap
+    // already identified and fixed for `create_timer`'s `SIGALRM` delivery and
+    // `console_resize_watcher_thread_body`'s `SIGWINCH` delivery a few hundred lines below (see
+    // either doc comment for the full "wrong-thread signal delivery -> spurious interrupt ->
+    // busy-livelock or mid-syscall corruption" explanation). Real Ctrl+C/Ctrl+Break deliver
+    // SIGINT/SIGTSTP to an entire foreground process group, not one arbitrary thread of one
+    // arbitrary guest process -- deliver to every active thread instead.
+    let threads: alloc::vec::Vec<ThreadHandle> = ACTIVE_THREADS.lock().unwrap().iter().cloned().collect();
+    for thread in threads {
         thread.deliver_signal(signal);
     }
 
@@ -3038,8 +3043,25 @@ fn console_resize_watcher_thread_body() {
         };
         if size != last_size {
             last_size = size;
-            let thread = ACTIVE_THREADS.lock().unwrap().first().cloned();
-            if let Some(thread) = thread {
+            // Previously delivered to `ACTIVE_THREADS.first()` -- an ARBITRARY managed thread,
+            // not necessarily one that cares about a window-size change, or worse, a thread
+            // belonging to a completely unrelated guest process (multiple guest "processes" are
+            // each an ordinary host thread sharing this one Windows process -- see
+            // `create_timer`'s own doc comment a few hundred lines above, which already
+            // identified and fixed the IDENTICAL "wrong-thread signal delivery" gap for
+            // `SIGALRM`/`ITIMER_REAL` timers). Spuriously interrupting a thread with no real
+            // pending signal to act on is not a no-op: `prepare_to_run_guest` returns
+            // `ready=true` again immediately, and the next `switch_to_guest` can re-enter this
+            // same interrupt path before making any other forward progress -- a busy-livelock
+            // shape, or worse, a thread interrupted mid-syscall/mid-critical-section with no
+            // real signal to consume. Deliver to every active thread instead (matching real
+            // Linux's own SIGWINCH-to-foreground-process-group semantics, which reaches every
+            // thread of every process in that group, not one arbitrary thread of one arbitrary
+            // process) -- each thread's own signal-delivery/disposition logic already handles an
+            // irrelevant signal correctly (default SIGWINCH disposition is Ignore).
+            let threads: alloc::vec::Vec<ThreadHandle> =
+                ACTIVE_THREADS.lock().unwrap().iter().cloned().collect();
+            for thread in threads {
                 thread.deliver_signal(litebox_common_linux::signal::Signal::SIGWINCH);
             }
         }
