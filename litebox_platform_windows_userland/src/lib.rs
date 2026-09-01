@@ -1190,6 +1190,40 @@ unsafe extern "system" fn vectored_exception_handler(
                     tls.is_in_guest.get(),
                     fork_verify::is_verifying(tls),
                 );
+                // Query the REAL Windows page state of the exact faulting address at the moment
+                // of the fault -- directly tests the 41st-pass hypothesis that the address itself
+                // is legitimately computed but the underlying page is not actually committed (or
+                // was committed then silently decommitted/relocated by another thread) despite
+                // the mapping call that should have committed it having already reported success.
+                {
+                    let fault_addr = exception_record.ExceptionInformation[1] as *mut c_void;
+                    let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+                    let ok = unsafe {
+                        Win32_Memory::VirtualQuery(
+                            fault_addr,
+                            &mut mbi,
+                            core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+                        ) != 0
+                    };
+                    if ok {
+                        eprintln!(
+                            "[diag-unrecov-av-pagestate] addr={:p} BaseAddress={:p} RegionSize={:#x} State={:#x} Protect={:#x} Type={:#x} AllocationProtect={:#x}",
+                            fault_addr,
+                            mbi.BaseAddress,
+                            mbi.RegionSize,
+                            mbi.State,
+                            mbi.Protect,
+                            mbi.Type,
+                            mbi.AllocationProtect,
+                        );
+                    } else {
+                        eprintln!(
+                            "[diag-unrecov-av-pagestate] addr={:p} VirtualQuery FAILED, GetLastError={}",
+                            fault_addr,
+                            unsafe { GetLastError() },
+                        );
+                    }
+                }
                 // Dump the top of this thread's real stack (module-relative RVAs where possible)
                 // to recover the call chain even though `rip` itself is a wild jump into
                 // non-code memory and cannot be symbolized or unwound normally.
