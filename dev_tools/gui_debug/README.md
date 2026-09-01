@@ -66,3 +66,11 @@ Repeatedly re-learned this session; recorded here so it doesn't need re-deriving
 tracing is not "fixed by observation" -- it means the race is real and timing-sensitive.** Don't
 conclude a bug is gone because a heavily-instrumented run didn't hit it; re-confirm at `error`
 level with several repeated runs before trusting a "clean" result.
+
+**When a bug is timing-sensitive enough that even `LITEBOX_LOG=debug` suppresses it, bump just
+the one or two specific `debug!`/`trace!` log lines you actually need to `error!` in the source,
+rebuild, and reproduce at `LITEBOX_LOG=error`** -- this gets targeted detail (e.g. exact
+`mmap`/`munmap` addresses and sizes) with far less overhead than blanket debug logging, and has
+reproduced a race on the first attempt where `LITEBOX_LOG=debug` failed 0/3 times. Revert the
+temporary level bump before committing any real fix -- it's a debugging aid, not a permanent
+logging-level change.
