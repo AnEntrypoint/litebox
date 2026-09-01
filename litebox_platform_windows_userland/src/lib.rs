@@ -500,6 +500,20 @@ unsafe extern "system" fn vectored_exception_handler(
         return EXCEPTION_CONTINUE_SEARCH;
     };
     let tls = unsafe { &*tls };
+    // DIAG (this investigation pass): the naked-asm trampoline's `.Lswap`/`.Lcall_here` fallback
+    // (fires when `host_sp` is still null -- the narrow post-`install_tls`-pre-`run_thread_arch`
+    // window every thread has -- or when `veh_depth` is at cap) calls straight into THIS function
+    // on whatever stack is currently live, without ever swapping to the real host stack first.
+    // Confirmed live via cdb this session: the fatal fault always has `is_verifying=false` right
+    // after a `[fork_verify] end` log line, with the crashing thread's `rsp` already corrupted to
+    // a near-`u64::MAX` value at the very first visible frame. If `host_sp` reads null HERE (this
+    // function's own entry, reached either via the swap OR the fallback), that's this exact
+    // fallback firing -- unconditional, allocation-free, so safe even if we're on an unprotected
+    // guest-address stack right now.
+    if tls.host_sp.get().is_null() {
+        let rec = unsafe { &*(*exception_info).ExceptionRecord };
+        diag_raw_print(b"[diag_null_host_sp] tid_hash=0x", std::process::id() as usize, b" code=0x", rec.ExceptionCode as usize);
+    }
     if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
         let depth = tls.veh_depth.get();
         if depth > 1 {
