@@ -519,7 +519,15 @@ impl TarIndex {
                     let file_idx = files.len();
                     files.push(IndexedFile {
                         data_range: content_start..content_end,
-                        mode: mode_of_modeflags(header.mode.to_flags().unwrap()),
+                        // A malformed octal mode field (e.g. from a tar repacked by a tool that
+                        // doesn't preserve Unix permission bits faithfully) must never panic the
+                        // whole process -- fall back to a permissive rwxrwxrwx default rather
+                        // than aborting, matching `owner_from_posix_header`'s own fallback for an
+                        // unparseable uid/gid just above.
+                        mode: header
+                            .mode
+                            .to_flags()
+                            .map_or(DEFAULT_DIR_MODE, mode_of_modeflags),
                         owner: owner_from_posix_header(header),
                         node_info: inode_allocator.next(),
                     });
@@ -697,8 +705,12 @@ fn mode_of_modeflags(perms: tar_no_std::ModeFlags) -> Mode {
 }
 
 fn owner_from_posix_header(posix_header: &tar_no_std::PosixHeader) -> UserInfo {
+    // A malformed or out-of-range octal uid/gid field (e.g. a tar repacked by a tool that writes
+    // a large host-derived numeric id rather than a genuine small Unix uid) must never panic the
+    // whole process -- fall back to uid/gid 0 (root), matching how a well-behaved tar reader
+    // degrades on an unparseable owner field instead of aborting.
     UserInfo {
-        user: posix_header.uid.as_number().unwrap(),
-        group: posix_header.gid.as_number().unwrap(),
+        user: posix_header.uid.as_number().unwrap_or(0),
+        group: posix_header.gid.as_number().unwrap_or(0),
     }
 }
