@@ -1942,6 +1942,20 @@ fn run_thread_inner(
         .guest_context_top
         .set(std::ptr::from_mut(ctx).wrapping_add(1));
 
+    // Diagnostic only (LITEBOX_DIAG_TLS_ADDR): print this thread's own TlsState address to check
+    // for cross-thread TlsState address collisions -- see AGENTS.md's "DEFINITIVE (4th pass)"
+    // entry, which found the earlier watchpoint captures never actually observed a second thread.
+    if std::env::var_os("LITEBOX_DIAG_TLS_ADDR").is_some() {
+        eprintln!(
+            "[diag-tls-addr] pid={} tid={:?} tls_state={:p}",
+            std::process::id(),
+            std::thread::current().id(),
+            &tls_state,
+        );
+        use std::io::Write;
+        let _ = std::io::stderr().flush();
+    }
+
     let mut thread_ctx = ThreadContext {
         shim,
         ctx,
