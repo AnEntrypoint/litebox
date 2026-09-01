@@ -2876,6 +2876,37 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     let tls = unsafe { &*get_tls_ptr().expect("TLS not initialized") };
     assert!(!tls.is_in_guest.get());
 
+    // A `ctx.rip`/`ctx.rsp` that falls outside the guest's own valid address range must never
+    // reach either resume path below -- both end in an unconditional jump/stack-adoption with no
+    // further checks, so a corrupted value here (e.g. a small integer like `2` that leaked in
+    // from unvalidated guest-memory state during `sigreturn`, or any other not-yet-discovered
+    // source) would otherwise silently jump/switch onto it, producing a fault whose own exception
+    // frame the CPU cannot even push (once `rsp` itself is the bad value), which this project's
+    // exception-table recovery is then structurally unable to help with -- live-captured this
+    // session as an infinite identical-`rip` retry loop culminating in a genuine host stack
+    // overflow (see AGENTS.md's 72nd/73rd/74th passes) rather than an ordinary guest-visible
+    // SIGSEGV. Fail loudly and immediately here instead: a real Linux kernel would deliver SIGSEGV
+    // to a userspace program that corrupts its own signal frame this way rather than crash the
+    // kernel itself; this project does not yet synthesize that signal at this choke point (a
+    // follow-up), but a diagnostic panic that unambiguously names the corrupted register and its
+    // value is a strict improvement over the current silent, unrecoverable, hard-to-diagnose
+    // cascade.
+    {
+        use litebox::platform::PageManagementProvider;
+        let task_min = <WindowsUserland as PageManagementProvider<0x1000>>::TASK_ADDR_MIN;
+        let task_max = <WindowsUserland as PageManagementProvider<0x1000>>::TASK_ADDR_MAX;
+        let rip_ok = (task_min..task_max).contains(&ctx.rip);
+        let rsp_ok = (task_min..task_max).contains(&ctx.rsp);
+        assert!(
+            rip_ok && rsp_ok,
+            "switch_to_guest: refusing to resume with an implausible guest address \
+             (rip={:#x} rip_ok={rip_ok} rsp={:#x} rsp_ok={rsp_ok}, valid range {task_min:#x}..{task_max:#x}) -- \
+             this would otherwise jump/switch onto a corrupted value with no further checks",
+            ctx.rip,
+            ctx.rsp,
+        );
+    }
+
     // Restore fsbase for the guest.
     WindowsUserland::restore_thread_fs_base();
 
