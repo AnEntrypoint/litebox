@@ -423,21 +423,24 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             return Err(DeliverFault);
         }
 
-        // Pass-29 diagnostic: the long-running `rip == 0` crash investigation (see FINDINGS.txt)
-        // established the guest branches to address 0 under its own power. `write_signal_frame`
-        // (x86_64.rs) sets `ctx.rip = action.sigaction` directly from caller-supplied dispositions
-        // with no validation; `action.sigaction == 0` is supposed to be structurally impossible
-        // here (the `SIG_DFL`/`SIG_IGN` match arms in `process_signals` are meant to intercept it
-        // before `deliver_signal` is ever called), but has never been empirically confirmed never
-        // to happen. Gated behind the `error!` log level (already filterable/cheap when disabled)
-        // rather than an env var, since this crate is `no_std` and has no direct env access; this
-        // is the cheapest possible falsification of the "signal delivery hands the guest a null
-        // handler" hypothesis.
-        if action.sigaction == 0 {
+        // The long-running "guest branches to an implausible rip" crash investigation (see
+        // FINDINGS.txt / AGENTS.md's 66th pass) live-captured `ctx.rip == usize::MAX` immediately
+        // after a signal delivery -- `write_signal_frame` (x86_64.rs) sets `ctx.rip =
+        // action.sigaction` directly from a caller-supplied disposition with no validation, and
+        // `switch_to_guest`'s resume trampoline (`jmp rcx`) then jumps to that value
+        // unconditionally. `SIG_DFL` (0) and `SIG_IGN` (1) are supposed to be intercepted by
+        // `process_signals`'s own match arms before `deliver_signal` is ever called, and
+        // `SIG_ERR` ((void*)-1 = `usize::MAX` in glibc/musl) should never be installed as a real
+        // handler by a well-behaved guest -- but none of that was ever actually enforced here, so
+        // a guest that races `sigaction()`/`signal()` or mishandles `SIG_ERR` can hand this code a
+        // non-function-pointer sentinel that gets jumped to as-is. Reject every disposition value
+        // that is not a real handler address rather than only diagnosing the `0` case.
+        if matches!(action.sigaction, 0 | 1 | usize::MAX) {
             litebox_util_log::error!(
-                signal:? = signal;
-                "[diag-rip0-sigdeliver] delivering signal with sigaction==0 (should be unreachable: SIG_DFL/SIG_IGN ought to have intercepted this in process_signals)"
+                signal:? = signal, sigaction:? = action.sigaction;
+                "signal delivery: rejecting implausible sigaction handler address (SIG_DFL/SIG_IGN/SIG_ERR reaching deliver_signal, which should be unreachable)"
             );
+            return Err(DeliverFault);
         }
 
         self.write_signal_frame(
