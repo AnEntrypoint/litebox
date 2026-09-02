@@ -3697,6 +3697,51 @@ kernel-debugger the user separately approved earlier in this pass. This is a leg
 point for this pass -- verifying/fixing this regression further without a reboot has hit
 diminishing returns after exhausting every code-level hypothesis.
 
+## 251st pass: root-caused pass 250's "environmental regression" -- it was NEVER a litebox bug, a Windows state issue, or anything the reboot could have fixed. MSYS2/Git Bash was silently auto-translating the Unix-style /bin/true PROGRAM ARGUMENT into a real Windows path (C:/Program Files/Git/usr/bin/true) before it ever reached the litebox exe, which then correctly reported ENOENT for that nonsensical path inside the guest tar. Fixed by adding MSYS2_ARG_CONV_EXCL="*" to every invocation (already known and applied to --resume-from earlier this session, but not previously realized to also apply to the bare PROGRAM_AND_ARGUMENTS positional argument)
+
+Added a temporary diagnostic (`eprintln!("[diag-load] prog_path={prog_path:?}")` plus a richer
+panic message) immediately before the `load_program(...).unwrap()` call pass 250 identified as
+the exact panic site. Rebuilt and reran the identical repro that had failed 100% deterministically
+across dozens of attempts (including after the user-approved reboot): `LITEBOX_LOG=error
+litebox_runner_linux_on_windows_userland.exe -Z --initial-files alpine-rootfs.tar -- /bin/true`.
+
+**The diagnostic immediately revealed the real cause**: `prog_path="C:/Program Files/Git/usr/bin/true"`
+-- MSYS2's own argv path-translation heuristic (any argument that LOOKS like a Unix path gets
+silently rewritten to its Windows equivalent before the child process ever sees it) was rewriting
+the bare `/bin/true` program argument itself, not just flag values. `litebox_runner_linux_on_windows_userland.exe`
+then correctly tried to open that nonsensical Windows-style path INSIDE the guest tar's own
+filesystem and correctly got `ENOENT` -- every part of litebox's own behavior here was completely
+correct; the bug was entirely in how this session's own Bash tool was invoking it.
+
+**Fix verified immediately**: prefixing the exact same command with
+`MSYS2_ARG_CONV_EXCL="*"` (this session's own established fix for exactly this MSYS2 quirk,
+already applied to `--resume-from` path values much earlier in this investigation's history, but
+never previously connected to also being necessary for the bare positional PROGRAM_AND_ARGUMENTS
+argument) immediately fixed it: `prog_path="/bin/true"`, clean `EXIT=0`.
+
+**Root-cause correction to pass 250's own conclusion**: the "environmental regression" pass 250
+spent an entire pass exhaustively investigating (ruling out tar corruption, this session's own
+VEH code changes, stale builds, a different tar, env var pollution, Defender, stale processes)
+and ultimately escalated to a full system reboot to diagnose was NEVER a real regression in
+litebox, Windows, or this session's own environment at all -- it was a Bash argv-translation
+artifact that happened to start firing (or was always firing, and pass 249's own successful runs
+happened to route through a DIFFERENT code path -- e.g. `--resume-from`'s own script-file
+argument, itself also MSYS2-mangled but tolerated differently, or simply luck in which exact
+`PROGRAM_AND_ARGUMENTS` value was used) at some point before pass 250 began testing bare
+`/bin/true` invocations directly. The reboot itself was NOT the fix (confirmed: the SAME bare
+`/bin/true` command, unprefixed, still failed identically immediately after rebooting) -- the fix
+was purely `MSYS2_ARG_CONV_EXCL="*"`. This is an important correction for any future session:
+`MSYS2_ARG_CONV_EXCL="*"` should be treated as a MANDATORY prefix for every single
+litebox_runner_linux_on_windows_userland.exe invocation from this Bash tool, not just ones
+passing `--resume-from`, to avoid this exact multi-hour false-alarm investigation recurring.
+
+**Diagnostic removed after root-causing** (reverted the `eprintln!`/richer-panic addition,
+confirmed `git diff` clean, rebuilt) -- this was a temporary investigation aid, not a real fix,
+and the underlying litebox code needed no change at all. Reviewing memory files is warranted
+here (per the user's own explicit reminder this pass, "any of our memories could potentially be
+wrong about something") since a stale memory entry may still claim `MSYS2_ARG_CONV_EXCL` is only
+needed for `--resume-from` specifically -- broaden that going forward to "every invocation."
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash
