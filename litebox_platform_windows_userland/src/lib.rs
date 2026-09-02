@@ -5473,8 +5473,18 @@ impl ConsoleStdinReader {
                 ready: std::sync::Condvar::new(),
                 eof: core::sync::atomic::AtomicBool::new(false),
             };
+            // Same-sized as every other guest-work-capable thread (see the sibling
+            // `litebox-console-resize-watcher` thread's own stack-size fix, above in this file, for
+            // why): this thread's blocking `ReadFile` loop can be interrupted and its underlying OS
+            // thread reused to service a real guest syscall (via `syscall_callback`) once the loop
+            // returns/exits, and Rust's plain default stack is undersized for that -- observed live
+            // (pass 170, this investigation) as the same class of bug manifesting in a DIFFERENT
+            // lazily-spawned background thread (`sys_write`'s own prologue faulting on a plain
+            // stack-relative store under heavy `fork_verify` load).
+            const GUEST_THREAD_STACK_SIZE: usize = 32 * 1024 * 1024;
             std::thread::Builder::new()
                 .name("litebox-console-stdin-reader".to_owned())
+                .stack_size(GUEST_THREAD_STACK_SIZE)
                 .spawn(move || Self::reader_thread_body(platform))
                 .expect("failed to spawn console stdin reader thread");
             reader
