@@ -631,8 +631,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let mask = mask_ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
 
         let old_mask = self.signals.blocked.get();
+        litebox_util_log::warn!(
+            tid:% = self.tid, has_pending_before:% = self.has_pending_signals();
+            "drm-diag: sigsuspend before sleep"
+        );
         self.signals.set_signal_mask(mask);
         let result = self.wait_cx().sleep();
+        litebox_util_log::warn!(tid:% = self.tid; "drm-diag: sigsuspend after sleep");
         self.signals.set_signal_mask(old_mask);
         match result {
             litebox::event::wait::WaitError::Interrupted => Err(Errno::EINTR),
