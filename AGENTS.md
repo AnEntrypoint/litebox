@@ -3228,6 +3228,61 @@ to non-CET causes of the same general "context/stack invariant violated before a
 class (still the leading theory from pass 234's own web research, just not via THIS specific
 Windows 11 security feature).
 
+## 240th pass: MAJOR BREAKTHROUGH -- reducing logging verbosity (LITEBOX_LOG=error instead of warn) changed the race's timing enough to reach FAR further than any prior capture (t=15.4s with weston fully configured and Xwayland compiling keymaps, vs. the usual ~37-39s crash point) AND captured the clearest evidence yet: the corruption cascade begins at the EXACT SAME moment CLAIMED_RANGES.try_lock() genuinely FAILS (contended by another thread) for the first time this whole investigation, strongly implicating a lock-contention/reentrancy interaction as the trigger, not a purely-random race
+
+**Reduced-overhead discovery**: this whole investigation has repeatedly noted that diagnostic
+logging overhead changes this bug's own timing (pass 205's own doc comments, `LITEBOX_VEH_TRACE`
+warnings). Tested this directly and deliberately for the first time: launched the real `--gui`
+XFCE session with `LITEBOX_LOG=error` (suppressing all `WARN`-level chatter, keeping only
+`ERROR`). Result: the FIRST such run reached **t=15.4s** with weston's DRM backend fully
+initialized (`Using Pixman renderer`, `DRM: head 'Virtual-1' found`, `Loading module
+'/usr/lib/weston/desktop-shell.so'`, `launching '/usr/libexec/weston-keyboard'`) and Xwayland
+actively compiling keymaps -- genuinely further, faster, and cleaner than any capture across
+this whole multi-session investigation's history (every earlier capture crashed or stalled in
+the 37-42 second range under normal `warn`-level logging). A second run with the same config
+reached even further (weston-desktop-shell launching, `begin()` call #21) before finally hitting
+the fault.
+
+**The clearest fault capture yet, with a genuinely new clue**: this second run's own crash trace
+shows, immediately preceding the whole-CONTEXT-corruption cascade (`rip=0, rsp=-1,
+rbp=0xc0000008`, matching pass 237's own earlier capture), a `[diag-fv-count]` line reading
+`claimed_ranges=18446744073709551615` (`0xFFFFFFFFFFFFFFFF` = `usize::MAX`). Traced this to its
+own source (`fork_verify.rs` line 2428-2431): `CLAIMED_RANGES.try_lock().map(...).unwrap_or(
+usize::MAX)` -- a deliberate sentinel meaning "the lock was contended, `try_lock` failed" (NOT a
+counting bug -- the `.unwrap_or(usize::MAX)` fallback is intentional, documented as "a diagnostic
+must never risk deadlocking"). **This is nonetheless the FIRST time this whole investigation has
+captured `CLAIMED_RANGES`'s mutex genuinely being held by another thread at the exact moment
+`begin()` runs, and it occurs at literally the SAME `begin()` call (#21) where the fatal
+corruption cascade starts on this same thread's very next captured event.**
+
+**This is a strong, concrete, newly-actionable lead**: if the SAME thread (or a thread whose
+exception handling interacts with this one) is holding `CLAIMED_RANGES`'s lock via
+`allocate_pages`'s own `Replace`-mode critical section (`_fixed_addr_guard`, a SEPARATE lock,
+but `claim_range` itself also locks `CLAIMED_RANGES` internally -- see `lib.rs`'s own
+`claim_range`/`find_foreign_claim` functions) at the exact moment a fault handler needs to run
+on this thread (or a thread it's about to context-switch with), and Windows' own exception
+delivery/unwind machinery ends up needing state that's locked out, that is a genuine, real
+lock-ordering hazard consistent with EVERY symptom this investigation has captured: it explains
+why the corruption is timing-sensitive (lock contention is inherently timing-dependent), why
+reducing logging overhead changes the outcome (logging itself does allocation/locking that
+perturbs exactly this kind of race), and why the corruption is so total (a thread resuming
+mid-critical-section with an inconsistent view of shared state, not a single bad pointer).
+
+**Concrete next step for a future pass**: audit every code path that can run DURING or
+IMMEDIATELY AFTER a `CLAIMED_RANGES`-holding critical section (`claim_range`,
+`find_foreign_claim`, `find_live_stack_overlap`, `release_all_claims_for_current_thread`, this
+session's own `reclaim_ranges_for_fork_child`) for whether ANY of them can be re-entered (via a
+nested exception on the SAME thread while the lock is already held) or can race a DIFFERENT
+thread's own exception-handling path that also needs this lock's protected state to resume
+correctly -- this is now the single most concrete, evidence-backed lead in the whole
+investigation's history, well ahead of the earlier CET/RSP-invariant/dbus-serialization
+hypotheses, all of which lacked this level of direct correlation with the actual fault moment.
+
+**Also recorded**: `LITEBOX_LOG=error` should become this project's own STANDARD launch
+configuration for further live XFCE testing going forward -- it reaches much further into the
+startup sequence than the previously-default `warn` level, giving any future debugging session
+a meaningfully better repro to work from.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
