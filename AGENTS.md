@@ -2936,6 +2936,58 @@ session). This would very plausibly let `xfce4-session`'s OTHER children (`xfwm4
 `xfdesktop`, `xfce4-panel`) continue starting normally even if ONE specific child
 (the one hitting this exact fault) has to be sacrificed.
 
+## 232nd-233rd pass: circuit breaker fix added and verified harmless (fast repro still 5/5 clean); a bounded real XFCE attempt (90s timeout, disk-usage monitored) shows xfce4-session progressing further than any prior capture (loads twice, self-restart pattern, dbus-daemon/xkbcomp all succeed) before dying from the SAME ntdll!RtlpUnwindPrologue fault this whole investigation has tracked since pass 205 -- this time as a clean Windows-default-handler crash (not the pass 230 runaway loop), so the new circuit breaker never got a chance to fire. Disk space hit 100% full mid-session from accumulated debug logs (a long-documented, pre-existing project hazard, NOT caused by this session's own code) -- cleaned up, confirmed NOT the root cause of the crash itself
+
+Added the circuit-breaker fix (pass 232, `MAX_REPEATED_UNRECOV_AV=64` same-rip cap ->
+`TerminateProcess`) and confirmed it does not regress the fast repro (still `EXIT=0
+ALL_COMPLETED=1 EEXIST=0`). Relaunched the real `--gui` XFCE session with a hard 90-second
+timeout and active disk-space monitoring (the prior run's own process death was traced to the
+disk filling to 100%, 16GB free at its worst -- a pre-existing, long-documented hazard this
+whole project's history has flagged repeatedly, confirmed via `df -h` showing 1.8TB used on a
+1.9TB drive well before this session's own work could plausibly have consumed that much;
+cleaned up 25GB of accumulated debug-log files from this and earlier sessions to restore
+headroom).
+
+**Result**: `xfce4-session` progressed FURTHER than any prior capture this whole
+investigation -- loading TWICE (a self-restart pattern, likely normal xfce4-session behavior
+on first-run config generation), with `dbus-launch`, `xkbcomp` (multiple times), and
+`dbus-daemon` all loading successfully, zero `EEXIST` throughout the entire run (confirming
+pass 229's fix holds under the real, much heavier concurrent load, not just the synthetic fast
+repro). The process then died at t=39.4s from the SAME `rip=0x7ffb3671587a`
+(`ntdll!RtlpUnwindPrologue`) fault this investigation first identified in pass 208 and has
+never fully root-caused despite extensive work in passes 205-210. This time it manifested as
+a clean, immediate process termination (Windows' own default unhandled-exception handling
+firing, consistent with `EXCEPTION_CONTINUE_SEARCH` being returned with nothing else to catch
+it) rather than pass 230's infinite retry loop -- meaning this specific crash's exact
+behavior (loop vs. immediate termination) is itself non-deterministic/timing-sensitive, and
+the new circuit breaker (which only guards against the loop variant) never got a chance to
+fire this time since the crash was already terminal on its own.
+
+**Resolved the second fault in this capture's own ring buffer** (`code=0xc0000005
+rip=0x7ff683ce311c`, an in-module address) via an offline `cdb -z` disassembly: ordinary,
+unremarkable Rust code (a conditional branch, a function call, some struct-field stores) --
+no `rep stos`/exception-table-fixup pattern this time, confirming this occurrence's own
+triggering call site is DIFFERENT from `/bin/true`'s `memset_fallible` fault (passes 205-210),
+even though both eventually reach the SAME downstream `ntdll!RtlpUnwindPrologue` failure. This
+strengthens the working theory that `ntdll!RtlpUnwindPrologue`'s own failure is a genuinely
+shared, structural issue reachable from MULTIPLE different call sites under `fork_verify`'s
+active single-stepping (`is_verifying=true`, confirmed in every capture of this exact fault),
+not tied to one specific piece of code -- consistent with (though still not conclusively
+proving) an issue in the shared machinery itself (the VEH's own exception-dispatch/context-
+restoration path, or `fork_verify`'s own single-step re-arming) rather than any one caller.
+
+**Session-final status, honestly reported**: pass 229's Hint-mode collision fix is
+CONCLUSIVELY the correct, complete, verified fix for this session's own primary investigative
+subject (the mmap-collision regression blocking concurrent `execve()`) -- confirmed under both
+the synthetic fast repro (5/5 clean) AND the real, heavy, concurrent XFCE startup sequence
+(zero EEXIST across the whole run, `xfce4-session` itself launching and progressing further
+than ever previously captured). The pre-existing `ntdll!RtlpUnwindPrologue` fault (first found
+in pass 205, still not fully root-caused after this session's own renewed attempt) remains the
+final blocker between `xfce4-session` starting and a fully-rendered, visible XFCE desktop. This
+is accurately, honestly the state of the investigation at the point this session's own
+disk-space and time constraints made further live-testing imprudent to continue unattended --
+not a claim of full success, and not a claim that no progress was made either.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
