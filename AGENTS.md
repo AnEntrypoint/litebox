@@ -3092,6 +3092,35 @@ race entirely, as one of THIS pass's own three attempts nearly did) or a genuine
 `Rsp`/return-address invariants a later, unrelated unwind could violate) is the remaining path
 to a fully-rendered desktop.
 
+## 236th pass: THIRD distinct manifestation of the SAME unwind fault found -- a silent stall (process alive but making zero forward progress, no crash, no giveup, no further log output) at the exact same point in xfce4-session's own startup (right after dbus-daemon launches). Combined with pass 233's clean crash and pass 235's runaway-loop-then-giveup, this is now THREE different observed outcomes from what is very likely the exact same underlying race, all clustering at the identical point in xfce4-session's own second-stage init -- narrows the trigger location precisely even though the exact mechanism remains open
+
+Ran a second 150s retry of the identical, unmodified script. Result: survived the historical
+crash window (reached `dbus-daemon` at t=37.8s, `xfce4-session`'s second load at t=38s), hit
+ONE unrecov-av fault at t=38.3s (survived, no giveup this time), then the log simply stops --
+no further syscall activity, no crash marker, no circuit-breaker trigger -- yet `ps` confirmed
+the process was still alive right up until the full 150-second timeout elapsed. This is neither
+a clean crash (pass 233's outcome) nor a runaway loop caught by the circuit breaker (pass 235's
+outcome) -- it is a silent, permanent stall, a third distinct failure shape from what is very
+likely the same underlying issue.
+
+**All three of this session's own captures of "the process doesn't reach xfwm4/xfdesktop/
+xfce4-panel" cluster at the SAME narrow window**: immediately after `dbus-daemon` starts, during
+`xfce4-session`'s own second-stage initialization (its OWN internal re-exec/re-init sequence,
+evidenced by `xfce4-session` appearing TWICE in the `ElfLoader::new` trace every single capture
+this whole investigation has made). This is a real, precise, now well-triangulated location for
+a future pass to focus dedicated live-debugging effort on, rather than the broader "somewhere
+during a real XFCE session" framing this investigation started with.
+
+**Given three consecutive attempts today (60s, 150s, 150s) all failed to reach `xfwm4`/
+`xfdesktop`/`xfce4-panel`** (one hung past the crash point without crashing but also without
+progressing; one hit the runaway loop, caught safely by the circuit breaker; one stalled
+silently) -- while genuinely NON-DETERMINISTIC in its exact FAILURE MODE (crash vs. loop vs.
+stall), reaching xfce4-session's own children appears to be a much rarer, perhaps not-yet-
+observed outcome under this specific combination of binary/environment/timing. This session's
+own live-testing budget (disk space, time) is now genuinely exhausted for further blind
+retries -- the marginal value of another identical attempt is low given three consecutive
+misses at the same point. Concluding this session's live-testing phase here.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
