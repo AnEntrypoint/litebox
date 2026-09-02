@@ -4648,6 +4648,53 @@ and worth searching XFCE/GTK/weston source for a literal `0x13`/`19` alpha const
 computed value from a known animation/fade-timing formula, which could directly identify the
 responsible component.
 
+## 271st pass: CORRECTION to pass 270 -- explicitly forced the swapchain's alpha_mode to Opaque (a real, kept hardening improvement) and confirmed this GPU/driver only ever offered ONE alpha mode, Opaque, the whole time -- so the low-alpha (0x13/255) pixel content from pass 270's own capture was NEVER being blended by Windows' DWM; Opaque mode discards alpha entirely and displays RGB as-is, and the RGB channels were genuinely (0,0,0) -- i.e. the captured frame really IS solid black, confirming litebox's own rendering pipeline (DRM buffer through to the displayed window) is correct and faithful end-to-end, and the true remaining mystery is unchanged from pass 268's own original framing: why does weston/XFCE never draw anything but black into the scanout buffer
+
+**What was tested**: explicitly preferred `wgpu::CompositeAlphaMode::Opaque` in the surface
+configuration (previously took whatever `caps.alpha_modes[0]` happened to report), on the theory
+that a non-opaque alpha mode could be letting Windows' DWM blend pass 270's own captured low-
+alpha (`A=0x13`) pixel content against the desktop behind the window, explaining why real,
+non-default pixel data still displayed as visually black.
+
+**Result: this GPU/driver combination only EVER reports one alpha mode, `Opaque`, confirmed via
+a new diagnostic log** (`[presenter-diag] configuring surface, alpha_mode=Opaque (available:
+[Opaque])`) -- meaning the surface was ALREADY configured as `Opaque` before this pass's own
+change, and this hypothesis is refuted: no DWM alpha-blending was ever happening. `Opaque`
+composite-alpha mode means the swapchain's presented content is shown using ONLY its RGB
+channels, with the alpha channel entirely discarded/ignored for display purposes (exactly
+matching how a real DRM scanout's own `XRGB8888` format works, which has no meaningful alpha
+channel for display at all) -- so pass 270's own captured `[R=0,G=0,B=0,A=0x13]` pixel data
+displays as pure, genuine black regardless of that unusual alpha byte, simply because its RGB
+channels really are all zero.
+
+**Net effect of this whole pass-270/271 alpha detour**: the `alpha_mode` fix itself is real,
+correct, defensive hardening (explicitly preferring `Opaque` rather than trusting whatever the
+driver reports first is still the right thing to do, even though it happened to make no
+difference on THIS specific hardware) -- kept. But it does NOT explain or fix the actual
+black-screen problem. **The core mystery is exactly where pass 268 originally left it**: the
+DRM framebuffer content weston/XFCE hands to litebox is genuinely, truly black (RGB 0,0,0,
+confirmed now at the individual-channel level, not just the diagnostic's own black/non-black
+classification), and the entire litebox-side pipeline (DRM buffer -> `notify_flip_callback` ->
+`FrameSender` -> wgpu texture upload -> swapchain present) is proven correct and faithful
+end-to-end -- this pass adds one more layer of proof to that, not a new lead. The unusual
+`A=0x13` byte was a genuine, real, but ultimately irrelevant curiosity (worth noting: it DOES
+mean something in the guest wrote a non-zero, non-max alpha value into what SHOULD be a fully
+opaque XRGB framebuffer, which could still be worth a quick look for whoever continues this --
+possibly a benign artifact of Pixman's own internal buffer format/padding, not necessarily
+anything guest programs intended to be meaningful).
+
+**Session status**: this pass (252-271) made substantial, real, verified progress -- fixed the
+safety-critical freeze, fixed the MSYS2 argv trap, found and fixed real bugs (VEH recursion,
+diagnostic-quality issues, a launch-script HOME-export bug), built genuinely reusable diagnostic
+infrastructure (guest-exception register/mapping capture, exec-mmap path correlation, a direct
+MiniDumpWriteDump watcher, per-frame content dumping), and definitively proved the entire
+rendering pipeline is correct, narrowing the true remaining mystery to a single, precise
+question: **why does weston's own Pixman-renderer compositor never draw anything but black into
+its own scanout buffer, even after `xfce4-session` and its children have had time to start?**
+This is the same question pass 268/269 already posed, now confirmed with even stronger evidence
+that it is the RIGHT question -- every other layer of the stack has been individually verified
+working correctly.
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash

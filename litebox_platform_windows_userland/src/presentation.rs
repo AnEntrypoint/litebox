@@ -560,7 +560,28 @@ impl ApplicationHandler for PresenterApp {
         // guarantees this); no measured need for `Immediate`/`Mailbox`'s lower latency in this
         // module's own use case (a guest's DRM page-flip rate, not a real-time renderer).
         let present_mode = wgpu::PresentMode::Fifo;
-        eprintln!("[presenter-diag] configuring surface");
+        // AGENTS.md pass 270: this previously took `caps.alpha_modes[0]` -- whatever alpha mode
+        // the GPU/driver happens to report FIRST, with no preference for `Opaque`. Live evidence
+        // (a real weston/XFCE frame captured via `LITEBOX_DUMP_FRAMES`, byte-inspected directly)
+        // showed genuine, distinct, non-default pixel content (uniform RGB=0 with a low but
+        // non-zero alpha, 0x13/255) being copied into this surface correctly by `present()`'s own
+        // plain `copy_texture_to_texture` (which does not itself blend), yet appearing visually
+        // black in the actual displayed window -- consistent with the SURFACE ITSELF being
+        // configured in a non-opaque alpha mode, letting Windows' own compositor (DWM) blend the
+        // low-alpha content against whatever is behind the window instead of showing it as-is.
+        // `Opaque` is what a real DRM scanout always is (the whole reason DRM's own dumb-buffer
+        // format doesn't even carry a meaningful alpha channel for display purposes -- `XRGB8888`,
+        // not `ARGB8888`) -- explicitly prefer it here, falling back to whatever the GPU actually
+        // offers only if `Opaque` genuinely isn't supported (extremely unlikely on any real
+        // Windows GPU/driver, but `caps.alpha_modes` is not guaranteed non-empty of `Opaque`
+        // specifically by the wgpu spec).
+        let alpha_mode = caps
+            .alpha_modes
+            .iter()
+            .copied()
+            .find(|m| *m == wgpu::CompositeAlphaMode::Opaque)
+            .unwrap_or(caps.alpha_modes[0]);
+        eprintln!("[presenter-diag] configuring surface, alpha_mode={alpha_mode:?} (available: {:?})", caps.alpha_modes);
         surface.configure(
             &device,
             &wgpu::SurfaceConfiguration {
@@ -570,7 +591,7 @@ impl ApplicationHandler for PresenterApp {
                 height: size.height.max(1),
                 present_mode,
                 desired_maximum_frame_latency: 2,
-                alpha_mode: caps.alpha_modes[0],
+                alpha_mode,
                 view_formats: vec![],
             },
         );
