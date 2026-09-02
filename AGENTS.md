@@ -4402,6 +4402,65 @@ to un-instrumented runs). The `xfce-layer-sw.tar` resume-from tar now also carri
 a real, reusable alternative to the crash-prone `desktop-shell.so` path, ready for any future
 session to build on directly.
 
+## 266th pass: fixed the WER-escape-hatch's own re-entrant RaiseFailFastException recursion (bailing out of the VEH immediately for STATUS_STACK_BUFFER_OVERRUN), built a proper direct-MiniDumpWriteDump watcher tool (bypassing WER entirely) to get real symbolicated thread stacks -- and discovered the actual remaining blocker is NOT a crash at all in the run this pass captured: it is a SILENT STALL, with one guest thread legitimately blocked in wait_for_exit() (waiting for a child process that never exits) and the whole process otherwise idle -- real, concrete, symbolicated evidence obtained for the first time, but the exact cause (a genuine deadlock vs. correct-but-slow behavior) is not yet conclusively determined
+
+**Fixed a real bug in this pass's own earlier-built tooling**: `LITEBOX_DIAG_ALLOW_WER`'s
+`RaiseFailFastException` call (pass 246) was being intercepted by litebox's own VEH and
+recursing back into itself instead of ever reaching Windows' crash-reporting path (re-confirmed
+this pass, matching pass 248's original finding). Added an unconditional, first-line bailout in
+`vectored_exception_handler` for the fail-fast exception code (`STATUS_STACK_BUFFER_OVERRUN`,
+`0xC0000409`) via `EXCEPTION_CONTINUE_SEARCH`, restoring the "non-interceptable by ordinary SEH/
+VEH" semantics real Windows code relies on. This stopped the pure-recursion pattern (confirmed:
+only 1-2 discrete `RaiseFailFastException` calls per run afterward, not dozens), but WER STILL
+never captured a dump on this system even with the recursion fixed and the WER LocalDumps
+registry key confirmed correctly configured throughout -- concluded (with the user's explicit
+approval to pivot rather than keep debugging WER specifically) that `RaiseFailFastException`/WER
+integration is not reliably reachable in this environment for reasons not further diagnosed this
+pass, and moved to a more direct tool instead.
+
+**Built and used a genuinely reliable capture tool**: a PowerShell watcher
+(`dump_watcher2.ps1`) that polls for the litebox process and calls `MiniDumpWriteDump` directly
+via P/Invoke, bypassing WER/RaiseFailFastException entirely. First version (2-second poll
+interval, full memory dumps) worked but produced 4.4GB-17.6GB dumps per snapshot (5 of them
+briefly dropped disk free space to 37GB before cleanup) -- too slow-to-analyze and too risky for
+repeated use. Second version (50ms poll interval, `MiniDumpNormal` mini dumps ~39MB each,
+keeping only the last 2) is the right shape for this: fast enough to poll tightly, small enough
+to be safe, and genuinely captures real, symbolicated (against the local `.pdb`) thread stacks.
+
+**What the capture actually showed, for the specific run captured**: this run did NOT crash
+within the observation window -- it went completely silent (no new log lines) after a routine
+`fixup_stale_elf_data_pointers` diagnostic at t=30s, with process memory flat (~7GB) for the
+following ~14 minutes until manually killed. The real, symbolicated thread-stack dump at that
+point shows 39 threads, the overwhelming majority correctly idle (GPU driver worker threads,
+Windows thread-pool workers, the presenter/GUI event loop correctly blocked in its own message
+pump). Two threads are directly relevant: one blocked in `litebox_shim_linux::syscalls::process::Process::wait_for_exit`
+(a guest process/thread waiting for a CHILD to exit -- i.e. a real guest `wait4()`/`waitpid()`
+call that has not yet returned), and one blocked in `is_signal_ignored`'s own `wait_until` path
+(a different, signal-related guest wait). **This could be entirely correct, expected behavior**
+(the launch script's own `xfce4-session & wait` shell construct legitimately blocks forever
+waiting for a long-running daemon, and `xfce4-session` itself may legitimately be idling
+correctly, just not yet producing visible output) OR it could be a genuine deadlock (a guest
+process waiting on a child that is itself stuck waiting on something upstream, forming a cycle) --
+this specific capture's own evidence does not distinguish between these two possibilities, since
+neither shows an obviously-corrupted register/stack value the way every prior crash capture this
+whole session found.
+
+**Assessment and next step**: this is a DIFFERENT observation from pass 264/265's own crash-class
+finding (this pass's run never hit that specific corruption signature at all, matching the
+established non-determinism every bug in this investigation has shown) -- it may be the SAME
+underlying issue manifesting as a silent hang instead of a crash on this particular run, or a
+genuinely separate, previously-unobserved failure mode. The `dump_watcher2.ps1` tool built this
+pass is real, reusable, disk-safe infrastructure -- the concrete next step for whoever continues
+this is to run several more repro attempts with it active, specifically looking for which guest
+PID/thread `wait_for_exit` is blocked on (add a targeted diagnostic logging the target PID at
+the call site, matching this whole session's own established pattern) to determine whether the
+awaited child is itself alive-but-stuck (real deadlock, worth finding its own root cause) or has
+actually already exited without its parent's wait ever being woken (a real litebox bug in the
+wake-on-child-exit signaling path, matching a DIFFERENT, much older bug this project's own
+history documents being fixed once already for a related but distinct symptom -- see the
+`sys_wait4`/`pid==-1` fix in `project_wgpu_gui_support.md`'s memory, worth checking whether an
+analogous gap exists for the `pid>0` specific-child-wait path this stall's own thread is using).
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash

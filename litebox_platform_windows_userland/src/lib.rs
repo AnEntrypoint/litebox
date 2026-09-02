@@ -481,6 +481,19 @@ fn faulting_instruction_has_fs_override(rip: usize) -> bool {
 unsafe extern "system" fn vectored_exception_handler(
     exception_info: *mut EXCEPTION_POINTERS,
 ) -> i32 {
+    // AGENTS.md pass 266: `RaiseFailFastException` (the LITEBOX_DIAG_ALLOW_WER escape hatch,
+    // pass 246) raises `STATUS_STACK_BUFFER_OVERRUN` (0xC0000409) specifically because real
+    // Windows treats it as non-continuable and non-interceptable by ordinary SEH/VEH handlers --
+    // it is meant to go straight to Windows' own crash-reporting (WER) path. Live captures
+    // (pass 248, confirmed again this pass) showed this VEH intercepting it anyway and recursing
+    // back into itself instead of ever reaching WER. Bail out immediately, before any other
+    // processing in this function, for exactly this one exception code -- restoring the
+    // "non-interceptable" semantics real Windows code relies on and letting the fail-fast path
+    // actually reach WER as intended.
+    if unsafe { (*(*exception_info).ExceptionRecord).ExceptionCode } == 0xC000_0409_u32.cast_signed()
+    {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     // See `WindowsUserland::init_thread_gs_base`'s doc comment: the same "Windows clears a
     // non-standard segment-base MSR under scheduling pressure" behavior already known and
     // repaired for `FS_BASE` plausibly affects `GS_BASE` too, and `GS_BASE` backs Windows' OWN
