@@ -2408,6 +2408,22 @@ fn arm_watchaddr_data() {
 /// Per-thread arm/disarm entry points, called through
 /// [`litebox::platform::ForkChildVerificationProvider`].
 pub(crate) fn begin(relocations: alloc::sync::Arc<litebox::mm::AddressRelocations>) {
+    // DIAG (this investigation pass): unconditional, process-wide counter of every `begin()`
+    // call (i.e. every `fork()` whose child reaches post-fork verification) -- confirmed live
+    // (AGENTS.md passes 199-200) that a plain, minimal `/bin/true & wait`-loop repro crashes
+    // fatally and deterministically on EXACTLY the 8th such fork, every single time, across both
+    // this session's pre- and post-fix binaries. Printed via raw `eprintln!` (already a proven,
+    // safe pattern elsewhere in this function) rather than the `litebox_util_log` macro, to avoid
+    // whatever caused an EARLIER, cross-crate counter attempt (pass 195) to introduce its own
+    // unrelated regression.
+    static DIAG_BEGIN_COUNT: core::sync::atomic::AtomicUsize =
+        core::sync::atomic::AtomicUsize::new(0);
+    let diag_begin_count =
+        DIAG_BEGIN_COUNT.fetch_add(1, core::sync::atomic::Ordering::SeqCst) + 1;
+    eprintln!(
+        "[diag-fv-count] tid={:?} begin() call #{diag_begin_count}",
+        std::thread::current().id(),
+    );
     if crate::diag_rip0_enabled() {
         eprintln!("[diag-fv] tid={:?} begin", std::thread::current().id());
     }
