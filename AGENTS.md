@@ -3199,6 +3199,35 @@ The mitigation attempted was reasonable and well-motivated but did not work; tha
 useful, ruled-out information for a future continuation, which should now focus on the
 CUMULATIVE-fork-count framing rather than any single specific process's own startup sequence.
 
+## 239th pass: web research surfaced CET (Control-flow Enforcement Technology) shadow-stack corruption as a plausible mechanism for the whole-CONTEXT-corrupted signature (rip=0, rsp=-1, rbp=NTSTATUS) -- checked directly and RULED IT OUT: neither the system nor this binary has CET/shadow-stack enabled
+
+Followed up on the qualitatively new whole-CONTEXT-corruption signature from pass 237
+(`rip=0x0`, `rsp=0xffffffffffffffff`, `rbp=0xc0000008`/`STATUS_INVALID_HANDLE`) with targeted
+web research. Found a real, externally-documented Windows mechanism that produces exactly this
+shape of corruption: CET (Control-flow Enforcement Technology) hardware shadow stacks --
+Windows 11's `RtlRestoreContext`/`NtContinue` path validates `Rip`/`Rsp` transitions against a
+separate, hardware-tracked shadow stack when CET is active for a process; a raw `context.Rip =
+<computed address>` write (exactly what `fork_verify`'s AV-path healing and this whole
+investigation's own recovery code does) bypasses the normal `call`/`ret` shadow-stack
+bookkeeping, and a LATER unwind/restore attempting to reconcile the real vs. shadow stack after
+such a bypass is a known Windows security-hardening failure class ("EXCEPTION_ON_INVALID_STACK",
+bug check `0x1AA`, confirmed via Microsoft's own documentation: "kernel stack pointer may have
+become corrupted during exception dispatch or unwind... due to stack corruption of a frame
+pointer").
+
+**Checked directly and RULED THIS OUT as the mechanism here**: `Get-ProcessMitigation -System`
+shows `UserShadowStack: NOTSET` (not forced at the OS level), and an offline `cdb -z !dh` PE-
+header dump of the actual release binary shows only `NX compatible` -- no CET/shadow-stack
+opt-in flag present in this binary's own `IMAGE_DLLCHARACTERISTICS_EX`. Since CET enforcement
+requires BOTH the OS policy AND the binary's own opt-in (or an OS-wide force-enable, also not
+set here), this specific, otherwise well-corroborated mechanism does not apply to this exact
+environment. **This is a genuine, valuable negative result** -- it closes off a concrete,
+externally-plausible explanation with direct evidence rather than leaving it as an open
+possibility, narrowing the remaining hypothesis space for whoever continues this investigation
+to non-CET causes of the same general "context/stack invariant violated before a later unwind"
+class (still the leading theory from pass 234's own web research, just not via THIS specific
+Windows 11 security feature).
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
