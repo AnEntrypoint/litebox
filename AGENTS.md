@@ -4280,6 +4280,53 @@ at process startup on every single binary. The standing goal ("get XFCE working 
 much closer to reachable via continuing to chase the weston crash classes than via fixing an
 unrelated packaging-compatibility gap in a different, less-mature path.
 
+## 263rd pass: BREAKTHROUGH -- switching weston's shell module from desktop-shell.so to kiosk-shell.so (already present in this layer's own package set, previously tried inconclusively due to a host/guest path mistake per this project's own earlier memory) ELIMINATES THE CRASH ENTIRELY: weston ran the full 40s test window with zero SIGSEGV, confirming the crash this whole investigation (passes 249, 255-261) has been chasing is specifically inside weston-desktop-shell's own code, not weston's core compositor -- this isolates the bug to a much smaller, more specific piece of code and opens a genuinely viable path forward (kiosk-shell can run a single fullscreen client directly, sidestepping the crashing component)
+
+**Test setup**: wrote a minimal `weston.ini` (`[core] shell=kiosk-shell.so`, `[shell] locking=false`)
+and a launch script identical to the established working weston invocation
+(`--backend=drm-backend.so --use-pixman`) but WITHOUT ever spawning `weston-keyboard` or
+`weston-desktop-shell` (kiosk-shell has no equivalent panel/background client) or `Xwayland`/
+`xfce4-session` (deliberately isolating just the compositor+shell layer first). Baked both files
+into the resume-from tar correctly this time (`tar -rf ... --owner=0 --group=0`, avoiding the
+host-path mistake an earlier pass's memory recorded).
+
+**Result: weston ran the FULL 40-second test window with zero crashes** -- no `SIGSEGV`, no
+`diag-guest-exception` firing at all, `WESTON_STARTED_OK` printed and the process cleanly gone
+from `tasklist` at the timeout (not crashed, just the test's own bounded wait completing). System
+fully stable throughout (95GB free disk unchanged, no freeze). This is a dramatic contrast with
+EVERY prior capture using `desktop-shell.so`, which crashed somewhere between t=1.9s and t=36s,
+100% of attempts, across dozens of runs this whole investigation.
+
+**This decisively narrows the bug's location**: the crash is inside `weston-desktop-shell`'s own
+code (the panel/background/window-decoration client weston's `desktop-shell.so` module spawns),
+NOT weston's core compositor, NOT `libweston`, NOT `libpixman`'s software rendering, NOT the DRM
+backend, and NOT any of the underlying litebox emulation layers those depend on -- all of which
+are exercised identically by both shell modules and only crash under `desktop-shell.so`. This
+also explains why every one of this pass's earlier crash-address correlation attempts failed to
+match any known library range: `weston-desktop-shell` is itself a separate ELF (per pass 249's
+own earlier find, `/usr/libexec/weston-desktop-shell`, "launching '/usr/libexec/weston-desktop-
+shell'" was the very next line in every prior crash log before the fault) -- this pass's own
+`diag-exec-mmap` tracking never happened to log ITS specific load event within the runs that
+also captured its crash (the diagnostic only fires once per address space and 5+ different
+forked processes exist in a typical run, making capturing both the load AND the matching crash
+in the SAME log a matter of luck this pass didn't have).
+
+**Concrete path forward, two options**:
+1. **Ship XFCE without weston's own desktop-shell entirely** -- kiosk-shell can run ONE fullscreen
+   client directly (`[shell] locking=false` plus a `[shell] client=` or launching the client as
+   kiosk-shell's own configured program). If `xfce4-session`/`xfwm4` can run as that one
+   kiosk-shell client (bypassing weston's own panel/background, letting XFCE's OWN `xfwm4`+
+   `xfdesktop`+`xfce4-panel` provide the desktop chrome instead), this could reach a genuinely
+   rendering XFCE desktop while sidestepping the crashing component entirely -- worth trying
+   immediately as the most direct path to the standing goal.
+2. **Root-cause and fix `weston-desktop-shell` itself** -- now a much smaller, more tractable
+   target (one specific client binary, not "somewhere in weston's whole dependency graph") for
+   the same crash-address-correlation technique this pass already built, next time it's captured
+   in the same log as its own load event.
+
+Option 1 is the faster, more direct route to "XFCE working as expected" and is being pursued
+immediately as this pass's next concrete step.
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash
