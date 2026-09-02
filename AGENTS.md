@@ -3404,6 +3404,108 @@ fix, logging-overhead reduction, 4-trial statistical batch, now process priority
 race condition has been probed from essentially every angle available without live-debugger
 access. The session's own final consolidated summary (below) stands as written.
 
+## 246th pass: NEW SESSION, MAJOR BREAKTHROUGH -- captured the first-ever real WER minidump of this crash (after diagnosing and fixing why WER never fired: the pass-232 circuit breaker called TerminateProcess directly, and EXCEPTION_CONTINUE_SEARCH alone caused infinite VEH re-delivery/stack overflow instead of reaching WER) and used it to find and fix a genuine bug in vectored_exception_handler_entry's own VEH_DEPTH_CAP fallback path (it never incremented veh_depth, so a fault recurring past the cap re-entered the full Rust handler UNBOUNDED on a guest stack with no swap, exhausting it) -- then captured a SECOND, cleaner dump revealing the true underlying fault for the first time ever: ntdll!RtlVirtualUnwind2 dereferencing an unconverted small-integer stack-offset accumulator (r8=0x21) as a pointer while unwinding a guest-emulated frame with no RUNTIME_FUNCTION/UNWIND_INFO entry
+
+**Context**: this pass began with the user explicitly approving two environmental additions
+(WER LocalDumps registry key, kernel debug boot mode via `bcdedit /debug on`) to get real
+diagnostic visibility into the long-standing, never-resolved `ntdll`-adjacent crash blocking
+XFCE. WER LocalDumps was configured immediately (registry path under
+`HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\litebox_runner_linux_on_windows_userland.exe`,
+DumpFolder under the user's local temp), and the kernel debugger's `bcdedit /debug on` was also
+set but requires a reboot this session deliberately avoided (disruptive), so all further work
+this pass used WER alone.
+
+**First obstacle discovered and fixed**: launching the real XFCE repro under the new WER config
+produced NO dump at all, despite the well-known crash occurring on schedule. Root cause: the
+pass-232 circuit breaker (`MAX_REPEATED_UNRECOV_AV`, added specifically to prevent unbounded
+disk-exhausting log growth) calls `TerminateProcess` directly once a fault repeats >64 times on
+the same `rip` -- a clean, deliberate exit that Windows' crash-reporting pipeline never sees.
+Added a `LITEBOX_DIAG_ALLOW_WER` env-var escape hatch to skip `TerminateProcess` on that path.
+First attempt (falling through to `EXCEPTION_CONTINUE_SEARCH` instead) caused the SAME fault to
+be re-delivered to the VEH over and over with no bound, and the process's own log showed
+`thread has overflowed its stack` -- worse than before, and still no dump. Switched the escape
+hatch to call `RaiseFailFastException` directly instead (the same WER-compatible fail-fast path
+Windows itself uses for unrecoverable corruption) -- this WORKED: a first real 38MB WER minidump
+was captured, after also switching `DumpType` from 2/full to 1/mini for speed (a full dump of
+this multi-hundred-MB process was taking so long the process outlived a 140s wait with no dump
+ever appearing).
+
+**First dump's root cause, and the REAL bug it revealed**: `!analyze -v`/`.ecxr` on the first
+dump showed the fault was NOT in Windows' own unwind machinery at all, but inside litebox's OWN
+code: `mov rax, [r14+r15*8]` at `litebox_runner_linux_on_windows_userland+0x271180`, with
+`r14=0xffffffffffffffff` (a poisoned/sentinel -1 value being read as a pointer) and `r15=0`.
+Full local-PDB symbol resolution (`cdb -y target\release`) identified this as inlined into
+`find_live_stack_overlap`/`vectored_exception_handler_entry`, and the call stack showed a tight,
+exact repeating 5-frame cycle (`find_live_stack_overlap` -> `vectored_exception_handler_entry`
+-> raw addresses -> repeat) recursing dozens of times with no host-stack swap in between.
+
+Traced this to `vectored_exception_handler_entry`'s own hand-written `naked_asm!` trampoline
+(lib.rs ~291-428): the trampoline's `.Lswap` path already has reentrancy protection via
+`veh_depth` (`TlsState::veh_depth`, capped at `VEH_DEPTH_CAP=512`) -- when depth reaches the cap,
+it jumps to a shared `.Lcall_here` label that calls the full Rust handler directly, WITHOUT
+swapping to the real host stack (deliberately, to avoid walking past committed memory). The bug:
+`.Lcall_here` also never incremented `veh_depth` on this path, so if the SAME fault recurs
+immediately after hitting the cap (exactly what a genuinely unrecoverable fault does), the depth
+check at the top of the trampoline reads the SAME stuck-at-cap value forever, taking this same
+uncapped path on every subsequent reentry -- calling the full Rust handler (large stack frames,
+RefCell/thread-local machinery) directly on whatever guest-address stack happens to be live,
+with no bound and no swap to a real, guard-page-protected stack. This exhausts the guest stack's
+own guard pages, and the Rust handler's writes past the exhausted stack corrupt arbitrary
+adjacent memory -- directly explaining both this session's own captured -1-as-pointer corruption
+AND the whole-CONTEXT corruption signatures (Rip=0/Rsp=-1/Rbp=NTSTATUS) documented since pass
+205 across the entire prior investigation history. This is very likely the actual root cause, or
+a major contributing cause, of the whole session's "still open" bug, finally identified via
+ground-truth post-mortem evidence instead of live-VEH inference.
+
+**Fix implemented**: split the shared `.Lcall_here` label into two: `.Lcall_here_startup` (the
+original, narrow, genuinely non-recursive `host_sp==0` early-startup case, unchanged behavior)
+and a new explicit cap-exceeded path that, instead of ever calling the full handler again, jumps
+straight to `.Lsearch` (`EXCEPTION_CONTINUE_SEARCH`) once `veh_depth >= VEH_DEPTH_CAP` -- bailing
+out of the recursive cascade entirely rather than ever risking another uncapped call on a
+non-swapped stack. Verified this builds cleanly.
+
+**Second dump, captured live against the real XFCE repro WITH this fix applied**: the process
+still crashed (~16s in, matching prior timing), but the crash's own character changed
+significantly: the error log shrank from over 13,000 lines (prior runaway recursion) to 248
+lines, and critically a WER minidump was captured automatically this time, with NO
+`LITEBOX_DIAG_ALLOW_WER` escape hatch needed at all, meaning the fix's `EXCEPTION_CONTINUE_SEARCH`
+bailout genuinely reaches Windows' own unhandled-exception path now instead of recursing
+forever. Analyzing this second, much cleaner dump revealed, for the first time in this entire
+multi-session investigation, the true underlying fault with full clarity: `ntdll!RtlVirtualUnwind2+0x199a`:
+`mov rcx, qword ptr [r8]` faults with `r8=0x21` (33 decimal) -- a small integer, not a real
+pointer. Disassembly of the surrounding `RtlVirtualUnwind2` code shows this value was
+accumulated at `[r14+0x98]` via a chain of `UWOP_ALLOC_SMALL`-class unwind-opcode processing
+(`add qword ptr [r14+98h], rcx` inside the `ecx==2` opcode-dispatch branch), then later read back
+from that same slot and used as a pointer (`lea rdx,[r14+98h]; mov r8,[rdx]; ... mov rcx,[r8]`)
+without ever being resolved to a real address first. Call stack:
+`KiUserExceptionDispatcher -> RtlWow64GetCurrentMachine+0x448 (inlined unwind-dispatch code) ->
+RtlVirtualUnwind2+0xfb9 -> RtlVirtualUnwind2+0x199a (fault)`. Confirmed via full-repo grep that
+litebox registers NO custom `RUNTIME_FUNCTION`/`UNWIND_INFO` tables of its own
+(`RtlAddFunctionTable`, `RtlInstallFunctionTableCallback` -- zero matches anywhere in the
+codebase) -- so this is Windows' own SEH second-pass unwind machinery attempting to walk a stack
+frame for which no valid unwind metadata exists at all (matching this investigation's own
+oldest finding, from early in a prior session: "no exception-table entry found" for exactly this
+class of guest-emulated frame), and RtlVirtualUnwind2's own internal opcode-processing logic
+mishandles that absent-metadata case by reading a stale numeric accumulator as if it were a
+resolved pointer.
+
+**Assessment**: this is very likely NOT a fixable bug on litebox's own side in the traditional
+sense (the fault is inside `ntdll.dll` itself, not litebox's code) -- the actual, addressable
+root cause is that a guest-emulated call frame reaches Windows' own exception-unwind path at all
+with no valid `RUNTIME_FUNCTION` entry describing it, which is what makes `RtlVirtualUnwind2`
+take this exact code path. The `.Lcall_here_startup`/depth-cap fix above is real, independently
+valuable hardening (confirmed to shrink the failure's own blast radius from over 13,000-line
+unbounded recursion to a clean, WER-visible 248-line single fault) and should be kept
+regardless. The next concrete, well-evidenced lead for a future session: identify which
+guest-emulated frame/call site lacks unwind metadata (the in-module addresses captured in the
+diag-unrecov-av-ring entries immediately preceding this fault are the concrete starting point)
+and either (a) register a synthetic `RUNTIME_FUNCTION`/`UNWIND_INFO` for it via
+`RtlAddFunctionTable`, giving Windows real unwind metadata to consume instead of falling into
+this codepath, or (b) prevent Windows' own SEH unwind from ever being invoked for a fault inside
+a guest-emulated frame in the first place (e.g. by having litebox's own VEH always fully
+handle/recover such faults without ever returning `EXCEPTION_CONTINUE_SEARCH` for them, since
+(a) is achievable and well-scoped while (b) is a larger architectural change).
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash
