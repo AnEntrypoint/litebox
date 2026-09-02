@@ -220,6 +220,31 @@ fn initialize_root_in_mem_layer<Platform: litebox::sync::RawSyncPrimitivesProvid
     });
 }
 
+/// A `tracing_subscriber` writer that flushes `std::io::stderr()` after every write.
+///
+/// Without this, `tracing_subscriber::fmt()`'s default writer goes through ordinary
+/// `std::io::stderr()`, which Rust's standard library block-buffers whenever stderr is NOT a
+/// live console (any redirected file, anonymous pipe, or `.NET`/other process-launcher capture)
+/// -- flushed only on process exit, never per line. Confirmed live: a `.NET`
+/// `Process`-redirected run received literally zero bytes of litebox's own log output over a full
+/// 30 real seconds of active, high-volume (`LITEBOX_LOG=debug`) logging, with the entire log only
+/// appearing once the process was killed. This is a SEPARATE code path from
+/// `litebox_platform_windows_userland`'s own raw-`WriteFile`-based guest-process stdout (already
+/// fixed for exactly this reason) -- that fix never covered litebox's OWN tracing output, which is
+/// the vast majority of every diagnostic capture this project's own investigations rely on.
+struct FlushingStderr;
+
+impl std::io::Write for FlushingStderr {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = std::io::stderr().write(buf)?;
+        std::io::stderr().flush()?;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stderr().flush()
+    }
+}
+
 /// Run Linux programs with LiteBox on unmodified Windows
 ///
 /// # Panics
@@ -231,6 +256,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     litebox_platform_windows_userland::install_memcpy_watch_from_env();
 
     tracing_subscriber::fmt()
+        .with_writer(|| FlushingStderr)
         .with_timer(tracing_subscriber::fmt::time::uptime())
         .with_level(true)
         .with_env_filter(
