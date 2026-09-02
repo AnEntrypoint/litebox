@@ -4498,6 +4498,64 @@ to the DRM/wgpu presentation pipeline specifically (confirmed working end-to-end
 synthetic test earlier this project's own history, per `project_wgpu_gui_support.md`, but never
 yet confirmed working for XFCE's own real Xwayland/X11-driven rendering path specifically).
 
+## 268th pass: DECISIVE FINDING -- fixed a real bug in the kiosk-shell launch script (HOME was never exported, so weston's own $HOME/.config/weston/weston.ini lookup silently failed and it fell back to desktop-shell.so every time despite passes 263/264 believing kiosk-shell was active; fixed via weston's own --config= flag, now deterministic), confirmed via litebox's own LITEBOX_DUMP_FRAMES diagnostic that real page-flips ARE occurring with real callback data reaching the presenter, but the frame content itself is non_black_pixels=0 at the raw DRM-buffer level -- i.e. weston's compositor is genuinely flipping frames, but nothing is ever actually being DRAWN/composited into the scanout buffer before the flip; this conclusively rules out the presenter/wgpu/window pipeline (proven correct, displaying exactly the all-black data it's given) and narrows the entire remaining investigation to weston's OWN compositing/repaint logic specifically
+
+**Real bug found and fixed in this session's own tooling**: `xfce_launch_kiosk2.sh` (pass 264)
+copied `weston_kiosk.ini` to `/root/.config/weston/weston.ini` but never exported `HOME`, so
+weston's own `$HOME`-relative config search silently found nothing and fell back to its DEFAULT
+shell (`desktop-shell.so`) every single time -- meaning passes 263/264's own reported "success"
+(reaching `xfce4-session` via kiosk-shell) may have been a coincidence of THAT SPECIFIC run
+happening to survive `desktop-shell.so`'s own crash long enough, not genuine kiosk-shell usage
+at all. Fixed via `weston --config=/weston_kiosk.ini` (explicit flag, no `$HOME` dependency) in a
+new `xfce_launch_kiosk4.sh` -- confirmed via weston's own log line ("Using config file
+'/weston_kiosk.ini'", "Loading module '/usr/lib/weston/kiosk-shell.so'") that this is now
+deterministic and reliable.
+
+**Built real, direct window-content capture tooling** (Win32 `EnumWindows`+`PrintWindow` against
+the litebox process's own specific window handle, bypassing the earlier full-screen-capture
+method's own failure to find the window when other applications occlude it) -- captured the
+litebox window's actual rendered content at multiple points, including immediately after
+confirmed `page_flip` events. Every capture showed a solid black window.
+
+**Used litebox's own pre-built `LITEBOX_DUMP_FRAMES=1` diagnostic** (a genuine, already-existing
+tool in `litebox_platform_windows_userland::presentation`, counting non-black pixels and
+distinct colors in every frame BEFORE it reaches the wgpu/window presentation layer) to settle,
+at the raw byte level, whether the black window was a presentation-layer bug or genuinely black
+source data. **Result: `non_black_pixels=0` for every captured frame** (1920x1080, pitch=7680,
+`distinct_colors_capped64=1` -- i.e. every single pixel in every frame is exactly the same
+single color, black). This is ground-truth, conclusive evidence: the DRM dumb-buffer content
+litebox reads directly from the guest's own shared memory (via `notify_flip_callback`, well
+BEFORE any Windows/wgpu/window-visibility concern could possibly affect it) is genuinely,
+entirely black.
+
+**This conclusively rules out the ENTIRE presentation pipeline** (the `FrameSender` channel, the
+`winit`/wgpu window, the `Bgra8Unorm` texture upload, the surface-present call) as the source of
+the problem -- all of that machinery was already independently verified working, pixel-perfect,
+earlier in this project's own history (`project_wgpu_gui_support.md`'s own solid-color tests),
+and this pass's own frame-content dump proves it is STILL working correctly: it is faithfully
+displaying exactly the all-black data weston itself is handing it. **The entire remaining
+mystery is now narrowly scoped to weston's OWN compositor/repaint logic**: why does its
+`--use-pixman` software-rendering backend, after successfully initializing (Pixman renderer
+active, output enabled, `page_flip` ioctl issued repeatedly with real timing/event-completion
+semantics) never actually draw ANYTHING into its own scanout buffer -- not even its own default
+solid-color background (which real weston normally draws immediately on compositor startup,
+before any client ever connects)?
+
+**Concrete, sharply-scoped next step for whoever continues this**: this is now specifically a
+question about weston's own Pixman-renderer repaint path (`libweston`'s
+`weston_output_repaint`/`pixman_renderer_repaint_output`-class functions) never actually issuing
+real Pixman drawing calls, or issuing them against the wrong/uninitialized buffer, or a genuine
+litebox emulation gap in whatever memory-mapping/shared-buffer mechanism Pixman's own software
+rasterizer writes into (distinct from the DRM dumb-buffer mmap path already proven working end-
+to-end for the SIMPLE synthetic `drmgui.c` test in this project's own much earlier history --
+worth checking whether weston's OWN Pixman-renderer buffer-acquisition path uses a DIFFERENT
+mmap/ioctl sequence than that simple test program did, which could explain why the simple test
+worked pixel-perfect while weston itself produces all-black frames). A targeted diagnostic
+logging every `mmap`/`ioctl` call weston's own Pixman renderer issues against the dumb buffer
+(reusing this pass's own `diag-exec-mmap`-style tooling, scoped to the specific fd/address range
+DRM's `CREATE_DUMB`/`MAP_DUMB` established) would directly answer whether weston is even writing
+to the buffer at all, or writing to a stale/wrong address.
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash
