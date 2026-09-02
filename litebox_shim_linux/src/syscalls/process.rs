@@ -1889,6 +1889,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         options: i32,
         _rusage: Option<UserPtrMut<u8>>,
     ) -> Result<usize, Errno> {
+        litebox_util_log::warn!(tid:% = self.tid, pid:% = pid, options:% = options; "drm-diag: sys_wait4 entry");
         const WNOHANG: i32 = 0x1;
         let no_hang = options & WNOHANG != 0;
         let process = self.process();
@@ -2007,16 +2008,37 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     return Ok(0);
                 }
             } else {
-                match self.wait_cx().wait_until(poll_once) {
+                match self.wait_cx().wait_until(&mut poll_once) {
                     Ok(()) => {}
                     Err(litebox::event::wait::WaitError::Interrupted) => {
-                        // No child had exited yet when the interrupt was observed.
-                        return Err(Errno::EINTR);
+                        // `wait_until`'s own `commit_wait` checks for a pending interrupt BEFORE
+                        // blocking on the condvar (see its own doc comment) -- this means the
+                        // EXACT SIGCHLD delivery that `Task::prepare_for_exit` queues to wake this
+                        // wait (`process.rs`'s parent-notify block, a few hundred lines above) is
+                        // itself observed as "an interrupt is pending" and short-circuits
+                        // `wait_until` with `Err(Interrupted)` on the very next loop iteration,
+                        // EVEN WHEN that interrupt is precisely the "your child just exited"
+                        // signal this call was waiting for. The old comment here ("no child had
+                        // exited yet") was an unverified assumption, not something this call site
+                        // actually confirmed -- `poll_once` was never re-invoked after the
+                        // interrupt fired. Re-check once more, synchronously, before surfacing
+                        // `EINTR`: if a child DID exit (the common case for this exact race), take
+                        // it immediately instead of returning a spurious `EINTR` that a caller
+                        // (e.g. BusyBox ash's own `wait` builtin) may not retry, hanging forever.
+                        // Confirmed live: this exact race reproduced 100% of the time with a
+                        // minimal `sh -c "sleep 3 & wait"` repro, hanging the shell's `wait`
+                        // builtin forever even though the backgrounded child exited cleanly.
+                        litebox_util_log::warn!(tid:% = self.tid; "drm-diag: sys_wait4 interrupted, re-polling");
+                        if !poll_once() {
+                            litebox_util_log::warn!(tid:% = self.tid; "drm-diag: sys_wait4 re-poll found nothing, returning EINTR");
+                            return Err(Errno::EINTR);
+                        }
+                        litebox_util_log::warn!(tid:% = self.tid; "drm-diag: sys_wait4 re-poll found exited child");
                     }
                     Err(litebox::event::wait::WaitError::TimedOut) => unreachable!(
                         "wait_until with no deadline never returns WaitError::TimedOut"
                     ),
-                }
+                };
             }
             found.expect("poll_once only returns true after `found` is set")
         } else {
