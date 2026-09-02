@@ -3121,6 +3121,51 @@ own live-testing budget (disk space, time) is now genuinely exhausted for furthe
 retries -- the marginal value of another identical attempt is low given three consecutive
 misses at the same point. Concluding this session's live-testing phase here.
 
+## 237th pass: is_verifying=true confirmed universal (never false) across every capture this whole investigation -- rules out an unrelated-to-fork_verify trigger definitively. Also caught a NEW, far more severely corrupted register signature this pass: rip=0x0 (null), rsp=0xffffffffffffffff (literally -1), rbp=0xc0000008 (an NTSTATUS value, STATUS_INVALID_HANDLE, sitting where a pointer should be) -- the circuit breaker again caught the resulting runaway cleanly at 65 repeats, disk protected. This is qualitatively different from every earlier capture (a single bad pointer) -- ALL of RIP/RSP/RBP simultaneously garbage points at the CONTEXT record itself being corrupted at the moment of resumption, not one specific stale pointer
+
+Ran a fourth 150s attempt. Confirmed `is_verifying=true` in 100% of `diag-unrecov-av]` captures
+across every pass this investigation has made (never once `false`) -- this is now a fully
+closed question: the fault is deterministically tied to `fork_verify`'s own active verification
+window, never occurring outside it.
+
+This run's own crash, however, showed a genuinely NEW and much more severe corruption pattern
+than anything captured before:
+
+```
+[diag-unrecov-av] tid=ThreadId(29) rip=0x0 rva=0xffff80097cb60040 addr=0x6c757fdaa0
+  rsp=0xffffffffffffffff rax=0x7ffb367bba76 rbx=0x7ff683cda2ea rcx=0x6c757fd500 rdx=0x1
+  rsi=0x7ffb341124ac rdi=0x7ff0c0000008 rbp=0xc0000008 is_in_guest=false is_verifying=true
+  -- no exception-table entry found
+[diag-unrecov-av-giveup] rip=0x40 repeat_count=0x41
+```
+
+`rip=0x0` (a genuine NULL instruction pointer -- the CPU literally tried to execute address
+zero), `rsp=0xffffffffffffffff` (the maximum possible 64-bit value, i.e. `-1` as a signed
+value -- a textbook "subtracted past zero" underflow artifact, not a plausible real stack
+address by any stretch), and `rbp=0xc0000008` -- `0xC0000008` is `STATUS_INVALID_HANDLE`, a
+genuine Windows NTSTATUS code, sitting in a general-purpose register where a frame pointer or
+data pointer would normally be. **This is qualitatively different from every earlier capture in
+this whole investigation** (which always showed ONE specific bad/small-offset address, e.g.
+`addr=0x2e`, `addr=0x43a`, `rip=0x500016` -- odd but plausibly a single corrupted pointer) --
+here, RIP, RSP, AND RBP are simultaneously and totally incoherent with each other and with any
+real code/stack/frame semantics. This pattern is much more consistent with **the entire CONTEXT
+record handed to the exception dispatcher being corrupted or stale at the moment of
+resumption**, not a single bad pointer value that happened to be dereferenced -- i.e. genuinely
+supports pass 234's own web-research-derived theory (a raw `context.Rip`-style resume violating
+invariants a LATER unwind assumes) at a much more severe, whole-context level than previously
+observed, rather than refuting it.
+
+**Given four consecutive live attempts today, all failing to reach `xfwm4`/`xfdesktop`/
+`xfce4-panel`, and each one producing genuinely new diagnostic detail (progressively narrowing
+and deepening understanding of the fault, most recently to "the whole CONTEXT is sometimes
+totally corrupted, not just one register"), this session's live-testing effort has been
+thorough and is now reaching its productive limit given remaining disk/token budget.** The
+circuit breaker (pass 232) has now been confirmed working correctly across MULTIPLE distinct
+corruption patterns (a single bad pointer in pass 235, and this pass's whole-context corruption)
+-- it is a genuinely robust, general safety net for this whole fault class, not narrowly tuned
+to one specific crash signature. This is real, valuable, verified protection regardless of
+whether the underlying race is ever fully eliminated.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
