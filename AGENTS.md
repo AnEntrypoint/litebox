@@ -2174,6 +2174,51 @@ specific binary should already be choosing its own `base_addr` freely and never 
 fixed address at all, which would mean the actual bug is further upstream: why is `/bin/true`'s
 loader path requesting a FIXED address for a relocatable PIE binary in the first place).
 
+## 215th pass: CONFIRMED -- an EARLIER session already correctly diagnosed and documented this EXACT gap in `elf.rs`'s own `reserve()` doc comment ("the ET_EXEC collision class needs a different fix in allocate_pages's own foreign-claim/collision handling, not here"), meaning pass 214's finding is not new territory -- it is the precise, previously-identified, still-open architectural gap, now finally reached and empirically confirmed live via this session's own repro rather than only theorized
+
+Read `litebox_shim_linux/src/loader/elf.rs`'s `reserve()` function (used only for `ET_DYN`/PIE
+binaries' base-address selection) and its own doc comment on the `hint`/`pid_salt` mitigation.
+It explicitly states, written by an EARLIER session investigating a related `gcc`-under-litebox
+crash: `pid_salt` spreads PIE binaries' preferred addresses apart, but "does NOT address the
+specific gcc-under-litebox crash... that crash's binary is ET_EXEC (not ET_DYN)... the ET_EXEC
+collision class needs a different fix (in allocate_pages's own foreign-claim/collision
+handling, not here)".
+
+This is EXACTLY pass 214's own finding, reached independently via live debug-trace evidence
+this session (the `GuestPid(9)` vs `GuestPid(1000)` simultaneous-collision capture) rather than
+by reading this comment first. The two lines of investigation -- an earlier session's `gcc`/PIE
+work and this session's `/bin/true`/fork-loop work -- converge on the identical, precisely
+located gap: `ET_EXEC` binaries (which `loader.rs`'s `load()` maps at `base_addr = 0`, i.e. the
+raw fixed addresses baked into the ELF, with NO reservation call and NO ability to relocate)
+have no defense against two simultaneously-alive guest processes wanting the same fixed
+address on this platform's single-real-address-space design. `/bin/true` on this Alpine build
+is confirmed (by taking this exact code path) to be `ET_EXEC`, not `ET_DYN` -- despite modern
+Alpine/musl commonly building many binaries as PIE by default, this specific one apparently is
+not (or the loader's own ELF-type detection classifies it as `ET_EXEC` for some other reason
+not further investigated this pass).
+
+**This is not a new bug to fix from scratch -- it is a known, precisely-scoped, previously
+deferred piece of work, now with a concrete live repro (`musl_repro_plain8.sh`) proving it is
+real and not merely theoretical.** The actual implementation (giving `allocate_pages`'s
+`Replace`-mode collision path a real "relocate AND tell the caller where" mechanism, plumbed
+back up through `MapMemory`/`Mapper`'s trait signature so `ElfParsedFile::load` can adapt its
+own subsequent segment-address math when a fixed request is forced to relocate) touches
+multiple crates' shared trait surface (`litebox_common_linux::loader::MapMemory`,
+`litebox_shim_linux`'s `Mapper` impl, `litebox_platform_windows_userland`'s `allocate_pages`)
+and is substantial enough to warrant its own dedicated, carefully-scoped implementation pass
+rather than a rushed addition at the tail of this already very long investigative arc. Recorded
+here as the precise, load-bearing, well-evidenced next step for whoever continues.
+
+**Session status at this point**: pass 213's mmap-address-verification fix (kept, genuine
+improvement -- converts silent corruption into a defined, safe failure) plus this pass's
+precise confirmation of the remaining `ET_EXEC`-collision gap together represent this session's
+real, durable contribution. The original deterministic "crashes on exactly the 8th fork" bug
+(passes 168-212's whole subject) is CONFIRMED FIXED as a crash -- the host process no longer
+terminates. What remains is a related, previously-known, now-precisely-reconfirmed gap in
+handling legitimate CONCURRENT `ET_EXEC` execution, which is what's currently blocking a full
+XFCE session (many concurrent processes, several of which are very likely `ET_EXEC`) from
+completing its startup sequence.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
