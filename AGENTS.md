@@ -3541,6 +3541,41 @@ specifically to capture a WER minidump of THIS host-mode `rip=0` fault, giving t
 ground-truth evidence pass 246 obtained for the guest-mode case. This is the clearest, most
 directly actionable next step for a future session or continuation of this one.
 
+## 248th pass: attempted to capture a WER dump of the separate host-mode rip=0/rsp=-1 corruption (pass 247's identified next step) via the existing LITEBOX_DIAG_ALLOW_WER escape hatch -- captured A dump, but it turned out to be the escape hatch's OWN RaiseFailFastException call re-entering the SAME r14=-1/find_live_stack_overlap recursion pass 246 already root-caused and fixed via VEH_DEPTH_CAP, not the underlying host-mode fault itself; the escape hatch is diagnostic-only tooling and this is a quirk of using it, not a new production bug
+
+Re-used the `LITEBOX_DIAG_ALLOW_WER=1` escape hatch (pass 246) against the real XFCE repro,
+specifically hoping to capture the OTHER, still-open `is_in_guest=false`/`rip=0x0`/`rsp=-1`
+corruption class (first seen pass 205, confirmed still present and un-touched by pass 246/247's
+guest-mode fix in pass 247's own verification run). A dump WAS captured
+(`litebox_runner_linux_on_windows_userland.exe.16964.dmp`), but analyzing it with local PDB
+symbols showed it is NOT a new capture of the host-mode fault -- it is the exact same
+`r14=0xffffffffffffffff`/`r15=0` fault inside `find_live_stack_overlap`/
+`vectored_exception_handler_entry` that pass 246 already root-caused and fixed (the
+`VEH_DEPTH_CAP` unbounded-recursion bug). This makes sense on reflection: the escape hatch calls
+`RaiseFailFastException` directly from inside the VEH itself, which appears to re-enter Windows'
+own exception dispatch and hand control back to this SAME `vectored_exception_handler_entry`
+before the process actually terminates -- i.e. this is a property of the diagnostic escape hatch
+itself (calling a fail-fast/crash-reporting primitive FROM WITHIN a vectored exception handler
+that is still active), not a new or different production bug. The shipped, non-diagnostic path
+(plain `TerminateProcess`, exercised in pass 247's own verification run with no escape hatch set)
+does NOT exhibit this -- it terminated cleanly with a bounded 310-line log and no recursion.
+
+**No new evidence obtained on the host-mode `rip=0`/`rsp=-1` bug this pass.** It remains open,
+exactly as characterized in pass 205 and re-confirmed in pass 247: `is_in_guest=false`, occurring
+in host code, a SEPARATE mechanism from the guest-mode unwind corruption pass 246 fixed. A
+cleaner way to capture ground-truth evidence of this SPECIFIC fault in a future session: rather
+than reusing the general `LITEBOX_DIAG_ALLOW_WER` hatch (which calls `RaiseFailFastException`
+from inside the active VEH and self-interferes as shown here), either (a) call
+`RaiseFailFastException` from a point OUTSIDE the VEH's own call frame (e.g. schedule it via a
+separate mechanism once the repeat-count threshold is hit, rather than inline), or (b) lower
+`MAX_REPEATED_UNRECOV_AV` temporarily and rely on the ALREADY-WORKING plain `TerminateProcess`
+circuit breaker path together with WER configured for a DIFFERENT, non-fail-fast exception type
+if one exists for this fault, or (c) most simply, add exception-code/PID-based dump triggering
+outside litebox's own process entirely (e.g. a lightweight watcher process that calls
+`MiniDumpWriteDump` directly against the target PID the moment it's spawned, sidestepping the
+in-process VEH entirely) -- this last option is probably the most robust path forward since it
+doesn't depend on getting litebox's own crash-handling code to cooperate with WER at all.
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash
