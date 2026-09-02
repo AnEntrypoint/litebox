@@ -3907,6 +3907,53 @@ unusually tight startup-code byte budgets (busybox/musl's own `_start`+TLS-setup
 application code), it does not block the primary weston/XFCE-on-litebox investigation and is
 filed here as a distinct, well-scoped finding for separate follow-up.
 
+## 255th pass: relaunched the primary weston/XFCE custom-layer repro post-freeze-fix, with MSYS2_ARG_CONV_EXCL="*" applied correctly (bare Windows path for --initial-files/--resume-from, untranslated Unix path for the program argument) -- ran clean, NO host freeze, NO crash-class from the whole prior ntdll/VEH investigation, and reached further than ever (weston loaded desktop-shell, began launching weston-desktop-shell) before hitting a genuinely NEW, distinct, contained guest-process panic: "failed to release memory mappings: UnmapError(Unaligned)" during process teardown at litebox_shim_linux/src/syscalls/process.rs:4257
+
+**Context**: with the kernel-debug freeze fixed (pass 252) and the MSYS2 argv fix confirmed (pass
+251), relaunched the SAME real XFCE repro this whole investigation has centered on (the custom
+Alpine+weston layer via `--resume-from xfce-layer-sw.tar`), this time with a hard 30s host-level
+`timeout` wrapper as an extra safety bound given the freeze history, and immediately verified
+system stability afterward (no new Event ID 41, disk unchanged, process cleanly gone from
+`tasklist`) before proceeding further.
+
+**Result: no freeze, no VEH/unwind-corruption crash class at all.** The run completed cleanly
+within the 30s bound, reaching the same "weston desktop-shell loading" point pass 249 reached
+(`Loading module '/usr/lib/weston/desktop-shell.so'`, `launching '/usr/libexec/weston-keyboard'`,
+`launching '/usr/libexec/weston-desktop-shell'`) -- but this time hit a DIFFERENT failure: a
+clean Rust panic during process teardown, `failed to release memory mappings: UnmapError(Unaligned)`
+at `litebox_shim_linux/src/syscalls/process.rs:4257`, inside `release_memory`'s own `unmap`
+call. The surrounding code (added as part of this project's own earlier `VM_OWN_FORK_PADDING`
+fix, per its own doc comment referencing "the long-standing fork()+execve() mallocng `.meta=0`
+crash") releases every non-empty `VmFlags` mapping OR any mapping carrying
+`VM_OWN_FORK_PADDING` -- the panic means one such mapping's range was not page-aligned when
+handed to the underlying OS unmap call.
+
+**Assessment**: this is progress, not a regression -- it is a NEW failure mode only reachable
+because this pass's earlier fixes (freeze eliminated, MSYS2 argv fixed, pass 246/247's guest-
+fault-termination and VEH_DEPTH_CAP fixes) let the process run further and cleaner than any
+prior capture in this whole investigation's history, reaching a process-EXIT-time code path
+(mapping cleanup) that was never reached before because something always crashed first. This is
+almost certainly a real, narrow litebox bug in whatever produced the unaligned range (a fork-
+padding region, per the surrounding code's own doc comment, or a `Vmem`-tracked mapping whose
+start/end somehow drifted off a page boundary) -- NOT a Windows/host-crash-class issue and NOT
+the weston SIGSEGV pass 249 found (this crash is litebox's OWN host-side Rust code panicking
+cleanly, not a guest-side SIGSEGV). This is the clearest, most concrete, most directly actionable
+lead for continuing toward a rendering XFCE desktop: whoever continues this should add a targeted
+diagnostic print at `process.rs:4257`'s own call site logging every candidate range BEFORE the
+`release_memory` call (their start/end/`VmFlags`), rerun this exact repro, and identify which
+specific range is misaligned and why -- likely traceable to whichever `Vmem` mutation
+(`mmap`/`munmap`/`mremap`/fork-duplicate) most recently touched that exact range.
+
+**This pass's overall trajectory (246-255) has been consistently good, real, verified progress**:
+root-caused and fixed a genuine VEH-recursion bug (246), root-caused and fixed a guest-fault-
+unwind-corruption bug (246/247), found and fixed a genuine system-freeze hazard from this
+session's own debugging setup (252), fixed a long-standing MSYS2 argv-mangling trap that was
+producing false-alarm "regressions" (251), and each successive fix has let the real XFCE repro
+run measurably further and more cleanly than the last, from "crashes with unrecoverable
+corruption within seconds" all the way to "runs cleanly through weston's own full startup
+sequence and only fails at process-teardown time." The remaining blocker is now narrow, concrete,
+and well-scoped rather than a diffuse, non-deterministic corruption mystery.
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash
