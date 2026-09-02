@@ -4602,6 +4602,52 @@ shell approach itself), this is a natural, well-documented stopping point for co
 future session with a much sharper, more concrete set of next steps than existed before this
 pass began.
 
+## 270th pass: REAL BREAKTHROUGH -- extended LITEBOX_DUMP_FRAMES to save every frame with a unique numbered filename (previously silently overwrote one file, hiding all but the last state) and found the "non_black_pixels=2073600" frames from pass 268/269's own desktop-shell test are a uniform [B=0,G=0,R=0,A=0x13] (RGBA 0,0,0,19) -- i.e. GENUINE, DISTINCT, NON-DEFAULT pixel content IS being composited by weston, just with a near-fully-transparent (7.5%) alpha that renders as visually indistinguishable from pure black once composited onto the presenter's own opaque black window background -- this is very likely a real, fixable alpha-handling bug (either in litebox's DRM/framebuffer-format handling or in how the presenter's wgpu blit treats the source alpha channel), not an absence-of-content issue
+
+**Numbered every dumped frame** (`FRAME_COUNTER`, litebox_platform_windows_userland/src/
+presentation.rs) so a run transitioning through multiple visually-similar-looking states (this
+pass confirmed: black -> uniform-but-technically-non-black -> black again) could be inspected
+frame-by-frame instead of only ever seeing whichever frame happened to be dumped last.
+
+**Direct byte-level inspection of a "non_black_pixels=2073600" frame** (`litebox_frame_dump_10.bmp`,
+captured against the ORIGINAL `desktop-shell.so` script, not kiosk-shell): every single pixel in
+the entire 1920x1080 frame is the exact same 4-byte value, `00 00 00 13` (BMP's own B-G-R-A byte
+order) -- i.e. RGB all zero (genuinely black in color) with `A=0x13` (19 decimal, ~7.5% opacity)
+rather than the fully-opaque `A=0xFF` a normal, correctly-composited black background would have.
+This is NOT the same as the `[0,0,0,0]`/`[0,0,0,255]` values `dump_frame_diagnostic`'s own check
+explicitly treats as "black" (hence it correctly registered as `non_black_pixels != 0`) -- it is
+a THIRD, distinct value the diagnostic's binary black/non-black check cannot itself further
+classify, but which is visually indistinguishable from true black once rendered (a 7.5%-opaque
+black pixel over ANY dark or black background is still overwhelmingly black-looking).
+
+**This is a genuinely new, different, more promising lead than anything in passes 249-269**:
+this is neither "nothing is being drawn" (pass 268's own initial reading) nor definitively "a
+weston compositor bug drawing nothing" -- it is evidence that SOMETHING with real, non-default,
+non-trivial pixel content (uniform low-alpha black is not what an initialized-but-empty buffer
+would contain by construction, e.g. `CREATE_DUMB`'s own zero-initialized memory would be
+`[0,0,0,0]`, matching the diagnostic's OWN black-check, not `[0,0,0,0x13]`) IS being composited
+into the scanout buffer -- most plausibly a real weston/XFCE surface with a genuine near-
+transparent black fill (a modal overlay, a fade transition, a splash screen background, or
+similar), whose alpha channel is then either (a) not being correctly interpreted as opaque by
+whatever wgpu blit/present path the presenter uses (an `Bgra8Unorm`-format texture IS supposed
+to have its alpha respected for blending, but this pipeline is a straight `copy_texture_to_texture`,
+which should treat alpha as opaque data, not blend it -- worth re-checking `present()`'s own
+exact blit semantics), or (b) genuinely correct low-alpha content from weston's own compositor
+that a REAL Linux desktop would ALSO show as visually-black-but-technically-not, in which case
+the actual "nothing renders" bug lies further upstream in why XFCE never draws anything MORE
+opaque/colorful over this base layer.
+
+**Concrete, sharply scoped next step for whoever continues this**: (1) confirm whether the
+presenter's `present()` function treats the source texture's alpha channel as pure data (correct,
+matching a real DRM scanout's own opaque-framebuffer semantics) or applies any blending -- if
+blending is happening anywhere in the `wgpu` pipeline (a render pipeline with alpha blending
+enabled, rather than a pure `copy_texture_to_texture`), that would directly explain low-alpha
+content rendering as invisible; (2) separately, trace where in weston/XFCE's own guest-side code
+a uniform `A=0x13` fill could originate -- this specific alpha value (19/255) is oddly precise
+and worth searching XFCE/GTK/weston source for a literal `0x13`/`19` alpha constant or a
+computed value from a known animation/fade-timing formula, which could directly identify the
+responsible component.
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash

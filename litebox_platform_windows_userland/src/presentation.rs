@@ -85,8 +85,15 @@ fn dump_frame_diagnostic(frame: &Frame) {
         distinct_colors.len()
     );
 
+    // AGENTS.md pass 270: number each dumped frame so a run that transitions through multiple
+    // distinct states (e.g. black -> real content -> black again, confirmed live this pass) can
+    // be inspected frame-by-frame instead of only ever seeing the LAST write, which silently
+    // overwrote every earlier, potentially more interesting frame.
+    static FRAME_COUNTER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let n = FRAME_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let out_path = std::env::var("LITEBOX_DUMP_FRAMES_PATH")
-        .unwrap_or_else(|_| "litebox_frame_dump.bmp".to_owned());
+        .map(|base| format!("{base}.{n}"))
+        .unwrap_or_else(|_| format!("litebox_frame_dump_{n}.bmp"));
     let row_bytes = width * 4;
     let pixel_data_size = row_bytes * height;
     let file_header_size = 14;
