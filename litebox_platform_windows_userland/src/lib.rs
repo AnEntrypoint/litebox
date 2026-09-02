@@ -1180,6 +1180,47 @@ unsafe extern "system" fn vectored_exception_handler(
                     ring[3] = (context.Rip, recover as u64);
                 }
             });
+            // DIAG (pass 205 follow-up): the fatal-fault investigation (AGENTS.md pass 205)
+            // proved this recovered branch IS taken for the specific `memset_fallible` AV that
+            // precedes the mysterious constant-address `c000000d` secondary fault -- but had no
+            // visibility into the recovered page's real Windows commit/protect state at the
+            // moment of recovery, nor RSP's 16-byte alignment right before returning
+            // `EXCEPTION_CONTINUE_EXECUTION`. Unconditional (not gated on `veh_trace_enabled()`,
+            // matching the sibling unrecovered-branch diagnostic below): cheap (one
+            // `VirtualQuery`, no allocation on the hot path since this only runs on an actual
+            // fault, never on ordinary execution), and this is exactly the path the whole
+            // investigation has never been able to observe directly.
+            if diag_fataldump_enabled() {
+                // Allocation-free (`diag_raw_print`, not `eprintln!`): pass 205's own capture
+                // showed this branch's original `eprintln!`-based version printed NOTHING despite
+                // running before `context.Rip` is overwritten -- i.e. even reaching the
+                // `eprintln!`/formatting machinery is enough to lose the print, matching this
+                // file's own established pattern (see `diag_raw_regdump`'s doc comment) that
+                // allocation-based printing is not trustworthy this early/this deep in a fault
+                // this investigation is chasing. Two raw prints instead of one richer `eprintln!`
+                // line, since `diag_raw_print` only carries two hex values at a time.
+                let fault_addr = exception_record.ExceptionInformation[1] as usize;
+                let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+                let ok = unsafe {
+                    Win32_Memory::VirtualQuery(
+                        fault_addr as *mut c_void,
+                        &mut mbi,
+                        core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+                    ) != 0
+                };
+                diag_raw_print(
+                    b"[diag-recovered-av] fault_addr=0x",
+                    fault_addr,
+                    b" recover_rip=0x",
+                    recover as usize,
+                );
+                diag_raw_print(
+                    b"[diag-recovered-av2] rsp=0x",
+                    context.Rsp as usize,
+                    b" State=0x",
+                    if ok { mbi.State as usize } else { 0xdead },
+                );
+            }
             context.Rip = recover as u64;
             return EXCEPTION_CONTINUE_EXECUTION;
         } else {

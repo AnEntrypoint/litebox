@@ -1615,6 +1615,88 @@ that label that a mid-`rep`-instruction fault leaves violated, that would explai
 Windows-side rejection of the continuation itself (`STATUS_INVALID_PARAMETER`) without any
 bug in `search_exception_tables`'s lookup logic itself.
 
+## 206th pass: BREAKTHROUGH -- the fatal sequence is THREE distinct faults, not two: (1) memset_fallible AV at addr=0x10305030 [captured by RAWREGS only], (2) a SEPARATE, DIFFERENT access violation at near-null addr=0x2e inside an unrelated write_u8-style fallible write [successfully recovered by search_exception_tables], (3) the still-unexplained c000000d at the constant ntdll address. Pass 205's recovered-branch diagnostic was silently eaten by eprintln!'s own allocation until switched to the allocation-free diag_raw_print helper, which finally printed and revealed fault #2 is NOT memset_fallible's fault at all
+
+Pass 205 added a page-state diagnostic to the SUCCESSFUL recovery branch
+(`search_exception_tables` returning `Some(recover)`), but it used `eprintln!` and never
+printed in testing, even though placed strictly before `context.Rip` is overwritten. Rewrote
+it using the same allocation-free `diag_raw_print` helper `diag_raw_regdump` already relies
+on (same rationale as that function's own doc comment: this deep into a fault this
+investigation is chasing, anything that allocates or takes the stdio lock is not trustworthy
+and can silently lose its own output). This is itself a finding worth keeping: `eprintln!`
+inside this exact VEH call is unreliable enough to drop an entire diagnostic line with no
+trace, confirming the established "allocation-free only" doctrine for diagnostics this deep
+in the fault path applies to EVERY diagnostic added at this call site, not just
+`diag_raw_regdump`'s own historical case.
+
+With the allocation-free version, a fresh capture against `musl_repro_plain8.sh` finally
+printed:
+
+```
+[veh] RAWREGS tid=5528 code=c0000005 addr=10305030 rip=7ff7d8ae6de6 rax=0 rbx=c8b7dfde50
+  rcx=1fa rdx=c8b7dfd903 rsi=2a0 rdi=10305030 rsp=c8b7dfdc70 rbp=c8b7dfdcf0
+[diag-recovered-av] fault_addr=0x2e recover_rip=0x7ff7d8ae78c7
+[diag-recovered-av2] rsp=0xc8b7dfdc70 State=0x10000
+[veh] RAWREGS tid=5528 code=c000000d addr=0 rip=7ffb36712d2f rax=0 rbx=c0000001 rcx=0
+  rdx=0 rsi=2a0 rdi=10305030 rsp=c8b7dfcfa0 rbp=c8b7dfdcf0
+```
+
+**This is a different address than the RAWREGS capture.** `fault_addr` here is read from
+`exception_record.ExceptionInformation[1]` (the REAL Windows-reported faulting address for
+THIS specific exception), and it is `0x2e` (46 decimal) -- a near-null pointer, structurally
+consistent with dereferencing a small nonzero field offset through a null base pointer (e.g.
+`some_null_struct_ptr->field_at_offset_0x2e`), NOT the `memset_fallible` destination
+(`0x10305030`) RAWREGS showed for the FIRST fault. `State=0x10000` (`MEM_FREE`) confirms
+`0x2e` is genuinely unbacked address space, not a spurious VirtualQuery failure.
+
+`recover_rip=0x7ff7d8ae78c7` (RVA `0x78c7`, module base `0x7ff7d8ae0000` this run)
+disassembles (via an offline `cdb -z` session against the release binary, no live process
+needed) to:
+
+```
+00000001`400078c7 488b8500010000  mov     rax,qword ptr [rbp+100h]
+00000001`400078ce 8810            mov     byte ptr [rax],dl        <-- the actual fixup target
+```
+
+`mov byte ptr [rax], dl` is the `write_u8_fallible` fixup pattern (single-byte MOV with a
+`{fault}` label immediately after), NOT `memset_fallible`'s `rep stos` pattern from pass 205.
+**This means the RAWREGS-captured `c0000005`/`addr=10305030` fault and the
+`search_exception_tables`-recovered `fault_addr=0x2e` fault are TWO DIFFERENT, UNRELATED
+access violations happening in immediate succession on the same thread** -- not one fault
+being reported twice. The sequence this pass's evidence now supports:
+
+1. `memset_fallible`'s `rep stosq` faults writing to unmapped guest address `0x10305030`
+   (BSS zero-fill for `/bin/true`'s 8th-fork post-exec ELF load). RAWREGS captures this
+   unconditionally.
+2. Something in this exception's OWN recovery/re-entry path immediately triggers a SECOND,
+   textually different access violation: a `write_u8_fallible`-style single-byte write
+   through a near-null (`0x2e`) pointer. This second fault IS found in the exception table
+   and IS recovered (`context.Rip` set to `0x...78c7`, `EXCEPTION_CONTINUE_EXECUTION`
+   returned) -- but recovering it evidently still isn't enough, since a THIRD fault
+   (`c000000d` at the eternal constant ntdll address) follows immediately after.
+3. The `c000000d` fault at `rip=0x7ffb36712d2f` -- unchanged across every capture this whole
+   investigation, on every binary, every session -- remains completely unexplained. Its own
+   `RAWREGS` line shows `rdi=0x10305030` still (the FIRST fault's value, likely just a stale
+   register never touched since), `rbx=0xc0000001` (looks like it could be an NTSTATUS-shaped
+   value someone stashed in RBX -- `STATUS_UNSUCCESSFUL` is `0xc0000001` -- worth checking
+   whether ntdll's own unwind/dispatch code uses RBX as a scratch/status register here).
+
+**Concrete next steps, not yet attempted:**
+- Identify what Rust code path performs a near-null (`+0x2e`) single-byte fallible write
+  immediately after (or as unwind/cleanup from) `memset_fallible`'s own fault -- likely
+  something in `AccessMemory::zero`'s caller chain, or a `Drop` impl running during the
+  `Err(Fault)` unwind from `fill_at_offset`, that itself touches a null/uninitialized
+  pointer. Grep for single-byte fallible writes (`write_u8_fallible`) reachable from
+  `ElfParsedFile::load`'s zero-fill error path specifically.
+- Check whether `0x2e` is a plausible field offset in any struct along that call chain (e.g.
+  an `Option<T>`'s discriminant-adjacent field, a `RefCell` borrow-flag offset, or similar)
+  -- `0x2e` = 46 is an oddly specific, non-round offset that may key a `grep`/struct-layout
+  search directly.
+- Investigate whether `rbx=0xc0000001` at the THIRD fault is coincidental garbage or an
+  actual NTSTATUS value ntdll's own exception-dispatch machinery placed there deliberately,
+  which would finally explain what class of internal Windows failure `c000000d` represents
+  in this specific context.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
