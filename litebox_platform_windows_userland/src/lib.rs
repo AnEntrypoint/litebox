@@ -338,7 +338,7 @@ unsafe extern "system" fn vectored_exception_handler_entry(
         // behavior for a window this narrow.
         mov     r11, QWORD PTR [r8 + {HOST_SP}]
         test    r11, r11
-        je      .Lcall_here
+        je      .Lcall_here_startup
 
         // Save the live (guest-address) rsp/rbp, then swap to this thread's real, Windows-
         // registered host stack (`TlsState.host_sp`/`host_bp`) before calling the full handler, so
@@ -359,9 +359,11 @@ unsafe extern "system" fn vectored_exception_handler_entry(
         // `host_sp - 64` slot unchanged.
         mov     r9d, DWORD PTR [r8 + {VEH_DEPTH}]
         cmp     r9d, {VEH_DEPTH_CAP}
-        jae     .Lcall_here          // past the cap: give up on the swap, call on whatever stack
-                                      // is live (matches the pre-existing null-host_sp fallback
-                                      // above) rather than risk walking past committed memory.
+        jae     .Lsearch             // past the cap: a fault recurring this deep on this thread
+                                      // cannot be safely handled at all -- see .Lcall_here_startup's
+                                      // doc comment for why this must bail out via
+                                      // EXCEPTION_CONTINUE_SEARCH rather than keep calling the
+                                      // full handler unbounded on a stack that is not being swapped.
         inc     DWORD PTR [r8 + {VEH_DEPTH}]
         imul    r9d, r9d, 64
         mov     r9, r9               // zero-extend the 32-bit product into a usable 64-bit index
@@ -402,7 +404,14 @@ unsafe extern "system" fn vectored_exception_handler_entry(
         dec     DWORD PTR [r8 + {VEH_DEPTH}]
         ret
 
-    .Lcall_here:
+    .Lcall_here_startup:
+        // Only the narrow `host_sp == 0` early-startup window lands here now (the
+        // `VEH_DEPTH_CAP` case now bails to `.Lsearch` directly, above -- see that jump's own
+        // comment: AGENTS.md continuation, this pass, root-caused via the first-ever WER
+        // minidump this investigation captured). This window is rare and inherently
+        // non-recursive (it exists only before `run_thread_arch`'s prologue populates
+        // `host_sp`), so falling through to call the full handler on whatever stack is already
+        // live remains safe here, unchanged from the original behavior.
         jmp     {vectored_exception_handler}
 
     .Lsearch:
@@ -1263,17 +1272,51 @@ unsafe extern "system" fn vectored_exception_handler(
                 };
                 LAST_UNRECOV_AV.set((context.Rip, repeat_count));
                 if repeat_count > MAX_REPEATED_UNRECOV_AV {
-                    diag_raw_print(
-                        b"[diag-unrecov-av-giveup] rip=0x",
-                        context.Rip as usize,
-                        b" repeat_count=0x",
-                        repeat_count as usize,
-                    );
-                    unsafe {
-                        windows_sys::Win32::System::Threading::TerminateProcess(
-                            windows_sys::Win32::System::Threading::GetCurrentProcess(),
-                            1,
+                    // Diagnostic escape hatch: `TerminateProcess` exits cleanly and never
+                    // reaches Windows Error Reporting, so WER's LocalDumps (configured
+                    // out-of-band for this investigation) never captures a minidump of the
+                    // actual fault. Setting LITEBOX_DIAG_ALLOW_WER=1 skips this clean exit for
+                    // exactly this one repeated-fault path and instead falls through to
+                    // EXCEPTION_CONTINUE_SEARCH below, letting the real unhandled exception
+                    // reach Windows so WER can capture full register/stack state. Never set
+                    // this outside a debugging session -- it reintroduces the unbounded
+                    // disk-exhaustion hazard this circuit breaker exists to prevent.
+                    if std::env::var_os("LITEBOX_DIAG_ALLOW_WER").is_none() {
+                        diag_raw_print(
+                            b"[diag-unrecov-av-giveup] rip=0x",
+                            context.Rip as usize,
+                            b" repeat_count=0x",
+                            repeat_count as usize,
                         );
+                        unsafe {
+                            windows_sys::Win32::System::Threading::TerminateProcess(
+                                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                                1,
+                            );
+                        }
+                    } else {
+                        // `EXCEPTION_CONTINUE_SEARCH` was tried first and found to recurse back
+                        // into this SAME VEH on immediate re-delivery of the identical fault,
+                        // exhausting the thread's stack ("has overflowed its stack") before ever
+                        // reaching a WER-visible unhandled-exception path. `RaiseFailFastException`
+                        // is the direct, WER-compatible fail-fast path Windows itself uses for
+                        // unrecoverable corruption (e.g. heap corruption, __fastfail) -- it invokes
+                        // crash reporting immediately with the CURRENT context, no re-delivery, no
+                        // handler chain to recurse through.
+                        diag_raw_print(
+                            b"[diag-unrecov-av-allow-wer] rip=0x",
+                            context.Rip as usize,
+                            b" repeat_count=0x",
+                            repeat_count as usize,
+                        );
+                        unsafe {
+                            windows_sys::Win32::System::Diagnostics::Debug::RaiseFailFastException(
+                                exception_record as *const EXCEPTION_RECORD,
+                                context as *const _
+                                    as *const windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+                                0,
+                            );
+                        }
                     }
                 }
                 unsafe extern "C" {
