@@ -850,7 +850,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Deliver any pending signals.
     pub(crate) fn process_signals(&self, ctx: &mut PtRegs) {
-        litebox_util_log::warn!(tid:% = self.tid; "drm-diag: process_signals entry");
+        #[cfg(target_arch = "x86_64")]
+        litebox_util_log::warn!(
+            tid:% = self.tid, rip:% = ctx.rip, orig_rax:% = ctx.orig_rax;
+            "drm-diag: process_signals entry with ctx"
+        );
         let mut iter_count: u32 = 0;
         loop {
             iter_count += 1;
