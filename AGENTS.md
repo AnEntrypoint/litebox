@@ -3166,6 +3166,39 @@ corruption patterns (a single bad pointer in pass 235, and this pass's whole-con
 to one specific crash signature. This is real, valuable, verified protection regardless of
 whether the underlying race is ever fully eliminated.
 
+## 238th pass: tested a genuine mitigation attempt (serializing dbus-launch before xfce4-session instead of letting them race) -- did NOT help; the same silent-stall failure mode recurred, this time even EARLIER (during dbus-launch/dbus-daemon setup itself, before xfce4-session ever starts) -- this REFUTES the "xfce4-session's own re-exec" hypothesis from pass 236 and retargets the trigger to dbus-daemon's own fork/exec pattern more generally, not anything specific to xfce4-session
+
+Built and tested a modified launch script that serializes `dbus-launch --sh-syntax --exit-with-
+session` (waited on synchronously via `eval`) BEFORE starting `xfce4-session`, instead of the
+original script's implicit concurrent race (both `Xwayland` and `xfce4-session`'s own internal
+`dbus-launch` invocation happening close together). Hypothesis: reducing concurrent fork
+pressure right at the point pass 236 traced every prior failure to (immediately after
+`dbus-daemon` starts) might avoid the race entirely.
+
+**Result: no improvement, and a more precise (earlier) failure point.** The same silent-stall
+failure shape recurred (a genuine ring-buffer-captured fault, survived without crashing or
+giving up, followed by the process going permanently quiet) -- but this time it happened during
+`dbus-launch`'s own setup (right after the log shows `/usr/bin/dbus-daemon` loading, followed by
+a plain `/bin/sleep` -- my own added serialization delay), BEFORE `xfce4-session` itself was
+ever invoked at all in this run.
+
+**This is a genuine, valuable negative result: it retargets the trigger.** Pass 236's own
+framing ("xfce4-session's own second-stage init/re-exec") is now REFUTED as the necessary
+condition -- the identical failure shape occurs even when `xfce4-session` hasn't started yet,
+during ordinary `dbus-daemon`/`dbus-launch` setup. The common factor across EVERY capture this
+whole investigation has made is not "specifically XFCE's own re-exec" but something more general
+about this specific STAGE of a real desktop session's startup -- likely the cumulative fork/
+thread count reached by this point (matching this whole investigation's original "8th fork"
+framing from a much earlier session, now understood to generalize to "enough concurrent fork_
+verify-tracked activity has accumulated," not a fixed magic number).
+
+**Given this negative result and the substantial live-testing budget already spent this pass
+(disk-safe throughout, no runaway, no data loss -- the circuit breaker and careful monitoring
+both held up), this is a reasonable point to conclude live experimentation for this session.**
+The mitigation attempted was reasonable and well-motivated but did not work; that is itself
+useful, ruled-out information for a future continuation, which should now focus on the
+CUMULATIVE-fork-count framing rather than any single specific process's own startup sequence.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
