@@ -2408,53 +2408,56 @@ fn arm_watchaddr_data() {
 /// Per-thread arm/disarm entry points, called through
 /// [`litebox::platform::ForkChildVerificationProvider`].
 pub(crate) fn begin(relocations: alloc::sync::Arc<litebox::mm::AddressRelocations>) {
-    // DIAG (this investigation pass): unconditional, process-wide counter of every `begin()`
-    // call (i.e. every `fork()` whose child reaches post-fork verification) -- confirmed live
-    // (AGENTS.md passes 199-200) that a plain, minimal `/bin/true & wait`-loop repro crashes
-    // fatally and deterministically on EXACTLY the 8th such fork, every single time, across both
-    // this session's pre- and post-fix binaries. Printed via raw `eprintln!` (already a proven,
-    // safe pattern elsewhere in this function) rather than the `litebox_util_log` macro, to avoid
-    // whatever caused an EARLIER, cross-crate counter attempt (pass 195) to introduce its own
-    // unrelated regression.
-    static DIAG_BEGIN_COUNT: core::sync::atomic::AtomicUsize =
-        core::sync::atomic::AtomicUsize::new(0);
-    let diag_begin_count =
-        DIAG_BEGIN_COUNT.fetch_add(1, core::sync::atomic::Ordering::SeqCst) + 1;
-    // Also snapshot every plausible fixed/growing-capacity process-wide resource this crate
-    // maintains, at the exact same moment, to see which one (if any) shows a suspicious value
-    // right before the fatal 8th call (AGENTS.md pass 202's own recommendation). `try_lock`, not
-    // `lock`, since `begin()` may run in a context where one of these is already held on this
-    // same thread -- a diagnostic must never risk deadlocking the very call it's observing.
-    let diag_claimed_ranges_occupied = crate::CLAIMED_RANGES
-        .try_lock()
-        .map(|c| c.iter().filter(|s| s.is_some()).count())
-        .unwrap_or(usize::MAX);
-    let diag_active_threads_len = crate::ACTIVE_THREADS
-        .try_lock()
-        .map(|t| t.len())
-        .unwrap_or(usize::MAX);
-    let diag_live_thread_stacks_len = crate::LIVE_THREAD_STACKS
-        .try_lock()
-        .map(|t| t.len())
-        .unwrap_or(usize::MAX);
-    let diag_next_claim_seq =
-        crate::NEXT_CLAIM_SEQ.load(core::sync::atomic::Ordering::Relaxed);
-    // Genuine Windows-OS-level counters (AGENTS.md pass 203's own follow-up hypothesis): the
-    // real numeric Windows TID (distinct from litebox's own sequential `std::thread::ThreadId`)
-    // and the process's total open-handle count, in case a Windows-side limit -- not a
-    // litebox-internal one -- is what's actually exhausted around the 8th real OS thread.
-    let diag_real_win_tid = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
-    let mut diag_handle_count: u32 = 0;
-    let diag_handle_count_ok = unsafe {
-        windows_sys::Win32::System::Threading::GetProcessHandleCount(
-            windows_sys::Win32::System::Threading::GetCurrentProcess(),
-            &raw mut diag_handle_count,
-        )
-    } != 0;
-    eprintln!(
-        "[diag-fv-count] tid={:?} win_tid={diag_real_win_tid} begin() call #{diag_begin_count} claimed_ranges={diag_claimed_ranges_occupied} active_threads={diag_active_threads_len} live_thread_stacks={diag_live_thread_stacks_len} next_claim_seq={diag_next_claim_seq} handle_count={diag_handle_count} handle_count_ok={diag_handle_count_ok}",
-        std::thread::current().id(),
-    );
+    // AGENTS.md pass 242: this whole diagnostic block (added passes 199-203) used to run
+    // UNCONDITIONALLY on every single `begin()` call -- i.e. every `fork()`, not just while
+    // actively debugging -- including a `CLAIMED_RANGES.try_lock()` (plus `ACTIVE_THREADS`/
+    // `LIVE_THREAD_STACKS`) on the SAME lock `reclaim_ranges_for_fork_child` (pass 217/218)
+    // already acquires on every newly-spawned thread's very first action. Pass 240 captured
+    // live evidence that `CLAIMED_RANGES`'s mutex is genuinely contended at the EXACT `begin()`
+    // call immediately preceding the still-unexplained whole-CONTEXT-corruption crash under a
+    // real, heavily-forking XFCE session -- this diagnostic itself was adding a real, always-on
+    // contention point on that same lock, on every single fork, for a debugging aid that should
+    // never have been unconditional in production once its own investigation moved past the
+    // narrow "why exactly the 8th call" question passes 199-203 were originally chasing. Gate it
+    // behind `diag_fataldump_enabled()` (this file's own established convention for "only pay
+    // this cost while actively investigating") so ordinary `fork()`s no longer pay this lock
+    // acquisition at all.
+    if crate::diag_fataldump_enabled() {
+        static DIAG_BEGIN_COUNT: core::sync::atomic::AtomicUsize =
+            core::sync::atomic::AtomicUsize::new(0);
+        let diag_begin_count =
+            DIAG_BEGIN_COUNT.fetch_add(1, core::sync::atomic::Ordering::SeqCst) + 1;
+        // `try_lock`, not `lock`, since `begin()` may run in a context where one of these is
+        // already held on this same thread -- a diagnostic must never risk deadlocking the very
+        // call it's observing.
+        let diag_claimed_ranges_occupied = crate::CLAIMED_RANGES
+            .try_lock()
+            .map(|c| c.iter().filter(|s| s.is_some()).count())
+            .unwrap_or(usize::MAX);
+        let diag_active_threads_len = crate::ACTIVE_THREADS
+            .try_lock()
+            .map(|t| t.len())
+            .unwrap_or(usize::MAX);
+        let diag_live_thread_stacks_len = crate::LIVE_THREAD_STACKS
+            .try_lock()
+            .map(|t| t.len())
+            .unwrap_or(usize::MAX);
+        let diag_next_claim_seq =
+            crate::NEXT_CLAIM_SEQ.load(core::sync::atomic::Ordering::Relaxed);
+        let diag_real_win_tid =
+            unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+        let mut diag_handle_count: u32 = 0;
+        let diag_handle_count_ok = unsafe {
+            windows_sys::Win32::System::Threading::GetProcessHandleCount(
+                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                &raw mut diag_handle_count,
+            )
+        } != 0;
+        eprintln!(
+            "[diag-fv-count] tid={:?} win_tid={diag_real_win_tid} begin() call #{diag_begin_count} claimed_ranges={diag_claimed_ranges_occupied} active_threads={diag_active_threads_len} live_thread_stacks={diag_live_thread_stacks_len} next_claim_seq={diag_next_claim_seq} handle_count={diag_handle_count} handle_count_ok={diag_handle_count_ok}",
+            std::thread::current().id(),
+        );
+    }
     if crate::diag_rip0_enabled() {
         eprintln!("[diag-fv] tid={:?} begin", std::thread::current().id());
     }
