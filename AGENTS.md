@@ -4461,6 +4461,43 @@ history documents being fixed once already for a related but distinct symptom --
 `sys_wait4`/`pid==-1` fix in `project_wgpu_gui_support.md`'s memory, worth checking whether an
 analogous gap exists for the `pid>0` specific-child-wait path this stall's own thread is using).
 
+## 267th pass: checked pass 266's own proposed wait_for_exit hypothesis against the actual sys_wait4 code -- the pid>0 (specific-child-wait) path is genuinely correct by construction (blocks on exactly the right child directly, unlike the OLD pid==-1 bug this hypothesis was modeled on), so there is no analogous bug here to find; the stall is most likely the launch script's own `xfce4-session & wait` shell construct correctly blocking forever on a long-running daemon -- meaning the real open question shifts from "is something deadlocked" to "is XFCE actually running successfully but just not producing visible rendered output"
+
+Read `sys_wait4`'s own `pid > 0` branch (`litebox_shim_linux/src/syscalls/process.rs` ~1911)
+directly: it looks up the EXACT target pid first (via `find_cross_process_child` for cross-
+process children, or -- for the thread-based case pass 266's own capture showed -- blocks
+directly on that specific child's own `wait_for_exit()`). This is structurally correct and has
+no equivalent to the OLD `pid == -1` bug (which picked an ARBITRARY child, not necessarily the
+one that actually exited first) -- a `pid > 0` wait can only ever be blocked on the one child it
+was asked to wait for, by construction. This refutes pass 266's own proposed hypothesis: there
+is no comparable "waiting on the wrong child" bug to find in this code path.
+
+**Revised understanding**: the stalled thread (blocked in `wait_for_exit`) is almost certainly
+`/bin/sh`'s own execution of this session's launch script's final line, `xfce4-session & wait` --
+`wait` (no arguments) blocks until ALL currently-running background jobs exit, and
+`xfce4-session` is a real, long-running desktop session manager DESIGNED to run indefinitely
+until the user logs out. **A shell legitimately blocking forever on `wait` for a daemon that is
+supposed to keep running is completely expected, correct behavior, not a bug or a hang at all.**
+This reframes the entire remaining investigation: the real open question is no longer "why is
+something deadlocked" but **"is `xfce4-session` (and whatever it spawns) actually running
+successfully in the background this whole time, just never producing a VISIBLE rendered
+window?"** -- a genuinely different, and more tractable, question than a deadlock hunt.
+
+**Concrete next step for whoever continues this**: instead of treating the flat ~7GB memory /
+silent log as evidence of a stuck process, treat it as a PLAUSIBLE SUCCESS SIGNAL needing
+verification -- take a screenshot of the `--gui` window during a long-running instance (this
+pass did this once via a direct Win32 `CopyFromScreen` capture, showing only a blank
+"litebox virtual display" window, but that single sample was taken without first confirming
+`xfce4-session`'s own children -- `xfwm4`/`xfdesktop`/`xfce4-panel` -- had actually started;
+worth re-checking process/thread state for evidence those specific child processes exist and are
+alive, not just that `wait_for_exit` is blocked on SOMETHING). If those children genuinely never
+start, the investigation should shift to why `xfce4-session` itself never spawns them (a real,
+separate, and more specific question than the broad "corruption race" framing this whole
+investigation has used) -- if they DO start but nothing renders, the investigation should shift
+to the DRM/wgpu presentation pipeline specifically (confirmed working end-to-end for a simple
+synthetic test earlier this project's own history, per `project_wgpu_gui_support.md`, but never
+yet confirmed working for XFCE's own real Xwayland/X11-driven rendering path specifically).
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash
