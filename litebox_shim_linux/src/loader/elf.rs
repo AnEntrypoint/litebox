@@ -303,12 +303,20 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
 impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfLoader<'a, Platform, FS> {
     /// Parses an ELF file from the given path.
     pub fn new(task: &'a Task<Platform, FS>, path: &'a str) -> Result<Self, ElfLoaderError> {
+        // DIAG (this investigation pass): warn-level (unlike sys_open's own debug-level path
+        // logging) so this survives in captures that use LITEBOX_LOG=warn to actually reach a
+        // slow-to-trigger crash without debug-level's much higher verbosity timing it out first.
+        litebox_util_log::warn!(path:% = path; "DIAG elf_load: ElfLoader::new main path");
         // Parse the main ELF file.
         let main = FileAndParsed::new(task, path)?;
 
         // Parse the interpreter ELF file, if any.
         let interp = if let Some(interp_name) = main.parsed.interp(&mut &main.file)? {
             // e.g., /lib64/ld-linux-x86-64.so.2
+            litebox_util_log::warn!(
+                interp_name:? = interp_name;
+                "DIAG elf_load: ElfLoader::new interp path"
+            );
             let mut interp = FileAndParsed::new(task, interp_name)?;
             // Linux places the ET_EXEC interpreter high so brk can grow above
             // the fixed-address main image without hitting ld.so.
