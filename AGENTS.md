@@ -3796,6 +3796,68 @@ is what caused this session's two hard freezes. If a kernel debugger is not imme
 to attach, prefer WER LocalDumps (already configured this session, works well, carries no
 system-freeze risk) or the guest-mode-fault termination fix (pass 246/247) for diagnosis instead.
 
+## 253rd pass: resumed after the freeze/reboot with the MSYS2 fix and confirmed-disabled kernel debugger -- launched the lightweight, litebox_packager-produced Alpine+IceWM image (a genuinely different, standard code path, Xorg not weston/Wayland) and hit a real, well-scoped, NEW bug: 2 syscall instructions per binary (including /bin/sh and /bin/echo, almost certainly musl's early-startup arch_prctl/ARCH_SET_FS call) that the syscall rewriter marks "unpatchable" and replaces with an ICEBP;HLT trap sequence deliver as a genuine, fatal guest SIGILL instead of being caught and emulated -- unlike alpine-rootfs.tar's binaries, which show ZERO unpatched syscalls and run cleanly, meaning this is specific to litebox_packager --oci-image's freshly-run rewriter output on this particular musl/busybox build, not a general litebox VEH/runtime bug, and NOT a host crash (guest task terminates cleanly via ordinary signal delivery, exactly the safe behavior this whole session's earlier VEH fixes were working toward)
+
+**Context**: resumed cleanly after confirming the kernel-debug-flag freeze (pass 252) was fully
+fixed (`debug No`, persisted across a clean reboot, no new Event ID 41 since). Relaunched the
+lightweight `ghcr.io/linuxserver/webtop:alpine-icewm-2.3.1-r0-ls1` image packaged via
+`litebox_packager --oci-image` (pass 250) with the now-proven `MSYS2_ARG_CONV_EXCL="*"` fix
+applied to every invocation.
+
+**First launch attempt failed on an unrelated MSYS2 quirk**: `--initial-files` itself also needs
+a real Windows-style path even with `MSYS2_ARG_CONV_EXCL="*"` set (that env var disables
+AUTOMATIC translation of arguments that LOOK like Unix paths, but `--initial-files` needs an
+actual Windows path regardless -- passing it as a bare `icewm-packaged.tar` relative reference
+with `MSYS2_ARG_CONV_EXCL` set produced `Error: The system cannot find the path specified.` since
+nothing translated it at all). Fixed by passing the full explicit `C:\Users\...` Windows path
+for `--initial-files` while leaving the PROGRAM argument (`/litebox/config_and_run.sh` or
+`/bin/echo`) as a bare Unix-style string, letting `MSYS2_ARG_CONV_EXCL="*"` correctly leave THAT
+one untranslated.
+
+**Real new bug found**: with the path issue fixed, the guest process launches correctly (ELF
+loading succeeds, syscall rewriter runs, trampoline region sizing/mapping succeeds) but then
+immediately crashes with a genuine, litebox-delivered `SIGILL` (`Signal(4)`) via the normal
+signal-delivery path (`fatal signal: terminating task signal=Signal(4)`) -- confirmed identical
+for BOTH `/bin/sh` (via `/litebox/config_and_run.sh`) AND a completely separate binary,
+`/bin/echo`, at the exact same `orig_rax=158` (`sys_arch_prctl`) syscall number, strongly
+suggesting this is musl's own very-early process-startup TLS setup (`ARCH_SET_FS`) hitting an
+unpatched syscall site. The warn-level log shows the mechanism precisely: `patch_code_segment`
+(the offline-style rewriter, now run live inside `litebox_packager --oci-image`) logs
+`"syscall instruction(s) could not be patched" count=2` for this binary, meaning 2 syscall sites
+had `InsufficientBytesBeforeOrAfter` -- not enough surrounding instruction bytes to safely
+rewrite a jump to the trampoline -- and per the rewriter's own designed fallback
+(`litebox_syscall_rewriter/src/lib.rs` ~line 555), such sites are replaced with an `ICEBP;HLT`
+trap sequence instead, meant to fault into the VEH and be handled reactively. Separately,
+`apply_trap_fallback`'s OWN independent disassembly pass (`trap_all_syscalls_in_code`) applies
+482 MORE syscall traps across the same code region -- but the crash's own `Exception(6)`
+(`SIGILL`) fires anyway, meaning the `ICEBP;HLT` trap sequence's OWN exception is NOT being
+caught/emulated as a syscall by whatever exception-dispatch path handles it, and instead reaches
+the guest as a genuine, fatal illegal-instruction signal.
+
+**Confirmed NOT a general litebox bug, NOT a host crash**: `alpine-rootfs.tar`'s own `/bin/echo`
+(this session's long-established working baseline) shows ZERO "could not be patched" warnings at
+`LITEBOX_LOG=warn` and runs cleanly (`hello`, `EXIT=0`) -- the gap is specific to whatever this
+particular musl/busybox build's binaries look like at the 2 unpatchable syscall sites, most
+likely a tight, low-byte-count startup sequence (very plausible for `_start`/TLS-setup code,
+which is often hand-optimized for minimal size) that the rewriter's `InsufficientBytesBeforeOrAfter`
+check correctly identifies as unsafe to jump-patch, combined with a separate, real gap in how
+the ICEBP;HLT fallback trap is actually dispatched at runtime. Critically, this is contained and
+SAFE: the guest task receives a normal signal and terminates cleanly (`fatal signal: terminating
+task`), with zero host-level impact -- exactly the correct, safe behavior this whole session's
+earlier VEH/guest-fault work (pass 246/247) was pushing toward, just reached via a different
+mechanism (a genuine ICEBP trap misrouted to SIGILL, rather than an unrecovered AV).
+
+**Next step for whoever continues this**: trace exactly what happens when Windows delivers the
+`ICEBP` (`0xF1`) exception this trap sequence uses -- confirm whether litebox's VEH even
+recognizes/handles ICEBP-class exceptions as a syscall-trap signal at all (search for `0xF1`/
+`ICEBP`/`INT1` handling in `litebox_platform_windows_userland/src/lib.rs`'s VEH), since the
+observed behavior (fatal SIGILL instead of syscall emulation) suggests it either isn't
+recognized, or is recognized but something about THIS specific instruction's placement/context
+prevents correct dispatch. This is a real, scoped, actionable litebox bug (in the ICEBP-trap
+runtime path, not the rewriter's own skip-detection logic, which appears to be working as
+designed) -- but is orthogonal to, and does not block progress on, the primary weston/XFCE
+investigation this session has otherwise been focused on.
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash
