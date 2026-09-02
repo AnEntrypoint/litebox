@@ -4244,6 +4244,42 @@ pass's 2 new captures were both the fork-padding-boundary class), so tracing eve
 step) remains the single most promising unexplored angle, now that the fork-padding thread is
 genuinely closed rather than left ambiguous.
 
+## 262nd pass: CORRECTED passes 253/254's own framing of the ICEBP;HLT fallback -- it is NOT a bug, it is working exactly as designed (deliver a clean guest SIGILL for a genuinely unpatchable syscall site, matching real Linux's own #UD behavior, confirmed via the existing EXCEPTION_ILLEGAL_INSTRUCTION -> INVALID_OPCODE translation already in place); but this correctly-working fallback still makes the litebox_packager-produced icewm/webtop image completely unusable (EVERY musl binary in it dies instantly at startup, before any output), a genuine dead end distinct from and unrelated to weston -- abandoned the icewm path, redirected all remaining effort back to the primary weston investigation which is genuinely further along
+
+**Correction to passes 253/254**: re-examined `litebox_platform_windows_userland`'s own
+`EXCEPTION_ILLEGAL_INSTRUCTION -> Exception::INVALID_OPCODE` translation (`lib.rs` ~line 6797,
+already present, unrelated to anything added this session) and realized the ICEBP;HLT fallback
+sequence's OWN doc comment was accurate all along: "so it traps instead of escaping to the host
+kernel" -- the intent was never to emulate the syscall via the trap, only to convert an
+unavoidable "this syscall instruction cannot be safely jump-patched" situation into a clean,
+contained, guest-visible `SIGILL` instead of letting the raw `syscall` instruction execute and
+either escape to the real Windows kernel (catastrophic) or hit an un-decoded page. This is
+correct, intentional, matches real Linux's own `#UD`-on-bad-instruction semantics, and needed no
+fix -- passes 253/254 misread "the guest process dies" as evidence of a broken trap-catching
+mechanism, when dying cleanly via `SIGILL` was the whole point.
+
+**However, this still makes the specific `litebox_packager`-produced Alpine+IceWM webtop image
+(pass 250/253) completely non-functional**: confirmed directly that EVERY tested binary from
+this image (`/bin/sh`, `/bin/echo`, `/bin/date`) dies instantly at startup with `SIGILL` at the
+exact same `arch_prctl`-adjacent instruction, before producing any output at all -- not a
+crash deep into execution, a startup-time failure for literally every process. `alpine-rootfs.tar`
+(this session's long-established working baseline, built via a different/earlier packaging
+process) never hits this at all. This points at a specific musl/busybox build-toolchain variant
+used for THIS particular upstream image having a tighter `_start`/TLS-setup code layout than the
+rewriter's `InsufficientBytesBeforeOrAfter` check can safely jump-patch around -- a real,
+narrow packaging-compatibility gap in `litebox_syscall_rewriter`, worth fixing eventually (a
+future session could grow the rewriter's own lookback/lookahead window, or use a shorter
+trampoline-jump encoding for exactly this tight-quarters case), but NOT a quick fix achievable
+this pass, and NOT related to weston/XFCE at all.
+
+**Decision: abandon the icewm/webtop image path for this session, redirect all remaining effort
+to the primary weston-based custom layer**, which is genuinely much further along (reaches real
+weston runtime execution, desktop-shell loading, multiple distinct crash classes already
+characterized with real register/mapping evidence -- see passes 249, 255-261) rather than dying
+at process startup on every single binary. The standing goal ("get XFCE working as expected") is
+much closer to reachable via continuing to chase the weston crash classes than via fixing an
+unrelated packaging-compatibility gap in a different, less-mature path.
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash
