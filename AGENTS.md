@@ -3858,6 +3858,55 @@ runtime path, not the rewriter's own skip-detection logic, which appears to be w
 designed) -- but is orthogonal to, and does not block progress on, the primary weston/XFCE
 investigation this session has otherwise been focused on.
 
+## 254th pass: narrowed pass 253's ICEBP-fallback bug to its precise mechanism -- litebox_shim_linux's own exception() entry point (litebox_shim_linux/src/lib.rs:157) has NO special-case recognizing an ICEBP-triggered EXCEPTION_SINGLE_STEP as a syscall-trampoline trap and redirecting it into syscall emulation; the observed Exception(6)/SIGILL is the immediately-following HLT byte actually executing, meaning something resumes past the ICEBP trap without emulating the syscall it was meant to represent, letting execution fall through to the deliberately-illegal HLT
+
+Traced the rewriter's own fallback design (`litebox_syscall_rewriter::replace_with_trap`,
+writes `0xF1` ICEBP followed presumably by `0xF4` HLT at any syscall site it cannot safely
+jump-patch) forward into the runtime to find where this trap is supposed to be caught and
+redirected into real syscall emulation. Found: `litebox_platform_windows_userland/src/lib.rs`'s
+own VEH has extensive `EXCEPTION_SINGLE_STEP` handling, but it is ENTIRELY devoted to
+`fork_verify`'s own reactive stale-pointer-healing single-stepping (armed via `EFLAGS.TF`, a
+different mechanism from an `ICEBP` instruction trap, though both surface as the same Windows
+exception code). `litebox_shim_linux::LinuxShimEntrypoints::exception()`
+(`litebox_shim_linux/src/lib.rs:157`), the shim-level entry point that ultimately handles guest
+exceptions, has explicit special-cases for a kernel page fault and (aarch64-only) a
+`sigreturn`-trampoline `brk` instruction, but NO special-case at all for an ICEBP-class trap at
+a known syscall-fallback site -- it falls straight through to `task.handle_exception_request(info)`,
+which (per the earlier live capture) ultimately delivers `SIGILL` to the guest for this exact
+case rather than decoding and emulating the intended syscall.
+
+**Concrete hypothesis for the actual bug**: the `ICEBP;HLT` pair is 2 bytes total (`0xF1 0xF4`).
+`ICEBP` (`#DB`) delivers `EXCEPTION_SINGLE_STEP` with `Rip` already advanced PAST the 1-byte
+`ICEBP` instruction (matching real x86 `#DB` semantics for `ICEBP`/`INT1`) -- i.e. `Rip` now
+points at the `HLT` byte. If NOTHING recognizes this specific `EXCEPTION_SINGLE_STEP` as a
+syscall-trampoline trap (per the above, nothing appears to), the exception is presumably treated
+as an ordinary spurious single-step and resumed via `EXCEPTION_CONTINUE_EXECUTION`(?) or falls
+through some other single-step path with no actual redirection to the trampoline/syscall-entry
+address -- execution then immediately hits the following `HLT` byte, a genuinely privileged/
+illegal instruction in user mode, producing the real, final `Exception(6)`/`SIGILL` that reaches
+`litebox_shim_linux`'s `exception()` and gets delivered to the guest as a fatal signal. This
+would mean the intended redirect-to-`syscall_entry_addr` step (present in the NORMAL, successfully
+-rewritten-jump case, where `hook_syscall_and_after` builds a proper trampoline jump) has no
+equivalent for the ICEBP-fallback case at all -- the fallback trap byte sequence is emitted, but
+nothing in the runtime is wired to actually CATCH it and perform the same redirect.
+
+**This remains unconfirmed at the disassembly/live-register level** (would need a targeted
+capture of the exact `Rip`/exception sequence at the moment of the ICEBP trap specifically, not
+just the final SIGILL delivery already captured) -- offered here as the most concrete, well-
+reasoned next step for whoever continues this, not as a proven root cause. If confirmed, the fix
+is architectural: either (a) wire a genuine ICEBP-trap recognition path into
+`vectored_exception_handler`/`LinuxShimEntrypoints::exception()` that checks whether the
+faulting `Rip - 1` (ICEBP's own address) matches a known trap site and, if so, redirects into
+the SAME syscall-trampoline-entry mechanism the successfully-patched jump case uses, or (b) more
+robustly, make `patch_code_segment`'s `InsufficientBytesBeforeOrAfter` case impossible by growing
+the pre-syscall lookback window / using a different, more compact trampoline-jump encoding for
+these specific tight-quarters sites, avoiding the fallback path's own apparent gap entirely
+rather than trying to make the fallback itself work. Given this is a narrow, safely-contained
+bug (confirmed: guest task terminates cleanly, zero host impact) that only affects binaries with
+unusually tight startup-code byte budgets (busybox/musl's own `_start`+TLS-setup, not typical
+application code), it does not block the primary weston/XFCE-on-litebox investigation and is
+filed here as a distinct, well-scoped finding for separate follow-up.
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash
