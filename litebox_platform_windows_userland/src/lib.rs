@@ -4908,6 +4908,20 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         debug_assert!(ALIGN.is_multiple_of(self.sys_info.read().unwrap().dwPageSize as usize));
         debug_assert_alignment!(suggested_range, ALIGN);
 
+        // DIAG (AGENTS.md pass 227): unconditional print of the actual `fixed_address_behavior`
+        // this call receives, plus the requested range -- pass 226 proved a `Replace`-mode
+        // fixed request IS being silently relocated somewhere in this function despite
+        // `found:false` on the foreign-claim check, and this investigation's working assumption
+        // (unverified until now) has been that every plain `MAP_FIXED` call reaches this
+        // function tagged `Replace`. Confirm or refute that assumption directly.
+        if suggested_range.start != 0 {
+            litebox_util_log::debug!(
+                start:% = suggested_range.start, end:% = suggested_range.end,
+                behavior:? = fixed_address_behavior;
+                "DIAG allocate_pages: entry, fixed-addr call"
+            );
+        }
+
         // A helper closure to reserve and commit memory in one go.
         //
         // Note that MEM_RESERVE requires the base address to be aligned to system allocation granularity,

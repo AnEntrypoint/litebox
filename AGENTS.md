@@ -2711,6 +2711,59 @@ and any OTHER address-space partition this session's own investigation has alrea
 in case this is a boundary/capacity-adjacent effect rather than a genuine per-request foreign
 collision.
 
+## 227th pass: fixed_address_behavior confirmed Replace (as assumed); traced the exact failing call and found found=true persists across all 5 retry attempts with foreign_owner=Some(GuestPid(1000)) (the shell) -- pass 217/218's fork-child claim-transfer fix does NOT eliminate this specific collision, meaning either that fix has a real gap, or this is a genuinely different, NOT-inherited-at-fork-time collision (the shell's own large 9.4MB heap/stack claim independently overlapping the child's own fresh ELF-segment address by coincidence, not a copy of shared memory)
+
+Added an unconditional diagnostic at `allocate_pages`'s own entry, printing `fixed_address_
+behavior` for every fixed-addr call. Confirmed `behavior=Replace` for the exact call
+(`start=270819328 end=271446016`) that pass 226 already proved is the direct source of one of
+the 8 EEXIST failures -- ruling out the "maybe it's actually Hint-mode" hypothesis from pass
+226's own writeup.
+
+Traced this SAME call's own foreign-claim-check retry loop (pass 216's bounded-retry code, all
+5 attempts) directly:
+
+```
+attempt=0 found=true foreign_owner=Some(GuestPid(1000)) foreign_range=Some((271384576, 280834048))
+attempt=1 found=true (same)
+attempt=2 found=true (same)
+attempt=3 found=true (same)
+attempt=4 found=true (same)
+-> allocate_pages: claiming fresh-address (start==0 path) start=264175616 end=264802304
+```
+
+**`found=true` persists across every retry, with the SAME `GuestPid(1000)` (the shell) as
+before pass 217/218's fix was ever added.** This directly contradicts this session's own
+passes 217/218/223's claim that the fix eliminated `found:true` entirely -- either those
+passes' own captures were looking at a different call/timing where the fix happened to work
+(this repro's OWN 8 mmap calls per process are not identical to each other -- earlier passes
+may have captured a DIFFERENT one of the 8, not this specific 626688-byte executable segment),
+or the fix's coverage has a real gap for this specific case.
+
+**Re-examining the numbers**: `foreign_range=(271384576, 280834048)` is a single, large
+(280834048-271384576 = 9449472 bytes, ~9 MiB) claimed range owned by `GuestPid(1000)` (the
+shell). This does NOT look like a small, per-segment ELF mapping -- it looks like the shell's
+own large contiguous region, most plausibly its HEAP (`brk`-grown) or a large `mmap(NULL, ...)`
+allocation the shell made independently, coincidentally overlapping the address `/bin/true`'s
+OWN fixed ELF segment wants. **This may not be a fork-inheritance case at all**: if the shell
+grew its own heap/mmap region to this size AFTER the fork that created guest pid 9 (this
+specific child), pass 217/218's fix (which only reclaims ranges that existed AT THE MOMENT OF
+FORK) would correctly NOT reclaim it, since it didn't exist yet at fork time -- and this really
+would be a genuine, simultaneous, both-alive resource conflict between the shell's own
+POST-fork growth and the child's OWN fixed-address ELF segment, exactly matching pass 214's
+ORIGINAL framing (before the fork-inheritance angle was discovered) -- i.e. passes 217/218's
+fix and passes 214's original finding may both be correct simultaneously, describing two
+DIFFERENT collision sub-cases (pre-fork-inherited memory, now fixed; post-fork-independent
+growth landing on the same address by coincidence, still unfixed).
+
+**This reframes the remaining problem accurately**: not a bug in the claim-transfer fix, but a
+genuinely unaddressed THIRD case -- two independently-growing, both-alive guest processes (a
+long-running shell doing ordinary heap growth, and a freshly-exec'd child needing a fixed
+low-address ELF segment) landing on the same real address purely by chance, which this
+platform's low, narrow, unrandomized address space (`DEFAULT_LOW_ADDR` family, `pid_salt`-only
+separation for `ET_DYN` -- pass 217's own finding) makes likely rather than rare. The `pid_salt`
+mitigation (`elf.rs` `reserve()`) exists exactly for this class of problem but does not cover
+address REUSE by an unrelated, independently-growing process's own heap.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
