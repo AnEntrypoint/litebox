@@ -3742,6 +3742,60 @@ here (per the user's own explicit reminder this pass, "any of our memories could
 wrong about something") since a stale memory entry may still claim `MSYS2_ARG_CONV_EXCL` is only
 needed for `--resume-from` specifically -- broaden that going forward to "every invocation."
 
+## 252nd pass: SAFETY-CRITICAL FINDING -- the kernel debug boot flag (bcdedit /debug on) set earlier this session caused TWO genuine, real hard system freezes (Event ID 41 unclean shutdown, no BugCheck/minidump produced -- a silent unrecoverable hang, not a normal crash) requiring hardware power-cycles, when litebox's own crash-heavy workload ran with debug mode active but no debugger ever attached. Disabled (bcdedit /debug off), confirmed persisted across a clean reboot. MANDATORY WARNING for any future session: never enable bcdedit /debug on for this project without an actual kernel debugger (kd.exe/windbg) attached and ready BEFORE running any litebox workload -- the risk is a full, silent host freeze requiring a hard power cycle, not a contained crash
+
+**What happened**: pass 246 (same session, prior to this one, before context compaction) added
+a kernel debug boot flag (`bcdedit /debug on` plus serial debug port settings) as one of two
+user-approved environmental additions for deeper crash diagnosis (the other, WER LocalDumps, was
+independently useful and is NOT implicated in this issue). The debug flag requires a reboot to
+take effect, which happened. After that reboot, running litebox's own crash-heavy verification
+workload (the ordinary XFCE launch repro, which deliberately triggers frequent guest-mode AVs as
+part of this whole investigation) caused the ENTIRE HOST to freeze solidly -- not a process
+crash, not a BSOD, a total system hang requiring a hard power-cycle. This happened TWICE in a
+row (once per attempted launch after the debug flag was active).
+
+**Confirmed via Windows Event Log**: two `Event ID 41` ("The system has rebooted without cleanly
+shutting down first... stopped responding, crashed, or lost power unexpectedly") entries at
+3:09:46 PM and 3:19:42 PM, each followed by an `Event ID 6008` ("previous system shutdown was
+unexpected"). Critically, **no `BugCheck`/minidump event exists for either freeze** (the most
+recent real BugCheck events in this system's history are from weeks earlier, unrelated) --
+meaning Windows's own kernel never detected a fault and produced a normal blue-screen/minidump;
+the system just silently stopped responding entirely and needed a hard power-cycle. This absence
+of a bugcheck, combined with `bcdedit /debug on` being confirmed active (`debug Yes` via elevated
+`bcdedit /enum`) at the time, strongly points to the well-known Windows kernel-debugger-hang
+mechanism: with `debug on` and a debug port configured but NO ACTUAL DEBUGGER EVER ATTACHED,
+certain kernel-level fault/breakpoint conditions cause the kernel to attempt to break into a
+debugger session that does not exist, hanging the entire system indefinitely rather than
+handling the fault normally. Litebox's own workload is unusually exception/AV-heavy by design
+(this whole investigation has been chasing exactly these kinds of faults), making it far more
+likely than an ordinary workload to trigger this exact kernel debugger wait-hang.
+
+**Fix applied and verified**: `bcdedit /debug off` (elevated, via a UAC-prompted `cmd.exe`
+subprocess since this session has no standing admin rights), confirmed `debug No` both
+immediately after the change and again after a subsequent clean reboot -- the setting persisted
+correctly and this exact freeze mechanism can no longer occur. Serial debug port settings
+(`debugtype Serial debugport 1 baudrate 115200`) remain configured but are inert/harmless with
+`debug` itself off.
+
+**This was correctly caught by the user, not by any automated process** -- the user directly
+reported "computer appears to freeze when we ran that command happened twice" and "userland apps
+shouldn't be able to freeze computers," which is exactly right: this was never a litebox bug at
+all, it was a consequence of an earlier debugging-environment change (this session's own,
+user-approved) creating a genuine host-level hazard once combined with litebox's own normal
+crash-heavy operation. Investigation paused immediately on this report (per the user's own
+explicit request to "investigate safely first") until the freeze's root cause was confirmed and
+fixed, with no further litebox launches attempted in between.
+
+**MANDATORY GUIDANCE for any future session touching this project**: NEVER enable
+`bcdedit /debug on` for litebox debugging purposes without an actual kernel debugger (`kd.exe`,
+WinDbg, or equivalent) already attached and confirmed working BEFORE running any litebox
+workload against it. If enabling it is genuinely necessary again, the correct sequence is:
+(1) enable the flag, (2) reboot, (3) attach a real debugger and confirm the attach succeeds
+BEFORE running litebox at all, (4) only then run the workload being diagnosed. Skipping step 3
+is what caused this session's two hard freezes. If a kernel debugger is not immediately available
+to attach, prefer WER LocalDumps (already configured this session, works well, carries no
+system-freeze risk) or the guest-mode-fault termination fix (pass 246/247) for diagnosis instead.
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash
