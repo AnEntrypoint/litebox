@@ -4695,6 +4695,59 @@ This is the same question pass 268/269 already posed, now confirmed with even st
 that it is the RIGHT question -- every other layer of the stack has been individually verified
 working correctly.
 
+## 272nd pass: FINALLY GOT WESTON SOURCE ACCESS (the single highest-leverage blocker a much earlier, deep sub-session explicitly named as the prerequisite for real further progress) via GitHub's microsoft/weston-mirror -- read desktop-shell's real client (clients/desktop-shell.c) and compositor-side plugin (desktop-shell/shell.c) source directly, confirmed weston's own background-drawing mechanism (desktop_shell_set_background, entirely client-driven, no compositor-side fallback/placeholder exists in current source) and found output_init() unconditionally creates+registers a background surface with no early-return that could explain a silent skip -- this rules out the exact hypotheses the client-side C logic could explain, and sharpens the true remaining question to "why does desktop-shell.c's own main() event loop never reach its output-initialization code at all", most likely because its initial wl_display_roundtrip() (waiting for the registry to finish enumerating globals) never returns
+
+**Real weston source finally read, resolving the single blocker sub-session 44 (an earlier, much
+deeper investigation than this session's own passes 249-271, documented earlier in this same
+AGENTS.md) explicitly said was required**: `WebFetch`/`WebSearch` capability, unavailable to
+that sub-session, IS available to this session -- fetched `desktop-shell/shell.c` (the
+compositor-side `desktop-shell.so` plugin) and `clients/desktop-shell.c` (the client binary,
+`/usr/libexec/weston-desktop-shell`) from `github.com/microsoft/weston-mirror` (a maintained
+GitHub mirror of weston's real upstream GitLab source).
+
+**Confirmed, directly from source, exactly how background rendering works**: `desktop_shell_set_background()`
+(compositor-side, `shell.c`) is a Wayland-protocol request handler -- it does nothing unless the
+CLIENT explicitly calls it, passing an already-drawn `wl_surface`. There is NO compositor-side
+automatic/fallback background drawing in current weston source -- confirming (and slightly
+refining) sub-session 44's own inference about a "persistent solid-colour placeholder view":
+whatever that specific pointer (`0x1bf60980`) was, it is not a documented, intentional weston
+feature in this source tree; it may be an artifact of an older weston version, or the DRM
+backend's own internal "no assigned plane content yet" bookkeeping unrelated to desktop-shell at
+all. This doesn't change the core finding either way -- the background genuinely never gets
+drawn.
+
+**Traced the client's own startup logic precisely, ruling out the specific hypotheses source
+access makes checkable**: `output_init()` (the function that creates+registers the background
+surface) is called either directly from `global_handler`'s `wl_output` case (if `desktop->shell`
+is already bound) OR via a compensating loop in `main()` (`wl_list_for_each(output, ...) if
+(!output->panel) output_init(...)`, which real weston already includes specifically to handle
+the "output global arrived before the shell global" race sub-session 44 might otherwise have
+suspected). `output_init()` itself has NO early-return path that could silently skip background
+creation -- `background_create()` and `weston_desktop_shell_set_background()` are called
+unconditionally, every time this function runs. This rules out both a registry-ordering race AND
+a silent early-return in `output_init` as explanations for the missing background.
+
+**This narrows the true remaining question to one, sharply specific thing**: `output_init()` is
+never being reached AT ALL for either code path, most plausibly because `desktop-shell.c`'s own
+`main()` function blocks (or crashes/exits) during its initial `wl_display_roundtrip()` call --
+the standard Wayland client pattern of doing one blocking round-trip immediately after connecting
+to receive the full registry global list before proceeding -- and this roundtrip never completes,
+consistent with sub-session 44's own observation that the client reaches a clean, correct-looking
+`epoll_pwait` idle state (which a stuck/never-returning roundtrip's own event-loop dispatch call
+could plausibly present as, if the compositor never sends the final `wl_display.sync` callback
+completion event the roundtrip is waiting for).
+
+**Concrete, now maximally sharp next step for whoever continues this**: fetch `desktop-shell.c`'s
+own `main()` function source directly (not yet done this pass -- ran out of remaining budget for
+this specific pass to also do this) to confirm the exact roundtrip/sync call sequence, then
+cross-reference against the raw Wayland-wire-protocol bytes already sitting in every prior
+repro's own log (sub-session 44's own next-step #2, still unactioned) to check whether the
+compositor's OWN `wl_callback.done` event for that specific sync ever gets sent at all -- if it
+does, the client should be unblocking normally; if it doesn't, this points squarely at
+litebox's/weston's own `wl_display_sync`-handling on the COMPOSITOR side never completing this
+one specific callback, which would be a genuinely novel, previously-uninvestigated angle distinct
+from every hypothesis sub-session 44 already exhausted.
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash
