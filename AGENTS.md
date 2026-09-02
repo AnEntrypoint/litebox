@@ -4556,6 +4556,52 @@ logging every `mmap`/`ioctl` call weston's own Pixman renderer issues against th
 DRM's `CREATE_DUMB`/`MAP_DUMB` established) would directly answer whether weston is even writing
 to the buffer at all, or writing to a stale/wrong address.
 
+## 269th pass: refined pass 268's own finding -- checked for any Wayland client surface ever being created/mapped in the frame-dump-enabled run's log and found NONE, suggesting the all-black frames are not a weston rendering BUG at all but architecturally expected: kiosk-shell.so is designed to host exactly one fullscreen client surface, and Xwayland (the bridge XFCE's own X11 apps need) may never be establishing itself as that one client in the first place -- reframing kiosk-shell as possibly the WRONG shell choice for hosting a full X11-via-Xwayland desktop session, not just a workaround for the desktop-shell crash
+
+**Checked the frame-dump-enabled run's own log for Wayland surface/client-connection activity**
+(`wl_shell`/`xdg_shell`/surface-creation log lines from weston's own compositor, or Xwayland's
+own connection to it) -- found NONE beyond the host-side presenter's own unrelated `wgpu`
+surface setup. This is consistent with, and offers a concrete explanation for, pass 268's own
+`non_black_pixels=0` finding: kiosk-shell's own design (per its name and general Wayland-shell
+conventions) is to host exactly ONE application surface fullscreen, with no independent
+background/wallpaper layer of its own the way `desktop-shell.so` explicitly manages -- if NO
+client (Xwayland included) ever successfully creates and maps a surface to it, kiosk-shell has
+architecturally nothing to composite, and black is not a bug in that case, it's the expected
+"no content" state.
+
+**This reframes the whole kiosk-shell detour**: switching to `kiosk-shell.so` was originally
+adopted (pass 263) purely as a way to avoid `desktop-shell.so`'s own crash, without considering
+whether kiosk-shell is even the RIGHT shell module for what this session is actually trying to
+do (host a full XFCE desktop session via Xwayland, not run one single native-Wayland kiosk app).
+It may be that `kiosk-shell` structurally cannot host what `xfce4-session`+`Xwayland` need at
+all, regardless of whether Xwayland itself starts successfully -- Xwayland needs to be recognized
+and placed as kiosk-shell's own "the" client, which may require explicit kiosk-shell
+configuration (an `[shell] client=` directive naming Xwayland itself, or a different invocation
+sequence) that this session's own launch scripts have not yet attempted.
+
+**Two concrete paths forward for whoever continues this**:
+1. **Configure kiosk-shell to explicitly host Xwayland as its client** (check kiosk-shell's own
+   config directives -- likely needs the compositor to launch Xwayland ITSELF via a `weston.ini`
+   `[shell] client=/usr/bin/Xwayland` -style directive, rather than this session's own scripts
+   launching Xwayland as an independent, unrelated background process the way `desktop-shell`
+   permits) -- if this makes Xwayland's own X11 root window actually appear as kiosk-shell's
+   single managed surface, XFCE's own X11 apps drawn on top of it should then become visible.
+2. **Go back to `desktop-shell.so` and instead find/fix the ACTUAL weston-desktop-shell crash**
+   this whole investigation originally set out to root-cause (passes 249, 255-261's own register/
+   mapping-level captures) -- `desktop-shell.so` is architecturally the correct, designed-for-
+   this-purpose shell for a full XFCE-via-Xwayland desktop session (it explicitly manages a
+   background, panel area, and arbitrary X11/Wayland client windows), so fixing its own crash
+   properly (rather than routing around it) is the more architecturally sound long-term path,
+   even though it is the harder one this session's own many earlier passes were unable to fully
+   resolve.
+
+Given this session's own significant remaining effort invested and the real, substantive,
+verified progress made this pass (the HOME-export bug fix, the conclusive frame-content
+evidence ruling out the presentation pipeline, and this architectural reframing of the kiosk-
+shell approach itself), this is a natural, well-documented stopping point for continuing in a
+future session with a much sharper, more concrete set of next steps than existed before this
+pass began.
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash
