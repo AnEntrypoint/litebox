@@ -1234,6 +1234,48 @@ unsafe extern "system" fn vectored_exception_handler(
             // access-violation-class fault racing a fork-heavy repro), so this diagnostic exists
             // specifically to survive on the fast/untraced path where the crash actually occurs.
             if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION {
+                // AGENTS.md pass 232: a genuinely unrecovered AV at this exact point (most
+                // often the still-unexplained `ntdll!RtlpUnwindPrologue` fault documented since
+                // pass 205) has been observed live to recur at the SAME `rip`, thousands of
+                // times per second, forever -- `EXCEPTION_CONTINUE_SEARCH` below hands the fault
+                // back to Windows, which apparently just re-delivers the identical fault
+                // instead of ever terminating the process or reaching a different handler.
+                // Confirmed live during a real XFCE session (pass 230): the log grew past
+                // 500,000 lines in a few seconds with the host process still nominally "alive"
+                // but making zero forward progress, an unbounded resource-exhaustion hazard
+                // (disk space) with no natural end. Bound this: if the SAME `rip` faults this
+                // way more than a small, generous number of times in a row on one thread,
+                // conclude this is genuinely unrecoverable and terminate the WHOLE process
+                // cleanly via `TerminateProcess` rather than let Windows spin forever -- this
+                // sacrifices whatever this one thread was doing (already true today, just via
+                // an infinite hang instead of a clean exit) without risking the runaway
+                // disk-exhaustion failure mode observed live.
+                thread_local! {
+                    static LAST_UNRECOV_AV: core::cell::Cell<(u64, u32)> =
+                        const { core::cell::Cell::new((0, 0)) };
+                }
+                const MAX_REPEATED_UNRECOV_AV: u32 = 64;
+                let (last_rip, repeat_count) = LAST_UNRECOV_AV.get();
+                let repeat_count = if last_rip == context.Rip {
+                    repeat_count + 1
+                } else {
+                    1
+                };
+                LAST_UNRECOV_AV.set((context.Rip, repeat_count));
+                if repeat_count > MAX_REPEATED_UNRECOV_AV {
+                    diag_raw_print(
+                        b"[diag-unrecov-av-giveup] rip=0x",
+                        context.Rip as usize,
+                        b" repeat_count=0x",
+                        repeat_count as usize,
+                    );
+                    unsafe {
+                        windows_sys::Win32::System::Threading::TerminateProcess(
+                            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                            1,
+                        );
+                    }
+                }
                 unsafe extern "C" {
                     safe static __ImageBase: c_void;
                 }
