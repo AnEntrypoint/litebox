@@ -466,6 +466,30 @@ where
         Some(())
     }
 
+    /// Fill `len` consecutive elements starting at the given offset with `value`.
+    ///
+    /// Returns `None` under the same conditions as [`Self::write_at_offset`]; on failure, there
+    /// are no guarantees about how many elements -- if any -- have been written.
+    ///
+    /// The default implementation writes one element at a time via [`Self::write_at_offset`],
+    /// matching this trait's other default implementations. Platforms whose fallible-write
+    /// mechanism pays a fixed per-call cost when the target is not yet backed (e.g. a full
+    /// exception-dispatch round-trip per byte) should override this with a genuinely bulk fill
+    /// covered by a single fault-recovery region -- see
+    /// `litebox_platform_windows_userland`'s `RawMutPointer<u8>` impl for `UserMutPtr`, and
+    /// `litebox::mm::exception_table::memset_fallible`, for the reference implementation this was
+    /// added to support.
+    #[must_use]
+    fn fill_at_offset(self, count: isize, len: usize, value: T) -> Option<()>
+    where
+        T: Clone,
+    {
+        for offset in count..count.checked_add_unsigned(len)? {
+            self.write_at_offset(offset, value.clone())?;
+        }
+        Some(())
+    }
+
     /// Obtain a mutable (sub)slice of memory at the pointer, and run `f` upon it.
     ///
     /// Returns `None` (and does not invoke `f`) if the provided pointer is invalid, or such a slice

@@ -14,7 +14,7 @@ use elf::parse::ParseAt as _;
 use litebox::{
     mm::linux::PAGE_SIZE,
     platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider},
-    utils::{ReinterpretSignedExt as _, TruncateExt as _},
+    utils::TruncateExt as _,
 };
 use thiserror::Error;
 use zerocopy::FromBytes;
@@ -942,12 +942,7 @@ impl<Platform: RawPointerProvider> AccessMemory for &Platform {
 
     fn zero(&mut self, address: usize, len: usize) -> Result<(), Fault> {
         let addr = Platform::RawMutPointer::<u8>::from_usize(address);
-        // TODO: add a fill method to [`RawMutPointer`] and use it.
-        for i in 0..len {
-            addr.write_at_offset(i.reinterpret_as_signed(), 0)
-                .ok_or(Fault)?;
-        }
-        Ok(())
+        addr.fill_at_offset(0, len, 0).ok_or(Fault)
     }
 }
 

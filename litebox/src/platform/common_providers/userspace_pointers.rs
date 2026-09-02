@@ -384,4 +384,40 @@ impl<V: ValidateAccess, T: FromBytes + IntoBytes> RawMutPointer<T> for UserMutPt
         })
         .ok()
     }
+
+    // Overridden for the same reason as `write_slice_at_offset` above: a single bulk
+    // `memset_fallible` covered by ONE fault-recovery region instead of `len` individual
+    // `write_at_offset` calls, each its own full VEH round-trip when the target page is not yet
+    // backed. Confirmed live: `ElfParsedFile::load`'s zero-fill of a freshly `map_file`'d ELF
+    // segment's BSS tail (up to several KiB) via the OLD per-byte loop produced a fatal,
+    // unrecoverable secondary fault during Windows exception unwind, plausibly from VEH-reentrancy
+    // exhaustion after enough single-byte round-trips in a tight loop -- this bulk path takes at
+    // most one such round-trip for the whole fill, regardless of `len`. Only takes the fast path
+    // for the all-zero-byte case this trait method exists to serve (`T = u8`, `value == 0`); any
+    // other element type/value falls back to the default per-element loop, unchanged.
+    fn fill_at_offset(self, count: isize, len: usize, value: T) -> Option<()>
+    where
+        T: Clone,
+    {
+        if len == 0 {
+            return Some(());
+        }
+        if size_of::<T>() == 1 {
+            // SAFETY: `T` is exactly one byte per the `size_of::<T>() == 1` check just above, so
+            // reinterpreting `&value` as `&u8` reads exactly the bytes `value` occupies.
+            let value_byte = unsafe { *(&raw const value).cast::<u8>() };
+            if value_byte == 0 {
+                let dst = self.as_ptr().wrapping_add(usize::try_from(count).ok()?);
+                let dst = V::validate_slice(core::ptr::slice_from_raw_parts_mut(dst, len))?;
+                return V::with_user_memory_access(|| unsafe {
+                    crate::mm::exception_table::memset_fallible(dst.cast(), len)
+                })
+                .ok();
+            }
+        }
+        for offset in count..count.checked_add_unsigned(len)? {
+            self.write_at_offset(offset, value.clone())?;
+        }
+        Some(())
+    }
 }

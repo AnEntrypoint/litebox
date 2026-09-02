@@ -203,6 +203,74 @@ pub unsafe fn memcpy_fallible(dst: *mut u8, src: *const u8, size: usize) -> Resu
     Ok(())
 }
 
+/// Zero-fills `size` bytes at `dst` in a fallible manner.
+///
+/// This is the `memset(dst, 0, size)` counterpart to [`memcpy_fallible`], added specifically to
+/// replace `AccessMemory::zero`'s prior byte-at-a-time `write_at_offset` loop -- confirmed live
+/// (an investigation into a fatal, unrecoverable crash inside `ElfParsedFile::load`'s own
+/// zero-fill call) that a large (thousands-of-bytes) zero-fill performed as thousands of
+/// individual single-byte fault-tolerant writes, each its own full VEH round-trip when the target
+/// page is not yet backed, is a plausible trigger for host-side VEH-reentrancy exhaustion/
+/// corruption after enough repeated faults in a tight loop -- matching this same investigation's
+/// own documented `TlsState::veh_depth` reentrancy-hazard class elsewhere in this codebase. A
+/// single bulk `rep stosq`/`rep stosb` pair covers the WHOLE zero-fill under one `[2:, 3:)`
+/// exception-table range, taking at most one VEH round-trip total instead of up to `size` of
+/// them, structurally closing that hazard regardless of its exact root cause.
+///
+/// # Safety
+/// `dst` must be valid for writes of `size` bytes, or a pointer that's guaranteed to be in
+/// non-Rust memory.
+pub unsafe fn memset_fallible(dst: *mut u8, size: usize) -> Result<(), Fault> {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        // See `memcpy_fallible`'s own doc comment for the qword-then-byte-tail reasoning; this
+        // mirrors it exactly but with `stos` (store, no source register) instead of `movs`.
+        let qword_count = size / 8;
+        let tail_len = size & 7;
+        core::arch::asm! {
+            "2:",
+            "rep stosq",
+            "mov rcx, {tail_len}",
+            "rep stosb",
+            "3:",
+            ex_table_entry!("2b", "3b", "{fault}"),
+            inout("rdi") dst => _,
+            inout("rcx") qword_count => _,
+            in("rax") 0u64,
+            tail_len = in(reg) tail_len,
+            fault = label { return Err(Fault) }
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        // Bulk zero-fill 16 bytes at a time via `stp`, then a byte tail for the remaining
+        // 0..15 bytes, mirroring `memcpy_fallible`'s aarch64 path.
+        core::arch::asm! {
+            "2:",
+            "cmp {size}, #16",
+            "b.lo 20f",
+            "30:",
+            "stp xzr, xzr, [{dst}], #16",
+            "sub {size}, {size}, #16",
+            "cmp {size}, #16",
+            "b.hs 30b",
+            "20:",
+            "cbz {size}, 3f",
+            "21:",
+            "strb wzr, [{dst}], #1",
+            "subs {size}, {size}, #1",
+            "b.ne 21b",
+            "3:",
+            ex_table_entry!("2b", "3b", "{fault}"),
+            dst = inout(reg) dst => _,
+            size = inout(reg) size => _,
+            fault = label { return Err(Fault) }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(target_arch = "x86_64")]
 macro_rules! read_fn {
     ($name:ident, $ty:ty, $mov_instr:expr) => {
