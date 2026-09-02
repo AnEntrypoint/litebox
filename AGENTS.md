@@ -1879,6 +1879,52 @@ systematic high-bits-truncation bug in exactly that code would explain both the
 one or more frames removed from the original fault, rather than an immediate, obviously-wrong
 crash at the fixup label itself.
 
+## 210th pass: RETRACT pass 209's "truncated pointer" reading of the 0xeb00... stack values -- 0xeb is literally the x86 opcode for `jmp rel8`, so these are far more likely raw instruction bytes (garbage/leftover stack content), not corrupted addresses; audited fork_verify's only 32-bit register read (register_value, line 1966) and confirmed it is correct, deliberate zero-extension, not a bug
+
+Audited every `context.<Reg> = ...` write in both `lib.rs` and `fork_verify.rs` for a 32-bit
+truncation bug, per pass 209's own proposed next step. Found exactly one place that narrows to
+32 bits: `fork_verify.rs`'s `register_value` (line 1966), `Some((value as u32) as usize)`. Read
+its full context and its own doc comment: this deliberately implements the correct x86-64
+architectural behavior for reading a 32-bit sub-register (e.g. `EAX`) -- real hardware
+zero-extends a 32-bit register write/read to the full 64-bit register, and this code exists
+specifically to replicate that when `register.size() == 4`. This is NOT a bug; the
+`#[allow(clippy::cast_possible_truncation)]` and its adjacent comment already document exactly
+this reasoning. No other 32-bit-narrowing register write was found anywhere in either file. The
+32-bit-truncation-bug hypothesis is retracted for lack of any actual candidate site.
+
+**Also retracting pass 209's characterization of the stack values themselves.** Re-examined
+`0xeb00000000`, `0xeb00000065`, `0xeb00500016`, `0x7ff700500016`: the shared high-byte pattern
+is `0xeb`, which is not a truncation artifact -- `0xEB` is the literal x86 opcode byte for a
+short-form `jmp rel8` instruction. Values shaped like `0xeb00500016` are far more plausibly
+raw bytes from disassembled/decoded instruction data (or simply uninitialized/stale stack
+content coincidentally containing opcode-looking bytes) sitting in this stack region, not a
+systematically corrupted pointer. This reframes pass 209's "corruption evidence" as most
+likely a false lead -- ordinary stack noise, not a smoking gun.
+
+**Where this leaves the investigation:** the concrete, load-bearing findings from passes
+205-208 stand and are NOT retracted:
+- The fatal sequence is genuinely three distinct events: (1) `memset_fallible`'s `rep stosq`
+  faults on an unmapped guest BSS address during the 8th fork's post-exec ELF load, (2) a
+  second, different access violation follows immediately (its exact nature varies run-to-run:
+  sometimes a `write_u8_fallible`-shaped fault that IS recovered by
+  `search_exception_tables`, sometimes a genuinely unrecovered fault inside
+  `ntdll!RtlpUnwindPrologue`), (3) in every capture across the whole investigation, this
+  ultimately manifests as (or is immediately followed by) `code=c000000d` at the same constant
+  ntdll address this session's earlier passes tracked.
+- `memset_fallible`'s own compiled unwind metadata is valid and complete (pass 209's `.fnent`
+  check) -- ruling out a missing-`.pdata` explanation for fault (2)/(3).
+- The underlying mechanism connecting fault (1) to faults (2)/(3) remains genuinely
+  unidentified after exhausting every register/stack-content lead available without a working
+  live debugger. Given `fork_verify`'s single-stepping is fundamentally incompatible with
+  external debugger attach (pass 205), and every remaining static/offline analysis avenue
+  (unwind info, register-truncation audit, stack-content pattern matching) has now been tried
+  and come up empty or been retracted, further progress on the EXACT mechanism most likely
+  requires either kernel-debugging tooling (a real KD session, not `cdb` user-mode attach) or
+  a from-scratch redesign of the fallible-primitive recovery path that sidesteps the whole
+  class of "resume execution via a raw `Rip` overwrite after a mid-instruction fault" pattern
+  (pass 208's originally-proposed fix (b), which remains valid architecture-hardening advice
+  independent of whether it's THE fix for this specific bug).
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
