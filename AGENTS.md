@@ -2836,6 +2836,66 @@ management issue this session's whole investigation uncovered.
 **Immediate next step**: retry the real XFCE GUI launch with this final fix in place -- every
 previously-identified blocker to `xfce4-session` starting should now be resolved.
 
+## 230th pass: MASSIVE PROGRESS -- xfce4-session itself successfully launches (t=40.5s) with dbus-daemon/xkbcomp/multiple helper scripts all loading with ZERO EEXIST failures for the entire run, definitively confirming pass 229's fix resolves the whole multi-process mmap-collision regression. BUT hit a NEW, different, real problem: an infinite retry loop of the exact same ntdll!RtlpUnwindPrologue fault from passes 205-210 (0x7ffb3671587a), now manifesting as a runaway spin (500K+ log lines in seconds) during fork_verify's active verification of one of xfce4-session's own spawned children, instead of the hard crash seen earlier -- killed the process before it exhausted disk
+
+Relaunched the real `--gui` XFCE session with pass 229's Hint-mode collision fix in place (no
+`LITEBOX_FORKVERIFY_OFF` this time -- the real launch path, `fork_verify` fully active).
+Result, the best this whole investigation has ever achieved:
+
+```
+t=27.7-29s: mkdir/chmod/sleep/Xwayland all load successfully, zero EEXIST
+t=36.9-40.5s: dbus-launch, xkbcomp (x3), dbus-daemon all load successfully, zero EEXIST
+t=40.5s: /usr/bin/xfce4-session itself loads successfully
+t=42-44s: xfce4-session's own spawned sh/xkbcomp helper scripts continue loading successfully
+```
+
+**Zero EEXIST failures across the ENTIRE run** -- this conclusively confirms pass 229's
+Hint-mode collision fix resolves the mmap-collision regression completely, even under the
+real, much heavier, much more concurrent XFCE startup sequence (not just the synthetic fast
+repro). `xfce4-session` -- the single component every earlier pass in this whole 213-229 arc
+identified as the final blocker -- now genuinely starts.
+
+**But a NEW, different, real problem surfaced right after**: the log fills with thousands of
+repeated `[diag-unrecov-av]` lines, all at the EXACT SAME address this whole investigation's
+much earlier passes (205-210) already identified: `rip=0x7ffb3671587a`, resolved back then to
+`ntdll!RtlpUnwindPrologue+0x11a` via an offline `cdb -z` symbol lookup. This time it carries
+`is_verifying=true` (confirmed, `fork_verify` genuinely active and mid-verification on this
+thread) and `addr=0x43a` (a different near-null-ish fault address than earlier captures, but
+the same tiny-offset shape). **Unlike every earlier capture of this exact fault (which
+terminated the process outright via the fatal `c000000d` unwind failure), this occurrence
+repeats in an apparent INFINITE LOOP** -- the log grew from ~380K to ~565K lines in 5 seconds
+of wall-clock time (thousands of repeats per second), with the host process still alive and
+NOT visibly making forward progress. Killed the process (`taskkill`) before it could exhaust
+disk space, a known recurring hazard this session's own history has flagged repeatedly.
+
+**This is very likely the SAME underlying, still-unresolved bug from passes 205-210** (the
+`memset_fallible`/exception-recovery-into-ntdll-unwind-failure mystery, retracted through
+several theories without full resolution) -- but manifesting differently under THIS specific
+concurrency/timing profile (a genuinely busy, many-threaded XFCE session, not the earlier
+passes' own simpler single-fork repros) as a retry loop rather than an immediate hard crash.
+Given `is_verifying=true`, this happens specifically during `fork_verify`'s own single-step
+healing of a freshly-forked child (one of `xfce4-session`'s own spawned helper processes) --
+consistent with everything already known about this fault's association with fork-heavy,
+concurrently-verifying code paths.
+
+**Immediate risk to flag for whoever continues**: this loop grows the log file at roughly
+37,000 lines/second -- left unattended, it will exhaust available disk space within minutes.
+Always run future `--gui` launch attempts with output redirected to a location that can be
+monitored/truncated, or with a hard wall-clock timeout, until this specific fault's true root
+cause and a real fix are found.
+
+**Where this leaves the investigation**: this session's OWN primary objective (fix the
+mmap-collision regression blocking `xfce4-session`) is COMPLETE and verified. A separate,
+pre-existing, still-open bug (the `ntdll!RtlpUnwindPrologue` fault from passes 205-210) is now
+confirmed to also affect the real XFCE launch path, manifesting as an infinite retry loop
+under this specific concurrency profile rather than the hard crash seen in earlier, simpler
+repros. This is the new, precise, final blocker to a fully-rendering XFCE desktop -- distinct
+from (and now that the mmap regression is fixed, more clearly isolated than) anything this
+session worked on directly. A future pass should pick up exactly where passes 205-210 left off
+(the ntdll unwind-failure mystery), now armed with a `is_verifying=true`/concurrent-XFCE-
+session repro that reaches it much more reliably (via a real GUI launch, not a synthetic
+fork loop) than anything available when those passes were investigating it.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
