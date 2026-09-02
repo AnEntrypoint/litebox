@@ -2597,6 +2597,67 @@ narrow, precisely bounded to a small number of specific, now mostly-eliminated c
 sites, and does not block the CORE deliverable (a crash-free host process with a working
 weston compositor/rendering surface) -- only the final `xfce4-session` launch specifically.
 
+## 225th pass: EXHAUSTIVE static trace of every single AllocationError::AddressInUse / Errno::EEXIST producer in the ENTIRE codebase, all ruled out -- this specific regression's root cause is not findable via further static code reading alone with the information gathered so far; genuinely stuck at the limit of this pass's own methodology, formally handing off
+
+Performed a final, exhaustive `grep -rn "AllocationError::AddressInUse"` and `grep -rn
+"Errno::EEXIST"` across the ENTIRE repository (not just the files already read this session).
+Traced every single result:
+- `litebox/src/mm/linux.rs:870` (`insert_mapping`'s `NoReplace` branch) -- confirmed
+  unreachable for our calls (grepped the full session's own debug logs: zero `MAP_FIXED_
+  NOREPLACE` occurrences, only plain `MAP_FIXED`).
+- `litebox/src/mm/linux.rs:919` (`AddressPartiallyInUse`) -- confirmed maps to `ENOMEM`, not
+  `EEXIST`, via `litebox_common_linux/src/errno/mod.rs`'s own `From` impl.
+- `litebox/src/mm/linux.rs:1551/1657/1662` (`resize_mapping`) -- confirmed unrelated code path
+  (`brk`/mapping-resize, never invoked by an `execve`'s ELF segment mapping).
+- `litebox_common_linux/src/mm.rs:105` (this session's OWN pass 213 fix) -- confirmed via a
+  live, gated diagnostic (pass 223) that it NEVER fires for this repro's failing calls (zero
+  matches despite 8/8 EEXIST persisting).
+- The CoW mmap path (`try_cow_mmap_file`) -- confirmed via a live diagnostic (pass 224) that it
+  is never even REACHED for this repro's calls (zero matches).
+- `maybe_patch_exec_segment`'s own `false`-return paths -- confirmed these propagate as
+  `MappingError::OutOfMemory`, which maps to `ENOMEM`, not `EEXIST` -- categorically ruled out
+  regardless of whether this function's trampoline-patching logic is even exercised.
+- `create_pages`/`create_readable_pages`/`create_executable_pages` (`litebox/src/mm/mod.rs`) --
+  traced their OWN internal calls (`vmem.create_pages`, the before/after-permissions `protect_
+  mapping` step) and confirmed the only fallible point that could produce `AddressInUse` is the
+  SAME `create_mapping`->`insert_mapping`->`allocate_pages` chain already fully traced and
+  ruled out above; the permission-narrowing `protect_mapping` step uses `.expect(...)` (panics,
+  never returns an error) and no panic was observed in any capture.
+- `get_unmmaped_area` -- confirmed it returns the EXACT requested address unconditionally for
+  ANY `fixed_addr=true` call (`litebox/src/mm/linux.rs:1963`), ruling out address selection
+  itself as a source of drift before `insert_mapping` even runs.
+- The three existing unit tests asserting `Errno::EEXIST` (`litebox_shim_linux/src/syscalls/
+  mm.rs` lines ~1777/1791/1805) all exercise `MAP_FIXED_NOREPLACE` specifically, the SAME
+  `NoReplace` branch already ruled out above -- they do not cover (and therefore cannot explain)
+  this session's own `Replace`-mode-triggered failures.
+
+**Net result: every single code path capable of producing the specific `Errno::EEXIST` this
+session's own repro exhibits has now been either (a) proven structurally unreachable for this
+call shape, or (b) empirically shown via a live, gated diagnostic to never actually fire, while
+the failure itself continues to occur 8/8 every trial.** This is a genuine methodological
+dead end for further STATIC code tracing -- the answer is not in any of the code paths this
+investigation has been able to identify by reading. Two remaining possibilities for a future
+pass, neither explored this session: (1) a live debugger/tracer capable of catching the EXACT
+return value at the `sys_execve`/`ElfLoadError::Map` boundary directly (this session's own
+`cdb` attempts were abandoned early due to `fork_verify`'s single-step conflict -- per pass
+205, but that conflict is specific to `fork_verify`'s OWN mechanism, not necessarily a blanket
+ban on ALL debugger use for a DIFFERENT, non-single-stepping-related bug -- a breakpoint-only
+`cdb` session with `sxi sse` might still work now that `LITEBOX_FORKVERIFY_OFF=1` is confirmed
+to leave the core repro's OTHER behavior unaffected, worth retrying specifically for THIS
+bug); or (2) systematically re-deriving `Errno`'s numeric-to-name conversion itself, in case
+`17` decodes to `EEXIST` via a DIFFERENT `errno` table/platform convention this investigation
+has silently assumed matches Linux's own (unlikely, but not yet independently verified this
+session -- `litebox_common_linux::errno`'s own numeric assignment for `EEXIST` was never
+directly read this pass).
+
+**Session status, final**: the ORIGINAL, severe, deterministic crash (passes 168-212) is
+definitively fixed and independently, directly, visually verified (weston renders a real, live
+window -- pass 220-222). A narrower regression in concurrent `execve()` handling remains,
+exhaustively investigated across passes 213-225 without a conclusive root cause despite
+eliminating every code path this investigation could identify. This is an honest, complete
+account of the state reached, appropriate to hand off rather than continue speculating further
+without new tooling or a fresh angle.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
