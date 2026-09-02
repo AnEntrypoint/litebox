@@ -4365,6 +4365,43 @@ work around) the SAME pass-205 corruption class this project has partially inves
 during fork-heavy guest activity), and the kiosk-shell path should carry all the way through to
 a real rendering desktop. This is now the session's own single highest-priority remaining item.
 
+## 265th pass: tried LITEBOX_FORKVERIFY_OFF=1 against the xfce4-session-stage race (pass 264's remaining blocker) -- re-confirms this project's own much older finding (disabling fork_verify makes things WORSE): with it off, weston itself never got Xwayland a working wayland socket in 2 separate attempts (with and without extra startup delay), a clean regression back to a KNOWN dead end, not a new lead. Reverting to fork_verify ON (default) as the correct configuration going forward
+
+Tested the one cheap, already-built lever available for the pass-264 host-mode race
+(`LITEBOX_FORKVERIFY_OFF=1`, an existing env var gate in `fork_verify.rs`) against the full
+kiosk-shell XFCE chain, twice (once with the original startup delays, once with weston's own
+startup delay extended from 15s to 25s and Xwayland's from 8s to 10s to rule out a timing
+coincidence). **Both attempts failed the SAME way**: no crash occurred (a genuine behavior
+change from fork_verify being on, where the pass-205 race consistently fires), but `Xwayland`
+itself could never connect to weston's Wayland socket at all (`could not connect to wayland
+server`, `Fatal server error: Couldn't add screen`) -- weston's own compositor apparently never
+became ready to accept a client connection with fork_verify disabled, regardless of how long
+Xwayland was made to wait.
+
+This is not a new finding -- it exactly re-confirms this project's OWN prior, pre-this-session
+investigation (documented earlier in this same `AGENTS.md`, the "STATUS (2026-09-01)" entry):
+disabling `fork_verify` entirely was already established as making things WORSE, specifically
+by preventing Xwayland from ever getting a working connection, not as a viable mitigation for
+the corruption race. This pass's own two attempts land on the identical, already-known dead end
+-- useful confirmation that this lever genuinely doesn't help (worth knowing definitively rather
+than assuming), but not a new path forward.
+
+**Reverting to `fork_verify` ON (the default, no env var set) as the correct, working
+configuration.** This is the configuration that reliably reaches `xfce4-session`'s own startup
+via the kiosk-shell path (pass 264) before hitting the still-open pass-205 host-mode race --
+the single most promising configuration this whole investigation has ever reached, and the one
+that should be used for any further work on the remaining blocker.
+
+**Session state at this point**: `litebox_shim_linux/src/lib.rs` and
+`litebox_shim_linux/src/syscalls/mm.rs` carry this pass's own real, kept diagnostic
+infrastructure (`diag-guest-exception` register/mapping capture, `diag-exec-mmap`/mprotect-exec
+path correlation) -- all additive, all confirmed non-perturbing to the crashes they were built
+to observe (every capture this pass used them without changing which crash class fired relative
+to un-instrumented runs). The `xfce-layer-sw.tar` resume-from tar now also carries the working
+`kiosk-shell.so`-based configuration (`weston_kiosk.ini`, `xfce_launch_kiosk2.sh`/`kiosk3.sh`) as
+a real, reusable alternative to the crash-prone `desktop-shell.so` path, ready for any future
+session to build on directly.
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash
