@@ -2453,6 +2453,39 @@ presenting an empty/background-only frame even without `xfce4-session`) has not 
 confirmed this pass -- log analysis alone cannot establish that; would need either the user's
 own observation or a screenshot-capable tool.
 
+## 221st pass: confirmed via Win32 EnumWindows that a REAL, visible, correctly-sized native top-level window titled "litebox virtual display" exists (1550x902, hwnd verified) -- direct pixel-content verification via screenshot was NOT possible from this sandboxed automation context (SetForegroundWindow is silently blocked, CopyFromScreen only ever captured whatever window Windows' own z-order already had on top at those screen coordinates); this is the strongest evidence this whole investigation has produced that the GUI path is genuinely working end-to-end, short of a human looking at the actual screen
+
+Used `Get-Process | Where-Object {$_.MainWindowTitle -ne ""}` and confirmed a real window: `PID
+23424 litebox_runner_linux_on_windows_userland "litebox virtual display"`. Verified more
+rigorously via a custom `EnumWindows`/`GetWindowThreadProcessId` P/Invoke walk (not just the
+single cached `MainWindowHandle`, which can be stale) that this process owns exactly one real,
+currently-visible top-level window: `hwnd=12979128 title='litebox virtual display'
+rect=77,77,1627,979` (1550x902 client area) -- consistent across two independent enumeration
+calls a few minutes apart, so this is a stable, real OS-level window object, not a transient
+artifact.
+
+**Attempted, but could not complete, direct visual verification**: `SetForegroundWindow`
++`ShowWindow(SW_RESTORE)` followed by `Graphics.CopyFromScreen` at the window's own rect
+produced the SAME captured image both before and after the foreground-focus attempt -- Discord's
+window, which happened to be positioned at/near the same screen coordinates. This is consistent
+with Windows' well-known foreground-lock restriction (a background/non-interactively-focused
+process cannot force itself to the front over the user's own active window) rather than any
+failure specific to litebox's own window -- this automation session has no direct interactive
+desktop session/mouse-click capability to bring a specific window forward the way a real user
+could. No browser-based screenshot tool applies either (litebox's window is a native Win32
+window, not a browser tab).
+
+**Net assessment**: this is the closest this whole multi-session investigation has come to a
+directly-observed successful XFCE/GUI launch -- a real, correctly-sized, live window handle
+exists, weston's own DRM backend logged successful virtual-output/shadow-framebuffer setup
+(pass 220), and the host process survived the ENTIRE run without crashing (every fix this
+session made verified holding). The one remaining verification gap (actual pixel content of
+that window, and whether `xfce4-session`'s own EEXIST failure means the window shows only
+weston's bare compositor background rather than a full XFCE desktop) requires either the user's
+own visual confirmation or a differently-privileged screenshot mechanism this session does not
+have access to. This is reported honestly as the session's final, best-evidence state rather
+than an unverified claim of full success.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
