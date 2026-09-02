@@ -3635,6 +3635,68 @@ guest binaries don't) -- distinguishing these two is the single highest-value ne
 this may be the last blocker standing between the current state and a genuinely rendering XFCE
 desktop.
 
+## 250th pass: pulled and syscall-rewrote a standard, lightweight (262MB compressed, 810MB rootfs) ghcr.io/linuxserver/webtop alpine-icewm image via litebox_packager's own built-in --oci-image mode (discovered mid-pass -- obsoletes the earlier manual GHCR-blob-pull approach entirely) -- but hit an UNRELATED, newly-appeared environmental regression: EVERY litebox invocation, including the previously-reliable alpine-rootfs.tar + /bin/true, now fails instantly with OpenError(ENOENT) at load_program, even on a byte-for-byte-verified-intact tar and a from-scratch clean rebuild; root cause NOT isolated this pass, strongly suspected to be transient live-Windows-session state (possibly interacting with this pass's own WER LocalDumps / bcdedit debug registry changes) rather than a code regression -- a reboot is the next diagnostic step
+
+**Context and detour**: following user steering ("use any tried and tested gui container...
+even webtop... it uses selkies"), attempted to swap the long-troubled custom Alpine+weston XFCE
+layer for a standard, widely-used container image, to isolate whether the weston SIGSEGV found
+in pass 249 is a litebox-side bug or a quirk specific to this project's own custom layer. Initial
+attempt used `ghcr.io/linuxserver/webtop:ubuntu-xfce` (Ubuntu-based) via manual GHCR
+anonymous-token blob downloads -- successfully pulled all 18 layers (verified byte-exact against
+the manifest) but flattening them via `tar -x` filled the ENTIRE 1.9TB C: drive to 0 bytes free
+(Ubuntu+XFCE decompresses past 25GB). Cleaned up immediately (removed the incomplete extraction).
+User then clarified the real target budget was ~2GB, prompting a switch to
+`ghcr.io/linuxserver/webtop:alpine-icewm-2.3.1-r0-ls1` (262MB compressed, Alpine-based, real Xorg
++ IceWM -- not Wayland/weston at all, a genuinely different code path from the existing custom
+layer). Also used this detour to clean up ~140GB of accumulated stale build artifacts per the
+user's explicit request: removed unused cross-compile `target/` subdirectories
+(`aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-gnu`,
+`x86_64-unknown-linux-gnu`, `debug/`, `doc/`, `tmp/`) and several loose stale diagnostic binaries,
+freeing the drive from 24GB to 81GB free without touching the active `release/` build.
+
+**Manual flattening initially failed** (missing `/bin/sh`, wrong tar entry format vs. the known-
+working `alpine-rootfs.tar`'s file-only/no-directory-entries layout, NTFS not preserving Unix
+exec bits) -- fixed each issue iteratively (added `/bin/sh` as a busybox copy, `--transform`
+to strip `./` prefixes, `--no-recursion` plus an explicit file list to exclude directory
+entries, `--mode='a+rx'` to force exec bits tar-side since NTFS can't track them) but STILL hit
+`ENOENT` when launching. **This led to discovering `litebox_packager`'s own `--oci-image` mode**
+(`litebox_packager.exe --oci-image <ref> -o <output.tar>`), which does the ENTIRE pull + rootfs
+flatten + syscall-rewrite-every-ELF + auto-generate-a-launch-script job in one command, correctly
+handling everything the manual approach struggled with (including running every binary through
+the syscall rewriter, which -- per the runner's own `--help` text, "All binaries must be
+pre-rewritten with the syscall rewriter" -- is REQUIRED for litebox to load them at all; this
+requirement had gone unnoticed all session since `alpine-rootfs.tar` was always already
+pre-rewritten). This tool should be the standard way to package any future non-Alpine-custom-layer
+image for litebox, and is a much better answer than the manual GHCR-pull approach used earlier
+in this pass.
+
+**New, unrelated blocker discovered while testing the properly-packaged image**: launching ANY
+program at all -- including `/bin/true` against `alpine-rootfs.tar`, the exact tar and exact
+command this session's own pass 249 verified working just prior -- now fails instantly with
+`OpenError(Errno(2 = ENOENT))` at `load_program`, followed by a stack-overflow message and a
+bash-level segfault during panic unwinding. Extensively ruled out: tar corruption (verified
+byte-identical file present, valid ELF, correct listing format); this session's own VEH code
+changes (reverted to pre-pass-246 `lib.rs`/`fork_verify.rs`, failure persisted identically);
+stale build artifacts (full clean rebuild of just the runner crate, failure persisted); a
+different, smaller tar (`alpine-fresh-test.tar`, same failure); environment variable pollution
+(`env -i` with a minimal environment, same failure); recent git history (no commits this session
+or before touch `load_program`/argument parsing); Windows Defender interference (no recent
+detections related to litebox); stale litebox processes or extreme handle counts (none found).
+**Not yet tried**: a full system reboot. Given this session made two live, disruptive
+environmental changes just prior to this regression first appearing -- WER LocalDumps registry
+configuration (`HKLM\...\LocalDumps\litebox_runner_linux_on_windows_userland.exe`) and
+`bcdedit /debug on` (kernel debug boot flag, not yet active pre-reboot per `bcdedit`'s own
+semantics, but Windows debug-related registry/BCD state can have partial live effects even
+before a reboot formally applies them) -- and given the failure is instant, 100% deterministic,
+and completely insensitive to every code/data variable tested, the most likely remaining
+explanation is some form of live Windows session/kernel state corruption from this session's own
+extensive crash-testing, the WER config change, or the debug BCD change, not a real code
+regression. **A reboot is the clear, well-justified next diagnostic step**: it would both
+resolve whatever transient state may be at fault AND is required anyway to activate the
+kernel-debugger the user separately approved earlier in this pass. This is a legitimate stopping
+point for this pass -- verifying/fixing this regression further without a reboot has hit
+diminishing returns after exhausting every code-level hypothesis.
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash
