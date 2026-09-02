@@ -146,6 +146,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
     type ExecutionContext = litebox_common_linux::PtRegs;
 
     fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+        litebox_util_log::warn!("drm-diag: init() entry");
         self.enter_shim(true, ctx, Task::handle_init_request)
     }
 
