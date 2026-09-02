@@ -3361,6 +3361,96 @@ did in earlier passes, even though this pass's own specific trial crashed early)
 insufficient alone; a future continuation should treat it as one ruled-adjacent factor among a
 still-open set, not the confirmed root cause.
 
+## 243rd-244th pass: FINAL 4-trial statistical batch, given confirmed extreme run-to-run non-determinism -- 0/4 reached xfce4-session's own children (xfwm4/xfdesktop/xfce4-panel); outcomes varied (circuit-breaker catch, silent stall, fault-ring crash x2), consistent with everything already established about this bug's timing-sensitivity. SESSION-FINAL CONSOLIDATED SUMMARY below
+
+Ran 4 back-to-back real `--gui` XFCE launches (`LITEBOX_LOG=error`, 150s timeout each,
+pass 242's fix in place) as a deliberate statistical retry, since this bug's own non-determinism
+means any single trial is weak evidence on its own. Results:
+- batch1: crashed with the tracked `rip=0x0/rsp=-1/rbp=0xc0000008` corruption signature,
+  caught cleanly by the circuit breaker (`repeat_count=0x41`).
+- batch2: silently stalled at t=10.7s (process alive, zero further log output, no crash marker
+  -- the same "quiet stall" shape first seen in pass 236/238).
+- batch3: hit the fault (unrecov-av ring entries captured), process ended.
+- batch4: hit the fault (unrecov-av ring entries captured), process ended.
+
+**0 of 4 trials reached `xfce4-session`'s own children** (`xfwm4`/`xfdesktop`/`xfce4-panel`).
+Disk stayed stable throughout (24GB free, no growth beyond normal). No new information beyond
+what passes 230-243 already established -- this batch exists to confirm, with real repeated
+sampling rather than a single anecdote, that the failure rate under current conditions is
+genuinely high (consistent with, not contradicting, the earlier near-success in pass 240's own
+first trial, which reached significantly further than any of these four before eventually
+stopping).
+
+---
+
+# SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
+
+**Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash
+regression in this project's Windows-hosted Linux emulation layer -- a `MAP_FIXED`/
+`MAP_FIXED_NOREPLACE` mmap request could be silently placed at the WRONG address (relocated by
+`allocate_pages`'s own collision-avoidance logic without the caller ever being told), leaving the
+ELF loader's own subsequent BSS zero-fill write to memory that was never actually mapped. Root-
+caused across passes 205-212 (pinpointing the exact fault site, disassembling it, tracing the
+mismatch through `allocate_pages`'s own `Hint`/`Replace`-mode branches). Fixed in three concrete,
+targeted commits: (1) `litebox_common_linux::mm::do_mmap` and the CoW mmap path now verify a
+fixed-address mapping's ACTUAL returned address matches the REQUEST, failing cleanly
+(`EEXIST`/`ENOMEM`) instead of silently succeeding at the wrong address (pass 213); (2)
+`fork()`-child `CLAIMED_RANGES` ownership is now correctly transferred to the child's own
+`GuestPid` at thread-spawn time, so a child's `execve()` no longer misidentifies its own
+inherited memory as a foreign parent's (pass 217-218); (3) `Hint`-mode `allocate_pages` calls now
+also consult `find_foreign_claim` (previously only `Replace`/`NoReplace` did), closing the gap
+that let a PIE binary's own base-address reservation land invisibly on another live guest
+process's memory (pass 228-229). **Verified 5/5 clean on the synthetic repro AND confirmed under
+real, heavy XFCE startup load: `xfce4-session` itself now reliably launches with ZERO `EEXIST`
+failures across every capture this session made from pass 229 onward** -- a component that never
+once successfully started in this whole multi-session investigation's history before this fix.
+
+**Secondary, verified deliverable**: a circuit breaker (pass 232) bounding the pre-existing,
+still-unresolved `ntdll!RtlpUnwindPrologue`-adjacent fault class -- confirmed live, multiple
+times, across genuinely different corruption signatures (a single bad pointer, a whole-CONTEXT
+corruption with `rip=0/rsp=-1/rbp=NTSTATUS`), to correctly and cleanly terminate the process via
+`TerminateProcess` after 65 identical repeated faults, converting what was previously an
+unbounded, disk-exhausting runaway loop (confirmed live, twice, to consume disk space at
+~37,000 lines/second) into a safe, bounded failure. This is real, valuable, general protection
+regardless of whether the underlying race is ever fully eliminated.
+
+**Remaining, NOT fixed**: a pre-existing (first identified pass 205, likely present in earlier
+sessions too under different framing), genuinely non-deterministic race condition, occurring
+specifically during `fork_verify`'s active verification window (`is_verifying=true` in 100% of
+captures, never once `false`), that corrupts a thread's CPU context (up to and including a
+totally incoherent `Rip=0`/`Rsp=-1`/`Rbp=NTSTATUS` state) and crashes inside `ntdll`'s own
+exception-unwind machinery. Investigated exhaustively this session via: static code tracing
+(passes 205-212, ruling out `memset_fallible`'s own unwind metadata, 32-bit truncation,
+corrupted-pointer misreadings); live debugger attempts (pass 205, confirmed structurally
+blocked -- `cdb`/WinDbg's own single-stepping conflicts irreconcilably with `fork_verify`'s own
+`EFLAGS.TF` usage); external web research (pass 234, corroborating the general "unwind
+blindly trusts `[Rsp]` as a return address" mechanism via real Microsoft documentation and
+independent Mozilla crash reports of the identical `RtlpUnwindPrologue` signature; pass 239,
+directly ruling out CET/shadow-stack corruption via `Get-ProcessMitigation` and a PE-header
+dump); numerous live mitigation attempts (fork_verify disabled -- made things WORSE, Xwayland
+itself stalls without it; dbus-launch serialization -- no improvement, same failure shape
+recurred even earlier; kiosk-shell weston config -- inconclusive due to a host/guest path
+mistake); and a concrete, implemented, live-tested fix attempt (pass 242, gating a diagnostic
+that was found to contend `CLAIMED_RANGES`'s lock on every single `fork()` -- kept as
+independently-correct hardening, but did not eliminate the crash in live testing). The single
+most valuable discovery for continuation is that `LITEBOX_LOG=error` (reduced logging overhead)
+reaches meaningfully further into XFCE's own startup sequence than the previous default
+`LITEBOX_LOG=warn` -- this should be the standard configuration for any future debugging session
+on this specific bug.
+
+**Final state of the stated goal**: XFCE does not yet render a visible desktop. Every launch
+attempt across this entire session -- with and without this session's own fixes, across dozens
+of trials and multiple genuinely different configurations -- was blocked from reaching
+`xfwm4`/`xfdesktop`/`xfce4-panel` by this one remaining, pre-existing, non-deterministic
+Windows exception-handling race. This session's own real, verified contribution is removing
+every OTHER blocker that stood in the way (the mmap regression, unbounded disk exhaustion) and
+narrowing the final remaining one to a precise, well-evidenced, externally-corroborated
+mechanism -- not resolving it outright. Achieving a fully rendered XFCE desktop requires either
+resolving this specific Windows x64 SEH/unwind race (which needs live-debugger access this
+session's own environment structurally cannot provide, given `fork_verify`'s single-stepping)
+or enough additional statistical trials/timing-tuning to reliably clear the race window, neither
+of which was achievable within this session's own remaining time and disk-space constraints.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
