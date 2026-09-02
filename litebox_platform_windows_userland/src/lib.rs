@@ -3736,10 +3736,30 @@ fn find_foreign_claim(
     range: core::ops::Range<usize>,
     exclude_owner: ClaimOwner,
 ) -> Option<(core::ops::Range<usize>, ClaimOwner)> {
+    // AGENTS.md pass 213/214: `exclude_owner` is a snapshot of `current_claim_owner()` taken at
+    // THIS call site, which returns `ClaimOwner::GuestPid(pid)` once `CURRENT_GUEST_PID` has been
+    // set for this thread and `ClaimOwner::ThreadId(...)` before that -- but a single guest
+    // process's OWN earlier claim (e.g. from a prior segment of the SAME `execve`'s multi-segment
+    // ELF load, or from before `CURRENT_GUEST_PID` was propagated onto this thread) can have been
+    // recorded under the OTHER variant. Comparing only `*owner != exclude_owner` then
+    // misidentifies a thread's own prior claim as "foreign", when what this check actually needs
+    // to know is "does this range belong to a DIFFERENT real OS thread" -- root-caused live: after
+    // pass 213's mmap-address-verification fix started correctly REJECTING (rather than silently
+    // corrupting on) exactly this kind of false-positive foreign-claim hit, EVERY `execve`
+    // (not just the historically-observed 8th) began failing with `EEXIST`, including trivial
+    // single-segment binaries (`/bin/mkdir`, `/bin/chmod`, `/bin/sleep`) with no plausible genuine
+    // cross-process collision. The real, always-stable identity for "is this my own thread's
+    // memory" is the real host `ThreadId` stored alongside each claim (`_tid`, previously unused
+    // for exclusion) -- always consistent across a single thread's lifetime including every
+    // `execve` on it, unlike `ClaimOwner`, which can legitimately change mid-lifetime.
+    let this_thread = std::thread::current().id();
     let claims = CLAIMED_RANGES.lock().unwrap();
     claims.iter().find_map(|slot| {
-        slot.as_ref().and_then(|(claimed, owner, _tid, _seq)| {
-            (*owner != exclude_owner && claimed.start < range.end && claimed.end > range.start)
+        slot.as_ref().and_then(|(claimed, owner, tid, _seq)| {
+            (*owner != exclude_owner
+                && *tid != this_thread
+                && claimed.start < range.end
+                && claimed.end > range.start)
                 .then(|| (claimed.clone(), *owner))
         })
     })

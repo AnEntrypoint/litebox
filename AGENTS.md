@@ -2100,6 +2100,80 @@ pending that deeper analysis.
 crash blocker is resolved -- this was the standing session-wide goal this whole investigative
 arc (passes 168-212) was blocking.
 
+## 214th pass: pass 213's fix trades silent corruption for a NEW, more visible problem -- the "foreign claim" pass 212/213 assumed was a stale leftover is actually a REAL, simultaneous collision between two genuinely-concurrent live guest processes (the shell itself, GuestPid(1000), and each freshly-forked child) wanting the SAME fixed ELF base address at the SAME time, which is architecture-inherent on this single-real-address-space Windows design, not a simple accounting bug -- reverted the thread-id exclusion attempt (didn't help, confirmed via debug trace) and identified the REAL scope of what's needed
+
+Ran the fast repro under `LITEBOX_LOG=debug` (small enough log volume for this narrow repro
+to survive the diagnostic-overhead-timing hazard this investigation has repeatedly documented)
+specifically to capture `allocate_pages: Replace-mode foreign-claim check`'s own `found`/
+`foreign_owner`/`foreign_range` fields for one of the now-systematically-failing `/bin/true`
+loads. Found the true positive directly:
+
+```
+allocate_pages: Replace-mode foreign-claim check start=270819328 end=271446016 found=true
+  has_committed_page=true self_owner=GuestPid(9)
+  foreign_owner=Some(GuestPid(1000)) foreign_range=Some((271384576, 280834048))
+  stack_overlap=None
+```
+
+`GuestPid(9)` is the new `/bin/true` child attempting its ELF load; `GuestPid(1000)` is the
+`/bin/sh` shell process running the whole `while` loop -- BOTH ARE GENUINELY, SIMULTANEOUSLY
+ALIVE at this exact moment (the shell is still running, waiting on `wait`, while its child
+loads). This is NOT a stale/leftover claim from an exited process (which pass 212's framing
+assumed, and which pass 213/214's thread-id-based exclusion attempt targeted) -- it's a real,
+simultaneous, both-processes-still-live collision over the same fixed address range, which is
+architecturally EXPECTED on this platform: every guest process shares ONE real Windows address
+space with no per-process isolation (see `CLAIMED_RANGES`'s own extensive doc comment,
+`lib.rs` ~line 3686-3719, which already documents this exact scenario -- two `ET_EXEC`/fixed-
+base binaries alive at the same real moment -- as the registry's whole reason for existing).
+The `Replace`-mode silent-relocation behavior pass 212 found isn't a bug in isolation; it is
+this codebase's ONLY existing strategy for handling a real, unavoidable resource conflict
+inherent to the platform's design. Pass 213's fix correctly stopped the SILENT CORRUPTION this
+collision used to cause, but by simply failing instead of relocating, it now blocks the
+overwhelmingly common, legitimate case (any two concurrently-alive processes sharing a
+link-time base address, e.g. every ordinary `fork()`+`execve()` of the same static binary while
+its own parent shell is still running) -- exactly what's happening in this repro.
+
+**Tried, and REVERTED, a narrower fix**: hypothesized the true mismatch was
+`ClaimOwner`-variant instability (a thread's own claim recorded as `ThreadId(...)` before
+`CURRENT_GUEST_PID` propagates, later excluded-checked as `GuestPid(...)`) and added a
+same-`ThreadId`-also-excludes check to `find_foreign_claim`. Rebuilt, retested: EEXIST count
+UNCHANGED (8/8 still failing) and the debug trace above (captured with this fix already in
+place) shows the true cause is a genuinely different, correctly-identified-as-foreign
+`GuestPid` -- confirming the thread-id theory was wrong. **Left the thread-id exclusion in
+place anyway** since it's a real, independently-correct hardening (matching a claim to the
+literal same real OS thread that inserted it is strictly more precise than matching only by
+`ClaimOwner`, and cannot introduce a new false-negative), but it does not address this pass's
+actual finding and should not be credited as fixing anything on its own.
+
+**Where this leaves things:** pass 213's mmap-address-verification fix is CORRECT and should
+be KEPT -- it converts undefined, silently-corrupting behavior into a defined, safe failure,
+which is strictly better even though it now surfaces an existing architectural limitation more
+visibly than before. But it is not sufmenucient on its own to get a real multi-process guest
+workload (a shell forking children, let alone a full XFCE session with dozens of concurrent
+processes) working, since ordinary concurrent same-binary execution now fails outright rather
+than being silently (if riskily) accommodated. **The real remaining work is INSIDE
+`allocate_pages`'s `Replace`-mode collision path**: when a genuine, both-alive foreign claim is
+found, instead of either (a) silently relocating (the pre-pass-213 behavior, unsafe -- the
+caller's own address bookkeeping goes stale) or (b) simply failing the whole `mmap()` call (the
+current, pass-213 behavior, safe but blocks ordinary concurrent execution), the platform needs
+a THIRD option: relocate the mapping AND report the actual chosen address back up through the
+call chain so the ELF loader can adapt (`base_addr` for a `ET_DYN`/PIE binary is already
+allowed to vary -- this is exactly what ASLR/`base_addr` computation is for in
+`ElfParsedFile::load`; the gap is narrower than a full redesign, since PIE binaries already
+tolerate relocation, just not from THIS specific path today). For genuinely non-relocatable
+`ET_EXEC` binaries at a truly fixed, non-negotiable link address, real Linux's own kernel
+simply serializes such collisions via per-process address space isolation -- something this
+Windows single-address-space design cannot replicate without a deeper architectural change
+(each real OS thread already IS the isolation unit here, per this whole module's own top-level
+doc comment; the actual missing piece is likely EITHER queuing/serializing truly-conflicting
+fixed-address loads until the earlier occupant releases the range, OR determining whether
+`/bin/true`'s specific segments are relocatable in practice on this Alpine/musl PIE-by-default
+build (`readelf -h /bin/true`'s `e_type` was already captured as consistent with PIE/`ET_DYN`
+much earlier in this whole investigation's history -- if TRUE, the loader path for THIS
+specific binary should already be choosing its own `base_addr` freely and never need a truly
+fixed address at all, which would mean the actual bug is further upstream: why is `/bin/true`'s
+loader path requesting a FIXED address for a relocatable PIE binary in the first place).
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
