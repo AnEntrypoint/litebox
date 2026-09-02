@@ -2308,6 +2308,55 @@ targeted, and genuinely different fix from anything attempted in passes 212-216 
 prioritizing over further work on the (now understood to be secondary/less relevant)
 `ET_EXEC`-collision framing.
 
+## 218th pass: implemented pass 217's fork-child claim-transfer fix (reclaim_ranges_for_fork_child) -- CONFIRMED it eliminates the originally-identified false-positive foreign-claim collision (found:true no longer appears anywhere in a fresh debug trace, versus every failing execve before), but 8/8 EEXIST STILL occurs via a DIFFERENT mechanism at each process's own SECOND PT_LOAD segment mmap, which never even logs its own "returned" line -- a genuinely new, more precisely localized symptom for a future pass to continue from
+
+Implemented the fix pass 217 scoped: on a `fork()`-spawned child's new OS thread, immediately
+after `CURRENT_GUEST_PID` is set, walk `CLAIMED_RANGES` for every entry owned by the PARENT
+(snapshotted on the spawning thread via `current_claim_owner()`, captured into the closure the
+same way `NEXT_SPAWNED_THREAD_GUEST_PID` already does) and re-insert matching ranges under the
+child's own new `ClaimOwner` via the existing `claim_range` (new function:
+`reclaim_ranges_for_fork_child`, `litebox_platform_windows_userland/src/lib.rs`). Built,
+re-ran the fast repro under `LITEBOX_LOG=debug`.
+
+**Confirmed working as intended for its own narrow scope**: `grep -a "found:true"` against the
+fresh debug trace returns ZERO matches -- every `allocate_pages: Replace-mode foreign-claim
+check` now correctly reports `found=false`, meaning the exact false-positive collision pass 217
+diagnosed (a child's own inherited memory misattributed to its parent) is genuinely eliminated.
+This is real, verified progress and the fix is being KEPT.
+
+**But EEXIST still fires 8/8, unchanged.** Traced the actual failure point via the `sys_mmap`
+debug trace more carefully this pass: every failing child's OWN SECOND `sys_mmap` call (`addr=X
+len=24576 prot=PROT_READ flags=MAP_PRIVATE|MAP_FIXED fd=3 offset=0` -- the ELF's first,
+read-only `PT_LOAD` segment, mapped into the space `reserve()`'s FIRST call, `len=811008
+prot=0x0 MAP_ANONYMOUS`, just finished reserving moments earlier at the EXACT SAME address)
+never logs its own `"sys_mmap: returned"` line at all before the process is killed -- unlike
+every prior successful call in the same trace, which always logs both `entry` and `returned`.
+This is a NEW, more precise localization than anything captured in passes 212-217: the failure
+is not on the FIRST segment (the reservation, which always succeeds) but specifically on the
+SECOND `mmap()` -- a `MAP_FIXED` re-map of memory ALREADY reserved by this exact same guest
+process moments earlier, which should be nearly the simplest possible case (no foreign process
+involved at all, self-referential fixed re-mapping within space this thread's own `reserve()`
+call just carved out).
+
+**This is not yet root-caused.** Candidate next steps for whoever continues, in rough priority
+order: (1) add a raw, allocation-free print (matching this whole investigation's established
+`diag_raw_print` pattern, given `eprintln!`'s own proven unreliability this deep in a fault
+path per passes 205-206) directly around this second `sys_mmap` call's own `allocate_pages`
+invocation, to see whether it's actually reaching `Replace`-mode's foreign-claim check at all
+(a `has_committed_page`/state query returning something unexpected for memory this exact
+thread JUST reserved is also plausible -- `reserve()`'s own `MAP_ANONYMOUS|PROT_NONE` first
+call and this second `PROT_READ|MAP_FIXED` call are two SEPARATE `sys_mmap` calls, and
+whatever state the first call leaves the region in needs to be exactly what the second call's
+`has_committed_page`/`Replace`-path logic expects); (2) check whether pass 213's own
+mmap-address-verification check (the ORIGINAL fix, `litebox_common_linux::mm::do_mmap`) is
+itself now the direct source of this specific EEXIST -- i.e. whether `allocate_pages` succeeds
+perfectly fine at a DIFFERENT-but-otherwise-harmless address for this self-re-mapping case, and
+pass 213's own strict address-match requirement is what's rejecting an outcome that would
+actually be fine to accept for this specific "reserve-then-immediately-fix-map-within-my-own-
+reservation" pattern (as opposed to the genuinely dangerous silent-relocation-of-someone-elses-
+memory case pass 212 found) -- if so, the fix may need to distinguish these two cases rather
+than treating every fixed-address mismatch identically.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.

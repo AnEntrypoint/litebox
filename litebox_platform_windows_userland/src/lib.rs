@@ -3180,6 +3180,25 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
         // for this spawn -- the new thread then falls back to its own `ThreadId`, same as before
         // this mechanism existed.
         let guest_pid = NEXT_SPAWNED_THREAD_GUEST_PID.take();
+        // AGENTS.md pass 217: a `fork()`'s new child inherits the ENTIRE parent address space
+        // (real Windows-side memory duplication, see `Vmem::duplicate`), but `CLAIMED_RANGES`
+        // ownership was never transferred -- every range the parent claimed stayed recorded
+        // under the PARENT's own `ClaimOwner` forever, even after the child's own copy of that
+        // memory is exclusively its own to freely replace. Root-caused live: a forked child's
+        // later `execve()` doing a `MAP_FIXED` load over its own inherited memory was
+        // misidentified by `find_foreign_claim` as colliding with the PARENT's still-live
+        // claim, deterministically blocking ordinary concurrent `fork()`+`execve()` usage (a
+        // shell forking children in a loop) even though there is no real conflict -- the child
+        // is only ever replacing memory that is, after `fork()`, exclusively its own. Snapshot
+        // the parent's own claim owner HERE, on the spawning (parent) thread -- `guest_pid`
+        // being `Some(_)` is this same code's own existing signal that this spawn is a
+        // `fork()`-shaped new guest process, not an ordinary same-process pthread clone (which
+        // correctly keeps sharing the parent's claims, since it IS the same guest process) --
+        // and re-claim the parent's overlapping ranges under the new child's own identity once
+        // it starts running, using the same mechanism (`NEXT_SPAWNED_THREAD_GUEST_PID`'s own
+        // documented pattern: read on the parent thread, moved into the child's closure) since
+        // the child thread's own `thread_local!`s start out fresh and cannot see the parent's.
+        let parent_owner_for_fork = guest_pid.is_some().then(current_claim_owner);
         // Constructed HERE, on the spawning thread (which already has a valid, installed TLS
         // slot and is fully protected by `vectored_exception_handler_entry`), not inside the new
         // thread's own closure -- see `thread_start`'s doc comment for why any fault during this
@@ -3192,6 +3211,9 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
             .spawn(move || {
                 if let Some(pid) = guest_pid {
                     CURRENT_GUEST_PID.set(Some(pid));
+                }
+                if let Some(parent_owner) = parent_owner_for_fork {
+                    reclaim_ranges_for_fork_child(parent_owner);
                 }
                 thread_start(init_thread, ctx, tls_state);
             })?;
@@ -3908,6 +3930,34 @@ fn claim_range(range: core::ops::Range<usize>) {
             );
             claims[idx] = Some((merged, owner, tid, seq));
         }
+    }
+}
+
+/// Re-claims every one of `parent_owner`'s ranges under the CALLING thread's own
+/// [`current_claim_owner`] (the new `fork()` child, whose `CURRENT_GUEST_PID` must already be
+/// set before calling this). See the call site in [`WindowsUserland::spawn_thread`] for the
+/// full rationale (AGENTS.md pass 217): a `fork()` child inherits its parent's entire address
+/// space, but never inherited the parent's `CLAIMED_RANGES` ownership until this function --
+/// without it, the child's own later `MAP_FIXED` replacement of its own inherited memory was
+/// misidentified as colliding with the (unrelated, still-live) parent.
+///
+/// Snapshots the matching entries first, then inserts the copies via the ordinary
+/// [`claim_range`] (which itself coalesces adjacent/overlapping same-owner entries) -- never
+/// removes the parent's own original entries, since the parent's own memory reservation is
+/// still real and still needs its own collision defense against OTHER unrelated processes.
+fn reclaim_ranges_for_fork_child(parent_owner: ClaimOwner) {
+    let matching: alloc::vec::Vec<core::ops::Range<usize>> = {
+        let claims = CLAIMED_RANGES.lock().unwrap();
+        claims
+            .iter()
+            .filter_map(|slot| {
+                slot.as_ref()
+                    .and_then(|(range, owner, _tid, _seq)| (*owner == parent_owner).then(|| range.clone()))
+            })
+            .collect()
+    };
+    for range in matching {
+        claim_range(range);
     }
 }
 
