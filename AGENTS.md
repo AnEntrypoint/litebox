@@ -2658,6 +2658,59 @@ eliminating every code path this investigation could identify. This is an honest
 account of the state reached, appropriate to hand off rather than continue speculating further
 without new tooling or a fresh angle.
 
+## 226th pass: FOUND IT -- pass 213's own address-verification check IS firing correctly after all (contradicting pass 223's negative result, which was looking at the wrong return point); allocate_pages GENUINELY relocates Replace-mode fixed requests even with found:false (no foreign claim detected), meaning the relocation is happening via a path pass 217/218's fork-child claim-transfer fix does not cover -- most likely has_committed_page's OWN check racing/misreading state for memory this exact thread just reserved moments earlier
+
+Added an UNCONDITIONAL (not mismatch-gated) diagnostic immediately after `do_mmap`'s own
+`pm.create_*_pages` call returns, printing `requested`/`actual`/`is_err` for every single
+`is_fixed_addr` call. Result -- the smoking gun this whole 213-225 arc was missing:
+
+```
+requested=Some(270819328) actual=Some(264175616) is_err=false
+requested=Some(271081472) actual=Some(264830976) is_err=false
+requested=Some(271343616) actual=Some(265486336) is_err=false
+requested=Some(271581184) actual=Some(266141696) is_err=false
+requested=Some(271843328) actual=Some(266207232) is_err=false
+requested=Some(272105472) actual=Some(266272768) is_err=false
+requested=Some(272367616) actual=Some(266338304) is_err=false
+requested=Some(272629760) actual=Some(266403840) is_err=false
+```
+
+Every one of these 8 lines' own TIMESTAMP exactly matches one of the 8 `EEXIST` failures in
+the same run (`0.464482100s` mismatch <-> `0.464499400s` EEXIST, etc., all 8 pairs aligned to
+within ~20 microseconds). **This conclusively proves pass 213's check fires correctly and is
+the direct, sole, working-as-designed cause of every one of these 8 EEXIST failures** -- and
+that `allocate_pages` genuinely DOES relocate a `Replace`-mode fixed request even now, AFTER
+pass 217/218's fork-child claim-transfer fix. Pass 223's own negative result (a diagnostic
+placed at `allocate_pages`'s OWN final success-path return, showing zero mismatches) must have
+been looking at the wrong exact return point, or a build/timing artifact -- this pass's result,
+captured closer to the actual call boundary and cross-validated against EEXIST's own
+timestamps, is the more trustworthy of the two.
+
+**This reopens, rather than closes, the investigation into WHY `allocate_pages` relocates.**
+Since `found:false` was independently confirmed (pass 217/218) for the foreign-claim/stack-
+overlap check specifically, the relocation must be coming from a DIFFERENT branch: most likely
+`has_committed_page && fixed_address_behavior == FixedAddressBehavior::Hint` (line ~5044) --
+but our calls are `Replace`, not `Hint`, so this shouldn't apply either... UNLESS
+`fixed_address_behavior` itself is NOT actually `Replace` for these specific calls, contrary to
+this whole investigation's working assumption since pass 212. Given `MAP_FIXED` (not `_NOREPLACE`)
+should always become `Replace` per `create_mapping`'s own translation (`litebox/src/mm/
+linux.rs` ~1460-1465), verifying that assumption directly (a diagnostic printing
+`fixed_address_behavior` itself at the `allocate_pages` call boundary) is the single highest-value
+next diagnostic, not yet added.
+
+**Concrete numeric pattern worth checking**: every `actual` value in this capture is
+SUBSTANTIALLY LOWER than its own `requested` value (by roughly 5-6.5 MiB each time,
+inconsistently -- `270819328-264175616=6643712`, `271081472-264830976=6250496`,
+`271343616-265486336=5857280` ... a shrinking gap each time) -- this specific shape (always
+lower, by a roughly-but-not-exactly-decreasing amount) does not look like "OS picked an
+arbitrary free address" (which would be essentially random relative to the request) -- it looks
+structured, consistent with EITHER a fixed, calculable offset/relationship to the request, or a
+shared underlying resource (e.g. a single, shrinking free region) being carved from
+sequentially. Worth checking directly against `HOST_ALLOCATOR_REGION_MIN`/`TASK_ADDR_MIN`/MAX
+and any OTHER address-space partition this session's own investigation has already documented,
+in case this is a boundary/capacity-adjacent effect rather than a genuine per-request foreign
+collision.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.

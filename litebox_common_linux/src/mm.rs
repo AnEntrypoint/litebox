@@ -98,6 +98,17 @@ pub fn do_mmap<
     // Catch any such mismatch here, in the one shared choke point every `mmap()` caller already
     // goes through, and fail the call the way real Linux would (`EEXIST`/`ENOMEM`), rather than
     // letting every individual platform backend need to remember to check this itself.
+    // DIAG (AGENTS.md pass 226): unconditional print of every fixed-addr call's own result
+    // shape, to determine empirically whether this check's own `if` condition is EVER true for
+    // the still-unexplained EEXIST regression (passes 213-225 exhausted every other candidate).
+    if is_fixed_addr {
+        litebox_util_log::debug!(
+            requested:? = suggested_addr.map(|a| a.as_usize()),
+            actual:? = result.as_ref().ok().map(litebox::platform::RawConstPointer::as_usize),
+            is_err:% = result.is_err();
+            "DIAG do_mmap: fixed-addr call result"
+        );
+    }
     if let (Ok(ptr), Some(requested)) = (&result, suggested_addr)
         && is_fixed_addr
         && litebox::platform::RawConstPointer::as_usize(ptr) != requested.as_usize()
