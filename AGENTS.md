@@ -2896,6 +2896,46 @@ session worked on directly. A future pass should pick up exactly where passes 20
 session repro that reaches it much more reliably (via a real GUI launch, not a synthetic
 fork loop) than anything available when those passes were investigating it.
 
+## 231st pass: LITEBOX_FORKVERIFY_OFF=1 is NOT a viable workaround for the pass 230 unwind-loop -- Xwayland itself stalls indefinitely (confirmed via a direct PrintWindow screenshot: still blank white, no further process loads after Xwayland at t=26.5s, process alive but log growth stopped entirely) when fork_verify's stale-pointer healing is disabled, since Xwayland's own forked children apparently depend on it to make forward progress. Reverting to fork_verify ENABLED (the pass 230 configuration where xfce4-session genuinely launched) as the correct baseline going forward -- the runaway unwind-failure loop needs its own real fix, not a blanket disable
+
+Tested the hypothesis that disabling `fork_verify` entirely would avoid pass 230's runaway
+`ntdll!RtlpUnwindPrologue` retry loop. Result: it does avoid THAT specific loop, but at the
+cost of a different, equally fatal failure mode -- Xwayland itself never completes
+initialization. Confirmed via direct evidence: the log stopped growing entirely (5134 lines,
+static across a 3-second re-check) at t=34.5s, stuck in a `sys_wait4` loop with no further
+`ElfLoader::new` events after Xwayland's own load at t=26.5s -- no `xfce4-session`, no further
+progress of any kind. A `PrintWindow` capture confirmed the window is still the same blank
+white canvas as every earlier capture, with the process alive but making no forward progress
+(not crashed, not looping fast, just genuinely stuck).
+
+**This makes sense architecturally**: `fork_verify` exists specifically to heal stale pointers
+in a freshly-`fork()`ed child's memory before it runs (Windows' fork-emulation has no
+equivalent to real Linux's copy-on-write address-space duplication getting the SAME virtual
+addresses for free). Xwayland forks multiple helper/client-handling processes internally;
+without `fork_verify` actively healing them, one of those children likely hits an
+unrecoverable stale-pointer fault immediately (silently, with no diagnostic output reaching
+this level) and hangs or dies in a way that blocks Xwayland's own readiness signal from ever
+firing -- consistent with `fork_verify`'s own well-established purpose throughout this whole
+multi-session investigation's history.
+
+**Reverted to the pass 230 configuration (fork_verify ENABLED) as the correct path forward.**
+That configuration is STRICTLY BETTER: it got all the way to `xfce4-session` launching
+successfully (zero EEXIST), only then hitting the separate unwind-loop issue on ONE of
+`xfce4-session`'s own spawned children. The unwind-loop bug needs a real, targeted fix (or at
+minimum a bounded retry cap to convert the infinite loop into a bounded, recoverable failure
+that lets the REST of the session continue) -- not a blanket disable of `fork_verify`, which
+trades one hard blocker for an earlier, equally hard one.
+
+**Concrete, scoped next step**: investigate whether `fork_verify`'s own single-step-based
+healing loop (wherever it retries `on_single_step`/exception recovery) has an existing retry
+cap, and if not, add one -- converting the current genuinely-infinite spin (pass 230's own
+~37,000-lines/second growth) into a bounded number of attempts before falling back to killing
+just that ONE stale/unhealable child process (matching real Linux's own behavior when a
+process hits a truly unrecoverable fault: SIGSEGV that one process, not hang the whole
+session). This would very plausibly let `xfce4-session`'s OTHER children (`xfwm4`,
+`xfdesktop`, `xfce4-panel`) continue starting normally even if ONE specific child
+(the one hitting this exact fault) has to be sacrificed.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
