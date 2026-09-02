@@ -457,7 +457,9 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     /// fails, matching `page_flip`'s own established "a host-side presentation miss must never
     /// fail the guest's own ioctl" contract.
     fn notify_flip_callback(&self, platform: &Platform, fb_id: u32) {
-        if self.flip_callback.lock().is_none() {
+        let has_callback = self.flip_callback.lock().is_some();
+        litebox_util_log::warn!(has_callback:? = has_callback; "drm-diag: notify_flip_callback called");
+        if !has_callback {
             return;
         }
         let Some((handle, size, width, height, pitch, pixel_format)) = ({
@@ -949,6 +951,7 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         boot_time: &<Platform as litebox::platform::TimeProvider>::Instant,
         ptr: UserPtr<DrmModeCrtcPageFlip>,
     ) -> Result<u32, Errno> {
+        litebox_util_log::warn!("drm-diag: page_flip called");
         let req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         if req.crtc_id != VIRTUAL_CRTC_ID {
             return Err(Errno::ENOENT);
