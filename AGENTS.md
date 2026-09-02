@@ -1697,6 +1697,48 @@ being reported twice. The sequence this pass's evidence now supports:
   which would finally explain what class of internal Windows failure `c000000d` represents
   in this specific context.
 
+## 207th pass: confirm NoValidation performs zero pointer checking (Windows userland's actual ValidateAccess impl), so the near-null 0x2e destination from pass 206 is a genuinely wrong/uninitialized computed pointer somewhere in Rust code, not a validator bug -- narrows the hunt but the exact call site remains unidentified without a working debugger
+
+Checked which `ValidateAccess` impl Windows userland actually wires up
+(`litebox_platform_windows_userland/src/lib.rs` lines 4651/4655): `NoValidation`, whose
+`validate()` is `Some(ptr)` unconditionally -- no null check, no range check, a complete
+pass-through (`litebox/src/platform/common_providers/userspace_pointers.rs` lines 79-88).
+This rules out "the validator let an obviously-bad pointer through due to a validator bug" --
+there is no validation logic to have a bug in. The near-null `0x2e` destination pass 206
+captured is therefore a **genuinely wrong pointer value some Rust call site computed** and
+handed to `write_at_offset`/`write_u8_fallible` directly, sight unseen.
+
+Traced the only two call sites of `write_u8_fallible` in the whole tree
+(`userspace_pointers.rs:316`, generic `write_at_offset` for any `T` with `size_of::<T>()==1`,
+and the historical `ElfParsedFile::load` BSS-zero-fill comment reference at
+`litebox_common_linux/src/loader.rs:377-380`/`litebox_shim_linux/src/loader/elf.rs:279` --
+which pass 206 already showed is STALE: that call site now goes through `memset_fallible`,
+not `write_u8_fallible`, since this session's own earlier `fill_at_offset` change). Read
+`ElfParsedFile::load`'s own zero-fill call site (`loader.rs:471-476`): `mem.zero(...)?`
+propagates `Err(Fault)` immediately via `?` with no further writes in `load()`'s own body --
+ruling out an immediate same-function retry-write as the source.
+
+**Net position at the end of this pass:** the near-null second fault's exact call site is
+still not identified. It is DEFINITELY not the same `memset_fallible` call that produced the
+first fault (different fixup RVA, different fault address, `write_u8_fallible`'s
+single-byte-mov pattern vs. `memset_fallible`'s `rep stos` pattern -- pass 206). It is
+reachable through the generic `write_at_offset<T: size 1>` path, used throughout the whole
+guest-pointer-write surface (not BSS-zero-fill-specific), so a plain grep-by-call-site search
+is too broad to narrow further without either (a) instrumenting `write_at_offset` itself with
+an allocation-free `diag_raw_print` gated on `dst < 0x1000` (cheap, rare-fire, would catch
+this exact case red-handed with a full backtrace-free "this call site, this dst" signal --
+NOT YET ATTEMPTED, the most promising concrete next step) or (b) a working debugger, which
+pass 205 already proved is architecturally blocked by `fork_verify`'s own EFLAGS.TF usage.
+
+**Recommended immediate next action for a future pass:** add exactly the `dst < 0x1000`-gated
+`diag_raw_print` to `write_at_offset` in `userspace_pointers.rs` (crate is `no_std` and
+platform-agnostic, so this needs either a callback/trait hook back into the platform layer,
+or a `#[cfg(target_os = "windows")]`-gated direct call if an allocation-free print primitive
+can be exposed there without breaking the crate's platform independence -- check whether
+`litebox_platform_windows_userland`'s `diag_raw_print` could be exposed as a weak/extern
+symbol or callback for exactly this purpose). This is the single highest-value remaining
+diagnostic given everything ruled out so far.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
