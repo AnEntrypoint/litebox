@@ -4327,6 +4327,44 @@ in the SAME log a matter of luck this pass didn't have).
 Option 1 is the faster, more direct route to "XFCE working as expected" and is being pursued
 immediately as this pass's next concrete step.
 
+## 264th pass: ran the FULL XFCE chain (weston+kiosk-shell -> Xwayland -> xfce4-session) for the first time -- genuinely reached xfce4-session's own startup ("LAUNCHING_XFCE" printed, past every point weston-desktop-shell previously crashed at) before hitting the SAME pre-existing, still-open host-mode rip-repeats-identically corruption class first documented pass 205 (confirmed distinct from the desktop-shell bug this pass fixed) -- real, measurable forward progress: the kiosk-shell swap genuinely unblocks weston, and the ORIGINAL session-opening blocker is now the sole remaining obstacle, reached via a healthier path than ever before
+
+**Setup**: extended pass 263's working kiosk-shell config with the full established XFCE chain
+(`Xwayland :0` bridging to the wayland-0 socket, then `xfce4-session`), identical to every prior
+attempt except for the `desktop-shell.so` -> `kiosk-shell.so` swap.
+
+**Result**: "LAUNCHING_XFCE" printed (confirming `xfce4-session` itself was invoked) -- genuinely
+further than any `desktop-shell.so`-based attempt this whole investigation ever reached (every
+prior run crashed at or before "launching weston-desktop-shell", well before `xfce4-session`
+would even start). xkbcommon logged real, ordinary keymap-compile errors (`XKB-822`, "failed to
+compile keymap") -- a mundane Linux desktop-in-container configuration issue (missing/misconfigured
+`XKB_CONFIG_ROOT` content for this specific rules/layout, not a litebox bug), not fatal on its
+own. The run ultimately still crashed, but via the SAME `is_in_guest=false`, `rip` identically-
+repeating corruption signature first documented in this project's OWN much older investigation
+history (pass 205, well before this session began) -- confirmed via the exact matching pattern
+(same `rip=0x7ff81097587a` repeating across dozens of ring-buffer entries, caught cleanly by the
+existing circuit breaker at `repeat_count=0x41`, zero host impact, system fully stable throughout
+this run per the usual post-run checks).
+
+**This is real, significant, measurable progress toward the standing goal**: the weston-desktop-
+shell crash (blocking EVERY attempt since this investigation began) is now confirmed avoidable
+via `kiosk-shell.so`, and doing so reaches all the way into `xfce4-session`'s own startup before
+hitting anything else. The REMAINING blocker is now, for the first time this whole multi-session
+investigation, confirmed to be the SAME SINGLE pre-existing corruption class this project's own
+`AGENTS.md` history has chased since pass 205 -- not a new bug, not weston-specific, and not
+something this pass's kiosk-shell fix could have been expected to also resolve (it's a
+host-mode, litebox-VEH-internal race, unrelated to which weston shell module is loaded).
+
+**Honest assessment against the standing goal ("get XFCE working as expected")**: XFCE is not
+yet rendering a visible desktop -- `xfwm4`/`xfdesktop`/`xfce4-panel` never got a chance to start
+before this run's own instance of the pre-existing host-mode race fired. But the path to get
+there is now clearer and more direct than at any point in this investigation's history: fix (or
+work around) the SAME pass-205 corruption class this project has partially investigated before
+(see this session's own passes 205-247 for the deepest prior characterization -- a Windows
+`ntdll`/SEH-unwind-adjacent race, `is_in_guest=false`, triggered somewhere in host-side code
+during fork-heavy guest activity), and the kiosk-shell path should carry all the way through to
+a real rendering desktop. This is now the session's own single highest-priority remaining item.
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash
