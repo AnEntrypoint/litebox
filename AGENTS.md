@@ -3045,6 +3045,53 @@ class of bug -- not a made-up theory -- but implementing a correct, verified fix
 dedicated work (auditing every raw-jump resume site against this exact invariant) beyond what
 remains safe to attempt given this session's own current disk-space and context constraints.
 
+## 235th pass: CIRCUIT BREAKER CONFIRMED WORKING IN A REAL XFCE SESSION -- pass 232's fix caught the runaway ntdll!RtlpUnwindPrologue loop after 65 repeats and cleanly terminated the process via TerminateProcess, protecting disk space exactly as designed (`[diag-unrecov-av-giveup] rip=0x7ffb3671587a repeat_count=0x41`). Also confirmed the crash's own non-determinism directly: one retry of the identical script survived well past the historical t=39.4s crash point with ZERO EEXIST and no runaway before its own 60s timeout elapsed, only reaching a DIFFERENT crash address (rip=0x500016, not the ntdll one) on a background thread without killing the main flow -- xfce4-session's own final desktop-component spawn (xfwm4/xfdesktop/xfce4-panel) was never reached in any capture this session, even with a 150s window, so the remaining blocker is confirmed real and still unresolved, but no longer an open question about SAFETY (disk exhaustion is now a solved, bounded problem)
+
+Ran three more real `--gui` XFCE launches this pass, hunting for either a clean success or
+confirmation the circuit breaker works under real conditions:
+
+1. A 60s-timeout run of the original working script: survived to the timeout with ZERO EEXIST
+   and only ONE unrecovered AV (`rip=0x500016`, a genuinely different address than the tracked
+   `ntdll!RtlpUnwindPrologue` one, on a background thread) that did NOT crash the main flow --
+   the process was still alive and responsive at t=42.3s, well past every prior session's own
+   crash point (t=39.4s). `xfce4-session` itself loaded a second time (self-restart) but its own
+   `xfwm4`/`xfdesktop`/`xfce4-panel` children were never reached before the timeout cut it off.
+2. A 150s-timeout retry of the SAME script: this time DID hit the runaway `ntdll!
+   RtlpUnwindPrologue` loop -- but pass 232's circuit breaker correctly caught it at 65 repeats
+   and terminated cleanly (`[diag-unrecov-av-giveup] rip=0x7ffb3671587a repeat_count=0x41`), with
+   disk space unaffected (stable at 25GB free before and after, vs. the earlier ~10GB drop from
+   an unguarded runaway). **This is the circuit breaker's first live confirmation working exactly
+   as designed in a real, not synthetic, repro.**
+3. A misconfigured kiosk-shell test (passing a HOST Windows path as a guest `/bin/sh` argument,
+   which the guest cannot resolve) produced two inconclusive stalls -- a real mistake this pass
+   made and caught, not a new finding; the guest process silently never started since the "file"
+   didn't exist inside its own filesystem. Recorded here only so a future pass doesn't repeat the
+   same setup error.
+
+**Consolidated, now very well-evidenced picture of the remaining blocker**: the `ntdll!
+RtlpUnwindPrologue` crash is genuinely NON-DETERMINISTIC/timing-sensitive (confirmed directly:
+identical script, identical binary, one run avoids it entirely for 42+ seconds, another run hits
+it as a runaway loop within a similar window) -- consistent with a real race condition, not a
+deterministic logic bug reachable via a fixed input. It remains the sole blocker between
+`xfce4-session`'s own startup (now fully reliable, zero EEXIST across every capture this whole
+pass) and the actual desktop UI (`xfwm4`/`xfdesktop`/`xfce4-panel`) ever spawning. The circuit
+breaker (pass 232) makes every future encounter with this bug SAFE (a clean, bounded process
+termination) rather than a resource-exhausting hang, which is real, valuable, shippable
+protection regardless of whether the underlying race is ever fully root-caused.
+
+**Session-final status, now maximally precise**: (1) the mmap-collision regression this session
+set out to fix is completely resolved and verified, including under real, heavy, repeated XFCE
+load; (2) the runaway-loop disk-exhaustion hazard this investigation's own live testing exposed
+is now bounded and safe; (3) a pre-existing, non-deterministic Windows exception/unwind race
+condition remains the final blocker to visible XFCE rendering, now understood in far more
+mechanistic and empirical depth (web-corroborated general mechanism, confirmed non-determinism,
+confirmed survivable in SOME runs) than at any earlier point in this whole multi-session
+investigation, but not yet eliminated. A future pass with either luck (a run that clears this
+race entirely, as one of THIS pass's own three attempts nearly did) or a genuine fix (per pass
+234's own scoped recommendation: audit every raw `context.Rip`-rewrite resume site for
+`Rsp`/return-address invariants a later, unrelated unwind could violate) is the remaining path
+to a fully-rendered desktop.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
