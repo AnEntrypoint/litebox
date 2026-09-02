@@ -4003,6 +4003,54 @@ diagnostic register/stack state for THIS specific weston fault (its own `rip`, n
 Windows-side corruption this whole investigation spent most of its early passes chasing) is now
 unambiguously the single highest-value next action for continuing toward the standing goal.
 
+## 257th pass: added a real guest-exception diagnostic and captured the first-ever concrete register state for weston's own SIGSEGV -- rip=cr2=0xfd9464b, error_code=0x6 (not-present, write, user), meaning weston's own guest code tried to EXECUTE an instruction at a garbage-looking, implausibly-low address (0xfd9464b is far too low for any real ELF text segment on x86_64) -- looks like a genuine bad-function-pointer/corrupted-callback jump inside weston itself, not an obvious litebox emulation gap, though not yet conclusively distinguished
+
+Added a diagnostic (`litebox_shim_linux::LinuxShimEntrypoints::exception()`,
+`litebox_shim_linux/src/lib.rs` ~line 212) logging the guest's real `rip`/`rsp` (x86_64) or
+`pc`/`sp` (aarch64) plus the raw hardware exception info (`cr2`/`error_code` on x86_64,
+`fault_address` on aarch64) BEFORE it gets translated into a Linux signal number -- the
+pre-existing `"fatal signal: terminating task"` log (`syscalls/signal/mod.rs`) only ever showed
+the synthesized signal number with zero register/fault-address context, making every prior
+capture of this crash (pass 249, 255, 256) unable to say anything more specific than
+"`Signal(11)` fired."
+
+**First real capture, `LITEBOX_LOG=warn`, same repro as every prior pass**:
+```
+diag-guest-exception: pre-signal snapshot exception=Exception(14) kernel_mode=false
+  rip=0xfd9464b rsp=0x1457f850 cr2=0xfd9464b error_code=0x6
+```
+`Exception(14)` is `PAGE_FAULT`. **`cr2` (the faulting address) exactly equals `rip`** -- the CPU
+was fetching the NEXT INSTRUCTION from `0xfd9464b` and that page faulted, meaning execution
+itself jumped to this address as a target, not merely a data access gone wrong.
+`error_code=0x6` decodes (x86 page-fault error-code bits: bit0=present, bit1=write, bit2=user)
+as `0b110`: not-present (bit0=0), write-context (bit1=1), user-mode (bit2=1) -- i.e. a
+not-present page, faulted in a write-adjacent instruction-fetch context, from user mode. Most
+tellingly: `0xfd9464b` (~265MB) is an implausibly low, oddly-specific virtual address for a real
+x86_64 ELF text segment (which normally load well above 0x400000/1MB at minimum, and typically
+much higher for a PIE binary like weston) -- this has the classic signature of a corrupted or
+garbage function pointer being called/jumped-to (a bad vtable slot, a stale/freed callback, or
+an uninitialized pointer read as code), not a normal "ran off the end of valid code" crash.
+
+**Not yet conclusively distinguished**: this could be (a) a genuine, pre-existing bug in
+weston/its dependencies on THIS specific Alpine/musl build, entirely independent of litebox
+(the kind of thing a real Linux kernel would also SIGSEGV on identically), or (b) a litebox
+emulation gap that corrupts a real, valid function pointer somewhere upstream (e.g. during
+`fork()`/`exec()`, a `dlopen`/PLT-resolution path, or some other litebox-mediated operation
+that weston relies on) before this crash's own final jump. Distinguishing these needs either (i)
+symbolizing `0xfd9464b` against weston's own loaded modules at crash time (is it inside ANY
+mapped region at all, or genuinely unmapped/garbage) or (ii) a disassembly of the instruction
+immediately preceding this jump, in whatever function actually performed it, to see whether the
+jump target came from a plausible-looking pointer (a real vtable/GOT/PLT slot whose CONTENT was
+corrupted) or an obviously-uninitialized/garbage value (suggesting a read-before-write bug in
+weston itself, unrelated to litebox).
+
+**Concrete next step for whoever continues this**: extend the same diagnostic block to also dump
+this thread's own `/proc/self/maps`-equivalent (litebox's own guest memory-region tracking, if
+queryable from this exact call site) at crash time, to answer (i) above directly -- if
+`0xfd9464b` falls inside a mapped-but-inaccessible region vs. genuinely unmapped space vs. a
+region belonging to a totally different, unrelated mapping, that alone would strongly indicate
+which of the two possibilities above is the real story.
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash

@@ -209,6 +209,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
                 return ContinueOperation::Terminate;
             }
         }
+        // AGENTS.md pass 257: diagnostic for the still-open weston guest-side SIGSEGV (pass
+        // 249, confirmed the single dominant remaining blocker as of pass 256) -- the existing
+        // "fatal signal: terminating task" log (syscalls/signal/mod.rs) has no register/fault-
+        // address context, only the synthesized Linux signal number. This captures the real
+        // guest instruction pointer/stack pointer and the raw exception info BEFORE it's
+        // translated into a signal, so the next capture of this exact crash gives an actual
+        // faulting instruction address to investigate instead of just "Signal(11)".
+        #[cfg(target_arch = "x86_64")]
+        litebox_util_log::error!(
+            exception:? = info.exception, kernel_mode:% = info.kernel_mode,
+            rip:% = format_args!("{:#x}", ctx.rip), rsp:% = format_args!("{:#x}", ctx.rsp),
+            cr2:% = format_args!("{:#x}", info.cr2), error_code:% = format_args!("{:#x}", info.error_code);
+            "diag-guest-exception: pre-signal snapshot"
+        );
+        #[cfg(target_arch = "aarch64")]
+        litebox_util_log::error!(
+            exception:? = info.exception, kernel_mode:% = info.kernel_mode,
+            pc:% = format_args!("{:#x}", ctx.pc), sp:% = format_args!("{:#x}", ctx.sp),
+            fault_address:% = format_args!("{:#x}", info.fault_address);
+            "diag-guest-exception: pre-signal snapshot"
+        );
         self.enter_shim(false, ctx, |task, _ctx| task.handle_exception_request(info))
     }
 
