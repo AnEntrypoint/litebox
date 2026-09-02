@@ -1318,25 +1318,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EBADF);
         };
         let files = self.files.borrow();
-        litebox_util_log::warn!(
-            tid:% = self.tid, fd:% = fd, buf_len:% = buf.len();
-            "drm-diag: do_write about to call files.fs.write"
-        );
         let res = files
             .run_on_raw_fd(
                 raw_fd,
-                |fd| {
-                    litebox_util_log::warn!(
-                        tid:% = self.tid;
-                        "drm-diag: do_write entering files.fs.write regular-file closure"
-                    );
-                    let r = files.fs.write(fd, buf, offset).map_err(Errno::from);
-                    litebox_util_log::warn!(
-                        tid:% = self.tid;
-                        "drm-diag: do_write files.fs.write returned"
-                    );
-                    r
-                },
+                |fd| files.fs.write(fd, buf, offset).map_err(Errno::from),
                 |fd| {
                     espipe_for_non_seekable_offset(offset)?;
                     self.global.sendto(

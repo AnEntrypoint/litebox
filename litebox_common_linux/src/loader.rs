@@ -471,22 +471,7 @@ impl ElfParsedFile {
                 if p_memsz > p_filesz && ph.p_flags & elf::abi::PF_W != 0 {
                     let unaligned_file_end = adjusted_vaddr + p_filesz;
                     if file_end > unaligned_file_end {
-                        litebox_util_log::warn!(
-                            unaligned_file_end:% = alloc::format!("{unaligned_file_end:#x}"),
-                            len:% = alloc::format!("{:#x}", file_end - unaligned_file_end),
-                            load_start:% = alloc::format!("{load_start:#x}"),
-                            file_end:% = alloc::format!("{file_end:#x}"),
-                            offset:% = alloc::format!("{offset:#x}");
-                            "DIAG elf_load: about to probe-read target byte before mem.zero"
-                        );
-                        let mut probe = [0u8; 1];
-                        let probe_result = mem.read(unaligned_file_end, &mut probe);
-                        litebox_util_log::warn!(
-                            probe_ok:% = probe_result.is_ok();
-                            "DIAG elf_load: probe-read returned"
-                        );
                         mem.zero(unaligned_file_end, file_end - unaligned_file_end)?;
-                        litebox_util_log::warn!("DIAG elf_load: mem.zero returned");
                     }
                 }
             }

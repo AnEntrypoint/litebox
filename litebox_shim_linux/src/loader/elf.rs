@@ -274,11 +274,9 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
                 "DIAG elf_load: PT_LOAD segment"
             );
         }
-        litebox_util_log::warn!("DIAG elf_load: about to call ElfParsedFile::load");
         let result = self
             .parsed
             .load(&mut self.file, &mut &*platform, reserve, apply_relocations);
-        litebox_util_log::warn!("DIAG elf_load: ElfParsedFile::load returned");
         Ok(result?)
     }
 }
