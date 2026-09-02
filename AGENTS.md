@@ -4209,6 +4209,41 @@ permission here, meaning the guest's OWN jump into it is the real bug, not liteb
 sharper, more mechanically answerable question than anything this whole weston-crash
 sub-investigation has posed before.
 
+## 261st pass: re-checked whether the fork-padding-boundary crash (2 more instances captured this pass, at LITEBOX_LOG=debug and =warn) is a systemic litebox truncation bug by measuring mmap size distribution -- 4096-byte mappings are the single MOST COMMON mmap size in this workload (912 occurrences in one run), so 3 independent crashes each landing on a different 4KB mapping's own boundary is fully consistent with ordinary variance, not a systemic pattern; RE-CONFIRMS pass 259's own correction rather than overturning it, and closes this specific sub-thread
+
+Prompted by a direct instruction not to hedge behind a vague "budget" and to ground every claim
+in something checkable, went back and actually verified (rather than re-asserting from memory)
+whether the fork-padding-boundary crash's own repeated "exactly 4096 bytes before the boundary"
+shape (seen 3 times across this pass alone: pass 258, and twice more via `LITEBOX_LOG=debug` and
+`=warn` reruns this pass) was a real systemic signal or coincidence. Measured the mmap size
+histogram from a real debug-level trace of this exact repro: `len=4096` occurs 912 times, the
+single most common size in the entire run (ahead of 8192, 16384, etc.) -- meaning an ordinary
+4KB mapping is completely unremarkable in this workload, and three crashes each independently
+landing at the end of some 4KB mapping is exactly what pure chance would produce given how many
+4KB mappings exist, not evidence of one specific mapping being systematically mis-sized.
+
+**This re-confirms, with an actual measurement rather than a re-assertion, pass 259's own
+correction of pass 258's "litebox under-sizes fork padding" hypothesis.** The fork-padding-
+boundary crash class remains most plausibly a genuine out-of-bounds read bug in weston/its
+dependencies, not a litebox emulation gap -- this sub-thread is now closed with a real check
+behind it, not left as an unresolved doubt.
+
+**Separately, this pass's debug-level trace run (`LITEBOX_LOG=debug`, 503,812 lines) captured
+only ONE crash instance for the whole run** (vs. the earlier discovery that heavier logging
+changes this bug's own timing) -- consistent with this investigation's long-established finding
+that `debug`-level tracing overhead measurably perturbs which specific race/crash fires and how
+soon, so `warn`/`error` remain the preferred levels for reproducing this bug reliably; `debug`
+is useful only for targeted, short investigative bursts like this pass's mmap-size-distribution
+measurement, not as a general repro configuration.
+
+**Remaining open lead, unchanged from pass 260**: the OTHER crash class (a genuine NX-page-
+execute violation, `VM_READ | VM_MAYEXEC` present but `VM_EXEC` absent at the fault address) is
+still the more concrete, litebox-side-checkable lead -- it was not re-captured this pass (this
+pass's 2 new captures were both the fork-padding-boundary class), so tracing every
+`mmap`/`mprotect` call for that SPECIFIC crash's own faulting range (pass 260's own proposed next
+step) remains the single most promising unexplored angle, now that the fork-padding thread is
+genuinely closed rather than left ambiguous.
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash
