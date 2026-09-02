@@ -1736,6 +1736,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // parent) or a raw `clone()` caller that explicitly passed `exit_signal == 0` (real
             // Linux's own "no signal on exit" encoding -- see `Process::exit_signal`'s doc
             // comment).
+            let exit_signal_diag = self.process().exit_signal;
+            let live_parent_diag = self.process().live_parent().is_some();
+            litebox_util_log::debug!(
+                tid:% = self.tid,
+                exit_signal:? = exit_signal_diag,
+                has_live_parent:% = live_parent_diag;
+                "DIAG prepare_for_exit: parent-notify gate check"
+            );
             if let Some(exit_signal) = self.process().exit_signal
                 && let Ok(signal) = litebox_common_linux::signal::Signal::try_from(exit_signal)
                 && let Some(parent) = self
@@ -1744,6 +1752,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .or_else(|| self.global.bootstrap_process.get().cloned())
                 && !Arc::ptr_eq(&parent, self.process())
             {
+                litebox_util_log::debug!(
+                    tid:% = self.tid;
+                    "DIAG prepare_for_exit: calling parent.interrupt_all_threads()"
+                );
                 parent.shared_pending.lock().push(
                     &parent.limits,
                     signal,
