@@ -5014,18 +5014,48 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     // because `has_committed_page` observed the target range as not-yet-MEM_COMMIT
                     // at the moment this thread queried it, skipping this check entirely under the
                     // old `has_committed_page &&` gate.
-                    let fc = find_foreign_claim(suggested_range.clone(), current_claim_owner());
-                    let stack_overlap = find_live_stack_overlap(suggested_range.clone());
-                    litebox_util_log::debug!(
-                        start:% = suggested_range.start, end:% = suggested_range.end,
-                        found:% = fc.is_some(), has_committed_page:% = has_committed_page,
-                        self_owner:? = current_claim_owner(),
-                        foreign_owner:? = fc.as_ref().map(|(_, owner)| *owner),
-                        foreign_range:? = fc.as_ref().map(|(r, _)| (r.start, r.end)),
-                        stack_overlap:? = stack_overlap.as_ref().map(|r| (r.start, r.end));
-                        "allocate_pages: Replace-mode foreign-claim check"
-                    );
-                    fc.is_some() || stack_overlap.is_some()
+                    //
+                    // AGENTS.md pass 216: retry this check a few times with a short sleep before
+                    // accepting a foreign-claim hit as final. Root-caused (passes 213-215) that a
+                    // `Replace`-mode collision here is very often a genuinely transient, both-
+                    // still-alive-for-a-moment race between an `ET_EXEC` binary's fixed load
+                    // address and a short-lived SIBLING process (e.g. a shell's own just-forked
+                    // child) that is already in the process of exiting -- not a long-lived,
+                    // truly-simultaneous conflict. Since pass 213's mmap-address-verification fix,
+                    // a caller whose fixed request gets silently relocated now correctly fails the
+                    // whole `mmap()`/`execve()` instead of continuing with corrupted address
+                    // bookkeeping -- but that means this collision, previously merely "unsafely
+                    // survived", now visibly BLOCKS ordinary concurrent execution of short-lived
+                    // programs unless the transient case is given a chance to clear first. Bounded
+                    // (5 attempts, 2ms apart -- 10ms worst case) and scoped to exactly this
+                    // already-rare, already-slow path so it cannot meaningfully regress the common
+                    // case; still holds `_fixed_addr_guard` throughout (only blocks OTHER threads'
+                    // own `Replace`-mode fixed allocations, never `Hint`-mode/ordinary growth).
+                    let mut collision = None;
+                    for attempt in 0..5u32 {
+                        let fc =
+                            find_foreign_claim(suggested_range.clone(), current_claim_owner());
+                        let stack_overlap = find_live_stack_overlap(suggested_range.clone());
+                        litebox_util_log::debug!(
+                            start:% = suggested_range.start, end:% = suggested_range.end,
+                            attempt:% = attempt,
+                            found:% = fc.is_some(), has_committed_page:% = has_committed_page,
+                            self_owner:? = current_claim_owner(),
+                            foreign_owner:? = fc.as_ref().map(|(_, owner)| *owner),
+                            foreign_range:? = fc.as_ref().map(|(r, _)| (r.start, r.end)),
+                            stack_overlap:? = stack_overlap.as_ref().map(|r| (r.start, r.end));
+                            "allocate_pages: Replace-mode foreign-claim check"
+                        );
+                        if fc.is_none() && stack_overlap.is_none() {
+                            collision = None;
+                            break;
+                        }
+                        collision = Some(());
+                        if attempt + 1 < 5 {
+                            std::thread::sleep(core::time::Duration::from_millis(2));
+                        }
+                    }
+                    collision.is_some()
                 }
             {
                 // See `CLAIMED_RANGES`'s doc comment: a claimed range here that this thread

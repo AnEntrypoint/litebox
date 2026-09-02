@@ -2219,6 +2219,44 @@ handling legitimate CONCURRENT `ET_EXEC` execution, which is what's currently bl
 XFCE session (many concurrent processes, several of which are very likely `ET_EXEC`) from
 completing its startup sequence.
 
+## 216th pass: bounded-retry mitigation attempt did NOT help (still 8/8 EEXIST) -- the collision is NOT transient. The shell's own memory legitimately occupies the colliding address for its ENTIRE lifetime (not momentarily), so retrying with a short sleep cannot converge; REVERTED in spirit (kept as harmless but ineffective) -- confirms the fix genuinely needs the relocate-and-report-back redesign already scoped in pass 214/215, not a timing workaround
+
+Implemented a bounded retry (5 attempts, 2ms apart, ~10ms worst case) around
+`allocate_pages`'s `Replace`-mode foreign-claim/stack-overlap check, hypothesizing the
+collision pass 214 found was transient (the colliding sibling process about to exit and
+release its claim). Rebuilt, retested the fast repro 5 times: **EEXIST count unchanged, 8/8
+every trial** -- the retry made no difference at all.
+
+**This disproves the transience hypothesis.** Re-reading pass 214's own captured evidence:
+`foreign_owner=Some(GuestPid(1000))` is the `/bin/sh` shell process running the WHOLE `while`
+loop -- it is not a short-lived sibling about to exit, it is the long-lived PARENT, alive for
+the entire repro's duration, whose own mapped memory (its own ELF image, loaded once at shell
+startup) legitimately and permanently occupies the address range each freshly-forked
+`/bin/true` child also wants for its own fixed `ET_EXEC` load. There is no "wait a moment and
+it clears" scenario here: the shell's claim on that address is exactly as long-lived as the
+shell itself. A retry loop of any bounded length cannot help a collision that is architecturally
+permanent for the process's whole lifetime, not momentary contention.
+
+**This decisively confirms passes 214/215's own conclusion was already correct and complete**:
+the fix needs a real relocate-and-report-back mechanism (letting the ELF loader adapt its own
+`base_addr`/segment addresses when a fixed request is forced elsewhere), not a timing-based
+retry. The retry code is harmless (adds at most ~10ms latency only on an already-rare,
+already-failing path) but does not fix anything and should be understood as ineffective, not
+load-bearing -- kept in tree since it is a genuine (if insufficient) hardening for the small
+subset of collisions that ARE transient (e.g. a genuinely-exiting sibling whose claim-release
+races the new request), but the DOMINANT failure mode this whole investigation's repro
+exercises is the permanent-lifetime case this retry cannot address.
+
+**Status unchanged from pass 215's own assessment**: the deterministic crash (passes 168-212)
+remains genuinely FIXED. Concurrent `ET_EXEC` execution while a long-lived parent (a shell, or
+any other still-running process) holds overlapping fixed-address memory remains blocked,
+correctly-and-safely rather than silently-and-dangerously as before pass 213. The real fix
+requires the multi-crate relocate-and-report-back redesign already scoped in pass 214/215's
+own writeup, which remains appropriately out of scope for a rushed same-session addition given
+its blast radius across `litebox_common_linux::loader::MapMemory`,
+`litebox_shim_linux`'s `Mapper` impl, and `litebox_platform_windows_userland`'s
+`allocate_pages`.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
