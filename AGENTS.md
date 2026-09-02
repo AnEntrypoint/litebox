@@ -2486,6 +2486,36 @@ own visual confirmation or a differently-privileged screenshot mechanism this se
 have access to. This is reported honestly as the session's final, best-evidence state rather
 than an unverified claim of full success.
 
+## 222nd pass: DIRECT VISUAL CONFIRMATION via PrintWindow (bypasses z-order/focus, unlike CopyFromScreen) -- the litebox virtual display window genuinely renders a live, correctly-sized surface (weston's own compositor output, confirmed real), but it is a BLANK WHITE screen, not an XFCE desktop: no panel, no wallpaper, no icons, matching the logs' own finding that xfce4-session never started
+
+Solved pass 221's screenshot-verification gap: `CopyFromScreen` captures whatever is on top in
+the OS's own z-order at those screen coordinates (Discord, in this sandboxed session with no
+interactive focus control), but `PrintWindow` with `PW_RENDERFULLCONTENT` (flag `2`) asks the
+target window to render its OWN content directly into a supplied device context, entirely
+independent of what's currently visible on screen or which window has focus. This succeeded
+(`PrintWindow` returned `true`) and produced a genuine capture of `litebox virtual display`'s
+own window content.
+
+**Result**: a real window with the correct title bar and icon, containing a plain, uniform
+WHITE rectangle -- not garbage, not black/unrendered, not a crash dialog, but also not any
+recognizable XFCE UI (no panel, no desktop icons, no wallpaper, no window decorations for any
+other app). This is exactly consistent with the picture passes 220-221 already built from log
+analysis alone: weston's DRM backend genuinely initialized a real output and shadow
+framebuffer (hence a real, live, correctly-behaving presentation surface exists and renders
+SOMETHING coherent, not corrupted), but `xfce4-session` -- the process that would actually
+launch `xfwm4`/`xfdesktop`/`xfce4-panel` to draw a real desktop -- never started, due to the
+still-open EEXIST regression documented across passes 213-219. A blank white weston canvas
+with no XFCE session running is exactly what this evidence predicts, and this pass's direct
+visual capture now confirms it firsthand rather than only by inference from logs.
+
+**This is the clearest, most complete picture this whole multi-session investigation has ever
+established**: the pipeline from "host process starts" through "weston compositor initializes
+a real, live rendering surface" now demonstrably WORKS, verified independently via process
+state, Win32 window enumeration, and direct pixel capture. The single remaining blocker to an
+actual visible XFCE desktop is `xfce4-session`'s own EEXIST failure (passes 213-219's own still
+partially-open investigation into `allocate_pages`'s `Replace`-mode success path). This is a
+precise, narrow, well-evidenced target for a future pass, not a vague or unverified goal.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
