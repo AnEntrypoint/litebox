@@ -1535,6 +1535,86 @@ live-debugger (`cdb`/WinDbg) single-step through the 7th-to-8th `begin()` transi
 and into whatever runs immediately after -- now cheap thanks to the sub-2-second
 `musl_repro_plain8.sh` repro.
 
+## 205th pass: cdb debugger attach proves architecturally incompatible with fork_verify (both fight over EFLAGS.TF/single-step-exception ownership); pivoted to LITEBOX_DIAG_FATALDUMP=1 against the fast plain repro instead, which FINALLY captured the exact fault RIP and proved the FIRST fault (c0000005) IS successfully recovered by search_exception_tables -- the real, still-unexplained crash is the SECOND fault happening during/after VEH's EXCEPTION_CONTINUE_EXECUTION resumption
+
+**cdb attach abandoned.** Multiple attempts (`sxi av`/`sxi gp`/`sxi sse`, hardware execute
+breakpoints via `ba e1 <addr>`) all failed identically: cdb, as the OS-level debugger,
+receives every `EFLAGS.TF`-generated single-step exception BEFORE our own in-process VEH
+gets a chance to run (`fork_verify`'s entire healing mechanism is single-step-based). This
+is a fundamental ownership conflict between an attached Win32 debugger and a program that
+implements its own single-stepping -- not a config mistake, `sxi` cannot mask this class of
+stop when the debugger itself is the outer exception-chain owner. No further debugger-attach
+attempts are worth trying against this specific mechanism; a kernel-mode approach or
+`DBG_EXCEPTION_NOT_HANDLED`-passthrough-aware tooling would be required, well beyond this
+investigation's proportionate effort.
+
+**Fresh diagnostic capture, finally clean.** Ran `LITEBOX_DIAG_FATALDUMP=1` (pre-existing,
+never tried against the FAST plain repro this session -- only ever tried against noisy/slow
+GUI runs previously) against `musl_repro_plain8.sh`. Captured, for the very first time this
+session, the actual fault RIP with a clean, uncorrupted `[veh] RAWREGS]` pair (no ring-buffer
+misattribution, since this raw regdump fires unconditionally and immediately, not from the
+small ring buffer):
+
+```
+[veh] RAWREGS tid=4a88 code=c0000005 addr=10305030 rip=7ff665c86de6 rax=0 rbx=2a0b1fe3d0
+  rcx=1fa rdx=2a0b1fde03 rsi=2a0 rdi=10305030 rsp=2a0b1fe1f0 rbp=2a0b1fe270
+[veh] RAWREGS tid=4a88 code=c000000d addr=0 rip=7ffb36712d2f rax=0 rbx=c0000001 rcx=0
+  rdx=0 rsi=2a0 rdi=10305030 rsp=2a0b1fd520 rbp=2a0b1fe270
+```
+
+Resolved `rip=0x7ff665c86de6` via the module's own preferred base (`0x140000000`) in an
+offline `cdb -z` symbol/disassembly session (no live process needed for this, sidesteps the
+whole attach problem): RVA `0x6de6` disassembles to EXACTLY
+
+```
+00000001`40006de3 4c89cf          mov     rdi,r9
+00000001`40006de6 f348ab          rep stos qword ptr [rdi]     <-- faults HERE
+00000001`40006de9 4c89c1          mov     rcx,r8
+00000001`40006dec f3aa            rep stos byte ptr [rdi]
+```
+
+i.e. this session's own `memset_fallible` (`litebox/src/mm/exception_table.rs`), called from
+the ELF loader's BSS zero-fill (`AccessMemory::zero`/`fill_at_offset`) for `/bin/true`'s
+8th-fork post-exec load -- `rdi` (fault address) matches `addr` exactly (`0x10305030`), a
+guest address that is NOT within the just-logged PT_LOAD segment's own range (segment
+`p_vaddr=0xc1830, p_filesz=0x3800, p_memsz=0x4328`), confirming the destination is some
+other, unrelated high guest region -- consistent with a genuinely unmapped/unbacked page,
+not a computation bug in the BSS-tail offset itself.
+
+**The load-bearing new finding: this first fault IS successfully recovered.** The
+`[diag-unrecov-av]` diagnostic (`-- no exception-table entry found`, printed only when
+`search_exception_tables` returns `None`) never fired for the `c0000005` fault. Since
+`diag_raw_regdump`'s RAWREGS print is unconditional and happens BEFORE the
+`search_exception_tables` lookup (confirmed by reading the call site, `lib.rs` ~line 586-601
+vs. the lookup at ~line 1164-1184), RAWREGS firing proves nothing about recovery outcome by
+itself -- but the ABSENCE of the sibling `[diag-unrecov-av]` line proves the `Some(recover)`
+branch was taken: `search_exception_tables` found the `.extable` entry, `context.Rip` was
+rewritten to the `3:` fixup label, and the handler returned `EXCEPTION_CONTINUE_EXECUTION`.
+**This refutes this session's own earlier working assumption (carried since pass ~199) that
+the fault is simply unrecovered/unhandled by our own exception-table machinery.** It IS
+handled, correctly, on the first pass.
+
+**The real, still-open mystery: what happens between our `EXCEPTION_CONTINUE_EXECUTION`
+return and the second `c000000d` fault.** RSP between the two RAWREGS captures differs by
+`0x2a0b1fe1f0 - 0x2a0b1fd520 = 0xccd0` (52,432 bytes) -- a huge, suspicious jump for what
+should be a same-thread, same-stack resumption a few instructions later. `rdi` is unchanged
+(`0x10305030`) across both faults, `rsi` is unchanged (`0x2a0`), but `rax`/`rbx`/`rcx`/`rdx`
+are all different, and critically `rip` jumps to the literal constant ntdll address this
+whole investigation has tracked since its earliest passes. This is consistent with Windows'
+own `KiUserExceptionDispatcher`/context-restoration machinery -- not our VEH, not our
+recovery code -- itself faulting while trying to resume execution at the continuation
+context our VEH set up, on what looks like a substantially different (or corrupted) stack.
+
+**Next concrete step, not yet attempted:** dump the full CONTEXT record (not just the 8 GPRs
+this diagnostic currently captures) at the moment of `EXCEPTION_CONTINUE_EXECUTION` return --
+specifically `SegSs`, `EFlags`, and whether `Rsp` is 16-byte aligned per the x64 ABI's
+requirement at a call boundary -- since `rep stosq`'s exception-table fixup label is entered
+via a raw `Rip` overwrite with no call/ret framing, if the surrounding Rust-generated
+prologue/epilogue around the `asm!` block assumes a specific stack alignment invariant at
+that label that a mid-`rep`-instruction fault leaves violated, that would explain a
+Windows-side rejection of the continuation itself (`STATUS_INVALID_PARAMETER`) without any
+bug in `search_exception_tables`'s lookup logic itself.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
