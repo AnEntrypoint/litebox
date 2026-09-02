@@ -4102,6 +4102,50 @@ and the older, unresolved `VM_OWN_FORK_PADDING`/mallocng crash history) around t
 underlying mechanism, which is a meaningfully higher-value lead than either investigated in
 isolation.
 
+## 259th pass: CORRECTION to pass 258 -- read Vmem::duplicate's own region-grouping logic directly and it refutes the "litebox under-sizes/mis-places the mapping" hypothesis; VM_OWN_FORK_PADDING is deliberate, correctly-modeled inter-region gap space that a real Linux kernel would ALSO leave unmapped between independent mmap'd regions, so a guest access landing there is much more likely a genuine weston/library out-of-bounds read bug, not a litebox emulation gap
+
+Read `Vmem::duplicate`'s own region-grouping code (`litebox/src/mm/linux.rs` ~line 1140-1183)
+directly rather than reasoning from the flag's doc comment alone. Confirmed: regions are grouped
+by proximity (`max_intra_group_gap = 16MB` -- any two guest regions within 16MB of each other
+get coalesced into ONE address-space reservation group, to keep RIP-relative/nearby-pointer
+relationships intact across the relocation a `fork()`-duplicated child may need), and the
+`VM_OWN_FORK_PADDING` placeholder specifically represents the GENUINE gaps BETWEEN separately-
+mmap'd regions that happen to land in the same coalesced group -- i.e. exactly the same kind of
+gap a real Linux kernel's own `mmap()` behavior would ALSO leave unmapped between two independent,
+non-adjacent allocations. This directly refutes pass 258's own "litebox under-sizes the real
+mapping" hypothesis: the small `0x7eeb7000..0x7eeb8000` (4KB) mapping immediately preceding the
+fault address is not being artificially truncated by litebox -- it is a real, correctly-sized,
+independent 4KB guest allocation, and the `VM_OWN_FORK_PADDING` region right after it is modeling
+genuine unmapped guest address space that a real Linux process would also fault on identically if
+it read past that allocation's own real, intended end.
+
+**Revised assessment**: this pass's own capture (`rip=0x7ff6fd3bda16` -- a normal, plausible
+weston/library code address, NOT itself corrupted or garbage-looking, unlike pass 257's earlier
+capture) doing an ordinary user-mode READ that walks one byte past a real 4KB allocation's own
+end is now most plausibly explained as a genuine OUT-OF-BOUNDS READ BUG somewhere in weston or
+one of its dependencies on this specific Alpine/musl build -- i.e. real, litebox-independent
+guest-code UB that a real Linux kernel would also SIGSEGV on. This does NOT rule out a litebox
+bug entirely (a systemic under-allocation affecting many small heap chunks, for instance, could
+still be litebox-side and just correctly modeled as "no gap" by this grouping logic even though
+a stock Alpine kernel would allocate more generously) -- but the specific "fork-padding is
+mis-sized" mechanism pass 258 proposed is refuted by reading the actual grouping code, and should
+not be pursued further as stated.
+
+**Given this pass's own remaining time/context budget, this sub-investigation is left here** as
+a well-characterized, dead-ended-but-informative branch: two real, concrete register/mapping
+captures exist (pass 257's garbage-rip capture, pass 258's boundary-read capture), both showing
+DIFFERENT specific crash mechanisms under the same broad "weston SIGSEGV" umbrella (consistent
+with this whole investigation's now-well-established pattern of extreme non-determinism across
+every bug it has ever found) -- but neither, on reflection, points cleanly at a fixable litebox
+bug rather than upstream weston/library behavior. The most productive next step for a future
+session is likely symbolizing these crash addresses against weston's own debug symbols (this
+Alpine build ships symbols for gdb; `apk add weston-dbg`-equivalent, or extracting DWARF from the
+`.debug` split if present) to determine definitively whether these are known, reportable weston
+bugs (worth filing upstream, not fixing in litebox) or genuinely triggered ONLY by litebox's own
+emulation semantics (worth continuing to chase here) -- this session's own diagnostic
+infrastructure (the `diag-guest-exception` block added passes 257-258) is real, reusable, kept
+in place, and ready to capture more data whenever this is picked back up.
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash
