@@ -2411,6 +2411,48 @@ the EEXIST regression present, XFCE's startup may tolerate a few failed early ex
 still coming up, unlike this session's fast synthetic repro which specifically stresses the
 exact failure mode via tight sequential forking.
 
+## 220th pass: real, substantial XFCE launch progress with this session's fixes in place -- weston successfully starts, detects a real DRM virtual output, configures a shadow framebuffer, and is ready to render, further than many earlier passes in this project's whole history reached; xfce4-session itself still fails to EEXIST, remaining the final blocker for the actual desktop appearing
+
+Ran the real `--gui` XFCE launch (`xfce_launch_sw.sh`, weston/pixman + Xwayland + xfce4-session)
+with every fix from this session in place (pass 213's mmap-address-verification,
+pass 216/217/218's fork-child claim-ownership-transfer). Result, compared to any prior session
+capture:
+
+```
+weston 14.0.2
+DRM: head 'Virtual-1' found, connector 1 is connected, EDID make 'unknown', ...
+DRM: output Virtual-1 uses shadow framebuffer.
+associating input device event0 with output Virtual-1
+Loading module '/usr/lib/weston/desktop-shell.so'
+```
+
+This is real, substantive progress: weston's own DRM backend genuinely initialized a virtual
+output with a working shadow framebuffer -- the actual pixel-producing path -- something no
+earlier capture in this whole session's own AGENTS.md history reached this cleanly (prior
+sessions' own status notes describe weston hangs, gcc/compile blockers, and the underlying
+fork/exec crash as blocking progress well before this point).
+
+**What still fails**: `weston-keyboard`/`weston-desktop-shell` (weston's OWN default helper
+processes, launched concurrently with weston itself still running -- exactly pass 217's own
+diagnosed scenario, a child colliding with its still-alive parent's memory) hit the residual
+EEXIST regression and retry repeatedly without success ("apparently cannot run at all"). These
+are NOT essential when layering XFCE on top of weston (XFCE supplies its own panel/desktop, not
+weston's default ones), so this specific failure likely does not block the real goal.
+
+**What DOES block the real goal**: `/usr/bin/xfce4-session` itself -- the actual XFCE session
+manager, launched by the outer shell script as a sibling of weston (not a CHILD of it) -- also
+hits the same EEXIST regression and never starts. This is the final, concrete blocker: without
+`xfce4-session` running, `xfwm4`/`xfdesktop`/`xfce4-panel` are never spawned, so no XFCE desktop
+UI can appear even though weston's own compositor and output are ready and waiting.
+
+**Status**: the host process itself survived the entire run (no crash, matching every fix this
+session made). Weston reached a genuinely rendering-ready state. `xfce4-session` -- the last
+remaining piece -- is blocked by the still-open EEXIST regression documented in passes 213-219.
+Whether a visible window actually appeared on screen (weston's own compositor may still be
+presenting an empty/background-only frame even without `xfce4-session`) has not been visually
+confirmed this pass -- log analysis alone cannot establish that; would need either the user's
+own observation or a screenshot-capable tool.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
