@@ -619,6 +619,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// forever even though the child itself exits correctly and promptly.
     pub(crate) fn sys_rt_sigsuspend(
         &self,
+        ctx: &mut PtRegs,
         mask_ptr: Option<UserPtr<SigSet>>,
         sigsetsize: usize,
     ) -> Result<usize, Errno> {
@@ -631,14 +632,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let mask = mask_ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
 
         let old_mask = self.signals.blocked.get();
-        litebox_util_log::warn!(
-            tid:% = self.tid, has_pending_before:% = self.has_pending_signals();
-            "drm-diag: sigsuspend before sleep"
-        );
         self.signals.set_signal_mask(mask);
         let result = self.wait_cx().sleep();
-        litebox_util_log::warn!(tid:% = self.tid; "drm-diag: sigsuspend after sleep");
         self.signals.set_signal_mask(old_mask);
+        // Real Linux `sigsuspend` doesn't just unblock and wait: the newly-unblocked pending
+        // signal is actually DELIVERED (its handler run, if one is installed, or its default
+        // action taken) before the syscall returns -- `sigsuspend(2)`'s own man page: "the system
+        // call ... suspends the process until delivery of a signal". Merely waking this thread up
+        // (this function's own `sleep()` call, which only checks whether an interrupt/pending
+        // signal EXISTS, never dispatches it) leaves the signal sitting in the queue -- a caller
+        // whose actual work is done by a signal HANDLER (as opposed to just wanting `sigsuspend`
+        // to return once the state changes) never gets that handler invoked, and if the caller
+        // doesn't separately re-check/reap via another syscall afterward, the same
+        // still-pending signal makes every SUBSEQUENT `sigsuspend` call return instantly forever
+        // (confirmed live: exactly this shape, a shell's `wait` builtin looping on `sigsuspend`
+        // after the first one already delivered SIGCHLD, spinning at ~175,000 calls/sec since the
+        // signal was never actually dispatched/cleared). Call `process_signals` here, exactly the
+        // same as the normal syscall-return path already does, so a real signal handler
+        // (installed via `rt_sigaction`) actually runs before this returns, matching real Linux.
+        self.process_signals(ctx);
         match result {
             litebox::event::wait::WaitError::Interrupted => Err(Errno::EINTR),
             litebox::event::wait::WaitError::TimedOut => {
