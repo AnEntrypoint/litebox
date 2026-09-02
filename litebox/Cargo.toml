@@ -24,6 +24,8 @@ litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60.2", features = [
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",
     "Win32_System_SystemInformation",

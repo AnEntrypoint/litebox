@@ -299,10 +299,67 @@ impl<V: ValidateAccess, T: FromBytes> RawConstPointer<T> for UserMutPtr<V, T> {
     }
 }
 
+/// DIAG (AGENTS.md pass 207): allocation-free (`WriteFile`-on-stack, no heap, no stdio lock --
+/// same rationale as `litebox_platform_windows_userland`'s own `diag_raw_print`, since a
+/// diagnostic added at this exact call site was previously proven to sometimes need to survive
+/// re-entry from a thread whose heap/lock state may already be suspect) raw print of a
+/// near-null destination pointer passed to a single-byte fallible write. Gated on `dst < 0x1000`
+/// so it only ever fires for genuinely anomalous (never legitimately guest-mapped) addresses --
+/// zero overhead on every ordinary write. Exists specifically to catch the pass 206 mystery
+/// (a `write_u8_fallible` fault at `fault_addr=0x2e` immediately following a `memset_fallible`
+/// fault, call site never identified) red-handed with its exact `dst` value.
+#[cfg(target_os = "windows")]
+fn diag_near_null_write(dst: usize) {
+    if dst >= 0x1000 {
+        return;
+    }
+    let mut line = [0u8; 64];
+    let mut pos = 0usize;
+    let prefix = b"[diag-near-null-write] dst=0x";
+    line[..prefix.len()].copy_from_slice(prefix);
+    pos += prefix.len();
+    // Minimal hex formatting, no `format!`/allocation.
+    let mut hexbuf = [0u8; 16];
+    let mut v = dst;
+    let mut hpos = 16;
+    if v == 0 {
+        hpos -= 1;
+        hexbuf[hpos] = b'0';
+    }
+    while v > 0 {
+        hpos -= 1;
+        let nib = (v & 0xf) as u8;
+        hexbuf[hpos] = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+        v >>= 4;
+    }
+    let hex = &hexbuf[hpos..];
+    let n = hex.len().min(line.len() - pos);
+    line[pos..pos + n].copy_from_slice(&hex[..n]);
+    pos += n;
+    line[pos] = b'\n';
+    pos += 1;
+    unsafe {
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
+        let handle = GetStdHandle(STD_ERROR_HANDLE);
+        if !handle.is_null() && handle != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            let mut written: u32 = 0;
+            windows_sys::Win32::Storage::FileSystem::WriteFile(
+                handle,
+                line.as_ptr(),
+                pos as u32,
+                &raw mut written,
+                core::ptr::null_mut(),
+            );
+        }
+    }
+}
+
 impl<V: ValidateAccess, T: FromBytes + IntoBytes> RawMutPointer<T> for UserMutPtr<V, T> {
     fn write_at_offset(self, count: isize, value: T) -> Option<()> {
         let dst = self.as_ptr().wrapping_add(usize::try_from(count).ok()?);
         let dst = V::validate(dst)?;
+        #[cfg(target_os = "windows")]
+        diag_near_null_write(dst as usize);
         // Match on the size of `T` to use the appropriate fallible write function to
         // ensure that small aligned writes are atomic (and faster than a full
         // memcpy). This match will be evaluated at compile time, so there is no

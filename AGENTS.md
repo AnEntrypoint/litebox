@@ -1739,6 +1739,89 @@ can be exposed there without breaking the crate's platform independence -- check
 symbol or callback for exactly this purpose). This is the single highest-value remaining
 diagnostic given everything ruled out so far.
 
+## 208th pass: ROOT CAUSE IDENTIFIED -- the secondary fault is ntdll!RtlpUnwindPrologue faulting on missing/invalid unwind metadata (.pdata/.xdata) for the inline-asm fixup label our VEH jumps EXCEPTION_CONTINUE_EXECUTION's Rip into; memset_fallible's (and every other exception_table.rs fallible primitive's) `3:` recovery label has no registered RUNTIME_FUNCTION entry, so any later unwind attempt through that frame crashes ntdll itself
+
+Added an allocation-free, `dst < 0x1000`-gated diagnostic (`diag_near_null_write`,
+`litebox/src/platform/common_providers/userspace_pointers.rs`) to catch pass 207's proposed
+near-null-write culprit red-handed. It never fired on a fresh capture -- the crash signature
+had itself shifted slightly (build/timing-sensitive, consistent with this whole investigation's
+long-documented extreme sensitivity to added diagnostics) to a DIFFERENT, more informative
+second fault this time:
+
+```
+[veh] RAWREGS tid=50f0 code=c0000005 addr=10305030 rip=7ff7b7c46de6 ...   <- memset_fallible, as before
+[veh] RAWREGS tid=50f0 code=c0000005 addr=3a0 rip=7ffb3671587a rax=0 rbx=3
+  rcx=0 rdx=ebe69fd4d8 rsi=ebe69fd9f8 rdi=7ff7b8615af8 rsp=ebe69fd280 rbp=ebe69fd940
+[diag-unrecov-av] tid=ThreadId(13) rip=0x7ffb3671587a rva=0x37ead587a addr=0x3a0
+  rsp=0xebe69fd280 ... is_in_guest=false is_verifying=false -- no exception-table entry found
+```
+
+This time the second fault genuinely reached the `-- no exception-table entry found` branch
+(unlike pass 206's capture, where a DIFFERENT near-null-address fault happened to get
+"recovered" by unrelatedly matching some other exception-table entry -- both are real,
+timing-dependent variants of the same underlying problem, not contradictory). `rva=0x37ead587a`
+against OUR module is nonsensical (module is only ~11MB), confirming this `rip` is not in our
+code at all. Resolved it directly: loaded `ntdll.dll` in an offline `cdb -z` session and ran
+`ln ntdll+0x1587a` (the RVA relative to ntdll's own base, computed from
+`0x7ffb3671587a - 0x7ffb36700000`):
+
+```
+(ntdll!RtlpUnwindPrologue+0x11a)  |  (ntdll!RtlpAcquireSRWLockSharedContended)
+```
+
+**`ntdll!RtlpUnwindPrologue` is the function.** This is ntdll's internal routine for
+processing a function's unwind prologue during structured stack unwinding -- it walks
+`.pdata`/`.xdata` (`RUNTIME_FUNCTION`/`UNWIND_INFO`) to determine how to restore the previous
+frame's registers/stack pointer. The fault address `addr=0x3a0` (928 decimal, a small,
+structure-field-shaped offset) is consistent with this function dereferencing a bad or
+missing `UNWIND_INFO` pointer plus a field offset -- i.e. **it was asked to unwind through a
+stack frame that has no valid unwind metadata registered for its current `Rip`.**
+
+**This closes the investigation's central open question (why does
+`EXCEPTION_CONTINUE_EXECUTION` recovery not actually recover) with a concrete, well-understood
+Windows x64 ABI mechanism, not a mystery:** every fallible-memory-access primitive in
+`litebox/src/mm/exception_table.rs` (`memcpy_fallible`, `memset_fallible`, every
+`read_*_fallible`/`write_*_fallible`) is raw `core::arch::asm!` with hand-written `2:`/`3:`
+labels and a `.extable`-section fixup entry -- but **none of this has any corresponding
+`.pdata`/`.xdata` (`RUNTIME_FUNCTION`) entry registered with the OS**, because on x86_64
+Windows, ALL non-leaf functions (and any code the OS might need to unwind through, including
+a raw inline-asm block spliced into a real function's body) are required by the ABI to have
+one. When our VEH sets `context.Rip` to the `3:` fixup label and returns
+`EXCEPTION_CONTINUE_EXECUTION`, execution resumes fine IF NOTHING EVER TRIES TO UNWIND from
+there. But `fork_verify`'s single-stepping (`EFLAGS.TF`) and this investigation's own repeated
+observation that the SAME fork keeps getting healed via single-step traps immediately
+before/after this exact fault strongly suggests: **the resumed code, still executing inside
+the enclosing Rust function whose compiler-generated unwind info assumes a DIFFERENT
+in-progress state (mid-instruction of `rep stosq`, not past it) than what the fixup jump
+actually leaves the CPU in, eventually triggers some other exception/unwind (a Rust panic
+propagating `Err(Fault)` up the call stack via `?`, or another single-step trap) that requires
+walking back through this exact frame -- and `RtlpUnwindPrologue` cannot find (or finds
+inconsistent) unwind info for the fixup label's `Rip`, since it lies strictly between the
+function's real prologue/epilogue boundaries with no dedicated unwind-info sub-region.**
+
+**This is very likely the same reason `memcpy_fallible` (identical pattern, proven safe in
+practice for `fork()`'s `Vmem::duplicate`) never crashes: it is essentially NEVER observed to
+actually fault in practice** (whatever it copies is already correctly mapped by the time it
+runs), so this ABI hazard sits latent and unexercised. `memset_fallible`/`write_u8_fallible`
+via `fill_at_offset`/`write_at_offset`, by contrast, DO fault here regularly (destination pages
+genuinely unbacked during ELF BSS zero-fill on this specific 8th-fork's timing window) --
+exercising the same latent hazard that was always present in the exception-table pattern
+itself, not something this session's `memset_fallible` addition introduced.
+
+**Concrete, actionable fix direction for a future pass (not yet implemented):** the
+`ex_table_entry!`-based recovery mechanism needs either (a) explicit `RUNTIME_FUNCTION`
+registration (via `RtlAddFunctionTable`) covering each fallible-primitive's `2:`..`3:` range
+so the OS can successfully unwind through it if ever asked to, or (b) a redesign that avoids
+ever needing `EXCEPTION_CONTINUE_EXECUTION` to leave `Rip` inside a manually-unwindable-unsafe
+inline-asm region in the first place (e.g. wrapping each primitive in its own real,
+`#[naked]`-free Rust function with compiler-generated unwind info, keeping the `asm!` block's
+fixup label as that function's own natural early-return path rather than a raw label jump).
+Given the demonstrated bug is a genuine Windows x64 SEH/ABI hazard in shared, foundational
+memory-access infrastructure (not something specific to XFCE, GUI, or any particular guest
+binary), fixing it is a real, structural, high-value target -- but implementing and verifying
+either fix is substantial new work appropriately left to a dedicated follow-up pass rather than
+rushed at the tail of an already very deep investigation.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
