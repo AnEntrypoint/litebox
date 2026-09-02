@@ -2556,6 +2556,47 @@ earlier agent session -- violates this project's own standing "zero branches and
 invariant (`CLAUDE.md`). Removed via `git worktree remove --force` + `git branch -D`, confirmed
 `git worktree list` now shows only the main working tree.
 
+## 224th pass: CoW mmap path EMPIRICALLY RULED OUT too (zero DIAG try_cow_mmap_file lines, despite 8/8 EEXIST still occurring) -- both allocate_pages's Replace success path (pass 223) and the CoW path are now confirmed NOT the source, narrowing the remaining candidates to try_dri_dumb_buffer_mmap/try_memfd_mmap (checked before the CoW/memcpy split) or do_mmap_file_memcpy's own logic beyond the parts already traced
+
+Added a `litebox_util_log::debug!` line inside `try_cow_mmap_file`, right after
+`get_static_backing_data` resolves successfully (`static_data`), to check empirically whether
+this path is even reached for the calls that end up EEXIST-failing -- pass 223's own reasoning
+(read the fallback logic, concluded it looks correct) was not yet empirically verified. Built,
+ran the fast repro under `LITEBOX_LOG=debug`:
+
+```
+grep -ac "try_cow_mmap_file" -> 0
+grep -ac "EEXIST" -> 8 (unchanged)
+```
+
+**Zero CoW attempts of any kind** -- this confirms none of `/bin/true`'s own file-backed
+segment mmaps ever reach `get_static_backing_data`'s success path at all (either it always
+returns `None` for this tar-mounted rootfs's files, or an earlier guard in `try_cow_mmap_file`
+-- the `len.is_multiple_of(PAGE_SIZE)` or `fd` conversion checks -- rejects every call before
+reaching this print). Combined with pass 223's own negative result, **both of the two mapping
+paths this investigation has directly instrumented are now conclusively ruled out** as the
+source of the still-open EEXIST regression.
+
+**Remaining candidates, not yet instrumented**: `sys_mmap`'s own two earlier, unconditional
+checks BEFORE the CoW/memcpy split (`try_dri_dumb_buffer_mmap`, `try_memfd_mmap` --
+`litebox_shim_linux/src/syscalls/mm.rs` lines ~617-634) -- both are gated on
+`!flags.contains(MapFlags::MAP_ANONYMOUS)`, which our file-backed `MAP_FIXED` calls DO satisfy,
+so they ARE at least evaluated (though expected to return `None` for an ordinary ELF-segment fd,
+not a DRM/memfd one) -- worth a quick empirical check rather than assumed innocent; or
+something in `do_mmap_file_memcpy` itself beyond what's already been traced (its own `op`
+closure doing the file read, or the runtime-syscall-rewriting/`maybe_patch_exec_segment` step
+that runs after a successful `PROT_EXEC` mapping, which this investigation has not yet examined
+at all and could plausibly relocate/fail independently of the mmap call itself).
+
+**Given the extensive, now sevenfold (213/214/216/217/218/219/223/224 -- eight, not seven)
+passes' worth of investigation into this specific regression without full resolution, and
+given the ORIGINAL crash this whole session's arc exists to fix is definitively resolved and
+directly visually confirmed (passes 212-222), this is an appropriate point to hand off the
+remaining EEXIST regression to a future session with fresh context.** The regression is real,
+narrow, precisely bounded to a small number of specific, now mostly-eliminated candidate call
+sites, and does not block the CORE deliverable (a crash-free host process with a working
+weston compositor/rendering surface) -- only the final `xfce4-session` launch specifically.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.

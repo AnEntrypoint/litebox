@@ -232,6 +232,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_| None,
                 |_| None)
             .ok()??;
+        // DIAG (AGENTS.md pass 223/224): confirm empirically whether this CoW mapping path is
+        // even reached for the calls that end up EEXIST-failing, since pass 223's own code
+        // reading could not fully rule it out without a live capture. `try_allocate_cow_pages`
+        // has no real implementation on Windows userland (always `UnsupportedByPlatform`) --
+        // this print exists to check whether reaching this far (i.e. `get_static_backing_data`
+        // succeeding) at all correlates with the still-open EEXIST regression.
+        litebox_util_log::debug!(
+            tid:% = self.tid, offset:% = offset, static_len:% = static_data.len();
+            "DIAG try_cow_mmap_file: static_data resolved, about to attempt CoW"
+        );
 
         if offset > static_data.len() {
             return None;
