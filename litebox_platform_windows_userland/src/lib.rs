@@ -1485,6 +1485,22 @@ unsafe extern "system" fn vectored_exception_handler(
     // `is_in_source` membership hit (never a coincidental numeric overlap), and never touches
     // any other register or memory -- the narrowest fix this specific gap admits, matching the
     // same bounded, deterministic shape every safe fix in `fork_verify.rs` itself already uses.
+    // Bounded-spin `try_lock`, never an unconditional block: see `FORK_VERIFY_HEAL_LOCK`'s own doc
+    // comment for why. Held across BOTH the AV-path healers below and the `on_single_step` call
+    // further down (they are sequential alternatives for the same fault, never nested) so no two
+    // threads' healing sequences for two different faults ever interleave.
+    let _fork_verify_heal_guard = {
+        let mut guard = None;
+        for _ in 0..1000 {
+            if let Ok(g) = FORK_VERIFY_HEAL_LOCK.try_lock() {
+                guard = Some(g);
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        guard
+    };
+
     if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
         && fork_verify::is_verifying(tls)
     {
@@ -5881,6 +5897,38 @@ static STDERR_WRITE_LOCK: Mutex<()> = Mutex::new(());
 /// protecting the SAME shared Windows resource is equivalent to no lock at all between the two
 /// code paths that each hold a different one.
 pub(crate) static VIRTUAL_PROTECT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Serializes the ENTIRE `fork_verify` healing sequence (every AV-path healer plus
+/// `on_single_step`) across threads process-wide.
+///
+/// # Why this exists
+///
+/// Confirmed live (this investigation, passes 168-172): two guest threads spawned from the same
+/// fork group (sharing the exact same relocation-tracked pages) can be mid-healing at genuinely
+/// the same moment -- `ThreadId(16)`/`ThreadId(17)` both actively patching stale slots in the
+/// exact window a THIRD thread's `sys_write` syscall prologue faulted on a plain, unrelated
+/// stack-relative store. `write_usize_fault_tolerant`'s own `VIRTUAL_PROTECT_LOCK` only serializes
+/// this module's writes against `VirtualProtect`/each other -- it says nothing about the READ
+/// side of the read-decide-write sequence in each AV-path/single-step case, nor about a
+/// completely unrelated thread's ordinary (non-`fork_verify`) instruction fetch/data access
+/// racing a healer's in-flight page-protection flip. Making the individual slot read/write atomic
+/// (see `read_usize_fault_tolerant`'s own doc comment) closed the narrowest torn-word hazard but
+/// did not close the broader one: two healers independently walking the SAME instruction's
+/// operands/registers/decode state at once is not sound just because each individual memory
+/// access is atomic. Serializing the whole healing sequence per-fault removes that broader
+/// class of concurrent-healer hazard entirely, at the cost of one thread's healing work being
+/// briefly delayed (never blocked long -- healing is always a small, bounded, non-blocking
+/// sequence of local checks and at most one word write) while another thread's healing for a
+/// DIFFERENT fault runs.
+///
+/// Uses `try_lock` in a small bounded spin (never an unconditional blocking `.lock()`): this runs
+/// inside exception-handling context, where a genuine nested re-entry on the SAME thread is a
+/// documented, observed scenario elsewhere in this file (see `TlsState::veh_depth`'s doc comment)
+/// -- an unconditional lock would deadlock a thread against itself on that path. A failed
+/// acquisition after the bounded spin falls through to the pre-existing, unserialized behavior
+/// (strictly no worse than before this fix) rather than risking an indefinite block inside VEH
+/// dispatch.
+pub(crate) static FORK_VERIFY_HEAL_LOCK: Mutex<()> = Mutex::new(());
 
 /// Serializes `allocate_pages`'s fixed-address (`suggested_range.start != 0`) check-then-act
 /// sequence -- see that call site's own comment for the real TOCTOU race this closes: without a
