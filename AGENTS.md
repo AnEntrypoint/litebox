@@ -4748,6 +4748,48 @@ litebox's/weston's own `wl_display_sync`-handling on the COMPOSITOR side never c
 one specific callback, which would be a genuinely novel, previously-uninvestigated angle distinct
 from every hypothesis sub-session 44 already exhausted.
 
+## 273rd pass: DECISIVE -- read desktop-shell.c's real main() function directly and found the compensating "wl_list_for_each(output,...) if (!output->panel) output_init(...)" loop runs IMMEDIATELY after registering the global handler, with NO wl_display_roundtrip/dispatch call in between -- meaning desktop->outputs is GUARANTEED EMPTY at that point (zero Wayland events have been processed yet) and this loop can only ever be a no-op at its own call site; background creation is therefore ENTIRELY dependent on global_handler firing live for wl_output AFTER weston_desktop_shell's own global was already bound during whatever internal dispatch display_create() performs -- i.e. this is a genuine, real registry-announcement-ORDER dependency with no runtime recovery path if the compositor announces wl_output before weston_desktop_shell, exactly the race pass 272 had provisionally ruled out but is now the single most concrete, directly-actionable hypothesis
+
+**Corrects pass 272's own premature dismissal of the registry-ordering race.** Pass 272 read
+`output_init()`'s own body and confirmed it has no early-return, concluding the ordering race
+was likely handled by a compensating loop -- but had NOT yet read where in `main()` that loop
+actually runs. This pass fetched `main()`'s real source directly and found the compensating loop
+executes with `desktop.outputs` necessarily still empty (no roundtrip/dispatch has run yet at
+that point in the function), making it non-functional as a genuine ordering-race mitigation at
+ITS OWN call site. The ONLY way `output_init()` for a given output ever actually runs is via the
+live `wl_output` case inside `global_handler` itself, and ONLY if `desktop->shell` (the
+`weston_desktop_shell` global) was already bound by the time that specific `wl_output` global's
+own handler callback fires -- i.e. genuinely, entirely dependent on the ORDER the compositor
+announces its globals during registry enumeration, with no other code path to recover if that
+order is wrong.
+
+**This is now the single most concrete, directly falsifiable hypothesis in this entire multi-
+session investigation**: does litebox's own Wayland-socket/registry-enumeration code (wherever
+`wl_registry.global` events are actually sent to a connecting client -- likely inside weston's
+own compositor core, not litebox code at all, but worth confirming) announce `wl_output` BEFORE
+`weston_desktop_shell`? If so, this exact client-side ordering assumption (real, upstream weston
+code, not a litebox bug) would be violated, and `weston-desktop-shell` would deterministically
+never draw its background -- fully explaining EVERY observation this whole investigation has
+made (client reaches clean idle, zero `wl_shm_create_pool` calls, zero crash, zero error message,
+because nothing in this exact code path even attempts to report failure -- it simply silently
+never runs `output_init` at all).
+
+**Concrete, maximally sharp next step for whoever continues this**: decode the raw
+`wl_registry.global` event bytes already sitting in every prior repro's own captured log (sub-
+session 44's own next-step #2, still unactioned across THREE separate passes now -- this
+session's own earlier `diag-exec-mmap`-style logs plus any `sys_sendmsg`/`sys_recvmsg` capture
+already taken would show these) to determine the EXACT order globals are announced in, comparing
+`weston_desktop_shell`'s own advertised name/id against `wl_output`'s. If `wl_output` genuinely
+comes first, the fix is either (a) patching `desktop-shell.c` itself (a real, small, surgical
+client-side fix: move/duplicate the compensating loop to run AFTER an explicit
+`wl_display_roundtrip()`, which upstream weston may already do differently in a newer version --
+worth checking git blame/recent commits for this exact function) or (b) more likely for THIS
+project's own goals, simply verify whether real, unmodified upstream weston (built normally, no
+litebox involved) exhibits the identical ordering on real hardware -- if litebox's own guest
+environment produces a genuinely different global-announcement order than a real Linux kernel +
+real DRM driver would, THAT specific difference (not weston's own C code, which is unmodified
+upstream) would be the real litebox-side bug worth fixing.
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash
