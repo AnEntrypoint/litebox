@@ -6437,7 +6437,15 @@ unsafe extern "C-unwind" fn exception_handler(
 
 unsafe extern "C-unwind" fn interrupt_handler(thread_ctx: &mut ThreadContext<'_>) {
     thread_ctx.tls.is_in_guest.set(false);
+    litebox_util_log::warn!(
+        tid:? = std::thread::current().id();
+        "drm-diag: interrupt_handler entry"
+    );
     thread_ctx.call_shim(|shim, ctx, interrupt| {
+        litebox_util_log::warn!(
+            tid:? = std::thread::current().id(), interrupt:% = interrupt;
+            "drm-diag: interrupt_handler call_shim closure"
+        );
         if interrupt {
             shim.interrupt(ctx)
         } else {
