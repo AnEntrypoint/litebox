@@ -218,6 +218,25 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
         path: impl litebox::path::Arg,
     ) -> Result<Self, ElfLoaderError> {
         let file = ElfFile::new(task, path).map_err(ElfLoaderError::OpenError)?;
+        // DIAG (this investigation pass): confirm exactly what this open actually reads,
+        // independent of the ELF header parse -- an earlier pass's ELF-header-patch workaround
+        // attempt showed the loaded program headers never reflecting an externally-edited/
+        // reimported tar's content across many verified-correct attempts; this reads the file's
+        // real size plus a small prefix directly to settle whether the FILE CONTENT ITSELF
+        // differs from what was staged.
+        {
+            use litebox_common_linux::loader::ReadAt as _;
+            let mut probe = [0u8; 16];
+            let size = (&file).size().ok();
+            let read_ok = (&file).read_at(0, &mut probe).is_ok();
+            litebox_util_log::warn!(
+                fd:% = file.fd,
+                size:? = size,
+                read_ok:% = read_ok,
+                prefix:? = probe;
+                "DIAG elf_load: FileAndParsed::new opened file, size+prefix"
+            );
+        }
         let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
             .map_err(ElfLoaderError::ParseError)?;
 
