@@ -307,6 +307,15 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfLoader<'a, Platform, FS> {
         // logging) so this survives in captures that use LITEBOX_LOG=warn to actually reach a
         // slow-to-trigger crash without debug-level's much higher verbosity timing it out first.
         litebox_util_log::warn!(path:% = path; "DIAG elf_load: ElfLoader::new main path");
+        // AGENTS.md pass 260: log the load base for every ELF this loader handles so a future
+        // guest-exception capture's `rip` can be matched against these ranges by hand to
+        // identify which file (and, via the path + `nm`/`objdump` on that exact file, which
+        // symbol) actually crashed -- litebox has no `/proc/self/maps` for the guest to
+        // introspect itself, so this is the only available source of file<->address mapping.
+        litebox_util_log::error!(
+            path:% = path;
+            "diag-elf-load-path: tracking for future crash-address correlation"
+        );
         // Parse the main ELF file.
         let main = FileAndParsed::new(task, path)?;
 

@@ -161,6 +161,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, fd, offset)?
         };
 
+        // AGENTS.md pass 260: log path<->address for every executable file-backed mapping, so a
+        // future guest-exception capture's `rip` can be matched by hand against these ranges to
+        // identify which shared library/binary actually crashed (litebox has no `/proc/self/maps`
+        // for the guest to introspect itself -- this is the only available source of that
+        // correlation, reusing the same `lookup_fd_path` mechanism `readlink("/proc/self/fd/N")`
+        // already relies on).
+        if is_exec {
+            let path = self.files.borrow().lookup_fd_path(fd as usize);
+            litebox_util_log::error!(
+                path:? = path, start:% = result.as_usize(), len:% = len, offset:% = offset;
+                "diag-exec-mmap: tracking for future crash-address correlation"
+            );
+        }
+
         // Runtime syscall rewriting: patch PROT_EXEC segments in-place.
         if is_exec {
             let syscall_entry = self.global.platform.get_syscall_entry_point();
@@ -939,6 +953,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 continue;
             }
             let mapped_addr = UserPtrMut::<u8>::from_usize(patch_start);
+            // AGENTS.md pass 260 follow-up: the direct mmap(PROT_EXEC)-time diagnostic missed
+            // the actual weston crash addresses entirely -- this is the OTHER route a mapping
+            // gains PROT_EXEC (an mmap(PROT_READ) followed later by mprotect(PROT_EXEC), the
+            // classic dynamic-linker lazy-mapping idiom), so track it here too.
+            let path = self.files.borrow().lookup_fd_path(fd as usize);
+            litebox_util_log::error!(
+                path:? = path, start:% = patch_start, len:% = patch_len;
+                "diag-exec-mmap: tracking via mprotect(PROT_EXEC) for future crash-address correlation"
+            );
             self.maybe_patch_exec_segment(mapped_addr, patch_len, fd, syscall_entry, None);
         }
     }

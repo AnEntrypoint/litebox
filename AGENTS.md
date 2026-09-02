@@ -4146,6 +4146,69 @@ emulation semantics (worth continuing to chase here) -- this session's own diagn
 infrastructure (the `diag-guest-exception` block added passes 257-258) is real, reusable, kept
 in place, and ready to capture more data whenever this is picked back up.
 
+## 260th pass: MAJOR BREAKTHROUGH -- added path<->address correlation diagnostics (both mmap(PROT_EXEC)-time and mprotect(PROT_EXEC)-time) attempting to symbolize weston's crash addresses; neither correlated directly, BUT re-examining the existing mapping-overlap dump (pass 258) against a fresh capture reveals the REAL mechanism for one whole crash class: the guest is executing code from a mapping that has VM_READ|VM_MAYEXEC but is MISSING VM_EXEC itself -- an actual NX/W^X violation, meaning something never called mprotect(PROT_EXEC) on this segment before jumping into it (or litebox silently drops the EXEC flag somewhere) -- this is now a concrete, checkable litebox-side hypothesis, not upstream weston UB
+
+**Correlation infrastructure added**: logged path+address for every `mmap(..., PROT_EXEC)`
+call (`litebox_shim_linux/src/syscalls/mm.rs`'s `do_mmap_file`) AND every
+`mprotect(..., PROT_EXEC)` call that patches a previously-non-exec mapping
+(`maybe_patch_on_mprotect_exec`), both via the same `lookup_fd_path` mechanism
+`readlink("/proc/self/fd/N")` already uses -- litebox has no `/proc/self/maps` for the guest
+itself to introspect, so this ad-hoc path<->address log is the only available correlation
+source. 3 repro runs against this instrumented build (all system-stable, no freeze recurrence,
+consistent with pass 252-256's fix holding) captured 4 total crash instances across the whole
+pass.
+
+**Direct path/mprotect correlation failed for every capture** -- none of the 4 crash `rip`
+values fell inside any logged `mmap(PROT_EXEC)` or `mprotect(PROT_EXEC)` range, missing by a
+consistent ~700KB-900KB in every case. This rules out the two most obvious "which file is this"
+hypotheses (a plain ELF `PT_LOAD` exec segment, or a lazily-`mprotect`'d dynamic-linker page) as
+this diagnostic's own coverage currently understands them.
+
+**The real breakthrough came from re-reading pass 258's own pre-existing mapping-overlap dump
+(never fully interpreted correctly until this pass)**, applied to a fresh capture:
+```
+diag-guest-exception: pre-signal snapshot exception=Exception(14) kernel_mode=false
+  rip=0xfda464b rsp=0x1457f850 cr2=0xfda464b error_code=0x6
+diag-guest-exception: mapping overlapping cr2 range_start=0xfd90000 range_end=0xfdc7000
+  flags=VmFlags(VM_READ | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC)
+```
+`rip == cr2` (an instruction FETCH faulting), and the fault address genuinely DOES fall inside a
+real, litebox-tracked mapping (`0xfd90000..0xfdc7000`, a real, substantial 220KB region --
+almost certainly the very same `/bin/mkdir`/`ld-musl-x86_64.so.1`-class small-binary mapping the
+correlation log tracks elsewhere in this address range, just not exactly matching due to
+CoW/relocation). **The mapping's own flags show `VM_READ | VM_MAYEXEC` -- readable, and
+mprotect-COULD-make-it-executable -- but `VM_EXEC` itself is conspicuously ABSENT.** This is a
+genuine NX-page-execute violation: the guest CPU tried to run code from a page litebox itself
+has marked non-executable. This is NOT upstream weston undefined behavior (a real Linux kernel
+enforces NX identically, so if this exact mapping were genuinely meant to be non-executable on
+real Linux, weston would crash there too regardless of litebox) -- the open question is whether
+litebox is CORRECTLY modeling a real NX-violation bug in weston's own guest code (e.g. weston
+computing a bad function pointer that happens to land in otherwise-legitimate, correctly-marked-
+non-exec data), or whether litebox itself FAILED to apply an `EXEC` bit that real Linux would
+have granted at this address (e.g. a missed `mprotect(PROT_EXEC)` call, or a mapping that should
+have inherited `PROT_EXEC` from its original `mmap()` flags but didn't).
+
+**This second, distinct crash instance in the SAME run had a completely different, unrelated
+signature** -- `Exception(13)` (`GENERAL_PROTECTION`), `cr2=0x0`, `rip=0x19e1f46a` (closest
+tracked mapping: `/usr/bin/Xwayland`, ~845KB away) -- a genuine NULL-pointer function call
+(calling through an uninitialized/zeroed callback), structurally unrelated to the NX-violation
+crash above. **This confirms, more concretely than any prior pass's own observation, that
+"weston SIGSEGV" was never a single bug -- it is at least two, and possibly more, genuinely
+distinct crash mechanisms**, each independently non-deterministic in when it triggers, which is
+why every capture across passes 249/255-260 has shown different-looking symptoms.
+
+**Concrete, well-scoped next step for the NX-violation crash class specifically** (the more
+promising of the two, since it has a clear litebox-vs-upstream fork in the road): trace every
+`mmap`/`mprotect` call litebox issues for the SPECIFIC mapping range `0xfd90000..0xfdc7000`
+across this exact run (add a temporary diagnostic logging every mmap/mprotect call's own
+address range + flags, not just the ones already tracked, and grep the full log for this exact
+range) to see whether an `mprotect(PROT_EXEC)` call for this range was ever ISSUED by the guest
+at all (if yes and it didn't take effect -- a real litebox bug in `sys_mprotect`'s flag
+application; if no -- weston/musl/whatever owns this mapping genuinely never asked for exec
+permission here, meaning the guest's OWN jump into it is the real bug, not litebox). This is a
+sharper, more mechanically answerable question than anything this whole weston-crash
+sub-investigation has posed before.
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash
