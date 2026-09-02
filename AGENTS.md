@@ -4051,6 +4051,57 @@ queryable from this exact call site) at crash time, to answer (i) above directly
 region belonging to a totally different, unrelated mapping, that alone would strongly indicate
 which of the two possibilities above is the real story.
 
+## 258th pass: extended pass 257's diagnostic to dump overlapping guest mappings at crash time -- second capture shows a DIFFERENT (genuinely non-deterministic, consistent with this whole investigation's established pattern) weston SIGSEGV: a real, plausible rip (0x7ff6fd3bda16, a normal high PIE address) doing a legitimate user-mode READ that faults at cr2=0x7eeb8000 -- exactly the boundary between a real VM_READ|VM_WRITE guest mapping ending at that address and litebox's own internal VM_OWN_FORK_PADDING-only region starting there, strongly suggesting this is litebox's OWN internal fork-padding bookkeeping leaking into guest-visible address space as a real access fault, not a genuine weston bug -- this is now the most concrete, well-evidenced lead in the whole weston-SIGSEGV sub-investigation
+
+**Second capture** (same repro, same diagnostic from pass 257, this run happened to hit a
+DIFFERENT instance of what is evidently a non-deterministic class of weston crash -- consistent
+with every other timing-sensitive bug this whole session/investigation has found):
+```
+diag-guest-exception: pre-signal snapshot exception=Exception(14) kernel_mode=false
+  rip=0x7ff6fd3bda16 rsp=0x9e2800e530 cr2=0x7eeb8000 error_code=0x4
+diag-guest-exception: mapping overlapping cr2 range_start=0x7eeb7000 range_end=0x7eeb8000
+  flags=VmFlags(VM_READ | VM_WRITE | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC)
+diag-guest-exception: mapping overlapping cr2 range_start=0x7eeb8000 range_end=0x7eec0000
+  flags=VmFlags(VM_OWN_FORK_PADDING)
+```
+`error_code=0x4` (`0b100`: not-present=0 is WRONG reading -- re-derive: bit0=present,
+bit1=write, bit2=user; `0x4` = bit2 only = present=0 (not-present fault), write=0 (a READ),
+user=1 (user-mode)) -- so this is an ordinary user-mode READ into a not-present page, at
+`cr2=0x7eeb8000`, which is EXACTLY the boundary address between two adjacent guest mappings:
+a real, normal `VM_READ | VM_WRITE | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC` region ending
+precisely at `0x7eeb8000`, immediately followed by an `8000`-byte (0x7eeb8000..0x7eec0000,
+32KB) region carrying ONLY the `VM_OWN_FORK_PADDING` flag -- no `VM_READ`/`VM_WRITE` at all.
+
+**This is a strong, concrete lead, not yet fully proven**: `VM_OWN_FORK_PADDING` (per its own
+doc comment, read during pass 255's investigation of a related teardown bug) marks "real,
+committed memory that belongs to no live guest mapping" -- litebox-internal bookkeeping for
+leaked fork-group address-space padding, NOT meant to represent real, accessible guest memory.
+If weston's own code (very plausibly `rip=0x7ff6fd3bda16`, inside its normal PIE text/data,
+nothing exotic) makes an entirely ordinary, sequential read that happens to walk from the end of
+one legitimately-sized mapping into what SHOULD be either (a) more of the same mapping (if
+litebox under-sized it relative to what the real ELF/allocator expected) or (b) a clean,
+consistently-faulting gap (if this is genuinely unmapped guest address space, which a real Linux
+kernel would ALSO fault on identically) -- distinguishing these two requires knowing what real
+Linux `/proc/self/maps` WOULD show at this exact address for this exact guest workload, which
+this capture alone cannot answer. But the coincidence of the fault address landing EXACTLY on a
+`VM_OWN_FORK_PADDING` region's own start address, immediately adjacent to a real mapping with
+matching R/W permissions, is a strong signal that litebox's own fork-padding accounting is
+under-sizing or mis-placing this specific mapping relative to what the guest legitimately needs.
+
+**Concrete next step for whoever continues this**: find where `VM_OWN_FORK_PADDING` regions are
+created/sized (`Vmem::duplicate`, per the `release_memory` comment's own cross-reference to "the
+long-standing fork()+execve() mallocng `.meta=0` crash" -- the SAME code path, and the SAME
+`VM_OWN_FORK_PADDING` flag, that an entirely different investigation in this project's own
+memory history (`project_npx_casey_goal_status.md`) already extensively chased for a related
+symptom) and check whether the REAL mapping immediately preceding this exact fork-padding region
+(`0x7eeb7000..0x7eeb8000`, a suspiciously round, small, single-page 4KB mapping) was originally
+sized/requested LARGER by the guest and got truncated/miscounted during a `fork()`'s own
+address-space duplication, leaving this padding region where real, accessible memory should be.
+This connects two previously-separate investigation threads (this session's weston-crash work,
+and the older, unresolved `VM_OWN_FORK_PADDING`/mallocng crash history) around the same
+underlying mechanism, which is a meaningfully higher-value lead than either investigated in
+isolation.
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash

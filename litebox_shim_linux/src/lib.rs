@@ -217,12 +217,38 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
         // translated into a signal, so the next capture of this exact crash gives an actual
         // faulting instruction address to investigate instead of just "Signal(11)".
         #[cfg(target_arch = "x86_64")]
-        litebox_util_log::error!(
-            exception:? = info.exception, kernel_mode:% = info.kernel_mode,
-            rip:% = format_args!("{:#x}", ctx.rip), rsp:% = format_args!("{:#x}", ctx.rsp),
-            cr2:% = format_args!("{:#x}", info.cr2), error_code:% = format_args!("{:#x}", info.error_code);
-            "diag-guest-exception: pre-signal snapshot"
-        );
+        {
+            litebox_util_log::error!(
+                exception:? = info.exception, kernel_mode:% = info.kernel_mode,
+                rip:% = format_args!("{:#x}", ctx.rip), rsp:% = format_args!("{:#x}", ctx.rsp),
+                cr2:% = format_args!("{:#x}", info.cr2), error_code:% = format_args!("{:#x}", info.error_code);
+                "diag-guest-exception: pre-signal snapshot"
+            );
+            // AGENTS.md pass 257 follow-up: distinguish "genuine weston bug jumping to a real
+            // but corrupted pointer value" from "litebox emulation gap leaving cr2 unmapped
+            // when it should be mapped" -- dump every guest mapping overlapping a window around
+            // `cr2` (or note that NOTHING overlaps at all, i.e. genuinely unmapped address
+            // space) so the next capture answers this directly instead of needing a second pass.
+            let probe_range = info.cr2.saturating_sub(0x1000)..info.cr2.saturating_add(0x1000);
+            let mut found_any = false;
+            for (r, flags) in self.process().0.pm().mappings() {
+                if r.start < probe_range.end && r.end > probe_range.start {
+                    found_any = true;
+                    litebox_util_log::error!(
+                        range_start:% = format_args!("{:#x}", r.start),
+                        range_end:% = format_args!("{:#x}", r.end),
+                        flags:? = flags;
+                        "diag-guest-exception: mapping overlapping cr2"
+                    );
+                }
+            }
+            if !found_any {
+                litebox_util_log::error!(
+                    cr2:% = format_args!("{:#x}", info.cr2);
+                    "diag-guest-exception: NO mapping overlaps cr2 (genuinely unmapped)"
+                );
+            }
+        }
         #[cfg(target_arch = "aarch64")]
         litebox_util_log::error!(
             exception:? = info.exception, kernel_mode:% = info.kernel_mode,
