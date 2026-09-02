@@ -2439,8 +2439,20 @@ pub(crate) fn begin(relocations: alloc::sync::Arc<litebox::mm::AddressRelocation
         .unwrap_or(usize::MAX);
     let diag_next_claim_seq =
         crate::NEXT_CLAIM_SEQ.load(core::sync::atomic::Ordering::Relaxed);
+    // Genuine Windows-OS-level counters (AGENTS.md pass 203's own follow-up hypothesis): the
+    // real numeric Windows TID (distinct from litebox's own sequential `std::thread::ThreadId`)
+    // and the process's total open-handle count, in case a Windows-side limit -- not a
+    // litebox-internal one -- is what's actually exhausted around the 8th real OS thread.
+    let diag_real_win_tid = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+    let mut diag_handle_count: u32 = 0;
+    let diag_handle_count_ok = unsafe {
+        windows_sys::Win32::System::Threading::GetProcessHandleCount(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            &raw mut diag_handle_count,
+        )
+    } != 0;
     eprintln!(
-        "[diag-fv-count] tid={:?} begin() call #{diag_begin_count} claimed_ranges={diag_claimed_ranges_occupied} active_threads={diag_active_threads_len} live_thread_stacks={diag_live_thread_stacks_len} next_claim_seq={diag_next_claim_seq}",
+        "[diag-fv-count] tid={:?} win_tid={diag_real_win_tid} begin() call #{diag_begin_count} claimed_ranges={diag_claimed_ranges_occupied} active_threads={diag_active_threads_len} live_thread_stacks={diag_live_thread_stacks_len} next_claim_seq={diag_next_claim_seq} handle_count={diag_handle_count} handle_count_ok={diag_handle_count_ok}",
         std::thread::current().id(),
     );
     if crate::diag_rip0_enabled() {

@@ -59,7 +59,8 @@ pub fn do_mmap<
         None => None,
     };
     let length = NonZeroPageSize::new(len).ok_or(MappingError::UnAligned)?;
-    match prot {
+    let is_fixed_addr = flags.contains(CreatePagesFlags::FIXED_ADDR);
+    let result = match prot {
         ProtFlags::PROT_READ_EXEC => unsafe {
             pm.create_executable_pages(suggested_addr, length, flags, op)
         },
@@ -82,8 +83,28 @@ pub fn do_mmap<
                 pm.create_inaccessible_pages(suggested_addr, length, flags, op)
             }
         }
+    };
+    // AGENTS.md pass 212: a `MAP_FIXED`/`MAP_FIXED_NOREPLACE` request must place the mapping at
+    // EXACTLY the requested address or fail -- that is real Linux `mmap(2)`'s contract, and
+    // every caller (the ELF loader chief among them) computes all subsequent addresses from the
+    // REQUESTED address, never from whatever a mapping call actually returns. A platform-layer
+    // page allocator can have its own internal reasons to relocate a fixed-address request
+    // instead of honoring it (e.g. this crate's Windows backend silently falls back to an
+    // OS-picked address when it detects the requested range is claimed by another live process,
+    // to avoid corrupting that process's real memory -- see `allocate_pages`'s own doc comment
+    // in `litebox_platform_windows_userland`). Root-caused (pass 212) to a real, deterministic,
+    // reproducible crash: silently returning a mapping at the WRONG address for a fixed request
+    // left the ELF loader's BSS zero-fill writing to memory that was never actually mapped.
+    // Catch any such mismatch here, in the one shared choke point every `mmap()` caller already
+    // goes through, and fail the call the way real Linux would (`EEXIST`/`ENOMEM`), rather than
+    // letting every individual platform backend need to remember to check this itself.
+    if let (Ok(ptr), Some(requested)) = (&result, suggested_addr)
+        && is_fixed_addr
+        && litebox::platform::RawConstPointer::as_usize(ptr) != requested.as_usize()
+    {
+        return Err(litebox::platform::page_mgmt::AllocationError::AddressInUse.into());
     }
-    .map(UserPtrMut::from_platform_ptr::<Platform>)
+    result.map(UserPtrMut::from_platform_ptr::<Platform>)
 }
 
 /// Handle syscall `munmap`

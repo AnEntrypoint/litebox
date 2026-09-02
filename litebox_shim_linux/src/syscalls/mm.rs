@@ -281,6 +281,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             fixed_behavior,
         ) {
             Ok(ptr) => {
+                // AGENTS.md pass 212: this CoW mapping path bypasses `litebox_common_linux::mm
+                // ::do_mmap`'s own shared fixed-address-mismatch check (this crate's other
+                // mmap path, `do_mmap_file_memcpy`, goes through it) by calling
+                // `try_allocate_cow_pages` directly -- needs the same guard. Real Linux's
+                // `MAP_FIXED` contract is "map exactly here or fail", never silently relocate;
+                // a platform's own `allocate_pages` can still choose to relocate a `Replace`
+                // request away from a foreign-claimed range rather than corrupt another live
+                // process (see `litebox_platform_windows_userland`'s `allocate_pages`), and this
+                // was root-caused (pass 212) to letting the ELF loader's BSS zero-fill target
+                // completely unmapped memory when that relocation silently happened underneath
+                // a `MAP_FIXED` ELF-segment mapping.
+                if fixed_behavior == FixedAddressBehavior::Replace
+                    && let Some(requested) = suggested_addr
+                    && ptr.as_usize() != requested
+                {
+                    return Some(Err(MappingError::OutOfMemory));
+                }
                 let range =
                     PageRange::new(ptr.as_usize(), ptr.as_usize().checked_add(len).unwrap())
                         .unwrap();

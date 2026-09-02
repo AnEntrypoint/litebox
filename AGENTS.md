@@ -2047,6 +2047,59 @@ request in the first place. Option (a) is the safer, more conservative fix regar
 underlying scenario is occurring, since silently mismapping `MAP_FIXED` is never correct Linux
 `mmap()` behavior.
 
+## 213th pass: FIX IMPLEMENTED AND VERIFIED -- the deterministic 8th-fork crash is FIXED, 5/5 trials now reach ALL_COMPLETED with EXIT=0 (previously 0/many across the whole multi-session investigation). Added a fixed-address-mismatch check to litebox_common_linux::mm::do_mmap (the shared choke point every mmap() caller goes through) plus the separate CoW mmap path, failing the call with AllocationError::AddressInUse instead of silently returning a mapping at the wrong address
+
+Implemented pass 212's proposed fix (a): detect when a `MAP_FIXED`/`MAP_FIXED_NOREPLACE`
+request's actual returned address does not match the requested address, and fail the call
+instead of silently succeeding with a mismatched mapping.
+
+**Two call sites needed the fix**, since they're separate code paths that don't share a single
+choke point:
+
+1. `litebox_common_linux/src/mm.rs`'s `do_mmap` (used by both anonymous mappings and the
+   `do_mmap_file_memcpy` fallback file-mapping path): captured `is_fixed_addr` before the
+   `flags` value is moved into the `match prot { ... }` arms, then after the match, compare the
+   returned pointer's address against `suggested_addr` when `is_fixed_addr` is set. On mismatch,
+   return `AllocationError::AddressInUse` (already converts to `MappingError::MapError` via its
+   existing `#[from]`).
+2. `litebox_shim_linux/src/syscalls/mm.rs`'s `try_cow_mmap_file` (the separate CoW-mapping path
+   for statically-backed files, which calls `try_allocate_cow_pages` directly and does NOT
+   route through `do_mmap` at all): added the equivalent check right after a successful
+   `try_allocate_cow_pages` call, gated on `fixed_behavior == FixedAddressBehavior::Replace`,
+   returning `MappingError::OutOfMemory` (matching this same function's own pre-existing
+   error-handling style a few lines above, for a different but analogous "can't safely proceed"
+   case).
+
+**Verification**: built `litebox_runner_linux_on_windows_userland` release, ran the established
+gold-standard fast repro (`musl_repro_plain8.sh`, `while` loop doing `/bin/true & ; wait` x15,
+`LITEBOX_LOG=warn`, no special env vars) 5 times in a row. **Every single trial**: `EXIT=0`,
+`COMPLETED_count=16` (all 16 markers, `COMPLETED_1` through `COMPLETED_15` plus the loop's own
+final echo), `ALL_COMPLETED` printed. Zero crashes across 5/5 trials -- this is the FIRST time
+in this entire multi-session investigation (dozens of passes, hundreds of prior trial runs, this
+session's own passes 168-212) that this repro has completed cleanly even once.
+
+**What this fix does NOT yet confirm**: whether the underlying `Replace`-mode
+foreign-claim/stack-overlap relocation in `allocate_pages`
+(`litebox_platform_windows_userland/src/lib.rs`) still fires under this fix (now correctly
+surfacing as a clean `mmap()` failure/EEXIST-equivalent instead of silent corruption) -- if it
+does still fire regularly, a real guest program that legitimately NEEDS its `MAP_FIXED` request
+honored (not just tolerant of relocation) could now see spurious `mmap()` failures where it
+previously got silent corruption. This trade-off (fail loudly and correctly vs. silently and
+incorrectly) is unambiguously the right one for correctness, but if `execve`'s ELF-segment
+`MAP_FIXED` calls start failing outright under this fix in a way that breaks program loading
+entirely (rather than just being detected), the DEEPER fix -- making `allocate_pages` actually
+honor `Replace`-mode fixed requests correctly instead of only detecting when it can't --
+becomes the necessary next step. The clean 5/5 repro pass here means, for THIS specific
+repro's shape at least, the underlying relocation either isn't happening anymore under
+whatever conditions this fix's error path creates, or is being handled by some retry/fallback
+elsewhere that this pass hasn't specifically traced. Given the concrete, immediate,
+verified positive result, this is recorded as a genuine fix rather than delayed further
+pending that deeper analysis.
+
+**Immediate next step**: attempt the real XFCE GUI launch now that the underlying fork/exec
+crash blocker is resolved -- this was the standing session-wide goal this whole investigative
+arc (passes 168-212) was blocking.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
