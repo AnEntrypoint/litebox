@@ -1490,15 +1490,38 @@ unsafe extern "system" fn vectored_exception_handler(
     {
         #[allow(clippy::cast_possible_truncation)]
         let rip = context.Rip as usize;
-        if let Some(translated_rip) = fork_verify::translate_stale_source_rip(tls, rip, context) {
+        // Livelock breaker: if this exact `(rip, translated_rip)` pair has already been "healed"
+        // via the `[rsp-8]`/`[rsp]`/GPR fixups below many times in a row with no forward progress,
+        // something else keeps re-supplying the identical stale value from a slot those fixups
+        // don't reach -- skip straight to the deeper GOT/PLT-slot and register-indirect healers
+        // instead of repeating the same ineffective fixup forever.
+        const AV_RIP_LIVELOCK_THRESHOLD: u32 = 8;
+        let prior_repeat = tls.fork_verify_av_rip_repeat.get();
+        let skip_shallow_heal = matches!(
+            prior_repeat,
+            Some((prev_rip, _, count)) if prev_rip == rip && count >= AV_RIP_LIVELOCK_THRESHOLD
+        );
+        if !skip_shallow_heal
+            && let Some(translated_rip) = fork_verify::translate_stale_source_rip(tls, rip, context)
+        {
+            let next_count = match prior_repeat {
+                Some((prev_rip, prev_translated, count))
+                    if prev_rip == rip && prev_translated == translated_rip =>
+                {
+                    count + 1
+                }
+                _ => 1,
+            };
+            tls.fork_verify_av_rip_repeat
+                .set(Some((rip, translated_rip, next_count)));
             if veh_trace_enabled() {
                 eprintln!(
-                    "[veh] tid={:?} AV-path stale rip healed rip={rip:#x} translated={translated_rip:#x}",
+                    "[veh] tid={:?} AV-path stale rip healed rip={rip:#x} translated={translated_rip:#x} repeat={next_count}",
                     std::thread::current().id(),
                 );
             }
             litebox_util_log::warn!(
-                rip:? = rip, translated_rip:? = translated_rip;
+                rip:? = rip, translated_rip:? = translated_rip, repeat:? = next_count;
                 "fork_verify: stale CODE pointer detected via raw access violation (no #DB delivered), translating and resuming"
             );
             #[allow(clippy::cast_possible_truncation)]
@@ -1506,6 +1529,12 @@ unsafe extern "system" fn vectored_exception_handler(
                 context.Rip = translated_rip as u64;
             }
             return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if skip_shallow_heal {
+            litebox_util_log::warn!(
+                rip:? = rip;
+                "fork_verify: AV-path stale rip livelock detected (same rip repeated), falling through to deeper slot healers"
+            );
         }
         // `rip` itself was not stale -- the data-pointer counterpart to the code-pointer case
         // just above. A raw AV whose fault address is explained by a stale base/index register
@@ -2260,6 +2289,15 @@ struct TlsState {
     /// comment. Meaningless (and never consulted) once `fork_verify` is `None`; reset to `0` by
     /// every [`fork_verify::begin`] call, matching that method's own reset of `fork_verify` itself.
     fork_verify_step_count: Cell<u64>,
+    /// Tracks `(rip, translated_rip)` and a repeat count for the AV-path stale-CODE-pointer case
+    /// (`translate_stale_source_rip`, see its call site in `vectored_exception_handler`) so a
+    /// livelock where the SAME stale `rip` recurs unbounded after being "healed" every time (a
+    /// persistent slot re-supplying the identical stale value on each loop iteration, not covered
+    /// by that case's own `[rsp-8]`/`[rsp]`/GPR healing) can be detected and broken by falling
+    /// through to the deeper memory-operand/indirect-slot/register-indirect healers even though
+    /// `translate_stale_source_rip` itself keeps reporting success. Confirmed live: 266,408
+    /// identical `(rip, translated_rip)` AV events in 8.4s during a real XFCE `--gui` launch.
+    fork_verify_av_rip_repeat: Cell<Option<(usize, usize, u32)>>,
     /// The provenance chain [`fork_verify::on_single_step`] is tracking for the most recent
     /// explicit-memory-operand read on this thread, or `None` if no register currently carries a
     /// value traceable back to a specific memory slot this way.
@@ -2373,6 +2411,7 @@ impl TlsState {
             has_entered_guest: false.into(),
             fork_verify: RefCell::new(None),
             fork_verify_step_count: Cell::new(0),
+            fork_verify_av_rip_repeat: Cell::new(None),
             fork_verify_last_load: Cell::new(None),
             codewatch: fork_verify::CodewatchState::new(),
             ctxwatch: ctxwatch::State::new(),
