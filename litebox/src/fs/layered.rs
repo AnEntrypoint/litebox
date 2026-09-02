@@ -954,6 +954,10 @@ impl<
             })
             .ok_or(WriteError::ClosedFd)
             .flatten()?;
+        litebox_util_log::warn!(
+            path_len:% = path.len(), path:? = path;
+            "drm-diag: layered::write resolved entry+path, about to match entry"
+        );
         match entry.as_ref() {
             EntryX::Upper { fd: upper_fd } => {
                 let num_bytes = self.upper.write(upper_fd, buf, offset)?;
