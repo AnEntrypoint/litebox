@@ -3576,6 +3576,65 @@ outside litebox's own process entirely (e.g. a lightweight watcher process that 
 in-process VEH entirely) -- this last option is probably the most robust path forward since it
 doesn't depend on getting litebox's own crash-handling code to cooperate with WER at all.
 
+## 249th pass: final verification run reached FAR further than any prior capture this session (weston fully initialized its compositor, GPU device, wgpu presenter, and began launching weston-desktop-shell) before failing -- and the failure is NOT a Windows VEH/unwind crash at all: weston itself received a genuine guest-side SIGSEGV (signal 11) at t=3.37s, killing the Wayland compositor, which cascaded into Xwayland's "could not connect to wayland server" and xfce4-session's "Cannot open display" -- this is very likely the REAL remaining blocker, a guest-side weston bug, not a Windows-hosting-layer bug
+
+Ran a clean verification of this pass's shipped state (no `LITEBOX_DIAG_ALLOW_WER` escape hatch,
+matching production behavior) against the real XFCE repro with a longer wait window. Two
+consecutive runs showed dramatically different, and far more informative, behavior than any
+prior capture in this session or its predecessor:
+
+**Run 1** (60s window): reached all the way through weston's own full compositor
+initialization -- DRM backend, GPU adapter/device/queue setup via the wgpu presenter,
+`desktop-shell.so` module loading, `weston-keyboard` launching -- and then simply stayed alive
+with NO crash, NO exit, for the entire 60s window, requiring a force-kill. This is itself
+significant: nothing in this session's history has previously seen litebox run this long,
+this stably, this far into a real XFCE launch without SOME crash marker appearing.
+
+**Run 2** (with a 120s+ window): stayed alive the FULL duration again with no crash, until
+force-killed -- but this time the log (178 lines, still very small/clean compared to the
+13,000+ line runaway recursion logs from earlier this pass) captured the REAL failure sequence
+that Run 1's shorter capture missed:
+- t=3.37s: `fatal signal: terminating task signal=Signal(11) pid=9 tid=9` -- a genuine SIGSEGV
+  delivered to what is almost certainly weston's own process (pid 9, the first guest process
+  launched by the script). This is followed immediately by seatd errors ("Could not read client
+  connection: zero-length read"), then weston's own Wayland server visibly dying:
+  "Failed to process Wayland connection: Broken pipe" / "failed to create display: Broken pipe"
+  (twice) / "could not connect to wayland server" / "Fatal server error: Couldn't add screen".
+  This is Xwayland trying to connect to a Wayland compositor that has already crashed.
+- t=10.36s: a SECOND, separate SIGSEGV on a different process (pid 20, likely Xwayland itself,
+  given the timing matches its own earlier `sleep 8` launch delay in the script) -- this one
+  WAS caught by this pass's `is_in_guest` diagnostic machinery (`rax=0xc0000100`, the same
+  recurring NTSTATUS pattern flagged as a lead in this project's very oldest commit history) and
+  correctly handled by pass 246/247's new guest-mode-fault guard (visible in the ring buffer as
+  `is_in_guest=true` entries with real, distinct `rip` values, not the `-1`/`rip=0` corruption
+  signatures from earlier in this pass).
+- Final line: `xfce4-session: Cannot open display: .` -- xfce4-session correctly detects there is
+  no display to connect to (weston/Xwayland both already dead) and exits cleanly with a normal
+  usage error, not a crash.
+
+**Assessment**: this run never hit ANY of the Windows-VEH/ntdll-unwind corruption class this
+whole pass (206-249, and the entire prior investigation history) has been chasing. Instead, it
+reached a clean, ordinary, ATTRIBUTABLE guest-side failure: weston's own process receiving
+SIGSEGV very early (t=3.37s) during real compositor operation (right as it starts loading
+`desktop-shell.so`/launching `weston-keyboard`), well past its earlier initialization work. This
+strongly suggests that pass 246/247's fixes (VEH_DEPTH_CAP recursion, guest-mode
+EXCEPTION_CONTINUE_SEARCH termination) have meaningfully improved overall stability -- runs now
+survive long enough, and fail cleanly enough, to expose what may be THE actual remaining blocker
+for XFCE: a genuine bug in weston's own guest-side execution (a real SIGSEGV, not a Windows
+hosting-layer artifact), separate from every corruption mechanism documented so far.
+
+**Concrete next step for a future session**: root-cause the weston SIGSEGV at t=3.37s directly --
+capture `is_in_guest=true` diagnostic output for THIS specific fault (rerun with
+`LITEBOX_LOG=error`, watch for the FIRST `[diag-unrecov-av]`/`[diag-unrecov-av-ring]` entries
+immediately following the `signal=Signal(11) pid=9` line, before the guest-mode guard terminates
+the process) to get its real faulting `rip`/register state, then determine whether this is
+(a) a genuine bug in weston/pixman/the software renderer path itself (fixable via a weston
+patch, config change, or by switching the compositor backend), or (b) still a litebox emulation
+gap (a syscall or memory-management edge case weston's own code path hits that other, simpler
+guest binaries don't) -- distinguishing these two is the single highest-value next action, since
+this may be the last blocker standing between the current state and a genuinely rendering XFCE
+desktop.
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash
