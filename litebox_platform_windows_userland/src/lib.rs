@@ -1176,7 +1176,18 @@ unsafe extern "system" fn vectored_exception_handler(
                         context.Rip,
                     );
                 }
-                unsafe { litebox_common_linux::wrfsbase(saved) };
+                // Confirmed live via `cdb`-attached exception-record capture (AGENTS.md pass
+                // 302): under a sufficiently high FS_BASE-reset rate, Windows can clear the MSR
+                // again between this write and the retried instruction actually completing, so a
+                // single `wrfsbase` is not always enough. Loop a small, bounded number of times,
+                // re-checking `rdfsbase()` after each write, before resuming -- this only costs
+                // extra work in the rare case the first write already lost the race.
+                for _ in 0..8 {
+                    unsafe { litebox_common_linux::wrfsbase(saved) };
+                    if unsafe { litebox_common_linux::rdfsbase() } == saved {
+                        break;
+                    }
+                }
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
         }
@@ -1596,7 +1607,15 @@ unsafe extern "system" fn vectored_exception_handler(
                     context.Rip,
                 );
             }
-            unsafe { litebox_common_linux::wrfsbase(saved) };
+            // See the host-mode repair site above (AGENTS.md pass 302): a single write can lose
+            // a race against another Windows-initiated FS_BASE reset under high-frequency
+            // triggering, so verify and retry a bounded number of times before resuming.
+            for _ in 0..8 {
+                unsafe { litebox_common_linux::wrfsbase(saved) };
+                if unsafe { litebox_common_linux::rdfsbase() } == saved {
+                    break;
+                }
+            }
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
