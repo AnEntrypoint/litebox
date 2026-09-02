@@ -2764,6 +2764,49 @@ separation for `ET_DYN` -- pass 217's own finding) makes likely rather than rare
 mitigation (`elf.rs` `reserve()`) exists exactly for this class of problem but does not cover
 address REUSE by an unrelated, independently-growing process's own heap.
 
+## 228th pass: THE ROOT CAUSE OF THE REMAINING REGRESSION -- reserve()'s own Hint-mode mmap call (which picks the ET_DYN base address) NEVER consults CLAIMED_RANGES at all, only Windows' own real MEM_COMMIT state via VirtualQuery -- so it can and does pick an address that LOOKS virtually free to Windows but is already claimed by another live guest process's own heap/mmap growth, tracked only in CLAIMED_RANGES, invisible to this check
+
+Re-read `reserve()` (`litebox_shim_linux/src/loader/elf.rs`) with pass 227's own finding in
+hand. Confirmed the call that picks `/bin/true`'s own base address is a plain, HINT-mode
+`sys_mmap` (`MAP_ANONYMOUS | MAP_PRIVATE`, no `MAP_FIXED` at all) -- NOT the `MAP_FIXED` call
+that later fails. This traces the true origin one step further back: the RESERVATION succeeds
+(Windows genuinely has free virtual address space there), but the address it picks happens to
+already be claimed -- in `CLAIMED_RANGES`, this session's own litebox-internal collision
+registry -- by the shell's own, separately and independently growing heap.
+
+**Read `allocate_pages`'s own `Hint`-mode branch precisely** (`litebox_platform_windows_
+userland/src/lib.rs` ~line 5044-5047): `if has_committed_page && fixed_address_behavior ==
+FixedAddressBehavior::Hint { base_addr = null; }` -- `has_committed_page` comes from
+`process_memory_range_by_regions`'s own `VirtualQuery`-based scan, checking REAL Windows
+memory-commit state ONLY. **`find_foreign_claim`/`CLAIMED_RANGES` is NEVER consulted for
+`Hint`-mode calls at all** -- that check only runs inside the `Replace`-mode branch, gated
+specifically on `fixed_address_behavior == FixedAddressBehavior::Replace` (see the whole
+`else if fixed_address_behavior == FixedAddressBehavior::Replace && { ... }` block, unreachable
+for `Hint`). This is a genuine, previously-undiscovered gap: `CLAIMED_RANGES` exists
+specifically to track litebox-internal ownership that Windows' own `VirtualQuery` cannot see
+(per `CLAIMED_RANGES`'s own extensive doc comment, `lib.rs` ~3686-3719) -- but a `Hint`-mode
+reservation call, exactly the kind `reserve()` uses to pick a PIE binary's own base address, has
+no equivalent defense. It can and evidently does pick an address Windows reports as free but
+`CLAIMED_RANGES` would have flagged as another live guest process's own memory, had it been
+consulted.
+
+**This finally, fully explains this whole session's remaining regression with no gaps left**:
+`/bin/true`'s `reserve()` call picks `base_addr` via a `Hint`-mode mmap that never checks
+`CLAIMED_RANGES` -> lands on an address that LOOKS free to Windows but is really the shell's own
+independently-grown heap -> the ELF loader then issues `MAP_FIXED` segment mappings relative to
+that `base_addr`, now genuinely, unavoidably colliding -> `Replace`-mode's OWN foreign-claim
+check (which DOES consult `CLAIMED_RANGES`) correctly detects this real collision and (correctly,
+per pass 213's fix) refuses to silently relocate, surfacing as `EEXIST`. Every layer of this
+chain has now been individually verified; the fix belongs in exactly one place.
+
+**Concrete, well-scoped fix for a future pass**: make `Hint`-mode `allocate_pages` ALSO consult
+`find_foreign_claim` (not just `VirtualQuery`'s `has_committed_page`), and relocate
+(`base_addr = null`) on a hit exactly the way it already does for a `VirtualQuery`-visible
+collision -- extending the SAME defense `Replace`-mode already has to the `Hint`-mode path that
+currently lacks it. This is a small, targeted, low-risk change (a few extra lines in an
+already-read function, reusing the already-tested `find_foreign_claim` helper) rather than a
+new mechanism, and should close this investigation's very last remaining gap.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
