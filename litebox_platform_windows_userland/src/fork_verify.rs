@@ -2420,8 +2420,27 @@ pub(crate) fn begin(relocations: alloc::sync::Arc<litebox::mm::AddressRelocation
         core::sync::atomic::AtomicUsize::new(0);
     let diag_begin_count =
         DIAG_BEGIN_COUNT.fetch_add(1, core::sync::atomic::Ordering::SeqCst) + 1;
+    // Also snapshot every plausible fixed/growing-capacity process-wide resource this crate
+    // maintains, at the exact same moment, to see which one (if any) shows a suspicious value
+    // right before the fatal 8th call (AGENTS.md pass 202's own recommendation). `try_lock`, not
+    // `lock`, since `begin()` may run in a context where one of these is already held on this
+    // same thread -- a diagnostic must never risk deadlocking the very call it's observing.
+    let diag_claimed_ranges_occupied = crate::CLAIMED_RANGES
+        .try_lock()
+        .map(|c| c.iter().filter(|s| s.is_some()).count())
+        .unwrap_or(usize::MAX);
+    let diag_active_threads_len = crate::ACTIVE_THREADS
+        .try_lock()
+        .map(|t| t.len())
+        .unwrap_or(usize::MAX);
+    let diag_live_thread_stacks_len = crate::LIVE_THREAD_STACKS
+        .try_lock()
+        .map(|t| t.len())
+        .unwrap_or(usize::MAX);
+    let diag_next_claim_seq =
+        crate::NEXT_CLAIM_SEQ.load(core::sync::atomic::Ordering::Relaxed);
     eprintln!(
-        "[diag-fv-count] tid={:?} begin() call #{diag_begin_count}",
+        "[diag-fv-count] tid={:?} begin() call #{diag_begin_count} claimed_ranges={diag_claimed_ranges_occupied} active_threads={diag_active_threads_len} live_thread_stacks={diag_live_thread_stacks_len} next_claim_seq={diag_next_claim_seq}",
         std::thread::current().id(),
     );
     if crate::diag_rip0_enabled() {
