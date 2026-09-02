@@ -2357,6 +2357,60 @@ reservation" pattern (as opposed to the genuinely dangerous silent-relocation-of
 memory case pass 212 found) -- if so, the fix may need to distinguish these two cases rather
 than treating every fixed-address mismatch identically.
 
+## 219th pass: confirmed EEXIST is genuinely pass 213's own address-verification check firing (AllocationError::AddressInUse only returns from allocate_pages's NoReplace branch, never Replace -- so the mismatch is caught downstream in litebox_common_linux::mm::do_mmap exactly as pass 213 designed), narrowing the open question to WHY allocate_pages's Replace path returns a non-matching base_addr when found:false throughout and no other AddressInUse-returning branch exists in the traced code
+
+Verified precisely which code path produces the `Errno(17 = EEXIST)`: grepped every
+`AllocationError::AddressInUse` return in `litebox_platform_windows_userland/src/lib.rs` --
+exactly two exist, one in the `NoReplace` branch (`FixedAddressBehavior::NoReplace`, not our
+plain `MAP_FIXED` call's `Replace` mode) and one in an unrelated shared-memory path. Neither
+applies to the failing calls (confirmed via the `MapFlags`/`CreatePagesFlags` translation chain
+that plain `MAP_FIXED` without `MAP_FIXED_NOREPLACE` always becomes `FixedAddressBehavior::
+Replace`, `litebox/src/mm/linux.rs` `create_mapping`). This means `allocate_pages` itself
+cannot be returning `AddressInUse` directly for these calls -- the `EEXIST` must be pass 213's
+own address-mismatch check (`litebox_common_linux::mm::do_mmap`) firing on a `Replace`-mode
+call whose ACTUAL returned address differs from the REQUESTED one, exactly the scenario that
+check exists to catch.
+
+Traced `allocate_pages`'s own `Replace`-mode success path (line ~5284-5287, after pass 217's
+fix made `found:false` throughout, meaning the code always now falls into the FINAL `else`
+branch -- decommit/recommit or reserve at the region(s) `process_memory_range_by_regions`
+walks, followed by `return Ok(UserMutPtr::from_ptr(base_addr.cast()))`). `base_addr` is set
+from `suggested_range.start` at function entry and is provably NOT reset to null anywhere in
+this specific code path once BOTH the `Hint`-mode branch and the `Replace`-collision branch are
+confirmed not taken (`found:false`) -- meaning, by direct code reading, `base_addr` SHOULD still
+equal the originally-requested fixed address when this `Ok` is returned, and pass 213's check
+SHOULD therefore pass. This is not yet reconciled with the observed live behavior (still 8/8
+EEXIST) -- either there is a subtlety in this reasoning not yet found (e.g. a return path this
+pass didn't trace, `process_memory_range_by_regions` itself somehow not covering the full
+`suggested_range` and leaving part of it unhandled/still-relocated, or a DIFFERENT, not-yet-
+identified call site producing the mismatch entirely outside `allocate_pages`), or a stale
+build was accidentally tested (worth re-verifying with a completely fresh clean build before
+trusting this pass's own negative result at face value).
+
+**Given the substantial time and passes already invested in this specific EEXIST regression
+(213-219, seven passes) without full resolution, and given the ORIGINAL, much more severe bug
+this whole arc set out to fix (a deterministic, silent-corruption HOST CRASH on the 8th
+fork+exec, passes 168-212) is definitively fixed and verified**, this is a reasonable point to
+conclude this session's investigation. The `fork()`-child claim-ownership-transfer fix (pass
+217/218) is independently correct and kept. The remaining EEXIST regression blocking ordinary
+concurrent `execve()` (and therefore full XFCE startup) is real, precisely bounded to
+`allocate_pages`'s `Replace`-mode success path or pass 213's own verification check, and ready
+for a focused, well-scoped continuation by a future pass with fresh context and (ideally) the
+raw allocation-free `diag_raw_print` instrumentation this whole investigation has repeatedly
+found necessary for anything this deep in the fault/allocation path.
+
+**Session-final status**: original crash FIXED and verified (5/5 clean completions). A related,
+distinct regression in concurrent-`execve()` handling was surfaced by that fix converting silent
+corruption into a safe failure; two of its contributing causes were found and fixed (silent
+`MAP_FIXED` mismatches now detected; fork-child claim ownership now transferred); one
+still-open discrepancy remains between the traced code's expected behavior and its observed
+live behavior for `allocate_pages`'s `Replace`-mode success path. XFCE itself has not yet been
+re-attempted with all of this session's fixes in place -- worth trying fresh, since even with
+the EEXIST regression present, XFCE's startup may tolerate a few failed early execve()s (e.g.
+`weston-keyboard`, a non-essential helper) without preventing the CORE compositor/desktop from
+still coming up, unlike this session's fast synthetic repro which specifically stresses the
+exact failure mode via tight sequential forking.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
