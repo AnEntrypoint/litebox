@@ -2260,10 +2260,17 @@ pub(crate) fn addr_is_codewatched_for_diagnostics(addr: usize) -> bool {
 /// after `fork()`, so it stays live, readable host memory in this same process -- see
 /// `AddressRelocations::is_in_source`'s doc comment). Returns `None` if `dest_addr` does not
 /// fall within any tracked destination range, or if `tls` is not a verifying fork child.
+/// Returns `(source_addr, None)` when `source_addr` could not actually be read (e.g. unmapped),
+/// distinct from `(source_addr, Some([0u8; 8]))` when the read genuinely succeeded and returned
+/// zero bytes -- a caller printing this diagnostic must be able to tell "the parent's memory
+/// really is zero here" apart from "this diagnostic failed to read the parent's memory at all"
+/// (an earlier revision silently conflated the two into an identical-looking `[0u8; 8]" in both
+/// cases, which made every capture using this function's own output ambiguous about which one
+/// actually happened -- see the investigation this fix is part of).
 pub(crate) fn reverse_translate_and_read_for_diagnostics(
     tls: &TlsState,
     dest_addr: usize,
-) -> Option<(usize, [u8; 8])> {
+) -> Option<(usize, Option<[u8; 8]>)> {
     let borrow = tls.fork_verify.borrow();
     let relocations = borrow.as_ref()?;
     let (source_range, dest_base) =
@@ -2277,9 +2284,9 @@ pub(crate) fn reverse_translate_and_read_for_diagnostics(
     let mut buf = [0u8; 8];
     let n = read_code_bytes(source_addr, &mut buf);
     if n == 0 {
-        return Some((source_addr, [0u8; 8]));
+        return Some((source_addr, None));
     }
-    Some((source_addr, buf))
+    Some((source_addr, Some(buf)))
 }
 
 pub(crate) fn describe_crash_page_for_diagnostics(rip: usize) {

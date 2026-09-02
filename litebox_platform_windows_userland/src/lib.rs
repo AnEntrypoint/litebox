@@ -812,9 +812,14 @@ unsafe extern "system" fn vectored_exception_handler(
         if let Some((source_addr, source_bytes)) =
             fork_verify::reverse_translate_and_read_for_diagnostics(tls, meta_slot)
         {
-            eprintln!(
-                "[veh] meta-slot parent-side source_addr={source_addr:#x} bytes={source_bytes:02x?}",
-            );
+            match source_bytes {
+                Some(bytes) => eprintln!(
+                    "[veh] meta-slot parent-side source_addr={source_addr:#x} bytes={bytes:02x?}",
+                ),
+                None => eprintln!(
+                    "[veh] meta-slot parent-side source_addr={source_addr:#x} READ FAILED (unmapped or unreadable, NOT a genuine zero)",
+                ),
+            }
         } else {
             eprintln!("[veh] meta-slot parent-side: no reverse translation found");
         }
