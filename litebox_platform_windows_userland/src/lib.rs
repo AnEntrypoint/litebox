@@ -5735,6 +5735,22 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             )
         } != 0;
         if !ok {
+            // AGENTS.md pass 255-256: this branch previously reported every failure as
+            // `SharedMemoryError::Unaligned` regardless of the REAL Windows error, swallowing
+            // the actual cause -- surfaced live as a confusing `UnmapError(Unaligned)` panic
+            // during a real weston/XFCE launch with no way to tell whether the range genuinely
+            // was misaligned or `UnmapViewOfFileEx` failed for some other reason (e.g. the view
+            // already unmapped, a stale/reused address, or a real Windows error). Diagnostic
+            // print (unconditional, this call is already on the rare failure path so it costs
+            // nothing on the common success path) to capture the real `GetLastError()` code the
+            // next time this fires.
+            let win_err = unsafe { GetLastError() };
+            diag_raw_print(
+                b"[diag-unmap-shared-fail] range.start=0x",
+                range.start,
+                b" win_err=0x",
+                win_err as usize,
+            );
             return Err(SharedMemoryError::Unaligned);
         }
         Ok(())

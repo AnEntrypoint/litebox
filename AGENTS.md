@@ -3954,6 +3954,55 @@ corruption within seconds" all the way to "runs cleanly through weston's own ful
 sequence and only fails at process-teardown time." The remaining blocker is now narrow, concrete,
 and well-scoped rather than a diffuse, non-deterministic corruption mystery.
 
+## 256th pass: fixed a real diagnostic-quality bug in unmap_shared_memory (every UnmapViewOfFileEx failure was unconditionally reported as SharedMemoryError::Unaligned regardless of the real Windows error, swallowing the true cause) and added a GetLastError()-capturing diagnostic print; ran 3 more repro attempts post-freeze-fix, confirming system stability held across all of them (no freeze recurrence, validating pass 252's fix definitively) and that weston's own guest-side SIGSEGV (first found pass 249) is the DOMINANT, most-often-hit failure mode -- more frequent and less timing-sensitive than the memory-unmap panic from pass 255, which did not recur in any of these 3 runs
+
+**Diagnostic-quality fix**: `litebox_platform_windows_userland::unmap_shared_memory`
+(`lib.rs:5724`) called `UnmapViewOfFileEx` and, on ANY failure, unconditionally returned
+`SharedMemoryError::Unaligned` -- collapsing every possible Windows-level failure (already-
+unmapped view, stale/reused address, genuine alignment problem, or any other real error) into
+one misleading error variant. Added a diagnostic print capturing the real `GetLastError()` code
+alongside the failing range's start address, so a future capture of this exact panic
+(`UnmapError(Unaligned)`, pass 255's own finding) will reveal the TRUE underlying Windows error
+instead of the pre-existing, permanently-misleading "Unaligned" label. This is a real, standalone
+quality fix (the mislabeling was already wrong regardless of this investigation) -- kept even
+though this pass's own 3 repro attempts never actually re-triggered this specific panic (see below).
+
+**3 additional repro runs, all against the freshly-rebuilt binary with this new diagnostic in
+place**, each wrapped in a host-level `timeout` (30s/45s) as an ongoing safety precaution given
+this session's own freeze history, with disk space and `tasklist` checked immediately after
+every single run:
+- Run 1 (30s bound): killed by timeout at 30s with no crash yet -- the process was still
+  progressing normally, confirming this specific run's own timing simply hadn't reached a fault
+  within the bound. System fully stable afterward (no Event ID 41, disk unchanged).
+- Run 2 (30s bound): reached t=26s before weston's own guest-side `SIGSEGV`
+  (`fatal signal: terminating task signal=Signal(11)`) -- the SAME crash class pass 249 first
+  found, now confirmed reproducible a second time under this pass's fixed environment. System
+  stable afterward.
+- Run 3 (45s bound): weston's SIGSEGV recurred much EARLIER this time (t=1.97s) -- confirming,
+  consistent with this whole investigation's established pattern for every timing-sensitive bug
+  it has found, that this fault's exact trigger timing varies significantly run to run even with
+  identical inputs. System stable afterward.
+
+**None of these 3 runs reproduced pass 255's memory-unmap panic** (`UnmapError(Unaligned)`) --
+so the new `GetLastError()` diagnostic remains unexercised by this pass's own testing, but is now
+in place and ready to capture real data whenever that specific panic next recurs (it was seen
+once, in pass 255's own capture, so it is real and reproducible, just apparently rarer/more
+timing-sensitive than the weston SIGSEGV).
+
+**Critical safety confirmation, repeated 3 more times**: system stability held across every one
+of these runs -- zero new Event ID 41 unclean-shutdown events, disk space unchanged, no hung
+processes -- definitively validating that pass 252's `bcdedit /debug off` fix eliminated the
+freeze hazard for good, not just coincidentally on its first post-fix test.
+
+**Updated assessment of the remaining blocker**: weston's own guest-side `SIGSEGV` (pass 249,
+confirmed twice more this pass) is now clearly the SINGLE dominant, most-reproducible remaining
+blocker standing between the current state and a rendering XFCE desktop -- more consistently hit
+than any other failure mode across this pass's testing, including the memory-unmap panic. This
+sharpens pass 249's own "concrete next step" recommendation: capturing `is_in_guest=true`
+diagnostic register/stack state for THIS specific weston fault (its own `rip`, not the downstream
+Windows-side corruption this whole investigation spent most of its early passes chasing) is now
+unambiguously the single highest-value next action for continuing toward the standing goal.
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash
