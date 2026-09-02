@@ -512,26 +512,35 @@ impl ApplicationHandler for PresenterApp {
             backends: wgpu::Backends::DX12,
             ..Default::default()
         });
+        eprintln!("[presenter-diag] creating surface");
         let Ok(surface) = instance.create_surface(window.clone()) else {
+            eprintln!("[presenter-diag] create_surface FAILED");
             return;
         };
-        let Ok(adapter) =
+        eprintln!("[presenter-diag] requesting adapter");
+        let adapter_result =
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
-            }))
-        else {
+            }));
+        eprintln!("[presenter-diag] request_adapter returned: {}", adapter_result.is_ok());
+        let Ok(adapter) = adapter_result else {
+            eprintln!("[presenter-diag] request_adapter FAILED: {:?}", adapter_result.err());
             return;
         };
-        let Ok((device, queue)) =
+        eprintln!("[presenter-diag] requesting device");
+        let device_result =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("litebox-presenter"),
                 ..Default::default()
-            }))
-        else {
+            }));
+        eprintln!("[presenter-diag] request_device returned: {}", device_result.is_ok());
+        let Ok((device, queue)) = device_result else {
+            eprintln!("[presenter-diag] request_device FAILED: {:?}", device_result.err());
             return;
         };
+        eprintln!("[presenter-diag] device+queue obtained, continuing setup");
         let size = window.inner_size();
         let caps = surface.get_capabilities(&adapter);
         let surface_format = caps
@@ -544,6 +553,7 @@ impl ApplicationHandler for PresenterApp {
         // guarantees this); no measured need for `Immediate`/`Mailbox`'s lower latency in this
         // module's own use case (a guest's DRM page-flip rate, not a real-time renderer).
         let present_mode = wgpu::PresentMode::Fifo;
+        eprintln!("[presenter-diag] configuring surface");
         surface.configure(
             &device,
             &wgpu::SurfaceConfiguration {
@@ -557,6 +567,7 @@ impl ApplicationHandler for PresenterApp {
                 view_formats: vec![],
             },
         );
+        eprintln!("[presenter-diag] surface configured, resumed() about to return");
         self.state = Some(GpuState {
             window,
             surface,
