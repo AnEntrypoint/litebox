@@ -1822,6 +1822,63 @@ binary), fixing it is a real, structural, high-value target -- but implementing 
 either fix is substantial new work appropriately left to a dedicated follow-up pass rather than
 rushed at the tail of an already very deep investigation.
 
+## 209th pass: RETRACT pass 208's "missing unwind info" theory -- .fnent proves memset_fallible DOES have valid, complete, compiler-generated unwind info (large-frame alloc + 8 non-volatile pushes); the real cause of ntdll!RtlpUnwindPrologue's fault is more likely genuine stack/return-address corruption, evidenced by suspicious 0xeb00... truncated-looking values on the fault-time stack dump
+
+Checked whether `memset_fallible`'s compiled function actually lacks `.pdata`/`.xdata`
+coverage, as pass 208 theorized. Ran `.fnent 0x140000000+0x6de6` (the exact fault RVA) in an
+offline `cdb -z` session against the release binary:
+
+```
+01: offs 13, unwind op 1 (UWOP_ALLOC_LARGE, FrameOffset: 288)
+03: offs c,  UWOP_PUSH_NONVOL rbx
+04: offs b,  UWOP_PUSH_NONVOL rdi
+05: offs a,  UWOP_PUSH_NONVOL rsi
+06: offs 9,  UWOP_PUSH_NONVOL r12
+07: offs 7,  UWOP_PUSH_NONVOL r13
+08: offs 5,  UWOP_PUSH_NONVOL r14
+09: offs 3,  UWOP_PUSH_NONVOL r15
+0a: offs 1,  UWOP_PUSH_NONVOL rbp
+```
+
+This is a complete, valid, compiler-generated `RUNTIME_FUNCTION`/`UNWIND_INFO` entry covering
+the WHOLE function `memset_fallible` compiles into (rustc/LLVM always emits one per function on
+x86_64 Windows; the `2:`/`3:` asm labels are just instruction offsets inside this one function,
+not a separate unregistered region as pass 208 assumed). **Pass 208's specific mechanism
+("no .pdata/.xdata for the fixup label") is retracted as WRONG** -- the unwind metadata is
+present and structurally normal. The finding that `ntdll!RtlpUnwindPrologue` is genuinely the
+function that faults (pass 208's disassembly/symbol resolution itself) stands; only the
+explanation for WHY it faults there needs revision.
+
+**Revised working theory:** `RtlpUnwindPrologue` walks the frame chain using the RETURN
+ADDRESS/RSP found on the stack, not just the current function's own (valid) unwind info -- if
+an ENCLOSING or CALLING frame's saved state has been corrupted (e.g. a stale/garbage return
+address, or RSP left inconsistent by the earlier partial `rep stosq` execution before our VEH
+jumped `Rip` to the fixup label without ever adjusting RSP/RBP/the pushed nonvolatiles to match
+what the *normal* function epilogue would have restored), the unwind can walk into garbage one
+frame up, independent of `memset_fallible`'s own entry being fine. This matches concrete
+evidence already captured: pass 206/208's `[diag-unrecov-av-stack]` dump around the SECOND
+fault shows values like `0xeb00000000`, `0xeb00000065`, `0xeb00500016`, `0x7ff700500016` on the
+stack near the fault -- the shared `0xeb00...`/`0x7ff700...` prefix pattern across multiple
+independent slots looks distinctly like TRUNCATED or BIT-SHIFTED pointers (a real, valid
+pointer's high bits got lost/mangled), not random uninitialized memory. This is a concrete,
+checkable lead for a future pass: identify what code path could produce a systematically
+truncated/shifted 64-bit value onto this thread's stack around the time of the first
+(`memset_fallible`) fault -- a 32-bit truncation-then-sign/zero-extension bug, or an
+accidental narrow (`mov eax` instead of `mov rax`) register write somewhere in the VEH's own
+context-save/restore path, would produce exactly this kind of corrupted-high-bits pattern.
+
+**Net effect on the fix recommendation:** pass 208's proposed fix (b) -- avoid leaving `Rip`
+in a manually-unwound-unsafe state after `EXCEPTION_CONTINUE_EXECUTION` -- is no longer
+motivated by a real unwind-info gap, since the gap doesn't exist. Fix (a) (explicit
+`RtlAddFunctionTable`) is now understood to be unnecessary; the metadata was already correct.
+The productive next step is instead **auditing the VEH's own `context` mutation
+(`litebox_platform_windows_userland/src/lib.rs`'s exception handler) for any place that writes
+a 32-bit (not 64-bit) value into a CONTEXT register field that should be full-width**, since a
+systematic high-bits-truncation bug in exactly that code would explain both the
+`0xeb00...`-pattern stack corruption AND why it specifically manifests as a stack-walk failure
+one or more frames removed from the original fault, rather than an immediate, obviously-wrong
+crash at the fixup label itself.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
