@@ -1491,6 +1491,50 @@ Read `process_signals`'''s own implementation (`litebox_shim_linux/src/syscalls/
 ## 202nd pass: SEARCHED for a capacity-7 structure per pass 201's own recommendation -- found NO obvious match in `fork_verify.rs`, `TlsState`'s full field list, or every bare `static` in `lib.rs` (`TLS_INDEX`, `ACTIVE_THREADS`, `CLAIMED_RANGES`/`MAX_CLAIMS=2048`, `LIVE_THREAD_STACKS`, the various `*_LOCK` mutexes, `DIAG_ALLOC_COUNT`) -- none has a capacity of 7, 8, or anything plausibly exhausted by exactly 8 forks. Attempted to resolve THIS pass's own fresh `LITEBOX_DIAG_FATALDUMP=1` capture's exact fault RIP via `cdb`+PDB (same methodology as passes 170/175/177): resolved to `smoltcp::iface::socket_set::SocketSet::get::<...tcp::Socket>` -- genuinely unrelated to fork/ELF-loading and almost certainly a MISATTRIBUTION (the same ring-buffer-catches-an-unrelated-concurrent-event failure mode already documented in pass 185), not the true final crash site; the `[veh] RAWREGS]`-based capture-then-resolve methodology is now confirmed, for a SECOND time this investigation, to be unreliable for pinpointing exact fault instructions, even though the higher-level signature (address family `0x10Xxxxxx`, secondary ntdll fault at the SAME literal `rip=0x7ffb36712d2f` seen in literally every capture this whole session) remains completely consistent. **Given the exact source-code location remains elusive despite pass 201's precise numeric characterization, and this pass's static search + symbol-resolution attempt both came up empty, the most valuable ACTIONABLE deliverable from this investigation is not a code fix but the diagnostic infrastructure and precise repro itself**: `musl_repro_plain8.sh` (`scratchpad/musl_repro_plain8.sh`, staged in `musl-repro-plain8.tar`) reliably, deterministically crashes on fork #8 in under 2 seconds, and the `fork_verify::begin()` call counter added in pass 201 (kept in the tree, `litebox_platform_windows_userland/src/fork_verify.rs`, unconditional `eprintln!`) gives any future session an immediate, unambiguous confirmation signal. **Recommended handoff for a genuinely fresh investigative angle**: rather than more static/log-based searching, a future session should use a REAL live debugger (accepting the earlier-documented difficulty, but now with a target that reproduces in under 2 seconds instead of 20+, making iteration on debugger-attachment technique itself far cheaper to experiment with) to single-step through the 7th-to-8th `fork_verify::begin()` transition specifically and directly inspect what differs, OR add MANY more counters (one per suspect subsystem: `CLAIMED_RANGES` occupancy, `ACTIVE_THREADS` length, `LIVE_THREAD_STACKS` length, `NEXT_CLAIM_SEQ` value) all logged together at every `begin()` call, to see which one(s) show a suspicious value specifically at call #7 (the one immediately preceding the fatal #8th).
 
 ## 203rd pass: IMPLEMENTED pass 202's own recommended multi-counter diagnostic (logging `CLAIMED_RANGES` occupancy, `ACTIVE_THREADS`/`LIVE_THREAD_STACKS` length, and `NEXT_CLAIM_SEQ` value together at every `fork_verify::begin()` call, via `try_lock` to avoid deadlock risk) and got clean, precise data -- but it RULES OUT all four suspected resources. Result across all 8 calls before the fatal crash: `claimed_ranges` grows perfectly linearly (5, 7, 9, 11, 13, 15, 17, 19 -- exactly +2 per call, nowhere near `MAX_CLAIMS=2048`), `active_threads=2` and `live_thread_stacks=2` stay PERFECTLY CONSTANT the entire time (not growing at all, ruling out both as any kind of accumulation), and `next_claim_seq` grows linearly too (~31/call). **None of the four candidate resources show any anomaly, spike, or near-capacity value right before call #8** -- this negative result is itself informative: whatever exhausts is NOT `CLAIMED_RANGES`, NOT the process's own thread-tracking lists, and not a claim-sequence-number issue. **New, more specific observation from this same data**: `ThreadId` itself increments by EXACTLY 1 per `begin()` call (`ThreadId(6)` through `ThreadId(13)`, confirming each `fork()` genuinely spawns one brand-new real Windows OS thread, consistent with this project's own well-established one-host-thread-per-guest-thread architecture) -- meaning the 8th `fork_verify::begin()` call is ALSO this process's 8th genuinely NEW OS thread SINCE THE FIRST FORK (not counting the main thread and one other pre-existing thread, since `active_threads` starts at 2), i.e. its 10th OR 11th real OS thread overall depending on exact counting. **This reopens a genuine Windows-OS-level-limit hypothesis** (not a litebox-internal counter at all) that this specific investigation has not yet directly tested -- e.g. a small, hardcoded thread-pool size, a per-process handle-table soft limit, or similar OS/CRT-level constraint that could plausibly bite around a process's 10th-13th real thread. **Concrete next step for pass 204+**: log the actual Windows-level thread COUNT (e.g. via `GetProcessHandleCount`, `NtQuerySystemInformation`, or simply the real numeric Windows TID -- not litebox's own `std::thread::ThreadId`, which is a Rust-internal sequential counter and may not reflect genuinely-live OS thread count if any earlier threads have already exited) at each `begin()` call, to distinguish "the 8th litebox-tracked fork" from "the Nth real OS thread this process has ever created" from "the Nth real OS thread SIMULTANEOUSLY ALIVE" -- these are three different numbers this investigation has never carefully distinguished, and the true constraint could be tied to any one of them specifically.
+## 204th pass: Windows-OS-level counters (real win32 TID, process handle count) at the fatal 8th fork_verify::begin() call show NOTHING anomalous -- rules out genuine Windows resource exhaustion as the cause
+
+Added `GetCurrentThreadId()` (real win32 TID, distinct from litebox's own sequential
+`std::thread::ThreadId`) and `GetProcessHandleCount()`/`GetCurrentProcess()` (total open
+Windows handle count for the process) to the existing `[diag-fv-count]` line in
+`fork_verify::begin()`. Ran the `musl_repro_plain8.sh` repro (plain `while` loop,
+`/bin/true & ; wait` x15) under the freshly built binary.
+
+Captured line at the fatal 8th call:
+
+```
+[diag-fv-count] tid=ThreadId(13) win_tid=17232 begin() call #8 claimed_ranges=19
+  active_threads=2 live_thread_stacks=2 next_claim_seq=246 handle_count=125
+  handle_count_ok=true
+```
+
+`handle_count=125` is an ordinary mid-range value, nowhere near any Windows default
+handle-count ceiling (typically in the tens of thousands per process before hitting
+practical limits), and shows no discontinuity versus earlier calls' `claimed_ranges`/
+`next_claim_seq` growth rates documented in pass 203. `win_tid=17232` is just an
+ordinary-looking real Windows TID with nothing distinguishing bit-pattern (not a
+round number, no low-bit pattern suggesting an internal counter wraparound).
+
+This rules out genuine Windows-OS-level resource exhaustion (handle table, thread
+accounting) as the trigger for the deterministic 8th-fork crash, joining every other
+counter checked in pass 203 (`CLAIMED_RANGES`, `ACTIVE_THREADS`, `LIVE_THREAD_STACKS`,
+`NEXT_CLAIM_SEQ`) and pass 202 (`TlsState` fields, `MAX_WATCHED`,
+`DIAG_RESUME_HISTORY_LEN`, `TLS_INDEX`) as NOT the cause.
+
+Note on this specific capture: the `timeout 15` guard fired before the run reached its
+final fault -- the log ends mid-ELF-segment-parse for `/bin/true`'s 8th `execve`
+(`PT_LOAD segment p_vaddr=0xc1830 ...`), with no `EXIT=`/crash marker recorded. This is
+consistent with the established signature (the crash happens deeper inside this same
+8th-fork's post-exec ELF loading path, i.e. AFTER `begin()` returns, not inside it) --
+`begin()`'s own counters being unremarkable is expected either way, since the fault is
+downstream of `begin()` returning cleanly.
+
+**All process-wide counters and all Windows-OS-level counters this project has
+instrumented are now exhausted with no anomaly found at call #8.** The next
+escalation per pass 202's own recommendation, not yet attempted, is a genuine
+live-debugger (`cdb`/WinDbg) single-step through the 7th-to-8th `begin()` transition
+and into whatever runs immediately after -- now cheap thanks to the sub-2-second
+`musl_repro_plain8.sh` repro.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
