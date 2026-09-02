@@ -5116,6 +5116,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 // over it.
                 base_addr = core::ptr::null_mut();
             } else {
+                let diag_requested_start = suggested_range.start;
                 process_memory_range_by_regions(
                     suggested_range,
                     |r, state| -> Result<bool, std::convert::Infallible> {
@@ -5283,6 +5284,24 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 .unwrap();
                 if fixed_address_behavior == FixedAddressBehavior::Replace {
                     claim_range(base_addr as usize..(base_addr as usize + size));
+                }
+                // DIAG (AGENTS.md pass 223): allocation-free raw print of the actual returned
+                // base_addr vs. the originally-requested suggested_range.start, specifically for
+                // Replace-mode fixed calls -- to finally observe directly whether this success
+                // path (reached whenever the collision/committed-page checks above do NOT
+                // trigger) ever returns a MISMATCHED address, which pass 213's own downstream
+                // check in litebox_common_linux::mm::do_mmap would then reject as EEXIST. Gated
+                // on a mismatch only, so it cannot spam the log on the overwhelming common case
+                // where this path already returns the correct address.
+                if fixed_address_behavior == FixedAddressBehavior::Replace
+                    && base_addr as usize != diag_requested_start
+                {
+                    diag_raw_print(
+                        b"[diag-replace-mismatch] requested=0x",
+                        diag_requested_start,
+                        b" actual=0x",
+                        base_addr as usize,
+                    );
                 }
                 return Ok(UserMutPtr::from_ptr(base_addr.cast()));
             }

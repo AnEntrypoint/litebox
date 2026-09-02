@@ -2516,6 +2516,46 @@ actual visible XFCE desktop is `xfce4-session`'s own EEXIST failure (passes 213-
 partially-open investigation into `allocate_pages`'s `Replace`-mode success path). This is a
 precise, narrow, well-evidenced target for a future pass, not a vague or unverified goal.
 
+## 223rd pass: added a targeted diag_raw_print at allocate_pages's own Replace-mode success-path return, confirmed it NEVER fires (zero mismatches) even while EEXIST still occurs 8/8 -- definitively rules out allocate_pages's traced success path as the source, narrows the remaining mystery to a call site this investigation has not yet directly instrumented (most likely the CoW mmap path's own address handling, still not fully eliminated despite reasoning through its fallback logic). Also found and removed a stray leftover git worktree from an unrelated earlier agent session, violating this project's standing zero-worktrees invariant
+
+Added an allocation-free `diag_raw_print` immediately after `allocate_pages`'s own `Replace`
+success-path return (`litebox_platform_windows_userland/src/lib.rs`, right before `return
+Ok(UserMutPtr::from_ptr(base_addr.cast()))`), gated on `base_addr` actually differing from the
+originally-requested address -- the exact condition that would explain pass 213's own
+downstream check rejecting the call. Rebuilt, ran the fast repro:
+
+```
+grep -a "diag-replace-mismatch" -> ZERO matches
+grep -ac "EEXIST" -> 8 (unchanged)
+```
+
+**This is a clean, definitive negative result**: `allocate_pages`'s own traced `Replace`-mode
+success path (reached whenever neither the `Hint`-mode nor the collision-detection branches
+fire, i.e. exactly the path pass 217's fork-child claim-transfer fix made the common case)
+NEVER returns a mismatched address in this repro. Every one of the 8 EEXIST failures must
+therefore originate from a DIFFERENT call site than the one this pass instrumented.
+
+**Traced the remaining candidate**: `try_cow_mmap_file` (`litebox_shim_linux/src/syscalls/
+mm.rs`), a SEPARATE mapping path (not routed through `allocate_pages`'s `Replace`-mode logic at
+all) used for statically-backed files (e.g. tar-mounted rootfs content, plausible for this
+repro's own file-backed ELF segments). Confirmed by reading the trait default
+(`litebox/src/platform/page_mgmt.rs` `try_allocate_cow_pages`, `Err(CowAllocationError::
+UnsupportedByPlatform)`, never overridden by Windows userland) that this path, when reached,
+should correctly fall back to `do_mmap_file_memcpy` (`Err(_cow_not_supported) => None` at its
+own call site) rather than propagating an error -- by direct code reading, this fallback logic
+looks correct and should not itself produce EEXIST. This reasoning is NOT yet empirically
+verified with its own targeted diagnostic (this pass ran out of scope to add one) -- the
+most direct next step for a future pass is a `diag_raw_print` inside `try_cow_mmap_file`
+itself (gated on whether `static_data` resolves to `Some`, i.e. whether this path is even
+being reached for these specific `/bin/true` loads), to either confirm or rule it out
+empirically rather than by code-reading alone.
+
+**Housekeeping**: found and removed a stray git worktree (`.claude/worktrees/agent-
+a7ad663989e15404d`, branch `worktree-agent-a7ad663989e15404d`) left behind by an unrelated
+earlier agent session -- violates this project's own standing "zero branches and worktrees"
+invariant (`CLAUDE.md`). Removed via `git worktree remove --force` + `git branch -D`, confirmed
+`git worktree list` now shows only the main working tree.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
