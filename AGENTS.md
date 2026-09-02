@@ -2257,6 +2257,57 @@ its blast radius across `litebox_common_linux::loader::MapMemory`,
 `litebox_shim_linux`'s `Mapper` impl, and `litebox_platform_windows_userland`'s
 `allocate_pages`.
 
+## 217th pass: THE REAL BUG -- CLAIMED_RANGES ownership is never transferred to a fork()ed child's own GuestPid; a child's execve() sees its OWN inherited copy of memory (identical address, now exclusively its own after fork()'s copy-on-fork duplication) misattributed as a "foreign" claim still owned by the parent shell, triggering the collision this whole pass-212-216 arc has been chasing. /bin/true is confirmed ET_DYN (PIE), not ET_EXEC as an earlier session's comment assumed for a different binary -- that assumption doesn't apply here
+
+Directly checked `/bin/true`'s own ELF header bytes (extracted from `alpine-rootfs.tar`):
+`e_type = 3` (`ET_DYN`/PIE), not `ET_EXEC` as pass 215 assumed by reusing an EARLIER session's
+comment written about a DIFFERENT binary (`gcc`/`cc1`). This binary goes through `reserve()`'s
+`ET_DYN` branch (`elf.rs` `load()`), which DOES use the existing `pid_salt` mitigation --
+confirmed via direct computation that the shell's own salted hint (`0x1fa00000`, `GuestPid`
+1000) and `/bin/true`'s salted hint (`0x10240000`, `GuestPid` 9) land in completely different,
+non-overlapping regions. So `pid_salt` is working correctly and is NOT the gap.
+
+**Traced `GuestPid(1000)`'s (the shell's) actual lifecycle** via the `do_clone`/`clone: spawned
+new task` debug trace: `parent_tid=1000` genuinely IS the long-lived shell, and every child
+(`child_tid=2` through `child_tid=11`...) is created via `fork()` (`is_process_clone=true`),
+which duplicates the PARENT's entire address space into the child (real `fork()` COW
+semantics -- `Vmem::duplicate`, extensively documented elsewhere in this investigation's own
+history). **The child's copy of memory at the exact address `/bin/true`'s own fixed-hint
+segment wants to load into is not foreign at all -- it is the child's OWN inherited copy of
+what used to be shared with the parent, now exclusively the child's own memory after `fork()`
+completes.** But `CLAIMED_RANGES`'s ownership bookkeeping was never updated to reflect this:
+the range is still recorded under the PARENT's `GuestPid(1000)`, so when the child (its own
+distinct `GuestPid`, e.g. 9) later calls `execve()` and its ELF loader tries a `MAP_FIXED` over
+that same address (now legitimately the child's own memory to freely replace), `find_foreign_
+claim` sees `owner=GuestPid(1000) != exclude_owner=GuestPid(9)` and incorrectly reports a
+foreign collision -- even though there is no real parent-vs-child memory conflict at all; the
+child is asking to replace ITS OWN inherited copy.
+
+**This is a genuine, precisely-located bug, distinct from (and more fundamental than) the
+`ET_EXEC`-collision framing passes 214/215 converged on** (which was based on an incorrect
+`ET_EXEC` assumption for this specific binary, imported from an unrelated earlier
+investigation). The real fix belongs in `fork()`'s own implementation
+(`litebox_shim_linux/src/syscalls/process.rs`'s `do_clone`, or wherever `Vmem::duplicate`'s
+Windows-side memory-duplication actually runs in `litebox_platform_windows_userland`): every
+`CLAIMED_RANGES` entry the parent owned that falls within the address ranges being duplicated
+into the child needs a NEW entry inserted under the child's own `GuestPid` (or, simpler and
+lower-risk: re-tag/duplicate the parent's existing claim entries to also list the child as an
+owner, or transfer them outright if COW means the parent no longer needs the claim once
+diverged) at `fork()` time, not left to still say the parent unconditionally forever.
+
+**Concrete next step for a future pass**: locate exactly where `fork()`'s guest-address-space
+duplication happens on the Windows platform side (very likely near
+`litebox_platform_windows_userland`'s own `Vmem`/`PageManager::duplicate`-adjacent code, given
+this investigation's own extensive prior history mapping that function), and add a step there
+that walks `CLAIMED_RANGES` for entries owned by the forking parent's `GuestPid`/`ThreadId`
+whose range overlaps the child's newly-duplicated memory, inserting a matching entry for the
+child's own new `GuestPid` (found via whatever mechanism assigns a fresh guest PID to a
+`fork()`ed child, e.g. `ThreadProvider::set_next_spawned_thread_guest_pid`, already referenced
+elsewhere in this codebase per pass 205's own investigation). This is a well-scoped, precisely
+targeted, and genuinely different fix from anything attempted in passes 212-216 -- worth
+prioritizing over further work on the (now understood to be secondary/less relevant)
+`ET_EXEC`-collision framing.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
