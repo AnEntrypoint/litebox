@@ -3506,6 +3506,41 @@ a guest-emulated frame in the first place (e.g. by having litebox's own VEH alwa
 handle/recover such faults without ever returning `EXCEPTION_CONTINUE_SEARCH` for them, since
 (a) is achievable and well-scoped while (b) is a larger architectural change).
 
+## 247th pass: fixed the guest-mode EXCEPTION_CONTINUE_SEARCH path (terminate cleanly instead, per pass 246's finding), verified live against real XFCE -- the crash still occurs but is now conclusively a DIFFERENT, pre-existing, still-open bug (is_in_guest=false, rip=0x0/rsp=-1 whole-CONTEXT corruption, first documented pass 205), NOT the guest-unwind corruption pass 246 root-caused; the guest-mode fix's own effect could not be independently isolated in this run since the host-mode bug fires first/instead
+
+Implemented the concrete next step from pass 246's own assessment: added a guard immediately
+before the guest-mode branch's `EXCEPTION_CONTINUE_SEARCH` return (lib.rs, `vectored_exception_handler`)
+that terminates the process cleanly via `TerminateProcess` when `tls.is_in_guest.get()` is true,
+instead of ever letting Windows' SEH unwinder attempt to walk the stackless, jump-entered guest
+frame that pass 246's WER minidump proved it cannot safely process. This does not change the
+ultimate outcome for an unrecoverable guest fault (the process was already doomed either way --
+no other recovery path exists once `search_exception_tables` finds nothing) but avoids the
+specific `ntdll!RtlVirtualUnwind2` memory-corruption mechanism pass 246 identified.
+
+**Live verification against the real XFCE repro**: the process still crashed at the same ~11-16s
+timing, with a clean, bounded 310-line log (vs the pre-pass-246 baseline of 13,000+ lines) --
+but the diagnostic output shows `is_in_guest=false`, `rip=0x0`, `rsp=0xffffffffffffffff`,
+`rbp=0xc0000008`, caught by the PRE-EXISTING repeat-count circuit breaker
+(`[diag-unrecov-av-giveup] rip=0x40 repeat_count=0x41`), not by this pass's new guard at all.
+This is the OTHER, separately-documented whole-CONTEXT corruption signature first identified in
+pass 205 (well before pass 246's guest-unwind finding), occurring in HOST code, not guest code
+-- confirming there are at least two distinct corruption mechanisms in this investigation's
+history, and pass 246/247's fix addresses only one of them (the guest-mode one). This run
+provides no direct evidence either way on whether the guest-mode fix works as intended, since
+this specific crash never reached that code path at all.
+
+**Assessment and next step**: pass 246's guest-mode fix is still correct and worth keeping (it
+is independently justified by the WER-captured evidence, regardless of whether it happens to be
+exercised in any one specific run), but the REMAINING blocker for XFCE is now clearly this
+separate `is_in_guest=false`/`rip=0`/`rsp=-1` host-mode corruption class. Given WER dumps are now
+proven to work reliably (this pass's own run did NOT produce a dump only because the pre-existing
+circuit breaker's `TerminateProcess` still fires before WER can see it, exactly as pass 246
+diagnosed for the guest case) -- the same `LITEBOX_DIAG_ALLOW_WER`/`RaiseFailFastException`
+escape hatch already added to that circuit breaker (pass 246) should be used again, this time
+specifically to capture a WER minidump of THIS host-mode `rip=0` fault, giving the same kind of
+ground-truth evidence pass 246 obtained for the guest-mode case. This is the clearest, most
+directly actionable next step for a future session or continuation of this one.
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash
