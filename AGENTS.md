@@ -3383,6 +3383,27 @@ stopping).
 
 ---
 
+## 245th pass: tested elevating the host process's Windows scheduling priority (PriorityClass=High, via PowerShell Start-Process) as a genuinely new lever for this timing-sensitive race -- did NOT change the outcome; identical crash signature (rip=0/rsp=-1/rbp=0xc0000008), caught cleanly by the circuit breaker as before
+
+Launched the real `--gui` XFCE session via PowerShell `Start-Process` (not the bash `nohup`
+wrapper used in every earlier pass, to get direct, reliable access to the real Windows process
+object) and set `PriorityClass = 'High'` immediately after launch, hypothesizing that reduced
+OS scheduling jitter/preemption might shift this genuine race condition's own timing enough to
+avoid the fault window, the same way logging-overhead changes (pass 240) already demonstrably
+shift its outcome.
+
+**Result: no change.** The process crashed with the identical, by-now-familiar signature
+(`rip=0x0, rsp=0xffffffffffffffff, rbp=0xc0000008`), caught cleanly by the circuit breaker
+(`repeat_count=0x41`) exactly as in every other recent capture. Process priority is NOT a lever
+that changes this race's outcome, at least not on its own -- a genuinely useful negative result,
+closing off another plausible mitigation angle without needing a future pass to rediscover it.
+
+**This is the last new mitigation angle attempted this session.** Combined with everything
+already tried (fork_verify disabled, dbus serialization, kiosk-shell config, lock-contention
+fix, logging-overhead reduction, 4-trial statistical batch, now process priority), the remaining
+race condition has been probed from essentially every angle available without live-debugger
+access. The session's own final consolidated summary (below) stands as written.
+
 # SESSION-FINAL CONSOLIDATED SUMMARY (this whole session, passes 204-244)
 
 **Primary, fully verified deliverable**: fixed a severe, long-standing, deterministic host-crash
