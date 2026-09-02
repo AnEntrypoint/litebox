@@ -1925,6 +1925,40 @@ likely a false lead -- ordinary stack noise, not a smoking gun.
   (pass 208's originally-proposed fix (b), which remains valid architecture-hardening advice
   independent of whether it's THE fix for this specific bug).
 
+## 211th pass: MAJOR NEGATIVE RESULT -- the crash reproduces IDENTICALLY with fork_verify entirely disabled (LITEBOX_FORKVERIFY_OFF=1), same 8th-fork trigger, same PT_LOAD segments, same crash point. This definitively rules out fork_verify's single-stepping/healing mechanism as the trigger, refuting every fork_verify-interaction theory from passes 205-210 (single-step-race, EFLAGS.TF interference, healing reentrancy) -- the bug is in the base ELF-loading/exception-recovery path itself, entirely independent of fork_verify
+
+Ran `musl_repro_plain8.sh` with `LITEBOX_FORKVERIFY_OFF=1` set (the existing, pre-built kill
+switch for the whole stale-pointer-healing module, `fork_verify.rs` line 2473). Result:
+crashed identically -- same `EXIT=127`, same log truncation immediately after the 8th
+`/bin/true`'s `PT_LOAD segment p_vaddr=0xc1830 p_filesz=0x3800 p_memsz=0x4328` line (the exact
+BSS-zero-fill-triggering segment this whole investigation has tracked since its earliest
+passes), `COMPLETED` markers stopping at 7 (crash during the 8th iteration), matching every
+prior capture's timing signature exactly.
+
+**This is a clean, decisive negative result with real diagnostic value:** every hypothesis
+from passes 205-210 that involved `fork_verify`'s own machinery -- its `EFLAGS.TF`
+single-stepping racing the VEH, its healing logic re-entering during the fault, its
+interaction with `EXCEPTION_CONTINUE_EXECUTION` recovery timing -- is now refuted. The bug
+reproduces with that entire subsystem switched off. **The true root cause lives entirely
+within the base exception-table/VEH/ELF-loader path** (`litebox/src/mm/exception_table.rs`'s
+`memset_fallible` and its `search_exception_tables`-based recovery, `litebox_platform_windows_
+userland/src/lib.rs`'s `exception_handler`, and/or `litebox_common_linux/src/loader.rs`'s
+`ElfParsedFile::load`), NOT in `fork_verify.rs` at all -- despite `fork_verify` being the
+mechanism most associated with "the 8th fork" framing throughout this whole multi-session
+investigation (the connection to "8 forks" is real and reproducible, per pass 199-201's own
+call-count diagnostics, but that's about WHEN the bug's preconditions are met -- e.g. a
+specific guest heap/address layout only reached after 8 rounds of `fork()`+`execve()` churn --
+not about fork_verify's mechanism being the actual faulting code).
+
+**This significantly re-scopes where a fix needs to go.** A future pass should stop looking at
+`fork_verify.rs` entirely and focus exclusively on: (1) why the specific guest BSS address
+(`0x10305030`-shaped, varying by ASLR but structurally consistent segment/offset each run) is
+genuinely unmapped at the moment `memset_fallible` tries to zero it on the 8th fork+exec but
+not on forks 1-7 of the identical binary/script -- i.e. what STATE accumulates across 7 prior
+fork+exec cycles that changes whether this specific page is backed; (2) the exact mechanism of
+the second/third fault this session's passes 206-210 already characterized in detail (still
+open, but now definitively known to be independent of fork_verify).
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
