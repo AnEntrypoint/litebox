@@ -3146,6 +3146,10 @@ pub enum SyscallRequest {
         oldset: Option<UserPtrMut<SigSet>>,
         sigsetsize: usize,
     },
+    RtSigsuspend {
+        mask: Option<UserPtr<SigSet>>,
+        sigsetsize: usize,
+    },
     RtSigaction {
         signum: signal::Signal,
         act: Option<UserPtr<signal::SigAction>>,
@@ -3822,6 +3826,7 @@ impl SyscallRequest {
                 oldset:*,
                 sigsetsize,
             }),
+            Sysno::rt_sigsuspend => sys_req!(RtSigsuspend { mask:*, sigsetsize }),
             Sysno::rt_sigaction => sys_req!(RtSigaction {
                 signum:?,
                 act:*,

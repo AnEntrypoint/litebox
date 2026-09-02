@@ -600,6 +600,48 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(0)
     }
 
+    /// Handle syscall `rt_sigsuspend`.
+    ///
+    /// Real Linux semantics: atomically replace the calling thread's signal mask with `mask`,
+    /// then block until a signal is delivered, then restore the ORIGINAL mask and return `-1`
+    /// with `EINTR` (this call never returns successfully -- a signal that actually terminates or
+    /// is otherwise handled is what makes the wait end, `sigsuspend` itself has no "wake up
+    /// normally" outcome).
+    ///
+    /// Without this, `rt_sigsuspend` fell through to the generic "unsupported syscall" fallback
+    /// (`SyscallRequest::try_from_raw`'s own default arm, `litebox_common_linux/src/lib.rs`),
+    /// returning `ENOSYS` IMMEDIATELY instead of blocking. Confirmed live: this is exactly what a
+    /// shell's own `wait` builtin (BusyBox ash included) uses to sleep until `SIGCHLD` arrives
+    /// after an initial `wait4(WNOHANG)` poll finds nothing ready -- with `rt_sigsuspend` never
+    /// actually blocking, the caller's own retry loop calls it again immediately, spinning as fast
+    /// as the host can dispatch syscalls (confirmed live: ~175,000 calls/second) instead of
+    /// sleeping until the child's `SIGCHLD` wakes it, hanging a backgrounded shell job's `wait`
+    /// forever even though the child itself exits correctly and promptly.
+    pub(crate) fn sys_rt_sigsuspend(
+        &self,
+        mask_ptr: Option<UserPtr<SigSet>>,
+        sigsetsize: usize,
+    ) -> Result<usize, Errno> {
+        if sigsetsize != core::mem::size_of::<SigSet>() {
+            return Err(Errno::EINVAL);
+        }
+        let Some(mask_ptr) = mask_ptr else {
+            return Err(Errno::EFAULT);
+        };
+        let mask = mask_ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+
+        let old_mask = self.signals.blocked.get();
+        self.signals.set_signal_mask(mask);
+        let result = self.wait_cx().sleep();
+        self.signals.set_signal_mask(old_mask);
+        match result {
+            litebox::event::wait::WaitError::Interrupted => Err(Errno::EINTR),
+            litebox::event::wait::WaitError::TimedOut => {
+                unreachable!("sigsuspend sleep has no deadline")
+            }
+        }
+    }
+
     pub(crate) fn sys_sigaltstack(
         &self,
         ss_ptr: Option<UserPtr<SigAltStack>>,
