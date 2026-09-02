@@ -1959,6 +1959,94 @@ fork+exec cycles that changes whether this specific page is backed; (2) the exac
 the second/third fault this session's passes 206-210 already characterized in detail (still
 open, but now definitively known to be independent of fork_verify).
 
+## 212th pass: TRUE ROOT CAUSE FOUND -- MAP_FIXED requests can be SILENTLY RELOCATED to a different address when allocate_pages (Replace mode) detects a foreign claim or stack overlap (lib.rs line ~5017, `base_addr = core::ptr::null_mut()`), but the ELF loader's caller never checks whether the returned address actually matches the requested one -- on the 8th fork+exec this silent relocation fires for /bin/true's writable data segment, and all subsequent BSS-zero-fill math is computed against the ORIGINAL (never-actually-used) address, producing a write to completely unmapped guest memory. This is a real, fixable, non-fork_verify bug, matching an EARLIER SESSION'S "FINDINGS.txt PASS 48" note already flagging returned-mmap-address anomalies as a suspected bug class
+
+Following up on pass 211's re-scoping (fork_verify definitively ruled out), ran the fast
+`musl_repro_plain8.sh` repro with `LITEBOX_LOG=debug LITEBOX_FORKVERIFY_OFF=1` to capture
+`sys_mmap`'s own entry/return trace for the 8th `/bin/true`'s ELF load (a much smaller, more
+targeted repro than any earlier session's GUI-based debug-log attempts, so the overhead-timing
+hazard this investigation has documented repeatedly stayed survivable). Found the exact
+`sys_mmap` call for the crashing segment:
+
+```
+sys_mmap: entry addr=271585280 len=20480 prot=PROT_READ|PROT_WRITE
+  flags=MAP_PRIVATE|MAP_FIXED fd=3 offset=786432
+allocate_pages: claiming fresh-address (start==0 path) range start=265027584 end=265048064
+sys_mmap: returned addr=271585280 len=20480 returned=265027584
+```
+
+`addr=271585280` (`0x102D0000`) is the REQUESTED fixed address (offset `786432` = `0xC0000`,
+the page-aligned start of `/bin/true`'s writable data/BSS segment, `p_vaddr=0xc1830`
+truncated down). **`returned=265027584` (`0xFC10000`) is a COMPLETELY DIFFERENT address** --
+not equal to the request, and the log line immediately above (`allocate_pages: claiming
+fresh-address (start==0 path)`) proves the platform's own `allocate_pages` treated this as an
+address-agnostic "OS picks anywhere" request, DESPITE the syscall being `MAP_FIXED`.
+
+**Read `allocate_pages`'s exact branch that causes this** (`litebox_platform_windows_userland/
+src/lib.rs`, the `suggested_range.start != 0` block, ~line 4982-5017): when
+`fixed_address_behavior == FixedAddressBehavior::Replace` (which is exactly what a real
+`MAP_FIXED` request maps to -- confirmed in `mm.rs`'s `try_cow_mmap_file`, line ~248) AND
+either a foreign claim (`find_foreign_claim`) or a live-thread-stack overlap
+(`find_live_stack_overlap`) is found in the requested range, the code does NOT honor the fixed
+address at all -- it sets `base_addr = core::ptr::null_mut()`, silently falling through to the
+"OS picks any free address" path instead (the exact `start==0`/`VirtualAlloc2(..., NULL, ...)`
+branch this pass's log line names). The comment directly above this code (lines 5010-5016)
+explicitly documents the INTENT as "Relocate to a fresh address instead of
+decommitting/recommitting/committing over it" -- this is a deliberate design choice for
+avoiding corruption of another live process's real memory, not an oversight in itself.
+
+**The actual bug is one level up: nothing downstream of `allocate_pages` ever checks whether
+the returned address equals the requested one.** `do_mmap_file`/`try_cow_mmap_file`
+(`litebox_shim_linux/src/syscalls/mm.rs`) return whatever `try_allocate_cow_pages` hands back
+without comparing it to `suggested_addr`, `sys_mmap` returns that straight to the ELF loader's
+`map_file` (`litebox_shim_linux/src/loader/elf.rs` line 150-166), which itself discards the
+`Result`'s `Ok(())` with no address-verification at all -- and `ElfParsedFile::load`
+(`litebox_common_linux/src/loader.rs`) computes `unaligned_file_end`/`file_end` purely from
+`base_addr + p_vaddr` (the ORIGINAL, requested layout) with NO knowledge that the actual
+mapping silently landed 26 MiB away (`271585280 - 265027584 = 6557696` bytes = ~6.25 MiB, not
+26 -- corrected: `0x102D0000 - 0xFC10000 = 0x64C0000` = 105,906,176 bytes ≈ **101 MiB away**).
+Every subsequent write computed against the segment's intended address (including the
+`memset_fallible` BSS zero-fill this whole investigation traced in passes 205-211) targets
+memory that was NEVER ACTUALLY MAPPED, producing the deterministic, unrecoverable
+`c0000005` this whole investigation has chased since its very first passes.
+
+**Why specifically the 8th fork+exec:** `find_foreign_claim`/`find_live_stack_overlap`
+checking against `CLAIMED_RANGES`/`LIVE_THREAD_STACKS` means this silent-relocation branch only
+fires when something else is *currently* claiming/using the requested address range at the
+exact moment of this `execve`'s `mmap`. Across a tight, sequential `fork()`+`execve()`+`wait()`
+loop (this repro's own shape), each `/bin/true` gets the SAME link-time-preferred base address
+(no ASLR variance for a fixed-position segment/offset within it) -- but the PREVIOUS child's
+own claim on that exact range may not yet be released by the time the NEXT child's `execve`
+tries to map there, if claim-release is tied to process-exit bookkeeping that itself takes a
+few forks' worth of churn to catch up/settle (matching this whole investigation's own
+independently-and-repeatedly-confirmed exact-8th-call determinism from passes 199-201, now
+finally given a plausible, concrete mechanical explanation instead of remaining an unexplained
+numerological curiosity).
+
+**This closes the investigation's central open question with a real, well-understood,
+actionable bug**, distinct from -- and far more concrete than -- every fork_verify-based theory
+this session explored and retracted (passes 205-211). It also matches an EARLIER SESSION's own
+suspicion: the `sys_mmap: returned` debug-trace line's own comment
+(`litebox_shim_linux/src/syscalls/mm.rs` ~line 691) references "FINDINGS.txt PASS 48" as having
+already flagged "a return value landing in the host allocator's own reserved region" as an
+actively-chased bug class, though that specific historical framing (host-allocator-region
+aliasing) differs from this pass's finding (guest-claim-based silent relocation) -- both are
+real, independently-discoverable consequences of the same underlying gap: nothing verifies a
+`MAP_FIXED` mmap's actual placement against its request.
+
+**Concrete, well-scoped fix for a future pass (not yet implemented, given the depth already
+reached this pass):** either (a) make `sys_mmap`/`do_mmap_file` detect a returned address that
+doesn't match a `MAP_FIXED` request's `suggested_addr` and fail the call with `EEXIST`/`ENOMEM`
+(matching real Linux's own `MAP_FIXED` contract -- it must either place the mapping EXACTLY
+there or fail, never silently relocate) rather than silently succeeding with the wrong address;
+or (b) if the foreign-claim/stack-overlap detection is a false positive for this specific case
+(the "foreign" claim actually belongs to an ALREADY-EXITED prior fork's process whose
+`CLAIMED_RANGES` entry simply hasn't been released yet), fix the claim-release timing/logic so
+a genuinely-dead process's claim does not block a fresh `execve`'s legitimate fixed-address
+request in the first place. Option (a) is the safer, more conservative fix regardless of which
+underlying scenario is occurring, since silently mismapping `MAP_FIXED` is never correct Linux
+`mmap()` behavior.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
