@@ -5055,7 +5055,27 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     }
                 })
                 .is_err();
-            if has_committed_page && fixed_address_behavior == FixedAddressBehavior::Hint {
+            // AGENTS.md pass 228: `Hint`-mode previously only checked Windows' own real
+            // `VirtualQuery`-visible commit state (`has_committed_page`) before deciding whether
+            // to relocate -- `CLAIMED_RANGES` (this crate's own litebox-internal ownership
+            // registry, tracking guest-process memory Windows itself cannot distinguish from
+            // "free", see that static's own doc comment) was never consulted for `Hint`-mode at
+            // all, unlike `Replace`/`NoReplace` a few lines below. Root-caused live: a PIE
+            // binary's own base-address reservation (`elf.rs`'s `reserve()`, a plain `Hint`-mode
+            // call) could pick an address Windows reports as genuinely free but that ALREADY
+            // belongs to a different, still-live guest process's own memory (e.g. a long-running
+            // shell's own independently-grown heap) -- invisible to `VirtualQuery` alone. The
+            // reservation would then succeed at that colliding address, and every subsequent
+            // `MAP_FIXED` segment placed relative to it would genuinely, unavoidably collide,
+            // surfacing later (correctly, per pass 213's own fix) as `EEXIST` instead of being
+            // caught and relocated here where it belongs. Extend the SAME foreign-claim defense
+            // `Replace`-mode already has to this path too, so a `Hint`-mode reservation gets a
+            // fresh address instead of one already claimed by someone else.
+            let hint_foreign_claim = fixed_address_behavior == FixedAddressBehavior::Hint
+                && find_foreign_claim(suggested_range.clone(), current_claim_owner()).is_some();
+            if (has_committed_page || hint_foreign_claim)
+                && fixed_address_behavior == FixedAddressBehavior::Hint
+            {
                 // If any page in the suggested range is already committed, and the caller
                 // did not request a fixed address, we ask the OS to allocate a new region.
                 base_addr = core::ptr::null_mut();

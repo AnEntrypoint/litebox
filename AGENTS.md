@@ -2807,6 +2807,35 @@ currently lacks it. This is a small, targeted, low-risk change (a few extra line
 already-read function, reusing the already-tested `find_foreign_claim` helper) rather than a
 new mechanism, and should close this investigation's very last remaining gap.
 
+## 229th pass: FIX IMPLEMENTED AND VERIFIED -- the EEXIST regression is FIXED, 5/5 trials now complete with ZERO EEXIST failures (down from 8/8 every trial). Extended Hint-mode's allocate_pages collision check with find_foreign_claim, closing the exact gap pass 228 identified
+
+Implemented pass 228's proposed fix: `Hint`-mode's relocate-on-collision check
+(`litebox_platform_windows_userland/src/lib.rs` ~line 5058) now ALSO consults `find_foreign_
+claim(suggested_range.clone(), current_claim_owner())`, not just `has_committed_page`
+(Windows' own `VirtualQuery`-visible state). On a hit, `base_addr` is set to null exactly as
+the pre-existing `has_committed_page` branch already does, triggering the OS-picks-a-fresh-
+address path instead of committing over another live guest process's own claimed memory.
+
+**Verification**: built, ran the fast repro (`musl_repro_plain8.sh`) 5 times:
+
+```
+trial 1: EXIT=0 ALL_COMPLETED=1 EEXIST=0
+trial 2: EXIT=0 ALL_COMPLETED=1 EEXIST=0
+trial 3: EXIT=0 ALL_COMPLETED=1 EEXIST=0
+trial 4: EXIT=0 ALL_COMPLETED=1 EEXIST=0
+trial 5: EXIT=0 ALL_COMPLETED=1 EEXIST=0
+```
+
+**Zero EEXIST failures across all 5 trials** -- down from 8/8 every single trial since pass
+213 first surfaced this regression. This closes the entire investigative arc spanning passes
+205-229: the original deterministic host crash (fixed, pass 212-213), the fork-child claim-
+ownership gap (fixed, pass 217-218), and now this final Hint-mode collision-detection gap
+(fixed, this pass) -- together resolving every layer of the underlying multi-process memory-
+management issue this session's whole investigation uncovered.
+
+**Immediate next step**: retry the real XFCE GUI launch with this final fix in place -- every
+previously-identified blocker to `xfce4-session` starting should now be resolved.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
