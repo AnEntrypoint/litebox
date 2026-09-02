@@ -1476,6 +1476,39 @@ unsafe extern "system" fn vectored_exception_handler(
                 use std::io::Write;
                 let _ = std::io::stderr().flush();
             }
+            // AGENTS.md pass 246: a WER minidump captured for the FIRST TIME in this whole
+            // investigation proved that `EXCEPTION_CONTINUE_SEARCH` here is not merely
+            // unproductive for an `is_in_guest` fault -- it is actively harmful.
+            // `switch_to_guest`'s own trampoline (`switch_to_guest_sysret`) enters guest code via
+            // a bare `jmp`, never a `call`, deliberately adopting the guest's own `rsp` with no
+            // host stack frame set up at all -- so there is no legitimate call chain for Windows'
+            // SEH machinery to walk back through once it takes over. The captured dump showed
+            // `ntdll!RtlVirtualUnwind2` itself faulting while attempting exactly this: reading a
+            // stale `UWOP_ALLOC_SMALL`-accumulated stack-offset value out of its own internal
+            // unwind-context struct and dereferencing it as a pointer, because no real
+            // `RUNTIME_FUNCTION`/`UNWIND_INFO` entry describes this jump-based guest frame.
+            // `EXCEPTION_CONTINUE_SEARCH` was previously reached unconditionally on the very
+            // FIRST unrecovered AV (before the sibling repeat-count circuit breaker above ever
+            // has a chance to intervene, since that only fires from the 65th identical repeat
+            // onward) -- meaning this exact ntdll corruption was hit on every single genuine
+            // first-chance unrecovered guest fault, not just a rare repeated-fault edge case.
+            // Terminate cleanly instead for this specific case: a guest-mode fault with no
+            // recognized exception-table entry is not something Windows' own unwind path can
+            // ever safely process, so handing it onward can only make things worse.
+            if tls.is_in_guest.get() {
+                diag_raw_print(
+                    b"[diag-unrecov-av-guest-terminate] rip=0x",
+                    context.Rip as usize,
+                    b" addr=0x",
+                    exception_record.ExceptionInformation[1],
+                );
+                unsafe {
+                    windows_sys::Win32::System::Threading::TerminateProcess(
+                        windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                        1,
+                    );
+                }
+            }
             return EXCEPTION_CONTINUE_SEARCH;
         }
     }
