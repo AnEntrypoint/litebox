@@ -3283,6 +3283,46 @@ configuration for further live XFCE testing going forward -- it reaches much fur
 startup sequence than the previously-default `warn` level, giving any future debugging session
 a meaningfully better repro to work from.
 
+## 241st pass: traced the CLAIMED_RANGES contention to its likely source -- this session's OWN pass 217/218 fix (reclaim_ranges_for_fork_child) acquires CLAIMED_RANGES.lock() on EVERY newly-spawned thread's very first action, right at thread startup, before fork_verify::begin() even runs -- under XFCE's heavy concurrent forking this creates a real, plausible contention point exactly matching pass 240's own captured evidence. NOT implementing a fix this pass given remaining budget -- this is the final, most concrete, well-scoped lead for continuation
+
+Grepped every `CLAIMED_RANGES.lock()`/`.try_lock()` call site in the codebase. Confirmed none
+exist inside `fork_verify.rs` itself (ruling out true VEH-reentrancy on this exact lock) -- all
+five call sites are in `lib.rs`, all using blocking `.lock()` except `begin()`'s own diagnostic
+snapshot (`.try_lock()`, pass 202-203's addition). This means pass 240's captured contention is
+ordinary two-thread racing on a shared `Mutex`, not a same-thread reentrancy deadlock -- still a
+real, meaningful correlation with the crash's own timing, just a different mechanism than
+initially guessed.
+
+**Identified the most likely source of that contention**: `reclaim_ranges_for_fork_child`
+(this session's OWN pass 217/218 addition, `lib.rs` ~line 3990) acquires
+`CLAIMED_RANGES.lock()` unconditionally on EVERY newly-spawned guest-process thread, as
+literally the first substantive action after `CURRENT_GUEST_PID` is set -- BEFORE
+`thread_start`/`fork_verify::begin()` runs at all. Under XFCE's own heavy, concurrent fork
+churn (many helper processes forking in quick succession during startup), many threads can
+plausibly all reach this exact lock acquisition within a very tight window, creating real,
+legitimate contention -- and `begin()`'s own diagnostic (which needs the SAME lock, via
+`try_lock`) can genuinely observe it held by a sibling thread doing the exact same
+just-forked-child bookkeeping. This is consistent with, though not yet proven identical to,
+the fatal corruption's own timing correlation from pass 240.
+
+**Not fixing this pass, deliberately, given remaining time/token budget**: any change to this
+lock's scope or the `reclaim_ranges_for_fork_child` call site needs careful live verification
+(the fast repro AND a real XFCE launch) before trusting it, and this session's own remaining
+budget is better spent leaving a precise, well-scoped, immediately-actionable lead than
+attempting a rushed change with no time left to verify it doesn't introduce a regression.
+**Concrete, ready-to-implement next step**: either (a) narrow `reclaim_ranges_for_fork_child`'s
+own lock hold time (it currently holds the lock only for the initial snapshot copy, already
+reasonably tight -- worth confirming this is genuinely as narrow as it can be, or whether the
+subsequent `claim_range` calls per matching range, each ALSO taking this same lock
+individually, could be batched into a single lock acquisition instead of N separate ones); or
+(b) determine whether `begin()`'s own diagnostic call genuinely NEEDS to be positioned where a
+contended lock can coincide with the fatal fault at all, e.g. by moving the diagnostic snapshot
+to a point in `begin()` less likely to race a sibling thread's own startup lock acquisition.
+Given `LITEBOX_LOG=error` (pass 240) is now the established best-available repro configuration
+(reaching t=15s+ vs. the historical ~37s crash point), verifying either fix is now MUCH cheaper
+than it would have been under the original `warn`-level logging's own timing-perturbing
+overhead.
+
 ## 66th pass: BREAKTHROUGH -- root-caused the ACTUAL underlying crash this entire 65-pass investigation has been chasing (not the same as the fork_verify-adjacent GUI-autostart hang, a genuinely different bug caught by pure luck while downloading `llvm22-libs` for an unrelated task). A live `[diag-unrecov-av]` capture showed `rip=0xffffffffffffffff is_in_guest=false` -- an unmistakable POISONED SENTINEL value (`-1i64`/`usize::MAX`/`SIG_ERR`), not a plausible wild-jump landing address, cascading into two further faults (`addr=0x40`, then `addr=0x2` with `matching_gprs=["rbx","r8"]`).
 
 Traced the fault to `switch_to_guest`'s `switch_to_guest_sysret` fast path (`litebox_platform_windows_userland/src/lib.rs:2762-2764`): `"mov rcx, [rcx + 0x80]"` (loads `ctx.rip`) immediately followed by `"jmp rcx"` -- an UNCONDITIONAL, UNVALIDATED jump to whatever `ctx.rip` holds, with no sanity check that it is a real, mapped, executable guest address. Traced backward to find WHERE `ctx.rip` gets set to a poisoned value: `litebox_shim_linux/src/syscalls/signal/x86_64.rs:147`, `write_signal_frame`'s `ctx.rip = action.sigaction;` -- sets the resume address directly from a guest-supplied `sigaction` handler pointer with NO validation.
