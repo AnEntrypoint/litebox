@@ -634,23 +634,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let old_mask = self.signals.blocked.get();
         self.signals.set_signal_mask(mask);
         let result = self.wait_cx().sleep();
-        self.signals.set_signal_mask(old_mask);
-        // Real Linux `sigsuspend` doesn't just unblock and wait: the newly-unblocked pending
-        // signal is actually DELIVERED (its handler run, if one is installed, or its default
-        // action taken) before the syscall returns -- `sigsuspend(2)`'s own man page: "the system
-        // call ... suspends the process until delivery of a signal". Merely waking this thread up
-        // (this function's own `sleep()` call, which only checks whether an interrupt/pending
-        // signal EXISTS, never dispatches it) leaves the signal sitting in the queue -- a caller
-        // whose actual work is done by a signal HANDLER (as opposed to just wanting `sigsuspend`
-        // to return once the state changes) never gets that handler invoked, and if the caller
-        // doesn't separately re-check/reap via another syscall afterward, the same
-        // still-pending signal makes every SUBSEQUENT `sigsuspend` call return instantly forever
-        // (confirmed live: exactly this shape, a shell's `wait` builtin looping on `sigsuspend`
-        // after the first one already delivered SIGCHLD, spinning at ~175,000 calls/sec since the
-        // signal was never actually dispatched/cleared). Call `process_signals` here, exactly the
-        // same as the normal syscall-return path already does, so a real signal handler
-        // (installed via `rt_sigaction`) actually runs before this returns, matching real Linux.
+        // Dispatch/consume the signal that woke this thread WHILE the caller-supplied (usually
+        // more permissive) mask from `sigsuspend`'s own argument is still installed -- real Linux
+        // `sigsuspend` delivers the waking signal under that temporary mask, not the original one
+        // (`sigsuspend(2)`: "the set of blocked signals is set to mask ... the original signal
+        // mask is restored after the call"). Confirmed live: restoring `old_mask` BEFORE this
+        // dispatch (the previous version of this fix) re-blocked SIGCHLD before it could be
+        // consumed, since a normal shell keeps SIGCHLD blocked by default and only unblocks it via
+        // `sigsuspend`'s own `mask` argument for the duration of exactly this call -- the signal
+        // was left queued-but-now-invisible again, making every SUBSEQUENT `sigsuspend` call
+        // return instantly (it should have blocked, since nothing new had arrived, but
+        // `has_pending_signals()` still saw the stale, never-cleared entry once its RESTORED
+        // block state briefly matched what `check_for_interrupt` samples on next entry).
         self.process_signals(ctx);
+        self.signals.set_signal_mask(old_mask);
         match result {
             litebox::event::wait::WaitError::Interrupted => Err(Errno::EINTR),
             litebox::event::wait::WaitError::TimedOut => {
