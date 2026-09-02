@@ -2453,6 +2453,17 @@ pub(crate) fn end() {
     if let Some(tls) = crate::get_tls_ptr() {
         // SAFETY: as above.
         let tls = unsafe { &*tls };
-        *tls.fork_verify.borrow_mut() = None;
+        // A nested fault during one of the AV-path stale-pointer healers (`translate_stale_*`)
+        // can re-enter the exception handler while an outer `tls.fork_verify.borrow()` from that
+        // healer is still alive on the same thread's stack -- if handling of that nested fault
+        // ends up calling `end()` (e.g. verification is deemed complete/aborted mid-healing),
+        // `borrow_mut()` here would panic on an already-borrowed `RefCell`. Confirmed live during
+        // a real XFCE launch. Use `try_borrow_mut` and skip clearing in that rare case rather than
+        // crashing the whole guest thread -- the outer healer's own borrow is about to be dropped
+        // when it returns, so at worst this leaves `fork_verify` set one exception cycle longer
+        // than ideal, never permanently.
+        if let Ok(mut slot) = tls.fork_verify.try_borrow_mut() {
+            *slot = None;
+        }
     }
 }
