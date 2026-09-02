@@ -158,6 +158,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
         ctx: &mut Self::ExecutionContext,
         info: &litebox::shim::ExceptionInfo,
     ) -> ContinueOperation {
+        litebox_util_log::warn!(
+            exception:? = info.exception, kernel_mode:% = info.kernel_mode;
+            "drm-diag: exception() entry"
+        );
         // The guest's synthesized sigreturn trampoline (see `ensure_sigreturn_trampoline`)
         // traps via `brk #0xdead` (SIGTRAP/BRK64) rather than the real `rt_sigreturn` syscall
         // number, which stays unconditionally seccomp-allowed on this platform (see the
