@@ -20,7 +20,13 @@
 #   6. Prints the verbose log at the end so it lands in the run log even if the writable layer
 #      is not exported.
 
-set -x
+# NO 'set -x'. Shell tracing writes a trace line before every command, and the
+# extra syscalls that generates -- interleaved with fork -- deterministically
+# kill the first backgrounded child via a #UD in a syscall trampoline stub
+# (bisected: 2/2 fail with it, 2/2 pass without). In these launchers that
+# child is dbus-daemon, so tracing silently takes out the session bus and
+# every component then fails with 'Connection refused'. Use explicit echo
+# markers at stage boundaries instead. Repro: advisor/probes/setx_ud_repro.sh
 export HOME=/root
 mkdir -p /root /tmp/.X11-unix /run/user/0
 chmod 1777 /tmp/.X11-unix
