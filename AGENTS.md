@@ -343,3 +343,34 @@ Bare-rootfs fork-bug repro (fast, no display stack): see the regression oracle a
   two `.unwrap()`s to a graceful error + exit if touched again.
 - **The program path passed to the runner must be RELATIVE, no leading slash** (`bin/sh`, not
   `/bin/sh`) — a leading slash also hits the same ENOENT-then-stack-overflow panic shape above.
+
+## Disk hygiene — read before generating any new layer tar or crash dump
+
+`.wfgy/xfce-build/` and `.wfgy/crash-dumps/` accumulated to **73 GiB** and **19 GiB**
+respectively by 2026-09-03, mostly near-duplicate incremental layer tars from iterative
+debugging (`layer77-idletest7.tar` through `layer84-wterm.tar` alone: ~5.5 GiB of snapshots that
+were never cleaned up) and old crash `.dmp` files (~3.8 GiB each) from a session whose findings
+were already fully captured as text in `AGENTS.md`/project memory. Total repo directory size hit
+85+ GiB before cleanup. Cleaned up same day: `.wfgy/xfce-build/` now holds only the 4 tars
+actually referenced by this file's "Reproduction commands" section
+(`alpine-pinned2.tar`, `xfce-layer31-nopanel.tar`, `layer31_direct.tar`,
+`layer31_direct_fixed.tar`, ~4.2 GiB total); `.wfgy/crash-dumps/` and `.wfgy/gdb-session/` were
+deleted entirely (their findings are already written up as text — the dumps themselves added no
+further value once analyzed).
+
+**To prevent this recurring:**
+- **A layer tar you build for one debugging iteration is disposable once you've extracted what
+  you needed from the run.** Do not accumulate `layerNN-<description>.tar` snapshots — if you
+  need to preserve a specific known-good state, name it something durable (e.g.
+  `layer31_direct_fixed.tar`, matching what's actually referenced in this file) and overwrite it
+  in place rather than incrementing a number and keeping every prior version.
+- **A `.dmp` crash dump is disposable once you've extracted the fault address/module/stack you
+  needed via `VirtualQuery`/`objdump`/gdb and written the finding into `AGENTS.md` or project
+  memory as text.** Delete it after use — a full-process minidump is typically 3-4 GiB on this
+  project, and the actual signal you need from it is a few lines of text.
+- **Only tars actually referenced in this file's "Reproduction commands" section (or an active,
+  in-progress investigation) belong in `.wfgy/xfce-build/`.** Before adding a new one, check
+  whether an existing tar can be reused/overwritten instead of creating another numbered variant.
+- **Periodically (or before ending a long debugging session), run `du -h --max-depth=1 .wfgy`**
+  and clean up anything not currently referenced — this is now a known failure mode for this
+  project specifically, not a one-off.
