@@ -805,6 +805,9 @@ fn default_fs<Platform: ShimPlatform>(
             .mount("/sys/dev/char", |allocator| {
                 litebox::fs::devices::SysDevChar::new(litebox, allocator)
             })
+            .mount("/proc/sys/kernel", |allocator| {
+                litebox::fs::devices::ProcSysKernel::new(litebox, allocator)
+            })
             .build()
             .unwrap(),
     );

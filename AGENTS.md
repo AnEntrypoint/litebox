@@ -493,6 +493,40 @@ possibly more such gaps as `bwrap` continues further into its sandbox setup — 
 iteratively (fix one blocker, rerun, see what's next) rather than trying to anticipate the full
 list up front.
 
+**`/proc/sys/kernel/{overflowuid,overflowgid}` FIX LANDED AND VERIFIED — real progress, but hits
+a genuinely much larger wall immediately behind it.** New `Backend` implementation,
+`litebox::fs::devices::ProcSysKernel`, mirroring `SysDevChar`'s exact structure (same minimal-
+Backend-trait pattern already established for `/sys/dev/char` etc.) but serving real readable
+content (`"65534\n"`) instead of symlinks — mounted at `/proc/sys/kernel` in
+`litebox_shim_linux/src/lib.rs`'s `Composer::builder()` chain. Built and tested: **the
+`overflowuid` read now succeeds — `bwrap` gets past this gap entirely.**
+**Immediately behind it, `bwrap` now fails with `bwrap: Creating new namespace failed: Invalid
+argument`.** Investigated: this is `bwrap` attempting to create the actual Linux namespace
+(`unshare()`/`clone()` with `CLONE_NEWUSER`/`CLONE_NEWNS`/etc.) its whole sandbox model depends
+on. **Confirmed: litebox has ZERO namespace support anywhere** — `unshare` isn't handled as a
+syscall at all (falls through to the generic unhandled-syscall path, `ENOSYS`); `clone()`'s
+flags are passed through generically with no rejection of namespace flags, but nothing in
+litebox's `do_clone` actually creates an isolated mount/user/pid namespace when they're set —
+they're silently accepted and ignored, which does not match what `bwrap` needs (it must be
+detecting the lack of real isolation and failing its own validation, hence its own "Invalid
+argument" message rather than a raw syscall error).
+**This is a fundamentally different scale of fix than `prctl`/`overflowuid` — implementing real
+Linux namespace isolation (mount namespaces, user namespace uid/gid remapping, pid namespaces)
+is a substantial feature, not a quick syscall-gap patch.** `bwrap`/`glycin`'s sandboxed image
+decoding is very likely blocked on this at a fundamental level until real namespace support
+exists in litebox — **this is the practical boundary of what's fixable quickly tonight.**
+**Two real, verified fixes landed as a result of this investigation regardless** (`prctl`
+`PR_SET_NO_NEW_PRIVS`/`PR_GET_NO_NEW_PRIVS`, `/proc/sys/kernel/{overflowuid,overflowgid}`) — both
+correct, general-purpose litebox improvements independent of whether namespace support ever gets
+built, and both needed regardless for any future namespace work. **Recommend pausing further work
+on the `bwrap`/`glycin`/PNG-decode path specifically** — the `xfce4-panel` `SIGABRT` on
+`image-missing.png` will most likely remain until real namespace support lands, which is a much
+larger, separate project. Worth discussing with the user whether that's worth pursuing, or
+whether a different, non-sandboxed image-decoding path should be sought instead (e.g. checking if
+an older Alpine branch or a different distro ships a `gdk-pixbuf` build with classic in-process
+PNG loaders, avoiding the sandboxing requirement entirely — ties back to the standing goal's own
+"if alpine doesn't provide a proper setup, use a distro that does" directive).
+
 **Historical note, kept for the forensic trail below**: earlier in this session a "MET" claim was
 made and retracted after a flawed pixel-count oracle mistook weston's own built-in panel for
 XFCE's; that retraction was correct at the time. This entry supersedes it with a fix-verified,

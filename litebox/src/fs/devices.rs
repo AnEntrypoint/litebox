@@ -2724,3 +2724,288 @@ where
         Err(SetTimesError::ReadOnlyFileSystem)
     }
 }
+
+/// The one `/proc/sys/kernel/{overflowuid,overflowgid}` pair a real sandboxing tool built on
+/// user namespaces needs. Both are standard fixed kernel values (`65534`, the traditional
+/// "nobody" uid/gid, used as the mapped-to id for anything outside a user namespace's uid/gid
+/// range) that `bwrap` (bubblewrap, used by `glycin`'s per-format sandboxed image decoders --
+/// `gdk-pixbuf`'s replacement for its old in-process PNG/JPEG loader `.so` modules) reads while
+/// setting up its sandbox, immediately after successfully calling
+/// `prctl(PR_SET_NO_NEW_PRIVS, 1)`. Without this file, `bwrap` fails outright
+/// (`bwrap: Can't read /proc/sys/kernel/overflowuid: No such file or directory`), which breaks
+/// glycin's sandboxed decode entirely and surfaces as a `Gtk:ERROR` assertion abort in any GTK
+/// app that needs to decode a PNG (confirmed live: this is exactly what was crashing
+/// `xfce4-panel` on its GTK-bundled `image-missing.png` fallback icon).
+///
+/// Deliberately NOT a general procfs/sysfs emulation -- only the exact two files real sandboxing
+/// tools read (mirrors the same "minimal, exact files a real client needs" pattern already used
+/// by [`SysDevChar`]/[`SysClassDrm`] for their respective real-client-driven subtrees). Mounted
+/// at `/proc/sys/kernel`.
+pub struct ProcSysKernel<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    _litebox: LiteBox<Platform>,
+    root_inode: NodeInfo,
+    _alloc: InodeAllocator,
+}
+
+impl<Platform> ProcSysKernel<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    /// Construct a new `ProcSysKernel` backend.
+    #[must_use]
+    pub fn new(litebox: &LiteBox<Platform>, allocator: InodeAllocator) -> Self {
+        let root_inode = allocator.next();
+        Self {
+            _litebox: litebox.clone(),
+            root_inode,
+            _alloc: allocator,
+        }
+    }
+}
+
+/// Directory handle: only the backend's mount root exists (a flat namespace, no
+/// per-entry subdirectories).
+#[derive(Debug, Clone, Copy)]
+pub struct ProcSysKernelDirHandle;
+
+/// Which of the two served files this handle names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcSysKernelEntry {
+    /// `overflowuid` -- the traditional fixed "nobody" uid, `65534`.
+    OverflowUid,
+    /// `overflowgid` -- the traditional fixed "nobody" gid, `65534`.
+    OverflowGid,
+}
+
+impl ProcSysKernelEntry {
+    const ALL: &'static [(&'static str, ProcSysKernelEntry)] = &[
+        ("overflowuid", ProcSysKernelEntry::OverflowUid),
+        ("overflowgid", ProcSysKernelEntry::OverflowGid),
+    ];
+
+    fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.iter().find(|(n, _)| *n == name).map(|(_, e)| *e)
+    }
+
+    /// Real `/proc/sys/kernel/{overflowuid,overflowgid}` content on any Linux kernel: the
+    /// decimal value `65534` followed by a trailing newline, nothing else.
+    fn content(self) -> &'static [u8] {
+        b"65534\n"
+    }
+}
+
+/// Node info for the `overflowuid` entry.
+const PROC_SYS_KERNEL_OVERFLOWUID_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 33,
+    rdev: None,
+};
+
+/// Node info for the `overflowgid` entry.
+const PROC_SYS_KERNEL_OVERFLOWGID_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 34,
+    rdev: None,
+};
+
+/// Owned file handle; identifies which entry this fd is, for `read`.
+#[derive(Debug, Clone, Copy)]
+pub struct ProcSysKernelFileHandle {
+    entry: ProcSysKernelEntry,
+}
+
+impl<Platform> super::backend::private::Sealed for ProcSysKernel<Platform> where
+    Platform: RawSyncPrimitivesProvider + 'static
+{
+}
+
+impl<Platform> BackendHandles for ProcSysKernel<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    type WalkingDirHandle<'a> = ProcSysKernelDirHandle;
+    type FileHandle = ProcSysKernelFileHandle;
+    type DirHandle = ProcSysKernelDirHandle;
+}
+
+impl<Platform> Backend for ProcSysKernel<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    fn root(&self) -> WalkingDirHandle<'_> {
+        WalkingDirHandle::from_typed::<Self>(ProcSysKernelDirHandle)
+    }
+
+    fn walk_directories<'a>(
+        &'a self,
+        from: WalkingDirHandle<'a>,
+        components: &[&str],
+    ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError> {
+        let from = from.into_typed::<Self>();
+        let Some(&component) = components.first() else {
+            return Ok(WalkOutcome {
+                components: vec![],
+                last: WalkingDirHandle::from_typed::<Self>(from),
+                stop_reason: WalkStopReason::CompleteDirectory,
+            });
+        };
+        if ProcSysKernelEntry::from_name(component).is_none() {
+            return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
+        }
+        Ok(WalkOutcome {
+            components: vec![],
+            last: WalkingDirHandle::from_typed::<Self>(from),
+            stop_reason: WalkStopReason::StoppedAtNonDirectory,
+        })
+    }
+
+    fn owned_dir_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        _flags: OFlags,
+    ) -> Result<DirHandle, OpenError> {
+        Ok(DirHandle::from_typed::<Self>(dir.into_typed::<Self>()))
+    }
+
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<WalkingDirHandle<'a>> {
+        Some(WalkingDirHandle::from_typed::<Self>(
+            *dir.get_typed::<Self>(),
+        ))
+    }
+
+    fn open_file_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        name: &str,
+        flags: OFlags,
+    ) -> Result<Permissioned<FileHandle>, OpenError> {
+        let _dir = dir.into_typed::<Self>();
+        let entry = ProcSysKernelEntry::from_name(name)
+            .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+        if flags.contains(OFlags::DIRECTORY) {
+            return Err(OpenError::PathError(PathError::ComponentNotADirectory));
+        }
+        Ok(Permissioned {
+            item: FileHandle::from_typed::<Self>(ProcSysKernelFileHandle { entry }),
+            permissions: PermissionCheck::ByBackend,
+        })
+    }
+
+    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
+        let _handle = handle.into_typed::<Self>();
+        Ok(ProcSysKernelEntry::ALL
+            .iter()
+            .map(|(n, _)| DirEntry {
+                name: String::from(*n),
+                file_type: FileType::RegularFile,
+                ino_info: None,
+            })
+            .collect())
+    }
+
+    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
+        let h = h.get_typed::<Self>();
+        let content = h.entry.content();
+        if offset >= content.len() {
+            return Ok(0);
+        }
+        let remaining = &content[offset..];
+        let n = remaining.len().min(buf.len());
+        buf[..n].copy_from_slice(&remaining[..n]);
+        Ok(n)
+    }
+
+    fn write(&self, _h: &FileHandle, _buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
+        Err(WriteError::NotForWriting)
+    }
+
+    fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {
+        Err(TruncateError::NotForWriting)
+    }
+
+    fn chmod(&self, _h: &FileHandle, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
+    fn seek_behavior(&self, _h: &FileHandle) -> SeekBehavior {
+        SeekBehavior::PositionBased
+    }
+
+    fn file_status(&self, h: &FileHandle) -> Result<FileStatus, FileStatusError> {
+        let h = h.get_typed::<Self>();
+        Ok(FileStatus {
+            file_type: FileType::RegularFile,
+            mode: Mode::RUSR | Mode::RGRP | Mode::ROTH,
+            size: h.entry.content().len(),
+            owner: UserInfo::ROOT,
+            node_info: match h.entry {
+                ProcSysKernelEntry::OverflowUid => PROC_SYS_KERNEL_OVERFLOWUID_NODE_INFO,
+                ProcSysKernelEntry::OverflowGid => PROC_SYS_KERNEL_OVERFLOWGID_NODE_INFO,
+            },
+            blksize: 0x1000,
+            atime: Timestamp::default(),
+            mtime: Timestamp::default(),
+        })
+    }
+
+    fn dir_status(&self, _h: &DirHandle) -> Result<FileStatus, FileStatusError> {
+        Ok(FileStatus {
+            file_type: FileType::Directory,
+            mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+            size: super::DEFAULT_DIRECTORY_SIZE,
+            owner: UserInfo::ROOT,
+            node_info: self.root_inode.clone(),
+            blksize: super::DEFAULT_DIRECTORY_SIZE,
+            atime: Timestamp::default(),
+            mtime: Timestamp::default(),
+        })
+    }
+
+    fn create_file_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _mode: Mode,
+    ) -> Result<FileHandle, OpenError> {
+        Err(OpenError::ReadOnlyFileSystem)
+    }
+
+    fn mkdir_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<DirHandle, MkdirError> {
+        Err(MkdirError::ReadOnlyFileSystem)
+    }
+
+    fn unlink_at(&self, _dir: DirHandle, _name: &str) -> Result<(), UnlinkError> {
+        Err(UnlinkError::ReadOnlyFileSystem)
+    }
+
+    fn rmdir_at(&self, _dir: DirHandle, _name: &str) -> Result<(), RmdirError> {
+        Err(RmdirError::ReadOnlyFileSystem)
+    }
+
+    fn chmod_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
+    fn chown_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _user: Option<u16>,
+        _group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        Err(ChownError::ReadOnlyFileSystem)
+    }
+
+    fn set_times_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _atime: Option<Timestamp>,
+        _mtime: Option<Timestamp>,
+    ) -> Result<(), SetTimesError> {
+        Err(SetTimesError::ReadOnlyFileSystem)
+    }
+}
