@@ -575,18 +575,44 @@ never destroyed, never re-created; no DRM ioctl in the wipe window (197 of 205 o
 own fork is innocent** (the wipe happens during Xwayland forking `xkbcomp`, a COMPLETELY
 DIFFERENT process from the one owning the mapping).
 
-**Reframed conclusion**: a live, correctly-shared 8.29MB section loses its contents to exactly
-zero, during fork activity by a DIFFERENT process than the one that owns the mapping, with no DRM
-operation involved and no destruction of the object.
+**CHECKED AND REFUTED (`advisor/probes/correlate_scanout_wipe.py`, commit `dcae67c8`): the
+memory-destruction theory is dead.** Direct address-range overlap test between every logged
+reclaim/decommit event (19,133 in one run) and each framebuffer's actual mapped address:
+```
+fb_id=1 mapped 0x76840000-0x77029000, wipe window t=8.52..23.61  -> ZERO overlapping destroys
+fb_id=2 mapped 0x104360000-0x104b49000, wipe window t=23.01..24.04 -> ZERO overlapping destroys
+```
+**Nothing decommits or unmaps the scanout buffers.** Do NOT re-investigate `VirtualFree`/
+`MEM_DECOMMIT`/reclaim paths for this bug — that whole line of investigation (this section's
+earlier framing) is closed. Also refuted en route: an apparent fb-id-to-handle "recycling"
+pattern (fb=2 seemingly moving between several handles) was a log-pairing artifact; matching by
+ADDRESS instead shows the mapping is completely stable (`fb_id=1`→handle 508 set once at t=7.55,
+`fb_id=2`→handle 512 set once at t=6.74, neither ever changes).
 
-**Decisive check, not yet done — this is a Windows platform-level lifetime question**: log every
-`VirtualFree`/`MEM_DECOMMIT`/`MEM_RESET`/`UnmapViewOfFileEx` call with its address range, then
-check whether any of them covers the framebuffer's mapped address during the wipe window
-(t=20.8-22.1). Exactly-zero contents on a section that was never destroyed is the classic
-signature of pages being decommitted and recommitted — decommit is the one operation that
-produces this without touching DRM state at all. Working theory: a fork-path teardown or
-relocation-walk touches a range that happens to include the shared scanout mapping, even though
-that mapping belongs to a DIFFERENT process than the one forking.
+**What survives measurement, the honest state of the defect**: same two shared objects (508,
+512) for the whole run, created once, never destroyed. VMA correctly shared (`flags=123`,
+`has_handle=true`). fb→handle mapping stable. NO destroy event touches either buffer. weston
+(pid 13) and weston-desktop-shell (pid 15) both alive to the end, zero exits. The system stays
+busy afterward (7,297 socket ops after t=25). **And yet contents still go from 6,221,880
+non-zero bytes to EXACTLY zero.** Every mechanism that could destroy the memory is now excluded.
+
+**REFRAMED (not yet confirmed): this may not be a memory bug at all.** Points instead toward
+"weston simply stopped DRAWING into the buffer, and what's observed is the buffer's
+original/never-written zero state persisting" — an exactly-zero signature fits a never-written
+shared section exactly as well as a wiped one. **Decisive next measurement, not memory-related**:
+sample the buffer at two points per flip and check whether ANY byte changed since the previous
+flip. If unchanged flip after flip once the "wipe" starts, weston is not drawing — the problem is
+on the Wayland/compositing side, not memory.
+
+**Leading alternative hypothesis**: weston keeps flipping and stays alive, but a compositor with
+no visible surfaces legitimately renders black. Since Xwayland takes the display right around
+this time and XFCE's clients are X clients, **"Xwayland has the output but its clients' content
+never reaches weston's scene graph" would explain every single observation with ZERO memory
+defect involved** — possibly a Wayland-protocol/scene-graph/surface-commit issue on the
+Xwayland↔weston boundary, not necessarily even a litebox bug in the traditional sense (could be
+correct behavior if a client's surface never actually gets committed/mapped properly). Next step:
+check weston's own surface/scene-graph state directly — does it have a valid, committed surface
+from Xwayland after the "wipe," or none at all.
 
 ## Reproduction commands
 
