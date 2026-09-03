@@ -533,6 +533,38 @@ during heavy protection churn while Xwayland is starting/forking.
 handle, then grep for the dumb buffer's specific handle in the t=19.7-20.3 window. If that
 handle's underlying object gets recreated there, that's the bug, found directly.
 
+**FURTHER NARROWED (not yet confirmed — needs instrumentation, do not trust a code read here)**:
+measured facts: (1) the scanout buffers are created ONCE at t=5.98 (2×`DrmModeCreateDumb` +
+2×`DrmModeMapDumb`), no `DestroyDumb`/`RmFB`/re-create for the whole run — kills the
+"object recreated" theory outright. (2) The wipe window (t=19.68→20.27) contains ZERO DRM
+ioctls, only 205 memory ops, 197 of them `caller=fork_duplicate` — the fork is Xwayland forking
+`xkbcomp` at t=19.37. (3) Some `fork_duplicate` ranges are framebuffer-shaped (82,944,000 bytes =
+exactly 10×1920×1080×4). (4) **Across the ENTIRE run, 9,304 `diag-protect-mapping` entries report
+`vma_shared=false` — not one `vma_shared=true` anywhere** (`vma_shared` =
+`vma.shared_handle.is_some()`).
+
+**Lead**: if weston's DRM-dumb-buffer VMA has no `shared_handle` attached, `Vmem::duplicate` at
+fork takes the non-shared branch and EAGERLY COPIES the region into fresh pages instead of
+re-mapping the same handle — fresh pages read as exactly zero, matching the measured signature
+precisely, and explains the timing (wipe only ever happens at a fork).
+
+**Caveat, stated honestly, do not skip verifying this**: the forking thread at the wipe moment is
+Xwayland's (weston is pid 13, Xwayland's fork is a different thread), so the absent
+`vma_shared=true` might just mean the diagnostic never fires on WESTON's own mapping at all — not
+that the mapping genuinely lacks a `shared_handle`. Zero logging currently exists on
+`map_shared_memory`/shared-handle attachment to settle this either way.
+
+**Decisive check, not yet done — REQUIRES LIVE INSTRUMENTATION, a code read is not sufficient**:
+log VMA flags and `shared_handle` presence at the moment the DRM dumb buffer is mmap'd by the
+guest (`try_dri_dumb_buffer_mmap`/`map_existing_shared_pages` in
+`litebox_shim_linux/src/syscalls/mm.rs`, ~line 615-655). `map_existing_shared_pages` calls
+`VmArea::new_shared(vm_flags, false, shared_handle)` with `may_flags_for_mapping(true, false)`,
+which DOES include `VM_SHARED` on a static read — but if the live behavior is broken, it's broken
+somewhere not visible from reading the code, hence the need to actually log and observe it. Two
+outcomes: `shared_handle` present + `VM_SHARED` set → this lead is wrong, wipe is something else.
+`shared_handle` absent or `VM_SHARED` unset → that's the bug; fix is attaching the handle
+correctly so fork re-maps instead of eagerly copying.
+
 ## Reproduction commands
 
 Full XFCE launch — **use `advisor/probes/run_xfce_staged.sh` as the launch script, NOT any
