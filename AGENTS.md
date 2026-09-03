@@ -433,6 +433,36 @@ no result, and GTK's `g_error()` assertion path fires exactly as observed.** Tes
 `glycin-image-rs` directly next, as the most surgical possible reproduction (no XFCE/GTK stack
 needed at all).
 
+**CONFIRMED — EXACT ROOT CAUSE FOUND, PRECISE AND FIXABLE.** New tool
+(`advisor/probes/bwrap_glycin_probe.sh`, no GUI/XFCE needed, runs in under 1 second) isolates it
+completely:
+```
+bwrap --version                                     -> rc=0, works fine
+bwrap --ro-bind / / --dev /dev echo bwrap-works      -> rc=1, FAILS
+
+Actual error printed by bwrap itself:
+  bwrap: prctl(PR_SET_NO_NEW_PRIVS) failed: Invalid argument
+```
+**`bwrap`'s sandbox setup calls `prctl(PR_SET_NO_NEW_PRIVS, ...)` — a standard Linux security
+hardening syscall — and litebox's `prctl` emulation returns `EINVAL` for it, so `bwrap` aborts
+immediately before it can even attempt namespace/mount setup.** This is a genuine litebox
+`prctl` gap, NOT a glycin/gdk-pixbuf/GTK issue, and NOT a packaging gap in the layer at all — the
+architecture (glycin, bwrap, all binaries) is correctly present and would work if this one
+`prctl` operation succeeded. **This single missing/broken `prctl` subcommand is very likely the
+common root cause of BOTH**: (1) `xfce4-panel`'s `SIGABRT` (any GTK PNG decode goes through
+glycin → bwrap → this failure → glycin never runs → gdk-pixbuf gets no image data → GTK's
+assertion fires), and quite plausibly (2) contributes to advisor-db's deterministic `/bin/sh`
+crashes and general run-to-run instability, if any other sandboxing/security-hardening tool in the
+stack (or `bwrap` itself, invoked elsewhere) hits the same `prctl` gap unpredictably depending on
+what's running concurrently.
+**Fix location**: find `prctl`'s syscall implementation in `litebox_shim_linux` (likely
+`litebox_shim_linux/src/syscalls/`) and add/correct handling for `PR_SET_NO_NEW_PRIVS` — this is a
+simple, well-understood Linux operation (marks the calling process so it and its children can
+never gain more privileges via `execve`, used specifically to make sandboxing safe) that should be
+straightforward to emulate correctly (litebox doesn't have real privilege escalation to prevent
+anyway, so this can very likely just succeed unconditionally, matching what a container/sandboxed
+environment typically does for this call). **Investigating the exact fix now.**
+
 **Historical note, kept for the forensic trail below**: earlier in this session a "MET" claim was
 made and retracted after a flawed pixel-count oracle mistook weston's own built-in panel for
 XFCE's; that retraction was correct at the time. This entry supersedes it with a fix-verified,
