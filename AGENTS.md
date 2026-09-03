@@ -32,8 +32,21 @@ should not be treated as corroboration. **Next step, in progress (advisor-db)**:
 longer tail after the panel starts, and force periodic capture so "idle but alive" is
 distinguishable from "never drew" — if frames with content below y=31 appear, XFCE is drawing; if
 flips genuinely never occur while all six components are alive and settled, (a) is confirmed and
-becomes a concrete question (why does a running `xfdesktop` generate zero damage). **Until that
-result lands, treat "does XFCE actually render its own content" as OPEN, not answered either way.**
+becomes a concrete question (why does a running `xfdesktop` generate zero damage). **Still OPEN,
+not answered either way — but the first properly-timestamp-checked data point leans toward "not
+drawing" (not conclusive, see caveats below):** a settle-window rerun captured two frames
+(t=55.41, t=55.53) 10.8s after `xfdesktop` started (t=44.60) and *before* `xfce4-panel` had even
+started (t=55.75) — decoded content was still only weston-desktop-shell's own 32px bar (~3.0%
+coverage, background `rgb(68,34,0)` at 97% of sampled pixels), nothing from `xfdesktop` visible.
+All six faults in that run were the optional `at-spi-bus-launcher` helper — no real XFCE component
+died; `xfdesktop` was alive and healthy for those 11s, it simply hadn't produced visible output
+yet. **Not treated as conclusive** (correctly, per advisor): 11s is short given components take
+tens of seconds to initialize in this environment, `xfce4-panel` hadn't even started yet, and the
+run ended at t=61.96 before reaching the intended 120s settle window — the long-tail test hasn't
+actually happened yet. Component spacing is consistent across runs (~10-11s apart: `xfdesktop` at
+t=44.60/t=48.67 across two runs, `xfce4-panel` at t=55.75/t=60.06), and the whole stack needs ~60s
+before the last component even starts — **a longer-budget rerun that actually reaches the settle
+window is in progress; treat this as leaning, not decided, until that lands.**
 
 **What IS genuinely fixed and verified (real, durable progress, not undersold)**: all six
 components (`weston`/`xfconfd`/`xfwm4`/`xfsettingsd`/`xfdesktop`/`xfce4-panel`) now start and stay
