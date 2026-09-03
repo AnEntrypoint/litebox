@@ -352,7 +352,25 @@ tracing of what each client does between its last X write and going silent, as a
 **Reusable tool**: `advisor/probes/xwire_probe.c` (4KB, freestanding, no Xlib, decodes X error
 codes with major opcode) is now a standing known-good baseline for "is X itself working right
 now" — use it first on any future X-related question in this project rather than re-deriving from
-inference.
+inference. **Reproduced independently on a second, fresh weston/Xwayland run**: identical result
+(`XWIRE_SETUP_STATUS=1`, `root=98 size=1920x1080 visual=35`, `CreateWindow`/`MapWindow` both
+error-free, frame coverage 46.3% with content bands at both y=0..28 and y=520..984) — "a correct
+X client can create, map and display a window here" is now confirmed twice, not a one-off; the
+stack below GTK is genuinely, repeatably good.
+
+**Bug found and fixed in the probe itself (`744009f0`) — worth knowing before trusting any of its
+output before this fix.** An intermediate run reported `XWIRE_SETUP_STATUS=1 bytes=8` followed by
+nonsense event types and zeroed error codes, briefly looking like a real X fault. It wasn't: the
+probe read the connection setup reply with a single `read()` call, and a socket read is not
+guaranteed to return a whole message — when only 8 bytes arrived, it parsed root window/visual out
+of an unfilled buffer and produced garbage ids, cascading into garbage results. **Fixed**: now
+reads the 8-byte header, takes the declared remaining length from bytes 6-7, and loops until that
+much has arrived, reporting `XWIRE_SETUP_INCOMPLETE` instead of silently continuing on partial
+data — verified working (the reproduction run above parsed `root=98` correctly). **General lesson,
+joins the session's other measurement pitfalls: never assume one `read()` returns a whole protocol
+message** — this is the second short-read-style assumption to bite an investigation tonight. Since
+this probe is now a shared cross-session baseline, make sure any copy in use is post-`744009f0` —
+a diagnostic that can silently produce plausible nonsense is worse than no diagnostic at all.
 
 **Layer gap, worth fixing regardless of how this investigation lands — has quietly shaped the
 whole session's guesswork problem**: the guest layer contains **zero X query tools** — no
