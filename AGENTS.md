@@ -1972,6 +1972,25 @@ Bare-rootfs fork-bug repro (fast, no display stack): see the regression oracle a
 
 ## Useful techniques discovered this session
 
+- **CRITICAL, applies to every run this file recommends: the Bash tool caps a command at roughly
+  two minutes EVEN WITH `run_in_background`.** Any litebox run needing longer (all full XFCE
+  launches) can get silently cut off mid-run — confirmed: two attempts truncated at t=18 and t=21
+  with ZERO faults and no final marker, which is indistinguishable at a glance from a genuine
+  hang/failure. `timeout N` INSIDE the command does not help — the cap is on the tool invocation,
+  not the command. **Diagnostic rule: a run that stops mid-log with zero faults and missing stage
+  markers was CUT OFF, not broken — check the last log timestamp against the script's expected
+  duration before investigating it as a bug.** **The form that actually survives**: a fully
+  detached subshell —
+  ```
+  (LITEBOX_LOG=error LITEBOX_DUMP_FRAMES=1 ./target/release/litebox_runner_...exe \
+      --initial-files <tar> bin/sh ./script.sh > /path/run.log 2>&1 &) ; sleep 5
+  ```
+  — then poll the log file for an end marker separately. The parenthesized subshell with the
+  trailing `&` survives the tool's timeout; a bare `run_in_background` call on the runner directly
+  does not. **Retroactive concern**: several of this session's "the component never got there"
+  observations may have this as their actual cause rather than a real stall — treat any earlier
+  finding that ended abruptly with no explicit end-of-run marker as suspect until re-verified with
+  the detached-subshell form.
 - **A stuck/hung litebox run holds the runner binary's exe file open, and `cargo build` then
   fails with "Access is denied" on that exe.** This looks like a toolchain problem but isn't —
   find and kill the leftover `litebox_runner*` process (Task Manager or
