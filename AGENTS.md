@@ -371,6 +371,24 @@ explains the `xfce4-panel` `SIGABRT` seen in both sessions' traces** — any ico
 the panel (or any other GTK app) that needs to decode a PNG and hits the fallback path will trip
 the same abort. Investigating how to source/build the loader now.
 
+**CORRECTED, exact mechanism refined after downloading the real Alpine package to compare —
+simpler fix than first thought, same family as the `gschemas.compiled` bug.** Downloaded the
+matching Alpine `gdk-pixbuf` package (`v3.20`, `x86_64`) directly from
+`dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/gdk-pixbuf-2.42.12-r0.apk` to compare — **it
+ALSO has no PNG loader module**: modern `gdk-pixbuf` builds PNG support directly INTO the core
+library (`libgdk_pixbuf-2.0.so`), not as a separate loadable plugin like JPEG/TIFF/etc. So the
+missing `libpixbufloader-png.so` theory was wrong. **The real bug: `loaders.cache` — the file that
+tells `gdk-pixbuf` which loader (including its own built-in PNG support) handles which format —
+does not exist ANYWHERE in this layer at all** (confirmed: `tar tf layer31_direct_fixed.tar | grep
+loaders.cache` returns nothing). Without it, `gdk-pixbuf` has no way to resolve ANY format,
+including its own built-in PNG support, via the normal lookup path. **Exactly the same bug class as
+the `gschemas.compiled` fix from earlier tonight — a compiled cache file the layer build never
+generated.** The tool to build it, `gdk-pixbuf-query-loaders`, IS already present in the layer at
+`/usr/bin/gdk-pixbuf-query-loaders`. **Fix**: run
+`gdk-pixbuf-query-loaders --update-cache` (or redirect its stdout to
+`/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache`, matching the standard path) once at launch
+time, same pattern as the `glib-compile-schemas` fix — no new files need sourcing from anywhere.
+
 **Historical note, kept for the forensic trail below**: earlier in this session a "MET" claim was
 made and retracted after a flawed pixel-count oracle mistook weston's own built-in panel for
 XFCE's; that retraction was correct at the time. This entry supersedes it with a fix-verified,
