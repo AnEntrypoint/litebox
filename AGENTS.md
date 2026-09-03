@@ -194,13 +194,23 @@ the LAST request each client sends before going idle, and is it a round-trip who
 arrives?** A client blocked on a missing reply would show exactly this profile — busy, then
 silent forever, connection healthy throughout.
 
-**Two more missing tools found, compounding the earlier `xdpyinfo`/`xrandr` gap**: `/usr/bin/timeout`
-is ALSO absent from the layer — meaning any script-level timeout guard (e.g. a `timeout 25 ...`
-wrapper) has been **silently not applying** all session. Anything relying on `timeout` in a probe
-script has not been doing what it appeared to; audit any prior result that assumed a timeout guard
-actually fired. Between no `timeout`, no `xdpyinfo`, no `xrandr`, and GTK built without debug
-support, **the layer is genuinely under-equipped for diagnosis** — this has cost real
-investigation time this session and is worth fixing as a standing item, not just a one-off.
+**RETRACTED — "`/usr/bin/timeout` is missing from the layer" was WRONG, do not act on it or audit
+prior results because of it.** advisor-db's own follow-up found the claim was based on
+over-reading a negative: (1) no "not found" shell error appears anywhere in the actual run logs —
+if `timeout` had genuinely failed to resolve, the shell would have said so; (2) the "duplicate
+binaries" observation that fed the original inference was ordinary `$PATH` search trying
+`/bin/xfce4-display-settings`, `/usr/bin/xfce4-display-settings`,
+`/usr/local/bin/xfce4-display-settings` in turn, not evidence of anything missing, and the same
+misreading pattern produced the `timeout` claim from two `ls` invocations; (3) the specific
+`PROBE_REAL_RC` line that never printed simply never printed because the run ended while that
+command was still executing, not because it was skipped. **No prior result relied on a
+silently-bypassed timeout guard; no audit of earlier findings is needed because of this.** What
+remains true and unaffected by this retraction: the layer genuinely has no `xdpyinfo`/`xrandr`/
+`xwininfo`/`xprop`/`xlsclients` (checked individually and via `find`), GTK is genuinely built
+without `G_ENABLE_DEBUG`, `xfce4-display-settings` run for real genuinely doesn't complete, its
+X round-trips genuinely succeed 60.00s apart matching the idle heartbeat, and every XFCE client is
+genuinely in that same connected-but-never-finishing state — the screen-usable conclusion and the
+sharpened decode question both stand unchanged.
 
 **Layer gap, worth fixing regardless of how this investigation lands — has quietly shaped the
 whole session's guesswork problem**: the guest layer contains **zero X query tools** — no
