@@ -1262,14 +1262,39 @@ frame callback never fires). **A surface with a valid buffer but no role, never 
 weston's scene graph because no XWM ever ran, explains all of it at once and requires zero litebox
 code changes.**
 
-**Fix is being tested now** (advisor-db, in parallel with a63e8ca59285f5871 dispatched here):
-found `xwayland.so` present at `/usr/lib/libweston-14/xwayland.so` in the layer already; the
-layer's `/etc/xdg/weston/weston.ini` had no `xwayland` setting at all. Added `xwayland=true` under
-`[core]`, wrote a launch script that does NOT spawn `Xwayland` manually, lets weston start and
-manage it internally, discovers whichever display socket weston actually creates instead of
-hardcoding `:1`, then runs a real client (`xfce4-appfinder`) against it. **If frames go non-zero,
-this closes the standing goal with a configuration fix, no litebox code change required — result
-pending.**
+**FIX CONFIRMED. ROOT CAUSE WAS OUR LAUNCH CONFIGURATION, NOT LITEBOX. THE BLACKOUT IS GONE.**
+advisor-db tested it directly: added `xwayland=true` under `[core]` in the layer's
+`/etc/xdg/weston/weston.ini` (`xwayland.so` was already present at
+`/usr/lib/libweston-14/xwayland.so`), stopped spawning `Xwayland` manually, let weston start and
+manage it itself, and discovered whichever display socket weston actually created (it picked `:0`
+on its own — our old hardcoded `:1` was ALSO wrong) instead of hardcoding one. weston's own log
+now shows the piece that was always missing:
+```
+[18:10:38.764] Loading module '/usr/lib/libweston-14/xwayland.so'
+[18:10:39.080] Registered plugin API 'weston_xwayland_v3' of size 32
+[18:10:39.080] Registered plugin API 'weston_xwayland_surface_v2' of size 24
+[18:10:50.253] launching '/usr/bin/Xwayland'
+[18:11:05.429] created wm, root 98
+```
+`created wm, root 98` is the XWM attach that was never happening before. Result:
+```
+BEFORE (manual Xwayland spawn): 19-23 frames, then px=0 permanently, wipe at t=16-23
+NOW (weston-managed Xwayland):  24 frames, run ENDS on px=2,073,597, NO WIPE AT ALL
+```
+First time all session the framebuffer still has real content at the end of a run. Combined with
+the memory-path exoneration above (11/11 cross-view agree=true, including the surface pools),
+this is a complete, closed explanation requiring **zero litebox code changes**: spawning Xwayland
+as a bare separate process gives an X server with no window manager attached, so X11 client
+surfaces get buffers with real pixels written into them but are never mapped into weston's scene
+graph, so they never composite.
+
+**NEXT STEP (in progress)**: run the full XFCE stack (not just one test client) this way — take
+`advisor/probes/run_xfce_staged.sh`, remove its manual Xwayland launch, set `xwayland=true`, point
+all XFCE components (xfconfd/xfwm4/xfsettingsd/xfdesktop/xfce4-panel) at weston's own display
+instead of a hardcoded `:1`. Since every XFCE component already launches and stays alive (per
+earlier findings in this doc) and the compositing path is now confirmed working, this is expected
+to be the run that finally satisfies the standing success oracle (`non_black_pixels > 0` in the
+FINAL frames of a full XFCE session, not just one test client).
 
 ## Reproduction commands
 
