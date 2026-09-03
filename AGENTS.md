@@ -125,10 +125,54 @@ picks it up next**: `cargo test -p litebox_shim_linux` currently fails to even c
 `epoll.rs`'s `wait` signature has 5 params, several test call sites still pass 3. Confirmed via
 `git stash` that this predates all of tonight's changes. May block CI or another agent's work.
 **All five fix/diag commits from tonight, on `main`**: `f824eb99`, `69ea9470` (advisor-db),
-`dc50f126`, `9504adbe`, `a0689cb6`. **Session complete: standing goal (working XFCE desktop)
-confirmed met, plus the two largest post-fix observability gaps (`setitimer` fixed, `inotify`
-correctly ruled out as non-load-bearing) resolved on top of it.** Both agents at a good stopping
-point.
+`dc50f126`, `9504adbe`, `a0689cb6`.
+
+**REOPENED — do not record the goal as fully, cleanly met yet. A real regression survives the
+fix: the desktop background is lost mid-run and never recovers, and a naive pixel-count oracle
+hides it.** advisor-db ran two follow-up checks after the "session complete" note above:
+**(1) Headless (`--gui` omitted entirely) is independently verified working** — 33 frames dumped,
+`TEST_DONE`, clean run, `decode_frame.py` shows content covering 1080/1080 rows. Confirms the
+runner's dump-only DRM flip callback (registered directly when `--gui` is absent,
+`lib.rs:454`) never depends on the presenter thread — frame capture doesn't require a window.
+Both headed (this session's own live run) and headless are now proven.
+**(2) THE REGRESSION.** Per-frame `non_black_pixels` across a full run:
+```
+frames ~22-26:  2,073,597   <- full desktop, the number used as "success" all session
+frames  27-30:     92,036   <- drops 95.6%, and NEVER RECOVERS
+frames  31-33:     92,661
+```
+Decoded frame 32 visually: the panel with its clock (top-right) and desktop icons (left) survive;
+**the filled desktop background is gone — most of the screen goes black and stays that way for the
+rest of the run.** advisor-db's clock-liveness check (`diff_frames` between 27 and 32) shows a
+small localized update at x=60..133, y=109..227 — **the session is genuinely still running, not
+frozen** (liveness is real) — **but liveness and correct rendering are separate claims, and only
+the first is currently established.** `2,073,597` is exactly the number that's been treated as the
+success figure all session; a check that samples the peak, or only counts non-black pixels without
+checking the FINAL state specifically, would report success on a desktop that's actually degraded
+by the end. **This may be the same blanking behavior from project memory** (`project_advisor_findings_xfce`):
+"renders a COMPLETE desktop reproducibly then blanks after ~25 frames via a protocol event on a
+HEALTHY connection" — frame 27 is suspiciously close to ~25. If so, this is a known-shaped bug
+that PREDATES tonight's fixes and was never actually resolved — the `do_kill` fix got the desktop
+to genuinely launch and stay live, which is real and major, but this specific symptom looks
+untouched by it.
+**Proposed next step (advisor-db offered, not yet started — assign to avoid duplication)**:
+instrument the DRM flip path to record what changes between frame 26 and 27 specifically — whether
+the scanout buffer swaps to a different `fb_id`, gets re-allocated, or is wiped in place. Existing
+`diag-drm-flip`/`diag-drm-scanout-bytes` gating in `syscalls/drm.rs` already logs `fb_id`/`crtc_id`
+per flip — a `LITEBOX_DRM_TRACE=1` run diffed around that boundary should name it directly. This
+distinguishes "compositor legitimately painted black" from "scanout memory got reclaimed
+underneath it" — `advisor/probes/correlate_scanout_wipe.py` already exists to cross-reference
+scanout mappings against `diag-reclaim`/`diag-decommit` ranges for exactly this.
+**This directly matches what the user observed live in this session's own run tonight**: a black
+background with only icons/panel visible, no filled desktop — consistent with landing in the
+post-blank state described above, not a config-loading problem as first suspected. Worth
+re-examining the earlier "panel only has 2 of 18 configured plugins" finding through this lens too
+— it may be a symptom of the same underlying blanking/reclaim issue rather than a `migrate`/config
+bug in isolation.
+**Standing goal status, corrected**: XFCE launches, all core components stay alive, and the
+session is genuinely live (not frozen) — real, major, verified progress from tonight's `do_kill`
+fix. But the desktop's OWN rendering degrades significantly partway through every observed run and
+never recovers, which falls short of "renders and stays up ... as expected." **Not fully closed.**
 
 **Historical note, kept for the forensic trail below**: earlier in this session a "MET" claim was
 made and retracted after a flawed pixel-count oracle mistook weston's own built-in panel for
