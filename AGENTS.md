@@ -48,6 +48,28 @@ t=44.60/t=48.67 across two runs, `xfce4-panel` at t=55.75/t=60.06), and the whol
 before the last component even starts — **a longer-budget rerun that actually reaches the settle
 window is in progress; treat this as leaning, not decided, until that lands.**
 
+**STRONG CANDIDATE EXPLANATION FOUND (advisor-db), plausible and cheap to confirm/refute — NOT
+YET ASSERTED, verification pending**: **the layer may simply have no desktop/panel configuration
+to draw.** `/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/` in the layer contains only
+`xfce4-keyboard-shortcuts.xml`, `xfce4-session.xml`, `xsettings.xml` — **`xfce4-desktop.xml` and
+`xfce4-panel.xml` are both MISSING** (a `find` across the whole layer returns nothing for either).
+Panel plugin binaries ARE present (`/usr/share/xfce4/panel/plugins/`: actions, applicationsmenu,
+clock, directorymenu, launcher, pager) but nothing tells the panel which plugins to instantiate or
+where, and nothing tells `xfdesktop` what backdrop to draw or whether to show icons. **An
+unconfigured `xfce4-panel` has no plugins to show; an unconfigured `xfdesktop` may legitimately
+draw nothing — both alive, healthy, zero errors, empty screen. This matches every observation so
+far exactly**, and if true would put the remaining gap in the same family as the missing-SONAME
+packaging bug from earlier this session (a layer-content gap, not a litebox defect). **Not yet
+confirmed**: `xfce4-panel`'s own `/usr/lib/xfce4/panel/migrate` step DID run in an earlier
+observed run, and migrate normally creates a default layout when none exists — so either it wrote
+a config that hasn't been found yet, or it failed silently.
+**Two cheap tests to settle it, advisor-db running (1) next**:
+1. After a run, list `$HOME/.config/xfce4/xfconf/xfce-perchannel-xml/` from inside the guest. Files
+   present = panel/desktop had a layout and chose to draw nothing (a real bug). Absent = nothing to
+   draw, packaging gap (not a litebox bug).
+2. Ship a minimal `xfce4-panel.xml` (one or two plugins) and `xfce4-desktop.xml` (a backdrop) into
+   the layer, rerun. Content appearing confirms the diagnosis; fix is layer content, not code.
+
 **What IS genuinely fixed and verified (real, durable progress, not undersold)**: all six
 components (`weston`/`xfconfd`/`xfwm4`/`xfsettingsd`/`xfdesktop`/`xfce4-panel`) now start and stay
 alive for the full run, where they previously exited with failures; the D-Bus session bus and
