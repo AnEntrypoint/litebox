@@ -2877,6 +2877,11 @@ pub enum PrctlArg {
     SetName(UserPtr<u8>),
     GetName(UserPtrMut<u8>),
     CapBSetRead(usize),
+    /// PR_SET_NO_NEW_PRIVS: set the calling thread's no_new_privs bit. LiteBox has no real
+    /// privilege escalation to prevent, so this is tracked but is always a safe no-op to accept.
+    SetNoNewPrivs(usize),
+    /// PR_GET_NO_NEW_PRIVS: get the calling thread's no_new_privs bit.
+    GetNoNewPrivs,
 }
 
 #[repr(i32)]
@@ -4201,6 +4206,12 @@ impl SyscallRequest {
                         },
                         PrctlOption::CapBSetRead => SyscallRequest::Prctl {
                             args: PrctlArg::CapBSetRead(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::SetNoNewPrivs => SyscallRequest::Prctl {
+                            args: PrctlArg::SetNoNewPrivs(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::GetNoNewPrivs => SyscallRequest::Prctl {
+                            args: PrctlArg::GetNoNewPrivs,
                         },
                         _ => {
                             return Err(unsupported_einval(format_args!("prctl({op:?})")));

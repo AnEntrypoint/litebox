@@ -1054,6 +1054,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // Note we don't support capabilities in LiteBox, so we always return 0.
                 Ok(0)
             }
+            PrctlArg::SetNoNewPrivs(value) => {
+                // PR_SET_NO_NEW_PRIVS: once set, the calling thread and its descendants can
+                // never gain more privileges via execve (used by sandboxing tools like bwrap
+                // before entering a mount/user namespace). LiteBox has no real privilege
+                // escalation path (no setuid execution, no real capabilities) for this to
+                // guard against, so accepting it unconditionally is safe. The only real
+                // constraint from the kernel's prctl(2) man page is that `value` must be 1;
+                // anything else is EINVAL.
+                if value != 1 {
+                    return Err(Errno::EINVAL);
+                }
+                Ok(0)
+            }
+            // PR_GET_NO_NEW_PRIVS: report the bit as always set. Nothing in LiteBox actually
+            // tracks per-thread no_new_privs state (see SetNoNewPrivs above), and sandboxing
+            // tools only use this to confirm the bit stuck, so reporting 1 unconditionally is
+            // consistent with SetNoNewPrivs always succeeding.
+            PrctlArg::GetNoNewPrivs => Ok(1),
             _ => unimplemented!(),
         }
     }

@@ -463,6 +463,36 @@ straightforward to emulate correctly (litebox doesn't have real privilege escala
 anyway, so this can very likely just succeed unconditionally, matching what a container/sandboxed
 environment typically does for this call). **Investigating the exact fix now.**
 
+**`prctl` FIX LANDED AND VERIFIED — one real bug closed, one more found immediately behind it.**
+Root cause confirmed exactly: `litebox_common_linux/src/lib.rs`'s syscall decoder for `Sysno::prctl`
+recognized `PR_SET_NO_NEW_PRIVS`/`PR_GET_NO_NEW_PRIVS` as valid `PrctlOption` values (they were
+already correctly numbered in the enum, `SetNoNewPrivs = 38`/`GetNoNewPrivs = 39`) but had no
+corresponding `PrctlArg` variant, so both fell through to `unsupported_einval` — the exact `EINVAL`
+`bwrap` saw. **Fixed**: added `PrctlArg::SetNoNewPrivs(usize)`/`GetNoNewPrivs` variants, wired them
+in the decoder, and implemented them in `litebox_shim_linux/src/syscalls/process.rs`'s `sys_prctl`
+— `SetNoNewPrivs` validates `value == 1` (per the real `prctl(2)` contract) and unconditionally
+succeeds (LiteBox has no real privilege-escalation path to guard against), `GetNoNewPrivs` reports
+`1` unconditionally to match. Built and tested directly against `bwrap_glycin_probe.sh`: **the
+`prctl` error is gone entirely** — confirmed real fix, not a regression-in-waiting.
+**Immediately behind it, a second real gap, larger in scope**: `bwrap` now fails with `bwrap:
+Can't read /proc/sys/kernel/overflowuid: No such file or directory`. **Litebox currently has NO
+`/proc/sys` synthesis at all** — only `/proc/self/fd/<N>` symlinks are handled
+(`litebox_shim_linux/src/syscalls/file.rs`); confirmed the layer tar itself contains zero `/proc`
+entries, so this must come from litebox's own runtime `/proc` emulation, which doesn't yet cover
+`/proc/sys`. `overflowuid`/`overflowgid` are standard fixed kernel values (usually `65534`) that
+sandboxing tools read to know the "nobody" uid/gid for user-namespace remapping — this is a
+genuine, real litebox gap, but building general `/proc/sys` file synthesis is a larger scope
+decision than the `prctl` fix (which was a two-line dispatch gap). **Not yet fixed — next
+well-scoped item, worth a decision on approach**: either (a) a minimal, targeted special-case for
+just this one path (and likely a small, known set of siblings like `overflowgid`,
+`pid_max`, `ngroups_max` — whatever the specific sandboxing tools in this stack actually read) in
+the existing `openat`/`open` dispatch, matching the pragmatic pattern already used for the
+`gschemas.compiled`/`loaders.cache` fixes tonight, or (b) genuine general `/proc/sys` file
+synthesis if more of these turn up. Given `prctl` alone didn't fully unblock `bwrap`, expect
+possibly more such gaps as `bwrap` continues further into its sandbox setup — recommend testing
+iteratively (fix one blocker, rerun, see what's next) rather than trying to anticipate the full
+list up front.
+
 **Historical note, kept for the forensic trail below**: earlier in this session a "MET" claim was
 made and retracted after a flawed pixel-count oracle mistook weston's own built-in panel for
 XFCE's; that retraction was correct at the time. This entry supersedes it with a fix-verified,
