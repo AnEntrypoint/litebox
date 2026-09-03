@@ -11,24 +11,29 @@ needs the detailed forensic trail — but start here, not there.
 Get XFCE actually rendering and staying up under litebox on a Windows host (no WSL, no
 hypervisor — see `feedback_no_wsl_or_hypervisor` in project memory).
 
-**NOT YET MET — CORRECTED, do not trust the earlier "MET" claim below in this file's history.**
-The process-launch and compositing blockers ARE fixed (see below) and are real, verified progress
-— but decoding an actual final frame (advisor-db, `.bmp` from `LITEBOX_DUMP_FRAMES=1`, frame 23 of
-24, 1920x1080) shows: **a 32px-tall top bar with an icon (top-left, x=12..31) and a
-clock/status area (top-right, x=1753..1904), and EVERYTHING below y=31 is exactly one flat color
-(`rgb(68,34,0)`)** — sampling every 4th row, only 8 of 270 rows contain any non-background pixel,
-all within that top bar. **`non_black_pixels=2,073,597` means the background isn't black — it does
-NOT mean a populated desktop.** The pixel-count oracle cannot distinguish "desktop renders" from
-"background fills the screen"; this was a real gap in the standing success oracle, now closed by
-requiring an actual frame decode, not just a pixel count, before declaring visual success.
-**This is exactly the user's original reported symptom — "we're only getting (after a pretty long
-wait) an icon and time"**: an icon top-left and a clock top-right on a flat background is precisely
-what was decoded. This session has NOT surpassed the starting point on visual output; it restored
-it after an intermediate period where it was fully black. `xfdesktop` is alive but draws nothing
-(no wallpaper beyond the flat fill, no desktop icons); `xfce4-panel` produces only the thin top
-bar, not a real populated panel. **These are now the actual remaining gap** — see "Remaining
-follow-on work" below, item 1 is superseded by this finding; investigating why `xfdesktop`/
-`xfce4-panel` render almost nothing is now the top-priority open item.
+**NOT YET MET — status PROVISIONAL, currently UNTESTED for the actual question, do not trust
+either the earlier "MET" claim or the immediately-following "xfdesktop draws nothing" claim, both
+superseded below.** The process-launch and compositing blockers ARE fixed (see below) and are
+real, verified progress. A first frame decode (advisor-db, `.bmp` from `LITEBOX_DUMP_FRAMES=1`,
+frame 23 of 24, 1920x1080) showed a 32px-tall top bar with an icon (x=12..31) and a clock/status
+area (x=1753..1904) and one flat color below y=31 — **but timing analysis of the SAME run then
+showed that frame was captured at t=30.93, while `xfdesktop` doesn't even start until t=48.67 and
+`xfce4-panel` not until t=60.06 (`TEST_DONE` at t=74.06).** The decoded frame predates both
+components' existence — it is weston-desktop-shell's OWN built-in panel being shown, not XFCE's.
+**"xfdesktop is running and drawing nothing" is UNSUPPORTED by this evidence and is retracted; the
+question is genuinely open, not answered.** `LITEBOX_DUMP_FRAMES` only captures on a weston page
+flip (flip-on-damage), and there were zero flips between t=31 and t=74 — which is consistent with
+either (a) XFCE genuinely produces no damage / doesn't draw (the original hypothesis, still
+possible), or (b) the run simply ends too soon after the panel starts (components need 60+s to
+come up, `TEST_DONE` fires only 14s after `xfce4-panel` starts) for any drawing+flip to occur in
+the captured window. **Resemblance to the user's original "icon and clock" complaint is likely
+coincidental** (that symptom came from a materially different, now-superseded launch path) and
+should not be treated as corroboration. **Next step, in progress (advisor-db)**: rerun with a much
+longer tail after the panel starts, and force periodic capture so "idle but alive" is
+distinguishable from "never drew" — if frames with content below y=31 appear, XFCE is drawing; if
+flips genuinely never occur while all six components are alive and settled, (a) is confirmed and
+becomes a concrete question (why does a running `xfdesktop` generate zero damage). **Until that
+result lands, treat "does XFCE actually render its own content" as OPEN, not answered either way.**
 
 **What IS genuinely fixed and verified (real, durable progress, not undersold)**: all six
 components (`weston`/`xfconfd`/`xfwm4`/`xfsettingsd`/`xfdesktop`/`xfce4-panel`) now start and stay
@@ -84,12 +89,15 @@ build/fix, don't just work around" discipline. See `advisor/probes/setx_ud_repro
 
 **Remaining follow-on work, re-prioritized after the frame-decode correction above (this is now
 the real state of the standing goal, not a nice-to-have polish list)**:
-1. **TOP PRIORITY: why do `xfdesktop` and `xfce4-panel` render almost nothing?** Both are alive
-   the whole run (no crash, no exit) but `xfdesktop` draws no wallpaper beyond the flat background
-   fill and no desktop icons; `xfce4-panel` draws only a thin ~32px bar with an icon and a
-   clock/status area, not a real populated panel. This is "alive but never completes its own
-   drawing" — the same class of question as item 2 below (client startup stalling) and may share a
-   root cause; advisor-db is investigating this now.
+1. **TOP PRIORITY: does `xfdesktop`/`xfce4-panel` render its own content at all? OPEN QUESTION,
+   not yet answered.** The earlier claim that they "render almost nothing" was retracted (see
+   above) — the frame that seemed to show that predates both components even starting, so it
+   actually showed weston-desktop-shell's own built-in panel, not XFCE's. The real test (rerun
+   with a longer post-panel-start tail + forced periodic capture, so idle-but-alive is
+   distinguishable from never-drew) is in progress, advisor-db. This may share a root cause with
+   item 2 below (client startup stalling) if the answer turns out to be "components are alive but
+   still mid-startup/never finish initializing enough to draw" — but that's speculative until the
+   rerun lands.
 2. **Client startup is extremely slow — unexplained, and likely the user's original "pretty long
    wait" complaint, and possibly directly related to item 1.** `xfce4-about --version` never
    exited in an 85s run; `xfce4-appfinder` never finished startup in 98s; even in the "successful"
