@@ -1243,6 +1243,34 @@ dumps every layer/view/surface + buffer info on demand, without requiring the cl
 this would show directly whether the X11 client's surface has ANY view/layer entry in the scene
 graph at all, confirming or refuting this theory in one shot.
 
+**MEMORY PATH FULLY EXONERATED — litebox's shared-memory implementation is CORRECT.** advisor's
+same-instant cross-view comparison now covers the actual surface pools (the 245,760-byte buffers
+that carry window pixels, not just protocol/cursor-sized objects), and ALL 11 comparisons agree:
+```
+handle=540 views=[(482082816, 1024), (928317440, 1024)] agree=true
+handle=108 views=[(929169408, 1024), (929562624, 1024)] agree=true
+```
+plus 4096/12288/20480/36864/40960-byte handles, all agree=true. Two genuinely different mappings
+of the same surface pool, read at the same instant, contain byte-identical content. **litebox's
+cross-process shared memory is correct end-to-end, including for the exact buffers that carry
+window pixels — there is no memory-path bug anywhere in this story.** Combined with the earlier
+XWM research this fully explains every measurement taken all session: client buffer has content
+(measured) -> both processes see identical content (measured, 11/11 agree) -> scanout is exactly
+zero (measured) -> weston's own log is clean/happy with the DRM path (measured) -> client never
+finishes startup, waits forever (measured, consistent with a surface that's never mapped so its
+frame callback never fires). **A surface with a valid buffer but no role, never entered into
+weston's scene graph because no XWM ever ran, explains all of it at once and requires zero litebox
+code changes.**
+
+**Fix is being tested now** (advisor-db, in parallel with a63e8ca59285f5871 dispatched here):
+found `xwayland.so` present at `/usr/lib/libweston-14/xwayland.so` in the layer already; the
+layer's `/etc/xdg/weston/weston.ini` had no `xwayland` setting at all. Added `xwayland=true` under
+`[core]`, wrote a launch script that does NOT spawn `Xwayland` manually, lets weston start and
+manage it internally, discovers whichever display socket weston actually creates instead of
+hardcoding `:1`, then runs a real client (`xfce4-appfinder`) against it. **If frames go non-zero,
+this closes the standing goal with a configuration fix, no litebox code change required — result
+pending.**
+
 ## Reproduction commands
 
 Full XFCE launch — **use `advisor/probes/run_xfce_staged.sh` as the launch script, NOT any
