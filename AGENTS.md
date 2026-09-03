@@ -137,10 +137,30 @@ compositor itself is meant to be the window manager for X11 clients** — runnin
 it is architecturally redundant, not merely buggy. This also explains why the EARLIER (pre-fix, no
 `xwayland=true`) runs never hit this: with no XWM at all, `xfwm4` was the only would-be window
 manager and there was nothing to contest — but surfaces were then never mapped either (the
-original blackout bug). **Testing now (advisor-db)**: identical launcher/config, `xfwm4` simply
-not started. Non-black content below y=31 confirms this theory and the fix is a one-line change
-(don't run `xfwm4` when weston manages Xwayland via `xwayland=true`). If this test is negative,
-resume the paused X-protocol decode immediately.
+original blackout bug).
+
+**TESTED AND WRONG — do not revisit, do not spend more time on window-manager arrangement.**
+advisor-db ran the identical launcher/config with `xfwm4` simply not started (weston's XWM the
+only window manager on the display). Frame at t=63.55 — 18.6s after `xfdesktop` started (t=44.91),
+7.1s after `xfce4-panel` started (t=56.38) — **identical to every previous run**: content band
+y=0..28 only, bright clusters at x=12..31 and x=1753..1904, 3.0% coverage. Removing the WM
+conflict changed nothing. `xfwm4` was not the cause.
+
+**Everything ruled out so far, for reference**: missing panel/desktop config (channels confirmed
+populated, still nothing); two window managers contesting the root (xfwm4 removed, still nothing);
+missing XWM (fixed earlier — `created wm, root 98` present in every run since); shared memory
+(11/11 same-instant cross-view comparisons agree); scanout corruption (nothing decommits/unmaps
+the buffers). **Components are alive, configured, with a working XWM and no WM conflict, and still
+produce no windows and no pixels.**
+
+**THE ONLY UNTESTED LINK IN THE CHAIN, now the live thread**: do the components issue
+`CreateWindow`/`MapWindow` at all, and what comes back? Assigned to `a63e8ca59285f5871`
+(X-protocol decode of the captured unix-stream traffic), now resumed. **One traffic-volume clue
+worth building on**: in the no-`xfwm4` run, the components produced 415 socket messages after the
+panel started but only 3 larger than 1KB (largest 1344 bytes) — a GTK panel that had actually
+created and populated a window would be moving pixmap/image data far larger than that. This
+pattern already suggests setup completes but drawing is never reached; the decode should look
+specifically for the LAST successful request and the first thing that stalls or errors.
 
 **STRONG CANDIDATE EXPLANATION FOUND (advisor-db), plausible and cheap to confirm/refute — NOT
 YET ASSERTED, verification pending**: **the layer may simply have no desktop/panel configuration
