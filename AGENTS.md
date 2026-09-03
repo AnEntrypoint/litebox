@@ -575,8 +575,8 @@ never destroyed, never re-created; no DRM ioctl in the wipe window (197 of 205 o
 own fork is innocent** (the wipe happens during Xwayland forking `xkbcomp`, a COMPLETELY
 DIFFERENT process from the one owning the mapping).
 
-**MEASUREMENT RETRACTED (methodological flaw, caught and reported honestly by advisor-db) — the
-reclaim/decommit path is STILL OPEN, do not treat it as ruled out.** The original overlap test
+**MEASUREMENT RETRACTED then CORRECTED AND RE-CONFIRMED (see below) — the reclaim/decommit path
+IS excluded, this time on solid footing.** The original overlap test
 (`advisor/probes/correlate_scanout_wipe.py`, commit `dcae67c8`) correlated destroy ranges against
 the address where the CAPTURE mapped the buffer — but `notify_flip_callback` calls
 `map_shared_memory` FRESH on every flip, reads, and unmaps immediately, so that mapping exists
@@ -587,12 +587,18 @@ stable framebuffer does not move; those were all transient capture mappings, not
 one. **weston's actual persistent mapping address was never logged and the correct overlap test
 has not been run.**
 
-**Fix for the test, not yet done**: log the address the GUEST (weston) gets back from
-`map_existing_shared_pages` inside `try_dri_dumb_buffer_mmap`
-(`litebox_shim_linux/src/syscalls/mm.rs`, ~line 646) — that's weston's real persistent mapping.
-Feed THAT into the same overlap check against `diag-reclaim`/`diag-decommit` (same `addr=`/
-`size=` field names, the existing correlator needs no changes). Until this runs, the reclaim path
-is an open suspect, not a closed one.
+**FIXED AND RE-RUN — this time a real, valid result: the reclaim/decommit path is genuinely
+excluded.** Logged the GUEST's real persistent scanout mapping addresses and re-ran the overlap
+test against them (not the transient capture mapping):
+```
+GUEST persistent scanout mappings:
+  0x1ef70000-0x1f759000 (8294400 bytes)
+  0x1fad0000-0x202b9000 (8294400 bytes)
+19,063 reclaim/decommit events
+-> no destroy event overlaps EITHER guest scanout mapping
+```
+This is a valid negative this time, not the near-tautology from before. **The reclaim and
+decommit paths genuinely do NOT touch the scanout buffers.**
 
 **What still stands, unaffected by the retraction above**: same two shared objects (508, 512) for
 the whole run, created once, never destroyed (no `DestroyDumb`/`RmFB`); VMA correctly shared
@@ -686,6 +692,29 @@ Bare-rootfs fork-bug repro (fast, no display stack): see the regression oracle a
   two `.unwrap()`s to a graceful error + exit if touched again.
 - **The program path passed to the runner must be RELATIVE, no leading slash** (`bin/sh`, not
   `/bin/sh`) — a leading slash also hits the same ENOENT-then-stack-overflow panic shape above.
+
+## Host memory hygiene — check before trusting any run's result
+
+When multiple sessions/agents run heavy full-XFCE launches concurrently, host free memory can
+drop low enough (confirmed: ~5 GiB free out of 16 GiB, one run outright died mid-launch with
+`memory allocation of 1342177280 bytes failed` at t=11.8s, well before the run's real content —
+e.g. the scanout blackout at t~19-20s — was ever reached) to silently corrupt oracle results.
+
+**The dangerous failure mode**: a run that dies early looks like "no bug occurred" to any oracle
+that only checks final frames or exit status — a FALSE PASS. A run genuinely ending on non-black
+frames because it crashed at t=8s, before ever reaching a bug that only manifests at t=19s, is
+indistinguishable from a real fix without checking the run actually completed its full intended
+duration.
+
+**Before trusting any launch-run result** (a regression-oracle count, a "the bug is fixed" claim,
+a clean/passing frame capture): check host memory first
+(`powershell -Command "Get-CimInstance Win32_OperatingSystem | Select-Object
+FreePhysicalMemory,TotalVisibleMemorySize"`), and verify the run's own log shows it actually ran
+for its full intended duration rather than dying early (check for the expected final log lines —
+`TEST_DONE`, the expected number of frames, no unexpected `thread panicked`/allocation-failure
+lines). **Prefer serializing heavy full-XFCE-launch runs across concurrent sessions rather than
+running several in parallel** — wall-clock is the thing being optimized, and a false result from
+memory pressure costs more total time than the parallelism saves.
 
 ## Disk hygiene — read before generating any new layer tar or crash dump
 
