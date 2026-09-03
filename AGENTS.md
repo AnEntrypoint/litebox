@@ -554,16 +554,39 @@ Xwayland's (weston is pid 13, Xwayland's fork is a different thread), so the abs
 that the mapping genuinely lacks a `shared_handle`. Zero logging currently exists on
 `map_shared_memory`/shared-handle attachment to settle this either way.
 
-**Decisive check, not yet done — REQUIRES LIVE INSTRUMENTATION, a code read is not sufficient**:
-log VMA flags and `shared_handle` presence at the moment the DRM dumb buffer is mmap'd by the
-guest (`try_dri_dumb_buffer_mmap`/`map_existing_shared_pages` in
-`litebox_shim_linux/src/syscalls/mm.rs`, ~line 615-655). `map_existing_shared_pages` calls
-`VmArea::new_shared(vm_flags, false, shared_handle)` with `may_flags_for_mapping(true, false)`,
-which DOES include `VM_SHARED` on a static read — but if the live behavior is broken, it's broken
-somewhere not visible from reading the code, hence the need to actually log and observe it. Two
-outcomes: `shared_handle` present + `VM_SHARED` set → this lead is wrong, wipe is something else.
-`shared_handle` absent or `VM_SHARED` unset → that's the bug; fix is attaching the handle
-correctly so fork re-maps instead of eagerly copying.
+**CHECKED AND REFUTED**: logged the VMA at creation —
+`diag-shared-vma-created flags=123 has_handle=true is_shared=true`,
+`diag-drm-dumb-mmap len=8294400 offset=4096`. `flags=123` =
+`VM_READ|VM_WRITE|VM_SHARED|VM_MAYREAD|VM_MAYWRITE|VM_MAYEXEC`, handle present, size exactly
+`1920*1080*4`. **The mapping IS correctly shared.** Fork takes the shared branch as expected — the
+"eager copy into fresh zeroed pages" theory does NOT apply. Do not re-investigate this. (The
+`vma_shared=false`-everywhere observation was a red herring: that diagnostic simply never fires
+on this VMA at all — an instrumentation gap, not evidence of a missing handle.)
+
+Also checked and refuted: two new shared objects DO get created right at the blackout (handles
+576/580 at t=20.62/20.77), but they are 82,944,000 and 36,864 bytes — NOT framebuffers. The
+capture reads `bytes_len=8,294,400` on every single flip (always the original 8.29MB objects), so
+no buffer-swap is happening either.
+
+**What's now solid, reproduced across three runs**: the SAME 8.29MB buffer objects are read
+throughout the whole run (`bytes_len` constant, never changes); buffers created once at t=5.94,
+never destroyed, never re-created; no DRM ioctl in the wipe window (197 of 205 ops there are
+`caller=fork_duplicate`); **weston forks exactly once, at t=6.52, LONG before the wipe — weston's
+own fork is innocent** (the wipe happens during Xwayland forking `xkbcomp`, a COMPLETELY
+DIFFERENT process from the one owning the mapping).
+
+**Reframed conclusion**: a live, correctly-shared 8.29MB section loses its contents to exactly
+zero, during fork activity by a DIFFERENT process than the one that owns the mapping, with no DRM
+operation involved and no destruction of the object.
+
+**Decisive check, not yet done — this is a Windows platform-level lifetime question**: log every
+`VirtualFree`/`MEM_DECOMMIT`/`MEM_RESET`/`UnmapViewOfFileEx` call with its address range, then
+check whether any of them covers the framebuffer's mapped address during the wipe window
+(t=20.8-22.1). Exactly-zero contents on a section that was never destroyed is the classic
+signature of pages being decommitted and recommitted — decommit is the one operation that
+produces this without touching DRM state at all. Working theory: a fork-path teardown or
+relocation-walk touches a range that happens to include the shared scanout mapping, even though
+that mapping belongs to a DIFFERENT process than the one forking.
 
 ## Reproduction commands
 
