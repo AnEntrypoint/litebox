@@ -1066,6 +1066,56 @@ changes though — fix `tkill` first, then re-check: with remote delivery workin
 park turn out to have been a real problem, or was it idling correctly the whole time, simply
 waiting for a broadcast that (pre-fix) could never arrive?
 
+**LOGGING FIX LANDED, ALREADY PAID FOR ITSELF: 19 distinct unsupported features exposed that were
+invisible in every release run this session has ever done.** advisor-db's change:
+`litebox_shim_linux/src/lib.rs:121`, `log_unsupported_fmt` no longer wraps its `warn!` in
+`if cfg!(debug_assertions)` (comment records why — `warn!` is already level-filtered at runtime,
+there was never a reason to also strip it at compile time). **Cost note**: at `LITEBOX_LOG=warn`
+this run is 14MB vs 165MB at `debug` — cheap enough to be the default for a first-look run,
+greppable in one pass. **Full census, one `xfce4-about`-in-stack run** (count × feature):
+```
+26  setitimer: nonzero it_interval not supported
+20  unsupported syscall fstatfs
+ 6  fcntl(cmd = 1033, arg = 2)
+ 5  unsupported syscall membarrier
+ 4  fcntl(cmd = 1034, arg = 48)
+ 4  fcntl(cmd = 1034, arg = 0)
+ 2  unsupported syscall inotify_init1
+ 2  unsupported syscall fadvise64
+ 2  setsockopt(level = 1, optname = 26)
+ 2  setsockopt(level = 1, optname = 16)
+ 2  ioctl Raw { cmd: 3222823994 }
+ 1  unsupported syscall pidfd_open
+ 1  unsupported syscall inotify_init
+ 1  unsupported syscall getresuid
+ 1  unsupported syscall close_range
+ 1  sys_tkill/sys_tgkill with a remote tid       <- the root cause above, appears EXACTLY ONCE
+ 1  ioctl Raw { cmd: 1074021792 }
+ 1  fcntl(cmd = 1033, arg = 3)
+ 1  fcntl(cmd = 1033, arg = 14)
+```
+Saved to `advisor/probes/unsupported-features-census.txt`. **Two things to take from this list**:
+1. **`remote tid` appears exactly once, at the moment predicted** — independent confirmation of
+   the root cause from a completely different logging path than the futex instrumentation. **Clean
+   pass/fail signal for the `do_kill` fix**: this line should disappear entirely once it lands.
+2. **`inotify` is the next escalation target after `do_kill`.** All three `inotify` calls fail in
+   the first 0.71s, with dbus's own reaction logged inline: `[session uid=0 pid=8] Cannot
+   initialize inotify: Function not implemented`. `dbus-daemon` uses `inotify` to watch its
+   service directories — without it, service activation and config reload are degraded from the
+   very start of EVERY run, upstream of essentially every XFCE component (they all activate over
+   the session bus). **May be behind failures attributed elsewhere all session.** Second pick:
+   `setitimer` with a nonzero interval (26 hits) — the repeating-timer path, i.e. anything doing
+   periodic work (clocks, blinking cursors, autosave, panel plugin refresh). Third: `membarrier`
+   (5 hits) — glibc uses this for RCU-ish synchronization; a silent failure there can produce
+   exactly the "correct-looking but never progresses" stall class this whole investigation chased.
+**Sequencing recommendation (agreed)**: land `do_kill` first, re-run at `LITEBOX_LOG=warn`, diff
+the census. Any feature that disappears was a downstream consequence of the `do_kill` bug; whatever
+remains is a genuine independent gap, ranked by the counts above.
+**Scope confirmation**: advisor-db has NOT touched `litebox_platform_windows_userland` (still
+`a63e8ca59285f5871`'s half) — their changes are in `litebox_shim_linux/src/lib.rs` and
+`litebox/src/sync/futex.rs` plus `process.rs` instrumentation, all additive logging except the
+one-line `cfg` gate removal.
+
 **In progress in parallel**: advisor-db is running a context test (a GTK binary inside the full
 display stack, expected ~2s reproduction if display-stack context is what triggers this) to give a
 fast verification target for whatever fix lands here.
