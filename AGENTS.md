@@ -489,6 +489,29 @@ c) **Ties into an earlier this-session correlation that was refuted as a CAUSE b
    explained: more concurrent passes means more chances for one to not come back. Worth checking
    whether the non-resuming thread's healing pass overlapped another concurrent pass.
 
+**CORRECTION (self-caught, code-verified): point (c) above is WRONG — `fork_verify` is NOT
+involved in xfwm4's hang at all. `ThreadId(46)` was never xfwm4's cloned thread.**
+`a63e8ca59285f5871` verified via code that `begin_fork_child_verification` (the only real
+`fork_verify` arming path besides the explicit cross-process
+`run_thread_with_fork_verification`) is called ONLY from `ThreadInitState::ForkedChild`
+(`litebox_shim_linux/src/syscalls/process.rs:4633-4655`). `xfwm4`'s `clone()` flags —
+`CloneFlags(8195840)` = `VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|SETTLS`, no `VFORK` — make
+`is_process_clone = false` (`process.rs:2251`), correctly routing to `ThreadInitState::NewThread`,
+**which never touches `fork_verify` at all.** The real explanation: the same trace shows pid=42
+(`dbus-daemon`) forking pid=43 (`/usr/libexec/at-spi-bus-launcher`) at t=29.957, that child exiting
+by signal at t=30.069, and `dbus-daemon` itself doing `exit_group` at t=30.095929200 — matching
+the earlier "`fork_verify` end (cleared)" timestamp to the microsecond. **`ThreadId(46)` was
+`dbus-daemon`'s own unrelated `fork()`-based process spawn, coincidentally overlapping `xfwm4`'s
+`clone()` in wall-clock time** — a timing correlation mistaken for causation, exactly the class of
+error this session has repeatedly caught and corrected. **The bug is purely within the
+same-process `CLONE_THREAD` path, `ThreadInitState::NewThread`'s dispatch**
+(`process.rs:4555-4632`), which sets `rsp`/`rax`/`tls`/`child_tid` and already has prior
+debug-level instrumentation at `4600-4630` (`"clone/NewThread: init_thread_context reached"`) that
+would show directly whether `init_thread_context` is reached at all and whether the guest stack is
+readable — **but this was invisible under `LITEBOX_LOG=error`, since it's a `debug!`-level line.**
+**Immediate next step**: rerun with `LITEBOX_LOG=debug` (or `trace`) to actually see whether that
+line fires, combined with the fast `xfce4-about --version` repro below for quick iteration.
+
 **In progress in parallel**: advisor-db is running a context test (a GTK binary inside the full
 display stack, expected ~2s reproduction if display-stack context is what triggers this) to give a
 fast verification target for whatever fix lands here.
