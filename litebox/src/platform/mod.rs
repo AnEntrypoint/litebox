@@ -297,10 +297,12 @@ pub trait RawMutex: Send + Sync + 'static {
 
 /// A zero-sized struct indicating that the block was immediately unblocked (due to non-matching
 /// value).
+#[derive(Debug)]
 pub struct ImmediatelyWokenUp;
 
 /// Named-boolean to indicate whether [`RawMutex::block_or_timeout`] was woken up or timed out.
 #[must_use]
+#[derive(Debug)]
 pub enum UnblockedOrTimedOut {
     /// Unblocked by a wake call
     Unblocked,
