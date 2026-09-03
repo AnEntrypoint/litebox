@@ -685,6 +685,49 @@ occurred" to a naive oracle — always check that a "clean" run's own log actual
 `diag-drm-flip-source-bytes` entries past t≈20s before trusting a negative/absent-overlap result
 from it. Check free memory before launching another full XFCE run if multiple sessions are active.
 
+**FAST REPRO FOUND (~16 seconds, not the full ~500s XFCE launch) — use this for iteration going
+forward**: three-way isolation, each run under 40 seconds:
+```
+weston alone + 20 backgrounded forks     -> NO wipe. 25 frames, ends at 2,073,597 px.
+weston + Xwayland, nothing connects to X -> NO wipe. 24 frames, ends at 2,073,597 px.
+weston + Xwayland + ONE X client         -> WIPE at t=16.4, nonzero 6,221,890 -> 0
+```
+**Forks alone do NOT trigger it. Xwayland merely running does NOT trigger it. It needs an X
+CLIENT to actually connect.** That connection is what makes Xwayland fork `xkbcomp` (2 execs in
+the failing repro, 0 in the no-client passing run), and `xkbcomp`'s fork carries a ~46,000-pointer
+heal versus a few hundred for an ordinary shell fork. Repro recipe: start seatd, start weston
+(drm-backend, pixman, desktop-shell), start Xwayland `:1` fullscreen, wait for
+`/tmp/.X11-unix/X1`, then run any X client (`DISPLAY=:1 xfce4-about --version` works) — no dbus,
+no xfconfd, no XFCE session, no window manager, no panel needed at all.
+
+**Every explicit memory operation now instrumented, NONE of them touch the scanout buffers**:
+scanned every logged operation carrying a start/end range against the two guest scanout mappings
+in the fast repro — `diag-commit` (`VirtualAlloc2`/`MEM_COMMIT`): 0 overlaps; `diag-reclaim`/
+`diag-decommit`: 0 overlaps; `diag-vprotect`: 2 overlaps, both at t=0.97 (creation only);
+`DrmModeMapDumb`: 2 total, both at startup; guest re-mmap of the buffer: none after t=0.97.
+**Nothing we currently log touches the scanout buffers between creation and the wipe, yet their
+contents go to exactly zero.** This is itself a strong clue: whatever zeroes it is not going
+through any currently-instrumented mapping-level path — it must be a WRITE, not a
+map/commit/decommit/protect operation.
+
+**Candidates, in priority order, none yet confirmed**:
+1. The fork/duplicate path writing INTO the child at addresses that alias the parent's shared
+   section. All guest processes share one real Windows address space, so a relocation computing
+   a wrong destination could land on the framebuffer without any decommit/commit ever being
+   logged — it would just look like an ordinary memcpy. Ties directly into the still-open
+   cross-`Vmem` real-address-collision question two paragraphs above.
+2. `fixup_stale_elf_data_pointers`/fork_verify's own healing writing through a stale pointer. The
+   ~46,000-pointer heal during `xkbcomp`'s fork is the largest such operation in the whole run,
+   and it's exactly what distinguishes the failing case from the two passing ones.
+3. Anything that zero-fills a BSS or new mapping using a length or base computed from the wrong
+   VMA.
+
+**Cheap next measurement, not yet done**: bisect with `LITEBOX_FORKVERIFY_OFF=1` (disables
+fork_verify's reactive healing) against the fast 16s repro — if the wipe stops, the heal path
+(candidate 2) is implicated directly. Alternatively, a guard page or write-watch on the scanout
+range during `xkbcomp`'s fork — Windows' `GetWriteWatch` API exists for exactly this and would
+catch candidate 1 or 3 without needing to guess which code path is responsible.
+
 ## Reproduction commands
 
 Full XFCE launch — **use `advisor/probes/run_xfce_staged.sh` as the launch script, NOT any
