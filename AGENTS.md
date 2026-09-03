@@ -1015,6 +1015,32 @@ possibly `fork_verify.rs`'s single-step machinery). Log entry/exit of any all-th
 operation with duration — if a suspend-all call's own duration spans a stall window, that names
 the mechanism directly and points at a far more tractable fix than anything involving locking.
 
+**A "60-second timeout" theory was proposed and then self-corrected within the same
+investigation — recorded here so it isn't re-derived.** A striking measurement (successive
+stall-end timestamps across 4 independent runs differing by exactly ~60.000s, sub-10ms alignment)
+initially looked like a missed-wakeup-rescued-by-timeout bug. Follow-up showed this was a
+misreading: at each 60-second boundary, the SAME epoll entry fires (`entry_id` fixed,
+`events_bits=1` then `=0` ~90µs later), then 60s of total silence — a periodic HEARTBEAT the
+guest itself set (in the ~208s run, only SIX log events total occur after t=30), not a rescued
+waiter. Static grep for `60_000`/`60000`/`Duration::from_secs(60)` across the tree also found
+nothing, consistent with this being a guest-side timer, not a litebox one. **Do not chase a
+missed-wakeup-on-a-60s-timeout theory** — it's refuted.
+
+**CURRENT BEST UNDERSTANDING, replacing the timeout theory: a client permanently stalls, not
+periodically.** `xfce4-about --version` never exits across a 208-second run — does real work for
+~25 seconds, then goes PERMANENTLY quiet (not throttled, not periodically slow — simply stops
+making progress at all, forever, except for its own unrelated heartbeat timer described above).
+This is the signature of a client **waiting for a reply that never arrives** — most likely a
+protocol response from Xwayland that's owed but never sent.
+
+**Next step, not yet done**: trace the client's last few `diag-unix-stream-write`/
+`diag-unix-stream-read` messages right before it goes silent (~t=25 in the observed runs) to
+identify what protocol exchange was in flight (likely an X11/Wayland request awaiting a specific
+reply). Check Xwayland's own side: did it receive the request but never respond, or never receive
+it at all? This would also explain everything else observed: weston stops flipping because
+nothing changes (no client ever finishes drawing anything), the framebuffer keeps whatever
+content it last had, and no XFCE component ever completes its startup sequence.
+
 ## Reproduction commands
 
 Full XFCE launch — **use `advisor/probes/run_xfce_staged.sh` as the launch script, NOT any
