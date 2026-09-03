@@ -977,22 +977,43 @@ times. This also confirms the lock-contention mechanism predicts EVERY observed 
 - dose-response with concurrency (measured much earlier this session) → more concurrent forks,
   more contention
 
-**Fix direction, agreed and reasoned through**: narrow the lock's SCOPE, do NOT add periodic
-yielding mid-copy. Yielding would reintroduce exactly the races the lock consolidation earlier
-this session was fixing (`984927b0`) — this lock now correctly protects allocate/deallocate/
-protect/`unmap_shared_memory` precisely because those must never interleave; releasing it partway
-through a copy weakens that invariant. The cleaner fix: **`fork_duplicate`'s bulk BYTE COPY does
-not need the same lock that protects VAD-tree mutations.** The copy is a memcpy into a
-destination the forking thread already exclusively owns — what needs serializing is the
-mapping/reservation operations around it (`allocate_pages`'s reserve+commit), not the bytes
-themselves. Splitting "reserve/map the destination under the lock" from "copy the bytes into it
-OUTSIDE the lock" removes the long hold entirely without weakening the invariant the lock exists
-to protect.
+**LOCK-CONTENTION THEORY REFUTED BY DIRECT MEASUREMENT — do NOT touch `VIRTUAL_PROTECT_LOCK`/
+`ALLOCATE_PAGES_FIXED_ADDR_LOCK`'s scope, that was a false lead.** The reasoning above (memory
+headroom correlating with hold duration) was plausible but wrong -- exactly the class of error
+this investigation has repeatedly had to catch via measurement rather than inference. Decisive
+test: instrumented the lock at `lib.rs:5425` with both WAIT-to-acquire and HOLD duration timing,
+logging any acquisition where either exceeded 50ms. Same 16s repro (weston + Xwayland + one X
+client), 3 stalls observed (4.27s, 5.38s, 5.22s):
+```
+lock acquisitions held >= 50ms:        ZERO
+lock acquisitions that waited >= 50ms: ZERO
+```
+**Not one acquisition of this lock even reached 50 milliseconds** — neither a long hold nor a
+long wait, anywhere in the run. If this lock were the mechanism, the holder would show a
+multi-second HOLD and blocked threads would show multi-second WAITs; neither appears. The
+structural code-reading analysis of what the lock covers was correct — it just isn't the cause of
+these stalls. Narrowing or restructuring it would reintroduce the real TOCTOU race it exists to
+prevent, for zero benefit.
 
-**Decisive measurement to run BEFORE changing code**: log lock acquire/release with duration for
-this lock specifically. If the 59.8s stall corresponds to a single acquisition of comparable
-length, the theory is proven outright and the fix target is exact — cheap (a few lines) and much
-safer than restructuring the locking on inference alone.
+**What still stands, measured not inferred**: stalls are global (every process/subsystem silent
+at once, confirmed two independent ways); NOT host memory pressure (9.3GB free made it WORSE than
+2.6GB); NOT lock contention (zero slow acquisitions, just refuted above); stalls recur even in
+the minimal repro with very little forking (t=3.5, 9.8, 19.1 observed in one run).
+
+**New leading candidates, ranked**:
+1. **Something that deliberately suspends ALL guest threads simultaneously BY DESIGN** — `fork`'s
+   `kill_other_threads` path, or any `fork_verify` single-step pass that suspends threads. A
+   suspend-all that then waits on one thread which is itself slow to reach a safe point would
+   produce exactly this signature (global freeze, no single lock implicated). **Top suspect.**
+2. A host-side GC/allocator pause inside the runner process itself (the Rust host allocator, not
+   litebox's guest-facing page management).
+3. Waiting on a Windows synchronization object with a long/infinite timeout satisfied late.
+
+**Next step, not yet done**: search for `kill_other_threads` and any thread-suspension code in
+`litebox_shim_linux`/`litebox_platform_windows_userland` (likely in the fork/clone path and
+possibly `fork_verify.rs`'s single-step machinery). Log entry/exit of any all-thread-suspend
+operation with duration — if a suspend-all call's own duration spans a stall window, that names
+the mechanism directly and points at a far more tractable fix than anything involving locking.
 
 ## Reproduction commands
 
