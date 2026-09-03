@@ -1078,7 +1078,13 @@ mod test {
             });
         }
         epoll
-            .wait(&task.global, &WaitState::new(platform()).context(), 1024)
+            .wait(
+                &task.global,
+                &WaitState::new(platform()).context(),
+                1024,
+                task.tid,
+                0,
+            )
             .unwrap();
     }
 
@@ -1181,7 +1187,13 @@ mod test {
         // fires -- this much already worked before this test (matches phase-3's own commit).
         write_eventfd();
         let events = outer
-            .wait(&task.global, &WaitState::new(platform()).context(), 1024)
+            .wait(
+                &task.global,
+                &WaitState::new(platform()).context(),
+                1024,
+                task.tid,
+                0,
+            )
             .unwrap();
         assert_eq!(
             events.len(),
@@ -1224,6 +1236,8 @@ mod test {
                     .context()
                     .with_timeout(core::time::Duration::from_secs(2)),
                 1024,
+                task.tid,
+                0,
             )
             .unwrap();
         assert_eq!(
@@ -1354,7 +1368,13 @@ mod test {
         // First wait: matches the eventfd variant, already known to work.
         send_from_writer();
         let events = outer
-            .wait(&task.global, &WaitState::new(platform()).context(), 1024)
+            .wait(
+                &task.global,
+                &WaitState::new(platform()).context(),
+                1024,
+                task.tid,
+                0,
+            )
             .unwrap();
         assert_eq!(
             events.len(),
@@ -1399,6 +1419,8 @@ mod test {
                     .context()
                     .with_timeout(core::time::Duration::from_secs(2)),
                 1024,
+                task.tid,
+                0,
             )
             .unwrap();
         assert_eq!(
@@ -1528,6 +1550,8 @@ mod test {
                             .context()
                             .with_timeout(core::time::Duration::from_millis(20)),
                         1024,
+                        0,
+                        0,
                     ) else {
                         continue;
                     };
@@ -1646,7 +1670,13 @@ mod test {
             );
         });
         epoll
-            .wait(&task.global, &WaitState::new(platform()).context(), 1024)
+            .wait(
+                &task.global,
+                &WaitState::new(platform()).context(),
+                1024,
+                task.tid,
+                0,
+            )
             .unwrap();
         let mut buf = [0; 2];
         task.global
