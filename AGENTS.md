@@ -349,6 +349,31 @@ one?** If GTK's own internal state machine never reaches the code path that call
 after `CreateWindow` succeeds, the X traffic itself is a red herring and the real bug is inside
 GTK's own window-realization logic — worth tracing at that level next (glibc/pthread/syscall
 tracing of what each client does between its last X write and going silent, as already planned).
+
+**MAJOR: pid-verified syscall trace precisely locates xfwm4's actual hang point — much earlier
+than previously believed, likely BEFORE any real X11/xfconf work at all.** IMPORTANT CORRECTION to
+the earlier `t=40.818`/`GetProperty`-then-silence attribution: that timestamp came from the
+UNVERIFIED unix-stream byte trace (busy socket inferred to be xfwm4 only by timing coincidence
+with its `execve`, no actual pid-to-socket mapping). A new trace with real per-pid syscall tracing
+(`a63e8ca59285f5871`) confirms via the `execve` DIAG_TIMELINE line that `xfwm4` is **pid=38**, and
+shows it makes 3589 syscalls in under one second after `execve` at t=27.386, then makes its
+**absolute LAST syscall ever at t=28.324931400s: a `futex` ENTRY with no matching EXIT anywhere in
+the rest of the 66-second run.** Confirmed not a global logging failure — `xfce4-panel` (pid=102)
+keeps logging syscalls until t=55.7+ in the same run. **The syscall sequence immediately before
+the hang**: a repeated `open`/`fcntl`/`fstat`/`read`/`mmap`×N/`close`/`mprotect`×many pattern
+(classic ELF shared-library `dlopen`), then `rt_sigprocmask` → `membarrier` (fails) →
+`rt_sigprocmask` → `rt_sigaction` → `tkill` (fails) → `futex` (hangs forever). **This specific
+sequence — `membarrier` + `tkill` + `futex` — is a known glibc pattern for dynamic thread/TLS-
+registration synchronization when `dlopen` loads a library with thread-local storage.** This
+strongly suggests `xfwm4` hangs extremely early, likely during its own startup `dlopen` of a
+GTK/xfce shared library, **NOT after any X11/xfconf work — it may never even reach xfconf init.**
+**In progress**: rebuilt instrumentation to also capture the full typed syscall request (including
+file paths for `open`) to identify exactly which library triggers this, and to directly check
+whether xfconf/dbus socket activity is ever reached before the hang (per the sharpened question
+above). **Also being re-verified**: whether the earlier `t=40.818` GetProperty-then-silence story
+is real but for a DIFFERENT client (`xfdesktop` or `xfce4-panel`, both alive and creating windows
+around then) once per-pid data is available with both instrumentation flags on together — do not
+treat that earlier timestamp as attributed to `xfwm4` specifically until re-confirmed.
 **Reusable tool**: `advisor/probes/xwire_probe.c` (4KB, freestanding, no Xlib, decodes X error
 codes with major opcode) is now a standing known-good baseline for "is X itself working right
 now" — use it first on any future X-related question in this project rather than re-deriving from
