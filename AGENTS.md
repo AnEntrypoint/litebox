@@ -753,6 +753,88 @@ t~16, `nonzero 6,221,890 -> exactly 0`; zero overlaps against the scanout range 
 whole run, both at creation (t=0.97) — nothing instrumented touches the buffer between creation
 and the wipe.
 
+**Independent second-session confirmation (this session), fully converged with everything above,
+plus new findings, dead ends, and a corrected fast-repro fact**:
+
+- Re-ran the full three-metric overlap check (`diag-commit`, `diag-decommit`, `diag-reclaim`)
+  against the GUEST's own persistent scanout addresses (independently re-derived and logged at
+  `litebox_shim_linux/src/syscalls/mm.rs`'s `try_dri_dumb_buffer_mmap` success point — confirmed
+  identical addresses to advisor's own: `0x1EF00000`/`519503872` and `0x1FA00000`/`531431424`,
+  logged exactly once per run at ~t=6s and stable for the buffer's whole lifetime) across two full
+  XFCE runs that both reached the wipe (t=19.30→19.82 and t=18.34→18.84). **Zero overlaps for all
+  three APIs, for the entire run, not just the wipe window** — same result as advisor's, reached
+  independently. This is now confirmed by two separate sessions using two separately-added,
+  independently-verified logging sites.
+- **Corrected fast-repro fact**: built a minimal fast-repro script (seatd → weston → Xwayland `:1`,
+  no X client at all) and reproduced the wipe in ~13.6s, WITHOUT ever running an X client —
+  contradicting advisor's "needs an X client to connect" finding above. Xwayland merely running
+  long enough (past `XWAYLAND_READY`) is sufficient to trigger it in this session's runs; whether
+  advisor's original 3-way isolation result was itself timing-sensitive (i.e. the "no wipe" cases
+  simply hadn't run long enough yet) is unresolved — the isolation experiment should be re-run with
+  a longer timeout before trusting "needs a client" as a real precondition.
+- **`LITEBOX_FORKVERIFY_OFF=1` bisection independently re-attempted and independently reached the
+  same inconclusive result** as advisor's own attempt above (both sessions tried this without
+  seeing each other's result first): with fork_verify's reactive healing disabled, the run dies
+  with a genuine host-side `#PF` (`Exception(14)`, `cr2` genuinely unmapped) partway through
+  startup — this run never even got weston running, let alone Xwayland or a client. **Two
+  independent attempts, two independent confirmations that this bisection is unusable** — do not
+  attempt it a third time; fork_verify's healing is load-bearing for basic process-launch
+  stability, and disabling it does not isolate the wipe question, it just substitutes a different,
+  earlier, already-documented crash.
+- **Traced but did NOT find evidence of exploitation**: `CLAIMED_RANGES`
+  (`litebox_platform_windows_userland/src/lib.rs` ~line 4018-4370), the registry that prevents two
+  different guest processes' `Replace`-mode (fixed-address) allocations from colliding on the same
+  real Windows address, is populated ONLY from `allocate_pages` calls (`claim_range`, called at
+  lines ~4332/5729/5797) — it is NEVER populated by `map_shared_memory` (confirmed via `grep`: zero
+  `claim_range` call sites in `map_shared_memory`/`create_shared_memory`). This means weston's DRM
+  scanout buffer's real address is structurally INVISIBLE to `CLAIMED_RANGES` — a genuinely
+  existing gap, not a hypothetical one. However: `Replace`-mode's OTHER collision guard
+  (`has_committed_page`, a direct `VirtualQuery` against Windows' own real VAD state, checked
+  before `find_foreign_claim` even runs) WOULD still see the buffer's real `MEM_COMMIT`/`MEM_MAPPED`
+  state correctly regardless of `CLAIMED_RANGES` — so this gap is not immediately exploitable by
+  itself. Whether some code path could still race past `has_committed_page`'s check (a TOCTOU
+  window, or a `Hint`-mode allocation that never queries commit state for a NULL-hint request) was
+  not fully resolved; this is real remaining uncertainty, not a dead end, but no live evidence of
+  it firing was found in any instrumented run (would show up as a `diag-reclaim`/`diag-commit`
+  overlap, and none were found).
+- **Two weston-upstream-source hypotheses investigated via subagents against real weston source
+  (gitlab.freedesktop.org/wayland/weston), both DEAD-ENDED**:
+  1. `drm_rb_discarded_cb()`/`pixman_renderer_resize_output()` creating a fresh (genuinely
+     all-zero-including-alpha) dumb buffer on an output resize/mode-change (`backend-drm/drm.c`,
+     `pixman-renderer.c`) — directly refuted against this session's own logs: the wipe window in a
+     confirmed-wiped run contains **exactly one `DrmModeSetCrtc` ioctl in the ENTIRE run, at t=6.09s
+     (initial setup)**, none anywhere near the wipe (t=18.3-18.8s), and the SAME `fb_id`/buffer
+     `handle` values (4556/4560) are used both immediately before and immediately after the wipe —
+     no new buffer was ever created, ruling out this mechanism for the observed data.
+  2. weston's pixman renderer or damage-tracking legitimately/buggily zero-filling the WHOLE output
+     (as opposed to real content or a solid background color) via some client-buffer-attach-failure
+     or damage-computation edge case — refuted by direct source reading:
+     `pixman_renderer_repaint_output()` scopes both `repaint_surfaces()` and `copy_to_hw_buffer()`
+     strictly to `output_damage`, never the whole buffer; `draw_view()` SKIPS compositing entirely
+     (a no-op, leaving existing content untouched) when a view has no buffer attached, rather than
+     clearing that region to zero. No `PIXMAN_OP_CLEAR`/memset-to-zero path exists in the renderer
+     for a stalled/hung client. **weston's own real compositing code structurally cannot produce a
+     whole-output, all-channel-zero frame while continuing to flip real fb ids** — this is a strong
+     negative result, not merely an unconfirmed one.
+- **Bottom line after two independent full sessions' worth of instrumentation**: every mechanism
+  either session could name AND instrument has been checked and excluded (Windows memory
+  management in full; weston's own real compositing/resize logic in full; fork_verify's own write
+  path, wrong shape for the data volume; handle-value reuse, never closed; cross-real-process
+  handle collision, structurally impossible in this architecture). The `CLAIMED_RANGES` gap above
+  is the one item that is genuinely still open rather than excluded, but has zero supporting
+  evidence from any run. **The honest state is: the wipe is real, reproducible in ~14-20s via the
+  fast repro, and its mechanism is not visible to any currently-instrumented logging path** — it is
+  a WRITE (not a map/commit/decommit/protect operation), it originates during Xwayland's presence
+  (not necessarily its fork specifically — see the corrected fast-repro fact above), and finding it
+  now requires either `GetWriteWatch`-style live write observation (does not work here — `MEM_WRITE_
+  WATCH` is incompatible with `MapViewOfFile3`-backed section views, only works on private
+  `VirtualAlloc`-committed memory, so this specific tool is NOT usable for a shared-section-backed
+  buffer like this one, a correction to option 1 below) or the `VirtualProtect(PAGE_READONLY)` +
+  existing-VEH write-trap approach (option 2 below), which was not attempted this session due to
+  the risk of destabilizing the existing, delicate VEH/fork_verify interaction without enough
+  remaining session budget to verify it doesn't regress anything — this is the precise, concrete
+  next step for whoever picks this up next, not a vague "needs more investigation."
+
 **PROXIMITY check tightens this further, AND opens a new possibility this whole section had not
 seriously considered — read before committing to GetWriteWatch/trap work.** Checked every logged
 range operation during the tight 450ms wipe window for PROXIMITY, not just overlap: not one range
@@ -779,15 +861,47 @@ only the DRM dumb-buffer ALLOCATION path produces the opaque-black initial state
 So the differing states (opaque-black at creation vs. fully-zero at wipe) do NOT actually rule out
 weston legitimately clearing the buffer during a normal repaint.
 
-**Decisive, cheap discriminator, in progress as of this writing**: connect an X client three more
-times, spaced out, well after the first wipe. If content is being CLEARED as part of a normal
-repaint cycle, later client activity should cause weston to redraw and content should return at
-least briefly. If it stays at exactly zero forever, the buffer is genuinely dead (memory
-corruption — fork-duplication-wrong-address or pointer-healing-stale-write). **If this comes back
-"content returns," the entire memory-corruption investigation above is misdirected, and the real
-question becomes why weston has nothing to composite once Xwayland owns the output** — a
-scene-graph/surface-visibility question in weston/Xwayland's own protocol handling, not a litebox
-memory bug. Check for a result before investing further in `GetWriteWatch`/trap plumbing.
+**MAJOR REFRAME: the flip cadence itself was misread, and this changes the whole shape of the
+investigation.** Full flip timeline (not just the few flips immediately after the wipe) across
+three independent runs shows weston is NOT continuously rendering — it flips in short bursts when
+something changes, then goes completely idle for 10+ seconds, and eventually stops flipping
+altogether entirely. That is CORRECT compositor behavior (no damage, no repaint), not evidence of
+anything broken:
+```
+xt1: 29 flips, first t=1.51, LAST t=25.45 -- run continues to t=85 with NO further flips
+     gaps: t=2.8->15.3 (12.5s), t=16.8->25.4 (8.5s)
+xc1: 30 flips, last t=28.1, gaps of 13.0s and 10.6s
+xfM: 25 flips, last t=48.8, gaps of 10.6s and 28.6s
+```
+The real sequence: t=1.5-2.8 weston paints its shell, flips actively (6,221,880 non-zero bytes).
+t=2.8-15.3: IDLE, no flips at all — nothing happening to the framebuffer during this whole
+window. t=15.3: Xwayland/xkbcomp activity causes a repaint. t=15.97: last flip, STILL showing old
+content. t=16.42: next flip, ZERO. **This is consistent with "weston repaints a scene that now has
+nothing visible in it, and paints it to zero" (candidate (c), legitimate clearing) rather than
+"content is drawn, then something corrupts it mid-life."** The earlier "weston would leave alpha
+set on a real clear" argument against (c) does not hold (see the prior reconsideration above) —
+this reframe makes (c) the LEADING hypothesis, not an outsider.
+
+**A more concrete, likely more directly user-facing bug found in the same investigation**: a
+trivial X client (`xfce4-about --version`, which should print a version string and exit in
+milliseconds) instead runs for 60+ SECONDS without exiting — still alive at the end of a
+repeated-client test, actively allocating shared memory and exchanging Wayland protocol at t=25.
+**This would fully explain the user's ORIGINAL reported symptom** ("we saw a blue bar, clock and
+icon display... then went black" after "a pretty long wait") — the X clients are alive but
+pathologically slow, so almost nothing gets drawn in reasonable time, independent of any
+memory/scanout question at all.
+
+**Revised priority order, redirect here first**:
+1. **Why does a trivial X client take 60+ seconds of wall time instead of milliseconds?** Profile
+   where it spends its time. This is likely the actual "XFCE is slow and mostly blank" cause and
+   is more directly tied to the original user-reported symptom than the scanout-zero question.
+2. Only after (1) is answered: whether the zero-buffer is weston correctly painting an empty
+   scene. Cheap test: run an X client that actually MAPS A WINDOW (not just connects and exits)
+   and see whether content appears. If a real window renders, there is likely no memory bug here
+   at all.
+
+**Hold `GetWriteWatch`/trap plumbing until (1) and (2) are answered** — that work presumes memory
+corruption that may not exist.
 
 ## Reproduction commands
 
