@@ -1075,6 +1075,49 @@ is already sampled. If it's non-zero, the client drew successfully and weston is
 composite it (candidate 1 or 3). If it's zero, the client's own drawing isn't landing at all
 (candidate 2, a shared-memory bug in the client-buffer path).
 
+**CLIENT-BUFFER SAMPLING INSTRUMENTATION ALREADY EXISTS — confirmed by code reading, this session
+(`litebox_platform_windows_userland/src/lib.rs`, `map_shared_memory`, ~line 6139-6161): every
+`map_shared_memory` call already logs `nonzero_in_sample` (first 4KiB of any buffer <=4MiB),
+gated the same as the scanout digest. The doc note above ("not yet done") is stale relative to
+current code; some peer session already landed this. Re-run and grep `nonzero_in_sample` rather
+than adding new instrumentation.**
+
+**One re-run this session (`fast_repro.sh` inside `layer31_direct_fixed.tar`, plain
+`xfce4-about --version`, `LITEBOX_DRM_TRACE=1`) did NOT reproduce advisor's t=28 compositing
+picture at all — a different, earlier divergence, underscoring the session's already-documented
+non-determinism:**
+```
+t=3.2-4.7   client creates several shm handles (4904/4908/4940, sizes up to 8,294,400)
+t=4.50      map_shared_memory FAILED handle=4980 win32_err=1132 (ERROR_MAPPED_ALIGNMENT) x3,
+            correctly retried/handled per the existing NoReplace/AddressInUse fallback -- not a bug
+t=4.51-4.68 create_shared_memory handle=4988 size=245760 (matches the 320x192x4 client-surface
+            shape advisor described) and handle=4992 size=4096 -- but NEITHER is ever mapped via
+            map_shared_memory anywhere later in this run (zero nonzero_in_sample events at all)
+t=5.06-5.79 scanout genuinely has real content, nonzero_bytes=6,221,881 (weston's own shell paint)
+t=16.4-17.4 Xwayland starts; scanout wipes to nonzero_bytes=0 and stays there through TEST_DONE
+t=21.1      execve xfce4-about; prints "xfce4-about 4.20.1 (Xfce 4.20)" and exits promptly;
+            Xwayland logs "failed to read client connection (pid 20)"
+t=38.8      a NEW create_shared_memory handle=4724 size=245760 appears (some other client/process)
+final frames (LITEBOX_DUMP_FRAMES): non_black_pixels=0 -- standing goal NOT met in this run
+```
+This run's `xfce4-about --version` behaved like a normal short-lived CLI probe (prints version,
+exits), not like advisor's characterized long-lived GTK client that draws a 320x192 surface and
+stalls at t=25-28 waiting on a compositor reply. Both shapes are real and reproducible on
+different runs -- **whether `xfce4-about --version` builds a real GTK window (and thus a wl_shm
+surface) at all may itself be non-deterministic or environment-dependent** (frozen locale/DISPLAY
+race, GTK falling back to a no-display code path, etc.) and is itself worth checking directly
+(`ldd`/`strace`-equivalent on what `xfce4-about --version` does on real Linux) before spending
+more time chasing the compositing theory on a client invocation that may not even reach the
+drawing code path every time.
+
+**Next step for whoever picks this up**: (1) confirm whether `xfce4-about --version` is expected
+to create a GTK window on real Linux at all (if not, swap the repro's client for one that
+definitely does, e.g. plain `xfce4-terminal` or a minimal wayland/X11 test client that always
+maps a surface) so the repro reliably reaches the code path the compositing theory is about; (2)
+once a client reliably reaches `map_shared_memory` for its own surface buffer, re-run with
+`LITEBOX_DRM_TRACE=1` and read `nonzero_in_sample` directly off the existing instrumentation
+(no new code needed) to settle candidates 1/2/3 above.
+
 ## Reproduction commands
 
 Full XFCE launch — **use `advisor/probes/run_xfce_staged.sh` as the launch script, NOT any

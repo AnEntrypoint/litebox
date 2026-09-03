@@ -535,6 +535,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Some(length) = litebox::mm::linux::NonZeroPageSize::new(aligned_len) else {
             return Some(Err(MappingError::UnAligned));
         };
+        // Note: `map_shared_memory` (litebox_platform_windows_userland/src/lib.rs) already logs
+        // a `nonzero_in_sample` content digest for every mapping it establishes, gated behind
+        // `LITEBOX_DRM_TRACE=1` -- this is the "sample the CLIENT buffer like the scanout buffer"
+        // instrumentation the investigation needs (see AGENTS.md's "Rendering/scanout blocker"
+        // section); no separate digest is needed here.
         Some(
             unsafe {
                 self.process()
