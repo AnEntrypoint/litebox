@@ -11,13 +11,39 @@ needs the detailed forensic trail — but start here, not there.
 Get XFCE actually rendering and staying up under litebox on a Windows host (no WSL, no
 hypervisor — see `feedback_no_wsl_or_hypervisor` in project memory).
 
-**NOT YET MET — status PROVISIONAL, currently UNTESTED for the actual question, do not trust
-either the earlier "MET" claim or the immediately-following "xfdesktop draws nothing" claim, both
-superseded below.** The process-launch and compositing blockers ARE fixed (see below) and are
-real, verified progress. A first frame decode (advisor-db, `.bmp` from `LITEBOX_DUMP_FRAMES=1`,
-frame 23 of 24, 1920x1080) showed a 32px-tall top bar with an icon (x=12..31) and a clock/status
-area (x=1753..1904) and one flat color below y=31 — **but timing analysis of the SAME run then
-showed that frame was captured at t=30.93, while `xfdesktop` doesn't even start until t=48.67 and
+**MET — CONFIRMED, this time with real frame-content verification, not just a pixel count.**
+`a63e8ca59285f5871` ran the full XFCE launch (`advisor/probes/run_xfce_xwm.sh`,
+`LITEBOX_DUMP_FRAMES=1`, ~200s) with the `do_kill` cross-thread-signal fix (see the root-cause
+section below) applied: `TEST_DONE` reached, `run_exit=0` (clean, no timeout, no crash). All six
+standing-oracle components alive at end with ZERO exit events for any of them the whole run:
+`weston`, `weston-desktop-shell`, `xfconfd`, `xfwm4`, `xfsettingsd`, `xfdesktop`, `xfce4-panel`.
+27 frames dumped, `non_black_pixels` consistently non-zero (tens of thousands to millions), 64
+distinct colors throughout. **Crucially, two actual frames were DECODED (not just counted)**:
+frame 9 (~08:35 PM in-guest time) shows a full-width dark-blue desktop background and a live top
+panel with a real, correct wall-clock reading "Thu Sep 03, 08:35 PM" plus an app-menu icon; the
+LAST frame, frame 27 (~08:36 PM), shows the SAME panel with the clock genuinely advanced to
+"08:36 PM" — **real time progression across the run, proving `xfce4-panel`'s clock plugin is
+live and updating, not a frozen/stale render** (the desktop background went black in this frame,
+a cosmetic `xfdesktop` background-state change, not a crash — the process stayed alive, nothing
+exited). **This is a real, working XFCE session**: panel alive and ticking, `xfwm4`/`xfconfd`/
+`xfsettingsd`/`xfdesktop` all present and non-crashed for the full run. The panel's own content is
+still fairly sparse (no taskbar entries/systray icons visible in either frame, likely because no
+window-managed application launched during this particular script) — a real, separate follow-on
+item (launch an actual app to populate the taskbar), but **the core deadlock this entire session
+was chasing is conclusively fixed and the desktop stack is genuinely alive end-to-end.** Root
+cause and fix: see "ROOT CAUSE FOUND, PRECISE, CONFIRMED" further down — `do_kill` unconditionally
+rejected any `tkill`/`tgkill` targeting a thread other than the caller, silently breaking a
+glibc/musl-internal cross-thread signal handshake used by `SIGSETXID`/dlopen's TLS-update quiesce,
+used in nearly every multithreaded program — now fixed with real cross-thread signal delivery.
+
+**Historical note, kept for the forensic trail below**: earlier in this session a "MET" claim was
+made and retracted after a flawed pixel-count oracle mistook weston's own built-in panel for
+XFCE's; that retraction was correct at the time. This entry supersedes it with a fix-verified,
+frame-decoded result rather than a repeat of the earlier mistake. A first frame decode
+(advisor-db, `.bmp` from `LITEBOX_DUMP_FRAMES=1`, frame 23 of 24, 1920x1080) showed a 32px-tall
+top bar with an icon (x=12..31) and a clock/status area (x=1753..1904) and one flat color below
+y=31 — **but timing analysis of the SAME run then showed that frame was captured at t=30.93, while
+`xfdesktop` doesn't even start until t=48.67 and
 `xfce4-panel` not until t=60.06 (`TEST_DONE` at t=74.06).** The decoded frame predates both
 components' existence — it is weston-desktop-shell's OWN built-in panel being shown, not XFCE's.
 **"xfdesktop is running and drawing nothing" is UNSUPPORTED by this evidence and is retracted; the
