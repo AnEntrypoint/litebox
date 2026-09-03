@@ -310,6 +310,33 @@ the gschema fix applied — captured before that fix existed, so 5 aborting `at-
 run were real noise in what that trace's conclusions were based on; treat the t=115.7s finding as
 needing a clean re-trace before being trusted further.
 
+**Clean re-trace done (this session, gschema-fixed launcher, `advisor/probes/
+run_xfce_crash_diag.sh`) — DID NOT REPRODUCE the Xwayland `SIGABRT`.** Confirms the run-to-run
+variance directly: same command, same fix applied, different outcome from the earlier trace.
+`weston.out` (now capturing real `xwm-wm-x11`/`xwayland` logger scopes) shows normal X11 window-
+management traffic (`XCB_CREATE_NOTIFY`/`XCB_MAP_REQUEST`/`XCB_CONFIGURE_NOTIFY` etc. for
+`xfce4-about`, `xfwm4`, `wrapper-2.0` instances) all the way through, with **no crash message, no
+fatal signal, no abnormal termination logged for either Xwayland or weston anywhere in this run.**
+DRM flips continued at t=203s, well past `TEST_DONE` (~t=172s) — **weston and Xwayland were
+genuinely still alive and rendering; this session's own custom `/proc`-based liveness-polling
+check in the diagnostic script is BROKEN** (falsely reported both dead at the very first 5s check,
+contradicted directly by real flip/log activity afterward) — do not trust `SETTLE_CHECK_*` output
+from `run_xfce_crash_diag.sh` as currently written; needs a fix (likely a glob/quoting issue with
+`for p in /proc/[0-9]*` under this shell) before it's usable as a liveness signal.
+**Frame series for this run** (`scan_frame_series.py .`): landed at a stable
+`non_black_pixels=92,661` (same settled value as previous runs) via a short SEQUENCE of
+transitions (frame 10→0, then partial recoveries/drops through frame 54 and 62 before settling) —
+matching the SHAPE of advisor-db's "run C" (multi-step degradation, no crash, no hang, ran fine to
+completion) rather than either of the other two shapes (single clean drop / hard hang). **One
+`xfce4-panel` `SIGABRT`(6) at t=72.5s** did occur in this run — consistent with advisor-db's
+independently-confirmed panel-`SIGABRT`-at-t=86 finding (different absolute time, same event
+class) — worth folding into the "deterministic guest crashes" investigation thread.
+**Net effect on Problem 2 (Xwayland `SIGABRT`)**: the original finding stands as a real, observed
+event from an earlier trace, but is now understood to be one of (at least) several possible
+outcomes for this launch sequence, not a reliable/reproducible failure mode on its own — consistent
+with the broader "outcomes vary run to run" finding above. Not retracted, just re-scoped: rare
+(1 run so far), not yet reproduced on demand.
+
 **Historical note, kept for the forensic trail below**: earlier in this session a "MET" claim was
 made and retracted after a flawed pixel-count oracle mistook weston's own built-in panel for
 XFCE's; that retraction was correct at the time. This entry supersedes it with a fix-verified,
