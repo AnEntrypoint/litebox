@@ -799,6 +799,21 @@ instead takes a different path (the `g_once` retry loop) that never reaches the 
 t=13.36-32.97s window (not just futex calls) — what is it actually spending 19+ seconds doing
 instead of servicing `tid=18`.
 
+**Discriminator question (host-side spawn bug vs. guest-side never-called-clone) already answered
+from existing data — no rebuild/rerun needed.** `a63e8ca59285f5871` had both signals already: (1)
+its own `"clone: spawned new task"` log (`process.rs:3162`, fires only AFTER `spawn_thread`
+returns `Ok` — i.e. the real OS thread already succeeded) shows exactly one clone from
+`xfce4-about`'s main thread, `parent_tid=17 child_tid=18` at t=13.025455700, a real
+`pthread_create`; (2) `tid=18` then makes genuine, unambiguous guest syscalls afterward (the
+`WAKE`/`WAIT` pair above), only reachable after `init_thread_context`/`prepare_to_run_guest`/
+`run_thread_arch`'s asm resume have all already succeeded. **The set difference is EMPTY**: the
+one thread that was clone-requested is the same one seen executing real guest code. **Confirms
+definitively: NOT a host-side spawn-scheduling bug** (clone accepted, thread never starts) — `tid=18`
+genuinely starts, runs real code, and only then gets stuck on its own internal futex wait, exactly
+as already concluded above. No missing thread, no silently-dropped clone. advisor-db's binary/
+repro is not needed to re-answer this specific question; effort redirects to the syscall
+histogram for `tid=17` above.
+
 **In progress in parallel**: advisor-db is running a context test (a GTK binary inside the full
 display stack, expected ~2s reproduction if display-stack context is what triggers this) to give a
 fast verification target for whatever fix lands here.
