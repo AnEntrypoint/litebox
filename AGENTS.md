@@ -374,6 +374,51 @@ above). **Also being re-verified**: whether the earlier `t=40.818` GetProperty-t
 is real but for a DIFFERENT client (`xfdesktop` or `xfce4-panel`, both alive and creating windows
 around then) once per-pid data is available with both instrumentation flags on together — do not
 treat that earlier timestamp as attributed to `xfwm4` specifically until re-confirmed.
+
+**ROOT CAUSE FOUND, PRECISE, CONFIRMED: this is a litebox `clone()`/`fork_verify` bug, not GTK,
+not xfconf, not X11 at all — a cloned pthread never resumes into guest code after its Windows
+thread-healing pass completes.** `a63e8ca59285f5871`'s request-detail syscall trace (full typed
+args, comm-filtered to `xfwm4`/`xfdesktop`/`xfce4-panel`) pins the exact sequence for `xfwm4`
+(pid=38):
+```
+t=29.855976900  clone() enters -- a real pthread_create()-style thread spawn (CloneArgs)
+t=29.856051900  clone() returns ok=true
+t=29.910541900  fork_verify: diag-fv-lifecycle BEGIN tid=ThreadId(46) win_tid=10876 range_count=37
+                 (litebox's Windows-specific post-clone memory-healing pass for the new thread)
+t=29.914-30.090 several write_usize_fault_tolerant widen/restore healing ops, all ok=true
+t=30.095929200  fork_verify: diag-fv-lifecycle END (cleared) tid=ThreadId(46) had_map=true
+                 range_count=37 -- healing completes successfully, NO error, NO fault reported
+t=30.247204-323 xfwm4's MAIN thread: RtSigprocmask x2, RtSigaction, then:
+t=30.247323500  Tkill { tid: 41, sig: 34 }   -- glibc's own thread-startup sync, targets the new
+                 thread (guest tid=41)
+t=30.247358200  Futex { Wait { val: 0x80000000, timeout: None } }  -- waits FOREVER
+```
+**The newly-cloned thread (guest tid=41, Windows `ThreadId(46)`) never appears in the log again
+after its healing completes at t=30.096 — no syscall, no fault, no exit, nothing, for the rest of
+the 66-second run.** It was created, its memory was healed successfully, and it then silently
+never executes another instruction of guest code. The parent's futex wait is a direct, mechanical
+consequence — not a bug in glibc's synchronization logic, which is working exactly as designed;
+the thread it's waiting on simply never runs to clear the sentinel. **This is glibc's
+`pthread_create()` synchronization pattern behaving correctly against a litebox bug**: `clone()`
+succeeds, `fork_verify` heals the new thread's memory successfully, and then something between
+"healing marked complete" and "new thread actually resumes executing guest code" silently fails to
+resume it. **Matches the shape of two already-documented bug classes in project memory** —
+`project_advisor_ud_trampoline_fork_bug` and `project_advisor_forked_child_text_not_present` — both
+describe a forked/cloned child that gets created and healed but never reaches its first real
+instruction. **Open question**: is this literally the same root cause recurring on a different
+trigger path, or a related-but-distinct issue specific to `CLONE_THREAD` (`pthread_create`) as
+opposed to plain `fork()`? **This reframes the ENTIRE session's XFCE investigation**: the
+GTK-internals / xfconf / dbus / X-protocol threads were following a real symptom to a real dead
+end — the actual bug is in `litebox_platform_windows_userland`'s clone-resume path, squarely a
+Windows-platform fork/thread-emulation bug (consistent with `feedback_fork_verify_windows_only` in
+project memory — this entire bug class only exists on Windows, real Linux/macOS `fork()`/`clone()`
+never needs this healing machinery at all). **Next step**: investigate exactly what happens
+between `fork_verify`'s "END (cleared)" log line and the new thread's actual resume-to-guest-code
+step in `litebox_platform_windows_userland/src/lib.rs` — NOT YET STARTED, that file is mid-edit by
+advisor-db all session, needs coordination before anyone touches it. The syscall-timeline
+instrumentation that found this (`litebox_shim_linux/src/lib.rs` + `litebox_shim_linux/src/diag.rs`,
+`LITEBOX_DIAG_SYSCALL_TIMELINE=1`) is uncommitted, pending a decision on whether to land it now or
+keep iterating.
 **Reusable tool**: `advisor/probes/xwire_probe.c` (4KB, freestanding, no Xlib, decodes X error
 codes with major opcode) is now a standing known-good baseline for "is X itself working right
 now" — use it first on any future X-related question in this project rather than re-deriving from
