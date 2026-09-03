@@ -890,6 +890,39 @@ duplication)**: log the guest `rip` and the OWNING tid at every `futex WAIT` wit
 `val==0x80000000`, plus whether `process_signals` is currently on the stack — names the lock
 owner directly and confirms or kills the signal-during-lock-hold theory in one run.
 
+**MAJOR: this is NON-DETERMINISTIC — the exact failure point moves run to run, strongly favoring a
+race condition over a single deterministic bad line/address.** Own-tooling bug found and fixed
+first (`a63e8ca59285f5871`): the syscall-detail trace had been keying on `self.pid` — the
+THREAD-GROUP id, shared by all `CLONE_THREAD` siblings including `tid=18` — without also including
+`tid`, so `tid=17` and `tid=18`'s syscalls had been silently MERGED under "pid=17" the whole
+session. Fixed by adding `tid` to the trace; rebuilt, reran. **With correct per-tid attribution,
+this run's `tid=18` hangs at a DIFFERENT, MUCH EARLIER point than the previous run**:
+```
+t=13.252535600  tid=18 rt_sigprocmask (SIG_SETMASK) -- ok=true
+t=13.252801900  tid=18 prctl(SetName(...)) -- ok=true (pthread_setname_np during thread startup)
+...tid=18 makes ZERO further syscalls for the entire rest of the run (timed out, run_exit=124)...
+```
+vs. the PREVIOUS run's `tid=18`, which got much further — a `WAKE`, then a genuine `futex WAIT`
+with `val=0`. **This run doesn't even reach its first futex call**; it goes silent immediately
+after the first two post-clone setup syscalls. **This run-to-run variability in exactly WHERE
+`tid=18` stops is a strong signal of genuine non-determinism** — consistent with advisor-db's
+independent finding of a `tgkill` landing during a dlopen-shaped `mmap` burst: a RACE between
+thread-startup/dlopen's own internal synchronization and asynchronous signal delivery, not one
+fixed line of guest code always failing identically. **Also reframes the session's very first
+finding**: "thread parks essentially immediately post-clone, no further syscalls ever" (last
+night) and "thread does real work first, then parks in a specific futex" (tonight) may be TWO
+OBSERVATIONS OF THE SAME underlying race, not two different bugs — the race just resolves at a
+different point depending on scheduling luck each run. **Raises the likelihood this is a genuine
+litebox-side bug in how a signal (plausibly the TLS/thread-start synchronization signal itself,
+given `tid=17` later `tkill`'s exactly `tid=18`) gets delivered to a newly-`clone()`'d thread
+relative to that thread's own startup sequence** — e.g. a signal landing before the thread has
+even finished its early setup (`prctl`, etc.), then never being processed/acknowledged correctly,
+permanently wedging it regardless of where in startup it happened to be.
+**Approved follow-up**: check whether `tid=18`'s sudden silence right after `prctl` means it's
+spinning in pure guest userspace (a busy-wait, no host round-trip) vs. genuinely blocked in the
+platform layer below the syscall level (an unhandled/swallowed exception) — via VEH/exception
+trace activity for `tid=18`'s underlying `win_tid` around t=13.25-13.3 in this specific run.
+
 **In progress in parallel**: advisor-db is running a context test (a GTK binary inside the full
 display stack, expected ~2s reproduction if display-stack context is what triggers this) to give a
 fast verification target for whatever fix lands here.
