@@ -16,6 +16,15 @@ echo STAGE_DBUS
 dbus-uuidgen --ensure=/var/lib/dbus/machine-id 2>/dev/null || true
 glib-compile-schemas /usr/share/glib-2.0/schemas && echo GSCHEMA_COMPILED=ok || echo GSCHEMA_COMPILED=fail
 
+# gdk-pixbuf's loaders.cache is missing entirely from this layer -- without it,
+# gdk-pixbuf cannot resolve ANY format via the normal lookup path, including its
+# own built-in PNG support. This is what aborts xfce4-panel/any GTK app the
+# instant it needs to decode a fallback icon (image-missing.png). Same bug
+# class and same fix pattern as the glib-compile-schemas fix above.
+export GDK_PIXBUF_MODULEDIR=/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders
+gdk-pixbuf-query-loaders > /usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache 2>/tmp/pixbufq.out \
+  && echo PIXBUF_CACHE_BUILT=ok || echo PIXBUF_CACHE_BUILT=fail
+
 export DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/xfce-bus
 dbus-daemon --nofork --nopidfile --nosyslog --config-file=/usr/share/dbus-1/session.conf --address="$DBUS_SESSION_BUS_ADDRESS" &
 i=0; while [ ! -e /tmp/xfce-bus ] && [ "$i" -lt 20 ]; do i=$((i+1)); sleep 0.5; done
