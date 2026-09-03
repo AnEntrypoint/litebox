@@ -445,6 +445,53 @@ particular clone/stack/TLS setup — `CloneFlags(8195840)` alone doesn't disting
 failing cases (identical across all three spawns above), so the next narrowing step is comparing
 full stack/TLS field values precisely, or instrumenting `fork_verify`'s own resume-scheduling
 handoff once `litebox_platform_windows_userland` is clear to touch.
+
+**FILE IS CLEAR — coordination resolved, fix work can proceed.** advisor-db confirmed
+`litebox_platform_windows_userland/src/lib.rs` working tree is CLEAN (`git status --short` empty);
+every diagnostic they'd added there is already committed (`map_shared_memory` content sampling,
+the cross-view registry, fixed-address lock timing, the Debug-formatter fix). No coordination
+needed, no conflict risk. advisor-db is deliberately staying out of the file entirely while this
+proceeds.
+
+**Precise pointer to the exact seam, from advisor-db's own work on this path tonight**:
+`run_thread_inner` at `lib.rs:2598`, specifically the closure around `~2627`:
+```rust
+ThreadHandle::run_with_handle(&tls_state, || unsafe {
+    // Arm fork_verify strictly AFTER run_with_handle's install_tls and strictly
+    // BEFORE run_thread_arch ever resumes guest code
+    if let Some(relocations) = fork_verify_relocations {
+        fork_verify::begin(relocations);
+    }
+    run_thread_arch(&mut thread_ctx, &tls_state);
+});
+```
+This is exactly the seam the syscall trace brackets: `fork_verify::begin` runs and logs its
+lifecycle to completion, and `run_thread_arch` is what actually resumes guest code. A thread that
+logs "END (cleared)" and then never executes a single guest instruction is failing between those
+two lines, or inside `run_thread_arch`'s entry itself.
+
+**Three things that may save time, from advisor-db's own prior work on this exact path**:
+a) **The ordering in that closure is deliberate and load-bearing — known trap, do not "fix" it by
+   reordering.** Comment at `2628-2631` and an earlier pass's note in the runner (`lib.rs:1103`)
+   record that arming `fork_verify` BEFORE `run_thread` was previously tried and was a silent
+   no-op, because `fork_verify::begin` only takes effect once `get_tls_ptr()` returns `Some`,
+   which is only true partway through `run_thread`'s internals.
+b) **Two distinct resume paths exist and are easy to conflate.**
+   `run_thread_with_fork_verification` (`2589`) is used by the CROSS-PROCESS fork child via
+   `adopt_forked_process` in the runner at `lib.rs:1110`. The same-process `do_clone` path (the
+   `xfwm4` case — `CLONE_THREAD`) arms verification through `Task::init`'s `ThreadInitState`
+   (`process.rs`, `ThreadInitState` at `924`, the `NewThread` variant at `928`) instead — **the
+   runner's cross-process call site is a red herring for this specific bug.**
+c) **Ties into an earlier this-session correlation that was refuted as a CAUSE but may still be a
+   symptom of this same bug.** The earlier finding that concurrent `fork_verify` healing passes
+   correlate with faults (41 runs, zero faults whenever only one pass was live) was refuted as
+   causal — but if a healed thread can silently fail to resume, that correlation is honestly
+   explained: more concurrent passes means more chances for one to not come back. Worth checking
+   whether the non-resuming thread's healing pass overlapped another concurrent pass.
+
+**In progress in parallel**: advisor-db is running a context test (a GTK binary inside the full
+display stack, expected ~2s reproduction if display-stack context is what triggers this) to give a
+fast verification target for whatever fix lands here.
 **Reusable tool**: `advisor/probes/xwire_probe.c` (4KB, freestanding, no Xlib, decodes X error
 codes with major opcode) is now a standing known-good baseline for "is X itself working right
 now" — use it first on any future X-related question in this project rather than re-deriving from
