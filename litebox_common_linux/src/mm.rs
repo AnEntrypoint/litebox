@@ -7,7 +7,7 @@ use litebox::{
     mm::linux::{
         CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE, VmemUnmapError,
     },
-    platform::page_mgmt::DeallocationError,
+    platform::page_mgmt::{DeallocationError, MemoryRegionPermissions},
 };
 
 use crate::{MRemapFlags, MapFlags, ProtFlags, UserPtrMut, errno::Errno};
@@ -172,20 +172,36 @@ pub fn sys_mprotect<
     }
 
     let addr = addr.to_platform_ptr::<Platform>();
-    match prot {
-        ProtFlags::PROT_READ_EXEC => unsafe { pm.make_pages_executable(addr, len) },
-        ProtFlags::PROT_READ_WRITE => unsafe { pm.make_pages_writable(addr, len) },
-        ProtFlags::PROT_READ => unsafe { pm.make_pages_readable(addr, len) },
-        ProtFlags::PROT_NONE => unsafe { pm.make_pages_inaccessible(addr, len) },
-        ProtFlags::PROT_READ_WRITE_EXEC => unsafe { pm.make_pages_rwx(addr, len) },
-        _ => {
-            #[cfg(debug_assertions)]
-            todo!("Unsupported prot flags {:?}", prot);
-            #[cfg(not(debug_assertions))]
-            return Err(Errno::EINVAL);
+    // Real Linux `mprotect(2)` accepts ANY combination of PROT_READ/PROT_WRITE/PROT_EXEC (8
+    // combinations total, since PROT_NONE=0 and the three bits are independent) -- there is
+    // nothing special about the 5 combinations previously matched here. The remaining 3
+    // (PROT_WRITE alone, PROT_EXEC alone, PROT_WRITE|PROT_EXEC) are real, legal, and used in
+    // practice: e.g. musl/glibc's dynamic linker widens a RELRO/relocated segment to PROT_WRITE
+    // alone (no PROT_READ bit set explicitly -- real hardware/Windows still allows reading a
+    // writable page, so this is a legitimate narrowing request, not a mistake) while patching
+    // relocations, then restores the segment's real final protection afterward. Previously,
+    // any of these 3 unhandled combinations fell to a `todo!()` panic (debug builds, aborting
+    // the whole runner on an ordinary guest syscall) or silently returned `EINVAL` (release
+    // builds) -- silently leaving the segment at its OLD protection while the guest's dynamic
+    // linker believed the mprotect had succeeded and proceeded to write relocations into
+    // memory that was never actually made writable, producing a guest-visible SIGSEGV
+    // (confirmed live: weston's own ld.so relocation sequence, `mprotect(PROT_WRITE)` on a
+    // freshly-loaded shared library's data segment, silently EINVAL'd, followed by a real write
+    // fault at the exact start of that same range).
+    let permissions = {
+        let mut permissions = MemoryRegionPermissions::empty();
+        if prot.contains(ProtFlags::PROT_READ) {
+            permissions |= MemoryRegionPermissions::READ;
         }
-    }
-    .map_err(Errno::from)
+        if prot.contains(ProtFlags::PROT_WRITE) {
+            permissions |= MemoryRegionPermissions::WRITE;
+        }
+        if prot.contains(ProtFlags::PROT_EXEC) {
+            permissions |= MemoryRegionPermissions::EXEC;
+        }
+        permissions
+    };
+    unsafe { pm.change_page_permissions(addr, len, permissions, "guest_mprotect") }.map_err(Errno::from)
 }
 
 /// Handle syscall `mremap`

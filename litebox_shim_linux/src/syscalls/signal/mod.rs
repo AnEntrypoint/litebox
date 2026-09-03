@@ -951,8 +951,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             litebox_util_log::error!(
                                 signal:? = signal,
                                 pid:% = self.pid,
-                                tid:% = self.tid;
+                                tid:% = self.tid,
+                                comm:? = self.comm.get();
                                 "fatal signal: terminating task"
+                            );
+                            // Always-on process-timeline diagnostic (advisor-db spec item 3):
+                            // same event, in the DIAG_TIMELINE-prefixed shape the other
+                            // exit/execve timeline lines use, for a uniform post-hoc `grep`.
+                            litebox_util_log::error!(
+                                pid:% = self.pid, comm:? = self.comm.get(), signal:? = signal;
+                                "DIAG_TIMELINE exit_signal"
                             );
                             // `sys_exit`/`sys_exit_group` both tear down fork-child single-step
                             // verification (`end_fork_child_verification`) before calling into

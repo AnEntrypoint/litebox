@@ -46,6 +46,7 @@ macro_rules! log_unsupported {
 }
 
 pub(crate) mod channel;
+pub mod diag;
 pub mod loader;
 pub(crate) mod stdio;
 pub mod syscalls;
@@ -1188,7 +1189,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ///
     /// Unsupported syscalls or arguments would trigger a panic for development purposes.
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
-        let return_value = match self.do_syscall(ctx) {
+        // Advisor-db diagnostics item 1 (`LITEBOX_STRACE_SUMMARY=1`): lazily latch the env flag
+        // on first dispatch (this `#![no_std]` crate has no other way to observe the host
+        // process environment -- see `diag`'s module doc comment) and, when enabled, time this
+        // dispatch and record the outcome. Zero overhead beyond one relaxed atomic load when
+        // unset.
+        crate::diag::init_strace_summary(self.global.platform.env_flag("LITEBOX_STRACE_SUMMARY"));
+        let timed = crate::diag::strace_summary_enabled();
+        #[cfg(target_arch = "x86_64")]
+        let syscall_number = ctx.orig_rax;
+        #[cfg(target_arch = "aarch64")]
+        let syscall_number = ctx.syscallno.reinterpret_as_unsigned() as usize;
+        let start = timed.then(|| self.global.platform.now());
+
+        let result = self.do_syscall(ctx);
+
+        if let Some(start) = start {
+            let elapsed = litebox::platform::Instant::duration_since(&self.global.platform.now(), &start);
+            let err_debug = result.as_ref().err().map(|e| alloc::format!("{e:?}"));
+            crate::diag::record_syscall(
+                syscall_number,
+                elapsed.as_nanos().try_into().unwrap_or(u64::MAX),
+                err_debug,
+            );
+        }
+
+        let return_value = match result {
             Ok(v) => v,
             Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
         };
@@ -1214,7 +1240,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let syscall_number = ctx.orig_rax;
         #[cfg(target_arch = "aarch64")]
         let syscall_number = ctx.syscallno.reinterpret_as_unsigned() as usize;
-        let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
+        let request = match SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                if crate::diag::strace_summary_enabled() {
+                    crate::diag::record_unresolved_syscall(
+                        syscall_number,
+                        self.pid,
+                        &alloc::string::String::from_utf8_lossy(&self.comm.get()),
+                    );
+                }
+                return Err(e);
+            }
+        };
         if matches!(
             request,
             SyscallRequest::Clone { .. }
@@ -1983,6 +2022,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             } => syscall!(sys_setitimer(which, new_value, old_value)),
             _ => {
                 log_unsupported!("{request:?}");
+                if crate::diag::strace_summary_enabled() {
+                    crate::diag::record_unsupported_subcommand(
+                        &alloc::format!("{request:?}"),
+                        "ENOSYS",
+                        self.pid,
+                        &alloc::string::String::from_utf8_lossy(&self.comm.get()),
+                    );
+                }
                 Err(Errno::ENOSYS)
             }
         }

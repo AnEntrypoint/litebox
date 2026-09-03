@@ -963,6 +963,18 @@ pub trait SystemInfoProvider {
     /// Return `Some(address)` if the VDSO is available on the platform, or `None`
     /// if the platform does not support or provide a VDSO.
     fn get_vdso_address(&self) -> Option<usize>;
+
+    /// Returns whether the given host environment variable is set to any non-empty value.
+    ///
+    /// Used by `#![no_std]` shim code (which has no direct way to read host process
+    /// environment) to gate optional diagnostics (e.g. `LITEBOX_STRACE_SUMMARY`,
+    /// `LITEBOX_CAPTURE_PROC_IO`) behind a host env var, mirroring how
+    /// `LITEBOX_VEH_TRACE`/`LITEBOX_LOG` are already read in the `std`-enabled runner/platform
+    /// crates. Default implementation always returns `false` (env var unset) so existing
+    /// platform implementations that don't override this keep their prior behavior.
+    fn env_flag(&self, _name: &str) -> bool {
+        false
+    }
 }
 
 /// A provider for thread-local storage.

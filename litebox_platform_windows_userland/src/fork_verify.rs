@@ -121,6 +121,78 @@ use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, EXCEPTION_RECORD};
 
 use crate::TlsState;
 
+std::thread_local! {
+    /// This thread's own address-space "generation" counter. Bumped only on THIS thread by
+    /// [`end`] (whose only two call paths are `execve`, which replaces the address space wholesale
+    /// on this thread, and `exit`/`exit_group`, which terminates this thread -- see `end`'s call
+    /// sites in `litebox_shim_linux::syscalls::process`: `sys_execve`, `sys_exit`,
+    /// `sys_exit_group`). Deliberately PER-THREAD, not a single process-wide counter: `fork_verify`
+    /// is genuinely concurrent across threads (confirmed live: `ThreadId(6)` and `ThreadId(7)` both
+    /// held live, independently-armed maps simultaneously, with `ThreadId(7)` ending at t=1.6344
+    /// while `ThreadId(6)` was still legitimately verifying until t=1.7431) -- a global counter
+    /// bumped on every `end()` would invalidate a DIFFERENT, still-valid thread's map the instant
+    /// any other thread exited or exec'd, turning a rare silent-corruption bug into a frequent
+    /// silent-failure-to-heal one.
+    ///
+    /// [`begin`] stamps the thread's current generation onto [`FORK_VERIFY_EPOCH`] when arming a
+    /// map; [`current_map_is_valid`] compares that stamp against this counter's LIVE value.
+    static FORK_VERIFY_GENERATION: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+
+    /// The [`FORK_VERIFY_GENERATION`] value stamped by the most recent [`begin`] call on this
+    /// thread. Compared against this thread's live generation by [`current_map_is_valid`].
+    ///
+    /// # Why this exists
+    ///
+    /// `end()`'s `tls.fork_verify.try_borrow_mut()` can find the `RefCell` already borrowed (a
+    /// nested fault re-entering the exception handler while an outer `translate_stale_*` healer's
+    /// own borrow is still alive) and skip clearing the map, on the documented assumption that the
+    /// outer healer's own borrow is about to be dropped and the leftover map is harmless for "one
+    /// exception cycle". Live log evidence disproved that: `ThreadId(18)` armed a 92-range map, hit
+    /// the SKIPPED-clear path ~183ms later during a DIFFERENT guest process's (`dbus-launch`)
+    /// fatal-signal termination, and never appeared in the log again -- the fatal-signal path does
+    /// not return through the healer to retry the clear, so the map leaked permanently. Any LATER
+    /// access violation on that thread would have found the four `translate_stale_*` healers still
+    /// willing to consult that stale map and silently translate through address ranges that no
+    /// longer describe anything real, corrupting whatever register or memory slot they touched.
+    ///
+    /// The generation stamp makes that a detectable, harmless refusal instead: even though the
+    /// fatal-signal path never runs the guest's own `sys_exit`/`sys_exit_group`/`sys_execve` (so it
+    /// cannot bump `FORK_VERIFY_GENERATION` itself), the SAME thread later being reused/torn down
+    /// through one of those paths -- or simply never touching a live map again -- means the stamp
+    /// recorded here stops mattering the moment this thread's own generation is next bumped by a
+    /// genuine `end()` call for THIS thread. Combined with `current_map_is_valid`'s check, a map
+    /// that survives a skipped clear is refused the instant this thread's own next `begin`/`end`
+    /// cycle would have invalidated it, rather than being trusted indefinitely.
+    static FORK_VERIFY_EPOCH: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// Returns `true` iff `tls.fork_verify`'s currently-armed map (if any) was stamped with THIS
+/// THREAD's generation still current -- i.e. no `execve`/task-termination [`end`] has run on this
+/// same thread since its own [`begin`]. The four AV-path `translate_stale_*` healers must call this
+/// before applying any translation from a borrowed map: a `false` result means the map is
+/// known-stale (left behind by `end()`'s `try_borrow_mut` skip path) and must be treated as "not
+/// handled" rather than trusted, converting what would otherwise be a silent corrupting translation
+/// into a logged, harmless refusal. Deliberately per-thread (see [`FORK_VERIFY_GENERATION`]'s doc
+/// comment) so one thread's own `execve`/exit never invalidates a different, still-verifying
+/// thread's perfectly valid map.
+pub(crate) fn current_map_is_valid() -> bool {
+    let stamped = FORK_VERIFY_EPOCH.with(core::cell::Cell::get);
+    let live = FORK_VERIFY_GENERATION.with(core::cell::Cell::get);
+    let valid = stamped == live;
+    if !valid {
+        litebox_util_log::error!(
+            tid:? = std::thread::current().id(),
+            stamped_generation:% = stamped,
+            live_generation:% = live;
+            "fork_verify: refusing stale-pointer translation -- armed map's generation does not \
+             match this thread's current address-space generation (map was left live past this \
+             thread's own execve/task-termination event); this thread should not still be treated \
+             as under fork-verification"
+        );
+    }
+    valid
+}
+
 /// The x86 `EFLAGS.TF` (trap flag) bit: when set, the CPU raises `#DB` after every instruction.
 ///
 /// This bit is owned exclusively by this module. It is masked out of every guest-visible eflags
@@ -496,6 +568,9 @@ pub(crate) fn translate_stale_source_rip(
 ) -> Option<usize> {
     let borrow = tls.fork_verify.borrow();
     let relocations = borrow.as_ref()?;
+    if !current_map_is_valid() {
+        return None;
+    }
     if !relocations.is_in_source(rip) {
         return None;
     }
@@ -590,6 +665,9 @@ pub(crate) fn translate_stale_source_memory_operand_registers(
     let Some(relocations) = borrow.as_ref() else {
         return false;
     };
+    if !current_map_is_valid() {
+        return false;
+    }
     let mut code = [0u8; MAX_INSTRUCTION_LEN];
     let len = read_code_bytes(rip, &mut code);
     if len == 0 {
@@ -640,6 +718,9 @@ pub(crate) fn translate_stale_source_indirect_call_target(
     let Some(relocations) = borrow.as_ref() else {
         return false;
     };
+    if !current_map_is_valid() {
+        return false;
+    }
     let mut code = [0u8; MAX_INSTRUCTION_LEN];
     let len = read_code_bytes(rip, &mut code);
     if len == 0 {
@@ -726,6 +807,9 @@ pub(crate) fn translate_stale_source_register_indirect_call_target(
     let Some(relocations) = borrow.as_ref() else {
         return false;
     };
+    if !current_map_is_valid() {
+        return false;
+    }
     let mut code = [0u8; MAX_INSTRUCTION_LEN];
     let len = read_code_bytes(rip, &mut code);
     if len == 0 {
@@ -1915,6 +1999,13 @@ fn write_usize_fault_tolerant(addr: usize, value: usize) {
             &raw mut old_protect,
         ) != 0
     };
+    litebox_util_log::error!(
+        tid:? = std::thread::current().id(),
+        addr:% = addr,
+        old_protect:% = old_protect,
+        ok:% = ok;
+        "diag-vprotect: write_usize_fault_tolerant widen"
+    );
     if !ok {
         return;
     }
@@ -1922,14 +2013,21 @@ fn write_usize_fault_tolerant(addr: usize, value: usize) {
     // `read_usize_fault_tolerant`'s comment covers why a full `usize` is always in-bounds here.
     unsafe { core::ptr::write_unaligned(addr as *mut usize, value) };
     let mut restored = 0u32;
-    unsafe {
+    let restore_ok = unsafe {
         Win32_Memory::VirtualProtect(
             addr as *mut core::ffi::c_void,
             core::mem::size_of::<usize>(),
             old_protect,
             &raw mut restored,
-        );
-    }
+        ) != 0
+    };
+    litebox_util_log::error!(
+        tid:? = std::thread::current().id(),
+        addr:% = addr,
+        restored_to:% = old_protect,
+        ok:% = restore_ok;
+        "diag-vprotect: write_usize_fault_tolerant restore"
+    );
 }
 
 /// Reads the 64-bit value of `register` (or the enclosing 64-bit register, for narrower
@@ -2468,6 +2566,12 @@ pub(crate) fn begin(relocations: alloc::sync::Arc<litebox::mm::AddressRelocation
             relocations.ranges(),
         );
     }
+    litebox_util_log::error!(
+        tid:? = std::thread::current().id(),
+        win_tid:% = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() },
+        range_count:% = relocations.ranges().len();
+        "diag-fv-lifecycle: begin"
+    );
     arm_codewatch(&relocations);
     arm_watchaddr_data();
     if let Some(tls) = crate::get_tls_ptr() {
@@ -2475,6 +2579,12 @@ pub(crate) fn begin(relocations: alloc::sync::Arc<litebox::mm::AddressRelocation
         let tls = unsafe { &*tls };
         if std::env::var_os("LITEBOX_FORKVERIFY_OFF").is_none() {
             tls.fork_verify_step_count.set(0);
+            // Stamp this thread with its OWN current generation before arming the map, so
+            // `current_map_is_valid` can later detect a leftover map that survived this same
+            // thread's own `end()`-triggered generation bump (execve, or a leaked skip-clear on
+            // task termination -- see `FORK_VERIFY_GENERATION`'s doc comment) without needing to
+            // track per-map validity any other way. Deliberately per-thread, not global.
+            FORK_VERIFY_EPOCH.with(|e| e.set(FORK_VERIFY_GENERATION.with(core::cell::Cell::get)));
             *tls.fork_verify.borrow_mut() = Some(relocations);
         }
     }
@@ -2486,6 +2596,19 @@ std::thread_local! {
 }
 
 pub(crate) fn end() {
+    // Bump THIS thread's own generation unconditionally, regardless of whether the
+    // `try_borrow_mut` below actually manages to clear `tls.fork_verify`. `end()`'s only two call
+    // paths are `execve` (replaces this thread's address space wholesale) and
+    // `exit`/`exit_group` (terminates this thread) -- see `litebox_shim_linux::syscalls::process`'s
+    // `sys_execve`/`sys_exit`/`sys_exit_group`, the only callers of
+    // `end_fork_child_verification()`, which is this function's only caller. So every `end()` call
+    // genuinely IS one of the two address-space-invalidating events for the CALLING thread, making
+    // an unconditional per-thread bump here correct: a map left behind by the `try_borrow_mut` skip
+    // path below is immediately stamped-stale (its recorded generation no longer matches this
+    // thread's live one) even though the `Option` itself is still `Some`. This is deliberately
+    // per-thread (see `FORK_VERIFY_GENERATION`'s doc comment) so it never invalidates a different,
+    // still-verifying thread's own live map.
+    FORK_VERIFY_GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
     if crate::diag_rip0_enabled() {
         eprintln!("[diag-fv] tid={:?} end", std::thread::current().id());
     }
@@ -2513,7 +2636,20 @@ pub(crate) fn end() {
         // when it returns, so at worst this leaves `fork_verify` set one exception cycle longer
         // than ideal, never permanently.
         if let Ok(mut slot) = tls.fork_verify.try_borrow_mut() {
+            let had_map = slot.is_some();
+            let range_count = slot.as_ref().map_or(0, |r| r.ranges().len());
+            litebox_util_log::error!(
+                tid:? = std::thread::current().id(),
+                had_map:% = had_map,
+                range_count:% = range_count;
+                "diag-fv-lifecycle: end (cleared)"
+            );
             *slot = None;
+        } else {
+            litebox_util_log::error!(
+                tid:? = std::thread::current().id();
+                "diag-fv-lifecycle: end (SKIPPED clear -- already borrowed, map left live)"
+            );
         }
     }
 }

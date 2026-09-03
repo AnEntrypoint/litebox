@@ -649,7 +649,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         msg: Message<Platform, FS>,
     ) -> Result<(), (Message<Platform, FS>, Errno)> {
         // TODO: write partial data?
-        self.connected_send_channel.try_write_one(msg)
+        let len = msg.data.len();
+        let sock_id = self as *const _ as usize;
+        let result = self.connected_send_channel.try_write_one(msg);
+        litebox_util_log::error!(
+            sock_id:% = sock_id,
+            len:% = len,
+            ok:% = result.is_ok();
+            "diag-unix-stream-write: try_sendto pushed into connected_send_channel"
+        );
+        result
     }
 
     /// Reads up to `buf.len()` bytes, same message-boundary-spanning behavior as before, plus any
@@ -692,6 +701,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             total_read += n;
             buf = &mut buf[n..];
         }
+        litebox_util_log::error!(
+            sock_id:% = self as *const _ as usize,
+            total_read:% = total_read;
+            "diag-unix-stream-read: try_recvfrom drained recv_channel"
+        );
         Ok((total_read, fds))
     }
 

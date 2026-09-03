@@ -325,6 +325,17 @@ pub(super) struct VmArea<Platform: PageManagementProvider<ALIGN>, const ALIGN: u
     /// created (see `create_pages`), so no `VmArea` on such a platform ever reaches this struct
     /// with `VM_SHARED` set and this field `None` -- that combination cannot occur.
     shared_handle: Option<Platform::SharedMemoryHandle>,
+    /// For a `shared_handle` mapping only: the REAL Windows/platform view's own base address and
+    /// length, exactly as returned by the `map_shared_memory` call that created it -- NOT the
+    /// VMA's current tracked range in `self.vmas` (a `rangemap::RangeMap`), which can SHRINK
+    /// (via `.remove()` splitting/trimming an entry on a partial `munmap`) independently of the
+    /// real view underneath, which never moves or resizes once mapped. These two fields must be
+    /// propagated UNCHANGED (never recomputed from a current, possibly-shrunken tracked range)
+    /// through every clone/split/reconstruction of a `VmArea` that still refers to the SAME real
+    /// view -- see `remove_mapping`'s full-coverage check, the only reader. `(0, 0)` for a
+    /// private (non-shared) mapping, where the fields are meaningless.
+    view_base: usize,
+    view_len: usize,
 }
 
 // Manual impls since `#[derive(Clone, Copy)]` would incorrectly require `Platform: Clone`/`Copy`
@@ -343,9 +354,39 @@ impl<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> PartialEq
     for VmArea<Platform, ALIGN>
 {
     fn eq(&self, other: &Self) -> bool {
+        // `self.vmas` is a `rangemap::RangeMap`, which automatically COALESCES adjacent/
+        // overlapping entries whose values compare equal (this is documented `rangemap`
+        // behavior, not a bug in that crate). For a genuinely shared mapping, `view_base`
+        // uniquely identifies the real underlying view, so two `VmArea`s that share it really
+        // are fragments of the SAME logical mapping and merging them back together is correct
+        // (this is in fact required for `remove_mapping`'s own "does any other fragment still
+        // survive" check to work at all).
+        //
+        // For a PRIVATE (non-shared) mapping, `shared_handle` is always `None` and `view_base`/
+        // `view_len` are always `(0, 0)` -- see `VmArea::new`'s doc comment -- so EVERY private
+        // `VmArea` with the same `flags`/`is_file_backed` compares equal to every OTHER private
+        // `VmArea` with the same flags, regardless of which real allocation either one actually
+        // describes. Two entirely unrelated, adjacent guest mappings (e.g. two different shared
+        // libraries loaded back-to-back by a dynamic linker) with matching protection flags
+        // then silently coalesce into ONE tracked `RangeMap` entry the moment `rangemap` notices
+        // they're adjacent -- confirmed live: a tracked VMA's extent was observed growing from
+        // 0.93 MB to 5.44 MB across a real run with no corresponding guest operation, and a
+        // later `mprotect`/`munmap` walk that should only have touched one of the coalesced
+        // fragments instead applied across the whole merged span, reaching into memory the
+        // guest never asked about. Since a private `VmArea` carries no field that uniquely
+        // identifies which real allocation it is, the only correct fix here is to never let two
+        // private `VmArea`s compare equal to each other at all -- forcing `rangemap` to keep
+        // every private mapping as its own distinct tracked entry, exactly matching real Linux
+        // VMA semantics (adjacent VMAs with identical protection are NOT silently merged by the
+        // kernel either, unless an explicit `mremap`/`mmap` operation asks for it).
+        if self.shared_handle.is_none() && other.shared_handle.is_none() {
+            return false;
+        }
         self.flags == other.flags
             && self.is_file_backed == other.is_file_backed
             && self.shared_handle == other.shared_handle
+            && self.view_base == other.view_base
+            && self.view_len == other.view_len
     }
 }
 impl<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> Eq for VmArea<Platform, ALIGN> {}
@@ -370,11 +411,18 @@ impl<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> VmArea<Platfor
             flags,
             is_file_backed,
             shared_handle: None,
+            view_base: 0,
+            view_len: 0,
         }
     }
 
     /// Create a new [`VmArea`] backed by a real platform shared-memory object -- see
     /// [`Self::shared_handle`]'s field doc comment.
+    ///
+    /// `view_base`/`view_len` are not known yet at this point (the real view hasn't been mapped
+    /// -- that only happens once this `VmArea` reaches `insert_mapping`), so they start at `0`
+    /// and get filled in by `insert_mapping` itself once the real `map_shared_memory` call
+    /// returns the view's actual base address.
     #[inline]
     pub(super) fn new_shared(
         flags: VmFlags,
@@ -385,6 +433,21 @@ impl<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> VmArea<Platfor
             flags,
             is_file_backed,
             shared_handle: Some(shared_handle),
+            view_base: 0,
+            view_len: 0,
+        }
+    }
+
+    /// Return `(view_base, view_len)` -- the REAL view's original full extent -- if this is a
+    /// shared mapping with the fields already populated (i.e. it has been through
+    /// `insert_mapping` at least once). `None` for a private mapping, or a shared `VmArea` that
+    /// hasn't reached `insert_mapping` yet.
+    #[inline]
+    pub(super) fn view_extent(self) -> Option<Range<usize>> {
+        if self.shared_handle.is_some() && self.view_len != 0 {
+            Some(self.view_base..(self.view_base + self.view_len))
+        } else {
+            None
         }
     }
 }
@@ -636,6 +699,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                         flags: VmFlags::empty(),
                         is_file_backed: false,
                         shared_handle: None,
+                        view_base: 0,
+                        view_len: 0,
                     },
                 );
             }
@@ -717,6 +782,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     flags,
                     is_file_backed,
                     shared_handle: None,
+                    view_base: 0,
+                    view_len: 0,
                 },
             );
             adopted += 1;
@@ -765,16 +832,107 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         range: PageRange<ALIGN>,
     ) -> Result<(), VmemUnmapError> {
         let range: Range<usize> = range.into();
-        let is_shared = self
+        // A shared-handle view can only be PHYSICALLY unmapped (`UnmapViewOfFileEx` on Windows)
+        // as a whole -- there is no OS primitive for unmapping a subrange of a view, unlike
+        // Linux's `munmap`, which allows any page-granularity subrange (real, common guest
+        // patterns: ld.so unmapping the gaps between a `.so`'s `PT_LOAD` segments, a `wl_shm`
+        // client trimming or splitting a pool). Confirmed live: `xfwm4` panics with
+        // `UnmapError(Unaligned)` hitting exactly this on a real weston/XFCE launch (AGENTS.md
+        // pass 255-256's own diagnostic capture: `ERROR_INVALID_ADDRESS`/`0x1e7` from
+        // `UnmapViewOfFileEx` on a range that was a genuine page-aligned SUBRANGE of a still-live
+        // view, not a misaligned address). For each shared VMA this removal overlaps, only issue
+        // the real platform unmap when `range` covers that VMA's own FULL current extent (i.e.
+        // this genuinely removes the whole view); for a partial overlap, treat it as a logical
+        // unmap instead -- revoke access via `update_permissions` (Windows freely allows
+        // re-protecting a SUBRANGE of an already-mapped view, unlike unmapping one) and leave the
+        // real view mapped underneath. The remaining, still-live subrange(s) of that view keep
+        // working normally; `self.vmas.remove(range)` below still correctly narrows/removes the
+        // logical bookkeeping either way, matching every other (non-shared) mapping's own
+        // partial-unmap handling.
+        // A single `munmap()` call only ever removes a SUBRANGE of `self.vmas`' current tracked
+        // bookkeeping for a view, which itself may already be a shrunken remnant of the view's
+        // real, original extent (a PRIOR partial `munmap` narrows the `RangeMap` entry via
+        // `.remove()` below without touching the real, still-fully-mapped Windows view
+        // underneath). So "does this call fully remove the whole real view" is a TWO-part
+        // question, not a single-range comparison against either extent alone:
+        //   1. does `range` cover this call's own overlapping VMA's CURRENT tracked range (i.e.
+        //      does this call empty that `RangeMap` entry) -- exactly the original per-call
+        //      check, still correct for its own purpose;
+        //   2. if so, does the real view (`view_base..view_base+view_len`, recorded once by
+        //      `insert_mapping` and NEVER recomputed from a shrunken tracked range -- see
+        //      `VmArea::view_base`'s doc comment) have any OTHER surviving tracked fragment
+        //      elsewhere in `self.vmas` -- i.e. is this genuinely the LAST piece.
+        // Only when both hold has the whole real view been removed; only then is it correct to
+        // call `unmap_shared_memory`, and always at `view_base` (the real original base
+        // `MapViewOfFile`/`map_shared_memory` returned), NEVER the current tracked range's own
+        // (possibly shrunken) start -- Windows' `UnmapViewOfFileEx` requires the exact original
+        // base and rejects anything else outright. This also fixes the mirror-image leak: a
+        // back-to-front unmap sequence now still recognizes "whole view removed" on its final
+        // fragment, since part 2 checks the fixed, never-shrinking `view_extent`, not removal
+        // order.
+        let shared_overlaps: alloc::vec::Vec<(Range<usize>, Range<usize>)> = self
             .vmas
             .overlapping(range.clone())
-            .any(|(_, vma)| vma.shared_handle.is_some());
+            .filter_map(|(r, vma)| vma.view_extent().map(|ve| (r.clone(), ve)))
+            .collect();
         unsafe {
-            if is_shared {
-                self.platform
-                    .unmap_shared_memory(range.clone())
-                    .map_err(|_| VmemUnmapError::UnmapError(DeallocationError::Unaligned))?;
-            } else {
+            for (vma_range, view_range) in &shared_overlaps {
+                let call_empties_this_fragment =
+                    range.start <= vma_range.start && range.end >= vma_range.end;
+                // Whether any OTHER tracked fragment of the SAME real view survives elsewhere in
+                // `self.vmas`, after this call's removal is applied. Any tracked entry whose
+                // `view_extent()` equals this one's, other than `vma_range` itself (which this
+                // call is about to fully remove, per `call_empties_this_fragment`), is such a
+                // survivor.
+                let other_fragment_survives = call_empties_this_fragment
+                    && self.vmas.iter().any(|(r, vma)| {
+                        r != vma_range && vma.view_extent().as_ref() == Some(view_range)
+                    });
+                if call_empties_this_fragment && !other_fragment_survives {
+                    // This call empties the last surviving tracked fragment of the whole real
+                    // view: a genuine whole-view removal. Always unmap at `view_range.start`
+                    // (== `view_base`), the real original base address.
+                    self.platform
+                        .unmap_shared_memory(view_range.clone())
+                        .map_err(|err| {
+                            // Preserve the real underlying error class instead of collapsing
+                            // every failure into a generic `Unaligned` -- a future diagnostic
+                            // sees which platform-level failure this actually was.
+                            VmemUnmapError::UnmapError(match err {
+                                SharedMemoryError::Unaligned => DeallocationError::Unaligned,
+                                SharedMemoryError::UnsupportedByPlatform
+                                | SharedMemoryError::OutOfMemory
+                                | SharedMemoryError::AddressInUse => {
+                                    DeallocationError::AlreadyUnallocated
+                                }
+                            })
+                        })?;
+                } else {
+                    // A genuine partial unmap of a still-live view: revoke access to just the
+                    // removed subrange instead of attempting (and failing) a real unmap. Errors
+                    // here are deliberately swallowed (best-effort revocation) rather than
+                    // surfaced as `VmemUnmapError`: Linux's own `munmap` on a subrange cannot
+                    // fail this way at all, so there is no correct errno to synthesize, and
+                    // failing the whole `remove_mapping` call over a permission-update glitch
+                    // would be a strictly worse outcome than leaving the (still logically
+                    // unmapped, per `self.vmas.remove` below) subrange READABLE a little longer.
+                    // Clamp to `vma_range` (this call's own overlapping tracked fragment), NOT
+                    // `view_range` (the whole real view, which can span far beyond this one
+                    // fragment once the view has been split into multiple tracked pieces by
+                    // earlier partial unmaps): revoking access across the WHOLE view would strip
+                    // a live guest's access to bytes belonging to a DIFFERENT, still-surviving
+                    // fragment of the same real view -- exactly the bug that produced a real,
+                    // reproducible SIGSEGV (weston writing into memory that this call incorrectly
+                    // NOACCESS'd, even though that memory belonged to a fragment this specific
+                    // `munmap()` call never asked to touch).
+                    let overlap_start = range.start.max(vma_range.start);
+                    let overlap_end = range.end.min(vma_range.end);
+                    let _ = self
+                        .platform
+                        .update_permissions(overlap_start..overlap_end, MemoryRegionPermissions::empty());
+                }
+            }
+            if shared_overlaps.is_empty() {
                 self.platform
                     .deallocate_pages(range.clone())
                     .map_err(VmemUnmapError::UnmapError)?;
@@ -851,7 +1009,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     pub(super) unsafe fn insert_mapping(
         &mut self,
         suggested_range: PageRange<ALIGN>,
-        vma: VmArea<Platform, ALIGN>,
+        mut vma: VmArea<Platform, ALIGN>,
         populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
@@ -1016,6 +1174,22 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         };
         let new_start = ret.as_usize();
         let new_end = new_start + suggested_range.len();
+        if vma.shared_handle.is_some() {
+            // This IS the real Windows/platform view-creation call (`map_shared_memory` above,
+            // in the `Some(shared_handle)` branch) -- `new_start..new_end` is the REAL view's own
+            // full original extent, exactly as the platform returned it. Record it now,
+            // unconditionally overwriting whatever `view_base`/`view_len` the caller's `vma`
+            // carried in (e.g. `0` for a freshly-`new_shared`-constructed one, or a stale prior
+            // view's extent when `resize_mapping`/`move_mappings` re-map the SAME handle at a
+            // new address): every path that reaches here (`create_pages`,
+            // `map_existing_shared_pages`, `resize_mapping`'s in-place expand,
+            // `move_mappings`, `Vmem::duplicate`) is, itself, the moment a NEW real view comes
+            // into existence, so this is always the correct, current, authoritative value --
+            // never stale. `remove_mapping`'s full-coverage check is the only reader, and it
+            // must always see the extent of the view that is ACTUALLY mapped right now.
+            vma.view_base = new_start;
+            vma.view_len = new_end - new_start;
+        }
         self.vmas.insert(new_start..new_end, vma);
         debug_assert!(new_start >= Platform::TASK_ADDR_MIN);
         debug_assert!(new_end <= Platform::TASK_ADDR_MAX);
@@ -1384,7 +1558,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     dest_ptr.as_usize() + length.as_usize(),
                 )
                 .ok_or(VmemDuplicateError::UnAligned)?;
-                unsafe { dest.protect_mapping(dest_range, vma.flags.into()) }
+                unsafe { dest.protect_mapping(dest_range, vma.flags.into(), "fork_duplicate") }
                     .map_err(|_| VmemDuplicateError::DestUnwritable)?;
             }
         }
@@ -1525,8 +1699,19 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             if self.vmas.overlaps(&r) {
                 return Err(VmemResizeError::RangeOccupied(r));
             }
-            if cur_vma.is_file_backed() {
-                unimplemented!("file-backed mapping expansion is not supported yet");
+            // A file-backed mapping with a real shared-memory handle (e.g. a `wl_shm`/memfd
+            // `MAP_SHARED` pool grown via `mremap`, `libwayland-cursor`'s own pool-growth
+            // pattern) is expanded through the exact same `insert_mapping` -> `map_shared_memory`
+            // path as an anonymous `MAP_SHARED` mapping below: `insert_mapping` already maps a
+            // fresh VIEW of the SAME underlying shared object at the new address when
+            // `vma.shared_handle` is `Some`, so no byte-copy or new handle is needed here -- the
+            // content lives in the shared object, not in either view. Only a *private*
+            // file-backed mapping (no shared handle: `MAP_PRIVATE` file-backed, or a platform with
+            // no real shared-memory backend at all -- see `VmArea::shared_handle`'s doc comment)
+            // has no live handle to re-map and so genuinely cannot be expanded in place; growth
+            // for that case is not implemented.
+            if cur_vma.is_file_backed() && cur_vma.shared_handle.is_none() {
+                unimplemented!("private file-backed mapping expansion is not supported yet");
             }
             let range = PageRange::new(range.end, new_end).unwrap();
             // Try to extend the mapping. Although we checked that there are no
@@ -1597,8 +1782,16 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .expect("VMEM: range not found");
         assert!(cur_range.contains(&(old_range.end - 1)));
 
-        if vma.is_file_backed() {
-            unimplemented!("file-backed mapping move is not supported yet");
+        // A file-backed mapping with a real shared-memory handle (a `wl_shm`/memfd `MAP_SHARED`
+        // pool, e.g. `libwayland-cursor`'s own pool-growth pattern) must fall through to the
+        // shared-handle branch just below, exactly like an anonymous `MAP_SHARED` mapping --
+        // `is_file_backed()` alone says nothing about whether there is a live handle to re-map,
+        // only `vma.shared_handle` does. Only a mapping with NO shared handle (private
+        // file-backed, or file-backed on a platform with no real shared-memory backend -- see
+        // `VmArea::shared_handle`'s doc comment) has no live object to re-map at the new address
+        // and so genuinely cannot be moved via this path.
+        if vma.is_file_backed() && vma.shared_handle.is_none() {
+            unimplemented!("private file-backed mapping move is not supported yet");
         }
 
         // A `shared_handle` mapping (anonymous `MAP_SHARED`, e.g. weston's pixman
@@ -1757,6 +1950,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         &mut self,
         range: PageRange<ALIGN>,
         permissions: MemoryRegionPermissions,
+        caller: &'static str,
     ) -> Result<(), VmemProtectError> {
         // `MemoryRegionPermissions` is a subset of `VmFlags` and we only change the access flags
         let flags =
@@ -1764,6 +1958,15 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         let range = range.start..range.end;
         let mut mappings_to_change = Vec::new();
         for (r, vma) in self.vmas.overlapping(range.clone()) {
+            litebox_util_log::error!(
+                caller:% = caller,
+                requested_start:% = range.start,
+                requested_end:% = range.end,
+                vma_start:% = r.start,
+                vma_end:% = r.end,
+                vma_shared:% = vma.shared_handle.is_some();
+                "diag-protect-mapping: found overlapping tracked vma"
+            );
             mappings_to_change.push((r.start, r.end, *vma));
         }
         if mappings_to_change.is_empty() {
@@ -1807,6 +2010,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     flags: new_flags,
                     is_file_backed: vma.is_file_backed,
                     shared_handle: vma.shared_handle,
+                    view_base: vma.view_base,
+                    view_len: vma.view_len,
                 },
             );
             if !before.is_empty() {

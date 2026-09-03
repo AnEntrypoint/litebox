@@ -745,11 +745,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> ReadySet<Platform, FS> {
                 continue;
             };
 
-            litebox_util_log::debug!(
+            litebox_util_log::error!(
+                entry_id:% = alloc::sync::Arc::as_ptr(&entry) as usize,
                 data:% = entry.data(),
-                has_event:% = event.is_some(),
+                events_bits:% = event.as_ref().map(|e| e.events).unwrap_or(0),
                 is_still_ready:% = is_still_ready;
-                "DIAG ReadySet::pop_multiple: entry polled"
+                "diag-epoll-pop: entry polled"
             );
 
             if let Some(event) = event {

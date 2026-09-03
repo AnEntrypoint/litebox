@@ -1832,6 +1832,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     pub(crate) fn sys_exit(&self, status: i32) {
+        // Always-on process-timeline diagnostic (advisor-db spec item 3).
+        litebox_util_log::error!(
+            pid:% = self.pid, comm:? = self.comm.get(), status:% = status;
+            "DIAG_TIMELINE exit"
+        );
+        self.print_diag_reports_if_bootstrap_process();
         // The `Task` will be dropped on the way out of the shim, which will
         // call `self.prepare_for_exit()`.
         self.global.platform.end_fork_child_verification();
@@ -1839,9 +1845,54 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     pub(crate) fn sys_exit_group(&self, status: i32) {
+        // Always-on process-timeline diagnostic (advisor-db spec item 3).
+        litebox_util_log::error!(
+            pid:% = self.pid, comm:? = self.comm.get(), status:% = status;
+            "DIAG_TIMELINE exit_group"
+        );
+        self.print_diag_reports_if_bootstrap_process();
         // Tear down occurs similarly to `sys_exit`.
         self.global.platform.end_fork_child_verification();
         self.exit_group(ExitStatus::Exit(status.trunc()));
+    }
+
+    /// Prints the `LITEBOX_STRACE_SUMMARY` table and the process-tree report when the exiting
+    /// process is this run's bootstrap (top-level) process.
+    ///
+    /// DISCREPANCY vs. the advisor-db spec, disclosed here: the spec asks for these reports at
+    /// "runner exit". `litebox_runner_linux_on_windows_userland::run` (which this crate's own
+    /// constraints forbid editing) terminates the whole process via `std::process::exit`, which
+    /// on Windows calls `ExitProcess` directly and does NOT run registered C-runtime `atexit`
+    /// handlers (confirmed live: a `libc::atexit` hook registered from `main.rs`, which IS
+    /// editable, never fired against this exact binary/toolchain). The bootstrap (pid 1, the
+    /// initial `--initial-files` guest program) exiting is the last point inside code this task
+    /// is allowed to touch that reliably runs on every real invocation, and is observationally
+    /// equivalent to "runner exit" for the common case (one top-level guest program per runner
+    /// invocation) -- but, unlike a true exit hook, it will not fire if the bootstrap process is
+    /// killed by an unhandled fatal signal rather than exiting via `exit`/`exit_group` (that path
+    /// is `syscalls/signal/mod.rs`'s fatal-signal handler, not covered here to keep this
+    /// surgical), and won't fire before an even-earlier host-level crash.
+    fn print_diag_reports_if_bootstrap_process(&self) {
+        let is_bootstrap = self
+            .global
+            .bootstrap_process
+            .get()
+            .is_some_and(|bp| Arc::ptr_eq(bp, self.process()));
+        if !is_bootstrap {
+            return;
+        }
+        crate::diag::print_strace_summary(|s| {
+            let _ = self.global.platform.write_to(
+                litebox::platform::StdioOutStream::Stderr,
+                s.as_bytes(),
+            );
+        });
+        crate::diag::print_process_tree(|s| {
+            let _ = self.global.platform.write_to(
+                litebox::platform::StdioOutStream::Stderr,
+                s.as_bytes(),
+            );
+        });
     }
 
     /// Pass 157: after a cross-process `fork()` child has been observed to exit (but before it is
@@ -4197,6 +4248,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             "sys_execve: entry"
         );
 
+        // Always-on process-timeline diagnostic (advisor-db spec item 3): one line per guest
+        // `execve`, at `error` level so it is always visible regardless of the configured log
+        // filter. Deliberately logged here (path resolved, before the point-of-no-return teardown
+        // below) rather than after `load_program` succeeds, so a process that dies mid-exec still
+        // leaves a timeline entry showing what it was trying to become.
+        litebox_util_log::error!(
+            pid:% = self.pid, ppid:% = self.ppid, comm:? = self.comm.get(), argv0:% = path;
+            "DIAG_TIMELINE execve"
+        );
+        crate::diag::record_process(
+            self.pid,
+            self.ppid,
+            &alloc::string::String::from_utf8_lossy(path.as_bytes()),
+        );
+
         // Copy argv and envp vectors
         let argv_vec = if argv.as_usize() == 0 {
             alloc::vec::Vec::new()
@@ -4253,8 +4319,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // mallocng `.meta=0` crash.
         let release =
             |_r: Range<usize>, vm: VmFlags| !vm.is_empty() || vm.contains(VmFlags::VM_OWN_FORK_PADDING);
-        unsafe { self.process().pm().release_memory(release) }
-            .expect("failed to release memory mappings");
+        if let Err(e) = unsafe { self.process().pm().release_memory(release) } {
+            // Real Linux `munmap()` failing is a recoverable per-call error, never a process
+            // abort -- and by this point in `execve` teardown (CLOEXEC fds already closed, robust
+            // list already woken) we are already past the point of no return for the OLD program
+            // image, matching the identical `load_program` failure case just below: terminate the
+            // guest process with `SIGSEGV` via `exit_group` instead of panicking the whole host
+            // runner thread over what is fundamentally a guest-side resource/bookkeeping failure.
+            litebox_util_log::warn!(
+                tid:% = self.tid, error:? = e;
+                "sys_execve: failed to release old memory mappings after point of no return, killing process with SIGSEGV"
+            );
+            self.exit_group(ExitStatus::Signal(
+                litebox_common_linux::signal::Signal::SIGSEGV,
+            ));
+            self.process().signal_vfork_done();
+            return Ok(0);
+        }
 
         #[cfg(target_arch = "x86_64")]
         self.global

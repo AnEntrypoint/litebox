@@ -68,7 +68,15 @@ pub fn dump_frame_diagnostic(frame: &Frame) {
             let Some(px) = frame.bytes.get(px_start..px_start + 4) else {
                 continue;
             };
-            if px != [0, 0, 0, 0] && px != [0, 0, 0, 255] {
+            // "Black" means the RGB channels alone, regardless of alpha -- confirmed live
+            // (advisor-db cross-session review) that the previous exact-match check against only
+            // `[0, 0, 0, 0]` and `[0, 0, 0, 255]` produced a false-positive whole-frame
+            // `non_black_pixels` count on a real capture whose actual bytes were `[0, 0, 0, 1]`
+            // (visually indistinguishable from black, just an off-by-one alpha value neither
+            // exact match caught) -- a scanout framebuffer's alpha byte carries no visual meaning
+            // for this diagnostic's own purpose (spotting real drawn RGB content), so it should
+            // never be part of the "is this black" test at all.
+            if px[0] != 0 || px[1] != 0 || px[2] != 0 {
                 non_black_pixels += 1;
             }
             if distinct_colors.len() < 64 {

@@ -553,6 +553,109 @@ unsafe extern "system" fn vectored_exception_handler(
                 ring[3] = (code, rip, rsp, this_is_in_guest);
             }
         });
+        // Confirmed live (this investigation): a fault dispatched all the way down to the guest
+        // shim's own "diag-guest-exception" path with `kernel_mode=false` can still have an `rip`
+        // FAR outside every guest process's own address range (guest mappings observed under
+        // ~0x40000000 this whole investigation; a real host-side fault here was `rip=
+        // 0x7feff8ed556e`, ~128 TB, i.e. deep in Windows' high host-address region). `kernel_mode`
+        // reflects x86 CPL (ring0 vs ring3), NOT "is this litebox's own host code" -- there is no
+        // existing check anywhere in this dispatch path that distinguishes "genuine guest-code
+        // fault" from "litebox's own host-side code faulted on a thread that happens to be
+        // guest-associated", so the latter gets silently reinterpreted as a guest SIGSEGV with no
+        // trace of which host function actually faulted. Resolve and log the owning module + file
+        // offset for every such fault so a future capture names the exact host function instead of
+        // requiring a live debugger.
+        // Gated behind an explicit env var: this fires on EVERY guest-associated fault, including
+        // the many expected/recoverable ones `fork_verify`'s own single-step healing deliberately
+        // takes (confirmed live: unthrottled, this alone produced 480,000+ log lines and slowed
+        // guest startup enough to change which bug a run even reaches -- see this investigation's
+        // own notes on instrumentation distorting timing). Only pay this cost while deliberately
+        // hunting a host-address/no-module fault.
+        if this_is_in_guest && std::env::var_os("LITEBOX_DIAG_FAULT_MODULE").is_some() {
+            let mut module: windows_sys::Win32::Foundation::HMODULE = core::ptr::null_mut();
+            let resolved = unsafe {
+                windows_sys::Win32::System::LibraryLoader::GetModuleHandleExW(
+                    windows_sys::Win32::System::LibraryLoader::GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                        | windows_sys::Win32::System::LibraryLoader::GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    rip as *const u16,
+                    &raw mut module,
+                ) != 0
+            };
+            if resolved && !module.is_null() {
+                let mut name_buf = [0u16; 512];
+                let name_len = unsafe {
+                    windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW(
+                        module,
+                        name_buf.as_mut_ptr(),
+                        name_buf.len() as u32,
+                    )
+                };
+                let module_base = module as u64;
+                let name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
+                eprintln!(
+                    "[diag-fault-module] rip={rip:#x} module_base={module_base:#x} module_offset={:#x} module_path={name}",
+                    rip.wrapping_sub(module_base),
+                );
+            } else {
+                let mut rip_mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+                let rip_queried = unsafe {
+                    Win32_Memory::VirtualQuery(
+                        rip as *const c_void,
+                        &raw mut rip_mbi,
+                        core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+                    ) != 0
+                };
+                eprintln!(
+                    "[diag-fault-module] rip={rip:#x} GetModuleHandleExW FAILED (rip not in any loaded module -- JIT/generated code, or a bogus address); VirtualQuery: queried={rip_queried} state={:#x} type={:#x} protect={:#x} region_base={:#x} region_size={:#x}",
+                    rip_mbi.State, rip_mbi.Type, rip_mbi.Protect,
+                    rip_mbi.BaseAddress as u64, rip_mbi.RegionSize,
+                );
+                // A control transfer landed on an address in no loaded module at all -- the
+                // classic signature of a corrupted return address or a bad indirect call/jump
+                // through a stale function pointer. Dump the raw stack words at `rsp` so a
+                // future capture can identify the last REAL return address (one that resolves
+                // to a real module) still visible on the stack, without needing a live
+                // debugger attached.
+                for i in 0..16u64 {
+                    let slot_addr = rsp.wrapping_add(i * 8);
+                    // SAFETY: best-effort diagnostic read of a small window around the faulting
+                    // thread's own stack pointer; a wild/unreadable address here would itself
+                    // fault, so guard with VirtualQuery (readable via a committed, non-guard,
+                    // non-PAGE_NOACCESS region) rather than reading blindly.
+                    let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+                    let queried = unsafe {
+                        Win32_Memory::VirtualQuery(
+                            slot_addr as *const c_void,
+                            &raw mut mbi,
+                            core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+                        ) != 0
+                    };
+                    let readable = queried
+                        && mbi.State == Win32_Memory::MEM_COMMIT
+                        && mbi.Protect != Win32_Memory::PAGE_NOACCESS
+                        && (mbi.Protect & Win32_Memory::PAGE_GUARD) == 0;
+                    if !readable {
+                        eprintln!("[diag-fault-stack] rsp+{:#x}=<unreadable>", i * 8);
+                        continue;
+                    }
+                    let word = unsafe { core::ptr::read_unaligned(slot_addr as *const u64) };
+                    let mut wmod: windows_sys::Win32::Foundation::HMODULE = core::ptr::null_mut();
+                    let word_resolved = unsafe {
+                        windows_sys::Win32::System::LibraryLoader::GetModuleHandleExW(
+                            windows_sys::Win32::System::LibraryLoader::GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                                | windows_sys::Win32::System::LibraryLoader::GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            word as *const u16,
+                            &raw mut wmod,
+                        ) != 0
+                    };
+                    eprintln!(
+                        "[diag-fault-stack] rsp+{:#x}={word:#x}{}",
+                        i * 8,
+                        if word_resolved && !wmod.is_null() { " (in-module)" } else { "" },
+                    );
+                }
+            }
+        }
     }
 
     let Some(tls) = get_tls_ptr() else {
@@ -4988,6 +5091,20 @@ where
             mbi.RegionSize
         );
         let success = operation(range.start..range.start + len, mbi.State)?;
+        if !success {
+            litebox_util_log::error!(
+                start:% = range.start,
+                end:% = range.start + len,
+                mbi_state:% = mbi.State,
+                mbi_type:% = mbi.Type,
+                mbi_protect:% = mbi.Protect,
+                mbi_alloc_protect:% = mbi.AllocationProtect,
+                mbi_base:% = mbi.BaseAddress as usize,
+                mbi_region_size:% = mbi.RegionSize,
+                last_error:% = std::io::Error::last_os_error();
+                "diag-region-op-fail: operation failed on region"
+            );
+        }
         assert!(
             success,
             "operation failed on region {:p}-{:p}: {}",
@@ -5566,6 +5683,34 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     r.start as *mut c_void,
                     r.end as *mut c_void
                 );
+                // `VirtualFree(MEM_DECOMMIT)` is only valid on privately-committed memory --
+                // calling it on a mapped SECTION VIEW (`MEM_MAPPED`) is invalid on Windows and,
+                // if litebox's own VMA bookkeeping ever fails to recognize a range as shared
+                // (the caller only reaches `deallocate_pages` when it believes NO shared VMA
+                // overlaps `range` -- see `Vmem::remove_mapping`'s `shared_overlaps.is_empty()`
+                // gate), silently decommits real backing a live view still needs. Confirmed live:
+                // a guest process's own ELF-loader trampoline mmap+munmap-trim sequence hit
+                // exactly this gap, decommitting a small guard page inside a larger `VM_SHARED`
+                // arena the guest was still actively using, producing a genuine SIGSEGV
+                // (write-fault into now-decommitted memory) moments later. Query the region's
+                // type before touching it and refuse to decommit a mapped view -- converting this
+                // silent corruption into a loud, attributable error instead.
+                let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+                let queried = unsafe {
+                    Win32_Memory::VirtualQuery(
+                        r.start as *const c_void,
+                        &raw mut mbi,
+                        core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+                    ) != 0
+                };
+                if queried && mbi.Type == Win32_Memory::MEM_MAPPED {
+                    litebox_util_log::error!(
+                        start:% = r.start,
+                        end:% = r.end;
+                        "diag-deallocate-refused: refusing to VirtualFree(MEM_DECOMMIT) a MEM_MAPPED section view -- litebox's VMA bookkeeping believes this range is unshared, but the real Windows allocation is a mapped view. Leaving it alone rather than corrupting a live shared mapping."
+                    );
+                    return Ok(true);
+                }
                 Ok(unsafe {
                     VirtualFree(r.start as *mut c_void, r.len(), Win32_Memory::MEM_DECOMMIT)
                 } != 0)
@@ -5604,9 +5749,19 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     r.end as *mut c_void
                 );
                 let mut old_protect: u32 = 0;
-                Ok(unsafe {
+                let ok = unsafe {
                     VirtualProtect(r.start as *mut c_void, r.len(), flags, &raw mut old_protect)
-                } != 0)
+                } != 0;
+                litebox_util_log::error!(
+                    tid:? = std::thread::current().id(),
+                    start:% = r.start,
+                    end:% = r.end,
+                    new_flags:% = flags,
+                    old_protect:% = old_protect,
+                    ok:% = ok;
+                    "diag-vprotect: update_permissions VirtualProtect"
+                );
+                Ok(ok)
             },
         )
         .expect("update_permissions failed");
@@ -5783,7 +5938,24 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 b" win_err=0x",
                 win_err as usize,
             );
-            return Err(SharedMemoryError::Unaligned);
+            // Map the REAL Windows error code to the closest `SharedMemoryError` variant instead
+            // of collapsing every failure into a generic `Unaligned` -- a future diagnostic (this
+            // fix's own motivating case: `remove_mapping` calling this with a stale, shrunken
+            // base address) sees which platform-level failure actually happened, not just a
+            // blanket "unaligned" label that was never true in the first place.
+            // `ERROR_INVALID_ADDRESS` (0x1e7 / 487): the given `range.start` is not a view's real
+            // original base -- closest existing variant is `AddressInUse` (this call's `range`
+            // argument IS an address, and this is fundamentally an address-validity failure, not
+            // an alignment one).
+            const ERROR_INVALID_ADDRESS: u32 = 487;
+            // `ERROR_NOT_ENOUGH_MEMORY`/`ERROR_OUTOFMEMORY`: genuine resource exhaustion.
+            const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
+            const ERROR_OUTOFMEMORY: u32 = 14;
+            return Err(match win_err {
+                ERROR_INVALID_ADDRESS => SharedMemoryError::AddressInUse,
+                ERROR_NOT_ENOUGH_MEMORY | ERROR_OUTOFMEMORY => SharedMemoryError::OutOfMemory,
+                _ => SharedMemoryError::Unaligned,
+            });
         }
         Ok(())
     }
@@ -7178,6 +7350,10 @@ impl litebox::platform::SystemInfoProvider for WindowsUserland {
     fn get_vdso_address(&self) -> Option<usize> {
         // Windows doesn't have VDSO equivalent, return None
         None
+    }
+
+    fn env_flag(&self, name: &str) -> bool {
+        std::env::var_os(name).is_some_and(|v| !v.is_empty())
     }
 }
 

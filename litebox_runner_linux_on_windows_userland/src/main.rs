@@ -51,6 +51,14 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Advisor-db diagnostics (`LITEBOX_STRACE_SUMMARY=1` summary + always-on process tree): the
+    // actual print call lives in `litebox_shim_linux::syscalls::process`, triggered when the
+    // bootstrap (top-level) guest process exits -- see
+    // `Task::print_diag_reports_if_bootstrap_process`'s doc comment for why: `run()` below
+    // terminates the whole runner process via `std::process::exit`, which on Windows calls
+    // `ExitProcess` directly and does NOT run registered C-runtime `atexit` handlers (confirmed
+    // live against this exact binary/toolchain, a `libc::atexit` registration here never fired),
+    // so there is no reliable post-`run()` hook point left inside code this task may edit.
     litebox_runner_linux_on_windows_userland::run(CliArgs::parse())
 }
 

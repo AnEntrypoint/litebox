@@ -1333,14 +1333,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
 
                 // Protect as RX immediately.
-                if self
-                    .sys_mprotect_raw(
-                        tramp_ptr,
-                        tramp_len,
-                        ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
-                    )
-                    .is_err()
-                {
+                if let Err(err) = self.sys_mprotect_raw(
+                    tramp_ptr,
+                    tramp_len,
+                    ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+                ) {
+                    litebox_util_log::error!(
+                        tramp_addr:% = tramp_ptr.as_usize(),
+                        tramp_len:% = tramp_len,
+                        errno:? = err;
+                        "diag-tramp-mprotect-fail: pre-patched trampoline mprotect(RX) failed, tearing down via munmap -- syscall rewriting for this binary is now BROKEN"
+                    );
                     let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
                     return false;
                 }

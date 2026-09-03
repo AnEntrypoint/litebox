@@ -374,6 +374,15 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfLoader<'a, Platform, FS> {
         aux.insert(AuxKey::AT_PHENT, info.phent_size());
         aux.insert(AuxKey::AT_PHNUM, info.num_phdrs);
         aux.insert(AuxKey::AT_ENTRY, info.entry_point);
+        litebox_util_log::error!(
+            main_base:% = alloc::format!("{:#x}", info.base_addr),
+            main_entry:% = alloc::format!("{:#x}", info.entry_point),
+            main_phdrs_addr:% = alloc::format!("{:#x}", info.phdrs_addr),
+            main_num_phdrs:% = info.num_phdrs,
+            interp_base:% = interp.as_ref().map_or_else(|| alloc::string::String::from("none"), |i| alloc::format!("{:#x}", i.base_addr)),
+            interp_entry:% = interp.as_ref().map_or_else(|| alloc::string::String::from("none"), |i| alloc::format!("{:#x}", i.entry_point));
+            "diag-elf-load: aux vector base/entry values"
+        );
         let entry = if let Some(interp) = &interp {
             aux.insert(AuxKey::AT_BASE, interp.base_addr);
             interp.entry_point
