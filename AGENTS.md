@@ -9,10 +9,63 @@ needs the detailed forensic trail — but start here, not there.
 ## Standing goal
 
 Get XFCE actually rendering and staying up under litebox on a Windows host (no WSL, no
-hypervisor — see `feedback_no_wsl_or_hypervisor` in project memory). **Not yet fully met, but
-close: every XFCE process now launches and stays alive — the sole remaining gap is that the
-framebuffer goes black shortly after Xwayland starts and never recovers, independent of XFCE
-itself.** See "Rendering/scanout blocker" below for the precise remaining gap and next step.
+hypervisor — see `feedback_no_wsl_or_hypervisor` in project memory).
+
+**MET.** A full XFCE desktop renders and stays up to the end of a run, verified against the
+standing success oracle (`non_black_pixels > 0` in the FINAL frames, not just any frame
+mid-run): 24 frames captured, EVERY ONE non-black, final five all at `non_black_pixels=2,073,597`,
+no zero frame anywhere in the run, `TEST_DONE` reached. All six components alive at the end
+(t=74.1s): `weston`, `xfconfd`, `xfwm4`, `xfsettingsd`, `xfdesktop`, `xfce4-panel` — zero exit with
+a failure status. `DBUS_UP=yes`, `XFCONF_PROBE_RC=0`, `XFCE_DISPLAY=:0`. The only remaining
+messages in any component's stderr are non-fatal warnings (AT-SPI accessibility bus absent —
+optional, no accessibility daemon in this layer; upower proxy refused — no power daemon in the
+layer; `SESSION_MANAGER` unset — expected, this launcher deliberately bypasses `xfce4-session`).
+Working launcher: `advisor/probes/run_xfce_xwm.sh`, committed `4e6fc556`.
+
+**Root cause of the entire session-long blocker, and the fix — both non-litebox, zero litebox
+code changes required:**
+1. **Missing XWM.** Launch scripts spawned `Xwayland` as a bare separate process. Rootful Xwayland
+   needs the launching compositor to attach an X Window Manager over a `-wm <fd>` connection —
+   that's what maps an X11 window's surface into the compositor's scene graph. weston's
+   `desktop-shell.so` has no XWM logic of its own; that lives exclusively in weston's own
+   `xwayland` module, loaded via `[core] xwayland=true` in `weston.ini`, which spawns AND manages
+   Xwayland itself (including the `-wm` handshake). Without it, X11 client surfaces got real pixel
+   content written into their buffers (independently verified byte-identical via same-instant
+   cross-process comparison — litebox's shared-memory path was never at fault) but were never
+   mapped into weston's scene graph, so nothing ever composited — the "renders fine, then goes
+   black and never recovers" symptom that dominated this entire session.
+2. **`set -x` in the launch script.** Shell tracing deterministically triggers a real, separate,
+   still-open litebox bug (a trampoline `#UD` at `rip=0x7feffff7fb8a`, deterministic 30s repro at
+   `advisor/probes/setx_ud_repro.sh`) that kills the first backgrounded child before it reaches
+   `execve()` — this is what was taking out `dbus-daemon` specifically, cascading into
+   `xfconfd`/`xfsettingsd`/`xfce4-panel` all failing with "Connection refused". `set -x` was
+   reintroduced by copying an older script mid-session and cost real additional time before being
+   caught a second time — treat as a standing hazard, not a one-off.
+
+**Durable launch-script configuration (6 items — apply to every XFCE launch script, not just the
+one already fixed)**:
+1. `weston.ini`: `[core] xwayland=true`.
+2. No manual `Xwayland` launch — let weston manage it.
+3. Discover the display weston chooses (currently `:0`) rather than hardcoding `:1`.
+4. **No `set -x` anywhere** in the script or anything it sources — use explicit `echo` markers at
+   stage boundaries instead. Grep for this explicitly when touching any launch script; it is easy
+   to reintroduce by copying.
+5. Single dbus spawn, no retry — retrying a backgrounded spawn after losing one child to the `#UD`
+   kills the launcher shell itself, not just the child. If dbus is lost, rerun the whole script.
+6. Capture backgrounded services' stderr AND print/tee it, so a fast fatal crash never presents as
+   a silent, misleading readiness-timeout.
+
+**What's still open, but no longer blocking**: the trampoline `#UD` itself (root-caused to
+`set -x`, but the underlying litebox bug that fires ANY time a backgrounded child races that
+specific instruction sequence is real and unfixed — just no longer triggered now that `set -x` is
+banned from launch scripts). Worth closing eventually per the standing "always build/fix, don't
+just work around" discipline, but does not block the standing goal, which is met. See
+`advisor/probes/setx_ud_repro.sh` for the repro.
+
+See "Rendering/scanout blocker" below for the full forensic trail (kept for anyone who needs the
+detailed history of how this was diagnosed — memory-corruption theories all refuted, compositing
+theory confirmed via same-instant cross-process comparison, root cause found via targeted web
+research on weston/Xwayland internals).
 
 ## Standing directives (do not relitigate these)
 
