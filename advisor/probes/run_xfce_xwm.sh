@@ -3,7 +3,9 @@
 # every service is started ALONE and given time to settle before the next,
 # so at most one fork_verify healing pass is live at a time (the condition
 # measured clean in 8/8 runs).
-set -x
+# NO 'set -x': shell tracing deterministically kills the first backgrounded
+# child via a #UD in a syscall trampoline stub (bisected 2/2 fail vs 2/2 pass).
+# It is what has been taking out dbus-daemon in every full-stack run.
 export HOME=/root
 export LD_LIBRARY_PATH=/usr/lib/weston:/usr/lib:/lib
 export XDG_RUNTIME_DIR=/run/user/0
