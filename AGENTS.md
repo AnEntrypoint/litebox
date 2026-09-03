@@ -1018,6 +1018,54 @@ currently blocked in a wait — litebox already has `interrupt_thread`/
 a thread parked in an unrelated futex wait gets woken to process the new signal, exactly like real
 Linux's signal delivery. **Ready to implement.**
 
+**Independently confirmed by advisor-db, exact same location and mechanism, arrived at
+separately.** Confirms `owner_tid=0` matches exactly: the lock is contended with no owner because
+the handoff was never started (`tid=18` was never told to produce the acknowledgment). advisor-db
+retracts their own earlier "futex wait is not signal-interruptible" theory — the interrupt
+machinery is fine and `WaitError::Interrupted` exists; the signal simply never gets sent in the
+first place, so interruptibility was never the bottleneck. **The fix is smaller than either agent
+initially proposed.**
+
+**SECOND, INDEPENDENT DEFECT FOUND — WHY THIS WAS INVISIBLE FOR 300+ PASSES ALL SESSION, worth
+fixing on its own merits regardless of the `tkill` fix.** `log_unsupported!` expands to:
+```rust
+fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
+    if cfg!(debug_assertions) {
+        litebox_util_log::warn!(feature:% = args; "unsupported");
+    }
+}
+```
+**In a release build, that body compiles to nothing.** Every run in this entire investigation has
+been `--release`. So the single most load-bearing event in the whole hang — "I was asked to do
+something I do not implement, and I silently lied about it" — was invisible by construction, at
+ANY `LITEBOX_LOG` level, all session. This is why the night went to futex keying, lost wakeups,
+thread spawn, and lock ordering: **the actual failure never appeared in any log captured, because
+the log line reporting it doesn't exist in release builds.** Every `log_unsupported!` site in the
+tree is currently a silent behavioral divergence from Linux in exactly the build configuration
+used for testing. **Fixing this (log unconditionally at warn, or gate on an env var instead of
+`cfg!(debug_assertions)`) is probably the single highest-leverage observability change available
+right now** — likely to surface several more silently-unimplemented syscalls/features immediately.
+
+**Task split, confirmed**: `a63e8ca59285f5871` takes the `do_kill` remote-thread-delivery fix
+(already assigned, in progress); advisor-db takes the release-build `log_unsupported!` logging
+fix; both re-run the fast repro against the combined result once ready. **Both halves of the
+`do_kill` fix already exist elsewhere in the codebase and just need wiring together, not new
+machinery**: `interrupt()` is already called on siblings in `exit_group`/`kill_other_threads`
+(`process.rs:831`/`895`) — the wake-a-parked-sibling path is proven to work.
+
+**Why this unblocks XFCE broadly, not just one test client**: signal 34 with that
+`sigprocmask`/`sigaction`/`tkill`/`futex-wait` preamble is glibc/musl's SIGSETXID / thread-list
+broadcast — routine in any multithreaded program touching setuid/setgid/locale/nsswitch. This is
+exactly why it reproduces across every GTK client and never in a single-threaded bare run —
+"works bare, hangs in the stack" has been the signature all along, and any threaded XFCE
+component can hit it.
+
+**Standing caveat, still open**: `tid=18`'s ORIGINAL park at t=13.52 (`846721840`, `val=0`, plain
+condition wait, immediately after fontconfig cache work) is still unexplained. Priority order
+changes though — fix `tkill` first, then re-check: with remote delivery working, does `tid=18`'s
+park turn out to have been a real problem, or was it idling correctly the whole time, simply
+waiting for a broadcast that (pre-fix) could never arrive?
+
 **In progress in parallel**: advisor-db is running a context test (a GTK binary inside the full
 display stack, expected ~2s reproduction if display-stack context is what triggers this) to give a
 fast verification target for whatever fix lands here.
