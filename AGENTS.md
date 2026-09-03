@@ -722,11 +722,36 @@ map/commit/decommit/protect operation.
 3. Anything that zero-fills a BSS or new mapping using a length or base computed from the wrong
    VMA.
 
-**Cheap next measurement, not yet done**: bisect with `LITEBOX_FORKVERIFY_OFF=1` (disables
-fork_verify's reactive healing) against the fast 16s repro — if the wipe stops, the heal path
-(candidate 2) is implicated directly. Alternatively, a guard page or write-watch on the scanout
-range during `xkbcomp`'s fork — Windows' `GetWriteWatch` API exists for exactly this and would
-catch candidate 1 or 3 without needing to guess which code path is responsible.
+**`LITEBOX_FORKVERIFY_OFF=1` bisection TRIED — INCONCLUSIVE, do not repeat.** Disabling reactive
+healing breaks the guest well before the point of interest: run dies at t=3.2 (`exit=11`) having
+only reached seatd startup — weston never starts, Xwayland never starts, no X client, no frames
+captured at all. Two guest faults on the way down, the second (`rip=0x7feffff80233`) in the
+trampoline band again. This cannot distinguish the heal-path candidate from the other two; the
+test itself is broken, not the hypothesis.
+
+**Decisive next measurement, not yet done — use one of these, not the FORKVERIFY_OFF bisection**:
+1. **`GetWriteWatch`** (Windows API, exactly for this): allocate the scanout buffers with
+   `MEM_WRITE_WATCH`, poll `GetWriteWatch` at each page flip, log which pages were dirtied since
+   the previous flip. During normal rendering this should show weston's own drawing; at the wipe
+   it will show whoever actually wrote there — the dirtied page addresses alone will usually
+   identify the writer directly.
+2. **Cheaper, deliberately destructive trap**: after the last known-good flip, `VirtualProtect`
+   the scanout range to `PAGE_READONLY` and let the offending write raise an access violation —
+   the existing VEH captures the faulting `rip` directly, naming the writer in one run. Not a
+   fix, a probe, but names the exact call site fast.
+
+**Caution for whoever runs this**: correlate against the GUEST's own PERSISTENT mapping, not any
+per-flip capture mapping — the capture maps the section fresh and drops it within microseconds,
+and the same fb has been observed at four different addresses across different flips. Correlating
+against the capture mapping gives a false negative that looks convincing (this exact mistake was
+made and retracted earlier in this investigation).
+
+Standing facts for whoever picks this up: repro is seatd, weston (drm/pixman/desktop-shell),
+Xwayland `:1` fullscreen, then ONE X client (`advisor/probes/scanout_wipe_repro.sh`); wipe at
+t~16, `nonzero 6,221,890 -> exactly 0`; zero overlaps against the scanout range across
+`diag-commit`/`diag-reclaim`/`diag-decommit`; only two `diag-vprotect` hits on that range in the
+whole run, both at creation (t=0.97) — nothing instrumented touches the buffer between creation
+and the wipe.
 
 ## Reproduction commands
 
