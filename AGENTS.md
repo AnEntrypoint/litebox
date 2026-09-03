@@ -62,6 +62,23 @@ banned from launch scripts). Worth closing eventually per the standing "always b
 just work around" discipline, but does not block the standing goal, which is met. See
 `advisor/probes/setx_ud_repro.sh` for the repro.
 
+**Remaining follow-on work, prioritized (none block the standing goal, which is met)**:
+1. **Verify the desktop actually LOOKS correct, not just non-black.** `non_black_pixels=2,073,597`
+   is the full 1920x1080 background — it does NOT by itself confirm the panel and desktop icons
+   are actually drawn rather than just a solid background color. The `.bmp` frame dumps from
+   `LITEBOX_DUMP_FRAMES=1` already exist; decoding one is the difference between "renders" and
+   "renders correctly" and would take minutes. Highest priority because it's cheap and it's the
+   thing that actually validates the whole result — do this before trusting the goal is FULLY
+   closed in a visual sense, not just a pixel-count sense.
+2. **Client startup is extremely slow — unexplained, and likely the user's original "pretty long
+   wait" complaint.** `xfce4-about --version` never exited in an 85s run; `xfce4-appfinder` never
+   finished startup in 98s; even in the successful run, components take ~60s to come up. Nobody
+   has root-caused this. The existing `ppoll`/wait-duration instrumentation from earlier this
+   session is already pointed at the right area — worth resuming.
+3. **Close the trampoline `#UD` itself** (`advisor/probes/setx_ud_repro.sh`, 30s deterministic
+   repro, `rip=0x7feffff7fb8a`). Real bug, understood, workaround (never `set -x`) is free and now
+   standing policy — lowest priority of the three since it's fully mitigated already.
+
 See "Rendering/scanout blocker" below for the full forensic trail (kept for anyone who needs the
 detailed history of how this was diagnosed — memory-corruption theories all refuted, compositing
 theory confirmed via same-instant cross-process comparison, root cause found via targeted web
