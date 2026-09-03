@@ -29,13 +29,24 @@ def main():
     text = ANSI.sub('', open(sys.argv[1], errors="replace").read())
 
     fbs = {}        # fb_id -> (addr, size) most recently seen
+    guest_maps = []  # the guest's own persistent mappings of the scanout buffers
     events = []     # (t, kind, payload)
     ts = 0.0
     for line in text.split("\n"):
         m = re.match(r'\s+([0-9.]+)s ', line)
         if m:
             ts = float(m.group(1))
-        if "diag-drm-fb-addr" in line:
+        if "diag-drm-fb-addr" in line and "fb_id=" not in line:
+            # The GUEST's persistent mapping (logged once at mmap, no fb_id field).
+            # This is the address a stray decommit/unmap would actually hit. The
+            # per-flip capture mapping is transient -- fresh-mapped and dropped in
+            # microseconds -- so correlating against THAT gives a near-tautological
+            # false negative. Learned the hard way.
+            ad = re.search(r'addr=(\d+)', line)
+            ln = re.search(r'len=(\d+)', line)
+            if ad and ln:
+                guest_maps.append((int(ad.group(1)), int(ln.group(1))))
+        elif "diag-drm-fb-addr" in line:
             fb = re.search(r'fb_id=(\d+)', line)
             ad = re.search(r'addr=(\d+)', line)
             sz = re.search(r'size=(\d+)', line)
@@ -78,6 +89,20 @@ def main():
     destroys = [(t, k, p) for t, k, p in events if k in ("reclaim", "decommit")]
     print("%d reclaim/decommit events total" % len(destroys))
     print()
+
+    if guest_maps:
+        print("GUEST persistent scanout mappings (the addresses that matter):")
+        for a, l in guest_maps:
+            print("  0x%x-0x%x (%d bytes)" % (a, a + l, l))
+        ghit = 0
+        for a, l in guest_maps:
+            for t, k, (s2, e2) in destroys:
+                if s2 < a + l and e2 > a:
+                    ghit += 1
+                    print("   *** OVERLAP %s at t=%.3f range 0x%x-0x%x hits guest map 0x%x" % (k, t, s2, e2, a))
+        if ghit == 0:
+            print("  (no destroy event overlaps any GUEST scanout mapping)")
+        print()
 
     hit = 0
     for fb, t0, t1 in wipes:
