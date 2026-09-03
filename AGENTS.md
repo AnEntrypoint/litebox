@@ -495,11 +495,43 @@ busiest.
 3. Decommit-then-recommit on the buffer range — a recommitted page comes back zeroed, matching
    `px=0` exactly (not garbage) far better than a corruption theory would.
 
-**Next measurement, not yet done**: at the flip, hash or sample a few bytes of the fb's backing
-memory and log it alongside `fb_id`. If the bytes are zero AT THE SOURCE (the actual backing
-memory), the buffer really was wiped — bisect what wiped it among the suspects above. If the
-bytes are non-zero at the source but the captured frame is black, the problem is in the
-capture/scanout READ path instead — a different, likely simpler fix.
+**MEASUREMENT DONE (commit `80590825`): the buffer is genuinely wiped at the SOURCE — airtight,
+eliminates every alternative.** Sampled the scanout buffer's real shared backing store directly
+at each flip (fresh `map_shared_memory(handle)` every time, never a stale view):
+```
+t=7.42-8.16  fb 1,2,1,2...  nonzero=6,221,884  first8=[23,11,0,255,...]  real content
+t=19.68      fb=1           nonzero=6,221,884  first8=[23,11,0,255,...]  still good
+t=20.27      fb=2           nonzero=0          first8=[0,0,0,0,0,0,0,0]  WIPED
+t=21.07      fb=1           nonzero=0          first8=[0,0,0,0,0,0,0,0]  WIPED
+```
+`fb=1` holds `6,221,884` non-zero bytes at t=19.68, exactly ZERO at t=21.07. **This rules out**:
+capture-path bug (fresh mapping each read), CoW/private-mapping divergence (reading the shared
+object itself), surface ownership (no third fb ever appears), compositor-stopped-presenting
+(flips continue throughout).
+
+**The signature is decisive**: buffers read EXACTLY zero, not garbage. Freshly-committed pages
+read as zero; corrupted/reused memory reads as garbage. This means the buffer's pages are being
+DECOMMITTED AND RECOMMITTED, or the shared section is being replaced/recreated, while DRM
+bookkeeping (fb ids, handles, flip path) stays perfectly valid — exactly why everything
+downstream still looks healthy. Same class as the already-fixed `memfd` mmap-time wipe bug, now
+on the DRM dumb-buffer path.
+
+**Critical narrowing**: the wipe window (t=19.68 to t=20.27) contains NO DRM ioctl at all — only
+205 `diag-vprotect` entries. Nothing in the DRM path itself wipes it; the memory subsystem does,
+during heavy protection churn while Xwayland is starting/forking.
+
+**Where to look, in priority order (not yet instrumented)**:
+1. Any path that recreates or resizes a shared-memory object for an EXISTING handle — the memfd
+   fix's analogue (whatever `resize_memfd_shared_backing`-equivalent may exist for DRM dumb
+   buffers, for the exact same shape as the already-fixed bug).
+2. Whether a decommit/recommit ever touches the dumb buffer's address range — a recommit produces
+   exactly-zero content, matching the signature precisely.
+3. `Vmem::duplicate`'s shared-mapping branch — read directly and appears correct (re-maps the
+   same handle rather than copying), but not yet instrumented/proven; verify rather than trust.
+
+**Next measurement, not yet done**: log create/resize/destroy of shared-memory objects with their
+handle, then grep for the dumb buffer's specific handle in the t=19.7-20.3 window. If that
+handle's underlying object gets recreated there, that's the bug, found directly.
 
 ## Reproduction commands
 
