@@ -1613,9 +1613,23 @@ surviving-component list pending.
 
 ## Reproduction commands
 
-Full XFCE launch — **use `advisor/probes/run_xfce_staged.sh` as the launch script, NOT any
-`set -x`-instrumented script** (`xfce_direct.sh`, if it still has `set -x`, will trigger the
-still-open #UD bug above and derail the run before it ever reaches the rendering blocker):
+**CRITICAL, READ FIRST: the program-path argument after `--` MUST be relative (no leading `/`),
+or every run below stack-overflows with no useful error.** Confirmed pre-existing bug (not a
+regression, predates all of this session's other work): `load_program(...).unwrap()` in
+`litebox_runner_linux_on_windows_userland/src/lib.rs:688` gets `ENOENT` for any leading-slash
+program path (`/bin/echo`, `/bin/sh`, ...) and the panic then **overflows the runner's own stack**,
+so the real ENOENT error is invisible — you just see `thread '<unknown>' has overflowed its
+stack`, which gives zero clue what's actually wrong. The SAME path with the leading slash dropped
+(`bin/echo`, `bin/sh`) works fine — confirmed on both a release build and an independently-built
+debug binary from earlier in this session, so it is not build-state-specific. **Every reproduction
+command below has been corrected to the working relative form** — do not add a leading slash back
+in. Real fix, not yet landed: normalize a leading slash in `load_program`'s path handling, and
+return the error there instead of `.unwrap()`ing it (so a future occurrence of this class of bug
+fails loud instead of as an unrelated-looking stack overflow).
+
+Full XFCE launch — **use `advisor/probes/run_xfce_xwm.sh` as the launch script** (the proven
+working launcher, commit `4e6fc556`; do NOT use any `set -x`-instrumented script — it will trigger
+the still-open #UD bug above and derail the run before it ever reaches the rendering blocker):
 ```
 cd C:\dev\litebox-main
 cargo build --release -p litebox_runner_linux_on_windows_userland --target x86_64-pc-windows-gnu
@@ -1625,7 +1639,7 @@ export LITEBOX_DUMP_FRAMES=1
 timeout 100 target/x86_64-pc-windows-gnu/release/litebox_runner_linux_on_windows_userland.exe \
   --initial-files .wfgy/xfce-build/layer31_direct_fixed.tar \
   --gui \
-  -- /bin/sh advisor/probes/run_xfce_staged.sh \
+  -- bin/sh advisor/probes/run_xfce_xwm.sh \
   > /tmp/pass_repro.log 2>&1
 ```
 (`layer31_direct_fixed.tar` = `alpine-pinned2.tar` + `layer31_direct.tar` merged, soname-repaired.
