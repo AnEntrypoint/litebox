@@ -1368,6 +1368,32 @@ other durable script.** The trampoline `#UD` at `rip=0x7feffff7fb8a` (partially 
 b4330590, still not fully closed) is now the single remaining bug standing between this session
 and a reproducible complete desktop — worth prioritizing over any further cosmetic script work.
 
+**SELF-CORRECTION (advisor) to the two entries directly above — read this before acting on
+either.** The repeated dbus failures across tonight's full-stack runs were advisor's own fault,
+not an intermittent litebox bug: the script that added the XWM fix carried over `set -x` from an
+older script, and `set -x` is the EXACT trigger this session bisected hours earlier as
+deterministically killing the first backgrounded child via the trampoline `#UD` (see the `set -x`
+entry under "Useful techniques"/observer-effect notes elsewhere in this doc). Evidence: dbus-daemon
+started perfectly in isolation on the current build, 3/3 runs, zero faults; it failed 4/4 inside
+the full script that had `set -x`. **Correction to what stands from the two entries above:**
+1. "Retrying kills the launcher shell" is still literally true as a measurement (bit-identical
+   crash addresses, loop and function form alike) — but the retry was never actually needed. The
+   correct fix was removing `set -x`, not working around its consequences. Do not read "retries
+   are unsafe" in isolation without this context.
+2. "The `#UD` intermittently kills dbus, full-stack verification stays flaky" is **overstated**.
+   On the current build, with no shell tracing anywhere in the launch path, dbus is reliable. The
+   `#UD` is real (still worth closing eventually) but is **not currently blocking full-stack
+   verification** — remove `set -x` and it goes away for this purpose.
+
+**Durable guidance that actually stands**: **never use `set -x` in any of these launch scripts —
+use explicit `echo` markers at stage boundaries instead.** `set -x` is easy to reintroduce by
+copying an older script (exactly what happened here) — anyone touching a launch script (including
+the agent landing the durable fix) must grep for and remove `set -x` from every script they touch.
+advisor is rerunning the full stack now with tracing removed — this should finally be a fair,
+unconfounded test of the complete desktop; result pending. The compositing fix and its
+verification are unaffected either way: both the isolated repro and the earlier (traced, dbus-
+broken) full-stack run ended on 2,073,597 non-black pixels, and neither depended on dbus.
+
 ## Reproduction commands
 
 Full XFCE launch — **use `advisor/probes/run_xfce_staged.sh` as the launch script, NOT any
