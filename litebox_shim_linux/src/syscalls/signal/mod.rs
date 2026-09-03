@@ -788,9 +788,56 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // to any target below, while still running every existence/reachability check exactly as
         // for a real signal.
         let signal = (signal != 0).then(|| Signal::try_from(signal)).transpose()?;
-        if tid.is_some_and(|tid| tid != self.tid) {
-            log_unsupported!("sys_tkill/sys_tgkill with a remote tid");
-            return Err(Errno::ESRCH);
+        // A `tkill`/`tgkill` targeting a DIFFERENT thread of THIS SAME process (the overwhelmingly
+        // common real-world case: glibc/musl's NPTL uses exactly this to signal one specific
+        // sibling thread for internal cross-thread synchronization handshakes, e.g. dlopen's
+        // TLS-update quiesce signal -- sent fire-and-forget, with the return value never checked
+        // by the caller). This used to be rejected outright with `ESRCH` here (there was no way
+        // to reach one specific sibling thread's own `self.signals.pending` from outside that
+        // thread's own `Task`), which glibc's internal call sites don't handle -- the signal was
+        // silently and permanently dropped, wedging both the sender (waiting on the receiver's
+        // acknowledgment) and the receiver (which never got a chance to run its handler) forever.
+        // Confirmed live as the root cause of a real, reproduced `xfce4-about`/GTK deadlock.
+        //
+        // There is still no per-sibling-thread signal queue reachable from here (`ThreadRemote`
+        // only exposes `interrupt()`, not the target `Task`'s own `Signals`), so this delivers via
+        // `shared_pending` (process-wide -- any thread of the process may pick it up, exactly like
+        // `deliver_to_child`'s process-directed delivery below) rather than a truly
+        // thread-specific queue, then interrupts ONLY the intended target thread (not every
+        // thread, unlike a real process-directed signal) so it -- not some other unrelated,
+        // already-runnable thread -- is the one woken to notice and consume it. This is not
+        // perfectly POSIX-accurate (real `tkill` is delivered to, and only to, the exact named
+        // thread; here, a different thread that happens to unblock first and check its pending
+        // signals before the target does could theoretically consume it instead), but is a large
+        // correctness improvement over unconditionally dropping the signal, and matches real
+        // behavior in the overwhelmingly common case this fixes: the sender is fire-and-forget,
+        // the target is the only thread actually blocked and waiting on this specific
+        // notification, so it is also the only thread that will actually be waiting to consume a
+        // signal at all.
+        if let Some(target_tid) = tid
+            && target_tid != self.tid
+        {
+            // Push the signal into `shared_pending` BEFORE checking whether the target thread is
+            // still live: a thread that exits between this check and the push could otherwise
+            // race a genuinely-missing target report, but pushing first and then unconditionally
+            // interrupting whatever's still there (a no-op if it already exited) matches real
+            // Linux's own "signal delivery and target liveness are checked together, atomically
+            // with respect to the target's own exit" semantics closely enough for this shim's
+            // purposes -- and, same as `deliver_to_child` above, a `None` (null-probe) signal
+            // delivers nothing at all, only the existence check below matters for it.
+            if let Some(signal) = signal
+                && !self.is_signal_ignored(signal)
+            {
+                self.signals
+                    .shared_pending
+                    .lock()
+                    .push(&self.process().limits, signal, siginfo_kill(signal));
+            }
+            return if self.process().interrupt_thread(target_tid) {
+                Ok(0)
+            } else {
+                Err(Errno::ESRCH)
+            };
         }
         // Process-directed delivery to a live child `Process`: any one of its threads may end up
         // handling it, exactly like a same-process `send_shared_signal`. Real Linux's SIG_IGN
