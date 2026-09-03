@@ -2112,6 +2112,14 @@ further value once analyzed).
 - **Periodically (or before ending a long debugging session), run `du -h --max-depth=1 .wfgy`**
   and clean up anything not currently referenced — this is now a known failure mode for this
   project specifically, not a one-off.
+- **Second recurrence, different location: a per-session scratchpad grew to 115 GiB** by copying a
+  full 2.4-3.5 GiB layer tar for every A/B/probe variant (~40 variants × ~3 GiB) instead of reusing
+  one working tar and swapping only the small script inside it. Drove the whole `C:` drive to 1.5
+  GiB free mid-investigation, crashing an unrelated concurrent process ("not enough space on
+  disk"). Cleaned to 3.5 GiB, freeing 127 GiB total. **Same underlying mistake as the
+  `.wfgy/xfce-build/` incident above, just in a different directory — the general rule applies
+  everywhere, not just `.wfgy`: never copy a multi-gigabyte tar per iteration; build one layer and
+  swap only what changed, or write variants into a single tar.**
 - **`rm -rf` on a directory another process (a running litebox instance, another session) has
   open fails silently with "Device or resource busy" on Windows, and a subsequent `mv <src>
   <same-name>` then lands INSIDE the still-existing target instead of replacing it** (confirmed
