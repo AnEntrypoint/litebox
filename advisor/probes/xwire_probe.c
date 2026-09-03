@@ -63,8 +63,30 @@ int main(int argc, char **argv) {
 
     // The reply's first byte is 1 on success, 0 on refusal.
     static u8 buf[16384];
-    i64 n = sys3(SYS_read, fd, (i64)buf, sizeof buf);
-    if (n < 8) { out("XWIRE_SHORT_REPLY n="); outn(n); out("\n"); sys1(SYS_exit, 3); }
+    // A single read() on a socket is NOT guaranteed to return the whole reply.
+    // Observed live: one run returned the full ~1KB setup and the window appeared;
+    // another returned only 8 bytes, after which parsing root/visual out of the
+    // unfilled buffer produced garbage ids and nonsense events. Read the 8-byte
+    // header, then loop until the declared remaining length has actually arrived.
+    i64 got = 0;
+    while (got < 8) {
+        i64 r = sys3(SYS_read, fd, (i64)(buf + got), 8 - got);
+        if (r <= 0) { out("XWIRE_SETUP_HDR_FAIL\n"); sys1(SYS_exit, 3); }
+        got += r;
+    }
+    unsigned want = 8 + 4u * (unsigned)(*(u16 *)(buf + 6));
+    if (want > sizeof buf) want = sizeof buf;
+    while (got < (i64)want) {
+        i64 r = sys3(SYS_read, fd, (i64)(buf + got), (i64)want - got);
+        if (r <= 0) break;
+        got += r;
+    }
+    i64 n = got;
+    if (n < (i64)want) {
+        out("XWIRE_SETUP_INCOMPLETE got="); outn(n);
+        out(" want="); outn(want); out("\n");
+        sys1(SYS_exit, 3);
+    }
     out("XWIRE_SETUP_STATUS="); outn(buf[0]); out(" bytes="); outn(n); out("\n");
     if (buf[0] != 1) { out("XWIRE_SETUP_REFUSED\n"); sys1(SYS_exit, 4); }
 
