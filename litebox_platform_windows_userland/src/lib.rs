@@ -571,6 +571,64 @@ unsafe extern "system" fn vectored_exception_handler(
         // guest startup enough to change which bug a run even reaches -- see this investigation's
         // own notes on instrumentation distorting timing). Only pay this cost while deliberately
         // hunting a host-address/no-module fault.
+        // DIAG (concurrent-fork SIGSEGV/SIGILL investigation, `rip==cr2` at instruction offsets
+        // ending 0x1464b/0x464b): `LITEBOX_DIAG_FAULT_VQ=1` -- captures real Windows memory state
+        // (`VirtualQuery`) at the faulting address AT THE MOMENT OF THE CRASH. AGENTS.md's "Open
+        // blockers" section established the crashing instruction is a real, valid instruction at
+        // the CORRECT offset relative to the child's own load base (confirmed via objdump) -- not
+        // a corrupted jump target -- and that Windows genuinely reports the page as not-present,
+        // not a permissions mismatch. This diagnostic answers "what does Windows' own VAD tree say
+        // about this exact address right now" directly, without needing a live debugger.
+        // Gated on `rip == cr2` (this investigation's own documented crash signature -- see
+        // AGENTS.md's "Exception(N)/error_code decoding" note: `rip==cr2` with a nonzero
+        // `error_code` whose low bit is set means a genuine instruction-FETCH fault on a
+        // not-present page): `fork_verify`'s own expected/recoverable single-step and AV-path
+        // healing faults (the overwhelming majority of in-guest faults on this platform) do NOT
+        // have `rip==cr2` -- they fault on a DIFFERENT address than the one currently executing.
+        // Without this filter, this fired 268,000+ times in one 30-concurrent-fork oracle run
+        // (confirmed live this investigation), each interleaved across many threads' own
+        // concurrent healing traffic, making the 5 real crashes impossible to correlate back to
+        // their own diagnostic block. Allocation-free (`diag_raw_print`, not `eprintln!`) and
+        // still gated behind an explicit env var for the same reason `LITEBOX_DIAG_FAULT_MODULE`
+        // is: unthrottled, this class of diagnostic has previously been observed to slow guest
+        // startup enough to change which bug a run even reaches.
+        if this_is_in_guest
+            && std::env::var_os("LITEBOX_DIAG_FAULT_VQ").is_some()
+            && rip == unsafe { (*(*exception_info).ExceptionRecord).ExceptionInformation[1] } as u64
+        {
+            let cr2 = unsafe { (*(*exception_info).ExceptionRecord).ExceptionInformation[1] };
+            let mut cr2_mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+            let cr2_queried = unsafe {
+                Win32_Memory::VirtualQuery(
+                    cr2 as *const c_void,
+                    &raw mut cr2_mbi,
+                    core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+                ) != 0
+            };
+            let tid = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+            diag_raw_print(b"[diag-fault-vq] tid=0x", tid as usize, b" rip=0x", rip as usize);
+            diag_raw_print(
+                b"[diag-fault-vq]   cr2=0x", cr2 as usize,
+                b" queried=0x", cr2_queried as usize,
+            );
+            diag_raw_print(
+                b"[diag-fault-vq]   state=0x", cr2_mbi.State as usize,
+                b" type=0x", cr2_mbi.Type as usize,
+            );
+            diag_raw_print(
+                b"[diag-fault-vq]   protect=0x", cr2_mbi.Protect as usize,
+                b" alloc_protect=0x", cr2_mbi.AllocationProtect as usize,
+            );
+            diag_raw_print(
+                b"[diag-fault-vq]   region_base=0x", cr2_mbi.BaseAddress as usize,
+                b" region_size=0x", cr2_mbi.RegionSize,
+            );
+            diag_raw_print(
+                b"[diag-fault-vq]   alloc_base=0x", cr2_mbi.AllocationBase as usize,
+                b" rsp=0x", rsp as usize,
+            );
+        }
+
         if this_is_in_guest && std::env::var_os("LITEBOX_DIAG_FAULT_MODULE").is_some() {
             let mut module: windows_sys::Win32::Foundation::HMODULE = core::ptr::null_mut();
             let resolved = unsafe {

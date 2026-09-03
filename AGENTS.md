@@ -150,13 +150,49 @@ section before acting on the rest.**
   the moment of the fault. No address-range collisions were found across extensive
   `fork_duplicate`/`create_mapping`/`guest_mprotect` log cross-referencing between concurrently
   forking children.
-- **Next concrete step, not yet done**: instrument exactly what real Windows memory state
-  (`VirtualQuery`) the faulting address shows AT THE MOMENT OF THE CRASH, and trace backward from
-  there — this measurement was identified but not reached in the most recent session. Given the
-  page is genuinely not-present per Windows itself (not a permissions issue, not a wrong-target
-  jump), the likely area is whatever commits/reserves the child's memory during
-  `PageManager::duplicate()`/`fork_duplicate` under concurrent execution — check for a race there
-  distinct from the now-fixed proactive-fixup locking gap.
+- **`VirtualQuery`-at-fault-time measurement DONE this session — corrects the "not-present"
+  characterization above.** Added `LITEBOX_DIAG_FAULT_VQ=1` to `vectored_exception_handler` in
+  `litebox_platform_windows_userland/src/lib.rs` (gated on `rip == cr2`, the documented crash
+  signature, to avoid the 268,000+ line flood an ungated version produces from `fork_verify`'s own
+  expected healing faults — confirmed live). Real captures from the regression oracle (3 real
+  crashes in one run, all 3 captured cleanly):
+  ```
+  cr2=rip=0x153e464b  state=0x1000 (MEM_COMMIT)  type=0x20000 (MEM_PRIVATE)  protect=0x2 (PAGE_READONLY)
+  cr2=rip=0x1fb4464b  state=0x1000 (MEM_COMMIT)  type=0x20000 (MEM_PRIVATE)  protect=0x2 (PAGE_READONLY)
+  cr2=rip=0x3b13464b  state=0x1000 (MEM_COMMIT)  type=0x20000 (MEM_PRIVATE)  protect=0x2 (PAGE_READONLY)
+  ```
+  All three: the page IS committed and present (contradicting the earlier "genuinely not-present"
+  read) — it is **`PAGE_READONLY` where `PAGE_EXECUTE_READ` is expected** for a code page about to
+  execute an instruction-fetch. This is a real permissions bug, not a missing-mapping bug. Given
+  `prot_flags()` (same file) correctly maps `VmFlags::VM_EXEC` to `PAGE_EXECUTE_READ` and
+  `Vmem::duplicate`'s eager-copy path (`litebox/src/mm/linux.rs`) correctly calls
+  `protect_mapping(dest_range, vma.flags.into(), "fork_duplicate")` with the source region's real
+  flags, the most likely explanation is that the exec-narrowing `protect_mapping` call for this
+  specific region either never ran, or ran and was then overwritten back to `PAGE_READONLY` by a
+  DIFFERENT thread's own operation on the same or an adjacent real address before the child ever
+  got to execute there. Not yet root-caused to an exact line.
+- **Tried and REVERTED**: wrapping the entire `PageManager::duplicate()` call in `do_clone`
+  (`litebox_shim_linux/src/syscalls/process.rs`) with `lock_fork_verify_heal()` (the same guard
+  already used for the proactive stale-pointer fixup passes) was a natural next attempt given the
+  above evidence, but **measured to make the oracle worse**, not better (30-concurrent-`/bin/true`:
+  baseline 3-6 faults rose to 9-11 across 5 reruns with this lock held). Reverted; a comment is
+  left at the call site so this specific change is not retried without new evidence. The real fix
+  needs to narrow down WHERE inside `duplicate()`'s per-region loop the wrong protection value
+  reaches `update_permissions`/`VirtualProtect`, not just serialize the whole call more broadly.
+- **Host resource exhaustion recurred this session**, matching a pattern this project's own memory
+  already documents (`pass 314`/`pass 315`'s "Heisenbug-shaped timing race" vs. genuine host
+  degradation distinction): free physical memory dropped to ~1.1-1.3 GiB out of 16 GiB after
+  several build+run cycles and did not recover after several seconds idle, with fault counts on
+  BOTH the FAIL oracle (rising to 8-12) and the PASS control (rising to 5-8, which must stay 0)
+  becoming unreliable at the same time. Every number from this investigation from that point
+  forward should be treated as suspect until re-measured on a fresh host/session state — this is
+  the same known confound, not new evidence of anything code-related.
+- **Next concrete step**: re-run the `LITEBOX_DIAG_FAULT_VQ=1` capture on a FRESH host session
+  (low memory pressure) across several of the 3-6 baseline faults, this time also logging, from
+  `Vmem::duplicate`'s own per-region loop, the exact `(source_range, dest_range, vma.flags)` for
+  every region as it is placed — then cross-reference by dest-address against the `cr2` values
+  captured here to identify definitively whether the faulting address's OWN `protect_mapping` call
+  ran at all, and with what flags, versus was silently skipped or overwritten afterward.
 
 ## Reproduction commands
 

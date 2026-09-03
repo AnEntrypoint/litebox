@@ -2431,6 +2431,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     tid:% = self.tid;
                     "do_clone: about to duplicate address space for fork()"
                 );
+                // NOTE (concurrent-fork SIGSEGV/SIGILL investigation): wrapping this call in
+                // `lock_fork_verify_heal()` was tried and MEASURED TO REGRESS the regression
+                // oracle (30-concurrent-`/bin/true`: fault count rose from the baseline 3-6 to
+                // 9-11 across 5 reruns) -- reverted. `PageManager::duplicate` itself already
+                // serializes each individual `insert_mapping`/`protect_mapping` call through
+                // `litebox_platform_windows_userland`'s own `ALLOCATE_PAGES_FIXED_ADDR_LOCK`/
+                // `VIRTUAL_PROTECT_LOCK` (the same mutex); the live `VirtualQuery`-at-fault-time
+                // evidence (`LITEBOX_DIAG_FAULT_VQ=1`: crashing page is `MEM_COMMIT`/`MEM_PRIVATE`
+                // but `PAGE_READONLY` where `PAGE_EXECUTE_READ` is expected) is real and still
+                // unexplained, but the cause is NOT simply "duplicate() needs the same
+                // process-wide lock as the proactive fixup pass" -- do not re-try this exact
+                // change without new evidence narrowing WHERE in `duplicate()`'s per-region loop
+                // the wrong permissions get applied.
                 let (dest_pm, relocations) = unsafe {
                     self.process().pm().duplicate(&self.global.litebox)
                 }
