@@ -9,8 +9,10 @@ needs the detailed forensic trail — but start here, not there.
 ## Standing goal
 
 Get XFCE actually rendering and staying up under litebox on a Windows host (no WSL, no
-hypervisor — see `feedback_no_wsl_or_hypervisor` in project memory). **Not yet met.** See
-"Open blockers" below for the precise remaining gap.
+hypervisor — see `feedback_no_wsl_or_hypervisor` in project memory). **Not yet fully met, but
+close: every XFCE process now launches and stays alive — the sole remaining gap is that the
+framebuffer goes black shortly after Xwayland starts and never recovers, independent of XFCE
+itself.** See "Rendering/scanout blocker" below for the precise remaining gap and next step.
 
 ## Standing directives (do not relitigate these)
 
@@ -97,18 +99,27 @@ hypervisor — see `feedback_no_wsl_or_hypervisor` in project memory). **Not yet
 
 ## Open blockers (the real remaining gap)
 
-**UPDATE (this session): the `rip==cr2`/`PAGE_READONLY`-not-`PAGE_EXECUTE_READ` concurrent-fork
-bug described in this whole section is ROOT-CAUSED AND FIXED.** See "FIX LANDED" at the end of
-this section for the exact mechanism, the fix, and its regression-oracle verification. **A
-SEPARATE, still-open concurrent-fork crash signature was found blocking the standing goal under
-the real, much-heavier XFCE launch load** — see "NEW: second, distinct crash signature under
-XFCE launch" further down. Read both before picking this up again.
+**MAJOR UPDATE (this session, latest): a complete XFCE desktop now comes up and stays alive.**
+weston, Xwayland, xfconfd, xfwm4, xfsettingsd, xfdesktop, and xfce4-panel all start successfully
+and remain alive to the end of a run (confirmed: `DBUS_UP=yes`, `XFCONF_PROBE_RC=0`, no component
+exits with a failure status, only cosmetic warnings in their stderr — AT-SPI accessibility bus
+address errors, missing GSettings schema, no SESSION_MANAGER var, none fatal). This required BOTH
+of the concurrent-fork fixes below AND removing `set -x` from the launch script (see the #UD
+bisection further down — `set -x` itself was triggering a real, separate litebox bug that broke
+the launch chain). **The remaining gap is now narrow and purely a rendering/scanout issue, not a
+process-launch issue**: weston renders a full desktop correctly at t=7.4s
+(`non_black_pixels=2073597`), then the framebuffer goes black at t=20.3s and never recovers —
+this happens the moment Xwayland forks `xkbcomp` after a large pointer-healing pass, BEFORE any
+XFCE component even starts (all XFCE components start from t=29.9s onward, well after the
+blackout — neither XFCE nor `xfwm4` causes it). See "Rendering/scanout blocker" below for the
+precise next diagnostic. **Two process-level bugs are fully fixed** (see "FIX LANDED" further
+down for both); **one process-level bug remains open but no longer blocks the launch chain**
+(the `set -x`-triggered #UD — has a fast deterministic repro, still needs a real fix, see below).
 
-**Single highest-priority item (historical framing, now fixed — kept for context): forked
-children die (SIGSEGV/SIGILL, `rip==cr2`) before they can `execve()`, under concurrent forking
-only.** This is the one thing standing between the current state and the standing goal. **The
-earlier "MAXCONCURRENT fork_verify healing passes" theory below is REFUTED as of the most recent
-measurement — read the correction at the end of this section before acting on the rest.**
+**Historical framing (both now fixed, kept for context): forked children died (SIGSEGV/SIGILL,
+`rip==cr2`) before they could `execve()`, under concurrent forking only.** The earlier
+"MAXCONCURRENT fork_verify healing passes" theory below is REFUTED as of a later measurement —
+read the correction further down before acting on it.
 
 - Reproduces on a **bare alpine rootfs with zero display components** — no weston/Xwayland/XFCE
   needed. A background/concurrent-fork shell pattern alone triggers it. Sequential forking is
@@ -335,9 +346,47 @@ measurement — read the correction at the end of this section before acting on 
   valid stub at a non-instruction boundary (a different bug class — a jump-target computation
   issue, not memory corruption).
 
+  **Keep this on the list even after it stops blocking the launch chain** (see the major update
+  at the top of this section — removing `set -x` unblocked the full XFCE launch without fixing
+  this bug). It's a real litebox bug with a fast, deterministic repro, and it silently breaks any
+  traced (`set -x`) script — worth fixing properly, not just avoiding.
+
+## Rendering/scanout blocker (the current single remaining gap)
+
+With both concurrent-fork process bugs fixed and `set -x` removed from the launch script, a full
+XFCE desktop now starts and stays alive (weston, Xwayland, xfconfd, xfwm4, xfsettingsd,
+xfdesktop, xfce4-panel — see the major update at the top of this section for exact confirmation).
+**The only remaining problem is that the framebuffer goes black and never recovers, independent
+of XFCE or `xfwm4` entirely:**
+
+- t=7.4s: `non_black_pixels=2073597`, `colors=64` — weston renders a full desktop correctly.
+- t=20.3s: `non_black_pixels=0`, `colors=1` — goes black, never recovers for the rest of the run.
+- The blackout coincides with Xwayland (not yet running any XFCE component) forking `xkbcomp`
+  after a large (46,327-pointer) fork_verify healing pass.
+- Every XFCE component starts from t=29.9s onward — well AFTER the blackout. Neither XFCE nor
+  `xfwm4` causes this; it's already black before any of them exist.
+
+This is now a compositing/scanout question, not a process-launch question: does Xwayland's output
+ever reach weston's scanout buffer, or does weston stop flipping once Xwayland becomes the top
+surface?
+
+**Next measurement, not yet done**: instrument the DRM ioctl path (`litebox_shim_linux/src/
+syscalls/file.rs:4689`, `drm_ioctl`'s dispatch — this specific piece of tooling was suggested
+early in this session and still has not been built) to log every `PAGE_FLIP`/dirty-fb/scanout-
+buffer change with its source, starting from t=15s onward through the blackout. Two outcomes,
+either decisive:
+- **Flips stop entirely at t=20.3s** → weston has stopped presenting. Investigate weston's own
+  output/renderer state after `xkbcomp` forks — possibly a repaint-scheduling or damage-tracking
+  bug triggered by the concurrent fork/heal activity.
+- **Flips continue but the buffer is all-zero** → Xwayland is presenting an empty surface.
+  Investigate the X side — Xwayland's own framebuffer/shm setup after this fork, possibly a
+  dmabuf/shm handoff timing issue with weston.
+
 ## Reproduction commands
 
-Full XFCE launch (once the fork bug above is fixed, use this to verify the standing goal):
+Full XFCE launch — **use `advisor/probes/run_xfce_staged.sh` as the launch script, NOT any
+`set -x`-instrumented script** (`xfce_direct.sh`, if it still has `set -x`, will trigger the
+still-open #UD bug above and derail the run before it ever reaches the rendering blocker):
 ```
 cd C:\dev\litebox-main
 cargo build --release -p litebox_runner_linux_on_windows_userland --target x86_64-pc-windows-gnu
@@ -347,7 +396,7 @@ export LITEBOX_DUMP_FRAMES=1
 timeout 100 target/x86_64-pc-windows-gnu/release/litebox_runner_linux_on_windows_userland.exe \
   --initial-files .wfgy/xfce-build/layer31_direct_fixed.tar \
   --gui \
-  -- /bin/sh /xfce_direct.sh \
+  -- /bin/sh advisor/probes/run_xfce_staged.sh \
   > /tmp/pass_repro.log 2>&1
 ```
 (`layer31_direct_fixed.tar` = `alpine-pinned2.tar` + `layer31_direct.tar` merged, soname-repaired.
