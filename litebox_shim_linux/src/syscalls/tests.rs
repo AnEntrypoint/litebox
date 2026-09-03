@@ -1,0 +1,1218 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+use litebox::fs::{FileSystem as _, Mode, OFlags};
+use litebox_common_linux::{AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
+use zerocopy::FromBytes as _;
+
+use crate::UserPtrMut;
+
+extern crate std;
+
+const TEST_TAR_FILE: &[u8] = include_bytes!("../../../litebox/src/fs/test.tar");
+
+/// The concrete platform used by the shim's unit tests.
+///
+/// This is selected by the build target so the tests can run against whichever
+/// userland platform matches the host (Linux or Windows) rather than being
+/// hard-wired to one.
+#[cfg(target_os = "linux")]
+pub(crate) use litebox_platform_linux_userland::LinuxUserland as TestPlatform;
+#[cfg(target_vendor = "apple")]
+pub(crate) use litebox_platform_macos_userland::MacOsUserland as TestPlatform;
+#[cfg(target_os = "windows")]
+pub(crate) use litebox_platform_windows_userland::WindowsUserland as TestPlatform;
+
+/// Returns the process-wide test platform, initializing it once.
+pub(crate) fn test_platform(tun_device_name: Option<&str>) -> &'static TestPlatform {
+    static PLATFORM: std::sync::OnceLock<&'static TestPlatform> = std::sync::OnceLock::new();
+    PLATFORM.get_or_init(|| {
+        // The Linux and macOS userland platforms take a tun device name; Windows does not.
+        #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+        {
+            TestPlatform::new(tun_device_name)
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let _ = tun_device_name;
+            TestPlatform::new()
+        }
+    })
+}
+
+#[must_use]
+pub(crate) fn init_platform(
+    tun_device_name: Option<&str>,
+) -> crate::Task<TestPlatform, crate::DefaultFS<TestPlatform>> {
+    let platform = test_platform(tun_device_name);
+
+    let shim_builder = crate::LinuxShimBuilder::new(platform);
+    let litebox = shim_builder.litebox();
+    let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
+    in_mem_fs.with_root_privileges(|fs| {
+        fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+            .expect("Failed to set permissions on root");
+    });
+    let fs = alloc::sync::Arc::new(shim_builder.default_fs(in_mem_fs, TEST_TAR_FILE.into()));
+    let task = shim_builder.build().0.new_test_task(fs);
+
+    if tun_device_name.is_some() {
+        let global = task.global.clone();
+        // Start a background thread to perform network interaction
+        // Naive implementation for testing purpose only
+        std::thread::spawn(move || {
+            loop {
+                while global
+                    .net
+                    .lock()
+                    .perform_platform_interaction()
+                    .call_again_immediately()
+                {}
+                core::hint::spin_loop();
+            }
+        });
+    }
+    task
+}
+
+#[test]
+fn test_fcntl() {
+    let task = init_platform(None);
+
+    let check = |fd: i32, flags1: OFlags, flags2: OFlags| {
+        assert_eq!(
+            task.sys_fcntl(fd, FcntlArg::GETFD).unwrap(),
+            FileDescriptorFlags::FD_CLOEXEC.bits()
+        );
+
+        assert_eq!(task.sys_fcntl(fd, FcntlArg::GETFL).unwrap(), flags1.bits());
+
+        task.sys_fcntl(fd, FcntlArg::SETFD(FileDescriptorFlags::empty()))
+            .unwrap();
+        assert_eq!(task.sys_fcntl(fd, FcntlArg::GETFD).unwrap(), 0);
+
+        // OFlags::RDWR should be ignored
+        task.sys_fcntl(fd, FcntlArg::SETFL(OFlags::RDWR)).unwrap();
+        assert_eq!(task.sys_fcntl(fd, FcntlArg::GETFL).unwrap(), flags2.bits());
+    };
+
+    // Test pipe
+    let (read_fd, write_fd) = task
+        .sys_pipe2(OFlags::CLOEXEC | OFlags::NONBLOCK)
+        .expect("Failed to create pipe");
+    let read_fd = i32::try_from(read_fd).unwrap();
+    check(read_fd, OFlags::RDONLY | OFlags::NONBLOCK, OFlags::RDONLY);
+    let write_fd = i32::try_from(write_fd).unwrap();
+    check(write_fd, OFlags::WRONLY | OFlags::NONBLOCK, OFlags::WRONLY);
+
+    // Test eventfd
+    let eventfd = task
+        .sys_eventfd2(
+            0,
+            EfdFlags::CLOEXEC | EfdFlags::SEMAPHORE | EfdFlags::NONBLOCK,
+        )
+        .expect("Failed to create eventfd");
+    let eventfd = i32::try_from(eventfd).unwrap();
+    check(eventfd, OFlags::RDWR | OFlags::NONBLOCK, OFlags::RDWR);
+
+    // Test fcntl with DUPFD
+    let fd = task
+        .sys_open("/dev/stdin", OFlags::RDONLY, Mode::empty())
+        .unwrap();
+    let fd = i32::try_from(fd).unwrap();
+
+    let min_fd = fd + 10;
+    let duplicated = task
+        .sys_fcntl(
+            fd,
+            FcntlArg::DUPFD {
+                cloexec: false,
+                min_fd: u32::try_from(min_fd).unwrap(),
+            },
+        )
+        .unwrap();
+    let duplicated = i32::try_from(duplicated).unwrap();
+
+    assert_eq!(duplicated, min_fd);
+}
+
+#[test]
+fn test_dup() {
+    let task = init_platform(None);
+
+    let fd = task
+        .sys_open("/dev/stdin", OFlags::RDONLY, Mode::empty())
+        .unwrap();
+    let fd = i32::try_from(fd).unwrap();
+    // test dup
+    let fd2 = task.sys_dup(fd, None, None).unwrap();
+    let fd2 = i32::try_from(fd2).unwrap();
+    assert_eq!(fd + 1, fd2);
+
+    // test dup2
+    let fd3 = task.sys_dup(fd2, Some(fd2 + 10), None).unwrap();
+    let fd3 = i32::try_from(fd3).unwrap();
+    assert_eq!(fd2 + 10, fd3);
+
+    // test dup3
+    assert_eq!(
+        task.sys_dup(fd3, Some(fd3), Some(OFlags::CLOEXEC)),
+        Err(Errno::EINVAL)
+    );
+    let fd4 = task
+        .sys_dup(fd2, Some(fd2 + 10), Some(OFlags::CLOEXEC))
+        .unwrap();
+    let fd4 = i32::try_from(fd4).unwrap();
+    assert_eq!(fd2 + 10, fd4);
+}
+
+// Note the test was generated by copilot with minor fixes.
+#[test]
+fn test_getdent64() {
+    let task = init_platform(None);
+
+    // Create test files in root directory for testing
+    let file1_fd = task
+        .sys_open(
+            "/test_file1.txt",
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test_file1.txt");
+    task.sys_close(file1_fd.try_into().unwrap())
+        .expect("Failed to close test_file1.txt");
+
+    let file2_fd = task
+        .sys_open(
+            "/test_file2.txt",
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test_file2.txt");
+    task.sys_close(file2_fd.try_into().unwrap())
+        .expect("Failed to close test_file2.txt");
+
+    // Open the root directory for testing
+    let dir_fd = task
+        .sys_open("/", OFlags::RDONLY, Mode::empty())
+        .expect("Failed to open root directory");
+    let dir_fd = dir_fd.try_into().unwrap();
+
+    // Test 1: Basic functionality - read directory entries
+    let mut buffer = alloc::vec![0u8; 4096];
+    let bytes_read = task
+        .sys_getdirent64(
+            dir_fd,
+            UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
+            buffer.len(),
+        )
+        .expect("Failed to read directory entries");
+
+    assert!(bytes_read > 0, "Should have read some directory entries");
+    assert!(
+        bytes_read <= buffer.len(),
+        "Should not read more than buffer size"
+    );
+
+    // Parse the returned entries to verify they are correct
+    let mut offset = 0;
+    let mut found_entries = alloc::vec::Vec::new();
+
+    while offset < bytes_read {
+        let (dirent, _) =
+            litebox_common_linux::LinuxDirent64::read_from_prefix(&buffer[offset..]).unwrap();
+
+        // Validate the entry length
+        assert!(dirent.len > 0, "Directory entry length must be positive");
+        assert!(
+            offset + dirent.len as usize <= bytes_read,
+            "Entry should not exceed buffer"
+        );
+
+        let name_bytes = {
+            let start = offset + core::mem::offset_of!(litebox_common_linux::LinuxDirent64, __name);
+            let end = offset + dirent.len as usize;
+            &buffer[start..end]
+        };
+
+        // Find the null terminator
+        let null_pos = name_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(name_bytes.len());
+        let name =
+            core::str::from_utf8(&name_bytes[..null_pos]).expect("Invalid UTF-8 in filename");
+
+        found_entries.push((alloc::string::String::from(name), dirent.typ, dirent.ino));
+        offset += dirent.len as usize;
+    }
+
+    assert!(
+        !found_entries.is_empty(),
+        "Should find at least some directory entries"
+    );
+
+    // Check that our test files appear in the directory listing
+    let mut entry_names: alloc::vec::Vec<alloc::string::String> = found_entries
+        .iter()
+        .map(|(name, _, _)| name.clone())
+        .collect();
+    entry_names.sort();
+    assert_eq!(
+        entry_names,
+        alloc::vec![
+            ".",
+            "..",
+            "bar",
+            "dev",
+            "foo",
+            "run",
+            "sys",
+            "test_file1.txt",
+            "test_file2.txt"
+        ]
+    );
+
+    // Verify that our test files have the correct type (regular file)
+    for (name, typ, _) in &found_entries {
+        if name == "test_file1.txt" || name == "test_file2.txt" {
+            assert_eq!(
+                *typ,
+                litebox_common_linux::DirentType::Regular as u8,
+                "Test files should have Regular type"
+            );
+        }
+    }
+
+    assert_eq!(
+        task.sys_getdirent64(
+            dir_fd,
+            UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
+            buffer.len()
+        )
+        .expect("Failed to read directory entries"),
+        0,
+        "should have read all entries in the previous call"
+    );
+    task.sys_close(dir_fd).expect("Failed to close directory");
+
+    // Test 2: Small buffer (should handle partial reads gracefully)
+    let dir_fd = task
+        .sys_open("/", OFlags::RDONLY, Mode::empty())
+        .expect("Failed to open root directory");
+    let dir_fd = dir_fd.try_into().unwrap();
+    let mut small_buffer = [0u8; 64];
+    let bytes = task
+        .sys_getdirent64(
+            dir_fd,
+            UserPtrMut::from_usize(small_buffer.as_mut_ptr() as usize),
+            small_buffer.len(),
+        )
+        .expect("Failed to read directory entries");
+
+    // Should either succeed with partial data or return 0 if no entry fits
+    assert!(bytes <= small_buffer.len(), "Should not exceed buffer size");
+    // If bytes > 0, verify the structure is valid
+    if bytes > 0 {
+        let (dirent, _) =
+            litebox_common_linux::LinuxDirent64::read_from_prefix(&small_buffer[..bytes]).unwrap();
+        assert!(
+            dirent.len as usize <= bytes,
+            "First entry length should fit in returned bytes"
+        );
+        assert!(dirent.len > 0, "Entry length should be positive");
+    }
+
+    // Test 3: Invalid file descriptor
+    let result = task.sys_getdirent64(
+        -1,
+        UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
+        buffer.len(),
+    );
+    assert_eq!(
+        result,
+        Err(Errno::EBADF),
+        "Should return EBADF for invalid fd"
+    );
+
+    // Test 4: File descriptor pointing to a regular file (not a directory)
+    let file1_fd = task
+        .sys_open("/test_file1.txt", OFlags::RDONLY, Mode::empty())
+        .expect("Failed to open test_file1.txt");
+    let file1_fd = file1_fd.try_into().unwrap();
+
+    let result = task.sys_getdirent64(
+        file1_fd,
+        UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
+        buffer.len(),
+    );
+    assert_eq!(
+        result,
+        Err(Errno::ENOTDIR),
+        "Should return ENOTDIR for non-directory fd"
+    );
+    task.sys_close(file1_fd).expect("Failed to close file");
+
+    // Test 5: Zero-length buffer
+    let result = task.sys_getdirent64(
+        dir_fd,
+        UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
+        0,
+    );
+    assert_eq!(
+        result,
+        Err(Errno::EINVAL),
+        "Should return EINVAL for zero-length buffer"
+    );
+
+    task.sys_close(dir_fd).expect("Failed to close directory");
+
+    // Test 6: Multiple reads (test directory offset tracking)
+    // Reopen directory to reset position
+    let dir_fd2 = task
+        .sys_open("/", OFlags::RDONLY, Mode::empty())
+        .expect("Failed to reopen root directory");
+    let dir_fd2 = dir_fd2.try_into().unwrap();
+
+    // Read entries in smaller chunks to test offset tracking
+    let mut all_entries = alloc::vec::Vec::new();
+
+    loop {
+        let mut chunk_buffer = [0u8; 64];
+        let bytes_read = task
+            .sys_getdirent64(
+                dir_fd2,
+                UserPtrMut::from_usize(chunk_buffer.as_mut_ptr() as usize),
+                chunk_buffer.len(),
+            )
+            .expect("Failed to read directory chunk");
+
+        if bytes_read == 0 {
+            break; // End of directory
+        }
+
+        // Parse entries from this chunk
+        let mut offset = 0;
+        while offset < bytes_read {
+            let (dirent, _) = litebox_common_linux::LinuxDirent64::read_from_prefix(
+                &chunk_buffer[offset..bytes_read],
+            )
+            .unwrap();
+
+            assert!(dirent.len > 0, "Entry length must be positive");
+            assert!(
+                offset + dirent.len as usize <= bytes_read,
+                "Entry should fit in chunk"
+            );
+
+            let name_bytes = {
+                let start =
+                    offset + core::mem::offset_of!(litebox_common_linux::LinuxDirent64, __name);
+                let end = offset + dirent.len as usize;
+                &chunk_buffer[start..end]
+            };
+
+            let null_pos = name_bytes
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(name_bytes.len());
+            let name =
+                core::str::from_utf8(&name_bytes[..null_pos]).expect("Invalid UTF-8 in filename");
+
+            all_entries.push(alloc::string::String::from(name));
+            offset += dirent.len as usize;
+        }
+    }
+
+    // Verify we still got our expected entries through chunked reading
+    all_entries.sort();
+    assert_eq!(
+        all_entries,
+        alloc::vec![
+            ".",
+            "..",
+            "bar",
+            "dev",
+            "foo",
+            "run",
+            "sys",
+            "test_file1.txt",
+            "test_file2.txt"
+        ]
+    );
+}
+
+#[test]
+fn test_umask_behavior() {
+    let task = init_platform(None);
+
+    // 1. Capture original mask without changing final state.
+    let orig = task.sys_umask(0).bits(); // sets mask to 0, returns previous
+    let _ = task.sys_umask(orig); // restore original
+
+    // We expect the default (from implementation) to be 0o022.
+    assert_eq!(orig, 0o022, "Default umask should be 022 (got {orig:03o})");
+
+    // 2. Set a new umask (e.g., 0o077) and verify file creation honors it.
+    let prev = task.sys_umask(0o077).bits();
+    assert_eq!(prev, orig, "Setting umask should return previous value");
+
+    // Create a file with mode 0o666; with umask 0o077 it should become 0o600.
+    let file_mode = Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH; // 0o666
+    let test_file = "/umask_rs_test_file_perm.txt";
+    let fd = task
+        .sys_open(test_file, OFlags::CREAT | OFlags::WRONLY, file_mode)
+        .expect("Failed to create test file with O_CREAT");
+    // Close it (ignore errors)
+    let _ = task.sys_close(i32::try_from(fd).unwrap());
+
+    let stat_file = task.sys_stat(test_file).expect("stat failed on test file");
+    let actual_file_perm = stat_file.st_mode & 0o777;
+    assert_eq!(
+        actual_file_perm, 0o600,
+        "File permission should respect umask (expected 600 got {actual_file_perm:03o})",
+    );
+
+    // 3. Create a directory with mode 0o777; with umask 0o077 should become 0o700.
+    let dir_mode = (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits();
+    let test_dir = "/umask_rs_test_dir";
+    task.sys_mkdirat(litebox_common_linux::AT_FDCWD, test_dir, dir_mode)
+        .expect("Failed to create test directory");
+
+    let stat_dir = task
+        .sys_stat(test_dir)
+        .expect("stat failed on test directory");
+    let actual_dir_perm = stat_dir.st_mode & 0o777;
+    assert_eq!(
+        actual_dir_perm, 0o700,
+        "Directory permission should respect umask (expected 700 got {actual_dir_perm:03o})",
+    );
+
+    // 4. High bits are ignored: set mask with bits beyond 0o777.
+    // Current mask is 0o077; now set 0o1777 -> stored low 9 bits = 0o777.
+    let prev2 = task.sys_umask(0o1777).bits();
+    assert_eq!(prev2, 0o077, "Returned previous mask should be 077");
+    let prev3 = task.sys_umask(0).bits(); // fetch current (0o777) and set to 0
+    assert_eq!(
+        prev3, 0o777,
+        "Only low 9 bits should be retained (expected 777)"
+    );
+    // Restore to original
+    let _ = task.sys_umask(orig);
+}
+
+#[test]
+fn test_rlimit_nofile() {
+    use litebox_common_linux::{Rlimit, RlimitResource, errno::Errno};
+
+    let task = crate::syscalls::tests::init_platform(None);
+
+    // 1. Get the current NOFILE limit.
+    let cur_lim = task
+        .do_prlimit(RlimitResource::NOFILE, None)
+        .expect("sys_getrlimit(NOFILE) failed");
+    assert!(cur_lim.rlim_max >= cur_lim.rlim_cur, "expected max >= cur");
+
+    // 2. Try to raise hard limit by 1 (should be EPERM and not change state).
+    let raise = Rlimit {
+        rlim_cur: cur_lim.rlim_cur,
+        rlim_max: cur_lim.rlim_max.saturating_add(1),
+    };
+    let err = task
+        .do_prlimit(RlimitResource::NOFILE, Some(raise))
+        .expect_err("raising NOFILE hard limit should fail");
+    assert_eq!(err, Errno::EPERM);
+
+    // 3. Try cur > max (EINVAL).
+    let bad_order = Rlimit {
+        rlim_cur: cur_lim.rlim_max + 1,
+        rlim_max: cur_lim.rlim_max,
+    };
+    let err = task
+        .do_prlimit(RlimitResource::NOFILE, Some(bad_order))
+        .expect_err("cur > max should be invalid");
+    assert_eq!(err, Errno::EINVAL);
+
+    // 4. Lower soft limit
+    let probe_fd = task.sys_dup(0, None, None).expect("probe dup failed");
+    let new_lim = Rlimit {
+        rlim_cur: probe_fd as usize + 1,
+        rlim_max: cur_lim.rlim_max,
+    };
+    task.do_prlimit(RlimitResource::NOFILE, Some(new_lim))
+        .expect("lowering NOFILE cur limit should succeed");
+    assert_eq!(
+        task.sys_dup(0, None, None)
+            .expect_err("dup should fail due to new cur limit"),
+        Errno::EMFILE,
+    );
+    assert_eq!(
+        task.sys_open("/prlimit_file", OFlags::CREAT | OFlags::RDONLY, Mode::RWXU)
+            .expect_err("open should fail due to new cur limit"),
+        Errno::EMFILE,
+    );
+}
+
+#[test]
+fn test_rlimit_other_resources_dont_panic_and_have_sane_defaults() {
+    use litebox_common_linux::{Rlimit, RlimitResource, errno::Errno, rlim_t};
+
+    let task = crate::syscalls::tests::init_platform(None);
+
+    // RLIMIT_SIGPENDING is actually enforced (see SignalQueue::push): a
+    // default of 0 would silently drop every queued/real-time signal.
+    let sigpending = task
+        .do_prlimit(RlimitResource::SIGPENDING, None)
+        .expect("sys_getrlimit(SIGPENDING) failed");
+    assert!(
+        sigpending.rlim_cur > 0,
+        "RLIMIT_SIGPENDING must not default to 0"
+    );
+
+    // Resources beyond NOFILE/STACK/SIGPENDING used to return EINVAL on get
+    // and panic (`unimplemented!`) on set. Neither should happen now: a
+    // getrlimit should succeed with a sane (non-EINVAL) value...
+    let core = task
+        .do_prlimit(RlimitResource::CORE, None)
+        .expect("sys_getrlimit(CORE) failed");
+    assert_eq!(
+        core.rlim_cur,
+        rlim_t::MAX,
+        "unenforced resources default to unlimited"
+    );
+
+    // ...and a setrlimit for one of these (e.g. what `ulimit -c 0` does)
+    // must not panic the runner, and must be observable on a later get.
+    let new_core = Rlimit {
+        rlim_cur: 0,
+        rlim_max: rlim_t::MAX,
+    };
+    task.do_prlimit(RlimitResource::CORE, Some(new_core))
+        .expect("setrlimit(CORE, 0) should succeed, not panic");
+    let after = task
+        .do_prlimit(RlimitResource::CORE, None)
+        .expect("sys_getrlimit(CORE) failed after set");
+    assert_eq!(after.rlim_cur, 0);
+
+    // Raising the hard limit above the previous max is still rejected.
+    let bad = Rlimit {
+        rlim_cur: rlim_t::MAX,
+        rlim_max: rlim_t::MAX,
+    };
+    // max is already rlim_t::MAX here so this should succeed (not raising);
+    // exercise the actual EPERM path on a resource with a finite max instead.
+    task.do_prlimit(RlimitResource::CORE, Some(bad))
+        .expect("raising cur to the existing max should succeed");
+    let lowered_max = Rlimit {
+        rlim_cur: 0,
+        rlim_max: 100,
+    };
+    task.do_prlimit(RlimitResource::CORE, Some(lowered_max))
+        .expect("lowering the hard limit should succeed");
+    let raise_above_new_max = Rlimit {
+        rlim_cur: 0,
+        rlim_max: 101,
+    };
+    assert_eq!(
+        task.do_prlimit(RlimitResource::CORE, Some(raise_above_new_max))
+            .expect_err("raising hard limit above current max should fail"),
+        Errno::EPERM
+    );
+}
+
+#[test]
+fn test_unlinkat() {
+    let task = init_platform(None);
+
+    // 1. Create a regular file and unlink it.
+    let file_path = "/unlink_test_file.txt";
+    let fd = task
+        .sys_open(
+            file_path,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file for unlink");
+    task.sys_close(i32::try_from(fd).unwrap())
+        .expect("Failed to close test file");
+    task.sys_unlinkat(0, file_path, AtFlags::empty())
+        .expect("unlinkat should succeed on regular file");
+    assert_eq!(
+        task.sys_stat(file_path),
+        Err(Errno::ENOENT),
+        "File should no longer exist after unlink"
+    );
+
+    // 2. Create a directory and attempt to unlink without AT_REMOVEDIR -> EISDIR.
+    let dir_path = "/unlink_dir";
+    let dir_mode = (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits();
+    task.sys_mkdirat(litebox_common_linux::AT_FDCWD, dir_path, dir_mode)
+        .expect("Failed to create directory");
+    assert_eq!(
+        task.sys_unlinkat(0, dir_path, AtFlags::empty()),
+        Err(Errno::EISDIR),
+        "Unlinking a directory without AT_REMOVEDIR should return EISDIR"
+    );
+
+    // 3. Create a non-empty directory and remove with AT_REMOVEDIR -> ENOTEMPTY.
+    let nonempty_dir = "/unlink_dir_nonempty";
+    task.sys_mkdirat(litebox_common_linux::AT_FDCWD, nonempty_dir, dir_mode)
+        .expect("Failed to create non-empty directory");
+    let inner_file_fd = task
+        .sys_open(
+            "/unlink_dir_nonempty/inner.txt",
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create inner file");
+    task.sys_close(i32::try_from(inner_file_fd).unwrap())
+        .expect("Failed to close inner file");
+    assert_eq!(
+        task.sys_unlinkat(0, nonempty_dir, AtFlags::AT_REMOVEDIR),
+        Err(Errno::ENOTEMPTY),
+        "Removing a non-empty directory with AT_REMOVEDIR should return ENOTEMPTY"
+    );
+
+    // 4. Invalid flag combination: AT_REMOVEDIR | (any other flag) -> EINVAL.
+    assert_eq!(
+        task.sys_unlinkat(
+            0,
+            dir_path,
+            AtFlags::AT_REMOVEDIR | AtFlags::AT_SYMLINK_NOFOLLOW
+        ),
+        Err(Errno::EINVAL),
+        "Invalid extra flags with AT_REMOVEDIR should return EINVAL"
+    );
+
+    // 5. Successfully remove previously created empty directory with AT_REMOVEDIR.
+    task.sys_unlinkat(0, dir_path, AtFlags::AT_REMOVEDIR)
+        .expect("Should remove empty directory with AT_REMOVEDIR");
+    assert_eq!(
+        task.sys_stat(dir_path),
+        Err(Errno::ENOENT),
+        "Directory should no longer exist after removal"
+    );
+
+    // 6. Create and remove another empty directory to ensure repeatability.
+    let empty_dir2 = "/unlink_empty_dir";
+    task.sys_mkdirat(litebox_common_linux::AT_FDCWD, empty_dir2, dir_mode)
+        .expect("Failed to create second empty directory");
+    task.sys_unlinkat(0, empty_dir2, AtFlags::AT_REMOVEDIR)
+        .expect("Should remove second empty directory");
+    assert_eq!(
+        task.sys_stat(empty_dir2),
+        Err(Errno::ENOENT),
+        "Second directory should no longer exist after removal"
+    );
+}
+
+/// Regression test for a bug where readers can be permanently starved on
+/// platforms where `wake_one` does not report whether it actually woke a thread
+/// (e.g. Windows with `WakeByAddressSingle`).
+#[test]
+fn test_rwlock_readers_not_starved_after_writer_handoff() {
+    fn join_with_timeout<T>(
+        handle: std::thread::JoinHandle<T>,
+        timeout: std::time::Duration,
+        thread_name: &str,
+    ) -> T {
+        let start = std::time::Instant::now();
+        while !handle.is_finished() {
+            assert!(
+                start.elapsed() < timeout,
+                "{thread_name} timed out after {timeout:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        handle.join().expect("{thread_name} panicked")
+    }
+
+    // Initialize the platform (reuses the global Once-based init).
+    let _task = init_platform(None);
+    let join_timeout = std::time::Duration::from_secs(5);
+
+    // We run the test many times to increase the probability of hitting the
+    // exact interleaving, since we rely on sleep-based synchronization.
+    for _ in 0..200 {
+        let lock = alloc::sync::Arc::new(litebox::sync::RwLock::<TestPlatform, u32>::new(0));
+        // Step 1: W1 acquires the write lock on the main thread.
+        let mut w1_guard = lock.write();
+
+        // Step 2: Spawn a reader that will block (READERS_WAITING).
+        let lock_r = lock.clone();
+        let reader_handle = std::thread::spawn(move || {
+            let r = lock_r.read();
+            drop(r);
+        });
+
+        // Step 3: Spawn W2 that will block (WRITERS_WAITING + other_writers_waiting).
+        let lock_w2 = lock.clone();
+        let writer_handle = std::thread::spawn(move || {
+            let mut w = lock_w2.write();
+            *w += 1;
+            // Hold briefly so reader stays blocked during our unlock.
+            drop(w);
+        });
+
+        // Give both threads time to block and set their waiting bits.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Step 4: W1 unlocks. This triggers wake_writer_or_readers which
+        // should eventually lead to both W2 and R being served.
+        *w1_guard = 42;
+        drop(w1_guard);
+
+        join_with_timeout(writer_handle, join_timeout, "writer");
+        join_with_timeout(reader_handle, join_timeout, "reader");
+    }
+}
+
+mod flock_tests {
+    extern crate std;
+
+    use litebox::fs::{Mode, OFlags};
+    use litebox_common_linux::errno::Errno;
+
+    use super::init_platform;
+
+    const LOCK_SH: i32 = 1;
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    const LOCK_UN: i32 = 8;
+
+    fn open_rw(
+        task: &crate::Task<super::TestPlatform, crate::DefaultFS<super::TestPlatform>>,
+    ) -> i32 {
+        i32::try_from(
+            task.sys_open(
+                "/flock_test_file.txt",
+                OFlags::CREAT | OFlags::RDWR,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .expect("failed to open flock test file"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn exclusive_lock_excludes_other_open() {
+        let task = init_platform(None);
+        let fd1 = open_rw(&task);
+        let fd2 = open_rw(&task);
+
+        assert_eq!(task.sys_flock(fd1, LOCK_EX).unwrap(), 0);
+        // A different open file description on the same file cannot also get the exclusive
+        // lock, and (non-blockingly) fails with EWOULDBLOCK/EAGAIN.
+        assert_eq!(
+            task.sys_flock(fd2, LOCK_EX | LOCK_NB),
+            Err(Errno::EWOULDBLOCK)
+        );
+        assert_eq!(
+            task.sys_flock(fd2, LOCK_SH | LOCK_NB),
+            Err(Errno::EWOULDBLOCK)
+        );
+
+        assert_eq!(task.sys_flock(fd1, LOCK_UN).unwrap(), 0);
+        // Now that fd1 released it, fd2 can acquire it.
+        assert_eq!(task.sys_flock(fd2, LOCK_EX | LOCK_NB).unwrap(), 0);
+    }
+
+    #[test]
+    fn shared_locks_can_coexist_across_opens() {
+        let task = init_platform(None);
+        let fd1 = open_rw(&task);
+        let fd2 = open_rw(&task);
+
+        assert_eq!(task.sys_flock(fd1, LOCK_SH | LOCK_NB).unwrap(), 0);
+        assert_eq!(task.sys_flock(fd2, LOCK_SH | LOCK_NB).unwrap(), 0);
+
+        // But an exclusive lock still can't be granted while any shared lock is held.
+        assert_eq!(
+            task.sys_flock(fd1, LOCK_EX | LOCK_NB),
+            Err(Errno::EWOULDBLOCK)
+        );
+    }
+
+    #[test]
+    fn dup_shares_the_lock_with_the_original_fd() {
+        let task = init_platform(None);
+        let fd1 = open_rw(&task);
+        let fd2 = open_rw(&task);
+
+        assert_eq!(task.sys_flock(fd1, LOCK_EX).unwrap(), 0);
+        let fd1_dup = i32::try_from(task.sys_dup(fd1, None, None).unwrap()).unwrap();
+
+        // fd1_dup shares fd1's open file description/lock, so re-locking (even exclusively)
+        // through the dup'd fd does not contend with fd1's own held lock.
+        assert_eq!(task.sys_flock(fd1_dup, LOCK_EX | LOCK_NB).unwrap(), 0);
+        assert_eq!(task.sys_flock(fd1_dup, LOCK_SH | LOCK_NB).unwrap(), 0);
+
+        // A genuinely independent open file description still cannot acquire it.
+        assert_eq!(
+            task.sys_flock(fd2, LOCK_EX | LOCK_NB),
+            Err(Errno::EWOULDBLOCK)
+        );
+
+        // Unlocking via the dup'd fd releases the shared open file description's lock.
+        assert_eq!(task.sys_flock(fd1_dup, LOCK_UN).unwrap(), 0);
+        assert_eq!(task.sys_flock(fd2, LOCK_EX | LOCK_NB).unwrap(), 0);
+    }
+
+    #[test]
+    fn closing_the_last_fd_releases_the_lock() {
+        let task = init_platform(None);
+        let fd1 = open_rw(&task);
+        let fd2 = open_rw(&task);
+
+        assert_eq!(task.sys_flock(fd1, LOCK_EX).unwrap(), 0);
+        task.sys_close(fd1).unwrap();
+
+        // fd1's open file description is now fully closed, so its lock must have been
+        // released, allowing fd2 to acquire it.
+        assert_eq!(task.sys_flock(fd2, LOCK_EX | LOCK_NB).unwrap(), 0);
+    }
+
+    #[test]
+    fn unrecognized_operation_is_einval() {
+        let task = init_platform(None);
+        let fd = open_rw(&task);
+        assert_eq!(task.sys_flock(fd, 0).unwrap_err(), Errno::EINVAL);
+        assert_eq!(task.sys_flock(fd, 3).unwrap_err(), Errno::EINVAL);
+    }
+
+    #[test]
+    fn blocking_exclusive_lock_waits_then_succeeds_after_release() {
+        // `Task` is deliberately not `Send`/`Sync` (it represents one thread's execution
+        // context), so this test models two independent processes sharing the same underlying
+        // file the way a real `fork()` would: two separate `Task`s, each with their own fd
+        // table, both built from the same shared `GlobalState` (so they share `flock_registry`)
+        // and the same shared filesystem backend (so they resolve to the same `(dev, ino)`).
+        let task1 = init_platform(None);
+        let fd1 = open_rw(&task1);
+
+        assert_eq!(task1.sys_flock(fd1, LOCK_EX).unwrap(), 0);
+
+        let global2 = task1.global.clone();
+        let fs2 = task1.files.borrow().fs.clone();
+        let waiter = std::thread::spawn(move || {
+            let task2 = global2.new_test_task(fs2);
+            let fd2 = open_rw(&task2);
+            // Blocks until task1 unlocks.
+            task2.sys_flock(fd2, LOCK_EX).unwrap();
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(task1.sys_flock(fd1, LOCK_UN).unwrap(), 0);
+
+        waiter.join().expect("waiter thread panicked");
+    }
+}
+
+#[allow(
+    clippy::similar_names,
+    reason = "st_atime/st_atime_nsec/st_mtime/st_mtime_nsec mirror struct-stat field names"
+)]
+mod utimensat_tests {
+    use super::init_platform;
+    use litebox_common_linux::{AtFlags, Timespec, UTIME_NOW, UTIME_OMIT, errno::Errno};
+
+    fn create_file(
+        task: &crate::Task<super::TestPlatform, crate::DefaultFS<super::TestPlatform>>,
+        path: &str,
+    ) {
+        let fd = task
+            .sys_open(
+                path,
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .expect("failed to create test file");
+        task.sys_close(i32::try_from(fd).unwrap())
+            .expect("failed to close test file");
+    }
+
+    use litebox::fs::{Mode, OFlags};
+
+    #[test]
+    fn sets_explicit_atime_and_mtime() {
+        let task = init_platform(None);
+        create_file(&task, "/utimensat_explicit.txt");
+
+        let atime = Timespec {
+            tv_sec: 1_000_000,
+            tv_nsec: 123_000_000,
+        };
+        let mtime = Timespec {
+            tv_sec: 2_000_000,
+            tv_nsec: 456_000_000,
+        };
+        task.sys_utimensat(
+            libc_at_fdcwd(),
+            "/utimensat_explicit.txt",
+            Some((atime, mtime)),
+            AtFlags::empty(),
+        )
+        .expect("utimensat should succeed on a regular file");
+
+        let stat = task.sys_stat("/utimensat_explicit.txt").unwrap();
+        let (st_atime, st_atime_nsec, st_mtime, st_mtime_nsec) = (
+            stat.st_atime,
+            stat.st_atime_nsec,
+            stat.st_mtime,
+            stat.st_mtime_nsec,
+        );
+        assert_eq!(st_atime, 1_000_000);
+        assert_eq!(st_atime_nsec, 123_000_000);
+        assert_eq!(st_mtime, 2_000_000);
+        assert_eq!(st_mtime_nsec, 456_000_000);
+    }
+
+    #[test]
+    fn null_times_sets_both_to_now() {
+        let task = init_platform(None);
+        create_file(&task, "/utimensat_now.txt");
+
+        task.sys_utimensat(
+            libc_at_fdcwd(),
+            "/utimensat_now.txt",
+            None,
+            AtFlags::empty(),
+        )
+        .expect("utimensat with times=NULL should succeed");
+
+        let stat = task.sys_stat("/utimensat_now.txt").unwrap();
+        let (st_atime, st_mtime) = (stat.st_atime, stat.st_mtime);
+        // We can't assert an exact value, but a freshly-set "now" timestamp should be
+        // (comfortably) nonzero -- this is the direct fix for the "mtime preserved as zero"
+        // symptom this feature exists to address.
+        assert!(st_atime > 0);
+        assert!(st_mtime > 0);
+    }
+
+    #[test]
+    fn utime_now_sentinel_sets_to_current_time() {
+        let task = init_platform(None);
+        create_file(&task, "/utimensat_sentinel_now.txt");
+
+        let now_ts = Timespec {
+            tv_sec: 0,
+            tv_nsec: u64::try_from(UTIME_NOW).unwrap(),
+        };
+        let omit_ts = Timespec {
+            tv_sec: 0,
+            tv_nsec: u64::try_from(UTIME_OMIT).unwrap(),
+        };
+        task.sys_utimensat(
+            libc_at_fdcwd(),
+            "/utimensat_sentinel_now.txt",
+            Some((now_ts, omit_ts)),
+            AtFlags::empty(),
+        )
+        .expect("UTIME_NOW/UTIME_OMIT should be accepted");
+
+        let stat = task.sys_stat("/utimensat_sentinel_now.txt").unwrap();
+        let (st_atime, st_mtime) = (stat.st_atime, stat.st_mtime);
+        assert!(st_atime > 0, "UTIME_NOW should resolve to a nonzero time");
+        assert_eq!(st_mtime, 0, "UTIME_OMIT should leave mtime untouched");
+    }
+
+    #[test]
+    fn utime_omit_leaves_both_unchanged() {
+        let task = init_platform(None);
+        create_file(&task, "/utimensat_omit.txt");
+
+        // First set explicit values.
+        let atime = Timespec {
+            tv_sec: 111,
+            tv_nsec: 0,
+        };
+        let mtime = Timespec {
+            tv_sec: 222,
+            tv_nsec: 0,
+        };
+        task.sys_utimensat(
+            libc_at_fdcwd(),
+            "/utimensat_omit.txt",
+            Some((atime, mtime)),
+            AtFlags::empty(),
+        )
+        .unwrap();
+
+        // Then omit both -- nothing should change.
+        let omit_ts = Timespec {
+            tv_sec: 0,
+            tv_nsec: u64::try_from(UTIME_OMIT).unwrap(),
+        };
+        task.sys_utimensat(
+            libc_at_fdcwd(),
+            "/utimensat_omit.txt",
+            Some((omit_ts, omit_ts)),
+            AtFlags::empty(),
+        )
+        .unwrap();
+
+        let stat = task.sys_stat("/utimensat_omit.txt").unwrap();
+        let (st_atime, st_mtime) = (stat.st_atime, stat.st_mtime);
+        assert_eq!(st_atime, 111);
+        assert_eq!(st_mtime, 222);
+    }
+
+    #[test]
+    fn nonexistent_path_returns_enoent() {
+        let task = init_platform(None);
+        assert_eq!(
+            task.sys_utimensat(
+                libc_at_fdcwd(),
+                "/does_not_exist.txt",
+                None,
+                AtFlags::empty(),
+            )
+            .unwrap_err(),
+            Errno::ENOENT
+        );
+    }
+
+    #[test]
+    fn futimens_via_empty_path_and_dirfd() {
+        // `futimens(fd, times)` compiles down to `utimensat(fd, NULL, times, AT_EMPTY_PATH)` in
+        // musl; exercise that exact shape directly against an open fd.
+        let task = init_platform(None);
+        create_file(&task, "/utimensat_futimens.txt");
+        let fd = task
+            .sys_open("/utimensat_futimens.txt", OFlags::RDONLY, Mode::empty())
+            .expect("failed to open test file");
+
+        let mtime = Timespec {
+            tv_sec: 42,
+            tv_nsec: 0,
+        };
+        task.sys_utimensat(
+            i32::try_from(fd).unwrap(),
+            "",
+            Some((mtime, mtime)),
+            AtFlags::AT_EMPTY_PATH,
+        )
+        .expect("futimens-style utimensat should succeed");
+
+        let stat = task.sys_stat("/utimensat_futimens.txt").unwrap();
+        let st_mtime = stat.st_mtime;
+        assert_eq!(st_mtime, 42);
+
+        task.sys_close(i32::try_from(fd).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn invalid_nsec_is_einval() {
+        let task = init_platform(None);
+        create_file(&task, "/utimensat_invalid.txt");
+
+        let bad = Timespec {
+            tv_sec: 0,
+            tv_nsec: 2_000_000_000, // not a valid nanosecond value, and not a sentinel either
+        };
+        assert_eq!(
+            task.sys_utimensat(
+                libc_at_fdcwd(),
+                "/utimensat_invalid.txt",
+                Some((bad, bad)),
+                AtFlags::empty(),
+            )
+            .unwrap_err(),
+            Errno::EINVAL
+        );
+    }
+
+    fn libc_at_fdcwd() -> i32 {
+        litebox_common_linux::AT_FDCWD
+    }
+}
+
+mod chmod_tests {
+    use super::init_platform;
+    use litebox::fs::{Mode, OFlags};
+    use litebox_common_linux::errno::Errno;
+
+    fn create_file(
+        task: &crate::Task<super::TestPlatform, crate::DefaultFS<super::TestPlatform>>,
+        path: &str,
+    ) {
+        let fd = task
+            .sys_open(
+                path,
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .expect("failed to create test file");
+        task.sys_close(i32::try_from(fd).unwrap())
+            .expect("failed to close test file");
+    }
+
+    fn libc_at_fdcwd() -> i32 {
+        litebox_common_linux::AT_FDCWD
+    }
+
+    #[test]
+    fn chmod_changes_mode_of_regular_file() {
+        let task = init_platform(None);
+        create_file(&task, "/chmod_regular.txt");
+
+        task.sys_fchmodat(libc_at_fdcwd(), "/chmod_regular.txt", 0o600)
+            .expect("chmod on a regular file should succeed");
+
+        let stat = task.sys_stat("/chmod_regular.txt").unwrap();
+        assert_eq!(stat.st_mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn fchmod_via_open_fd_changes_mode() {
+        let task = init_platform(None);
+        create_file(&task, "/fchmod_target.txt");
+
+        let fd = task
+            .sys_open("/fchmod_target.txt", OFlags::RDONLY, Mode::empty())
+            .expect("failed to open test file");
+
+        task.sys_fchmod(fd, 0o640)
+            .expect("fchmod via an open fd should succeed");
+
+        let stat = task.sys_fstat(i32::try_from(fd).unwrap()).unwrap();
+        assert_eq!(stat.st_mode & 0o777, 0o640);
+
+        task.sys_close(i32::try_from(fd).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn fchmodat_with_dirfd_changes_mode() {
+        let task = init_platform(None);
+        task.sys_mkdirat(libc_at_fdcwd(), "/fchmodat_dir", 0o755)
+            .expect("failed to create test directory");
+        create_file(&task, "/fchmodat_dir/file.txt");
+
+        let dirfd = task
+            .sys_open(
+                "/fchmodat_dir",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .expect("failed to open test directory");
+
+        task.sys_fchmodat(i32::try_from(dirfd).unwrap(), "file.txt", 0o444)
+            .expect("fchmodat with a dirfd should succeed");
+
+        let stat = task.sys_stat("/fchmodat_dir/file.txt").unwrap();
+        assert_eq!(stat.st_mode & 0o777, 0o444);
+
+        task.sys_close(i32::try_from(dirfd).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn chmod_nonexistent_path_returns_enoent() {
+        let task = init_platform(None);
+        assert_eq!(
+            task.sys_fchmodat(libc_at_fdcwd(), "/chmod_does_not_exist.txt", 0o600)
+                .unwrap_err(),
+            Errno::ENOENT
+        );
+    }
+}

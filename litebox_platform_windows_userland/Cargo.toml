@@ -1,0 +1,67 @@
+[package]
+name = "litebox_platform_windows_userland"
+version = "0.1.0"
+edition = "2024"
+
+[target.'cfg(windows)'.dependencies]
+getrandom = "0.3.4"
+iced-x86 = { version = "1.21", default-features = false, features = [
+    "no_std",
+    "decoder",
+    "instr_info",
+] }
+litebox = { path = "../litebox/", version = "0.1.0" }
+litebox_common_linux = { path = "../litebox_common_linux", version = "0.1.0" }
+litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
+# smoltcp powers a second, private in-process network stack used as a userspace NAT gateway (see
+# `src/net.rs`) so real TCP/UDP networking works without Administrator privileges (unlike a TUN
+# driver or WinDivert, both of which require elevation to install/attach on Windows).
+smoltcp = { version = "0.12.0", default-features = false, features = [
+    "log",
+    "proto-ipv4",
+    "medium-ip",
+    "socket",
+    "socket-tcp",
+    "socket-udp",
+    "std",
+] }
+# Portable nonblocking-connect / socket-option control for the NAT gateway's real outbound
+# sockets; ordinary unprivileged Winsock calls under the hood, same as any desktop application.
+socket2 = "0.6"
+
+windows-sys = { version = "0.60.2", features = [
+    "Win32_System_Console",
+    "Win32_System_Environment",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_System_Kernel",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_LibraryLoader",
+    "Win32_System_ProcessStatus",
+    "Win32_System_WindowsProgramming",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+] }
+zerocopy = { version = "0.8", default-features = false }
+# GUI application support (DRM/KMS dumb-buffer emulation's host-side presentation layer, see
+# `src/presentation.rs`): `winit` opens the real host window and pumps its message loop on a
+# dedicated OS thread (Windows message loops are per-thread, not process-wide -- unlike macOS'
+# Cocoa, nothing on Windows requires this to be the process's first/main thread, so this coexists
+# with `litebox_runner_linux_on_windows_userland`'s own main thread running the guest via
+# `run_thread`); `wgpu` is the cross-platform (Vulkan/Metal/DX12/GL) presentation surface that
+# receives each DRM page-flip's dumb-buffer pixel content as a texture upload + blit, chosen
+# specifically so the SAME presentation code ports to macOS/Linux userland later (see the
+# `gui-macos-linux-presentation-port` PRD row) rather than needing three separate native
+# windowing/graphics implementations.
+wgpu = "27"
+winit = "0.30"
+# Blocks on wgpu's async adapter/device-request calls -- a tiny, dependency-free executor
+# (documented by wgpu's own examples as the standard way to do this outside a real async runtime,
+# which this crate does not otherwise pull in).
+pollster = "0.4"
+
+[lints]
+workspace = true

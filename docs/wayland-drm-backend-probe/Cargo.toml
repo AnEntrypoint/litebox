@@ -1,0 +1,39 @@
+[workspace]
+
+[package]
+name = "wayland-probe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+smithay = { version = "0.7", default-features = false, features = ["backend_drm", "wayland_frontend"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+libc = "0.2"
+
+[[bin]]
+name = "wayland-probe"
+path = "src/main.rs"
+
+[[bin]]
+name = "wayland-client-probe"
+path = "src/client.rs"
+
+[[bin]]
+name = "wayland-combined"
+path = "src/combined.rs"
+
+[[bin]]
+name = "wayland-desktop"
+path = "src/desktop.rs"
+
+[[bin]]
+name = "wayland-desktop-client"
+path = "src/desktop_client.rs"
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+panic = "abort"
+strip = true

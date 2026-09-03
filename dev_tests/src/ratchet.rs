@@ -1,0 +1,216 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+use anyhow::{Result, bail};
+use fs::File;
+use fs_err as fs;
+use std::io::BufRead as _;
+use std::io::BufReader;
+
+#[test]
+fn ratchet_transmutes() -> Result<()> {
+    ratchet(
+        &[
+            ("dev_tests/", 2),
+            ("litebox/", 8),
+            // 3 rather than 2: the aarch64 guest-dispatch branch transmutes
+            // `syscall_callback`'s `unsafe extern "C" fn() -> isize` to a
+            // `fn()` so `set_signal_return` can install it as a raw signal
+            // return target; landed with the earlier aarch64 proxy work this
+            // session but never bumped then -- unavoidable at this boundary
+            // since `set_signal_return`'s target type is untyped.
+            ("litebox_platform_linux_userland/", 3),
+        ],
+        |file| {
+            Ok(file
+                .lines()
+                .filter(|line| {
+                    let line = line.as_ref().unwrap();
+                    // Only check the code portion (before any // comment)
+                    let code_part = line.split("//").next().unwrap_or(line);
+                    code_part.contains("transmute")
+                })
+                .count())
+        },
+    )
+}
+
+#[test]
+fn ratchet_globals() -> Result<()> {
+    ratchet(
+        &[
+            ("dev_bench/", 1),
+            // 10 rather than 9 for exception_table.rs's __dso_handle extern static, needed to
+            // locate this image's Mach-O header when looking up the exception table on Apple
+            // hosts (see that cfg(target_vendor = "apple") function's own doc comment).
+            ("litebox/", 10),
+            ("litebox_platform_linux_kernel/", 6),
+            // 9 rather than 5: AARCH64_SCRATCH_PTR/AARCH64_HOST_ONLY_SCRATCH/
+            // AARCH64_GUEST_ALT_STACK_BASES were introduced by the aarch64 userland port
+            // earlier this session but never bumped this ratchet (an oversight in that pass,
+            // not new growth here); MAILBOX (aarch64_syscall_proxy's single-slot,
+            // signal-safe request/response mailbox to the dedicated always-unfiltered proxy
+            // thread) is the one genuinely new static added in this pass, needed because the
+            // mailbox must be process-wide (one proxy thread serving every host-code caller)
+            // and signal-handler-safe (no allocation), which rules out anything but a `static`.
+            ("litebox_platform_linux_userland/", 9),
+            ("litebox_platform_lvbs/", 24),
+            // 6 rather than 5 for create_shared_memory's own COUNTER, used to
+            // build a unique shm_open name (Darwin has no SHM_ANON).
+            ("litebox_platform_macos_userland/", 6),
+            ("litebox_platform_multiplex/", 1),
+            // 11 rather than 10 for the single `LITEBOX_DIAG_WAIT4GATE` diagnostic thread-local,
+            // which is inert unless that environment variable is set. It is deliberately one
+            // thread-local holding a small struct rather than one per recorded field.
+            // 12 rather than 11 for `VIRTUAL_PROTECT_LOCK`, a process-wide lock serializing every
+            // `VirtualProtect` call this crate issues (`WindowsUserland::update_permissions` and
+            // `fork_verify::write_usize_fault_tolerant`) so an ordinary guest `mprotect()` on one
+            // thread can never race `fork_verify`'s own temporary protection-flip-and-restore on
+            // an overlapping page from another thread -- see its doc comment for the crash
+            // signature (`STATUS_ACCESS_VIOLATION` at a small-offset near-null address on a
+            // completely unrelated thread) this closes.
+            // 14 rather than 12 for `DIAG_ALLOC_COUNT`/`DIAG_ALLOC_ENABLED_CACHE`, the temporary,
+            // allocation-free `LITEBOX_DIAG_ALLOC=1` diagnostic instrumenting every host-allocator
+            // call to locate the long-standing deterministic leaked-pointer offset (0x1013480)
+            // seen at the apk/jq smoke-test crash site. Remove both statics (and this bump) once
+            // that investigation is root-caused and the diagnostic is deleted.
+            // 15 rather than 14 for `ctxwatch.rs`'s `TARGET` (`LITEBOX_DIAG_WATCHADDR`'s armed
+            // address, a `thread_local!`), which a prior pass introduced without bumping this
+            // count. Remove alongside the rest of the `ctxwatch` Dr1 diagnostic once the mallocng
+            // `hlt` crash this investigation is now chasing (see `FINDINGS.txt` pass 49) is
+            // root-caused and the diagnostic is deleted.
+            // 18 rather than 15: at least THREAD_GS_BASE (a GS_BASE-repair mirror of the existing
+            // THREAD_FS_BASE), REGISTER_KEY, and PLATFORM_TLS were introduced across earlier
+            // passes this multi-session investigation without bumping this count each time --
+            // this repo's own copy of dev_tests never actually ran against a real CI pipeline
+            // until this session's first push, so this drift went undetected for a while.
+            // Re-verified by direct line-count against the exact heuristic below.
+            ("litebox_platform_windows_userland/", 18),
+            ("litebox_runner_lvbs/", 5),
+            ("litebox_runner_snp/", 2),
+            ("litebox_shim_linux/", 1),
+            ("litebox_shim_optee/", 5),
+        ],
+        |file| {
+            Ok(file
+                .lines()
+                .filter(|line| {
+                    // Heuristic: detect "static" at the start of a line, excluding whitespace. This should
+                    // prevent us from accidentally including code that contains the word in a comment, or
+                    // is referring to the `'static` lifetime.
+                    let trimmed = line.as_ref().unwrap().trim_start();
+                    trimmed.starts_with("static ")
+                        || trimmed.split_once(' ').is_some_and(|(a, b)| {
+                            // Account for `pub`, `pub(crate)`, ...
+                            a.starts_with("pub") && b.starts_with("static ")
+                        })
+                })
+                .count())
+        },
+    )
+}
+
+#[test]
+fn ratchet_maybe_uninit() -> Result<()> {
+    ratchet(
+        &[
+            ("dev_tests/", 1),
+            ("litebox/", 1),
+            ("litebox_platform_linux_userland/", 2),
+        ],
+        |file| {
+            Ok(file
+                .lines()
+                .filter(|line| line.as_ref().unwrap().contains("MaybeUninit"))
+                .count())
+        },
+    )
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// Convenience function to set up a ratchet test, see below for examples.
+///
+/// `expected` is a list of (file name prefix, expected count) pairs.
+#[track_caller]
+fn ratchet(expected: &[(&str, usize)], f: impl Fn(BufReader<File>) -> Result<usize>) -> Result<()> {
+    let all_rs_files = crate::all_rs_files()?.collect::<Vec<std::path::PathBuf>>();
+    let mut errors = Vec::new();
+
+    for (i, (prefix_i, _)) in expected.iter().enumerate() {
+        if !prefix_i.ends_with('/') {
+            errors.push(format!(
+                "The prefix '{prefix_i}' should end with a '/'. Please make sure all prefixes end with a '/' to avoid accidental overlaps."
+            ));
+        }
+        for (j, (prefix_j, _)) in expected.iter().enumerate() {
+            if i != j && prefix_i.starts_with(prefix_j) {
+                errors.push(format!(
+                    "The prefix '{prefix_j}' is a prefix of '{prefix_i}'. Please make sure the prefixes are unique and non-overlapping."
+                ));
+            }
+        }
+        for (prefix, _) in expected {
+            if !all_rs_files
+                .iter()
+                .any(|p| p.to_string_lossy().starts_with(prefix))
+            {
+                errors.push(format!(
+                    "The prefix '{prefix}' does not match any file. Please make sure all prefixes match at least one file."
+                ));
+            }
+        }
+    }
+    for p in &all_rs_files {
+        let file_name = p.to_string_lossy();
+        if !expected
+            .iter()
+            .any(|(prefix, _)| file_name.starts_with(prefix))
+            && f(BufReader::new(File::open(p).unwrap()))? > 0
+        {
+            errors.push(format!(
+                "The file '{file_name}'  that with a non-zero ratchet value is not covered by any prefix.\nPlease make sure all files are covered by some prefix."
+            ));
+        }
+    }
+
+    for (prefix, expected_count) in expected {
+        let count = all_rs_files
+            .iter()
+            .filter(|p| p.to_string_lossy().starts_with(prefix))
+            .map(|p| BufReader::new(File::open(p).unwrap()))
+            .map(&f)
+            .sum::<Result<usize>>()?;
+
+        match count.cmp(expected_count) {
+            std::cmp::Ordering::Less => {
+                errors.push(format!(
+                    "Good news!! Ratched count for paths starting with '{prefix}' decreased! :)\n\nPlease reduce the expected count in the ratchet to {count}"
+                ));
+            }
+            std::cmp::Ordering::Equal => {
+                if count == 0 {
+                    errors.push(format!(
+                        "The prefix {prefix} should be removed from the list since the ratchet has succesfully worked! :)"
+                    ));
+                }
+            }
+            std::cmp::Ordering::Greater => {
+                errors.push(format!(
+                    "Ratcheted count for paths starting with '{prefix}' increased by {} :(\n\nYou might be using a feature that is ratcheted (i.e., we are aiming to reduce usage of in the codebase).\nTips:\n\tTry if you can work without using this feature.\n\tIf you think the heuristic detection is incorrect, you might need to update the ratchet's heuristic.\n\tIf the heuristic is correct, you might need to update the count.",
+                    count - expected_count
+                ));
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        bail!(
+            "Ratchet test failed in {}:\n{}",
+            std::panic::Location::caller(),
+            errors.join("\n\n")
+        );
+    }
+
+    Ok(())
+}

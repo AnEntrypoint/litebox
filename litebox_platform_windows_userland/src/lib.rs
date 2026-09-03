@@ -1,0 +1,6109 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+//! A [LiteBox platform](../litebox/platform/index.html) for running LiteBox on userland Windows.
+
+// Restrict this crate to only work on Windows. For now, we are restricting this to only x86-64
+// Windows, but we _may_ allow for more in the future, if we find it useful to do so.
+#![cfg(all(target_os = "windows", target_arch = "x86_64"))]
+
+mod ctxwatch;
+mod fork_verify;
+mod net;
+pub mod presentation;
+pub mod process_fork;
+
+use core::cell::Cell;
+use core::panic;
+use core::sync::atomic::{AtomicU32, Ordering};
+use core::time::Duration;
+use std::cell::RefCell;
+use std::os::raw::c_void;
+use std::os::windows::io::AsRawHandle as _;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use litebox::platform::ImmediatelyWokenUp;
+use litebox::platform::UnblockedOrTimedOut;
+use litebox::platform::page_mgmt::{
+    AllocationError, FixedAddressBehavior, MemoryRegionPermissions, SharedMemoryError,
+};
+use litebox::shim::{ContinueOperation, Exception};
+use litebox::utils::TruncateExt as _;
+
+use windows_sys::Win32::Foundation::{self as Win32_Foundation, FILETIME};
+use windows_sys::Win32::{
+    Foundation::GetLastError,
+    System::Diagnostics::Debug::{
+        AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+        EXCEPTION_POINTERS, EXCEPTION_RECORD,
+    },
+    System::Memory::{
+        self as Win32_Memory, CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_EXTENDED_PARAMETER,
+        MEM_EXTENDED_PARAMETER_0, MapViewOfFile3, MemExtendedParameterAddressRequirements,
+        PrefetchVirtualMemory, UnmapViewOfFileEx, VirtualAlloc2, VirtualFree, VirtualProtect,
+    },
+    System::SystemInformation::{self as Win32_SysInfo, GetSystemTimePreciseAsFileTime},
+    System::Threading::{self as Win32_Threading, GetCurrentProcess},
+    System::WindowsProgramming::QueryUnbiasedInterruptTimePrecise,
+};
+use zerocopy::{FromBytes, IntoBytes};
+
+extern crate alloc;
+
+// Thread-local storage for FS base state
+thread_local! {
+    static THREAD_FS_BASE: Cell<usize> = const { Cell::new(0) };
+    /// This thread's real Windows TEB pointer (`GS_BASE`), captured once, early, via
+    /// [`WindowsUserland::init_thread_gs_base`] -- see that function's doc comment for why a
+    /// cached value is needed at all, given `GS_BASE` is normally Windows' own to manage.
+    static THREAD_GS_BASE: Cell<usize> = const { Cell::new(0) };
+    /// Set while this thread is inside [`vectored_exception_handler`]'s
+    /// `diag_fataldump_enabled()` diagnostic block (mallocng `.meta=0` investigation, 2026-08-26).
+    /// That block does real work (`Vec`/`String`/`format!`, i.e. host heap allocation) from a VEH
+    /// callback; a live investigation pass caught it re-faulting recursively at the SAME
+    /// `memmove` instruction 7 times in a row on the exact same thread -- a second exception
+    /// raised *while already inside* this diagnostic code re-entering the identical diagnostic
+    /// path, obscuring the original guest fault entirely. Per-thread (not a global `AtomicBool`)
+    /// because a VEH handler can legitimately run concurrently on unrelated threads and a global
+    /// guard would falsely suppress diagnostics for a genuinely separate, simultaneous crash.
+    static IN_VEH_DIAG_BLOCK: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII guard: sets [`IN_VEH_DIAG_BLOCK`] on construction, clears it on drop (including on an
+/// early return or a panic unwinding through the diagnostic block), so a second, nested entry
+/// into the diagnostic block on the SAME thread can detect it's already running and skip straight
+/// past the re-entrant work instead of recursing into the same crash-prone code again.
+struct VehDiagBlockGuard {
+    already_active: bool,
+}
+
+impl VehDiagBlockGuard {
+    fn enter() -> Self {
+        let already_active = IN_VEH_DIAG_BLOCK.with(Cell::get);
+        if !already_active {
+            IN_VEH_DIAG_BLOCK.with(|c| c.set(true));
+        }
+        Self { already_active }
+    }
+}
+
+impl Drop for VehDiagBlockGuard {
+    fn drop(&mut self) {
+        if !self.already_active {
+            IN_VEH_DIAG_BLOCK.with(|c| c.set(false));
+        }
+    }
+}
+
+/// The userland Windows platform.
+///
+/// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
+/// traits.
+pub struct WindowsUserland {
+    reserved_pages: alloc::vec::Vec<core::ops::Range<usize>>,
+    sys_info: std::sync::RwLock<Win32_SysInfo::SYSTEM_INFO>,
+    /// The userspace NAT gateway backing [`IPInterfaceProvider`](litebox::platform::IPInterfaceProvider)
+    /// (see the private `net` module), lazily initialized on first network use.
+    net_gateway: std::sync::OnceLock<net::NatGateway>,
+    /// Backing state for [`read_from_raw_handle`]/[`stdin_ready_raw_handle`]'s console
+    /// (`FILE_TYPE_CHAR`) case, lazily initialized (spawning its background reader thread) on
+    /// first stdin access. See [`ConsoleStdinReader`]'s doc comment for why this exists. A field
+    /// on this per-instance struct rather than a bare `static`, matching `net_gateway` above --
+    /// `WindowsUserland::new` always hands back a `&'static Self` in practice, so this is no less
+    /// process-lifetime than a bare static would be, without adding to the crate's ratcheted
+    /// bare-static count.
+    console_stdin_reader: std::sync::OnceLock<ConsoleStdinReader>,
+}
+
+impl core::fmt::Debug for WindowsUserland {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WindowsUserland").finish_non_exhaustive()
+    }
+}
+
+// Safety: Given that SYSTEM_INFO is not Send/Sync (it contains *mut c_void), we use RwLock to
+// ensure that the sys_info is only accessed in a thread-safe manner.
+// Moreover, SYSTEM_INFO is only initialized once during platform creation, and it is read-only
+// after that.
+unsafe impl Send for WindowsUserland {}
+unsafe impl Sync for WindowsUserland {}
+
+/// Helper functions for managing per-thread FS base
+impl WindowsUserland {
+    /// Get the current thread's FS base state
+    fn get_thread_fs_base() -> usize {
+        THREAD_FS_BASE.get()
+    }
+
+    /// Set the current thread's FS base
+    fn set_thread_fs_base(new_base: usize) {
+        THREAD_FS_BASE.set(new_base);
+        // Mirror into `TlsState.guest_fs_base` too, if this thread's `TlsState` is already
+        // installed -- see that field's doc comment for why the mirror exists. Not yet installed
+        // during this platform's own construction (the main thread's very first
+        // `init_thread_fs_base()` call, before `install_tls` has ever run for it); harmless to
+        // skip the mirror there, since `vectored_exception_handler_entry`'s fast path already
+        // falls through to the full handler whenever `get_tls_ptr()` finds nothing installed.
+        if let Some(tls) = get_tls_ptr() {
+            unsafe { &*tls }.guest_fs_base.set(new_base);
+        }
+        Self::restore_thread_fs_base();
+    }
+
+    /// Restore the current thread's FS base from saved state
+    fn restore_thread_fs_base() {
+        unsafe {
+            litebox_common_linux::wrfsbase(THREAD_FS_BASE.get());
+        }
+    }
+
+    /// Initialize FS base state for a new thread
+    fn init_thread_fs_base() {
+        Self::set_thread_fs_base(0);
+    }
+
+    /// Captures this thread's real TEB pointer (`GS_BASE`) once, early in the thread's life, so
+    /// [`Self::restore_thread_gs_base_if_cleared`] has a known-good value to repair back to later.
+    ///
+    /// # Why this exists
+    ///
+    /// `GS_BASE` is normally entirely Windows' own to manage (it always points at this thread's
+    /// TEB, e.g. `ntdll`'s own code depends on it) -- litebox never legitimately writes it the
+    /// way it does `FS_BASE` (the guest's own TLS base, fully owned and set via `arch_prctl`).
+    /// But the exact same "Windows clears this thread's segment-base MSR back to 0 under
+    /// scheduling pressure" behavior already documented and repaired for `FS_BASE` (see
+    /// `restore_thread_fs_base`'s callers in `vectored_exception_handler`) plausibly affects
+    /// `GS_BASE` too -- both are non-standard x86_64 MSRs from the CPU's perspective, and this
+    /// platform's own `vectored_exception_handler_entry` fast path (`gs:[r8*8 +
+    /// TEB_TLS_SLOTS_OFFSET]`) already depends on `GS_BASE` being correct at one of the hottest,
+    /// earliest-in-exception-dispatch code paths in the whole crate. Investigated live while
+    /// chasing a reliably reproducible `EXCEPTION_ACCESS_VIOLATION` INSIDE `ntdll.dll` itself
+    /// (`is_in_guest=false`, a NULL-pointer read, looping forever at the identical instruction
+    /// under nested `vfork()`'s added kernel-transition pressure) -- this repair alone did not
+    /// resolve that specific crash (its true cause is still open, see FINDINGS.txt), but is a
+    /// real, independently-justified defense against the documented FS_BASE-reset behavior
+    /// plausibly extending to `GS_BASE`, confirmed harmless (no regression across repeated runs
+    /// of the existing single-`vfork()` repro) and kept on that basis.
+    fn init_thread_gs_base() {
+        let gs_base = unsafe { litebox_common_linux::rdgsbase() };
+        THREAD_GS_BASE.set(gs_base);
+    }
+
+    /// Restores this thread's `GS_BASE` from the value [`Self::init_thread_gs_base`] captured, if
+    /// the CPU currently reads back a cleared (`0`) value. A no-op if `init_thread_gs_base` was
+    /// never called on this thread (`THREAD_GS_BASE` still `0`) -- matches
+    /// `restore_thread_fs_base`'s own "never repair to a value we don't actually trust"
+    /// discipline.
+    fn restore_thread_gs_base_if_cleared() {
+        let saved = THREAD_GS_BASE.get();
+        if saved != 0 && unsafe { litebox_common_linux::rdgsbase() } == 0 {
+            unsafe { litebox_common_linux::wrgsbase(saved) };
+        }
+    }
+}
+
+/// Diagnostic tracing gated by `LITEBOX_VEH_TRACE=1`, added to root-cause the intermittent
+/// hang/crash in the `apk add nodejs` repro. Temporary; remove once root-caused.
+///
+/// Deliberately re-reads the environment on every call rather than caching the result behind a
+/// `static` (this crate's bare-static count is tracked by `dev_tests/src/ratchet.rs`'s
+/// `ratchet_globals`, which is actively trying to reduce, not grow, that count): this is only
+/// called on already-rare exception-handling paths, so the cost of an uncached env lookup is
+/// negligible relative to introducing another global.
+pub(crate) fn veh_trace_enabled() -> bool {
+    std::env::var_os("LITEBOX_VEH_TRACE").is_some()
+}
+
+/// Whether the targeted `rip == 0` crash diagnostics (`LITEBOX_DIAG_WAIT4GATE=1`) are enabled.
+///
+/// Deliberately a separate, much narrower gate than [`veh_trace_enabled`]: full `LITEBOX_VEH_TRACE`
+/// emits a per-instruction trace that perturbs timing enough to hide the crash being investigated,
+/// whereas this gate only enables a handful of one-off prints around fork-child verification and
+/// the fault itself. Cached per thread so the resume path pays only a thread-local read rather
+/// than an environment lookup when unset.
+pub(crate) fn diag_rip0_enabled() -> bool {
+    DIAG.with_borrow_mut(|d| {
+        *d.enabled
+            .get_or_insert_with(|| std::env::var_os("LITEBOX_DIAG_WAIT4GATE").is_some())
+    })
+}
+
+/// Whether the fatal-fault-only dump (`LITEBOX_DIAG_FATALDUMP=1`) is enabled.
+///
+/// Pass-39/40: split out from [`veh_trace_enabled`] because that gate also turns on
+/// `fork_verify`'s own per-single-step trace print on every trapped instruction of a
+/// verifying fork child (thousands of prints per fork, each an expensive `eprintln!` to a
+/// piped terminal) -- perturbing timing enough in practice to hide the very crash under
+/// investigation (see FINDINGS.txt pass 39 item 3). This gate covers only the rare block
+/// below that dumps rip bytes/regs on an actual fatal fault (rip==0 privileged-instruction
+/// class, or a near-null access violation), so it is cheap enough to leave on for an entire
+/// local repro run without masking the bug. Deliberately re-reads the environment on every
+/// call for the same "rare path, avoid growing the bare-static count" reason documented on
+/// `veh_trace_enabled`.
+pub(crate) fn diag_fataldump_enabled() -> bool {
+    veh_trace_enabled() || std::env::var_os("LITEBOX_DIAG_FATALDUMP").is_some()
+}
+
+/// Minimal-footprint entry point registered with `AddVectoredExceptionHandler`, in place of
+/// [`vectored_exception_handler`] directly.
+///
+/// # Why this exists
+///
+/// Guest code runs with the real CPU `rsp`/`rbp` holding a GUEST-address value (this platform
+/// has no separate emulated guest stack -- see `switch_to_guest`'s doc comment) -- memory that,
+/// while genuinely backed by real committed pages, has no relationship to Windows' own per-thread
+/// stack-overflow/guard-page bookkeeping (`TEB.StackBase`/`StackLimit`). Windows always invokes a
+/// registered VEH callback using whatever `rsp` the CPU held at fault time -- there is no
+/// mechanism to make it invoke the callback on a different, pre-chosen stack. A `fork()` child's
+/// very first exception (routinely the "Windows cleared FS_BASE upon scheduling" condition the
+/// full [`vectored_exception_handler`] below already repairs, just far down in its body) was
+/// confirmed live to make that full handler's own sizeable stack frame (several hundred lines of
+/// body, multiple large diagnostic branches) trip `__chkstk`'s guard-page probe against that
+/// unrecognized guest-address memory, which recursively re-faulted at the same instruction on
+/// every retry -- exhausting the thread's REAL stack one guard page at a time until the process
+/// died with a genuine stack overflow, never once reaching the repair the full handler already
+/// has.
+///
+/// This entry point's own frame is kept deliberately minimal (raw register/memory reads only, no
+/// heap allocation) specifically so it can safely run in that same narrow, guest-address-stack
+/// window. Two things happen here, in order:
+///
+/// 1. A fast path for exactly the one condition the guest hits almost immediately after a
+///    `fork()` resume (`EXCEPTION_ACCESS_VIOLATION`, `rdfsbase() == 0`, a genuine instruction
+///    rather than a null `Rip`): repaired in place with a handful of instructions, matching
+///    exactly what [`vectored_exception_handler`]'s own later, redundant repair already does, and
+///    returns immediately -- avoiding entering the full handler's larger frame at all for the
+///    single most common case.
+/// 2. For every other exception code/condition, this thread's own `TlsState.host_sp`/`host_bp`
+///    (populated by `run_thread_arch`'s prologue before guest code ever runs, and always a real,
+///    Windows-registered stack address for this exact thread -- see those fields' own doc
+///    comments) are swapped into the LIVE `rsp`/`rbp` registers before `call`ing the full
+///    [`vectored_exception_handler`], so its own much larger frame -- and everything it in turn
+///    calls (`fork_verify::on_single_step`'s instruction-decode logic, the diagnostic branches,
+///    ...) -- runs on real, guard-page-protected memory instead of the guest's. The original
+///    (guest-address) `rsp`/`rbp` are saved first and restored after the call returns, immediately
+///    before this function's own `ret` -- the full handler communicates any guest-context changes
+///    (including a deliberate `Rsp`/`Rbp` rewrite, e.g. `exception_callback`'s own redirect) via
+///    the `CONTEXT` structure in memory, which this stack swap never touches, so nothing about the
+///    full handler's existing behavior changes -- only which stack ITS OWN Rust code executes on
+///    while deciding what to write into that `CONTEXT`.
+#[unsafe(naked)]
+unsafe extern "system" fn vectored_exception_handler_entry(
+    exception_info: *mut EXCEPTION_POINTERS,
+) -> i32 {
+    core::arch::naked_asm!(
+        "
+        // rcx = exception_info (EXCEPTION_POINTERS*), per the x64 'extern system' ABI. No stack
+        // use yet, so no shadow space/alignment to establish for this first, read-only portion.
+        mov     rax, [rcx]           // rax = ExceptionRecord*
+        mov     edx, [rax]           // edx = ExceptionRecord->ExceptionCode (i32)
+
+        // Read this thread's TlsState pointer via the same TEB-slot lookup pattern
+        // `syscall_callback` already uses elsewhere in this file. Needed by both the fast path
+        // below and the host-stack swap before falling through to the full handler, so done once,
+        // unconditionally, up front.
+        mov     r8d, DWORD PTR [rip + {TLS_INDEX}]
+        mov     r8, QWORD PTR gs:[r8 * 8 + {TEB_TLS_SLOTS_OFFSET}]
+        test    r8, r8
+        je      .Lsearch             // TLS not installed on this thread -- matches the full handler's
+                                      // own `get_tls_ptr()`-is-`None` early return: not our exception.
+
+        cmp     edx, {EXCEPTION_ACCESS_VIOLATION}
+        jne     .Lswap
+
+        rdfsbase r9
+        test    r9, r9
+        jne     .Lswap               // FS base is not zero; not this condition
+
+        mov     r10, [rcx + 8]       // r10 = ContextRecord*
+        mov     r11, [r10 + {CONTEXT_RIP}]
+        test    r11, r11
+        je      .Lswap               // Rip == 0: not a real instruction, let the full handler triage it
+
+        mov     rax, QWORD PTR [r8 + {GUEST_FS_BASE}]
+        test    rax, rax
+        je      .Lswap               // no saved FS base to restore; let the full handler decide
+
+        wrfsbase rax
+        mov     eax, {EXCEPTION_CONTINUE_EXECUTION}
+        ret
+
+    .Lswap:
+        // TLS is installed (r8 non-null, checked above) but `host_sp` is only populated by
+        // `run_thread_arch`'s own prologue, which runs strictly after `install_tls` -- there is a
+        // narrow window on every thread between the two where `TlsState` exists but `host_sp` is
+        // still its `TlsState::new()` default of null. Guard against swapping onto a null stack in
+        // that window; fall through to calling the full handler on whatever stack is already live,
+        // exactly as this trampoline did not exist -- strictly no worse than the pre-existing
+        // behavior for a window this narrow.
+        mov     r11, QWORD PTR [r8 + {HOST_SP}]
+        test    r11, r11
+        je      .Lcall_here
+
+        // Save the live (guest-address) rsp/rbp, then swap to this thread's real, Windows-
+        // registered host stack (`TlsState.host_sp`/`host_bp`) before calling the full handler, so
+        // ITS much larger frame -- and everything it calls -- runs on real, guard-page-protected
+        // memory instead of guest-address memory `__chkstk` cannot safely probe.
+        mov     r9, rsp
+        mov     r10, rbp
+        mov     rbp, QWORD PTR [r8 + {HOST_BP}]
+        // Reserve 48 bytes on the host stack: 32 for the Win64 shadow space the callee is entitled
+        // to write into, plus 16 to save the original guest rsp/rbp across the call (rsp must also
+        // land 16-byte-aligned at the `call` below, per the Win64 ABI -- `host_sp` is a fresh,
+        // untouched stack top and 48 is a multiple of 16, so this holds as long as `host_sp`
+        // itself came in aligned, which `run_thread_arch`'s own prologue -- a normal `extern
+        // \"C-unwind\"` function the Win64 ABI already requires 16-byte-aligned entry for --
+        // guarantees).
+        lea     rsp, [r11 - 48]
+        mov     QWORD PTR [rsp + 32], r9
+        mov     QWORD PTR [rsp + 40], r10
+
+        call    {vectored_exception_handler}
+
+        mov     r9, QWORD PTR [rsp + 32]
+        mov     r10, QWORD PTR [rsp + 40]
+        mov     rsp, r9
+        mov     rbp, r10
+        ret
+
+    .Lcall_here:
+        jmp     {vectored_exception_handler}
+
+    .Lsearch:
+        mov     eax, {EXCEPTION_CONTINUE_SEARCH}
+        ret
+        ",
+        EXCEPTION_ACCESS_VIOLATION = const Win32_Foundation::EXCEPTION_ACCESS_VIOLATION,
+        EXCEPTION_CONTINUE_EXECUTION = const EXCEPTION_CONTINUE_EXECUTION,
+        EXCEPTION_CONTINUE_SEARCH = const EXCEPTION_CONTINUE_SEARCH,
+        CONTEXT_RIP = const core::mem::offset_of!(
+            windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+            Rip
+        ),
+        TLS_INDEX = sym TLS_INDEX,
+        TEB_TLS_SLOTS_OFFSET = const 5248,
+        GUEST_FS_BASE = const core::mem::offset_of!(TlsState, guest_fs_base),
+        HOST_SP = const core::mem::offset_of!(TlsState, host_sp),
+        HOST_BP = const core::mem::offset_of!(TlsState, host_bp),
+        vectored_exception_handler = sym vectored_exception_handler,
+    );
+}
+
+/// Whether the instruction at `rip` genuinely has an `FS:` segment-override prefix (opcode byte
+/// `0x64`), i.e. is a real `%fs:`-relative access that a stale/zeroed `FS_BASE` could plausibly
+/// explain.
+///
+/// The FS_BASE-reset repair sites below (both the guest-mode and host-mode occurrences) used to
+/// treat *every* `EXCEPTION_ACCESS_VIOLATION` seen while `rdfsbase() == 0` as "Windows cleared
+/// this thread's FS_BASE MSR again, just restore it and retry" -- with no check that the faulting
+/// instruction actually reads/writes through the FS segment at all. Since Windows clearing
+/// `FS_BASE` is asynchronous ("apparently as part of ordinary scheduling", per the repair sites'
+/// own comments) it can coincide with an *unrelated* real fault -- e.g. a genuine null-pointer
+/// dereference in guest code -- at which point `wrfsbase`-then-retry does nothing to fix the real
+/// problem and the identical instruction re-faults immediately, forever: a silent, non-converging
+/// repair loop with the exact same observable shape (`EXCEPTION_ACCESS_VIOLATION`, `rdfsbase() ==
+/// 0`, same `rip` every time) as the real FS_BASE-reset case, confirmed live via
+/// `LITEBOX_VEH_TRACE=1` against a `process.title = <string>` repro under Node.js (a plain `mov
+/// rdx, [rdx+0x788]` with `rdx` already null -- no FS override, no REX.W-only coincidence -- was
+/// being "repaired" and retried unboundedly). This mirrors the file's own precedent for exactly
+/// this class of bug: the `Rip != 0` guard a few lines below this function's call sites was added
+/// after an earlier livelock (1809+ repeated repairs, no forward progress) was found to be the
+/// same shape -- blindly retrying a fault the repair could never actually fix.
+///
+/// x86_64 legacy prefixes (`LOCK` `0xF0`, `REP`/`REPNE` `0xF2`/`0xF3`, the six segment overrides
+/// `0x2E`/`0x36`/`0x3E`/`0x26`/`0x64`/`0x65`, operand-size `0x66`, address-size `0x67`) may appear
+/// in any order before the opcode, followed optionally by a single REX prefix (`0x40`-`0x4F`)
+/// immediately before the opcode itself -- per the Intel SDM, at most four legacy prefixes are
+/// architecturally meaningful, though nothing stops more from being *present* in an
+/// (unusual/malformed) encoding. Scanning a bounded window (the SDM's own 15-byte maximum
+/// instruction length) and stopping at the first REX/opcode-shaped byte once at least one
+/// definite non-prefix byte class is hit would require a much more complete decoder than this
+/// narrow check needs; instead, scan only the legacy-prefix run (bounded to 4 bytes, matching the
+/// SDM's own limit) and check whether `0x64` appears anywhere in it -- false-negatives (missing a
+/// real FS-relative access) are safe here, since they only fall through to the normal exception
+/// path instead of repairing, at worst turning a real FS_BASE-reset case into a diagnosable crash
+/// rather than a silent hang; false-positives (wrongly treating a non-FS-relative fault as
+/// FS-relative) are what this function exists to eliminate, and requiring the exact `0x64` byte to
+/// be genuinely present in the prefix run has none.
+fn faulting_instruction_has_fs_override(rip: usize) -> bool {
+    let mut buf = [0u8; 4];
+    let n = fork_verify::read_code_bytes_for_diagnostics(rip, &mut buf);
+    buf[..n].contains(&0x64)
+}
+
+unsafe extern "system" fn vectored_exception_handler(
+    exception_info: *mut EXCEPTION_POINTERS,
+) -> i32 {
+    // See `WindowsUserland::init_thread_gs_base`'s doc comment: the same "Windows clears a
+    // non-standard segment-base MSR under scheduling pressure" behavior already known and
+    // repaired for `FS_BASE` plausibly affects `GS_BASE` too, and `GS_BASE` backs Windows' OWN
+    // TEB access (`ntdll`, `TlsGetValue` below, this thread's exception dispatch machinery
+    // itself). A no-op when `GS_BASE` already reads back correctly; cheap enough to check
+    // unconditionally, this early, before anything in this handler (including `get_tls_ptr`'s own
+    // `TlsGetValue` call, which depends on a working TEB) risks running with it wrong.
+    WindowsUserland::restore_thread_gs_base_if_cleared();
+
+    let Some(tls) = get_tls_ptr() else {
+        // TLS slot not initialized yet; cannot be in guest
+        return EXCEPTION_CONTINUE_SEARCH;
+    };
+    let tls = unsafe { &*tls };
+    let (info, exception_record, context);
+    unsafe {
+        info = *exception_info;
+        exception_record = &*info.ExceptionRecord;
+        context = &mut *info.ContextRecord;
+    }
+
+    // Pass (2026-08-27 XFCE session, take 2): call the raw, allocation-free, lock-free
+    // `diag_raw_regdump` (WriteFile-on-stack, same mechanism the global allocator's own
+    // diagnostics use) as the UNCONDITIONAL, LITERAL FIRST thing this handler does with
+    // `exception_record`/`context` in hand -- before `veh_trace_enabled()`'s own `eprintln!`
+    // calls below, before `diag_fataldump_enabled()`'s gated block, before `IN_VEH_DIAG_BLOCK`.
+    // Live captures this pass showed the real, causative first fault (`is_in_guest=true`,
+    // `addr=usize::MAX`) reaches the `veh_trace_enabled()` block below and its `eprintln!` calls,
+    // but that block's own formatting/allocation/stdio-lock machinery re-faults on this thread
+    // (whose heap/lock state is already corrupted by the very bug being diagnosed) BEFORE those
+    // prints complete -- permanently losing this fault's registers behind whatever LATER fault in
+    // the same cascade happens to reach a working print first (previously misidentified as "the"
+    // crash across three retracted hypotheses: `0x4e12c0`, `0xfefefefefefefeff`, "-libcalls" --
+    // all three were actually a downstream, already-corrupted-execution-state artifact fault, not
+    // the real bug). `eprintln!` is fundamentally not safe to call first on a thread in this
+    // state; only a raw `WriteFile` with no allocation and no lock is trustworthy here.
+    if veh_trace_enabled() || diag_fataldump_enabled() {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "diagnostic-only; this platform is x86_64-only, register values fit in usize"
+        )]
+        diag_raw_regdump(
+            exception_record.ExceptionCode.cast_unsigned(),
+            exception_record.ExceptionInformation[1],
+            context.Rip as usize,
+            context.Rax as usize,
+            context.Rbx as usize,
+            context.Rcx as usize,
+            context.Rdx as usize,
+            context.Rsi as usize,
+            context.Rdi as usize,
+            context.Rsp as usize,
+            context.Rbp as usize,
+        );
+    }
+
+    if veh_trace_enabled() {
+        // DIAG-REALSTACK (mallocng .meta=0 investigation continuation): reads the REAL host
+        // TEB's StackBase/StackLimit/DeallocationStack directly via inline asm to check whether a
+        // crashing thread's real Windows-backing stack reservation is genuinely the expected 8
+        // MiB (`GUEST_THREAD_STACK_SIZE`) or something smaller -- e.g. because it's a `sh -c "...
+        // ; weston ..."` tail-call `execve()` reusing an OS thread that was never spawned with
+        // that size in the first place (`execve()` never calls `Platform::spawn_thread`, unlike
+        // `fork()`/`clone()`). `StackLimit` alone is NOT sufficient here -- it tracks only the
+        // currently-COMMITTED floor, which grows on demand and looks deceptively small early in a
+        // thread's life; `DeallocationStack` (TEB+0x1478) is the true bottom of the whole
+        // reservation, set once at thread creation, and is what actually answers the question.
+        #[allow(clippy::cast_possible_truncation, reason = "diagnostic-only; x86_64 only")]
+        let rsp_now = context.Rsp;
+        let stack_base: u64;
+        let stack_limit: u64;
+        let dealloc_stack: u64;
+        unsafe {
+            core::arch::asm!(
+                "mov {0}, gs:[0x08]",
+                "mov {1}, gs:[0x10]",
+                "mov {2}, gs:[0x1478]",
+                out(reg) stack_base,
+                out(reg) stack_limit,
+                out(reg) dealloc_stack,
+            );
+        }
+        eprintln!(
+            "[veh] DIAG-REALSTACK exc_code={:#x} rsp={rsp_now:#x} stack_base={stack_base:#x} stack_limit={stack_limit:#x} dealloc_stack={dealloc_stack:#x} committed={:#x} total_reserved={:#x} remaining_to_dealloc={}",
+            exception_record.ExceptionCode,
+            stack_base.wrapping_sub(stack_limit),
+            stack_base.wrapping_sub(dealloc_stack),
+            i64::try_from(rsp_now.wrapping_sub(dealloc_stack)).unwrap_or(-1),
+        );
+        unsafe extern "C" {
+            safe static __ImageBase: c_void;
+        }
+        let image_base = (&raw const __ImageBase).addr();
+        eprintln!(
+            "[veh] tid={:?} code={:#x} rip={:#x} rva={:#x} addr={:#x} is_in_guest={} is_verifying={} rdfsbase={:#x} thread_fs_base={:#x}",
+            std::thread::current().id(),
+            exception_record.ExceptionCode,
+            context.Rip,
+            {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "diagnostic-only; this platform is x86_64-only, rip fits in usize"
+                )]
+                (context.Rip as usize).wrapping_sub(image_base)
+            },
+            exception_record.ExceptionInformation[1],
+            tls.is_in_guest.get(),
+            fork_verify::is_verifying(tls),
+            unsafe { litebox_common_linux::rdfsbase() },
+            WindowsUserland::get_thread_fs_base(),
+        );
+    }
+    if diag_fataldump_enabled()
+        && (exception_record.ExceptionCode == 0xC000_0096_u32.cast_signed()
+            // TEMPORARY (pass 37): also dump on an ordinary access violation whose faulting
+            // address is small (a near-null pointer, as opposed to an unrelated guard-page/
+            // demand-paging fault at a normal-looking guest address) -- this is the shape of the
+            // CI-only "segfault right after apk's own child reaps, before jq prints hello" crash
+            // (`addr=0x18` observed live), which is a *data* access, not the privileged-
+            // instruction/rip==0 shape the rest of this block was built for. Remove once that
+            // crash is root-caused and fixed; see FINDINGS.txt pass 37.
+            //
+            // Pass-40: EXCLUDE the extremely common, already-diagnosed, already-repaired
+            // "Windows spontaneously clears this thread's FS_BASE MSR" condition (see the long
+            // comment ~40 lines below this one) -- that path also produces
+            // `EXCEPTION_ACCESS_VIOLATION` with a small `ExceptionInformation[1]` (any `mov
+            // %fs:offset` reads/writes through linear address `0 + offset`), fires many times per
+            // second under ordinary scheduler pressure, and is unconditionally repaired and
+            // retried a few lines down -- it is not fatal and was never the crash this dump exists
+            // to catch. Without this exclusion the dump fired on nearly every guest instruction
+            // during scheduler pressure, which is exactly the "expensive `eprintln!` perturbs
+            // timing enough to hide the crash" problem `diag_fataldump_enabled` was split out to
+            // avoid (confirmed empirically this pass: with the exclusion absent, a local repro run
+            // that crashes in seconds under no tracing took the entire 480s budget without ever
+            // reaching the real fault). Uses the EXACT same condition the repair branches below
+            // use to decide whether to repair-and-retry (`rdfsbase() == 0`, `Rip != 0`, AND a
+            // non-zero saved FS base to restore -- not just `rdfsbase() == 0` alone, which a first
+            // pass at this exclusion used and which risked also silencing a genuine fatal fault
+            // that happened to occur while FS_BASE was zero for an unrelated reason): only
+            // excluded when the repair below is actually about to fire and resolve the fault,
+            // never when the fault is going to reach `EXCEPTION_CONTINUE_SEARCH`/deliver a real
+            // SIGSEGV to the guest.
+            || (exception_record.ExceptionCode == 0xC000_0005_u32.cast_signed()
+                && (exception_record.ExceptionInformation[1] < 0x1_0000
+                    // Pass-42: ALSO dump on the GP-fault-shaped variant of this same crash (see
+                    // `exception_handler`'s own `read_write_flag == 0 && faulting_address == !0`
+                    // reclassification a few hundred lines below): a local repro of the apk/jq
+                    // crash was observed to fault with `ExceptionInformation[1] ==
+                    // 0xffff_ffff_ffff_ffff` at the SAME `rip` this investigation's CI captures
+                    // have repeatedly shown for the `addr=0x18` shape, rather than a small
+                    // near-null offset -- evidently which exact shape appears depends on what
+                    // happens to be mapped at the leaked pointer's `+0x80`/dtv-slot offset on a
+                    // given run, not a different bug. Remove alongside the rest of this gate once
+                    // root-caused.
+                    || exception_record.ExceptionInformation[1] == usize::MAX)
+                && !(unsafe { litebox_common_linux::rdfsbase() } == 0
+                    && context.Rip != 0
+                    && WindowsUserland::get_thread_fs_base() != 0)))
+        // A second exception raised while this thread is ALREADY inside this diagnostic block
+        // (see `IN_VEH_DIAG_BLOCK`'s doc comment) means the diagnostic code itself is the thing
+        // that just faulted -- skip straight past it and let the exception propagate normally
+        // instead of recursing into the identical crash-prone path again.
+        && !IN_VEH_DIAG_BLOCK.with(Cell::get)
+    {
+        let _veh_diag_guard = VehDiagBlockGuard::enter();
+        // Pass (2026-08-27 XFCE session): print the raw crash registers FIRST, before any other
+        // diagnostic call in this block runs -- prior runs showed this block can itself re-fault
+        // partway through (nested exception, caught by `IN_VEH_DIAG_BLOCK` above but only AFTER
+        // losing this fault's own diagnostics), so whichever fault reaches this line first now
+        // always gets its registers on record even if everything after this print is lost to a
+        // nested fault. Explicitly tagged FIRST/NESTED so a log with multiple faults in one
+        // cascade is unambiguous about which fault produced which dump -- this exact ambiguity
+        // (conflating a later cascading fault's dump with the real first fault's) cost an entire
+        // prior investigation pass.
+        eprintln!(
+            "[veh-regs] ENTRY tid={:?} rip={:#x} rdi={:#x} rsi={:#x} rdx={:#x} rax={:#x} rsp={:#x}",
+            std::thread::current().id(),
+            context.Rip,
+            context.Rdi,
+            context.Rsi,
+            context.Rdx,
+            context.Rax,
+            context.Rsp,
+        );
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "diagnostic-only; this platform is x86_64-only, rip fits in usize"
+        )]
+        let rip = context.Rip as usize;
+        let mut buf = [0u8; 16];
+        let n = fork_verify::read_code_bytes_for_diagnostics(rip, &mut buf);
+        eprintln!("[veh] rip bytes ({n}): {:02x?}", &buf[..n]);
+        let mut before = [0u8; 8];
+        let before_start = rip.wrapping_sub(8);
+        let nb = fork_verify::read_code_bytes_for_diagnostics(before_start, &mut before);
+        eprintln!("[veh] rip-8 bytes ({nb}): {:02x?}", &before[..nb]);
+        fork_verify::describe_crash_page_for_diagnostics(rip);
+        let fault_addr = exception_record.ExceptionInformation[1];
+        let (fa_mtype, fa_protect, fa_alloc_base) =
+            fork_verify::describe_addr_for_diagnostics(fault_addr);
+        eprintln!(
+            "[veh] fault addr={fault_addr:#x} type={fa_mtype:#x} protect={fa_protect:#x} alloc_base={fa_alloc_base:#x} watched={}",
+            fork_verify::addr_is_codewatched_for_diagnostics(fault_addr),
+        );
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "diagnostic-only; this platform is x86_64-only, rdi fits in usize"
+        )]
+        let rdi = context.Rdi as usize;
+        let meta_slot = rdi.wrapping_sub(0x10);
+        let (ms_mtype, ms_protect, ms_alloc_base) =
+            fork_verify::describe_addr_for_diagnostics(meta_slot);
+        let mut meta_bytes = [0u8; 8];
+        let nmb = fork_verify::read_code_bytes_for_diagnostics(meta_slot, &mut meta_bytes);
+        eprintln!(
+            "[veh] group meta-slot rdi-0x10={meta_slot:#x} type={ms_mtype:#x} protect={ms_protect:#x} alloc_base={ms_alloc_base:#x} bytes({nmb})={:02x?}",
+            &meta_bytes[..nmb],
+        );
+        // Pass 132 lead (B): dump the FULL `struct group` at meta_slot (not just the 8-byte
+        // `.meta` field) to distinguish "never-constructed group" (everything zero, including
+        // bytes musl's own code would only ever leave nonzero) from "legitimately-retired group,
+        // poisoned by `free_group()`" (per pass 131 STEP 4, musl's free.c line 30 explicitly does
+        // `g->mem->meta = 0` on a genuine retirement -- ONLY that one field, nothing else in
+        // `struct group`/`struct meta`). `struct group` layout (meta.h): `meta` at +0x00 (8
+        // bytes, already dumped above as `meta_bytes`), `active_idx:5` bit-packed into the byte
+        // at +0x08, then `pad[...]`, then `storage[]` (the actual chunk payload, i.e. what `rdi`
+        // itself points at) starting at +UNIT (0x10 on this build, matching `rdi` itself). Dump
+        // 0x30 bytes starting at meta_slot: covers `.meta` (+0x00..0x08), `.active_idx`+pad
+        // (+0x08..0x10), and the first 0x20 bytes of `storage[]` (+0x10..0x30, i.e. what `rdi`
+        // points at -- the guest chunk CPython's dict-resize free() was about to operate on) so a
+        // human/future pass can see whether the surrounding bytes look like live, non-zero guest
+        // heap data (supporting "group struct specifically zeroed, chunk payload untouched" i.e.
+        // the free_group() poison theory) or whether the WHOLE region reads as zero (supporting
+        // "this entire page/range was never populated with real data at all").
+        let mut group_full = [0u8; 0x30];
+        let ngf = fork_verify::read_code_bytes_for_diagnostics(meta_slot, &mut group_full);
+        eprintln!(
+            "[veh] group full-dump meta_slot={meta_slot:#x} (+0x00 .meta, +0x08 .active_idx/pad, +0x10.. storage[]/rdi) bytes({ngf})={:02x?}",
+            &group_full[..ngf],
+        );
+        // Pass 129: reverse-lookup the meta-slot's PARENT-side (pre-`fork()` `duplicate()`
+        // source) address and read what is still live there -- the parent's original mapping is
+        // never unmapped, so this tells us whether the PARENT's own copy of this slot was
+        // already zero (meaning `duplicate()` faithfully copied an already-zero value) or
+        // non-zero (meaning `duplicate()`'s copy path itself lost the value).
+        if let Some((source_addr, source_bytes)) =
+            fork_verify::reverse_translate_and_read_for_diagnostics(tls, meta_slot)
+        {
+            eprintln!(
+                "[veh] meta-slot parent-side source_addr={source_addr:#x} bytes={source_bytes:02x?}",
+            );
+        } else {
+            eprintln!("[veh] meta-slot parent-side: no reverse translation found");
+        }
+        eprintln!(
+            "[veh] crash regs rdi={:#x} rsi={:#x} rdx={:#x} rax={:#x} rsp={:#x} rbp={:#x} rbx={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+            context.Rdi,
+            context.Rsi,
+            context.Rdx,
+            context.Rax,
+            context.Rsp,
+            context.Rbp,
+            context.Rbx,
+            context.R8,
+            context.R9,
+            context.R10,
+            context.R11,
+            context.R12,
+            context.R13,
+            context.R14,
+            context.R15,
+        );
+        // Temporary diagnostic (DIAG-STACKWALK, mallocng .meta=0 investigation continuation):
+        // `get_meta()` never pushes to the stack before this crash point (confirmed via
+        // disassembly of the real shipped musl -- it's a leaf-shaped assert-chain using only
+        // `rdi`/`rax`/`rcx`/`rdx`/`rsi`/`r8`/`r9`), so `[rsp]` at crash time should still be the
+        // return address `get_meta()` will eventually `ret` to -- its caller. Widened from an
+        // earlier 8-qword version: `free()`'s own prologue pushes `r14`/`rbx` and subtracts 0x18
+        // from `rsp` before reaching this crash point, so `free()`'s OWN return address (its
+        // caller -- the actual pixman/weston/libwayland call site that triggered this) sits
+        // further up the stack than the original dump's depth reached. Dump 32 QWORDs from
+        // `[rsp]` upward -- enough headroom to walk past free()'s frame and find its caller.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "diagnostic-only; this platform is x86_64-only, rsp fits in usize"
+        )]
+        let rsp = context.Rsp as usize;
+        let mut stack_words = [0u8; 256];
+        let nsw = fork_verify::read_code_bytes_for_diagnostics(rsp, &mut stack_words);
+        let words: Vec<u64> = stack_words[..nsw]
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap_or([0; 8])))
+            .collect();
+        eprintln!("[veh] DIAG-STACKWALK rsp={rsp:#x} qwords={words:#x?}");
+    }
+
+    // Diagnostic-only (`LITEBOX_CTXWATCH=1`): decisive aliasing-vs-overwrite check at the exact
+    // moment of the `rip=0` crash this whole mechanism was built to root-cause. If a hardware
+    // write watchpoint was armed on this thread's `ctx.rip` field (`ctxwatch::current_armed_addr`
+    // non-zero) and we just trapped with `context.Rip == 0`, read the LIVE memory currently at
+    // that watched address: if it is non-zero, the watchpoint's silence (established across 70+
+    // runs in prior passes: zero hits, correct address, correct cross-thread arming) is explained
+    // -- nothing ever wrote 0 there, so whatever produced `rip=0` read a DIFFERENT address than
+    // the one that was armed/validated (an aliasing/wrong-pointer-read bug). If it reads back 0
+    // too, the field really was zeroed by a write the watchpoint should have caught but didn't,
+    // pointing at a watchpoint/CPU-level gap instead.
+    if context.Rip == 0 && diag_rip0_enabled() {
+        eprintln!(
+            "[diag-rip0] tid={:?} exc_code={:#x} rsp={:#x} rax={:#x} is_in_guest={} is_verifying={}",
+            std::thread::current().id(),
+            exception_record.ExceptionCode,
+            context.Rsp,
+            context.Rax,
+            tls.is_in_guest.get(),
+            fork_verify::is_verifying(tls),
+        );
+        eprintln!(
+            "[diag-rip0-hist] tid={:?} {}",
+            std::thread::current().id(),
+            diag_resume_history()
+        );
+        // Classify the fault. `av_type == 8` (EXCEPTION_EXECUTE_FAULT) at `av_addr == 0` means
+        // the CPU faulted *fetching* an instruction at address 0, i.e. the guest itself branched
+        // to null -- as opposed to LiteBox resuming the guest with a corrupted saved `rip`. The
+        // words around the faulting `rsp` disambiguate further: a zero immediately below `rsp` is
+        // the signature of a `ret` that popped a zeroed return address off the guest's own stack.
+        {
+            use core::fmt::Write as _;
+            let mut around = String::new();
+            for i in -4i64..4 {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "diagnostic-only; this platform is x86_64-only, so rsp fits in usize"
+                )]
+                let addr = (context.Rsp as usize).wrapping_add_signed(
+                    isize::try_from(i * 8).expect("small constant offset fits in isize"),
+                );
+                let v = fork_verify::read_stack_word_for_diagnostics(addr);
+                let _ = write!(around, " [rsp{i:+}*8={addr:#x}]={v:?}");
+            }
+            eprintln!(
+                "[diag-rip0-av] tid={:?} av_type={:#x} av_addr={:#x}{}",
+                std::thread::current().id(),
+                exception_record.ExceptionInformation[0],
+                exception_record.ExceptionInformation[1],
+                around,
+            );
+        }
+        // Pass-29: walk the faulting guest stack upward from `rsp`, classifying each word so the
+        // return-address chain identifies which guest function executed the null branch. Each
+        // word's own host-memory region is described via `codewatch::describe` (page type/protect/
+        // alloc_base) -- a plausible return address lands in an executable, non-writable region; a
+        // stack-local value lands in a writable, non-executable region; `None`/zero are called out
+        // directly. 32 words covers several stack frames on a typical musl/busybox call depth.
+        {
+            use core::fmt::Write as _;
+            let mut walk = String::new();
+            for i in 0i64..32 {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "diagnostic-only; this platform is x86_64-only, so rsp fits in usize"
+                )]
+                let addr = (context.Rsp as usize).wrapping_add(
+                    usize::try_from(i * 8).expect("small constant offset fits in usize"),
+                );
+                let v = fork_verify::read_stack_word_for_diagnostics(addr);
+                match v {
+                    None => {
+                        let _ = write!(walk, "\n  [rsp+{:#06x}={:#x}] <unreadable>", i * 8, addr);
+                    }
+                    Some(0) => {
+                        let _ = write!(walk, "\n  [rsp+{:#06x}={:#x}] = 0", i * 8, addr);
+                    }
+                    Some(val) => {
+                        let (mtype, protect, alloc_base) =
+                            fork_verify::describe_addr_for_diagnostics(val);
+                        let _ = write!(
+                            walk,
+                            "\n  [rsp+{:#06x}={:#x}] = {val:#x}  page_type={mtype:#x} protect={protect:#x} alloc_base={alloc_base:#x}",
+                            i * 8,
+                            addr,
+                        );
+                    }
+                }
+            }
+            eprintln!(
+                "[diag-rip0-stackwalk] tid={:?} rsp={:#x}{}",
+                std::thread::current().id(),
+                context.Rsp,
+                walk,
+            );
+        }
+        // Pass-30: record the faulting rsp so the reactive watchpoint (armed further below, AFTER
+        // `ctxwatch::disarm()` runs on this same VEH call as the crash is absorbed into a
+        // guest-visible SIGSEGV) targets `faulting_rsp - 8` -- see that arm site's own comment.
+        diag_pending_watch_addr(context.Rsp);
+    }
+    if ctxwatch::enabled() && context.Rip == 0 {
+        let watched = ctxwatch::current_armed_addr();
+        if watched != 0 {
+            let live_value = unsafe { core::ptr::read_unaligned(watched as *const u64) };
+            eprintln!(
+                "[ctxwatch] CRASH tid={:?} rip=0 watched_addr={:#x} live_value_at_watched_addr={:#x}",
+                std::thread::current().id(),
+                watched,
+                live_value,
+            );
+        } else {
+            eprintln!(
+                "[ctxwatch] CRASH tid={:?} rip=0 but no watchpoint currently armed on this thread",
+                std::thread::current().id(),
+            );
+        }
+    }
+
+    // Diagnostic code-page watchpoint (`LITEBOX_CODEWATCH=1`). Both of these must be triaged
+    // BEFORE the `!is_in_guest` branch below: the whole point of the watchpoint is to observe
+    // writes into a `fork()` child's own copied code that happen while LiteBox's *host*
+    // syscall-servicing code is running (i.e. `is_in_guest == false`), which that branch would
+    // otherwise hand straight to `EXCEPTION_CONTINUE_SEARCH` and turn into a process-killing
+    // unhandled exception -- as would the `TF` single-step the watchpoint uses to let the trapped
+    // write complete.
+    if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
+        && fork_verify::on_codewatch_write(exception_record, context)
+    {
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_SINGLE_STEP
+        && !tls.is_in_guest.get()
+        && fork_verify::on_codewatch_step(context)
+    {
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    // Diagnostic-only (`LITEBOX_CTXWATCH=1`): a hardware write-watchpoint hit on some thread's
+    // `ctx.rip` field. Checked regardless of `is_in_guest` -- the whole point is to catch a
+    // WRITER thread that may be running host code, not necessarily the watched thread's own
+    // guest execution (which never legitimately writes this field via the watched path at all).
+    // Resume immediately after logging; the write already completed (hardware data watchpoints
+    // trap post-write), so there is nothing further to step over.
+    if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_SINGLE_STEP
+        && ctxwatch::on_possible_hit(context)
+    {
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    // Temporary (see FINDINGS.txt PASS 48): `LITEBOX_DIAG_WATCHADDR=<hex>`-gated fixed-address
+    // `Dr1` write watch, independent of the `Dr0`-based mechanism above -- see
+    // `ctxwatch::arm_fixed_on_current_thread`'s doc comment.
+    if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_SINGLE_STEP
+        && ctxwatch::on_possible_fixed_hit(context)
+    {
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    if !tls.is_in_guest.get() {
+        // Same FS_BASE-reset repair as the guest-mode case below, but for *host* Rust code: live
+        // tracing (`LITEBOX_VEH_TRACE=1`) while investigating an `apk add nodejs` trigger-script
+        // hang showed `EXCEPTION_ACCESS_VIOLATION`s with `is_in_guest == false` and
+        // `rdfsbase() == 0` -- the same signature as the guest-mode case, just reached while
+        // running host code between guest instructions instead of guest code. Repairing it here
+        // too, before the exception-table lookup below, is a real, verified improvement (confirmed
+        // firing correctly in that trace).
+        //
+        // A second, now more precisely characterized, and still separate issue remains open past
+        // this fix (and past the `EXCEPTION_SINGLE_STEP`-path FS_BASE repair below, which fixes
+        // the quadratic single-step/FS_BASE-reset slowdown this comment originally attributed the
+        // whole hang to): `apk add --no-cache nodejs` deterministically stalls forever partway
+        // through -- specifically while `ash` runs the `icu-data-en` package's `.post-install`
+        // trigger script, right at the point that script's `fork()`ed child completes its
+        // `execve()` (the last traced activity is always the fork_verify single-step window's
+        // final few guest instructions immediately before the call into `switch_to_guest`/the
+        // syscall trampoline for `execve`; nothing more is ever traced afterward on any thread).
+        // `gdb`-attaching to a stalled process shows every OS thread cleanly parked in
+        // `WaitOnAddress`/`recvfrom`/threadpool-wait -- no thread spinning, no thread executing
+        // guest code, no panic message on stderr -- consistent with the parent's `wait4()` (via
+        // `Process::wait_for_exit`'s `nr_threads.block(n)` loop) never being woken because
+        // `Process::detach_thread`'s "last thread exited" bookkeeping and wake never ran for the
+        // execve'd child, rather than any FS_BASE or FS_BASE-adjacent problem (`rdfsbase()` reads
+        // back correct at every point observed near the stall). Notably, attaching `gdb` (whose
+        // `attach` implicitly suspends every thread in the process, the same primitive
+        // `ThreadHandle::interrupt` uses via `SuspendThread`/`SetThreadContext`/`ResumeThread`)
+        // was observed to occasionally produce one more increment of forward progress before the
+        // process re-stalled identically -- suggestive of a race in the interrupt/thread-exit
+        // signaling path (`litebox/src/event/wait.rs`, `Process::detach_thread`) rather than a
+        // true unconditional infinite loop, but not yet root-caused to a specific line. This is a
+        // distinct bug from the FS_BASE/single-step quadratic slowdown fixed in this commit and
+        // deserves its own dedicated investigation (ideally starting from a debug build under
+        // `gdb` with breakpoints on `Process::detach_thread`/`ThreadHandle::interrupt`, reproduced
+        // via `apk add --no-cache nodejs` against a freshly packaged `alpine-rootfs.tar`) rather
+        // than being folded into this fix.
+        if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
+            && std::env::var_os("LITEBOX_DIAG_AVFULL").is_some()
+        {
+            // `has_fs_override` reads the instruction bytes AT `rip` -- when `rip` itself is a
+            // corrupted, unmapped address (the `rip=0x100000001`-class crash this diagnostic was
+            // built to characterize), there is no instruction to read at all, so
+            // `faulting_instruction_has_fs_override` correctly (and, per its own doc comment,
+            // intentionally) returns `false` as a safe false-negative for the FS_BASE-repair
+            // guard's purposes below. That same `false` is misleading read as a standalone
+            // diagnostic line, though: it looks identical to "confirmed not FS-relative" when the
+            // real state is "rip is unreadable, this tells us nothing" -- confirmed live this
+            // session, where a `has_fs_override=false` reading for a corrupted `rip` initially
+            // looked like it ruled out the FS-relative-canary-check pattern, until a gdb-attached
+            // repro of the same crash class showed the actual fault (before `rip` got corrupted
+            // further downstream) was a completely ordinary `sub %fs:0x28,%rax` stack-protector
+            // check. Report whether `rip` was even readable as its own field so a future
+            // investigator sees "unreadable, inconclusive" rather than a false "not FS-relative".
+            let mut probe = [0u8; 4];
+            let rip_readable =
+                fork_verify::read_code_bytes_for_diagnostics(context.Rip.trunc(), &mut probe) > 0;
+            eprintln!(
+                "[diag-avfull] tid={:?} rip={:#x} fsbase={:#x} fault_addr={:#x} rip_readable={} has_fs_override={}",
+                std::thread::current().id(),
+                context.Rip,
+                unsafe { litebox_common_linux::rdfsbase() },
+                exception_record.ExceptionInformation[1],
+                rip_readable,
+                faulting_instruction_has_fs_override(context.Rip.trunc()),
+            );
+        }
+        if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
+            && unsafe { litebox_common_linux::rdfsbase() } == 0
+            // A zero `Rip` is not a real FS_BASE-reset fault: the FS_BASE-reset repair's whole
+            // premise is that the guest/host instruction at `Rip` is genuine and merely read/wrote
+            // through the wrong (zeroed) segment base -- retrying it after `wrfsbase` makes forward
+            // progress. `Rip == 0` means the CPU never reached a real instruction at all, so
+            // "repairing" FS_BASE and resuming at address 0 just re-faults with the exact same
+            // signature (`EXCEPTION_ACCESS_VIOLATION`, `rdfsbase() == 0`, because execution never
+            // gets anywhere real to leave FS_BASE in a consistent state) -- an infinite repair loop
+            // observed in practice via `LITEBOX_VEH_TRACE=1` (1809+ repeated repairs, no forward
+            // progress). Skip the repair here so this falls through to the exception-table lookup /
+            // `EXCEPTION_CONTINUE_SEARCH` below instead, turning the silent livelock into a
+            // diagnosable crash.
+            && context.Rip != 0
+            // The fault must actually be an FS-relative access -- see
+            // `faulting_instruction_has_fs_override`'s doc comment for why this guard exists: an
+            // unrelated real fault (e.g. a null-pointer dereference with no FS prefix at all)
+            // coinciding with `rdfsbase() == 0` was being misdiagnosed as FS_BASE-reset and
+            // retried forever, since `wrfsbase` does nothing to fix a fault that was never about
+            // FS_BASE in the first place.
+            && faulting_instruction_has_fs_override(context.Rip.trunc())
+        {
+            let saved = WindowsUserland::get_thread_fs_base();
+            if saved != 0 {
+                if veh_trace_enabled() {
+                    eprintln!(
+                        "[veh] tid={:?} host-mode FS_BASE-reset in-place repair (rip={:#x})",
+                        std::thread::current().id(),
+                        context.Rip,
+                    );
+                }
+                unsafe { litebox_common_linux::wrfsbase(saved) };
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+
+        // This might be a faulting guest memory access in LiteBox code. Try to
+        // recover.
+        if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
+            && let Some(recover) =
+                litebox::mm::exception_table::search_exception_tables(context.Rip.trunc())
+        {
+            // Found a matching exception table entry.
+            context.Rip = recover as u64;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        } else {
+            // Not one of our exceptions; let other handlers process it.
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+    }
+
+    // Windows clears this thread's FS_BASE MSR back to 0 on its own initiative, apparently as
+    // part of ordinary scheduling (observed to recur many times per second under load, e.g.
+    // during `apk add nodejs`'s guest dynamic-linking/TLS-heavy startup). A guest `mov %fs:...`
+    // hit while FS_BASE is 0 reads/writes through linear address `0 + offset` instead of the
+    // real TLS block, which is (almost always) unmapped and therefore an ordinary `#PF` here,
+    // reported as `EXCEPTION_ACCESS_VIOLATION` -- indistinguishable, without this check, from a
+    // genuine guest segfault.
+    //
+    // Detect and repair this *before* any other exception-code-specific handling (in particular
+    // before the `EXCEPTION_SINGLE_STEP` triage below, which hands off to
+    // `fork_verify::on_single_step` -- that function has no notion of FS_BASE at all, and running
+    // its source/destination-range and instruction-decode logic against a thread whose FS_BASE is
+    // transiently wrong would either misclassify the trap or simply waste the step; simplest and
+    // safest is to make sure FS_BASE is never wrong by the time exception-code-specific logic
+    // runs, for every exception code, not just the ones this repro happens to hit).
+    //
+    // Repair happens in place, without ever leaving guest mode: just `wrfsbase` the stored value
+    // back and retry the exact same faulting instruction via `EXCEPTION_CONTINUE_EXECUTION`. This
+    // used to instead route through `interrupt_callback` (`set_context_to_interrupt_callback`),
+    // which is far more expensive -- it leaves guest mode, saves the full guest context, and takes
+    // a `NtContinue` round-trip through host Rust code before `switch_to_guest` gets back around
+    // to restoring FS_BASE and re-entering the guest. Under the same scheduler pressure that
+    // causes FS_BASE to be cleared in the first place, that round-trip reliably took long enough
+    // for FS_BASE to be cleared *again* before the guest completed even one more instruction,
+    // producing an unbounded livelock: thousands of these access violations in a row, forward
+    // progress permanently stalled, observed in practice as the reported indefinite hang (see the
+    // `LITEBOX_VEH_TRACE=1` diagnostic traces this fix was root-caused from -- runs that hung
+    // showed exactly this pattern: repeated `EXCEPTION_ACCESS_VIOLATION` with `rdfsbase() == 0` at
+    // a different `rip` each time, `is_verifying == false`, never reaching a third occurrence of
+    // the same instruction because the guest one instruction at a time). Fixing FS_BASE directly
+    // in the handler removes every one of those host round-trip's kernel transitions from the
+    // recovery path, so recovery is a single MSR write plus a `CONTINUE_EXECUTION` return -- no
+    // syscalls, no context save, no scheduling-visible event of its own to compound the problem.
+    //
+    // This does forgo the old comment's stated rationale for going through `interrupt_callback`
+    // ("avoid missing a real interrupt that arrives while resuming the guest"): a pending
+    // interrupt is not inspected here before resuming. This is safe: interrupt/signal delivery to
+    // a running guest is already only ever "eventually", never guaranteed at a specific
+    // instruction boundary (the same is true on real hardware), and `ThreadHandle::interrupt`
+    // does not depend on this path at all -- it suspends the target thread directly and rewrites
+    // its context itself, which still works correctly regardless of whether this handler happens
+    // to run in between. A real interrupt is caught at the next point that already checks for one
+    // (the next syscall, or the next time this same thread is suspended-and-inspected by
+    // `ThreadHandle::interrupt`), exactly as it would be if this exact access violation had not
+    // happened to occur at all.
+    if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
+        && unsafe { litebox_common_linux::rdfsbase() } == 0
+        // See the matching guard in the `!is_in_guest` branch above: `Rip == 0` means this is not
+        // a genuine FS_BASE-reset fault at a real instruction, and blindly repairing-and-resuming
+        // would just re-fault at address 0 forever. Fall through to the normal exception path
+        // below (single-step triage / `exception_callback`) instead of looping silently.
+        && context.Rip != 0
+        // Same guard as the host-mode repair above -- see
+        // `faulting_instruction_has_fs_override`'s doc comment. Without this, a real guest fault
+        // (e.g. a null-pointer dereference with no FS-segment prefix) coinciding with
+        // `rdfsbase() == 0` gets misdiagnosed as FS_BASE-reset and retried forever; confirmed live
+        // via a `process.title = <string>` repro under Node.js, where a plain `mov rdx,
+        // [rdx+0x788]` (no FS override) with `rdx` already null was being "repaired" and retried
+        // unboundedly on a background guest thread.
+        && faulting_instruction_has_fs_override(context.Rip.trunc())
+    {
+        let saved = WindowsUserland::get_thread_fs_base();
+        if saved != 0 {
+            if veh_trace_enabled() {
+                eprintln!(
+                    "[veh] tid={:?} FS_BASE-reset in-place repair (rip={:#x})",
+                    std::thread::current().id(),
+                    context.Rip,
+                );
+            }
+            unsafe { litebox_common_linux::wrfsbase(saved) };
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+
+    // A single-step trap while in guest mode belongs to the post-`fork()` verification machinery
+    // (`EFLAGS.TF` is masked out of every guest-visible eflags value, so the guest can never arm
+    // it itself). Either it is a clean step -- in which case we re-arm TF and resume without ever
+    // leaving guest mode -- or it caught the child executing/writing through a stale pointer into
+    // the parent's address space, in which case we fall through to the normal exception path with
+    // a synthesized access violation so the child dies exactly as it would on real hardware.
+    //
+    // FS_BASE-reset repair applies here too, and matters *far* more here than on the plain
+    // (non-single-stepped) guest-execution path above: single-stepping means every guest
+    // instruction is its own kernel round-trip through this handler, which is exactly the kind of
+    // scheduling-visible event the FS_BASE-reset behavior above is already keyed off of ("observed
+    // to recur many times per second under load") -- so a `fork()` child under verification hits
+    // the reset on very nearly every single instruction (confirmed via `LITEBOX_VEH_TRACE=1`:
+    // >99% of `on_single_step` calls during a real `apk add nodejs` run observed `rdfsbase() ==
+    // 0`), not merely "many times per second". Before this fix, this path had no FS_BASE repair of
+    // its own: `on_single_step` only *logged* the corruption and proceeded with its rip/instruction
+    // classification regardless (which is safe -- it never reads `%fs:`-relative memory itself,
+    // only CPU registers and instruction bytes at `rip`), then re-armed `TF` and resumed the
+    // *original* guest instruction with FS_BASE still zero. If that instruction touched `%fs:`, it
+    // then took a *second* trap -- `EXCEPTION_ACCESS_VIOLATION` this time -- which the repair above
+    // fixes and retries via `CONTINUE_EXECUTION`, but with `TF` still armed the whole time, so the
+    // very next instruction immediately single-steps again, and if FS_BASE has already been reset
+    // yet again by then (observed to be the common case), the two traps alternate in an extremely
+    // tight loop -- thousands of round trips to make a handful of instructions of real forward
+    // progress, exactly the "quadratic-ish" slowdown reported as an apparent hang. Repairing FS_BASE
+    // in place here, before `on_single_step` runs, means the guest instruction that resumes after
+    // this step always sees correct FS_BASE the first time, so it never needs that second
+    // access-violation-and-retry round trip at all: one MSR rewrite replaces two full VEH
+    // dispatches.
+    if unsafe { litebox_common_linux::rdfsbase() } == 0 {
+        let saved = WindowsUserland::get_thread_fs_base();
+        if saved != 0 {
+            unsafe { litebox_common_linux::wrfsbase(saved) };
+        }
+    }
+
+    // A stale, untranslated source-range `rip` (the exact class of value case (1) in
+    // `fork_verify::on_single_step` already exists to heal -- see that function's own doc
+    // comment) does not always announce itself as `EXCEPTION_SINGLE_STEP`: whether Windows
+    // delivers a clean `#DB` trap (the page the stale address names is still resident, so the
+    // CPU can fetch and execute it under `TF` before this handler ever sees it) or a raw
+    // `EXCEPTION_ACCESS_VIOLATION` (the page is not resident at all) is incidental paging state
+    // at that instant, not something the single-step-only dispatch below distinguishes.
+    // Confirmed live (litebox-xfce-1, dbus-daemon fork-child investigation,
+    // `LITEBOX_DIAG_FATALDUMP=1`/`LITEBOX_VEH_TRACE=1`): a thread single-stepping cleanly under
+    // verification set `rip` to a source-range value via an ordinary instruction, and the VERY
+    // NEXT event on that thread was a raw `EXCEPTION_ACCESS_VIOLATION` with the fault address
+    // equal to that same `rip` -- an execute fault reaching this handler entirely outside the
+    // `EXCEPTION_SINGLE_STEP` branch below, so `fork_verify::on_single_step`'s case (1) never
+    // ran at all. This mirrors case (1) exactly (translate via the same relocation map already
+    // proven correct for every other register at `fork()` time, resume at the translated
+    // address) rather than reimplementing it: only fires for a genuinely `is_verifying` thread,
+    // only on an EXECUTE-shaped guest-mode AV whose fault address is a real, exact
+    // `is_in_source` membership hit (never a coincidental numeric overlap), and never touches
+    // any other register or memory -- the narrowest fix this specific gap admits, matching the
+    // same bounded, deterministic shape every safe fix in `fork_verify.rs` itself already uses.
+    if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
+        && fork_verify::is_verifying(tls)
+    {
+        #[allow(clippy::cast_possible_truncation)]
+        let rip = context.Rip as usize;
+        if let Some(translated_rip) = fork_verify::translate_stale_source_rip(tls, rip) {
+            if veh_trace_enabled() {
+                eprintln!(
+                    "[veh] tid={:?} AV-path stale rip healed rip={rip:#x} translated={translated_rip:#x}",
+                    std::thread::current().id(),
+                );
+            }
+            litebox_util_log::warn!(
+                rip:? = rip, translated_rip:? = translated_rip;
+                "fork_verify: stale CODE pointer detected via raw access violation (no #DB delivered), translating and resuming"
+            );
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                context.Rip = translated_rip as u64;
+            }
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        // `rip` itself was not stale -- the data-pointer counterpart to the code-pointer case
+        // just above. A raw AV whose fault address is explained by a stale base/index register
+        // in the faulting instruction's own memory operand (the register went stale earlier via
+        // an ordinary register-to-register `mov` this module has no general single-step case
+        // for) never reaches `on_single_step`'s case (2)/(2b) at all when it arrives as a raw AV
+        // rather than a clean `#DB` -- the identical AV-bypass problem the `rip` healing above
+        // exists for, just for a DATA pointer instead of a CODE pointer. Confirmed live
+        // (litebox-xfce-1, dbus-daemon fork-child investigation): a thread's `rbp` held a stale
+        // source-range value across a full single-step trap with no intervening healing
+        // opportunity (case (1) only fires when `rip` itself lands in-source; this `rbp` never
+        // did), then the next instruction dereferenced `[rbp+disp]` and faulted with the fault
+        // address exactly equal to the stale `rbp` plus that displacement. Mirrors case (2)/(2b)
+        // exactly (decode the instruction, translate its memory-operand registers through the
+        // same relocation map, retry) via `translate_stale_source_memory_operand_registers`,
+        // never advancing `rip` so the CPU re-executes the same instruction with the now-healed
+        // register.
+        if fork_verify::translate_stale_source_memory_operand_registers(tls, rip, context) {
+            if veh_trace_enabled() {
+                eprintln!(
+                    "[veh] tid={:?} AV-path stale data-pointer register healed at rip={rip:#x}",
+                    std::thread::current().id(),
+                );
+            }
+            litebox_util_log::warn!(
+                rip:? = rip;
+                "fork_verify: stale DATA pointer register detected via raw access violation (no #DB delivered), translating and retrying"
+            );
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+
+    let mut synthesized_record = None;
+    if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_SINGLE_STEP {
+        match fork_verify::on_single_step(tls, context) {
+            fork_verify::StepOutcome::Continue => return EXCEPTION_CONTINUE_EXECUTION,
+            fork_verify::StepOutcome::StalePointer { address, is_write } => {
+                // Report it as a page fault on the offending address so the shim raises the same
+                // `SIGSEGV` on the child that real hardware would have raised.
+                synthesized_record = Some(fork_verify::access_violation_record(
+                    exception_record,
+                    address,
+                    is_write,
+                ));
+            }
+        }
+    }
+    let exception_record: &EXCEPTION_RECORD =
+        synthesized_record.as_ref().unwrap_or(exception_record);
+
+    tls.is_in_guest.set(false);
+    // Diagnostic-only (`LITEBOX_CTXWATCH=1`): the watchpoint's job for this guest-entry cycle is
+    // done once we're leaving guest mode again; the next `ContinueOperation::Resume` re-arms it
+    // fresh for the new `ctx`. Cheap no-op when never armed.
+    ctxwatch::disarm();
+    // Pass-30 (`LITEBOX_DIAG_WAIT4GATE=1`): if the `[diag-rip0]` block above (this same VEH call)
+    // just recorded a pending guest-stack-slot address from a `rip=0` fault, arm the reactive
+    // write-watchpoint on it now -- strictly AFTER `ctxwatch::disarm()` above, so it survives past
+    // this handler's return instead of being immediately cleared by it. Pass 28/29 established
+    // this is a genuine guest-side null branch (the guest's own stack held a bad zero at
+    // `rsp - 8`), so unlike every pass 20-25 watchpoint (armed on the HOST-side `ctx.rip` field,
+    // which pass 28 retracted as never actually implicated), this watches the address proven to
+    // hold the bad value. Left armed across the crash: the process survives (pass 28 item 3), and
+    // watching stays live for whatever the guest shell runs next in the SAME session, so a SECOND
+    // repro attempt in the same run can catch a hit even though the exact faulting address differs
+    // run-to-run (this pass reactively re-derives it fresh from each run's own first crash instead
+    // of guessing a fixed address up front).
+    if let Some(addr) = diag_take_pending_watch_addr() {
+        ctxwatch::arm_addr(addr);
+        eprintln!(
+            "[diag-rip0-watch] tid={:?} armed reactive write-watch on faulting_rsp-8={:#x} (post-crash, for next repro attempt in this session)",
+            std::thread::current().id(),
+            addr,
+        );
+    }
+
+    // From here on, `context` is being redirected into `exception_callback` or
+    // `interrupt_callback` (host code), and control never returns to `fork_verify::on_single_step`
+    // to re-arm or clear `TF` again. If `TF` were left set (a `fork()` child under verification
+    // hit a genuine exception -- our own synthesized one above, or an unrelated real one, e.g. a
+    // guest access violation that happens to occur mid-verification), the CPU would single-step
+    // through `exception_callback`'s/`interrupt_callback`'s own host instructions with
+    // `is_in_guest` now `false`, which the `!is_in_guest` branch above does not handle for
+    // `EXCEPTION_SINGLE_STEP` -- an unhandled `STATUS_SINGLE_STEP` (`0x80000004`) that kills the
+    // whole host process instead of just this child. Clear it unconditionally on every path that
+    // leaves guest mode here, not just the `StalePointer` one.
+    #[allow(clippy::cast_possible_truncation)]
+    let eflags_tf = fork_verify::EFLAGS_TF as u32;
+    context.EFlags &= !eflags_tf;
+
+    let regs = unsafe { &mut *tls.guest_context_top.get().wrapping_sub(1) };
+    save_guest_context(regs, context);
+
+    // Note: an `EXCEPTION_ACCESS_VIOLATION` caused by a cleared FS_BASE is already handled above,
+    // before `is_in_guest` was cleared and before the single-step triage ran -- nothing between
+    // there and here writes FS_BASE, so by construction every remaining exception here is a
+    // genuine one and always goes to `exception_callback`.
+    //
+    // Write the exception record into scratch space BELOW `host_sp`, well clear of the
+    // `thread_ctx` pointer that `run_thread_arch`'s prologue pushed at `[host_sp]`/
+    // `[host_sp + 8]`. `exception_callback` (like `syscall_callback` and `interrupt_callback`)
+    // expects `[rsp] == thread_ctx`, so `Rsp` must land exactly on `host_sp`, unmodified -- it
+    // must NOT be repointed into the exception-record scratch area itself. Previously `Rsp` was
+    // set to the (16-byte-realigned) exception-record address instead of `host_sp`, so
+    // `exception_callback`'s `mov rcx, [rsp]` read raw bytes from within the just-written
+    // `EXCEPTION_RECORD` (misinterpreted as `&mut ThreadContext`) rather than the real
+    // `thread_ctx` pointer -- observed in practice as `ThreadContext` fields reading back as
+    // null/garbage.
+    let exception_record_ptr = tls
+        .host_sp
+        .get()
+        .cast::<EXCEPTION_RECORD>()
+        .wrapping_byte_sub(EXCEPTION_RECORD_RESERVE);
+    assert!(exception_record_ptr.is_aligned());
+    // Explicitly `VirtualAlloc(MEM_COMMIT)` the target page before writing, rather than relying on
+    // Windows' automatic guard-page stack growth: this single `write()` lands up to
+    // `EXCEPTION_RECORD_RESERVE` (64 KiB) below `host_sp`, far past the thread's actual committed
+    // stack depth in every captured crash this bug has ever produced (`committed=0x4000`, 16 KiB,
+    // is the consistent real-world figure across dozens of `DIAG-REALSTACK` captures in this
+    // investigation's history) -- a single write that far past the guard page does not reliably
+    // trigger the normal one-page-at-a-time stack-growth fault Windows expects `__chkstk`-style
+    // sequential probing to drive; it can instead raise `STATUS_STACK_OVERFLOW` on this exact
+    // instruction, which VEH re-enters as a SECOND, nested exception on a thread already mid-
+    // dispatch of the first one -- matching this investigation's own long-documented, previously
+    // unexplained `rsp=0x1`/`code=0x1e` garbage second-exception signature exactly. This is
+    // deliberately NOT another "probe more stack ahead of time" attempt (two prior variants of
+    // that family were tried and refuted) -- it explicitly commits precisely the one page this
+    // write needs, at the moment it needs it, via the OS's own allocation API rather than a
+    // touch-and-hope memory access.
+    unsafe {
+        let commit_page = exception_record_ptr
+            .cast::<u8>()
+            .map_addr(|addr| addr & !0xFFF);
+        let _ = windows_sys::Win32::System::Memory::VirtualAlloc(
+            commit_page.cast(),
+            4096,
+            windows_sys::Win32::System::Memory::MEM_COMMIT,
+            windows_sys::Win32::System::Memory::PAGE_READWRITE,
+        );
+    }
+    unsafe { exception_record_ptr.write(*exception_record) };
+
+    // Ensure that `run_thread_arch` is linked in so that `exception_callback` is visible.
+    let _ = run_thread_arch as *const () as usize;
+
+    // Update the thread context to jump to the exception handler.
+    context.Rip = exception_callback as *const () as usize as u64;
+    context.Rsp = tls.host_sp.get() as u64;
+    context.Rbp = tls.host_bp.get() as u64;
+    context.Rdx = exception_record_ptr as u64;
+
+    EXCEPTION_CONTINUE_EXECUTION
+}
+
+fn save_guest_context(
+    guest_context: &mut litebox_common_linux::PtRegs,
+    context: &windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+) {
+    let litebox_common_linux::PtRegs {
+        r15,
+        r14,
+        r13,
+        r12,
+        rbp,
+        rbx,
+        r11,
+        r10,
+        r9,
+        r8,
+        rax,
+        rcx,
+        rdx,
+        rsi,
+        rdi,
+        orig_rax,
+        rip,
+        cs: _,
+        eflags,
+        rsp,
+        ss: _,
+    } = guest_context;
+    *r15 = context.R15.trunc();
+    *r14 = context.R14.trunc();
+    *r13 = context.R13.trunc();
+    *r12 = context.R12.trunc();
+    *rbp = context.Rbp.trunc();
+    *rbx = context.Rbx.trunc();
+    *r11 = context.R11.trunc();
+    *r10 = context.R10.trunc();
+    *r9 = context.R9.trunc();
+    *r8 = context.R8.trunc();
+    *rax = context.Rax.trunc();
+    *rcx = context.Rcx.trunc();
+    *rdx = context.Rdx.trunc();
+    *rsi = context.Rsi.trunc();
+    *rdi = context.Rdi.trunc();
+    *orig_rax = context.Rax.trunc();
+    *rip = context.Rip.trunc();
+    // `EFLAGS.TF` is owned exclusively by the post-`fork()` verification machinery
+    // (`fork_verify`), which arms it on guest entry and re-arms it on every trap. It must never
+    // leak into guest-visible state: if it did, it would be restored on the next guest entry
+    // (via `pushfq`/`popfq` in the syscall path, or `EFlags` in `switch_to_guest_ntcontinue`)
+    // long after verification ended, producing single-step traps with nothing left to handle
+    // them.
+    *eflags = context.EFlags as usize & !fork_verify::EFLAGS_TF;
+    *rsp = context.Rsp.trunc();
+}
+
+impl WindowsUserland {
+    /// Create a new userland-Windows platform for use in `LiteBox`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the TLS slot cannot be created.
+    pub fn new() -> &'static Self {
+        let mut sys_info = Win32_SysInfo::SYSTEM_INFO::default();
+        Self::get_system_information(&mut sys_info);
+
+        // TODO(chuqi): Currently we just print system information for
+        // `TASK_ADDR_MIN` and `TASK_ADDR_MAX`.
+        // Will remove these prints once we have a better way to replace
+        // the current `const` values in PageManagementProvider.
+        #[cfg(debug_assertions)]
+        {
+            println!("System information.");
+            println!(
+                "=> Max user address: {:#x}",
+                sys_info.lpMaximumApplicationAddress as usize
+            );
+            println!(
+                "=> Min user address: {:#x}",
+                sys_info.lpMinimumApplicationAddress as usize
+            );
+        }
+
+        let reserved_pages = Self::read_memory_maps::<4096>();
+
+        let platform = Self {
+            reserved_pages,
+            sys_info: std::sync::RwLock::new(sys_info),
+            net_gateway: std::sync::OnceLock::new(),
+            console_stdin_reader: std::sync::OnceLock::new(),
+        };
+
+        // Initialize it's own fs-base (for the main thread)
+        WindowsUserland::init_thread_fs_base();
+
+        // Windows sets FS_BASE to 0 regularly upon scheduling; we register an exception handler
+        // to set FS_BASE back to a "stored" value whenever we notice that it has become 0.
+        unsafe {
+            let _ = AddVectoredExceptionHandler(0, Some(vectored_exception_handler_entry));
+        }
+
+        // Register a console control handler to receive Ctrl+C / Ctrl+Break
+        unsafe {
+            windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
+                Some(ctrl_c_handler),
+                1, // TRUE — add the handler
+            );
+        }
+
+        // Watch for real console window resizes and deliver SIGWINCH. There is no Win32 resize
+        // *event* callback equivalent to `SetConsoleCtrlHandler` -- `GetConsoleScreenBufferInfo`
+        // polling on a dedicated thread is the standard approach (e.g. used by libuv/Node's own
+        // Windows tty backend). This deliberately does not touch `STD_INPUT_HANDLE` or the input
+        // event queue at all (unlike `ConsoleStdinReader`), so it cannot race with or steal
+        // events from the existing stdin reader thread -- `GetConsoleScreenBufferInfo` reads the
+        // *output* buffer's window-size state, a wholly separate API surface.
+        std::thread::Builder::new()
+            .name("litebox-console-resize-watcher".to_owned())
+            .spawn(console_resize_watcher_thread_body)
+            .expect("failed to spawn console resize watcher thread");
+
+        Box::leak(Box::new(platform))
+    }
+
+    /// Reinterprets `&self` as `&'static Self`.
+    ///
+    /// # Why this is sound
+    ///
+    /// [`Self::new`] always returns its result from `Box::leak`, and this crate creates exactly
+    /// one `WindowsUserland` per process (there is no `Drop` impl, no way to reclaim the leaked
+    /// allocation, and every entry point that could construct a second instance is either test-only
+    /// or documented as such) -- so any `&self` reachable from an instance method is, in practice,
+    /// already borrowed from that single `'static` allocation. This exists specifically for
+    /// [`ConsoleStdinReader::get`], whose background reader thread must outlive the calling stack
+    /// frame (see its doc comment); every other instance method continues to take a plain `&self`
+    /// with its natural (shorter, borrow-checked) lifetime, so this cast is used only where a
+    /// `'static` bound is genuinely required, not as a blanket escape hatch.
+    fn as_static(&self) -> &'static Self {
+        // Safety: see the doc comment above -- `self` is always ultimately derived from a
+        // `Box::leak`'d allocation with no legitimate way to outlive the process.
+        unsafe { &*core::ptr::from_ref(self) }
+    }
+
+    fn read_memory_maps<const ALIGN: usize>() -> alloc::vec::Vec<core::ops::Range<usize>> {
+        let mut reserved_pages = alloc::vec::Vec::new();
+        let mut address = 0usize;
+        // Only regions inside the guest's own addressable range are ever meaningful to
+        // `Vmem`'s placement logic (see `TASK_ADDR_MAX`'s and `HOST_ALLOCATOR_REGION_MIN`'s doc
+        // comments): anything at or above `TASK_ADDR_MAX` belongs to the host process itself
+        // (its own stack, loaded modules, TEB, and -- since this split was introduced -- the
+        // host global allocator's own reserved region) and must never be recorded as "reserved
+        // guest space". Recording it anyway would make `Vmem::new_excluding`'s
+        // `last_range_value()` see a spurious high-address entry, defeating the top-down
+        // placement fast path and forcing every guest allocation through the slower gap-search
+        // fallback -- or exhausting it outright once `TASK_ADDR_MAX` sits meaningfully below the
+        // real top of the process address space (confirmed live: this broke ordinary anonymous
+        // `mmap`/`mremap` once `TASK_ADDR_MAX` was lowered by 64 GiB to make room for
+        // `HOST_ALLOCATOR_REGION_MIN`).
+        let task_addr_max =
+            <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::TASK_ADDR_MAX;
+
+        loop {
+            if address >= task_addr_max {
+                break;
+            }
+            let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+            let ok = unsafe {
+                Win32_Memory::VirtualQuery(
+                    address as *const c_void,
+                    &raw mut mbi,
+                    core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+                ) != 0
+            };
+            if !ok {
+                break;
+            }
+
+            if mbi.State == Win32_Memory::MEM_RESERVE || mbi.State == Win32_Memory::MEM_COMMIT {
+                let start = mbi.BaseAddress as usize;
+                let end = (start + mbi.RegionSize).min(task_addr_max);
+                if start < end {
+                    reserved_pages.push(core::ops::Range { start, end });
+                }
+            }
+
+            address = mbi.BaseAddress as usize + mbi.RegionSize;
+            if address == 0 {
+                break;
+            }
+        }
+
+        reserved_pages
+    }
+
+    /// Retrieves information about the host platform (Windows).
+    fn get_system_information(sys_info: &mut Win32_SysInfo::SYSTEM_INFO) {
+        unsafe {
+            Win32_SysInfo::GetSystemInfo(sys_info);
+        }
+    }
+
+    fn round_up_to_granu(&self, x: usize) -> usize {
+        let gran = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
+        (x + gran - 1) & !(gran - 1)
+    }
+
+    fn round_down_to_granu(&self, x: usize) -> usize {
+        let gran = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
+        x & !(gran - 1)
+    }
+
+    pub fn init_task(&self) -> litebox_common_linux::TaskParams {
+        // TODO: Currently we are using a static thread ID and credentials (faked).
+        // This is a placeholder for future implementation to use passthrough.
+        //
+        // Credentials are root (uid/gid 0), matching a real container's initial process (a
+        // fresh OCI/container rootfs such as Alpine ships `/`, `/etc`, `/lib`, etc. root-owned
+        // at mode 0755, and its init process runs as root absent an explicit `USER` directive).
+        // Callers that build the guest's file system (e.g.
+        // `litebox_runner_linux_on_windows_userland`) must set the in-memory file system's
+        // persistent user to match via `litebox::fs::in_mem::FileSystem::set_default_user`, or
+        // `getuid()` will disagree with what the filesystem layer's permission checks enforce.
+        litebox_common_linux::TaskParams {
+            pid: 1000,
+            // TODO: placeholder for actual PPID
+            ppid: 0,
+            uid: 0,
+            gid: 0,
+            euid: 0,
+            egid: 0,
+        }
+    }
+}
+
+impl litebox::platform::Provider for WindowsUserland {}
+
+impl litebox::platform::SignalProvider for WindowsUserland {
+    type Signal = litebox_common_linux::signal::Signal;
+
+    fn take_pending_signals(&self, mut f: impl FnMut(Self::Signal)) {
+        let bits = get_tls_ptr().map_or(0, |p| {
+            unsafe { &*p }
+                .pending_host_signals
+                .swap(0, Ordering::SeqCst)
+        });
+        let sigs = litebox_common_linux::signal::SigSet::from_u64(u64::from(bits));
+        for signal in sigs {
+            f(signal);
+        }
+    }
+}
+
+/// Ensures the module-wide TLS slot index ([`TLS_INDEX`]) has been allocated.
+///
+/// This must be called before any code that reads `TLS_INDEX`. Both
+/// [`run_thread`] (guest threads) and `WindowsUserland`'s `ThreadProvider::run_test_thread`
+/// (test threads, only present in `#[cfg(debug_assertions)]` builds) go through here.
+fn ensure_tls_index() {
+    // Allocate a TLS slot for this module if not already done. This is used as
+    // a place to store data across calls to the guest, since all the registers
+    // are used by the guest and will be clobbered.
+    //
+    // We use this instead of native TLS because accesses are easier from
+    // assembly. In particular, finding the module's TLS base requires extra
+    // registers and/or clobbering flags, whereas we can get the value of a
+    // TLS slot with only one register and no changes to flags.
+    static REGISTER_KEY: std::sync::Once = const { std::sync::Once::new() };
+    REGISTER_KEY.call_once(|| {
+        let index = unsafe { windows_sys::Win32::System::Threading::TlsAlloc() };
+        assert!(
+            index < 64,
+            "no non-extended TLS slots available: {index:#x}"
+        );
+        TLS_INDEX.store(index, Ordering::Relaxed);
+    });
+}
+
+/// Runs a guest thread using the provided shim and the given initial context.
+///
+/// This will run until the thread terminates.
+///
+/// # Safety
+/// The context must be valid guest context.
+pub unsafe fn run_thread(
+    shim: impl litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    ctx: &mut litebox_common_linux::PtRegs,
+) {
+    ensure_tls_index();
+    run_thread_inner(&shim, ctx, None);
+}
+
+/// Identical to [`run_thread`], but additionally arms [`fork_verify`]'s post-fork stale-pointer
+/// single-step verification for this thread -- the cross-process fork() child's equivalent of what
+/// the thread-based fork path's own `ThreadInitState::ForkedChild` dispatch achieves via
+/// `EnterShim::init` (`litebox_shim_linux/src/syscalls/process.rs`'s `begin_fork_child_verification`
+/// call, itself invoked from inside `run_thread_arch`'s guest-entry machinery, strictly after TLS
+/// installation).
+///
+/// # Why this exists (pass 143)
+///
+/// A cross-process fork() child is built via `LinuxShim::adopt_forked_process`, not `do_clone`'s
+/// same-process `ThreadInitState::ForkedChild` path, so it never goes through that dispatch. Before
+/// this function existed, callers (the diagnostic/production task-resume probes in
+/// `litebox_runner_linux_on_windows_userland`) called
+/// `ForkChildVerificationProvider::begin_fork_child_verification` directly, BEFORE calling
+/// [`run_thread`] -- but that provider method's own implementation (`fork_verify::begin`) only takes
+/// effect if `get_tls_ptr()` returns `Some`, which is only true from partway through
+/// [`run_thread`]'s own internals ([`ThreadHandle::run_with_handle`]'s `install_tls` call) onward.
+/// Called too early, `fork_verify::begin`'s `tls.fork_verify = Some(relocations)` step was silently
+/// a no-op (the `if let Some(tls) = get_tls_ptr()` guard simply never entered its body), leaving
+/// `fork_verify::is_verifying` permanently `false` for the whole resumed thread -- the guest's
+/// single-step healing regime never engaged, and any stale pointer left over from the parent's
+/// `WriteProcessMemory` memory copy went completely unrepaired, producing an unexplained
+/// `STATUS_ACCESS_VIOLATION` on the guest's very first few instructions with zero VEH trace output
+/// (the SAME symptom shape as a missing FS base, but a distinct root cause).
+///
+/// # Safety
+/// Same contract as [`run_thread`].
+pub unsafe fn run_thread_with_fork_verification(
+    shim: impl litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    ctx: &mut litebox_common_linux::PtRegs,
+    relocations: Arc<litebox::mm::AddressRelocations>,
+) {
+    ensure_tls_index();
+    run_thread_inner(&shim, ctx, Some(relocations));
+}
+
+fn run_thread_inner(
+    shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    ctx: &mut litebox_common_linux::PtRegs,
+    fork_verify_relocations: Option<Arc<litebox::mm::AddressRelocations>>,
+) {
+    let tls_state = TlsState::new();
+    tls_state
+        .guest_context_top
+        .set(std::ptr::from_mut(ctx).wrapping_add(1));
+
+    let mut thread_ctx = ThreadContext {
+        shim,
+        ctx,
+        tls: &tls_state,
+    };
+    ThreadHandle::run_with_handle(&tls_state, || unsafe {
+        // Arm fork_verify (if requested) strictly AFTER `run_with_handle`'s own `install_tls` call
+        // (already done by the time this closure body runs) and strictly BEFORE `run_thread_arch`
+        // ever resumes guest code -- see this function's caller, `run_thread_with_fork_verification`,
+        // for why the timing matters.
+        if let Some(relocations) = fork_verify_relocations {
+            fork_verify::begin(relocations);
+        }
+        run_thread_arch(&mut thread_ctx, &tls_state);
+    });
+}
+
+static TLS_INDEX: AtomicU32 = AtomicU32::new(u32::MAX);
+
+struct TlsState {
+    host_sp: Cell<*mut u128>,
+    host_bp: Cell<*mut u128>,
+    guest_context_top: Cell<*mut litebox_common_linux::PtRegs>,
+    /// The guest's `xmm0`-`xmm5` (the Windows x64 ABI's *caller-saved* SSE registers) at the
+    /// moment the guest last entered the host via `syscall_callback`. These are deliberately not
+    /// part of `PtRegs` (a Linux ABI-shaped struct whose layout other code depends on via fixed
+    /// byte offsets, e.g. `switch_to_guest_sysret`'s hardcoded field offsets) -- this is
+    /// host-only bookkeeping.
+    ///
+    /// `run_thread_arch`'s prologue already saves/restores `xmm6`-`xmm15` (the ABI's
+    /// *callee*-saved SSE registers) around the entire guest-thread lifetime, because the host
+    /// Rust code that runs between guest entries is a normal Windows x64 callee and is only
+    /// obligated to preserve those. `xmm0`-`xmm5` are caller-saved, so any host code path
+    /// reached from `syscall_callback` (the syscall handler, allocator code it calls into, etc.)
+    /// is free to clobber them -- and every guest resume path (`switch_to_guest_sysret`,
+    /// `switch_to_guest_ntcontinue`/`NtContinue`) previously left whatever value was physically
+    /// in those registers untouched, silently replacing the guest's own `xmm0`-`xmm5` with
+    /// leftover host state on every single syscall return. `NtContinue`'s `CONTEXT` was also
+    /// never given `CONTEXT_FLOATING_POINT`, so the slow resume path had the identical gap.
+    guest_xmm0_5: Cell<[u128; 6]>,
+    /// Mirrors `THREAD_FS_BASE`'s value for this thread, kept in sync by
+    /// `WindowsUserland::set_thread_fs_base`. `THREAD_FS_BASE` itself is a Rust `thread_local!`,
+    /// whose storage location is not reachable from hand-written assembly the way a plain
+    /// `#[repr(Rust)]` struct field is via `core::mem::offset_of!` -- this mirror exists solely so
+    /// `vectored_exception_handler_entry`'s naked fast path can read the saved FS base value
+    /// without depending on `thread_local!`'s internal ABI.
+    guest_fs_base: Cell<usize>,
+    scratch: Cell<usize>,
+    is_in_guest: Cell<bool>,
+    interrupt: Cell<bool>,
+    continue_context:
+        Box<std::cell::UnsafeCell<windows_sys::Win32::System::Diagnostics::Debug::CONTEXT>>,
+    /// Bitmask of pending host-originated signals for this thread.
+    pending_host_signals: AtomicU32,
+    /// Pointer to the `Waker` currently being waited on, or null if not
+    /// waiting.
+    waiting_waker: std::sync::atomic::AtomicPtr<litebox::event::wait::Waker<WindowsUserland>>,
+    /// Whether this host thread has ever entered guest mode before. `switch_to_guest`'s
+    /// `rcx == rip` fast path (`switch_to_guest_sysret`) relies on genuine `sysret`-style CPU
+    /// semantics that are only valid for a thread resuming guest mode after a PRIOR entry via
+    /// the `syscall` instruction on this exact thread; a brand-new host thread's very first
+    /// transition into guest mode (e.g. a `fork()`-created child resuming into a copy of the
+    /// parent's syscall-entry context, where `rcx == rip` holds by coincidence) must always use
+    /// the slower but universally-correct `NtContinue` path instead.
+    has_entered_guest: Cell<bool>,
+    /// The post-`fork()` address-space relocation map this thread's guest execution is being
+    /// verified against, or `None` if this thread is not a `fork()` child under verification.
+    ///
+    /// See [`fork_verify`] and [`litebox::platform::ForkChildVerificationProvider`].
+    fork_verify: RefCell<Option<Arc<litebox::mm::AddressRelocations>>>,
+    /// Count of single-step traps [`fork_verify::on_single_step`] has processed on this thread
+    /// since the most recent [`fork_verify::begin`], used only to bound verification duration for
+    /// an IDENTITY (cross-process) relocation map -- see `MAX_IDENTITY_VERIFICATION_STEPS`'s doc
+    /// comment. Meaningless (and never consulted) once `fork_verify` is `None`; reset to `0` by
+    /// every [`fork_verify::begin`] call, matching that method's own reset of `fork_verify` itself.
+    fork_verify_step_count: Cell<u64>,
+    /// The provenance chain [`fork_verify::on_single_step`] is tracking for the most recent
+    /// explicit-memory-operand read on this thread, or `None` if no register currently carries a
+    /// value traceable back to a specific memory slot this way.
+    ///
+    /// Lets [`fork_verify::on_single_step`] recognize a register-indirect `call reg`/`jmp reg`
+    /// (or a case (2c) memory read) whose target was loaded from a stale memory slot -- possibly
+    /// several instructions earlier, and possibly after the loaded value was advanced by simple
+    /// constant-offset pointer arithmetic (`add`/`sub`/`lea` naming only the tracked register and
+    /// an immediate, e.g. `mov reg, [slot]` then `add reg, 8` then `call reg`) -- so that slot can
+    /// be healed even though the instruction that ultimately uses the stale value has no memory
+    /// operand naming the slot directly, and even though the exact bit pattern read from the slot
+    /// is no longer what is in the register by the time it is used. See
+    /// [`fork_verify::on_single_step`]'s case (2c)/(4) for the full reasoning, including why this
+    /// is restricted to a single register carrying a chain of *purely additive-constant* updates
+    /// from one specific load (never an unbounded history, never more than one register, never an
+    /// update that folds in another register's value) -- a false match against a stale, unrelated
+    /// earlier read, or against ordinary pointer-to-pointer-style double indirection that does not
+    /// actually chain back to the same slot, would risk the same false-positive hazard case (3)'s
+    /// doc comment describes.
+    fork_verify_last_load: Cell<Option<fork_verify::LastLoad>>,
+    /// Backing state for the diagnostic code-page watchpoint (`LITEBOX_CODEWATCH=1`); see
+    /// [`fork_verify`]'s `codewatch` module. A field here rather than a bare `static`, matching
+    /// `WindowsUserland::console_stdin_reader`'s reasoning -- it keeps this diagnostic off the
+    /// crate's ratcheted bare-static count, and per-thread is its natural scope anyway (the
+    /// `fork()` child arms the ranges on its own thread and is the thread that traps on them).
+    codewatch: fork_verify::CodewatchState,
+    /// Backing state for the diagnostic `ctx.rip` hardware watchpoint (`LITEBOX_CTXWATCH=1`); see
+    /// [`ctxwatch`]. A field here rather than a bare `static`/`thread_local!`, same reasoning as
+    /// `codewatch` above: keeps this diagnostic off the crate's ratcheted bare-static count, and
+    /// per-thread is its natural scope (each host OS thread has its own debug registers, and only
+    /// the thread arming the watchpoint ever needs to recognize/disarm its own).
+    ctxwatch: ctxwatch::State,
+}
+
+// SAFETY: `TlsState` is always constructed on one thread and handed to another via
+// `spawn_thread` (built on the spawning thread so a fault during construction is diagnosable,
+// see `thread_start`'s doc comment), then used exclusively by that new thread from
+// `run_with_handle` onward -- its `Cell`/raw-pointer fields are never accessed concurrently by
+// two threads at once, matching `install_tls`'s own safety contract that `tls` remains valid and
+// single-threaded-owned for the duration of its use.
+unsafe impl Send for TlsState {}
+
+/// Scratch space (in bytes) reserved below `host_sp` for the `EXCEPTION_RECORD` that
+/// `vectored_exception_handler` writes when redirecting to `exception_callback`. Must be
+/// large enough to hold a full `EXCEPTION_RECORD` (152 bytes on x86_64) plus alignment slack,
+/// and must keep clear of `[host_sp]`/`[host_sp + 8]`, where `run_thread_arch`'s prologue
+/// pushes `thread_ctx` -- `exception_callback` (like `syscall_callback` and
+/// `interrupt_callback`) reads `thread_ctx` back via `[rsp]`, so `Rsp` is always set to
+/// `host_sp` itself, unmodified; the exception record lives in this separate reserve instead
+/// of overlapping the `Rsp` landing spot.
+///
+/// Must ALSO stay clear of `exception_handler`'s own stack frame: `exception_callback` sets
+/// `Rsp = host_sp` before calling it (see above), so `exception_handler`'s locals grow downward
+/// from the exact same address this reserve is computed relative to. A too-small reserve here
+/// lets that frame's own stack usage overlap and overwrite the just-written record before
+/// `exception_handler` ever reads it. Confirmed live (root-caused via a write-then-immediate-
+/// readback diagnostic in `vectored_exception_handler`, matching the written code, paired with a
+/// diagnostic at `exception_handler`'s own first line reading back a DIFFERENT code at the exact
+/// same address, with no intervening exception dispatch and `EFLAGS.TF` confirmed clear the
+/// whole time -- ruling out re-entrancy, leaving frame-overlap as the only remaining
+/// explanation): `/bin/sh` executing a script FILE (not `-c "..."`, which never reproduced this)
+/// drives `fork_verify`'s single-step verification deep enough, combined with a debug-build
+/// (unoptimized, larger-than-release) `exception_handler` frame -- itself containing a sizeable
+/// `LITEBOX_DIAG_MALLOCNG`-gated diagnostic block with several local buffers plus the full
+/// exception-dispatch `match` -- to exceed the previous 4096-byte reserve and corrupt
+/// `ExceptionCode` before it was read, surfacing as a spurious "Unhandled Win32 exception code"
+/// panic for what was actually a legitimate, already-handled `STATUS_PRIVILEGED_INSTRUCTION`
+/// mallocng trap.
+///
+/// Widened generously (16x) rather than heap-allocating the record: this scratch write happens
+/// on the exception-dispatch hot path, potentially while the guest's own allocator lock is held
+/// (the mallocng trap this bug was found via is itself an allocator-internal assertion) --
+/// allocating here risks reentering a possibly-already-locked allocator. A fixed, generously-
+/// sized stack-relative reserve avoids that risk entirely; `exception_handler`'s frame is a
+/// fraction of 64KiB even accounting for every diagnostic branch's locals.
+const EXCEPTION_RECORD_RESERVE: usize = 65536;
+
+impl TlsState {
+    /// Creates a new `TlsState` with all fields zeroed / defaulted.
+    fn new() -> Self {
+        Self {
+            host_sp: Cell::new(core::ptr::null_mut()),
+            host_bp: Cell::new(core::ptr::null_mut()),
+            guest_context_top: core::ptr::null_mut::<litebox_common_linux::PtRegs>().into(),
+            guest_xmm0_5: Cell::new([0; 6]),
+            guest_fs_base: Cell::new(0),
+            scratch: 0.into(),
+            is_in_guest: false.into(),
+            interrupt: false.into(),
+            continue_context: Box::default(),
+            pending_host_signals: AtomicU32::new(0),
+            waiting_waker: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            has_entered_guest: false.into(),
+            fork_verify: RefCell::new(None),
+            fork_verify_step_count: Cell::new(0),
+            fork_verify_last_load: Cell::new(None),
+            codewatch: fork_verify::CodewatchState::new(),
+            ctxwatch: ctxwatch::State::new(),
+        }
+    }
+}
+
+/// Stores `tls` in the current thread's Windows TLS slot.
+///
+/// # Safety
+///
+/// The caller must ensure `tls` remains valid for the duration of its use.
+unsafe fn install_tls(tls: &TlsState) {
+    let tls_index = TLS_INDEX.load(Ordering::Relaxed);
+    unsafe {
+        windows_sys::Win32::System::Threading::TlsSetValue(
+            tls_index,
+            core::ptr::from_ref(tls).cast(),
+        );
+    }
+}
+
+/// Clears the current thread's Windows TLS slot.
+fn uninstall_tls() {
+    let tls_index = TLS_INDEX.load(Ordering::Relaxed);
+    unsafe { windows_sys::Win32::System::Threading::TlsSetValue(tls_index, core::ptr::null()) };
+}
+
+fn get_tls_ptr() -> Option<*const TlsState> {
+    let tls_index = TLS_INDEX.load(Ordering::Relaxed);
+    if tls_index == u32::MAX {
+        return None;
+    }
+    let ptr =
+        unsafe { windows_sys::Win32::System::Threading::TlsGetValue(tls_index).cast::<TlsState>() };
+    if ptr.is_null() {
+        return None;
+    }
+    Some(ptr)
+}
+
+/// Runs the guest thread until it terminates.
+///
+/// This saves all non-volatile register state then switches to the guest
+/// context. When the guest makes a syscall, it jumps back into the middle of
+/// this routine, at `syscall_callback`. This code then updates the guest
+/// context structure, switches back to the host stack, and calls the syscall
+/// handler.
+///
+/// When the guest thread terminates, this function returns after restoring
+/// non-volatile register state.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+unsafe extern "C-unwind" fn run_thread_arch(thread_ctx: &mut ThreadContext, tls_state: &TlsState) {
+    core::arch::naked_asm!(
+    "
+    .seh_proc run_thread
+    // Push all non-volatiles
+    push rbp
+    .seh_pushreg rbp
+    mov rbp, rsp
+    .seh_setframe rbp, 0
+    push rbx
+    .seh_pushreg rbx
+    push rdi
+    .seh_pushreg rdi
+    push rsi
+    .seh_pushreg rsi
+    push r12
+    .seh_pushreg r12
+    push r13
+    .seh_pushreg r13
+    push r14
+    .seh_pushreg r14
+    push r15
+    .seh_pushreg r15
+    sub rsp, 168 // align + space for xmm6-xmm15
+    .seh_stackalloc 168
+    movdqa [rsp + 0*16], xmm6
+    .seh_savexmm xmm6, 0*16
+    movdqa [rsp + 1*16], xmm7
+    .seh_savexmm xmm7, 1*16
+    movdqa [rsp + 2*16], xmm8
+    .seh_savexmm xmm8, 2*16
+    movdqa [rsp + 3*16], xmm9
+    .seh_savexmm xmm9, 3*16
+    movdqa [rsp + 4*16], xmm10
+    .seh_savexmm xmm10, 4*16
+    movdqa [rsp + 5*16], xmm11
+    .seh_savexmm xmm11, 5*16
+    movdqa [rsp + 6*16], xmm12
+    .seh_savexmm xmm12, 6*16
+    movdqa [rsp + 7*16], xmm13
+    .seh_savexmm xmm13, 7*16
+    movdqa [rsp + 8*16], xmm14
+    .seh_savexmm xmm14, 8*16
+    movdqa [rsp + 9*16], xmm15
+    .seh_savexmm xmm15, 9*16
+    .seh_endprologue
+
+    // Offset into the TEB (gs segment) where TLS slots are stored.
+    .equ TEB_TLS_SLOTS_OFFSET, 5248
+
+    push    rcx // Alignment
+    push    rcx // Save thread_ctx
+
+    // Save the host rsp and rbp into the TLS state.
+    mov     QWORD PTR [rdx + {HOST_SP}], rsp
+    mov     QWORD PTR [rdx + {HOST_BP}], rbp
+
+    call {init_handler}
+    jmp .Ldone
+
+    // This entry point is called from the guest when it issues a syscall
+    // instruction.
+    //
+    // At entry, the register context is the guest context with the
+    // return address in rcx. r11 is an available scratch register (it would
+    // contain rflags if the syscall instruction had actually been issued).
+    .globl  syscall_callback
+syscall_callback:
+    // Get the TLS state from the TLS slot, save the guest's own rsp into TlsState, and switch
+    // rsp to the host-owned guest-context stack BEFORE touching the real stack pointer in any
+    // way (no push/pop, no [rsp]-relative access of any kind up to this point). This ordering
+    // is load-bearing: a guest thread that just munmap'd its own stack as the last step of
+    // musl's `pthread_exit`/`__unmapself` idiom (real Linux's own version of this idiom
+    // deliberately touches zero stack bytes between the munmap and its own exit syscall, which
+    // is what makes it safe there) reaches this trampoline for that immediately-following exit
+    // syscall with `rsp` still pointing into the region it just unmapped -- any push/pop before
+    // this switch (the previous code had `pushfq`/`and`/`popfq` here first) writes into freed,
+    // decommitted memory and raises an unhandled, VEH-invisible access violation. Every
+    // instruction below, up to and including the `mov rsp, ...`, is register/memory-operand
+    // only (`[r11 + ...]`, `[rip + ...]`, `gs:[...]`) and never dereferences `[rsp]` itself, so
+    // it is safe regardless of whether the guest's own stack is still mapped.
+    mov     r11d, DWORD PTR [rip + {TLS_INDEX}]
+    mov     r11, QWORD PTR gs:[r11 * 8 + TEB_TLS_SLOTS_OFFSET]
+    mov     QWORD PTR [r11 + {SCRATCH}], rsp
+    mov     rsp, QWORD PTR [r11 + {GUEST_CONTEXT_TOP}]
+
+    // Clear EFLAGS.TF in the live CPU flags. The guest reaches here via a call (the syscall
+    // rewriter's trampoline for every guest syscall instruction, not a real syscall), which is
+    // itself the next instruction a fork() child under fork_verify single-step verification was
+    // stepped through -- so if TF was armed, it is still live in the CPU's real flags register
+    // at this point, and every subsequent host instruction here (the register spills below, the
+    // call into the syscall handler, ...) would otherwise raise its own single-step trap while
+    // is_in_guest is about to be (or has just been) cleared, i.e. exactly the state
+    // vectored_exception_handler does not have a fork_verify handler for -- an unhandled
+    // EXCEPTION_SINGLE_STEP (STATUS_SINGLE_STEP, 0x80000004) that tears down the whole host
+    // process instead of just the child. pushfq/and/popfq now runs on the host-owned stack
+    // (rsp was already switched above), so it is always safe regardless of the guest stack's
+    // state.
+    pushfq
+    and     QWORD PTR [rsp], 0xfffffffffffffeff
+    popfq
+    // Clear the in-guest flag.
+    mov     BYTE PTR [r11 + {IS_IN_GUEST}], 0
+    // Save the guest's caller-saved xmm0-xmm5 into TlsState before any other host code (which
+    // is free to clobber them) runs. xmm6-xmm15 are already protected for the whole guest-thread
+    // lifetime by run_thread_arch's own prologue/epilogue; these are the remaining, previously
+    // unsaved ones. Must happen before the `call {syscall_handler}` below.
+    movups  XMMWORD PTR [r11 + {GUEST_XMM0_5} + 0*16], xmm0
+    movups  XMMWORD PTR [r11 + {GUEST_XMM0_5} + 1*16], xmm1
+    movups  XMMWORD PTR [r11 + {GUEST_XMM0_5} + 2*16], xmm2
+    movups  XMMWORD PTR [r11 + {GUEST_XMM0_5} + 3*16], xmm3
+    movups  XMMWORD PTR [r11 + {GUEST_XMM0_5} + 4*16], xmm4
+    movups  XMMWORD PTR [r11 + {GUEST_XMM0_5} + 5*16], xmm5
+
+    // Save caller-saved registers
+    push    0x2b       // pt_regs->ss = __USER_DS
+    push    QWORD PTR [r11 + {SCRATCH}] // pt_regs->sp
+    pushfq             // pt_regs->eflags
+    push    0x33       // pt_regs->cs = __USER_CS
+    push    rcx        // pt_regs->ip
+    push    rax        // pt_regs->orig_ax
+
+    push    rdi         // pt_regs->di
+    push    rsi         // pt_regs->si
+    push    rdx         // pt_regs->dx
+    push    rcx         // pt_regs->cx
+    push    -38         // pt_regs->ax = ENOSYS
+    push    r8          // pt_regs->r8
+    push    r9          // pt_regs->r9
+    push    r10         // pt_regs->r10
+    push    [rsp + 88]  // pt_regs->r11 = rflags
+    push    rbx         // pt_regs->bx
+    push    rbp         // pt_regs->bp
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+
+    /// Reestablish the stack and frame pointers.
+    mov     rsp, [r11 + {HOST_SP}]
+    mov     rbp, [r11 + {HOST_BP}]
+
+    // Handle the syscall. This will jump back to the guest but
+    // will return if the thread is exiting.
+    mov  rcx, QWORD PTR [rsp] // thread_ctx
+    call {syscall_handler}
+    jmp .Ldone
+
+exception_callback:
+    // Handle the exception. The stack and frame pointers are already restored,
+    // and the guest context is up to date. rcx contains a pointer to the
+    // guest pt_regs, and rdx contains a pointer to the exception record.
+    mov  rcx, QWORD PTR [rsp] // thread_ctx
+    call {exception_handler}
+    jmp .Ldone
+
+interrupt_callback:
+    mov  rcx, QWORD PTR [rsp] // thread_ctx
+    call {interrupt_handler}
+    jmp .Ldone
+
+.Ldone:
+    // Restore non-volatile registers and return.
+    lea  rsp, [rbp - (168 + 56)]
+    movdqa xmm6, [rsp + 0*16]
+    movdqa xmm7, [rsp + 1*16]
+    movdqa xmm8, [rsp + 2*16]
+    movdqa xmm9, [rsp + 3*16]
+    movdqa xmm10, [rsp + 4*16]
+    movdqa xmm11, [rsp + 5*16]
+    movdqa xmm12, [rsp + 6*16]
+    movdqa xmm13, [rsp + 7*16]
+    movdqa xmm14, [rsp + 8*16]
+    movdqa xmm15, [rsp + 9*16]
+    add rsp, 168 // 10 * 16 + 8 (for stack alignment)
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rsi
+    pop  rdi
+    pop  rbx
+    pop  rbp
+    ret
+    .seh_endproc
+    ",
+    init_handler = sym init_handler,
+    syscall_handler = sym syscall_handler,
+    exception_handler = sym exception_handler,
+    interrupt_handler = sym interrupt_handler,
+    TLS_INDEX = sym TLS_INDEX,
+    HOST_SP = const core::mem::offset_of!(TlsState, host_sp),
+    HOST_BP = const core::mem::offset_of!(TlsState, host_bp),
+    GUEST_CONTEXT_TOP = const core::mem::offset_of!(TlsState, guest_context_top),
+    GUEST_XMM0_5 = const core::mem::offset_of!(TlsState, guest_xmm0_5),
+    SCRATCH = const core::mem::offset_of!(TlsState, scratch),
+    IS_IN_GUEST = const core::mem::offset_of!(TlsState, is_in_guest),
+    );
+}
+
+thread_local! {
+    /// All per-thread state for the `LITEBOX_DIAG_WAIT4GATE` diagnostics, in one thread-local.
+    static DIAG: RefCell<DiagState> = const { RefCell::new(DiagState::new()) };
+}
+
+/// Number of recent guest resumes [`DiagState::history`] retains per thread.
+const DIAG_RESUME_HISTORY_LEN: usize = 8;
+
+/// One recorded guest resume: `(orig_rax, rip, rcx, rsp, rax)`.
+type DiagResume = (usize, usize, usize, usize, usize);
+
+/// Per-thread state backing the `LITEBOX_DIAG_WAIT4GATE` diagnostics.
+///
+/// Purely a debugging aid, and entirely inert unless that environment variable is set: nothing
+/// here is required for correctness, and no field is read except by the diagnostic prints in
+/// [`vectored_exception_handler`].
+struct DiagState {
+    /// Cache of whether the diagnostics are enabled, `None` until first queried. Caching this
+    /// per thread keeps the guest-resume path off the environment-lookup path when unset.
+    enabled: Option<bool>,
+    /// Which resume path (`"sysret"`/`"ntcontinue"`) this thread last took, so a crash handler
+    /// can report which one was in effect for the resume immediately preceding a fault.
+    last_resume_path: &'static str,
+    /// Ring buffer of this thread's most recent resumes, plus the running total, so a crash
+    /// handler can print the exact sequence of resumes leading up to a fault.
+    history: (usize, [DiagResume; DIAG_RESUME_HISTORY_LEN]),
+    /// Pass-30: `faulting_rsp - 8` recorded by the `[diag-rip0]` block, consumed once (after
+    /// `ctxwatch::disarm()` runs later in the same `vectored_exception_handler` call) to arm the
+    /// reactive guest-stack-slot watchpoint. `None` when no fault has queued an address yet, or
+    /// after it has already been consumed.
+    pending_watch_addr: Option<usize>,
+}
+
+impl DiagState {
+    const fn new() -> Self {
+        Self {
+            enabled: None,
+            last_resume_path: "none",
+            history: (0, [(0, 0, 0, 0, 0); DIAG_RESUME_HISTORY_LEN]),
+            pending_watch_addr: None,
+        }
+    }
+}
+
+/// Diagnostic-only (`LITEBOX_DIAG_WAIT4GATE=1`): records `faulting_rsp - 8` -- the guest stack
+/// slot proven (pass 28/29) to hold the bad zero a null-branching guest read -- for the reactive
+/// watchpoint armed later in the same `vectored_exception_handler` call, after `ctxwatch::disarm()`
+/// runs.
+fn diag_pending_watch_addr(faulting_rsp: u64) {
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "diagnostic-only; this platform is x86_64-only, so rsp fits in usize"
+    )]
+    let addr = (faulting_rsp as usize).wrapping_sub(8);
+    DIAG.with_borrow_mut(|d| d.pending_watch_addr = Some(addr));
+}
+
+/// Diagnostic-only (`LITEBOX_DIAG_WAIT4GATE=1`): takes (clears) this thread's pending reactive
+/// watch address, if any, set by [`diag_pending_watch_addr`] earlier in the same VEH call.
+fn diag_take_pending_watch_addr() -> Option<usize> {
+    DIAG.with_borrow_mut(|d| d.pending_watch_addr.take())
+}
+
+/// Diagnostic-only (`LITEBOX_DIAG_WAIT4GATE=1`): records one guest resume, along with which path
+/// it took, into this thread's [`DiagState`].
+fn diag_record_resume(path: &'static str, ctx: &litebox_common_linux::PtRegs) {
+    DIAG.with_borrow_mut(|d| {
+        d.last_resume_path = path;
+        let n = d.history.0;
+        d.history.1[n % DIAG_RESUME_HISTORY_LEN] =
+            (ctx.orig_rax, ctx.rip, ctx.rcx, ctx.rsp, ctx.rax);
+        d.history.0 = n.wrapping_add(1);
+    });
+}
+
+/// Diagnostic-only: formats this thread's last resume path and recent-resume history, oldest
+/// first.
+fn diag_resume_history() -> String {
+    use core::fmt::Write as _;
+    DIAG.with_borrow(|d| {
+        let (total, ring) = d.history;
+        let shown = total.min(DIAG_RESUME_HISTORY_LEN);
+        let mut out = format!("last_resume_path={} total={total}", d.last_resume_path);
+        for i in (0..shown).rev() {
+            let (orig_rax, rip, rcx, rsp, rax) = ring[(total - 1 - i) % DIAG_RESUME_HISTORY_LEN];
+            let _ = write!(
+                out,
+                " | -{i}: orig_rax={orig_rax:#x} rip={rip:#x} rcx={rcx:#x} rsp={rsp:#x} rax={rax:#x}"
+            );
+        }
+        out
+    })
+}
+
+/// Switches to the provided guest context.
+///
+/// # Safety
+/// The context must be valid guest context. This can only be called if
+/// `run_thread_arch` is on the stack; after the guest exits, it will return to
+/// the interior of `run_thread_arch`.
+///
+/// Do not call this at a point where the stack needs to be unwound to run
+/// destructors.
+///
+unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
+    #[unsafe(naked)]
+    extern "C" fn switch_to_guest_sysret(ctx: &litebox_common_linux::PtRegs) -> ! {
+        // SAFETY/CORRECTNESS NOTE: this function must never repoint the real CPU `rsp`
+        // at `ctx`'s own backing memory (a `&PtRegs`, not a real guarded stack) while
+        // any GPR field is still unread. Doing so leaves a window in which any
+        // synchronous, thread-local event (SEH/VEH dispatch, a debug/trace trap, or
+        // any other mechanism that pushes data onto "the current stack") would corrupt
+        // not-yet-consumed fields -- including `rip`/`rcx` -- before they are used.
+        // Every GPR is therefore addressed directly off `rcx` (the `ctx` pointer, per
+        // the `extern "C"` ABI) via fixed offsets matching `PtRegs`'s `#[repr(C)]`
+        // field order, and the real `rsp` is set to the guest's `rsp` only in the
+        // second-to-last instruction, immediately before the final `jmp`, mirroring
+        // the same narrow, unavoidable gap the original fast path already had at its
+        // very end.
+        core::arch::naked_asm!(
+            "switch_to_guest_start:",
+            // `rcx` (the `ctx` pointer, per the extern "C" ABI) is the base for every
+            // field read below, addressed by fixed offset matching `PtRegs`'s
+            // `#[repr(C)]` field order: r15=0x00 r14=0x08 r13=0x10 r12=0x18 rbp=0x20
+            // rbx=0x28 r11=0x30 r10=0x38 r9=0x40 r8=0x48 rax=0x50 rcx=0x58 rdx=0x60
+            // rsi=0x68 rdi=0x70 orig_rax=0x78 rip=0x80 cs=0x88 eflags=0x90 rsp=0x98.
+            //
+            // The real `rsp` is never repointed at `ctx`'s own backing memory --
+            // every GPR is loaded directly into its final register while `rsp` still
+            // refers to the real (host) stack, which remains valid the entire time,
+            // so any synchronous, thread-local event (SEH/VEH dispatch, a debug/trace
+            // trap, etc.) that lands during this window pushes onto real stack
+            // memory, never onto `ctx`'s fields. `rcx` itself (the base pointer) is
+            // the very last register loaded, immediately before the jump, the same
+            // way the original fast path only set the real `rsp` immediately before
+            // its own final `jmp rcx`. Like the original fast path, this relies on
+            // the sysret-entry invariant `ctx.rcx == ctx.rip` (checked by the caller
+            // before choosing this path): `rcx` is used as the `ctx` base pointer for
+            // every field read, then overwritten with `ctx.rip` (equal to `ctx.rcx`
+            // by that invariant) as its own final value immediately before the jump.
+            "mov r15, [rcx + 0x00]",
+            "mov r14, [rcx + 0x08]",
+            "mov r13, [rcx + 0x10]",
+            "mov r12, [rcx + 0x18]",
+            "mov rbp, [rcx + 0x20]",
+            "mov rbx, [rcx + 0x28]",
+            "mov r11, [rcx + 0x30]",
+            "mov r10, [rcx + 0x38]",
+            "mov r9,  [rcx + 0x40]",
+            "mov r8,  [rcx + 0x48]",
+            "mov rax, [rcx + 0x50]",
+            "mov rdx, [rcx + 0x60]",
+            "mov rsi, [rcx + 0x68]",
+            "mov rdi, [rcx + 0x70]",
+            // Stage and restore `eflags` on the still-valid real (host) stack --
+            // ordinary `push`/`popfq` here are no different from any other function
+            // using its own stack; it is not the hazardous "rsp points into a
+            // struct" pattern, since `rsp` itself has not moved yet. Only once
+            // `eflags` is fully restored does `rsp` adopt the guest's real value, in
+            // a single `mov`, immediately followed by the jump -- the same narrow,
+            // unavoidable gap the original fast path already had at its own end.
+            "push qword ptr [rcx + 0x90]", // eflags
+            "popfq",                       // restore guest eflags, from the real host stack
+            "mov rsp, [rcx + 0x98]",       // adopt the guest's real rsp
+            "mov rcx, [rcx + 0x80]",       // guest rip -> rcx (also satisfies the sysret
+            // ABI invariant that rcx == rip on guest entry)
+            "jmp rcx", // jump to guest rip
+            "switch_to_guest_end:",
+        );
+    }
+
+    fn switch_to_guest_ntcontinue(tls: &TlsState, ctx: &litebox_common_linux::PtRegs) -> ! {
+        use litebox::utils::ReinterpretSignedExt;
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_INTEGER_AMD64,
+        };
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtContinue(
+                ctx: *const CONTEXT,
+                raise_alert: u8,
+            ) -> windows_sys::Win32::Foundation::NTSTATUS;
+        }
+        let win_ctx = tls.continue_context.get();
+        // SAFETY: no other code accesses `continue_context` while `is_in_guest` is false.
+        unsafe {
+            win_ctx.write(CONTEXT {
+                ContextFlags: CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64,
+                // `EFLAGS.TF` is never present in `ctx.eflags` (it is masked out of every
+                // guest-visible eflags value); it is added here, and only here, when this thread
+                // is a `fork()` child under verification -- arming the single-step trap that
+                // `fork_verify` uses to inspect each of the child's instructions.
+                EFlags: (ctx.eflags | fork_verify::entry_eflags_tf(tls)).trunc(),
+                Rax: ctx.rax as u64,
+                Rcx: ctx.rcx as u64,
+                Rdx: ctx.rdx as u64,
+                Rbx: ctx.rbx as u64,
+                Rsp: ctx.rsp as u64,
+                Rbp: ctx.rbp as u64,
+                Rsi: ctx.rsi as u64,
+                Rdi: ctx.rdi as u64,
+                R8: ctx.r8 as u64,
+                R9: ctx.r9 as u64,
+                R10: ctx.r10 as u64,
+                R11: ctx.r11 as u64,
+                R12: ctx.r12 as u64,
+                R13: ctx.r13 as u64,
+                R14: ctx.r14 as u64,
+                R15: ctx.r15 as u64,
+                Rip: ctx.rip as u64,
+                // `CONTEXT_CONTROL_AMD64` covers `SegCs`/`SegSs` in addition to
+                // `Rip`/`Rsp`/`Rbp`/`EFlags` (all of which this literal already sets) -- omitting
+                // them here left them at `CONTEXT::default()`'s zero, i.e. every `NtContinue`-path
+                // resume (every thread's very first resume, and every resume of a `fork()` child
+                // under verification) asked the kernel to establish an invalid/null code and stack
+                // segment selector instead of the guest's real user-mode `0x33`/`0x2b` (see
+                // `litebox_common_linux::arch::USER_CS`/`USER_DS`, which `PtRegs::cs`/`ss` are
+                // always populated with). Populate them explicitly from `ctx.cs`/`ctx.ss`, the
+                // same values the `switch_to_guest_sysret` fast path already restores correctly
+                // via its own `popfq`-preserved segment state. Segment selectors are always
+                // 16-bit values (`ctx.cs`/`ctx.ss` are `usize` only for uniform `PtRegs` field
+                // typing); the exact values written here are always `arch::USER_CS`/`USER_DS`
+                // (`0x33`/`0x2b`), which trivially fit.
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "segment selectors are always 16-bit values (USER_CS/USER_DS)"
+                )]
+                SegCs: ctx.cs as u16,
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "segment selectors are always 16-bit values (USER_CS/USER_DS)"
+                )]
+                SegSs: ctx.ss as u16,
+                ..CONTEXT::default()
+            });
+        }
+        // Ensure the context is written before we set `is_in_guest` so that
+        // `ThreadHandle::interrupt` can see a consistent state.
+        std::sync::atomic::compiler_fence(Ordering::Release);
+        tls.is_in_guest.set(true);
+        unsafe {
+            let status = NtContinue(win_ctx, 0);
+            panic!(
+                "NtContinue failed: {}",
+                std::io::Error::from_raw_os_error(
+                    windows_sys::Win32::Foundation::RtlNtStatusToDosError(status)
+                        .reinterpret_as_signed(),
+                ),
+            );
+        }
+    }
+
+    let tls = unsafe { &*get_tls_ptr().expect("TLS not initialized") };
+    assert!(!tls.is_in_guest.get());
+
+    // Restore fsbase for the guest.
+    WindowsUserland::restore_thread_fs_base();
+
+    // Restore the guest's xmm0-xmm5 (the caller-saved SSE registers, see `guest_xmm0_5`'s doc
+    // comment) as late as possible, immediately before handing control to either resume path --
+    // no host Rust code runs between this and the jump into guest code on either path, so
+    // nothing here can re-clobber them.
+    {
+        let xmm = tls.guest_xmm0_5.get();
+        unsafe {
+            core::arch::asm!(
+                "movups xmm0, [{p} + 0*16]",
+                "movups xmm1, [{p} + 1*16]",
+                "movups xmm2, [{p} + 2*16]",
+                "movups xmm3, [{p} + 3*16]",
+                "movups xmm4, [{p} + 4*16]",
+                "movups xmm5, [{p} + 5*16]",
+                p = in(reg) xmm.as_ptr(),
+                out("xmm0") _, out("xmm1") _, out("xmm2") _,
+                out("xmm3") _, out("xmm4") _, out("xmm5") _,
+                options(nostack, readonly),
+            );
+        }
+    }
+
+    // The fast path for switching to the guest relies on rcx == rip. This is
+    // the common case, because the syscall instruction sets rcx to rip at entry
+    // to the kernel. When this is not the case, we use NtContinue to jump to
+    // the guest with the full register state.
+    //
+    // This is much slower, but it is only used for things like signal handlers,
+    // so it should not be on the critical path.
+    //
+    // The fast path additionally requires this thread to have entered guest mode at least once
+    // before: `switch_to_guest_sysret` relies on genuine `sysret`-style CPU semantics that are
+    // only established by a PRIOR entry into kernel mode via the `syscall` instruction on this
+    // exact thread. A brand-new host thread's first-ever transition (e.g. a `fork()`-created
+    // child resuming into a copy of the parent's syscall-entry context, where `rcx == rip` holds
+    // only by coincidence) must always take the slower `NtContinue` path instead.
+    //
+    // A `fork()` child under verification must likewise always take the `NtContinue` path: it is
+    // the only one that can set `EFLAGS.TF` (the fast path restores eflags from `ctx`, which
+    // never carries TF) to arm the single-step trap `fork_verify` depends on.
+    if ctx.rcx == ctx.rip && tls.has_entered_guest.get() && !fork_verify::is_verifying(tls) {
+        if diag_rip0_enabled() {
+            diag_record_resume("sysret", ctx);
+        }
+        tls.is_in_guest.set(true);
+        switch_to_guest_sysret(ctx)
+    } else {
+        if diag_rip0_enabled() {
+            diag_record_resume("ntcontinue", ctx);
+        }
+        tls.has_entered_guest.set(true);
+        switch_to_guest_ntcontinue(tls, ctx)
+    }
+}
+
+fn thread_start(
+    init_thread: Box<
+        dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
+    >,
+    mut ctx: litebox_common_linux::PtRegs,
+    tls_state: TlsState,
+) {
+    // `tls_state` is constructed by the SPAWNING thread (see `spawn_thread`), not here: any
+    // fault during `TlsState::new()` -- including the heap allocation inside
+    // `continue_context: Box::default()` -- would otherwise run on this brand-new OS thread
+    // BEFORE `install_tls` (called by `run_with_handle` below) has populated this thread's own
+    // Windows TLS slot, hitting the exact same silently-undiagnosable window this function's own
+    // `init_thread.init()` comment below already documents for a different call -- confirmed live
+    // as a 100%-reproducible whole-host-process crash (`labwc`'s own fontconfig-cache pthread
+    // spawn, no `[veh]` trace lines at all) that a fresh `LITEBOX_DIAG_FATALDUMP=1` capture could
+    // not explain until this construction-ordering gap was found by direct code reading.
+    tls_state
+        .guest_context_top
+        .set(std::ptr::from_mut(&mut ctx).wrapping_add(1));
+
+    ThreadHandle::run_with_handle(&tls_state, || {
+        // `init_thread.init()` -- which, for a `fork()` child, does real work capable of
+        // faulting or arming `EFLAGS.TF` (`ThreadInitState::ForkedChild`'s `sys_arch_prctl`/
+        // `begin_fork_child_verification` calls in `litebox_shim_linux`) -- must run strictly
+        // AFTER `install_tls` (done by `run_with_handle` above), never before: this thread's
+        // Windows TLS slot is otherwise still unpopulated, so `vectored_exception_handler`'s
+        // very first check (`get_tls_ptr()`) finds nothing, bails via
+        // `EXCEPTION_CONTINUE_SEARCH`, and every one of this file's own carefully-built
+        // exception repair paths (the FS_BASE-reset repair, fork_verify's single-step healing)
+        // is silently bypassed for any fault raised during that window -- confirmed live as the
+        // cause of a 100%-reproducible stack overflow on `sh -c "a; b"` (any two-command shell
+        // sequence forking a child): `LITEBOX_VEH_TRACE=1` showed zero `[veh]` trace lines
+        // despite a real, dispatched exception, which is only possible via that early-return.
+        let shim = init_thread.init();
+
+        // Allow caller to run some code before we return to the new thread.
+        let mut thread_ctx = ThreadContext {
+            shim: shim.as_ref(),
+            ctx: &mut ctx,
+            tls: &tls_state,
+        };
+        unsafe { run_thread_arch(&mut thread_ctx, &tls_state) };
+    });
+}
+
+impl litebox::platform::ThreadProvider for WindowsUserland {
+    type ExecutionContext = litebox_common_linux::PtRegs;
+    type ThreadSpawnError = std::io::Error;
+    type ThreadHandle = ThreadHandle;
+
+    unsafe fn spawn_thread(
+        &self,
+        ctx: &litebox_common_linux::PtRegs,
+        init_thread: Box<
+            dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
+        >,
+    ) -> Result<(), Self::ThreadSpawnError> {
+        // Guest code (both a brand-new thread's entry point and a `fork()` child resuming via
+        // `ThreadInitState::ForkedChild`) runs directly on this real Windows thread's own stack --
+        // there is no separate emulated guest-stack region (see `switch_to_guest`'s doc comment).
+        // `std::thread::Builder`'s default stack size (1 MiB on Windows) is far smaller than a
+        // Linux guest program is entitled to assume (`DEFAULT_STACK_SIZE` in
+        // `litebox_shim_linux::loader` is 8 MiB, matching real Linux's default `ulimit -s`).
+        // Mirror the guest's own expected stack size here so an undersized real host stack is
+        // never a needless bottleneck; TODO(perf): const should live at a shared layer both
+        // crates use instead of being duplicated here once one exists.
+        const GUEST_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
+        let ctx = ctx.clone();
+        // Take (clearing) whatever guest-pid the shim declared via
+        // `set_next_spawned_thread_guest_pid` for the thread about to be spawned -- read on
+        // THIS, the spawning thread, since the new thread's own `thread_local!`s start out
+        // completely fresh/`None` and cannot see this thread's own state. Propagated into the
+        // new thread's own `CURRENT_GUEST_PID` inside `thread_start`, before it registers itself
+        // via `run_with_handle` (so every `CLAIMED_RANGES` operation on the new thread, from its
+        // very first one, already sees the correct owner). `None` if the shim never called it
+        // for this spawn -- the new thread then falls back to its own `ThreadId`, same as before
+        // this mechanism existed.
+        let guest_pid = NEXT_SPAWNED_THREAD_GUEST_PID.take();
+        // Constructed HERE, on the spawning thread (which already has a valid, installed TLS
+        // slot and is fully protected by `vectored_exception_handler_entry`), not inside the new
+        // thread's own closure -- see `thread_start`'s doc comment for why any fault during this
+        // construction (in particular `continue_context`'s `Box::default()` heap allocation) must
+        // never run on the new thread before `install_tls` has had a chance to run.
+        let tls_state = TlsState::new();
+        // TODO: do we need to wait for the handle in the main thread?
+        let _handle = std::thread::Builder::new()
+            .stack_size(GUEST_THREAD_STACK_SIZE)
+            .spawn(move || {
+                if let Some(pid) = guest_pid {
+                    CURRENT_GUEST_PID.set(Some(pid));
+                }
+                thread_start(init_thread, ctx, tls_state);
+            })?;
+
+        Ok(())
+    }
+
+    fn current_thread(&self) -> Self::ThreadHandle {
+        CURRENT_THREAD_HANDLE.with_borrow(|current| {
+            current
+                .clone()
+                .expect("current thread is not managed by LiteBox")
+        })
+    }
+
+    fn interrupt_thread(&self, thread: &Self::ThreadHandle) {
+        CURRENT_THREAD_HANDLE.with_borrow(|current| {
+            thread.interrupt(current.as_ref());
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
+        // Ensure the module-wide TLS slot is allocated.
+        ensure_tls_index();
+        let tls = TlsState::new();
+        ThreadHandle::run_with_handle(&tls, f)
+    }
+
+    fn host_debug_tid(&self) -> u64 {
+        u64::from(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() })
+    }
+
+    fn set_next_spawned_thread_guest_pid(&self, pid: i32) {
+        NEXT_SPAWNED_THREAD_GUEST_PID.set(Some(pid));
+    }
+}
+
+impl litebox::platform::TimerProvider for WindowsUserland {
+    type TimerHandle = TimerHandle;
+    type Signal = litebox_common_linux::signal::Signal;
+
+    fn create_timer(
+        &self,
+        signal: Self::Signal,
+    ) -> Result<Self::TimerHandle, litebox::platform::TimerCreationError> {
+        // Capture the CALLING thread's own handle so the timer callback delivers the signal
+        // back to the thread that actually armed it (see `TimerCallbackContext::target` and
+        // `threadpool_timer_callback` below).
+        //
+        // Previously this callback picked `ACTIVE_THREADS.lock().unwrap().first().cloned()` --
+        // an arbitrary managed thread, not necessarily the one that owns this timer. That was a
+        // correctness gap the `ACTIVE_THREADS` doc comment already flagged ("only works when we
+        // support a single process"), and it stopped being merely theoretical once multiple
+        // guest "processes" (each an ordinary host thread sharing this one Windows process, see
+        // `spawn_thread`) could each own their own per-process `SIGALRM`/`ITIMER_REAL` timer
+        // (`Process::alarm_timer`, armed via `sys_alarm`/`sys_setitimer`): whenever that timer
+        // fires, delivering its signal to the wrong thread means the intended recipient never
+        // sees it (a real, silent signal-delivery bug on its own) while an unrelated guest
+        // process's thread gets spuriously interrupted -- if that thread has no real pending
+        // signal or exit condition to act on, `prepare_to_run_guest` just returns `ready=true`
+        // again immediately, and the next `switch_to_guest` can re-enter this same interrupt
+        // path before making any other forward progress, i.e. a busy-livelock shaped exactly
+        // like this investigation's other FS_BASE-reset livelocks. Found by code inspection while
+        // investigating a separate, since-confirmed-distinct hang (`sh -c "timeout 5 tar -tzf
+        // <2-gzip-member.tar.gz>"`, ultimately root-caused to a process-exit fd-leak in
+        // `close_all_fds_on_process_exit`, not this); fixed on its own merits regardless, since
+        // `ACTIVE_THREADS.first()` is unconditionally wrong once more than one guest process can
+        // own a timer.
+        let target = CURRENT_THREAD_HANDLE
+            .with_borrow(Clone::clone)
+            .expect("create_timer called from a thread not managed by LiteBox");
+        let ctx = Box::new(TimerCallbackContext { signal, target });
+
+        // Create a threadpool timer with the callback registered up-front.
+        // The callback fires whenever the timer is armed via
+        // `SetThreadpoolTimer` and the due time elapses.
+        //
+        // Safety: We pass a raw pointer to `ctx` which is heap-allocated via
+        // `Box` and lives as long as the `TimerHandle`. The `Drop` impl
+        // cancels and waits for all in-flight callbacks before the `Box` is
+        // dropped, so the pointer remains valid for every callback invocation.
+        let tp_timer = unsafe {
+            Win32_Threading::CreateThreadpoolTimer(
+                Some(threadpool_timer_callback),
+                &raw const *ctx as *mut c_void,
+                std::ptr::null(),
+            )
+        };
+        assert!(
+            tp_timer != 0,
+            "CreateThreadpoolTimer failed: {}",
+            std::io::Error::last_os_error()
+        );
+        Ok(TimerHandle {
+            tp_timer,
+            _ctx: ctx,
+        })
+    }
+}
+
+pub struct TimerHandle {
+    tp_timer: Win32_Threading::PTP_TIMER,
+    /// Prevent the context from being dropped while the timer is alive.
+    /// The raw pointer passed to the threadpool callback points into this box.
+    _ctx: Box<TimerCallbackContext>,
+}
+
+impl Drop for TimerHandle {
+    fn drop(&mut self) {
+        // Cancel any pending callback, wait for in-flight callbacks to
+        // complete, then close the threadpool timer.
+        //
+        // After this sequence completes the callback will never run again, so
+        // it is safe to let `self.ctx` (the `Box`) drop normally.
+        unsafe {
+            Win32_Threading::SetThreadpoolTimer(self.tp_timer, std::ptr::null(), 0, 0);
+            Win32_Threading::WaitForThreadpoolTimerCallbacks(self.tp_timer, 1);
+            Win32_Threading::CloseThreadpoolTimer(self.tp_timer);
+        }
+    }
+}
+
+impl litebox::platform::TimerHandle for TimerHandle {
+    fn set_timer(&self, duration: core::time::Duration) {
+        if duration.is_zero() {
+            // A zero duration cancels the timer without firing.
+            // Passing NULL as the due-time pointer tells Windows to cancel
+            // the pending callback.
+            unsafe {
+                Win32_Threading::SetThreadpoolTimer(self.tp_timer, std::ptr::null(), 0, 0);
+            }
+            return;
+        }
+
+        // Due time is in 100 ns intervals; negative means relative.
+        // Pack into a FILETIME for SetThreadpoolTimer.
+        let due_time_100ns: i64 = {
+            let intervals = duration.as_nanos() / 100;
+            -(i64::try_from(intervals).unwrap_or(i64::MAX))
+        };
+        let due_time = FILETIME {
+            dwLowDateTime: due_time_100ns.cast_unsigned().trunc(),
+            dwHighDateTime: (due_time_100ns >> 32).cast_unsigned().trunc(),
+        };
+
+        // Arm the threadpool timer. The callback registered at creation
+        // time will fire after `duration` elapses.
+        unsafe {
+            Win32_Threading::SetThreadpoolTimer(
+                self.tp_timer,
+                &raw const due_time,
+                0, // no repeat
+                0, // no window
+            );
+        }
+    }
+}
+
+/// Context shared between the `TimerHandle` and the threadpool timer callback.
+struct TimerCallbackContext {
+    signal: litebox_common_linux::signal::Signal,
+    /// The specific thread that armed this timer (via `create_timer`), and therefore the one
+    /// this timer's signal must always be delivered to -- never an arbitrary "active" thread.
+    /// See the doc comment on `TimerProvider::create_timer` for why this matters.
+    target: ThreadHandle,
+}
+
+/// Threadpool timer callback registered via `CreateThreadpoolTimer`.
+///
+/// Delivers the signal to the specific thread that armed this timer (`ctx.target`), captured at
+/// `create_timer` time -- not an arbitrary active thread. See `TimerProvider::create_timer`'s
+/// doc comment for the real, reproduced livelock this fixes.
+unsafe extern "system" fn threadpool_timer_callback(
+    _instance: Win32_Threading::PTP_CALLBACK_INSTANCE,
+    context: *mut c_void,
+    _timer: Win32_Threading::PTP_TIMER,
+) {
+    // Safety: `context` points to the `TimerCallbackContext` owned by the
+    // `TimerHandle`. The handle's `Drop` impl waits for all in-flight
+    // callbacks before dropping the context, so this reference is valid.
+    let ctx = unsafe { &*context.cast::<TimerCallbackContext>() };
+    ctx.target.deliver_signal(ctx.signal);
+}
+
+/// Console control handler registered via `SetConsoleCtrlHandler`.
+///
+/// When the user presses Ctrl+C, this sets the SIGINT bit on every active
+/// managed thread and interrupts them so the shim can deliver the signal.
+/// Ctrl+Break similarly maps to SIGTSTP (job-control suspend): both are keyboard-driven console
+/// control events with no real Windows analog to "suspend a process group", so SIGTSTP is the
+/// closest Linux-shell-observable behavior a real terminal's Ctrl+Z would produce.
+unsafe extern "system" fn ctrl_c_handler(ctrl_type: u32) -> i32 {
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
+
+    let signal = match ctrl_type {
+        CTRL_C_EVENT => litebox_common_linux::signal::Signal::SIGINT,
+        CTRL_BREAK_EVENT => litebox_common_linux::signal::Signal::SIGTSTP,
+        _ => return 0, // FALSE — let the next handler deal with it
+    };
+
+    // Pick one arbitrary thread to deliver the signal to.
+    let thread = ACTIVE_THREADS.lock().unwrap().first().cloned();
+
+    if let Some(thread) = thread {
+        thread.deliver_signal(signal);
+    }
+
+    1 // TRUE — we handled it
+}
+
+/// Runs on a dedicated background thread for the lifetime of the process: polls the console
+/// output buffer's window size and delivers SIGWINCH to an active guest thread whenever it
+/// changes. See the doc comment at this thread's spawn site (`WindowsUserland::new`) for why
+/// polling `GetConsoleScreenBufferInfo` is used instead of an input-event-based approach.
+fn console_resize_watcher_thread_body() {
+    use windows_sys::Win32::System::Console::{
+        CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetStdHandle, STD_OUTPUT_HANDLE,
+    };
+
+    // No real console attached (e.g. fully redirected stdio): nothing to poll, exit quietly
+    // rather than spin forever on a handle that will never report window-size changes.
+    let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    if handle.is_null() || handle == Win32_Foundation::INVALID_HANDLE_VALUE {
+        return;
+    }
+
+    let read_size = || -> Option<(i16, i16)> {
+        let mut info: CONSOLE_SCREEN_BUFFER_INFO = unsafe { core::mem::zeroed() };
+        if unsafe { GetConsoleScreenBufferInfo(handle, &raw mut info) } == 0 {
+            return None;
+        }
+        Some((
+            info.srWindow.Right - info.srWindow.Left + 1,
+            info.srWindow.Bottom - info.srWindow.Top + 1,
+        ))
+    };
+
+    let Some(mut last_size) = read_size() else {
+        // Not actually a console handle (e.g. a redirected pipe) -- nothing to watch.
+        return;
+    };
+
+    loop {
+        // A short sleep, not a blocking wait: there is no Win32 wait handle that signals
+        // specifically on window-size change (`WaitForSingleObject` on the console input handle
+        // wakes on ANY input event, which would require also filtering/re-injecting events and
+        // risks the same cooked-read race `ConsoleStdinReader`'s doc comment describes -- plain
+        // polling avoids touching that handle at all). 250ms is frequent enough that a resize
+        // feels immediate to a human resizing a terminal window, and cheap enough not to matter
+        // against a whole guest program's runtime.
+        std::thread::sleep(core::time::Duration::from_millis(250));
+
+        let Some(size) = read_size() else {
+            continue;
+        };
+        if size != last_size {
+            last_size = size;
+            let thread = ACTIVE_THREADS.lock().unwrap().first().cloned();
+            if let Some(thread) = thread {
+                thread.deliver_signal(litebox_common_linux::signal::Signal::SIGWINCH);
+            }
+        }
+    }
+}
+
+/// Helper to lock two mutexes in address order, to prevent deadlock. Shared by
+/// `ThreadHandle::interrupt` and `ctxwatch_arm_other_threads`, both of which suspend a target
+/// thread from a "current" thread and must avoid two threads each locking the other's mutex in
+/// opposite order concurrently.
+fn lock_two<'a, T, U>(
+    left: &'a Mutex<T>,
+    right: &'a Mutex<U>,
+) -> (std::sync::MutexGuard<'a, T>, std::sync::MutexGuard<'a, U>) {
+    if std::ptr::from_ref(left).addr() < std::ptr::from_ref(right).addr() {
+        let l = left.lock().unwrap();
+        let r = right.lock().unwrap();
+        (l, r)
+    } else {
+        let r = right.lock().unwrap();
+        let l = left.lock().unwrap();
+        (l, r)
+    }
+}
+
+/// Diagnostic-only (`LITEBOX_CTXWATCH=1`): arms the same `ctx.rip` write-watchpoint `ctxwatch::arm`
+/// just set on the calling thread on every OTHER live thread registered in `ACTIVE_THREADS` too.
+/// Debug registers are per-thread Windows state (virtualized via `Get`/`SetThreadContext`), so a
+/// watchpoint armed on only one thread can never catch a write made by an instruction executing
+/// on a different thread -- this closes that coverage gap by reusing the same
+/// suspend/get-context/set-context/resume sequence `ThreadHandle::interrupt` already relies on for
+/// cross-thread context manipulation elsewhere in this file. Best-effort and non-fatal: a thread
+/// that disappears or fails to arm is skipped, logged, and does not stop the rest.
+///
+/// Lock ordering mirrors `ThreadHandle::interrupt` exactly: `current`'s own mutex is held for the
+/// duration of each per-target suspend/arm/resume, via the same `lock_two` address-ordered
+/// two-mutex acquisition `interrupt` uses. This matters because, unlike a diagnostic that only
+/// ever touches one target, multiple pipeline threads can each independently reach this same
+/// exit_group path and call this function concurrently -- without holding its own lock while
+/// suspending another thread, thread A suspending B while B concurrently (and lock-free) suspends
+/// A is exactly the ABBA deadlock/race `interrupt`'s `lock_two` pattern was written to prevent.
+fn ctxwatch_arm_other_threads(ctx: *const litebox_common_linux::PtRegs) {
+    let addr = (ctx as usize).wrapping_add(ctxwatch::RIP_FIELD_OFFSET);
+    let Some(current) = CURRENT_THREAD_HANDLE.with(|c| c.borrow().clone()) else {
+        // Not a LiteBox-managed thread; nothing to lock ourselves against.
+        return;
+    };
+    let others: alloc::vec::Vec<ThreadHandle> = ACTIVE_THREADS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|h| !Arc::ptr_eq(&current.0, &h.0))
+        .cloned()
+        .collect();
+    for other in others {
+        // Lock both `current` and `other` (address-ordered, matching `interrupt`) so this thread
+        // is never suspended by a concurrent caller while it holds `other`'s lock, and vice versa.
+        let (_current_guard, guard) = lock_two(&current.0, &other.0);
+        let Some(inner) = guard.as_ref() else {
+            continue;
+        };
+        let raw_handle = inner.handle.as_raw_handle();
+        // SAFETY: `raw_handle` comes from a live `ThreadHandleInner` held under its own lock, so
+        // the OS thread handle is valid for the duration of this suspend/arm/resume sequence.
+        unsafe {
+            windows_sys::Win32::System::Threading::SuspendThread(raw_handle);
+        }
+        let _resume_guard = litebox::utils::defer(|| unsafe {
+            windows_sys::Win32::System::Threading::ResumeThread(raw_handle);
+        });
+        // SAFETY: `raw_handle` is a valid, now-suspended thread handle.
+        unsafe {
+            ctxwatch::arm_on_handle(raw_handle, addr);
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ThreadHandle(Arc<Mutex<Option<ThreadHandleInner>>>);
+
+struct ThreadHandleInner {
+    handle: std::os::windows::io::OwnedHandle,
+    tls: SendConstPtr<TlsState>,
+}
+
+struct SendConstPtr<T>(*const T);
+unsafe impl<T> Send for SendConstPtr<T> {}
+
+thread_local! {
+    static CURRENT_THREAD_HANDLE: RefCell<Option<ThreadHandle>> = const { RefCell::new(None) };
+}
+
+thread_local! {
+    /// This thread's own guest-space process id, if one has ever been assigned -- see
+    /// [`ThreadProvider::set_next_spawned_thread_guest_pid`]'s doc comment for why this exists
+    /// and how it propagates from a spawning thread to the thread it spawns.
+    ///
+    /// `None` on a thread that never went through this propagation (the very first/initial
+    /// guest thread of a fresh `litebox_runner` invocation, or a host-only test thread) -- such
+    /// a thread's own `std::thread::ThreadId` is already a correct, unique-enough proxy for its
+    /// guest-process identity on its own, since it has no sibling thread within the same guest
+    /// process to be confused with.
+    static CURRENT_GUEST_PID: Cell<Option<i32>> = const { Cell::new(None) };
+}
+
+thread_local! {
+    /// Set by [`WindowsUserland::set_next_spawned_thread_guest_pid`] on the SPAWNING thread,
+    /// immediately before its own call to [`ThreadProvider::spawn_thread`]; read and cleared by
+    /// that same call (on the SAME, spawning thread, never the new one) to capture the value to
+    /// propagate into the new thread's own [`CURRENT_GUEST_PID`].
+    static NEXT_SPAWNED_THREAD_GUEST_PID: Cell<Option<i32>> = const { Cell::new(None) };
+}
+
+/// Returns the calling thread's own guest-process identity for [`CLAIMED_RANGES`] ownership
+/// purposes: its propagated [`CURRENT_GUEST_PID`] if one was ever assigned (recognizing sibling
+/// pthreads of the SAME guest process as the SAME owner), falling back to the real
+/// [`std::thread::ThreadId`] for a thread that never went through that propagation (see
+/// [`CURRENT_GUEST_PID`]'s doc comment).
+fn current_claim_owner() -> ClaimOwner {
+    match CURRENT_GUEST_PID.get() {
+        Some(pid) => ClaimOwner::GuestPid(pid),
+        None => ClaimOwner::ThreadId(std::thread::current().id()),
+    }
+}
+
+/// Global registry of all active managed thread handles.
+///
+/// Threads are registered in [`ThreadHandle::run_with_handle`] and
+/// removed when the guard drops.
+///
+/// TODO: This global list only works when we support a single process. For
+/// multi-process support, each process (or `WindowsUserland` instance) should
+/// track its own thread list.
+static ACTIVE_THREADS: Mutex<alloc::vec::Vec<ThreadHandle>> = Mutex::new(alloc::vec::Vec::new());
+
+/// The owner of a [`ClaimSlot`]: either a real host [`std::thread::ThreadId`] (a thread that
+/// never had a guest-pid propagated onto it, see [`CURRENT_GUEST_PID`]) or a guest-space process
+/// id shared by every one of that guest process's own OS threads (see
+/// `ThreadProvider::set_next_spawned_thread_guest_pid`'s doc comment) -- two claims sharing the
+/// SAME guest pid are the SAME guest process's own memory, even when their real OS `ThreadId`s
+/// differ (e.g. a guest process's own additional pthread, not a `fork()`ed sibling process).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ClaimOwner {
+    ThreadId(std::thread::ThreadId),
+    GuestPid(i32),
+}
+
+/// One entry in [`CLAIMED_RANGES`]: a host address range, the [`ClaimOwner`] of the guest
+/// process that owns it (for collision/coalescing checks -- shared across every OS thread of the
+/// same guest process), the real [`std::thread::ThreadId`] of the SPECIFIC thread that inserted
+/// it (for release-on-thread-exit, which must only drop THIS thread's own entries, never a
+/// still-live sibling thread's -- see `release_all_claims_for_current_thread`'s doc comment), and
+/// a monotonically-increasing insertion sequence number used to find the single oldest entry for
+/// eviction when the registry is full (see `claim_range`). `None` means the slot is empty.
+type ClaimSlot = Option<(core::ops::Range<usize>, ClaimOwner, std::thread::ThreadId, u64)>;
+
+/// How many concurrently-live guest processes can each hold a `Replace`-mode claim at once (see
+/// [`CLAIMED_RANGES`]'s doc comment). A fixed, generous upper bound rather than a growable
+/// collection deliberately: `BTreeMap`/`Vec::push` route through this process's own
+/// `#[global_allocator]` (`SafeZoneAllocator`, a `spin::SpinMutex`-protected slab/buddy
+/// allocator, `litebox/src/mm/allocator.rs`), and calling into it from `allocate_pages`'s already
+/// timing-sensitive `Replace` path was found live to make an existing, pre-existing, still-not-
+/// fully-understood class of Windows scheduling/segment-MSR instability (see the FS_BASE/GS_BASE
+/// repair sites above) fire far more often -- a fixed-size array sidesteps the allocator (and
+/// its spinlock) entirely for this registry's own bookkeeping.
+///
+/// Originally 64, sized only for "a handful of nested `vfork()` levels" -- confirmed live via a
+/// weston repro to be a real under-count once `Hint`-mode calls started reaching `claim_range`
+/// (see that function's own doc comment): a single guest process doing ordinary DRM/GL/dynamic-
+/// library `mmap(NULL,...)` churn produces hundreds of small, mutually non-adjacent ranges in
+/// well under a second (633 real, logged `claim_range DROPPED (registry full)` events observed
+/// in one 30-second repro), silently evicting a DIFFERENT, still-live guest process's own
+/// legitimate claim -- exactly the collision this registry exists to prevent. Raised to 512
+/// (8x): a full XFCE desktop session (weston + xfsettingsd + xfce4-panel + xfdesktop + xfconfd +
+/// dbus-daemon + at-spi-bus-launcher, ~20 real OS threads, each doing its own concurrent dynamic-
+/// library-loading churn during startup) was confirmed live to exhaust the 512-slot registry
+/// within ~20 seconds of the first few clients launching (844 real eviction events logged in one
+/// repro, `occupied=512 max=512` sustained thereafter) -- and unlike the single-process case 512
+/// was tuned for, evictions here landed on STILL-LIVE, actively-loading sibling processes
+/// (`xfsettingsd`/`xfdesktop`, confirmed via the evicted entries' own logged `GuestPid` owners),
+/// not stale leftovers. Every one of those processes' every thread then permanently stalled in a
+/// genuine (non-corrupted, `cdb`-confirmed) `WaitOnAddress` a few seconds later with no wake ever
+/// arriving -- consistent with this doc comment's own described failure mode (a later
+/// `Replace`-mode allocation silently decommitting/recommitting straight over the evicted range's
+/// still-live memory, corrupting a live thread's own state with no crash, no page fault, and no
+/// guest-visible signal, only an unexplained later hang).
+///
+/// First tried raising this to 4096 (8x again) -- confirmed live to be the WRONG fix on its own:
+/// both `claim_range`'s mandatory per-call coalescing scan and (before it was removed, see
+/// `find_foreign_claim`'s own doc comment) an unconditional debug-log-only occupancy count scaled
+/// linearly with `MAX_CLAIMS`, and at 4096 slots this cost enough extra latency across the ~9000
+/// `claim_range`/`find_foreign_claim` calls a full XFCE session's startup churn produces that
+/// weston's own timing-sensitive DRM initialization sequence never completed a single
+/// `DRM_IOCTL_MODE_SETCRTC` in a 108+ second repro (previously ~15-25s) -- trading the original
+/// hang for an even worse one. Settled on 2048 (4x, half the scan cost of the 4096 attempt) after
+/// also removing `find_foreign_claim`'s superfluous full-array occupancy scan (used only to
+/// populate a debug log field, paid unconditionally regardless of whether logging was even
+/// enabled) -- combined, these give real headroom over the ~900-1000 peak occupancy observed
+/// before eviction previously kicked in, without reintroducing the 4096 attempt's own regression.
+/// Genuine LRU eviction (below) remains the correctness backstop for whatever churn volume still
+/// exceeds 2048: exhaustion now evicts the single OLDEST entry (by insertion sequence, tracked in
+/// `ClaimSlot`) rather than silently dropping the NEWEST one -- the newest claim is, by
+/// construction, the one about to be relevant to an imminent collision check, while an entry old
+/// enough to be the least-recently-inserted across the WHOLE registry is far more likely to
+/// belong to memory that's since been superseded or released. This only gives up this registry's
+/// own collision defense for whichever single entry loses the eviction race, never correctness
+/// of anything else.
+const MAX_CLAIMS: usize = 2048;
+
+/// Host address ranges currently claimed by a live guest "process" (a real OS thread), see
+/// [`ClaimSlot`]/[`MAX_CLAIMS`] for the storage shape and why it is a fixed array.
+///
+/// # Why this exists
+///
+/// Every guest "process" in this architecture is a real OS thread sharing ONE real Windows
+/// process (see this module's top-level doc comment) -- there is no per-process address space
+/// isolation the way real Linux `fork()`/`execve()` gets for free. `Vmem::insert_mapping`'s
+/// `FixedAddressBehavior::Replace` path (real `MAP_FIXED`, used for every ELF segment of a
+/// non-PIE/`ET_EXEC` binary, which loads at a fixed, non-negotiable address baked into the ELF
+/// itself -- `gcc`, `cc1`, and most Alpine/musl binaries) can only see ITS OWN guest-level
+/// `Vmem` bookkeeping plus the platform's raw `VirtualQuery` state; neither can distinguish "this
+/// committed range is a stale leftover from MY OWN prior `execve()` on this same thread, safe to
+/// overwrite" from "this committed range is another guest process's CURRENTLY LIVE memory" --
+/// e.g. a `vfork()`-blocked parent's own image, still fully intact and about to resume. Two
+/// non-PIE binaries loaded at the same address (extremely common: EVERY `ET_EXEC` binary with
+/// the same link-time base, e.g. `0x400000`, collides with every other) that happen to be alive
+/// at the same real moment -- a `vfork()`-ing child that itself `vfork()`s again, e.g. `gcc`
+/// (still blocked, waiting on its own child) `vfork()`ing `cc1` -- silently clobber each other's
+/// real memory with no error, no page fault, and no guest-visible signal: confirmed live via a
+/// Windows minidump showing a `ret` faulting on a `rsp` that no longer pointed at valid committed
+/// memory, because a sibling process's fixed-address ELF load had silently decommitted and
+/// recommitted straight over top of it.
+///
+/// This registry closes that gap: every successful [`WindowsUserland::allocate_pages`] call whose
+/// `fixed_address_behavior` is [`FixedAddressBehavior::Replace`] (the only mode with no existing
+/// collision defense -- `Hint`/`NoReplace` already refuse to build on a real `MEM_COMMIT` via
+/// `has_committed_page`) records its range here under the CALLING thread's own
+/// [`std::thread::ThreadId`] (stable for a guest process's entire lifetime -- `execve` reuses the
+/// same real OS thread, never spawning a new one). Deliberately consulted and updated ONLY on
+/// this already-rare, already-`VirtualQuery`-scanning `Replace` path -- NOT on every
+/// `allocate_pages` call -- so ordinary `Hint`-mode allocation (guest heap/stack/mmap growth, the
+/// overwhelming majority of calls) pays no additional cost at all.
+static CLAIMED_RANGES: Mutex<[ClaimSlot; MAX_CLAIMS]> = Mutex::new([const { None }; MAX_CLAIMS]);
+
+/// Monotonically-increasing insertion counter for [`ClaimSlot`]'s sequence field, guarded by the
+/// same [`CLAIMED_RANGES`] lock (never accessed independently) -- used only to find the single
+/// oldest entry when the registry is full and a new claim needs a slot (see `claim_range`).
+static NEXT_CLAIM_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Returns the (range, owner) of any claimed range overlapping `range` whose owner is NOT
+/// `exclude_owner`, if one exists.
+///
+/// Deliberately does not also compute/log an occupancy count here -- an earlier version did, via
+/// an unconditional `claims.iter().filter(...).count()` purely to populate a debug-log field,
+/// paid on every call regardless of whether logging was even enabled. At `MAX_CLAIMS`'s current
+/// size that extra full-array scan, multiplied across the thousands of calls a real XFCE
+/// session's startup churn produces, was confirmed live to contribute real, measurable latency to
+/// this already-hot path -- see [`MAX_CLAIMS`]'s own doc comment for the full story.
+fn find_foreign_claim(
+    range: core::ops::Range<usize>,
+    exclude_owner: ClaimOwner,
+) -> Option<(core::ops::Range<usize>, ClaimOwner)> {
+    let claims = CLAIMED_RANGES.lock().unwrap();
+    claims.iter().find_map(|slot| {
+        slot.as_ref().and_then(|(claimed, owner, _tid, _seq)| {
+            (*owner != exclude_owner && claimed.start < range.end && claimed.end > range.start)
+                .then(|| (claimed.clone(), *owner))
+        })
+    })
+}
+
+/// Records that the calling thread now owns `range`, coalescing it into any of ITS OWN prior
+/// entries that overlap OR are immediately adjacent to it (a re-`execve` or a `Replace` over
+/// one's own stale leftover legitimately changes what this thread owns at that address; ordinary
+/// contiguous heap/mmap growth on the SAME thread should extend one bounding entry rather than
+/// consume a fresh slot per call) but leaving every other thread's entries untouched.
+///
+/// Originally called only for `Replace`-mode allocations; now also called for `Hint`-mode ones
+/// (see `allocate_pages`'s own call sites) -- a `Hint`-mode allocation (e.g. an ordinary guest
+/// `mmap(NULL, ...)`) commits real, live host memory just as much as a `Replace`-mode one does,
+/// and a DIFFERENT thread's LATER `Replace`-mode fixed-address allocation (e.g. that thread's own
+/// `brk()` growth) can land on this exact real address with no page fault or guest-visible signal
+/// if this range was never claimed -- confirmed live via a weston + weston-desktop-shell repro
+/// where the child's freshly-`brk()`'d heap landed exactly on the parent's own live, unclaimed
+/// `mmap(NULL, 4096)` region, and `find_foreign_claim` returning `None` for it let the `Replace`
+/// path decommit-and-recommit straight over the parent's still-live memory. The merge-into-one-
+/// bounding-entry behavior (rather than the strict supersede-only behavior this function used
+/// before `Hint` calls started reaching it) keeps the fixed-size registry from being exhausted by
+/// ordinary, frequent, mostly-contiguous heap/mmap growth, which `Replace`-only callers never
+/// produced enough of to matter.
+///
+/// Silently drops the claim if every slot is already in use by some OTHER thread's own ranges
+/// (see [`MAX_CLAIMS`] -- this only gives up this registry's own collision defense for the
+/// dropped claim, never a hard error).
+fn claim_range(range: core::ops::Range<usize>) {
+    if range.is_empty() {
+        return;
+    }
+    let owner = current_claim_owner();
+    let tid = std::thread::current().id();
+    litebox_util_log::debug!(
+        start:% = range.start, end:% = range.end, owner:? = owner;
+        "allocate_pages: DIAG claim_range"
+    );
+    let mut claims = CLAIMED_RANGES.lock().unwrap();
+    // Absorb this GUEST PROCESS's own prior entries (matched by `ClaimOwner`, shared across
+    // every one of its own OS threads -- not just this specific thread's own `ThreadId`) that
+    // overlap OR touch (are immediately adjacent to) the new range into one merged bound, rather
+    // than dropping them outright -- this is what keeps ordinary sequential heap/mmap growth on
+    // one thread from consuming a fresh slot per call, and now ALSO coalesces a sibling
+    // pthread's own overlapping claim into the same guest process's own bound.
+    let mut merged = range;
+    for slot in claims.iter_mut() {
+        if let Some((claimed, o, _tid, _seq)) = slot
+            && *o == owner
+            && claimed.start <= merged.end
+            && claimed.end >= merged.start
+        {
+            merged.start = merged.start.min(claimed.start);
+            merged.end = merged.end.max(claimed.end);
+            *slot = None;
+        }
+    }
+    let seq = NEXT_CLAIM_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if let Some(empty_slot) = claims.iter_mut().find(|s| s.is_none()) {
+        *empty_slot = Some((merged, owner, tid, seq));
+    } else {
+        // Registry genuinely full even after this thread's own coalescing -- evict the single
+        // OLDEST entry (lowest sequence number) across the WHOLE registry, regardless of owner,
+        // rather than silently dropping this brand-new claim. See `MAX_CLAIMS`'s doc comment for
+        // why the newest claim is the one worth keeping when a choice must be made.
+        let oldest_idx = claims
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.as_ref().map(|(_, _, _tid, seq)| (i, *seq)))
+            .min_by_key(|(_, seq)| *seq)
+            .map(|(i, _)| i);
+        if let Some(idx) = oldest_idx {
+            litebox_util_log::debug!(
+                start:% = merged.start, end:% = merged.end, owner:? = owner;
+                "allocate_pages: DIAG claim_range evicting oldest entry (registry full)"
+            );
+            claims[idx] = Some((merged, owner, tid, seq));
+        }
+    }
+}
+
+/// Removes every range inserted BY THE CALLING THREAD ITSELF. Called once, from
+/// [`ThreadHandle::run_with_handle`]'s teardown guard, when a guest process's real OS thread
+/// itself exits -- see [`CLAIMED_RANGES`]'s doc comment for why `execve` alone must not do this.
+///
+/// Deliberately matches on the real [`std::thread::ThreadId`] that INSERTED each entry, never
+/// the (possibly-shared-across-threads) [`ClaimOwner`] -- a guest process's own additional
+/// pthread exiting must only release THAT THREAD's own claims, never a still-live sibling
+/// thread's (e.g. the SAME guest process's main thread) claims that happen to share the same
+/// `ClaimOwner::GuestPid`.
+fn release_all_claims_for_current_thread() {
+    let tid = std::thread::current().id();
+    for slot in CLAIMED_RANGES.lock().unwrap().iter_mut() {
+        if matches!(slot, Some((_, _owner, t, _seq)) if *t == tid) {
+            *slot = None;
+        }
+    }
+}
+
+/// Removes `range` from the calling thread's own claims (called on `deallocate_pages`/`munmap`).
+/// Unlike a growable map, a fixed-array slot that only PARTIALLY overlaps `range` is dropped
+/// whole rather than split/shrunk (splitting would need a second slot, which may not be
+/// available) -- a rare, always-safe-to-be-conservative-about approximation: the untouched
+/// remainder of that slot's original range simply stops being defended by this registry until
+/// this thread's own next `Replace` allocation re-claims it, which is no worse than this
+/// registry not existing at all for that sliver.
+fn release_claim_range_for_current_thread(range: core::ops::Range<usize>) {
+    if range.is_empty() {
+        return;
+    }
+    let owner = current_claim_owner();
+    for slot in CLAIMED_RANGES.lock().unwrap().iter_mut() {
+        if let Some((claimed, o, _tid, _seq)) = slot
+            && *o == owner
+            && claimed.start < range.end
+            && claimed.end > range.start
+        {
+            *slot = None;
+        }
+    }
+}
+
+impl ThreadHandle {
+    /// Creates a [`ThreadHandle`] referencing the calling OS thread.
+    fn for_current_thread(tls: &TlsState) -> ThreadHandle {
+        let win_handle = unsafe {
+            std::os::windows::io::BorrowedHandle::borrow_raw(
+                windows_sys::Win32::System::Threading::GetCurrentThread(),
+            )
+        };
+        ThreadHandle(Arc::new(Mutex::new(Some(ThreadHandleInner {
+            handle: win_handle
+                .try_clone_to_owned()
+                .expect("failed to clone current thread handle"),
+            tls: SendConstPtr(tls),
+        }))))
+    }
+
+    /// Runs `f`, ensuring that [`CURRENT_THREAD_HANDLE`] is set while in the call to `f`.
+    fn run_with_handle<R>(tls: &TlsState, f: impl FnOnce() -> R) -> R {
+        // Safety: `tls_state` lives for the duration of this call.
+        unsafe { install_tls(tls) };
+
+        // Capture this thread's own real GS_BASE (TEB pointer) now, while it is still known-good
+        // -- see `init_thread_gs_base`'s doc comment for why this repair exists at all.
+        WindowsUserland::init_thread_gs_base();
+
+        let handle = Self::for_current_thread(tls);
+        ACTIVE_THREADS.lock().unwrap().push(handle.clone());
+        CURRENT_THREAD_HANDLE.with_borrow_mut(|current| {
+            assert!(
+                current.is_none(),
+                "thread is already registered with LiteBox",
+            );
+            *current = Some(handle.clone());
+        });
+        let _guard = litebox::utils::defer(move || {
+            let current = CURRENT_THREAD_HANDLE.take().unwrap();
+            // Remove from the global registry.
+            ACTIVE_THREADS
+                .lock()
+                .unwrap()
+                .retain(|h| !Arc::ptr_eq(&h.0, &current.0));
+            release_all_claims_for_current_thread();
+            *current.0.lock().unwrap() = None;
+            uninstall_tls();
+        });
+        f()
+    }
+
+    /// Sets a pending signal on this thread, wakes it from any condvar wait,
+    /// and interrupts it so the shim processes the signal promptly.
+    fn deliver_signal(&self, signal: litebox_common_linux::signal::Signal) {
+        let bit: u32 = 1 << (signal.as_i32() - 1);
+
+        // Set the pending signal bit and wake the condvar in one lock scope.
+        {
+            let inner = self.0.lock().unwrap();
+            if let Some(inner) = inner.as_ref() {
+                // Safety: the TLS pointer is valid as long as the thread is
+                // alive, and we hold the thread handle lock.
+                let tls = unsafe { &*inner.tls.0 };
+                tls.pending_host_signals.fetch_or(bit, Ordering::SeqCst);
+
+                let waker = tls.waiting_waker.load(Ordering::Acquire);
+                if !waker.is_null() {
+                    // SAFETY: `waker` was heap-allocated via `Box::into_raw` in
+                    // `update_waker`. It remains valid here because
+                    // `update_waker` acquires this same `ThreadHandleInner`
+                    // mutex before freeing the old pointer, and we hold that
+                    // mutex now.
+                    let waker = unsafe { &*waker };
+                    waker.wake();
+                }
+            }
+        }
+
+        self.interrupt(None);
+    }
+
+    /// Interrupt the thread represented by this handle, where `current` is the
+    /// current thread's handle if it is managed by LiteBox.
+    ///
+    /// The basic strategy is this:
+    /// 1. Suspend the target thread.
+    /// 2. Access its TLS state to check if it's in the guest.
+    /// 3. If it's not actually in the guest, set the interrupt flag and resume,
+    ///    with some careful handling to make sure the interrupt flag is
+    ///    evaluated upon return to the guest in all cases.
+    /// 4. If it is in the guest, save the guest context and set the thread
+    ///    context to resume at the interrupt callback.
+    /// 5. Resume the target thread.
+    fn interrupt(&self, current: Option<&ThreadHandle>) {
+        let (_current_guard, target) = if let Some(current) = current {
+            if Arc::ptr_eq(&current.0, &self.0) {
+                // Interrupting self; just set the flag.
+                (unsafe { &*get_tls_ptr().unwrap() }).interrupt.set(true);
+                return;
+            }
+
+            // Lock both the current and target thread handles so that this
+            // thread is not suspended while holding the target thread lock.
+            let (c, t) = lock_two(&current.0, &self.0);
+            (Some(c), t)
+        } else {
+            // The current thread can't be suspended since it's not managed by LiteBox.
+            (None, self.0.lock().unwrap())
+        };
+        let Some(inner) = target.as_ref() else {
+            // The target is no longer managed by LiteBox.
+            return;
+        };
+
+        // Suspend the target thread.
+        unsafe {
+            windows_sys::Win32::System::Threading::SuspendThread(inner.handle.as_raw_handle());
+        }
+        let _resume_guard = litebox::utils::defer(|| unsafe {
+            windows_sys::Win32::System::Threading::ResumeThread(inner.handle.as_raw_handle());
+        });
+
+        // SAFETY: The target TLS state is accessible while the thread is
+        // suspended.
+        let target_tls = unsafe { &*inner.tls.0 };
+
+        // Write the target interrupt flag.
+        target_tls.interrupt.set(true);
+
+        if !target_tls.is_in_guest.get() {
+            // Not running in the guest. The interrupt flag will be checked
+            // before returning to the guest, so just resume.
+            return;
+        }
+
+        let guest_context = target_tls.guest_context_top.get().wrapping_sub(1);
+
+        // Running in the guest. There are multiple possibilities:
+        //
+        // 1. The thread is in the middle of returning to the guest via the
+        //    register pop path. Don't save context but do jump to the interrupt
+        //    callback.
+        // 2. The thread is in the middle of returning to the guest via the
+        //    NtContinue path. Update the NtContinue context to point to the
+        //    interrupt callback.
+        // 3. The thread is beginning to handle an exception. Don't do anything;
+        //    this path will check the interrupt flag.
+        // 4. In the guest. Save the guest context and jump to the interrupt callback.
+
+        // Get the current register context.
+        let mut context = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT {
+            ContextFlags: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64
+                | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_INTEGER_AMD64,
+            ..Default::default()
+        };
+        let r = unsafe {
+            windows_sys::Win32::System::Diagnostics::Debug::GetThreadContext(
+                inner.handle.as_raw_handle(),
+                &raw mut context,
+            )
+        };
+        assert_ne!(
+            r,
+            0,
+            "GetThreadContext failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let run_interrupt_callback = if (switch_to_guest_start as *const () as usize
+            ..switch_to_guest_end as *const () as usize)
+            .contains(&(context.Rip.trunc()))
+        {
+            if diag_rip0_enabled() {
+                eprintln!(
+                    "[diag-interrupt] tid={:?} target_tid={:?} case=1 target_rip={:#x}",
+                    std::thread::current().id(),
+                    inner.handle.as_raw_handle(),
+                    context.Rip,
+                );
+            }
+            // Case 1: jump to interrupt callback without saving the guest
+            // context, since it's already saved.
+            true
+        } else if is_in_ntdll_or_this(context.Rip.trunc()) {
+            // Case 2/3: we can't distinguish between them. For case 2 we don't
+            // need to do anything, but for case 3 we need to update the
+            // NtContinue context to point to the interrupt callback (the guest
+            // context is already up to date).
+            //
+            // In case 2, the NtContinue context is not being used, so it is
+            // safe to update it anyway.
+
+            // SAFETY: `continue_context` is not accessed by user-mode code
+            // while `is_in_guest` is true.
+            let continue_context = unsafe { &mut *target_tls.continue_context.get() };
+            set_context_to_interrupt_callback(target_tls, continue_context);
+            false
+        } else {
+            // Case 4: save the guest context and jump to interrupt callback.
+            if diag_rip0_enabled() {
+                eprintln!(
+                    "[diag-interrupt] tid={:?} case=4 target_rip={:#x} guest_context={:#x}",
+                    std::thread::current().id(),
+                    context.Rip,
+                    guest_context as usize,
+                );
+            }
+            save_guest_context(unsafe { &mut *guest_context }, &context);
+            true
+        };
+        if run_interrupt_callback {
+            set_context_to_interrupt_callback(target_tls, &mut context);
+            unsafe {
+                windows_sys::Win32::System::Diagnostics::Debug::SetThreadContext(
+                    inner.handle.as_raw_handle(),
+                    &raw const context,
+                );
+            }
+        }
+    }
+}
+
+/// Updates `context` to jump to the interrupt callback with the given
+/// `guest_context` pointer.
+fn set_context_to_interrupt_callback(
+    tls: &TlsState,
+    context: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+) {
+    let required_flags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64
+        | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_INTEGER_AMD64;
+    assert_eq!(context.ContextFlags & required_flags, required_flags);
+    context.Rip = interrupt_callback as *const () as usize as u64;
+    context.Rsp = tls.host_sp.get().addr() as u64;
+    context.Rbp = tls.host_bp.get().addr() as u64;
+}
+
+/// Returns true if the given instruction pointer is in ntdll.dll or this module.
+fn is_in_ntdll_or_this(ip: usize) -> bool {
+    static BOUNDS: OnceLock<[std::ops::Range<usize>; 2]> = const { OnceLock::new() };
+
+    let bounds = BOUNDS.get_or_init(|| {
+        unsafe extern "C" {
+            safe static __ImageBase: c_void;
+        }
+        fn module_bounds(module: *const c_void) -> std::ops::Range<usize> {
+            let mut module_info = windows_sys::Win32::System::ProcessStatus::MODULEINFO::default();
+            let r = unsafe {
+                windows_sys::Win32::System::ProcessStatus::GetModuleInformation(
+                    windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                    module.cast_mut(),
+                    &raw mut module_info,
+                    size_of_val(&module_info).try_into().unwrap(),
+                )
+            };
+            assert_ne!(
+                r,
+                0,
+                "GetModuleInformation failed: {}",
+                std::io::Error::last_os_error()
+            );
+            let start = module_info.lpBaseOfDll.addr();
+            let end = start + module_info.SizeOfImage as usize;
+            start..end
+        }
+
+        let ntdll = unsafe {
+            windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(windows_sys::w!(
+                "ntdll.dll"
+            ))
+        };
+        [module_bounds(ntdll), module_bounds(&raw const __ImageBase)]
+    });
+
+    bounds.iter().any(|b| b.contains(&ip))
+}
+
+impl litebox::platform::RawMutexProvider for WindowsUserland {
+    type RawMutex = RawMutex;
+
+    fn update_waker(&self, waker: Option<litebox::event::wait::Waker<Self>>)
+    where
+        Self: litebox::sync::RawSyncPrimitivesProvider,
+    {
+        if let Some(tls) = get_tls_ptr().map(|p| unsafe { &*p }) {
+            let waker_ptr = waker.map_or(std::ptr::null_mut(), |w| Box::into_raw(Box::new(w)));
+            let old = tls.waiting_waker.swap(waker_ptr, Ordering::AcqRel);
+            if !old.is_null() {
+                // Synchronize with `deliver_signal`, which may be concurrently
+                // reading the old waker pointer on another thread while holding
+                // the `ThreadHandleInner` mutex. Acquiring the same mutex here
+                // ensures that `deliver_signal` has finished using the pointer
+                // before we free it.
+                CURRENT_THREAD_HANDLE.with_borrow(|handle| {
+                    let _guard = handle.as_ref().map(|handle| handle.0.lock().unwrap());
+                    // SAFETY: old pointer was created by Box::into_raw in a previous
+                    // call to update_waker. No other thread can be accessing it now
+                    // because we synchronized via the ThreadHandleInner mutex above.
+                    unsafe { drop(Box::from_raw(old)) };
+                });
+            }
+        }
+    }
+}
+
+// A skeleton of a raw mutex for Windows.
+pub struct RawMutex {
+    // The `inner` is the value shown to the outside world as an underlying atomic.
+    inner: AtomicU32,
+}
+
+impl RawMutex {
+    const fn new() -> Self {
+        Self {
+            inner: AtomicU32::new(0),
+        }
+    }
+
+    #[expect(clippy::unnecessary_wraps)]
+    fn block_or_maybe_timeout(
+        &self,
+        val: u32,
+        timeout: Option<Duration>,
+    ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
+        // Compute timeout in ms
+        let timeout_ms = match timeout {
+            None => Win32_Threading::INFINITE, // no timeout
+            Some(timeout) => {
+                let ms = timeout.as_millis();
+                ms.min(u128::from(Win32_Threading::INFINITE - 1)).trunc()
+            }
+        };
+
+        let ok = unsafe {
+            Win32_Threading::WaitOnAddress(
+                (&raw const self.inner).cast::<c_void>(),
+                (&raw const val).cast::<c_void>(),
+                std::mem::size_of::<u32>(),
+                timeout_ms,
+            ) != 0
+        };
+
+        if ok {
+            Ok(UnblockedOrTimedOut::Unblocked)
+        } else {
+            // Check why WaitOnAddress failed
+            let err = unsafe { GetLastError() };
+            match err {
+                Win32_Foundation::ERROR_TIMEOUT => Ok(UnblockedOrTimedOut::TimedOut),
+                e => panic!("Unexpected error={e} for WaitOnAddress"),
+            }
+        }
+    }
+}
+
+impl litebox::platform::RawMutex for RawMutex {
+    const INIT: Self = Self::new();
+
+    fn underlying_atomic(&self) -> &AtomicU32 {
+        &self.inner
+    }
+
+    fn wake_many(&self, n: usize) -> usize {
+        assert!(n > 0, "wake_many should be called with n > 0");
+        let n: u32 = n.try_into().unwrap();
+
+        let mutex = core::ptr::from_ref(self.underlying_atomic()).cast::<c_void>();
+        unsafe {
+            if n == 1 {
+                Win32_Threading::WakeByAddressSingle(mutex);
+            } else if n >= i32::MAX as u32 {
+                Win32_Threading::WakeByAddressAll(mutex);
+            } else {
+                // Wake up `n` threads iteratively
+                for _ in 0..n {
+                    Win32_Threading::WakeByAddressSingle(mutex);
+                }
+            }
+        }
+
+        // For windows, the OS kernel does not tell us how many threads were actually woken up,
+        // so we return zero to indicate that the count is unknown.
+        0
+    }
+
+    fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
+        match self.block_or_maybe_timeout(val, None) {
+            Ok(UnblockedOrTimedOut::Unblocked) => Ok(()),
+            Ok(UnblockedOrTimedOut::TimedOut) => unreachable!(),
+            Err(ImmediatelyWokenUp) => Err(ImmediatelyWokenUp),
+        }
+    }
+
+    fn block_or_timeout(
+        &self,
+        val: u32,
+        timeout: Duration,
+    ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
+        self.block_or_maybe_timeout(val, Some(timeout))
+    }
+}
+
+impl litebox::platform::IPInterfaceProvider for WindowsUserland {
+    fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
+        net::send_ip_packet(&self.net_gateway, packet)
+    }
+
+    fn receive_ip_packet(
+        &self,
+        packet: &mut [u8],
+    ) -> Result<usize, litebox::platform::ReceiveError> {
+        net::receive_ip_packet(&self.net_gateway, packet)
+    }
+}
+
+impl WindowsUserland {
+    /// Wait until there is data available from the userspace NAT gateway (see the private `net`
+    /// module), or `timeout` elapses. Mirrors `LinuxUserland::wait_on_tun`; used by a
+    /// network-worker thread to sleep efficiently between rounds of network interaction instead
+    /// of busy-polling.
+    pub fn wait_on_tun(&self, timeout: Option<Duration>) {
+        net::wait_on_tun(&self.net_gateway, timeout);
+    }
+}
+
+impl litebox::platform::TimeProvider for WindowsUserland {
+    type Instant = Instant;
+    type SystemTime = SystemTime;
+
+    fn now(&self) -> Self::Instant {
+        let mut ts = 0;
+        unsafe { QueryUnbiasedInterruptTimePrecise(&raw mut ts) };
+        Instant(ts)
+    }
+
+    fn current_time(&self) -> Self::SystemTime {
+        let mut filetime = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        unsafe {
+            GetSystemTimePreciseAsFileTime(&raw mut filetime);
+        }
+        let FILETIME {
+            dwLowDateTime: low,
+            dwHighDateTime: high,
+        } = filetime;
+        let filetime = (u64::from(high) << 32) | u64::from(low);
+        SystemTime { filetime }
+    }
+}
+
+/// 100ns units returned by `QueryUnbiasedInterruptTimePrecise`.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Instant(u64);
+
+impl litebox::platform::Instant for Instant {
+    fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
+        let diff = self.0.checked_sub(earlier.0)?;
+        // Convert from 100ns intervals to nanoseconds. This won't overflow in
+        // our lifetimes.
+        Some(Duration::from_nanos(diff * 100))
+    }
+
+    fn checked_add(&self, duration: core::time::Duration) -> Option<Self> {
+        let duration_100ns: u64 = (duration.as_nanos() / 100).try_into().ok()?;
+        let new = self.0.checked_add(duration_100ns)?;
+        Some(Instant(new))
+    }
+}
+
+pub struct SystemTime {
+    // 100ns intervals since Windows epoch
+    filetime: u64,
+}
+
+impl litebox::platform::SystemTime for SystemTime {
+    // Windows epoch: Jan 1, 1601
+    // Unix epoch: Jan 1, 1970
+    // Difference: 11644473600 seconds
+    // Intervals: 100ns intervals
+    // Seconds per interval: 10^-7
+    const UNIX_EPOCH: Self = SystemTime {
+        filetime: 11_644_473_600 * 10_000_000,
+    };
+
+    fn duration_since(&self, earlier: &Self) -> Result<core::time::Duration, core::time::Duration> {
+        if self.filetime >= earlier.filetime {
+            let diff_100ns = self.filetime - earlier.filetime;
+            let nanos = diff_100ns * 100;
+            let secs = nanos / 1_000_000_000;
+            let remaining_nanos = nanos % 1_000_000_000;
+            Ok(core::time::Duration::new(secs, remaining_nanos as u32))
+        } else {
+            let diff_100ns = earlier.filetime - self.filetime;
+            let nanos = diff_100ns * 100;
+            let secs = nanos / 1_000_000_000;
+            let remaining_nanos = nanos % 1_000_000_000;
+            Err(core::time::Duration::new(secs, remaining_nanos as u32))
+        }
+    }
+}
+
+impl litebox::platform::ArchSpecificProvider for WindowsUserland {
+    fn set_arch_specific_register(
+        &self,
+        reg: &litebox::platform::ArchSpecificRegister,
+        val: usize,
+    ) -> Result<(), litebox::platform::ArchSpecificError> {
+        match reg {
+            litebox::platform::ArchSpecificRegister::FsBase => {
+                // Two checks, deliberately layered: `is_valid_user_fs_base` enforces the generic
+                // x86_64 Linux ABI ceiling (`USER_ADDR_END`), which is NOT tight enough on this
+                // platform specifically -- this platform's actual guest-addressable ceiling
+                // (`TASK_ADDR_MAX`) sits far below `USER_ADDR_END`, and everything from
+                // `TASK_ADDR_MAX` up through `HOST_ALLOCATOR_REGION_MIN`'s reserved 64 GiB span
+                // belongs to the HOST process (its own stack, modules, and the host global
+                // allocator's own reserved region -- see `HOST_ALLOCATOR_REGION_MIN`'s doc
+                // comment), never to the guest. Every caller that can set a thread's FS base
+                // (`arch_prctl(ARCH_SET_FS)`, `clone(CLONE_SETTLS)`, and `fork()`'s own
+                // parent-to-child FS-base propagation) funnels through this one function, so
+                // rejecting an out-of-range value here closes off, at a single choke point, the
+                // musl dtv-clear crash this investigation has chased for many passes (`mov rdx,
+                // [rax+0x80]` on a `rax` proven to be a live `HOST_ALLOCATOR_REGION_MIN`-range
+                // address) regardless of how such a value could ever have been computed upstream.
+                let task_addr_max = <Self as litebox::platform::PageManagementProvider<
+                    { litebox::mm::linux::PAGE_SIZE },
+                >>::TASK_ADDR_MAX;
+                if litebox_common_linux::arch::is_valid_user_fs_base(val) && val < task_addr_max {
+                    // Use WindowsUserland's per-thread FS base management system
+                    Self::set_thread_fs_base(val);
+                    Ok(())
+                } else {
+                    Err(litebox::platform::ArchSpecificError::RegisterUnpermittedValue)
+                }
+            }
+            litebox::platform::ArchSpecificRegister::GsBase => {
+                // Windows uses GS for its own thread environment block
+                // (TEB); the host platform does not expose a safe way for
+                // the guest to program gs base without breaking the host.
+                Err(litebox::platform::ArchSpecificError::RegisterReserved)
+            }
+            _ => Err(litebox::platform::ArchSpecificError::RegisterUnsupported),
+        }
+    }
+
+    fn get_arch_specific_register(
+        &self,
+        reg: &litebox::platform::ArchSpecificRegister,
+    ) -> Result<usize, litebox::platform::ArchSpecificError> {
+        match reg {
+            litebox::platform::ArchSpecificRegister::FsBase => Ok(Self::get_thread_fs_base()),
+            litebox::platform::ArchSpecificRegister::GsBase => {
+                // See note above: gs base is reserved by the Windows host.
+                Err(litebox::platform::ArchSpecificError::RegisterReserved)
+            }
+            _ => Err(litebox::platform::ArchSpecificError::RegisterUnsupported),
+        }
+    }
+
+    /// Writes the guest's live xmm0-xmm15 (256 bytes) into `out[..256]`.
+    ///
+    /// Correctness depends on the same invariant `guest_xmm0_5` itself relies on (see that
+    /// field's doc comment): whenever host Rust code is running (which this function's own
+    /// caller always is, since it's a plain Rust method, never reached from the naked-asm guest
+    /// entry trampolines directly), xmm0-xmm5 are the Windows x64 ABI's *caller-saved* registers
+    /// -- any host code between a guest exit and this call is free to have clobbered them, so the
+    /// only reliably-guest-valid copy is the one `syscall_callback` already captured into
+    /// `TlsState.guest_xmm0_5` before any other host code ran. xmm6-xmm15 are *callee*-saved by
+    /// the same ABI, and `run_thread_arch`'s own prologue/epilogue already preserves them for the
+    /// guest-thread's *entire* lifetime around all host code -- so those six-through-fifteen are
+    /// still genuinely live, guest-valid values in the real hardware registers right now, with no
+    /// separate capture needed.
+    fn get_fp_state(&self, out: &mut [u8]) -> Result<(), litebox::platform::ArchSpecificError> {
+        const XMM_BYTES: usize = 16 * 16;
+        if out.len() < XMM_BYTES {
+            return Err(litebox::platform::ArchSpecificError::RegisterUnpermittedValue);
+        }
+        let Some(tls) = get_tls_ptr() else {
+            return Err(litebox::platform::ArchSpecificError::RegisterUnsupported);
+        };
+        let tls = unsafe { &*tls };
+        out[0..96].copy_from_slice(tls.guest_xmm0_5.get().as_bytes());
+        let p = out.as_mut_ptr();
+        unsafe {
+            core::arch::asm!(
+                "movups [{p} + 6*16], xmm6",
+                "movups [{p} + 7*16], xmm7",
+                "movups [{p} + 8*16], xmm8",
+                "movups [{p} + 9*16], xmm9",
+                "movups [{p} + 10*16], xmm10",
+                "movups [{p} + 11*16], xmm11",
+                "movups [{p} + 12*16], xmm12",
+                "movups [{p} + 13*16], xmm13",
+                "movups [{p} + 14*16], xmm14",
+                "movups [{p} + 15*16], xmm15",
+                p = in(reg) p,
+                options(nostack),
+            );
+        }
+        Ok(())
+    }
+
+    /// Writes `state[..256]` back into the guest's real xmm0-xmm15, the inverse of
+    /// [`Self::get_fp_state`]. See that function's doc comment for why xmm0-5 must go through
+    /// `TlsState.guest_xmm0_5` (restored to the live registers later, at the same point
+    /// `switch_to_guest`'s existing xmm0-5 restore already runs) rather than being written to the
+    /// hardware registers directly here: this call's own caller is host Rust code, so any xmm0-5
+    /// value written straight to hardware now would just be clobbered by the next caller-saved
+    /// use before the guest ever resumes.
+    fn set_fp_state(&self, state: &[u8]) -> Result<(), litebox::platform::ArchSpecificError> {
+        const XMM_BYTES: usize = 16 * 16;
+        if state.len() < XMM_BYTES {
+            return Err(litebox::platform::ArchSpecificError::RegisterUnpermittedValue);
+        }
+        let Some(tls) = get_tls_ptr() else {
+            return Err(litebox::platform::ArchSpecificError::RegisterUnsupported);
+        };
+        let tls = unsafe { &*tls };
+        let mut xmm0_5 = [0u128; 6];
+        xmm0_5.as_mut_bytes().copy_from_slice(&state[0..96]);
+        tls.guest_xmm0_5.set(xmm0_5);
+        let p = state.as_ptr();
+        unsafe {
+            core::arch::asm!(
+                "movups xmm6, [{p} + 6*16]",
+                "movups xmm7, [{p} + 7*16]",
+                "movups xmm8, [{p} + 8*16]",
+                "movups xmm9, [{p} + 9*16]",
+                "movups xmm10, [{p} + 10*16]",
+                "movups xmm11, [{p} + 11*16]",
+                "movups xmm12, [{p} + 12*16]",
+                "movups xmm13, [{p} + 13*16]",
+                "movups xmm14, [{p} + 14*16]",
+                "movups xmm15, [{p} + 15*16]",
+                p = in(reg) p,
+                out("xmm6") _, out("xmm7") _, out("xmm8") _, out("xmm9") _, out("xmm10") _,
+                out("xmm11") _, out("xmm12") _, out("xmm13") _, out("xmm14") _, out("xmm15") _,
+                options(nostack, readonly),
+            );
+        }
+        Ok(())
+    }
+}
+
+type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::UserConstPtr<
+    litebox::platform::common_providers::userspace_pointers::NoValidation,
+    T,
+>;
+type UserMutPtr<T> = litebox::platform::common_providers::userspace_pointers::UserMutPtr<
+    litebox::platform::common_providers::userspace_pointers::NoValidation,
+    T,
+>;
+
+impl litebox::platform::RawPointerProvider for WindowsUserland {
+    type RawConstPointer<T: FromBytes> = UserConstPtr<T>;
+    type RawMutPointer<T: FromBytes + IntoBytes> = UserMutPtr<T>;
+}
+
+#[allow(
+    clippy::match_same_arms,
+    reason = "Iterate over all cases for prot_flags."
+)]
+fn prot_flags(flags: MemoryRegionPermissions) -> Win32_Memory::PAGE_PROTECTION_FLAGS {
+    match (
+        flags.contains(MemoryRegionPermissions::READ),
+        flags.contains(MemoryRegionPermissions::WRITE),
+        flags.contains(MemoryRegionPermissions::EXEC),
+    ) {
+        // no permissions
+        (false, false, false) => Win32_Memory::PAGE_NOACCESS,
+        // read-only
+        (true, false, false) => Win32_Memory::PAGE_READONLY,
+        // write-only (Windows doesn't have write-only, so we use r+w)
+        (false, true, false) => Win32_Memory::PAGE_READWRITE,
+        // read-write
+        (true, true, false) => Win32_Memory::PAGE_READWRITE,
+        // exeute-only (Windows doesn't have execute-only, so we use r+x)
+        (false, false, true) => Win32_Memory::PAGE_EXECUTE_READ,
+        // read-execute
+        (true, false, true) => Win32_Memory::PAGE_EXECUTE_READ,
+        // write-execute (Windows doesn't have write-execute, so we use rwx)
+        (false, true, true) => Win32_Memory::PAGE_EXECUTE_READWRITE,
+        // read-write-execute
+        (true, true, true) => Win32_Memory::PAGE_EXECUTE_READWRITE,
+    }
+}
+
+fn do_prefetch_on_range(start: usize, size: usize) {
+    let ok = unsafe {
+        let prefetch_entry = Win32_Memory::WIN32_MEMORY_RANGE_ENTRY {
+            VirtualAddress: start as *mut c_void,
+            NumberOfBytes: size,
+        };
+        PrefetchVirtualMemory(GetCurrentProcess(), 1, &raw const prefetch_entry, 0) != 0
+    };
+    assert!(ok, "PrefetchVirtualMemory failed with error: {}", unsafe {
+        GetLastError()
+    });
+}
+
+fn do_query_on_region(mbi: &mut Win32_Memory::MEMORY_BASIC_INFORMATION, base_addr: *mut c_void) {
+    let ok = unsafe {
+        Win32_Memory::VirtualQuery(
+            base_addr,
+            mbi,
+            core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+        ) != 0
+    };
+    assert!(ok, "VirtualQuery addr={:p} failed: {}", base_addr, unsafe {
+        GetLastError()
+    });
+}
+
+/// Helper method to process a memory range by iterating through Windows memory regions.
+///
+/// Windows memory is managed in Virtual Address Descriptors (VADs) at the NT kernel level,
+/// which means a single user-space range might span multiple regions. This helper method
+/// queries each region within the specified range and applies the given operation.
+///
+/// # Parameters
+/// - `range`: The memory range to process
+/// - `operation`: A closure that takes (region_range, region_state) and returns Result<bool, E>.
+///
+/// # Panics
+///
+/// Panics if the operation returns false for any region.
+fn process_memory_range_by_regions<F, E>(
+    mut range: core::ops::Range<usize>,
+    mut operation: F,
+) -> Result<(), E>
+where
+    F: FnMut(core::ops::Range<usize>, Win32_Memory::VIRTUAL_ALLOCATION_TYPE) -> Result<bool, E>,
+{
+    while !range.is_empty() {
+        let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+        do_query_on_region(&mut mbi, range.start as *mut c_void);
+        debug_assert_eq!(range.start, mbi.BaseAddress as usize);
+        let len = mbi.RegionSize.min(range.len());
+        let success = operation(range.start..range.start + len, mbi.State)?;
+        assert!(
+            success,
+            "operation failed on region {:p}-{:p}: {}",
+            range.start as *mut c_void,
+            (range.start + len) as *mut c_void,
+            std::io::Error::last_os_error()
+        );
+        range = (range.start + len)..range.end;
+    }
+    Ok(())
+}
+
+macro_rules! debug_assert_alignment {
+    ($r:ident, $page_size:expr) => {
+        debug_assert!($r.start.is_multiple_of($page_size));
+        debug_assert!($r.end.is_multiple_of($page_size));
+    };
+}
+
+/// Lower boundary (inclusive) of the address range exclusively reserved for the host-side
+/// global Rust allocator ([`SLAB_ALLOC`]/[`WindowsUserland::alloc`]). Nothing below this
+/// address is ever requested by [`WindowsUserland::alloc`], and the guest's own
+/// [`litebox::platform::PageManagementProvider::TASK_ADDR_MAX`] is set to end strictly below
+/// it (see that constant's own doc comment). This is a fixed split of the process's 47-bit
+/// canonical user address space (`0`..`0x7FFF_FFFF_FFFF`), carving off the top 64 GiB for the
+/// host allocator and leaving the rest for the guest. 64 GiB (not a smaller value) because the
+/// host allocator backs ordinary host-process `Vec`/`String` growth too -- e.g. reading a
+/// multi-gigabyte initial-files tar archive via `std::fs::read` -- and a too-small reservation
+/// reintroduces a real, easily-hit out-of-memory failure (confirmed live: a 2 GiB reservation
+/// failed to read a 1.3 GB tar file, since `SafeZoneAllocator` doubles requested size for
+/// alignment padding and its buddy allocator's largest block class is `1 << ORDER` = 16 GiB).
+///
+/// # Why this exists
+///
+/// Before this split existed, [`WindowsUserland::alloc`] called `VirtualAlloc2` with a null
+/// (OS-chosen) base address, completely unconstrained. Windows was therefore free to hand back
+/// an address anywhere in the process's address space, including inside
+/// `TASK_ADDR_MIN..TASK_ADDR_MAX`, the same range the guest's own `Vmem` independently manages
+/// for guest mmap/heap/stack placement. `Vmem`'s own placement logic only avoids addresses
+/// captured in a one-time startup snapshot (`WindowsUserland::read_memory_maps`), so it had no
+/// visibility into memory the global allocator committed later during ordinary guest execution.
+/// When both sides raced to commit overlapping virtual addresses, Windows gave no error --
+/// each `VirtualAlloc2` call "succeeds" independently -- and whichever side committed second
+/// silently aliased memory the other side believed it exclusively owned, corrupting guest state
+/// (e.g. musl's malloc/TLS bookkeeping) with unrelated host allocator content. Statically
+/// partitioning the address space so the two allocators' domains are disjoint makes that
+/// collision unrepresentable rather than merely unlikely.
+const HOST_ALLOCATOR_REGION_MIN: usize = 0x7FF0_0000_0000;
+
+impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for WindowsUserland {
+    // TODO(chuqi): These are currently "magic numbers" grabbed from my Windows 11 SystemInformation.
+    // The actual values should be determined by `GetSystemInfo()`.
+    //
+    // NOTE: make sure the values are PAGE_ALIGNED.
+    const TASK_ADDR_MIN: usize = 0x1_0000;
+    /// Kept strictly below [`HOST_ALLOCATOR_REGION_MIN`] so the guest's own `Vmem` placement
+    /// (which only avoids a one-time startup snapshot of committed regions, see that constant's
+    /// doc comment) can never be handed an address the host global allocator later claims.
+    const TASK_ADDR_MAX: usize = HOST_ALLOCATOR_REGION_MIN - 0x1_0000;
+    fn allocate_pages(
+        &self,
+        suggested_range: core::ops::Range<usize>,
+        initial_permissions: MemoryRegionPermissions,
+        can_grow_down: bool,
+        populate_pages_immediately: bool,
+        fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<Self::RawMutPointer<u8>, AllocationError> {
+        debug_assert!(ALIGN.is_multiple_of(self.sys_info.read().unwrap().dwPageSize as usize));
+        debug_assert_alignment!(suggested_range, ALIGN);
+
+        // A helper closure to reserve and commit memory in one go.
+        //
+        // Note that MEM_RESERVE requires the base address to be aligned to system allocation granularity,
+        // while MEM_COMMIT only requires page-aligned address.
+        //
+        // To ensure future MEM_COMMIT calls on sub-ranges succeed, we always reserve the entire aligned range
+        // (i.e., MEM_RESERVE size is also made aligned to system allocation granularity).
+        let reserve_and_commit = |r: core::ops::Range<usize>,
+                                  flags: Win32_Memory::PAGE_PROTECTION_FLAGS|
+         -> *mut c_void {
+            let aligned_start_addr = self.round_down_to_granu(r.start);
+            let aligned_end_addr = self.round_up_to_granu(r.end);
+
+            // When the caller (guest `Vmem`) does not suggest a specific address (`r.start ==
+            // 0`), the MEM_RESERVE below previously asked Windows to pick ANY free address in
+            // the whole process with no upper bound -- unlike every OTHER guest allocation path
+            // in this function, which is asserted to stay within `TASK_ADDR_MIN..TASK_ADDR_MAX`
+            // (see the `suggested_range.start != 0` branch below). Windows is free to satisfy an
+            // unconstrained request from anywhere, including inside
+            // `HOST_ALLOCATOR_REGION_MIN..`, the range this process's own global allocator
+            // (`WindowsUserland::alloc`, below) is exclusively constrained to via the mirror-image
+            // `MEM_ADDRESS_REQUIREMENTS` there. A guest allocation landing in that region is
+            // indistinguishable, from the guest's perspective, from ordinary guest heap memory --
+            // it silently aliases whatever the host allocator later places at the same address,
+            // corrupting both sides with no page fault to signal it. Constrain this path
+            // symmetrically to `TASK_ADDR_MIN..TASK_ADDR_MAX` so the two regions can never
+            // overlap.
+            let mut addr_req = MEM_ADDRESS_REQUIREMENTS {
+                LowestStartingAddress: <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::TASK_ADDR_MIN as *mut c_void,
+                HighestEndingAddress: (<WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::TASK_ADDR_MAX - 1) as *mut c_void,
+                Alignment: 0,
+            };
+            let mut ext_param = MEM_EXTENDED_PARAMETER {
+                Anonymous1: MEM_EXTENDED_PARAMETER_0 {
+                    _bitfield: MemExtendedParameterAddressRequirements as u64,
+                },
+                Anonymous2: windows_sys::Win32::System::Memory::MEM_EXTENDED_PARAMETER_1 {
+                    Pointer: (&raw mut addr_req).cast::<c_void>(),
+                },
+            };
+            let ptr = if r.start == 0 {
+                unsafe {
+                    VirtualAlloc2(
+                        GetCurrentProcess(),
+                        core::ptr::null_mut(),
+                        aligned_end_addr - aligned_start_addr,
+                        Win32_Memory::MEM_RESERVE,
+                        Win32_Memory::PAGE_NOACCESS,
+                        &raw mut ext_param,
+                        1,
+                    )
+                }
+            } else {
+                unsafe {
+                    VirtualAlloc2(
+                        GetCurrentProcess(),
+                        aligned_start_addr as *mut c_void,
+                        aligned_end_addr - aligned_start_addr,
+                        Win32_Memory::MEM_RESERVE,
+                        Win32_Memory::PAGE_NOACCESS,
+                        core::ptr::null_mut(),
+                        0,
+                    )
+                }
+            };
+            if ptr.is_null() {
+                core::ptr::null_mut()
+            } else {
+                unsafe {
+                    VirtualAlloc2(
+                        GetCurrentProcess(),
+                        if r.start == 0 {
+                            ptr
+                        } else {
+                            r.start as *mut c_void
+                        },
+                        r.len(),
+                        Win32_Memory::MEM_COMMIT,
+                        flags,
+                        core::ptr::null_mut(),
+                        0,
+                    )
+                }
+            }
+        };
+
+        let mut base_addr = suggested_range.start as *mut c_void;
+        let size = suggested_range.len();
+        // TODO: For Windows, there is no MAP_GROWDOWN features so far.
+        let _ = can_grow_down;
+
+        if suggested_range.start != 0 {
+            assert!(suggested_range.start >= <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::
+                                                            TASK_ADDR_MIN);
+            assert!(suggested_range.end <= <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::
+                                                            TASK_ADDR_MAX);
+
+            // Hold `ALLOCATE_PAGES_FIXED_ADDR_LOCK` across the ENTIRE check-then-act sequence
+            // below (the `has_committed_page` query through the final `VirtualAlloc2`/`VirtualFree`
+            // calls) -- without this, a real TOCTOU race exists: `has_committed_page` can observe
+            // a range as free, but before this thread's own subsequent allocation call actually
+            // reserves/commits it, a DIFFERENT concurrently-running guest process's thread could
+            // allocate into the exact same real address (confirmed real and unfixed via direct
+            // code review: the existing `assert_eq!(fixed_address_behavior, Replace, "raced with
+            // another memory allocator")` a few lines below is a pre-existing, already-known,
+            // still-live acknowledgment of this exact gap, previously marked only with a
+            // `// TODO: handle this race condition properly` comment). Real Linux's kernel-level
+            // `mmap()` is atomic against concurrent sibling-process mmaps; this two-Windows-API-
+            // call reimplementation was not, until now. Scoped to only the fixed-address path
+            // (`suggested_range.start != 0`) -- the OS-picks-any-address path (`start == 0`) has
+            // no equivalent race, since `VirtualAlloc2` with no address hint is itself atomic.
+            let _fixed_addr_guard = ALLOCATE_PAGES_FIXED_ADDR_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+            let has_committed_page =
+                process_memory_range_by_regions(suggested_range.clone(), |r, state| {
+                    let mbi_type = {
+                        let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+                        do_query_on_region(&mut mbi, r.start as *mut c_void);
+                        mbi.Type
+                    };
+                    litebox_util_log::debug!(
+                        start:% = r.start, end:% = r.end, state:? = state, mbi_type:? = mbi_type;
+                        "allocate_pages: DIAG region state at has_committed_page check"
+                    );
+                    if state == Win32_Memory::MEM_COMMIT {
+                        Err(())
+                    } else {
+                        Ok(true)
+                    }
+                })
+                .is_err();
+            if has_committed_page && fixed_address_behavior == FixedAddressBehavior::Hint {
+                // If any page in the suggested range is already committed, and the caller
+                // did not request a fixed address, we ask the OS to allocate a new region.
+                base_addr = core::ptr::null_mut();
+            } else if has_committed_page
+                && fixed_address_behavior == FixedAddressBehavior::NoReplace
+            {
+                return Err(AllocationError::AddressInUse);
+            } else if fixed_address_behavior == FixedAddressBehavior::Replace
+                && {
+                    // Checked regardless of `has_committed_page`: a foreign claim can cover a
+                    // range Windows currently reports as MEM_FREE or MEM_RESERVE (not yet
+                    // MEM_COMMIT) when the owning thread reserved-but-hasn't-yet-committed it, or
+                    // when this thread's own view of "committed" raced with the owner's. Only
+                    // checking `has_committed_page && Replace` (the prior condition) let a
+                    // `Replace`-mode caller's `MEM_FREE`/`MEM_RESERVE` branch below commit
+                    // straight over another thread's still-live claim with zero foreign-claim
+                    // check at all -- confirmed live via a weston + weston-desktop-shell repro:
+                    // one thread's own already-committed `mmap(NULL, 4096)` region was corrupted
+                    // by a sibling thread's `brk()`-driven `Replace`-mode growth landing on it,
+                    // because `has_committed_page` observed the target range as not-yet-MEM_COMMIT
+                    // at the moment this thread queried it, skipping this check entirely under the
+                    // old `has_committed_page &&` gate.
+                    let fc = find_foreign_claim(suggested_range.clone(), current_claim_owner());
+                    litebox_util_log::debug!(
+                        start:% = suggested_range.start, end:% = suggested_range.end,
+                        found:% = fc.is_some(), has_committed_page:% = has_committed_page;
+                        "allocate_pages: Replace-mode foreign-claim check"
+                    );
+                    fc.is_some()
+                }
+            {
+                // See `CLAIMED_RANGES`'s doc comment: a claimed range here that this thread
+                // does not itself own is another still-live guest process's real memory (most
+                // commonly two `ET_EXEC` binaries sharing the same link-time base address while
+                // both alive via nested `vfork()`), never a stale leftover safe to clobber.
+                // Relocate to a fresh address instead of decommitting/recommitting/committing
+                // over it.
+                base_addr = core::ptr::null_mut();
+            } else {
+                process_memory_range_by_regions(
+                    suggested_range,
+                    |r, state| -> Result<bool, std::convert::Infallible> {
+                        let ok = match state {
+                            // In case the region is already reserved, we just need to commit it.
+                            // In case the region is already committed, decommit and recommit it.
+                            Win32_Memory::MEM_RESERVE | Win32_Memory::MEM_COMMIT => {
+                                let mut was_mapped_view = false;
+                                if state == Win32_Memory::MEM_COMMIT {
+                                    // TODO: handle this race condition properly.
+                                    assert_eq!(
+                                        fixed_address_behavior,
+                                        FixedAddressBehavior::Replace,
+                                        "raced with another memory allocator"
+                                    );
+                                    // `r` here is a single `VirtualQuery`/`MEMORY_BASIC_INFORMATION`
+                                    // region, i.e. a maximal run of pages sharing the same state
+                                    // and protection. Windows merges adjacent same-attribute
+                                    // regions from *distinct* `VirtualAlloc2` reservations into
+                                    // one reported region, so `r` can straddle an allocation-object
+                                    // boundary even though it looked like one region to us. A
+                                    // single `VirtualFree(MEM_DECOMMIT)` call cannot span more than
+                                    // one allocation object -- Windows rejects it wholesale with
+                                    // ERROR_INVALID_PARAMETER (87) rather than decommitting the
+                                    // part(s) it could -- confirmed live via a weston `dlopen()` of
+                                    // `xwayland.so`, whose fixed-address PT_LOAD placement landed
+                                    // exactly on such a merged-region boundary and crashed the host
+                                    // process. Recover by bisecting: on failure, split the range in
+                                    // half and decommit each half (recursively, in case a half still
+                                    // straddles another boundary) instead of asserting success on
+                                    // the whole range in one shot.
+                                    //
+                                    // A distinct, non-bisectable failure mode: `r` can be a
+                                    // `MEM_MAPPED` (or `MEM_IMAGE`) region -- a real
+                                    // `MapViewOfFile3`-backed view, e.g. litebox's own
+                                    // `map_shared_memory` (guest `MAP_SHARED`/`wl_shm` buffers) --
+                                    // rather than an ordinary `VirtualAlloc2`-committed `MEM_PRIVATE`
+                                    // region. `VirtualFree(MEM_DECOMMIT)` is documented by Microsoft
+                                    // to be invalid on a mapped view regardless of size (it fails
+                                    // with `ERROR_INVALID_PARAMETER` or, observed live,
+                                    // `ERROR_INVALID_HANDLE` (6)) -- bisecting it down to a single
+                                    // page still can't succeed, since the operation itself is
+                                    // categorically wrong for this region type, not merely
+                                    // mis-sized. Confirmed live: a real Weston `mremap()` (pixman
+                                    // shadow-framebuffer growth) placed a `Replace`-mode fixed
+                                    // allocation exactly on a `MEM_MAPPED` region and hit this same
+                                    // decommit path, panicking the host. The correct operation for a
+                                    // mapped view is `UnmapViewOfFileEx`, which drops the whole view
+                                    // (mapped views cannot be partially unmapped -- unlike
+                                    // `VirtualFree`, there is no sub-range form), after which the
+                                    // freed range is `MEM_FREE` again for `VirtualAlloc2` to commit
+                                    // fresh `MEM_PRIVATE` pages into, matching what a real Linux
+                                    // `mmap(MAP_FIXED)` replacing a `shmat`/file mapping does.
+                                    let mbi_type = {
+                                        let mut mbi =
+                                            Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+                                        do_query_on_region(&mut mbi, r.start as *mut c_void);
+                                        mbi.Type
+                                    };
+                                    was_mapped_view = mbi_type == Win32_Memory::MEM_MAPPED
+                                        || mbi_type == Win32_Memory::MEM_IMAGE;
+                                    let decommit_ok = if was_mapped_view {
+                                        (unsafe {
+                                            UnmapViewOfFileEx(
+                                                Win32_Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                                                    Value: r.start as *mut c_void,
+                                                },
+                                                0,
+                                            )
+                                        }) != 0
+                                    } else {
+                                        fn decommit_bisecting(range: core::ops::Range<usize>) -> bool {
+                                            if range.is_empty() {
+                                                return true;
+                                            }
+                                            let ok = unsafe {
+                                                VirtualFree(
+                                                    range.start as *mut c_void,
+                                                    range.len(),
+                                                    Win32_Memory::MEM_DECOMMIT,
+                                                )
+                                            } != 0;
+                                            if ok {
+                                                return true;
+                                            }
+                                            // Only bisect on the specific "spans multiple allocation
+                                            // objects" error; any other failure should surface as-is.
+                                            if unsafe { GetLastError() } != windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER
+                                            {
+                                                return false;
+                                            }
+                                            // A single page can't be split further; nothing left to try.
+                                            // Use the fixed 4 KiB Windows page granularity here (not
+                                            // the outer `ALIGN` const, which nested `fn`s can't see) --
+                                            // any multiple of the true page size is a valid split point.
+                                            const PAGE: usize = 0x1000;
+                                            if range.len() <= PAGE {
+                                                return false;
+                                            }
+                                            let mid = range.start
+                                                + ((range.len() / 2) / PAGE).max(1) * PAGE;
+                                            decommit_bisecting(range.start..mid)
+                                                && decommit_bisecting(mid..range.end)
+                                        }
+                                        decommit_bisecting(r.clone())
+                                    };
+                                    if !decommit_ok {
+                                        let mut mbi =
+                                            Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+                                        do_query_on_region(&mut mbi, r.start as *mut c_void);
+                                        litebox_util_log::debug!(
+                                            start:% = r.start, end:% = r.end,
+                                            mbi_type:? = mbi.Type, mbi_state:? = mbi.State,
+                                            mbi_protect:? = mbi.Protect;
+                                            "allocate_pages: DIAG decommit failed, dumping region info"
+                                        );
+                                    }
+                                    assert!(
+                                        decommit_ok,
+                                        "VirtualFree(DECOMMIT) failed: {}",
+                                        unsafe { GetLastError() }
+                                    );
+                                }
+                                // `UnmapViewOfFileEx` (the `was_mapped_view` branch above) drops
+                                // the freed range straight to `MEM_FREE`, not `MEM_RESERVE` --
+                                // unlike `VirtualFree(MEM_DECOMMIT)`, which leaves the allocation
+                                // reserved. `VirtualAlloc2(MEM_COMMIT)` alone requires an existing
+                                // reservation, so a former mapped view needs the same
+                                // reserve-and-commit path as a genuinely free region.
+                                let ptr = if was_mapped_view {
+                                    reserve_and_commit(r.clone(), prot_flags(initial_permissions))
+                                } else {
+                                    unsafe {
+                                        VirtualAlloc2(
+                                            GetCurrentProcess(),
+                                            r.start as *mut c_void,
+                                            r.len(),
+                                            Win32_Memory::MEM_COMMIT,
+                                            prot_flags(initial_permissions),
+                                            core::ptr::null_mut(),
+                                            0,
+                                        )
+                                    }
+                                };
+                                !ptr.is_null()
+                            }
+                            // In case the region is free, we need to reserve and commit it.
+                            Win32_Memory::MEM_FREE => {
+                                let ptr =
+                                    reserve_and_commit(r.clone(), prot_flags(initial_permissions));
+                                !ptr.is_null()
+                            }
+                            _ => unimplemented!(
+                                "Unexpected memory state: {:?} when allocating pages",
+                                state
+                            ),
+                        };
+                        // Prefetch the memory range if requested
+                        if ok && populate_pages_immediately {
+                            do_prefetch_on_range(r.start, r.len());
+                        }
+                        Ok(ok)
+                    },
+                )
+                .unwrap();
+                if fixed_address_behavior == FixedAddressBehavior::Replace {
+                    claim_range(base_addr as usize..(base_addr as usize + size));
+                }
+                return Ok(UserMutPtr::from_ptr(base_addr.cast()));
+            }
+        }
+
+        debug_assert!(base_addr.is_null());
+        let ptr = reserve_and_commit(0..size, prot_flags(initial_permissions));
+        assert!(
+            !ptr.is_null(),
+            "VirtualAlloc2(RESERVE|COMMIT size=0x{:x}) failed: {}",
+            size,
+            std::io::Error::last_os_error()
+        );
+
+        // Prefetch the memory range if requested
+        if populate_pages_immediately {
+            do_prefetch_on_range(ptr as usize, size);
+        }
+        // Claim unconditionally here (unlike the fixed-address branch above, which only claims
+        // for `Replace`): this is the OS-picks-any-address path, taken by every ordinary guest
+        // `mmap(NULL, ...)` (`Hint` mode) in addition to the unconstrained `Replace`/`NoReplace`
+        // case where `suggested_range.start == 0`. See `claim_range`'s doc comment for why a
+        // `Hint`-mode commit needs to be visible to a later, different thread's `Replace`-mode
+        // collision check.
+        litebox_util_log::debug!(
+            start:% = ptr as usize, end:% = (ptr as usize + size);
+            "allocate_pages: claiming fresh-address (start==0 path) range"
+        );
+        claim_range(ptr as usize..(ptr as usize + size));
+        Ok(UserMutPtr::from_ptr(ptr.cast::<u8>()))
+    }
+
+    unsafe fn deallocate_pages(
+        &self,
+        range: core::ops::Range<usize>,
+    ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
+        debug_assert_alignment!(range, ALIGN);
+        // Hold `ALLOCATE_PAGES_FIXED_ADDR_LOCK` across this entire query-then-decommit walk, for
+        // the same reason `allocate_pages`'s fixed-address path holds it (see that call site's own
+        // doc comment): `process_memory_range_by_regions`'s `VirtualQuery`-then-act loop has no
+        // atomicity guarantee against a concurrently-running guest thread's own `VirtualFree`/
+        // `VirtualAlloc2` call on the same or an adjacent region -- Windows' own VAD tree can
+        // coalesce/split nodes spanning a query boundary, so an unlocked reader here could act on
+        // a state that's already stale by the time it does. `deallocate_pages` previously took no
+        // lock at all here, an asymmetry with `allocate_pages`'s own already-locked fixed-address
+        // path -- closing it so both allocate and deallocate are serialized against each other.
+        let _fixed_addr_guard = ALLOCATE_PAGES_FIXED_ADDR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        process_memory_range_by_regions(
+            range.clone(),
+            |r, state| -> Result<bool, std::convert::Infallible> {
+                debug_assert_ne!(
+                    state,
+                    Win32_Memory::MEM_FREE,
+                    "Trying to deallocate a free region: {:p}-{:p}",
+                    r.start as *mut c_void,
+                    r.end as *mut c_void
+                );
+                Ok(unsafe {
+                    VirtualFree(r.start as *mut c_void, r.len(), Win32_Memory::MEM_DECOMMIT)
+                } != 0)
+            },
+        )
+        .expect("deallocate_pages failed");
+        // Release this thread's own claim (see `CLAIMED_RANGES`'s doc comment), if any -- an
+        // explicit `munmap` genuinely relinquishes the range, unlike `execve` (which leaves an
+        // old claim standing until superseded by the new image's own `Replace` allocations, or
+        // this thread itself exits).
+        release_claim_range_for_current_thread(range);
+        Ok(())
+    }
+
+    unsafe fn update_permissions(
+        &self,
+        range: core::ops::Range<usize>,
+        new_permissions: MemoryRegionPermissions,
+    ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
+        debug_assert_alignment!(range, ALIGN);
+        let flags = prot_flags(new_permissions);
+        // Hold `VIRTUAL_PROTECT_LOCK` for the whole region walk: see its doc comment for why an
+        // unsynchronized `VirtualProtect` here can race `fork_verify`'s own temporary
+        // protection-flip-and-restore on a page shared with an unrelated thread.
+        let _guard = VIRTUAL_PROTECT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        process_memory_range_by_regions(
+            range,
+            |r, state| -> Result<bool, std::convert::Infallible> {
+                debug_assert_eq!(
+                    state,
+                    Win32_Memory::MEM_COMMIT,
+                    "Trying to change permissions on a non-committed region: {:p}-{:p}",
+                    r.start as *mut c_void,
+                    r.end as *mut c_void
+                );
+                let mut old_protect: u32 = 0;
+                Ok(unsafe {
+                    VirtualProtect(r.start as *mut c_void, r.len(), flags, &raw mut old_protect)
+                } != 0)
+            },
+        )
+        .expect("update_permissions failed");
+        Ok(())
+    }
+
+    fn reserved_pages(&self) -> impl Iterator<Item = &std::ops::Range<usize>> {
+        self.reserved_pages.iter()
+    }
+
+    // A Windows file-mapping `HANDLE`, backed by the system paging file (no real file on disk)
+    // since litebox only uses this for anonymous `MAP_SHARED` memory. Cast to/from `usize` at
+    // the trait boundary since `HANDLE` (a `*mut c_void`-shaped type) is not `Send`/`Sync` by
+    // itself, but the raw value it wraps is just an opaque per-process kernel-object identifier
+    // that is safe to copy and pass across threads (the same handle value is valid from any
+    // thread of this process, per the Win32 handle model).
+    type SharedMemoryHandle = usize;
+
+    fn create_shared_memory(
+        &self,
+        size: usize,
+    ) -> Result<Self::SharedMemoryHandle, SharedMemoryError> {
+        let size_u64 = size as u64;
+        // Intentional truncation: `CreateFileMappingW` takes the 64-bit size split into
+        // high/low 32-bit halves, not a single 64-bit parameter.
+        #[expect(clippy::cast_possible_truncation)]
+        let handle = unsafe {
+            CreateFileMappingW(
+                Win32_Foundation::INVALID_HANDLE_VALUE,
+                core::ptr::null(),
+                Win32_Memory::PAGE_EXECUTE_READWRITE,
+                (size_u64 >> 32) as u32,
+                size_u64 as u32,
+                core::ptr::null(),
+            )
+        };
+        if handle.is_null() {
+            return Err(SharedMemoryError::OutOfMemory);
+        }
+        Ok(handle as usize)
+    }
+
+    fn map_shared_memory(
+        &self,
+        handle: Self::SharedMemoryHandle,
+        suggested_range: core::ops::Range<usize>,
+        initial_permissions: MemoryRegionPermissions,
+        fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<Self::RawMutPointer<u8>, SharedMemoryError> {
+        debug_assert_alignment!(suggested_range, ALIGN);
+        // Mirrors `allocate_pages`'s `reserve_and_commit` null-address branch (see
+        // `HOST_ALLOCATOR_REGION_MIN`'s doc comment): when no hint address is available (either
+        // `suggested_range.start == 0`, or a hinted address was rejected and we fall back to
+        // asking Windows to place it), `MapViewOfFile3` used to be called with a null base
+        // address and NO `MEM_EXTENDED_PARAMETER` array at all -- completely unconstrained,
+        // unlike every other guest allocation path in this file. Windows was free to satisfy
+        // that request from anywhere, including inside `HOST_ALLOCATOR_REGION_MIN..`, the host
+        // global allocator's exclusive region, silently aliasing an anonymous `MAP_SHARED`
+        // guest mapping with host allocator memory. Constrain the null-address case the same
+        // way, via `MEM_ADDRESS_REQUIREMENTS`.
+        let mut addr_req = MEM_ADDRESS_REQUIREMENTS {
+            LowestStartingAddress: <WindowsUserland as litebox::platform::PageManagementProvider<
+                ALIGN,
+            >>::TASK_ADDR_MIN as *mut c_void,
+            HighestEndingAddress: (<WindowsUserland as litebox::platform::PageManagementProvider<
+                ALIGN,
+            >>::TASK_ADDR_MAX
+                - 1) as *mut c_void,
+            Alignment: 0,
+        };
+        let mut ext_param = MEM_EXTENDED_PARAMETER {
+            Anonymous1: MEM_EXTENDED_PARAMETER_0 {
+                _bitfield: MemExtendedParameterAddressRequirements as u64,
+            },
+            Anonymous2: windows_sys::Win32::System::Memory::MEM_EXTENDED_PARAMETER_1 {
+                Pointer: (&raw mut addr_req).cast::<c_void>(),
+            },
+        };
+        let mut try_map = |base_addr: *const c_void, constrained: bool| unsafe {
+            if constrained {
+                MapViewOfFile3(
+                    handle as *mut c_void,
+                    GetCurrentProcess(),
+                    base_addr,
+                    0,
+                    suggested_range.len(),
+                    0,
+                    prot_flags(initial_permissions),
+                    &raw mut ext_param,
+                    1,
+                )
+            } else {
+                MapViewOfFile3(
+                    handle as *mut c_void,
+                    GetCurrentProcess(),
+                    base_addr,
+                    0,
+                    suggested_range.len(),
+                    0,
+                    prot_flags(initial_permissions),
+                    core::ptr::null_mut(),
+                    0,
+                )
+            }
+        };
+        let base_addr = if suggested_range.start == 0 {
+            core::ptr::null()
+        } else {
+            suggested_range.start as *const c_void
+        };
+        let mut view = try_map(base_addr, base_addr.is_null());
+        // `Hint` means the platform may pick a different address if the hint isn't available
+        // (matching `allocate_pages`'s handling of the same case): retry with no address hint
+        // rather than surfacing an address collision as an error.
+        if view.Value.is_null()
+            && !base_addr.is_null()
+            && fixed_address_behavior == FixedAddressBehavior::Hint
+        {
+            view = try_map(core::ptr::null(), true);
+        }
+        if view.Value.is_null() {
+            let err = unsafe { GetLastError() };
+            litebox_util_log::debug!(
+                base_addr:% = base_addr as usize, len:% = suggested_range.len(),
+                fixed_address_behavior:? = fixed_address_behavior, win32_err:% = err;
+                "map_shared_memory: DIAG MapViewOfFile3 failed"
+            );
+            if fixed_address_behavior == FixedAddressBehavior::NoReplace
+                && (err == Win32_Foundation::ERROR_INVALID_ADDRESS
+                    || err == Win32_Foundation::ERROR_MAPPED_ALIGNMENT)
+            {
+                // ERROR_MAPPED_ALIGNMENT (1132): MapViewOfFile3 requires any explicit
+                // fixed-address request to be allocation-granularity aligned (64 KiB), not
+                // just page aligned (4 KiB). A page-aligned-but-not-granularity-aligned
+                // target (e.g. an in-place shared-mapping expand target computed by
+                // `resize_mapping`) hits this, not ERROR_INVALID_ADDRESS. Treat it the same
+                // way: report it as an ordinary address-in-use collision so the caller's
+                // real retry/placement-search path (`move_mappings`) picks a fresh,
+                // granularity-valid address instead of this surfacing as a permanent ENOMEM.
+                return Err(SharedMemoryError::AddressInUse);
+            }
+            return Err(SharedMemoryError::OutOfMemory);
+        }
+        Ok(UserMutPtr::from_ptr(view.Value.cast::<u8>()))
+    }
+
+    unsafe fn unmap_shared_memory(
+        &self,
+        range: core::ops::Range<usize>,
+    ) -> Result<(), SharedMemoryError> {
+        debug_assert_alignment!(range, ALIGN);
+        let ok = unsafe {
+            UnmapViewOfFileEx(
+                Win32_Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: range.start as *mut c_void,
+                },
+                0,
+            )
+        } != 0;
+        if !ok {
+            return Err(SharedMemoryError::Unaligned);
+        }
+        Ok(())
+    }
+
+    fn close_shared_memory(
+        &self,
+        handle: Self::SharedMemoryHandle,
+    ) -> Result<(), SharedMemoryError> {
+        // Best-effort: a `CloseHandle` failure here would mean the handle was already invalid,
+        // which is not actionable by the caller (the shared memory is either already gone or was
+        // never valid) -- matching this file's existing style of not treating cleanup-path
+        // failures as fatal (see e.g. `VirtualFree` callers that only assert in truly
+        // unexpected cases).
+        let _ = unsafe { Win32_Foundation::CloseHandle(handle as *mut c_void) };
+        Ok(())
+    }
+}
+
+/// Background state backing [`read_from_raw_handle`]/[`stdin_ready_raw_handle`] for a real console
+/// (`FILE_TYPE_CHAR`) `STD_INPUT_HANDLE`.
+///
+/// # Why a background reader thread, not `PeekConsoleInputW`
+///
+/// An earlier version of this readiness probe used `GetNumberOfConsoleInputEvents`/
+/// `PeekConsoleInputW` to inspect the console's raw `INPUT_RECORD` queue directly, on the
+/// assumption that "a queued key-down record" and "`ReadFile` would return immediately" were the
+/// same fact. They are not, once `ENABLE_LINE_INPUT` (the default console mode, and the mode a
+/// real interactive shell like `ash` runs under) is in play: conhost's cooked-read line editor
+/// consumes `KEY_EVENT_RECORD`s out of the raw queue as they arrive (to echo them and perform
+/// line editing), and only stages the finished line -- terminated by Enter -- in its own private,
+/// unqueryable buffer. `ReadFile`/`ReadConsole`, however small the requested byte count, drain
+/// that private cooked-read buffer directly, not the raw `INPUT_RECORD` queue. Confirmed live via
+/// the ConPTY test harness (see this fix's commit message) and independently corroborated by
+/// Microsoft Terminal maintainers (`microsoft/terminal#12143`): once a full line has been typed
+/// and Enter pressed, a single small `ReadFile` call correctly drains the first few bytes, but the
+/// *remaining* buffered bytes of that already-committed line are invisible to
+/// `PeekConsoleInputW`/`GetNumberOfConsoleInputEvents` (they undercount to 0 or a stale
+/// non-key-down remnant), even though `ReadFile` would still return them immediately with no
+/// blocking. There is no supported Win32 API to peek cooked-read readiness -- the community-
+/// converged workaround (also used by libraries like `system-terminal`) is what this does: run a
+/// background thread doing nothing but blocking `ReadFile` calls, and treat *that thread's*
+/// buffered results, not the raw input queue, as the readiness signal.
+struct ConsoleStdinReader {
+    /// Bytes already read from the console but not yet consumed by a guest `read()` call.
+    buffer: std::sync::Mutex<std::collections::VecDeque<u8>>,
+    /// Signaled whenever `buffer` transitions from empty to non-empty, or `eof` becomes true.
+    ready: std::sync::Condvar,
+    eof: core::sync::atomic::AtomicBool,
+}
+
+impl ConsoleStdinReader {
+    /// Returns `platform`'s lazily-initialized [`ConsoleStdinReader`], spawning its background
+    /// reader thread the first time this is called for a given `WindowsUserland` instance.
+    ///
+    /// Takes `&'static WindowsUserland` (not just `&WindowsUserland`) because the spawned reader
+    /// thread's closure must outlive the calling stack frame -- `WindowsUserland::new` always
+    /// hands back a `&'static Self` in practice (there is exactly one platform instance per
+    /// process, leaked for its lifetime), so every real caller already has one.
+    fn get(platform: &'static WindowsUserland) -> &'static Self {
+        platform.console_stdin_reader.get_or_init(|| {
+            let reader = ConsoleStdinReader {
+                buffer: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                ready: std::sync::Condvar::new(),
+                eof: core::sync::atomic::AtomicBool::new(false),
+            };
+            std::thread::Builder::new()
+                .name("litebox-console-stdin-reader".to_owned())
+                .spawn(move || Self::reader_thread_body(platform))
+                .expect("failed to spawn console stdin reader thread");
+            reader
+        })
+    }
+
+    /// Chunk size for each background `ReadFile` call. Sized to comfortably hold a typical typed
+    /// line; larger than this just means a following `ConsoleStdinReader::read` call drains it
+    /// across more than one guest `read()` invocation, matching how a real Linux pipe/tty already
+    /// behaves for an over-long line.
+    const CHUNK_LEN: u32 = 4096;
+
+    /// Clears `ENABLE_LINE_INPUT` on `STD_INPUT_HANDLE`, once, before the reader thread's first
+    /// `ReadFile` call.
+    ///
+    /// # Why this is required for correctness, not just a latency optimization
+    ///
+    /// With the console's default `ENABLE_LINE_INPUT` ("cooked mode") active, `ReadFile` does not
+    /// release ANY buffered bytes to the caller until a full line (terminated by Enter) is
+    /// available -- confirmed via a minimal, litebox-free repro: writing `ESC[6n` (a cursor-
+    /// position-report query, which busybox ash's line editor issues via `ask_terminal()` when
+    /// drawing a prompt) causes conhost to genuinely inject the `ESC[row;colR` reply into the
+    /// console's raw input queue near-instantly (visible via `PeekConsoleInputW`), but a
+    /// concurrently-blocked `ReadFile` call does NOT return with those bytes -- it stays blocked
+    /// indefinitely, because the reply has no trailing Enter and cooked-mode line buffering will
+    /// not release a partial line. The reply only becomes readable once concatenated with
+    /// whatever the user types *next*, which corrupts ash's own escape-sequence/line-buffer
+    /// state (`libbb/read_key.c`'s CPR-scanning loop and lineedit.c's stateful `read_key_buffer`)
+    /// -- observed live as `ls /` corrupted into `ls: /<3 garbage bytes>: Invalid argument`,
+    /// reproducible on the *second* interactive command in a session (the first has no pending,
+    /// still-unread CPR reply from an earlier prompt draw to collide with).
+    ///
+    /// Since the guest (`ash`) already performs its own line editing character-by-character via
+    /// its own `read(2)` loop (confirmed via syscall tracing: every guest read requests exactly 1
+    /// byte), there is no reason for the *Windows* console to also cook/line-buffer input on top
+    /// -- doing so is actively harmful here, not merely redundant. Clearing `ENABLE_LINE_INPUT`
+    /// makes `ReadFile` release each byte (or escape-sequence reply) as soon as it is queued,
+    /// exactly matching a real Linux tty's raw-mode delivery semantics and closing this race.
+    /// `ENABLE_ECHO_INPUT`/`ENABLE_PROCESSED_INPUT` are deliberately left untouched: local
+    /// character echo and Ctrl+C/Ctrl+Z signal generation continue to work exactly as before --
+    /// this is not a full raw-mode switch, only the minimum change needed to stop the console
+    /// from withholding already-arrived bytes behind an unrelated future line terminator.
+    ///
+    /// Best-effort: `SetConsoleMode` can return a nonzero-`GetLastError` "failure" on some
+    /// ConPTY-backed handles even though the mode change visibly takes effect (confirmed via the
+    /// same repro: `GetConsoleMode` read back afterward reflects the change, and the CPR-reply
+    /// race closes, despite `GetLastError() == ERROR_INVALID_PARAMETER`) -- so this does not
+    /// panic or retry on failure, only attempts the change once.
+    fn disable_line_input_mode() {
+        use windows_sys::Win32::System::Console::{
+            ENABLE_LINE_INPUT, GetConsoleMode, STD_INPUT_HANDLE, SetConsoleMode,
+        };
+
+        let handle = unsafe { windows_sys::Win32::System::Console::GetStdHandle(STD_INPUT_HANDLE) };
+        if handle.is_null() || handle == Win32_Foundation::INVALID_HANDLE_VALUE {
+            // No real console attached (e.g. redirected pipe/file stdin): nothing to do, and
+            // `read_from_raw_handle`'s non-`FILE_TYPE_CHAR` path never routes through this reader
+            // anyway.
+            return;
+        }
+        let mut mode: u32 = 0;
+        if unsafe { GetConsoleMode(handle, &raw mut mode) } == 0 {
+            // Not actually a console handle (e.g. a redirected pipe reports `FILE_TYPE_CHAR` in
+            // some edge cases) -- nothing to change.
+            return;
+        }
+        let _ = unsafe { SetConsoleMode(handle, mode & !ENABLE_LINE_INPUT) };
+    }
+
+    /// Runs on a dedicated background thread for the lifetime of the process: repeatedly issues a
+    /// single genuinely blocking `ReadFile` against `STD_INPUT_HANDLE` and appends whatever comes
+    /// back to `buffer`, waking any waiter. This is the only thread that ever calls `ReadFile` on
+    /// the console handle, so its blocking is invisible to every guest thread -- they only ever
+    /// observe this struct's already-buffered results.
+    fn reader_thread_body(platform: &'static WindowsUserland) {
+        use windows_sys::Win32::Storage::FileSystem::ReadFile;
+        use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
+
+        let this = Self::get(platform);
+        Self::disable_line_input_mode();
+        loop {
+            let handle =
+                unsafe { windows_sys::Win32::System::Console::GetStdHandle(STD_INPUT_HANDLE) };
+            if handle.is_null() || handle == Win32_Foundation::INVALID_HANDLE_VALUE {
+                this.eof.store(true, Ordering::SeqCst);
+                this.ready.notify_all();
+                return;
+            }
+            let mut chunk = [0u8; Self::CHUNK_LEN as usize];
+            let mut read: u32 = 0;
+            let ok = unsafe {
+                ReadFile(
+                    handle,
+                    chunk.as_mut_ptr(),
+                    Self::CHUNK_LEN,
+                    &raw mut read,
+                    core::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                let err = unsafe { GetLastError() };
+                // `ERROR_BROKEN_PIPE` (the write end of a redirected pipe closed) is EOF, matching
+                // a real Linux `read()` on a closed pipe's read end.
+                if err == Win32_Foundation::ERROR_BROKEN_PIPE {
+                    this.eof.store(true, Ordering::SeqCst);
+                    this.ready.notify_all();
+                    return;
+                }
+                panic!("ReadFile(STD_INPUT_HANDLE) failed: error={err}");
+            }
+            if read == 0 {
+                // A successful zero-byte read is EOF (matches `read_from_raw_handle`'s previous
+                // direct-call contract).
+                this.eof.store(true, Ordering::SeqCst);
+                this.ready.notify_all();
+                return;
+            }
+            // `read <= CHUNK_LEN` (4096), which fits in `usize` on every supported target.
+            let read = usize::try_from(read).unwrap_or(chunk.len());
+            let mut buffer = this.buffer.lock().unwrap();
+            let was_empty = buffer.is_empty();
+            buffer.extend(&chunk[..read]);
+            drop(buffer);
+            if was_empty {
+                this.ready.notify_all();
+            }
+        }
+    }
+
+    /// Copies already-buffered bytes into `buf` (up to `buf.len()`), blocking until at least one
+    /// byte is available or EOF is reached. Never itself calls `ReadFile`.
+    fn read(&self, buf: &mut [u8]) -> usize {
+        let mut buffer = self.buffer.lock().unwrap();
+        loop {
+            if !buffer.is_empty() {
+                let len = buffer.len().min(buf.len());
+                for slot in &mut buf[..len] {
+                    *slot = buffer.pop_front().unwrap();
+                }
+                return len;
+            }
+            if self.eof.load(Ordering::SeqCst) {
+                return 0;
+            }
+            buffer = self.ready.wait(buffer).unwrap();
+        }
+    }
+
+    /// Non-blocking: `true` if a [`Self::read`] call right now would return immediately (either
+    /// real buffered bytes, or EOF).
+    fn is_ready(&self) -> bool {
+        !self.buffer.lock().unwrap().is_empty() || self.eof.load(Ordering::SeqCst)
+    }
+}
+
+/// Reads directly from the process's raw `STD_INPUT_HANDLE`, bypassing `std::io::stdin()`.
+///
+/// See the doc comment on [`write_to_raw_handle`] for why this deliberately avoids the `std::io`
+/// wrappers: the exact same cross-guest-"process" lock-starvation hazard applies symmetrically to
+/// `std::io::Stdin`'s internal buffered-reader lock.
+///
+/// For a real console (`FILE_TYPE_CHAR`), this drains [`ConsoleStdinReader`]'s buffer (see its doc
+/// comment for why a background reader thread is required, not a direct `ReadFile` here) rather
+/// than calling `ReadFile` itself. For a pipe/regular file, `ReadFile` remains safe to call
+/// directly (no cooked-read desync applies to non-console handles), so this still issues it inline
+/// for those, preserving the original direct-call behavior and error handling.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "mirrors StdioProvider::read_from_stdin's Result signature (and write_to_raw_handle's shape) even though every current failure path here maps to Ok(0)/EOF rather than a real Err; keeps the two raw-handle helpers symmetric and leaves room for a genuine error case without a signature change"
+)]
+fn read_from_raw_handle(
+    platform: &'static WindowsUserland,
+    buf: &mut [u8],
+) -> Result<usize, litebox::platform::StdioReadError> {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_CHAR, GetFileType, ReadFile};
+    use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
+
+    let handle = unsafe { windows_sys::Win32::System::Console::GetStdHandle(STD_INPUT_HANDLE) };
+    if handle.is_null() || handle == Win32_Foundation::INVALID_HANDLE_VALUE {
+        // No console/redirected input attached at all: behave like an already-closed stdin.
+        return Ok(0);
+    }
+    if unsafe { GetFileType(handle) } == FILE_TYPE_CHAR {
+        return Ok(ConsoleStdinReader::get(platform).read(buf));
+    }
+    let mut read: u32 = 0;
+    let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+    let ok = unsafe {
+        ReadFile(
+            handle,
+            buf.as_mut_ptr(),
+            len,
+            &raw mut read,
+            core::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        let err = unsafe { GetLastError() };
+        // `ERROR_BROKEN_PIPE` (the write end of a redirected pipe closed) is EOF, matching a
+        // real Linux `read()` on a closed pipe's read end -- not an error condition to panic on.
+        if err == Win32_Foundation::ERROR_BROKEN_PIPE {
+            return Ok(0);
+        }
+        panic!("ReadFile(STD_INPUT_HANDLE) failed: error={err}");
+    }
+    Ok(read as usize)
+}
+
+/// Non-blocking readiness probe for [`read_from_raw_handle`]'s `STD_INPUT_HANDLE`: answers
+/// "would a `read_from_raw_handle` call right now return immediately" without itself blocking or
+/// consuming any input, mirroring what a real kernel's `poll(2)`/`select(2)` does for an
+/// inherited stdin fd independently of the read path.
+///
+/// This exists because [`read_from_raw_handle`] can genuinely block indefinitely on a pipe/regular
+/// file's direct `ReadFile` call: unlike a real Linux fd, Windows gives no portable way to make a
+/// handle's `ReadFile` itself non-blocking or cancellable mid-call from another thread, so the
+/// guest-visible `poll`/`select`/`epoll_wait` syscalls (see
+/// `litebox_shim_linux::syscalls::epoll::EpollDescriptor::poll`'s `File` arm) must be answered by
+/// a *separate*, genuinely non-blocking readiness check instead of by the read call itself. Before
+/// this existed, that `poll` arm hardcoded stdin as always-readable, which is exactly wrong for a
+/// real interactive console with no pending keystrokes: libuv (Node's stdio backend) polls stdin
+/// as part of its startup/`uv_tty_init` path, saw the hardcoded "readable", issued a `read()`
+/// that landed in the blocking `ReadFile` above, and hung forever with a genuinely-attached
+/// console that had no pending input -- the process-never-exits bug this function fixes.
+///
+/// Dispatches on the handle's real type:
+/// - **Console** (`FILE_TYPE_CHAR`): defers to [`ConsoleStdinReader::is_ready`] -- see its doc
+///   comment for why the raw `INPUT_RECORD` queue (`GetNumberOfConsoleInputEvents`/
+///   `PeekConsoleInputW`) cannot reliably answer this once `ENABLE_LINE_INPUT`'s cooked-read line
+///   editor is involved, which a real interactive console always has enabled by default.
+/// - **Pipe** (`FILE_TYPE_PIPE`, e.g. a redirected/piped stdin): `PeekNamedPipe` reports the
+///   number of bytes currently available to read without consuming them (no cooked-read layer
+///   applies to a pipe, so this remains a direct, reliable non-consuming probe).
+/// - Anything else (regular file, `FILE_TYPE_UNKNOWN`, invalid/null handle): these are always
+///   immediately readable (a disk file's `ReadFile` never blocks waiting for data to arrive, and
+///   an absent handle behaves like already-closed/EOF stdin, matching [`read_from_raw_handle`]'s
+///   own `Ok(0)` treatment of that case) -- report ready so the guest's `read()` promptly
+///   observes the real outcome instead of appearing to hang on a readiness check.
+fn stdin_ready_raw_handle(platform: &'static WindowsUserland) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_CHAR, FILE_TYPE_PIPE, GetFileType};
+    use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    let handle = unsafe { windows_sys::Win32::System::Console::GetStdHandle(STD_INPUT_HANDLE) };
+    if handle.is_null() || handle == Win32_Foundation::INVALID_HANDLE_VALUE {
+        // No input attached at all: behaves like already-closed/EOF stdin (see
+        // `read_from_raw_handle`'s identical handling), which is always "ready" to read (the
+        // read immediately returns `Ok(0)`).
+        return true;
+    }
+
+    match unsafe { GetFileType(handle) } {
+        FILE_TYPE_CHAR => ConsoleStdinReader::get(platform).is_ready(),
+        FILE_TYPE_PIPE => {
+            let mut available: u32 = 0;
+            let ok = unsafe {
+                PeekNamedPipe(
+                    handle,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    &raw mut available,
+                    core::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                // A broken/closed pipe reads as EOF (see `read_from_raw_handle`'s
+                // `ERROR_BROKEN_PIPE` handling) -- that is also "ready" (the read returns `Ok(0)`
+                // immediately rather than blocking).
+                return true;
+            }
+            available > 0
+        }
+        // Regular disk file, `FILE_TYPE_UNKNOWN`, or anything else: `ReadFile` never blocks
+        // waiting for data on these, so they are always immediately ready.
+        _ => true,
+    }
+}
+
+/// Writes directly to the process's raw `STD_OUTPUT_HANDLE`/`STD_ERROR_HANDLE` via `WriteFile`,
+/// bypassing `std::io::stdout()`/`std::io::stderr()`.
+///
+/// # Why not `std::io::stdout()`/`std::io::stderr()`
+///
+/// Every emulated Linux guest "process" litebox creates is, under the hood, an ordinary Windows
+/// thread inside this single shared host process (see `spawn_thread`/`thread_start` above, and
+/// `Vmem::duplicate`'s doc comment) -- there is no per-guest-process OS-level isolation for
+/// anything that is itself process-global host state. `std::io::Stdout`/`std::io::Stdin` are
+/// exactly such state: each is a lazily-initialized, process-wide singleton guarded by its own
+/// internal lock (`ReentrantMutex` wrapping a `LineWriter`), shared by every caller in the host
+/// process regardless of which guest "process" or thread is calling. On real Linux, by contrast,
+/// two independent processes writing to the same (or different) fd 1 never contend on any
+/// in-process Rust-level lock at all -- the kernel's own per-file-description state and the
+/// `write(2)` syscall boundary provide all necessary serialization, and neither process can ever
+/// be blocked by the other holding a lock inside libc.
+///
+/// This mismatch was investigated as a candidate cause of a real hang this session chased
+/// (`sh -c "timeout 5 tar -tzf <2-member-gzip.tar.gz>"`, where two guest processes each
+/// independently call `write(1, ...)`/`write(2, ...)` at nearly the same moment) -- syscall-level
+/// tracing during that investigation caught one process's `writev(fd=1, ...)` as the last syscall
+/// it ever issued, never returning, while a second process concurrently reached its own
+/// stdout-bound write around the same instant, and `gdb`-attaching to the stalled process showed
+/// every real OS thread cleanly parked (no panic, no spin) -- a pattern consistent with, though
+/// not conclusively proven to be, one guest thread's `write()` becoming stuck on
+/// `std::io::Stdout`'s internal lock (`ThreadHandle::interrupt`'s `SuspendThread`/`ResumeThread`
+/// pair, used by both `fork_verify` and process-exit teardown, can suspend a thread while it is
+/// executing arbitrary *host* Rust code, including while it holds that lock, since `SuspendThread`
+/// is called unconditionally before this module's `is_in_guest` check -- an OS-level
+/// thread-suspend primitive has no notion of "don't suspend while a Rust-level lock is held").
+/// That specific hang was ultimately root-caused to a different, independently-confirmed bug (a
+/// process-exit fd leak fixed in `litebox_shim_linux`'s `close_all_fds_on_process_exit`), so this
+/// exact lock-contention scenario was not the deciding factor there -- but the underlying
+/// coupling this fix removes is real and independently worth fixing on its own: a guest process
+/// legitimately has no reason to ever be blockable by another, unrelated guest process's
+/// console/pipe writes, and routing every guest "process"'s stdio through one shared host-level
+/// lock creates exactly that illegitimate dependency regardless of whether this particular repro
+/// exercises it.
+///
+/// The fix: skip `std::io`'s buffering/locking entirely and issue the write as a single raw
+/// `WriteFile` call against the real OS handle, the same way a genuine Linux `write(2)` syscall
+/// would go straight to the kernel with no intervening userspace lock. This is correct for both a
+/// real console (`WriteFile` writes bytes through the console's active codepage, exactly as a
+/// real Linux process's raw `write()` to an inherited console fd would) and a redirected
+/// file/pipe (a plain byte-for-byte `WriteFile`).
+///
+/// One gap this leaves: real Linux `write(2)` to a TTY (or a pipe/regular file, up to
+/// implementation-defined size limits -- `PIPE_BUF`-ish for pipes) is atomic with respect to other
+/// concurrent writers to the *same* file description -- the kernel serializes byte ranges so one
+/// writer's bytes are never torn/interleaved mid-flight with another's. A single guest "process"
+/// can itself be multi-threaded (every guest thread is an ordinary Windows thread in this shared
+/// host process, same as the guest-process note above), and Win32's `WriteFile` on a console
+/// handle provides no equivalent atomicity guarantee across concurrent callers -- two threads
+/// calling `WriteFile` on the same `STD_OUTPUT_HANDLE`/`STD_ERROR_HANDLE` at once can have their
+/// bytes genuinely interleaved by the console subsystem, which a real Linux kernel would never
+/// allow. This was the confirmed mechanism behind a reported live keystroke/output corruption bug
+/// in a heavily-multithreaded guest (Node.js's REPL, whose main JS thread, libuv threadpool, and
+/// V8 GC/compiler threads can all independently reach `write(1, ...)`/`write(2, ...)`): one
+/// thread's diagnostic stderr write landed spliced into the middle of another thread's stdout
+/// bytes.
+///
+/// Fixed with a pair of raw mutexes (`STDOUT_WRITE_LOCK`/`STDERR_WRITE_LOCK`, one per stream so a
+/// stalled stdout writer never blocks a concurrent stderr writer or vice versa), held only for the
+/// duration of the `WriteFile` call itself -- never across anything that can block indefinitely.
+/// This is safe with respect to `ThreadHandle::interrupt`'s `SuspendThread`/`ResumeThread` pair
+/// (the documented hazard above, where a thread suspended while holding a lock can wedge every
+/// other thread waiting on it forever): `interrupt` always pairs its `SuspendThread` with a
+/// `defer`-guaranteed `ResumeThread` before `interrupt` itself returns, so the suspend window is
+/// bounded by that one function call, never indefinite -- a thread blocked on this lock waits out,
+/// at worst, one `interrupt` call's short suspend/resume window, never forever. This differs from
+/// the `std::io::Stdout` case in scope, not just mechanism: that lock was one process-wide
+/// singleton shared by *every* guest process for *every* stdio stream, coupling unrelated guest
+/// processes' liveness together; these locks are per-stream only, so unrelated guest
+/// processes/threads writing to different streams never contend at all, and even same-stream
+/// writers only ever wait for one bounded `WriteFile` call to finish.
+static STDOUT_WRITE_LOCK: Mutex<()> = Mutex::new(());
+static STDERR_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Serializes every `VirtualProtect` call this process issues against guest-mapped memory.
+///
+/// `VirtualProtect` changes are page-granular and process-wide: two threads racing independent
+/// `VirtualProtect` calls that happen to cover the same page (e.g. an ordinary guest `mprotect()`
+/// on one thread racing [`fork_verify`](crate::fork_verify)'s own temporary
+/// read-only-to-`PAGE_EXECUTE_READWRITE`-and-back flip on another, unrelated, thread while healing
+/// a stale post-`fork()` pointer slot) can interleave: one thread's `VirtualProtect(...,
+/// old_protect_restore)` can land between another thread's `VirtualProtect(...,
+/// PAGE_EXECUTE_READWRITE)` and its write, transiently narrowing the page back to a
+/// non-writable/non-executable protection out from under an in-flight write or a concurrent
+/// instruction fetch on a third thread executing code on the same page -- observed in practice as
+/// a `STATUS_ACCESS_VIOLATION` on a small-offset near-null address (`addr=0x18`-shaped) on a
+/// completely unrelated thread shortly after an unrelated fork-child's own post-exit healing pass
+/// ran. Every call site that mutates page protection on guest-mapped memory (both
+/// [`WindowsUserland::update_permissions`](crate) and
+/// [`fork_verify::write_usize_fault_tolerant`](crate::fork_verify)) must hold this lock for the
+/// full read-modify-write span (query/flip, mutate, restore), not just around the `VirtualProtect`
+/// call itself, so the two paths can never observe or produce a torn intermediate protection state
+/// on a shared page.
+pub(crate) static VIRTUAL_PROTECT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Serializes `allocate_pages`'s fixed-address (`suggested_range.start != 0`) check-then-act
+/// sequence -- see that call site's own comment for the real TOCTOU race this closes: without a
+/// lock spanning the ENTIRE query-then-allocate span, two concurrently-running guest processes'
+/// own OS threads could both observe the same real address range as free and then both allocate
+/// into it, silently aliasing each other's memory with no error, no page fault, and no
+/// guest-visible signal -- the exact same class of gap `CLAIMED_RANGES`'s own doc comment
+/// documents for a DIFFERENT, already-defended case (fixed-address `Replace`-mode reuse); this
+/// lock closes the general case for every `fixed_address_behavior` variant.
+static ALLOCATE_PAGES_FIXED_ADDR_LOCK: Mutex<()> = Mutex::new(());
+
+fn write_to_raw_handle(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    buf: &[u8],
+    lock: &Mutex<()>,
+) -> Result<usize, litebox::platform::StdioWriteError> {
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+
+    if handle.is_null() || handle == Win32_Foundation::INVALID_HANDLE_VALUE {
+        // No console/redirected output attached at all: silently discard, matching a Linux
+        // process whose stdout/stderr fd was closed out from under it (further writes are
+        // simply lost from the caller's perspective once the peer is gone) rather than panicking.
+        return Ok(buf.len());
+    }
+    let mut written: u32 = 0;
+    let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+    // Serialize this write against any other concurrent writer to the same stream (see the doc
+    // comment above); held only across the `WriteFile` call itself, never across anything that can
+    // block for an unbounded time.
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let ok = unsafe {
+        WriteFile(
+            handle,
+            buf.as_ptr(),
+            len,
+            &raw mut written,
+            core::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        let err = unsafe { GetLastError() };
+        // The reader end of a redirected pipe going away is the Windows analogue of `EPIPE`/a
+        // broken pipe on Linux -- report it the same way the previous `std::io`-based
+        // implementation did, rather than panicking.
+        if err == Win32_Foundation::ERROR_BROKEN_PIPE || err == Win32_Foundation::ERROR_NO_DATA {
+            return Err(litebox::platform::StdioWriteError::Closed);
+        }
+        panic!("WriteFile(stdio handle) failed: error={err}");
+    }
+    Ok(written as usize)
+}
+
+impl litebox::platform::StdioProvider for WindowsUserland {
+    fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
+        read_from_raw_handle(self.as_static(), buf)
+    }
+
+    fn write_to(
+        &self,
+        stream: litebox::platform::StdioOutStream,
+        buf: &[u8],
+    ) -> Result<usize, litebox::platform::StdioWriteError> {
+        use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
+
+        let (std_handle, lock) = match stream {
+            litebox::platform::StdioOutStream::Stdout => (STD_OUTPUT_HANDLE, &STDOUT_WRITE_LOCK),
+            litebox::platform::StdioOutStream::Stderr => (STD_ERROR_HANDLE, &STDERR_WRITE_LOCK),
+        };
+        let handle = unsafe { windows_sys::Win32::System::Console::GetStdHandle(std_handle) };
+        write_to_raw_handle(handle, buf, lock)
+    }
+
+    fn is_a_tty(&self, stream: litebox::platform::StdioStream) -> bool {
+        use litebox::platform::StdioStream;
+        use std::io::IsTerminal as _;
+        match stream {
+            StdioStream::Stdin => std::io::stdin().is_terminal(),
+            StdioStream::Stdout => std::io::stdout().is_terminal(),
+            StdioStream::Stderr => std::io::stderr().is_terminal(),
+        }
+    }
+
+    fn stdin_ready(&self) -> bool {
+        stdin_ready_raw_handle(self.as_static())
+    }
+
+    fn tty_window_size(&self) -> Option<(u16, u16)> {
+        use windows_sys::Win32::System::Console::{
+            CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, STD_OUTPUT_HANDLE,
+        };
+
+        let handle =
+            unsafe { windows_sys::Win32::System::Console::GetStdHandle(STD_OUTPUT_HANDLE) };
+        if handle.is_null() || handle == Win32_Foundation::INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut info: CONSOLE_SCREEN_BUFFER_INFO = unsafe { core::mem::zeroed() };
+        if unsafe { GetConsoleScreenBufferInfo(handle, &raw mut info) } == 0 {
+            // Not a real console (e.g. redirected stdout): let the caller fall back to a
+            // reasonable default rather than reporting a fake size.
+            return None;
+        }
+        // `srWindow` is the visible window rectangle, not the full (possibly larger, scrollback-
+        // including) screen buffer size -- this matches what a real Linux tty's `TIOCGWINSZ`
+        // reports: the visible terminal dimensions, not a scrollback buffer size.
+        let cols = info
+            .srWindow
+            .Right
+            .saturating_sub(info.srWindow.Left)
+            .saturating_add(1);
+        let rows = info
+            .srWindow
+            .Bottom
+            .saturating_sub(info.srWindow.Top)
+            .saturating_add(1);
+        let cols = u16::try_from(cols).ok()?;
+        let rows = u16::try_from(rows).ok()?;
+        if cols == 0 || rows == 0 {
+            return None;
+        }
+        Some((rows, cols))
+    }
+}
+
+#[global_allocator]
+static SLAB_ALLOC: litebox::mm::allocator::SafeZoneAllocator<'static, 34, WindowsUserland> =
+    litebox::mm::allocator::SafeZoneAllocator::new();
+
+/// Temporary, allocation-free diagnostic for the long-standing deterministic `rax =
+/// HOST_ALLOCATOR_REGION_MIN + 0x1013480` leak (see this file's `HOST_ALLOCATOR_REGION_MIN` doc
+/// comment and the investigation notes it links to). Gated behind `LITEBOX_DIAG_ALLOC=1`; logs
+/// every `WindowsUserland::alloc` call's returned base address and size via a raw `OutputDebugStringA`
+/// call so it cannot recurse into this same allocator (unlike `eprintln!`/`format!`, which route
+/// through allocating machinery elsewhere in the host Rust runtime). Remove once the leak is
+/// root-caused and fixed.
+static DIAG_ALLOC_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Tri-state cache for [`diag_alloc_enabled`]: 0 = not yet checked, 1 = enabled, 2 = disabled.
+/// Populated lazily, on the FIRST call, directly via the raw `GetEnvironmentVariableA` Win32 API
+/// rather than `std::env::var_os` -- `var_os` allocates an `OsString`, which would recurse into
+/// this very allocator when called from `WindowsUserland::alloc` itself (observed in practice to
+/// hang: reentering `OnceLock`'s internal synchronization on the same thread self-deadlocks, and a
+/// naive allocating re-check on every call is no better, just slower to hang). `GetEnvironmentVariableA`
+/// writes into a fixed-size stack buffer and touches no Rust allocator at all, so it is safe to call
+/// from inside `alloc` on the very first host allocation the process ever makes -- unlike the
+/// earlier `init`-called-from-`WindowsUserland::new` approach, this has no blind spot for
+/// allocations made before that constructor runs (e.g. `tracing_subscriber`/`clap`/the mmapped
+/// rootfs tar setup in `litebox_runner_linux_on_windows_userland::run`, all of which allocate via
+/// this same global allocator before `Platform::new()` is ever reached).
+static DIAG_ALLOC_ENABLED_CACHE: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
+
+/// Allocation-free: reads `LITEBOX_DIAG_ALLOC` via the raw Win32 API on first call (caching the
+/// result), or just the cache thereafter. Safe to call from inside `WindowsUserland::alloc` itself,
+/// including the very first allocation the process ever makes.
+fn diag_alloc_enabled() -> bool {
+    let cached = DIAG_ALLOC_ENABLED_CACHE.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached == 1;
+    }
+    let mut buf = [0u8; 4];
+    let name = b"LITEBOX_DIAG_ALLOC\0";
+    let len = unsafe {
+        windows_sys::Win32::System::Environment::GetEnvironmentVariableA(
+            name.as_ptr(),
+            buf.as_mut_ptr(),
+            4u32,
+        )
+    };
+    // `GetEnvironmentVariableA` returns 0 (with `GetLastError() ==
+    // ERROR_ENVIRONMENT_VARIABLE_NOT_FOUND`) when the variable is unset -- any successful return
+    // (the variable exists, regardless of its value) is enough to enable this diagnostic, matching
+    // every other `LITEBOX_*`-gated diagnostic in this file (`std::env::var_os(..).is_some()`).
+    let enabled = len != 0;
+    DIAG_ALLOC_ENABLED_CACHE.store(if enabled { 1 } else { 2 }, Ordering::Relaxed);
+    enabled
+}
+
+/// Format `n` as decimal into `buf`, returning the written prefix. No heap allocation.
+fn fmt_usize_hex(mut n: usize, buf: &mut [u8; 20]) -> &[u8] {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut i = buf.len();
+    if n == 0 {
+        i -= 1;
+        buf[i] = b'0';
+    } else {
+        while n != 0 {
+            i -= 1;
+            buf[i] = DIGITS[n & 0xf];
+            n >>= 4;
+        }
+    }
+    &buf[i..]
+}
+
+/// Raw, allocation-free debug print: writes `prefix` + hex(`a`) + `mid` + hex(`b`) + "\n" straight
+/// to the process's `STD_ERROR_HANDLE` via `WriteFile`, entirely on the stack, so CI's captured
+/// stderr picks it up exactly like every other `LITEBOX_VEH_TRACE`-style diagnostic. Safe to call
+/// from inside the global allocator itself since it never touches `SLAB_ALLOC` (unlike
+/// `eprintln!`/`format!`, which can recurse into it via the host Rust I/O stack). Deliberately
+/// skips `STDERR_WRITE_LOCK` -- interleaving with other stderr writers is an acceptable, purely
+/// cosmetic risk for this temporary, allocation-free diagnostic.
+// TEMPORARY diagnostic (litebox investigation: XFCE/weston mallocng heap-corruption bug
+// hunt) -- wires up `litebox::mm::exception_table`'s memcpy-write watch range from the
+// `LITEBOX_MEMCPY_WATCH=<start_hex>-<end_hex>` env var, logging any overlapping write via
+// the same raw, allocation-free `diag_raw_print` mechanism the VEH diagnostics use. Lets a
+// repro determine whether a specific guest heap address is ever written to via litebox's
+// own fallible-memory-write path (any syscall copying host data into guest memory), as
+// opposed to a raw guest-code store that never goes through litebox at all. Remove once the
+// investigation concludes.
+pub fn install_memcpy_watch_from_env() {
+    let Some(spec) = std::env::var_os("LITEBOX_MEMCPY_WATCH") else {
+        return;
+    };
+    let Some(spec) = spec.to_str() else { return };
+    let Some((start_str, end_str)) = spec.split_once('-') else {
+        return;
+    };
+    let (Ok(start), Ok(end)) = (
+        usize::from_str_radix(start_str.trim_start_matches("0x"), 16),
+        usize::from_str_radix(end_str.trim_start_matches("0x"), 16),
+    ) else {
+        return;
+    };
+    fn hook(dst: usize, size: usize) {
+        diag_raw_print(b"[memcpy-watch] dst=0x", dst, b" size=0x", size);
+    }
+    unsafe {
+        litebox::mm::exception_table::set_memcpy_watch_range(start, end, Some(hook));
+    }
+}
+
+fn diag_raw_print(prefix: &[u8], a: usize, mid: &[u8], b: usize) {
+    let mut line = [0u8; 128];
+    let mut pos = 0usize;
+    let push = |bytes: &[u8], line: &mut [u8; 128], pos: &mut usize| {
+        let n = bytes.len().min(line.len().saturating_sub(*pos));
+        line[*pos..*pos + n].copy_from_slice(&bytes[..n]);
+        *pos += n;
+    };
+    push(prefix, &mut line, &mut pos);
+    let mut hexbuf = [0u8; 20];
+    push(fmt_usize_hex(a, &mut hexbuf), &mut line, &mut pos);
+    push(mid, &mut line, &mut pos);
+    let mut hexbuf2 = [0u8; 20];
+    push(fmt_usize_hex(b, &mut hexbuf2), &mut line, &mut pos);
+    push(b"\n", &mut line, &mut pos);
+    unsafe {
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
+        let handle = GetStdHandle(STD_ERROR_HANDLE);
+        if !handle.is_null() && handle != Win32_Foundation::INVALID_HANDLE_VALUE {
+            let mut written: u32 = 0;
+            windows_sys::Win32::Storage::FileSystem::WriteFile(
+                handle,
+                line.as_ptr(),
+                u32::try_from(pos).unwrap_or(u32::MAX),
+                &raw mut written,
+                core::ptr::null_mut(),
+            );
+        }
+    }
+}
+
+/// Raw, allocation-free, lock-free dump of the fault's full register set plus the exception
+/// code/faulting address, via the same `WriteFile`-on-stack mechanism as [`diag_raw_print`].
+/// Exists because `eprintln!`/`format!` (used by the `[veh-regs] ENTRY` print a few lines below
+/// this call site) do real host heap allocation and take the stdio lock -- both were caught this
+/// pass re-faulting on a thread whose heap/lock state is already corrupted by the same bug this
+/// diagnostic exists to observe, silently losing the first, real, causative fault's own register
+/// state behind a second "fault-in-the-fault-handler" (a non-standard `code=0x6` host-side
+/// exception) every time it happened. Called as the LITERAL FIRST operation once the fatal-dump
+/// gate is true, before even `VehDiagBlockGuard::enter()` -- if thread-local access or heap
+/// allocation is what's re-faulting, guarding against re-entrancy after already attempting one of
+/// those is too late.
+#[allow(clippy::too_many_arguments, reason = "raw diagnostic dump, one field per register")]
+fn diag_raw_regdump(
+    code: u32,
+    addr: usize,
+    rip: usize,
+    rax: usize,
+    rbx: usize,
+    rcx: usize,
+    rdx: usize,
+    rsi: usize,
+    rdi: usize,
+    rsp: usize,
+    rbp: usize,
+) {
+    let mut line = [0u8; 512];
+    let mut pos = 0usize;
+    let push = |bytes: &[u8], line: &mut [u8; 512], pos: &mut usize| {
+        let n = bytes.len().min(line.len().saturating_sub(*pos));
+        line[*pos..*pos + n].copy_from_slice(&bytes[..n]);
+        *pos += n;
+    };
+    let push_hex = |v: usize, line: &mut [u8; 512], pos: &mut usize| {
+        let mut hexbuf = [0u8; 20];
+        push(fmt_usize_hex(v, &mut hexbuf), line, pos);
+    };
+    push(b"[veh] RAWREGS tid=", &mut line, &mut pos);
+    push_hex(
+        unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() } as usize,
+        &mut line,
+        &mut pos,
+    );
+    push(b" code=", &mut line, &mut pos);
+    push_hex(code as usize, &mut line, &mut pos);
+    push(b" addr=", &mut line, &mut pos);
+    push_hex(addr, &mut line, &mut pos);
+    push(b" rip=", &mut line, &mut pos);
+    push_hex(rip, &mut line, &mut pos);
+    push(b" rax=", &mut line, &mut pos);
+    push_hex(rax, &mut line, &mut pos);
+    push(b" rbx=", &mut line, &mut pos);
+    push_hex(rbx, &mut line, &mut pos);
+    push(b" rcx=", &mut line, &mut pos);
+    push_hex(rcx, &mut line, &mut pos);
+    push(b" rdx=", &mut line, &mut pos);
+    push_hex(rdx, &mut line, &mut pos);
+    push(b" rsi=", &mut line, &mut pos);
+    push_hex(rsi, &mut line, &mut pos);
+    push(b" rdi=", &mut line, &mut pos);
+    push_hex(rdi, &mut line, &mut pos);
+    push(b" rsp=", &mut line, &mut pos);
+    push_hex(rsp, &mut line, &mut pos);
+    push(b" rbp=", &mut line, &mut pos);
+    push_hex(rbp, &mut line, &mut pos);
+    push(b"\n", &mut line, &mut pos);
+    unsafe {
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
+        let handle = GetStdHandle(STD_ERROR_HANDLE);
+        if !handle.is_null() && handle != Win32_Foundation::INVALID_HANDLE_VALUE {
+            let mut written: u32 = 0;
+            windows_sys::Win32::Storage::FileSystem::WriteFile(
+                handle,
+                line.as_ptr(),
+                u32::try_from(pos).unwrap_or(u32::MAX),
+                &raw mut written,
+                core::ptr::null_mut(),
+            );
+        }
+    }
+}
+
+impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
+    fn alloc(layout: &std::alloc::Layout) -> Option<(usize, usize)> {
+        let size = core::cmp::max(
+            layout.size().next_power_of_two(),
+            // Note `mmap` provides no guarantee of alignment, so we double the size to ensure we
+            // can always find a required chunk within the returned memory region.
+            core::cmp::max(layout.align(), 0x1000) << 1,
+        );
+
+        // Constrain every host-allocator-backing page to `HOST_ALLOCATOR_REGION_MIN..`, strictly
+        // above the guest's own `TASK_ADDR_MAX`, so this allocator can never be handed an address
+        // the guest's `Vmem` also considers fair game. See `HOST_ALLOCATOR_REGION_MIN`'s doc
+        // comment for why an unconstrained (null-base) request was unsafe here.
+        let mut addr_req = MEM_ADDRESS_REQUIREMENTS {
+            LowestStartingAddress: HOST_ALLOCATOR_REGION_MIN as *mut c_void,
+            HighestEndingAddress: core::ptr::null_mut(),
+            Alignment: 0,
+        };
+        let mut ext_param = MEM_EXTENDED_PARAMETER {
+            Anonymous1: MEM_EXTENDED_PARAMETER_0 {
+                _bitfield: MemExtendedParameterAddressRequirements as u64,
+            },
+            Anonymous2: windows_sys::Win32::System::Memory::MEM_EXTENDED_PARAMETER_1 {
+                Pointer: (&raw mut addr_req).cast::<c_void>(),
+            },
+        };
+
+        match unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                core::ptr::null_mut(),
+                size,
+                Win32_Memory::MEM_COMMIT | Win32_Memory::MEM_RESERVE,
+                Win32_Memory::PAGE_READWRITE,
+                &raw mut ext_param,
+                1,
+            )
+        } {
+            addr if addr.is_null() => None,
+            addr => {
+                if diag_alloc_enabled() {
+                    let n = DIAG_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+                    let offset = (addr as usize).wrapping_sub(HOST_ALLOCATOR_REGION_MIN);
+                    diag_raw_print(b"[diag_alloc] n=0x", n, b" off=0x", offset);
+                    diag_raw_print(
+                        b"[diag_alloc]   size=0x",
+                        size,
+                        b" layout_size=0x",
+                        layout.size(),
+                    );
+                }
+                Some((addr as usize, size))
+            }
+        }
+    }
+
+    unsafe fn free(addr: usize) {
+        // `addr` is guaranteed by the `MemoryProvider` contract to be a base address
+        // previously returned by `alloc`, i.e. the base of a whole `VirtualAlloc2`
+        // RESERVE|COMMIT region. `MEM_RELEASE` requires exactly that: the original
+        // base address and a size of 0 (it always releases the entire region).
+        let ok = unsafe { VirtualFree(addr as *mut c_void, 0, Win32_Memory::MEM_RELEASE) } != 0;
+        assert!(ok, "VirtualFree(RELEASE) failed: {}", unsafe {
+            GetLastError()
+        });
+    }
+}
+
+unsafe extern "C" {
+    // Defined in asm blocks above
+    fn syscall_callback() -> isize;
+    fn exception_callback() -> isize;
+    fn interrupt_callback();
+    fn switch_to_guest_start();
+    fn switch_to_guest_end();
+}
+
+unsafe extern "C-unwind" fn init_handler(thread_ctx: &mut ThreadContext<'_>) {
+    // Pre-commit the real Windows stack pages below `host_sp` that
+    // `vectored_exception_handler`'s `EXCEPTION_RECORD_RESERVE`-relative scratch write later
+    // depends on. Guest threads have been observed reaching their first exception with as
+    // little as 12KB of their 8MiB stack reservation actually committed, letting that write
+    // land outside committed memory (`INVALID_POINTER_WRITE_c0000005_VCRUNTIME140.dll!memcpy`).
+    // Touching each page here (before any guest code runs) forces Windows to commit it.
+    {
+        let host_sp = thread_ctx.tls.host_sp.get().cast::<u8>();
+        let page_size = 4096usize;
+        let mut offset = page_size;
+        while offset <= EXCEPTION_RECORD_RESERVE {
+            let probe_addr = host_sp.wrapping_byte_sub(offset);
+            unsafe {
+                core::ptr::write_volatile(probe_addr, core::ptr::read_volatile(probe_addr));
+            }
+            offset += page_size;
+        }
+    }
+    thread_ctx.call_shim(|shim, ctx, _interrupt| shim.init(ctx));
+}
+
+unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext<'_>) {
+    thread_ctx.call_shim(|shim, ctx, _interrupt| shim.syscall(ctx));
+}
+
+unsafe extern "C-unwind" fn exception_handler(
+    thread_ctx: &mut ThreadContext<'_>,
+    exception_record: &EXCEPTION_RECORD,
+) {
+    // Temporary (PASS 59, see FINDINGS.txt): `LITEBOX_DIAG_MALLOCNG=1`-gated dump of the mallocng
+    // `free()` self-consistency check's operands (`rax = [rdi-0x10]` = the group pointer loaded
+    // from the chunk header, `rcx = rdi-0x10` = the self-address the group's own `->self`-shaped
+    // field at `[rax+0x10]` is expected to equal) right before the `0xc0000096` (privileged
+    // instruction, i.e. `hlt`) catch-all panic below. Directly reads both the expected value
+    // (`rcx`) and the actual value found at `[rax+0x10]` at the moment of the trap, without
+    // needing a second run or a hardware watchpoint -- distinguishes "the slot holds a stale
+    // pointer" (a translatable/healable value) from "the slot holds something not pointer-shaped
+    // at all" (a wrong-length-copy/layout bug, pass 43's alternate hypothesis) directly.
+    if exception_record.ExceptionCode == 0xc0000096u32.cast_signed()
+        && std::env::var_os("LITEBOX_DIAG_MALLOCNG").is_some()
+    {
+        let ctx = &*thread_ctx.ctx;
+        let rdi = ctx.rdi;
+        let rax = ctx.rax;
+        let rcx = ctx.rcx;
+        // `rdi`/`rax` are ordinary guest register values at trap time, not guaranteed to hold a
+        // valid pointer (confirmed live: `rax == 0` for one crash this diagnostic was used to
+        // investigate, making the un-guarded `rax + 0x10` dereference below itself crash the
+        // diagnostic pass with an unrelated access violation). Use the same fault-tolerant
+        // primitive `fork_verify`'s own diagnostics already rely on instead of a raw
+        // dereference, so a not-pointer-shaped register value reports as `None` here rather than
+        // taking down the process the diagnostic was trying to observe.
+        let group_ptr = fork_verify::read_stack_word_for_diagnostics(rdi.wrapping_sub(0x10));
+        let self_slot_addr = rax.wrapping_add(0x10);
+        let self_slot_value = fork_verify::read_stack_word_for_diagnostics(self_slot_addr);
+        // Pass N: this trap is mallocng's basic 16-byte pointer-alignment check on `rdi` itself
+        // (`test dil, 0xf` right before the `hlt`), not the `free()` self-pointer check this
+        // block's own doc comment above describes -- `rdi & 0xf` is the actual failing
+        // condition. Reverse-translate `rdi` (a CHILD/dest-space address, since this trap fires
+        // on a fork() child under active verification) back to the PARENT's own pre-fork address
+        // to determine whether the misalignment already existed before `fork()` duplicated this
+        // memory (a genuine guest-side issue) or was introduced by litebox's own duplication/
+        // healing (a litebox bug) -- must run before `end_fork_child_verification()` clears the
+        // relocation map this needs.
+        let rdi_source = get_tls_ptr().and_then(|tls| {
+            fork_verify::reverse_translate_and_read_for_diagnostics(unsafe { &*tls }, rdi)
+        });
+        eprintln!(
+            "[diag-mallocng] tid={:?} rdi={rdi:#x} rdi&0xf={:#x} rax={rax:#x} rcx={rcx:#x} \
+             [rdi-0x10]={group_ptr:#x?} self_slot_addr(rax+0x10)={self_slot_addr:#x} \
+             self_slot_value={self_slot_value:#x?} expected(rcx)={rcx:#x} match={} \
+             rdi_source_addr={:#x?}",
+            std::thread::current().id(),
+            rdi & 0xf,
+            self_slot_value == Some(rcx),
+            rdi_source.map(|(source_addr, _)| source_addr),
+        );
+    }
+    let (exception, error_code, cr2) = match exception_record.ExceptionCode {
+        Win32_Foundation::EXCEPTION_ACCESS_VIOLATION => {
+            let info = exception_record.ExceptionInformation;
+            let read_write_flag = info[0];
+            let faulting_address = info[1];
+            if read_write_flag == 0 && faulting_address == !0 {
+                // This is probably a #GP, not a #PF.
+                (Exception::GENERAL_PROTECTION_FAULT, 0, 0)
+            } else {
+                let error_code = 4 | if read_write_flag == 0 { 0 } else { 1 << 1 }; // PF error code: bit 1 = write
+                (Exception::PAGE_FAULT, error_code, faulting_address)
+            }
+        }
+        Win32_Foundation::EXCEPTION_ILLEGAL_INSTRUCTION => (Exception::INVALID_OPCODE, 0, 0),
+        Win32_Foundation::EXCEPTION_BREAKPOINT => (Exception::BREAKPOINT, 0, 0),
+        Win32_Foundation::EXCEPTION_INT_DIVIDE_BY_ZERO => (Exception::DIVIDE_ERROR, 0, 0),
+        // `STATUS_PRIVILEGED_INSTRUCTION` (0xc0000096): Windows' name for trapping an `hlt`
+        // executed at CPL3. On real x86_64/Linux, an unprivileged `hlt` raises vector 6 (`#UD`,
+        // Invalid Opcode) -- the exact trap musl's `a_crash()` (mallocng's heap-integrity-assert
+        // abort primitive, `src/malloc/mallocng/*.c`) deliberately executes on a failed
+        // assertion. Before this arm existed, this code reached the catch-all `panic!` below
+        // instead of being delivered to the guest as `SIGILL` like real Linux would: harmless to
+        // the host process itself (the panic unwinds and the OS thread's own outcome is usually
+        // unobserved) but printed spurious "Unhandled Win32 exception" panic noise to stderr on
+        // every mallocng-assert trap, including ones the guest's own signal handling could
+        // otherwise report/recover from normally.
+        code if code == 0xc0000096u32.cast_signed() => (Exception::INVALID_OPCODE, 0, 0),
+        code => panic!("Unhandled Win32 exception code: {code:#x}"),
+    };
+
+    let info = litebox::shim::ExceptionInfo {
+        exception,
+        error_code,
+        cr2,
+        kernel_mode: false,
+    };
+
+    thread_ctx.call_shim(|shim, ctx, _interrupt| shim.exception(ctx, &info));
+}
+
+unsafe extern "C-unwind" fn interrupt_handler(thread_ctx: &mut ThreadContext<'_>) {
+    thread_ctx.tls.is_in_guest.set(false);
+    thread_ctx.call_shim(|shim, ctx, interrupt| {
+        if interrupt {
+            shim.interrupt(ctx)
+        } else {
+            // We likely got here just to restore fsbase, so don't bother the
+            // shim.
+            ContinueOperation::Resume
+        }
+    });
+}
+
+struct ThreadContext<'a> {
+    shim: &'a dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    ctx: &'a mut litebox_common_linux::PtRegs,
+    tls: &'a TlsState,
+}
+
+impl ThreadContext<'_> {
+    /// Calls `f` in order to call into a shim entrypoint.
+    fn call_shim(
+        &mut self,
+        f: impl FnOnce(
+            &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+            &mut litebox_common_linux::PtRegs,
+            bool,
+        ) -> ContinueOperation,
+    ) {
+        // Clear the interrupt flag before calling the shim, since we've handled it
+        // now (by calling into the shim), and it might be set again by the shim
+        // before returning.
+        let op = f(self.shim, self.ctx, self.tls.interrupt.replace(false));
+        match op {
+            ContinueOperation::Resume => {
+                // Diagnostic-only (`LITEBOX_CTXWATCH=1`): arm a hardware write-watchpoint on
+                // this thread's own `ctx.rip` field right before resuming into the guest,
+                // conditioned on `orig_rax == 0x3d` (wait4) to minimize overhead and match the
+                // exact syscall this bug's crashes have consistently followed. See `ctxwatch`
+                // for the full rationale. `vectored_exception_handler` disarms it again the next
+                // time this thread leaves guest mode.
+                // Temporary (see FINDINGS.txt PASS 48, revised PASS 54): arm the fixed-address
+                // `Dr1` watch on this thread's first resume -- cheap (no-op unless
+                // `LITEBOX_DIAG_WATCHADDR` is set) and self-limiting to once per thread (see
+                // `ctxwatch::State::fixed_armed`), guaranteeing it is set before the very first
+                // guest instruction runs on this thread without re-arming (and paying a
+                // `GetThreadContext`/`SetThreadContext` round-trip) on every subsequent syscall
+                // return for that thread's whole lifetime, which pass 53 found perturbs some
+                // repros' timing badly enough to prevent them ever reaching the code being
+                // watched.
+                ctxwatch::arm_fixed_on_current_thread();
+                if ctxwatch::enabled() && self.ctx.orig_rax == 0x3d {
+                    ctxwatch::arm(self.ctx);
+                    // Debug registers are per-thread on Windows (virtualized via
+                    // Get/SetThreadContext): a watchpoint armed only on this (the shell's own)
+                    // thread can never observe a write performed by an instruction executing on
+                    // a DIFFERENT OS thread, e.g. a pipeline child's own exit/teardown code
+                    // running on its own thread. Arm the identical watchpoint on every other
+                    // live thread too, reusing the same suspend/set-context/resume pattern
+                    // `ThreadHandle::interrupt` already uses for cross-thread context
+                    // manipulation.
+                    ctxwatch_arm_other_threads(self.ctx);
+                }
+                unsafe { switch_to_guest(self.ctx) }
+            }
+            ContinueOperation::Terminate => {}
+        }
+    }
+}
+
+impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
+    fn begin_fork_child_verification(&self, relocations: Arc<litebox::mm::AddressRelocations>) {
+        fork_verify::begin(relocations);
+    }
+
+    fn end_fork_child_verification(&self) {
+        fork_verify::end();
+    }
+
+    fn current_thread_fork_relocations(&self) -> Option<Arc<litebox::mm::AddressRelocations>> {
+        let tls = get_tls_ptr()?;
+        // SAFETY: `get_tls_ptr` returns this thread's live `TlsState`.
+        let tls = unsafe { &*tls };
+        tls.fork_verify.borrow().clone()
+    }
+
+    fn diagnostic_reverse_translate_fork_child_addr(&self, dest_addr: usize) -> Option<usize> {
+        let tls = get_tls_ptr()?;
+        // SAFETY: `get_tls_ptr` returns this thread's live `TlsState`.
+        let tls = unsafe { &*tls };
+        fork_verify::reverse_translate_and_read_for_diagnostics(tls, dest_addr)
+            .map(|(source_addr, _bytes)| source_addr)
+    }
+
+    fn diagnostic_process_fork_probe(
+        &self,
+        relocations: &litebox::mm::AddressRelocations,
+        fd_complexity: litebox::platform::ForkFdComplexity,
+        translated_gprs: Option<litebox::platform::ForkGprSnapshot>,
+        full_translated_gprs: Option<litebox::platform::ForkFullGprSnapshot>,
+    ) {
+        // Independent of the spawn probe's own gate below (pass 116): purely logs the fd-table
+        // classification `do_clone` already computed, never touches the spawn/resume/fds probes'
+        // own state, and is itself inert unless its own env var is set.
+        if process_fork::diag_process_fork_fd_complexity_enabled() {
+            eprintln!(
+                "[process_fork_diag] fork(): fd-complexity total_alive={} beyond_stdio={} ({})",
+                fd_complexity.total_alive,
+                fd_complexity.beyond_stdio,
+                if fd_complexity.beyond_stdio == 0 {
+                    "simple: process-based fork could inherit this fd table today"
+                } else {
+                    "complex: process-based fork would need to fall back to thread-based fork for this fd table"
+                }
+            );
+        }
+        if !process_fork::diag_process_fork_spawn_enabled() {
+            return;
+        }
+        let group_relocations = relocations.group_relocations();
+        eprintln!(
+            "[process_fork_diag] fork(): probing {} reservation group(s) against a real, inert CreateProcess child",
+            group_relocations.len()
+        );
+        // Read each group's real, live bytes out of THIS (the parent) process -- same primitive
+        // `Vmem::duplicate` itself uses (`RawConstPointer::to_owned_slice`), just invoked here
+        // for a diagnostic side channel rather than the real duplication path.
+        let read_source_bytes = |range: core::ops::Range<usize>| {
+            use litebox::platform::RawConstPointer as _;
+            let ptr =
+                <Self as litebox::platform::RawPointerProvider>::RawConstPointer::<u8>::from_usize(
+                    range.start,
+                );
+            ptr.to_owned_slice(range.len()).map(<[u8]>::into_vec)
+        };
+        let want_registers = process_fork::diag_process_fork_registers_enabled();
+        let inject_gprs = if want_registers {
+            translated_gprs
+        } else {
+            None
+        };
+        let want_real_resume = process_fork::diag_process_fork_real_resume_enabled();
+        let want_task_resume = process_fork::diag_process_fork_task_resume_enabled();
+        let inject_full_gprs = if want_real_resume || want_task_resume {
+            full_translated_gprs
+        } else {
+            None
+        };
+        // Pass 122: serialize the REAL `AddressRelocations` this actual `fork()` call just built
+        // (the same object the working thread-based path hands to `fork_verify::begin` today) so
+        // the cross-process diagnostic child can reconstruct an equivalent object and arm its own
+        // `fork_verify` -- see `diag_process_fork_relocations_enabled`'s doc comment for why this
+        // is sound for this diagnostic's identity-address design. Computed unconditionally
+        // (cheap: a handful of VMAs in every repro this investigation has run) and gated inside
+        // `diagnostic_spawn_and_copy` itself, matching every other probe's own style.
+        let relocations_line = Some(relocations.serialize_for_diagnostic());
+        match process_fork::diagnostic_spawn_and_copy(
+            group_relocations,
+            read_source_bytes,
+            inject_gprs,
+            inject_full_gprs,
+            relocations_line,
+        ) {
+            Ok(results) => {
+                let succeeded = results.iter().filter(|r| r.succeeded).count();
+                eprintln!(
+                    "[process_fork_diag] fork(): {succeeded}/{} group(s) succeeded",
+                    results.len()
+                );
+                for r in &results {
+                    if r.succeeded {
+                        eprintln!(
+                            "[process_fork_diag]   OK    group={:#x}..{:#x} (len={:#x})",
+                            r.source_group.start,
+                            r.source_group.end,
+                            r.source_group.len()
+                        );
+                    } else {
+                        eprintln!(
+                            "[process_fork_diag]   FAIL  group={:#x}..{:#x} (len={:#x}) GetLastError={}",
+                            r.source_group.start,
+                            r.source_group.end,
+                            r.source_group.len(),
+                            r.last_error
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[process_fork_diag] fork(): probe setup failed: {e}");
+            }
+        }
+    }
+
+    fn wait_for_cross_process_exit(
+        &self,
+        handle: litebox::platform::CrossProcessChildHandle,
+    ) -> u32 {
+        // Safety: `handle.0` is a `HANDLE` value registered via `Process::register_cross_process_child`,
+        // which only ever receives a real, currently-open process handle (see
+        // `diagnostic_cross_process_wait4_probe`, this pass's only producer) not yet closed --
+        // the registry entry's removal (`sys_wait4`'s `reap_cross_process_child`) is the only
+        // thing that ever invalidates it, and that always happens strictly after this call.
+        unsafe {
+            process_fork::wait_for_process_exit(handle.0 as windows_sys::Win32::Foundation::HANDLE)
+        }
+    }
+
+    fn try_wait_for_cross_process_exit(
+        &self,
+        handle: litebox::platform::CrossProcessChildHandle,
+    ) -> Option<u32> {
+        // Safety: same contract as `wait_for_cross_process_exit` above.
+        unsafe {
+            process_fork::try_wait_for_process_exit(
+                handle.0 as windows_sys::Win32::Foundation::HANDLE,
+            )
+        }
+    }
+
+    fn diagnostic_cross_process_wait4_probe(
+        &self,
+        register: &mut dyn FnMut(i32, litebox::platform::CrossProcessChildHandle),
+    ) {
+        process_fork::diagnostic_cross_process_wait4_probe(register);
+    }
+
+    fn take_cross_process_writable_layer_export(
+        &self,
+        handle: litebox::platform::CrossProcessChildHandle,
+    ) -> Option<alloc::vec::Vec<u8>> {
+        // The child's own export path is derived from its REAL Windows pid (see
+        // `process_fork::cross_process_writable_export_path`'s doc comment) -- recover that pid
+        // from the still-open process `HANDLE` this registry entry carries, exactly as
+        // `spawn_process_fork_child`'s own diagnostics already do via `GetProcessId`.
+        let raw_handle = handle.0 as windows_sys::Win32::Foundation::HANDLE;
+        let pid = unsafe { windows_sys::Win32::System::Threading::GetProcessId(raw_handle) };
+        if pid == 0 {
+            return None;
+        }
+        let tar_path = std::env::var_os(process_fork::FORK_CHILD_TAR_PATH_ENV_VAR)?;
+        let export_path =
+            process_fork::cross_process_writable_export_path(std::path::Path::new(&tar_path), pid);
+        let bytes = std::fs::read(&export_path).ok()?;
+        // The export is single-use: once read back into the parent, remove it so a later,
+        // unrelated child that happens to reuse the same (now-recycled) pid never sees a stale
+        // archive left over from a previous run.
+        let _ = std::fs::remove_file(&export_path);
+        Some(bytes)
+    }
+
+    fn spawn_cross_process_fork_child(
+        &self,
+        relocations: &litebox::mm::AddressRelocations,
+        full_gprs: litebox::platform::ForkFullGprSnapshot,
+    ) -> Option<litebox::platform::CrossProcessChildHandle> {
+        std::env::var_os("LITEBOX_PROCESS_FORK")?;
+        let group_relocations = relocations.group_relocations();
+        let vma_layout = relocations.vma_layout();
+        let read_source_bytes = |range: core::ops::Range<usize>| {
+            use litebox::platform::RawConstPointer as _;
+            let ptr =
+                <Self as litebox::platform::RawPointerProvider>::RawConstPointer::<u8>::from_usize(
+                    range.start,
+                );
+            ptr.to_owned_slice(range.len()).map(<[u8]>::into_vec)
+        };
+        // PASS 150: the child's own `fork_verify` reads this line back and calls `translate()` on
+        // it to repair stale pointers it observes mid-execution -- but the cross-process child's
+        // real memory always lives at SOURCE coordinates (`copy_one_group` never uses `dest_base`
+        // to place bytes), so the child must see an IDENTITY relocation map, not the thread-based
+        // path's own `dest_base` values. See `AddressRelocations::identity_for_cross_process`'s
+        // doc comment for the exact fault this fixes (a repeating `EXECUTE/DEP` instruction-fetch
+        // crash from `fork_verify` "healing" a live `rip` into an unmapped thread-based-path
+        // destination address).
+        let relocations_line = relocations
+            .identity_for_cross_process()
+            .serialize_for_diagnostic();
+        match process_fork::spawn_process_fork_child(
+            group_relocations,
+            &vma_layout,
+            read_source_bytes,
+            full_gprs,
+            relocations_line,
+        ) {
+            Ok(Some((pid, handle))) => {
+                litebox_util_log::debug!(
+                    pid:% = pid;
+                    "spawn_cross_process_fork_child: child spawned and resumed successfully"
+                );
+                Some(litebox::platform::CrossProcessChildHandle(handle as usize))
+            }
+            Ok(None) => {
+                litebox_util_log::warn!(
+                    "spawn_cross_process_fork_child: spawn/resume failed, caller should fall back to thread-based fork"
+                );
+                None
+            }
+            Err(e) => {
+                litebox_util_log::warn!(
+                    err:% = e;
+                    "spawn_cross_process_fork_child: setup error, caller should fall back to thread-based fork"
+                );
+                None
+            }
+        }
+    }
+}
+
+impl litebox::platform::SystemInfoProvider for WindowsUserland {
+    fn get_syscall_entry_point(&self) -> usize {
+        syscall_callback as *const () as usize
+    }
+
+    fn get_vdso_address(&self) -> Option<usize> {
+        // Windows doesn't have VDSO equivalent, return None
+        None
+    }
+}
+
+thread_local! {
+    // Use `ManuallyDrop` for more efficient TLS accesses, since this is always
+    // dropped manually before the thread exits.
+    static PLATFORM_TLS: Cell<*mut ()> = const { Cell::new(core::ptr::null_mut()) };
+}
+
+/// WindowsUserland platform's thread-local storage implementation.
+unsafe impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
+    fn get_thread_local_storage() -> *mut () {
+        PLATFORM_TLS.get()
+    }
+
+    unsafe fn replace_thread_local_storage(new_tls: *mut ()) -> *mut () {
+        PLATFORM_TLS.replace(new_tls)
+    }
+}
+
+impl litebox::platform::CrngProvider for WindowsUserland {
+    fn fill_bytes_crng(&self, buf: &mut [u8]) {
+        getrandom::fill(buf).expect("getrandom failed");
+    }
+}
+
+/// Dummy `VmemPageFaultHandler`.
+///
+/// Page faults are handled transparently by the host Windows kernel.
+/// Provided to satisfy trait bounds for `PageManager::handle_page_fault`.
+impl litebox::mm::linux::VmemPageFaultHandler for WindowsUserland {
+    unsafe fn handle_page_fault(
+        &self,
+        _fault_addr: usize,
+        _flags: litebox::mm::linux::VmFlags,
+        _error_code: u64,
+    ) -> Result<(), litebox::mm::linux::PageFaultError> {
+        unreachable!("host kernel handles page faults for Windows userland")
+    }
+
+    fn access_error(_error_code: u64, _flags: litebox::mm::linux::VmFlags) -> bool {
+        unreachable!("host kernel handles page faults for Windows userland")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::AtomicU32;
+    use std::thread::sleep;
+
+    use crate::WindowsUserland;
+    use crate::process_memory_range_by_regions;
+    use litebox::platform::PageManagementProvider;
+    use litebox::platform::RawConstPointer;
+    use litebox::platform::RawMutex;
+    use litebox::platform::page_mgmt::FixedAddressBehavior;
+    use litebox::platform::page_mgmt::MemoryRegionPermissions;
+
+    #[test]
+    fn test_raw_mutex() {
+        let mutex = std::sync::Arc::new(super::RawMutex {
+            inner: AtomicU32::new(0),
+        });
+
+        let copied_mutex = mutex.clone();
+        std::thread::spawn(move || {
+            sleep(core::time::Duration::from_millis(500));
+            copied_mutex
+                .inner
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            copied_mutex.wake_many(10);
+        });
+
+        assert!(mutex.block(0).is_ok());
+    }
+
+    #[test]
+    fn test_reserved_pages() {
+        let platform = WindowsUserland::new();
+        let reserved_pages: Vec<_> =
+            <WindowsUserland as PageManagementProvider<4096>>::reserved_pages(platform).collect();
+
+        // Check that the reserved pages are not empty
+        assert!(!reserved_pages.is_empty(), "No reserved pages found");
+
+        // Check that the reserved pages are in order and non-overlapping
+        let mut prev = 0;
+        for page in reserved_pages {
+            assert!(page.start >= prev);
+            assert!(page.end > page.start);
+            prev = page.end;
+        }
+    }
+
+    #[test]
+    fn test_page_provider() {
+        let collect_regions = |r| {
+            let mut regions = Vec::new();
+            process_memory_range_by_regions(
+                r,
+                |region, state| -> Result<bool, core::convert::Infallible> {
+                    regions.push((region, state));
+                    Ok(true)
+                },
+            )
+            .unwrap();
+            regions
+        };
+
+        let platform = WindowsUserland::new();
+        let system_allocation_granularity =
+            platform.sys_info.read().unwrap().dwAllocationGranularity as usize;
+        // Allocate some pages: it should reserve `system_allocation_granularity` bytes but only commit 0x1000 bytes
+        let addr = <WindowsUserland as PageManagementProvider<4096>>::allocate_pages(
+            platform,
+            0..0x1000,
+            MemoryRegionPermissions::WRITE,
+            false,
+            true,
+            FixedAddressBehavior::Hint,
+        )
+        .unwrap()
+        .as_usize();
+        assert_eq!(
+            collect_regions(addr..addr + system_allocation_granularity),
+            vec![
+                (
+                    addr..addr + 0x1000,
+                    windows_sys::Win32::System::Memory::MEM_COMMIT
+                ),
+                (
+                    addr + 0x1000..addr + system_allocation_granularity,
+                    windows_sys::Win32::System::Memory::MEM_RESERVE
+                ),
+            ]
+        );
+
+        assert!(system_allocation_granularity >= 0x1_0000);
+        // We should be able to allocate [addr + 0x8000, addr + 0x1_0000)
+        let addr2 = <WindowsUserland as PageManagementProvider<4096>>::allocate_pages(
+            platform,
+            (addr + 0x8000)..(addr + 0x1_0000),
+            MemoryRegionPermissions::WRITE,
+            false,
+            true,
+            FixedAddressBehavior::Hint,
+        )
+        .unwrap()
+        .as_usize();
+        // Even though `fixed_address` is false, we should still get the requested address if it's free.
+        assert_eq!(addr2, addr + 0x8000);
+        assert_eq!(
+            collect_regions(addr..addr + 0x1_0000),
+            vec![
+                (
+                    addr..addr + 0x1000,
+                    windows_sys::Win32::System::Memory::MEM_COMMIT
+                ),
+                (
+                    addr + 0x1000..addr + 0x8000,
+                    windows_sys::Win32::System::Memory::MEM_RESERVE
+                ),
+                (
+                    addr + 0x8000..addr + 0x1_0000,
+                    windows_sys::Win32::System::Memory::MEM_COMMIT
+                ),
+            ]
+        );
+
+        // Try to allocate [addr + 0x4000, addr + 0x1_0000), which overlaps with existing committed pages.
+        // OS should allocate a new region instead of the requested one (as `fixed_address` is false)
+        let addr3 = <WindowsUserland as PageManagementProvider<4096>>::allocate_pages(
+            platform,
+            (addr + 0x4000)..(addr + 0x1_0000),
+            MemoryRegionPermissions::WRITE,
+            false,
+            true,
+            FixedAddressBehavior::Hint,
+        )
+        .unwrap()
+        .as_usize();
+        assert_ne!(addr3, addr + 0x4000);
+    }
+
+    /// Regression coverage for the `node -e "..."` hang: [`super::stdin_ready_raw_handle`] must
+    /// give a genuine non-blocking readiness answer instead of the old hardcoded
+    /// `EpollDescriptor::File`'s-caller-side "stdin is always readable" assumption that let
+    /// libuv's poll-then-read pattern land in [`super::read_from_raw_handle`]'s blocking
+    /// `ReadFile` with nothing queued. This drives `STD_INPUT_HANDLE` through both non-console
+    /// backings the function distinguishes (`FILE_TYPE_PIPE`/`FILE_TYPE_UNKNOWN`) via real OS
+    /// handles, since a genuinely console-backed `STD_INPUT_HANDLE` is not available in this
+    /// test-runner's (non-interactive) process.
+    #[test]
+    fn test_stdin_ready_pipe_and_regular_file() {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::Storage::FileSystem::WriteFile;
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE, SetStdHandle};
+        use windows_sys::Win32::System::Pipes::CreatePipe;
+
+        // Swap `STD_INPUT_HANDLE` for the lifetime of this test and always restore it, so this
+        // doesn't corrupt any other test's view of the process's real stdin.
+        struct RestoreStdin(HANDLE);
+        impl Drop for RestoreStdin {
+            fn drop(&mut self) {
+                unsafe {
+                    SetStdHandle(STD_INPUT_HANDLE, self.0);
+                }
+            }
+        }
+        let _restore = RestoreStdin(unsafe { GetStdHandle(STD_INPUT_HANDLE) });
+
+        // `stdin_ready_raw_handle` only needs a live `WindowsUserland` instance for its
+        // `FILE_TYPE_CHAR` (real console) branch, which this test deliberately does not exercise
+        // (see this test's doc comment) -- but the parameter is required regardless, so get a real
+        // instance the same way any other caller would.
+        let platform = WindowsUserland::new();
+
+        // An empty anonymous pipe (`FILE_TYPE_PIPE`) with nothing written yet: must report
+        // not-ready, since a `ReadFile` on it would block until a writer sends data -- this is
+        // the exact "poll says ready, read blocks forever" hazard this function exists to avoid.
+        let (mut read_handle, mut write_handle): (HANDLE, HANDLE) =
+            (core::ptr::null_mut(), core::ptr::null_mut());
+        let ok = unsafe {
+            CreatePipe(
+                &raw mut read_handle,
+                &raw mut write_handle,
+                core::ptr::null(),
+                0,
+            )
+        };
+        assert_ne!(ok, 0, "CreatePipe failed: {}", unsafe {
+            windows_sys::Win32::Foundation::GetLastError()
+        });
+        unsafe {
+            SetStdHandle(STD_INPUT_HANDLE, read_handle);
+        }
+        assert!(
+            !super::stdin_ready_raw_handle(platform),
+            "an empty pipe with no writer output yet must not report ready"
+        );
+
+        // Write a byte into the pipe: now a `ReadFile` would return immediately, so readiness
+        // must flip to `true`.
+        let mut written: u32 = 0;
+        let ok = unsafe {
+            WriteFile(
+                write_handle,
+                [7u8].as_ptr(),
+                1,
+                &raw mut written,
+                core::ptr::null_mut(),
+            )
+        };
+        assert_ne!(ok, 0);
+        assert!(
+            super::stdin_ready_raw_handle(platform),
+            "a pipe with data already written must report ready"
+        );
+
+        unsafe {
+            CloseHandle(read_handle);
+            CloseHandle(write_handle);
+        }
+
+        // A null/invalid handle (no stdin attached at all) must report ready: `read_from_stdin`
+        // treats this as already-closed/EOF, which is an immediate (non-blocking) outcome.
+        unsafe {
+            SetStdHandle(STD_INPUT_HANDLE, core::ptr::null_mut());
+        }
+        assert!(
+            super::stdin_ready_raw_handle(platform),
+            "no stdin handle attached at all must report ready (matches EOF semantics)"
+        );
+    }
+}

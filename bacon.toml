@@ -1,0 +1,95 @@
+# This is a configuration file for the bacon tool
+#
+# Complete help on configuration: https://dystroy.org/bacon/config/
+# 
+# You may check the current default at
+#   https://github.com/Canop/bacon/blob/main/defaults/default-bacon.toml
+
+default_job = "clippy"
+env.CARGO_TERM_COLOR = "always"
+
+# Check on all targets
+[jobs.check]
+command = ["cargo", "check", "--all-targets"]
+need_stdout = false
+
+# Check on all targets and features
+[jobs.check-all]
+command = ["cargo", "check", "--all-targets", "--all-features"]
+need_stdout = false
+
+# Clippy on all targets
+[jobs.clippy]
+command = ["cargo", "clippy", "--all-targets"]
+need_stdout = false
+
+# Clippy on all targets and features
+[jobs.clippy-all]
+command = ["cargo", "clippy", "--all-targets", "--all-features"]
+need_stdout = false
+
+# Clippy on Windows target using PowerShell on WSL
+[jobs.clippy-windows]
+command = ["pwsh.exe", "-Command", '$env:CARGO_TARGET_DIR = ".\target\windows"; $env:CARGO_INCREMENTAL = "0"; cargo --color=never clippy -p litebox_runner_linux_on_windows_userland --all-targets --all-features 2>&1 | ForEach-Object { [Console]::WriteLine($PSItem) }']
+need_stdout = true
+extraneous_args = false
+
+# All build checks on LVBS
+[jobs.buildchecks-lvbs]
+command = ["bash", "-c", """
+#!/bin/bash
+set -eo pipefail
+set -x
+TOOLCHAIN=$(awk -F'"' '/channel/{print $2}' litebox_runner_lvbs/rust-toolchain.toml)
+cargo +$TOOLCHAIN clippy --lib --bins --examples --no-deps --all-features -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
+cargo +$TOOLCHAIN clippy --lib --bins --examples --no-deps --all-features -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_platform_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
+cargo +$TOOLCHAIN build -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
+cargo +$TOOLCHAIN build -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_platform_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
+"""]
+need_stdout = false
+
+# All build checks on SNP
+[jobs.buildchecks-snp]
+command = ["bash", "-c", """
+#!/bin/bash
+set -eo pipefail
+set -x
+TOOLCHAIN=$(awk -F'"' '/channel/{print $2}' litebox_runner_snp/rust-toolchain.toml)
+cargo +$TOOLCHAIN clippy --bins --examples --all-features -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem --manifest-path=litebox_runner_snp/Cargo.toml --target litebox_runner_snp/target.json
+cargo +$TOOLCHAIN build -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem --manifest-path=litebox_runner_snp/Cargo.toml --target litebox_runner_snp/target.json
+"""]
+need_stdout = false
+
+# Run nextest on default target
+[jobs.nextest]
+command = [
+    "cargo", "nextest", "run",
+    "--hide-progress-bar", "--failure-output", "final"
+]
+need_stdout = true
+analyzer = "nextest"
+
+# Documentation
+[jobs.doc]
+command = ["cargo", "doc", "--no-deps"]
+need_stdout = false
+
+# If the doc compiles, then it opens in your browser
+[jobs.doc-open]
+command = ["cargo", "doc", "--no-deps", "--open"]
+need_stdout = false
+allow_warnings = true
+on_success = "job:doc" # so that we don't open the browser at each change
+
+# Project-specific keybindings, to make it easier to run the various jobs here.
+[keybindings]
+k = "job:check"
+alt-k = "job:check-all"
+c = "job:clippy"
+alt-c = "job:clippy-all"
+n = "job:nextest"
+d = "job:doc-open"
+alt-d = "job:doc"
+v = "job:buildchecks-lvbs"
+alt-s = "job:buildchecks-snp"
+w = "job:clippy-windows"

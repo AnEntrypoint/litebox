@@ -1,0 +1,1082 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+//! The underlying platform upon which LiteBox resides.
+//!
+//! The top-level trait that denotes something is a valid LiteBox platform is [`Provider`]. This
+//! trait is merely a collection of subtraits that could be composed independently from various
+//! other crates that implement them upon various types.
+
+mod arch;
+pub mod common_providers;
+pub mod page_mgmt;
+pub mod trivial_providers;
+
+#[cfg(test)]
+pub(crate) mod mock;
+
+use thiserror::Error;
+use zerocopy::{FromBytes, IntoBytes};
+
+pub use arch::{ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister};
+pub use page_mgmt::PageManagementProvider;
+
+/// A provider of a platform upon which LiteBox can execute.
+///
+/// Ideally, a [`Provider`] is zero-sized, and only exists to provide access to functionality
+/// provided by it. _However_, most of the provided APIs within the provider act upon an `&self` to
+/// allow storage of any useful "globals" within it necessary.
+pub trait Provider:
+    RawMutexProvider + IPInterfaceProvider + TimeProvider + ArchSpecificProvider + RawPointerProvider
+{
+}
+
+/// Thread management provider.
+pub trait ThreadProvider: RawPointerProvider {
+    /// Execution context for the current thread of the guest program.
+    type ExecutionContext;
+    /// Error type for [`ThreadProvider::spawn_thread`].
+    type ThreadSpawnError: core::error::Error;
+    type ThreadHandle: 'static + Send + Sync;
+
+    /// Spawn a new thread with the given entry point.
+    ///
+    /// `ctx` contains the initial register state, including the entry point and stack pointer.
+    ///
+    /// `init_thread` provides an object used to initialize the shim on the new thread.
+    ///
+    /// # Safety
+    ///
+    /// The context must be valid.
+    unsafe fn spawn_thread(
+        &self,
+        ctx: &Self::ExecutionContext,
+        init_thread: alloc::boxed::Box<
+            dyn crate::shim::InitThread<ExecutionContext = Self::ExecutionContext>,
+        >,
+    ) -> Result<(), Self::ThreadSpawnError>;
+
+    /// Returns a handle to the current thread, which can be used to interrupt
+    /// it later.
+    ///
+    /// # Panics
+    /// May panic if called outside the platform's call to one of the
+    /// [`EnterShim`] methods.
+    ///
+    /// [`EnterShim`]: crate::shim::EnterShim
+    fn current_thread(&self) -> Self::ThreadHandle;
+
+    /// Interrupt the given thread from running guest code.
+    ///
+    /// Ensures that one of the [`EnterShim`] methods ([`EnterShim::interrupt`]
+    /// if no other guest exit is concurrently in progress) is called on the
+    /// thread as soon as possible, interrupting currently running guest code if
+    /// needed.
+    ///
+    /// [`EnterShim`]: crate::shim::EnterShim
+    /// [`EnterShim::interrupt`]: crate::shim::EnterShim::interrupt
+    fn interrupt_thread(&self, thread: &Self::ThreadHandle);
+
+    /// Runs `f` on the current thread after performing any platform-specific
+    /// thread registration needed for [`current_thread`](Self::current_thread)
+    /// and related functionality to work.
+    ///
+    /// This is intended for test threads that do not go through the normal
+    /// [`spawn_thread`](Self::spawn_thread) / guest entry path. The platform
+    /// sets up thread state before calling `f` and tears it down afterward.
+    ///
+    /// The default implementation simply calls `f()` with no additional setup.
+    /// Platforms that require explicit thread registration should override this.
+    #[cfg(debug_assertions)]
+    fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
+        f()
+    }
+
+    /// Returns the host OS's own thread identifier for the current thread, for
+    /// diagnostic correlation with host-level crash dumps (which report an
+    /// OS thread id, not litebox's own guest-space `Task::tid`). Purely
+    /// diagnostic -- no functional code should depend on this value.
+    ///
+    /// Default implementation returns 0 (unavailable); platforms that can
+    /// cheaply expose a real host thread id should override this.
+    fn host_debug_tid(&self) -> u64 {
+        0
+    }
+
+    /// Declares the guest-space process id (`Task::pid`) that the NEXT thread
+    /// spawned via [`spawn_thread`](Self::spawn_thread) on this calling
+    /// thread will belong to.
+    ///
+    /// A platform that tracks host address ranges per real OS thread as a
+    /// proxy for "which guest process owns this memory" (because every guest
+    /// process here is really just an OS thread sharing one host process, see
+    /// e.g. `litebox_platform_windows_userland`'s `CLAIMED_RANGES`) cannot
+    /// otherwise distinguish "a brand-new pthread within the SAME guest
+    /// process" from "an entirely unrelated guest process" -- both show up as
+    /// a new, distinct OS `ThreadId` with no inherent relationship to the
+    /// spawning thread's own `ThreadId`. Calling this immediately before
+    /// [`spawn_thread`](Self::spawn_thread) lets such a platform propagate
+    /// the correct guest-pid onto the newly-spawned thread at spawn time,
+    /// so both threads are recognized as the same owner.
+    ///
+    /// The shim calls this with the CHILD's own eventual `Task::pid` right
+    /// before every [`spawn_thread`](Self::spawn_thread) call: for an
+    /// ordinary same-process thread clone this is identical to the calling
+    /// thread's own pid (an ordinary pthread `clone()`); for a `fork()`
+    /// (process clone) it is the freshly-allocated child pid, correctly
+    /// giving the child its own, distinct identity from the moment it starts
+    /// running, not a false "same guest process as the parent" merge.
+    ///
+    /// Default implementation does nothing; platforms with no such
+    /// per-thread guest-process bookkeeping can ignore this entirely.
+    fn set_next_spawned_thread_guest_pid(&self, pid: i32) {
+        let _ = pid;
+    }
+}
+
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum TimerCreationError {
+    #[error("The platform does not support timers at all.")]
+    Unsupported,
+}
+
+/// Timer support for proactive signal delivery.
+pub trait TimerProvider {
+    /// The timer handle type.
+    ///
+    /// `Send + Sync` because a timer handle is stored inside a shared, cross-thread `Mutex`
+    /// (e.g. `litebox_shim_linux`'s per-process alarm timer) -- a timer handle is fundamentally
+    /// just an opaque OS-level identifier (e.g. a `timer_t`) with no thread-affinity, so this is
+    /// not an additional runtime requirement on real implementations, only a bound the compiler
+    /// needs stated explicitly on the trait to allow generic code to rely on it.
+    type TimerHandle: TimerHandle + Send + Sync;
+    /// The signal type delivered by timers.
+    type Signal;
+
+    /// Create a new one-shot timer that delivers `signal` when it fires.
+    ///
+    /// By default, this returns an error indicating that timers are not supported.
+    /// Platforms that support it should overwrite this.
+    #[expect(unused_variables, reason = "returns an error by default")]
+    fn create_timer(&self, signal: Self::Signal) -> Result<Self::TimerHandle, TimerCreationError> {
+        Err(TimerCreationError::Unsupported)
+    }
+}
+
+/// A handle to a platform timer created by [`TimerProvider::create_timer`].
+pub trait TimerHandle: Sized {
+    /// Arm (or re-arm) the timer to fire after `duration` elapses.
+    ///
+    /// If the timer is already armed, the previous deadline is replaced.
+    /// A zero duration cancels the timer without firing.
+    fn set_timer(&self, duration: core::time::Duration);
+
+    /// Delete the timer.
+    fn delete_timer(self) {}
+}
+
+/// Provider for consuming platform-originating signals.
+///
+/// Platforms can record signals (e.g., `SIGINT`) and the shim should call
+/// [`SignalProvider::take_pending_signals`] to consume them.
+pub trait SignalProvider {
+    /// The signal type produced by this platform.
+    type Signal;
+
+    /// Atomically take all pending asynchronous signals (e.g., SIGINT and SIGALRM)
+    /// for the current thread, passing each one to `f`.
+    ///
+    /// Platforms that support asynchronous signals should override this method.
+    #[expect(unused_variables, reason = "no-op by default")]
+    fn take_pending_signals(&self, f: impl FnMut(Self::Signal)) {}
+}
+
+/// A provider of raw mutexes
+pub trait RawMutexProvider {
+    type RawMutex: RawMutex;
+
+    /// Updates the waker for the current thread's interruptible wait.
+    ///
+    /// Called by `WaitContext::start_wait` with `Some(waker)` when the current thread
+    /// enters an interruptible wait, and by `WaitContext::end_wait` with
+    /// `None` when it leaves. The thread in an interruptible wait can be unblocked
+    /// by [`Waker::wake`].
+    ///
+    /// This is a no-op by default.
+    ///
+    /// [`Waker::wake`]: crate::event::wait::Waker::wake
+    #[expect(unused_variables)]
+    fn update_waker(&self, waker: Option<crate::event::wait::Waker<Self>>)
+    where
+        Self: crate::sync::RawSyncPrimitivesProvider + Sized,
+    {
+    }
+}
+
+/// A raw mutex/lock API; expected to roughly match (or even be implemented using) a Linux futex.
+pub trait RawMutex: Send + Sync + 'static {
+    /// The initial value for a raw mutex, with an underlying atomic with a
+    /// value of zero.
+    const INIT: Self;
+
+    /// Returns a reference to the underlying atomic value
+    fn underlying_atomic(&self) -> &core::sync::atomic::AtomicU32;
+
+    /// Wake up `n` threads blocked on on this raw mutex.
+    ///
+    /// Returns the number of waiters that were woken up.
+    /// Some platforms cannot observe this number and may return zero
+    /// even when one or more waiters were woken up, so callers must
+    /// not rely on zero meaning that no waiters were woken up.
+    fn wake_many(&self, n: usize) -> usize;
+
+    /// Wake up one thread blocked on this raw mutex.
+    ///
+    /// Returns true if this actually woke up such a thread. Returns false
+    /// if no thread was waiting on this raw mutex, or if the platform
+    /// cannot observe whether a thread was woken up.
+    fn wake_one(&self) -> bool {
+        self.wake_many(1) > 0
+    }
+
+    /// Wake up all threads that are blocked on this raw mutex.
+    ///
+    /// Returns the number of waiters that were woken up. This may be
+    /// zero on platforms that cannot observe this number.
+    fn wake_all(&self) -> usize {
+        self.wake_many(i32::MAX as usize)
+    }
+
+    /// If the underlying value is `val`, block until a wake operation wakes us up.
+    ///
+    /// Importantly, a wake operation does NOT guarantee that the underlying value has changed; it
+    /// only means that a wake operation has occurred. However, an [`ImmediatelyWokenUp`] means that
+    /// the value had changed _before_ it went to sleep.
+    fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp>;
+
+    /// If the underlying value is `val`, block until a wake operation wakes us up, or some `time`
+    /// has passed without a wake operation having occurred.
+    ///
+    /// See comment on [`Self::block`] for more details on underlying value.
+    fn block_or_timeout(
+        &self,
+        val: u32,
+        time: core::time::Duration,
+    ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp>;
+}
+
+/// A zero-sized struct indicating that the block was immediately unblocked (due to non-matching
+/// value).
+pub struct ImmediatelyWokenUp;
+
+/// Named-boolean to indicate whether [`RawMutex::block_or_timeout`] was woken up or timed out.
+#[must_use]
+pub enum UnblockedOrTimedOut {
+    /// Unblocked by a wake call
+    Unblocked,
+    /// Sufficient time elapsed without a wake call
+    TimedOut,
+}
+
+/// An IP packet interface to the outside world.
+///
+/// This could be implemented via a `read`/`write` to a TUN device.
+pub trait IPInterfaceProvider {
+    /// Send the IP packet.
+    ///
+    /// Returns `Ok(())` when entire packet is sent, or a [`SendError`] if it is unable to send the
+    /// entire packet.
+    fn send_ip_packet(&self, packet: &[u8]) -> Result<(), SendError>;
+
+    /// Receive an IP packet into `packet`.
+    ///
+    /// Returns size of packet received, or a [`ReceiveError`] if unable to receive an entire
+    /// packet.
+    fn receive_ip_packet(&self, packet: &mut [u8]) -> Result<usize, ReceiveError>;
+}
+
+/// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::send_ip_packet`].
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum SendError {}
+
+/// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::receive_ip_packet`].
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum ReceiveError {
+    #[error("Receive operation would block")]
+    WouldBlock,
+}
+
+/// An interface to understanding time.
+pub trait TimeProvider {
+    type Instant: Instant;
+    type SystemTime: SystemTime;
+    /// Returns an instant corresponding to "now".
+    fn now(&self) -> Self::Instant;
+    /// Returns the current system time.
+    fn current_time(&self) -> Self::SystemTime;
+}
+
+/// An opaque measurement of a monotonically nondecreasing clock.
+///
+/// Notable, the `Instant` is distinct from [`SystemTime`], in that the `Instant` is monotonic, and
+/// need not have any relation with "real" time. It does not matter if the world takes a step
+/// backwards in time, the `Instant` continues marching forward.
+pub trait Instant: Copy + Clone + PartialEq + Eq + PartialOrd + Ord + Send + Sync {
+    /// Returns the amount of time elapsed from another instant to this one, or `None` if that
+    /// instant is later than this one.
+    fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration>;
+    /// Returns the amount of time elapsed from another instant to this one, or zero duration if
+    /// that instant is later than this one.
+    fn duration_since(&self, earlier: &Self) -> core::time::Duration {
+        self.checked_duration_since(earlier)
+            .unwrap_or(core::time::Duration::from_secs(0))
+    }
+    /// Returns a new `Instant` that is the sum of this instant and the provided
+    /// duration, or `None` if the resulting instant would overflow.
+    fn checked_add(&self, duration: core::time::Duration) -> Option<Self>;
+}
+
+/// A measurement of the system clock.
+///
+/// Notably, the `SystemTime` is distinct from [`Instant`], in that the `SystemTime` need not be
+/// monotonic, but instead is the best guess of "real" or "wall clock" time.
+pub trait SystemTime: Send + Sync {
+    /// An anchor in time corresponding to "1970-01-01 00:00:00 UTC".
+    const UNIX_EPOCH: Self;
+    /// Returns the amount of time elapsed from an `earlier` point in time to this one. This is
+    /// fallible since the clock might have been adjusted backwards in time to before the earlier
+    /// point in time was measured; in such a case, it returns an `Err(_)` with the absolute
+    /// duration.
+    fn duration_since(&self, earlier: &Self) -> Result<core::time::Duration, core::time::Duration>;
+}
+
+/// A common interface for raw pointers, aimed at usage in shims _above_ LiteBox.
+///
+/// Essentially, these types indicate "user" pointers (which are allowed to be null). Platforms with
+/// no meaningful user-kernel separation can use [`trivial_providers::TransparentConstPtr`] and
+/// [`trivial_providers::TransparentMutPtr`]. Platforms with meaningful user-kernel separation
+/// should define their own `repr(C)` newtype wrappers that perform relevant copying between user
+/// and kernel.
+pub trait RawPointerProvider {
+    type RawConstPointer<T: FromBytes>: RawConstPointer<T>;
+    type RawMutPointer<T: FromBytes + IntoBytes>: RawMutPointer<T>;
+}
+
+/// A read-only raw pointer, morally equivalent to `*const T`.
+///
+/// See [`RawPointerProvider`] for details.
+pub trait RawConstPointer<T>: Copy + core::fmt::Debug + FromBytes + IntoBytes
+where
+    T: FromBytes,
+{
+    /// Get the address of the pointer as a `usize`.
+    fn as_usize(&self) -> usize;
+
+    /// Convert a `usize` to a pointer with that address.
+    ///
+    /// Note: this can have tricky implications on exotic hardware. Implementors of this trait are
+    /// encouraged to read about [Exposed
+    /// Provenance](https://doc.rust-lang.org/std/ptr/index.html#exposed-provenance).
+    fn from_usize(addr: usize) -> Self;
+
+    /// Read the value of the pointer at signed offset from it.
+    ///
+    /// Returns `None` if the provided pointer is invalid, or such an offset is known (in advance)
+    /// to be invalid.
+    ///
+    /// If `T` is of size 1, 2, 4, or (on 64-bit platforms) 8 bytes, and the pointer is aligned,
+    /// then this function will perform a relaxed atomic load of the value. Otherwise, the
+    /// access pattern is unspecified.
+    fn read_at_offset(self, count: isize) -> Option<T>;
+
+    /// Read the pointer as an owned slice of memory.
+    ///
+    /// Returns `None` if the provided pointer is invalid, or such a slice is known (in advance) to
+    /// be invalid.
+    fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>>;
+
+    /// Read the pointer as an owned C string.
+    ///
+    /// Returns `None` if the provided pointer is invalid, or such a string is known (in advance) to
+    /// be invalid.
+    fn to_cstring(self) -> Option<alloc::ffi::CString>
+    where
+        T: core::cmp::PartialEq<core::ffi::c_char>,
+        Self: RawConstPointer<core::ffi::c_char>,
+    {
+        use alloc::boxed::Box;
+        use alloc::vec::Vec;
+        use core::ffi::c_char;
+        let nul_position = {
+            let mut i = 0isize;
+            while <Self as RawConstPointer<c_char>>::read_at_offset(self, i)? != 0 {
+                i = i.checked_add(1)?;
+            }
+            i
+        };
+        let len = nul_position.checked_add(1)?.try_into().ok()?;
+        let bytes: Box<[c_char]> = self.to_owned_slice(len)?;
+        // Doing a direct transmute of `Box<[c_char]>` to `Box<[u8]>` may not be guaranteed to be
+        // safe (it probably is fine, but the following sequence of steps ensures we are
+        // staying in a very safe subset).
+        let bytes: *mut [c_char] = Box::into_raw(bytes);
+        // SAFETY: c_char and u8 have the same size and alignment. The cast is a no-op on
+        // targets where c_char is u8 (e.g. aarch64), hence the `unnecessary_cast` allow.
+        #[allow(clippy::unnecessary_cast)]
+        let bytes: *mut [u8] = bytes as *mut [u8];
+        let bytes: Box<[u8]> = unsafe { Box::from_raw(bytes) };
+        let bytes: Vec<u8> = Vec::from(bytes);
+        alloc::ffi::CString::from_vec_with_nul(bytes).ok()
+    }
+}
+
+/// A writable raw pointer, morally equivalent to `*mut T`.
+///
+/// See [`RawPointerProvider`] for details.
+///
+/// This is a sub-trait of [`RawConstPointer`] in order to support the reading-related functionality
+/// on the pointer in addition to the writing-related functionality defined by this trait.
+pub trait RawMutPointer<T>: Copy + RawConstPointer<T>
+where
+    T: FromBytes + IntoBytes,
+{
+    /// Write the value of the pointer at signed offset from it.
+    ///
+    /// Returns `None` if the provided pointer is invalid, or such an offset is known (in advance)
+    /// to be invalid.
+    #[must_use]
+    fn write_at_offset(self, count: isize, value: T) -> Option<()>;
+
+    /// Write a slice of values at the given offset.
+    ///
+    /// Returns `None` if the provided pointer is invalid, or if the specified offset is known (in
+    /// advance) to be invalid; in that case there are no guarantees about how many values — if any —
+    /// have been written.
+    #[must_use]
+    fn write_slice_at_offset(self, count: isize, values: &[T]) -> Option<()>
+    where
+        T: Clone,
+    {
+        for (offset, v) in (count..).zip(values) {
+            self.write_at_offset(offset, v.clone())?;
+        }
+        Some(())
+    }
+
+    /// Obtain a mutable (sub)slice of memory at the pointer, and run `f` upon it.
+    ///
+    /// Returns `None` (and does not invoke `f`) if the provided pointer is invalid, or such a slice
+    /// is known (in advance) to be invalid.
+    ///
+    /// This function may be a direct access to the underlying slice, or may be a newly allocated
+    /// slice that is "flushed" at the end of the execution, depending on the platform. Thus, for
+    /// performance reasons, a user of this function ideally invokes with the shortest subslice that
+    /// they wish to mutate.
+    ///
+    /// Note: if `f` panics, there is no guarantee that the memory is left unchanged.
+    #[must_use]
+    #[deprecated = "will be removed in the future, do not use this"]
+    fn mutate_subslice_with<R>(
+        self,
+        range: impl core::ops::RangeBounds<isize>,
+        f: impl FnOnce(&mut [T]) -> R,
+    ) -> Option<R>;
+
+    /// Copy in a slice at the pointer offset.
+    ///
+    /// Returns `None` without copying if the provided pointer is invalid, or such a slice is known
+    /// (in advance) to be invalid.
+    ///
+    /// This is essentially just a convenience wrapper around [`Self::mutate_subslice_with`], that
+    /// makes it easier to notice and prevent some hazards that can come from
+    /// `mutate_subslice_with`, by making sure kernel buffers are used before copying things in.
+    #[must_use]
+    fn copy_from_slice(self, start_offset: usize, buf: &[T]) -> Option<()>
+    where
+        T: Copy,
+    {
+        let start: isize = start_offset.try_into().ok()?;
+        let end = start.checked_add_unsigned(buf.len())?;
+        #[allow(deprecated)]
+        self.mutate_subslice_with(start..end, |x| {
+            debug_assert_eq!(x.len(), buf.len());
+            x.copy_from_slice(buf);
+        })
+    }
+}
+
+/// A non-exhaustive list of errors that can be thrown by [`StdioProvider::read_from_stdin`].
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum StdioReadError {
+    #[error("input stream has been closed")]
+    Closed,
+}
+
+/// A non-exhaustive list of errors that can be thrown by [`StdioProvider::write_to`].
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum StdioWriteError {
+    #[error("output stream has been closed")]
+    Closed,
+}
+
+/// Possible standard output/error streams
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StdioOutStream {
+    /// Standard output
+    Stdout,
+    /// Standard error
+    Stderr,
+}
+
+/// Possible standard input/output streams
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StdioStream {
+    /// Standard input
+    Stdin = 0,
+    /// Standard output
+    Stdout = 1,
+    /// Standard error
+    Stderr = 2,
+}
+
+/// A provider of standard input/output functionality.
+pub trait StdioProvider {
+    /// Read from standard input. Returns number of bytes read.
+    fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, StdioReadError>;
+
+    /// Write to stdout/stderr. Returns number of bytes written.
+    fn write_to(&self, stream: StdioOutStream, buf: &[u8]) -> Result<usize, StdioWriteError>;
+
+    /// Check if a stream is connected to a TTY.
+    fn is_a_tty(&self, stream: StdioStream) -> bool;
+
+    /// Non-blocking readiness probe for standard input: returns `true` if a subsequent
+    /// [`StdioProvider::read_from_stdin`] call is expected to return immediately (either with
+    /// data or at EOF/closed), without actually consuming or blocking on any input.
+    ///
+    /// This exists because [`StdioProvider::read_from_stdin`] itself is permitted to be a plain
+    /// blocking read (matching a real Linux `read(2)` on an inherited stdin fd): the guest-visible
+    /// `poll`/`select`/`epoll_wait` syscalls need a way to answer "is stdin readable right now"
+    /// *without* performing that blocking read, exactly as the real kernel does by tracking
+    /// pending input independently of the read path. A platform whose readiness and read
+    /// operations are both trivially non-blocking (e.g. a native Linux fd, where the host kernel
+    /// already provides real `poll(2)` semantics) may simply return `true` unconditionally here.
+    fn stdin_ready(&self) -> bool;
+
+    /// Returns the controlling terminal's current size as `(rows, cols)`, if this platform can
+    /// determine it (e.g. by querying the real console/tty window size). Returns `None` when
+    /// there is no real terminal to query (headless, redirected, or a platform where the guest's
+    /// own tty layer already tracks this independently) -- callers should fall back to a
+    /// reasonable default `Winsize` rather than treating `None` as an error.
+    ///
+    /// Backing `TIOCGWINSZ`: guests (notably `ash`'s line editor) use this to decide the visual
+    /// column width at which to wrap echoed input, so returning a fixed, too-narrow size here
+    /// causes the guest to insert spurious wraps into its own echo well before the real terminal
+    /// would ever need to.
+    fn tty_window_size(&self) -> Option<(u16, u16)> {
+        None
+    }
+}
+
+/// A provider that can verify a freshly-`fork()`ed child's execution against the address-space
+/// relocation its `fork()` performed.
+///
+/// `fork()` in LiteBox duplicates the parent's guest address space to *different* host addresses
+/// (see [`PageManager::duplicate`](crate::mm::PageManager::duplicate)) and translates the child's
+/// captured CPU registers accordingly -- but raw pointer values that were already sitting in
+/// *memory* (return addresses pushed on the stack by the parent's `call`s, pointers spilled into
+/// stack slots or globals, ...) are copied verbatim and are therefore stale in the child. Because
+/// `fork()` only ever *adds* mappings and never unmaps the parent's, such a stale pointer is
+/// still live, mapped host memory: dereferencing it silently reads or, far worse, *writes* the
+/// running parent's state instead of faulting the way it would on real Linux hardware.
+///
+/// A platform that can single-step the guest may implement this to detect that situation and
+/// convert it into what real hardware would have produced -- a fault in the child -- rather than
+/// letting it silently corrupt the parent.
+///
+/// The default implementations do nothing, which is always correct-but-unverified behavior.
+pub trait ForkChildVerificationProvider {
+    /// Begin verifying the current (freshly-`fork()`ed child) thread's guest execution against
+    /// `relocations`, which describe how this child's address space was relocated relative to
+    /// its parent's.
+    ///
+    /// Called on the child's own thread, immediately before it first resumes into guest code.
+    /// Verification ends automatically when the child reaches `execve`/`exit`/`exit_group` (at
+    /// which point the stale parent addresses are no longer reachable), or when
+    /// [`end_fork_child_verification`](Self::end_fork_child_verification) is called.
+    fn begin_fork_child_verification(
+        &self,
+        relocations: alloc::sync::Arc<crate::mm::AddressRelocations>,
+    ) {
+        let _ = relocations;
+    }
+
+    /// Stop verifying the current thread's guest execution, if it was being verified.
+    fn end_fork_child_verification(&self) {}
+
+    /// Returns the CALLING thread's own currently-active relocation map, if the calling thread
+    /// is itself a `fork()` descendant still under verification (i.e. `self` is running on a
+    /// thread that was itself a target of a prior [`begin_fork_child_verification`] call whose
+    /// matching [`end_fork_child_verification`] has not yet fired).
+    ///
+    /// Called on the PARENT's own thread from `do_clone`, immediately after this fork's own
+    /// `PageManager::duplicate` call, BEFORE the fresh relocation map is handed to the new
+    /// child's own [`begin_fork_child_verification`] -- lets a nested fork (a fork whose OWN
+    /// parent is itself a fork descendant, e.g. a grandchild) fold the calling thread's inherited
+    /// ancestor ranges into the grandchild's map via
+    /// [`crate::mm::AddressRelocations::merge_ancestor_ranges`], so the grandchild transitively
+    /// covers every ancestor generation instead of only its immediate parent's. `None` for a
+    /// thread that is not itself under verification (the common case: a top-level, non-nested
+    /// fork), which is exactly when no merge is needed. The default implementation returns
+    /// `None`, matching every other member's "correct-but-unverified" default.
+    fn current_thread_fork_relocations(&self) -> Option<alloc::sync::Arc<crate::mm::AddressRelocations>> {
+        None
+    }
+
+    /// Diagnostic-only hook, called from `do_clone` immediately after a real `fork()`/`vfork()`
+    /// duplicates the parent's address space (same call site as
+    /// [`begin_fork_child_verification`](Self::begin_fork_child_verification), on the PARENT's
+    /// own thread before the new child thread/process is spawned).
+    ///
+    /// A platform MAY use this to exercise an experimental, alternative fork mechanism against
+    /// the REAL `relocations` this actual `fork()` call just produced, entirely as a side effect
+    /// that must not observably affect this `fork()` call's real outcome. The default
+    /// implementation does nothing.
+    ///
+    /// Concretely: `litebox_platform_windows_userland`'s implementation (pass 111 of
+    /// `scratchpad/jqrepro/FINDINGS.txt`'s investigation, gated behind
+    /// `LITEBOX_DIAG_PROCESS_FORK_SPAWN=1`, off by default) spawns a real, inert, suspended
+    /// Windows child process and proves out `relocations.group_relocations()`'s per-group
+    /// forced-address `VirtualAlloc2` + `WriteProcessMemory` copy mechanism -- the first
+    /// concrete building block of a future process-based `fork()` -- against this call's actual
+    /// production guest memory layout, then tears the experimental child down without ever
+    /// resuming it. See that implementation's module doc comment for the full mechanism and why
+    /// it is safe to run alongside the real, unmodified, thread-based fork path.
+    ///
+    /// `fd_complexity` is a cheap, read-only classification of the fd table this `fork()` call is
+    /// about to duplicate (see [`ForkFdComplexity`]), computed unconditionally in `do_clone`
+    /// before this hook is dispatched (see that computation's own doc comment for why it is
+    /// unconditional and inert on every platform by default). Per pass 116 of
+    /// `scratchpad/jqrepro/FINDINGS.txt`'s design investigation: none of litebox's 7 fd subsystems
+    /// (FS/Network/Pipes/Eventfd/Epoll/UnixSocket/Pty) are backed by a real Windows HANDLE, so a
+    /// future process-based `fork()` cannot inherit a "complex" fd (anything beyond the inherited
+    /// stdio slots 0/1/2) via `DuplicateHandle` the way pass 115 proved works for the host's own
+    /// real stdio HANDLEs -- see that pass's findings for the full reasoning and the recommended
+    /// scope-reduction path (fall back to the existing thread-based fork whenever a fork() call's
+    /// fd table has any occupied slot beyond 0/1/2).
+    /// `translated_gprs`, when present, is the child's already-translated (post-
+    /// `AddressRelocations::translate`) `rip`/`rsp`/`rax` snapshot at the exact instant this
+    /// `fork()` call would resume the child -- the SAME values `do_clone` computes into its own
+    /// `child_ctx` immediately after this hook returns, just narrowed to a platform-agnostic
+    /// `[usize; 3]`-shaped struct so `litebox` (this crate) never needs a dependency on
+    /// `litebox_common_linux::PtRegs` (a strict layering violation: `litebox` sits BELOW
+    /// `litebox_common_linux`/`litebox_shim_linux` in the dependency graph). Pass 118 of
+    /// `scratchpad/jqrepro/FINDINGS.txt` is the first consumer: it is the exact register triple a
+    /// narrow, diagnostic-only `SetThreadContext` injection into a `CreateProcess`-spawned
+    /// suspended child needs to prove cross-process register injection works at all, before any
+    /// larger cross-process `Task`-reconstruction work is attempted. `None` on every call site that
+    /// does not (yet) compute a translated snapshot ahead of this hook.
+    /// `full_translated_gprs` (pass 120): the SAME `child_ctx` values as `translated_gprs`, carried
+    /// in full (every GPR plus `eflags`/`cs`/`ss`, matching `litebox_common_linux::PtRegs`'s x86_64
+    /// layout -- see [`ForkFullGprSnapshot`]'s doc comment for why this is a separate type rather
+    /// than widening [`ForkGprSnapshot`] in place). Pass 118/119's minimal-stub probe only ever
+    /// needed `rip`/`rsp`/`rax`; pass 120's real-guest-resume probe needs the complete context to
+    /// build a full `CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64` structure mirroring
+    /// `switch_to_guest_ntcontinue`'s own field mapping exactly. `None` on every call site that does
+    /// not (yet) compute this (every platform except `litebox_platform_windows_userland`, and every
+    /// non-`x86_64` target there too).
+    fn diagnostic_process_fork_probe(
+        &self,
+        relocations: &crate::mm::AddressRelocations,
+        fd_complexity: ForkFdComplexity,
+        translated_gprs: Option<ForkGprSnapshot>,
+        full_translated_gprs: Option<ForkFullGprSnapshot>,
+    ) {
+        let _ = relocations;
+        let _ = fd_complexity;
+        let _ = translated_gprs;
+        let _ = full_translated_gprs;
+    }
+
+    /// Diagnostic-only: if the calling thread is still a `fork()` child under active
+    /// [`Self::begin_fork_child_verification`] tracking, reverse-translates `dest_addr` (an
+    /// address in this thread's own, post-`fork()`-relocated DESTINATION address space) back to
+    /// the corresponding SOURCE (pre-`fork()`, parent-space) address, per the same
+    /// `AddressRelocations` map [`begin_fork_child_verification`](Self::begin_fork_child_verification)
+    /// was armed with. Returns `None` if this thread has no active verification, or if
+    /// `dest_addr` does not fall within any tracked destination range.
+    ///
+    /// Exists so a caller elsewhere in the shim (which does not itself have access to the
+    /// platform's private `AddressRelocations` bookkeeping) can determine a memory location's
+    /// TRUE pre-fork identity -- e.g. distinguishing a value that lives in the ELF's static
+    /// `.bss` segment from one that lives in the dynamically-grown heap, which requires comparing
+    /// against the parent's own address space, not the child's relocated copy. Must be called
+    /// before [`Self::end_fork_child_verification`] clears the tracked relocation map for this
+    /// thread. The default implementation (every platform without a relocating `fork()`) always
+    /// returns `None`.
+    fn diagnostic_reverse_translate_fork_child_addr(&self, dest_addr: usize) -> Option<usize> {
+        let _ = dest_addr;
+        None
+    }
+
+    /// Blocks the calling thread until the real OS process identified by `handle` (opaque,
+    /// platform-defined -- see [`CrossProcessChildHandle`]'s doc comment) terminates, then returns
+    /// its raw OS exit code.
+    ///
+    /// Part of pass 141 of `scratchpad/jqrepro/FINDINGS.txt`'s cross-process `wait4()` bridge: a
+    /// `LITEBOX_PROCESS_FORK=1` child (a genuinely separate Windows process, not the existing
+    /// same-process thread-based `fork()`) cannot be waited for via `Process::wait_for_exit`'s
+    /// existing `nr_threads`-futex mechanism -- that only observes threads inside THIS OS process.
+    /// A platform whose `fork()` can produce such a child overrides this to call the real
+    /// OS-level blocking wait (`WaitForSingleObject` + `GetExitCodeProcess` on Windows). The
+    /// default implementation panics: it must never be called on a platform/build that never
+    /// registers a [`CrossProcessChildHandle`] in the first place (see
+    /// `Process::cross_process_children`'s doc comment -- the caller only reaches this method for
+    /// a pid actually found in that registry).
+    fn wait_for_cross_process_exit(&self, handle: CrossProcessChildHandle) -> u32 {
+        let _ = handle;
+        unreachable!(
+            "wait_for_cross_process_exit called on a platform with no cross-process fork support"
+        )
+    }
+
+    /// Non-blocking poll variant of [`Self::wait_for_cross_process_exit`], used by
+    /// `wait4(WNOHANG)`. Returns `Some(raw_exit_code)` if the process has already terminated,
+    /// `None` if it is still running. Same default-panics contract as the blocking variant.
+    fn try_wait_for_cross_process_exit(&self, handle: CrossProcessChildHandle) -> Option<u32> {
+        let _ = handle;
+        unreachable!(
+            "try_wait_for_cross_process_exit called on a platform with no cross-process fork support"
+        )
+    }
+
+    /// Pass 157: after `sys_wait4` has observed cross-process child `handle`'s real exit (via
+    /// [`Self::wait_for_cross_process_exit`]/[`Self::try_wait_for_cross_process_exit`]) but
+    /// BEFORE reaping it from the registry, returns the raw bytes of a tar archive containing
+    /// that child's writable filesystem-layer deltas (every file it created or modified during
+    /// its run, e.g. `apk`'s installed packages), if that child exported one before exiting.
+    /// `sys_wait4`'s caller applies these entries into the calling (parent) process's own
+    /// writable layer, so a later `&&`/pipeline-chained command sharing the parent's process sees
+    /// them -- closing the gap documented in pass 156 (STEP 7/8) of
+    /// `scratchpad/jqrepro/FINDINGS.txt`: real Linux processes always share one filesystem
+    /// regardless of process boundaries, but a `LITEBOX_PROCESS_FORK=1` cross-process child's
+    /// independently-reconstructed in-memory filesystem previously vanished with the child's own
+    /// process on exit, invisible to the parent.
+    ///
+    /// `None` if the child never exported anything (e.g. it made no writable-layer changes, or
+    /// this platform/build has no cross-process fork support at all -- the default
+    /// implementation). Not a hard error either way: a fork() child that dies before reaching its
+    /// own export call (a crash, a signal) simply contributes no filesystem changes back, exactly
+    /// as if it had never written anything -- matching this call's best-effort, no-panic
+    /// contract, mirroring [`Self::try_wait_for_cross_process_exit`]'s own `Option`-based (not
+    /// `Result`-based) shape.
+    fn take_cross_process_writable_layer_export(
+        &self,
+        handle: CrossProcessChildHandle,
+    ) -> Option<alloc::vec::Vec<u8>> {
+        let _ = handle;
+        None
+    }
+
+    /// Diagnostic-only hook (pass 141, `LITEBOX_DIAG_PROCESS_FORK_WAIT4=1`, off by default),
+    /// called from `do_clone`'s process-clone branch at the SAME call site as
+    /// [`Self::diagnostic_process_fork_probe`], purely to live-exercise the cross-process
+    /// `wait4()` exit-status bridge ([`Self::wait_for_cross_process_exit`],
+    /// [`CrossProcessChildHandle`], and `litebox_shim_linux::syscalls::process::Process::
+    /// cross_process_children`/`encode_cross_process_exit_status`/
+    /// `decode_cross_process_wait_status`) end-to-end against a REAL, ordinary Windows child
+    /// process -- entirely independent of, and without altering, this actual `fork()` call's
+    /// real outcome. `register` is the callback a platform implementation uses to register the
+    /// real child it spawns into the CALLING process's actual `cross_process_children` registry
+    /// (so the proof exercises the real production registry, not a throwaway one), keyed to the
+    /// pid the platform makes up for this diagnostic exercise (any value not colliding with a
+    /// real guest pid; the default implementation never calls it). The default implementation
+    /// does nothing.
+    fn diagnostic_cross_process_wait4_probe(
+        &self,
+        register: &mut dyn FnMut(i32, CrossProcessChildHandle),
+    ) {
+        let _ = register;
+    }
+
+    /// Production (pass 142) counterpart to [`Self::diagnostic_process_fork_probe`]: spawns a
+    /// genuine, ongoing cross-process `fork()` child -- the SAME proven mechanism (memory
+    /// placement, register/context setup, real guest resume) that hook exercises, but WITHOUT its
+    /// diagnostic teardown. On success the child is left running real guest execution and this
+    /// returns its real pid, wrapped in a [`CrossProcessChildHandle`] the caller registers into
+    /// `litebox_shim_linux::syscalls::process::Process::cross_process_children` for a later
+    /// `wait4()` to reap (see that registry's doc comment). Returns `None` on any failure (the
+    /// child is torn down internally before returning) or when this platform has no such
+    /// mechanism (the default implementation) -- either way the caller falls back to the existing,
+    /// unconditionally-safe thread-based `fork()` path.
+    ///
+    /// `child_tid` is the pid the shim has already allocated for this `fork()` call's child
+    /// `Process` (see `do_clone`) -- the real Windows pid a spawned cross-process child gets is
+    /// necessarily different (assigned by the OS), so the caller uses ITS OWN `child_tid` as the
+    /// `cross_process_children` registry key (matching how a thread-based child is keyed), not
+    /// whatever this function returns as the process's real OS pid (needed only to interpret the
+    /// `HANDLE`, never exposed to the guest).
+    fn spawn_cross_process_fork_child(
+        &self,
+        relocations: &crate::mm::AddressRelocations,
+        full_gprs: ForkFullGprSnapshot,
+    ) -> Option<CrossProcessChildHandle> {
+        let _ = relocations;
+        let _ = full_gprs;
+        None
+    }
+}
+
+/// An opaque, platform-defined handle to a cross-process `fork()` child's real OS process,
+/// stored in the shim's `Process::cross_process_children` registry (see
+/// `litebox_shim_linux::syscalls::process::Process`'s doc comment) instead of the normal
+/// same-process `Arc<Process>` a thread-based `fork()` child uses.
+///
+/// Represented as a raw `usize` (a Windows `HANDLE` is pointer-sized and `Copy`) rather than an
+/// associated type on [`ForkChildVerificationProvider`], so `litebox_shim_linux`'s `Process`
+/// struct -- which is generic over `Platform: ShimPlatform` but must stay `Send`/`Sync` without
+/// per-platform `unsafe impl` boilerplate -- can hold it directly. The platform implementation is
+/// solely responsible for interpreting this value correctly (on Windows: a raw `HANDLE` value,
+/// kept alive for as long as this registry entry exists -- see the entry's own removal/`CloseHandle`
+/// discipline in `sys_wait4`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrossProcessChildHandle(pub usize);
+
+/// A minimal, platform-agnostic snapshot of the three registers a diagnostic cross-process
+/// register-injection probe (pass 118) needs: where the child's translated instruction pointer,
+/// stack pointer, and `fork()` return value (`rax`, always `0` for the child per the `fork()`
+/// ABI) would be if this `fork()` call resumed the child for real today. See
+/// [`ForkChildVerificationProvider::diagnostic_process_fork_probe`]'s doc comment for why this is
+/// a bespoke 3-field struct here rather than reusing `litebox_common_linux::PtRegs` directly.
+#[derive(Debug, Clone, Copy)]
+pub struct ForkGprSnapshot {
+    /// The child's translated instruction pointer (`child_ctx.rip` after
+    /// `AddressRelocations::translate`).
+    pub rip: usize,
+    /// The child's translated stack pointer (`child_ctx.rsp` after
+    /// `AddressRelocations::translate`).
+    pub rsp: usize,
+    /// The child's `fork()` return value (always `0`, the child-side ABI contract).
+    pub rax: usize,
+}
+
+/// The FULL translated register set a pass-120 "real guest resume" diagnostic probe needs --
+/// every GPR plus `eflags`/`cs`/`ss`, mirroring `litebox_common_linux::PtRegs`'s x86_64 field
+/// layout exactly (same bespoke-struct-not-`PtRegs` reasoning as [`ForkGprSnapshot`]: `litebox`
+/// sits below `litebox_common_linux` in the crate dependency graph). Distinct from
+/// [`ForkGprSnapshot`] (kept as-is, still used by pass 118/119's minimal-stub probe) rather than
+/// widening that type in place, since the two probes are independently gated and this pass's own
+/// FINDINGS.txt entry documents the minimal-stub probe as already proven and not to be disturbed.
+#[derive(Debug, Clone, Copy)]
+pub struct ForkFullGprSnapshot {
+    pub r15: usize,
+    pub r14: usize,
+    pub r13: usize,
+    pub r12: usize,
+    pub rbp: usize,
+    pub rbx: usize,
+    pub r11: usize,
+    pub r10: usize,
+    pub r9: usize,
+    pub r8: usize,
+    pub rax: usize,
+    pub rcx: usize,
+    pub rdx: usize,
+    pub rsi: usize,
+    pub rdi: usize,
+    pub orig_rax: usize,
+    pub rip: usize,
+    pub cs: usize,
+    pub eflags: usize,
+    pub rsp: usize,
+    pub ss: usize,
+    /// Pass 143: the already-translated-and-fixed-up `%fs` base (see `do_clone`'s `fs_base`
+    /// computation, `litebox_shim_linux/src/syscalls/process.rs`) the child's own host thread
+    /// must install via `arch_prctl(ARCH_SET_FS(..))`-equivalent before ever resuming guest
+    /// code. The thread-based fork path gets this for free (`ThreadInitState::ForkedChild`'s own
+    /// `fs_base` field, set on the SAME OS thread that goes on to run the guest); a
+    /// cross-process child is a brand-new OS thread in a brand-new OS process with no such
+    /// propagation, so this field is the cross-process carrier for the exact same value.
+    pub fs_base: usize,
+}
+
+/// Cheap, read-only classification of a fork()ing process's fd table, computed in `do_clone`
+/// immediately before duplicating it, purely to inform diagnostic instrumentation (see
+/// [`ForkChildVerificationProvider::diagnostic_process_fork_probe`]'s doc comment). Never changes
+/// `fork()`'s real behavior.
+///
+/// Per pass 115/116 of `scratchpad/jqrepro/FINDINGS.txt`, none of litebox's fd subsystems are
+/// backed by a real Windows HANDLE, so a process-based fork cannot yet inherit any fd beyond the
+/// conventional stdio slots (0/1/2) via the `DuplicateHandle` mechanism pass 115 proved out. This
+/// type exists so a future process-based fork implementation can cheaply decide, at the exact
+/// `do_clone` call site, whether to take that (not-yet-implemented) path or fall back to the
+/// existing thread-based fork -- without re-deriving the fd table scan itself.
+#[derive(Debug, Clone, Copy)]
+pub struct ForkFdComplexity {
+    /// Total number of currently-occupied raw fd slots in the fork()ing process's fd table.
+    pub total_alive: usize,
+    /// Number of occupied raw fd slots whose raw index is 3 or greater, i.e. anything beyond the
+    /// conventional stdin/stdout/stderr slots (0/1/2). A real process-based fork can only safely
+    /// inherit this process's fd table today (per pass 116's finding) when this is `0`.
+    pub beyond_stdio: usize,
+}
+
+/// A provider for system information.
+pub trait SystemInfoProvider {
+    /// Returns the address of the syscall entry point for the platform.
+    ///
+    /// The entry point address is typically used by the runtime or kernel to save/restore
+    /// execution context and transfer control to the syscall handler.
+    fn get_syscall_entry_point(&self) -> usize;
+
+    /// Get the address of the VDSO (Virtual Dynamic Shared Object).
+    ///
+    /// Return `Some(address)` if the VDSO is available on the platform, or `None`
+    /// if the platform does not support or provide a VDSO.
+    fn get_vdso_address(&self) -> Option<usize>;
+}
+
+/// A provider for thread-local storage.
+///
+/// Currently, this provides just a single thread-local storage pointer. Shims
+/// should use [`shim_thread_local!`](crate::shim_thread_local) macro for a safe
+/// and ergonomic interface to TLS.
+///
+/// # Safety
+/// The implementation must ensure that the TLS pointer that is set for the
+/// thread (via `replace_thread_local_storage`) is the one that is returned, and
+/// that [`null_mut()`](core::ptr::null_mut) is returned if no TLS pointer has
+/// been set.
+pub unsafe trait ThreadLocalStorageProvider {
+    /// Gets the current thread-local storage pointer that was set with the most
+    /// recent call to `replace_thread_local_storage`. If
+    /// `replace_thread_local_storage` was never called, this function must
+    /// return [`null_mut()`](core::ptr::null_mut).
+    ///
+    // DEVNOTE: note that this does not take `&self`. So far, this has not been
+    // a problem for platform implementations, and allowing this does improve
+    // performance by avoiding a platform lookup on every TLS access. But we
+    // could consider changing this in the future if needed.
+    fn get_thread_local_storage() -> *mut ();
+
+    /// Replaces the current thread-local storage pointer with `value`,
+    /// returning the previous value.
+    ///
+    /// The initial value for a thread is [`null_mut()`](core::ptr::null_mut).
+    ///
+    /// # Safety
+    /// The caller must cooperate with other users of this function to ensure
+    /// that the TLS pointer is not replaced with an invalid pointer.
+    ///
+    /// This can be achieved by using
+    /// [`shim_thread_local!`](crate::shim_thread_local).
+    unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut ();
+}
+
+/// A provider of cryptographically-secure random data.
+///
+/// The purpose of this provider is to allow LiteBox code to efficiently
+/// generate cryptographically-secure random bytes. This must be an infallible
+/// operation, with no possibility of failure, blocking, or returning
+/// low-quality randomness. The implementation must ensure that the CRNG is
+/// appropriately initialized and seeded by the time this method can be called.
+///
+/// Beyond that, the precise behavior and implementation is platform specific,
+/// and in general these methods should pass through to the platform's native
+/// cryptographic RNG API when one exists.
+///
+/// **Caution**: it may be tempting to write an non-passthrough implementation
+/// of this method, perhaps for efficiency reasons, seeding a CRNG algorithm's
+/// state from the platform's kernel CRNG or other trusted sources. Don't do
+/// this! Implementing this correctly as anything other than a direct
+/// passthrough is highly non-trivial, especially in the presence of `fork()`
+/// and VM snapshots. Only the native platform has enough visibility to get this
+/// right.
+///
+/// If you _are_ implementing a native platform, without an available CRNG to
+/// leverage, then be sure to take such details into account.
+///
+/// See [this Linux kernel patch series][1] for more details of the kinds of
+/// issues involved.
+///
+/// [1]: https://lore.kernel.org/all/20240703183115.1075219-1-Jason@zx2c4.com/
+pub trait CrngProvider {
+    /// Fill `buf` with cryptographically secure random bytes.
+    ///
+    /// This may take a long time for large buffers. Consider calling this
+    /// multiple times, checking for interrupts between calls, if you need to
+    /// fill a very large buffer.
+    ///
+    /// # Panics
+    /// Panics if unable to fill the buffer with random bytes. This is
+    /// considered a fatal error--LiteBox code is not expected to handle such
+    /// failures.
+    fn fill_bytes_crng(&self, buf: &mut [u8]);
+}
+
+/// Provider of derived device-specific keys.
+///
+/// Some shims need support for deriving keys that survives past reboots (for example, to support
+/// secure storage). Such keys are derived from some device-specific secret (called `root_key`) and
+/// some `context`, and a key derivation function (KDF).
+///
+/// Platforms might differ drastically on their own notion of device-specific secrets, and what
+/// "reboot-surviving" means. Some platforms might have a real never-revealed never-modified root
+/// key (e.g., TPMs), while others might maintain a persistent key across LiteBox invocations,
+/// but that persistent-key might be re-initialized to a new value every "real" reboot, etc.
+///
+/// Concretely, no shim can depend _directly_ on the existence of a device-specific secret. However,
+/// interestingly, for cryptographically strong KDFs where you do not know the root key,
+/// `KDF(root_key, context)` is indistinguishable from `KDF(KDF'(root_key, context'), context)`, etc.
+/// Thus, while some shims might be particular about their choice of KDF, and platforms might be
+/// particular about their choice of KDFs, they can mutually-distrustingly just simply run two KDFs
+/// if needed. For performance reasons however, this is not ideal to be forced always, and thus this
+/// specific provider supports a model that allows for more pragmatic choices, while making sure
+/// that the platform has final say on the total strictness of the root key (since it is what
+/// finally owns the root key).
+#[expect(
+    clippy::type_complexity,
+    reason = "separating the KDF fn into its own type makes it harder to read"
+)]
+pub trait DerivedKeyProvider {
+    /// Derive a new key using the `shim_kdf` (if provided) and the current context
+    /// (`params.context`), and place it into `params.output`.
+    ///
+    /// The platform is allowed to completely ignore the provided `shim_kdf` and use its own KDF
+    /// instead if it chooses to; alternatively, some platforms might not have their own KDFs, and
+    /// only run if the shim provides a KDF.
+    ///
+    /// The `shim_kdf` is a `fn` not a `Fn`/`FnMut`/`FnOnce` in order to incentivize usage of pure
+    /// functions.
+    fn derive_key<E>(
+        &self,
+        shim_kdf: Option<fn(&[u8], KDFParams) -> Result<(), E>>,
+        params: KDFParams,
+    ) -> Result<(), DerivedKeyError<E>>;
+}
+
+/// Input and output parameters to a KDF other than the secret itself.
+pub struct KDFParams<'a> {
+    /// The input context provided to the KDF. The output is guaranteed to be the same if the same
+    /// input context is provided.
+    pub context: &'a [u8],
+    /// The output of the KDF produces a key of the exact length of the buffer provided as a
+    /// parameter.
+    pub output: &'a mut [u8],
+}
+
+#[derive(Debug, Error)]
+/// Errors that might be returned upon attempting to derive a key.
+pub enum DerivedKeyError<ShimKDFError> {
+    #[error("platform does not support purely-platform KDFs")]
+    ShimKDFRequired,
+    #[error(transparent)]
+    ShimKDFError(#[from] ShimKDFError),
+    #[error("this platform does not support reboot-persistent keys")]
+    UnsupportedRebootPersistentKey,
+}

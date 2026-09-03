@@ -1,0 +1,68 @@
+[workspace]
+resolver = "2"
+members = [
+    "litebox", 
+    "litebox_common_linux",
+    "litebox_common_optee",
+    "litebox_common_lvbs",
+    "litebox_platform_linux_kernel",
+    "litebox_platform_linux_userland",
+    "litebox_platform_macos_userland",
+    "litebox_platform_windows_userland",
+    "litebox_platform_lvbs",
+    "litebox_platform_multiplex",
+    "litebox_runner_linux_userland",
+    "litebox_runner_linux_on_windows_userland",
+    "litebox_runner_lvbs",
+    "litebox_runner_optee_on_linux_userland",
+    "litebox_shim_linux",
+    "litebox_syscall_rewriter",
+    "litebox_packager",
+    "litebox_runner_snp",
+    "litebox_session_daemon",
+    "litebox_termemu",
+    "litebox_util_log",
+    "litebox_util_log_macros",
+    # The CI tests are not meant to be released (thus are not prefixed with
+    # `litebox_`), but exist purely to better manage development on LiteBox.
+    "dev_tests",
+    "dev_bench",
+]
+default-members = [
+    "litebox",
+    "litebox_common_linux",
+    "litebox_common_optee",
+    "litebox_common_lvbs",
+    "litebox_platform_linux_kernel",
+    "litebox_platform_linux_userland",
+    "litebox_platform_windows_userland",
+    "litebox_platform_lvbs",
+    "litebox_platform_multiplex",
+    "litebox_runner_linux_userland",
+    "litebox_runner_linux_on_windows_userland",
+    "litebox_shim_linux",
+    "litebox_shim_optee",
+    "litebox_syscall_rewriter",
+    "litebox_packager",
+    "litebox_session_daemon",
+    "litebox_termemu",
+    "litebox_util_log",
+    "litebox_util_log_macros",
+    "dev_tests",
+    "dev_bench",
+]
+# We exclude `litebox_runner_lvbs` from `default-members` because it requires
+# a custom target and `-Z build-std`, which requires a nightly toolchain.
+
+# Introduce all the pedantic clippy lints and remove ones I (jayb) think are
+# pushing it too far; this way we get something even further than default clippy
+# but not _too_ ridiculous.
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unreadable_literal = "allow"
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+needless_pass_by_value = "allow"
+redundant_else = "allow"
+must_use_candidate = "allow"
+too_many_lines = "allow"

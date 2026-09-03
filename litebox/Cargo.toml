@@ -1,0 +1,42 @@
+[package]
+name = "litebox"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arrayvec = { version = "0.7.6", default-features = false, optional = true }
+bitflags = "2.13.1"
+either = { version = "1.13.0", default-features = false }
+hashbrown = "0.15.2"
+smallvec = "1.13.2"
+smoltcp = { version = "0.12.0", default-features = false, features = ["log", "proto-ipv4", "medium-ip", "socket", "socket-tcp", "socket-udp", "socket-icmp", "socket-raw", "alloc"] }
+spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
+tar-no-std = { version = "0.3.3", default-features = false, features = ["alloc"] }
+thiserror = { version = "2.0.6", default-features = false }
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+rangemap = { version = "1.5.1", features = ["const_fn"] }
+ringbuf = { version = "0.4.8", default-features = false, features = ["alloc"] }
+buddy_system_allocator = { version = "0.11.0", default-features = false, features = ["use_spin"] }
+# Depend on (currently unreleased) slabmalloc `main`, which contains some fixes on top of `0.11.0`
+slabmalloc = { git = "https://github.com/gz/rust-slabmalloc.git", rev = "19480b2e82704210abafe575fb9699184c1be110" }
+litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+]}
+
+[features]
+lock_tracing = ["dep:arrayvec", "spin/mutex"]
+panic_on_unclosed_fd_drop = []
+enforce_singleton_litebox_instance = []
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3"

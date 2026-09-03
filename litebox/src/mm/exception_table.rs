@@ -1,0 +1,571 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+//! Exception Table Infrastructure
+//!
+//! This module provides the core exception table mechanism used by fallible
+//! memory operations.
+//!
+//! ## Architecture
+//!
+//! The exception table works by:
+//! 1. Assembly code marks potentially faulting instructions with entries in `.ex_table`
+//! 2. Each entry maps a faulting instruction address to a recovery address
+//! 3. Signal/exception handlers use [`search_exception_tables`] to look up recovery points
+//! 4. If found, execution is redirected to allow graceful failure handling
+//!
+//! New fallible functions should follow the pattern established by [`memcpy_fallible`].
+
+use crate::utils::TruncateExt as _;
+
+#[cfg(any(target_os = "linux", target_os = "none"))]
+macro_rules! ex_table_section {
+    () => {
+        // a = allocate, R = retain: don't discard on linking.
+        "ex_table,\"aR\""
+    };
+}
+
+#[cfg(target_os = "windows")]
+macro_rules! ex_table_section {
+    () => {
+        // d = data, r = read-only
+        ".extable,\"dr\""
+    };
+}
+
+#[cfg(target_vendor = "apple")]
+macro_rules! ex_table_section {
+    () => {
+        // Mach-O spells a section as `segment,section[,type[,attributes]]`.
+        // `__TEXT` keeps the table read-only (the entries are link-time-resolved
+        // relative offsets, so no runtime relocation is needed), matching where
+        // the platform ABI already puts `__gcc_except_tab`. `no_dead_strip` is
+        // the Mach-O counterpart of ELF's `R` (retain) flag: the entries carry
+        // no symbol of their own, so without it the linker would drop them.
+        "__TEXT,__ex_table,regular,no_dead_strip"
+    };
+}
+
+macro_rules! ex_table_entry {
+    ($start:tt, $stop:tt, $recover:tt) => {
+        concat!(
+            ".pushsection ",
+            ex_table_section!(),
+            "\n",
+            ".balign 4\n",
+            ".long ",
+            $start,
+            " - .\n",
+            ".long ",
+            $stop,
+            " - .\n",
+            ".long ",
+            $recover,
+            " - .\n",
+            ".popsection"
+        )
+    };
+}
+
+/// Represents a fault during a fallible memory operation.
+pub struct Fault;
+
+// TEMPORARY diagnostic (litebox investigation: XFCE/weston mallocng heap-corruption
+// bug hunt) -- logs any `memcpy_fallible` write whose destination range overlaps a
+// configurable watch window, to determine whether the corrupting write to a specific
+// guest heap address ever goes through this crate's own fallible-write path (as
+// opposed to a raw guest-code memory store that never calls into litebox at all).
+// Remove once the investigation concludes.
+static WATCH_RANGE_START: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static WATCH_RANGE_END: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static WATCH_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Configures the address range `[start, end)` that [`memcpy_fallible`] watches for
+/// overlapping writes, and the raw callback invoked when a write overlaps it. `hook`
+/// receives `(dst, size)` of the overlapping write. Pass `start == end` to disable.
+///
+/// # Safety
+/// `hook`, if non-null, must be safely callable from any thread at any time (including
+/// from within a signal/exception handler context), and must not itself perform a
+/// memory access that could recurse into `memcpy_fallible`.
+pub unsafe fn set_memcpy_watch_range(start: usize, end: usize, hook: Option<fn(usize, usize)>) {
+    use core::sync::atomic::Ordering;
+    WATCH_RANGE_START.store(start, Ordering::SeqCst);
+    WATCH_RANGE_END.store(end, Ordering::SeqCst);
+    WATCH_HOOK.store(hook.map_or(0, |f| f as usize), Ordering::SeqCst);
+}
+
+#[inline]
+fn check_memcpy_watch(dst: *mut u8, size: usize) {
+    use core::sync::atomic::Ordering;
+    let start = WATCH_RANGE_START.load(Ordering::SeqCst);
+    let end = WATCH_RANGE_END.load(Ordering::SeqCst);
+    if start == end {
+        return;
+    }
+    let dst = dst as usize;
+    let dst_end = dst.saturating_add(size);
+    if dst < end && dst_end > start {
+        let hook = WATCH_HOOK.load(Ordering::SeqCst);
+        if hook != 0 {
+            let f: fn(usize, usize) = unsafe { core::mem::transmute(hook) };
+            f(dst, size);
+        }
+    }
+}
+
+/// Copies `size` bytes from `src` to `dst` in a fallible manner.
+///
+/// This function can recover from memory access exceptions (e.g., page faults,
+/// SIGSEGV) when proper exception handling is set up by the platform.
+///
+/// For details on how fallible memory access works and platform requirements,
+/// see [`crate::platform::common_providers::userspace_pointers`].
+///
+/// # Safety
+/// `dst` and `src` must be valid for reads and writes of `size` bytes, or
+/// pointers that are guaranteed to be in non-Rust memory.
+pub unsafe fn memcpy_fallible(dst: *mut u8, src: *const u8, size: usize) -> Result<(), Fault> {
+    check_memcpy_watch(dst, size);
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        // `rep movsb` alone is byte-granularity for the ENTIRE copy -- correct, but far slower
+        // than necessary for the large (multi-MiB to multi-GiB) regions `Vmem::duplicate` copies
+        // at `fork()` time (see that function's call site): moving one byte per iteration instead
+        // of eight leaves most of the copy bandwidth on the table. `rep movsq` moves 8 bytes per
+        // iteration for the bulk of the copy, then a second `rep movsb` handles the 0..7-byte
+        // tail (or the whole copy, when `size < 8`, since `movsq` runs zero times). `dst`/`src`
+        // are left exactly where `rep movsq` advanced them to (RDI/RSI advance by 8 per
+        // iteration, `RCX` counts iterations, not bytes -- so after `rep movsq` completes, RDI/RSI
+        // point at the first untouched byte and only the byte count in RCX needs resetting for
+        // the tail). Every faulting load/store stays covered by the single [2:, 3:) exception
+        // table range spanning both `rep`s -- a fault in either phase lands at the same recovery
+        // label, discarding whatever partial progress happened, matching this function's existing
+        // documented contract (partially-copied destination is observable to the caller).
+        let qword_count = size / 8;
+        let tail_len = size & 7;
+        core::arch::asm! {
+            "2:",
+            "rep movsq",
+            "mov rcx, {tail_len}",
+            "rep movsb",
+            "3:",
+            ex_table_entry!("2b", "3b", "{fault}"),
+            inout("rdi") dst => _,
+            inout("rsi") src => _,
+            inout("rcx") qword_count => _,
+            tail_len = in(reg) tail_len,
+            fault = label { return Err(Fault) }
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        // Bulk-copy 16 bytes at a time via ldp/stp, then a byte tail for the
+        // remaining 0..15 bytes. aarch64 permits unaligned access on normal
+        // memory, so no alignment prologue is needed.
+        //
+        // Every faulting load/store must be covered by the [2:, 3:) exception
+        // table range; non-memory instructions (cmp/sub/branch) within the
+        // range never fault. On fault, the partially-copied destination is
+        // observable to the caller, matching the x86_64 `rep movsb` behavior.
+        core::arch::asm! {
+            "2:",
+            "cmp {size}, #16",
+            "b.lo 20f",
+            // 16-byte chunk loop.
+            "30:",
+            "ldp {t1}, {t2}, [{src}], #16",
+            "stp {t1}, {t2}, [{dst}], #16",
+            "sub {size}, {size}, #16",
+            "cmp {size}, #16",
+            "b.hs 30b",
+            // Byte tail (0..15 bytes remaining).
+            "20:",
+            "cbz {size}, 3f",
+            "21:",
+            "ldrb {t1:w}, [{src}], #1",
+            "strb {t1:w}, [{dst}], #1",
+            "subs {size}, {size}, #1",
+            "b.ne 21b",
+            "3:",
+            ex_table_entry!("2b", "3b", "{fault}"),
+            dst = inout(reg) dst => _,
+            src = inout(reg) src => _,
+            size = inout(reg) size => _,
+            t1 = out(reg) _,
+            t2 = out(reg) _,
+            fault = label { return Err(Fault) }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+macro_rules! read_fn {
+    ($name:ident, $ty:ty, $mov_instr:expr) => {
+        /// Reads a value from the given `src` pointer in a fallible manner.
+        ///
+        /// # Safety
+        /// `src` must be valid for reads or a pointer that's guaranteed to be
+        /// in non-Rust memory.
+        pub unsafe fn $name(src: *const $ty) -> Result<$ty, Fault> {
+            let value: usize;
+            let failed: u32;
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                core::arch::asm! {
+                    "2:",
+                    $mov_instr,
+                    "xor {failed:e}, {failed:e}",
+                    "3:",
+                    ex_table_entry!("2b", "3b", "3b"),
+                    src = in(reg) src,
+                    dest = out(reg) value,
+                    failed = inout(reg) 1 => failed,
+                }
+            }
+            // FUTURE: use a `label` like with the write functions once Rust
+            // supports them with `out` operands.
+            if failed == 0 {
+                Ok((value as u64).trunc())
+            } else {
+                Err(Fault)
+            }
+        }
+    };
+}
+
+#[cfg(target_arch = "x86_64")]
+read_fn!(read_u8_fallible, u8, "movzx {dest:e}, byte ptr [{src}]");
+#[cfg(target_arch = "x86_64")]
+read_fn!(read_u16_fallible, u16, "movzx {dest:e}, word ptr [{src}]");
+#[cfg(target_arch = "x86_64")]
+read_fn!(read_u32_fallible, u32, "mov {dest:e}, dword ptr [{src}]");
+#[cfg(target_arch = "x86_64")]
+read_fn!(read_u64_fallible, u64, "mov {dest:r}, qword ptr [{src}]");
+
+#[cfg(target_arch = "aarch64")]
+macro_rules! read_fn {
+    ($name:ident, $ty:ty, $load_instr:expr) => {
+        /// Reads a value from the given `src` pointer in a fallible manner.
+        ///
+        /// # Safety
+        /// `src` must be valid for reads or a pointer that's guaranteed to be
+        /// in non-Rust memory.
+        pub unsafe fn $name(src: *const $ty) -> Result<$ty, Fault> {
+            let value: usize;
+            let failed: u32;
+            unsafe {
+                core::arch::asm! {
+                    "2:",
+                    $load_instr,
+                    "mov {failed:w}, wzr",
+                    "3:",
+                    ex_table_entry!("2b", "3b", "3b"),
+                    src = in(reg) src,
+                    dest = out(reg) value,
+                    failed = inout(reg) 1u32 => failed,
+                }
+            }
+            if failed == 0 {
+                Ok((value as u64).trunc())
+            } else {
+                Err(Fault)
+            }
+        }
+    };
+}
+
+#[cfg(target_arch = "aarch64")]
+read_fn!(read_u8_fallible, u8, "ldrb {dest:w}, [{src}]");
+#[cfg(target_arch = "aarch64")]
+read_fn!(read_u16_fallible, u16, "ldrh {dest:w}, [{src}]");
+#[cfg(target_arch = "aarch64")]
+read_fn!(read_u32_fallible, u32, "ldr {dest:w}, [{src}]");
+#[cfg(target_arch = "aarch64")]
+read_fn!(read_u64_fallible, u64, "ldr {dest}, [{src}]");
+
+#[cfg(target_arch = "x86_64")]
+macro_rules! write_fn {
+    ($name:ident, $ty:ty, $mov_instr:expr) => {
+        /// Writes a value to the given `dest` pointer in a fallible manner.
+        ///
+        /// # Safety
+        /// `dest` must be valid for writes or a pointer that's guaranteed to be
+        /// in non-Rust memory.
+        pub unsafe fn $name(dest: *mut $ty, value: $ty) -> Result<(), Fault> {
+            let value: usize = (u64::from(value)).trunc();
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                core::arch::asm! {
+                    "2:",
+                    $mov_instr,
+                    "3:",
+                    ex_table_entry!("2b", "3b", "{fault}"),
+                    src = in(reg) value,
+                    dest = in(reg) dest,
+                    fault = label { return Err(Fault) }
+                }
+            }
+            Ok(())
+        }
+    };
+}
+
+#[cfg(target_arch = "x86_64")]
+write_fn!(write_u8_fallible, u8, "mov byte ptr [{dest}], {src:l}");
+#[cfg(target_arch = "x86_64")]
+write_fn!(write_u16_fallible, u16, "mov word ptr [{dest}], {src:x}");
+#[cfg(target_arch = "x86_64")]
+write_fn!(write_u32_fallible, u32, "mov dword ptr [{dest}], {src:e}");
+#[cfg(target_arch = "x86_64")]
+write_fn!(write_u64_fallible, u64, "mov qword ptr [{dest}], {src:r}");
+
+#[cfg(target_arch = "aarch64")]
+macro_rules! write_fn {
+    ($name:ident, $ty:ty, $store_instr:expr, $convert:expr) => {
+        /// Writes a value to the given `dest` pointer in a fallible manner.
+        ///
+        /// # Safety
+        /// `dest` must be valid for writes or a pointer that's guaranteed to be
+        /// in non-Rust memory.
+        pub unsafe fn $name(dest: *mut $ty, value: $ty) -> Result<(), Fault> {
+            unsafe {
+                core::arch::asm! {
+                    "2:",
+                    $store_instr,
+                    "3:",
+                    ex_table_entry!("2b", "3b", "{fault}"),
+                    src = in(reg) $convert(value),
+                    dest = in(reg) dest,
+                    fault = label { return Err(Fault) }
+                }
+            }
+            Ok(())
+        }
+    };
+}
+
+#[cfg(target_arch = "aarch64")]
+write_fn!(write_u8_fallible, u8, "strb {src:w}, [{dest}]", u32::from);
+#[cfg(target_arch = "aarch64")]
+write_fn!(write_u16_fallible, u16, "strh {src:w}, [{dest}]", u32::from);
+#[cfg(target_arch = "aarch64")]
+write_fn!(
+    write_u32_fallible,
+    u32,
+    "str {src:w}, [{dest}]",
+    core::convert::identity
+);
+#[cfg(target_arch = "aarch64")]
+write_fn!(
+    write_u64_fallible,
+    u64,
+    "str {src}, [{dest}]",
+    core::convert::identity
+);
+
+/// Exception table entry with relative offsets
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct ExceptionTableEntry {
+    start: i32,
+    stop: i32,
+    fixup: i32,
+}
+
+/// Returns the exception table, found by linker-defined symbols marking the
+/// start and end of the section.
+#[cfg(any(target_os = "linux", target_os = "none"))]
+fn exception_table() -> &'static [ExceptionTableEntry] {
+    // SAFETY: the linker automatically defines these symbols when the section
+    // is non-empty.
+    unsafe extern "C" {
+        #[link_name = "__start_ex_table"]
+        static START_EX_TABLE: [ExceptionTableEntry; 0];
+        #[link_name = "__stop_ex_table"]
+        static STOP_EX_TABLE: [ExceptionTableEntry; 0];
+    }
+
+    // Ensure the section exists even if there no recovery descriptors get
+    // generated.
+    //
+    // SAFETY: just a no-op asm block to force the section to be created.
+    unsafe {
+        core::arch::asm!(concat!(
+            ".pushsection ",
+            ex_table_section!(),
+            "\n",
+            ".popsection"
+        ));
+    }
+
+    // SAFETY: accessing the section as defined above.
+    unsafe {
+        core::slice::from_raw_parts(
+            START_EX_TABLE.as_ptr(),
+            STOP_EX_TABLE
+                .as_ptr()
+                .offset_from_unsigned(START_EX_TABLE.as_ptr()),
+        )
+    }
+}
+
+/// Returns the exception table, found by finding the .section via the PE
+/// headers.
+///
+/// The more typical way to do this on Windows is to use the grouping feature of
+/// the linker to create symbols marking the start and end of the section, via
+/// something like `.ex_table$a` and `.ex_table$z`, with the elements in between
+/// in `.ex_table$b`.
+///
+/// However, Rust/LLVM inline asm (but not global asm) seems to drop the '$', so
+/// this doesn't work. So, we use a different technique.
+#[cfg(windows)]
+#[expect(clippy::cast_ptr_alignment)]
+fn exception_table() -> &'static [ExceptionTableEntry] {
+    use crate::utils::ReinterpretUnsignedExt as _;
+
+    /// Find a PE section by name.
+    fn find_section(name: [u8; 8]) -> Option<(*const u8, usize)> {
+        use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64;
+        use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SECTION_HEADER;
+        use windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER;
+
+        unsafe extern "C" {
+            safe static __ImageBase: IMAGE_DOS_HEADER;
+        }
+
+        let dos_header = &__ImageBase;
+        let base_ptr = &raw const __ImageBase;
+        // SAFETY: the current module must have valid PE headers.
+        let pe = unsafe {
+            &*base_ptr
+                .byte_add(dos_header.e_lfanew.reinterpret_as_unsigned() as usize)
+                .cast::<IMAGE_NT_HEADERS64>()
+        };
+        let number_of_sections: usize = pe.FileHeader.NumberOfSections.into();
+
+        // SAFETY: the section table is laid out in memory according to the PE format.
+        let sections = unsafe {
+            let base = (&raw const pe.OptionalHeader)
+                .byte_add(pe.FileHeader.SizeOfOptionalHeader.into())
+                .cast::<IMAGE_SECTION_HEADER>();
+            core::slice::from_raw_parts(base, number_of_sections)
+        };
+
+        sections.iter().find_map(|section| {
+            (section.Name == name).then_some({
+                // SAFETY: section data is valid according to the PE format.
+                unsafe {
+                    (
+                        base_ptr.byte_add(section.VirtualAddress as usize).cast(),
+                        section.Misc.VirtualSize as usize,
+                    )
+                }
+            })
+        })
+    }
+
+    let Some((start, len)) = find_section(*b".extable") else {
+        // No recovery descriptors.
+        return &[];
+    };
+    assert_eq!(len % size_of::<ExceptionTableEntry>(), 0);
+    // SAFETY: this section is made up solely of ExceptionTableEntry entries.
+    unsafe {
+        core::slice::from_raw_parts(
+            start.cast::<ExceptionTableEntry>(),
+            len / size_of::<ExceptionTableEntry>(),
+        )
+    }
+}
+
+/// Returns the exception table, found by locating the Mach-O section through
+/// the current image's load commands.
+///
+/// Mach-O has no linker-synthesized `__start_`/`__stop_` pair for an arbitrary
+/// section, so the table is located the same way the Windows path locates its
+/// PE section: from the image headers at runtime. `__dso_handle` is the Mach-O
+/// header of the image this code was linked into, and `getsectiondata` walks
+/// its load commands and applies the slide.
+#[cfg(target_vendor = "apple")]
+#[expect(clippy::cast_ptr_alignment)]
+fn exception_table() -> &'static [ExceptionTableEntry] {
+    unsafe extern "C" {
+        /// This image's Mach-O header. Rust prefixes Mach-O symbols with `_`,
+        /// so this resolves to `___dso_handle`, the symbol the linker
+        /// synthesizes for every image.
+        static __dso_handle: u8;
+
+        /// `<mach-o/getsect.h>`: yields the in-memory address (slide applied)
+        /// and size of `segname,sectname` within the image at `mhp`, or null
+        /// when the image has no such section.
+        fn getsectiondata(
+            mhp: *const u8,
+            segname: *const core::ffi::c_char,
+            sectname: *const core::ffi::c_char,
+            size: *mut core::ffi::c_ulong,
+        ) -> *mut u8;
+    }
+
+    // Ensure the section exists even if no recovery descriptors get generated.
+    //
+    // SAFETY: just a no-op asm block to force the section to be created.
+    unsafe {
+        core::arch::asm!(concat!(
+            ".pushsection ",
+            ex_table_section!(),
+            "\n",
+            ".popsection"
+        ));
+    }
+
+    let mut size: core::ffi::c_ulong = 0;
+    // SAFETY: `__dso_handle` is this image's Mach-O header, both names are
+    // NUL-terminated, and `getsectiondata` only reads the image's load
+    // commands. It reports a null base for an absent section.
+    let start = unsafe {
+        getsectiondata(
+            &raw const __dso_handle,
+            c"__TEXT".as_ptr(),
+            c"__ex_table".as_ptr(),
+            &raw mut size,
+        )
+    };
+    if start.is_null() {
+        // No recovery descriptors.
+        return &[];
+    }
+    let size = usize::try_from(size).expect("a section is never larger than the address space");
+    assert_eq!(size % size_of::<ExceptionTableEntry>(), 0);
+    // SAFETY: this section is made up solely of `ExceptionTableEntry` entries,
+    // each `.balign 4`-ed by `ex_table_entry!` to the type's alignment.
+    unsafe {
+        core::slice::from_raw_parts(
+            start.cast::<ExceptionTableEntry>(),
+            size / size_of::<ExceptionTableEntry>(),
+        )
+    }
+}
+
+/// Search the exception table for a matching instruction address.
+/// If found, returns the corresponding recovery address.
+pub fn search_exception_tables(addr: usize) -> Option<usize> {
+    let table = exception_table();
+    let reloc = |addr: &i32| -> usize {
+        let base = &raw const *addr as usize;
+        base.wrapping_add_signed(*addr as isize)
+    };
+    for entry in table {
+        let start = reloc(&entry.start);
+        let stop = reloc(&entry.stop);
+        if addr >= start && addr < stop {
+            return Some(reloc(&entry.fixup));
+        }
+    }
+    None
+}
