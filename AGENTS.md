@@ -372,6 +372,33 @@ message** — this is the second short-read-style assumption to bite an investig
 this probe is now a shared cross-session baseline, make sure any copy in use is post-`744009f0` —
 a diagnostic that can silently produce plausible nonsense is worse than no diagnostic at all.
 
+**INVALID A/B RUN, correctly self-caught before being asserted, but surfaced a real layer gap.**
+advisor-db's GTK-vs-XFCE A/B test (raw known-good probe + `thunar` in the same run) did NOT
+validly test the intended question: the script never ran `dbus-uuidgen`/started a session bus, so
+`thunar` failed immediately with `Failed to initialize Xfconf: Cannot spawn a message bus without
+a machine-id: Unable to load /var/lib/dbus/machine-id or /etc/machine-id: No such file or
+directory`. The XFCE launchers DO run `dbus-uuidgen` already, so their own panel/desktop failures
+are unaffected and unrelated to this — but the A/B comparison itself is invalid as run, since it
+denied `thunar` a prerequisite the XFCE components had. **Fixed, rerunning with a machine-id and
+session bus.**
+
+**The real finding, independent of the script mistake: THE LAYER SHIPS NO MACHINE-ID AT ALL.**
+Neither `/var/lib/dbus/machine-id` nor `/etc/machine-id` exists. Any GTK/dbus client launched
+without `dbus-uuidgen` run first fails immediately and hard — with a clear error message, but no
+window, which looks exactly like every other "silent" GTK failure investigated tonight unless you
+happen to be capturing that specific stderr line. **Same family as the missing SONAME links and
+the absent X query tools — worth fixing in the layer itself** (ship a machine-id, or generate one
+at image build time) rather than every launcher having to remember `dbus-uuidgen` individually;
+removes a whole class of "why did this GTK app do nothing" failures for good.
+
+**Sharp follow-up question for the GTK/syscall-timeline investigation**: do the XFCE components
+get far enough that their OWN xfconf initialization actually succeeds? `thunar`'s failure was at
+exactly that step. The earlier `XFCONF_PROBE_RC=0` finding only confirmed `xfconfd` was reachable
+externally — it does NOT confirm each client's own internal xfconf init succeeds. If the panel and
+desktop are stalling at this same step for a different (litebox-relevant, not machine-id-related,
+since their launcher already provides one) reason, that would be a much more specific, actionable
+lead than "GTK stalls somewhere."
+
 **Layer gap, worth fixing regardless of how this investigation lands — has quietly shaped the
 whole session's guesswork problem**: the guest layer contains **zero X query tools** — no
 `xdpyinfo`, `xrandr`, `xwininfo`, `xprop`, `xlsclients` — confirmed absent. This is why every
