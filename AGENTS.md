@@ -174,6 +174,49 @@ session is genuinely live (not frozen) — real, major, verified progress from t
 fix. But the desktop's OWN rendering degrades significantly partway through every observed run and
 never recovers, which falls short of "renders and stays up ... as expected." **Not fully closed.**
 
+**FOLLOW-UP TRACE (this session, reproduced independently with `LITEBOX_DRM_TRACE=1` +
+`LITEBOX_DUMP_FRAMES=1` together) — reveals TWO SEPARATE PROBLEMS, not one.** New tool:
+`advisor/probes/scan_frame_series.py <dir>` (scans a numbered `litebox_frame_dump_N.bmp` series
+and reports `non_black_pixels` per frame with a `<<<< DROP` marker on any >50% drop from the prior
+frame — used to locate the transition precisely and automatically rather than by hand).
+**Problem 1, reproduced at a different frame number than advisor-db's run (frame 64 here vs. ~27
+there — confirms it's real and not tied to a fixed frame count) but the SAME magnitude**:
+`non_black_pixels` drops from 2,073,597 to ~92,040 (95.6%) between frames 63→64 and never
+recovers. Correlated directly against `diag-drm-scanout-bytes`: the SAME `fb_id` is used before
+and after (no buffer-identity swap), and the sampled `first8`/`mid8` byte offsets are IDENTICAL
+before and after — but total `nonzero_bytes` drops from 6,221,900 to 2,258,788 at that exact
+moment (t=42.487s → t=42.558s). **This means specific REGIONS of the buffer went to zero while
+other regions (including the sampled offsets) stayed intact — consistent with a partial
+reclaim/decommit of part of the framebuffer, not a full compositor repaint or full buffer swap.**
+No `create_mapping`/`guest_mprotect` event was found touching the framebuffer's own address range
+(`0x11b330000`-`0x11bb19000`) at the transition — the nearby memory activity found (several
+`dbus-daemon` service-activation instances dying: pid=99 exit status=1, pid=98 `SIGKILL`, pid=97
+exit status=0, all within ~200ms of the drop) is suggestive but not yet proven causal. **Not
+resolved — needs the exact regions that zeroed correlated against what surface/client owned them.**
+**Problem 2, NEW, more severe, found in this trace — a later hard crash, not just a visual
+regression**: at t=115.748s, **`Xwayland` itself dies with `SIGABRT` (signal 6)**, immediately
+followed by `weston` receiving `SIGPIPE` (signal 13) and dying too — the compositor connection is
+severed entirely. Immediately prior: `xfce4-panel` (pid=138) is loading `/usr/lib/xfce4/panel/
+plugins/libpager.so` (the pager plugin) and doing a rapid mmap/munmap churn pattern (repeated
+4096-byte alloc/free, the shape of GLib/GObject allocator churn during icon-theme/pixbuf loading)
+right up to t=115.730s, ~18ms before Xwayland's abort. **Plausible trigger: the pager plugin's own
+X11 client work is what's crashing Xwayland** — not yet proven, needs Xwayland's own stderr/core
+dump or an X protocol trace at that exact boundary to confirm which specific request (if any)
+preceded the abort. This is DOWNSTREAM of and separate from Problem 1's earlier scanout drop
+(t=42.5s vs t=115.7s) — fixing one will not necessarily fix the other.
+**Full run's fatal-signal census, useful groundwork for whoever continues this**: 5×
+`at-spi-bus-launcher` dying with `SIGTRAP`(5) (t=26.8, 27.7, 36.3, 41.8, 64.2 — a11y bus repeatedly
+failing to start, consistent with the known missing `gsettings-desktop-schemas` package noted
+earlier tonight, likely benign/expected); 3× `dbus-daemon` `SIGKILL`(9) (t=42.4, 80.1, 183.9 —
+service-activation churn, possibly tied to Problem 1); the `Xwayland`/`weston` pair at t=115.7
+(Problem 2); one `pool-2` (an xfce4-panel plugin worker thread) `SIGSEGV`(11) at t=120.1, after
+the Xwayland crash, likely a downstream consequence of losing the X connection.
+**This resolves the earlier "panel only has 2 of 18 plugins" observation from this same
+investigation**: `libpager` (the 3rd plugin in the default 18-plugin layout) was in the middle of
+loading when Xwayland crashed — the panel doesn't have only 2 plugins by design or by a
+config-loading failure, it's stuck partway through loading them because the whole X session dies
+mid-startup. **Not a config bug — confirmed the same root story as Problems 1/2.**
+
 **Historical note, kept for the forensic trail below**: earlier in this session a "MET" claim was
 made and retracted after a flawed pixel-count oracle mistook weston's own built-in panel for
 XFCE's; that retraction was correct at the time. This entry supersedes it with a fix-verified,
