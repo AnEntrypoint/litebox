@@ -596,23 +596,36 @@ ADDRESS instead shows the mapping is completely stable (`fb_id=1`→handle 508 s
 busy afterward (7,297 socket ops after t=25). **And yet contents still go from 6,221,880
 non-zero bytes to EXACTLY zero.** Every mechanism that could destroy the memory is now excluded.
 
-**REFRAMED (not yet confirmed): this may not be a memory bug at all.** Points instead toward
-"weston simply stopped DRAWING into the buffer, and what's observed is the buffer's
-original/never-written zero state persisting" — an exactly-zero signature fits a never-written
-shared section exactly as well as a wiped one. **Decisive next measurement, not memory-related**:
-sample the buffer at two points per flip and check whether ANY byte changed since the previous
-flip. If unchanged flip after flip once the "wipe" starts, weston is not drawing — the problem is
-on the Wayland/compositing side, not memory.
+**"Not a memory bug" REFRAMING ABOVE IS ITSELF REFUTED — confirmed genuine memory bug, decisive
+detail found.** Per-flip content digest + non-zero byte count (commit `71cd2ee8`):
+```
+t=6.67-7.50  nonzero=2,073,600   buffer at creation
+t=7.63-8.36  nonzero=6,221,895   weston actively drawing (digest changes every flip)
+t=18.93      nonzero=6,221,895   last real content
+t=19.53+     nonzero=0           BLACK
+```
+**Decisive detail**: `2,073,600` = exactly `1920*1080` = one non-zero byte per pixel — an OPAQUE
+CLEARED framebuffer (`alpha=255`, RGB zero), the buffer's state at creation. `6,221,895` ≈ 3
+bytes/pixel = real color content. `0` = not even the alpha channel. **The final state is
+STRICTLY EMPTIER than the buffer's own initial state.** weston never writes an all-zero buffer —
+even a fully black desktop keeps alpha set (t=6.67's state). A compositor that merely stopped
+drawing would leave the CLEARED state behind (`nonzero=2,073,600`), not reach `nonzero=0`. **The
+memory really is being zeroed.** (Caveat: the digest samples every 4096th byte, so an identical
+digest between states is a hash collision, not proof of identical state — the non-zero BYTE COUNT
+is the real distinguishing evidence, not the digest.)
 
-**Leading alternative hypothesis**: weston keeps flipping and stays alive, but a compositor with
-no visible surfaces legitimately renders black. Since Xwayland takes the display right around
-this time and XFCE's clients are X clients, **"Xwayland has the output but its clients' content
-never reaches weston's scene graph" would explain every single observation with ZERO memory
-defect involved** — possibly a Wayland-protocol/scene-graph/surface-commit issue on the
-Xwayland↔weston boundary, not necessarily even a litebox bug in the traditional sense (could be
-correct behavior if a client's surface never actually gets committed/mapped properly). Next step:
-check weston's own surface/scene-graph state directly — does it have a valid, committed surface
-from Xwayland after the "wipe," or none at all.
+**Where this leaves us, all explicit destroy paths now excluded**: something zeroes the 8.29MB
+shared section — never destroyed, correctly shared (`flags=123`, `has_handle=true`, stable
+fb→handle mapping), not touched by any decommit/unmap (0 overlaps in 19,133 destroy events) —
+while another process forks. The remaining candidates are IMPLICIT (don't go through an explicit
+destroy call at all): a fresh `VirtualAlloc2` with `MEM_COMMIT` over the SAME address, a
+`MEM_RESET`, or a section view being re-established/re-mapped.
+
+**Next step, not yet done**: log `VirtualAlloc2` calls with `MEM_COMMIT` and their address range
+(the gap in existing tracing — `diag-shm` covers create/map, but nothing that commits OVER an
+existing range). Add a `diag-commit` line in the SAME format `advisor/probes/
+correlate_scanout_wipe.py` already expects (it reads `diag-reclaim`/`diag-decommit`) so the
+existing correlator checks this path automatically with no other changes needed.
 
 ## Reproduction commands
 
