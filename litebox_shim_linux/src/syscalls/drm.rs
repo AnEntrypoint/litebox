@@ -1039,6 +1039,17 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             return Err(Errno::ENOENT);
         }
         *self.crtc_fb.lock() = Some(req.fb_id);
+        // Log WHICH framebuffer is being scanned out. A screen that goes black while
+        // flips continue is either the same fb losing its contents (a mapping or
+        // coherency problem) or a different fb being scanned out than the one being
+        // drawn into (a surface-ownership problem) -- and only the fb id distinguishes
+        // them.
+        if drm_trace_enabled() {
+            litebox_util_log::error!(
+                fb_id:% = req.fb_id, crtc_id:% = req.crtc_id;
+                "diag-drm-flip"
+            );
+        }
         self.notify_flip_callback(platform, req.fb_id);
         // This device has no real vsync/vblank interrupt to wait for, so the flip is complete
         // (in the sense a client cares about -- the CRTC now scans out the new framebuffer) the
