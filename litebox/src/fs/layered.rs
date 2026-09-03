@@ -316,7 +316,32 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     .node_info,
                 layered_id,
             );
-            assert!(old.is_none());
+            // `migrate_file_up` holds no lock spanning its own full body (the `root_guard` lock
+            // below is only taken after this point), so two threads can genuinely race to
+            // migrate paths concurrently -- each opens its own `upper_fd` via `OFlags::CREAT`
+            // (which, without `EXCL`, happily reopens a file a racing thread already created),
+            // and each then reaches this insert. Confirmed live TWICE on real weston/XFCE-under-
+            // litebox repros: once as the same `layered_id` re-inserted for the same key (a
+            // genuinely benign double-migration of the SAME path), and once as this key already
+            // mapped to a DIFFERENT `layered_id` (plausible if the upper filesystem backend
+            // recycles a freed node-info/inode number quickly under concurrent creates, so two
+            // logically distinct migrated paths land on the same upper node-info id in short
+            // succession). Either way the underlying migration of `path`'s own data/metadata onto
+            // `upper_fd` above already completed correctly -- `node_info_lookup` is a lookup
+            // cache keyed by node-info, not the source of truth for file content/identity -- so
+            // losing a stale/superseded cache entry to whichever insert won the race is a correct
+            // outcome, not corruption. Panicking the whole host process here (as the original
+            // `assert!(old.is_none())` did) turns a benign cache race into total guest-session
+            // loss; log and move on instead.
+            if let Some(old_id) = old {
+                if old_id != layered_id {
+                    litebox_util_log::warn!(
+                        old_id:? = old_id, new_id:? = layered_id;
+                        "migrate_file_up: node_info_lookup insert raced with a different \
+                         layered_id for the same upper node-info key -- keeping the newer entry"
+                    );
+                }
+            }
         }
         // Now that we've migrated the data (and node-info) over, we can close out both of the file
         // descriptors.

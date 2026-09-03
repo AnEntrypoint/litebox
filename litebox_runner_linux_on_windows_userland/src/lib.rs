@@ -583,9 +583,32 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         // safe to call from any thread concurrently with `run_thread` running the guest below (see
         // those methods' doc comments in `litebox_shim_linux`).
         let out_shim = shim.clone();
+        // `LITEBOX_GUEST_STDOUT_FILE`, if set, routes the guest's own pty output to a dedicated
+        // file instead of this process's real stdout -- opt-in, since the default (sharing stdout
+        // with litebox's own `tracing_subscriber` output, see `FlushingStderrWriter` above) is
+        // what every existing caller/script still expects. Exists because a caller that redirects
+        // both this process's stdout AND stderr into the SAME file (`> out.log 2>&1`, the shape
+        // every `--gui`-less debugging repro in this project's own history has used) previously
+        // had no way to read a crashing guest program's own diagnostic output cleanly: this
+        // forwarder and litebox's own log writer are two independent threads racing to append to
+        // the same fd with no shared line-buffering, so their bytes interleave mid-line/mid-ANSI-
+        // escape in the combined file -- confirmed live, chasing a labwc/wlroots abort where
+        // wlroots' own `wlr_log` diagnostic lines (which would have named the exact failing
+        // dimension/mode) were unrecoverable from the combined log for exactly this reason. With
+        // this set, the guest's raw bytes land in their own file, so "what did the guest program
+        // actually print" is a plain read of that file instead of manual byte-level
+        // reconstruction.
+        let guest_stdout_file = std::env::var_os("LITEBOX_GUEST_STDOUT_FILE").map(|path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .expect("failed to open LITEBOX_GUEST_STDOUT_FILE")
+        });
         let stdout_forwarder = std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             let mut stdout = std::io::stdout();
+            let mut guest_file = guest_stdout_file;
             loop {
                 match out_shim.pty_master_read(pty_id, &mut buf) {
                     // `Ok(0)`: guest exited and the pty hung up. `Err`: a real read failure. Both
@@ -593,7 +616,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         use std::io::Write as _;
-                        if stdout.write_all(&buf[..n]).is_err() || stdout.flush().is_err() {
+                        let ok = if let Some(file) = guest_file.as_mut() {
+                            file.write_all(&buf[..n]).is_ok() && file.flush().is_ok()
+                        } else {
+                            stdout.write_all(&buf[..n]).is_ok() && stdout.flush().is_ok()
+                        };
+                        if !ok {
                             break;
                         }
                     }

@@ -162,6 +162,22 @@ pub(crate) struct DrmSubsystem<Platform: ShimPlatform> {
     /// The framebuffer currently attached to the virtual CRTC (via `SETCRTC` or `PAGE_FLIP`),
     /// `None` until the guest sets one.
     crtc_fb: litebox::sync::Mutex<Platform, Option<u32>>,
+    /// Whether the virtual CRTC currently has a MODE configured, independent of whether a
+    /// framebuffer is currently attached to it. Real DRM's `drmModeGetCrtc` reports the CRTC's
+    /// current mode (`mode_valid = 1`) as long as a mode has been set, even mid-modeset when no
+    /// framebuffer is scanned out yet (e.g. wlroots' own atomic-modeset-emulation-on-legacy-KMS
+    /// path deliberately attaches an "empty" buffer -- `fb_id == 0` -- while transitioning to a
+    /// new mode, see `types/output/render.c`'s "Attaching empty buffer to output for modeset").
+    /// Previously this device conflated the two (`mode_valid` was derived from `fb_id != 0`), so
+    /// that exact empty-buffer modeset transition made a subsequent `GETCRTC` incorrectly report
+    /// `mode_valid = 0` -- a real KMS driver never does this, and a client that re-derives its
+    /// output dimensions from `GETCRTC`'s reported mode during a modeset would see a bogus "no
+    /// mode" answer instead of the mode it just set. Set by [`Self::set_crtc`] whenever the guest
+    /// supplies a mode (`req.mode_valid != 0`), left in whatever state it already had if the
+    /// guest calls `SETCRTC` with `mode_valid == 0` purely to change/detach the framebuffer (real
+    /// DRM only clears the configured mode via an explicit "set to no mode" `SETCRTC`, i.e.
+    /// `mode_valid == 0` in that same call), and cleared only when `mode_valid == 0`.
+    crtc_mode_set: litebox::sync::Mutex<Platform, bool>,
     /// The framebuffer currently attached to [`VIRTUAL_PLANE_ID`] via `SETPLANE`, `None` until
     /// the guest sets one. Deliberately independent of `crtc_fb` (a real primary plane's `fb_id`
     /// and its CRTC's own `fb_id` are two separate pieces of driver state that a real client can
@@ -234,6 +250,7 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             buffers: litebox::sync::Mutex::new(BTreeMap::new()),
             framebuffers: litebox::sync::Mutex::new(BTreeMap::new()),
             crtc_fb: litebox::sync::Mutex::new(None),
+            crtc_mode_set: litebox::sync::Mutex::new(false),
             plane_fb: litebox::sync::Mutex::new(None),
             pending_flip_events: litebox::sync::Mutex::new(VecDeque::new()),
             flip_pollee: Pollee::new(),
@@ -379,6 +396,12 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         req.connection = 1;
         req.mm_width = 0;
         req.mm_height = 0;
+        litebox_util_log::warn!(
+            count_modes:? = req.count_modes,
+            connection:? = req.connection,
+            connector_type:? = req.connector_type;
+            "drm-ioctl: GETCONNECTOR reply"
+        );
         ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
         Ok(0)
     }
@@ -409,12 +432,19 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         req.x = 0;
         req.y = 0;
         req.gamma_size = 0;
-        if fb_id != 0 {
+        if *self.crtc_mode_set.lock() {
             req.mode_valid = 1;
             req.mode = virtual_mode();
         } else {
             req.mode_valid = 0;
         }
+        litebox_util_log::warn!(
+            fb_id:? = req.fb_id,
+            mode_valid:? = req.mode_valid,
+            hdisplay:? = req.mode.hdisplay,
+            vdisplay:? = req.mode.vdisplay;
+            "drm-ioctl: GETCRTC reply"
+        );
         ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
         Ok(0)
     }
@@ -431,7 +461,26 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         if req.fb_id != 0 && !self.framebuffers.lock().contains_key(&req.fb_id) {
             return Err(Errno::ENOENT);
         }
+        litebox_util_log::warn!(
+            fb_id:? = req.fb_id,
+            mode_valid:? = req.mode_valid,
+            hdisplay:? = req.mode.hdisplay,
+            vdisplay:? = req.mode.vdisplay,
+            count_connectors:? = req.count_connectors;
+            "drm-ioctl: SETCRTC request"
+        );
         *self.crtc_fb.lock() = if req.fb_id == 0 { None } else { Some(req.fb_id) };
+        // Track mode-configured state independent of `fb_id` -- see [`Self::crtc_mode_set`]'s
+        // own doc comment for why conflating the two previously misreported `GETCRTC` during a
+        // legitimate empty-buffer modeset transition.
+        if req.mode_valid != 0 {
+            *self.crtc_mode_set.lock() = true;
+        } else if req.fb_id == 0 {
+            // A real "disable this CRTC" SETCRTC (no mode, no framebuffer) genuinely clears the
+            // configured mode too -- distinct from an empty-buffer-during-modeset call, which
+            // still carries `mode_valid != 0` and is handled by the branch above.
+            *self.crtc_mode_set.lock() = false;
+        }
         // A legacy (non-atomic) client's own repaint loop -- weston's DRM backend with a shadow
         // framebuffer included, confirmed live this session -- commonly re-attaches its updated
         // framebuffer via repeated `SETCRTC` calls rather than `PAGE_FLIP` once initial modesetting
@@ -820,6 +869,10 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     ) -> Result<u32, Errno> {
         let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         if req.width == 0 || req.height == 0 || req.bpp == 0 || req.flags != 0 {
+            litebox_util_log::warn!(
+                width:? = req.width, height:? = req.height, bpp:? = req.bpp, flags:? = req.flags;
+                "drm-ioctl: CREATE_DUMB rejected"
+            );
             return Err(Errno::EINVAL);
         }
         let bytes_per_pixel = req.bpp.div_ceil(8);
@@ -930,6 +983,11 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         if !self.buffers.lock().contains_key(&handle) {
             return Err(Errno::ENOENT);
         }
+        litebox_util_log::warn!(
+            width:? = req.width, height:? = req.height, pixel_format:? = req.pixel_format,
+            handle:? = handle;
+            "drm-ioctl: ADDFB2 request"
+        );
         let fb_id = self.next_fb_id.fetch_add(1, Ordering::Relaxed);
         self.framebuffers.lock().insert(
             fb_id,
