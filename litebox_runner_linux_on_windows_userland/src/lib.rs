@@ -258,7 +258,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // point, which is what answers "is the guest still page-flipping?" -- the
     // question that separates a compositor that stopped presenting from a client
     // presenting an empty buffer.
-    litebox_shim_linux::syscalls::drm::set_drm_trace(
+    litebox_shim_linux::syscalls::set_drm_trace(
         std::env::var_os("LITEBOX_DRM_TRACE").is_some(),
     );
 
