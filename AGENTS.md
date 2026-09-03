@@ -48,6 +48,29 @@ t=44.60/t=48.67 across two runs, `xfce4-panel` at t=55.75/t=60.06), and the whol
 before the last component even starts — **a longer-budget rerun that actually reaches the settle
 window is in progress; treat this as leaning, not decided, until that lands.**
 
+**RESOLVED. CONFIRMED: XFCE genuinely draws nothing.** A properly-timed run (advisor-db) settled
+it: `xfdesktop` started at t=52.56, `xfce4-panel` at t=64.04, `SETTLE_START` at t=77.86, frames
+captured at t=78.86/t=78.91 — **26.3s after `xfdesktop` started, 14.9s after `xfce4-panel`
+started, both alive the whole time, no component died.** Decoded content: background
+`rgb(68,34,0)` at 97% of sampled pixels, content in only 8 of 270 sampled rows, one band y=0..28,
+bright clusters at x=12..31 and x=1753..1904 — **identical to the pre-XFCE frames.** With both
+components running and SETTLED for 15-26 seconds (long enough that "we looked too early" no
+longer applies), the screen still shows only weston-desktop-shell's own 32px bar. **This closes
+the open question from above: it is (a), not (b) — XFCE produces no visible output, not "the run
+ended before drawing could happen."** The earlier claim was directionally right the first time,
+it just wasn't yet measured soundly enough to assert (see the retraction/re-confirmation trail
+above — this is now the confirmed, sound version).
+
+**Leading cause, believed likely but not yet fully confirmed**: the missing `xfce4-panel.xml` /
+`xfce4-desktop.xml` finding two entries below — an unconfigured panel has no plugins to
+instantiate, an unconfigured desktop has no backdrop/icons to draw, both would be exactly this:
+alive, error-free, legitimately blank. **Decisive test in progress (advisor-db)**: dump the
+guest's own `$HOME/.config/xfce4/xfconf/xfce-perchannel-xml/` after the settle window and query
+the `xfce4-panel`/`xfce4-desktop` channels directly — configs present would mean a real drawing
+bug (layout exists, chose not to render); configs absent confirms the packaging-gap theory and the
+fix is shipping default configs into the layer. My dispatched agent (a63e8ca59285f5871) is
+cross-checking this same question in parallel.
+
 **STRONG CANDIDATE EXPLANATION FOUND (advisor-db), plausible and cheap to confirm/refute — NOT
 YET ASSERTED, verification pending**: **the layer may simply have no desktop/panel configuration
 to draw.** `/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/` in the layer contains only
