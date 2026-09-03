@@ -253,6 +253,15 @@ impl std::io::Write for FlushingStderr {
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
 pub fn run(cli_args: CliArgs) -> Result<()> {
+    // The shim is `no_std` and cannot read the environment itself, so translate
+    // `LITEBOX_DRM_TRACE=1` here. This logs every DRM ioctl at its single dispatch
+    // point, which is what answers "is the guest still page-flipping?" -- the
+    // question that separates a compositor that stopped presenting from a client
+    // presenting an empty buffer.
+    litebox_shim_linux::syscalls::drm::set_drm_trace(
+        std::env::var_os("LITEBOX_DRM_TRACE").is_some(),
+    );
+
     litebox_platform_windows_userland::install_memcpy_watch_from_env();
 
     tracing_subscriber::fmt()

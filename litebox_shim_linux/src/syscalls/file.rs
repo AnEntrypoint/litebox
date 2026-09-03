@@ -4687,6 +4687,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Dispatch a `DRM_IOCTL_MODE_*` request (already confirmed to target a real DRI device fd
     /// by the caller) to the shim-wide [`crate::syscalls::drm::DrmSubsystem`].
     fn drm_ioctl(&self, arg: &IoctlArg) -> Result<u32, Errno> {
+        // Every DRM ioctl funnels through here, so this one line makes the whole
+        // guest<->KMS conversation visible. Gated behind `LITEBOX_DRM_TRACE=1` so it
+        // costs nothing by default: an ungated per-ioctl log floods a real session
+        // (page flips arrive at vblank rate) and has previously throttled the
+        // emulator badly enough to change what is being measured.
+        if crate::syscalls::drm::drm_trace_enabled() {
+            litebox_util_log::error!(pid:% = self.pid, ioctl:? = arg; "diag-drm-ioctl");
+        }
         match arg {
             IoctlArg::DrmModeGetResources(ptr) => self.global.drm.get_resources(*ptr),
             IoctlArg::DrmModeGetCrtc(ptr) => self.global.drm.get_crtc(*ptr),

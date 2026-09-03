@@ -56,6 +56,27 @@ use zerocopy::IntoBytes;
 
 use crate::{ShimPlatform, UserPtr, UserPtrMut};
 
+/// Whether per-ioctl DRM tracing is enabled (set from `LITEBOX_DRM_TRACE=1` by
+/// the runner, since this `no_std` crate cannot read the environment itself).
+///
+/// Off by default and deliberately so: every DRM ioctl passes through
+/// `drm_ioctl`, and page flips arrive at vblank rate, so an ungated log floods a
+/// real session and has previously throttled the emulator enough to change the
+/// behaviour being measured. Turn it on to answer "is the guest still flipping?",
+/// the question that separates a compositor that stopped presenting from a client
+/// presenting an empty buffer.
+pub(crate) fn drm_trace_enabled() -> bool {
+    DRM_TRACE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set once by the runner to turn DRM ioctl tracing on.
+pub fn set_drm_trace(enabled: bool) {
+    DRM_TRACE.store(enabled, core::sync::atomic::Ordering::Relaxed);
+}
+
+static DRM_TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+
 /// The virtual display's fixed mode. 1920x1080@60 is a reasonable, widely-compatible default
 /// for a single software display with no real monitor to query.
 const VIRTUAL_WIDTH: u32 = 1920;
