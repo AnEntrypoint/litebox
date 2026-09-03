@@ -11,16 +11,37 @@ needs the detailed forensic trail — but start here, not there.
 Get XFCE actually rendering and staying up under litebox on a Windows host (no WSL, no
 hypervisor — see `feedback_no_wsl_or_hypervisor` in project memory).
 
-**MET.** A full XFCE desktop renders and stays up to the end of a run, verified against the
-standing success oracle (`non_black_pixels > 0` in the FINAL frames, not just any frame
-mid-run): 24 frames captured, EVERY ONE non-black, final five all at `non_black_pixels=2,073,597`,
-no zero frame anywhere in the run, `TEST_DONE` reached. All six components alive at the end
-(t=74.1s): `weston`, `xfconfd`, `xfwm4`, `xfsettingsd`, `xfdesktop`, `xfce4-panel` — zero exit with
-a failure status. `DBUS_UP=yes`, `XFCONF_PROBE_RC=0`, `XFCE_DISPLAY=:0`. The only remaining
-messages in any component's stderr are non-fatal warnings (AT-SPI accessibility bus absent —
-optional, no accessibility daemon in this layer; upower proxy refused — no power daemon in the
-layer; `SESSION_MANAGER` unset — expected, this launcher deliberately bypasses `xfce4-session`).
-Working launcher: `advisor/probes/run_xfce_xwm.sh`, committed `4e6fc556`.
+**NOT YET MET — CORRECTED, do not trust the earlier "MET" claim below in this file's history.**
+The process-launch and compositing blockers ARE fixed (see below) and are real, verified progress
+— but decoding an actual final frame (advisor-db, `.bmp` from `LITEBOX_DUMP_FRAMES=1`, frame 23 of
+24, 1920x1080) shows: **a 32px-tall top bar with an icon (top-left, x=12..31) and a
+clock/status area (top-right, x=1753..1904), and EVERYTHING below y=31 is exactly one flat color
+(`rgb(68,34,0)`)** — sampling every 4th row, only 8 of 270 rows contain any non-background pixel,
+all within that top bar. **`non_black_pixels=2,073,597` means the background isn't black — it does
+NOT mean a populated desktop.** The pixel-count oracle cannot distinguish "desktop renders" from
+"background fills the screen"; this was a real gap in the standing success oracle, now closed by
+requiring an actual frame decode, not just a pixel count, before declaring visual success.
+**This is exactly the user's original reported symptom — "we're only getting (after a pretty long
+wait) an icon and time"**: an icon top-left and a clock top-right on a flat background is precisely
+what was decoded. This session has NOT surpassed the starting point on visual output; it restored
+it after an intermediate period where it was fully black. `xfdesktop` is alive but draws nothing
+(no wallpaper beyond the flat fill, no desktop icons); `xfce4-panel` produces only the thin top
+bar, not a real populated panel. **These are now the actual remaining gap** — see "Remaining
+follow-on work" below, item 1 is superseded by this finding; investigating why `xfdesktop`/
+`xfce4-panel` render almost nothing is now the top-priority open item.
+
+**What IS genuinely fixed and verified (real, durable progress, not undersold)**: all six
+components (`weston`/`xfconfd`/`xfwm4`/`xfsettingsd`/`xfdesktop`/`xfce4-panel`) now start and stay
+alive for the full run, where they previously exited with failures; the D-Bus session bus and
+`xfconfd` settings daemon work (`DBUS_UP=yes`, `XFCONF_PROBE_RC=0`, `XFCE_DISPLAY=:0`, the whole
+"Connection refused" failure class is gone); the compositing blackout is fixed and understood; the
+layer's 921 broken ELFs (missing SONAME symlinks) are fixed; two real litebox bugs were found and
+fixed this session (`unmap_shared_memory` host-crash race, fork claim-ownership race) and verified
+independently by both sessions. 24 frames captured, none go to zero after the fix (previously every
+run wiped to black and stayed there) — the specific mechanism that was destroying the framebuffer
+is genuinely gone, it's just that what remains after that fix is a mostly-undrawn desktop, not a
+fully-rendered one. Working launcher (process/compositing fix only, does not fix the under-drawing
+gap): `advisor/probes/run_xfce_xwm.sh`, committed `4e6fc556`.
 
 **Root cause of the entire session-long blocker, and the fix — both non-litebox, zero litebox
 code changes required:**
@@ -55,29 +76,30 @@ one already fixed)**:
 6. Capture backgrounded services' stderr AND print/tee it, so a fast fatal crash never presents as
    a silent, misleading readiness-timeout.
 
-**What's still open, but no longer blocking**: the trampoline `#UD` itself (root-caused to
-`set -x`, but the underlying litebox bug that fires ANY time a backgrounded child races that
-specific instruction sequence is real and unfixed — just no longer triggered now that `set -x` is
-banned from launch scripts). Worth closing eventually per the standing "always build/fix, don't
-just work around" discipline, but does not block the standing goal, which is met. See
-`advisor/probes/setx_ud_repro.sh` for the repro.
+**What's still open, but no longer blocking process launch or compositing**: the trampoline `#UD`
+itself (root-caused to `set -x`, but the underlying litebox bug that fires ANY time a backgrounded
+child races that specific instruction sequence is real and unfixed — just no longer triggered now
+that `set -x` is banned from launch scripts). Worth closing eventually per the standing "always
+build/fix, don't just work around" discipline. See `advisor/probes/setx_ud_repro.sh` for the repro.
 
-**Remaining follow-on work, prioritized (none block the standing goal, which is met)**:
-1. **Verify the desktop actually LOOKS correct, not just non-black.** `non_black_pixels=2,073,597`
-   is the full 1920x1080 background — it does NOT by itself confirm the panel and desktop icons
-   are actually drawn rather than just a solid background color. The `.bmp` frame dumps from
-   `LITEBOX_DUMP_FRAMES=1` already exist; decoding one is the difference between "renders" and
-   "renders correctly" and would take minutes. Highest priority because it's cheap and it's the
-   thing that actually validates the whole result — do this before trusting the goal is FULLY
-   closed in a visual sense, not just a pixel-count sense.
+**Remaining follow-on work, re-prioritized after the frame-decode correction above (this is now
+the real state of the standing goal, not a nice-to-have polish list)**:
+1. **TOP PRIORITY: why do `xfdesktop` and `xfce4-panel` render almost nothing?** Both are alive
+   the whole run (no crash, no exit) but `xfdesktop` draws no wallpaper beyond the flat background
+   fill and no desktop icons; `xfce4-panel` draws only a thin ~32px bar with an icon and a
+   clock/status area, not a real populated panel. This is "alive but never completes its own
+   drawing" — the same class of question as item 2 below (client startup stalling) and may share a
+   root cause; advisor-db is investigating this now.
 2. **Client startup is extremely slow — unexplained, and likely the user's original "pretty long
-   wait" complaint.** `xfce4-about --version` never exited in an 85s run; `xfce4-appfinder` never
-   finished startup in 98s; even in the successful run, components take ~60s to come up. Nobody
-   has root-caused this. The existing `ppoll`/wait-duration instrumentation from earlier this
-   session is already pointed at the right area — worth resuming.
+   wait" complaint, and possibly directly related to item 1.** `xfce4-about --version` never
+   exited in an 85s run; `xfce4-appfinder` never finished startup in 98s; even in the "successful"
+   run, components take ~60s to come up. The existing `ppoll`/wait-duration instrumentation from
+   earlier this session is already pointed at the right area; a dispatched agent is investigating
+   this now.
 3. **Close the trampoline `#UD` itself** (`advisor/probes/setx_ud_repro.sh`, 30s deterministic
    repro, `rip=0x7feffff7fb8a`). Real bug, understood, workaround (never `set -x`) is free and now
-   standing policy — lowest priority of the three since it's fully mitigated already.
+   standing policy — lower priority than 1/2 since it's fully mitigated already and doesn't affect
+   visual output.
 
 See "Rendering/scanout blocker" below for the full forensic trail (kept for anyone who needs the
 detailed history of how this was diagnosed — memory-corruption theories all refuted, compositing
