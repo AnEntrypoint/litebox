@@ -923,6 +923,59 @@ spinning in pure guest userspace (a busy-wait, no host round-trip) vs. genuinely
 platform layer below the syscall level (an unhandled/swallowed exception) — via VEH/exception
 trace activity for `tid=18`'s underlying `win_tid` around t=13.25-13.3 in this specific run.
 
+**BREAKTHROUGH — LIKELY ROOT CAUSE, PRECISE AND STRUCTURAL: litebox's `futex WAIT` is probably not
+signal-interruptible, a real Linux-semantics gap.** advisor-db's follow-up probe (log guest `rip` +
+owning tid at every `FUTEX_WAITERS` wait) resolves the whole chain end to end. **Headline: `tid=17`
+is waiting on a contended lock with `owner_tid=0` — nobody owns it.** Not a deadlock over a held
+lock; a signal that never gets delivered to a futex-parked thread. Decisive sequence, one run:
+```
+13.519402  tid=18  futex WAKE addr=849502616 requested=INT_MAX woken=0
+13.519489  tid=18  futex WAIT enter addr=846721840 val=0 current_value=Some(0)
+           ...tid=18 emits ZERO further log lines for the rest of the run (verified, count 0 after t=13.6)
+
+36.870760  tid=17  RtSigprocmask { how: SIG_BLOCK, ... }
+36.870807  tid=17  RtSigaction  { signum: Signal(34), act: Some(...) }
+36.871030  tid=17  Tkill { tid: 18, sig: 34 }
+36.871089  tid=17  futex WAIT enter addr=822036864 val=0x80000000
+36.871102  tid=17  futex WAIT on CONTENDED lock owner_tid=0 raw_val=0x80000000
+```
+**Mechanism**: that `sigprocmask` → `sigaction(34)` → `tkill(18, 34)` → `futex-wait` sequence is
+glibc/musl's **SIGSETXID / thread-list broadcast** — a thread makes a change every other thread
+must acknowledge, signals each sibling, then blocks until they all check in. `tid=17` does exactly
+that, then waits for `tid=18`'s acknowledgement. **But `tid=18` has been parked in `futex WAIT`
+since t=13.52 — 23 seconds earlier — and never runs again.** The signal is posted to a thread
+that's blocked inside a futex wait and is never woken to run its handler. Nobody acknowledges, so
+`tid=17` waits forever. **`owner_tid=0` is the proof this isn't a lock-ordering deadlock**: the
+word is exactly `0x80000000`, `FUTEX_WAITERS` set with a ZERO tid field — a real held lock would
+carry the owner's tid; an unowned-but-contended word is what a handoff protocol produces when it
+never completes.
+**What this means for the fix — a Linux-semantics gap, not a lock-specific bug**: on real Linux, a
+signal sent to a thread blocked in `futex(FUTEX_WAIT)` INTERRUPTS the wait — the thread returns
+`EINTR`, runs the handler, and (for restartable cases) re-enters the wait. This is precisely how
+SIGSETXID acknowledgement works at all — every sibling is usually parked somewhere when the
+broadcast arrives. **If litebox's futex wait is not interruptible by signal delivery, this
+deadlock is STRUCTURAL and will hit any multithreaded glibc/musl program that triggers a
+setxid/thread-list broadcast** — exactly why it reproduces across every GTK app and never in
+single-threaded bare runs. **The one question that decides the fix**: does `futex_manager.wait()`
+have any path that returns `EINTR` on a pending signal, and does signal delivery to a parked
+thread wake its waker? Predicted answer: no — the wait likely blocks on a host primitive with only
+`done` and timeout as wake conditions, no signal-pending check. **If confirmed, the fix is to make
+the futex wait signal-interruptible** (register the parked thread so signal delivery wakes it,
+return `EINTR`, let the guest's restart logic re-enter) — not anything futex-keying-specific.
+**Subsumes the earlier cascade framing cleanly**: `tid=17`'s park IS downstream of `tid=18`'s (as
+already established), but the coupling is the undeliverable signal, not a shared lock.
+**Explicit caveat, not papered over**: WHY `tid=18` parked at t=13.52 in the first place (its own
+wait at `846721840` val=0 is a plain condition wait, not contended) is still unexplained — it was
+doing fontconfig cache work (`/root/.cache/fontconfig/...cache-9`,
+`/usr/share/fonts/encodings/large/.uuid`) immediately prior. **These are two separate defects**:
+even if `tid=18`'s original park turns out legitimate and short-lived on real Linux, the
+signal-interruptibility gap alone would still convert it into a permanent hang here — worth fixing
+on its own merits regardless of how the first question resolves.
+**Assigned**: `a63e8ca59285f5871` — verify directly in code whether `futex_manager.wait()` (or
+equivalent) checks/returns on pending signals at all; advisor-db is available to instrument the
+signal-delivery path (does anything attempt to wake a parked thread on `tkill`?) if that's not
+already covered, to avoid duplication.
+
 **In progress in parallel**: advisor-db is running a context test (a GTK binary inside the full
 display stack, expected ~2s reproduction if display-stack context is what triggers this) to give a
 fast verification target for whatever fix lands here.
