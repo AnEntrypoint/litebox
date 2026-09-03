@@ -903,6 +903,30 @@ memory/scanout question at all.
 **Hold `GetWriteWatch`/trap plumbing until (1) and (2) are answered** — that work presumes memory
 corruption that may not exist.
 
+**(1) PARTIALLY ANSWERED: the client is NOT round-trip-amplification-slow — it's blocking on
+genuine multi-second dead stalls.** Directly measured: extracted every `diag-unix-stream`
+timestamp after the client execve's (503 messages over ~37s). The gap distribution is NOT "many
+round-trips each slightly slow" — most consecutive gaps are ~90 MICROSECONDS (fast, normal
+socket traffic), interrupted by a handful of MULTI-SECOND dead gaps with ZERO logged activity of
+ANY kind (no socket traffic, no epoll activity, no memory ops, no fork_verify activity) during
+them:
+```
+21.92 -> 23.76  (1.83s)
+24.44 -> 29.38  (4.94s)
+30.00 -> 39.74  (9.74s)   <- checked directly, genuinely nothing logged in this window
+39.94 -> 43.39  (3.45s)
+43.51 -> 47.11  (3.60s)
+48.30 -> 54.45  (6.15s)
+54.59 -> 56.86  (2.28s)
+```
+This refutes the round-trip-amplification theory: if thousands of round-trips each cost ms
+instead of µs, spacing would be roughly even throughout, not fast bursts separated by
+multi-second silence. **The process is genuinely blocking on something** (a wait/poll/timeout, a
+lock, a resource) during these gaps, not doing slow-but-steady protocol work. **Not yet
+instrumented**: `sys_ppoll`/`sys_poll`/timeout-syscall logging (requested timeout value vs. actual
+wall-clock duration) would directly show whether this is a real wait honoring a correct-but-large
+timeout, a timer running at the wrong speed, or blocking on something else the client depends on.
+
 ## Reproduction commands
 
 Full XFCE launch — **use `advisor/probes/run_xfce_staged.sh` as the launch script, NOT any
