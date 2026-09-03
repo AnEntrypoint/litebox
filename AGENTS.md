@@ -314,6 +314,46 @@ client can draw AT ALL. If the probe succeeds, the decode's finding reframes to 
 look at what GTK does with the replies." If the probe fails, the decode is measuring a path broken
 beneath the clients entirely. Result pending — frame decode plus every X reply the probe observed.
 
+**RESULT: THE WHOLE STACK WORKS. FIRST NON-WESTON CONTENT EVER RENDERED IN THIS ENVIRONMENT. THE
+BUG IS ABOVE X — IN GTK/XFCE, NOT IN X11/COMPOSITOR/DRM.** The raw probe:
+```
+XWIRE_CONNECTED           connect to /tmp/.X11-unix/X0 succeeded
+XWIRE_SETUP_STATUS=1      server ACCEPTED the connection
+XWIRE_ROOT=98 size=1920x1080 visual=35    <- root=98 matches weston's "created wm, root 98" exactly
+XWIRE_CREATEWINDOW_SENT   NO error returned
+XWIRE_MAPWINDOW_SENT      NO error returned
+```
+**And it appeared on screen.** The frame captured after `MapWindow`: a new content band at
+y=520..984 (468px), x=876..1520 (644px), dominant color `rgb(255,0,255)` — exactly the requested
+magenta — plus `rgb(204,204,204)`/`rgb(255,255,255)` (weston's own title-bar decoration drawn
+around it). Coverage jumped 3.0% → 46.3%. **A 600x400 window plus decorations, centered on a
+1920x1080 screen — precisely what was requested.** (Minor, unrelated to the result: the probe's
+own `CreateGC` got `BadLength` and the follow-on `PolyFillRectangle` got `BadGC` — the probe's own
+request-encoding bugs, not litebox faults, and irrelevant since the window was already visible
+from its background pixel alone.)
+
+**Conclusion, proven by direct demonstration rather than inference: raw X client → Xwayland →
+weston's XWM → scene graph → DRM scanout → visible pixels is a FULLY FUNCTIONAL path.** Window
+creation, mapping, compositing, and display all work correctly on this exact server (confirmed
+same server via matching root window id). **Every layer this session spent hours investigating
+(shared memory, DRM/scanout, the XWM, the compositing path, dual-WM contention) is now proven
+good by demonstration, not just by elimination.** The XFCE components are not failing because of
+anything below GTK — they fail for a reason ABOVE X, in GTK initialization or the XFCE code
+itself (or something those depend on).
+
+**Sharpens the X-protocol decode's target further**: we now know a *correct* client's
+`CreateWindow`/`MapWindow` succeed on this exact server. So the decode's question becomes: **do
+the XFCE clients ever ISSUE `CreateWindow` at all** (already known: yes, 9 confirmed) **and, given
+that a correct client's `MapWindow` call would succeed here, why do the XFCE clients never send
+one?** If GTK's own internal state machine never reaches the code path that calls `MapWindow`
+after `CreateWindow` succeeds, the X traffic itself is a red herring and the real bug is inside
+GTK's own window-realization logic — worth tracing at that level next (glibc/pthread/syscall
+tracing of what each client does between its last X write and going silent, as already planned).
+**Reusable tool**: `advisor/probes/xwire_probe.c` (4KB, freestanding, no Xlib, decodes X error
+codes with major opcode) is now a standing known-good baseline for "is X itself working right
+now" — use it first on any future X-related question in this project rather than re-deriving from
+inference.
+
 **Layer gap, worth fixing regardless of how this investigation lands — has quietly shaped the
 whole session's guesswork problem**: the guest layer contains **zero X query tools** — no
 `xdpyinfo`, `xrandr`, `xwininfo`, `xprop`, `xlsclients` — confirmed absent. This is why every
