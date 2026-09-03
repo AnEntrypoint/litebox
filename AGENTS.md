@@ -758,6 +758,47 @@ per the standing disk-hygiene lesson). If whoever has a layer with a working scr
 already wired can run this repro against the newly-built binary, it settles both questions in one
 ~2 minute pass.
 
+**RESOLVED: this is ONE bug, not two — collapses the whole investigation to a single precise
+question.** `a63e8ca59285f5871`'s full thread census (clone/execve/exit_group + futex trace
+together, on `xfce4-about --version`):
+```
+t=12.232717  pid=17 execve /usr/bin/xfce4-about
+t=13.023028  tid=17 starts its own g_once-shaped counter at addr=841662104 (Some(1)..Some(12), woken=0)
+t=13.025455  clone: parent_tid=17 child_tid=18 flags=CloneFlags(4001536) is_process_clone=false
+             -- the ONLY thread xfce4-about ever spawns
+t=13.362118  tid=18 WAKE addr=848912792 current_value=Some(1) woken=0
+t=13.362172  tid=18 WAIT enter addr=846132016 val=0 current_value=Some(0)  -- PARKS HERE, correctly
+             ...tid=18 NEVER appears again anywhere in the rest of the 33-second run...
+t=24.810392  tid=17 resumes its g_once hammer (Some(13)..Some(26), still woken=0)
+t=32.970194  tid=17 WAIT enter addr=821447040 val=0x80000000 (the sentinel)  -- tid=17 ALSO parks
+run ends (timeout)
+```
+**Only TWO threads ever exist in this process — `tid=17` (main) and `tid=18` (its one worker).
+There is no "missing initializer thread"** — `tid=18` IS the thread supposed to do the init work
+(fontconfig cache scan, per the earlier syscall evidence) and then signal completion or exit.
+**The `val=0x80000000` sentinel `tid=17` waits on at the end is glibc's classic "wait for this
+specific thread to finish" pattern** (`pthread_join`-equivalent / `__libc_start_main`'s exit-wait)
+— NOT a separate bug, but the direct mechanical consequence of `tid=18` never finishing:
+`tid=17` is waiting for `tid=18`'s `clear_child_tid` futex wake (`litebox_shim_linux/src/syscalls/
+process.rs:1772-1785`, `prepare_for_exit`'s wake-on-thread-exit code, which only fires if the
+thread actually reaches `prepare_for_exit`), and `tid=18` never reaches its own exit because it's
+stuck at `846132016` first. **Everything downstream (`tid=17`'s own park) is just this one hang
+propagating up — one bug, not two.**
+**The real, now-narrower open question**: what is SUPPOSED to write a non-zero value to
+`846132016` and wake it? `tid=17` is still actively running (its own `g_once` dance) when `tid=18`
+parks at t=13.36 — not itself stuck yet — so it COULD in principle be a producer/consumer handoff
+where `tid=17` is meant to eventually signal `tid=18`. **But the trace shows `tid=17` never
+touches `846132016` (or anything near it) at any point in the whole run** — only `841662104` (its
+`g_once` counter) and finally `821447040` (its own join-wait). **`tid=17` genuinely never attempts
+to wake `tid=18`'s futex either.** Narrows to exactly two possibilities: (a) this is a
+signal/timerfd/epoll-driven wake, not another thread — e.g. fontconfig's cache scan waiting on an
+inotify or timer event that litebox's emulation never delivers; or (b) `tid=17` was SUPPOSED to
+call futex-wake on `846132016` as part of some code path it takes between t=13.36 and t=32.97, but
+instead takes a different path (the `g_once` retry loop) that never reaches the real wake.
+**Approved next step**: full syscall-type histogram for `tid=17` specifically across the
+t=13.36-32.97s window (not just futex calls) — what is it actually spending 19+ seconds doing
+instead of servicing `tid=18`.
+
 **In progress in parallel**: advisor-db is running a context test (a GTK binary inside the full
 display stack, expected ~2s reproduction if display-stack context is what triggers this) to give a
 fast verification target for whatever fix lands here.
