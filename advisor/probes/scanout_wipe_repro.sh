@@ -12,7 +12,10 @@ rm -f /run/seatd.sock
 seatd -l error &
 i=0; while [ ! -e /run/seatd.sock ] && [ "$i" -lt 30 ]; do i=$((i+1)); sleep 0.5; done
 echo XC_SEATD=$i
-weston --backend=drm-backend.so --socket=wayland-0 --use-pixman --shell=desktop-shell.so &
+# --logger-scopes turns on weston's own diagnostics. Capturing its stderr
+# separately is what names WHY a committed surface is not composited,
+# instead of us inferring it from memory contents.
+weston --backend=drm-backend.so --socket=wayland-0 --use-pixman --shell=desktop-shell.so --logger-scopes=log > /tmp/weston.out 2>&1 &
 i=0; while [ ! -e "$XDG_RUNTIME_DIR/wayland-0" ] && [ "$i" -lt 60 ]; do i=$((i+1)); sleep 0.5; done
 echo XC_WESTON=$i
 sleep 6
@@ -30,5 +33,9 @@ echo XC_XSOCK=$i
 unset WAYLAND_DISPLAY
 DISPLAY=:1 GDK_BACKEND=x11 xfce4-about --version > /tmp/xc.out 2>&1
 echo XC_CLIENT_RC=$?
+i=0; while [ "$i" -lt 20 ]; do i=$((i+1)); sleep 0.5; done
+echo "=== BEGIN weston.out ==="
+cat /tmp/weston.out 2>/dev/null | tail -60 || echo "(none)"
+echo "=== END weston.out ==="
 i=0; while [ "$i" -lt 40 ]; do i=$((i+1)); sleep 0.5; done
 echo XC_DONE
