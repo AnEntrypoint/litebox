@@ -693,6 +693,43 @@ unmatched" from "waiter was genuinely absent when the wake fired" — the one th
 cannot yet tell apart, and the fact that would separate "wake arrives too early" (classic
 lost-wakeup race) from "wake never targets that word at all" (address-computation bug).
 
+**DECISIVE: this is NOT a lost-wakeup / futex-manager bug at all — it's upstream of the futex
+mechanism entirely.** `a63e8ca59285f5871` added memory-value dumps to both WAIT and WAKE (reads
+the actual u32 at the futex address alongside every trace line):
+```
+t=13.809-13.8xx  tid=17 WAKE addr=841531032, current_value INCREMENTING 1,2,3...12, requested=INT_MAX, all woken=0
+t=14.490594      tid=18 WAKE addr=848781720, current_value=Some(1), woken=0
+t=14.490647      tid=18 WAIT enter addr=846000944 val=0 current_value=Some(0)  -- CORRECT park, val matches exactly
+                 ...nothing touches 846000944 EVER AGAIN for the remaining 23+ seconds...
+t=29.919466      tid=17 WAKE addr=841531032, current_value continues 13...26, still woken=0
+t=37.996072      tid=17 WAIT enter addr=821315968 val=0x80000000, current_value matches -- tid=17 ALSO correctly parks
+```
+**Key findings**: (1) `841531032`'s value is a monotonically incrementing counter on every wake
+from the same thread (`tid=17`) — this exactly matches GLib's `g_once_impl` pattern
+(`g_once_init_leave`: store a new generation value, then unconditional `FUTEX_WAKE(INT_MAX)`,
+whether or not anyone's waiting) — `woken=0` here is genuinely normal, not a bug, confirming the
+earlier reframe. (2) `846000944`'s wait is **CORRECTLY parked** — `val=0` matches `current_value`
+exactly at park time, no race, no stale check, the futex mechanism itself did the right thing.
+**But nothing in the rest of the run ever touches that address again — no WAKE, and (implicitly)
+no write either.** This is NOT "a wake happened but missed the waiter" — **it's "the write+wake
+that was supposed to eventually happen here never happens at all, from any thread, for the rest of
+the run."** **This retracts the futex-manager-bug framing**: the bug is not in litebox's futex
+WAIT/WAKE correctness — it's that whatever OTHER thread is supposed to (a) finish producing the
+value `tid=18` is waiting for and (b) call `FUTEX_WAKE(846000944)` once it does, **never gets
+there at all.** Consistent with the fontconfig-cache-init-condvar hypothesis IF the thread
+responsible for that init work is itself stuck, never spawned, or never reaches its own completion
+code — **which loops the investigation back to a resume-path or thread-spawn question for THAT
+specific (different) thread, not a futex-manager correctness bug.** Only 4 threads visible active
+near t=13-14.5s, no distinct "initializer" thread visible completing near then — two live
+possibilities: (a) `tid=17` itself was supposed to do the cache-init work and write+wake
+`846000944`, but is off doing something else (the `g_once` dance, then its own unrelated park at
+t=37.9) — i.e. `tid=17` may ALSO be stalled/deprioritized rather than genuinely progressing; or
+(b) a dedicated worker thread for this was supposed to spawn and simply never did — the SAME class
+of bug as the very first finding in this whole investigation (a thread that should exist but
+doesn't). **Approved next step**: add a "log every distinct tid ever seen" + "log thread exit"
+trace across the whole window to definitively answer whether an expected initializer thread is
+simply missing.
+
 **In progress in parallel**: advisor-db is running a context test (a GTK binary inside the full
 display stack, expected ~2s reproduction if display-stack context is what triggers this) to give a
 fast verification target for whatever fix lands here.
