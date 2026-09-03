@@ -615,6 +615,42 @@ broken handshake looks like: **one side signaling a word the other side is not w
 either litebox is computing the wake address from the WRONG FIELD of the thread descriptor, or a
 wake that should target the waiter's word is targeting the signaler's own word instead.
 
+**REFINEMENT (self-caught by a63e8ca59285f5871, independently reproduced the same addresses):
+the "wrong field" hypothesis is WEAKENED — the address deltas are too large for it.** Own separate
+run confirms the exact same addresses (`tid=18` parks at `846000944`; `tid=17` hammers
+`841531032` 26× with `requested=INT_MAX` "wake all", always `woken=0`; `tid=18` itself wakes a
+third address `848781720` just before parking; `tid=17` later parks at `821315968`
+`val=0x80000000`, the same glibc thread-creation-sync sentinel from the very first trace last
+night). All four addresses are properly 8-byte aligned, but pairwise deltas are multi-megabyte
+(4.4MB, 7.2MB, 2.7MB, 20MB, 24MB) — **not a small constant offset (4/8/16 bytes)** that "reading
+the wrong field of the same nearby struct" would produce. This looks more like genuinely separate
+memory regions (different threads' stacks/TLS blocks, typically MB apart from fresh mmaps) —
+arguing against a simple wrong-field bug and toward either (a) legitimate, unrelated
+synchronization points in normal musl/glibc/glib startup, or (b) a subtler bug (a stale per-thread
+pointer, or referencing the wrong thread's control block entirely, not just a field within it).
+
+**Important reframe on `woken=0`, worth internalizing broadly**: `requested=INT_MAX` + `woken=0`,
+repeated many times on one address by the same thread, is **normal behavior on real Linux too** —
+futex-based mutex/condvar implementations routinely call `FUTEX_WAKE` speculatively on unlock even
+when nobody is waiting (glibc's `pthread_mutex_unlock`/GLib's `GMutex` both do this — fast path,
+wake unconditionally, let the kernel say 0 waiters). **`tid=17`'s repeated `woken=0` wakes may not
+themselves be a bug** — could just be a lock being pulsed with nobody waiting at that instant. **The
+one unambiguous, definitely-broken fact remains**: `tid=18` parks at `846000944` `val=0`, no
+timeout, and is NEVER woken by anything for the rest of the run (10+ seconds observed).
+
+**Sharper next question, replacing "which wake call was supposed to match"**: what host-visible
+EVENT was `tid=18` waiting for, and did whatever's responsible for producing it actually run? A
+10+ second gap with zero logged activity from `tid=17` (t=13.19-24.2s in the independent trace)
+raises a new possibility — `tid=17` may ALSO be effectively wedged (busy-spinning, blocked on I/O,
+or genuinely working very slowly) rather than genuinely making forward progress; its own
+wake-spam at `841531032` could itself be a symptom of a stuck retry loop rather than healthy
+operation. **Decisive test proposed and approved**: add memory-content dumps to the trace — read
+what's actually stored at `846000944` at park time and periodically afterward. If something
+writes a non-zero value there but the corresponding wake message never fires, that's a genuine
+lost-wakeup in litebox's futex implementation. If nothing ever writes there at all, `tid=18` is
+waiting on an event that never occurs upstream (a different, non-futex bug entirely) — directly
+distinguishing "nobody ever unlocks this" from "someone unlocks it but the wake is lost."
+
 **In progress in parallel**: advisor-db is running a context test (a GTK binary inside the full
 display stack, expected ~2s reproduction if display-stack context is what triggers this) to give a
 fast verification target for whatever fix lands here.
