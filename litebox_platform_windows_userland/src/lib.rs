@@ -4777,6 +4777,18 @@ impl RawMutex {
             }
         };
 
+        // `LITEBOX_DIAG_WAIT_DUR=1`: log requested-vs-actual duration for every
+        // `WaitOnAddress` call whose actual elapsed time is itself suspiciously long (>=1s),
+        // regardless of whether it timed out or was woken. This is the decisive measurement
+        // for the "missed wakeup, rescued only by a timeout" theory (AGENTS.md,
+        // "Rendering/scanout blocker": stalls recur in precise 60.000s-period blocks) -- a
+        // genuine missed-wakeup shows requested==actual (always times out, never woken
+        // early), whereas a real wake arriving late but before the timeout shows
+        // actual<requested. Gated and gap-filtered to avoid flooding on the (extremely
+        // common) fast/normal wait case.
+        let diag = diag_wait_dur_enabled();
+        let start = diag.then(std::time::Instant::now);
+
         let ok = unsafe {
             Win32_Threading::WaitOnAddress(
                 (&raw const self.inner).cast::<c_void>(),
@@ -4786,7 +4798,7 @@ impl RawMutex {
             ) != 0
         };
 
-        if ok {
+        let result = if ok {
             Ok(UnblockedOrTimedOut::Unblocked)
         } else {
             // Check why WaitOnAddress failed
@@ -4795,8 +4807,41 @@ impl RawMutex {
                 Win32_Foundation::ERROR_TIMEOUT => Ok(UnblockedOrTimedOut::TimedOut),
                 e => panic!("Unexpected error={e} for WaitOnAddress"),
             }
+        };
+
+        if let Some(start) = start {
+            let elapsed = start.elapsed();
+            if elapsed >= Duration::from_secs(1) {
+                // `ThreadId` and `UnblockedOrTimedOut` are Debug-only, not Display,
+                // so both must use `:?` here.
+                litebox_util_log::error!(
+                    tid:? = std::thread::current().id(),
+                    requested:? = timeout,
+                    elapsed_ms:% = elapsed.as_millis(),
+                    result:? = result;
+                    "[diag-wait-dur] WaitOnAddress"
+                );
+            }
         }
+
+        result
     }
+}
+
+/// Whether `LITEBOX_DIAG_WAIT_DUR=1` wait-duration diagnostics are enabled. Cached per thread,
+/// same pattern as [`diag_rip0_enabled`].
+fn diag_wait_dur_enabled() -> bool {
+    thread_local! {
+        static ENABLED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+    ENABLED.with(|e| {
+        if let Some(v) = e.get() {
+            return v;
+        }
+        let v = std::env::var_os("LITEBOX_DIAG_WAIT_DUR").is_some();
+        e.set(Some(v));
+        v
+    })
 }
 
 impl litebox::platform::RawMutex for RawMutex {
@@ -5422,9 +5467,40 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             // call reimplementation was not, until now. Scoped to only the fixed-address path
             // (`suggested_range.start != 0`) -- the OS-picks-any-address path (`start == 0`) has
             // no equivalent race, since `VirtualAlloc2` with no address hint is itself atomic.
+            // Time both the WAIT for this lock and the HOLD of it. This lock is
+            // shared by allocate_pages, deallocate_pages, update_permissions and
+            // unmap_shared_memory, so a long hold freezes every guest thread that
+            // touches memory -- the "all processes silent at once, then all resume"
+            // signature seen in the scanout investigation (up to 59.8s of a 117s run).
+            // Measuring wait vs hold separates "one slow holder" from "many short
+            // acquisitions contending", which need different fixes.
+            let adv_wait_start = std::time::Instant::now();
             let _fixed_addr_guard = ALLOCATE_PAGES_FIXED_ADDR_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let adv_waited = adv_wait_start.elapsed();
+            let adv_hold_start = std::time::Instant::now();
+            struct AdvLockTimer(std::time::Instant, usize, std::time::Duration);
+            impl Drop for AdvLockTimer {
+                fn drop(&mut self) {
+                    let held = self.0.elapsed();
+                    // Only report acquisitions that actually cost something, so the
+                    // common fast path does not flood the log and skew the run.
+                    if held.as_millis() >= 50 || self.2.as_millis() >= 50 {
+                        litebox_util_log::error!(
+                            held_ms:% = held.as_millis(),
+                            waited_ms:% = self.2.as_millis(),
+                            len:% = self.1;
+                            "diag-lockhold: ALLOCATE_PAGES_FIXED_ADDR_LOCK"
+                        );
+                    }
+                }
+            }
+            let _adv_lock_timer = AdvLockTimer(
+                adv_hold_start,
+                suggested_range.end - suggested_range.start,
+                adv_waited,
+            );
 
             let has_committed_page =
                 process_memory_range_by_regions(suggested_range.clone(), |r, state| {
@@ -6060,10 +6136,32 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             }
             return Err(SharedMemoryError::OutOfMemory);
         }
-        litebox_util_log::error!(
-            handle:% = handle as usize, pid:% = std::process::id(), addr:% = view.Value as usize;
-            "diag-shm: map_shared_memory OK"
-        );
+        // Sample the mapped content. The scanout path is already instrumented; this
+        // covers the CLIENT surface buffers, which is what decides whether weston
+        // fails to composite a surface that HAS content (a compositing bug) or is
+        // correctly compositing a surface whose content never landed (a shared-memory
+        // bug on the client-buffer path). Only small buffers are sampled: the 8.29MB
+        // scanout has its own dedicated diagnostics and scanning it here would slow
+        // every flip.
+        {
+            let sample_len = core::cmp::min(suggested_range.len(), 4096);
+            let nz = if sample_len > 0 && suggested_range.len() <= 4 * 1024 * 1024 {
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(view.Value.cast::<u8>(), sample_len)
+                };
+                bytes.iter().filter(|b| **b != 0).count()
+            } else {
+                usize::MAX // not sampled
+            };
+            litebox_util_log::error!(
+                handle:% = handle as usize,
+                pid:% = std::process::id(),
+                addr:% = view.Value as usize,
+                size:% = suggested_range.len(),
+                nonzero_in_sample:% = nz;
+                "diag-shm: map_shared_memory OK"
+            );
+        }
         Ok(UserMutPtr::from_ptr(view.Value.cast::<u8>()))
     }
 
