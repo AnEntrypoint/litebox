@@ -589,6 +589,32 @@ core `litebox::event::wait` crate) for a wait-queue keying mismatch, a dropped-n
 thread's own last action before parking was ITSELF a `futex WAKE` returning `woken=0`, immediately
 followed by parking on its own futex.
 
+**RESOLVED to a specific mechanism: THIS IS A MISSING WAKE (the wake for these futexes is never
+issued at all), NOT a queue-keying mismatch.** advisor-db extracted and analyzed the full 44-wake
+list against the two waited addresses:
+```
+t=13.464  tid=18  waits addr=846000944  -- NEVER returns (zero "futex: WAIT return" lines at all)
+t=32.803  tid=17  waits addr=821315968  -- NEVER returns
+```
+**Decisive facts across all 44 wakes**: not one wake address equals a waited address; not one is
+within 100 KB of either; **every single wake reports `woken=0`** (zero waiters found, every time).
+If this were a keying bug, wakes would be expected at addresses derived from the waited ones (off
+by a constant, a page offset, a hash collision) — there is none of that. **The wake and wait sets
+simply never intersect anywhere in the run.**
+**The wake pattern itself is informative**: t=0.08-3.28 shows a steady march of one-off wakes at
+~36 MB intervals (`38301584, 74542992, 110784400, ...`) — looks like per-thread/per-process
+structure init, each waking its own word with no waiter yet (expected/benign). **t=13.06: tid=17
+fires TWELVE wakes at `addr=841531032` in 4 milliseconds, all `woken=0`** — a tight retry burst
+against one address that never has a waiter. t=13.464: tid=18 wakes `848781720`, then parks on
+`846000944` microseconds later — two different words ~2.8 MB apart. **t=24.0: tid=17 fires
+FOURTEEN MORE wakes at that same `841531032`, again all `woken=0`.** The repeated hammering of one
+address by the main thread while `tid=18` sits on a completely different address (`846000944`,
+~4.5 MB away — smells like two different thread structures, not two fields of one) is what a
+broken handshake looks like: **one side signaling a word the other side is not watching.**
+**Leading hypothesis for where to look**: whatever glibc uses to signal thread-start completion —
+either litebox is computing the wake address from the WRONG FIELD of the thread descriptor, or a
+wake that should target the waiter's word is targeting the signaler's own word instead.
+
 **In progress in parallel**: advisor-db is running a context test (a GTK binary inside the full
 display stack, expected ~2s reproduction if display-stack context is what triggers this) to give a
 fast verification target for whatever fix lands here.
