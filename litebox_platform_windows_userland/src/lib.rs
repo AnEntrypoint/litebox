@@ -3561,6 +3561,24 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
     fn set_next_spawned_thread_guest_pid(&self, pid: i32) {
         NEXT_SPAWNED_THREAD_GUEST_PID.set(Some(pid));
     }
+
+    fn with_fork_duplicate_claim_owner<R>(&self, child_pid: i32, f: impl FnOnce() -> R) -> R {
+        // Save/restore THIS (the parent's) thread's own `CURRENT_GUEST_PID` around `f` --
+        // `duplicate()`'s eager address-space copy runs synchronously on the parent's thread, so
+        // every `claim_range`/`current_claim_owner` call it makes reads this same thread-local.
+        // Temporarily pointing it at the child's own future pid (see this method's doc comment
+        // on `ThreadProvider` for the full concurrent-fork collision rationale) makes the copy's
+        // own claims register under the CHILD's identity instead of the parent's, so a second,
+        // concurrently-forking sibling child (attributed to ITS OWN distinct future pid the same
+        // way) is correctly treated as a foreign owner by `find_foreign_claim` for the whole
+        // vulnerable window, rather than being silently coalesced/ignored as "the parent's own
+        // memory, growing normally" by `claim_range`'s same-owner-coalescing fast path.
+        let prior = CURRENT_GUEST_PID.get();
+        CURRENT_GUEST_PID.set(Some(child_pid));
+        let result = f();
+        CURRENT_GUEST_PID.set(prior);
+        result
+    }
 }
 
 impl litebox::platform::TimerProvider for WindowsUserland {

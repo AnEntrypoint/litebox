@@ -97,11 +97,18 @@ hypervisor — see `feedback_no_wsl_or_hypervisor` in project memory). **Not yet
 
 ## Open blockers (the real remaining gap)
 
-**Single highest-priority item: forked children die (SIGSEGV/SIGILL, `rip==cr2`) before they can
-`execve()`, under concurrent forking only.** This is the one thing standing between the current
-state and the standing goal. **The earlier "MAXCONCURRENT fork_verify healing passes" theory
-below is REFUTED as of the most recent measurement — read the correction at the end of this
-section before acting on the rest.**
+**UPDATE (this session): the `rip==cr2`/`PAGE_READONLY`-not-`PAGE_EXECUTE_READ` concurrent-fork
+bug described in this whole section is ROOT-CAUSED AND FIXED.** See "FIX LANDED" at the end of
+this section for the exact mechanism, the fix, and its regression-oracle verification. **A
+SEPARATE, still-open concurrent-fork crash signature was found blocking the standing goal under
+the real, much-heavier XFCE launch load** — see "NEW: second, distinct crash signature under
+XFCE launch" further down. Read both before picking this up again.
+
+**Single highest-priority item (historical framing, now fixed — kept for context): forked
+children die (SIGSEGV/SIGILL, `rip==cr2`) before they can `execve()`, under concurrent forking
+only.** This is the one thing standing between the current state and the standing goal. **The
+earlier "MAXCONCURRENT fork_verify healing passes" theory below is REFUTED as of the most recent
+measurement — read the correction at the end of this section before acting on the rest.**
 
 - Reproduces on a **bare alpine rootfs with zero display components** — no weston/Xwayland/XFCE
   needed. A background/concurrent-fork shell pattern alone triggers it. Sequential forking is
@@ -193,6 +200,98 @@ section before acting on the rest.**
   every region as it is placed — then cross-reference by dest-address against the `cr2` values
   captured here to identify definitively whether the faulting address's OWN `protect_mapping` call
   ran at all, and with what flags, versus was silently skipped or overwritten afterward.
+
+- **FIX LANDED (this session): root mechanism found and fixed, regression oracle verified clean.**
+  Confirmed by direct code reading: `PageManager::duplicate()` (`litebox/src/mm/linux.rs`) runs
+  entirely on the PARENT's own thread — the new child's real OS thread does not exist yet
+  (`spawn_thread`/`std::thread::Builder::new()` in `litebox_platform_windows_userland/src/lib.rs`
+  runs strictly AFTER `duplicate()` returns, see `do_clone` in `litebox_shim_linux/src/syscalls/
+  process.rs`). Every `allocate_pages`/`protect_mapping` call `duplicate()` makes therefore runs
+  under `current_claim_owner()` == the PARENT's own `ClaimOwner` (`CURRENT_GUEST_PID` is only
+  repointed at the CHILD's pid later, inside the new OS thread's own closure, via
+  `reclaim_ranges_for_fork_child` — long after `duplicate()` already ran). Windows' own
+  `CLAIMED_RANGES` foreign-claim defense (`claim_range`, `find_foreign_claim`, same file) exists
+  specifically to stop one guest process's allocation from silently decommitting/recommitting over
+  a DIFFERENT, still-live guest process's memory — but it only recognizes a claim as foreign when
+  its owner differs. Two SIBLINGS forking CONCURRENTLY from the same parent both get their entire
+  eager address-space copy attributed to that SAME parent owner, so `claim_range`'s own
+  same-owner-coalescing fast path (deletes and merges any prior claim from the "same" owner that
+  overlaps or touches the new one — by design, this is what keeps ordinary sequential heap growth
+  on one thread cheap) can merge/absorb one sibling's just-placed destination region into the
+  other sibling's own claim, making the `Replace`-mode per-region placement blind to a genuine
+  cross-sibling collision it would otherwise have caught and relocated away from. This produces
+  exactly the observed `PAGE_READONLY`-where-`PAGE_EXECUTE_READ`-expected signature: one child's
+  freshly-narrowed R+X code page gets silently decommitted/recommitted (back to the eager-copy's
+  initial R+W, before ITS OWN later narrowing step runs) by a concurrently-copying sibling that
+  was never flagged as foreign.
+
+  **Fix**: added `ThreadProvider::with_fork_duplicate_claim_owner(child_pid, f)` (default no-op,
+  `litebox/src/platform/mod.rs`), implemented on Windows (`litebox_platform_windows_userland/src/
+  lib.rs`) as a save/restore of the CALLING (parent) thread's own `CURRENT_GUEST_PID`
+  thread-local around `f`. `do_clone` (`litebox_shim_linux/src/syscalls/process.rs`) now wraps
+  the `PageManager::duplicate()` call with `self.global.platform.with_fork_duplicate_claim_owner
+  (child_tid, || ...)` — `child_tid` is already allocated before this point and, for a real
+  process-clone (`fork()`), IS the child's real future `pid` (matches what
+  `set_next_spawned_thread_guest_pid` assigns later at spawn time). This makes every claim the
+  eager copy registers belong to the CHILD's own future identity instead of the parent's, so two
+  concurrently-duplicating siblings are correctly mutually foreign for the whole vulnerable
+  window — restoring the exact collision defense that already existed for "two unrelated guest
+  processes" to this "two sibling children of the same still-forking parent" case too. Narrowly
+  scoped to claim attribution only, per this section's own "narrow it down further" directive —
+  does not touch the previously-reverted broader `lock_fork_verify_heal()`-around-the-whole-call
+  approach (still correctly reverted, still a worse fix).
+
+  **Verified against the regression oracle**, with real memory headroom explicitly checked before
+  trusting the numbers (free physical memory ~1.9–3.7 GiB out of ~16 GiB across the runs below —
+  BELOW the ~4 GiB caution threshold this project's own memory already flags as a known confound;
+  treat these as probably-real but not iron-clad, and re-verify on a fresh host if revisited):
+  FAIL case (30-concurrent-`/bin/true`, baseline 3-6 faults/run): **8/8 consecutive runs at 0
+  faults** post-fix. PASS control (was 0/0/0): **3/3 runs still at 0/0/0**, no regression.
+
+- **NEW: second, distinct crash signature found blocking the standing goal under the real XFCE
+  launch load — STILL OPEN, not fixed by the above.** Running the full reproduction command
+  (below) against `layer31_direct_fixed.tar` with the fix above in place: weston (`--use-pixman
+  --shell=desktop-shell.so`) still renders correctly and `non_black_pixels=2073597` (the full
+  1920x1080 desktop signature) is sustained through the FINAL frames of a 100s run — but this is
+  STILL the weston-only false-positive this doc's own "standing directives" section warns about:
+  XFCE itself never comes up. Direct cause, found by reading the log's own shell `-x` trace
+  end-to-end: `xfce_direct.sh` line 11, `dbus-daemon --nofork --nopidfile --nosyslog
+  --address="$DBUS_SESSION_BUS_ADDRESS" --session &`, backgrounds a subshell that is killed by a
+  fatal signal BEFORE `dbus-daemon` itself ever reaches `execve()` — confirmed by grepping the
+  entire run log for any trace of `dbus-daemon` (execve, DIAG_TIMELINE, or otherwise): it never
+  appears ANYWHERE. The killed process's own `comm` is still `sh` (the backgrounding subshell),
+  `Signal(4)` (SIGILL), `cr2=0x0`/`error_code=0x0` (genuinely-unmapped `#UD`, not a page-fault —
+  see this doc's own "Exception(N)/error_code decoding" technique below), and critically **`rip`
+  is the SAME fixed value both times this was observed in one run** (`0x7feffff7fb8a`) —
+  `pid=7` at 0.68s (the dbus-daemon backgrounding attempt) and again `pid=73` at 35.1s (a later,
+  unidentified `sh` subshell during the xfwm4/xfdesktop/xfce4-panel launch sequence). A fixed,
+  repeated `rip` across two unrelated fork instances initially looked like a fault-tolerant
+  healing helper (`fork_verify`'s own protection widen/restore lines appear right beside both
+  crashes in the log) — **checked directly and refuted**: `rip=0x7feffff7fb8a` decimal is
+  `140668768353162`, which falls squarely inside the SAME run's own logged `diag-exec-mmap` range
+  for `/lib/ld-musl-x86_64.so.1` (`140668768194560`..`140668768559104`, offset `+158602` into the
+  mapping) — this is a fault on REAL, in-range musl libc code (very likely `sh`'s own fork/thread
+  startup path inside musl, given the two occurrences are both `sh` forking), not a `fork_verify`
+  internal at all. The concrete next step is therefore the same class of investigation as the
+  now-fixed bug above, but for this different path: capture `LITEBOX_DIAG_FAULT_VQ=1` for THIS
+  signature specifically (it won't be caught by the existing `rip==cr2` gate, since here
+  `cr2=0x0` while `rip` is the real fault address — the gate condition itself may need widening
+  to `rip != 0 && (rip == cr2 || cr2 == 0)` for this class) to see the actual committed/protect
+  state of the `ld-musl` page at fault time, then check whether THIS shared library's own
+  concurrent-fork placement path (likely still going through `Vmem::duplicate`'s per-region loop,
+  same as before, but possibly a DIFFERENT coalescing/grouping edge case than the one just fixed
+  — e.g. `ld-musl` may land in its OWN relocation group separate from `/bin/sh`'s main image,
+  worth checking `MAX_INTRA_GROUP_GAP`-driven grouping specifically) is similarly vulnerable to a
+  same-owner-coalescing collision the just-landed fix does not fully cover. Because `dbus-daemon` never starts, `xfconfd`/`xfwm4`/`xfdesktop`/`xfce4-panel` all still
+  launch with no session bus — the log shows zero "Connection refused" lines this run (an
+  improvement over the previously-documented full cascade) but also zero evidence any of those
+  components did real session-bus-dependent work, since none of their execve/DIAG_TIMELINE lines
+  appear either (only weston, weston-desktop-shell, and dbus-uuidgen ever reach execve in this
+  run's full log). **The standing goal is NOT met.** This is a DIFFERENT crash signature (fixed,
+  non-`cr2` `rip`; `cr2=0` not a real code-page address) from the `rip==cr2`/`PAGE_READONLY` bug
+  fixed above — do not assume the same root cause or the same fix applies; investigate
+  independently, likely starting inside `fork_verify.rs`'s own fault-tolerant-write healing path
+  rather than `Vmem::duplicate`.
 
 ## Reproduction commands
 

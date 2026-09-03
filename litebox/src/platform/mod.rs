@@ -132,6 +132,35 @@ pub trait ThreadProvider: RawPointerProvider {
     fn set_next_spawned_thread_guest_pid(&self, pid: i32) {
         let _ = pid;
     }
+
+    /// Temporarily attributes any host-memory-ownership bookkeeping this platform performs
+    /// (see [`set_next_spawned_thread_guest_pid`](Self::set_next_spawned_thread_guest_pid)'s
+    /// doc comment for why such bookkeeping exists at all -- `litebox_platform_windows_userland`'s
+    /// `CLAIMED_RANGES`) to `child_pid` for the duration of `f`, restoring whatever this thread's
+    /// prior attribution was before returning.
+    ///
+    /// The shim calls this to wrap `PageManager::duplicate()`'s eager address-space copy during
+    /// `fork()` (`do_clone`, before the child's own real OS thread exists to claim its own
+    /// memory): that copy necessarily runs on the PARENT's thread, so every allocation it makes
+    /// for the child's new mappings would otherwise be attributed to the PARENT's own identity.
+    /// On a platform whose collision defense treats same-owner ranges as mutually non-foreign
+    /// (exactly what makes ordinary sequential `mmap` growth on one thread cheap), two SIBLING
+    /// children of the same parent forking concurrently would then be invisible to each other's
+    /// collision checks for the whole duration of this copy -- both attributed to the same
+    /// parent owner -- letting one child's `Replace`-mode placement silently decommit/recommit
+    /// directly over a sibling child's still-copying memory with no fault, no relocation, and no
+    /// diagnostic. Attributing the copy to the CHILD's own future pid instead (known before
+    /// `duplicate()` runs -- the shim allocates it first) makes two concurrently-duplicating
+    /// children mutually foreign for the whole vulnerable window, exactly like two unrelated
+    /// guest processes, restoring the existing foreign-claim defense's coverage of this case.
+    ///
+    /// Default implementation just runs `f()` with no attribution change; platforms with no such
+    /// per-thread ownership bookkeeping (i.e. every platform except
+    /// `litebox_platform_windows_userland`) can ignore this entirely.
+    fn with_fork_duplicate_claim_owner<R>(&self, child_pid: i32, f: impl FnOnce() -> R) -> R {
+        let _ = child_pid;
+        f()
+    }
 }
 
 #[non_exhaustive]

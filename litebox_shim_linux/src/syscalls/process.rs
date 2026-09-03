@@ -2444,9 +2444,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // process-wide lock as the proactive fixup pass" -- do not re-try this exact
                 // change without new evidence narrowing WHERE in `duplicate()`'s per-region loop
                 // the wrong permissions get applied.
-                let (dest_pm, relocations) = unsafe {
-                    self.process().pm().duplicate(&self.global.litebox)
-                }
+                // Attribute this copy's host-memory claims to the CHILD's own future pid
+                // (`child_tid`, already allocated above -- for a process clone this IS the
+                // child's real `pid`), not this (parent) thread's own identity: see
+                // `ThreadProvider::with_fork_duplicate_claim_owner`'s doc comment for why --
+                // this copy runs on the parent's own thread, before the child's real OS thread
+                // exists to claim its own memory, so without this a second, concurrently
+                // forking sibling child would be invisible to this child's own collision
+                // defense for the whole copy (both attributed to the same parent owner).
+                let (dest_pm, relocations) = self.global.platform.with_fork_duplicate_claim_owner(
+                    child_tid,
+                    || unsafe { self.process().pm().duplicate(&self.global.litebox) },
+                )
                 .map_err(|err| {
                     litebox_util_log::error!(err:% = err; "failed to duplicate address space for fork()");
                     Errno::ENOMEM
