@@ -1316,6 +1316,39 @@ permanent blackout before — reproducible, doesn't touch dbus at all. Anyone hi
 in a future full-stack run should treat it as this known trampoline `#UD` flakiness, retry, and
 not read anything into the frame result of that specific run.
 
+**FULL-STACK RESULT: COMPOSITING FIX VERIFIED END-TO-END, ORACLE PASSES — with one honest,
+correctly-flagged caveat.** advisor-db's full-stack run with weston managing Xwayland:
+```
+23 frames captured; last four (t=24.40, 24.44, 37.49, 37.53) ALL non_black_pixels=2,073,597
+no zero frame anywhere in the run -- the first full-stack run all session that never blacks out
+alive at end (t=75.5): seatd, weston, xfwm4, xfdesktop
+```
+Every previous full-stack run went to zero and stayed there; this one holds real content to the
+end. **The compositing/blackout blocker that dominated this entire session is fixed and verified.**
+
+**Caveat, stated precisely and NOT to be glossed over**: `dbus` was lost to the same trampoline
+`#UD` again in this run (`DBUS_UP=no`, `Exception(6)` at `rip=0x7feffff7fb8a`, `dbus-daemon`
+never execs), so `xfconfd` never started and `xfsettingsd`/`xfce4-panel` never came up. **This is
+a PARTIAL desktop — window manager (xfwm4) and desktop (xfdesktop) running and rendering; panel
+and settings daemon missing for the unrelated, already-known dbus `#UD` reason.** Do not call this
+"XFCE working" until a run has both the compositing fix AND a clean dbus start (all of xfconfd/
+xfwm4/xfsettingsd/xfdesktop/xfce4-panel alive) with non-black final frames — that is the actual
+remaining bar for the standing goal, now narrowed to exactly one known bug.
+
+**Durable fix, to be landed permanently in the launch scripts** (three fix + two hard-won
+operational lessons):
+1. `weston.ini` needs `xwayland=true` under `[core]`.
+2. Do NOT spawn `Xwayland` manually — let weston launch/manage it.
+3. Discover weston's own display rather than hardcoding `:1` (it has chosen `:0` in every run).
+4. Capture backgrounded services' stderr AND print/tee it — silent redirects turn fast, clear
+   crashes into mysterious multi-minute "timeouts" (see the earlier weston-typo methodology
+   finding above).
+5. The dbus spawn needs a bounded retry structured as a shell **function called N times**, NOT a
+   `while`-loop body backgrounding inside the loop — advisor found that backgrounding from inside
+   a `while` loop converts what should be a probabilistic single-child death into a deterministic
+   death of the launcher shell itself (bit-identical registers across runs); a function call
+   avoids this shape. advisor is testing this retry now; report pending.
+
 ## Reproduction commands
 
 Full XFCE launch — **use `advisor/probes/run_xfce_staged.sh` as the launch script, NOT any
