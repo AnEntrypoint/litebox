@@ -259,6 +259,57 @@ about so far tonight (including this session's own Problem 2/Xwayland-crash trac
 this fix existed). Doesn't invalidate Problem 2's finding, but any FOLLOW-UP trace on Problem 2
 should use a gschema-fixed launcher to remove that confound.
 
+**MAJOR REFRAME (advisor-db, three runs of the identical command): outcomes VARY RUN TO RUN, and
+symptoms do NOT reliably co-occur.**
+```
+run A: full desktop -> single drop to 92,036 -> stayed
+run B: full desktop -> drop -> HANG at t=56, no more flips, 26 threads, flat CPU
+run C: full desktop for 20 frames -> degraded through a SEQUENCE of values (92036, 92661, 39999,
+       40009, 99323, 102106, settling 92661) -> no hang, no Xwayland crash, ran fine to t=265
+```
+The Xwayland `SIGABRT` at t=115.7s (this session), the hard hang at t=56.2s (advisor-db), and the
+blanking do NOT reliably co-occur. **A fix validated on a single run proves very little — both
+sessions adopting 3+ runs before calling anything fixed, going forward.** Also retroactively
+corrects the "~25 frames then blanks" framing from earlier project memory as over-fitted to one
+run — this session's frame-64 observation and advisor-db's frame-27 one are the same underlying
+phenomenon landing at different times, not evidence of a fixed frame count.
+
+**NEW, MORE TRACTABLE LEAD — two DETERMINISTIC guest crashes with IDENTICAL fault addresses
+across independent process instances, which is a real litebox bug signature, not flakiness.**
+```
+/bin/sh  SIGILL   rip=0x7feffff7fb8a   both occurrences IDENTICAL — the trampoline band, ~449KB
+                  below TASK_ADDR_MAX, nothing mapped there — matches the session's known
+                  trampoline #UD (advisor/probes/setx_ud_repro.sh has an old repro)
+/bin/sh  SIGSEGV  cr2=0x352e30         both occurrences IDENTICAL, genuinely unmapped
+xfce4-panel SIGABRT at t=86            reproduces in BOTH sessions' traces — solid, confirmed twice
+```
+Four `/bin/sh` deaths per run is a lot of dead launcher shells — **a launcher shell dying mid-script
+silently truncates whatever it was starting**, which could plausibly produce exactly the run-to-run
+variance found above. **Ranked above the blanking**: it's deterministic, it's a real litebox bug
+(not guest logic), and may be upstream of the variance that's currently making everything else hard
+to measure reliably.
+
+**New tooling, with a useful negative result (advisor-db, committed `863cba19`)**:
+`advisor/probes/run_xfce_stream.sh` starts a `tail -f` per component BEFORE any component launches
+(files pre-created) and prefixes output `GUESTOUT[<component>]` — the old launchers only dumped
+component logs at the very END, so any run that hung or crashed first destroyed exactly the
+evidence needed (which is why so little direct signal has come from `xfdesktop`/panel logs so far).
+**Negative result**: across a full run, the components emit essentially NO stderr at all.
+`xfdesktop` and the panel are not reporting errors — they just stop painting. **The blanking will
+not be explained by component logs — stop expecting that.** Combined with the earlier
+fresh-mapped-buffer finding (content already gone at the source, in the guest), **the guest is
+painting black deliberately and silently** — more consistent with a legitimate response to
+something (an X event, a lost surface, a resize) than an outright fault.
+
+**Task split, revised**: advisor-db switches to the deterministic `/bin/sh` `SIGILL`/`SIGSEGV`
+crashes (fixed address, fast repro, likely upstream of the measurement variance); this session
+stays on Xwayland/panel-`SIGABRT` as already assigned; the blanking is PARKED until the shell
+crashes are understood, since they may be corrupting/truncating the very runs used to study it.
+**Action item for this session's own Xwayland-crash trace specifically**: re-check whether it had
+the gschema fix applied — captured before that fix existed, so 5 aborting `at-spi` processes per
+run were real noise in what that trace's conclusions were based on; treat the t=115.7s finding as
+needing a clean re-trace before being trusted further.
+
 **Historical note, kept for the forensic trail below**: earlier in this session a "MET" claim was
 made and retracted after a flawed pixel-count oracle mistook weston's own built-in panel for
 XFCE's; that retraction was correct at the time. This entry supersedes it with a fix-verified,
