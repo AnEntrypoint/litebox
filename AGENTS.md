@@ -1118,6 +1118,91 @@ once a client reliably reaches `map_shared_memory` for its own surface buffer, r
 `LITEBOX_DRM_TRACE=1` and read `nonzero_in_sample` directly off the existing instrumentation
 (no new code needed) to settle candidates 1/2/3 above.
 
+**(2) IS NOW DONE, on a run where the client DID reach the drawing path — DECISIVE, COMPOSITING
+THEORY CONFIRMED. STOP ALL MEMORY-CORRUPTION WORK.** Sampling every shared mapping under 4MiB at
+map time in the 16s repro:
+```
+handle=540, size=245,760: nonzero_in_sample=0 at map (t=2.51), then 1024 at t=2.64
+handle=600, size=245,760: nonzero_in_sample=0 at map (t=25.65), then 1024 at t=31.65
+```
+245,760 bytes = 320*192*4, a client surface buffer. It starts empty then HAS CONTENT. Other
+client buffers show the same pattern (36864→4096 nonzero, 20480→1664, 40960→1664). **The client
+draws successfully, and litebox delivers that content faithfully through the shared-memory path
+— the shared-memory path WORKS.** Meanwhile the 8,294,400-byte scanout stays at exactly zero
+throughout the same run. **The client has pixels; weston is not compositing them into the
+scanout. This is confirmed as a compositing problem, not memory corruption.**
+
+**STOP, effective immediately, do not resume without strong new contrary evidence**:
+`GetWriteWatch` on the scanout, any `PAGE_READONLY` write-trap, any further lock-scope work, any
+further hunt for what "zeroes" the framebuffer. Nothing zeroes it — weston composites an empty
+scene, and an empty scene reads as zero.
+
+**Caveat on the above (advisor, precise on purpose — do not overread this)**: each client handle
+above was seen mapped at TWO distinct addresses (e.g. handle=540 at addr=482,082,816 reading 0,
+and addr=928,317,440 reading 1024). It is tempting to read this as "the client sees content,
+weston's own mapping reads zero" — **it does not show that.** Both samples were taken at MAP
+time, so the zero reading is just a mapping established before the client had drawn, and the
+non-zero one is later — same object, two different moments, not necessarily two different
+processes' views. (Also: every mapping logs host pid 25532 for all of them, because all guest
+"processes" are threads in one shared host process, so pid cannot be used to distinguish
+client-side vs weston-side mappings here.) The still-open, still-decisive test is: sample BOTH
+the client's mapping and weston's own mapping of the SAME handle at the SAME instant. If weston's
+reads zero while the client's reads non-zero at that instant, that's a genuine litebox
+cross-process shared-mapping bug (new territory, never instrumented this session). If they agree,
+litebox is delivering correctly and the bug is entirely inside weston's own scene graph (surface
+role / damage / repaint scheduling) — likely not a litebox bug at all. Cheapest next discriminator
+per advisor: weston's own debug flags (surface role, damage, repaint-scheduling logging) may name
+the reason directly, without guessing from memory contents.
+
+**Methodology finding (advisor, applies broadly — audit other launch scripts for this)**: a
+background service (e.g. `weston ... > file 2>&1 &`) that dies with a clear fatal error prints
+that error ONLY into the redirected file, never into the main log. The launcher then just times
+out waiting for the socket/marker that service was supposed to create, which looks exactly like a
+stall or a litebox bug rather than what it is (a bad CLI arg / fast crash). Confirmed directly: a
+stray `n` typo on weston's command line caused `fatal: unhandled option: n` + immediate exit,
+invisible until the redirect file was read by hand; the launcher reported `WESTON=60` (full
+timeout) with zero indication in the main log of why. **Any script backgrounding a service with
+`> file 2>&1` should either tee to the console too, or `cat` the file automatically on a
+readiness-timeout path — silent redirects turned real, fast, self-explanatory crashes into
+mysterious multi-minute "hangs" for a meaningful fraction of this session's wasted investigation
+time.** `advisor/probes/run_xfce_staged.sh` and this session's own probes (`fast_repro.sh`,
+`scanout_wipe_repro.sh`, `scanout_wipe_discriminator.sh`) all redirect weston/Xwayland/xfwm4/
+xfsettingsd/xfdesktop/xfce4-panel this same way — treat as a liability, not a feature, and fix
+before further debugging sessions burn time on phantom "timeouts."
+
+With the weston-arg typo fixed, weston's own log confirms the DRM/wgpu emulation path is fully
+healthy — no errors/warnings anywhere in weston's own startup: `weston 14.0.2`, OS reports as
+`LiteBox, 5.11.0, x86_64`, `drm-backend` loads, libseat/seatd session granted, `/dev/dri/card0`
+in use, `Using Pixman renderer, shadow framebuffer`, head `Virtual-1` connected at
+`virtual-1920x1080@60.0`, `desktop-shell.so` loaded, input device associated with the output. This
+is a genuinely good, previously-unconfirmed result for the DRM/wgpu work: weston itself considers
+litebox's virtual display device fully functional. The corrected run reproduces the same frame
+pattern (19 real frames, then zero) — the scanout-blackout timing/behavior is unchanged by this
+fix, so it does not explain the blocker, but it does rule out "weston doesn't like the DRM device"
+as a contributing theory.
+
+**Where the actual bug is now, in priority order**:
+1. **weston's own import of the client's `wl_shm` pool — closest to litebox, cheapest to test
+   with existing instrumentation.** weston receives the commit and must map the client's
+   245,760-byte pool on ITS OWN side. Compare: does the SAME handle (540 or 600 above) get mapped
+   a SECOND time by weston's own process, and does THAT mapping's `nonzero_in_sample` agree with
+   the client's? If weston's own view of the identical handle reads zero/empty while the client's
+   view is non-zero, that is a cross-process shared-mapping consistency bug — genuinely litebox's,
+   but on a completely different code path than the scanout (never investigated this session).
+   If weston's view agrees (non-zero), litebox is faithfully delivering the content and the bug
+   is entirely inside weston's own scene-graph handling — likely NOT a litebox bug at all.
+2. Surface role and mapping — a `wl_surface` with a buffer attached but no assigned role, or
+   never properly mapped, is legitimately not composited by a correct compositor. Xwayland's
+   rootful window needs a shell-surface role from weston's desktop-shell.
+3. Damage/frame-callback handling — the client waiting forever for a frame callback is consistent
+   with weston never scheduling a repaint that includes it.
+
+**If (1) comes back "weston's own view agrees, non-zero"**: this is very likely NOT a litebox bug
+at all, and the standing goal may need reframing around a weston/Xwayland-side workaround (e.g. a
+different shell/compositor configuration, or an upstream weston fix) rather than a litebox code
+change — worth surfacing to the user as a real possible outcome, not assumed to always be
+litebox's fault to fix.
+
 ## Reproduction commands
 
 Full XFCE launch — **use `advisor/probes/run_xfce_staged.sh` as the launch script, NOT any
