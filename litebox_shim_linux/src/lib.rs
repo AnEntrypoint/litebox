@@ -1202,7 +1202,46 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let syscall_number = ctx.syscallno.reinterpret_as_unsigned() as usize;
         let start = timed.then(|| self.global.platform.now());
 
+        // `LITEBOX_DIAG_SYSCALL_TIMELINE=1`: log syscall ENTRY (before dispatch, so a syscall
+        // that blocks forever still shows up -- `LITEBOX_STRACE_SUMMARY`'s aggregate-only
+        // exit-time recording above cannot show this) with pid/comm/syscall name/timestamp, for
+        // processes whose `comm` matches [`crate::diag::is_syscall_timeline_target_comm`] only.
+        // Built for the "what is this specific client process blocked on" question -- see
+        // AGENTS.md's "Rendering/scanout blocker" section: a client's last X11 write is known
+        // precisely (from the unix-stream byte trace), but not what it does afterward. An
+        // unfiltered every-process version was tried first and OOM'd the host runner process (a
+        // 1.25GB single allocation failure, ~21s into a busy full-desktop run, ~26000 log lines
+        // already emitted by then) -- logging every syscall of every guest process on a busy
+        // multi-process desktop session is not viable; filtering by comm (rather than pid, which
+        // this `#![no_std]` shim has no host-env-var integer-parsing path to configure without a
+        // new `SystemInfoProvider` trait method -- avoided here specifically because that trait
+        // is in `litebox/src/platform/mod.rs`, mid-edit by a peer session this pass) keeps this
+        // proportional to the specific client processes under investigation.
+        crate::diag::init_syscall_timeline(self.global.platform.env_flag("LITEBOX_DIAG_SYSCALL_TIMELINE"));
+        let comm_bytes = self.comm.get();
+        let is_target = crate::diag::syscall_timeline_enabled()
+            && crate::diag::is_syscall_timeline_target_comm(&comm_bytes);
+        if is_target {
+            litebox_util_log::error!(
+                pid:% = self.pid,
+                comm:% = alloc::string::String::from_utf8_lossy(&comm_bytes),
+                syscall:% = crate::diag::syscall_name_pub(syscall_number),
+                syscall_num:% = syscall_number;
+                "diag-syscall-enter"
+            );
+        }
+
         let result = self.do_syscall(ctx);
+
+        if is_target {
+            litebox_util_log::error!(
+                pid:% = self.pid,
+                comm:% = alloc::string::String::from_utf8_lossy(&comm_bytes),
+                syscall:% = crate::diag::syscall_name_pub(syscall_number),
+                ok:% = result.is_ok();
+                "diag-syscall-exit"
+            );
+        }
 
         if let Some(start) = start {
             let elapsed = litebox::platform::Instant::duration_since(&self.global.platform.now(), &start);
@@ -1254,6 +1293,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 return Err(e);
             }
         };
+        // `LITEBOX_DIAG_SYSCALL_TIMELINE=1`, matching comm only (see `handle_syscall_request`'s
+        // own copy of this gate/comment): log the full, typed request args here (not just the
+        // syscall name, as the earlier version in `handle_syscall_request` did) -- this is
+        // AFTER `SyscallRequest::try_from_raw` has decoded e.g. an `Open`'s path string, so it
+        // answers "which file/library" a hanging `open`->`dlopen` sequence was for, not just
+        // that some `open` happened. Truncated: some variants (e.g. a `write` with a large
+        // buffer) could otherwise produce a huge line.
+        if crate::diag::is_syscall_timeline_target_comm(&self.comm.get()) {
+            let debug_str = alloc::format!("{request:?}");
+            let truncated = if debug_str.len() > 200 {
+                alloc::format!("{}...", &debug_str[..200])
+            } else {
+                debug_str
+            };
+            litebox_util_log::error!(
+                pid:% = self.pid,
+                comm:% = alloc::string::String::from_utf8_lossy(&self.comm.get()),
+                request:% = truncated;
+                "diag-syscall-request-detail"
+            );
+        }
         if matches!(
             request,
             SyscallRequest::Clone { .. }

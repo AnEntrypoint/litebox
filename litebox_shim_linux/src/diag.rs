@@ -127,6 +127,49 @@ pub fn record_unsupported_subcommand(description: &str, errno_name: &str, pid: i
         .count += 1;
 }
 
+static SYSCALL_TIMELINE_ENABLED: AtomicBool = AtomicBool::new(false);
+static SYSCALL_TIMELINE_INIT: AtomicBool = AtomicBool::new(false);
+
+/// Call once, early, with the platform's `env_flag` result for
+/// `LITEBOX_DIAG_SYSCALL_TIMELINE`. Idempotent, same lazy-latch pattern as
+/// [`init_strace_summary`].
+pub fn init_syscall_timeline(enabled: bool) {
+    if !SYSCALL_TIMELINE_INIT.swap(true, Ordering::AcqRel) {
+        SYSCALL_TIMELINE_ENABLED.store(enabled, Ordering::Release);
+    }
+}
+
+pub fn syscall_timeline_enabled() -> bool {
+    SYSCALL_TIMELINE_ENABLED.load(Ordering::Acquire)
+}
+
+/// `comm` prefixes worth per-syscall tracing for the "why does this client go silent after
+/// CreateWindow" investigation (AGENTS.md's "Rendering/scanout blocker" section) -- the XFCE
+/// components confirmed (via the X11 protocol decode) to create a window, do some property
+/// setup, then never issue another X11 request. Kept as a short fixed list, not a general
+/// pattern, so this stays a targeted diagnostic rather than growing back into the
+/// every-process firehose that OOM'd the host once already (see the call site's own comment).
+const SYSCALL_TIMELINE_TARGET_COMMS: &[&[u8]] = &[b"xfwm4", b"xfdesktop", b"xfce4-panel"];
+
+/// Whether `comm` (the raw, NUL-padded `[u8; 16]`-shaped process name, as read from
+/// `Task::comm`) matches one of [`SYSCALL_TIMELINE_TARGET_COMMS`]. A prefix match (real Linux
+/// truncates `comm` to 15 bytes + NUL, and this project's own `comm` field mirrors that), so
+/// e.g. a future longer name is still matched on its first 15 bytes.
+pub fn is_syscall_timeline_target_comm(comm: &[u8]) -> bool {
+    let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+    let trimmed = &comm[..end];
+    SYSCALL_TIMELINE_TARGET_COMMS
+        .iter()
+        .any(|target| trimmed == *target || target.starts_with(trimmed))
+}
+
+/// Public wrapper around [`syscall_name`] for `lib.rs`'s per-syscall timeline trace (the
+/// original is private since it was only ever used inside this module's own summary printer
+/// before now).
+pub fn syscall_name_pub(number: usize) -> String {
+    syscall_name(number)
+}
+
 fn syscall_name(number: usize) -> String {
     #[cfg(target_arch = "x86_64")]
     {
