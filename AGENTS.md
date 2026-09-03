@@ -634,11 +634,56 @@ while another process forks. The remaining candidates are IMPLICIT (don't go thr
 destroy call at all): a fresh `VirtualAlloc2` with `MEM_COMMIT` over the SAME address, a
 `MEM_RESET`, or a section view being re-established/re-mapped.
 
-**Next step, not yet done**: log `VirtualAlloc2` calls with `MEM_COMMIT` and their address range
-(the gap in existing tracing — `diag-shm` covers create/map, but nothing that commits OVER an
-existing range). Add a `diag-commit` line in the SAME format `advisor/probes/
-correlate_scanout_wipe.py` already expects (it reads `diag-reclaim`/`diag-decommit`) so the
-existing correlator checks this path automatically with no other changes needed.
+**MEASUREMENT DONE (this session's own instrumentation, independently converged with advisor's
+identical fix): `diag-commit` added at all `VirtualAlloc2(MEM_COMMIT)` call sites
+(`litebox_platform_windows_userland/src/lib.rs`, both inside the `reserve_and_commit` closure and
+the fixed-address-loop's direct commit-over-`MEM_RESERVE` branch), same field format as
+`diag-reclaim`/`diag-decommit` (`start=`/`end=`/`len=`). Also independently added
+`diag-drm-fb-addr` logging at the GUEST's own `try_dri_dumb_buffer_mmap` success point
+(`litebox_shim_linux/src/syscalls/mm.rs`, ~line 646) — confirmed the same persistent guest
+addresses advisor found (`519503872`/`0x1EF00000`..`527798272` and
+`531431424`/`0x1FA00000`..`539725824`), logged exactly once per run at ~t=6s and never again for
+the buffer's whole lifetime.**
+
+**Result, re-verified across 2 complete runs that both instrumented ALL THREE paths (`diag-commit`,
+`diag-decommit`, `diag-reclaim`) AND reached the wipe window (one wipe at t=19.30→19.82, another at
+t=18.34→18.84): ZERO overlaps with either guest scanout address range, for ANY of the three memory
+APIs, across the ENTIRE run** (not just the wipe window — checked in full, ~2,000-7,700 events per
+path per run). This independently confirms and extends advisor's `correlate_scanout_wipe.py`
+result: it is not merely that decommit/reclaim don't touch the buffer, `VirtualAlloc2(MEM_COMMIT)`
+doesn't either. **Every Windows-level memory-management API this project can instrument
+(decommit, unmap, reclaim, and now commit) is now excluded as the wipe mechanism.**
+
+**Also checked and dead-ended**: (1) `fork_verify`'s `write_usize_fault_tolerant` (the single-step
+stale-pointer healing write path) only ever writes one `usize` (8 bytes) per fault — structurally
+cannot explain a ~6MB content loss even under a hypothesized systematic mistranslation, and its
+target addresses are individually fault-driven, not a bulk range write; not instrumented further
+because the mechanism itself is the wrong shape for this signature. (2) `close_shared_memory` is
+never called on the buffer's handle in any run (zero `diag-shm: close_shared_memory` log lines) —
+rules out handle-value reuse/collision via an errant close. (3) Confirmed via a dedicated subagent
+that ALL guest "processes" (weston, Xwayland, xkbcomp, etc.) run as `std::thread`s inside ONE real
+Windows host process — `fork()`/`clone()` goes through `Vmem::duplicate` (`litebox/src/mm/linux.rs`),
+never real `CreateProcessW` (that path, `litebox_platform_windows_userland/src/process_fork.rs`, is
+explicitly diagnostic-only, gated behind `LITEBOX_DIAG_PROCESS_FORK_SPAWN=1`, and its spawned child
+is `TerminateProcess`'d immediately without running real guest code). This rules out a
+cross-real-process HANDLE-value collision (no second real handle table exists), but leaves open
+whether two DIFFERENT guest processes' own *logical* `Vmem`s (weston's and Xwayland's, each
+believing it owns its own guest-virtual address space) could pick the SAME real underlying Windows
+host address for unrelated allocations without either one's bookkeeping ever knowing — this was
+dispatched to a subagent for investigation (see `CLAIMED_RANGES`,
+`litebox_platform_windows_userland/src/lib.rs` ~line 4018-4370) but not yet resolved as of this
+writing; the next session should read that subagent's report (or re-run the investigation if it
+did not complete) before opening new avenues.
+
+**Operational note for future sessions**: host memory pressure is a real, live confound.
+`Get-CimInstance Win32_OperatingSystem` showed ~4.9GB free out of 16GB total during this session
+with two parallel investigating sessions plus their subagents/background runs all launching XFCE
+concurrently; at least one run in this session and one in advisor's died early
+(`memory allocation of ... bytes failed`, or simply stalled with no further output) well before
+ever reaching the t≈19s wipe window. A run that dies/stalls early looks identical to "no wipe
+occurred" to a naive oracle — always check that a "clean" run's own log actually reaches
+`diag-drm-flip-source-bytes` entries past t≈20s before trusting a negative/absent-overlap result
+from it. Check free memory before launching another full XFCE run if multiple sessions are active.
 
 ## Reproduction commands
 

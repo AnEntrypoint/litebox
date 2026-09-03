@@ -643,14 +643,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Some(Err(MappingError::UnAligned));
         };
         let _ = prot;
-        Some(
-            unsafe {
-                self.process()
-                    .pm()
-                    .map_existing_shared_pages(suggested_addr, length, create_flags, shared_handle)
-            }
-            .map(UserPtrMut::from_platform_ptr::<Platform>),
-        )
+        let result = unsafe {
+            self.process()
+                .pm()
+                .map_existing_shared_pages(suggested_addr, length, create_flags, shared_handle)
+        };
+        // Log the GUEST-visible address this dumb buffer lands at -- unlike the host
+        // presentation thread's own transient per-flip mapping (a fresh address every
+        // time), this is the fixed address weston's own process actually reads/writes
+        // through for the buffer's whole lifetime, which is what a decommit/unmap
+        // range needs to be compared against to catch a cross-process reclaim hitting
+        // this VMA.
+        if let Ok(ptr) = &result {
+            litebox_util_log::error!(
+                addr:% = ptr.as_usize(), len:% = aligned_len;
+                "diag-drm-fb-addr"
+            );
+        }
+        Some(result.map(UserPtrMut::from_platform_ptr::<Platform>))
     }
 
     /// Handle syscall `mmap`

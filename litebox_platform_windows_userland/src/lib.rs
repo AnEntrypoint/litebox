@@ -5376,14 +5376,17 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             if ptr.is_null() {
                 core::ptr::null_mut()
             } else {
+                let commit_addr = if r.start == 0 { ptr } else { r.start as *mut c_void };
+                litebox_util_log::error!(
+                    start:% = commit_addr as usize, end:% = commit_addr as usize + r.len(),
+                    len:% = r.len(), pid:% = std::process::id(),
+                    tid:? = std::thread::current().id();
+                    "diag-commit: VirtualAlloc2(MEM_COMMIT) reserve_and_commit"
+                );
                 unsafe {
                     VirtualAlloc2(
                         GetCurrentProcess(),
-                        if r.start == 0 {
-                            ptr
-                        } else {
-                            r.start as *mut c_void
-                        },
+                        commit_addr,
                         r.len(),
                         Win32_Memory::MEM_COMMIT,
                         flags,
@@ -5598,6 +5601,20 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                     };
                                     was_mapped_view = mbi_type == Win32_Memory::MEM_MAPPED
                                         || mbi_type == Win32_Memory::MEM_IMAGE;
+                                    // allocate_pages reclaiming an already-committed range either
+                                    // unmaps a live section view or decommits its pages. Both
+                                    // destroy contents while leaving higher-level bookkeeping
+                                    // intact, which is exactly the observed blackout: a DRM
+                                    // scanout buffer that is never destroyed yet reads as
+                                    // EXACTLY zero after a fork. Log the range so it can be
+                                    // matched against the framebuffer's own mapping.
+                                    litebox_util_log::error!(
+                                        start:% = r.start,
+                                        end:% = r.end,
+                                        len:% = r.len(),
+                                        was_mapped_view:? = was_mapped_view;
+                                        "diag-reclaim: allocate_pages destroying committed range"
+                                    );
                                     let decommit_ok = if was_mapped_view {
                                         (unsafe {
                                             UnmapViewOfFileEx(
@@ -5669,6 +5686,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                 let ptr = if was_mapped_view {
                                     reserve_and_commit(r.clone(), prot_flags(initial_permissions))
                                 } else {
+                                    litebox_util_log::error!(
+                                        start:% = r.start, end:% = r.end, len:% = r.len(),
+                                        pid:% = std::process::id(),
+                                        tid:? = std::thread::current().id();
+                                        "diag-commit: VirtualAlloc2(MEM_COMMIT) over reserved range"
+                                    );
                                     unsafe {
                                         VirtualAlloc2(
                                             GetCurrentProcess(),
@@ -5830,6 +5853,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     );
                     return Ok(true);
                 }
+                litebox_util_log::error!(
+                    start:% = r.start, end:% = r.end, len:% = r.len(),
+                    pid:% = std::process::id(), tid:? = std::thread::current().id();
+                    "diag-decommit: VirtualFree(MEM_DECOMMIT)"
+                );
                 Ok(unsafe {
                     VirtualFree(r.start as *mut c_void, r.len(), Win32_Memory::MEM_DECOMMIT)
                 } != 0)
@@ -5920,6 +5948,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         if handle.is_null() {
             return Err(SharedMemoryError::OutOfMemory);
         }
+        litebox_util_log::error!(
+            handle:% = handle as usize, size:% = size, pid:% = std::process::id();
+            "diag-shm: create_shared_memory"
+        );
         Ok(handle as usize)
     }
 
@@ -6008,6 +6040,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 fixed_address_behavior:? = fixed_address_behavior, win32_err:% = err;
                 "map_shared_memory: DIAG MapViewOfFile3 failed"
             );
+            litebox_util_log::error!(
+                handle:% = handle as usize, pid:% = std::process::id(), win32_err:% = err;
+                "diag-shm: map_shared_memory FAILED"
+            );
             if fixed_address_behavior == FixedAddressBehavior::NoReplace
                 && (err == Win32_Foundation::ERROR_INVALID_ADDRESS
                     || err == Win32_Foundation::ERROR_MAPPED_ALIGNMENT)
@@ -6024,6 +6060,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             }
             return Err(SharedMemoryError::OutOfMemory);
         }
+        litebox_util_log::error!(
+            handle:% = handle as usize, pid:% = std::process::id(), addr:% = view.Value as usize;
+            "diag-shm: map_shared_memory OK"
+        );
         Ok(UserMutPtr::from_ptr(view.Value.cast::<u8>()))
     }
 
@@ -6050,6 +6090,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         let _guard = VIRTUAL_PROTECT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        litebox_util_log::error!(
+            start:% = range.start, end:% = range.end, len:% = range.len(),
+            pid:% = std::process::id(), tid:? = std::thread::current().id();
+            "diag-decommit: UnmapViewOfFileEx"
+        );
         let ok = unsafe {
             UnmapViewOfFileEx(
                 Win32_Memory::MEMORY_MAPPED_VIEW_ADDRESS {
@@ -6106,6 +6151,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         // never valid) -- matching this file's existing style of not treating cleanup-path
         // failures as fatal (see e.g. `VirtualFree` callers that only assert in truly
         // unexpected cases).
+        litebox_util_log::error!(
+            handle:% = handle, pid:% = std::process::id();
+            "diag-shm: close_shared_memory"
+        );
         let _ = unsafe { Win32_Foundation::CloseHandle(handle as *mut c_void) };
         Ok(())
     }
