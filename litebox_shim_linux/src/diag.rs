@@ -149,7 +149,7 @@ pub fn syscall_timeline_enabled() -> bool {
 /// setup, then never issue another X11 request. Kept as a short fixed list, not a general
 /// pattern, so this stays a targeted diagnostic rather than growing back into the
 /// every-process firehose that OOM'd the host once already (see the call site's own comment).
-const SYSCALL_TIMELINE_TARGET_COMMS: &[&[u8]] = &[b"xfwm4", b"xfdesktop", b"xfce4-panel"];
+const SYSCALL_TIMELINE_TARGET_COMMS: &[&[u8]] = &[b"xfwm4", b"xfdesktop", b"xfce4-panel", b"xfce4-about"];
 
 /// Whether `comm` (the raw, NUL-padded `[u8; 16]`-shaped process name, as read from
 /// `Task::comm`) matches one of [`SYSCALL_TIMELINE_TARGET_COMMS`]. A prefix match (real Linux
