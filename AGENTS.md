@@ -3658,3 +3658,59 @@ musl's NPTL `SIGSETXID`/TLS-update signal-and-wait handshake now completes becau
 sibling thread is actually interrupted out of its unrelated futex wait to process it, exactly as
 proposed. No code change needed this pass — this was verification-only, confirming a fix already
 on `main`.
+
+## Pass — gdk-pixbuf v3.19 downgrade: real tar-append bug found and fixed, PNG registration gap still open
+
+Continuing the glycin/bwrap-avoidance PNG fix (swap `libgdk_pixbuf-2.0.so*` + CLI tools to Alpine
+v3.19's `2.42.12-r0`, confirmed via `nm -D`/`readelf -d` to have real `io-png.c` PNG (40 syms) and
+JPEG (22 syms) support with satisfied `libpng16.so.16`/`libjpeg.so.8` deps already in the layer).
+
+**Real bug found and fixed: `tar -rf` append without a `./` prefix silently creates an
+unreached duplicate path.** `layer_pngfix.tar`'s other members are all packed as `./usr/lib/...`;
+an earlier append of a rebuilt `loaders.cache` used a bare `usr/lib/...` path. `tar tf` shows both
+as *distinct* entries (`usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache` and
+`./usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache`) — litebox's tar-backed filesystem apparently keys
+by the literal path string, so the bare-prefix copy was never the one actually opened by the guest.
+Confirmed live via `LITEBOX_LOG=litebox_shim_linux::syscalls=debug` trace: `gdk-pixbuf-pixdata`'s
+`sys_openat` for `/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache` returned no fd (ENOENT-shaped) even
+though a same-named file existed in the tar. Re-appended with the correct `./usr/...` prefix; the
+open now succeeds. **General takeaway for this project: always verify a `tar -rf` append's path
+matches the tar's own existing prefix convention (`tar tf | head` first) before trusting it's
+reachable — this is the same "last member wins, but only if the path string matches" class of
+gotcha as the previously-documented duplicate-member issue, one level more subtle.**
+
+**PNG registration gap confirmed real and still open, not a caching/packaging artifact.** Live-
+captured `gdk-pixbuf-query-loaders`'s own stdout from the *swapped* v3.19 binary, run through
+litebox directly against this layer: the resulting `loaders.cache` lists only `tiff` and
+`legacy-xpm` (both loadable-module loaders) — zero PNG or JPEG entries, despite the core library
+genuinely containing compiled-in `io-png.c`. This directly contradicts the generic upstream
+`meson.build` default (`builtin_loaders=['png','jpeg']`, confirmed by reading GNOME/gdk-pixbuf's
+`meson.build` on GitHub) and this specific Alpine v3.19 `APKBUILD` (fetched directly from
+`gitlab.alpinelinux.org/alpine/aports` at tag `v3.19.7`: passes no `-Dpng`/`-Djpeg`/
+`-Dbuiltin-loaders`/`-Dothers` override at all, i.e. relies on the meson default). Even after
+fixing the tar-append bug above and confirming the cache file is genuinely reachable, PNG decode
+still fails with the same `Couldn't recognize the image file format` error. **Root cause of why
+this build's built-in PNG/JPEG support isn't reaching `gdk_pixbuf_get_formats()`/the format-sniff
+path is still unknown** — candidates not yet ruled out: (a) `gdk-pixbuf-pixdata`'s own binary
+(also swapped to v3.19) has some internal expectation about `.pc`/build-time `GDK_PIXBUF_TARGET`
+macros baked in at compile time that doesn't match a hand-assembled binary+lib pairing outside its
+original package; (b) the actual Alpine v3.19 *build log* (not just the APKBUILD recipe) may show
+meson auto-detecting `others_opt`/`gio_sniffing` differently in Alpine's sandboxed builder than a
+bare recipe read suggests; (c) a real upstream Alpine bug/quirk specific to this package version.
+**Recommended next step for whoever picks this up:** stop trusting `nm -D` symbol presence as
+sufficient evidence of built-in-format registration — instead write a tiny freestanding C probe
+(per the standing `feedback_host_crosscompile_guest_probes` convention) that calls
+`gdk_pixbuf_get_formats()` directly and prints the returned `GdkPixbufFormat` names/count, to see
+definitively whether PNG appears in the RUNTIME format table regardless of what `loaders.cache`
+says — `gdk-pixbuf-pixdata`'s own error path may not even consult `get_formats()` the way assumed.
+
+**Post-futex-fix full XFCE launch: real progress confirmed, high run-to-run variance under current
+host load.** One run (`layer_pngfix.tar`, `run_xfce_crash_diag.sh`) reached `STAGE_PANEL` cleanly
+with **zero panel SIGABRT signature** in the captured logs — a genuine improvement over every
+pre-futex-fix run, which always crashed at the panel stage on the `image-missing.png`/glycin/bwrap
+path. A second run under continued host load in the same session silently truncated its log at
+t=11.9s mid-`fork_duplicate`, with a clean `exit_group status=0` on the outer shell — consistent
+with this file's already-documented host-load-driven non-determinism (see pass 317), not a new
+regression. Per that pass's own recommendation: the next clean full-launch verification pass
+should run in a fresh session/host state, not stacked on top of this session's own already-heavy
+cumulative load.

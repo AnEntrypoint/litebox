@@ -1,0 +1,27 @@
+=== run 1 tail ===
+   3.977660400s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=1667661824 requested_end=1667674112 vm
+   3.977846600s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=create_mapping requested_start=1667420160 requested_end=1667641344 vm
+   3.978029000s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=1667661824 requested_end=1667674112 vm
+   3.978052200s ERROR litebox_shim_linux::loader::elf: diag-elf-load: aux vector base/entry values main_base=0x10480000 main_entry=0x10486ed1 main_phdrs_addr=0x10480040 m
+   3.978313500s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=1667641344 requested_end=1667645440 vm
+   3.978404900s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=273944576 requested_end=273960960 vma_
+   3.978440300s ERROR litebox_shim_linux::syscalls::process: DIAG_TIMELINE exit_group pid=18 comm=[101, 99, 104, 111, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] status=0
+   3.978453800s ERROR litebox_platform_windows_userland::fork_verify: diag-fv-lifecycle: end (cleared) tid=ThreadId(22) had_map=false range_count=0
+=== run 2 tail ===
+   4.098893500s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=create_mapping requested_start=1674170368 requested_end=1674391552 vm
+   4.099059000s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=1674412032 requested_end=1674424320 vm
+   4.099083300s ERROR litebox_shim_linux::loader::elf: diag-elf-load: aux vector base/entry values main_base=0x63360000 main_entry=0x63366ed1 main_phdrs_addr=0x63360040 m
+   4.100769600s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=1682837504 requested_end=1682841600 vm
+   4.100800400s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=1674391552 requested_end=1674395648 vm
+   4.100865300s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=1665273856 requested_end=1665290240 vm
+   4.100896400s ERROR litebox_shim_linux::syscalls::process: DIAG_TIMELINE exit_group pid=33 comm=[101, 99, 104, 111, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] status=0
+   4.100907900s ERROR litebox_platform_windows_userland::fork_verify: diag-fv-lifecycle: end (cleared) tid=ThreadId(32) had_map=false range_count=0
+=== run 3 tail ===
+   4.324321100s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=1675264000 requested_end=1675276288 vm
+   4.324506000s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=create_mapping requested_start=1675022336 requested_end=1675243520 vm
+   4.324688100s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=1675264000 requested_end=1675276288 vm
+   4.324727300s ERROR litebox_shim_linux::loader::elf: diag-elf-load: aux vector base/entry values main_base=0x10500000 main_entry=0x10506ed1 main_phdrs_addr=0x10500040 m
+   4.325021800s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=1675243520 requested_end=1675247616 vm
+   4.325136200s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=274468864 requested_end=274485248 vma_
+   4.325184500s ERROR litebox_shim_linux::syscalls::process: DIAG_TIMELINE exit_group pid=20 comm=[101, 99, 104, 111, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] status=0
+   4.325202100s ERROR litebox_platform_windows_userland::fork_verify: diag-fv-lifecycle: end (cleared) tid=ThreadId(24) had_map=false range_count=0
