@@ -730,6 +730,34 @@ doesn't). **Approved next step**: add a "log every distinct tid ever seen" + "lo
 trace across the whole window to definitively answer whether an expected initializer thread is
 simply missing.
 
+**Complementary instrumentation built in parallel (advisor-db), compiled and verified present in
+the binary (built 22:18)** — deliberately not a duplicate of the tid-lifecycle trace above:
+1. `"clone: request registered"` — `litebox_shim_linux/src/syscalls/process.rs`, at the
+   `thread.init_state.set(init_state)` seam BOTH the `ForkedChild` and `NewThread` arms fall
+   through to. Logs `child_tid`+`parent_pid` at the moment a clone is ACCEPTED, before the new
+   thread has any chance to run.
+2. `"futex: WAKE matched nothing"` — `litebox/src/sync/futex.rs`, in `wake()` when `woken == 0`
+   (already existed; kept as corroboration — expected to be quiet per the current read, and
+   quietness there would itself support the finding above).
+**Why this is the discriminating complement, not a duplicate**: the tid-lifecycle trace enumerates
+tids that were SEEN (executed). This one enumerates tids that were ASKED FOR (`clone()` accepted).
+The set difference between them settles the two live possibilities cleanly:
+- **Clone request logged, no corresponding start in the lifecycle trace** → the spawn path itself
+  drops it — bug is in thread creation/scheduling, HOST-side (litebox).
+- **No clone request logged at all for the missing thread** → the guest never even called
+  `clone()` — bug is upstream in the GUEST's own logic (a library deciding not to spawn its
+  worker, e.g. because an earlier probe/init call returned something unexpected) — and the whole
+  thread-spawn machinery is exonerated.
+**Note**: fires on the fork path too (shared seam) — expect volume on a heavy-forking run; grep
+for the specific tid rather than reading linearly.
+**Practical blocker, needs resolving to actually run this**: advisor-db's ~100x-faster repro
+(`advisor/probes/run_ctx_test.sh`) is not packaged inside their current layer tar, and rebuilding a
+fresh 2.5GB layer risks repeating the earlier disk-fill incident (124GB free right now — real
+headroom, but advisor-db is rightly cautious about burning it on a full tar copy per iteration,
+per the standing disk-hygiene lesson). If whoever has a layer with a working script-injection step
+already wired can run this repro against the newly-built binary, it settles both questions in one
+~2 minute pass.
+
 **In progress in parallel**: advisor-db is running a context test (a GTK binary inside the full
 display stack, expected ~2s reproduction if display-stack context is what triggers this) to give a
 fast verification target for whatever fix lands here.
