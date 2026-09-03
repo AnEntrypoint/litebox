@@ -492,6 +492,33 @@ c) **Ties into an earlier this-session correlation that was refuted as a CAUSE b
 **In progress in parallel**: advisor-db is running a context test (a GTK binary inside the full
 display stack, expected ~2s reproduction if display-stack context is what triggers this) to give a
 fast verification target for whatever fix lands here.
+
+**RESULT: INDEPENDENT CONFIRMATION FROM A COMPLETELY DIFFERENT METHOD, PLUS A ~100x FASTER
+REPRODUCTION FOR VERIFYING ANY FIX.** Same binary, same command line, only the surrounding context
+differs:
+```
+xfce4-about --version, BARE guest (no weston/Xwayland/XFCE): EXITS in 1.7s
+xfce4-about --version, FULL display stack:                   pid 17, still hung at t=128.6
+```
+**Why this matters beyond corroboration**: (1) two entirely different methods — a syscall trace
+finding a thread that never resumes, and a black-box exit/hang measurement — converge on the same
+conclusion, from opposite directions. (2) `--version` runs almost no application logic (no window,
+no xfconf work, no rendering) — so the hang is in STARTUP, exactly where GTK/glib spawns its first
+thread, ruling out everything downstream and matching `pthread_create` → `clone` → thread-never-
+resumes precisely. (3) **This is a ~100x faster reproduction**: the full XFCE stack takes 60+
+seconds to reach the failure and needs a frame decode to verify; this reaches it in the time it
+takes weston+Xwayland to come up (a few seconds), and the verdict is a single exit-or-hang check.
+**Verification recipe, committed**: `advisor/probes/run_ctx_test.sh` (bring up seatd + weston with
+`xwayland=true`, wait for the X socket, run `DISPLAY=:0 GDK_BACKEND=x11 xfce4-about --version` —
+PASS = exits, FAIL = hangs) paired with a control, `advisor/probes/tls_dlopen_test.sh` (the same
+binary in a bare guest, must keep exiting in ~2s so a regression there is distinguishable from
+this bug). **Clean before/after for whatever fix lands**: today it hangs in the stack and exits
+bare; after a real fix it should exit in both. advisor-db is staying out of
+`litebox_platform_windows_userland/src/lib.rs` entirely as agreed, and is ready to run this
+verification against any fix attempt immediately (harness warm, tars already in place).
+**Bonus explanation**: this also accounts for the earlier-puzzling "60-second idle heartbeat" —
+a process hung in `pthread_create` is not idle by choice; the only thing still waking it is an
+unrelated timer elsewhere in the process. Consistent with this bug, not a separate mystery.
 **Reusable tool**: `advisor/probes/xwire_probe.c` (4KB, freestanding, no Xlib, decodes X error
 codes with major opcode) is now a standing known-good baseline for "is X itself working right
 now" — use it first on any future X-related question in this project rather than re-deriving from
