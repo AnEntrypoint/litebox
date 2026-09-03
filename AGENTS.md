@@ -267,6 +267,31 @@ that trace) and becomes the actual root cause to fix, upstream of the window-map
 hold the X-protocol instrumentation uncommitted and do not chase the client-side-stall theory
 further until this is resolved either way.**
 
+**TESTED AND WRONG — do not revisit, resume the X-protocol decode/instrumentation.** Bare alpine
+rootfs, no display stack: `sleep 2` completes normally; `timeout 3 sleep 30` returns promptly;
+`timeout 3 sh -c '<busy loop>'` also returns promptly. **Guest timer and alarm delivery both work
+correctly.** (Note for anyone reading exit codes here: both `timeout` invocations returned `RC=0`,
+not GNU `timeout`'s usual `124`-on-kill — likely busybox semantics or the child exiting via another
+path; the command still returned on schedule, so the timer genuinely fired, but `timeout`'s exit
+code is not a reliable "did it kill vs. did the child finish" signal in this environment — worth
+knowing if anything branches on it.) The original "`timeout 25 xfce4-display-settings` never
+fired" observation is now believed to be a second instance of the same measurement pattern as the
+earlier `/usr/bin/timeout`-absence retraction: most likely the timer DID fire and the exit event
+for that pid was simply missed by the timeline-extraction method (matches only certain exit-record
+fields), not a second independent bug — not being asserted as confirmed, just no longer treated as
+a live theory.
+
+**Where this leaves the investigation — unchanged and solid, five hypotheses now refuted by direct
+measurement**: X round-trips succeed, screen is usable, GTK finds a visual (screen-capability,
+refuted); the WM conflict is not the cause (dual-WM, refuted); missing config is not the cause
+(config-load, refuted); shared memory is fine (cross-view, confirmed correct); the scanout is not
+corrupted (nothing decommits/unmaps); guest timers work (this entry, refuted). **The X-protocol
+decode's question — what is the last request each client sends before going idle, and does its
+reply ever arrive — remains the sharpest instrument on the table and is once again the live
+thread.** `a63e8ca59285f5871`'s instrumentation and decoder should be committed and the
+investigation continued from its result (client-side stall after successful `CreateWindow`, before
+`MapWindow` — see above).
+
 **Layer gap, worth fixing regardless of how this investigation lands — has quietly shaped the
 whole session's guesswork problem**: the guest layer contains **zero X query tools** — no
 `xdpyinfo`, `xrandr`, `xwininfo`, `xprop`, `xlsclients` — confirmed absent. This is why every
