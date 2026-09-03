@@ -814,6 +814,82 @@ as already concluded above. No missing thread, no silently-dropped clone. adviso
 repro is not needed to re-answer this specific question; effort redirects to the syscall
 histogram for `tid=17` above.
 
+**HISTOGRAM RESULT: `tid=17`'s later park (at t~31-33) is CONFIRMED a downstream cascade of
+`tid=18`'s original hang, not an independent second bug — collapses the investigation to ONE
+precisely-scoped open question.** `a63e8ca59285f5871`'s full request-detail trace: `tid=17` is
+genuinely BUSY, not idle, across t=13.36-32.97 — 494 real syscalls, dominated by `recvmsg` (143,
+X11/DBus event loop) and `mmap`/`open`/`mprotect` (dlopen-shaped library loading, consistent with
+GTK module/theme-engine loading). Real forward progress. The window ends with:
+```
+t=31.076831800  tkill enter: Tkill { tid: 18, sig: 34 }   -- targets tid=18 BY NAME, explicitly
+t=31.076868900  futex enter: Wait { addr: 810305920, val: 2147483648, timeout: None }  -- tid=17 parks
+```
+This is glibc's dynamic linker doing a `dlopen()`-triggered TLS/module-load quiesce
+(`membarrier`+per-thread `tkill` handshake — same SHAPE as thread-creation sync but with no
+preceding `clone()` in this run, so it's dlopen's "quiesce all existing threads to update TLS"
+path, not a spawn). **It explicitly signals `tid=18` — the SAME thread parked at `846132016`
+since t=13.362 — and then waits for it to acknowledge.** So `tid=17`'s hang is the direct,
+mechanical consequence of needing to synchronize with `tid=18` as a normal part of loading another
+shared library, and being unable to because `tid=18` has been unresponsive the whole time. **Fixing
+`tid=18`'s original park should resolve this second hang as a side effect — no separate fix
+needed for it.**
+
+**ENTIRE BUG NOW NARROWED TO ONE PRECISE QUESTION: why does nothing ever write a non-zero value to
+`addr=846132016` and wake `tid=18` from its `futex Wait(val=0, no timeout)` at t=13.362172?** Both
+threads in this process are fully accounted for — `tid=17` never touches this address at any point
+before its own later, unrelated (now-explained) hang. So whatever `tid=18` is waiting for is
+either (a) meant to come from OUTSIDE this process entirely — e.g. a response from Xwayland/dbus/
+the X server over a socket, if `tid=18`'s blocked operation is itself gated behind a prior
+`recvmsg`/`poll` that never completes — worth checking `tid=18`'s own syscalls in the moments
+just before it parks, not just at park time; or (b) a signal/timer-driven wake litebox's
+timer/signal emulation never delivers.
+
+**COMPLEMENTARY, POSSIBLY-CONVERGING theory (advisor-db, independent repro, `advisor/probes/
+ctx-futex-evidence.txt`) — a signal delivered while the guest still holds a lock it needs back.**
+Their own independent run shows the SAME two-wait shape (`tid=18` at `846656304` val=0; `tid=17`
+at `821971328` val=`0x80000000`=`FUTEX_WAITERS`, both correctly parked, both never touched again)
+— **and crucially, `tid=17`'s val being exactly `FUTEX_WAITERS` means it's blocking on a lock
+whose contended bit is ALREADY set: waiting for an owner to hand it off, not merely quiescing.**
+Immediately before that park: `WARN signal: process_signals entry with ctx tid=17 ... orig_rax=200`
+— `orig_rax=200` is `tgkill`, appearing EXACTLY ONCE in the entire run, at this exact moment
+(every other `orig_rax` for `tid=17` is ordinary: 9 `mmap`, 2 `open`, 202 `futex`, ...).
+Immediately prior to THAT: bulk sequential reads of one file to EOF, then four `mmap`s and a
+`munmap` — the dynamic-loader-mapping-a-shared-object signature (same dlopen shape both agents are
+seeing). **advisor-db's read**: a library finishing `dlopen` sends a signal to a sibling thread
+(`tgkill`), and the handler needs a lock the caller is holding. On real Linux this is safe if the
+lock is released before the signal fires, or the handler doesn't take it. **Under litebox, if
+signal delivery is injected at a point where the guest still holds that lock — or delivery runs on
+the wrong thread's context — this exact shape results: a correctly-parked waiter on a
+correctly-contended lock, with the owner parked elsewhere.** This would also explain the
+session-wide context-dependence (bare `xfce4-about` is fine, in-stack hangs) — it needs a SECOND
+live thread to be signaled at the wrong instant, which only exists once real concurrency is
+present. **Predicts the bug is in WHERE `process_signals` is allowed to run relative to guest lock
+ownership — consistent with, and possibly the same underlying issue as, the `tid=18`-origin
+question above** (a signal-during-dlopen-lock-hold could equally explain why `tid=18`'s own
+completion signal to `846132016` never arrives, if the same class of mistiming affects the very
+first dlopen in the chain). **Corroboration from both agents independently**: advisor-db's
+`"futex: WAKE matched nothing"` instrument fired 44× with waiters absent (matches the earlier
+read that it's quiet/uninformative); their clone-request instrument independently matched the
+empty-set-difference result above (20 clone requests, zero orphans) — same conclusion via a
+second, separately-built tool.
+**Reusable, disk-safe repro invocation for anyone continuing this** (advisor-db's `--resume-from`
+trick avoids any full-tar rebuild — injects a 10KB script tar over the existing layer):
+```
+MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 LITEBOX_LOG=debug \
+./target/release/litebox_runner_linux_on_windows_userland.exe \
+  --initial-files layer_timeline3.tar --resume-from <win-path>/ctx_inject.tar \
+  --env HOME=/root -- /bin/sh /run_ctx_test.sh
+```
+Two traps already hit and worth avoiding: MSYS mangles `/bin/sh` into a Windows path (use
+`MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1`); the runner is a Windows binary so an MSYS-style
+`/tmp` path passed to `--resume-from` fails — always pass a real Windows path. Also: a leading
+slash combined with a MISSING `--resume-from` file panics into the known stack-overflow bug at
+`lib.rs:347` (pass 336) — still live, watch for it.
+**Suggested next probe (advisor-db offered, awaiting a decision on who runs it to avoid
+duplication)**: log the guest `rip` and the OWNING tid at every `futex WAIT` with
+`val==0x80000000`, plus whether `process_signals` is currently on the stack — names the lock
+owner directly and confirms or kills the signal-during-lock-hold theory in one run.
+
 **In progress in parallel**: advisor-db is running a context test (a GTK binary inside the full
 display stack, expected ~2s reproduction if display-stack context is what triggers this) to give a
 fast verification target for whatever fix lands here.
