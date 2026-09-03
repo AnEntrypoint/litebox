@@ -573,6 +573,22 @@ resumes." **Suspected mechanisms, in priority order**:
 **Next step**: advisor-db has the full 154MB debug log and will pull specific excerpts (not share
 wholesale, will delete once extracted) — needs specific addresses or time ranges to dig into next.
 
+**Independently triple-confirmed**: `a63e8ca59285f5871`'s own separate debug capture (disk-safe,
+filtered at write time, <40 lines) shows the identical two-checkpoint pattern back-to-back
+(`"drm-diag: init() entry"` at t=13.008983, `"clone/NewThread: init_thread_context reached"` 10
+microseconds later at t=13.008993, `rip`/`rsp`/`tls` all plausible, `stack_readable=Some(true)`) —
+matches advisor-db's finding exactly. **Both agents initially read this as "the resume path itself
+is fine, so the failure must be in `prepare_to_run_guest` or the asm jump-back" — corrected**: per
+advisor-db's fuller syscall-level trace, the thread genuinely DOES resume and run ~400ms of real
+guest code (not an immediate hang at resume) before parking on the never-woken futex. The two
+log-line checkpoints alone under-determine the failure point; the syscall-level trace is what
+actually located it. **Current live focus, assigned to `a63e8ca59285f5871`**: read litebox's
+actual futex WAIT/WAKE implementation (`litebox_shim_linux/src/wait.rs`, likely delegating to the
+core `litebox::event::wait` crate) for a wait-queue keying mismatch, a dropped-not-queued wake
+(classic lost-wakeup), or a val-check/registration race — using the specific clue that the hanging
+thread's own last action before parking was ITSELF a `futex WAKE` returning `woken=0`, immediately
+followed by parking on its own futex.
+
 **In progress in parallel**: advisor-db is running a context test (a GTK binary inside the full
 display stack, expected ~2s reproduction if display-stack context is what triggers this) to give a
 fast verification target for whatever fix lands here.
