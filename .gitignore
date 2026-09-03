@@ -215,3 +215,9 @@ litebox_runner_linux_on_windows_userland/tests/test-bins/*.hooked
 /alpine-rootfs.tar
 /alpine-rootfs-fresh.tar
 /.wfgy/
+/pass_*.log
+/pass_*.txt
+/pass*.png
+/litebox_frame_dump_*.bmp
+/frame_dump/
+/overlay*/
