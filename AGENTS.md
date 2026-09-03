@@ -1241,6 +1241,12 @@ Bare-rootfs fork-bug repro (fast, no display stack): see the regression oracle a
 
 ## Useful techniques discovered this session
 
+- **A stuck/hung litebox run holds the runner binary's exe file open, and `cargo build` then
+  fails with "Access is denied" on that exe.** This looks like a toolchain problem but isn't —
+  find and kill the leftover `litebox_runner*` process (Task Manager or
+  `Get-Process litebox_runner* | Stop-Process -Force`) and the build unblocks immediately. Check
+  for this FIRST before investigating any other cause of a build failing only with a Windows
+  file-locking error.
 - **Guest stdout is interleaved character-wise with litebox's own log lines** in the runner's
   captured output, making a crashing guest program's own diagnostic messages unreadable via
   normal line-based grep. Recovery: `sed 's/\x1b\[[0-9;]*m//g' run.log | tr -d '\n' | grep -oE
