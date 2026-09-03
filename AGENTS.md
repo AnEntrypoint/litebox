@@ -417,8 +417,34 @@ between `fork_verify`'s "END (cleared)" log line and the new thread's actual res
 step in `litebox_platform_windows_userland/src/lib.rs` — NOT YET STARTED, that file is mid-edit by
 advisor-db all session, needs coordination before anyone touches it. The syscall-timeline
 instrumentation that found this (`litebox_shim_linux/src/lib.rs` + `litebox_shim_linux/src/diag.rs`,
-`LITEBOX_DIAG_SYSCALL_TIMELINE=1`) is uncommitted, pending a decision on whether to land it now or
-keep iterating.
+`LITEBOX_DIAG_SYSCALL_TIMELINE=1`) is committed: `f824eb99`.
+
+**SCOPED PRECISELY: this is NOT "clone()/thread-spawning is broken in general" — it's specific to
+one particular thread-resume path.** From the same run: (1) **plain `fork()` works fine** —
+`xfce4-panel`'s `fork()` at t=55.920 returns successfully at t=56.753 (833ms, slow but succeeds),
+and the child (new pid=112, confirmed = `/usr/lib/xfce4/panel/migrate`) makes real, continuing
+forward progress (`set_tid_address` → `rt_sigprocmask` → `rt_sigaction`×3, normal post-fork
+sequence, well beyond that point) — no hang. (2) **`CLONE_THREAD` is not universally broken
+either** — the SAME `xfce4-panel` process spawns two more worker threads via `clone()` moments
+earlier (t=55.900915, t=55.902573, both `ok=true`), and BOTH continue executing interleaved real
+work afterward (their syscalls interleave out of chronological order with each other, e.g. two
+`futex` WAKE calls a few ms apart from what must be two live racing threads) — a completely
+different, WORKING pattern: `futex` **WAKE** (GLib thread-pool notification style), not the
+WAIT-forever pattern `xfwm4` hit. (3) `xfwm4`'s hang specifically is: `clone()` succeeds →
+`fork_verify` healing completes cleanly → `tkill(tid, SIGRTMIN+2-ish)` immediately followed by
+`futex(WAIT, val=0x80000000, timeout=None)` — and the new thread (guest tid=41 / win
+`ThreadId(46)`) never appears again anywhere in the log, not even one further syscall. This
+specific `tkill`+`futex-WAIT(no timeout)` pattern is glibc's "wait for new thread to clear its
+TLS/stack-guard-page-not-ready sentinel" step — narrower than ordinary thread-pool spawning, and
+looks tied to a `dlopen()`'d shared library needing TLS setup (matches the `open`/`mmap`/`mprotect`
+burst immediately preceding it). **Best current read**: NOT a general clone/fork_verify failure —
+most spawns of both kinds work fine in this exact run. Likely either (a) a race where the new
+thread's `fork_verify` healing (t=29.910-30.096, ~185ms) doesn't finish before something else
+needed for the thread's actual first-instruction resume, or (b) a bug specific to threads carrying
+particular clone/stack/TLS setup — `CloneFlags(8195840)` alone doesn't distinguish the working vs.
+failing cases (identical across all three spawns above), so the next narrowing step is comparing
+full stack/TLS field values precisely, or instrumenting `fork_verify`'s own resume-scheduling
+handoff once `litebox_platform_windows_userland` is clear to touch.
 **Reusable tool**: `advisor/probes/xwire_probe.c` (4KB, freestanding, no Xlib, decodes X error
 codes with major opcode) is now a standing known-good baseline for "is X itself working right
 now" — use it first on any future X-related question in this project rather than re-deriving from
