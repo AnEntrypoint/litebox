@@ -651,6 +651,48 @@ lost-wakeup in litebox's futex implementation. If nothing ever writes there at a
 waiting on an event that never occurs upstream (a different, non-futex bug entirely) — directly
 distinguishing "nobody ever unlocks this" from "someone unlocks it but the wake is lost."
 
+**PRECISE CODE-PATH IDENTIFIED: this is fontconfig cache work, not glibc thread-start signaling —
+retracts the earlier "look at thread-start handshake" guidance.** `tid=18`'s exact syscalls right
+before parking (advisor-db):
+```
+13.4633  sys_read fd=4 len=120 -> Ok(120)
+13.4635  sys_openat /root/.cache/fontconfig/5ca8086aeacc9c68e81a71e7ef846b3b-le64.cache-9
+13.4637  sys_openat /usr/share/fonts/encodings/large/.uuid
+13.4638  sys_openat /root/.fontconfig/5ca8086aeacc9c68e81a71e7ef846b3b-le64.cache-9
+13.4640  sys_openat /usr/share/fonts/encodings/large/.uuid
+13.4641  futex WAKE addr=848781720 requested=2147483647 woken=0
+13.4642  futex WAIT addr=846000944 timeout=None
+```
+The thread is deep in fontconfig cache scanning when it blocks — **the earlier suggestion to look
+at glibc's thread-start signaling was the wrong target; redirect to whatever synchronization
+fontconfig/glib uses around cache init.** `requested=2147483647` (`INT_MAX`) is the signature of a
+lock RELEASE or condition BROADCAST ("wake everyone"), not a targeted signal to one specific
+waiter — so the sequence is: finish a fontconfig operation, broadcast-release one word, immediately
+park on a DIFFERENT word. **This is a condition-variable or once-initialization handshake, exactly
+the pattern where a lost wakeup deadlocks.**
+**Fontconfig itself is confirmed NOT broken**: standalone in a bare guest, `fc-cache -f -v` returns
+`rc=0`, `fc-list` returns `rc=0` and enumerates 46 fonts, no hang. **The layer ships no prebuilt
+`/var/cache/fontconfig`**, so every client rebuilds the cache on first run — explaining why this
+path is hot at startup for every GTK app (another layer-packaging gap, same family as the missing
+SONAMEs/machine-id/X-query-tools, though not necessarily the root cause here since fontconfig
+itself works fine standalone).
+**The pattern across everything tested tonight is now fully consistent — nothing is broken in
+isolation, everything fails only inside the multi-process/multi-threaded display-stack context**:
+```
+dlopen + TLS   fine bare   hangs in-stack
+fontconfig     fine bare   parks in-stack
+xfce4-about    exits 1.7s  hangs in-stack
+guest timers   fine bare   n/a
+raw X path     -           renders a window correctly (works even in-stack)
+```
+This is precisely the profile of a futex wake-delivery bug that only manifests under real
+concurrency — consistent with, not contradicting, the ongoing code investigation.
+**Instrumentation addition proposed and approved**: log the wake's target address alongside the
+full waiter list AT WAKE TIME (not just after the fact), to distinguish "waiter was registered but
+unmatched" from "waiter was genuinely absent when the wake fired" — the one thing current logging
+cannot yet tell apart, and the fact that would separate "wake arrives too early" (classic
+lost-wakeup race) from "wake never targets that word at all" (address-computation bug).
+
 **In progress in parallel**: advisor-db is running a context test (a GTK binary inside the full
 display stack, expected ~2s reproduction if display-stack context is what triggers this) to give a
 fast verification target for whatever fix lands here.
