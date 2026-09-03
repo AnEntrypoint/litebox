@@ -24,6 +24,17 @@ glib-compile-schemas /usr/share/glib-2.0/schemas && echo GSCHEMA_COMPILED=ok || 
 export GDK_PIXBUF_MODULEDIR=/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders
 gdk-pixbuf-query-loaders > /usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache 2>/tmp/pixbufq.out \
   && echo PIXBUF_CACHE_BUILT=ok || echo PIXBUF_CACHE_BUILT=fail
+echo PIXBUF_CACHE_LINES=$(wc -l < /usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache 2>/dev/null)
+echo "=== BEGIN loaders.cache ==="
+cat /usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache 2>/dev/null || echo "(none)"
+echo "=== END loaders.cache ==="
+echo "=== BEGIN pixbufq.out (stderr) ==="
+cat /tmp/pixbufq.out 2>/dev/null || echo "(none)"
+echo "=== END pixbufq.out ==="
+# GTK looks for the cache via GDK_PIXBUF_MODULE_FILE if set, else the compiled-in
+# default path (<libdir>/gdk-pixbuf-2.0/2.10.0/loaders.cache). Set it explicitly
+# in case the compiled-in default differs from what we wrote to.
+export GDK_PIXBUF_MODULE_FILE=/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache
 
 export DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/xfce-bus
 dbus-daemon --nofork --nopidfile --nosyslog --config-file=/usr/share/dbus-1/session.conf --address="$DBUS_SESSION_BUS_ADDRESS" &
