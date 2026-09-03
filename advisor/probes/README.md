@@ -100,3 +100,84 @@ claims about litebox; isolate one variable before concluding the emulator is at 
   Xwayland's own libGL/libLLVM load happens earlier and completes fine; gives xfce4-session a
   180 s budget since it only reaches interesting work ~60 s in; and prints the surviving process
   list at the end.
+- `xfce_on_weston.sh`: runs the XFCE session on WESTON instead of labwc, sidestepping an
+  upstream labwc quirk. labwc's own `src/server.c` unconditionally calls
+  `wlr_output_destroy(wlr_headless_add_output(server->headless.backend, 0, 0))` — creating a
+  0x0 headless output and destroying it, a documented workaround for virtual-output overlay.
+  Under litebox something renders that transient output and wlroots'
+  `wlr_swapchain_create` asserts `width > 0 && height > 0`, killing the session ~50s in.
+  That is upstream behaviour, not a litebox defect: litebox's DRM emulation is confirmed
+  working (1920x1080 mode enumerated + selected, dumb buffer allocated, pixman renderer
+  created, swapchain tested OK on 'Virtual-1' — all quoted from the guest's own logs).
+  weston is already proven to render a complete desktop in this environment
+  (2,073,597 non-black pixels). Layer `xfce-layer31-nopanel.tar` contains weston plus all
+  XFCE binaries. Bake the script into the layer, run it as the runner's top-level program,
+  and export `LITEBOX_LOG=error` + `LITEBOX_DUMP_FRAMES=1` in the HOST environment.
+  Includes the readiness polls, HOME/XFSM_VERBOSE, GL avoidance and trailing verbose-log
+  dump from `xfce_diag_launch.sh`.
+
+## Reading interleaved guest output (important)
+
+Guest stdout/stderr is interleaved CHARACTER-WISE with litebox's own log lines, so ordinary
+`grep` on the log misses guest messages that span line boundaries. To read them:
+
+    sed 's/\x1b\[[0-9;]*m//g' run.log | tr -d '\n' | grep -oE ".{90}PATTERN.{50}"
+
+That single trick recovered the wlroots/labwc messages that several hours of line-based
+greps had failed to find, including the `1920x1080 @ 60.000 Hz` mode line and
+`manually creating headless backend`. Per-process stdout capture (advisory item 3.2) would
+remove the need for it entirely.
+
+## litebox gap: `test -S` never succeeds (no S_IFSOCK)
+
+litebox's in-memory filesystem reports no socket file type: grepping `litebox/src/fs` and
+`litebox_shim_linux/src/syscalls/file.rs` for `S_IFSOCK` / `FileType::Socket` / `is_socket`
+returns nothing. So a bound unix socket is connectable by path, but `stat`/`lstat` does not
+identify it as a socket and shell `test -S` is false forever.
+
+This cost a full weston run: `xfce_on_weston.sh` originally waited with `[ -S "$sock" ]` and
+timed out after 60s even though weston had started correctly and bound
+`/run/user/0/wayland-0` (its own log shows "Output 'Virtual-1' enabled" and
+"launching '/usr/libexec/weston-desktop-shell'"). Fixed by using `[ -e ]` throughout.
+
+Guidance: in guest scripts always test socket readiness with `[ -e path ]`, never `[ -S path ]`.
+Worth fixing properly in the FS layer — real software checks this, and stale-socket cleanup
+logic (e.g. the `/run/seatd.sock` blocker found this session) cannot distinguish a stale
+regular file from a live socket without it.
+- `bgshell_probe.sh`: minimal repro for the guest-shell fragility that blocks every XFCE launch
+  path. Backgrounds five long-lived processes, does ordinary shell work, checks they survive,
+  repeats, and polls. No dbus/weston/X/XFCE involved. Prints `BG_SHELL_OK` on success. Motivated
+  by pass_weston5.log, where the launch script's own `/bin/sh` took SIGILL (Exception 6 #UD,
+  rip=0x7feffff7fb8a, ~449 KB below TASK_ADDR_MAX with nothing mapped there) at t=0.997s right
+  after `dbus-daemon &`, so dbus never started and every downstream readiness wait timed out.
+  Across recent runs FOUR distinct fatal signals were seen in guest shells — SIGILL(4),
+  SIGSEGV(11), SIGTRAP(5), SIGABRT(6) — which argues the fragility is broad rather than one
+  defect. Run it 20 times: the failures are intermittent, so one clean pass proves nothing.
+
+## tramp_fork_probe.c  (advisory 3F -- USE THIS, not bgshell_probe.sh)
+
+Fast repro (~1 s vs ~80 s) for the deterministic #UD that kills the first backgrounded service
+in every launch script.
+
+BUILT AND VERIFIED on the host: valid static ET_EXEC x86-64, entry 0x2016a0, 20 syscall sites
+(so it genuinely exercises the trampoline patching path).
+
+    clang --target=x86_64-unknown-linux-gnu -nostdlib -nostdinc -ffreestanding \
+          -fno-stack-protector -static -O1 -o tramp_fork_probe tramp_fork_probe.c
+
+Run as the runner's TOP-LEVEL program from a tar layer, never via `sh -c`.
+Exit code = number of children killed by a signal; 0 means it did not reproduce.
+
+The shape it tests: fork(), then the CHILD runs 200 syscall pairs BEFORE execve. That pre-exec
+window is the whole point -- it executes trampoline stubs in the freshly relocated child, which
+is where the bad bytes are. bigfork_probe.c execs immediately and therefore SKIPS this window,
+which is why it does not show the bug.
+
+Interpreting a failure: grep the run log for "fatal signal". A rip within a few hundred KB below
+TASK_ADDR_MAX (0x7fefffff0000) confirms 3F, since that is the top-down band where
+maybe_patch_exec_segment places stubs.
+
+### Superseded
+bgshell_probe.sh was written for an intermittent "shell fragility" problem. That framing is
+withdrawn: pass_weston5 and pass_weston6 show bit-identical rip AND rsp, so the failure is
+deterministic and much narrower than "backgrounding is unreliable". Prefer tramp_fork_probe.

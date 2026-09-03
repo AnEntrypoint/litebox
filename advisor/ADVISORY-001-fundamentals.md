@@ -1046,3 +1046,56 @@ Still to verify:
 - `QueueUserAPC2` availability on this build for cross-process signal delivery.
 - The exact ioctl list modesetting needs (2a): enumerate from source.
 - Whether Alpine's Xorg build has glamor compiled in (if so, `Option "AccelMethod" "none"`).
+
+## 3F. Deterministic #UD in a trampoline during fork_verify (supersedes 3E's "shell fragility")
+
+Evidence from pass_weston5.log and pass_weston6.log, two independent runs:
+
+    rip=0x7feffff7fb8a  rsp=0xcf9f6b8  cr2=0x0  error_code=0x0  Exception(6)  Signal(4) SIGILL  pid=7 comm=sh
+
+Both registers are bit-identical across runs with different layouts. This is deterministic,
+not intermittent, and my earlier "four different signals, broad shell fragility" framing is
+withdrawn for this failure.
+
+**Exception(6) is #UD, not a page fault.** cr2=0 and error_code=0 confirm it: a page fault
+always sets cr2 and a nonzero error_code. So rip is MAPPED and READABLE, and the bytes there
+simply do not decode. The earlier reading ("jumped to unmapped memory, instruction-fetch
+fault") is withdrawn. litebox's "NO mapping overlaps cr2" line refers to cr2=0 and is
+meaningless here.
+
+**rip is in the trampoline band.** `mm/linux.rs:2180` allocates top-down from
+`TASK_ADDR_MAX - length`; `mm.rs:1906` notes this sits just below the host allocator region;
+`mm.rs:1406` sets `state.trampoline_addr` from that allocation. The faulting rip is 449 KB
+below TASK_ADDR_MAX, inside that band. The guest is executing a syscall trampoline stub whose
+bytes are wrong.
+
+**The task never reached execve.** No `DIAG_TIMELINE execve pid=7` line exists in the run.
+pid=6 execs dbus-uuidgen and exits; pid=8 execs /bin/sleep. pid=7 exists only to die, comm
+still "sh". It is the forked child of `dbus-daemon &`, dying between fork and execve. That is
+why dbus never starts and every downstream readiness poll times out.
+
+**It dies inside a live fork_verify pass.** The line immediately after the fatal signal is
+`diag-fv-lifecycle: end (cleared) tid=ThreadId(11) had_map=true range_count=18` — the
+relocation map was still active and was torn down only because the task died. The preceding
+90 ms contain nothing but `write_usize_fault_tolerant` widen/restore pairs.
+
+**Hypothesis:** fork_verify's pointer healing writes into, or fails to fix up, trampoline
+stub bytes in the forked child, which then executes a half-rewritten stub. Fixed rip AND
+fixed rsp fit this exactly (same stub, same call depth) and are inconsistent with a wild jump.
+Trampolines hold generated code, not guest data pointers, so healing must never touch them.
+
+Checks, cheapest first:
+1. Dump 16 bytes at the faulting rip and diff against what `maybe_patch_exec_segment` wrote
+   into that stub in the parent. A difference proves the corruption outright.
+2. Log each process's `trampoline_addr`+len; assert no fork_verify write address falls inside
+   any trampoline range. Exclude trampoline pages from healing if one does.
+3. Check whether the child inherits the parent's trampoline mapping and range list
+   (`range_count=18` in both runs suggests a fixed inherited set).
+
+This is Windows-specific by construction: fork_verify exists only because Windows fork
+emulation shares one real address space. It blocks the FIRST backgrounded service in every
+launch script on either compositor, so it gates dbus -> seatd -> weston -> Xwayland -> XFCE.
+
+**Retracted here:** bgshell_probe.sh was written for an intermittent problem that turns out to
+be deterministic; it is no longer the right next test. The fast repro is instead: fork from a
+shell whose binary went through syscall patching, do a little work in the child before execve.
