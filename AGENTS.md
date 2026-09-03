@@ -292,6 +292,28 @@ thread.** `a63e8ca59285f5871`'s instrumentation and decoder should be committed 
 investigation continued from its result (client-side stall after successful `CreateWindow`, before
 `MapWindow` — see above).
 
+**PARALLEL TEST, running now (advisor-db): a minimal known-correct X11 client, bypassing GTK
+entirely, to separate "X clients can't draw here" from "GTK can't draw here."** Reframe that
+prompted it: **no X11 client has EVER drawn a pixel in this environment, in any run this session.**
+weston-desktop-shell (the only thing seen rendering) is a Wayland client, not X11. The only X
+clients observed are `xkbcomp` (draws nothing by design) and various GTK apps (none of which have
+ever displayed anything) — so "X is broken here" and "GTK is broken here" have never actually been
+distinguished, and the layer has no tool that could (no `xdpyinfo`, `xmessage`, `xclock`, and GTK
+built without debug support). **Built**: `advisor/probes/xwire_probe.c` — a freestanding C X11
+client speaking the wire protocol directly over the Unix socket, no Xlib, no headers: connects,
+reads the setup reply, creates a 600x400 window with a magenta background, maps it, creates a
+graphics context, fills it bright green, then drains and decodes every reply (reporting X error
+codes with their major opcode, i.e. exactly which request was rejected, if any). Committed, built,
+packaged, running. **Two possible outcomes, pointing in opposite directions**: a green rectangle
+in a frame capture means the X path works end-to-end and the fault is in GTK or above — shrinks
+the search to the toolkit; nothing appearing (or an X error) means the fault is BELOW GTK, in X or
+its route to the compositor — and this becomes a ~4KB standalone reproduction instead of a full
+desktop. **Explicitly complementary, not duplicating, the X-protocol decode**: the decode asks
+what real clients send and whether replies arrive; this probe asks whether a minimal known-correct
+client can draw AT ALL. If the probe succeeds, the decode's finding reframes to "requests are fine,
+look at what GTK does with the replies." If the probe fails, the decode is measuring a path broken
+beneath the clients entirely. Result pending — frame decode plus every X reply the probe observed.
+
 **Layer gap, worth fixing regardless of how this investigation lands — has quietly shaped the
 whole session's guesswork problem**: the guest layer contains **zero X query tools** — no
 `xdpyinfo`, `xrandr`, `xwininfo`, `xprop`, `xlsclients` — confirmed absent. This is why every
