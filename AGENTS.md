@@ -512,6 +512,34 @@ readable — **but this was invisible under `LITEBOX_LOG=error`, since it's a `d
 **Immediate next step**: rerun with `LITEBOX_LOG=debug` (or `trace`) to actually see whether that
 line fires, combined with the fast `xfce4-about --version` repro below for quick iteration.
 
+**FULL RESUME PATH MAPPED STATICALLY (no runs, no disk cost) — two precise diagnostic checkpoints
+identified for whoever reads the debug capture.** Complete call chain for the same-process
+`CLONE_THREAD` path: `spawn_thread` (`litebox_platform_windows_userland/src/lib.rs:3497` — real
+`std::thread::Builder::new().stack_size(32MB).spawn(...)`, error-checked; a spawn failure logs
+`error!()` and returns ENOMEM, which would show as `clone() ok=false` — but `xfwm4`'s `clone()` was
+`ok=true`, so the OS thread genuinely got created) → `thread_start` (`lib.rs:3423` — builds
+`TlsState`, calls `ThreadHandle::run_with_handle` to install TLS, then inside that closure calls
+`init_thread.init()` then `run_thread_arch`) → `run_thread_arch` (`lib.rs:2879`, naked asm — saves
+host sp/bp into `TlsState`, `call init_handler`) → `init_handler` (`lib.rs:7278` — pre-commits
+stack pages, then `shim.init(ctx)`) → `LinuxShimEntrypoints::init`
+(`litebox_shim_linux/src/lib.rs:149` — calls `enter_shim(true, ctx, Task::handle_init_request)`) →
+`enter_shim` (`lib.rs:282` — runs `handle_init_request`, which calls `init_thread_context` — the
+`ThreadInitState::NewThread` dispatch setting `rsp`/`rax`/`tls`/`child_tid`, `process.rs:4555` —
+then `task.prepare_to_run_guest(ctx)`; `true` → `ContinueOperation::Resume`, `false` →
+`Terminate`, which would exit not hang) → `prepare_to_run_guest`
+(`litebox_shim_linux/src/wait.rs:38` — delegates to the core `litebox::event::wait` crate,
+processes pending signals, returns `!is_exiting()`).
+**Two clean diagnostic checkpoints, in order, both previously silenced under `LITEBOX_LOG=error`**:
+1. `litebox_shim_linux/src/lib.rs:150`: `warn!("drm-diag: init() entry")` — fires on EVERY
+   thread/process init, WARN level. Present for `xfwm4`'s guest tid=41 → `shim.init()` was reached
+   (the OS thread started and ran real litebox code). Absent → the failure is even earlier, inside
+   `thread_start`/`run_with_handle`/`run_thread_arch`'s asm prologue itself, before `shim.init()`
+   is ever called.
+2. `process.rs:4622` `debug!()`: `"clone/NewThread: init_thread_context reached"` — fires but
+   nothing after it (no syscall ever) → the failure is inside/after `prepare_to_run_guest`'s
+   resume decision, or in the asm's actual jump-back-to-guest-code path.
+**Whichever of these two is the LAST one present in the capture pinpoints the exact gap.**
+
 **In progress in parallel**: advisor-db is running a context test (a GTK binary inside the full
 display stack, expected ~2s reproduction if display-stack context is what triggers this) to give a
 fast verification target for whatever fix lands here.
