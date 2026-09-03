@@ -435,17 +435,38 @@ This is now a compositing/scanout question, not a process-launch question: does 
 ever reach weston's scanout buffer, or does weston stop flipping once Xwayland becomes the top
 surface?
 
-**Next measurement, not yet done**: instrument the DRM ioctl path (`litebox_shim_linux/src/
-syscalls/file.rs:4689`, `drm_ioctl`'s dispatch — this specific piece of tooling was suggested
-early in this session and still has not been built) to log every `PAGE_FLIP`/dirty-fb/scanout-
-buffer change with its source, starting from t=15s onward through the blackout. Two outcomes,
-either decisive:
-- **Flips stop entirely at t=20.3s** → weston has stopped presenting. Investigate weston's own
-  output/renderer state after `xkbcomp` forks — possibly a repaint-scheduling or damage-tracking
-  bug triggered by the concurrent fork/heal activity.
-- **Flips continue but the buffer is all-zero** → Xwayland is presenting an empty surface.
-  Investigate the X side — Xwayland's own framebuffer/shm setup after this fork, possibly a
-  dmabuf/shm handoff timing issue with weston.
+**MEASUREMENT DONE: `LITEBOX_DRM_TRACE=1` (commit `a6d6ba55`, corrected call path in `37cf16fb`)
+answers the "did weston stop flipping" question decisively — it did NOT.** 67 DRM ioctls
+captured on a full XFCE run, 27 `DrmModePageFlip`. Critical correlation:
+- Frames go BLACK at t=19.63.
+- Page flips CONTINUE at t=19.74, 19.99, 20.10 — AFTER the blackout.
+- 27 page flips == 27 captured `LITEBOX_DUMP_FRAMES` frames exactly — no missed-frame/capture
+  artifact; every flip is faithfully observed.
+
+**The guest IS flipping buffers — the buffer CONTENTS are empty.** This rules out "weston
+stopped presenting" entirely; the mechanism is a buffer-content problem, not a flip-scheduling
+problem.
+
+**Sharper timing pattern**: flips are not evenly spaced.
+- t=7.78–8.15: nine flips in ~0.4s (weston-desktop-shell's own render, `2,073,597` px each — the
+  already-confirmed-working weston path).
+- t=8.15 → t=19.10: **an 11-SECOND GAP with ZERO flips at all.**
+- t=19.10, 19.63, 19.74, 19.99, 20.10: flips RESUME, now BLACK, never recovers.
+
+The gap begins the moment Xwayland `exec`s (pid 17 at t=9.78) and ends around when Xwayland forks
+its `xkbcomp` helper (pid 21 at t=18.80). Sequence: weston renders its own shell fine → Xwayland
+starts and weston stops flipping ENTIRELY for 11s → flipping resumes with an EMPTY buffer and
+never recovers. Reads as Xwayland taking over the output and never producing real content — not
+anything XFCE does (every XFCE component starts after t=29, well past this whole sequence).
+
+**Next measurement, not yet done**: extend the DRM trace to log the FB id and buffer handle on
+each `DrmModePageFlip`, plus `DrmModeAddFB2` and `DrmModeCreateDumb`. Compare the handle flipped
+BEFORE t=8.15 against the handle AFTER t=19.10:
+- **Same handle throughout** → the buffer's contents are being cleared/lost — a mapping/coherency
+  problem on the scanout buffer itself.
+- **Different handle after** → Xwayland allocated its own buffer and is scanning that out while
+  drawing somewhere else (or not drawing at all) — a surface/ownership handoff problem between
+  weston and Xwayland.
 
 ## Reproduction commands
 
