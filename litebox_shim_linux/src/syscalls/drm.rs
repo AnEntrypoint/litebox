@@ -558,6 +558,38 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
                 // slice, not the address) can invalidate it before the `unmap_shared_memory` call
                 // immediately below.
                 let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, size) };
+                // Sample the SHARED BACKING STORE directly (this mapping was just
+                // established fresh from `handle`, so it is not a stale view). A black
+                // captured frame with non-zero bytes here would mean the capture path is
+                // at fault; zero bytes here means the backing store itself really was
+                // wiped, and the search moves to whatever wiped it.
+                if drm_trace_enabled() {
+                    let n = bytes.len();
+                    let nz = bytes.iter().filter(|b| **b != 0).count();
+                    litebox_util_log::error!(
+                        fb_id:% = fb_id,
+                        bytes_len:% = n,
+                        nonzero_bytes:% = nz,
+                        first8:? = &bytes[..core::cmp::min(8, n)],
+                        mid8:? = &bytes[n / 2..core::cmp::min(n / 2 + 8, n)];
+                        "diag-drm-scanout-bytes"
+                    );
+                }
+                if drm_trace_enabled() {
+                    // Sample the SOURCE bytes right at this fresh mapping, before the callback
+                    // sees them -- distinguishes "the shared buffer itself is zero" (a real
+                    // wipe/coherency bug upstream of this function) from "the buffer holds real
+                    // content but something downstream of this function drops it" (a capture/
+                    // presentation-path bug instead). Counting only a bounded prefix keeps this
+                    // cheap enough to run on every flip while `LITEBOX_DRM_TRACE=1` is set.
+                    let sample_len = bytes.len().min(4096);
+                    let non_zero_in_sample = bytes[..sample_len].iter().filter(|b| **b != 0).count();
+                    litebox_util_log::error!(
+                        fb_id:% = fb_id, handle:? = handle, addr:% = addr, size:% = size,
+                        sample_len:% = sample_len, non_zero_in_sample:% = non_zero_in_sample;
+                        "diag-drm-flip-source-bytes"
+                    );
+                }
                 if let Some(callback) = self.flip_callback.lock().as_ref() {
                     callback(bytes, width, height, pitch, pixel_format);
                 }
