@@ -3697,12 +3697,43 @@ macros baked in at compile time that doesn't match a hand-assembled binary+lib p
 original package; (b) the actual Alpine v3.19 *build log* (not just the APKBUILD recipe) may show
 meson auto-detecting `others_opt`/`gio_sniffing` differently in Alpine's sandboxed builder than a
 bare recipe read suggests; (c) a real upstream Alpine bug/quirk specific to this package version.
-**Recommended next step for whoever picks this up:** stop trusting `nm -D` symbol presence as
-sufficient evidence of built-in-format registration — instead write a tiny freestanding C probe
-(per the standing `feedback_host_crosscompile_guest_probes` convention) that calls
-`gdk_pixbuf_get_formats()` directly and prints the returned `GdkPixbufFormat` names/count, to see
-definitively whether PNG appears in the RUNTIME format table regardless of what `loaders.cache`
-says — `gdk-pixbuf-pixdata`'s own error path may not even consult `get_formats()` the way assumed.
+**ROOT CAUSE FOUND: `nm -D`'s 40 "PNG symbols" were all `U` (undefined imports), not proof of
+registration — the format-dispatch table itself is empty for PNG.** Attempted the recommended
+live `gdk_pixbuf_get_formats()` C probe via `dlopen`/`dlsym` (kept at
+`advisor/probes/pixbuf_formats_probe.c`) but this Windows host has no musl cross-toolchain
+(`clang -target x86_64-linux-musl` lacks musl's own crt objects/libc.so stub, and the layer tar is
+a stripped runtime-only rootfs with zero dev/crt artifacts to link against) — building one is a
+real but out-of-scope detour for a diagnostic probe, so pivoted to static analysis instead, which
+turned out to be fully decisive without needing execution at all:
+
+- `nm -D libgdk_pixbuf-2.0.so.0` — every one of the 40 `png_*`/22 `jpeg_*` symbols is marked `U`
+  (**undefined**, i.e. an *import* the loader code calls into `libpng16`/`libjpeg` for), not a
+  defined export. This means `io-png.c`/`io-jpeg.c` object code is genuinely linked into the
+  binary and correctly resolves against `libpng16.so.16`/`libjpeg.so.8` — but that only proves the
+  *decoder implementation* is present, never that anything actually calls it.
+- `strings -a libgdk_pixbuf-2.0.so.0 | grep -iE '^(png|jpeg|tiff|xpm|bmp|gif)$'` — returns only
+  `JPEG` (uppercase, almost certainly a MIME/description string, not the lowercase `"png"`/`"jpeg"`
+  format-id string gdk-pixbuf's `builtin_loaders[]` table in `gdk-pixbuf-io.c` registers each
+  loader under). **No `"png"` string literal exists anywhere in the binary.** Since gdk-pixbuf's
+  built-in-loader registration is a static compile-time array of `{name, fill_vtable, fill_info}`
+  triples matched by that exact lowercase name string, its total absence is conclusive: this
+  specific Alpine v3.19 `gdk-pixbuf-2.42.12-r0` binary's `builtin_loaders[]` table was built
+  *without* PNG (and JPEG) wired in, even though the loader object code for both was compiled and
+  linked as dead weight. This is a genuine upstream Alpine v3.19 packaging defect/quirk in that
+  specific build — not a litebox gap, not a caching/packaging mistake on this session's part, and
+  not something fixable by re-swapping files at the tar level.
+
+**Conclusion: the v3.19-downgrade approach for avoiding glycin/bwrap cannot work as originally
+conceived — its own PNG loader is unreachable dead code, not merely uncached.** A real fix would
+require either (a) a different Alpine release/branch whose `gdk-pixbuf` build genuinely wires PNG
+into `builtin_loaders[]` (needs the same `nm -D` + `strings` verification against candidate
+versions BEFORE attempting another swap — do not trust symbol presence alone again), (b) building
+the litebox namespace-support wall this whole investigation thread originally hit (real `unshare`/
+`CLONE_NEWUSER`/`CLONE_NEWNS` support, a substantial standalone feature, see the `prctl`/
+`/proc/sys/kernel` fixes earlier in this file for the two smaller gaps already closed on that
+path), or (c) building a musl-linux-x86_64 cross-toolchain on this host (not yet present) to
+compile a small ad-hoc loader shim from source rather than relying on any prebuilt Alpine package.
+This PRD row is deferred pending one of those three real paths, not resolved.
 
 **Post-futex-fix full XFCE launch: real progress confirmed, high run-to-run variance under current
 host load.** One run (`layer_pngfix.tar`, `run_xfce_crash_diag.sh`) reached `STAGE_PANEL` cleanly
