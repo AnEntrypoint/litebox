@@ -337,6 +337,40 @@ outcomes for this launch sequence, not a reliable/reproducible failure mode on i
 with the broader "outcomes vary run to run" finding above. Not retracted, just re-scoped: rare
 (1 run so far), not yet reproduced on demand.
 
+**`xfce4-panel` `SIGABRT` ROOT-CAUSED PRECISELY, exact fix identified, real packaging gap — not a
+litebox bug at all.** `panel.out`'s actual stderr, previously never captured before this session's
+`run_xfce_crash_diag.sh` fixed the "dump component logs at the end after they may have already
+crashed" gap:
+```
+(xfce4-panel:147): Gtk-WARNING **: 21:38:49.459: Invalid icon size 16
+**
+Gtk:ERROR:../gtk/gtkiconhelper.c:495:ensure_surface_for_gicon: assertion failed (error == NULL):
+Failed to load /org/gtk/libgtk/icons/24x24/status/image-missing.png: Unrecognized image file
+format (gdk-pixbuf-error-quark, 3)
+Bail out! Gtk:ERROR:../gtk/gtkiconhelper.c:495:ensure_surface_for_gicon: assertion failed
+(error == NULL): Failed to load .../image-missing.png: Unrecognized image file format
+```
+`xfce4-panel` tries to load GTK's built-in fallback "image-missing" icon (a `.png`), fails to
+decode it, and `g_error()` deliberately aborts — matches the syscall trace exactly: `Write { fd:
+5, ... count: 8 }` (a crash-report/log pipe write) → `RtSigaction { signum: Signal(6), ... }` →
+**`Tkill { tid: 147, sig: 6 }`, the process sending itself `SIGABRT` on purpose** — this is a
+deliberate GTK assertion-abort, not a memory-safety crash or a litebox bug.
+**Confirmed exact cause**: `tar tf layer31_direct_fixed.tar | grep libpixbufloader` shows **only
+`libpixbufloader-xpm.so` present — NO PNG loader, no `loaders.cache` file at all.**
+`image-missing.png` is a PNG file; with no PNG loader registered in `gdk-pixbuf`, any icon lookup
+that falls back to it fails to decode and GTK's assertion path aborts the whole process. The
+underlying decoder library (`libpng16.so`/`.so.16`/`.so.16.58.0`) IS present in the layer — only
+the `gdk-pixbuf` bridging plugin (`libpixbufloader-png.so`) that connects `libpng` to GTK's image
+loading framework is missing. **Same family as the missing-SONAME/missing-machine-id/missing-
+gschemas-compiled findings this session — a genuine layer-packaging gap, not a litebox defect.**
+**This is now the clearest, most tractable fix on the table**: source or build
+`libpixbufloader-png.so` for this Alpine/musl target and add it (plus a regenerated
+`loaders.cache` via `gdk-pixbuf-query-loaders`, already present in the layer at
+`/usr/bin/gdk-pixbuf-query-loaders`) to the layer tar. **This single missing file plausibly
+explains the `xfce4-panel` `SIGABRT` seen in both sessions' traces** — any icon lookup anywhere in
+the panel (or any other GTK app) that needs to decode a PNG and hits the fallback path will trip
+the same abort. Investigating how to source/build the loader now.
+
 **Historical note, kept for the forensic trail below**: earlier in this session a "MET" claim was
 made and retracted after a flawed pixel-count oracle mistook weston's own built-in panel for
 XFCE's; that retraction was correct at the time. This entry supersedes it with a fix-verified,
