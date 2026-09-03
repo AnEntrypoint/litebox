@@ -1116,6 +1116,67 @@ remains is a genuine independent gap, ranked by the counts above.
 `litebox/src/sync/futex.rs` plus `process.rs` instrumentation, all additive logging except the
 one-line `cfg` gate removal.
 
+**FIX LANDED AND VERIFIED — THE HANG THAT GATED THIS ENTIRE INVESTIGATION IS FIXED.**
+`a63e8ca59285f5871` implemented and verified the `do_kill` fix. Diff:
+```rust
+// litebox_shim_linux/src/syscalls/process.rs -- new method on Process
+pub(crate) fn interrupt_thread(&self, tid: i32) -> bool {
+    let remote = self.inner.lock().threads.get(&tid).cloned();
+    let found = remote.is_some();
+    if let Some(thread) = remote {
+        thread.interrupt();
+    }
+    found
+}
+
+// litebox_shim_linux/src/syscalls/signal/mod.rs -- do_kill, replacing the old ESRCH-always guard
+if let Some(target_tid) = tid
+    && target_tid != self.tid
+{
+    if let Some(signal) = signal
+        && !self.is_signal_ignored(signal)
+    {
+        self.signals
+            .shared_pending
+            .lock()
+            .push(&self.process().limits, signal, siginfo_kill(signal));
+    }
+    return if self.process().interrupt_thread(target_tid) {
+        Ok(0)
+    } else {
+        Err(Errno::ESRCH)
+    };
+}
+```
+**Rationale**: `ThreadRemote` only exposes `interrupt()`, not a handle to the target `Task`'s own
+per-thread pending-signal queue, so there's no truly per-sibling signal queue reachable from
+another thread yet. Delivers via `shared_pending` (process-wide, the same mechanism
+`deliver_to_child`'s process-directed delivery already uses), then interrupts ONLY the intended
+target thread specifically via the new tid-keyed `interrupt_thread`, using the existing
+`threads: BTreeMap<i32, Arc<ThreadRemote<Platform>>>` registry (already present for
+`interrupt_all_threads`). Not perfectly POSIX-accurate (a different unblocked thread could
+theoretically steal the signal first) but correct in the overwhelmingly common real case this
+fixes: the target is the only thread actually blocked waiting on this specific notification. Also
+fixes real-ESRCH-for-genuinely-missing-tid (previously any remote tid was rejected identically
+whether it existed or not).
+**VERIFIED with the fast repro, clean release build, no debug logging needed**:
+```
+CTX_START
+CTX_ABOUT_VERSION_RC=0      <- was: hangs forever (run_exit=124 timeout) before this fix
+CTX_ABOUT_SPAWNED
+```
+**`xfce4-about --version` now exits with code 0 instead of hanging indefinitely — this is the
+exact symptom that gated the entire investigation.** One unrelated, pre-existing issue noted in
+the run tail (not blocking): `org.a11y.Bus` dbus service fails to activate — `Cannot get the
+default GSettingsSchemaSource - is the gsettings-desktop-schemas package installed?` — a missing
+guest package (layer gap, not a litebox bug), affects only accessibility-bus activation. A
+`run_exit=127` on the outer script may be the wait-loop being affected by something separate
+(backgrounding `xfce4-about` without `--version` opens a real window) — flagged for a follow-up
+run, does not affect the confirmed core fix.
+**Next**: commit this fix, then run the full XFCE launch (`run_xfce_xwm.sh`) to confirm it also
+resolves the original `xfwm4`/panel hangs from the very start of the session — the actual standing
+goal.
+
 **In progress in parallel**: advisor-db is running a context test (a GTK binary inside the full
 display stack, expected ~2s reproduction if display-stack context is what triggers this) to give a
 fast verification target for whatever fix lands here.
