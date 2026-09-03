@@ -1033,13 +1033,47 @@ making progress at all, forever, except for its own unrelated heartbeat timer de
 This is the signature of a client **waiting for a reply that never arrives** — most likely a
 protocol response from Xwayland that's owed but never sent.
 
-**Next step, not yet done**: trace the client's last few `diag-unix-stream-write`/
-`diag-unix-stream-read` messages right before it goes silent (~t=25 in the observed runs) to
-identify what protocol exchange was in flight (likely an X11/Wayland request awaiting a specific
-reply). Check Xwayland's own side: did it receive the request but never respond, or never receive
-it at all? This would also explain everything else observed: weston stops flipping because
-nothing changes (no client ever finishes drawing anything), the framebuffer keeps whatever
-content it last had, and no XFCE component ever completes its startup sequence.
+**FOUND — the full coherent picture, likely the actual root cause.** At t=28.03, in one 100ms
+window, everything observed together:
+```
+client creates shared memory handle=592, size=245,760, maps it, VirtualProtects it
+client sends 112 bytes to the compositor (a surface commit)
+weston page-flips fb_id=2, handle=516, size=8,294,400
+that scanout reads nonzero_bytes=0
+```
+`245,760 = 320*192*4` is a small CLIENT SURFACE buffer. `8,294,400 = 1920*1080*4` is the SCANOUT
+buffer. **The client IS allocating a buffer, IS drawing, and IS committing it to the compositor.
+weston IS receiving the commit and IS page-flipping. But the client's surface never appears in
+the scanout, which stays at exactly zero.**
+
+**This makes it a COMPOSITING problem, not memory corruption.** Nothing wipes the scanout buffer
+— weston composites an EMPTY SCENE into it and flips that (correctly, mechanically). This
+retroactively explains every observation this whole investigation collected: no decommit/unmap/
+commit ever touches the scanout (0 overlaps in 19,133 events) because nothing does; the buffer
+ends "strictly emptier than initial state" because weston clears to transparent black (alpha
+included) vs. the dumb-buffer allocation's opaque-black initial state; fb→handle mapping stable
+because it was never the problem; weston stops flipping afterward because an unchanging empty
+scene generates no damage; the client never exits because it's waiting for a frame callback that
+never comes, since its surface isn't being composited.
+
+**Where to investigate now — a genuinely different area from everything dug into so far — why
+weston does not include the client's surface in its scene**, in priority order:
+1. The surface is never "mapped" — the commit arrives but weston doesn't treat it as ready to
+   show (missing/mis-handled `wl_surface.attach`/`commit` sequence, or weston rejects the buffer).
+2. **The shm pool import fails silently on weston's side** — weston has a surface with no usable
+   buffer content. Closest to litebox's own code (weston maps the client's 245,760-byte pool
+   through the shim's shared-memory path) — and this project already found ONE shm bug this
+   session (the memfd mmap-time wipe, already fixed). If weston's mapping of the CLIENT buffer
+   reads as zero, the client draws into one view while weston reads a different one — a real
+   litebox bug, on the client-buffer path instead of the scanout path.
+3. Xwayland's rootful window isn't being given a shell surface role at all, so weston has nothing
+   positioned to draw.
+
+**Cheap decisive test, not yet done — same instrumentation already built, pointed at a different
+handle**: sample the CLIENT's buffer (handle 592, 245,760 bytes) the same way the scanout buffer
+is already sampled. If it's non-zero, the client drew successfully and weston is failing to
+composite it (candidate 1 or 3). If it's zero, the client's own drawing isn't landing at all
+(candidate 2, a shared-memory bug in the client-buffer path).
 
 ## Reproduction commands
 
