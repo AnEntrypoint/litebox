@@ -7130,6 +7130,34 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         fork_verify::end();
     }
 
+    fn lock_fork_verify_heal(&self) -> impl Sized {
+        // Bounded-spin `try_lock`, never an unconditional block -- see `FORK_VERIFY_HEAL_LOCK`'s
+        // own doc comment for why: this can run on the PARENT's thread inside `do_clone`, which
+        // must never risk deadlocking against a healing pass that itself needs to make forward
+        // progress (e.g. a nested fork's own proactive fixup, or this same thread's own re-entry
+        // via a nested fault). A failed acquisition after the bounded spin falls through to the
+        // pre-existing, unserialized behavior (strictly no worse than before this guard existed)
+        // rather than risking an indefinite block.
+        let mut guard = None;
+        let mut spins = 0u32;
+        for _ in 0..1000 {
+            if let Ok(g) = FORK_VERIFY_HEAL_LOCK.try_lock() {
+                guard = Some(g);
+                break;
+            }
+            spins += 1;
+            core::hint::spin_loop();
+        }
+        if std::env::var_os("LITEBOX_DIAG_HEALLOCK").is_some() {
+            eprintln!(
+                "[diag-heallock] tid={:?} spins={spins} acquired={}",
+                std::thread::current().id(),
+                guard.is_some(),
+            );
+        }
+        guard
+    }
+
     fn current_thread_fork_relocations(&self) -> Option<Arc<litebox::mm::AddressRelocations>> {
         let tls = get_tls_ptr()?;
         // SAFETY: `get_tls_ptr` returns this thread's live `TlsState`.

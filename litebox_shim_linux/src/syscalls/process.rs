@@ -2609,12 +2609,34 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     });
                 #[cfg(not(target_arch = "x86_64"))]
                 let child_fs_base_for_stack_scan: Option<usize> = None;
+                // Serialize this proactive scan-and-rewrite pass against every other concurrent
+                // fork-verify healing writer process-wide -- both another concurrently-forking
+                // parent thread's own proactive pass here, and any already-live child's reactive
+                // AV-path/single-step healing (`fork_verify::on_single_step` and friends). See
+                // `ForkChildVerificationProvider::lock_fork_verify_heal`'s doc comment for the
+                // full mechanism: on a platform whose `fork()` shares one real address space
+                // across every guest process (Windows userland), this pass was previously
+                // completely unserialized against those other writers -- a real gap, closed here.
+                //
+                // NOT CONFIRMED to be THE dominant cause of the concurrent-fork "child dies
+                // pre-execve" bug this investigation is chasing: measured directly (30-concurrent-
+                // `/bin/true` oracle, `scratchpad`/session notes), this change alone did not reduce
+                // the fault rate, and `LITEBOX_FORKVERIFY_OFF=1` (fork_verify's reactive healing
+                // fully disabled, this proactive pass still enabled) reproduces the SAME fault rate
+                // as with both enabled -- proving fork_verify's reactive single-step/AV-path
+                // healing is not the dominant contributor to the residual faults either. The
+                // residual corrupting mechanism remains open; see that investigation's notes for
+                // the current state. This lock is kept regardless: it closes a real, independently
+                // worth-fixing unlocked-concurrent-write gap on this pass, even though it is not a
+                // complete fix for the oracle.
+                let _fork_verify_heal_guard = self.global.platform.lock_fork_verify_heal();
                 fixup_stale_stack_pointers::<Platform>(
                     &relocations,
                     child_ctx.rsp,
                     child_fs_base_for_stack_scan,
                 );
                 fixup_stale_elf_data_pointers::<Platform>(&relocations);
+                drop(_fork_verify_heal_guard);
             }
 
             // Diagnostic-only (pass 111, `LITEBOX_DIAG_PROCESS_FORK_SPAWN=1`, off by default): a

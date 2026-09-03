@@ -643,6 +643,36 @@ pub trait ForkChildVerificationProvider {
     /// Stop verifying the current thread's guest execution, if it was being verified.
     fn end_fork_child_verification(&self) {}
 
+    /// Acquires this platform's process-wide fork-verify healing lock (if it has one) for the
+    /// duration of the returned guard, serializing the CALLER against every other concurrent
+    /// fork-verify healing writer -- both this platform's own reactive AV-path/single-step
+    /// healers (see [`begin_fork_child_verification`](Self::begin_fork_child_verification)'s doc
+    /// comment) and the PROACTIVE stale-pointer fixup passes `do_clone` runs on the parent's own
+    /// thread immediately after `PageManager::duplicate` (`fixup_stale_stack_pointers`/
+    /// `fixup_stale_elf_data_pointers` in `litebox_shim_linux::syscalls::process`), before the
+    /// new child's own `begin_fork_child_verification` is even called.
+    ///
+    /// # Why this exists
+    ///
+    /// A platform whose `fork()` emulation gives every guest process the SAME real address space
+    /// (Windows userland's thread-based fork -- see `litebox_platform_windows_userland::
+    /// fork_verify`'s module doc comment) has exactly one real, mutable memory image shared by
+    /// every concurrently-live guest "process". The proactive fixup passes scan and rewrite a
+    /// freshly-`fork()`ed child's own private data ranges on the PARENT's thread, entirely
+    /// unsynchronized with any other concurrently-running fork's own proactive fixup pass or any
+    /// other thread's reactive single-step/AV-path healing -- confirmed live (this investigation)
+    /// to correlate, with a clean monotonic dose-response, concurrent healing-pass overlap with a
+    /// forked child dying pre-`execve()` on a genuinely-unmapped instruction fetch. Wrapping the
+    /// call sites in `do_clone` with this guard, alongside the existing VEH-dispatch-side use in
+    /// `litebox_platform_windows_userland`, closes the gap: no two fork-verify-shaped memory
+    /// writers (proactive or reactive, on any thread) are ever active at the same instant.
+    ///
+    /// A platform with genuine per-guest-process OS-level memory isolation (real Linux/macOS
+    /// `fork()`) has no such shared-image hazard at all -- this whole trait is inert there (every
+    /// member's default implementation is a no-op), so the default guard here is a real,
+    /// zero-cost unit value that acquires and holds nothing.
+    fn lock_fork_verify_heal(&self) -> impl Sized {}
+
     /// Returns the CALLING thread's own currently-active relocation map, if the calling thread
     /// is itself a `fork()` descendant still under verification (i.e. `self` is running on a
     /// thread that was itself a target of a prior [`begin_fork_child_verification`] call whose
