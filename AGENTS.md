@@ -1349,6 +1349,25 @@ operational lessons):
    death of the launcher shell itself (bit-identical registers across runs); a function call
    avoids this shape. advisor is testing this retry now; report pending.
 
+**CORRECTION — item 5 above is WRONG, do not implement it. RETRY MAKES THIS WORSE, NOT BETTER.**
+advisor tested the bounded dbus retry two ways (while-loop body, and a shell function called
+three times) and BOTH kill the launcher shell itself, not just the dbus child:
+```
+attempt 1 (while-loop retry):        dbus child dies (Exception 6, rip=0x7feffff7fb8a),
+                                      then the LAUNCHER SHELL dies at rip=0x7feffff6fb11
+attempt 2 (function called 3x):      identical outcome, same two addresses
+```
+So the trigger is NOT loop-vs-function syntax (that was a reasonable but incorrect earlier
+hypothesis) — it's **retrying a backgrounded spawn at all, after one child has already been
+lost to this bug, that takes down the shell issuing the retry.** Consequence: **single-spawn is
+the only currently-safe pattern.** If dbus is lost to the `#UD`, the correct response is to
+**rerun the whole script, not retry in-script** — an in-script retry converts an intermittent
+*partial* failure (missing panel/settings this run) into a reliable *total* failure (dead
+launcher, nothing comes up at all). **Do not add a dbus retry loop to `run_xfce_staged.sh` or any
+other durable script.** The trampoline `#UD` at `rip=0x7feffff7fb8a` (partially mitigated by
+b4330590, still not fully closed) is now the single remaining bug standing between this session
+and a reproducible complete desktop — worth prioritizing over any further cosmetic script work.
+
 ## Reproduction commands
 
 Full XFCE launch — **use `advisor/probes/run_xfce_staged.sh` as the launch script, NOT any
