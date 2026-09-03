@@ -387,3 +387,13 @@ further value once analyzed).
 - **Periodically (or before ending a long debugging session), run `du -h --max-depth=1 .wfgy`**
   and clean up anything not currently referenced — this is now a known failure mode for this
   project specifically, not a one-off.
+- **`rm -rf` on a directory another process (a running litebox instance, another session) has
+  open fails silently with "Device or resource busy" on Windows, and a subsequent `mv <src>
+  <same-name>` then lands INSIDE the still-existing target instead of replacing it** (confirmed
+  live: a cleanup pass this session moved 4 essential tars into
+  `.wfgy/xfce-build/xfce-build-keep/*.tar` instead of `.wfgy/xfce-build/*.tar`, one level deeper
+  than intended, when the original `xfce-build/` directory couldn't be removed because a
+  concurrent litebox process still had it open). Nothing was lost, but a peer session relying on
+  the expected path got a false "file is gone" read. **After any `rm -rf`/`mv` cleanup pass on a
+  shared directory, verify with `ls`/`find` that the result actually landed where you expect** —
+  don't assume a `mv` to a name that used to be occupied succeeded as a plain rename.
