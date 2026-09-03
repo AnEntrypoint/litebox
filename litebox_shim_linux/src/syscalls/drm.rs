@@ -558,6 +558,14 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
                 // slice, not the address) can invalidate it before the `unmap_shared_memory` call
                 // immediately below.
                 let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, size) };
+                // Log the address this fb is mapped at, so a range destroyed by
+                // allocate_pages (see diag-reclaim) can be matched against it.
+                if drm_trace_enabled() {
+                    litebox_util_log::error!(
+                        fb_id:% = fb_id, addr:% = addr, size:% = size;
+                        "diag-drm-fb-addr"
+                    );
+                }
                 // Sample the SHARED BACKING STORE directly (this mapping was just
                 // established fresh from `handle`, so it is not a stale view). A black
                 // captured frame with non-zero bytes here would mean the capture path is
@@ -566,6 +574,17 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
                 if drm_trace_enabled() {
                     let n = bytes.len();
                     let nz = bytes.iter().filter(|b| **b != 0).count();
+                    // A cheap content fingerprint. If this never changes flip after
+                    // flip, the guest is not drawing into the buffer at all -- which
+                    // would mean the blackout is a compositing problem (no visible
+                    // surface, so a legitimately black frame) rather than memory being
+                    // destroyed. That distinction decides whether this is a litebox bug
+                    // at all, so it is worth measuring before any more memory work.
+                    let mut sum: u64 = 0;
+                    for (i, b) in bytes.iter().enumerate().step_by(4096) {
+                        sum = sum.wrapping_mul(31).wrapping_add((*b as u64) ^ (i as u64));
+                    }
+                    litebox_util_log::error!(fb_id:% = fb_id, digest:% = sum; "diag-drm-digest");
                     litebox_util_log::error!(
                         fb_id:% = fb_id,
                         bytes_len:% = n,
