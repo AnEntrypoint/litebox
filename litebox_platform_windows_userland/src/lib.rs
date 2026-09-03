@@ -6161,6 +6161,42 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 nonzero_in_sample:% = nz;
                 "diag-shm: map_shared_memory OK"
             );
+
+            // Same-instant cross-mapping comparison. Two guest processes each map a
+            // shared pool at different addresses; sampling each only at ITS OWN map
+            // time cannot show whether they see the same bytes, because the samples
+            // are taken at different moments. Keeping every live mapping of a handle
+            // lets us read them ALL right now, so a divergence means the client and
+            // the compositor genuinely disagree about the buffer's contents -- which
+            // would be a litebox shared-mapping bug rather than a compositing one.
+            if nz != usize::MAX {
+                let mut live = ADV_SHM_VIEWS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                live.entry(handle as usize)
+                    .or_insert_with(Vec::new)
+                    .push((view.Value as usize, suggested_range.len()));
+                if let Some(views) = live.get(&(handle as usize))
+                    && views.len() > 1
+                {
+                    let readings: Vec<(usize, usize)> = views
+                        .iter()
+                        .map(|(a, l)| {
+                            let n = core::cmp::min(*l, 4096);
+                            // SAFETY: every address here was returned by MapViewOfFile3
+                            // for this handle and is not unmapped until the guest drops it.
+                            let b = unsafe { core::slice::from_raw_parts(*a as *const u8, n) };
+                            (*a, b.iter().filter(|x| **x != 0).count())
+                        })
+                        .collect();
+                    let distinct: std::collections::BTreeSet<usize> =
+                        readings.iter().map(|(_, n)| *n).collect();
+                    litebox_util_log::error!(
+                        handle:% = handle as usize,
+                        views:? = readings,
+                        agree:? = distinct.len() == 1;
+                        "diag-shm-crossview"
+                    );
+                }
+            }
         }
         Ok(UserMutPtr::from_ptr(view.Value.cast::<u8>()))
     }
@@ -6170,6 +6206,18 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         range: core::ops::Range<usize>,
     ) -> Result<(), SharedMemoryError> {
         debug_assert_alignment!(range, ALIGN);
+        // Drop this view from the cross-view registry BEFORE unmapping it. Without
+        // this, a later same-instant sample would read through an address that no
+        // longer exists and take an access violation -- which is exactly what
+        // happened on the first attempt at this diagnostic.
+        {
+            let mut live = ADV_SHM_VIEWS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for views in live.values_mut() {
+                views.retain(|(addr, _)| *addr != range.start);
+            }
+        }
         // Hold `VIRTUAL_PROTECT_LOCK` across this unmap: without it, this `UnmapViewOfFileEx`
         // call raced `update_permissions`'s own locked `VirtualQuery`-then-`VirtualProtect`
         // sequence on the SAME shared section view -- e.g. a guest process's real munmap()/exit
@@ -6713,6 +6761,11 @@ static STDERR_WRITE_LOCK: Mutex<()> = Mutex::new(());
 /// protecting the SAME shared Windows resource is equivalent to no lock at all between the two
 /// code paths that each hold a different one.
 pub(crate) static VIRTUAL_PROTECT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Every live mapping of each shared-memory handle, so all views of one object can
+/// be sampled at the SAME instant (see `diag-shm-crossview`). Diagnostic only.
+static ADV_SHM_VIEWS: Mutex<std::collections::BTreeMap<usize, Vec<(usize, usize)>>> =
+    Mutex::new(std::collections::BTreeMap::new());
 
 /// Serializes the ENTIRE `fork_verify` healing sequence (every AV-path healer plus
 /// `on_single_step`) across threads process-wide.
