@@ -162,6 +162,18 @@ created and populated a window would be moving pixmap/image data far larger than
 pattern already suggests setup completes but drawing is never reached; the decode should look
 specifically for the LAST successful request and the first thing that stalls or errors.
 
+**PARALLEL HYPOTHESIS, running (advisor-db), tests a different link in the same chain**: does the
+GTK client even believe it has a usable screen/visual to draw into? A GTK app that can't find one
+initializes, sits idle, and draws nothing — with NO error — matching every observation exactly
+(alive, configured, no errors, no windows, no pixels). If true, the X-protocol decode's answer
+(CreateWindow never issued) follows automatically from this upstream cause. Probe: run
+`xfce4-appfinder` with `GTK_DEBUG=all` (logs GTK's own display/visual selection) plus
+`xfce4-display-settings` for a RandR/geometry view, dump both alongside weston's log. **Notable
+gap found along the way**: the guest layer contains **zero X query tools** — no `xdpyinfo`,
+`xrandr`, `xwininfo`, `xprop`, or `xlsclients` — which is why nobody could inspect the X server's
+live state directly all session; `GTK_DEBUG=all` is the workaround, but adding `xdpyinfo` (at
+minimum) to the layer would materially help any future X-related debugging here.
+
 **POSSIBLE GAME-CHANGER, NEEDS IMMEDIATE RE-VERIFICATION: the slow-startup investigation (my
 dispatched agent, `a23992b80c8de9190`) found the layer tar's `weston.ini` had REGRESSED and lost
 the `xwayland=true` fix entirely.** `.wfgy/xfce-build/layer31_direct_fixed.tar`'s baked-in
