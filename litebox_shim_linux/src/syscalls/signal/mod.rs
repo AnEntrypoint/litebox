@@ -24,6 +24,7 @@ use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 #[cfg(target_arch = "x86_64")]
 use litebox::utils::TruncateExt as _;
+use litebox::platform::{Instant as _, TimerHandle as _};
 use litebox::{shim::Exception, sync::Mutex, utils::ReinterpretUnsignedExt as _};
 use litebox_common_linux::signal::{
     MINSIGSTKSZ, NSIG, SI_KERNEL, SI_USER, SIG_DFL, SIG_IGN, SaFlags, SigAction, SigAltStack,
@@ -1077,7 +1078,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .deadline
             .is_some_and(|deadline| self.global.platform.now() >= deadline)
         {
-            alarm.deadline = None;
+            // Periodic `setitimer(ITIMER_REAL, ...)` (nonzero `it_interval`): re-arm for another
+            // `interval` instead of leaving `deadline`/`interval` cleared, exactly matching the
+            // real-platform-timer path in `queue_signals` below -- see `Alarm::interval`'s doc
+            // comment for why this emulation exists (`TimerHandle` has no native repeat concept).
+            alarm.deadline = alarm
+                .interval
+                .and_then(|interval| self.global.platform.now().checked_add(interval));
             self.send_shared_signal(
                 litebox_common_linux::signal::Signal::SIGALRM,
                 siginfo_kill(litebox_common_linux::signal::Signal::SIGALRM),
@@ -1087,11 +1094,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     pub(crate) fn queue_signals(&self, signal: litebox_common_linux::signal::Signal) {
         if signal == litebox_common_linux::signal::Signal::SIGALRM {
-            // The platform timer fired; clear the stored deadline so that a
-            // subsequent `alarm()` call does not see a stale positive remaining
-            // time due to timer imprecision (the timer can fire slightly before
-            // the exact deadline).
-            self.process().alarm_timer.lock().deadline = None;
+            let mut alarm = self.process().alarm_timer.lock();
+            // Periodic `setitimer(ITIMER_REAL, ...)` (nonzero `it_interval`): re-arm the real
+            // platform timer for another `interval` instead of leaving it disarmed, so the next
+            // `SIGALRM` actually arrives -- see `Alarm::interval`'s doc comment. A one-shot
+            // `alarm()`/single-shot `setitimer()` has `interval == None`, matching the previous
+            // behavior exactly (clear the stored deadline so a subsequent `alarm()` call does not
+            // see a stale positive remaining time due to timer imprecision -- the timer can fire
+            // slightly before the exact deadline).
+            match alarm.interval {
+                Some(interval) => {
+                    alarm.deadline = self.global.platform.now().checked_add(interval);
+                    if let Some(handle) = &alarm.handle {
+                        handle.set_timer(interval);
+                    }
+                }
+                None => alarm.deadline = None,
+            }
         }
         self.send_shared_signal(signal, siginfo_kill(signal));
     }

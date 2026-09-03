@@ -21,7 +21,7 @@ use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
 use litebox::sync::Mutex;
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{
-    ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, TimeParam,
+    ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, TimeParam, TimeVal,
     errno::Errno,
 };
 
@@ -285,6 +285,17 @@ pub(crate) struct Alarm<Platform: ShimPlatform> {
     pub(crate) handle: Option<<Platform as litebox::platform::TimerProvider>::TimerHandle>,
     /// The deadline for the alarm.
     pub(crate) deadline: Option<<Platform as litebox::platform::TimeProvider>::Instant>,
+    /// The repeat interval for a periodic `setitimer(ITIMER_REAL, ...)` timer (`it_interval`), or
+    /// `None` for a one-shot `alarm()`/single-shot `setitimer()`. [`TimerHandle`] itself only
+    /// supports a single-shot `set_timer(duration)` (no platform natively re-arms), so a periodic
+    /// timer is emulated by re-arming for another `interval` every time this alarm fires -- see
+    /// the two firing points that read this field, `check_alarm_deadline` (the no-real-timer
+    /// polling fallback) and `queue_signals` (the real-platform-timer SIGALRM-arrived path).
+    /// Real Linux XFCE/GTK apps depend heavily on this: the panel clock, plugin refresh timers,
+    /// cursor blink, and animation loops are all typically periodic `setitimer`s via GLib's main
+    /// loop, and before this field existed every nonzero-`it_interval` `setitimer()` call was
+    /// rejected outright with `ENOSYS`.
+    pub(crate) interval: Option<Duration>,
 }
 
 impl<Platform: ShimPlatform> Alarm<Platform> {
@@ -425,6 +436,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
             alarm_timer: Mutex::new(Alarm {
                 handle: None,
                 deadline: None,
+                interval: None,
             }),
             pm: Mutex::new(pm),
             parent,
@@ -3673,7 +3685,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ///
     /// The alarm is per-process: all threads share the same alarm timer.
     pub(crate) fn sys_alarm(&self, seconds: u32) -> Result<u32, Errno> {
-        let prev = self.arm_real_timer(Duration::from_secs(u64::from(seconds)))?;
+        let (prev, _prev_interval) =
+            self.arm_real_timer(Duration::from_secs(u64::from(seconds)), None)?;
         // Round remaining time up to whole seconds, saturating to u32::MAX.
         if prev.is_zero() {
             Ok(0)
@@ -3686,15 +3699,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Arm or disarm the per-process `ITIMER_REAL` timer. Returns the raw
     /// `Duration` remaining on the previous arming; zero means "was not
     /// armed". `delay = 0` disarms.
-    fn arm_real_timer(&self, delay: Duration) -> Result<Duration, Errno> {
+    ///
+    /// `interval`, if non-`None` and nonzero, makes this a PERIODIC timer (`setitimer`'s
+    /// `it_interval`): [`TimerHandle`] itself only supports a single-shot
+    /// `set_timer(duration)`, so periodicity is emulated by storing `interval` on `Alarm` and
+    /// re-arming for another `interval` every time this alarm actually fires -- see
+    /// `check_alarm_deadline` and `queue_signals`, the two firing points that read it. `alarm()`
+    /// (via `sys_alarm`) always passes `None` here: real Linux's `alarm()` is unconditionally
+    /// one-shot, with no interval concept at all.
+    fn arm_real_timer(
+        &self,
+        delay: Duration,
+        interval: Option<Duration>,
+    ) -> Result<(Duration, Option<Duration>), Errno> {
         let mut alarm = self.process().alarm_timer.lock();
         let now = self.global.platform.now();
-        let prev = alarm.remaining(now);
+        let prev = (alarm.remaining(now), alarm.interval);
         let new_deadline = if delay.is_zero() {
             None
         } else {
             Some(now.checked_add(delay).ok_or(Errno::EINVAL)?)
         };
+        alarm.interval = new_deadline.and(interval.filter(|d| !d.is_zero()));
         if alarm.handle.is_none() {
             match self
                 .global
@@ -3731,15 +3757,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         let prev = match which {
             IntervalTimer::Real => {
-                if new_remaining.is_zero() {
-                    ItimerVal::single_shot(self.arm_real_timer(Duration::ZERO)?)
-                } else if !new_interval.is_zero() {
-                    // TODO: support periodic timers
-                    log_unsupported!("setitimer: nonzero it_interval not supported");
-                    return Err(Errno::ENOSYS);
+                let (prev_remaining, prev_interval) = if new_remaining.is_zero() {
+                    self.arm_real_timer(Duration::ZERO, None)?
                 } else {
-                    ItimerVal::single_shot(self.arm_real_timer(new_remaining)?)
-                }
+                    self.arm_real_timer(new_remaining, Some(new_interval))?
+                };
+                ItimerVal::new(
+                    TimeVal::from(prev_interval.unwrap_or(Duration::ZERO)),
+                    TimeVal::from(prev_remaining),
+                )
             }
             IntervalTimer::Virtual | IntervalTimer::Prof => {
                 log_unsupported!("setitimer: ITIMER_VIRTUAL/PROF not supported");
@@ -3760,19 +3786,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         which: IntervalTimer,
         curr_value: UserPtrMut<ItimerVal>,
     ) -> Result<(), Errno> {
-        let value = match which {
+        let (value, interval) = match which {
             IntervalTimer::Real => {
                 let alarm = self.process().alarm_timer.lock();
                 let now = self.global.platform.now();
-                alarm.remaining(now)
+                (alarm.remaining(now), alarm.interval.unwrap_or(Duration::ZERO))
             }
             IntervalTimer::Virtual | IntervalTimer::Prof => {
                 log_unsupported!("getitimer: ITIMER_VIRTUAL/PROF not supported");
-                Duration::ZERO
+                (Duration::ZERO, Duration::ZERO)
             }
         };
         curr_value
-            .write_at_offset::<Platform>(0, ItimerVal::single_shot(value))
+            .write_at_offset::<Platform>(0, ItimerVal::new(TimeVal::from(interval), TimeVal::from(value)))
             .ok_or(Errno::EFAULT)
     }
 
