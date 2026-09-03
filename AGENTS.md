@@ -72,6 +72,38 @@ repeating timer stops UI updates outright. `membarrier` (8) third.
 rearming; advisor-db — `inotify` (starting with whether a minimal always-empty-but-valid fd
 satisfies dbus, vs. needing real watch semantics).
 
+**`inotify` RESULT: NOT LOAD-BEARING — retracted, do not build it.** advisor-db's empirical-first
+approach (test whether dbus actually degrades before building anything) paid off directly: it
+stopped a fix that would have bought nothing. Committed `36e7cf35`, probe
+`advisor/probes/inotify_probe.sh`, evidence `advisor/probes/inotify-not-load-bearing.txt`. dbus
+works fine without it — `INO_BUS_UP=yes`, `INO_LISTNAMES_RC=0`, `INO_LISTACT_RC=0` (15 activatable
+services enumerated), `INO_STARTSERVICE_RC=0`. dbus's own log settles it end to end:
+```
+dbus-daemon: Cannot initialize inotify: Function not implemented
+dbus-daemon: Activating service name='org.xfce.Xfconf' requested by ':1.2'
+dbus-daemon: Successfully activated service 'org.xfce.Xfconf'
+```
+It complains, then enumerates its service directories by reading them directly and activates on
+demand anyway — `inotify` is only used to notice LATER changes to those directories, and nothing
+in XFCE startup depends on that.
+**Lesson worth keeping broadly: a scary startup log message is not evidence of degradation.**
+`inotify` was ranked second on the strength of the error message appearing at 0.71s under
+everything — wrong. **The census counts already showed the answer and it was misread**: 3 attempts
+in the first 0.71s and never again is the signature of "checked once, gave up, moved on," not of
+something load-bearing — if it mattered, it would have been retried. **Applies to the rest of the
+census too: attempt-count-over-time discriminates cosmetic from load-bearing before any code gets
+written** — worth the same functional test before anyone builds `fstatfs`, `close_range`, or the
+`fcntl` family; none look load-bearing on current evidence.
+**Remaining follow-on priority, revised**: `setitimer` (168 hits, repeating timers) is the ONLY
+gap currently worth doing — stays with `a63e8ca59285f5871`, non-urgent. `membarrier` (8) next
+after that, purely because silent sync failures are expensive to chase (as this whole session just
+demonstrated) — but there's no evidence it's currently biting anything.
+
+**advisor-db's session summary, all committed to `main` as `lanmower`, working tree clean**:
+`69ea9470` (release-build `log_unsupported!` fix + futex owner-decode, wake-census and
+clone-request diagnostics), `d48bb085` (post-fix census, rising-count-as-confirmation technique
+written down), `36e7cf35` (`inotify` retraction). advisor-db is at a good stopping point.
+
 **Historical note, kept for the forensic trail below**: earlier in this session a "MET" claim was
 made and retracted after a flawed pixel-count oracle mistook weston's own built-in panel for
 XFCE's; that retraction was correct at the time. This entry supersedes it with a fix-verified,
