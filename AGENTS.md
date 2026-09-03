@@ -306,6 +306,35 @@ measurement — read the correction at the end of this section before acting on 
   independently, likely starting inside `fork_verify.rs`'s own fault-tolerant-write healing path
   rather than `Vmem::duplicate`.
 
+  **DETERMINISTIC 30-SECOND REPRO FOUND for this #UD (bisected, do not use the full XFCE stack to
+  chase this — use this instead):** the trigger is `set -x` in the launch script, NOT anything
+  about dbus-daemon or XFCE specifically. Bisection: starting from a script where `dbus-daemon`
+  spawns fine (3/3), adding back only `set -x` (no `LD_LIBRARY_PATH`) reproduces the #UD 2/2;
+  adding back only `LD_LIBRARY_PATH` (no `set -x`) stays clean 2/2. `set -x` makes the shell
+  write a trace line to stderr before every command, including right around a backgrounded job's
+  fork — extra `write()` syscalls interleaved with fork, each running through a patched
+  trampoline stub. Working theory: this extra concurrent trampoline traffic during fork is what
+  makes a stub fail to decode. Minimal repro going forward: `set -x` + a single backgrounded
+  command, no XFCE/weston/display stack needed at all.
+
+  **Methodological warning this bisection surfaces**: `set -x` is present in most of this
+  project's own debug/launch scripts written throughout tonight's investigation (including
+  `advisor/probes/run_xfce_staged.sh` and probably `xfce_launch.sh` variants). Some portion of
+  earlier "XFCE is broken" findings in this session's history may be an observer effect — the
+  tracing instrumentation itself crashing the very thing being traced — rather than a genuine
+  XFCE/display-path bug. Treat any earlier finding that used a `set -x`-instrumented script with
+  appropriate skepticism until reproduced without it. **Action taken**: `set -x` should be
+  dropped from launch/debug scripts going forward (replace with explicit `echo` stage markers) —
+  but the #UD itself is still a real, worth-fixing litebox bug now that it has a fast deterministic
+  repro, not something to just work around by removing tracing.
+
+  **Next measurement, given the fault is now reliably reproducible in ~30s**: dump the trampoline
+  stub bytes from BOTH the parent (which survives) and the child (via
+  `LITEBOX_DIAG_FAULT_VQ=1`/its rip==cr2-widened variant) and diff them directly. Differing bytes
+  = fork is corrupting trampoline stubs during copy. Identical bytes = the child jumped into a
+  valid stub at a non-instruction boundary (a different bug class — a jump-target computation
+  issue, not memory corruption).
+
 ## Reproduction commands
 
 Full XFCE launch (once the fork bug above is fixed, use this to verify the standing goal):
