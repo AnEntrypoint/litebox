@@ -104,6 +104,32 @@ demonstrated) — but there's no evidence it's currently biting anything.
 clone-request diagnostics), `d48bb085` (post-fix census, rising-count-as-confirmation technique
 written down), `36e7cf35` (`inotify` retraction). advisor-db is at a good stopping point.
 
+**`setitimer` FIXED AND VERIFIED — closes the last identified gap on top of the already-met
+standing goal.** `a63e8ca59285f5871`, commit `a0689cb6`
+(`litebox_shim_linux/src/syscalls/process.rs` + `signal/mod.rs`). Root cause matched advisor-db's
+census exactly: `sys_setitimer` unconditionally returned `ENOSYS` for any nonzero `it_interval`
+(a repeating timer) — exactly what GLib's main loop uses for the panel clock, plugin refresh,
+cursor blink, and animation timers. **Fix**: `TimerHandle` only supports single-shot
+`set_timer(duration)` (no native repeat), so periodicity is emulated — `Alarm` gained an
+`interval` field, and both `SIGALRM`-firing paths (`queue_signals`, the real-platform-timer path;
+`check_alarm_deadline`, the polling fallback) now re-arm for another `interval` when firing
+instead of leaving the timer disarmed. Also fixed `getitimer`'s `it_interval` field, previously
+always reported as zero regardless of what was actually armed.
+**Verified two ways**: (1) full XFCE launch post-fix shows ZERO occurrences of `"setitimer:
+nonzero it_interval not supported"` anywhere in the trace (previously 168 per advisor-db's
+census) — gap fully closed; (2) no regressions — `xfce4-about` fast repro still exits `rc=0`, full
+XFCE launch still reaches `TEST_DONE` with `run_exit=0`, a decoded frame shows the panel clock
+still live and correctly updating (08:45 PM).
+**Unrelated pre-existing issue noted in passing, NOT fixed (out of scope), flagged for whoever
+picks it up next**: `cargo test -p litebox_shim_linux` currently fails to even compile —
+`epoll.rs`'s `wait` signature has 5 params, several test call sites still pass 3. Confirmed via
+`git stash` that this predates all of tonight's changes. May block CI or another agent's work.
+**All five fix/diag commits from tonight, on `main`**: `f824eb99`, `69ea9470` (advisor-db),
+`dc50f126`, `9504adbe`, `a0689cb6`. **Session complete: standing goal (working XFCE desktop)
+confirmed met, plus the two largest post-fix observability gaps (`setitimer` fixed, `inotify`
+correctly ruled out as non-load-bearing) resolved on top of it.** Both agents at a good stopping
+point.
+
 **Historical note, kept for the forensic trail below**: earlier in this session a "MET" claim was
 made and retracted after a flawed pixel-count oracle mistook weston's own built-in panel for
 XFCE's; that retraction was correct at the time. This entry supersedes it with a fix-verified,
