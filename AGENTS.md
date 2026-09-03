@@ -1216,6 +1216,33 @@ different shell/compositor configuration, or an upstream weston fix) rather than
 change — worth surfacing to the user as a real possible outcome, not assumed to always be
 litebox's fault to fix.
 
+**LIKELY ROOT CAUSE FOUND (web research), cheap to test, try BEFORE any more shared-memory
+forensics: no XWM (X Window Manager) is running.** Our setup launches weston with
+`--shell=desktop-shell.so` and spawns `Xwayland :1 ...` as a bare separate process. Rootful
+Xwayland launched this way needs the launching compositor to also attach an X Window Manager over
+a separate `-wm <fd>` connection — that XWM is what maps an X11 window's Wayland surface into the
+compositor's scene graph on `MapNotify`. weston's `desktop-shell.so` implements `wl_shell`/
+`xdg-shell` roles for NATIVE Wayland clients ONLY — it has no XWM logic. XWM support lives
+exclusively in weston's OWN `xwayland` module (`xwayland.so`), which is loaded via
+`[core] xwayland=true` in `weston.ini` and which spawns AND manages Xwayland itself (including
+the `-wm` fd handshake). By manually spawning `Xwayland` as an unrelated separate process, we
+bypass this entirely: **the client's wl_shm buffer gets written with real content (matches our
+own instrumentation exactly) but the surface never receives a role/gets mapped into weston's
+scene graph, because nothing ever performed the XWM's map-on-MapNotify step.** This is a known,
+documented pattern (Arch Wiki Weston page, weston.ini man page both describe `xwayland=true` as
+the supported mechanism; the separate "Xweston" project exists specifically to swap out
+desktop-shell for an external WM, confirming XWM duties and the shell are coupled, not
+independent).
+**Fix to try next**: stop spawning `Xwayland` manually. Instead set `xwayland=true` under
+`[core]` in a `weston.ini` weston can find, ensure `xwayland.so` is present/loadable in the layer
+tar, let weston launch Xwayland itself, and point clients at the `$DISPLAY` weston exports (rather
+than hardcoding `:1` and manually waiting for `/tmp/.X11-unix/X1`).
+**Cheap diagnostic if the fix doesn't immediately work**: weston's `scene-graph` debug scope
+(`--debug` + `--logger-scopes=scene-graph`, or live via the `weston-debug` protocol client)
+dumps every layer/view/surface + buffer info on demand, without requiring the client to exit —
+this would show directly whether the X11 client's surface has ANY view/layer entry in the scene
+graph at all, confirming or refuting this theory in one shot.
+
 ## Reproduction commands
 
 Full XFCE launch — **use `advisor/probes/run_xfce_staged.sh` as the launch script, NOT any
