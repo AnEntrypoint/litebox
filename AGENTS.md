@@ -92,15 +92,30 @@ independent lines of evidence now converge on the same conclusion:
 **Conclusion: the icon+clock bar is weston-desktop-shell's own UI, not XFCE's, confirmed three
 independent ways — this is solid, not just a timing inference.**
 
-**IMPORTANT — the "missing config" leading cause above is WEAKENED, not confirmed.** The SAME run
-that produced the byte-diff above had advisor-db's minimal `xfce4-panel.xml` (panel with
-applicationsmenu/tasklist/clock) and `xfce4-desktop.xml` (solid backdrop + icons) already
-installed — **and the screen still showed only weston's bar.** Both components are alive, have a
-real configuration now, produce no errors, and still put nothing on screen. **This rules out "no
-config to draw" as the explanation.** The question is now sharper: **why do configured,
-error-free, alive `xfce4-panel`/`xfdesktop` processes produce zero visible output?** advisor-db's
-next direction: check whether their X windows are being mapped at all (rather than continuing to
-look at configuration).
+**"MISSING CONFIG" THEORY: TESTED AND DEAD — do not revisit.** The SAME run that produced the
+byte-diff above had advisor-db's minimal `xfce4-panel.xml`/`xfce4-desktop.xml` already installed
+AND the screen still showed only weston's bar. Direct confirmation the components actually READ
+those configs: querying the live xfconf channels from inside the guest after settle shows
+`xfce4-panel`'s `/panels/panel-1/{length,plugin-ids,position,...}` and `/plugins/plugin-1,-2,-3`,
+and `xfce4-desktop`'s `/backdrop/.../{color-style,image-style,rgba1}` and
+`/desktop-icons/{style,file-icons/...}` — exactly the values shipped. **They know they should have
+three plugins and a backdrop with icons. They still draw nothing.** (Side note: the guest's own
+`$HOME/.../xfce-perchannel-xml/` contains only `displays.xml`/`xfce4-keyboard-shortcuts.xml`/
+`xsettings.xml` — no user copies of panel/desktop — confirming `xfconfd` is correctly serving the
+shipped `/etc/xdg` defaults rather than needing a user override.)
+
+**REAL FAILURE POINT, PRECISELY LOCATED: zero X windows are ever mapped.** weston's XWM is created
+and healthy (`xfixes version: 6.0`, `created wm, root 98`) — but its log reports **NOT ONE managed
+window for the entire run**, no map events, no window events at all, despite `xfwm4`/`xfdesktop`/
+`xfce4-panel` all alive and configured for 30+ seconds afterward. **Everything downstream (no
+surface, no composite, no pixels) follows automatically from this one fact.** This is now squarely
+an X-protocol question, not a memory or compositing one. Two concrete next checks identified: (1)
+confirm the components are actually connected to the right display (`--display=$DISP` resolves to
+`:0`, `xfce4-about` connected successfully earlier, so probably fine but cheap to confirm from
+their own X traffic); (2) decode whether their `CreateWindow`/`MapWindow` requests are being
+issued at all — the raw X protocol traffic is already captured in the unix-stream logs, just needs
+request-level decoding. **In progress**, split to avoid duplication — see who's assigned in the
+git log / cross-session messages around this entry for current ownership.
 
 **STRONG CANDIDATE EXPLANATION FOUND (advisor-db), plausible and cheap to confirm/refute — NOT
 YET ASSERTED, verification pending**: **the layer may simply have no desktop/panel configuration
