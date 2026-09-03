@@ -651,6 +651,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         // TODO: write partial data?
         let len = msg.data.len();
         let sock_id = self as *const _ as usize;
+        // `LITEBOX_DRM_TRACE=1` (reused; same flag already wired end-to-end for DRM tracing, see
+        // `drm::drm_trace_enabled`'s doc comment -- not adding a new env var to avoid touching
+        // the runner's own std-only `env::var_os` call site, which is mid-edit by a peer session
+        // this pass): dump a bounded hex prefix of the bytes actually written to a unix stream.
+        // This is the X11-protocol-decode instrumentation for AGENTS.md's "Rendering/scanout
+        // blocker" investigation -- an X11 request over a unix-domain socket starts with a 1-byte
+        // opcode (CreateWindow=1, MapWindow=8, ConfigureWindow=12, ...). A 32-byte prefix was
+        // tried first and was NOT enough: a `write()` syscall on a busy X11 client socket
+        // typically batches several small requests together (observed live: a single write
+        // covering the whole QueryExtension/CreateGC/GetProperty/... startup sequence), so a
+        // short prefix only ever shows the first one or two requests before running off the end
+        // of the capture window -- exactly the failure mode that made the CreateWindow/MapWindow
+        // question undecidable with 32 bytes. Raised to 4096 (most individual X11 requests,
+        // including a `CreateWindow` with a full property/attribute list, fit well inside this;
+        // only genuinely large payloads like `PutImage`/`ChangeProperty` with big property data
+        // exceed it, which is fine -- those aren't the requests this trace needs to see in full).
+        if crate::syscalls::drm::drm_trace_enabled() {
+            let n = core::cmp::min(msg.data.len(), 4096);
+            litebox_util_log::error!(
+                sock_id:% = sock_id,
+                len:% = len,
+                prefix_hex:? = &msg.data[..n];
+                "diag-unix-stream-write-bytes"
+            );
+        }
         let result = self.connected_send_channel.try_write_one(msg);
         litebox_util_log::error!(
             sock_id:% = sock_id,
@@ -669,10 +694,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
     /// message's remaining bytes).
     fn try_recvfrom(
         &self,
-        mut buf: &mut [u8],
+        buf: &mut [u8],
     ) -> Result<(usize, AnyDupFds<Platform, FS>), TryOpError<Errno>> {
         let mut total_read = 0;
         let mut fds = Vec::new();
+        // `buf` itself is reassigned (advanced) below as bytes are consumed; keep a raw pointer
+        // to the ORIGINAL start so the trace below (added after the loop) can still read from
+        // offset 0 regardless of how many partial reads happened. Only used for the bounded,
+        // env-gated hex-prefix trace -- never for correctness.
+        let buf_start: *const u8 = buf.as_ptr();
+        let mut buf: &mut [u8] = buf;
         while !buf.is_empty() {
             let n = match self.recv_channel.peek_and_consume_one(|msg| {
                 // `Vec::append` empties `msg.fds`, so a later partial read of this same
@@ -700,6 +731,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             };
             total_read += n;
             buf = &mut buf[n..];
+        }
+        // See `try_sendto`'s matching comment: same `LITEBOX_DRM_TRACE=1` reuse, same bounded hex
+        // prefix, this time on bytes actually delivered back to the reading process (an X11
+        // reply/error/event starts with a 1-byte type byte: 0=Error, 1=Reply, 2+=Event).
+        if crate::syscalls::drm::drm_trace_enabled() && total_read > 0 {
+            let n = core::cmp::min(total_read, 4096);
+            // SAFETY: `buf_start` points at the start of the caller-provided buffer, which is
+            // still valid for the duration of this function call; `total_read` (and so `n <=
+            // total_read`) bytes starting there were just written by the loop above.
+            let prefix = unsafe { core::slice::from_raw_parts(buf_start, n) };
+            litebox_util_log::error!(
+                sock_id:% = self as *const _ as usize,
+                total_read:% = total_read,
+                prefix_hex:? = prefix;
+                "diag-unix-stream-read-bytes"
+            );
         }
         litebox_util_log::error!(
             sock_id:% = self as *const _ as usize,
