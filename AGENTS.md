@@ -85,30 +85,27 @@ hypervisor — see `feedback_no_wsl_or_hypervisor` in project memory). **Not yet
    its caller (`guest_mprotect` / `make_pages_*` / `create_mapping` / `fork_duplicate`), so a
    future protection-related crash can be attributed to its actual origin in one log read instead
    of hours of inference. This tooling investment paid for itself directly this session.
+5. **Unlocked-write gap in proactive fork stale-pointer fixup.** The proactive
+   `fixup_stale_stack_pointers`/`fixup_stale_elf_data_pointers` pass (runs on the parent's own
+   thread right after `PageManager::duplicate()`) rewrote a freshly-forked child's memory with no
+   locking at all — not against `fork_verify`'s existing reactive healing lock, nor against a
+   second concurrently-forking parent thread's own proactive pass. Fixed by adding
+   `ForkChildVerificationProvider::lock_fork_verify_heal()` and wrapping both calls with it.
+   Commit `bcc6a3e7`. **Real and worth keeping, but does NOT by itself fix the open blocker
+   below** — direct measurement showed no change in fault rate; see "Open blockers" for the
+   still-open mechanism.
 
 ## Open blockers (the real remaining gap)
 
-**Single highest-priority item: a concurrent-fork_verify-healing-pass race kills forked children
-before they can `execve()`.** This is the one thing standing between the current state and the
-standing goal. Full mechanism, established via careful controlled experimentation (see
-`project_advisor_forked_child_text_not_present` in project memory for the complete forensic
-trail if needed):
+**Single highest-priority item: forked children die (SIGSEGV/SIGILL, `rip==cr2`) before they can
+`execve()`, under concurrent forking only.** This is the one thing standing between the current
+state and the standing goal. **The earlier "MAXCONCURRENT fork_verify healing passes" theory
+below is REFUTED as of the most recent measurement — read the correction at the end of this
+section before acting on the rest.**
 
 - Reproduces on a **bare alpine rootfs with zero display components** — no weston/Xwayland/XFCE
-  needed. A background/concurrent-fork shell pattern alone triggers it.
-- Six-condition controlled comparison gave clean statistical separation: sequential execution or
-  `&` immediately followed by `wait` never crashes; `&` with children that exit almost
-  immediately crashes; `&` with children that stay alive 5-8s with **no exits during the test
-  window** still crashes (ruling out "child exit" as the trigger); a global lock serializing
-  execve's entire address-space transition did **not** reduce fault counts (ruling out execve's
-  own setup as the race site).
-- Best-supported current mechanism: `fixup_stale_elf_data_pointers`'s `healed_count` (inside
-  `fork_verify.rs`'s stale-pointer-healing pass) plateaus at a stable number across
-  clean/sequential runs but grows unbounded under concurrent forking, with a clean dose-response
-  relationship to both concurrency level and fault count. Directly measured: pairing
-  `diag-fv-lifecycle: begin`/`end` log lines to count MAX CONCURRENT healing passes correlates
-  almost perfectly with faults (MAXCONCURRENT==1 → 0/8 clean runs faulted; MAXCONCURRENT>=2 →
-  27/33 runs faulted, scaling with concurrency).
+  needed. A background/concurrent-fork shell pattern alone triggers it. Sequential forking is
+  rock-solid (0 faults across repeated runs); only concurrent forking triggers it.
 - Concretely, this kills `dbus-daemon`'s forked child before it reaches `execve()` in a typical
   XFCE launch, which cascades: no D-Bus session bus → `xfconfd`/`xfsettingsd`/`xfce4-panel` all
   fail with "Connection refused" → `xfce4-session` launches zero children. This is why the
@@ -120,20 +117,46 @@ trail if needed):
   ```
   FAIL case (must go to 0 faults after a real fix):
     i=1; while [ $i -le 30 ]; do /bin/true & i=$((i+1)); done; sleep 2
-    (currently: 3,3,5 "fatal signal" log lines per run)
+    (currently: 3-6 "fatal signal" log lines per run, unchanged by the fix below)
 
   PASS control (must STAY at 0 — don't break this while fixing the above):
     i=1; while [ $i -le 10 ]; do sleep 5 & sleep 0.3; i=$((i+1)); done; sleep 6
-    (currently: 0,0,0)
+    (was 0,0,0; noted as occasionally noisy on a loaded host in the most recent session — treat
+    a single nonzero reading here with suspicion and rerun before trusting it as signal)
   ```
-- Hypothesis, not yet confirmed by a landed fix: `fork_verify`'s relocation/healing state is
-  likely scoped per-address-space (shared across every concurrently-live guest process, since
-  Windows fork emulation gives them all the same real address space) rather than properly
-  per-child, and/or isn't correctly retired when one child's healing completes while another
-  concurrently-forking child's pass is still active.
-
-**A fresh agent is (or was, check its status) actively working this specific bug as of this
-entry** — check for a recent commit before starting from scratch.
+- **A real, genuine locking gap WAS found and fixed** (commit `bcc6a3e7`): the proactive
+  `fixup_stale_stack_pointers`/`fixup_stale_elf_data_pointers` pass
+  (`litebox_shim_linux/src/syscalls/process.rs`'s `do_clone`, runs on the parent's own thread
+  right after `PageManager::duplicate()`) rewrote a freshly-forked child's memory with **zero
+  locking** — not serialized against `fork_verify`'s reactive AV-path/single-step healing lock
+  (`FORK_VERIFY_HEAL_LOCK`, which already existed but was never wired into this path), nor
+  against a second concurrently-forking parent thread's own proactive pass. Fixed by adding
+  `ForkChildVerificationProvider::lock_fork_verify_heal()` and wrapping both proactive fixup
+  calls with it. This is a correct, worthwhile fix on its own merits — but **direct measurement
+  shows it does NOT reduce the fault rate of the bug described here.** Landed and kept regardless.
+- **CORRECTION — the "MAXCONCURRENT fork_verify healing passes" correlation from earlier this
+  session is REFUTED.** Setting `LITEBOX_FORKVERIFY_OFF=1` (disables fork_verify's reactive
+  single-step/AV-path healing entirely, proactive fixup left on) reproduces the SAME fault rate
+  as normal — proving that reactive healing machinery is NOT the dominant contributor to these
+  faults, contrary to the strong-looking dose-response correlation measured earlier (that
+  correlation was real but was not causal, or was confounded by something else that also scales
+  with concurrency). Conversely, disabling the *proactive* fixup pass instead spikes faults to
+  ~31/run (nearly every child) — confirming that pass does real, necessary work and is not itself
+  spurious corruption.
+- **Crash signature re-examined and clarified**: `rip==cr2`, offset `0x1464b`/`0x464b` low bits,
+  confirmed via `objdump` disassembly to be a **real, valid busybox instruction**
+  (`lea 0x148(%rbx),%rax`) at the CORRECT offset relative to the child's own load base — this is
+  not a corrupted/wrong jump target. Windows is genuinely reporting that page as not-present at
+  the moment of the fault. No address-range collisions were found across extensive
+  `fork_duplicate`/`create_mapping`/`guest_mprotect` log cross-referencing between concurrently
+  forking children.
+- **Next concrete step, not yet done**: instrument exactly what real Windows memory state
+  (`VirtualQuery`) the faulting address shows AT THE MOMENT OF THE CRASH, and trace backward from
+  there — this measurement was identified but not reached in the most recent session. Given the
+  page is genuinely not-present per Windows itself (not a permissions issue, not a wrong-target
+  jump), the likely area is whatever commits/reserves the child's memory during
+  `PageManager::duplicate()`/`fork_duplicate` under concurrent execution — check for a race there
+  distinct from the now-fixed proactive-fixup locking gap.
 
 ## Reproduction commands
 
