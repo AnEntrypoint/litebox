@@ -221,3 +221,8 @@ litebox_runner_linux_on_windows_userland/tests/test-bins/*.hooked
 /litebox_frame_dump_*.bmp
 /frame_dump/
 /overlay*/
+
+# Compiled guest probe binaries -- build with the host clang line in each .c file
+/advisor/probes/xwire_probe
+/advisor/probes/bigfork_probe
+/advisor/probes/tramp_fork_probe
