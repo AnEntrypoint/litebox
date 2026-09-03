@@ -71,6 +71,37 @@ bug (layout exists, chose not to render); configs absent confirms the packaging-
 fix is shipping default configs into the layer. My dispatched agent (a63e8ca59285f5871) is
 cross-checking this same question in parallel.
 
+**ATTRIBUTION OF THE TOP BAR TO WESTON (NOT XFCE), CONFIRMED BY BYTE-LEVEL DIFF — directly
+answers a user question challenging the earlier claim, and the challenge was worth raising.**
+advisor-db compared two frames from the SAME run byte-for-byte (not just "same decode verdict"):
+frame 26 (t=43.43, before `xfce4-panel` starts at t=54.38) vs frame 28 (t=103.48, 49s after the
+panel started and fully settled). SHA256 differs — **not** byte-identical — but the actual diff is
+6 changed rows (of 540 sampled) confined to y=12..22, 8 changed columns at x=1874..1881, entirely
+inside the clock cluster (x=1753..1904) already identified earlier. **That's a clock digit
+advancing (a minute ticking over) — nothing else on the entire 1920x1080 screen changed.** Three
+independent lines of evidence now converge on the same conclusion:
+1. **Timing**: the bar is present in the FIRST captured frame (t=6.60), 36s before `xfdesktop`
+   starts (t=43.12) and 48s before `xfce4-panel` starts (t=54.38) — it predates both.
+2. **Direct attribution**: weston loads `/usr/lib/weston/desktop-shell.so` at t=5.76 and execs
+   `/usr/libexec/weston-desktop-shell` at t=6.51, immediately before the bar first appears —
+   weston-desktop-shell draws its own panel with a clock by default; this is standard weston
+   behavior, not anything this project configured.
+3. **The diff itself**: if `xfce4-panel` were the one drawing that bar, its startup would have
+   *created* it: instead the screen already had it, and `xfce4-panel` starting only nudged one
+   clock digit within the existing bar.
+**Conclusion: the icon+clock bar is weston-desktop-shell's own UI, not XFCE's, confirmed three
+independent ways — this is solid, not just a timing inference.**
+
+**IMPORTANT — the "missing config" leading cause above is WEAKENED, not confirmed.** The SAME run
+that produced the byte-diff above had advisor-db's minimal `xfce4-panel.xml` (panel with
+applicationsmenu/tasklist/clock) and `xfce4-desktop.xml` (solid backdrop + icons) already
+installed — **and the screen still showed only weston's bar.** Both components are alive, have a
+real configuration now, produce no errors, and still put nothing on screen. **This rules out "no
+config to draw" as the explanation.** The question is now sharper: **why do configured,
+error-free, alive `xfce4-panel`/`xfdesktop` processes produce zero visible output?** advisor-db's
+next direction: check whether their X windows are being mapped at all (rather than continuing to
+look at configuration).
+
 **STRONG CANDIDATE EXPLANATION FOUND (advisor-db), plausible and cheap to confirm/refute — NOT
 YET ASSERTED, verification pending**: **the layer may simply have no desktop/panel configuration
 to draw.** `/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/` in the layer contains only
