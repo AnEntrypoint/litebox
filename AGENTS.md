@@ -1394,6 +1394,34 @@ unconfounded test of the complete desktop; result pending. The compositing fix a
 verification are unaffected either way: both the isolated repro and the earlier (traced, dbus-
 broken) full-stack run ended on 2,073,597 non-black pixels, and neither depended on dbus.
 
+**IN PROGRESS, LOOKS LIKE THE FIRST FULLY UNCONFOUNDED RUN — NOT YET CONFIRMED CLEAN, result
+pending.** With `set -x` removed AND the XWM fix in place simultaneously (first time both
+conditions held at once):
+```
+DBUS_UP=yes
+XFCONF_PROBE_RC=0        -- xfconf-query reached the daemon, settings available
+XFCE_DISPLAY=:0          -- weston's own Xwayland, discovered not hardcoded
+frames: 19 x 2,073,597, no wipe
+running so far: xfconfd, xfwm4, xfsettingsd, xfdesktop
+```
+Every component that previously failed with "Connection refused" now has a working bus and
+settings daemon — that whole failure class appears gone. **Do not treat this as confirmed
+success yet**: advisor explicitly flagged two other faults in this same run (not dbus-related,
+not yet identified) and will not call the run clean until those are checked. Final frame data and
+surviving-component list pending.
+
+**Durable configuration for `run_xfce_staged.sh`, now believed complete (6 items)**:
+1. `weston.ini`: `[core] xwayland=true`
+2. No manual `Xwayland` launch — weston manages it.
+3. Discover the display weston chooses (currently `:0`) rather than hardcoding.
+4. **No `set -x` anywhere** in the script or anything it sources — explicit `echo` markers at
+   stage boundaries instead. (This one has bitten the project twice now — once in original
+   bisection, once when advisor reintroduced it by copying an old script an hour ago — deserves an
+   explicit check/grep in whatever lands, not just a comment.)
+5. Single dbus spawn, no retry (retry-after-loss kills the launcher shell itself).
+6. Capture backgrounded services' stderr AND print/tee it, so failures never present as silent
+   timeouts.
+
 ## Reproduction commands
 
 Full XFCE launch — **use `advisor/probes/run_xfce_staged.sh` as the launch script, NOT any
