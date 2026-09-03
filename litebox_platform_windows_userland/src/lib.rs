@@ -5913,6 +5913,24 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         range: core::ops::Range<usize>,
     ) -> Result<(), SharedMemoryError> {
         debug_assert_alignment!(range, ALIGN);
+        // Hold `VIRTUAL_PROTECT_LOCK` across this unmap: without it, this `UnmapViewOfFileEx`
+        // call raced `update_permissions`'s own locked `VirtualQuery`-then-`VirtualProtect`
+        // sequence on the SAME shared section view -- e.g. a guest process's real munmap()/exit
+        // teardown of a `VM_SHARED` mapping (see `litebox/src/mm/linux.rs`'s `unmap_shared_memory`
+        // caller) racing a different guest thread's `mprotect()` on that same shared region.
+        // `update_permissions` queries the region as `MEM_COMMIT` and then calls `VirtualProtect`
+        // on it, but between those two steps this unlocked path could free the whole view out
+        // from under it, leaving `VirtualProtect` to observe `MEM_FREE` and fail with a spurious
+        // `ERROR_SUCCESS` last-error -- confirmed live as a real host-process panic
+        // (`process_memory_range_by_regions`'s `assert!(success, ...)`) during an actual XFCE/
+        // Xwayland launch, immediately following a crashing guest process's shared-memory
+        // teardown. `VIRTUAL_PROTECT_LOCK` already unifies every other Windows VAD-tree mutator
+        // in this file (`VirtualProtect`, `VirtualFree`, `VirtualAlloc2` fixed-address paths --
+        // see that constant's own doc comment); this call was the one remaining VAD-tree mutator
+        // outside that unification.
+        let _guard = VIRTUAL_PROTECT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let ok = unsafe {
             UnmapViewOfFileEx(
                 Win32_Memory::MEMORY_MAPPED_VIEW_ADDRESS {
