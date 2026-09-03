@@ -55,7 +55,7 @@ use winit::window::{Window, WindowId};
 /// the Windows window-capture path entirely). BMP (not PNG) because it needs no compression/CRC
 /// library -- a raw `BITMAPFILEHEADER`+`BITMAPINFOHEADER` plus the pixel bytes verbatim (already
 /// `BGRA8`, matching BMP's own native 32bpp row order once rows are flipped bottom-to-top).
-fn dump_frame_diagnostic(frame: &Frame) {
+pub fn dump_frame_diagnostic(frame: &Frame) {
     let width = frame.width as usize;
     let height = frame.height as usize;
     let pitch = frame.pitch as usize;

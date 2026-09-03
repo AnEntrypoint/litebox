@@ -14,7 +14,7 @@ use litebox::{
     fs::{Mode, OFlags, SeekWhence},
     mm::linux::PAGE_SIZE,
     path::{self, Arg as _},
-    platform::{Instant as _, StdioStream, TimeProvider},
+    platform::{Instant as _, RawConstPointer as _, RawMutPointer as _, StdioStream, TimeProvider},
     sync::RawSyncPrimitivesProvider,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
@@ -835,17 +835,104 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let files = self.files.borrow();
         let status = files.fs.fd_file_status(fd).map_err(Errno::from)?;
         let key = (status.node_info.dev, status.node_info.ino);
+        drop(files);
         let page_aligned_size = length.next_multiple_of(PAGE_SIZE).max(PAGE_SIZE);
+
+        // A Windows file mapping's size is fixed at creation (see `create_shared_memory`'s own
+        // doc comment), so growing/shrinking a memfd genuinely requires a new handle -- but a
+        // resize must not silently orphan whatever any existing mapper (the guest's own earlier
+        // mapping, or a peer's, e.g. the compositor already holding the client's previous-size
+        // `wl_shm` pool mapped) already wrote there. `libwayland-cursor`'s own pool-growth path
+        // (`shm_pool_resize`: `ftruncate` then re-`mmap`) is exactly this pattern live. Copy the
+        // OLD handle's real, live content into the new one before swapping the registry entry,
+        // via the same private-transient-mapping trick `try_memfd_mmap` already uses -- copying
+        // from the shared object itself, never from the (possibly stale) in-mem `Vec<u8>`.
+        let old_entry = {
+            let memfds = self.global.memfds.lock();
+            memfds.get(&key).map(|e| (e.handle, e.size, e.mapped))
+        };
+        let old_was_mapped = old_entry.map(|(_, _, mapped)| mapped).unwrap_or(false);
+        let old_entry = old_entry.map(|(handle, size, _)| (handle, size));
+        let mut carry_bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        if let Some((old_handle, old_size)) = old_entry
+            && let Some(old_len) =
+                litebox::mm::linux::NonZeroPageSize::new(old_size.next_multiple_of(PAGE_SIZE).max(PAGE_SIZE))
+        {
+            // SAFETY: a fresh, private, non-fixed, read-only-intent mapping of `old_handle` --
+            // no guest code has ever observed this address; read and unmap immediately.
+            if let Ok(ptr) = unsafe {
+                self.process().pm().map_existing_shared_pages(
+                    None,
+                    old_len,
+                    litebox::mm::linux::CreatePagesFlags::empty(),
+                    old_handle,
+                )
+            } {
+                let readable_len = old_size.min(old_len.as_usize());
+                let mut buf = alloc::vec![0u8; readable_len];
+                for (offset, slot) in buf.iter_mut().enumerate() {
+                    if let Some(v) = ptr.read_at_offset(isize::try_from(offset).unwrap_or(0)) {
+                        *slot = v;
+                    }
+                }
+                carry_bytes = buf;
+                let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
+                let _ = litebox_common_linux::mm::sys_munmap(
+                    &self.process().pm(),
+                    user_ptr,
+                    old_len.as_usize(),
+                );
+            }
+        }
+
         let handle = self
             .global
             .platform
             .create_shared_memory(page_aligned_size)
             .map_err(|_| Errno::ENOMEM)?;
+        if !carry_bytes.is_empty()
+            && let Some(new_len) = litebox::mm::linux::NonZeroPageSize::new(page_aligned_size)
+        {
+            // SAFETY: same transient-private-mapping pattern as the read above, on the freshly
+            // created (so definitely unobserved) `handle`.
+            if let Ok(ptr) = unsafe {
+                self.process().pm().map_existing_shared_pages(
+                    None,
+                    new_len,
+                    litebox::mm::linux::CreatePagesFlags::empty(),
+                    handle,
+                )
+            } {
+                let copy_len = carry_bytes.len().min(page_aligned_size);
+                let _ = ptr.write_slice_at_offset(0, &carry_bytes[..copy_len]);
+                let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
+                let _ = litebox_common_linux::mm::sys_munmap(
+                    &self.process().pm(),
+                    user_ptr,
+                    page_aligned_size,
+                );
+            }
+        }
         self.global.memfds.lock().insert(
             key,
             super::mm::MemfdEntry {
                 handle,
                 size: length,
+                // Carry `old_was_mapped` forward, NOT unconditionally `false` (a real gap in an
+                // earlier version of this fix, caught in review): once ANY second party has ever
+                // `mmap`'d this memfd, the shared object may hold writes that never went through
+                // this fd's own `write()`/`pwrite()` (the compositor drawing directly into a
+                // `wl_shm` pool it mapped itself is exactly this) -- the in-mem file's `Vec<u8>`
+                // does not and cannot reflect those, so it must never again be allowed to
+                // overwrite the shared object once that has happened, resize or not. The
+                // `carry_bytes` copy above already preserved that content into the new handle;
+                // marking the new entry `mapped: true` here (when `old_was_mapped`) is what keeps
+                // it preserved through the FIRST mmap after this resize too. Only when the old
+                // entry was NEVER mapped by more than this fd's own writer (`old_was_mapped ==
+                // false`, e.g. a fresh memfd's very first `ftruncate`) does `mapped: false` remain
+                // correct/needed, so the eventual first `mmap` still runs the ordinary
+                // `write()`-then-`mmap()` sync path once.
+                mapped: old_was_mapped,
             },
         );
         Ok(())

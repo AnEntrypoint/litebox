@@ -33,6 +33,19 @@ pub(crate) struct MemfdEntry<Platform: PageManagementProvider<{ litebox::mm::lin
     /// resolves against `size.next_multiple_of(PAGE_SIZE)`, matching `create_shared_memory`'s own
     /// page-rounding).
     pub(crate) size: usize,
+    /// Whether `handle` has already been `mmap`'d by anyone since it was (re)created. The
+    /// backing in-mem file's `Vec<u8>` is only ever written by `write()`/`pwrite()`, never by a
+    /// peer's `mmap`'d writes -- so once a SECOND process (or the same process a second time,
+    /// e.g. the compositor mapping a `wl_shm` pool the client already drew into through its own
+    /// mapping) maps this handle, the `Vec<u8>` is stale and must NOT be re-copied over the
+    /// shared object, or every write anyone has made through their own mapping is silently
+    /// wiped back to whatever the guest last `write()`'d (usually zeros, since real Wayland/X11
+    /// shm clients draw exclusively through their mapping and never call `write()` at all).
+    /// Confirmed live: this is why every dumped frame ever captured under `--gui` showed only
+    /// weston-desktop-shell's own repainted-every-second clock widget and nothing else -- every
+    /// surface that painted once and then waited for damage got mmap-wiped back to black the
+    /// moment the compositor mapped the client's pool.
+    pub(crate) mapped: bool,
 }
 pub(crate) type MemfdRegistry<Platform> = BTreeMap<(usize, usize), MemfdEntry<Platform>>;
 
@@ -449,8 +462,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_| None)
             .ok()
             .flatten()?;
-        let memfds = self.global.memfds.lock();
-        let entry = memfds.get(&key)?;
+        let mut memfds = self.global.memfds.lock();
+        let entry = memfds.get_mut(&key)?;
         // A memfd's backing shared-memory object is exactly `entry.size` bytes (the last
         // `ftruncate`'d size, rounded up to a whole page by `create_shared_memory` itself); a
         // client mapping a stale offset/length past that (e.g. before ever calling `ftruncate`,
@@ -460,6 +473,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Some(Err(MappingError::UnAligned));
         }
         let handle = entry.handle;
+        // See `MemfdEntry::mapped`'s own doc comment: only the FIRST `mmap` of a given handle
+        // may sync the in-mem `Vec<u8>` into the shared object -- every mmap after that must
+        // leave the shared object's own live contents alone, or a second mapper (typically the
+        // compositor, mapping a `wl_shm` pool the client already drew into through its own
+        // mapping) wipes everything the first mapper wrote.
+        let already_mapped = entry.mapped;
+        entry.mapped = true;
         drop(memfds);
         drop(files);
         // Sync in whatever bytes the guest already wrote via ordinary `write()`/`pwrite()` calls
@@ -468,8 +488,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // the compositor -- `mmap()`s the same fd to read it, see this function's own doc comment
         // for why an ordinary in-mem file can't support `MAP_SHARED|PROT_WRITE` directly). A
         // transient, private, exclusively-owned mapping the caller never observes -- copies bytes
-        // in and unmaps immediately, before returning the REAL mapping requested below.
-        if let Some(sync_len) = litebox::mm::linux::NonZeroPageSize::new(aligned_len) {
+        // in and unmaps immediately, before returning the REAL mapping requested below. Skipped
+        // entirely once `already_mapped`, since the shared object is now the sole source of
+        // truth and re-syncing from the (now-stale) `Vec<u8>` would destroy live content.
+        if !already_mapped
+            && let Some(sync_len) = litebox::mm::linux::NonZeroPageSize::new(aligned_len)
+        {
             // SAFETY: a fresh, private, non-fixed mapping of `handle` -- no guest code has ever
             // observed this address, so writing into it and unmapping it immediately after is
             // sound; `handle` itself outlives this transient mapping (owned by `memfds`).

@@ -414,17 +414,45 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         })
             .expect("failed to spawn GUI presenter thread");
         if let Ok(sender) = sender_rx.recv() {
+            let dump_frames = std::env::var_os("LITEBOX_DUMP_FRAMES").is_some();
             shim.set_drm_flip_callback(move |bytes, width, height, pitch, _pixel_format| {
-                sender.send(litebox_platform_windows_userland::presentation::Frame {
+                let frame = litebox_platform_windows_userland::presentation::Frame {
                     width,
                     height,
                     pitch,
                     bytes: bytes.to_vec(),
-                });
+                };
+                // Dump BEFORE handing `frame` to the presenter's channel (which takes ownership),
+                // so `LITEBOX_DUMP_FRAMES` observes every real page-flip even if the presenter
+                // thread itself is stuck/slow/never got past `resumed()` -- confirmed live this
+                // session as a real, frequent failure mode independent of this fix, not
+                // hypothetical (see AGENTS.md's own `--gui` presenter-race entries).
+                if dump_frames {
+                    litebox_platform_windows_userland::presentation::dump_frame_diagnostic(&frame);
+                }
+                sender.send(frame);
             });
         }
         handle
     });
+    // Headless (`--gui` omitted) verification path: `LITEBOX_DUMP_FRAMES` must not require a
+    // working host window/wgpu presenter at all -- the presenter thread is a genuinely separate,
+    // independently flaky subsystem (real Win32 window + wgpu device/surface setup racing guest
+    // DRM startup, see the `--gui` doc comments above), and tying frame verification to it means
+    // a presenter hang silently blocks every other diagnostic too. When `--gui` was NOT
+    // requested, register the SAME dump-only callback directly (no `Presenter`, no window, no
+    // wgpu) so a headless run still writes numbered `.bmp` frames whenever real page-flips occur.
+    if gui_presenter_thread.is_none() && std::env::var_os("LITEBOX_DUMP_FRAMES").is_some() {
+        shim.set_drm_flip_callback(move |bytes, width, height, pitch, _pixel_format| {
+            let frame = litebox_platform_windows_userland::presentation::Frame {
+                width,
+                height,
+                pitch,
+                bytes: bytes.to_vec(),
+            };
+            litebox_platform_windows_userland::presentation::dump_frame_diagnostic(&frame);
+        });
+    }
 
     // Spawn a background worker that drives real network I/O (via the in-process userspace NAT
     // gateway, see `litebox_platform_windows_userland::net`) so guest sockets can actually reach
