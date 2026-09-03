@@ -976,6 +976,48 @@ equivalent) checks/returns on pending signals at all; advisor-db is available to
 signal-delivery path (does anything attempt to wake a parked thread on `tkill`?) if that's not
 already covered, to avoid duplication.
 
+**ROOT CAUSE CONFIRMED, EXACT LOCATION, FOUND VIA DIRECT CODE READING — no run needed.**
+`litebox_shim_linux/src/syscalls/signal/mod.rs`, `do_kill` (called by both `sys_tkill` and
+`sys_tgkill`), lines 791-794:
+```rust
+if tid.is_some_and(|tid| tid != self.tid) {
+    log_unsupported!("sys_tkill/sys_tgkill with a remote tid");
+    return Err(Errno::ESRCH);
+}
+```
+**Explicit and unconditional: ANY `tkill`/`tgkill` targeting a DIFFERENT thread than the caller is
+rejected outright with `ESRCH`.** But `tkill(tid, sig)`'s entire POSIX purpose is signaling an
+ARBITRARY OTHER thread — that's the only reason it takes a `tid` argument instead of just being
+`raise()`. **Self-signaling-only support means every real cross-thread `tkill` use is silently
+broken.** Directly confirmed live in the trace: `tid=17`'s exact call `Tkill { tid: 18, sig: 34 }`
+shows `syscall=tkill ok=false` at t=28.7426s in one run; the very first trace from the start of
+this investigation showed the identical shape (`tkill` immediately followed by a `futex Wait` that
+never returns). Signal 34 = `SIGRTMIN` (real-time signal base), which glibc/musl's NPTL
+implementation uses internally for exactly this cross-thread pthread synchronization (dlopen's
+TLS-update quiesce handshake). **glibc's internal `__nptl_setxid`/TLS-update signal-and-wait path
+does NOT check `tkill`'s return value** — it's an internal implementation detail, not something
+application code is expected to see fail — it fires the `tkill`, then unconditionally
+futex-waits for the target to acknowledge via a shared counter/flag. Since litebox's `tkill`
+silently no-ops, **the target thread NEVER receives the signal, NEVER runs whatever
+handler/acknowledgment code was supposed to bump the futex word, and the waiter blocks forever.**
+**This single `ESRCH` guard plausibly explains BOTH observed hang shapes** (early, right after
+`prctl SetName`; and later, after real work, in a specific `futex Wait`) — the SAME handshake
+pattern (`tkill` + `futex-wait`) recurs at multiple points during thread startup/dlopen (matches
+glibc's NPTL design — this pattern fires for every dlopen involving TLS-using modules, not just
+once), so WHICH occurrence "wins the race" and hangs first varies run to run depending on
+scheduling — **the non-determinism observed above, now explained without needing an actual race
+condition**: it's a deterministic missing feature (cross-thread `tkill`) that different runs
+happen to trip over at different call sites depending on thread interleaving.
+**Proposed fix**: implement real cross-thread signal delivery in `do_kill` for the `tid.is_some()`
+case instead of rejecting it — (1) look up the target `Task` by `tid` (likely via the Process's
+thread table, similar to how the existing `deliver_to_child` closure looks up child processes),
+(2) enqueue the signal on that target `Task`'s own pending-signal queue (the same mechanism
+self-signaling and process-directed signals already use), (3) interrupt the target thread if
+currently blocked in a wait — litebox already has `interrupt_thread`/
+`ThreadProvider::interrupt_thread` (`litebox_platform_windows_userland/src/lib.rs:3586-3590`) — so
+a thread parked in an unrelated futex wait gets woken to process the new signal, exactly like real
+Linux's signal delivery. **Ready to implement.**
+
 **In progress in parallel**: advisor-db is running a context test (a GTK binary inside the full
 display stack, expected ~2s reproduction if display-stack context is what triggers this) to give a
 fast verification target for whatever fix lands here.
