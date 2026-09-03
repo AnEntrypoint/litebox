@@ -922,10 +922,46 @@ them:
 This refutes the round-trip-amplification theory: if thousands of round-trips each cost ms
 instead of µs, spacing would be roughly even throughout, not fast bursts separated by
 multi-second silence. **The process is genuinely blocking on something** (a wait/poll/timeout, a
-lock, a resource) during these gaps, not doing slow-but-steady protocol work. **Not yet
-instrumented**: `sys_ppoll`/`sys_poll`/timeout-syscall logging (requested timeout value vs. actual
-wall-clock duration) would directly show whether this is a real wait honoring a correct-but-large
-timeout, a timer running at the wrong speed, or blocking on something else the client depends on.
+lock, a resource) during these gaps, not doing slow-but-steady protocol work.
+
+**CONFIRMED FROM TWO INDEPENDENT ANGLES: the stall is a GLOBAL FREEZE, not the X client blocking
+on something specific.** advisor-db checked the ENTIRE log (all processes, all subsystems) for
+gaps and found the same multi-second dead windows with NOTHING logged by ANY process —
+weston, Xwayland, the shell, no memory ops, no fork activity, all silent simultaneously
+(`t=3.71` gap 4.23s, `t=8.54` gap 1.08s, `t=10.28` gap 6.81s, `t=21.31` gap 5.16s — 17.3s of dead
+time in a 98s run). Independently, this session's own `sys_ppoll`-scoped debug capture confirms
+it from a different subsystem: Xwayland's own event loop (`tid=12`, which normally spins at
+~5-7ms poll intervals continuously) ALSO goes completely silent for the exact same window
+(t≈29.44 to t=39.36 in that run) — Xwayland is not doing anything either, not just the client.
+**A single guest thread waiting on a timer would not silence weston, Xwayland, and the shell all
+at once — every guest thread stops together.**
+
+**Leading theory: lock contention, likely `VIRTUAL_PROTECT_LOCK`/`ALLOCATE_PAGES_FIXED_ADDR_LOCK`
+(the same lock, two names) held across a large `fork_duplicate` copy.** This session already
+landed a fix (`984927b0`) making `unmap_shared_memory` take this same shared lock, and it's
+already known to be shared across allocate/deallocate/protect paths. If `PageManager::duplicate()`
+holds this lock for the DURATION of copying a large region (confirmed elsewhere in this
+investigation: `fork_duplicate` copies up to 110,206,976 bytes, and 197 `fork_duplicate`
+operations were observed inside one single 450ms window), every OTHER guest thread that touches
+memory during that copy blocks behind it — producing exactly the observed "everything freezes at
+once" signature. Fits the earlier (now-recontextualized) dose-response finding: more concurrent
+forking correlates with more/longer freezes.
+
+**CAUTION before acting on this**: a harness's own `sleep 0.5` polling loop in a launch script
+produces regular ~0.5s "gaps" that are NOT real stalls — exclude those; only the irregular
+multi-second gaps are the real signal. Also: **host memory pressure is a live, real confound
+right now** (multiple concurrent sessions/agents running heavy launches) — before concluding this
+is a genuine litebox lock-contention bug, re-run the fast repro with real memory headroom and
+check whether the stalls shrink or vanish, to separate "real litebox bug" from "tonight's
+memory-pressure-induced host scheduling noise." This distinction should be settled BEFORE
+changing any locking code.
+
+**Not yet done**: (1) the memory-headroom control re-run described above; (2) if stalls persist
+with headroom, correlate stall windows directly against large `fork_duplicate` copy timing/
+duration to confirm the lock-holding theory; (3) if confirmed, the fix would need to either
+narrow the lock's scope so one large copy doesn't block unrelated concurrent guest threads, or
+have `fork_duplicate` periodically yield/release the lock during a large copy rather than holding
+it for the whole operation.
 
 ## Reproduction commands
 
