@@ -37,5 +37,13 @@ i=0; while [ "$i" -lt 20 ]; do i=$((i+1)); sleep 0.5; done
 echo "=== BEGIN weston.out ==="
 cat /tmp/weston.out 2>/dev/null | tail -60 || echo "(none)"
 echo "=== END weston.out ==="
+# Redirected-service output is otherwise invisible to the main log: a fast fatal
+# error here (e.g. a bad CLI arg) prints ONLY into the redirect file, and the
+# readiness-wait loops above just look like an ordinary timeout with no
+# indication why (confirmed live this session with a weston arg typo). Always
+# surface it, unconditionally, not just on a detected timeout.
+echo "=== BEGIN xc.out ==="
+cat /tmp/xc.out 2>/dev/null || echo "(none)"
+echo "=== END xc.out ==="
 i=0; while [ "$i" -lt 40 ]; do i=$((i+1)); sleep 0.5; done
 echo XC_DONE

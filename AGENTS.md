@@ -1170,6 +1170,19 @@ time.** `advisor/probes/run_xfce_staged.sh` and this session's own probes (`fast
 xfsettingsd/xfdesktop/xfce4-panel this same way — treat as a liability, not a feature, and fix
 before further debugging sessions burn time on phantom "timeouts."
 
+**AUDITED AND FIXED (this pass) for every probe script that has real source on disk**:
+`run_xfce_staged.sh` (added `xfconfd.out` to the existing unconditional end-of-run `cat` loop --
+every other redirected service there was already covered), `scanout_wipe_repro.sh` (now
+unconditionally `cat`s `xc.out`, the client's own output, alongside the already-fixed
+`weston.out`), and `scanout_wipe_discriminator.sh` (previously had NO file redirects at all for
+seatd/weston/Xwayland — fine for visibility but meant nothing to `cat` on a hang either; now
+redirects all of them plus every client (`xc1`-`xc4`) to files and unconditionally `cat`s all
+seven at the end). **`fast_repro.sh` could NOT be fixed the same way** — it exists only packed
+inside `.wfgy/xfce-build/layer31_direct_fixed.tar` (confirmed via `tar tf`), with no source file
+anywhere in this repo; whoever packed it did so ad hoc. If it's still in active use, extract it
+from the tar, apply the same unconditional-`cat`-at-end fix, and repack — or replace it with
+`run_xfce_staged.sh`/`scanout_wipe_repro.sh`, which are equivalent and now fixed.
+
 With the weston-arg typo fixed, weston's own log confirms the DRM/wgpu emulation path is fully
 healthy — no errors/warnings anywhere in weston's own startup: `weston 14.0.2`, OS reports as
 `LiteBox, 5.11.0, x86_64`, `drm-backend` loads, libseat/seatd session granted, `/dev/dri/card0`

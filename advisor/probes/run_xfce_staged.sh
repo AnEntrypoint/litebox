@@ -111,7 +111,7 @@ xfce4-panel --display=:1 > /tmp/panel.out 2>&1 &
 i=0; while [ "$i" -lt 24 ]; do i=$((i+1)); sleep 0.5; done
 echo PANEL_WAITED
 
-for f in xfwm4 xfsettingsd xfdesktop panel; do
+for f in xfconfd xfwm4 xfsettingsd xfdesktop panel; do
   echo "=== BEGIN $f.out ==="
   cat /tmp/$f.out 2>/dev/null || echo "(none)"
   echo "=== END $f.out ==="
