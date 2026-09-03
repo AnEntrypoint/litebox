@@ -575,26 +575,33 @@ never destroyed, never re-created; no DRM ioctl in the wipe window (197 of 205 o
 own fork is innocent** (the wipe happens during Xwayland forking `xkbcomp`, a COMPLETELY
 DIFFERENT process from the one owning the mapping).
 
-**CHECKED AND REFUTED (`advisor/probes/correlate_scanout_wipe.py`, commit `dcae67c8`): the
-memory-destruction theory is dead.** Direct address-range overlap test between every logged
-reclaim/decommit event (19,133 in one run) and each framebuffer's actual mapped address:
-```
-fb_id=1 mapped 0x76840000-0x77029000, wipe window t=8.52..23.61  -> ZERO overlapping destroys
-fb_id=2 mapped 0x104360000-0x104b49000, wipe window t=23.01..24.04 -> ZERO overlapping destroys
-```
-**Nothing decommits or unmaps the scanout buffers.** Do NOT re-investigate `VirtualFree`/
-`MEM_DECOMMIT`/reclaim paths for this bug — that whole line of investigation (this section's
-earlier framing) is closed. Also refuted en route: an apparent fb-id-to-handle "recycling"
-pattern (fb=2 seemingly moving between several handles) was a log-pairing artifact; matching by
-ADDRESS instead shows the mapping is completely stable (`fb_id=1`→handle 508 set once at t=7.55,
-`fb_id=2`→handle 512 set once at t=6.74, neither ever changes).
+**MEASUREMENT RETRACTED (methodological flaw, caught and reported honestly by advisor-db) — the
+reclaim/decommit path is STILL OPEN, do not treat it as ruled out.** The original overlap test
+(`advisor/probes/correlate_scanout_wipe.py`, commit `dcae67c8`) correlated destroy ranges against
+the address where the CAPTURE mapped the buffer — but `notify_flip_callback` calls
+`map_shared_memory` FRESH on every flip, reads, and unmaps immediately, so that mapping exists
+for microseconds. Finding nothing destroys THAT is nearly tautological; it never tested weston's
+own actual, long-lived mapping. Tell in the data: `fb_id=1` was logged at four DIFFERENT
+addresses across different flips (`1620770816`, `2126577664`, `4470276096`, `743571456`) — a
+stable framebuffer does not move; those were all transient capture mappings, not weston's real
+one. **weston's actual persistent mapping address was never logged and the correct overlap test
+has not been run.**
 
-**What survives measurement, the honest state of the defect**: same two shared objects (508,
-512) for the whole run, created once, never destroyed. VMA correctly shared (`flags=123`,
-`has_handle=true`). fb→handle mapping stable. NO destroy event touches either buffer. weston
-(pid 13) and weston-desktop-shell (pid 15) both alive to the end, zero exits. The system stays
-busy afterward (7,297 socket ops after t=25). **And yet contents still go from 6,221,880
-non-zero bytes to EXACTLY zero.** Every mechanism that could destroy the memory is now excluded.
+**Fix for the test, not yet done**: log the address the GUEST (weston) gets back from
+`map_existing_shared_pages` inside `try_dri_dumb_buffer_mmap`
+(`litebox_shim_linux/src/syscalls/mm.rs`, ~line 646) — that's weston's real persistent mapping.
+Feed THAT into the same overlap check against `diag-reclaim`/`diag-decommit` (same `addr=`/
+`size=` field names, the existing correlator needs no changes). Until this runs, the reclaim path
+is an open suspect, not a closed one.
+
+**What still stands, unaffected by the retraction above**: same two shared objects (508, 512) for
+the whole run, created once, never destroyed (no `DestroyDumb`/`RmFB`); VMA correctly shared
+(`flags=123`, `has_handle=true`); fb→handle mapping stable (`fb_id=1`→handle 508 set once at
+t=7.55, `fb_id=2`→handle 512 set once at t=6.74, neither ever changes, verified by address
+matching); weston (pid 13) and weston-desktop-shell (pid 15) both alive to the end, zero exits;
+system stays busy afterward (7,297 socket ops after t=25). **And yet contents still go from
+6,221,880 non-zero bytes to EXACTLY zero.** Whether an explicit destroy/decommit call is
+responsible is UNRESOLVED (see retraction above) — not excluded, not confirmed.
 
 **"Not a memory bug" REFRAMING ABOVE IS ITSELF REFUTED — confirmed genuine memory bug, decisive
 detail found.** Per-flip content digest + non-zero byte count (commit `71cd2ee8`):
