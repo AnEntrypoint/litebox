@@ -162,6 +162,33 @@ created and populated a window would be moving pixmap/image data far larger than
 pattern already suggests setup completes but drawing is never reached; the decode should look
 specifically for the LAST successful request and the first thing that stalls or errors.
 
+**POSSIBLE GAME-CHANGER, NEEDS IMMEDIATE RE-VERIFICATION: the slow-startup investigation (my
+dispatched agent, `a23992b80c8de9190`) found the layer tar's `weston.ini` had REGRESSED and lost
+the `xwayland=true` fix entirely.** `.wfgy/xfce-build/layer31_direct_fixed.tar`'s baked-in
+`weston.ini` no longer had `xwayland=true` — meaning **Xwayland was never actually starting** in
+whatever runs used this tar copy, and every "60-98s startup" measurement from earlier passes was
+just a shell poll loop burning its full timeout waiting for an X11 socket that could never appear.
+Fixed (restored `xwayland=true`, old version kept as `.bak_no_xwayland_fix`): X11 socket now ready
+on the first 0.2s poll, `xfce4-about --version` exits cleanly `rc=0` in ~17s total instead of never
+exiting in 85-98s. **This directly threatens the "zero mapped windows" chain of investigation
+above (dual-WM test, missing-config test, the X-protocol decode) — if THOSE runs also used a copy
+of this same regressed tar, Xwayland may not have been running at all during them, which would
+trivially explain zero mapped windows without needing any X-protocol bug.** advisor-db's zero-
+managed-windows finding explicitly showed weston's XWM log lines (`xfixes version 6.0`, `created
+wm, root 98`), which only happen if Xwayland DID start — so advisor-db's specific runs are likely
+unaffected by this particular regression. But **anyone re-running or re-verifying anything above
+should first confirm their own layer tar actually has `xwayland=true` in its baked-in `weston.ini`
+before trusting any result**, since this tar can silently regress (it's a gitignored artifact, not
+tracked, and has apparently reverted at least once already this session).
+Also fixed by the same agent, both real: `import_writable_layer` panicked with
+`PathError(MissingComponent)` on tar entries whose parent dirs weren't separate members — now
+creates parent dirs on the fly; the leading-slash `load_program(...).unwrap()` bug from pass 336
+now prints the actual error and exits cleanly instead of stack-overflowing (verified:
+`/bin/does_not_exist` → clean `ENOENT` message); ~11,000 unconditional `error!`-level diagnostic
+log lines firing in 8 seconds of guest execution (no env-var gate at all, unlike every other
+diagnostic in the file) now gated behind `LITEBOX_DIAG_MM=1` (default off). New repro script:
+`advisor/probes/startup_timing_repro.sh`. All committed `1cc6d9f0`.
+
 **STRONG CANDIDATE EXPLANATION FOUND (advisor-db), plausible and cheap to confirm/refute — NOT
 YET ASSERTED, verification pending**: **the layer may simply have no desktop/panel configuration
 to draw.** `/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/` in the layer contains only
