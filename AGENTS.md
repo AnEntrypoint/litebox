@@ -459,14 +459,47 @@ starts and weston stops flipping ENTIRELY for 11s → flipping resumes with an E
 never recovers. Reads as Xwayland taking over the output and never producing real content — not
 anything XFCE does (every XFCE component starts after t=29, well past this whole sequence).
 
-**Next measurement, not yet done**: extend the DRM trace to log the FB id and buffer handle on
-each `DrmModePageFlip`, plus `DrmModeAddFB2` and `DrmModeCreateDumb`. Compare the handle flipped
-BEFORE t=8.15 against the handle AFTER t=19.10:
-- **Same handle throughout** → the buffer's contents are being cleared/lost — a mapping/coherency
-  problem on the scanout buffer itself.
-- **Different handle after** → Xwayland allocated its own buffer and is scanning that out while
-  drawing somewhere else (or not drawing at all) — a surface/ownership handoff problem between
-  weston and Xwayland.
+**MEASUREMENT DONE (commit `9c4dd998`): fb-id logging gives a definitive answer — content loss
+on EXISTING buffers, not a surface-ownership swap.** weston double-buffers between `fb_id=1` and
+`fb_id=2` for the whole run. Correlating each flip's fb id against that frame's pixel count:
+```
+t=7.07 - 7.81   fb 1,2,1,2,...   px=2,073,597   good
+t=18.34         fb_id=1          px=2,073,597   still good
+t=18.89         fb_id=2          px=0           BLACK
+t=19.28         fb_id=2          px=0           BLACK
+t=19.42         fb_id=1          px=0           BLACK
+```
+`fb_id=1` renders `2,073,597` pixels at t=18.34 and `0` pixels at t=19.42 — the SAME framebuffer,
+contents gone 1.1 seconds later. **No third framebuffer ever appears — rules out
+surface-ownership handoff entirely.** Combined with flips continuing throughout (established
+above), the mechanism is: **the existing dumb buffers' contents are being zeroed or their mapping
+lost, while the DRM bookkeeping stays perfectly valid.** weston keeps flipping the same two fbs;
+they simply no longer contain what weston drew.
+
+**Matches an already-fixed bug class in this project**: same shape as the `memfd` mmap-time wipe
+bug fixed earlier this session (commit `3a0755e4`) — a shared object's contents overwritten with
+zeros behind a live mapping — just on the DRM dumb-buffer path instead of `wl_shm`. Timing fits:
+the zeroing happens right as Xwayland starts up and forks, exactly when the memory subsystem is
+busiest.
+
+**Concrete suspects, in priority order**:
+1. Anything that re-creates/re-commits the dumb buffer's backing memory while a mapping is still
+   live — check for a DRM-dumb-buffer equivalent of the memfd "copy the Vec over the shared
+   object" bug (see the fixed memfd bug for the exact pattern to look for).
+2. CoW/fork interaction with `MAP_SHARED` dumb buffers: weston maps the scanout buffer, a fork
+   happens nearby (Xwayland/xkbcomp). If a shared scanout mapping gets treated as private and
+   copied during fork, the compositor keeps writing into a copy while scanout reads the
+   original — exactly matches "flips continue, content frozen then lost." Check whether
+   `PageManager::duplicate()` (already touched twice tonight for unrelated fork races) handles a
+   `MAP_SHARED` dumb-buffer mapping correctly during fork.
+3. Decommit-then-recommit on the buffer range — a recommitted page comes back zeroed, matching
+   `px=0` exactly (not garbage) far better than a corruption theory would.
+
+**Next measurement, not yet done**: at the flip, hash or sample a few bytes of the fb's backing
+memory and log it alongside `fb_id`. If the bytes are zero AT THE SOURCE (the actual backing
+memory), the buffer really was wiped — bisect what wiped it among the suspects above. If the
+bytes are non-zero at the source but the captured frame is black, the problem is in the
+capture/scanout READ path instead — a different, likely simpler fix.
 
 ## Reproduction commands
 
