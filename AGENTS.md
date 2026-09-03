@@ -753,6 +753,42 @@ t~16, `nonzero 6,221,890 -> exactly 0`; zero overlaps against the scanout range 
 whole run, both at creation (t=0.97) — nothing instrumented touches the buffer between creation
 and the wipe.
 
+**PROXIMITY check tightens this further, AND opens a new possibility this whole section had not
+seriously considered — read before committing to GetWriteWatch/trap work.** Checked every logged
+range operation during the tight 450ms wipe window for PROXIMITY, not just overlap: not one range
+comes within 16MB of either buffer (436 commits, 404 reclaims, 280 protect-mappings, 197
+`fork_duplicate` ops in that window, none anywhere near the framebuffer). The window itself:
+```
+t=15.48  Xwayland forks, pid 16 execs xkbcomp
+t=15.78  xkbcomp exits status=0
+t=15.97  LAST GOOD flip, nonzero=6,221,890
+t=16.42  FIRST BLACK flip, nonzero=0
+t=16.60  Xwayland forks AGAIN, pid 18 execs xkbcomp
+t=16.67  second xkbcomp exits status=0
+```
+Confirms the write does not come from address-space bookkeeping — it comes through a mapping,
+which range logs structurally cannot see.
+
+**Possibility this may not be a memory bug at all, reconsidering the earlier "exactly zero"
+argument**: two `xkbcomp` forks within 1.2s means Xwayland set up its keymap twice — in a Wayland
+compositor, a client appearing and resulting surface/output changes routinely cause a repaint,
+and a repaint of a scene with no visible content legitimately clears the framebuffer to zero. The
+earlier argument ("weston would leave alpha set on a real clear, so exact-zero proves corruption")
+is weaker than it looked: pixman clearing to TRANSPARENT BLACK writes all-zero INCLUDING alpha —
+only the DRM dumb-buffer ALLOCATION path produces the opaque-black initial state seen at t=6.67.
+So the differing states (opaque-black at creation vs. fully-zero at wipe) do NOT actually rule out
+weston legitimately clearing the buffer during a normal repaint.
+
+**Decisive, cheap discriminator, in progress as of this writing**: connect an X client three more
+times, spaced out, well after the first wipe. If content is being CLEARED as part of a normal
+repaint cycle, later client activity should cause weston to redraw and content should return at
+least briefly. If it stays at exactly zero forever, the buffer is genuinely dead (memory
+corruption — fork-duplication-wrong-address or pointer-healing-stale-write). **If this comes back
+"content returns," the entire memory-corruption investigation above is misdirected, and the real
+question becomes why weston has nothing to composite once Xwayland owns the output** — a
+scene-graph/surface-visibility question in weston/Xwayland's own protocol handling, not a litebox
+memory bug. Check for a result before investing further in `GetWriteWatch`/trap plumbing.
+
 ## Reproduction commands
 
 Full XFCE launch — **use `advisor/probes/run_xfce_staged.sh` as the launch script, NOT any
