@@ -389,6 +389,21 @@ generated.** The tool to build it, `gdk-pixbuf-query-loaders`, IS already presen
 `/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache`, matching the standard path) once at launch
 time, same pattern as the `glib-compile-schemas` fix — no new files need sourcing from anywhere.
 
+**TESTED, FIX DID NOT WORK — same crash, same message, identical to before the fix.** Ran
+`gdk-pixbuf-query-loaders > .../loaders.cache` at startup (`PIXBUF_CACHE_BUILT=ok`, no error), but
+`xfce4-panel` still hits the exact same `Gtk:ERROR:.../gtkiconhelper.c:495:ensure_surface_for_gicon`
+→ `Bail out!` → self-`Tkill(sig=6)` sequence at t=75.7s (previous run: t=72.5s — same class, timing
+varies as expected given the "outcomes vary run to run" finding). **The cache-missing theory as the
+sole cause is now in doubt** — either (a) the cache was built successfully but doesn't contain a
+usable PNG entry (plausible if PNG really is compiled directly into `libgdk_pixbuf` with no loader
+module to register, meaning `gdk-pixbuf-query-loaders` has nothing to write for PNG specifically —
+the "missing cache" and "no PNG support at all" theories converge on the same symptom but need
+different fixes), or (b) GTK isn't reading the cache from the path it was written to (no
+`GDK_PIXBUF_MODULE_FILE` was set in the first attempt — GTK may look at a different compiled-in
+default). **In progress**: added diagnostic dumps of the actual `gdk-pixbuf-query-loaders` output/
+stderr and the resulting cache file content, plus explicit `GDK_PIXBUF_MODULE_FILE`, to
+distinguish these — rerunning now.
+
 **Historical note, kept for the forensic trail below**: earlier in this session a "MET" claim was
 made and retracted after a flawed pixel-count oracle mistook weston's own built-in panel for
 XFCE's; that retraction was correct at the time. This entry supersedes it with a fix-verified,
