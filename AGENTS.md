@@ -192,6 +192,29 @@ unaffected by this particular regression. But **anyone re-running or re-verifyin
 should first confirm their own layer tar actually has `xwayland=true` in its baked-in `weston.ini`
 before trusting any result**, since this tar can silently regress (it's a gitignored artifact, not
 tracked, and has apparently reverted at least once already this session).
+
+**CONFIRMED: advisor-db's zero-managed-windows chain is UNAFFECTED by the weston.ini regression
+above — verified two independent ways.** Static: every tar advisor-db used (`noxfwm.tar`,
+`probe.tar`, `wm.tar`, `withcfg.tar`) has `xwayland=true` present in its baked `weston.ini`.
+Dynamic (the stronger proof): the run logs themselves show weston logging `"launching
+'/usr/bin/Xwayland'"` and `"created wm"` exactly once per run (`noxfwm2`, `wm1`) — these lines only
+fire when weston actually loads `xwayland.so` and spawns Xwayland itself, so the setting wasn't
+just present in the tar, it was read and acted on. **The dual-WM test, missing-config test, and
+frame decodes all genuinely ran with Xwayland up under weston's management — stand as recorded.**
+
+**METHODOLOGY GOTCHA WORTH KNOWING for anyone auditing these tars**: a tar can contain multiple
+entries for the same path (e.g. `./etc/xdg/weston/weston.ini` AND `etc/xdg/weston/weston.ini` as
+two separate members, from appending overlays onto a base tar) — **the LAST member wins at
+extraction time**, not the first. Grepping/extracting by only one path-prefix form can find a
+STALE earlier copy and report a false regression (this nearly happened to advisor-db just now — a
+`./`-prefixed extraction reported `xwayland=true` absent, while the unprefixed extraction, which
+is what the runner actually uses, showed it present). **Any tar audit must extract the same way
+the runner does, not just grep the first match.** Durable fix identified but not yet done: rebuild
+these tars from a single clean tree instead of appending overlays, so there's exactly one copy of
+every path and no extraction-order ambiguity — removes this whole class of silent drift, which
+traces back to the layer tar being a gitignored, untracked, silently-mutable artifact in the first
+place.
+
 Also fixed by the same agent, both real: `import_writable_layer` panicked with
 `PathError(MissingComponent)` on tar entries whose parent dirs weren't separate members — now
 creates parent dirs on the fly; the leading-slash `load_program(...).unwrap()` bug from pass 336
