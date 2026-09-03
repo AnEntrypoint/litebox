@@ -1099,3 +1099,54 @@ launch script on either compositor, so it gates dbus -> seatd -> weston -> Xwayl
 **Retracted here:** bgshell_probe.sh was written for an intermittent problem that turns out to
 be deterministic; it is no longer the right next test. The fast repro is instead: fork from a
 shell whose binary went through syscall patching, do a little work in the child before execve.
+
+## 3G. THE XFCE BLOCKER: concurrently-live forked children (supersedes 3F's attribution)
+
+Four-way controlled experiment, identical work, 4 runs per condition, on a BARE alpine rootfs
+with no weston/X/XFCE at all, sub-second per run:
+
+    CONDITION                       FAULTS/run    max healed_count
+    sequential, no "&"              0,0,0,0       plateaus 256
+    backgrounded + wait (10 procs)  0,0,0,0       PINNED at 231 every run
+    backgrounded, no wait (10)      2,1,0,1       climbs 222 -> 293
+    backgrounded, no wait (30)      5,3,3         499
+
+**"&" is innocent.** `/bin/true & wait` in a loop is 4/4 clean and its healed_count is pinned at
+exactly 231 on every run. Remove only the `wait` and it crashes. Forking, backgrounding, job
+control and execve all work. The trigger is CHILDREN BEING ALIVE AT THE SAME TIME.
+
+**Clean dose-response.** 10 -> 30 concurrent children takes faults from ~1 to ~3.7 per run and
+healed_count from 293 to 499, monotonically. That is state accumulation, not timing luck, and it
+refutes "host non-determinism" for this failure class.
+
+**The tell.** `fixup_stale_elf_data_pointers` healed_count CONVERGES and stops growing when
+children are serialised, but grows without bound when they overlap. Suspect the relocation/heal
+range set is per-address-space rather than per-child, or that a child's ranges are not retired on
+exit while siblings are still live. On Windows every child shares ONE real address space, which
+is exactly where that assumption breaks.
+
+**Regression oracle**, 5 lines, sub-second:
+`i=1; while [ $i -le 30 ]; do /bin/true & i=$((i+1)); done; sleep 2`
+Pass = zero "fatal signal" lines over 3 runs (currently 3,3,5). Paired control: add `wait` after
+`&`, which must stay at 0 with healed_count pinned.
+
+**Why this is the blocker.** Every launch script backgrounds dbus, seatd, the compositor,
+Xwayland and several XFCE components, all alive at once, at higher concurrency than this test.
+It explains dbus never coming up in the weston runs while the same commands work individually,
+and it explains the apparent randomness: fault count scales with how many services are live.
+
+### Corrections to 3F (both retracted, by measurement)
+- "fork_duplicate downgrades child text to PAGE_READONLY": FALSE. Of 238 duplicated ranges,
+  exec ranges skipping the permission restore = 0. Source flag word == crash flag word.
+- "text VMA is missing VM_EXEC": FALSE. The 0x71 flag word is a CORRECT read-only rodata
+  mapping. The mmap trace shows the faulting 0x36000 range begins exactly where musl text ends
+  (0x3e2d000) at the matching file offset (0x6d000), mapped PROT_READ as it should be.
+- Also ruled out by measurement: `mm/mod.rs:1458 register_existing_mapping` (0 calls in a
+  crashing run) and `apply_trap_fallback` (correctly restores RX).
+
+### Two real usability bugs found while doing this
+- The runner's program path must be RELATIVE (`bin/sh`, not `/bin/sh`). A leading slash gives
+  ENOENT which then STACK-OVERFLOWS the runner at `lib.rs:679` (`load_program(...).unwrap()`),
+  hiding the real error entirely. Normalise the path and return the error instead of unwrapping.
+- Exit code hides the bug: runs with exit=0 still killed children. Any harness checking only the
+  exit code will report false success. Count "fatal signal" lines instead.
