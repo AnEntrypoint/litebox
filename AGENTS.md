@@ -1296,6 +1296,26 @@ earlier findings in this doc) and the compositing path is now confirmed working,
 to be the run that finally satisfies the standing success oracle (`non_black_pixels > 0` in the
 FINAL frames of a full XFCE session, not just one test client).
 
+**Confound found mid-verification, correctly NOT conflated with the XWM fix**: the first
+full-stack attempt with `xwayland=true` progressed cleanly (DBUS/SEATD/WESTON/XWAYLAND/XFCONFD/
+XCHECK stages, 18 frames at 2,073,597 non-black, no wipe at t=36) but hit `DBUS_UP=no` — the
+long-known intermittent trampoline `#UD` (`Exception(6) rip=0x7feffff7fb8a`, same bit-identical
+address as every prior occurrence this session) fired again and killed the backgrounded
+`dbus-daemon` before it could exec (`dbus-daemon execs: 0`), so `xfconfd`/`xfsettingsd`/
+`xfdesktop`/`xfce4-panel` can't start (would fail with "Connection refused" as in every earlier
+run). **This is a SEPARATE, already-known-intermittent bug (partially mitigated by b4330590,
+still not fully closed) — it does NOT retroactively implicate or exonerate the XWM fix either
+way.** A run where an unrelated component fails to start is not a fair test of the compositing
+fix in either direction: non-black final frames from such a run wouldn't prove the XWM fix handles
+a full desktop, and black final frames wouldn't disprove it either, since half the desktop never
+launched. Correct discipline (applied): rerun until a clean `DBUS_UP=yes` run is obtained, and
+only then read the final-frame oracle. **The isolated (non-full-stack) result is unaffected by
+this confound and stands on its own regardless of how the full-stack run lands**: weston managing
+Xwayland itself (`xwayland=true`) ends a run at 2,073,597 non-black pixels with no wipe, vs.
+permanent blackout before — reproducible, doesn't touch dbus at all. Anyone hitting `DBUS_UP=no`
+in a future full-stack run should treat it as this known trampoline `#UD` flakiness, retry, and
+not read anything into the frame result of that specific run.
+
 ## Reproduction commands
 
 Full XFCE launch — **use `advisor/probes/run_xfce_staged.sh` as the launch script, NOT any
