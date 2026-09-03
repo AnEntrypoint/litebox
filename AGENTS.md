@@ -166,13 +166,26 @@ specifically for the LAST successful request and the first thing that stalls or 
 GTK client even believe it has a usable screen/visual to draw into? A GTK app that can't find one
 initializes, sits idle, and draws nothing — with NO error — matching every observation exactly
 (alive, configured, no errors, no windows, no pixels). If true, the X-protocol decode's answer
-(CreateWindow never issued) follows automatically from this upstream cause. Probe: run
-`xfce4-appfinder` with `GTK_DEBUG=all` (logs GTK's own display/visual selection) plus
-`xfce4-display-settings` for a RandR/geometry view, dump both alongside weston's log. **Notable
-gap found along the way**: the guest layer contains **zero X query tools** — no `xdpyinfo`,
-`xrandr`, `xwininfo`, `xprop`, or `xlsclients` — which is why nobody could inspect the X server's
-live state directly all session; `GTK_DEBUG=all` is the workaround, but adding `xdpyinfo` (at
-minimum) to the layer would materially help any future X-related debugging here.
+(CreateWindow never issued) follows automatically from this upstream cause. **Update: the
+`GTK_DEBUG=all` plan hit a dead end** — this layer's GTK is built without `G_ENABLE_DEBUG`
+(`"GTK_DEBUG set but ignored because gtk isn't built with G_ENABLE_DEBUG"`), so GTK cannot report
+its own display/visual selection at all; the intended instrument doesn't exist in this build.
+**Trap avoided, worth flagging generally**: running a GTK program with `--help` does NOT open a
+display, so a zero exit code from `--help` proves nothing about screen usability — briefly
+mistaken for evidence, caught before being asserted. **Switched to**: `GDK_SYNCHRONIZE=1` (GDK's
+X error reporting is always compiled in, unlike `GTK_DEBUG`) plus actually running
+`xfce4-display-settings` for real (so it genuinely queries RandR) rather than `--help`. Committed
+as `advisor/probes/run_screen_probe.sh`; result pending.
+
+**Layer gap, worth fixing regardless of how this investigation lands — has quietly shaped the
+whole session's guesswork problem**: the guest layer contains **zero X query tools** — no
+`xdpyinfo`, `xrandr`, `xwininfo`, `xprop`, `xlsclients` — confirmed absent. This is why every
+question about X server state all session had to be answered by inference from litebox's own
+logs rather than a direct one-line query, exactly the guesswork the standing directives ask to
+eliminate. **Concrete suggestion**: add `xdpyinfo` and `xrandr` to the layer — tiny, no unusual
+dependencies, and between them answer screen geometry/depth/visuals/extensions/RandR outputs
+directly. Given how much time tonight went into inferring what `xdpyinfo` would print in
+milliseconds, this is probably the single highest-leverage layer addition available.
 
 **POSSIBLE GAME-CHANGER, NEEDS IMMEDIATE RE-VERIFICATION: the slow-startup investigation (my
 dispatched agent, `a23992b80c8de9190`) found the layer tar's `weston.ini` had REGRESSED and lost
