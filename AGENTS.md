@@ -3640,3 +3640,21 @@ repro used throughout this pass), `.wfgy/xfce-build/layer31_direct_fixed.tar` (w
 `xwayland=true` restored — gitignored, not part of the commit, but the canonical filename other
 scripts/sessions reference, fixed in place per this file's own disk-hygiene convention; the
 pre-fix tar is kept as `.tar.bak_no_xwayland_fix` alongside it for reference).
+
+**Independent live re-verification of the tkill/futex fix (commit `dc50f126`), PRD row
+`symbolize-futex-address-2103003520-and-add-tid-plumbing-guest-pr` closed.** Rebuilt
+`litebox_runner_linux_on_windows_userland` at current `HEAD` (`b4529f76`) — build finished in 1.09s
+(fully incremental, confirming the checked-in binary already carried the fix). Ran a fresh,
+from-scratch repro against `layer31_direct_fixed.tar` via the documented `--resume-from` injection
+pattern: dbus → seatd → weston → Xwayland, then `xfce4-about --version` under `time`, the exact
+command this whole investigation was assigned to explain and that previously hung indefinitely at
+t=59.245s waiting on a `futex(val=0x80000000)` with `owner_tid=0`. **Result: `TEST_DONE` reached at
+t=27.59s**, `exit_group status=0` on the whole shell, no hang, no 90s timeout. Process tree confirms
+`xfce4-about` (pid=21) ran to completion under `pid=20 /usr/bin/time`, and weston/Xwayland/
+at-spi-bus-launcher all progressed normally afterward. Confirms the fix (real cross-thread
+`tkill`/`tgkill` delivery in `do_kill`, replacing the old unconditional `ESRCH` reject for
+`tid != self.tid`) is landed, correct, and closes this specific deadlock class for good — glibc/
+musl's NPTL `SIGSETXID`/TLS-update signal-and-wait handshake now completes because the signaled
+sibling thread is actually interrupted out of its unrelated futex wait to process it, exactly as
+proposed. No code change needed this pass — this was verification-only, confirming a fix already
+on `main`.
