@@ -217,6 +217,48 @@ loading when Xwayland crashed — the panel doesn't have only 2 plugins by desig
 config-loading failure, it's stuck partway through loading them because the whole X session dies
 mid-startup. **Not a config bug — confirmed the same root story as Problems 1/2.**
 
+**REAL FIX LANDED (advisor-db, `20d61808`): the repeated `at-spi-bus-launcher` SIGTRAP crashes are
+FIXED, and it's a genuine root cause, not cosmetic.** The layer ships all 40 `.gschema.xml`
+sources but NOT `gschemas.compiled` — the binary cache GLib actually reads.
+`g_settings_schema_source_get_default()` returns NULL, `at-spi-bus-launcher` calls `g_error(...)`,
+and `g_error` aborts via a debug trap — that's the `SIGTRAP`(5), and it took its own `dbus-daemon`
+down with it each time. `glib-compile-schemas` is already in the layer, so the fix is one line at
+startup (`advisor/probes/run_xfce_gschema.sh`). **Verified: fatal SIGTRAPs 5 → 0,
+GSCHEMA_COMPILED=ok.** This also retroactively accounts for the `dbus-daemon` deaths found near
+the scanout drop in Problem 1's trace above — they were at-spi's own `dbus-daemon` instances dying
+alongside it, **NOT the blanking cause**. Worth folding into every launcher going forward.
+
+**Problem 1 (blanking) does NOT get fixed by the gschema patch — confirmed independently, and its
+location is now proven: it's IN THE GUEST, not litebox's memory/capture path.** With SIGTRAPs at
+zero, the background still drops `2,073,597` → `92,036`. advisor-db's DRM correlation matches this
+session's exactly and adds the decisive piece: `guest scanout nonzero_bytes: 6,221,890 → 2,258,768`
+sampled from a mapping established FRESH from the handle on that very flip, BEFORE litebox's
+capture path ever touches it — the content is already gone in the guest's own buffer at the source.
+Combined with this session's same-`fb_id`/same-sampled-offsets finding, **this rules out litebox's
+memory/capture/coherency path entirely: something in the guest legitimately painted most of the
+screen black.** Stop looking at litebox memory management for this specific symptom.
+
+**THIRD, SEPARATE symptom found (advisor-db) — the session can also HARD HANG, distinct from both
+the blanking and the Xwayland crash.** A run stopped emitting page flips entirely at t=56.2s and
+never resumed: 26 live threads, CPU flat at 67.98→68.40% over seven full minutes (initially
+misread as spinning; flat CPU over that long actually means genuinely hung, not busy-looping).
+Last lines before the hang: a `fork_verify` lifecycle boundary and a `libLLVM.so.22.1` load — i.e.
+Mesa's software renderer (`llvmpipe`) initializing. **Now THREE distinct symptoms — resist
+assuming they're one bug**: (a) background blanks in the guest's own buffer (Problem 1); (b)
+Xwayland `SIGABRT` + weston `SIGPIPE` at t=115.7s (Problem 2, this session's finding); (c) a hard
+hang at t=56.2s (advisor-db, new). **(c) hangs EARLIER than (b) crashes — they may be alternative
+outcomes of the same underlying instability rather than a fixed sequence, meaning a fix validated
+against one symptom may leave another untouched.** advisor-db's next thread: check whether the
+blanking coincides with `llvmpipe` initializing, and whether forcing a simpler software path
+changes it — "the guest painted black" plus "we're on a software GL stack that just loaded a
+100MB+ LLVM shared object" is a suggestive pairing worth testing directly.
+
+**Process note, apply going forward**: re-run with the gschema fix applied before drawing further
+conclusions from any NEW trace — 5 aborting processes per run was real noise in everything reasoned
+about so far tonight (including this session's own Problem 2/Xwayland-crash trace, captured before
+this fix existed). Doesn't invalidate Problem 2's finding, but any FOLLOW-UP trace on Problem 2
+should use a gschema-fixed launcher to remove that confound.
+
 **Historical note, kept for the forensic trail below**: earlier in this session a "MET" claim was
 made and retracted after a flawed pixel-count oracle mistook weston's own built-in panel for
 XFCE's; that retraction was correct at the time. This entry supersedes it with a fix-verified,
