@@ -114,8 +114,33 @@ confirm the components are actually connected to the right display (`--display=$
 `:0`, `xfce4-about` connected successfully earlier, so probably fine but cheap to confirm from
 their own X traffic); (2) decode whether their `CreateWindow`/`MapWindow` requests are being
 issued at all — the raw X protocol traffic is already captured in the unix-stream logs, just needs
-request-level decoding. **In progress**, split to avoid duplication — see who's assigned in the
-git log / cross-session messages around this entry for current ownership.
+request-level decoding. Assigned to `a63e8ca59285f5871`, **PAUSED pending the theory directly
+below**, which may make it unnecessary.
+
+**LIKELY ROOT CAUSE OF THE ZERO-MANAGED-WINDOWS RESULT: TWO WINDOW MANAGERS RUNNING SIMULTANEOUSLY
+ON THE SAME DISPLAY — strong, coherent hypothesis, verification in progress (advisor-db).**
+Timeline from weston's own log against the components' own startup:
+```
+18:44:19.922  weston launches Xwayland
+18:44:28.700  weston: "created wm, root 98"     <- weston's own XWM claims the root window
+18:44:30.846  xfwm4's first message              <- xfwm4 is ALSO a window manager
+18:44:45.869  xfdesktop's first message
+```
+X11 permits exactly ONE client to select `SubstructureRedirect` on the root window; a second
+client requesting it gets `BadAccess` and either exits or runs degraded. weston's own XWM (loaded
+via `xwayland=true` — the exact fix landed earlier this session) claims the root window first, and
+`xfwm4` then starts and tries to become window manager too. **weston's XWM is precisely the
+mechanism that maps X surfaces into the compositor's scene graph — if `xfwm4` is disrupting it,
+that alone would produce exactly the observed symptom (zero managed windows, nothing composited).**
+Notably coherent, not just plausible: under a Wayland compositor with rootful Xwayland, **the
+compositor itself is meant to be the window manager for X11 clients** — running `xfwm4` alongside
+it is architecturally redundant, not merely buggy. This also explains why the EARLIER (pre-fix, no
+`xwayland=true`) runs never hit this: with no XWM at all, `xfwm4` was the only would-be window
+manager and there was nothing to contest — but surfaces were then never mapped either (the
+original blackout bug). **Testing now (advisor-db)**: identical launcher/config, `xfwm4` simply
+not started. Non-black content below y=31 confirms this theory and the fix is a one-line change
+(don't run `xfwm4` when weston manages Xwayland via `xwayland=true`). If this test is negative,
+resume the paused X-protocol decode immediately.
 
 **STRONG CANDIDATE EXPLANATION FOUND (advisor-db), plausible and cheap to confirm/refute — NOT
 YET ASSERTED, verification pending**: **the layer may simply have no desktop/panel configuration
