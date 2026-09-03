@@ -175,7 +175,32 @@ display, so a zero exit code from `--help` proves nothing about screen usability
 mistaken for evidence, caught before being asserted. **Switched to**: `GDK_SYNCHRONIZE=1` (GDK's
 X error reporting is always compiled in, unlike `GTK_DEBUG`) plus actually running
 `xfce4-display-settings` for real (so it genuinely queries RandR) rather than `--help`. Committed
-as `advisor/probes/run_screen_probe.sh`; result pending.
+as `advisor/probes/run_screen_probe.sh`.
+
+**RESULT: TESTED AND REFUTED — do not revisit "client can't find a usable screen."**
+`xfce4-display-settings` run for real (t=29.8 to t=138, still alive, 108+s without completing) is
+**NOT blocked on a failed X call — its socket exchanges succeed**: `t=78.478` and `t=138.480` each
+show a clean `send 64B → recv 64B → recv/send 32B` round trip, **60.00 seconds apart** — the same
+idle heartbeat identified earlier, every exchange completing normally. Activity profile: 1248
+socket events in t=20-30, 620 in t=30-40, then **nothing until 4 events at t=70-80**. The client
+does its real work in ~20s, then goes completely idle, waking only on its own timer. **X
+round-trips work; the screen is not unusable; GTK is not failing to find a visual.**
+
+**What this sharpens for the decode**: every XFCE client observed is in the IDENTICAL state —
+connected, exchanging successfully, alive indefinitely, never finishing startup, never drawing,
+same shape as `xfce4-about --version` never exiting. **This is one behavior across every client,
+not something panel- or desktop-specific.** The decode's most useful question is now: **what is
+the LAST request each client sends before going idle, and is it a round-trip whose reply never
+arrives?** A client blocked on a missing reply would show exactly this profile — busy, then
+silent forever, connection healthy throughout.
+
+**Two more missing tools found, compounding the earlier `xdpyinfo`/`xrandr` gap**: `/usr/bin/timeout`
+is ALSO absent from the layer — meaning any script-level timeout guard (e.g. a `timeout 25 ...`
+wrapper) has been **silently not applying** all session. Anything relying on `timeout` in a probe
+script has not been doing what it appeared to; audit any prior result that assumed a timeout guard
+actually fired. Between no `timeout`, no `xdpyinfo`, no `xrandr`, and GTK built without debug
+support, **the layer is genuinely under-equipped for diagnosis** — this has cost real
+investigation time this session and is worth fixing as a standing item, not just a one-off.
 
 **Layer gap, worth fixing regardless of how this investigation lands — has quietly shaped the
 whole session's guesswork problem**: the guest layer contains **zero X query tools** — no
