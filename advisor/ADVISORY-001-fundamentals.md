@@ -1150,3 +1150,50 @@ and it explains the apparent randomness: fault count scales with how many servic
   hiding the real error entirely. Normalise the path and return the error instead of unwrapping.
 - Exit code hides the bug: runs with exit=0 still killed children. Any harness checking only the
   exit code will report false success. Count "fatal signal" lines instead.
+
+## 3H. MECHANISM: concurrent fork_verify healing passes (41-run statistical result)
+
+Pair `diag-fv-lifecycle: begin`/`end` in any run log to count how many fork_verify healing
+passes are LIVE SIMULTANEOUSLY. Across 41 runs spanning all conditions:
+
+    MAXCONCURRENT == 1 :  8 runs, ALL ZERO faults          (8/8 clean)
+    MAXCONCURRENT >= 2 : 33 runs, 27 crashed (82%), up to 13 faults
+
+**Zero counterexamples: no run with a single healing pass has ever crashed.** The 6 clean runs
+at >=2 fit a race needing the right interleaving, not every overlap. Concurrent healing passes
+are a NECESSARY condition for the crash.
+
+Per-condition:
+
+    CONDITION                       MAXCONCURRENT   FAULTS
+    A  sequential, no "&"                 1            0
+    B  "&" + wait                         1            0
+    C  "&" spaced, short-lived            2            1
+    E  "&" spaced, long-lived             2            0
+    G  "&" fast x30, /bin/true            6            5
+    D  "&" fast x10, /bin/true            7            2
+    F  "&" fast x30, sleep 8             13            5
+
+**Why mechanistically right:** fork_verify heals stale pointers by SINGLE-STEPPING the child,
+and on Windows every guest process shares ONE real address space. Two single-step passes running
+at once, each setting the trap flag and rewriting pointers in that shared space, is exactly the
+shape that corrupts a peer. Adjacent hazards are already documented in the tree:
+`process.rs:2710` (proactive fixups deliberately NOT applied cross-process because they would
+write into the wrong address space) and `process.rs:1287`
+(`residual-second-fork-verify-corruption-bug`). Same family, triggered by concurrency rather
+than by a second sequential fork. It also explains the victim profile: always a forked child
+that has not yet reached execve, i.e. exactly fork_verify's active window.
+
+**Recommended test:** serialise fork_verify with one global lock held begin-to-end, so at most
+one pass runs at a time. If MAXCONCURRENT drops to 1 and faults go to 0 on condition F, the
+mechanism is confirmed; the real fix is then per-child healing state or scoping the single-step
+so passes cannot interfere. NOTE: whether holding a lock across a single-step walk can deadlock
+against the traced thread needs care -- that is why this was not attempted from the advisor side.
+
+### Disproven by implementing them (do not retry)
+- **Serialising execve does NOT help.** A global spinlock around the entire execve
+  address-space transition (taken before `kill_other_threads()`, held through `load_program`)
+  gave 3,3,4 faults vs 5,3,3 without. The damage happens BEFORE execve.
+- **`LITEBOX_VEH_TRACE=1` does NOT suppress this crash and makes it WORSE**: 1,7,13 faults vs
+  5,3,3 without. This contradicts the earlier session belief that VEH_TRACE mitigates crashes;
+  that belief does not generalise to this failure.
