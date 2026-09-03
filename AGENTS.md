@@ -141,15 +141,18 @@ measurement — read the correction at the end of this section before acting on 
   `ForkChildVerificationProvider::lock_fork_verify_heal()` and wrapping both proactive fixup
   calls with it. This is a correct, worthwhile fix on its own merits — but **direct measurement
   shows it does NOT reduce the fault rate of the bug described here.** Landed and kept regardless.
-- **CORRECTION — the "MAXCONCURRENT fork_verify healing passes" correlation from earlier this
-  session is REFUTED.** Setting `LITEBOX_FORKVERIFY_OFF=1` (disables fork_verify's reactive
-  single-step/AV-path healing entirely, proactive fixup left on) reproduces the SAME fault rate
-  as normal — proving that reactive healing machinery is NOT the dominant contributor to these
-  faults, contrary to the strong-looking dose-response correlation measured earlier (that
-  correlation was real but was not causal, or was confounded by something else that also scales
-  with concurrency). Conversely, disabling the *proactive* fixup pass instead spikes faults to
-  ~31/run (nearly every child) — confirming that pass does real, necessary work and is not itself
-  spurious corruption.
+- **CORRECTION — the "MAXCONCURRENT fork_verify healing passes" correlation's CAUSAL EXPLANATION
+  was wrong; the correlation itself was real.** Setting `LITEBOX_FORKVERIFY_OFF=1` (disables
+  fork_verify's reactive single-step/AV-path healing entirely, proactive fixup left on)
+  reproduces the SAME fault rate as normal — proving reactive healing machinery is NOT itself the
+  mechanism. But the underlying 41-run measurement (0 faults in 8/8 at MAXCONCURRENT==1) was not
+  spurious: concurrent fork_verify healing passes were a PROXY for concurrent
+  `PageManager::duplicate()` calls — the actual root cause, fixed below (`166b5a90`) — since both
+  scale together with concurrent forking. Record this as "correct correlation, wrong causal
+  attribution," not "the correlation was noise": it remains a useful detector for this class of
+  concurrency bug even though the fix landed elsewhere. Conversely, disabling the *proactive*
+  fixup pass instead spikes faults to ~31/run (nearly every child) — confirming that pass does
+  real, necessary work and is not itself spurious corruption.
 - **Crash signature re-examined and clarified**: `rip==cr2`, offset `0x1464b`/`0x464b` low bits,
   confirmed via `objdump` disassembly to be a **real, valid busybox instruction**
   (`lea 0x148(%rbx),%rax`) at the CORRECT offset relative to the child's own load base — this is
@@ -247,6 +250,16 @@ measurement — read the correction at the end of this section before acting on 
   treat these as probably-real but not iron-clad, and re-verify on a fresh host if revisited):
   FAIL case (30-concurrent-`/bin/true`, baseline 3-6 faults/run): **8/8 consecutive runs at 0
   faults** post-fix. PASS control (was 0/0/0): **3/3 runs still at 0/0/0**, no regression.
+
+  **Independently reverified on a separate host session with healthy memory (~5.7 GiB free,
+  above the caution threshold)**: FAIL case **0 faults in 10 CONSECUTIVE runs** (deliberately run
+  longer than the original 8 given the earlier memory-pressure caveat), PASS control **0 faults,
+  2/2**. Two independent methods (litebox's own VMA-flags table, logged as
+  `VM_READ|VM_MAYREAD|VM_MAYWRITE|VM_MAYEXEC` with `VM_EXEC` absent on the crashing range, plus a
+  separate count of 108 `PAGE_READONLY` vs. 59 `PAGE_EXECUTE_READ` `VirtualProtect` calls in one
+  run; and this session's own `VirtualQuery`-at-fault-time capture,
+  `MEM_COMMIT`/`MEM_PRIVATE`/`PAGE_READONLY`) independently agree on the same permissions-mismatch
+  symptom this fix addresses. This is a solid, cross-verified fix — confidence is high.
 
 - **NEW: second, distinct crash signature found blocking the standing goal under the real XFCE
   launch load — STILL OPEN, not fixed by the above.** Running the full reproduction command
