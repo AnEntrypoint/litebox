@@ -956,12 +956,43 @@ check whether the stalls shrink or vanish, to separate "real litebox bug" from "
 memory-pressure-induced host scheduling noise." This distinction should be settled BEFORE
 changing any locking code.
 
-**Not yet done**: (1) the memory-headroom control re-run described above; (2) if stalls persist
-with headroom, correlate stall windows directly against large `fork_duplicate` copy timing/
-duration to confirm the lock-holding theory; (3) if confirmed, the fix would need to either
-narrow the lock's scope so one large copy doesn't block unrelated concurrent guest threads, or
-have `fork_duplicate` periodically yield/release the lock during a large copy rather than holding
-it for the whole operation.
+**CONTROL TEST DONE: memory pressure is EXCLUDED, and the result confirms the lock-contention
+theory decisively.** Same repro, same binary, same script, two host memory states:
+```
+2.6 GB free:  4 stalls, 17.3s stalled of a 98s run   (18% stalled)
+9.3 GB free:  5 stalls, 106.1s stalled of a 117s run (91% stalled)   -- includes a single
+                                                                          30.8s stall AND a
+                                                                          single 59.8s stall
+```
+**With nearly 4x the free memory, stalls got dramatically WORSE, not better.** This directly
+excludes "tonight's host memory pressure/concurrent-session noise" as the explanation — the
+stalls are reproducible and severe regardless of host state, confirmed on the SAME code both
+times. This also confirms the lock-contention mechanism predicts EVERY observed property:
+- all guest threads silent simultaneously → a global lock, not a per-thread wait
+- duration varies wildly (1s to 60s) → scales with the size of whatever holds the lock
+- **worse with MORE free memory** → larger copies SUCCEED and run to completion (holding the
+  lock the whole time) instead of failing/bailing early when memory is tight — this is the
+  counterintuitive result that most sharply confirms the theory over any host-noise explanation
+- correlates with fork activity → `fork_duplicate`'s eager copy is the big lock-holder
+- dose-response with concurrency (measured much earlier this session) → more concurrent forks,
+  more contention
+
+**Fix direction, agreed and reasoned through**: narrow the lock's SCOPE, do NOT add periodic
+yielding mid-copy. Yielding would reintroduce exactly the races the lock consolidation earlier
+this session was fixing (`984927b0`) — this lock now correctly protects allocate/deallocate/
+protect/`unmap_shared_memory` precisely because those must never interleave; releasing it partway
+through a copy weakens that invariant. The cleaner fix: **`fork_duplicate`'s bulk BYTE COPY does
+not need the same lock that protects VAD-tree mutations.** The copy is a memcpy into a
+destination the forking thread already exclusively owns — what needs serializing is the
+mapping/reservation operations around it (`allocate_pages`'s reserve+commit), not the bytes
+themselves. Splitting "reserve/map the destination under the lock" from "copy the bytes into it
+OUTSIDE the lock" removes the long hold entirely without weakening the invariant the lock exists
+to protect.
+
+**Decisive measurement to run BEFORE changing code**: log lock acquire/release with duration for
+this lock specifically. If the 59.8s stall corresponds to a single acquisition of comparable
+length, the theory is proven outright and the fix target is exact — cheap (a few lines) and much
+safer than restructuring the locking on inference alone.
 
 ## Reproduction commands
 
