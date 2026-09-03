@@ -36,6 +36,42 @@ rejected any `tkill`/`tgkill` targeting a thread other than the caller, silently
 glibc/musl-internal cross-thread signal handshake used by `SIGSETXID`/dlopen's TLS-update quiesce,
 used in nearly every multithreaded program — now fixed with real cross-thread signal delivery.
 
+**Independently confirmed by advisor-db on the combined build** (`fe4ca386` + `69ea9470`):
+`xfce4-about --version` reaches `CTX_ABOUT_VERSION_RC=0`, `CTX_WAITED`, `CTX_DONE` — previously
+hung at `CTX_START` and never reached `CTX_WAITED` at all. `remote tid` count in the new census:
+**0**. Confirmed from two independent angles now.
+**Census diff (before → after the fix)**, `advisor/probes/unsupported-census-after-dokill.txt`:
+```
+GONE:    sys_tkill/sys_tgkill with a remote tid   1 -> 0   (the fix)
+NEW:     setsockopt(level=1, optname=59)          0 -> 2
+         setsockopt(level=1, optname=31)          0 -> 2
+GREW:    setitimer nonzero it_interval            26 -> 168  (6.5x, now dominant)
+         fstatfs                                  20 -> 30
+         membarrier                                5 -> 8
+         fadvise64                                 2 -> 4
+         getresuid                                 1 -> 2
+         ioctl Raw{3222823994}                     2 -> 3
+UNCHANGED: inotify_init1(2), inotify_init(1), pidfd_open(1), close_range(1),
+           fcntl 1033/1034 family, setsockopt 16/26, ioctl Raw{1074021792}
+```
+**Nothing regressed — the growth is itself confirmation the fix works**: these counts rose because
+the process now gets PAST the deadlock and executes code that was previously unreachable. (Run log
+grew 14MB→25MB for the same reason.)
+**Revised ranking for next-tier work (not blocking the now-met standing goal)**: `setitimer`
+nonzero `it_interval` is now the top target, ahead of `inotify` — at 168 hits it dominates the
+census 5.6x over the next entry, and it's the REPEATING timer path specifically (one-shot works,
+periodic does not). Everything that redraws or polls on a schedule depends on it: the panel clock,
+plugin refresh, cursor blink, animations, session-manager keepalives, GTK frame timing — directly
+load-bearing for "XFCE displaying and updating," and likely behind some of the "renders once then
+goes stale" behavior seen earlier this session. Should be a small fix — the one-shot machinery
+already exists, it needs rearming on expiry. `inotify` (3 hits, unchanged) stays second — still
+fails in the first 0.71s (`"Cannot initialize inotify: Function not implemented"`), degrading
+dbus service activation under everything — degrades rather than deadlocks, whereas a dead
+repeating timer stops UI updates outright. `membarrier` (8) third.
+**Split for follow-on work (not urgent, goal already met)**: `a63e8ca59285f5871` — `setitimer`
+rearming; advisor-db — `inotify` (starting with whether a minimal always-empty-but-valid fd
+satisfies dbus, vs. needing real watch semantics).
+
 **Historical note, kept for the forensic trail below**: earlier in this session a "MET" claim was
 made and retracted after a flawed pixel-count oracle mistook weston's own built-in panel for
 XFCE's; that retraction was correct at the time. This entry supersedes it with a fix-verified,
