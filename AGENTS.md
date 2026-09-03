@@ -162,6 +162,38 @@ created and populated a window would be moving pixmap/image data far larger than
 pattern already suggests setup completes but drawing is never reached; the decode should look
 specifically for the LAST successful request and the first thing that stalls or errors.
 
+**RESULT: DECISIVE. `CreateWindow` succeeds; `MapWindow` is NEVER called by any client, and it is
+not because they're stuck waiting on an X reply.** `a63e8ca59285f5871` built a proper stream-
+reassembly X11 decoder (fixed an early opcode-misalignment bug from treating every `write()`
+syscall boundary as a request boundary; widened trace capture from 32 to 4096 bytes since the
+original prefix cut off real traffic on busy sockets — some `write()`s carry 12KB+ of batched
+requests) and ran a clean full-stack launch (`run_xfce_xwm.sh`, `DBUS_UP=yes`, `TEST_DONE` at
+t=70.844, exit 0) with it. 7564 unix-stream events, 14 genuine X11 client connections (verified via
+protocol-major-version=11, not just the byte-order marker — that alone false-positived on D-Bus,
+which shares the same convention). **9 confirmed `CreateWindow` calls, properly decoded with
+correct length-field alignment. `MapWindow` (opcode 8) appears ZERO times anywhere in the entire
+capture, on any of the 14 sockets, in either direction.**
+
+Clearest single data point: `xfwm4`'s main socket (12508 bytes traffic, 538 events) issues two
+`CreateWindow` calls (t=40.309, t=40.607), does normal WM-startup work (`ChangeWindowAttributes`,
+`GetWindowAttributes`, `QueryTree`, two non-fatal `BadWindow`/`BadDrawable` errors that look like
+ordinary "window already gone" races), does a `GetProperty` (looks like Gtk/IconSizes) that gets a
+clean large reply (1168 bytes, no error) at t=40.818 — **then goes completely silent: not one more
+byte in or out for the remaining ~30s of the run, connection never closed, no timeout, no error.**
+Every other X11 socket (panel, desktop, display-settings) shows the identical shape: a burst of
+`CreateWindow`/`ChangeProperty`/`InternAtom`/`QueryExtension` activity, a clean small reply, then
+permanent silence — all clients' "last gasp" lands between roughly t=29-59s, then nothing for the
+remaining 10-40s even though `TEST_DONE` doesn't fire until t=70.8. **Ruled out**: this is NOT a
+request stuck waiting on a missing reply — every request found across all 14 sockets got answered.
+The clients are not blocked on X11 I/O by the time they go quiet. **Points to**: something in each
+client's OWN code deciding not to proceed past window creation — `CreateWindow` succeeds, some
+property/theme setup happens, and the code path that would normally call `MapWindow` next is
+either never reached or silently stalls without issuing another X call (GTK/glib mainloop stall, a
+blocking non-X syscall, a wait on a non-X fd that never fires...). Worth checking whether it's the
+SAME point in every client's own source (a shared GTK/xfce4 helper library init path).
+Instrumentation not yet committed — held pending reconciliation with the timer hypothesis directly
+below, which may explain this result entirely.
+
 **PARALLEL HYPOTHESIS, running (advisor-db), tests a different link in the same chain**: does the
 GTK client even believe it has a usable screen/visual to draw into? A GTK app that can't find one
 initializes, sits idle, and draws nothing — with NO error — matching every observation exactly
@@ -211,6 +243,29 @@ without `G_ENABLE_DEBUG`, `xfce4-display-settings` run for real genuinely doesn'
 X round-trips genuinely succeed 60.00s apart matching the idle heartbeat, and every XFCE client is
 genuinely in that same connected-but-never-finishing state — the screen-usable conclusion and the
 sharpened decode question both stand unchanged.
+
+**STRONG UNIFYING HYPOTHESIS, testing now (advisor-db): a broken timer/alarm mechanism in the
+guest.** Fell out of correcting the timeout retraction above — `timeout` IS present and DOES exec
+(`argv0=/usr/bin/timeout` appears in the log) but **never actually fires**: `timeout 25
+xfce4-display-settings` started at t=30.715 (pid 42) is still alive with zero exit events at
+t=95.259 — 64 seconds past its 25-second deadline. `timeout(1)`'s entire job is arming a timer and
+killing its child on expiry; if it never fires, the guest's timer/alarm delivery itself is broken.
+**This would explain every symptom chased tonight in one shot**: GTK schedules significant startup
+work on timers/idle callbacks — a broken timer means deferred work (including, plausibly, the
+`MapWindow` call the X-protocol decode just found is never reached) never runs; `xfce4-about
+--version` never exiting is consistent with waiting on a timer that never expires; the 60-second
+"idle heartbeat" that's the ONLY thing that ever wakes any client is suspiciously close to a
+socket/protocol-level keepalive — i.e. the one wakeup source that does NOT depend on guest timers
+at all; `timeout(1)` itself failing is the cleanest, simplest possible confirming signal, since its
+whole job is nothing but setting a timer. **Test in progress, seconds not minutes**: in a bare
+guest with no display stack, run `timeout 3 sleep 30` — hangs past 3s = self-contained litebox
+timer bug, trivially reproducible, fully independent of X/weston/XFCE. Then `sleep 3` alone (known
+to work, since poll loops in every script this session have advanced on wall-clock time) to
+separate "sleep works" from "alarm delivery works" specifically. **If this reproduces, it explains
+the X-protocol decode result directly (a client blocked on a never-firing timer produces exactly
+that trace) and becomes the actual root cause to fix, upstream of the window-mapping question —
+hold the X-protocol instrumentation uncommitted and do not chase the client-side-stall theory
+further until this is resolved either way.**
 
 **Layer gap, worth fixing regardless of how this investigation lands — has quietly shaped the
 whole session's guesswork problem**: the guest layer contains **zero X query tools** — no
