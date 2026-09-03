@@ -404,6 +404,35 @@ default). **In progress**: added diagnostic dumps of the actual `gdk-pixbuf-quer
 stderr and the resulting cache file content, plus explicit `GDK_PIXBUF_MODULE_FILE`, to
 distinguish these — rerunning now.
 
+**RERAN: confirmed the cache theory was fully wrong, root cause is architectural, not a missing
+file.** The rebuilt `loaders.cache` (13 lines) contains exactly ONE entry — `legacy-xpm` — nothing
+else. **`gdk-pixbuf-query-loaders` correctly reports there is genuinely no separate loader module
+for PNG to register.** Downloaded the EXACT matching stock Alpine package
+(`gdk-pixbuf-2.44.7-r1`, from `community`, not `main` — moved repos in this version) directly from
+`dl-cdn.alpinelinux.org` to compare: **its `libgdk_pixbuf-2.0.so.0.4400.7` ALSO has zero `png_*`
+symbols** (`nm -D | grep png_` → nothing). This is not a broken/incomplete build of this layer —
+**stock Alpine 2.44.7 genuinely ships this way.**
+**Fetched Alpine's actual build script** (`APKBUILD` for `gdk-pixbuf`,
+`gitlab.alpinelinux.org/alpine/aports/-/raw/master/community/gdk-pixbuf/APKBUILD`) — confirms
+deliberately: `-Dpng=disabled -Djpeg=disabled -Dgif=disabled -Dtiff=disabled -Dothers=disabled
+-Dglycin=enabled`. **Alpine has moved ALL image decoding to `glycin`** — a modern, sandboxed
+image-loading architecture (separate subprocess per format, communicating over a private protocol,
+replacing the classic in-process loader `.so` model for security reasons). Confirmed
+`libgdk_pixbuf` DOES have glycin integration compiled in
+(`gdk_pixbuf__glycin_image_load_increment`, links `libglycin-2.so.0`).
+**Checked the layer: everything glycin needs IS present** — `libglycin-2.so.0`,
+`glycin-image-rs` (the actual PNG-capable decoder binary,
+`/usr/libexec/glycin-loaders/2+/glycin-image-rs`), its config
+(`/usr/share/glycin-loaders/2+/conf.d/glycin-image-rs.conf`), and **`/usr/bin/bwrap`
+(bubblewrap)** — glycin sandboxes each decode in a `bwrap` container for security. **This is the
+new leading hypothesis**: `bwrap` needs Linux namespace/mount syscalls (`unshare`, `mount`,
+`pivot_root`, etc.) to create its sandbox — exactly the kind of low-level, rarely-exercised
+syscall surface most likely to be unimplemented or broken under litebox's emulation. **If `bwrap`
+fails silently or errors out, `glycin-image-rs` never actually runs, `gdk_pixbuf__glycin_*` gets
+no result, and GTK's `g_error()` assertion path fires exactly as observed.** Testing `bwrap` and
+`glycin-image-rs` directly next, as the most surgical possible reproduction (no XFCE/GTK stack
+needed at all).
+
 **Historical note, kept for the forensic trail below**: earlier in this session a "MET" claim was
 made and retracted after a flawed pixel-count oracle mistook weston's own built-in panel for
 XFCE's; that retraction was correct at the time. This entry supersedes it with a fix-verified,
