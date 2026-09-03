@@ -4844,6 +4844,37 @@ fn diag_wait_dur_enabled() -> bool {
     })
 }
 
+/// Whether `LITEBOX_DIAG_MM=1` memory-management diagnostics are enabled. Cached per thread,
+/// same pattern as [`diag_wait_dur_enabled`].
+///
+/// Gates the `diag-commit`/`diag-reclaim`/`diag-decommit`/`diag-vprotect`/`diag-shm` family of
+/// `error!`-level log lines that earlier debugging passes added directly to the hot
+/// commit/decommit/protect/shared-memory paths with NO env-var gate at all (unlike every other
+/// diagnostic in this file). Measured directly (AGENTS.md, "client startup is slow"
+/// investigation): a single XFCE client-startup repro emitted 11,405 of these lines in the
+/// first 8 seconds of guest execution, before Xwayland was even ready -- every `VirtualAlloc2`/
+/// `VirtualProtect`/`VirtualFree`/shared-memory call in the whole run synchronously formats and
+/// writes a structured log line, unconditionally, regardless of `LITEBOX_LOG` level (these are
+/// `error!` calls, so `LITEBOX_LOG=error` does not suppress them either). A desktop launch
+/// performs tens of thousands of such operations across weston/Xwayland/every XFCE component, so
+/// this was pure always-on overhead on the single hottest code path in the runtime -- almost
+/// certainly a real, previously-unidentified contributor to "client startup takes 60+ seconds
+/// with no single explaining stall." Default is now OFF; set `LITEBOX_DIAG_MM=1` to restore the
+/// old always-on behavior for a future investigation that specifically needs it.
+fn diag_mm_enabled() -> bool {
+    thread_local! {
+        static ENABLED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+    ENABLED.with(|e| {
+        if let Some(v) = e.get() {
+            return v;
+        }
+        let v = std::env::var_os("LITEBOX_DIAG_MM").is_some();
+        e.set(Some(v));
+        v
+    })
+}
+
 impl litebox::platform::RawMutex for RawMutex {
     const INIT: Self = Self::new();
 
@@ -5422,12 +5453,14 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 core::ptr::null_mut()
             } else {
                 let commit_addr = if r.start == 0 { ptr } else { r.start as *mut c_void };
-                litebox_util_log::error!(
-                    start:% = commit_addr as usize, end:% = commit_addr as usize + r.len(),
-                    len:% = r.len(), pid:% = std::process::id(),
-                    tid:? = std::thread::current().id();
-                    "diag-commit: VirtualAlloc2(MEM_COMMIT) reserve_and_commit"
-                );
+                if diag_mm_enabled() {
+                    litebox_util_log::error!(
+                        start:% = commit_addr as usize, end:% = commit_addr as usize + r.len(),
+                        len:% = r.len(), pid:% = std::process::id(),
+                        tid:? = std::thread::current().id();
+                        "diag-commit: VirtualAlloc2(MEM_COMMIT) reserve_and_commit"
+                    );
+                }
                 unsafe {
                     VirtualAlloc2(
                         GetCurrentProcess(),
@@ -5684,13 +5717,15 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                     // scanout buffer that is never destroyed yet reads as
                                     // EXACTLY zero after a fork. Log the range so it can be
                                     // matched against the framebuffer's own mapping.
-                                    litebox_util_log::error!(
-                                        start:% = r.start,
-                                        end:% = r.end,
-                                        len:% = r.len(),
-                                        was_mapped_view:? = was_mapped_view;
-                                        "diag-reclaim: allocate_pages destroying committed range"
-                                    );
+                                    if diag_mm_enabled() {
+                                        litebox_util_log::error!(
+                                            start:% = r.start,
+                                            end:% = r.end,
+                                            len:% = r.len(),
+                                            was_mapped_view:? = was_mapped_view;
+                                            "diag-reclaim: allocate_pages destroying committed range"
+                                        );
+                                    }
                                     let decommit_ok = if was_mapped_view {
                                         (unsafe {
                                             UnmapViewOfFileEx(
@@ -5762,12 +5797,14 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                 let ptr = if was_mapped_view {
                                     reserve_and_commit(r.clone(), prot_flags(initial_permissions))
                                 } else {
-                                    litebox_util_log::error!(
-                                        start:% = r.start, end:% = r.end, len:% = r.len(),
-                                        pid:% = std::process::id(),
-                                        tid:? = std::thread::current().id();
-                                        "diag-commit: VirtualAlloc2(MEM_COMMIT) over reserved range"
-                                    );
+                                    if diag_mm_enabled() {
+                                        litebox_util_log::error!(
+                                            start:% = r.start, end:% = r.end, len:% = r.len(),
+                                            pid:% = std::process::id(),
+                                            tid:? = std::thread::current().id();
+                                            "diag-commit: VirtualAlloc2(MEM_COMMIT) over reserved range"
+                                        );
+                                    }
                                     unsafe {
                                         VirtualAlloc2(
                                             GetCurrentProcess(),
@@ -5929,11 +5966,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     );
                     return Ok(true);
                 }
-                litebox_util_log::error!(
-                    start:% = r.start, end:% = r.end, len:% = r.len(),
-                    pid:% = std::process::id(), tid:? = std::thread::current().id();
-                    "diag-decommit: VirtualFree(MEM_DECOMMIT)"
-                );
+                if diag_mm_enabled() {
+                    litebox_util_log::error!(
+                        start:% = r.start, end:% = r.end, len:% = r.len(),
+                        pid:% = std::process::id(), tid:? = std::thread::current().id();
+                        "diag-decommit: VirtualFree(MEM_DECOMMIT)"
+                    );
+                }
                 Ok(unsafe {
                     VirtualFree(r.start as *mut c_void, r.len(), Win32_Memory::MEM_DECOMMIT)
                 } != 0)
@@ -5975,15 +6014,17 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 let ok = unsafe {
                     VirtualProtect(r.start as *mut c_void, r.len(), flags, &raw mut old_protect)
                 } != 0;
-                litebox_util_log::error!(
-                    tid:? = std::thread::current().id(),
-                    start:% = r.start,
-                    end:% = r.end,
-                    new_flags:% = flags,
-                    old_protect:% = old_protect,
-                    ok:% = ok;
-                    "diag-vprotect: update_permissions VirtualProtect"
-                );
+                if diag_mm_enabled() {
+                    litebox_util_log::error!(
+                        tid:? = std::thread::current().id(),
+                        start:% = r.start,
+                        end:% = r.end,
+                        new_flags:% = flags,
+                        old_protect:% = old_protect,
+                        ok:% = ok;
+                        "diag-vprotect: update_permissions VirtualProtect"
+                    );
+                }
                 Ok(ok)
             },
         )
@@ -6024,10 +6065,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         if handle.is_null() {
             return Err(SharedMemoryError::OutOfMemory);
         }
-        litebox_util_log::error!(
-            handle:% = handle as usize, size:% = size, pid:% = std::process::id();
-            "diag-shm: create_shared_memory"
-        );
+        if diag_mm_enabled() {
+            litebox_util_log::error!(
+                handle:% = handle as usize, size:% = size, pid:% = std::process::id();
+                "diag-shm: create_shared_memory"
+            );
+        }
         Ok(handle as usize)
     }
 
@@ -6143,7 +6186,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         // bug on the client-buffer path). Only small buffers are sampled: the 8.29MB
         // scanout has its own dedicated diagnostics and scanning it here would slow
         // every flip.
-        {
+        if diag_mm_enabled() {
             let sample_len = core::cmp::min(suggested_range.len(), 4096);
             let nz = if sample_len > 0 && suggested_range.len() <= 4 * 1024 * 1024 {
                 let bytes = unsafe {
@@ -6236,11 +6279,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         let _guard = VIRTUAL_PROTECT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        litebox_util_log::error!(
-            start:% = range.start, end:% = range.end, len:% = range.len(),
-            pid:% = std::process::id(), tid:? = std::thread::current().id();
-            "diag-decommit: UnmapViewOfFileEx"
-        );
+        if diag_mm_enabled() {
+            litebox_util_log::error!(
+                start:% = range.start, end:% = range.end, len:% = range.len(),
+                pid:% = std::process::id(), tid:? = std::thread::current().id();
+                "diag-decommit: UnmapViewOfFileEx"
+            );
+        }
         let ok = unsafe {
             UnmapViewOfFileEx(
                 Win32_Memory::MEMORY_MAPPED_VIEW_ADDRESS {
@@ -6297,10 +6342,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         // never valid) -- matching this file's existing style of not treating cleanup-path
         // failures as fatal (see e.g. `VirtualFree` callers that only assert in truly
         // unexpected cases).
-        litebox_util_log::error!(
-            handle:% = handle, pid:% = std::process::id();
-            "diag-shm: close_shared_memory"
-        );
+        if diag_mm_enabled() {
+            litebox_util_log::error!(
+                handle:% = handle, pid:% = std::process::id();
+                "diag-shm: close_shared_memory"
+            );
+        }
         let _ = unsafe { Win32_Foundation::CloseHandle(handle as *mut c_void) };
         Ok(())
     }

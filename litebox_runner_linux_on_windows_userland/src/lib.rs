@@ -683,9 +683,27 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 // identity directly, from the thread itself -- see `set_current_thread_guest_pid`'s
                 // doc comment for the full story and the confirmed-live bug this fixes.
                 litebox_platform_windows_userland::set_current_thread_guest_pid(init_task.pid);
-                let program = shim
-                    .load_program(initial_file_system, init_task, &prog_path, argv, envp)
-                    .unwrap();
+                // Deliberately NOT `.unwrap()`/`.expect()` here: on this codebase's Windows
+                // target, panicking on this specific spawned thread has been observed to
+                // overflow the stack during unwind (confirmed live, AGENTS.md's "Reproduction
+                // commands" section -- a leading `/` on the program path makes this fail with a
+                // real `ENOENT`, but the panic-unwind path masks it behind an opaque "thread
+                // '<unknown>' has overflowed its stack" with zero indication of the real cause).
+                // Print the real error and exit cleanly instead of unwinding through whatever
+                // is fragile on this thread.
+                let program = match shim.load_program(
+                    initial_file_system,
+                    init_task,
+                    &prog_path,
+                    argv,
+                    envp,
+                ) {
+                    Ok(program) => program,
+                    Err(e) => {
+                        eprintln!("failed to load program {prog_path:?}: {e:?}");
+                        std::process::exit(1);
+                    }
+                };
                 unsafe {
                     litebox_platform_windows_userland::run_thread(
                         program.entrypoints,
@@ -1260,6 +1278,33 @@ fn import_writable_layer(
                 let mut contents = Vec::new();
                 std::io::Read::read_to_end(&mut entry, &mut contents)
                     .map_err(|e| anyhow!("failed to read {path} from archive: {e}"))?;
+                // Some archives (e.g. ones built by appending individual files with
+                // `tarfile.open(path, 'a')` or GNU `tar -r` rather than a full
+                // directory-recursive `tar -c`) omit the intermediate `Directory`
+                // entries for a file's parent path. `fs.open` below requires every
+                // parent component to already exist, so create them here rather than
+                // assuming the archive lists directories before the files inside them
+                // -- a real, reproducible panic (`PathError(MissingComponent)`) hit on
+                // `advisor/probes/run_xfce_staged.sh` in a genuine archive from this
+                // session without this. Ignore AlreadyExists for the same reason as the
+                // `Directory` arm above.
+                if let Some(parent) = std::path::Path::new(&path).parent() {
+                    let mut built = String::new();
+                    for component in parent.components() {
+                        use std::path::Component;
+                        match component {
+                            Component::RootDir => built.push('/'),
+                            Component::Normal(part) => {
+                                if !built.ends_with('/') {
+                                    built.push('/');
+                                }
+                                built.push_str(&part.to_string_lossy());
+                                let _ = fs.mkdir(&*built, litebox::fs::Mode::from_bits_truncate(0o755));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 let fd = fs
                     .open(
                         &*path,

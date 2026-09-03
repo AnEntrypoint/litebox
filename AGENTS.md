@@ -224,7 +224,17 @@ one already fixed)**:
 3. Discover the display weston chooses (currently `:0`) rather than hardcoding `:1`.
 4. **No `set -x` anywhere** in the script or anything it sources — use explicit `echo` markers at
    stage boundaries instead. Grep for this explicitly when touching any launch script; it is easy
-   to reintroduce by copying.
+   to reintroduce by copying. **Full repo-wide audit done (advisor-db, `f3248418`)**: 7 files
+   mention `set -x`, only 3 as an active directive — `setx_ud_repro.sh` (intentional, it IS the
+   `#UD` repro), and two stale real launchers that DID still have it live
+   (`xfce_on_weston.sh`, `xfce_diag_launch.sh`) — fixed, each now carries a comment explaining the
+   mechanism instead of a bare deletion (so it isn't silently re-added for debugging later). The
+   three current launchers (`run_xfce_xwm.sh`, `run_xfce_staged.sh`, `run_xfce_noxfwm.sh`) are
+   clean. Two scripts inside the merged guest layer tar (`run_xfce.sh`, `xfce_on_weston.sh`) still
+   carry tracing but are confirmed NOT executed by the tar/script combination actually run
+   (`xfce_launch.sh` is what's inside the tar, has no `set -x`, and run logs confirm it's never
+   invoked) — nothing dormant is interfering with current results. **Closed, no longer a live
+   loose end.**
 5. Single dbus spawn, no retry — retrying a backgrounded spawn after losing one child to the `#UD`
    kills the launcher shell itself, not just the child. If dbus is lost, rerun the whole script.
 6. Capture backgrounded services' stderr AND print/tee it, so a fast fatal crash never presents as
@@ -1739,10 +1749,26 @@ Bare-rootfs fork-bug repro (fast, no display stack): see the regression oracle a
 - **A missing `--resume-from`/`--initial-files` file panics the runner with a stack overflow**
   instead of a clean error (`lib.rs:338` and `lib.rs:679`, both `.unwrap()` on a file-open
   result) — if you see "thread 'main' has overflowed its stack" right after an "os error 2" (file
-  not found) message, the actual bug is your invocation, not litebox itself. Worth fixing these
-  two `.unwrap()`s to a graceful error + exit if touched again.
-- **The program path passed to the runner must be RELATIVE, no leading slash** (`bin/sh`, not
-  `/bin/sh`) — a leading slash also hits the same ENOENT-then-stack-overflow panic shape above.
+  not found) message, the actual bug is your invocation, not litebox itself.
+- **FIXED (this session, "client startup" investigation): the `load_program(...).unwrap()` on the
+  spawned initial-guest-thread (`litebox_runner_linux_on_windows_userland/src/lib.rs`, was line
+  688) no longer panics-then-stack-overflows on a bad program path.** Root-caused precisely: this
+  is NOT a leading-slash issue in litebox's own path handling (leading `/` is litebox's correct
+  internal convention, confirmed by reading `import_writable_layer`'s
+  `alloc::format!("/{header_path}")`) — it was **Git-Bash/MSYS2 silently rewriting a bare
+  `/bin/sh`-style argument into a Windows path before the runner ever saw it**, which then
+  legitimately got `ENOENT` from `load_program`, and panicking on that specific spawned thread
+  overflows the stack during unwind (a real, separate, now also-fixed issue below). Confirmed via
+  `MSYS2_ARG_CONV_EXCL="*"`: with that set, a plain `/bin/sh` argument reaches the runner correctly
+  and works fine — **always set `MSYS2_ARG_CONV_EXCL="*"` before invoking the runner from Git
+  Bash/MSYS2**, or the exact same false "litebox path bug" will reappear. Independently also fixed
+  the panic-shape itself: the spawned thread's `load_program(...).unwrap()` now matches on the
+  `Result` and does `eprintln!` + `std::process::exit(1)` instead of unwinding, so any FUTURE
+  genuine `load_program` failure (wrong path, corrupted binary, whatever) fails with a clean,
+  readable one-line error instead of the opaque "thread '\<unknown\>' has overflowed its stack".
+  Verified directly: `-- /bin/does_not_exist` now prints
+  `failed to load program "/bin/does_not_exist": OpenError(Errno(2 = ENOENT: ...))` and exits 1,
+  no stack overflow.
 
 ## Host memory hygiene — check before trusting any run's result
 
@@ -1807,3 +1833,111 @@ further value once analyzed).
   the expected path got a false "file is gone" read. **After any `rm -rf`/`mv` cleanup pass on a
   shared directory, verify with `ls`/`find` that the result actually landed where you expect** —
   don't assume a `mv` to a name that used to be occupied succeeded as a plain rename.
+
+## Pass 340 — "client startup is slow" ROOT-CAUSED AND FIXED: it was never litebox at all
+
+**Assigned task**: priority-2 follow-on, "client startup under litebox is extremely slow,
+unexplained" (`xfce4-about --version` never exited in an 85s run; `xfce4-appfinder` never finished
+in 98s). Used the existing `LITEBOX_DIAG_WAIT_DUR=1` instrumentation and built a minimal timed
+repro (`advisor/probes/startup_timing_repro.sh`, new, committed) that stamps `date +%s.%N` at every
+launch-script stage boundary (dbus/seatd/weston/Xwayland-socket/xfconfd/client) instead of relying
+on frame captures or full-desktop launches.
+
+**FOUND, CONFIRMED, AND FIXED: the layer tar's baked-in `weston.ini` never actually had the
+`xwayland=true` fix that this file's pass 322/328 (2026-09-03, earlier the same day) describe as
+landed and verified.** Direct extraction proved it:
+```
+$ tar xf .wfgy/xfce-build/layer31_direct_fixed.tar -O ./etc/xdg/weston/weston.ini
+[core]
+shell=desktop-shell.so
+[shell]
+...
+```
+No `xwayland=true` line anywhere. `run_xfce_xwm.sh` itself never sets it either (relies entirely on
+the layer's own config) — so despite the earlier passes' clean measurements, **the actual
+`layer31_direct_fixed.tar` on disk regressed back to the pre-fix config at some point** (most
+likely overwritten by a later `--export-writable-layer` snapshot from a run that didn't have the
+ini fix applied, given how many sessions have written to this same filename per the disk-hygiene
+section above). Direct consequence, confirmed by isolating just the seatd+weston+Xwayland-wait
+stages with `--logger-scopes=log,xwm,xwayland`: weston's own log shows **no
+`Loading module '.../xwayland.so'` line at all**, and the launch script's own X11-socket poll loop
+(`while [ "$i" -lt 200 ]; do ... sleep 0.2; done`, a 40-second budget) runs to its FULL bound with
+`disp=` staying empty the entire time. **This is the "extremely slow, unexplained" client startup**
+— not a litebox lock, not a missed wakeup, not thousands of small syscall overheads: a fixed 40s
+(or up to ~56s measured, depending on which script's own poll bounds are summed) shell-level
+timeout burning down while waiting for an X11 socket that will never appear, because Xwayland was
+never told to start. When `xfce4-about --version` then runs against an empty `DISPLAY=""`, it hits
+a **separate, already-extensively-documented (30+ archived passes), still-unresolved crash class**
+(`[diag-unrecov-av] ... addr=0x2 ... is_in_guest=false`, a near-null host-side fault with no
+exception-table entry — see `docs/AGENTS_ARCHIVE_2026-09-03.md`'s 20th/21st/26th passes) rather
+than exiting cleanly — this crash is NOT new, was not investigated further here (already has 30+
+passes of prior investigation with no root cause found; not this session's job to re-open), and is
+a completely separate bug from the weston.ini regression.
+
+**Fix applied and verified**: rebuilt `.wfgy/xfce-build/layer31_direct_fixed.tar`'s
+`etc/xdg/weston/weston.ini` with `xwayland=true` restored under `[core]` (old broken tar kept as
+`.wfgy/xfce-build/layer31_direct_fixed.tar.bak_no_xwayland_fix` for reference, not committed —
+`.wfgy/` is gitignored). Direct before/after measurement, isolated repro (seatd+weston+Xwayland
+socket wait only, no full desktop):
+```
+WITHOUT xwayland=true:  XWAYLAND_SOCKET_UP disp=            iters=200  (full 40s timeout burned)
+WITH xwayland=true:     XWAYLAND_SOCKET_UP disp=:0 iters=0  (~1s, first poll succeeds)
+weston's own log, WITH the fix: 18:42:10.538 (weston starts) -> 18:42:10.923 ("xserver listening
+  on display :0") -- under 400ms for the entire seatd+DRM+Xwayland-launch sequence
+```
+Full end-to-end repro through an actual `xfce4-about --version` call, WITH the fix:
+```
+STAGE_DBUS_START -> CLIENT_DONE rc=0 in 17 seconds total wall time (was: never finished in 85-98s)
+xfce4-about prints its version banner and exits cleanly, rc=0 -- no hang, no crash
+```
+Final full-desktop verification against the fixed tar via the documented repro command
+(`advisor/probes/run_xfce_xwm.sh`, `--gui`, `LITEBOX_DUMP_FRAMES=1`): `DBUS_UP=yes`,
+`SEATD_READY=1`, `WESTON_READY=1`, `XFCE_DISPLAY=:0`, `XWAYLAND_READY=0` (ready on the very first
+poll), `XFCONF_PROBE_RC=0`, **`XCHECK_RC=0`** (the embedded `xfce4-about --version` probe — the
+exact command this whole investigation was assigned to explain — now exits 0 immediately, not
+"never exits in 85-98s"), all six components reach their `_WAITED` stage, `TEST_DONE` reached.
+
+**Answering the direct question this pass was asked to settle**: with the fix, startup
+**completes**, does not hang/stall indefinitely, and does not take 60-98 seconds for a trivial
+client — it was never a real per-component slowness at all. The ~60s figures measured in earlier
+passes were shell polling-loop timeout budgets being fully consumed while waiting on a socket that
+could never appear; they say nothing about litebox's own syscall-emulation performance, and nothing
+about whether XFCE draws correctly once it does start (that remains pass 339's open question, now
+on solid footing since components genuinely do come up promptly).
+
+**Also fixed, found investigating this (both in
+`litebox_platform_windows_userland`/`litebox_runner_linux_on_windows_userland`, tracked-source
+commits)**:
+1. **`import_writable_layer` (`--resume-from` archive import) panicked with `PathError(
+   MissingComponent)` on any archive entry whose parent directories weren't themselves present as
+   separate tar members** (e.g. one built by appending individual files rather than a full
+   directory-recursive `tar -c` — confirmed reproducible on `advisor/probes/run_xfce_staged.sh`'s
+   own entry in `layer31_direct_fixed.tar`). Fixed by creating parent directories on the fly before
+   `fs.open`, mirroring the existing `Directory` arm's `AlreadyExists`-tolerant `mkdir`.
+2. **The spawned initial-guest-thread's `load_program(...).unwrap()` panicked-then-stack-
+   overflowed on any real `load_program` failure** (confirmed: a genuinely missing binary path),
+   producing an opaque "thread '\<unknown\>' has overflowed its stack" with zero indication of the
+   real underlying error. Changed to a `match` that prints the real error and `std::process::exit
+   (1)` cleanly instead of unwinding — verified: `-- /bin/does_not_exist` now prints
+   `failed to load program "/bin/does_not_exist": OpenError(Errno(2 = ENOENT: ...))` and exits 1.
+3. **~11,000 unconditional `error!`-level log lines fired in the first 8 seconds of a single guest
+   run** from `litebox_platform_windows_userland/src/lib.rs`'s hot memory-management path
+   (`VirtualAlloc2`/`VirtualProtect`/`VirtualFree`/shared-memory create/map/close) — these calls
+   had NO env-var gate at all (unlike every other diagnostic in this file, including the existing
+   `LITEBOX_DIAG_WAIT_DUR`), fired regardless of `LITEBOX_LOG` level (they're `error!` calls), and
+   were pure overhead: a full desktop launch performs tens of thousands of such operations. Not the
+   root cause of the 60s startup symptom (that was the weston.ini regression, above), but a real,
+   previously-unidentified source of avoidable per-syscall overhead and log-volume noise that made
+   this investigation itself much harder (11,405 lines to read through for 8 seconds of guest
+   time). Gated all of them behind a new `LITEBOX_DIAG_MM=1` env var (default OFF, same
+   thread-local-cached pattern as `diag_wait_dur_enabled`) — `nonzero_in_sample`/
+   `diag-shm-crossview` (the compositing-bug diagnostics pass 322 relied on) are preserved under
+   the same flag for any future investigation that needs them, just no longer always-on.
+
+**Files changed**: `litebox_platform_windows_userland/src/lib.rs` (import-layer parent-dir fix,
+`LITEBOX_DIAG_MM` gating), `litebox_runner_linux_on_windows_userland/src/lib.rs` (clean
+`load_program` error path), `advisor/probes/startup_timing_repro.sh` (new, the minimal timed
+repro used throughout this pass), `.wfgy/xfce-build/layer31_direct_fixed.tar` (weston.ini
+`xwayland=true` restored — gitignored, not part of the commit, but the canonical filename other
+scripts/sessions reference, fixed in place per this file's own disk-hygiene convention; the
+pre-fix tar is kept as `.tar.bak_no_xwayland_fix` alongside it for reference).
