@@ -540,6 +540,39 @@ processes pending signals, returns `!is_exiting()`).
    resume decision, or in the asm's actual jump-back-to-guest-code path.
 **Whichever of these two is the LAST one present in the capture pinpoints the exact gap.**
 
+**RESULT, MAJOR CORRECTION: the thread DOES resume and run real guest code. The bug is a LOST
+FUTEX WAKEUP, not a thread that never resumes into guest code.** advisor-db's `LITEBOX_LOG=debug`
+capture on the fast `xfce4-about` repro:
+```
+t=13.068       clone/NewThread: init_thread_context reached tid=18 host_tid=5860
+               rip=0x30f4a573 rsp=0x33662128 tls=Some(862346040) stack_readable=Some(true)
+t=13.07-13.46  tid=18 RUNS REAL GUEST CODE: 5,112 signal ops, 1,170 file ops, 913 memory ops
+t=13.464       tid=18 -> futex WAIT enter addr=846000944 val=0 timeout=None
+t=32.803       tid=17 (the MAIN thread) -> futex WAIT enter addr=821315968
+neither address is EVER woken; whole-run totals: 2 futex WAITs, 44 WAKEs, zero overlap
+```
+**Both of the diagnostic checkpoints above fire** — `init_thread_context` is reached, and the
+thread executes ~400ms of real guest work afterward. By the decision tree above that puts the
+failure past both markers, and the data confirms it: **this is not a resume-path bug at all.**
+**Refined diagnosis**: the cloned thread starts correctly, does real work, then blocks on a futex
+with no timeout that nobody ever signals. The main thread later blocks on a DIFFERENT futex,
+also never signaled. Two threads, two waits, zero matching wakes out of 44 total wakes in the
+run — **a deadlock in futex wake delivery or wait/wake address pairing, i.e. a genuine litebox
+lost-wakeup bug**, materially different from (and more specific than) "healed thread never
+resumes." **Suspected mechanisms, in priority order**:
+1. A WAKE on an address may not be reaching a waiter registered on the same address — a wait-queue
+   keying mismatch would produce exactly this (wakes happening, waiters never woken).
+2. **Classic lost-wakeup race**: a wake issued BEFORE the waiter registers is lost rather than
+   remembered/queued — fits "44 wakes, 2 waits, no overlap" precisely. **Specific supporting
+   detail**: tid=18's last actions before parking are a futex WAKE (`woken=0`, no waiter present
+   yet) immediately followed by `process_signals` then its own WAIT — a wake with `woken=0`
+   landing just before the partner registers is exactly this shape.
+3. The `val=0` check: futex WAIT should return immediately if the word no longer equals the
+   expected value at check time — a stale/racy comparison could park a thread that should never
+   have slept in the first place.
+**Next step**: advisor-db has the full 154MB debug log and will pull specific excerpts (not share
+wholesale, will delete once extracted) — needs specific addresses or time ranges to dig into next.
+
 **In progress in parallel**: advisor-db is running a context test (a GTK binary inside the full
 display stack, expected ~2s reproduction if display-stack context is what triggers this) to give a
 fast verification target for whatever fix lands here.
