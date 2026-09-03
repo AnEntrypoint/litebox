@@ -635,6 +635,37 @@ impl<Platform: ShimPlatform> Process<Platform> {
         }
     }
 
+    /// Interrupts exactly one live thread of this process by `tid` (a no-op if that `tid` isn't a
+    /// currently-live thread of this process), causing it to re-evaluate its wait condition at
+    /// its next opportunity -- same purpose and same "never call `interrupt()` while still
+    /// holding `inner`" contract as [`Self::interrupt_all_threads`], just targeted at one thread
+    /// instead of all of them. See `do_kill`'s same-process-remote-`tid` case (lost-wakeup
+    /// investigation, sub-session 37) for why this exists: `tkill(tid, sig)`/`tgkill(pid, tid,
+    /// sig)` are POSIX's *only* way to signal one specific thread of a multi-threaded process
+    /// (unlike `kill(pid, sig)`, which may land on any thread) -- glibc/musl's NPTL uses this
+    /// exact primitive internally for cross-thread synchronization handshakes (e.g. dlopen's
+    /// TLS-update quiesce signal, `SIGRTMIN`/signal 34), sent fire-and-forget with the return
+    /// value never checked. Before this existed, `do_kill` rejected every remote-`tid` call
+    /// outright with `ESRCH` (there was no way to deliver to one specific sibling thread's own
+    /// pending-signal queue at all -- only `shared_pending`, process-wide), which glibc's internal
+    /// call sites don't check for, so the signal was silently and permanently dropped. Confirmed
+    /// live as the root cause of a real, reproduced `xfce4-about`/GTK deadlock: the target thread
+    /// never received the signal it was fire-and-forget-`tkill`'d, so it never ran whatever
+    /// handler/acknowledgment code the sender was then unconditionally `futex`-waiting on, wedging
+    /// both threads forever.
+    /// Returns whether `tid` was a currently-live thread of this process (i.e. whether there was
+    /// anything to interrupt) -- `do_kill`'s same-process-remote-`tid` case uses this to return a
+    /// real `ESRCH` for a genuinely nonexistent/already-exited tid, matching real Linux's
+    /// `tkill`/`tgkill` behavior, rather than reporting false success.
+    pub(crate) fn interrupt_thread(&self, tid: i32) -> bool {
+        let remote = self.inner.lock().threads.get(&tid).cloned();
+        let found = remote.is_some();
+        if let Some(thread) = remote {
+            thread.interrupt();
+        }
+        found
+    }
+
     /// Returns the exit code if all threads in this process have already exited, without
     /// blocking. Used by `wait4(WNOHANG)`.
     pub fn try_wait_for_exit(&self) -> Option<ExitStatus> {
@@ -3103,6 +3134,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 None,
             )
         };
+        // Every clone REQUEST, logged before the new thread runs (or fails to). A hang whose
+        // waiter parks correctly on a value nobody ever produces is ambiguous between "the
+        // producing thread ran and went wrong" and "the producing thread was never created";
+        // pairing this line with the thread's own first-instruction log tells them apart, and a
+        // clone that appears here with no corresponding start means the failure is in spawn.
+        litebox_util_log::debug!(
+            child_tid:% = child_tid,
+            parent_pid:% = self.pid;
+            "clone: request registered"
+        );
         thread.init_state.set(init_state);
         thread.clear_child_tid.set(clear_child_tid);
 
@@ -4039,6 +4080,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let Some(count) = core::num::NonZeroU32::new(count) else {
                     return Ok(0);
                 };
+                // Lost-wakeup investigation (sub-session 37): read the futex word's CURRENT value
+                // at the moment of the wake, before waking anyone. If a wake with woken=0 shows a
+                // value that looks like "the lock/condition was genuinely released" (e.g. flipped
+                // to the value a waiter's `val` check would no longer match), that's consistent
+                // with ordinary "no one happened to be waiting yet" -- normal on real Linux too.
+                // If instead the SAME address's WAIT enter later shows the word still matches the
+                // waiter's `expected_value`, but no subsequent WAKE for that exact address ever
+                // appears, that points at a genuinely dropped/misdirected wake rather than benign
+                // wake-on-unlock noise.
+                let current_value = addr.read_at_offset::<Platform>(0);
                 let woken = self.global.futex_manager.wake(
                     addr.to_platform_ptr::<Platform>(),
                     count,
@@ -4048,6 +4099,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     tid:% = self.tid,
                     host_tid:% = self.global.platform.host_debug_tid(),
                     addr:% = addr.as_usize(),
+                    current_value:? = current_value,
                     requested:% = count.get(),
                     woken:% = woken;
                     "futex: WAKE"
@@ -4062,13 +4114,35 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             } => {
                 warn_shared_futex!(flags);
                 let timeout = timeout.read::<Platform>()?;
+                // Lost-wakeup investigation (sub-session 37): log the word's value right before
+                // blocking too (mirrors the WAKE side's own `current_value` log added alongside
+                // this) -- lets a later pass directly compare "what a waiter expected" against
+                // "what any wake anywhere ever saw", without needing a live memory-poll thread.
+                let current_value = addr.read_at_offset::<Platform>(0);
                 litebox_util_log::debug!(
                     tid:% = self.tid,
                     addr:% = addr.as_usize(),
                     val:% = val,
+                    current_value:? = current_value,
                     timeout:? = timeout;
                     "futex: WAIT enter"
                 );
+                // A wait whose expected value has FUTEX_WAITERS (0x8000_0000) set is a
+                // *contended lock* handoff, not a plain condition wait: glibc/musl encode the
+                // owning thread's TID in the low 30 bits. Decoding it names the thread that must
+                // release before this one can run, which is the whole question in a two-waiter
+                // stall -- otherwise the address alone says nothing about who is responsible.
+                // A named owner that is itself parked is a deadlock; an owner that has already
+                // exited is a lost handoff.
+                if val & 0x8000_0000 != 0 {
+                    litebox_util_log::debug!(
+                        tid:% = self.tid,
+                        addr:% = addr.as_usize(),
+                        owner_tid:% = val & 0x3fff_ffff,
+                        raw_val:% = val;
+                        "futex: WAIT on CONTENDED lock"
+                    );
+                }
                 let res = self.global.futex_manager.wait(
                     &self.wait_cx().with_timeout(timeout),
                     addr.to_platform_ptr::<Platform>(),

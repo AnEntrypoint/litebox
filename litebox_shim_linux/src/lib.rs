@@ -119,9 +119,15 @@ impl<T> ShimPlatform for T where
 
 /// On debug builds, logs that the user attempted to use an unsupported feature.
 fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
-    if cfg!(debug_assertions) {
-        litebox_util_log::warn!(feature:% = args; "unsupported");
-    }
+    // Unconditional, NOT gated on `debug_assertions`. An unsupported feature is a silent
+    // behavioural divergence from Linux -- the syscall returns an error the guest did not
+    // deserve -- so it is exactly what a release-build investigation most needs to see.
+    // Compiling it out of release builds cost a long hunt for a hang whose actual cause was
+    // `sys_tkill` to a remote tid returning ESRCH without sending the signal: that one
+    // load-bearing event was invisible at every `LITEBOX_LOG` level, and the search went to
+    // futex keying, lost wakeups and thread spawn instead. `warn!` already costs nothing when
+    // the level is filtered out, so there is no reason to also strip it at compile time.
+    litebox_util_log::warn!(feature:% = args; "unsupported");
 }
 
 #[cfg(target_pointer_width = "64")]
@@ -1224,6 +1230,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if is_target {
             litebox_util_log::error!(
                 pid:% = self.pid,
+                tid:% = self.tid,
                 comm:% = alloc::string::String::from_utf8_lossy(&comm_bytes),
                 syscall:% = crate::diag::syscall_name_pub(syscall_number),
                 syscall_num:% = syscall_number;
@@ -1236,6 +1243,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if is_target {
             litebox_util_log::error!(
                 pid:% = self.pid,
+                tid:% = self.tid,
                 comm:% = alloc::string::String::from_utf8_lossy(&comm_bytes),
                 syscall:% = crate::diag::syscall_name_pub(syscall_number),
                 ok:% = result.is_ok();
@@ -1309,6 +1317,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             };
             litebox_util_log::error!(
                 pid:% = self.pid,
+                tid:% = self.tid,
                 comm:% = alloc::string::String::from_utf8_lossy(&self.comm.get()),
                 request:% = truncated;
                 "diag-syscall-request-detail"

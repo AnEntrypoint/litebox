@@ -1,0 +1,137 @@
+   0.053503900s DEBUG litebox_shim_linux::syscalls::process: clone: request registered child_tid=2 parent_pid=1000
+   0.104856100s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: clear_child_tid futex wake start tid=2
+   0.104871800s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=38301584 requested=1
+   0.104877500s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=2 host_tid=7672 addr=38301584 current_value=Some(0) requested=1 woken=0
+   0.104926200s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: clear_child_tid futex wake done tid=2
+   0.116382000s DEBUG litebox_shim_linux::syscalls::process: clone: request registered child_tid=3 parent_pid=1000
+   0.166532300s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: clear_child_tid futex wake start tid=3
+   0.166542000s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=74542992 requested=1
+   0.166596000s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=3 host_tid=4780 addr=74542992 current_value=Some(0) requested=1 woken=0
+   0.166628500s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: clear_child_tid futex wake done tid=3
+   0.178217500s DEBUG litebox_shim_linux::syscalls::process: clone: request registered child_tid=4 parent_pid=1000
+   0.221341700s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: clear_child_tid futex wake start tid=4
+   0.221350500s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=110784400 requested=1
+   0.221359400s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=4 host_tid=6836 addr=110784400 current_value=Some(0) requested=1 woken=0
+   0.221420000s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: clear_child_tid futex wake done tid=4
+   0.232296500s DEBUG litebox_shim_linux::syscalls::process: clone: request registered child_tid=5 parent_pid=1000
+   0.287150600s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: clear_child_tid futex wake start tid=5
+   0.287160600s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=147025808 requested=1
+   0.287168900s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=5 host_tid=10224 addr=147025808 current_value=Some(0) requested=1 woken=0
+   0.287229500s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: clear_child_tid futex wake done tid=5
+   0.297696900s DEBUG litebox_shim_linux::syscalls::process: clone: request registered child_tid=6 parent_pid=1000
+   0.342250400s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: clear_child_tid futex wake start tid=6
+   0.342259500s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=183267216 requested=1
+   0.342268900s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=6 host_tid=22892 addr=183267216 current_value=Some(0) requested=1 woken=0
+   0.342340700s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: clear_child_tid futex wake done tid=6
+   0.353852800s DEBUG litebox_shim_linux::syscalls::process: clone: request registered child_tid=7 parent_pid=1000
+   0.410888900s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: clear_child_tid futex wake start tid=7
+   0.410897200s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=219508624 requested=1
+   0.410905800s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=7 host_tid=7412 addr=219508624 current_value=Some(0) requested=1 woken=0
+   0.410958500s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: clear_child_tid futex wake done tid=7
+   0.420862100s DEBUG litebox_shim_linux::syscalls::process: clone: request registered child_tid=8 parent_pid=1000
+   0.431124200s DEBUG litebox_shim_linux::syscalls::process: clone: request registered child_tid=9 parent_pid=1000
+   0.996312800s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: clear_child_tid futex wake start tid=9
+   0.996321700s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=265252752 requested=1
+   0.996329900s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=9 host_tid=7844 addr=265252752 current_value=Some(0) requested=1 woken=0
+   0.996398200s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: clear_child_tid futex wake done tid=9
+   1.004732600s DEBUG litebox_shim_linux::syscalls::process: clone: request registered child_tid=10 parent_pid=1000
+   1.014906100s DEBUG litebox_shim_linux::syscalls::process: clone: request registered child_tid=11 parent_pid=1000
+   1.570870600s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: clear_child_tid futex wake start tid=11
+   1.570934400s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=267808656 requested=1
+   1.570954600s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=11 host_tid=8792 addr=267808656 current_value=Some(0) requested=1 woken=0
+   1.570973700s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: clear_child_tid futex wake done tid=11
+   1.579619700s DEBUG litebox_shim_linux::syscalls::process: clone: request registered child_tid=12 parent_pid=1000
+   1.588931300s DEBUG litebox_shim_linux::syscalls::process: clone: request registered child_tid=13 parent_pid=1000
+   2.157572000s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: clear_child_tid futex wake start tid=13
+   2.157599300s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=280719248 requested=1
+   2.157661300s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=13 host_tid=18024 addr=280719248 current_value=Some(0) requested=1 woken=0
+   2.157793100s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: clear_child_tid futex wake done tid=13
+   2.166339100s DEBUG litebox_shim_linux::syscalls::process: clone: request registered child_tid=14 parent_pid=1000
+   2.421434600s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=526171800 requested=2147483647
+   2.421449200s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=12 host_tid=3536 addr=526171800 current_value=Some(1) requested=2147483647 woken=0
+   2.421504900s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=526171800 requested=2147483647
+   2.421513900s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=12 host_tid=3536 addr=526171800 current_value=Some(2) requested=2147483647 woken=0
+   2.932855200s DEBUG litebox_shim_linux::syscalls::process: clone: request registered child_tid=15 parent_pid=12
+   3.473417100s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=669630104 requested=2147483647
+   3.473428600s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=15 host_tid=3076 addr=669630104 current_value=Some(1) requested=2147483647 woken=0
+   3.473489000s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=669630104 requested=2147483647
+   3.473497500s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=15 host_tid=3076 addr=669630104 current_value=Some(2) requested=2147483647 woken=0
+   8.247716500s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: clear_child_tid futex wake start tid=14
+   8.247728100s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=526872464 requested=1
+   8.247798600s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=14 host_tid=5400 addr=526872464 current_value=Some(0) requested=1 woken=0
+   8.247835200s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: clear_child_tid futex wake done tid=14
+   8.260301600s DEBUG litebox_shim_linux::syscalls::process: clone: request registered child_tid=16 parent_pid=1000
+  12.346129800s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: clear_child_tid futex wake start tid=16
+  12.346139200s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=785149840 requested=1
+  12.346172600s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=16 host_tid=19604 addr=785149840 current_value=Some(0) requested=1 woken=0
+  12.346183200s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: clear_child_tid futex wake done tid=16
+  12.357583000s DEBUG litebox_shim_linux::syscalls::process: clone: request registered child_tid=17 parent_pid=1000
+  14.865014600s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=842186392 requested=2147483647
+  14.865029100s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=17 host_tid=18332 addr=842186392 current_value=Some(1) requested=2147483647 woken=0
+  14.865115600s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=842186392 requested=2147483647
+  14.865229200s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=17 host_tid=18332 addr=842186392 current_value=Some(2) requested=2147483647 woken=0
+  14.869412000s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=842186392 requested=2147483647
+  14.869426300s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=17 host_tid=18332 addr=842186392 current_value=Some(3) requested=2147483647 woken=0
+  14.869549300s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=842186392 requested=2147483647
+  14.869567100s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=17 host_tid=18332 addr=842186392 current_value=Some(4) requested=2147483647 woken=0
+  14.869676200s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=842186392 requested=2147483647
+  14.869688600s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=17 host_tid=18332 addr=842186392 current_value=Some(5) requested=2147483647 woken=0
+  14.869744700s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=842186392 requested=2147483647
+  14.869754900s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=17 host_tid=18332 addr=842186392 current_value=Some(6) requested=2147483647 woken=0
+  14.869809400s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=842186392 requested=2147483647
+  14.869820000s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=17 host_tid=18332 addr=842186392 current_value=Some(7) requested=2147483647 woken=0
+  14.869882000s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=842186392 requested=2147483647
+  14.869896800s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=17 host_tid=18332 addr=842186392 current_value=Some(8) requested=2147483647 woken=0
+  14.869950700s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=842186392 requested=2147483647
+  14.869960600s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=17 host_tid=18332 addr=842186392 current_value=Some(9) requested=2147483647 woken=0
+  14.870502600s DEBUG litebox_shim_linux::syscalls::process: clone: request registered child_tid=18 parent_pid=17
+  14.870861500s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=842186392 requested=2147483647
+  14.870869300s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=17 host_tid=18332 addr=842186392 current_value=Some(10) requested=2147483647 woken=0
+  14.870934100s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=842186392 requested=2147483647
+  14.870943900s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=17 host_tid=18332 addr=842186392 current_value=Some(11) requested=2147483647 woken=0
+  14.870990300s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=842186392 requested=2147483647
+  14.870998300s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=17 host_tid=18332 addr=842186392 current_value=Some(12) requested=2147483647 woken=0
+  15.146636500s DEBUG litebox_shim_linux::syscalls::process: clone: request registered child_tid=19 parent_pid=12
+  15.450672100s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=849437080 requested=2147483647
+  15.450685800s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=18 host_tid=23912 addr=849437080 current_value=Some(1) requested=2147483647 woken=0
+  15.450874700s DEBUG litebox_shim_linux::syscalls::process: futex: WAIT enter tid=18 addr=846656304 val=0 current_value=Some(0) timeout=None
+  27.051142700s DEBUG litebox_shim_linux::syscalls::process: clone: request registered child_tid=20 parent_pid=19
+  27.259393600s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: clear_child_tid futex wake start tid=20
+  27.259403700s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=1567518608 requested=1
+  27.259479400s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=20 host_tid=15856 addr=1567518608 current_value=Some(0) requested=1 woken=0
+  27.259529200s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: clear_child_tid futex wake done tid=20
+  28.641354200s DEBUG litebox_shim_linux::syscalls::process: clone: request registered child_tid=21 parent_pid=19
+  28.821025300s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: clear_child_tid futex wake start tid=21
+  28.821038700s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=1916104592 requested=1
+  28.821107000s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=21 host_tid=18260 addr=1916104592 current_value=Some(0) requested=1 woken=0
+  28.821140200s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: clear_child_tid futex wake done tid=21
+  28.830598600s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=842186392 requested=2147483647
+  28.830656200s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=17 host_tid=18332 addr=842186392 current_value=Some(13) requested=2147483647 woken=0
+  28.830709900s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=842186392 requested=2147483647
+  28.830716400s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=17 host_tid=18332 addr=842186392 current_value=Some(14) requested=2147483647 woken=0
+  28.830755300s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=842186392 requested=2147483647
+  28.830761700s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=17 host_tid=18332 addr=842186392 current_value=Some(15) requested=2147483647 woken=0
+  28.830812300s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=842186392 requested=2147483647
+  28.830818600s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=17 host_tid=18332 addr=842186392 current_value=Some(16) requested=2147483647 woken=0
+  28.830859600s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=842186392 requested=2147483647
+  28.830865900s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=17 host_tid=18332 addr=842186392 current_value=Some(17) requested=2147483647 woken=0
+  28.830912400s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=842186392 requested=2147483647
+  28.830919200s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=17 host_tid=18332 addr=842186392 current_value=Some(18) requested=2147483647 woken=0
+  28.847801200s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=842186392 requested=2147483647
+  28.847811900s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=17 host_tid=18332 addr=842186392 current_value=Some(19) requested=2147483647 woken=0
+  28.847867500s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=842186392 requested=2147483647
+  28.847880000s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=17 host_tid=18332 addr=842186392 current_value=Some(20) requested=2147483647 woken=0
+  28.857484200s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=842186392 requested=2147483647
+  28.857499900s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=17 host_tid=18332 addr=842186392 current_value=Some(21) requested=2147483647 woken=0
+  28.857632100s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=842186392 requested=2147483647
+  28.857641400s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=17 host_tid=18332 addr=842186392 current_value=Some(22) requested=2147483647 woken=0
+  28.857725900s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=842186392 requested=2147483647
+  28.857736000s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=17 host_tid=18332 addr=842186392 current_value=Some(23) requested=2147483647 woken=0
+  28.857792400s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=842186392 requested=2147483647
+  28.857801500s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=17 host_tid=18332 addr=842186392 current_value=Some(24) requested=2147483647 woken=0
+  28.858148800s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=842186392 requested=2147483647
+  28.858154900s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=17 host_tid=18332 addr=842186392 current_value=Some(25) requested=2147483647 woken=0
+  28.858182800s DEBUG litebox::sync::futex: futex: WAKE matched nothing addr=842186392 requested=2147483647
+  28.858187700s DEBUG litebox_shim_linux::syscalls::process: futex: WAKE tid=17 host_tid=18332 addr=842186392 current_value=Some(26) requested=2147483647 woken=0
+  38.504982000s  WARN litebox_shim_linux::syscalls::signal: drm-diag: process_signals entry with ctx tid=17 rip=821987658 orig_rax=200
+  38.505021800s DEBUG litebox_shim_linux::syscalls::process: futex: WAIT enter tid=17 addr=821971328 val=2147483648 current_value=Some(2147483648) timeout=None

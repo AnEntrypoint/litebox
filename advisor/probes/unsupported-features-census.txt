@@ -1,0 +1,83 @@
+   0.685651000s  WARN litebox_shim_linux: unsupported feature=unsupported syscall close_range
+   0.709801500s  WARN litebox_shim_linux: unsupported feature=unsupported syscall pidfd_open
+   0.713197900s  WARN litebox_shim_linux: unsupported feature=unsupported syscall inotify_init1
+   0.713222400s  WARN litebox_shim_linux: unsupported feature=unsupported syscall inotify_init1
+   0.713246300s  WARN litebox_shim_linux: unsupported feature=unsupported syscall inotify_init
+   1.881784600s  WARN litebox_shim_linux: unsupported feature=unsupported syscall membarrier
+   1.902639700s  WARN litebox_shim_linux: unsupported feature=setsockopt(level = 1, optname = 26)
+   1.902861500s  WARN litebox_shim_linux: unsupported feature=setsockopt(level = 1, optname = 16)
+   1.905614200s  WARN litebox_shim_linux: unsupported feature=ioctl with arg Raw { cmd: 1074021792, arg: UserPtrMut(455733372) }
+   1.931049000s  WARN litebox_shim_linux: unsupported feature=fcntl(cmd = 1033, arg = 2)
+   1.931247700s  WARN litebox_shim_linux: unsupported feature=fcntl(cmd = 1033, arg = 14)
+   1.931984400s  WARN litebox_shim_linux: unsupported feature=setsockopt(level = 1, optname = 26)
+   1.932054400s  WARN litebox_shim_linux: unsupported feature=setsockopt(level = 1, optname = 16)
+   2.178854300s  WARN litebox_shim_linux: unsupported feature=unsupported syscall membarrier
+   3.042301700s  WARN litebox_shim_linux: unsupported feature=fcntl(cmd = 1033, arg = 3)
+   3.052917400s  WARN litebox_shim_linux: unsupported feature=fcntl(cmd = 1034, arg = 0)
+   3.052993100s  WARN litebox_shim_linux: unsupported feature=fcntl(cmd = 1033, arg = 2)
+   3.053324700s  WARN litebox_shim_linux: unsupported feature=fcntl(cmd = 1034, arg = 0)
+   3.053400400s  WARN litebox_shim_linux: unsupported feature=fcntl(cmd = 1034, arg = 48)
+   3.080146100s  WARN litebox_shim_linux: unsupported feature=fcntl(cmd = 1033, arg = 2)
+   3.158285300s  WARN litebox_shim_linux: unsupported feature=unsupported syscall fstatfs
+   3.158837700s  WARN litebox_shim_linux: unsupported feature=unsupported syscall fstatfs
+   3.161824500s  WARN litebox_shim_linux: unsupported feature=unsupported syscall fstatfs
+   3.162386200s  WARN litebox_shim_linux: unsupported feature=unsupported syscall fstatfs
+   3.208738800s  WARN litebox_shim_linux: unsupported feature=unsupported syscall fstatfs
+   3.209373200s  WARN litebox_shim_linux: unsupported feature=unsupported syscall fstatfs
+   3.283489400s  WARN litebox_shim_linux: unsupported feature=unsupported syscall fstatfs
+   3.284094500s  WARN litebox_shim_linux: unsupported feature=unsupported syscall fstatfs
+   3.325238000s  WARN litebox_shim_linux: unsupported feature=unsupported syscall fstatfs
+   3.325886100s  WARN litebox_shim_linux: unsupported feature=unsupported syscall fstatfs
+   3.349914600s  WARN litebox_shim_linux: unsupported feature=fcntl(cmd = 1033, arg = 2)
+   3.350775300s  WARN litebox_shim_linux: unsupported feature=fcntl(cmd = 1034, arg = 48)
+   3.351198400s  WARN litebox_shim_linux: unsupported feature=fcntl(cmd = 1034, arg = 48)
+   3.351393000s  WARN litebox_shim_linux: unsupported feature=ioctl with arg Raw { cmd: 3222823994, arg: UserPtrMut(455733888) }
+  13.092532800s  WARN litebox_shim_linux: unsupported feature=unsupported syscall getresuid
+  13.093206600s  WARN litebox_shim_linux: unsupported feature=unsupported syscall membarrier
+  13.466778400s  WARN litebox_shim_linux: unsupported feature=unsupported syscall fstatfs
+  13.467115400s  WARN litebox_shim_linux: unsupported feature=unsupported syscall fstatfs
+  13.467767800s  WARN litebox_shim_linux: unsupported feature=unsupported syscall fstatfs
+  13.467967300s  WARN litebox_shim_linux: unsupported feature=unsupported syscall fstatfs
+  13.468174600s  WARN litebox_shim_linux: unsupported feature=unsupported syscall fadvise64
+  13.468596900s  WARN litebox_shim_linux: unsupported feature=unsupported syscall fstatfs
+  13.468799700s  WARN litebox_shim_linux: unsupported feature=unsupported syscall fstatfs
+  13.468974700s  WARN litebox_shim_linux: unsupported feature=unsupported syscall fadvise64
+  13.469400000s  WARN litebox_shim_linux: unsupported feature=unsupported syscall fstatfs
+  13.469597200s  WARN litebox_shim_linux: unsupported feature=unsupported syscall fstatfs
+  13.470254800s  WARN litebox_shim_linux: unsupported feature=unsupported syscall fstatfs
+  13.470478600s  WARN litebox_shim_linux: unsupported feature=unsupported syscall fstatfs
+  21.594525900s  WARN litebox_shim_linux: unsupported feature=unsupported syscall membarrier
+  22.735972800s  WARN litebox_shim_linux: unsupported feature=setitimer: nonzero it_interval not supported
+  22.737092500s  WARN litebox_shim_linux: unsupported feature=setitimer: nonzero it_interval not supported
+  22.737993800s  WARN litebox_shim_linux: unsupported feature=setitimer: nonzero it_interval not supported
+  22.747561600s  WARN litebox_shim_linux: unsupported feature=setitimer: nonzero it_interval not supported
+  22.756687700s  WARN litebox_shim_linux: unsupported feature=setitimer: nonzero it_interval not supported
+  22.768570600s  WARN litebox_shim_linux: unsupported feature=setitimer: nonzero it_interval not supported
+  22.769364500s  WARN litebox_shim_linux: unsupported feature=setitimer: nonzero it_interval not supported
+  22.770303800s  WARN litebox_shim_linux: unsupported feature=fcntl(cmd = 1034, arg = 0)
+  22.770594600s  WARN litebox_shim_linux: unsupported feature=fcntl(cmd = 1033, arg = 2)
+  22.771945900s  WARN litebox_shim_linux: unsupported feature=fcntl(cmd = 1034, arg = 0)
+  23.556814500s  WARN litebox_shim_linux: unsupported feature=setitimer: nonzero it_interval not supported
+  23.558441600s  WARN litebox_shim_linux: unsupported feature=setitimer: nonzero it_interval not supported
+  23.559103900s  WARN litebox_shim_linux: unsupported feature=setitimer: nonzero it_interval not supported
+  23.559766500s  WARN litebox_shim_linux: unsupported feature=setitimer: nonzero it_interval not supported
+  23.560508800s  WARN litebox_shim_linux: unsupported feature=setitimer: nonzero it_interval not supported
+  23.561642200s  WARN litebox_shim_linux: unsupported feature=setitimer: nonzero it_interval not supported
+  23.563066200s  WARN litebox_shim_linux: unsupported feature=setitimer: nonzero it_interval not supported
+  23.572675200s  WARN litebox_shim_linux: unsupported feature=setitimer: nonzero it_interval not supported
+  23.573526800s  WARN litebox_shim_linux: unsupported feature=setitimer: nonzero it_interval not supported
+  23.574277700s  WARN litebox_shim_linux: unsupported feature=setitimer: nonzero it_interval not supported
+  23.575071900s  WARN litebox_shim_linux: unsupported feature=setitimer: nonzero it_interval not supported
+  23.576325100s  WARN litebox_shim_linux: unsupported feature=setitimer: nonzero it_interval not supported
+  23.577691100s  WARN litebox_shim_linux: unsupported feature=setitimer: nonzero it_interval not supported
+  23.578618800s  WARN litebox_shim_linux: unsupported feature=setitimer: nonzero it_interval not supported
+  23.579597600s  WARN litebox_shim_linux: unsupported feature=setitimer: nonzero it_interval not supported
+  23.580605700s  WARN litebox_shim_linux: unsupported feature=setitimer: nonzero it_interval not supported
+  23.581602700s  WARN litebox_shim_linux: unsupported feature=setitimer: nonzero it_interval not supported
+  23.582449000s  WARN litebox_shim_linux: unsupported feature=setitimer: nonzero it_interval not supported
+  23.583888300s  WARN litebox_shim_linux: unsupported feature=setitimer: nonzero it_interval not supported
+  32.078270100s  WARN litebox_shim_linux: unsupported feature=unsupported syscall membarrier
+  32.078372100s  WARN litebox_shim_linux: unsupported feature=sys_tkill/sys_tgkill with a remote tid
+  33.906627200s  WARN litebox_shim_linux: unsupported feature=fcntl(cmd = 1033, arg = 2)
+  33.907934900s  WARN litebox_shim_linux: unsupported feature=fcntl(cmd = 1034, arg = 48)
+  33.908307600s  WARN litebox_shim_linux: unsupported feature=ioctl with arg Raw { cmd: 3222823994, arg: UserPtrMut(455733888) }

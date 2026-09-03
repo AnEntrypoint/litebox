@@ -157,6 +157,21 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
                 core::ops::ControlFlow::Continue(true)
             }
         });
+        // A wake that finds nothing is the interesting case: it distinguishes "a waiter was
+        // registered on this address but did not match" from "no waiter was there at all when
+        // the wake fired". The first is a queue/bitset bug; the second is a lost-wakeup race
+        // where the wake ran before the waiter parked. Reporting every address currently queued
+        // in this bucket separates them: an address close to the target means the waiter is
+        // present under a different key, while an empty or unrelated bucket means the waiter
+        // had not registered yet.
+        if woken == 0 {
+            litebox_util_log::debug!(
+                addr:% = addr,
+                requested:% = num_to_wake_up.get();
+                "futex: WAKE matched nothing"
+            );
+        }
+
         // Wake the waiters outside the `extract_if` closure to minimize the list's lock hold
         // time.
         for entry in entries {

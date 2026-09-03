@@ -45,7 +45,11 @@ int main(int argc, char **argv) {
     const char *path = (argc > 1) ? argv[1] : "/tmp/.X11-unix/X0";
     out("XWIRE_START\n");
 
-    i64 fd = sys3(SYS_socket, 1 /*AF_UNIX*/, 1 /*SOCK_STREAM*/, 0);
+    // SOCK_NONBLOCK (0x800): a blocking read on a healthy X connection waits
+    // forever once the server has said all it has to say, so the drain loop below
+    // never returns and the calling script never proceeds. Non-blocking makes an
+    // empty read return EAGAIN instead, which the loop treats as 'nothing more'.
+    i64 fd = sys3(SYS_socket, 1 /*AF_UNIX*/, 1 | 0x800 /*SOCK_STREAM|NONBLOCK*/, 0);
     if (fd < 0) { out("XWIRE_SOCKET_FAIL\n"); sys1(SYS_exit, 1); }
 
     struct sockaddr_un sa;
@@ -71,6 +75,7 @@ int main(int argc, char **argv) {
     i64 got = 0;
     while (got < 8) {
         i64 r = sys3(SYS_read, fd, (i64)(buf + got), 8 - got);
+        if (r == -11) continue;              // EAGAIN: reply not here yet
         if (r <= 0) { out("XWIRE_SETUP_HDR_FAIL\n"); sys1(SYS_exit, 3); }
         got += r;
     }
@@ -78,6 +83,7 @@ int main(int argc, char **argv) {
     if (want > sizeof buf) want = sizeof buf;
     while (got < (i64)want) {
         i64 r = sys3(SYS_read, fd, (i64)(buf + got), (i64)want - got);
+        if (r == -11) continue;              // EAGAIN: more still coming
         if (r <= 0) break;
         got += r;
     }
@@ -136,7 +142,13 @@ int main(int argc, char **argv) {
 
     // Drain replies/errors. An X error reply starts with byte 0 and carries the
     // error code in byte 1 -- that is what says a request was rejected.
-    for (int round = 0; round < 40; round++) {
+    // Drain a BOUNDED number of rounds. A blocking read() on a healthy X
+    // connection simply waits when the server has nothing more to say, so an
+    // unbounded drain loop here never returns and the calling script never
+    // proceeds -- observed live: the probe sat in this loop past t=162 and the
+    // rest of the script never ran. Five rounds is enough to collect the replies
+    // to the requests just sent.
+    for (int round = 0; round < 5; round++) {
         n = sys3(SYS_read, fd, (i64)buf, sizeof buf);
         if (n <= 0) { out("XWIRE_READ_END n="); outn(n); out("\n"); break; }
         for (i64 i = 0; i + 32 <= n; i += 32) {
