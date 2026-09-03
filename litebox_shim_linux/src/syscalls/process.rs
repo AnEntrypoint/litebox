@@ -2452,6 +2452,34 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // exists to claim its own memory, so without this a second, concurrently
                 // forking sibling child would be invisible to this child's own collision
                 // defense for the whole copy (both attributed to the same parent owner).
+                //
+                // SIGILL/`STATUS_PRIVILEGED_INSTRUCTION` (`hlt`) investigation, this pass: holds
+                // `elf_patch_cache` for the duration of the eager copy below, closing a genuine,
+                // previously-unsynchronized data race. `duplicate()`'s per-region loop
+                // (`Vmem::duplicate` in `litebox/src/mm/linux.rs`) reads this process's LIVE
+                // trampoline-stub region (see `maybe_patch_exec_segment`, this file) as plain
+                // bytes via `to_owned_slice` -- with NO lock at all, not even the Windows
+                // allocation/protect locks `duplicate()`'s own writes use. `maybe_patch_exec_segment`
+                // (this file, same module) WRITES new stubs into that exact region
+                // (`tramp_write_ptr.copy_from_slice`) while holding `elf_patch_cache.lock()`, but
+                // that lock was never taken here on the read side. Confirmed live this
+                // investigation (advisor bisection + this session's own `LITEBOX_DIAG_FAULT_VQ`
+                // capture, widened to also catch `STATUS_PRIVILEGED_INSTRUCTION`/`0xc0000096`, not
+                // just a plain `#UD`): the fatal `dbus-daemon`/`sh` fork crash is
+                // `Exception(6)`/`SIGILL` with `raw_code=0xc0000096` (an unprivileged `hlt` --
+                // mallocng's OWN deliberate corruption-detected trap, matching this file's
+                // "already-fixed" `is_private_data_range` doc comment's prior instance of the
+                // exact same signature) at a fixed `rip` inside the trampoline-stub band
+                // (`maybe_patch_exec_segment`'s allocation range, confirmed via `VirtualQuery` at
+                // fault time: `MEM_COMMIT`/`MEM_PRIVATE`/`PAGE_EXECUTE_READ`, a real, present, but
+                // apparently torn/mid-write code page) -- and reproduces ONLY when a script runs
+                // with `set -x` (extra `write()` syscalls -- each one executing through a
+                // trampoline stub -- interleaved with a backgrounded fork), never without it. This
+                // lock does not change `duplicate()`'s own algorithm at all; it only ensures the
+                // eager byte-copy of the trampoline region can never observe a torn write from a
+                // concurrent `maybe_patch_exec_segment` call on another thread of this same
+                // process.
+                let cache_guard = self.global.elf_patch_cache.lock();
                 let (dest_pm, relocations) = self.global.platform.with_fork_duplicate_claim_owner(
                     child_tid,
                     || unsafe { self.process().pm().duplicate(&self.global.litebox) },
@@ -2460,6 +2488,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     litebox_util_log::error!(err:% = err; "failed to duplicate address space for fork()");
                     Errno::ENOMEM
                 })?;
+                // Release as soon as the eager copy is done -- everything after this point
+                // (relocation-map merging, fd-table duplication) reads/writes neither the
+                // trampoline region nor `elf_patch_cache`, so there is no reason to keep other
+                // threads' `maybe_patch_exec_segment` calls blocked any longer than the actual
+                // vulnerable window above.
+                drop(cache_guard);
                 // Nested-fork (fork-of-a-fork) coverage: if the calling thread (this fork's
                 // PARENT) is itself a fork descendant still under verification, its own
                 // relocation map only covers ranges relative to ITS parent (the new child's

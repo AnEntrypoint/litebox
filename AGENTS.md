@@ -351,6 +351,71 @@ read the correction further down before acting on it.
   this bug). It's a real litebox bug with a fast, deterministic repro, and it silently breaks any
   traced (`set -x`) script — worth fixing properly, not just avoiding.
 
+  **UPDATE (this pass): exact exception decoded, root cause partially found and partially fixed,
+  NOT fully closed — the #UD is NOT a plain `#UD` at all.** `LITEBOX_DIAG_FAULT_VQ=1`'s gate
+  (`vectored_exception_handler`, `litebox_platform_windows_userland/src/lib.rs`) was `rip == cr2`
+  only, which never fires for this signature (`cr2=0` always, for either sub-case below) —
+  widened to also catch raw Windows exception code `0xc0000096`
+  (`STATUS_PRIVILEGED_INSTRUCTION`), not just `EXCEPTION_ILLEGAL_INSTRUCTION`. Live capture on
+  both real crashes this pass: `raw_code=0xc0000096`, `region_base=0x7feffff7f000`,
+  `state=MEM_COMMIT`, `protect=PAGE_EXECUTE_READ` — a **real, present, executable page inside the
+  trampoline-stub band** (`maybe_patch_exec_segment`'s allocation range, `litebox_shim_linux/src/
+  syscalls/mm.rs`), not a plain `#UD`/invalid-byte-decode. `0xc0000096` is Windows' name for an
+  unprivileged `hlt` — the EXACT trap musl's mallocng `a_crash()` deliberately executes on a
+  detected heap-integrity violation (see this file's own `is_private_data_range` doc comment in
+  `litebox/src/mm/linux.rs` for a PRIOR, already-fixed instance of this identical
+  `STATUS_PRIVILEGED_INSTRUCTION`/`hlt` signature, caused THAT time by a stale untranslated
+  post-fork heap pointer reaching `free()`). This crash is very likely the SAME class of signal
+  (mallocng correctly self-detecting real corruption), not litebox generating a bad instruction
+  directly — but the corruption source this time is different from that prior fix.
+
+  **A real, confirmed synchronization gap was found and fixed** (uncommitted as of this pass —
+  see below): `PageManager::duplicate()`'s eager per-region byte-copy (`litebox/src/mm/linux.rs`)
+  reads a forking process's OWN LIVE trampoline-stub memory region with **no lock at all** — not
+  even the Windows allocation/protect locks its own writes use. `maybe_patch_exec_segment`
+  (`litebox_shim_linux/src/syscalls/mm.rs`) WRITES new stubs into that exact region while holding
+  `elf_patch_cache.lock()`, but `do_clone` (`litebox_shim_linux/src/syscalls/process.rs`) never
+  took that same lock before calling `duplicate()` — a genuine, unsynchronized data race between
+  one thread extending the trampoline (triggered by `set -x`'s extra `write()` syscalls, each one
+  executing through a trampoline stub) and a different thread's concurrent `fork()` reading that
+  same memory. **Fix applied**: `do_clone` now holds `self.global.elf_patch_cache.lock()` for the
+  duration of the `duplicate()` call (dropped immediately after, before relocation-map
+  merging/fd-table duplication, which don't need it).
+
+  **Verification result — fix is real but INCOMPLETE, do not claim this bug is closed:**
+  - The isolated fast repro (advisor's bisected `set -x` + single backgrounded `dbus-daemon`,
+    `alpine-pinned2.tar`): **6/6 clean runs post-fix** (was reliably 2/2 FAIL pre-fix).
+  - The 30-concurrent-fork regression oracle (the OTHER, earlier-fixed bug's own oracle): **3/3
+    clean**, no regression.
+  - The FULL `xfce_direct.sh` launch (still has `set -x`, `layer31_direct_fixed.tar`): **still
+    crashes, bit-for-bit identical signature** (`rip=0x7feffff7fb8a`, `pid=7`/`73`, same two
+    timestamps ~0.5s/~36s) even with this fix applied. An isolated repro built from the SAME tar
+    (`layer31_direct_fixed.tar` instead of `alpine-pinned2.tar`) but only running the dbus-daemon
+    lines from `xfce_direct.sh` (not the full script) stayed clean, meaning the full script's
+    heavier concurrency (more background services, more forked children, more trampoline
+    extension traffic) still finds a window this specific lock does not close — likely a second
+    reader of the trampoline region that also bypasses `elf_patch_cache` (candidate: `fork_verify`'s
+    own single-step/AV-path healing reads code bytes via `read_code_bytes`,
+    `litebox_platform_windows_userland/src/fork_verify.rs`, also with no `elf_patch_cache`
+    coordination) or a race window inside `duplicate()`'s multi-step
+    allocate-then-copy-then-protect sequence that a single outer lock around the whole call does
+    not fully serialize against a writer that also needs to allocate more trampoline pages
+    mid-race (`maybe_patch_exec_segment`'s `do_mmap_anonymous` growth path, `litebox_shim_linux/
+    src/syscalls/mm.rs` ~line 1530).
+  - **Next step if resumed**: per the diff-the-stub-bytes suggestion already in this section,
+    capture the PARENT's copy of the same trampoline region (via `LITEBOX_DIAG_FAULT_VQ`'s
+    already-added, now `0xc0000096`-aware capture, extended to dump N bytes at `rip` not just
+    `VirtualQuery` metadata) and diff against the CHILD's corrupted copy on a repro that still
+    fails post-fix, to confirm whether the corruption is still a torn trampoline write (this fix's
+    own hypothesis, apparently still not fully closed) or something else the evidence has not yet
+    distinguished.
+
+  **Priority note**: superseded as the launch-blocking issue by "Rendering/scanout blocker" below
+  (removing `set -x` from the launch script sidesteps this bug entirely and the desktop now comes
+  up) — this bug is no longer standing between the session and the standing goal, but is still a
+  real, reproducible litebox bug silently breaking any `set -x`-traced script, worth closing
+  properly if picked up again.
+
 ## Rendering/scanout blocker (the current single remaining gap)
 
 With both concurrent-fork process bugs fixed and `set -x` removed from the launch script, a full

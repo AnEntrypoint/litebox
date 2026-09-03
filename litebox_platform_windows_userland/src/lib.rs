@@ -592,11 +592,53 @@ unsafe extern "system" fn vectored_exception_handler(
         // still gated behind an explicit env var for the same reason `LITEBOX_DIAG_FAULT_MODULE`
         // is: unthrottled, this class of diagnostic has previously been observed to slow guest
         // startup enough to change which bug a run even reaches.
+        // Widened (SIGILL/`#UD`-under-concurrent-fork investigation): the original gate below
+        // (`rip == cr2`) only fires for a genuine page-fault-shaped crash where Windows reports a
+        // faulting address distinct from an access-violation's `ExceptionInformation[1]` equal to
+        // the current `rip`. A real `#UD` (`EXCEPTION_ILLEGAL_INSTRUCTION`) carries NO faulting
+        // address at all -- `vectored_exception_handler`'s own dispatch above always reports
+        // `cr2=0, error_code=0` for it (see the `Win32_Foundation::EXCEPTION_ILLEGAL_INSTRUCTION =>
+        // (Exception::INVALID_OPCODE, 0, 0)` arm) -- so the strict `rip == cr2` equality never
+        // holds for this class and the diagnostic silently never fires for it. Detect that case
+        // directly from the raw Windows exception code instead of relying on the already-decoded
+        // `cr2`, and query `rip` itself (not `cr2`, which is meaningless here) for its real
+        // Windows memory-state at the moment of the fault.
+        let raw_exception_code =
+            unsafe { (*(*exception_info).ExceptionRecord).ExceptionCode };
+        // Both `EXCEPTION_ILLEGAL_INSTRUCTION` (a real `#UD`) AND `0xc0000096`
+        // (`STATUS_PRIVILEGED_INSTRUCTION`, Windows' name for an unprivileged `hlt` -- the exact
+        // trap musl's mallocng `a_crash()` deliberately executes on a heap-integrity assert, see
+        // this file's own dispatch match arm a few hundred lines below) both map to
+        // `Exception::INVALID_OPCODE`/`SIGILL` for the guest. The original single-code check here
+        // silently missed the `0xc0000096` case -- confirmed live this investigation: the real
+        // dbus/`sh` SIGILL crash's own `diag-guest-exception` snapshot (downstream, in
+        // `litebox_shim_linux`) fired with `exception=Exception(6)` (== INVALID_OPCODE) on both
+        // observed occurrences, while THIS diagnostic never fired for either -- the only
+        // explanation consistent with both facts is that the raw code took the `0xc0000096` arm,
+        // not the `EXCEPTION_ILLEGAL_INSTRUCTION` arm this check alone was gated on.
+        let is_ud_fault = raw_exception_code == Win32_Foundation::EXCEPTION_ILLEGAL_INSTRUCTION
+            || raw_exception_code == 0xc0000096u32.cast_signed();
+        // Unconditional (no env-var gate, no `this_is_in_guest` gate), allocation-free: SIGILL-
+        // class investigation. `#UD` is rare enough (never fires on the ordinary hot path this
+        // handler otherwise serves -- access violations and single-steps dominate call volume) to
+        // print every occurrence without flooding, and this fires BEFORE the `this_is_in_guest`
+        // gate below so it can independently confirm whether that gate itself is the reason the
+        // main diagnostic below stays silent for this exception class.
+        if is_ud_fault {
+            let tid0 = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+            diag_raw_print(b"[diag-ud-entry] tid=0x", tid0 as usize, b" rip=0x", rip as usize);
+            diag_raw_print(
+                b"[diag-ud-entry]   this_is_in_guest=0x", this_is_in_guest as usize,
+                b" raw_code=0x", raw_exception_code as usize as usize,
+            );
+        }
+        let raw_cr2 =
+            unsafe { (*(*exception_info).ExceptionRecord).ExceptionInformation[1] } as u64;
         if this_is_in_guest
             && std::env::var_os("LITEBOX_DIAG_FAULT_VQ").is_some()
-            && rip == unsafe { (*(*exception_info).ExceptionRecord).ExceptionInformation[1] } as u64
+            && (rip == raw_cr2 || is_ud_fault)
         {
-            let cr2 = unsafe { (*(*exception_info).ExceptionRecord).ExceptionInformation[1] };
+            let cr2 = if is_ud_fault { rip } else { raw_cr2 };
             let mut cr2_mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
             let cr2_queried = unsafe {
                 Win32_Memory::VirtualQuery(
@@ -607,6 +649,7 @@ unsafe extern "system" fn vectored_exception_handler(
             };
             let tid = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
             diag_raw_print(b"[diag-fault-vq] tid=0x", tid as usize, b" rip=0x", rip as usize);
+            diag_raw_print(b"[diag-fault-vq]   is_ud_fault=0x", is_ud_fault as usize, b" raw_code=0x", raw_exception_code as usize as usize);
             diag_raw_print(
                 b"[diag-fault-vq]   cr2=0x", cr2 as usize,
                 b" queried=0x", cr2_queried as usize,
