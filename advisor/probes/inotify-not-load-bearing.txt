@@ -1,0 +1,25 @@
+INO_START
+INO_BUS_UP=yes
+INO_LISTNAMES_RC=0
+INO_LISTACT_RC=0
+INO_ACT_COUNT=15
+      string "org.freedesktop.DBus"
+      string "org.xfce.Thunar"
+      string "org.freedesktop.thumbnails.Manager1"
+      string "org.a11y.Bus"
+      string "org.xfce.Xfconf"
+      string "org.freedesktop.thumbnails.Thumbnailer1"
+      string "org.gnome.keyring.SystemPrompter"
+      string "org.gnome.keyring"
+      string "org.freedesktop.FileManager1"
+      string "org.freedesktop.secrets"
+      string "org.freedesktop.impl.portal.Secret"
+      string "org.gtk.GLib.PACRunner"
+      string "org.gnome.keyring.PrivatePrompter"
+      string "org.xfce.FileManager"
+      string "org.freedesktop.thumbnails.Cache1"
+INO_STARTSERVICE_RC=0
+dbus-daemon[4]: [session uid=0 pid=4] Cannot initialize inotify: Function not implemented
+dbus-daemon[4]: [session uid=0 pid=4] Activating service name='org.xfce.Xfconf' requested by ':1.2' (uid=0 pid=10 comm="")
+dbus-daemon[4]: [session uid=0 pid=4] Successfully activated service 'org.xfce.Xfconf'
+INO_DONE
