@@ -5587,3 +5587,86 @@ setting -- this pass only controlled the no-GUI pair, not the full 2x2.
 Files: `advisor/probes/bench_idle_bg.sh` (new), `AGENTS.md` (this entry). Raw logs kept at
 `.wfgy/bench_scratch/idle_bg_n0_log.log`, `.wfgy/bench_scratch/idle_bg_n20_log.log` (gitignored
 scratch, not committed).
+
+## Pass 349 -- noise-floor established (10 reps, one fixed config): real run-to-run variance is
+~20% on this host, smaller than pass 347's 3x gap but large enough that every prior single-shot
+comparison in this thread (passes 346/347/348) needs an explicit unreplicated-n=1 caveat
+
+Before running the planned full 2x2 alignment x GUI matrix, a peer session (sdv) independently ran
+their own idle-background-process discriminator a second time and got a NON-MONOTONIC result (0
+procs 13196ms, 5 procs 10526ms -- FASTER than 0, 20 procs 14311ms) -- direct evidence that
+run-to-run variance on this host is comparable to or larger than several of the effects this
+investigation has been attributing to alignment/GUI/process-count so far. Every number in passes
+346-348 was n=1 (occasionally n=2). The coordinator redirected this pass to establish the actual
+noise floor BEFORE spending more cycles on comparisons that might just be measurement noise dressed
+up as a finding.
+
+**Method**: one fixed config -- `layer31_direct_fixed.tar` (unaligned canonical), no GUI,
+`advisor/probes/bench_idle_bg.sh 0` (zero background processes, 200-`busybox true` timing loop) --
+run 10 times back to back, same host state, nothing else running (confirmed via `Get-Process`
+before starting; `sdv` was asked to and did hold off any full-stack boots for the duration).
+
+**A real methodology fix needed mid-pass**: the guest's busybox `date +%s%3N` silently truncates to
+whole seconds on this rootfs (same gap pass 346 already documented), which is far too coarse to
+resolve a ~50ms/exec signal across 200 execs (whole-second rounding alone is a ±10% wobble at this
+scale) -- an initial `LITEBOX_LOG`-unset run confirmed this: 8 of 10 reps landed on an identical
+50.00ms/exec with the other two at 55/60ms, a suspiciously quantized pattern that is a rounding
+artifact, not a real reading. Re-ran all 10 reps with `LITEBOX_LOG=error` instead (chosen for
+sub-millisecond `DIAG_TIMELINE execve` timestamp precision, not to match any prior pass's exact
+setting -- a noise-floor test needs internal consistency across its own 10 reps, not cross-pass
+matching) and bracketed the first-to-last of the 200 `argv0=/bin/busybox` `DIAG_TIMELINE execve`
+timestamps per run, same method passes 347/348 used.
+
+**Results** (10/10 runs completed cleanly, `EXIT=0`, all 200 execs present each time):
+
+| run | per_exec (ms) |
+|---|---|
+| 1 | 55.41 |
+| 2 | 51.31 |
+| 3 | 51.40 |
+| 4 | 58.12 |
+| 5 | 51.91 |
+| 6 | 49.42 |
+| 7 | 52.51 |
+| 8 | 59.63 |
+| 9 | 58.83 |
+| 10 | 52.08 |
+
+**min=49.42ms, max=59.63ms, median=52.30ms, mean=54.06ms, stdev=3.64ms, spread=10.21ms (~20% of
+median).**
+
+**Honest reading**: real run-to-run variance on this host, for this exact fixed config, is
+genuinely non-trivial (~20% peak-to-peak) but noticeably TIGHTER and more well-behaved than sdv's
+own 0/5/20-process comparison (which showed a ~36% non-monotonic swing with the middle value
+LOWER than both endpoints) -- worth flagging as a real, unexplained difference between the two
+measurement setups (possibly `LITEBOX_LOG=error`'s own overhead stabilizing timing by dominating
+smaller effects, possibly a difference in exactly which processes/scripts were running, not yet
+isolated). This pass's own 20% noise floor is smaller than pass 347's ~3x (300%) alignment+GUI
+regression -- so pass 347's finding is very unlikely to be pure noise -- but it is LARGER than
+pass 348's ~16% idle-process-count effect (62.66ms N=0 vs 72.98ms N=20), meaning **pass 348's
+process-count effect cannot be distinguished from noise at n=1 per cell** and should be treated as
+unconfirmed, not refuted-then-reconfirmed, until re-run with multiple reps per N value.
+
+**Revised priority, per the coordinator's own instruction**: the originally-planned 2x2 matrix
+(alignment x GUI-presence) is NOT run this pass. Given a ~20% single-config noise floor, any
+matrix cell run at n=1 (as originally planned) would be exactly as unreliable as passes 346-348
+already are -- each 2x2 cell needs multiple reps (this pass's own 10-rep protocol, or at minimum
+3-5) to produce a number worth comparing against another cell. That is substantially more boot
+cycles (4 cells x N reps, several of which are full XFCE GUI boots at ~80-100s each) than this
+pass's own scope. Recommend whoever continues this either: (a) run the full matrix with proper
+replication per cell now that the noise-floor protocol and script are established, accepting the
+real time cost, or (b) use a between-groups statistical test (e.g. comparing this pass's own
+52.30ms median unaligned/no-GUI distribution against a similarly-replicated realigned/no-GUI
+distribution first, the cheaper no-GUI half of the matrix, before committing to the two
+GUI-required cells) to get a faster, still-honest signal.
+
+**No promotion decision made or changed this pass.** `layer31_direct_fixed.tar` remains canonical,
+untouched. `layer31_realigned.tar` remains NOT promoted -- pass 347's finding stands as real
+(300% gap dwarfs this pass's 20% noise floor) but its EXACT causal explanation (fork_verify
+scaling, `LITEBOX_LOG` confound, or something else) is still open, per pass 348's own honest
+non-conclusion.
+
+Files: `.wfgy/bench_scratch/noise_floor.log` (first, `LITEBOX_LOG`-unset attempt, kept as evidence
+of the whole-second rounding artifact), `.wfgy/bench_scratch/noise_floor2.log` (the real 10-rep
+`LITEBOX_LOG=error` data this pass's numbers come from) -- both gitignored scratch, not committed.
+`AGENTS.md` (this entry).
