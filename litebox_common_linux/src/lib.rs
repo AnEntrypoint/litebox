@@ -985,6 +985,31 @@ pub const DRM_IOCTL_MODE_GETPROPERTY: u32 = 0xC040_64AA;
 /// (dumb buffers, page-flip) could even be attempted, regardless of how correct the rest of this
 /// device's ioctl coverage is.
 pub const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u32 = 0xC020_64B9;
+/// `DRM_IOCTL_MODE_SETPROPERTY = DRM_IOWR(0xab, struct drm_mode_connector_set_property)`,
+/// `size=16` (a `u64` then two `u32`s, `size_of::<DrmModeConnectorSetProperty>()`
+/// independently re-verified the same way as the other `DRM_IOCTL_MODE_*` constants here) --
+/// named `DRM_IOCTL_MODE_CONNECTOR_SETPROPERTY` by libdrm/wlroots' own call sites, but the real
+/// kernel header (`include/uapi/drm/drm.h`) itself spells it `DRM_IOCTL_MODE_SETPROPERTY`; this
+/// constant keeps the wlroots-facing name since that's the call site this device exists to
+/// satisfy (verified against the real kernel header, not guessed -- an earlier attempt at this
+/// constant used a hand-remembered `nr=0xb1`, which silently fell through to the ioctl
+/// dispatch's `EINVAL` default arm with exactly the same "Invalid argument" symptom this ioctl
+/// was meant to fix, since a wrong `nr` means the real ioctl number the client sends never
+/// matches any dispatch arm at all).
+///
+/// The legacy (pre-atomic) per-connector property-set ioctl -- wlroots' `backend/drm/legacy.c`
+/// uses this specifically for DPMS (`connector Virtual-1: Failed to set DPMS property: Invalid
+/// argument`, confirmed live as labwc's exact failure when this ioctl was entirely unhandled and
+/// fell through to the dispatch's `EINVAL` default arm). See
+/// [`DrmSubsystem::connector_set_property`]'s own doc comment for why accepting this is a safe,
+/// honest no-op in a single-address-space shim with no real hardware DPMS state to change.
+pub const DRM_IOCTL_MODE_CONNECTOR_SETPROPERTY: u32 = 0xC010_64AB;
+/// `DRM_IOCTL_MODE_GETPROPBLOB = DRM_IOWR(0xac, struct drm_mode_get_blob)`, `size=16` (two
+/// `u32`s then a `u64`, same independent-re-verification discipline as the constant above). Real
+/// clients reach this after `OBJ_GETPROPERTIES` returns a blob-typed property (this device's
+/// [`VIRTUAL_CONNECTOR_EDID_PROP_ID`]) to fetch the blob's raw bytes -- see
+/// [`DrmSubsystem::get_prop_blob`]'s own doc comment for the synthesized EDID this backs.
+pub const DRM_IOCTL_MODE_GETPROPBLOB: u32 = 0xC010_64AC;
 /// `DRM_MODE_OBJECT_CONNECTOR` -- the `obj_type` a real client passes when asking
 /// `DRM_IOCTL_MODE_OBJ_GETPROPERTIES` about a connector (as opposed to a CRTC, encoder, or
 /// plane). This device only tracks connector-object property queries today (the only object type
@@ -1011,6 +1036,27 @@ pub const VIRTUAL_PLANE_TYPE_PROP_ID: u32 = 100;
 /// `value` field, then reading that entry's `name` string (`"Primary"`) -- the raw number
 /// itself is driver-chosen and opaque, so any fixed, non-zero, mutually-distinct value is valid.
 pub const VIRTUAL_PLANE_TYPE_VALUE: u64 = 1;
+/// `DRM_MODE_PROP_BLOB` (`1<<4`, real kernel `drm_mode.h` value) -- marks a property's value as
+/// a blob ID to be resolved via [`DRM_IOCTL_MODE_GETPROPBLOB`], rather than an immediate scalar
+/// (as [`DRM_MODE_PROP_ENUM`]'s plane `type` property is).
+pub const DRM_MODE_PROP_BLOB: u32 = 1 << 4;
+/// A fixed, arbitrary, non-zero property ID for the virtual connector's `DPMS` property --
+/// see [`DrmSubsystem::obj_get_properties`]'s connector branch and
+/// [`DrmSubsystem::connector_set_property`]'s own doc comment for why this device accepts a
+/// DPMS set as a no-op rather than tracking real display-power state.
+pub const VIRTUAL_CONNECTOR_DPMS_PROP_ID: u32 = 101;
+/// The on-the-wire value this device's connector reports for its `DPMS` property -- `DRM_MODE_
+/// DPMS_ON` (`0`, real kernel `drm_mode.h` value), matching a virtual display that is always
+/// "on" (there is no real backlight/power state to report otherwise).
+pub const VIRTUAL_CONNECTOR_DPMS_VALUE: u64 = 0;
+/// A fixed, arbitrary, non-zero property ID for the virtual connector's `EDID` blob property --
+/// see [`DrmSubsystem::get_prop_blob`]'s own doc comment for the synthesized EDID bytes this
+/// resolves to.
+pub const VIRTUAL_CONNECTOR_EDID_PROP_ID: u32 = 102;
+/// A fixed, arbitrary, non-zero blob ID for the virtual connector's synthesized EDID -- real DRM
+/// blob IDs are driver-internal opaque values from userspace's perspective, resolved purely by
+/// round-tripping through [`DRM_IOCTL_MODE_GETPROPBLOB`], exactly like the property IDs above.
+pub const VIRTUAL_CONNECTOR_EDID_BLOB_ID: u32 = 200;
 /// `DRM_CAP_DUMB_BUFFER` -- the one allocation-related capability this device's
 /// `DRM_IOCTL_GET_CAP` genuinely supports (see [`DrmGetCap`]'s doc comment).
 pub const DRM_CAP_DUMB_BUFFER: u64 = 0x1;
@@ -1423,6 +1469,29 @@ pub struct DrmModePropertyEnum {
     pub name: [u8; 32],
 }
 
+/// `struct drm_mode_connector_set_property` (`DRM_IOCTL_MODE_CONNECTOR_SETPROPERTY`). See
+/// [`DRM_IOCTL_MODE_CONNECTOR_SETPROPERTY`]'s own doc comment for the real client (wlroots'
+/// legacy DPMS-set path) this exists to satisfy.
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmModeConnectorSetProperty {
+    pub value: u64,
+    pub prop_id: u32,
+    pub connector_id: u32,
+}
+
+/// `struct drm_mode_get_blob` (`DRM_IOCTL_MODE_GETPROPBLOB`), same two-call size-probe pattern
+/// as every other variable-length query this device implements: a caller passes `length` set to
+/// its buffer size (0 to just probe the true length), and gets the true length written back to
+/// `length` regardless of whether it supplied a buffer.
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmModeGetBlob {
+    pub blob_id: u32,
+    pub length: u32,
+    pub data: u64,
+}
+
 /// `struct drm_version` (`DRM_IOCTL_VERSION`) -- the two-call size-probe pattern applies to the
 /// three trailing `(len, ptr)` string pairs the same way it does to `drm_mode_card_res`'s object
 /// arrays: a caller passes `name_len`/`date_len`/`desc_len` set to its buffer sizes (0 to just
@@ -1746,6 +1815,11 @@ pub enum IoctlArg {
     DrmModeObjGetProperties(UserPtrMut<DrmModeObjGetProperties>),
     /// `DRM_IOCTL_MODE_GETPROPERTY` -- resolve a single property ID's name/values.
     DrmModeGetProperty(UserPtrMut<DrmModeGetProperty>),
+    /// `DRM_IOCTL_MODE_CONNECTOR_SETPROPERTY` -- legacy per-connector property set (DPMS).
+    DrmModeConnectorSetProperty(UserPtr<DrmModeConnectorSetProperty>),
+    /// `DRM_IOCTL_MODE_GETPROPBLOB` -- resolve a blob property's raw bytes (two-call size-probe
+    /// pattern for `data`, same shape as [`DrmModeObjGetProperties`]'s own arrays).
+    DrmModeGetPropBlob(UserPtrMut<DrmModeGetBlob>),
     /// `DRM_IOCTL_PRIME_HANDLE_TO_FD` -- export a dumb-buffer handle as a real fd onto the same
     /// backing memory. See [`DRM_IOCTL_PRIME_HANDLE_TO_FD`]'s own doc comment.
     DrmPrimeHandleToFd(UserPtrMut<DrmPrimeHandle>),
@@ -4037,6 +4111,12 @@ impl SyscallRequest {
                         }
                         DRM_IOCTL_MODE_GETPROPERTY => {
                             IoctlArg::DrmModeGetProperty(ctx.sys_req_ptr(2))
+                        }
+                        DRM_IOCTL_MODE_CONNECTOR_SETPROPERTY => {
+                            IoctlArg::DrmModeConnectorSetProperty(ctx.sys_req_ptr(2))
+                        }
+                        DRM_IOCTL_MODE_GETPROPBLOB => {
+                            IoctlArg::DrmModeGetPropBlob(ctx.sys_req_ptr(2))
                         }
                         DRM_IOCTL_PRIME_HANDLE_TO_FD => {
                             IoctlArg::DrmPrimeHandleToFd(ctx.sys_req_ptr(2))

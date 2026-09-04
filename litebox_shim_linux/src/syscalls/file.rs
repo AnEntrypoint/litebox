@@ -4475,6 +4475,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             | IoctlArg::DrmAuthMagic(..)
             | IoctlArg::DrmModeObjGetProperties(..)
             | IoctlArg::DrmModeGetProperty(..)
+            | IoctlArg::DrmModeConnectorSetProperty(..)
+            | IoctlArg::DrmModeGetPropBlob(..)
             | IoctlArg::DrmPrimeHandleToFd(..)
             | IoctlArg::DrmPrimeFdToHandle(..)
             | IoctlArg::DrmGemClose(..) => files.run_on_raw_fd(
@@ -4885,6 +4887,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             IoctlArg::DrmAuthMagic(ptr) => self.global.drm.auth_magic(*ptr),
             IoctlArg::DrmModeObjGetProperties(ptr) => self.global.drm.obj_get_properties(*ptr),
             IoctlArg::DrmModeGetProperty(ptr) => self.global.drm.get_property(*ptr),
+            IoctlArg::DrmModeConnectorSetProperty(ptr) => {
+                self.global.drm.connector_set_property(*ptr)
+            }
+            IoctlArg::DrmModeGetPropBlob(ptr) => self.global.drm.get_prop_blob(*ptr),
             IoctlArg::DrmPrimeHandleToFd(ptr) => self.drm_prime_handle_to_fd(*ptr),
             IoctlArg::DrmPrimeFdToHandle(ptr) => self.drm_prime_fd_to_handle(*ptr),
             IoctlArg::DrmGemClose(ptr) => {

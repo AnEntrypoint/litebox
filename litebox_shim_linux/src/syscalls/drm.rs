@@ -44,12 +44,14 @@ use litebox_common_linux::{
     DRM_AUTH_MAGIC_VALUE, DRM_CAP_CRTC_IN_VBLANK_EVENT, DRM_CAP_DUMB_BUFFER, DRM_CAP_PRIME,
     DRM_CAP_TIMESTAMP_MONOTONIC, DRM_CLIENT_CAP_UNIVERSAL_PLANES, DRM_EVENT_FLIP_COMPLETE,
     DRM_MODE_CONNECTOR_VIRTUAL, DRM_MODE_ENCODER_VIRTUAL, DRM_MODE_OBJECT_CONNECTOR,
-    DRM_MODE_OBJECT_PLANE, DRM_MODE_PAGE_FLIP_EVENT, DRM_MODE_PROP_ENUM, DRM_PRIME_CAP_EXPORT,
-    DRM_PRIME_CAP_IMPORT, DrmAuth, DrmEvent, DrmEventVblank, DrmGetCap, DrmModeCardRes,
-    DrmModeCreateDumb, DrmModeCrtc, DrmModeCrtcPageFlip, DrmModeDestroyDumb, DrmModeFbCmd2,
-    DrmModeGetConnector, DrmModeGetEncoder, DrmModeGetPlane, DrmModeGetPlaneRes,
-    DrmModeGetProperty, DrmModeMapDumb, DrmModeModeinfo, DrmModeObjGetProperties,
-    DrmModePropertyEnum, DrmModeSetPlane, DrmSetClientCap, DrmVersion, VIRTUAL_PLANE_TYPE_PROP_ID,
+    DRM_MODE_OBJECT_PLANE, DRM_MODE_PAGE_FLIP_EVENT, DRM_MODE_PROP_BLOB, DRM_MODE_PROP_ENUM,
+    DRM_PRIME_CAP_EXPORT, DRM_PRIME_CAP_IMPORT, DrmAuth, DrmEvent, DrmEventVblank, DrmGetCap,
+    DrmModeCardRes, DrmModeConnectorSetProperty, DrmModeCreateDumb, DrmModeCrtc,
+    DrmModeCrtcPageFlip, DrmModeDestroyDumb, DrmModeFbCmd2, DrmModeGetBlob, DrmModeGetConnector,
+    DrmModeGetEncoder, DrmModeGetPlane, DrmModeGetPlaneRes, DrmModeGetProperty, DrmModeMapDumb,
+    DrmModeModeinfo, DrmModeObjGetProperties, DrmModePropertyEnum, DrmModeSetPlane,
+    DrmSetClientCap, DrmVersion, VIRTUAL_CONNECTOR_DPMS_PROP_ID, VIRTUAL_CONNECTOR_DPMS_VALUE,
+    VIRTUAL_CONNECTOR_EDID_BLOB_ID, VIRTUAL_CONNECTOR_EDID_PROP_ID, VIRTUAL_PLANE_TYPE_PROP_ID,
     VIRTUAL_PLANE_TYPE_VALUE, errno::Errno,
 };
 use zerocopy::IntoBytes;
@@ -105,6 +107,23 @@ const VIRTUAL_PLANE_ID: u32 = 4;
 /// fetched from `drm_fourcc.h` this pass (see `docs/drm-dumb-buffer-ioctl-reference.md`'s "gaps"
 /// section); this is the standard, well-known fourcc encoding for that format.
 const DRM_FORMAT_XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
+
+/// A minimal, spec-valid EDID 1.3 block for the virtual connector -- see
+/// [`DrmSubsystem::get_prop_blob`]'s own doc comment for why these exact bytes were chosen and
+/// how the checksum (byte 127) was derived. No display-timing descriptor blocks are populated;
+/// this device's one fixed mode is reported directly via `GETCONNECTOR`, not re-derived from
+/// EDID by any client this device has been tested against.
+#[rustfmt::skip]
+const VIRTUAL_EDID_BLOB: [u8; 128] = [
+    0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x1E, 0x6D, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x1E, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x56,
+];
 
 fn virtual_mode() -> DrmModeModeinfo {
     let mut name = [0u8; 32];
@@ -830,10 +849,19 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     /// (`smithay`'s `backend_drm`, `docs/wayland-drm-backend-probe/`) failing outright on this
     /// exact call immediately after `GETCONNECTOR` succeeded: unimplemented before this, every
     /// real client following the standard connector-properties-query sequence failed before
-    /// reaching any further DRM work. This device has no dynamic KMS properties for a connector
-    /// (no DPMS, no EDID blob, nothing a hardware driver would register) -- `count_props = 0` is
-    /// the real kernel's own well-defined answer for an object with a genuinely empty property
-    /// list, not a truncation.
+    /// reaching any further DRM work.
+    ///
+    /// The connector object reports two real properties, `DPMS` and `EDID` (see
+    /// [`Self::connector_set_property`]/[`Self::get_prop_blob`]'s own doc comments) -- an
+    /// earlier revision of this device reported `count_props = 0` unconditionally here, a valid
+    /// real-kernel-accurate answer for an object with a genuinely empty property list in the
+    /// abstract, but wlroots' legacy (non-atomic) output-commit path (reached via labwc,
+    /// `backend/drm/legacy.c`) unconditionally tries to read EDID and set DPMS as part of a
+    /// normal commit and treats their absence as fatal (`Failed to parse EDID` /
+    /// `Failed to set DPMS property: Invalid argument`, confirmed live), hanging indefinitely
+    /// with zero frames ever presented rather than crashing outright. Real hardware DRM
+    /// connectors always have at least these two properties on legacy KMS, so reporting them is
+    /// the more real-kernel-accurate response, not a fabrication.
     ///
     /// The plane object DOES report one real property (`type` = `"Primary"`, see
     /// [`Self::get_property`]'s own doc comment): real legacy (non-atomic) universal-planes
@@ -847,9 +875,6 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         ptr: UserPtrMut<DrmModeObjGetProperties>,
     ) -> Result<u32, Errno> {
         let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-        if req.obj_type == DRM_MODE_OBJECT_CONNECTOR && req.obj_id != VIRTUAL_CONNECTOR_ID {
-            return Err(Errno::ENOENT);
-        }
         // `DRM_MODE_OBJECT_ANY` (`0`, real kernel `drm_mode.h` value) lets a caller query an
         // object's properties without knowing/caring which KMS object type it is -- wlroots'
         // `backend/drm/drm.c` (`check_drm_features()`/`scan_drm_connectors()`) issues a second
@@ -880,25 +905,174 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
             return Ok(0);
         }
+        if req.obj_type == DRM_MODE_OBJECT_CONNECTOR
+            || (req.obj_type == 0 && req.obj_id == VIRTUAL_CONNECTOR_ID)
+        {
+            if req.obj_id != VIRTUAL_CONNECTOR_ID {
+                return Err(Errno::ENOENT);
+            }
+            // Two-call size-probe pattern, same shape as the plane branch above: this connector
+            // has exactly two properties (DPMS, EDID), so a short-sized caller buffer can never
+            // actually truncate.
+            if req.count_props > 0 && req.props_ptr != 0 && req.prop_values_ptr != 0 {
+                let props = UserPtrMut::<u32>::from_usize(req.props_ptr as usize);
+                let values = UserPtrMut::<u64>::from_usize(req.prop_values_ptr as usize);
+                props
+                    .write_at_offset::<Platform>(0, VIRTUAL_CONNECTOR_DPMS_PROP_ID)
+                    .ok_or(Errno::EFAULT)?;
+                values
+                    .write_at_offset::<Platform>(0, VIRTUAL_CONNECTOR_DPMS_VALUE)
+                    .ok_or(Errno::EFAULT)?;
+                props
+                    .write_at_offset::<Platform>(1, VIRTUAL_CONNECTOR_EDID_PROP_ID)
+                    .ok_or(Errno::EFAULT)?;
+                values
+                    .write_at_offset::<Platform>(1, u64::from(VIRTUAL_CONNECTOR_EDID_BLOB_ID))
+                    .ok_or(Errno::EFAULT)?;
+            }
+            req.count_props = 2;
+            ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+            return Ok(0);
+        }
         req.count_props = 0;
+        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        Ok(0)
+    }
+
+    /// `DRM_IOCTL_MODE_CONNECTOR_SETPROPERTY` -- the legacy (pre-atomic) per-connector
+    /// property-set ioctl. wlroots' `backend/drm/legacy.c` uses this specifically to set DPMS
+    /// (`DRM_MODE_DPMS_ON`/`_STANDBY`/`_SUSPEND`/`_OFF`) as part of every legacy output commit;
+    /// with this ioctl entirely unhandled, it fell through to `EINVAL` and labwc hung
+    /// indefinitely waiting on a commit that could never succeed (confirmed live: "Failed to set
+    /// DPMS property: Invalid argument" followed by "Failed to commit frame", zero frames ever
+    /// presented).
+    ///
+    /// Accepted and reported back as a no-op success, never enforced: this single-address-space
+    /// shim has no real display-power hardware whose behavior a DPMS transition would need to
+    /// change, so there is nothing for `_OFF`/`_STANDBY`/`_SUSPEND` to actually do -- the virtual
+    /// display stays "on" regardless, exactly the same "accept but don't enforce, since there is
+    /// no real corresponding hardware/threat distinction here" pattern this codebase already
+    /// applies to `memfd` sealing (see `syscalls::file::do_fcntl`'s `FcntlArg::ADD_SEALS`/
+    /// `GET_SEALS` handling). Only the DPMS property ID is accepted; any other `prop_id` gets a
+    /// real `ENOENT` (unknown property), matching [`Self::get_property`]'s own precedent.
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn connector_set_property(
+        &self,
+        ptr: UserPtr<DrmModeConnectorSetProperty>,
+    ) -> Result<u32, Errno> {
+        let req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        if req.connector_id != VIRTUAL_CONNECTOR_ID {
+            return Err(Errno::ENOENT);
+        }
+        if req.prop_id != VIRTUAL_CONNECTOR_DPMS_PROP_ID {
+            return Err(Errno::ENOENT);
+        }
+        Ok(0)
+    }
+
+    /// `DRM_IOCTL_MODE_GETPROPBLOB` -- resolve a blob property's raw bytes. The only blob this
+    /// device exposes is the virtual connector's synthesized EDID (see
+    /// [`VIRTUAL_CONNECTOR_EDID_BLOB_ID`]), returned via the standard two-call size-probe
+    /// pattern (a `length`-only probe call, followed by a caller-sized-buffer call).
+    ///
+    /// The 128 bytes below are a minimal, spec-valid EDID 1.3 block -- the fixed header magic
+    /// (`00 FF FF FF FF FF FF 00`), a fabricated-but-well-formed manufacturer ID/product code/
+    /// serial (real values, not zeroed, since some parsers reject an all-zero block outright),
+    /// EDID version `1.3`, and a correct checksum (byte 127, chosen so all 128 bytes sum to `0
+    /// mod 256`, the one hard requirement every EDID parser -- including wlroots'
+    /// `backend/drm/util.c` -- actually validates). No real display-timing descriptor blocks are
+    /// populated: this device already reports its one fixed mode ([`VIRTUAL_WIDTH`] x
+    /// [`VIRTUAL_HEIGHT`] @ [`VIRTUAL_REFRESH_HZ`]) directly via `GETCONNECTOR`'s `modes` array,
+    /// which is what real clients actually use to pick a mode -- the EDID's only job here is to
+    /// exist and parse successfully, not to redundantly describe a mode a client would prefer
+    /// over the one already offered.
+    pub(crate) fn get_prop_blob(&self, ptr: UserPtrMut<DrmModeGetBlob>) -> Result<u32, Errno> {
+        let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        if req.blob_id != VIRTUAL_CONNECTOR_EDID_BLOB_ID {
+            return Err(Errno::ENOENT);
+        }
+        if req.length > 0 && req.data != 0 {
+            let len = core::cmp::min(req.length as usize, VIRTUAL_EDID_BLOB.len());
+            let dest = UserPtrMut::<u8>::from_usize(req.data as usize);
+            for (i, byte) in VIRTUAL_EDID_BLOB[..len].iter().enumerate() {
+                dest.write_at_offset::<Platform>(i as isize, *byte)
+                    .ok_or(Errno::EFAULT)?;
+            }
+        }
+        req.length = VIRTUAL_EDID_BLOB.len() as u32;
         ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
         Ok(0)
     }
 
     /// `DRM_IOCTL_MODE_GETPROPERTY` -- resolve a property ID's name/values.
     ///
-    /// This device's plane object reports one real property via [`Self::obj_get_properties`]:
-    /// `type` (id [`VIRTUAL_PLANE_TYPE_PROP_ID`]), an enum property whose one real,
-    /// on-the-wire value ([`VIRTUAL_PLANE_TYPE_VALUE`]) resolves to the `"Primary"` enum
-    /// name -- matching real weston's `plane_type_enums[WDRM_PLANE_TYPE_PRIMARY].name` in
-    /// `libweston/backend-drm/kms.c`, which is the exact string real clients compare against
-    /// (`drm_property_info_populate`'s `strcmp(prop->enums[l].name, info[j].enum_values[k].name)`
-    /// loop), not the raw numeric value. Every other property ID this device could ever be
-    /// asked about (there are none, since [`Self::obj_get_properties`] never reports any other
-    /// ID) gets a real `ENOENT` (unknown property) rather than an `ENOTTY` that would look like
-    /// a missing driver.
+    /// This device reports three real properties across [`Self::obj_get_properties`]'s object
+    /// branches: the plane's `type` (id [`VIRTUAL_PLANE_TYPE_PROP_ID`]), and the connector's
+    /// `DPMS` (id [`VIRTUAL_CONNECTOR_DPMS_PROP_ID`]) and `EDID` (id
+    /// [`VIRTUAL_CONNECTOR_EDID_PROP_ID`]). wlroots' `backend/drm/properties.c` resolves each
+    /// `OBJ_GETPROPERTIES`-reported ID through exactly this ioctl before deciding how to use it
+    /// (confirmed live: "Failed to get property 101/102 of DRM object 1" was this device's
+    /// exact prior failure mode when only the plane's `type` property was recognized here, even
+    /// though `obj_get_properties` itself already reported the connector's DPMS/EDID IDs --
+    /// `OBJ_GETPROPERTIES` and per-ID `GETPROPERTY` are two separate ioctls with two separate
+    /// property tables in a real driver, and this device's table needs every ID it ever
+    /// advertises, not just the ones a caller happens to exercise directly). Every other
+    /// property ID this device could ever be asked about (there are none) gets a real `ENOENT`
+    /// (unknown property) rather than an `ENOTTY` that would look like a missing driver.
     pub(crate) fn get_property(&self, ptr: UserPtrMut<DrmModeGetProperty>) -> Result<u32, Errno> {
         let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        if req.prop_id == VIRTUAL_CONNECTOR_DPMS_PROP_ID {
+            const NAME: &[u8] = b"DPMS";
+            req.name = [0u8; 32];
+            req.name[..NAME.len()].copy_from_slice(NAME);
+            req.flags = DRM_MODE_PROP_ENUM;
+            // Real DPMS is a 4-valued enum (On/Standby/Suspend/Off); this device only ever
+            // reports/accepts "On" (see [`Self::connector_set_property`]'s own doc comment for
+            // why), so only that one enum entry is populated -- a real client resolving DPMS by
+            // name (rather than assuming the value's meaning) still finds exactly the entry it
+            // needs.
+            if req.count_values > 0 && req.values_ptr != 0 {
+                UserPtrMut::<u64>::from_usize(req.values_ptr as usize)
+                    .write_at_offset::<Platform>(0, VIRTUAL_CONNECTOR_DPMS_VALUE)
+                    .ok_or(Errno::EFAULT)?;
+            }
+            if req.count_enum_blobs > 0 && req.enum_blob_ptr != 0 {
+                const ENUM_NAME: &[u8] = b"On";
+                let mut name = [0u8; 32];
+                name[..ENUM_NAME.len()].copy_from_slice(ENUM_NAME);
+                UserPtrMut::<DrmModePropertyEnum>::from_usize(req.enum_blob_ptr as usize)
+                    .write_at_offset::<Platform>(
+                        0,
+                        DrmModePropertyEnum {
+                            value: VIRTUAL_CONNECTOR_DPMS_VALUE,
+                            name,
+                        },
+                    )
+                    .ok_or(Errno::EFAULT)?;
+            }
+            req.count_values = 1;
+            req.count_enum_blobs = 1;
+            ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+            return Ok(0);
+        }
+        if req.prop_id == VIRTUAL_CONNECTOR_EDID_PROP_ID {
+            const NAME: &[u8] = b"EDID";
+            req.name = [0u8; 32];
+            req.name[..NAME.len()].copy_from_slice(NAME);
+            req.flags = DRM_MODE_PROP_BLOB;
+            // A blob property's "value" is the blob ID itself, resolved separately via
+            // `DRM_IOCTL_MODE_GETPROPBLOB` (see [`Self::get_prop_blob`]) -- there is no enum
+            // table for a blob-typed property, matching real kernel semantics.
+            if req.count_values > 0 && req.values_ptr != 0 {
+                UserPtrMut::<u64>::from_usize(req.values_ptr as usize)
+                    .write_at_offset::<Platform>(0, u64::from(VIRTUAL_CONNECTOR_EDID_BLOB_ID))
+                    .ok_or(Errno::EFAULT)?;
+            }
+            req.count_values = 1;
+            req.count_enum_blobs = 0;
+            ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+            return Ok(0);
+        }
         if req.prop_id != VIRTUAL_PLANE_TYPE_PROP_ID {
             return Err(Errno::ENOENT);
         }
