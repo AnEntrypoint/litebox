@@ -5670,3 +5670,72 @@ Files: `.wfgy/bench_scratch/noise_floor.log` (first, `LITEBOX_LOG`-unset attempt
 of the whole-second rounding artifact), `.wfgy/bench_scratch/noise_floor2.log` (the real 10-rep
 `LITEBOX_LOG=error` data this pass's numbers come from) -- both gitignored scratch, not committed.
 `AGENTS.md` (this entry).
+
+## Pass 350 -- attempted `docs/cow-mmap-fixed-address-design.md` step 1 (throwaway memcpy-skip
+hack to measure CoW's theoretical upper bound); the hack itself crashes the runner before any
+timing data can be collected -- a real, useful negative result, not a measurement
+
+Per the design doc's own step 1 (`docs/cow-mmap-fixed-address-design.md`, "If proceeding with
+Option B: concrete implementation plan"), attempted to measure the theoretical best-case wall-clock
+benefit of CoW succeeding for every attempt, by temporarily gating `do_mmap_file_memcpy`
+(`litebox_shim_linux/src/syscalls/mm.rs`) behind a hardcoded `const
+HACK_SKIP_MEMCPY_FOR_MEASUREMENT_ONLY: bool` that, when `true`, skips the real `sys_read` loop
+entirely and reports `Ok(len)` immediately -- exactly the hack the design doc describes, intended
+to leave guest memory uninitialized/garbage in exchange for a fast, fake "always succeeds" mmap
+path.
+
+**Result: the hack crashes the runner itself before any guest code runs, exit code 11, zero
+output, even for the simplest possible invocation (`/bin/sh -c 'echo HI'` against the canonical
+layer, no bench script, no GUI).** Confirmed this is caused by the hack (not an unrelated build
+issue) by reverting the flag to `false` and rebuilding: the exact same invocation then works
+cleanly (exit 0, `HI` printed). Root cause, read directly from the surrounding code
+(`do_mmap_file`, immediately after the CoW/memcpy branch): every executable (`PROT_EXEC`)
+file-backed mapping goes through `maybe_patch_exec_segment`, litebox's runtime syscall rewriter,
+which scans the newly-mapped bytes for real syscall instructions to patch in place. With the hack
+active, those bytes are genuinely uninitialized garbage (never populated by any real
+`sys_read`/memcpy) -- the rewriter almost certainly either scans garbage as if it were real
+machine code (undefined behavior) or hits an assertion/bounds check that this codebase treats as
+fatal, well before the guest's own `/bin/sh` gets to execute at all. This is a DIFFERENT and much
+earlier failure point than the design doc anticipated ("guest processes with garbage memory
+content... not expected to run correctly beyond timing" assumed the CRASH would happen inside
+guest code after a successful, timeable mmap -- not that the mmap's own in-process side effect
+(the rewriter) would crash the host runner before timing could even start).
+
+**Why this wasn't pursued further this pass**: making the hack survive the rewriter would require
+either (a) also faking/skipping `maybe_patch_exec_segment` for hack-mode mappings (a second,
+compounding hack inside code this project has already flagged as fragile-under-modification
+today, e.g. the fork_verify/CoW interactions in passes 343-344), or (b) restricting the hack to
+non-executable mappings only (which would systematically exclude PT_LOAD text segments -- exactly
+the mappings CoW is meant to help most, since they're the largest and most frequently re-mapped
+across execs of the same binary, per this session's own symlink-preservation findings). Neither
+is a genuine "throwaway, five minutes, revert before commit" experiment anymore; both would need
+their own careful scoping, which is out of proportion to a measurement-only pass.
+
+**Disposition**: the hack was fully reverted (`git checkout -- litebox_shim_linux/src/syscalls/mm.rs`,
+confirmed zero diff) and the release runner rebuilt clean before this pass ended -- `main` never
+had the hack in a committed state, and the current release binary is the real, unmodified memcpy
+path. No wall-clock numbers were collected (none exist to report, honestly).
+
+**What this pass DOES establish, negatively but genuinely**: the "quick hack to measure the
+upper bound" approach the design doc proposed does not work as simply as written, for a reason
+specific to this codebase (the runtime syscall rewriter's dependence on real mapped content) that
+a purely abstract read of `do_mmap_file_memcpy` in isolation would not have surfaced. Whoever
+picks up the measurement-first step next has two real options, neither attempted this pass: (1)
+scope and build a SECOND, compounding hack that also bypasses `maybe_patch_exec_segment` for
+hack-mode mappings (real, non-trivial work, needs its own care given this exact code's fragility
+history today), or (2) skip the "theoretical upper bound" shortcut entirely and go straight to a
+minimal-but-REAL implementation of Option B's step 2-4 (thread file-offset-alignment into
+`ElfFile::reserve`, extend `try_allocate_cow_pages` for the padding-registration case) restricted
+to a narrow, low-risk subset first (e.g. only apply it and measure for ONE specific known-hot
+binary/library, not universally) -- since a correct real implementation, even a narrow one, would
+produce a trustworthy number without needing a second throwaway hack at all.
+
+**Recommendation**: given this pass's finding, prefer option (2) above over building a second
+compounding hack -- the throwaway-measurement shortcut has turned out to be nearly as much
+implementation risk as a narrow real fix, without producing a trustworthy number even if it did
+work, so the shortcut's own value proposition (skip design/implementation risk, get a number fast)
+no longer holds for this specific codebase.
+
+Files: `litebox_shim_linux/src/syscalls/mm.rs` (hack added then fully reverted, net zero diff),
+`AGENTS.md` (this entry). `target/release/litebox_runner_linux_on_windows_userland.exe` rebuilt
+clean (hack disabled) before this pass ended.
