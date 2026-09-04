@@ -1958,7 +1958,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         let range = range.start..range.end;
         let mut mappings_to_change = Vec::new();
         for (r, vma) in self.vmas.overlapping(range.clone()) {
-            litebox_util_log::error!(
+            // Debug, not error: this fires once per VMA that OVERLAPS the requested range, which
+            // is the normal, expected outcome of this loop -- not a fault. At error! it emitted
+            // 3,800 lines across 200 execs (19 per exec) in a clean successful run, which both
+            // buries real errors and made error-level output useless for triage.
+            litebox_util_log::debug!(
                 caller:% = caller,
                 requested_start:% = range.start,
                 requested_end:% = range.end,

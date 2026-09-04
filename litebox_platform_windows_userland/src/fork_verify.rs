@@ -2566,7 +2566,10 @@ pub(crate) fn begin(relocations: alloc::sync::Arc<litebox::mm::AddressRelocation
             relocations.ranges(),
         );
     }
-    litebox_util_log::error!(
+    // Debug, not error: fork_verify begin/end is ordinary per-fork lifecycle bookkeeping, emitted
+    // 3 times per exec (600 lines across 200 execs) on every successful run. See the
+    // exec-path-27ms PRD row -- at error! these drowned out real faults entirely.
+    litebox_util_log::debug!(
         tid:? = std::thread::current().id(),
         win_tid:% = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() },
         range_count:% = relocations.ranges().len();
@@ -2638,7 +2641,7 @@ pub(crate) fn end() {
         if let Ok(mut slot) = tls.fork_verify.try_borrow_mut() {
             let had_map = slot.is_some();
             let range_count = slot.as_ref().map_or(0, |r| r.ranges().len());
-            litebox_util_log::error!(
+            litebox_util_log::debug!(
                 tid:? = std::thread::current().id(),
                 had_map:% = had_map,
                 range_count:% = range_count;
@@ -2646,7 +2649,7 @@ pub(crate) fn end() {
             );
             *slot = None;
         } else {
-            litebox_util_log::error!(
+            litebox_util_log::debug!(
                 tid:? = std::thread::current().id();
                 "diag-fv-lifecycle: end (SKIPPED clear -- already borrowed, map left live)"
             );
