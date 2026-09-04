@@ -312,7 +312,7 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfLoader<'a, Platform, FS> {
         // identify which file (and, via the path + `nm`/`objdump` on that exact file, which
         // symbol) actually crashed -- litebox has no `/proc/self/maps` for the guest to
         // introspect itself, so this is the only available source of file<->address mapping.
-        litebox_util_log::error!(
+        litebox_util_log::debug!(
             path:% = path;
             "diag-elf-load-path: tracking for future crash-address correlation"
         );
@@ -374,7 +374,7 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfLoader<'a, Platform, FS> {
         aux.insert(AuxKey::AT_PHENT, info.phent_size());
         aux.insert(AuxKey::AT_PHNUM, info.num_phdrs);
         aux.insert(AuxKey::AT_ENTRY, info.entry_point);
-        litebox_util_log::error!(
+        litebox_util_log::debug!(
             main_base:% = alloc::format!("{:#x}", info.base_addr),
             main_entry:% = alloc::format!("{:#x}", info.entry_point),
             main_phdrs_addr:% = alloc::format!("{:#x}", info.phdrs_addr),

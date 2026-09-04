@@ -1999,7 +1999,7 @@ fn write_usize_fault_tolerant(addr: usize, value: usize) {
             &raw mut old_protect,
         ) != 0
     };
-    litebox_util_log::error!(
+    litebox_util_log::debug!(
         tid:? = std::thread::current().id(),
         addr:% = addr,
         old_protect:% = old_protect,
@@ -2021,7 +2021,7 @@ fn write_usize_fault_tolerant(addr: usize, value: usize) {
             &raw mut restored,
         ) != 0
     };
-    litebox_util_log::error!(
+    litebox_util_log::debug!(
         tid:? = std::thread::current().id(),
         addr:% = addr,
         restored_to:% = old_protect,

@@ -955,14 +955,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Deliver any pending signals.
     pub(crate) fn process_signals(&self, ctx: &mut PtRegs) {
         #[cfg(target_arch = "x86_64")]
-        litebox_util_log::warn!(
+            // Debug, not warn: `process_signals` is the GENERAL signal path, not DRM-specific --
+            // the `drm-diag` prefix is leftover from a DRM investigation. It runs 32 times per
+            // exec, emitting 128 warn-level lines per exec on a completely normal run.
+        litebox_util_log::debug!(
             tid:% = self.tid, rip:% = ctx.rip, orig_rax:% = ctx.orig_rax;
             "drm-diag: process_signals entry with ctx"
         );
         let mut iter_count: u32 = 0;
         loop {
             iter_count += 1;
-            litebox_util_log::warn!(tid:% = self.tid, iter_count:% = iter_count; "drm-diag: process_signals loop iteration");
+            litebox_util_log::debug!(tid:% = self.tid, iter_count:% = iter_count; "drm-diag: process_signals loop iteration");
             let blocked = self.signals.blocked.get();
             let (signal, siginfo) = {
                 let mut pending = self.signals.pending.borrow_mut();
@@ -974,12 +977,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     if let Some(signal) = shared.next(blocked) {
                         (signal, shared.remove(signal))
                     } else {
-                        litebox_util_log::warn!(tid:% = self.tid, iter_count:% = iter_count; "drm-diag: process_signals breaking (nothing pending)");
+                        litebox_util_log::debug!(tid:% = self.tid, iter_count:% = iter_count; "drm-diag: process_signals breaking (nothing pending)");
                         break;
                     }
                 }
             };
-            litebox_util_log::warn!(tid:% = self.tid, signal:? = signal; "drm-diag: process_signals dispatching signal");
+            litebox_util_log::debug!(tid:% = self.tid, signal:? = signal; "drm-diag: process_signals dispatching signal");
             if self.is_exiting() {
                 // Don't deliver any more signals if exiting.
                 return;
@@ -1057,7 +1060,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
             }
         }
-        litebox_util_log::warn!(tid:% = self.tid; "drm-diag: process_signals returning normally");
+        litebox_util_log::debug!(tid:% = self.tid; "drm-diag: process_signals returning normally");
     }
 
 

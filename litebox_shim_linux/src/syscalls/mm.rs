@@ -182,7 +182,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // already relies on).
         if is_exec {
             let path = self.files.borrow().lookup_fd_path(fd as usize);
-            litebox_util_log::error!(
+            litebox_util_log::debug!(
                 path:? = path, start:% = result.as_usize(), len:% = len, offset:% = offset;
                 "diag-exec-mmap: tracking for future crash-address correlation"
             );
@@ -997,7 +997,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // gains PROT_EXEC (an mmap(PROT_READ) followed later by mprotect(PROT_EXEC), the
             // classic dynamic-linker lazy-mapping idiom), so track it here too.
             let path = self.files.borrow().lookup_fd_path(fd as usize);
-            litebox_util_log::error!(
+            litebox_util_log::debug!(
                 path:? = path, start:% = patch_start, len:% = patch_len;
                 "diag-exec-mmap: tracking via mprotect(PROT_EXEC) for future crash-address correlation"
             );
@@ -2342,6 +2342,63 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err, Errno::ENODEV);
+    }
+
+    /// Contrast case for [`test_map_shared_writable_file_returns_enodev_instead_of_panicking`]
+    /// just above: a file created under `/dev/shm` is real Linux's own tmpfs, so unlike an
+    /// ordinary file it must NOT hit that `ENODEV` rejection -- `MAP_SHARED|PROT_WRITE` there is
+    /// exactly the real shared-memory semantics glibc's `shm_open` relies on (see
+    /// `syscalls::file::is_dev_shm_path`'s doc comment for the open-time `MemfdMarker` tagging
+    /// this exercises, and the runner's `initialize_root_in_mem_layer` for why `/dev/shm` exists
+    /// as a directory at all). Live-verified against a real freestanding guest probe
+    /// (`advisor/probes/shm_probe.c`) doing the identical `open+ftruncate+mmap+write+read-back`
+    /// sequence before this unit test was written -- this is the regression-test-level
+    /// equivalent.
+    #[test]
+    fn test_dev_shm_file_supports_map_shared_write() {
+        let task = init_platform(None);
+        // `/dev` already exists in this test's own fixture tar (`litebox/src/fs/test.tar`) --
+        // unlike the real runner's fresh in-mem layer, which needs it created explicitly (see
+        // `initialize_root_in_mem_layer`'s doc comment) -- so only `/dev/shm` needs creating here.
+        let _ = task.sys_mkdirat(
+            litebox_common_linux::AT_FDCWD,
+            "/dev",
+            (Mode::RWXU | Mode::RGRP | Mode::ROTH).bits(),
+        );
+        task.sys_mkdirat(
+            litebox_common_linux::AT_FDCWD,
+            "/dev/shm",
+            (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits(),
+        )
+        .unwrap();
+
+        let fd = task
+            .sys_open(
+                "/dev/shm/probe_name",
+                OFlags::RDWR | OFlags::CREAT | OFlags::EXCL,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+
+        task.sys_ftruncate(fd, 0x1000).unwrap();
+
+        let addr = task
+            .sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_SHARED,
+                fd,
+                0,
+            )
+            .unwrap();
+        addr.write_slice_at_offset::<Platform>(0, &[0xab; 0x10])
+            .unwrap();
+        assert_eq!(addr.read_at_offset::<Platform>(0).unwrap(), 0xab_u8);
+
+        task.sys_munmap(addr, 0x1000).unwrap();
+        task.sys_close(fd).unwrap();
     }
 
     #[test]
