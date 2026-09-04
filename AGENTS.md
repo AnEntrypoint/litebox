@@ -5450,3 +5450,69 @@ Files changed/added: `advisor/probes/run_xfce_xwm_with_exec_bench.sh` (new), `AG
 `.wfgy/bench_scratch/bench_inject.tar` (gitignored scratch, not committed) is the disposable overlay
 tar used to inject the new script into a run -- regenerable via `tar -cf <out>.tar -C
 /tmp/bench_inject advisor` after copying the script into `/tmp/bench_inject/advisor/probes/`.
+
+## Pass 347 -- realigned canonical layer verified to boot XFCE cleanly, but the combined-with-GUI
+exec-benchmark number is WORSE than pass 346's original, not better: NOT promoted, real regression
+between isolated and combined measurement
+
+A peer session (advisor-db) measured a large win from retrofitting the same 64KiB-alignment/
+dedup packager fix onto `layer31_direct_fixed.tar` via `advisor/probes/realign_tar.py` (committed
+`dfb9c166`): a bare-shell, no-GUI 400-exec benchmark went from 26.6ms/exec (original) to ~0ms/exec
+(realigned) -- 2447MB -> 700MB, 872 dedup groups, 90% of large files 64KiB-aligned (independently
+re-verified this pass via a fresh regeneration + direct tar-offset check, ruling out a stale/
+partial file: `518/574 = 90% aligned`, matching the peer's own number exactly). This pass ran the
+SAME combined XFCE+exec-benchmark verification pass 346 used (`run_xfce_xwm_with_exec_bench.sh`,
+same `--resume-from bench_inject.tar` overlay, same launch shape) against this freshly-regenerated
+realigned layer to confirm the win holds under a real GUI workload before promoting it to canonical.
+
+**XFCE-up half: confirmed clean, matches pass 346's quality.** `TEST_DONE` reached at ~82s, zero
+`exit_group` events for any of `xfwm4`/`xfsettingsd`/`xfdesktop`/`xfce4-panel` (checked by decoding
+each `comm` byte array, not just grepping for a name substring, to avoid a false match against e.g.
+`xfce4-about`) across the ENTIRE run including the full bench phase. 100 real frames dumped this
+run; frame 97 (captured during this run, not a stale file from an earlier pass -- confirmed via
+mtime) decoded via `advisor/probes/decode_frame.py`: "content covers ~1080 of 1080 rows (100.0%)",
+real bright icon/text clusters at specific x-ranges, matching pass 346's frame 99 in character.
+
+**Exec-benchmark half: the opposite of expected.** Bracketing `/bin/date` `DIAG_TIMELINE execve`
+timestamps around the 200-exec loop: `82.263316400s` -> `107.438442500s` = 25.175s / 200 =
+**125.9ms/exec** -- more than 3x WORSE than pass 346's own 40.56ms/exec on the UNALIGNED original
+layer, and nowhere close to advisor-db's ~0ms/exec bare-shell figure on the same realigned tar.
+
+**This is not a measurement artifact carried over from a stale file** (independently re-verified
+alignment, see above) **and not obviously explained by log-level noise alone**: `LITEBOX_LOG=error`
+was set for this run (pass 346's own documented command shows no `LITEBOX_LOG` override at all, a
+real methodology difference worth flagging), but the concrete evidence pointing elsewhere is that
+`fixup_stale_elf_data_pointers` (the `fork_verify` stale-pointer-healing pass, the same mechanism
+investigated earlier this session in the mate-session/DT_NEEDED thread) fired **204 times during
+the 200-exec bench window alone** -- essentially once per exec, with `healed_count` in the
+mid-300s each time. That is real emulation WORK happening on every exec in this combined scenario,
+not a logging artifact, and it did not fire at all in advisor-db's isolated bare-shell measurement
+(no live GUI process tree for it to have stale pointers into). The working hypothesis: with a live
+XFCE session's process tree present, each new exec's `fork_verify` healing pass has substantially
+more state to walk/heal than in a bare-shell-only guest, and that cost dominates over whatever the
+tar-alignment/CoW-adjacent fix saves on the file-read side -- i.e. **the two measurements are not
+in tension over the SAME cost**, they are measuring different dominant costs in different guest
+process-tree shapes. This is a hypothesis, not yet confirmed by direct instrumentation isolating
+fork_verify's own per-exec cost in each scenario.
+
+**Decision: NOT promoted.** Per the user's explicit new standing goal ("get it as performant as
+possible, WITHOUT BREAKING ANYTHING"), a change that is faster in isolation but 3x slower in the
+actual combined-with-GUI scenario is not a verified net win for the workload that matters --
+promoting `layer31_realigned.tar` over `layer31_direct_fixed.tar` as canonical on the strength of
+the isolated number alone would be exactly the kind of overclaim this project's standing discipline
+exists to prevent. `layer31_direct_fixed.tar` remains canonical, untouched. `layer31_realigned.tar`
+is kept at `.wfgy/xfce-build/layer31_realigned.tar` (not deleted -- real, reproducible, dedup/
+alignment-correct artifact, useful for whoever continues this) but is NOT the canonical reference.
+
+**Concrete next step for whoever continues**: isolate whether `fork_verify`'s per-exec cost is
+itself sensitive to live-GUI-process-tree size/shape (i.e. does the SAME 200-exec loop cost
+~40ms/exec with a live GUI present regardless of tar alignment, meaning fork_verify overhead is the
+actual dominant cost in this scenario and the tar-alignment win is real but currently masked by it)
+-- if confirmed, the tar-alignment fix is still real and worth keeping/promoting once combined with
+separate fork_verify-cost work, not a wasted effort, just not sufficient alone for THIS workload
+shape. Re-run pass 346's exact original (unaligned) combined benchmark once more alongside this
+pass's realigned-layer combined benchmark, both with the SAME `LITEBOX_LOG` setting, to remove that
+one remaining methodology variance before concluding further.
+
+Files: `.wfgy/xfce-build/layer31_realigned.tar` (734MB, gitignored scratch, not committed, kept for
+follow-on work), `AGENTS.md` (this entry).
