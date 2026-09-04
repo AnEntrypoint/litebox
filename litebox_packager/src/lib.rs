@@ -693,7 +693,55 @@ fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("failed to create output file {}", output.display()))?;
     let mut builder = Builder::new(file);
 
+    // Copy-on-write mapping alignment. `MapViewOfFile3` (the Win32 primitive behind
+    // `try_allocate_cow_pages`) requires a view's FILE OFFSET to be 64KiB-aligned -- unlike
+    // Linux `mmap`, which needs only 4KiB. Tar's 512-byte block layout means a natural archive
+    // lands almost nothing on that boundary: a real Alpine layer measured 1 of 88 files (1.1%)
+    // aligned, so the CoW fast path fell back to a 4KB-per-syscall memcpy for essentially every
+    // exec (386 sys_read calls to launch one busybox).
+    //
+    // Pad before any entry whose DATA is large enough to be worth mapping so its data starts on
+    // a 64KiB boundary. Only files >= 64KiB are padded: a smaller file cannot fill a view and
+    // aligning it would cost space for no benefit. On that same layer only 11 of 88 files
+    // qualify -- but they are exactly the ones every exec maps (busybox, ld-musl, libcrypto,
+    // libssl) -- so the whole change costs 0.41 MB on 8.43 MB, 4.8%.
+    const COW_VIEW_ALIGN: u64 = 65536;
+    const TAR_BLOCK: u64 = 512;
+    // Tracks the byte offset the next entry's HEADER will be written at, mirroring what the
+    // builder itself emits: one header block, then the data rounded up to a block boundary.
+    let mut offset: u64 = 0;
+
     for entry in entries {
+        // Emit alignment padding BEFORE this entry's header when its data would otherwise
+        // straddle a 64KiB boundary. The padding is a real tar entry (a regular file under
+        // litebox/, ignored by the guest) rather than raw bytes, because a tar reader must be
+        // able to walk past it -- raw filler would desynchronize every subsequent header.
+        if entry.symlink_target.is_none() && entry.data.len() as u64 >= COW_VIEW_ALIGN {
+            let data_start = offset + TAR_BLOCK;
+            let misalign = data_start % COW_VIEW_ALIGN;
+            if misalign != 0 {
+                // Space to fill, minus the padding entry's own header block.
+                let mut gap = COW_VIEW_ALIGN - misalign;
+                while gap < TAR_BLOCK * 2 {
+                    gap += COW_VIEW_ALIGN;
+                }
+                let pad_len = gap - TAR_BLOCK;
+                let pad = vec![0u8; usize::try_from(pad_len).expect("pad fits usize")];
+                let mut pad_header = Header::new_ustar();
+                pad_header.set_size(pad_len);
+                pad_header.set_mode(0o644);
+                pad_header.set_uid(1000);
+                pad_header.set_gid(1000);
+                pad_header.set_entry_type(tar::EntryType::Regular);
+                pad_header.set_cksum();
+                let pad_name = format!("litebox/.align/{offset}");
+                builder
+                    .append_data(&mut pad_header, &pad_name, pad.as_slice())
+                    .with_context(|| format!("failed to add alignment padding {pad_name}"))?;
+                offset += TAR_BLOCK + pad_len.div_ceil(TAR_BLOCK) * TAR_BLOCK;
+            }
+        }
+        let entry_data_len = entry.data.len() as u64;
         // Note: we use the ustar format because the runtime tar filesystem
         // (`litebox/src/fs/tar_ro.rs`) uses the `tar_no_std` crate which only
         // supports ustar. This limits path lengths to 256 bytes (with the
@@ -716,6 +764,8 @@ fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
                 .with_context(|| {
                     format!("failed to add symlink {} -> {target} to tar", entry.tar_path)
                 })?;
+            // A symlink entry is header-only, no data blocks.
+            offset += TAR_BLOCK;
             continue;
         }
         header.set_entry_type(tar::EntryType::Regular);
@@ -723,6 +773,7 @@ fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
         builder
             .append_data(&mut header, &entry.tar_path, entry.data.as_slice())
             .with_context(|| format!("failed to add {} to tar", entry.tar_path))?;
+        offset += TAR_BLOCK + entry_data_len.div_ceil(TAR_BLOCK) * TAR_BLOCK;
     }
 
     builder.finish().context("failed to finalize tar archive")?;
