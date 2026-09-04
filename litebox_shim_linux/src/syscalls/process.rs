@@ -4152,12 +4152,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `futex`
     pub(crate) fn sys_futex(&self, arg: litebox_common_linux::FutexArgs) -> Result<usize, Errno> {
-        /// Note our mutex implementation assumes futexes are private as we don't support shared memory yet.
-        /// It should be fine to treat shared futexes as private for now.
+        /// A futex without `FUTEX_PRIVATE_FLAG` asks for cross-PROCESS semantics. Every guest
+        /// thread here lives in one host process sharing one address space, so a "shared" futex
+        /// word is reachable at the same address by every waiter anyway -- treating it as private
+        /// is CORRECT here, not an approximation, and the wait/wake pairing behaves identically.
+        ///
+        /// Logged at debug rather than through `log_unsupported!`: this is not an unimplemented
+        /// feature and it dominated the unsupported-feature census (20 hits per XFCE run,
+        /// the largest single entry) purely as noise, competing for attention with real gaps.
         macro_rules! warn_shared_futex {
             ($flag:ident) => {
                 if !$flag.contains(litebox_common_linux::FutexFlags::PRIVATE) {
-                    log_unsupported!("shared futex");
+                    litebox_util_log::debug!("futex: shared futex treated as private (correct in a single address space)");
                 }
             };
         }
