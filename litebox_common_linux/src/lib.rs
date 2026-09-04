@@ -4562,6 +4562,24 @@ impl SyscallRequest {
                 mask,
                 statxbuf:*,
             }),
+            // Namespace creation is genuinely not permitted here, and the DISTINCTION between
+            // "not permitted" (EPERM) and "broken/unknown" (EINVAL/ENOSYS) is load-bearing for
+            // callers. Sandboxing libraries probe for namespace support and degrade gracefully
+            // when refused: glycin (the image decoder modern Alpine's gdk-pixbuf delegates ALL
+            // PNG/JPEG decoding to) string-matches bwrap's stderr for "No permissions to create
+            // a new namespace" / "Permission denied" and then proceeds unsandboxed, logging
+            // "Glycin running without sandbox". Returning ENOSYS/EINVAL instead reads to such a
+            // caller as "something is broken" rather than "you may not", so it propagates a hard
+            // failure -- which is what made xfce4-panel abort on GTK's fallback icon decode.
+            //
+            // EPERM is also what real Linux returns for unprivileged namespace creation when it
+            // is administratively disabled, so this is closer to Linux behaviour, not further
+            // from it. Deliberately NOT a fake namespace implementation: pretending to isolate
+            // would be far worse than an honest refusal, because callers would believe they are
+            // sandboxed when they are not.
+            Sysno::unshare | Sysno::setns => {
+                return Err(errno::Errno::EPERM);
+            }
             // Noisy unsupported syscalls.
             Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 return Err(errno::Errno::ENOSYS);

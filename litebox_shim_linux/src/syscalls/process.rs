@@ -2325,6 +2325,34 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // Ignored since we don't support sysv semaphores anyway.
             | CloneFlags::SYSVSEM;
 
+        // Namespace-creation flags get EPERM, not EINVAL. The distinction is load-bearing:
+        // sandboxing tools probe for namespace support and degrade gracefully when REFUSED,
+        // but treat EINVAL as "something is broken" and fail hard. glycin -- which modern
+        // Alpine's gdk-pixbuf delegates all PNG/JPEG decoding to -- runs bwrap and
+        // string-matches its stderr for "No permissions to create a new namespace" /
+        // "Permission denied", then proceeds unsandboxed ("Glycin running without sandbox").
+        // With EINVAL bwrap instead reports "Creating new namespace failed: Invalid argument",
+        // which glycin does not recognise, so image decoding fails outright and GTK aborts on
+        // its fallback icon -- observed as xfce4-panel/xfdesktop SIGABRT.
+        //
+        // EPERM is also what real Linux reports for unprivileged namespace creation when it is
+        // administratively disabled, so this moves toward Linux behaviour rather than away.
+        // Deliberately NOT a fake namespace implementation: claiming isolation we do not
+        // provide would be far worse than an honest refusal.
+        const NAMESPACE_FLAGS: CloneFlags = CloneFlags::NEWNS
+            .union(CloneFlags::NEWUSER)
+            .union(CloneFlags::NEWPID)
+            .union(CloneFlags::NEWNET)
+            .union(CloneFlags::NEWIPC)
+            .union(CloneFlags::NEWUTS)
+            .union(CloneFlags::NEWCGROUP);
+        if flags.intersects(NAMESPACE_FLAGS) {
+            log_unsupported!(
+                "clone with namespace flags (refused with EPERM): {:?}",
+                flags & NAMESPACE_FLAGS
+            );
+            return Err(Errno::EPERM);
+        }
         if flags.intersects(!supported_clone_flags) {
             log_unsupported!(
                 "clone with unsupported flags: {:?}",
