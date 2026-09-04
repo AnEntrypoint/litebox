@@ -6173,14 +6173,40 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         // would see the latter as already-owned-by-this-process and could silently succeed by
         // overwriting adjacent, real segment content. Rather than risk that, `Replace`/
         // `NoReplace` always take the existing, safe `Unaligned` fallback below.
-        let can_relocate = fixed_address_behavior == FixedAddressBehavior::Hint;
+        // AGENTS.md pass 344 CORRECTION: pass 343 attempted a `Hint`-only "map the containing
+        // 64KiB-aligned region and offset the returned pointer into it" optimization here. That
+        // is unsound as written and has been reverted: the `view_padding` bytes BEFORE the
+        // returned pointer are real, physically-mapped, guest-accessible memory (part of the
+        // same `MapViewOfFile3` view) that this function never reports to its caller --
+        // `litebox_shim_linux`'s `Vmem`/`register_existing_mapping` (see
+        // `syscalls::mm::try_cow_mmap_file`) only ever learns about `len = source_data.len()`
+        // bytes starting at the returned pointer, not the padding prefix. Confirmed live as a
+        // real, reproducible crash (not a hypothetical): a guest touching an address inside that
+        // untracked padding faults, and litebox's own SIGSEGV path reports it as "genuinely
+        // unmapped" (Vmem has no record of it) even though the OS itself has it mapped; worse,
+        // this codebase's crash-cleanup path then calls `VirtualFree(MEM_DECOMMIT)` on that same
+        // untracked address range, which fails outright (`os error 487`/`os error 6`) because the
+        // memory is backed by a `MapViewOfFile3` view, not a `VirtualAlloc` region --
+        // `VirtualFree(MEM_DECOMMIT)` is never valid on mapped-view memory, only
+        // `UnmapViewOfFileEx` is, and this function has no path to register/track the padding for
+        // that call either. Reproduced deterministically via `/usr/bin/labwc --help` against
+        // `webtop_seatd.tar` (`view_padding=61440`, `file_offset=1011216384`, fault at
+        // `cr2=0xa0f2a0`, inside the padding region, followed by the `os error 487` panic in
+        // `process_memory_range_by_regions`). This optimization was already confirmed to have
+        // zero effect on the ELF-load hot path it was written for (that path is always
+        // `Replace`/`NoReplace`, never `Hint` -- see the paragraph below), so disabling it
+        // entirely for `Hint` too costs nothing while removing a real, live memory-safety bug.
+        // A correct version of this optimization would need to register the padding prefix with
+        // `Vmem` (e.g. as a real tracked mapping the caller then immediately unmaps/truncates) or
+        // use a Windows API that can create a view starting exactly at `file_offset` without the
+        // 64KiB constraint -- neither of which exists today; left for whoever revisits this.
         let aligned_offset = file_offset - (file_offset % ALLOCATION_GRANULARITY);
         let view_padding = file_offset - aligned_offset;
-        if view_padding != 0 && !can_relocate {
+        if view_padding != 0 {
             if diag_mm_enabled() {
                 litebox_util_log::debug!(
                     file_offset:% = file_offset, len:% = source_data.len();
-                    "diag-cow: file offset not 64KiB-aligned and address is fixed, falling back to memcpy path"
+                    "diag-cow: file offset not 64KiB-aligned, falling back to memcpy path"
                 );
             }
             return Err(CowAllocationError::Unaligned);
@@ -6248,18 +6274,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             },
         };
         let view_protect = prot_flags(permissions);
-        // When `view_padding != 0` (only reachable for `Hint`, see the check above), the view
-        // must start at `aligned_offset` and cover `view_padding` extra leading bytes so the
-        // OS-level `Offset` parameter stays 64KiB-aligned; the returned pointer is adjusted by
-        // `view_padding` below so the caller still sees `source_data`'s own first byte, not the
-        // padding. A `Hint` request has no exact-address requirement, so this padded view is
-        // always placed by letting Windows choose (unconstrained `base_addr = null`) rather than
-        // honoring `suggested_start` directly -- `suggested_start` was computed assuming a
-        // `view_padding`-less mapping and offsetting it backwards by `view_padding` could itself
-        // collide with something else, the same class of risk the `Replace`/`NoReplace` case
-        // above avoids entirely.
         let map_offset = aligned_offset as u64;
-        let map_len = source_data.len() + view_padding;
+        let map_len = source_data.len();
         let mut try_map = |base_addr: *const c_void, constrained: bool| unsafe {
             if constrained {
                 MapViewOfFile3(
@@ -6287,7 +6303,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 )
             }
         };
-        let base_addr = if view_padding != 0 || suggested_start == 0 {
+        let base_addr = if suggested_start == 0 {
             core::ptr::null()
         } else {
             suggested_start as *const c_void
@@ -6318,16 +6334,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             }
             return Err(CowAllocationError::InternalFailure);
         }
-        // SAFETY: `view` covers `map_len = source_data.len() + view_padding` bytes starting at
-        // file offset `aligned_offset`; `view_padding` is exactly `file_offset - aligned_offset`,
-        // so `view.Value + view_padding` is the address of file offset `file_offset` -- the same
-        // content `source_data` itself starts at -- and at least `source_data.len()` bytes remain
-        // in the view from there.
-        let result_ptr = unsafe { view.Value.cast::<u8>().add(view_padding) };
+        // SAFETY: `view` covers exactly `map_len = source_data.len()` bytes starting at file
+        // offset `aligned_offset`, which equals `file_offset` since `view_padding == 0` is
+        // enforced above -- `view.Value` is the address of `source_data`'s own first byte.
+        let result_ptr = view.Value.cast::<u8>();
         if diag_mm_enabled() {
             litebox_util_log::error!(
-                addr:% = result_ptr as usize, len:% = source_data.len(), file_offset:% = file_offset,
-                view_padding:% = view_padding;
+                addr:% = result_ptr as usize, len:% = source_data.len(), file_offset:% = file_offset;
                 "diag-cow: try_allocate_cow_pages OK"
             );
         }
