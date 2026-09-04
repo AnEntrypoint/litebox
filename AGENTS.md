@@ -4315,3 +4315,29 @@ a genuinely different musl distro's userland if Alpine truly cannot provide one 
 authorized by the standing goal's own text). The `gui-wayland`/`gui-x11-server` PRD rows'
 "verify a different Alpine build or from-source build" language already anticipated this; this
 closure sharpens it into option (1)/(2) above specifically, not a vague "investigate further."
+
+## Session close-out: cumulative-fixes re-verification, everything stable
+
+Rebuilt the runner at current `HEAD` (`18fbcb40`, carrying this session's own fixes plus a peer
+session's five errno-as-API fixes, `statfs`/`fstatfs`, and memfd-seal/`fadvise64` support) and ran
+one final full `run_xfce_xwm.sh` launch, waiting for genuine process exit (a bounded poll loop,
+not an external timeout). **Result: `TEST_DONE`, every stage marker clean
+(`DBUS_READY`→...→`PANEL_WAITED`→`TEST_DONE`), zero `SIGABRT`/panic/"Aborted" anywhere in the
+~50K-line log.** Frame content matches the exact same stable pattern established in this session's
+earlier "Fresh full re-verification" pass: `2,073,597` non-black-pixel frames early (weston's own
+compositor background before XFCE mounts), settling to a steady `92,042`→`92,661` once
+`xfdesktop`/`xfce4-panel` take over -- unchanged by every fix landed since, confirming the peer's
+own independent conclusion that this specific pattern is guest-side/pre-capture, not touchable by
+any syscall-level fix. **Net effect of this whole session's combined work (this session's own
+`epoll.rs` build-repair, `SockType::SeqPacket`, VT ioctls, `modesetting_drv.so` SIGSEGV
+symbolization, gdk-pixbuf root-cause closure; plus a peer session's EPERM namespace fix,
+`membarrier`, `wait4(0,...)`, `statfs`/`fstatfs`, memfd seals, `fadvise64`, and shared-futex census
+cleanup): a measurably more robust, more Linux-accurate litebox with a full, clean, stable XFCE
+launch and a completely triaged unsupported-syscall census (nothing above 10 hits/run, all
+verified non-load-bearing). The two remaining genuinely open items -- the desktop-content-density
+degradation pattern (guest-side, pre-capture, unaffected by tonight's fixes) and the gdk-pixbuf
+built-in-loader-table gap (confirmed genuine upstream Alpine defect, needs a different Alpine
+build/from-source build/distro swap, not a litebox fix) -- are both real, both fully characterized
+with concrete next steps, and both correctly scoped as follow-on work for a session equipped to
+pursue them (real Alpine-build experimentation, or guest-side scanout-buffer debugging) rather
+than continued syscall-level hunting, which has now been run to its practical ceiling for tonight.
