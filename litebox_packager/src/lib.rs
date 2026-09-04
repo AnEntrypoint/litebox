@@ -319,6 +319,18 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
     let par_results: Vec<anyhow::Result<TarEntry>> = file_entries
         .into_par_iter()
         .map(|(_key_path, entry)| {
+            // A symlink carries no payload: emit the link itself and never read, rewrite, or
+            // copy its target. Reading it here is exactly what flattened every layer, turning
+            // /bin/ls -> /bin/busybox into a second 804 KB copy of busybox.
+            if let Some(target) = entry.symlink_target {
+                return Ok(TarEntry {
+                    tar_path: entry.tar_path,
+                    data: Vec::new(),
+                    mode: entry.mode,
+                    symlink_target: Some(target),
+                });
+            }
+
             let data = std::fs::read(&entry.read_path)
                 .with_context(|| format!("failed to read {}", entry.read_path.display()))?;
 
@@ -332,6 +344,7 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
                 tar_path: entry.tar_path,
                 data: rewritten,
                 mode: entry.mode,
+                symlink_target: None,
             })
         })
         .collect();
@@ -360,6 +373,7 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
                 tar_path: CONFIG_JSON_TAR_PATH.to_string(),
                 data: extracted.config_json,
                 mode: 0o644,
+                symlink_target: None,
             });
         } else {
             eprintln!("warning: tar already contains {CONFIG_JSON_TAR_PATH}, skipping");
@@ -377,6 +391,7 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
                 tar_path: CONFIG_AND_RUN_TAR_PATH.to_string(),
                 data: script.into_bytes(),
                 mode: 0o755,
+                symlink_target: None,
             });
         } else {
             eprintln!(
@@ -665,6 +680,12 @@ struct TarEntry {
     tar_path: String,
     data: Vec<u8>,
     mode: u32,
+    /// When `Some`, this entry is a SYMLINK to the given target rather than a regular file,
+    /// and `data` is empty. Real container images are largely defined by their symlink
+    /// structure (`/bin/ls -> /bin/busybox`, `/lib64 -> /lib`), so materializing each link as
+    /// a full file copy produces a rootfs that is no longer the image it came from -- and
+    /// duplicates enormously (295 copies of one 804 KB busybox, 226 MB, in a single layer).
+    symlink_target: Option<String>,
 }
 
 fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
@@ -685,6 +706,18 @@ fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
         header.set_mode(entry.mode & 0o777);
         header.set_uid(1000);
         header.set_gid(1000);
+        // A symlink entry carries its target in the header's linkname and no payload.
+        if let Some(target) = &entry.symlink_target {
+            header.set_size(0);
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_cksum();
+            builder
+                .append_link(&mut header, &entry.tar_path, target)
+                .with_context(|| {
+                    format!("failed to add symlink {} -> {target} to tar", entry.tar_path)
+                })?;
+            continue;
+        }
         header.set_entry_type(tar::EntryType::Regular);
         header.set_cksum();
         builder
@@ -694,4 +727,65 @@ fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
 
     builder.finish().context("failed to finalize tar archive")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod symlink_emit_tests {
+    use super::*;
+
+    /// A `TarEntry` carrying a `symlink_target` must be written as a real symlink header, not a
+    /// file. Every layer built before this contained ZERO symlinks -- 295 copies of one 804 KB
+    /// busybox in a single layer -- because the packager resolved links away, on the since-stale
+    /// premise that the runtime tar filesystem could not read them.
+    #[test]
+    fn build_tar_emits_symlink_entries() {
+        let dir = std::env::temp_dir().join("litebox_symlink_emit_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("out.tar");
+
+        let entries = vec![
+            TarEntry {
+                tar_path: "bin/busybox".to_string(),
+                data: b"ELF-ish payload".to_vec(),
+                mode: 0o755,
+                symlink_target: None,
+            },
+            TarEntry {
+                tar_path: "bin/ls".to_string(),
+                data: Vec::new(),
+                mode: 0o777,
+                symlink_target: Some("busybox".to_string()),
+            },
+        ];
+        build_tar(&entries, &out).unwrap();
+
+        let mut archive = tar::Archive::new(std::fs::File::open(&out).unwrap());
+        let mut saw_symlink = false;
+        let mut saw_regular = false;
+        for e in archive.entries().unwrap() {
+            let e = e.unwrap();
+            let path = e.path().unwrap().to_string_lossy().to_string();
+            match e.header().entry_type() {
+                tar::EntryType::Symlink => {
+                    assert_eq!(path, "bin/ls");
+                    let target = e.link_name().unwrap().unwrap();
+                    assert_eq!(target.to_string_lossy(), "busybox");
+                    // A symlink must carry no payload -- otherwise it is still a copy.
+                    assert_eq!(e.header().size().unwrap(), 0);
+                    saw_symlink = true;
+                }
+                tar::EntryType::Regular => {
+                    assert_eq!(path, "bin/busybox");
+                    // The exec bit must survive: a shell refuses to run a 0644 binary (rc=126)
+                    // even though litebox itself ignores the mode.
+                    assert_eq!(e.header().mode().unwrap() & 0o777, 0o755);
+                    saw_regular = true;
+                }
+                other => panic!("unexpected entry type {other:?} for {path}"),
+            }
+        }
+        assert!(saw_symlink, "no symlink entry was written");
+        assert!(saw_regular, "no regular entry was written");
+        let _ = std::fs::remove_file(&out);
+    }
 }

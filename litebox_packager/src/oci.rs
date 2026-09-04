@@ -66,6 +66,16 @@ pub struct RootfsEntry {
     pub is_executable: bool,
     /// Unix permission mode (lower 12 bits).
     pub mode: u32,
+    /// When `Some`, this entry is a SYMLINK whose target is this string, and it should be
+    /// emitted as a real symlink tar entry rather than a copy of `read_path`'s contents.
+    ///
+    /// A container image is largely DEFINED by its symlink structure
+    /// (`/bin/ls -> /bin/busybox`, `/lib64 -> /lib`); resolving links away yields a rootfs
+    /// that is no longer the image, and duplicates hugely -- one real layer held 295 copies
+    /// of the same 804 KB busybox, 226 MB. The runtime tar filesystem has supported symlinks
+    /// for some time (`litebox/src/fs/tar_ro.rs`: `IndexedChild::Symlink`, `read_link`), so
+    /// the flattening is no longer necessary.
+    pub symlink_target: Option<String>,
 }
 
 /// Pull an OCI image from a registry and extract its layers into a temp directory.
@@ -800,6 +810,28 @@ fn lookup_mode(rel_path: &Path, permissions: &HashMap<PathBuf, u32>) -> u32 {
 /// `permissions` provides Unix permission modes captured from tar headers
 /// during extraction, so permission bits are accurate on non-Unix hosts.
 #[allow(clippy::implicit_hasher)]
+/// The link target to record for a symlink at `host_path`, as a Unix-style string.
+///
+/// Prefers `symlink_map`, which carries the target verbatim from the OCI layer's own tar
+/// headers -- the only faithful source on a non-Unix host, where extraction cannot create real
+/// symlinks and the on-disk entry is a placeholder. Falls back to the OS link (Linux hosts).
+///
+/// Returning `None` means "emit this as a file copy after all", so a target that cannot be
+/// recovered degrades to the previous behaviour rather than producing a dangling link.
+fn link_target_for(
+    host_path: &Path,
+    rootfs: &Path,
+    symlink_map: &HashMap<PathBuf, PathBuf>,
+) -> Option<String> {
+    let rel = host_path.strip_prefix(rootfs).unwrap_or(host_path);
+    if let Some(target) = symlink_map.get(rel) {
+        return Some(target.to_string_lossy().replace('\\', "/"));
+    }
+    std::fs::read_link(host_path)
+        .ok()
+        .map(|t| t.to_string_lossy().replace('\\', "/"))
+}
+
 pub fn scan_rootfs(
     rootfs: &Path,
     symlink_map: &HashMap<PathBuf, PathBuf>,
@@ -861,6 +893,7 @@ pub fn scan_rootfs(
                     read_path: entry.path().to_path_buf(),
                     is_executable,
                     mode,
+                    symlink_target: None,
                 },
             );
         } else if entry.file_type().is_symlink() {
@@ -878,6 +911,7 @@ pub fn scan_rootfs(
                             read_path: resolved.clone(),
                             is_executable,
                             mode,
+                            symlink_target: link_target_for(entry.path(), rootfs, symlink_map),
                         },
                     );
                 } else if resolved.is_dir() {
@@ -964,6 +998,10 @@ pub fn scan_rootfs(
                     read_path,
                     is_executable,
                     mode,
+                    // Directory-symlink EXPANSION: these are synthesized paths under the
+                    // symlink's prefix (e.g. lib64/x from usr/lib64/x), not links themselves,
+                    // so they stay real file copies.
+                    symlink_target: None,
                 },
             );
         }
