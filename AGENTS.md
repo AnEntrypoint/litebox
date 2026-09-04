@@ -4414,3 +4414,70 @@ support), using the musl-cross toolchain already proven to work this session. No
 syscall work, sandbox tracing, or protocol archaeology is indicated -- the remaining work is a
 build-configuration change to gdk-pixbuf itself, squarely in scope for a session focused on that
 specific rebuild.
+
+## FIXED AND LIVE-VERIFIED: gdk-pixbuf rebuilt with glycin disabled, PNG decode genuinely works
+
+Actually executed the fix this session identified as decisive, end to end, not just documented it.
+
+**Build.** Cross-compiled gdk-pixbuf 2.44.7's CORE library from real upstream source
+(`github.com/GNOME/gdk-pixbuf`, tag `2.44.7`) with `-Dglycin=disabled -Dpng=enabled
+-Djpeg=enabled -Dbuiltin_loaders=png,jpeg`, using: a real `x86_64-linux-musl-cross` toolchain
+(musl.cc, gcc 11.2.1) for headers/`crtbeginS.o`/`libgcc.a`; real Alpine `-dev` packages
+(`glib-dev`, `libpng-dev`, `libjpeg-turbo-dev`, `zlib-dev`, `pcre2-dev`, `libffi-dev`,
+`util-linux-dev`, `shared-mime-info`) fetched directly from `dl-cdn.alpinelinux.org/alpine/edge`
+for headers and `.pc` files; the canonical layer's own REAL RUNTIME `.so` files
+(`libglib-2.0.so.0` etc., extracted straight from `layer31_direct_fixed.tar`) for actual linking,
+since Alpine's `-dev` packages ship headers/`.pc` files only, not the runtime libraries
+themselves. `meson`+`ninja` installed via `pip install --user meson` (Python 3.12 already on
+host) and `scoop install pkgconf`. Two build-time-only native tools (`glib-genmarshal`,
+`glib-mkenums`) turned out to be pure Python scripts with no non-stdlib imports -- copied and
+wrapper-invoked directly via the host's own Python, no cross-compilation needed for them.
+`glib-compile-resources` (a real ELF binary, needed only for `tests/`, which are disabled) was
+satisfied with a stub `find_program` target since it's never actually invoked on this config.
+Fixed two real meson/clang cross-compilation gotchas along the way, both worth remembering for
+next time: (1) `sys_root` in a meson cross-file's `[properties]` block gets silently
+double-concatenated onto pkg-config's own already-absolute library paths when clang's
+`--sysroot` is also set -- omit `sys_root` and let `pkg_config_libdir` alone handle path
+resolution; (2) clang's `-B<dir>` flag adds a directory to the compiler/linker EXECUTABLE search
+path but NOT the library (`-l`) search path -- `crtbeginS.o`/`libgcc.a` still need an explicit
+`-L<dir>` alongside `-B<dir>` for the same directory. Also manually patched `config.h`'s
+`HAVE_ROUND`/`HAVE_LRINT` to `1` after meson's own configure-time function-detection checks
+(`Checking for function "round" with dependency -lm: NO`) produced false negatives for functions
+musl's libc.a genuinely provides -- a configure-time linker-flag propagation gap, not an actual
+missing-symbol problem (confirmed by the final link succeeding once the fallback `fallback-c89.c`
+implementations were correctly skipped).
+
+**Live verification, in order:**
+1. `nm -D`/`strings` on the built `libgdk_pixbuf-2.0.so.0.4400.7`: genuine, real `png_read_image`/
+   `png_create_read_struct_2`/etc. `libpng` calls linked in (not dead weight -- confirmed
+   referenced, unlike the broken stock build), plus the `"jpeg"` format-name string present.
+2. Packaged into a new layer (`.wfgy/xfce-build/layer31_glycin_disabled.tar`, based on
+   `layer31_direct_fixed.tar` plus this session's earlier mime.cache fix, both correctly
+   `./`-prefixed per the established tar-append convention) and ran `gdk-pixbuf-pixdata` against
+   a real PNG through litebox: **`RC=0`, no error, no warning -- genuine, successful PNG decode**,
+   the first time this has ever worked in this whole multi-session investigation.
+3. Full `run_xfce_xwm.sh` launch (waited for genuine process exit via a `tasklist` poll loop):
+   `TEST_DONE`, every stage clean, zero `SIGABRT`. **The `Gtk-WARNING: Could not load a pixbuf
+   from .../drive-harddisk.png` line -- present in EVERY prior run this whole session, the exact
+   symptom that started this entire investigation thread -- is completely ABSENT from this run's
+   log.** GTK's own built-in icon resources now load correctly.
+
+**One separate, distinct, still-open bug found in the same log, NOT touched by this fix:**
+`xfdesktop_regular_file_icon_new: assertion 'G_IS_FILE_INFO(file_info)' failed` -- xfdesktop's
+desktop-icon enumeration gets a NULL `GFileInfo` from what is almost certainly a GIO
+file-listing/async-query issue, unrelated to image DECODING (which is now confirmed working).
+This is why the sparse-icon-column visual pattern persists largely unchanged (`~94953` vs the
+prior `~92036`/`~92661` non-black-pixel steady-state) despite the pixbuf fix being genuinely
+correct and verified -- the desktop icon grid still doesn't populate, but now because of a
+GFileInfo/GIO enumeration bug, not because icons fail to decode. **Concrete next step for
+whoever picks this up:** trace `xfdesktop_regular_file_icon_new`'s caller in xfdesktop's own
+source (likely `xfdesktop-file-icon-manager.c`'s async directory-listing callback) to find why
+the `GFileInfo` it receives is NULL -- this is now a GIO/file-enumeration question, cleanly
+separated from the (now-fixed) image-decoding question.
+
+**Not yet done, correctly left for a follow-on decision rather than made unilaterally:**
+promoting `layer31_glycin_disabled.tar` to become the new canonical `layer31_direct_fixed.tar`
+(backing up the old one first per this project's disk-hygiene convention). The fix is real and
+verified working on its own terms, but leaving the new layer as a separate, clearly-named variant
+lets whoever picks up the `G_IS_FILE_INFO` follow-on verify that fix too before any promotion, so
+the eventual canonical-layer swap lands as one complete, fully-verified unit.
