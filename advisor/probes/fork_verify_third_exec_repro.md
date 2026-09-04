@@ -35,12 +35,42 @@ where `/p.sh` is simply:
 So it is not exec count in general (60 small execs are fine), not switching
 between binaries (one binary suffices), and not two execs (needs the third).
 
-## Interpretation
+## Interpretation -- MECHANISM CLAIM WITHDRAWN
 
-Whatever accumulates scales with ELF size/relocation count, not exec count:
-60 small execs survive, 3 large ones do not. Consistent with a leak or
-off-by-one in `fork_verify`'s per-exec relocation-range bookkeeping --
-`mate-session` carries far more relocation ranges than busybox.
+An earlier version of this file attributed the fault to a leak/off-by-one in
+`fork_verify`'s per-exec relocation-range bookkeeping. **That mechanism is
+withdrawn** -- it was stated without verification, and a prior 30+-pass
+investigation (`docs/AGENTS_ARCHIVE_2026-09-03.md`, passes 14-233) points
+elsewhere: at `litebox/src/mm/exception_table.rs`'s fallible-memory primitives,
+whose raw-asm recovery labels have no registered RUNTIME_FUNCTION/.pdata/.xdata,
+so ntdll's unwinder faults when anything later unwinds through such a frame.
+Note that archive's own pass-208 theory was RETRACTED in pass 209 (the primitive
+it blamed turned out to have complete compiler-generated unwind coverage), so
+the root cause is genuinely open -- do not treat any of these as settled.
+
+What survives here is the OBSERVATION, not an explanation. The archive's passes
+14-19 also caution that secondary faults surface wherever the stack happens to
+be corrupted, so differing `rip` values across captures (`RtlpUnwindPrologue`
+in one, `rip=0x0` here) are plausibly one corruption seen at different points.
+
+## The one discriminating control (not in the archive)
+
+Three execs each, identical script shape, same layer -- only the program varies:
+
+    /bin/busybox           --version x3   av=0,  completed
+    /usr/bin/seatd         --version x3   av=0,  completed
+    /usr/bin/mate-session  --version x3   av=64, faults
+
+`seatd` is dynamically linked and uses the same fallible primitives, yet
+survives. So the fault scales with the BINARY, not with the operation: a purely
+guest-agnostic unwind-metadata gap should be trippable by any dynamically-linked
+binary. Something ELF-shape-dependent (size, relocation count, segment count,
+TLS) is required to REACH the corrupting condition.
+
+Useful next measurement, cheap and code-free: bisect the image's binaries by
+size/relocation count between `seatd` (clean) and `mate-session` (faults) to
+identify which property is actually required. That constrains any eventual fix
+and is the question the archive never settled.
 
 Earlier framings, both wrong and corrected here: "mate-session --help crashes"
 (it returns rc=0 in isolation) and "a sequence of DIFFERENT large binaries is
