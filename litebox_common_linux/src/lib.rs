@@ -2967,6 +2967,8 @@ pub enum PrctlArg {
     SetNoNewPrivs(usize),
     /// PR_GET_NO_NEW_PRIVS: get the calling thread's no_new_privs bit.
     GetNoNewPrivs,
+    /// `PR_SET_PDEATHSIG`: request a signal when the parent dies. Accepted, not delivered.
+    SetPDeathSig(i32),
 }
 
 #[repr(i32)]
@@ -4315,6 +4317,21 @@ impl SyscallRequest {
                         },
                         PrctlOption::GetNoNewPrivs => SyscallRequest::Prctl {
                             args: PrctlArg::GetNoNewPrivs,
+                        },
+                        // `PR_SET_PDEATHSIG` asks for a signal when the PARENT dies. GLib's
+                        // `g_spawn_*` sets it in the child between fork and exec, and treats a
+                        // failure there as a spawn failure -- which is how a missing handler here
+                        // surfaced as glycin's "Could not spawn ... Invalid argument", blocking
+                        // all image decoding rather than merely losing a cleanup nicety.
+                        //
+                        // Accepted rather than refused: a guest child here does not outlive the
+                        // runner process, so the condition this signal guards against (an
+                        // orphaned child lingering after its parent exits) is already handled by
+                        // process teardown. The signal is not delivered, which is why this is
+                        // recorded as unsupported for the census while still succeeding -- a hard
+                        // EINVAL claims the caller's ARGUMENTS are malformed, which they are not.
+                        PrctlOption::SetPDeathSig => SyscallRequest::Prctl {
+                            args: PrctlArg::SetPDeathSig(ctx.sys_req_arg(1)),
                         },
                         _ => {
                             return Err(unsupported_einval(format_args!("prctl({op:?})")));

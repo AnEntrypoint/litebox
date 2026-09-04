@@ -1184,6 +1184,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Errno::EINVAL
         })?;
         let (sock1, sock2) = self.do_socketpair(domain, ty, flags, protocol)?;
+        // `socketpair` had NO logging, unlike `sys_socket` next door, which made an fd pair
+        // appear in a trace with no visible origin -- exactly the guesswork that costs hours
+        // when a child inherits one of the two fds and then fails on it (glycin's decoder
+        // receives its D-Bus socket this way via --dbus-fd).
+        litebox_util_log::debug!(
+            tid:% = self.tid,
+            ty:? = ty,
+            sock1:% = sock1,
+            sock2:% = sock2;
+            "sys_socketpair: created"
+        );
         sockvec
             .write_at_offset::<Platform>(0, sock1)
             .ok_or(Errno::EFAULT)?;

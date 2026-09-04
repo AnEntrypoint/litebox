@@ -1072,6 +1072,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // tools only use this to confirm the bit stuck, so reporting 1 unconditionally is
             // consistent with SetNoNewPrivs always succeeding.
             PrctlArg::GetNoNewPrivs => Ok(1),
+            // Accepted so `g_spawn`'s child does not abort the whole spawn; the signal itself is
+            // never delivered (a guest child cannot outlive the runner, so nothing is orphaned).
+            PrctlArg::SetPDeathSig(_) => Ok(0),
             _ => unimplemented!(),
         }
     }

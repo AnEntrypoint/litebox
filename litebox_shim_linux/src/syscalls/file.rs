@@ -1388,7 +1388,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// If `Some`, it will write to the specified offset without changing the current file position.
     pub fn sys_write(&self, fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Errno> {
         let result = self.do_write(fd, buf, offset);
-        let preview_len = buf.len().min(64);
+        // A guest's own error text -- panics, assertion failures, library diagnostics -- reaches
+        // us only through this write, and 64 bytes truncates essentially all of it. A real
+        // example: a glycin decoder panic logged as
+        //   "thread 'main' (18) panicked at glycin-utils/src/instruction_han"
+        // cutting off exactly where the reason would have been. When a guest process writes to
+        // stderr and then dies, this line is frequently the ONLY record of why.
+        //
+        // Cap generously for stderr (fd 2), which is low-volume and diagnostic by definition,
+        // and keep stdout and files short so a chatty program does not flood the log.
+        let preview_len = buf.len().min(if fd == 2 { 4096 } else { 64 });
         litebox_util_log::debug!(
             tid:% = self.tid,
             fd:% = fd,
@@ -2045,7 +2054,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
-        self.do_close(raw_fd)
+        // `close` had NO logging, so fd REUSE was invisible: a trace would show the same fd
+        // number opened twice with no close between, which reads as a collision bug when it is
+        // normal reuse. fd lifetime is exactly what matters when diagnosing an inherited-fd
+        // failure (a child getting EPIPE on a socket it was handed), so make it visible.
+        let result = self.do_close(raw_fd);
+        litebox_util_log::debug!(
+            tid:% = self.tid,
+            fd:% = fd,
+            result:? = result;
+            "sys_close"
+        );
+        result
     }
 
     /// Handle syscall `fsync`
