@@ -4109,9 +4109,96 @@ mod unix_tests {
     fn test_unix_socketpair_bidirectional() {
         unix_socketpair_bidirectional(SockType::Stream, false);
         unix_socketpair_bidirectional(SockType::Datagram, false);
+        unix_socketpair_bidirectional(SockType::SeqPacket, false);
 
         unix_socketpair_bidirectional(SockType::Stream, true);
         unix_socketpair_bidirectional(SockType::Datagram, true);
+        unix_socketpair_bidirectional(SockType::SeqPacket, true);
+    }
+
+    /// `SOCK_SEQPACKET`'s defining behavior versus `SOCK_STREAM`: two `send()`s never merge into
+    /// one `recv()`. Send two short messages back-to-back (no synchronization between them, so
+    /// both are queued before the reader ever runs -- exactly the shape a naive `SOCK_STREAM`
+    /// implementation would incorrectly concatenate), then confirm two separate `recv()` calls
+    /// are needed, each returning exactly one message's own bytes.
+    #[test]
+    fn test_unix_seqpacket_preserves_message_boundaries() {
+        let task = init_platform(None);
+        let mut sv_ptr = alloc::vec![0u32; 2];
+        let sv_mut_ptr = UserPtrMut::from_usize(sv_ptr.as_mut_ptr() as usize);
+        task.sys_socketpair(
+            AddressFamily::UNIX as u32,
+            SockType::SeqPacket as u32,
+            0,
+            sv_mut_ptr,
+        )
+        .unwrap();
+        let sock1 = sv_ptr[0];
+        let sock2 = sv_ptr[1];
+
+        task.do_sendto(sock1, b"first", SendFlags::empty(), None)
+            .expect("first sendto failed");
+        task.do_sendto(sock1, b"second-msg", SendFlags::empty(), None)
+            .expect("second sendto failed");
+
+        let mut buf = [0u8; 64];
+        let n = task
+            .do_recvfrom(sock2, &mut buf, ReceiveFlags::empty(), None)
+            .expect("first recvfrom failed");
+        assert_eq!(&buf[..n], b"first", "first recv should return only the first message");
+
+        let n = task
+            .do_recvfrom(sock2, &mut buf, ReceiveFlags::empty(), None)
+            .expect("second recvfrom failed");
+        assert_eq!(
+            &buf[..n],
+            b"second-msg",
+            "second recv should return only the second message, not leftover stream bytes"
+        );
+
+        close_socket(&task, sock1);
+        close_socket(&task, sock2);
+    }
+
+    /// A message larger than the reader's buffer is truncated to the buffer size, and the excess
+    /// is discarded rather than left queued for a follow-up read (real `recv(2)` semantics for
+    /// message-boundary-preserving socket types).
+    #[test]
+    fn test_unix_seqpacket_truncates_oversized_message() {
+        let task = init_platform(None);
+        let mut sv_ptr = alloc::vec![0u32; 2];
+        let sv_mut_ptr = UserPtrMut::from_usize(sv_ptr.as_mut_ptr() as usize);
+        task.sys_socketpair(
+            AddressFamily::UNIX as u32,
+            SockType::SeqPacket as u32,
+            0,
+            sv_mut_ptr,
+        )
+        .unwrap();
+        let sock1 = sv_ptr[0];
+        let sock2 = sv_ptr[1];
+
+        task.do_sendto(sock1, b"0123456789", SendFlags::empty(), None)
+            .expect("sendto failed");
+        task.do_sendto(sock1, b"next", SendFlags::empty(), None)
+            .expect("sendto failed");
+
+        let mut small_buf = [0u8; 4];
+        let n = task
+            .do_recvfrom(sock2, &mut small_buf, ReceiveFlags::empty(), None)
+            .expect("recvfrom failed");
+        assert_eq!(n, 4);
+        assert_eq!(&small_buf, b"0123");
+
+        // The rest of "0123456789" must be discarded, not delivered on the next read.
+        let mut buf = [0u8; 64];
+        let n = task
+            .do_recvfrom(sock2, &mut buf, ReceiveFlags::empty(), None)
+            .expect("recvfrom failed");
+        assert_eq!(&buf[..n], b"next");
+
+        close_socket(&task, sock1);
+        close_socket(&task, sock2);
     }
 
     fn unix_socket_recv_timeout(ty: SockType) {

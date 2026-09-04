@@ -756,6 +756,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         Ok((total_read, fds))
     }
 
+    /// `SOCK_SEQPACKET`'s own boundary-preserving read: unlike [`Self::try_recvfrom`], never
+    /// spans more than the ONE message at the front of `recv_channel`. A message larger than
+    /// `buf` is truncated (matching real Linux `recv(2)`'s "excess bytes in a datagram are
+    /// discarded" behavior for message-boundary-preserving socket types) rather than left
+    /// partially in the queue for a follow-up read to continue.
+    fn try_recvfrom_one_message(
+        &self,
+        buf: &mut [u8],
+    ) -> Result<(usize, AnyDupFds<Platform, FS>), TryOpError<Errno>> {
+        let mut fds = Vec::new();
+        let n = self.recv_channel.peek_and_consume_one(|msg| {
+            fds.append(&mut msg.fds);
+            let n = core::cmp::min(buf.len(), msg.data.len());
+            buf[..n].copy_from_slice(&msg.data[..n]);
+            // Always fully consume the message from the channel, even if `buf` was too
+            // small to hold all of it -- the remainder is discarded, not left for a
+            // later read (message-boundary semantics, not stream semantics).
+            Ok((true, n))
+        });
+        match n {
+            Ok(n) => Ok((n, fds)),
+            Err(Errno::EAGAIN) => Err(TryOpError::TryAgain),
+            Err(other) => Err(TryOpError::Other(other)),
+        }
+    }
+
     fn check_io_events(&self) -> Events {
         let mut events = Events::empty();
         let is_read_shutdown = self.recv_channel.is_shutdown();
@@ -811,12 +837,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStreamState<Platform, FS> {
 
 struct UnixStream<Platform: ShimPlatform, FS: ShimFS> {
     state: RwLock<Platform, Option<UnixStreamState<Platform, FS>>>,
+    /// `true` for `SOCK_SEQPACKET`, `false` for `SOCK_STREAM`. The two share every bit of
+    /// connection-establishment machinery (bind/listen/connect/accept) here -- the only real
+    /// behavioral difference Linux draws between them is on the read side: `SOCK_STREAM`
+    /// `recv()` freely spans multiple queued messages into one byte stream, while
+    /// `SOCK_SEQPACKET` `recv()` never returns more than the front message's own bytes (see
+    /// `UnixConnectedStream::try_recvfrom` vs `try_recvfrom_one_message`).
+    preserve_boundaries: bool,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
-    fn new(state: UnixStreamState<Platform, FS>) -> Self {
+    fn new(state: UnixStreamState<Platform, FS>, preserve_boundaries: bool) -> Self {
         Self {
             state: litebox::sync::RwLock::new(Some(state)),
+            preserve_boundaries,
         }
     }
 
@@ -978,6 +1012,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                     }
                     Ok(UnixSocketInner::Stream(UnixStream::new(
                         UnixStreamState::Connected(accepted),
+                        self.preserve_boundaries,
                     )))
                 },
             )
@@ -1063,7 +1098,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                         let conn = state
                             .connected()
                             .ok_or(TryOpError::Other(Errno::ENOTCONN))?;
-                        let n = conn.try_recvfrom(buf)?;
+                        let n = if self.preserve_boundaries {
+                            conn.try_recvfrom_one_message(buf)?
+                        } else {
+                            conn.try_recvfrom(buf)?
+                        };
                         // For connected stream sockets, no need to return the source address
                         if let Some(source_addr) = source_addr.as_deref_mut() {
                             *source_addr = None;
@@ -1544,9 +1583,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
 
     pub(super) fn new(sock_type: SockType, flags: SockFlags) -> Option<Self> {
         let inner = match sock_type {
-            SockType::Stream => UnixSocketInner::Stream(UnixStream::new(UnixStreamState::Init(
-                UnixInitStream::new(),
-            ))),
+            SockType::Stream | SockType::SeqPacket => {
+                UnixSocketInner::Stream(UnixStream::new(
+                    UnixStreamState::Init(UnixInitStream::new()),
+                    matches!(sock_type, SockType::SeqPacket),
+                ))
+            }
             SockType::Datagram => UnixSocketInner::Datagram(UnixDatagram::new()),
             e => {
                 log_unsupported!("Unsupported unix socket type: {:?}", e);
@@ -1717,20 +1759,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         flags: SockFlags,
     ) -> Option<(UnixSocket<Platform, FS>, UnixSocket<Platform, FS>)> {
         match ty {
-            SockType::Stream => {
+            SockType::Stream | SockType::SeqPacket => {
                 // Both ends of a socketpair(2) are created by the same task, so each
                 // reports the creating task's own real credentials as its peer's identity
                 // -- matching real Linux's symmetric behavior for socketpair-created socks.
                 let cred = task.peer_cred();
                 let (conn1, conn2) =
                     UnixConnectedStream::new_pair(None, None, None, false, false, cred, cred);
+                let preserve_boundaries = matches!(ty, SockType::SeqPacket);
                 Some((
                     UnixSocket::new_with_inner(
-                        UnixSocketInner::Stream(UnixStream::new(UnixStreamState::Connected(conn1))),
+                        UnixSocketInner::Stream(UnixStream::new(
+                            UnixStreamState::Connected(conn1),
+                            preserve_boundaries,
+                        )),
                         flags,
                     ),
                     UnixSocket::new_with_inner(
-                        UnixSocketInner::Stream(UnixStream::new(UnixStreamState::Connected(conn2))),
+                        UnixSocketInner::Stream(UnixStream::new(
+                            UnixStreamState::Connected(conn2),
+                            preserve_boundaries,
+                        )),
                         flags,
                     ),
                 ))
@@ -1854,7 +1903,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                 }
                 // Unix sockets don't track async errors
                 SocketOption::ERROR => 0,
-                SocketOption::TYPE => match self.inner {
+                SocketOption::TYPE => match &self.inner {
+                    UnixSocketInner::Stream(stream) if stream.preserve_boundaries => {
+                        SockType::SeqPacket as u32
+                    }
                     UnixSocketInner::Stream(_) => SockType::Stream as u32,
                     UnixSocketInner::Datagram(_) => SockType::Datagram as u32,
                 },

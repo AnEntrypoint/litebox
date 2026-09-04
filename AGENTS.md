@@ -4192,3 +4192,98 @@ implementation. **This is the single, concrete, well-bounded next fix for whoeve
 row** -- confirmed to be the last blocker between the now-working namespace/EPERM fallback path and
 a fully working gdk-pixbuf/glycin PNG decode (and, by extension, the sparse-desktop-content gap
 this whole thread traces back to).
+
+## Pass — `SOCK_SEQPACKET` implemented and verified real, BUT confirmed not sufficient alone;
+## a distinct, earlier blocker (a stalled `clone()` for glycin's subprocess) was found live
+
+**`SOCK_SEQPACKET` (type 5) is now implemented for `AF_UNIX` sockets, correctly, and independently
+verified against real Linux `socket(7)` semantics.** Added `SockType::SeqPacket = 5`
+(`litebox_common_linux/src/lib.rs`) and threaded it through `litebox_shim_linux/src/syscalls/
+unix.rs`: `UnixStream` gained a `preserve_boundaries: bool` field (connection-establishment --
+bind/listen/connect/accept -- is byte-for-byte identical to `SOCK_STREAM`, since `AF_UNIX`
+`SEQPACKET` is connection-oriented like `STREAM`; only the READ side differs), and a new
+`UnixConnectedStream::try_recvfrom_one_message` that consumes exactly one queued `Message` per
+call and discards any bytes beyond the caller's buffer (matching real Linux `recv(2)`'s "excess
+bytes in an over-large message-boundary-preserving datagram are discarded, not left queued"
+behavior) rather than the existing `try_recvfrom`'s `SOCK_STREAM`-only "span every queued message
+until `buf` is full" loop. Wired through `accept()` (an accepted connection inherits the listening
+socket's own boundary-preservation flag, fixing a real bug this pass caught: the pre-existing
+`accept()` hardcoded `UnixSocketInner::Stream`, which would have silently downgraded an accepted
+`SEQPACKET` connection back to byte-stream semantics), `new_connected_pair()` (`socketpair(2)`),
+and `getsockopt(SO_TYPE)` (previously reported every `UnixSocketInner::Stream` as `SOCK_STREAM`
+unconditionally). Two new tests added and passing (`test_unix_seqpacket_preserves_message_
+boundaries`, `test_unix_seqpacket_truncates_oversized_message`), full 180-test suite green.
+Committed `<pending>`.
+
+**Live-verified this IS a real, correct, general litebox capability -- but ALSO live-verified it
+is NOT, by itself, sufficient to unblock glycin's PNG decode**, contradicting this pass's own
+earlier optimistic framing ("the single, concrete, well-bounded next fix," "confirmed to be the
+last blocker"). Two independent facts, both confirmed by fresh live traces against
+`layer_timeline3.tar` with the SEQPACKET fix built in:
+
+1. **A peer session (advisor-db) found, via a control comparison this session independently
+   re-verified byte-for-byte in a fresh trace, that the ORIGINAL "socket(type=5) EINVAL" trace
+   analysis was itself incomplete**: `gdk-pixbuf-csource`/`gdk-pixbuf-pixdata` reject BOTH PNG and
+   XPM (a format this layer ships a real, physically-present `libpixbufloader-xpm.so` for)
+   identically, with glycin never even reached (zero glycin subprocess, zero glycin log lines) --
+   meaning the true FIRST blocker, upstream of the SEQPACKET gap entirely, was `/usr/share/mime/
+   mime.cache` never being generated in the canonical layer (`update-mime-database` never invoked)
+   for a build using `GDK_PIXBUF_USE_GIO_MIME` (confirmed via source read, see the prior "real,
+   from-scratch PNG loader module" pass). **Independently re-confirmed live in a fresh trace this
+   pass**: `/usr/share/mime/mime.cache` and `/usr/share/mime/magic` both `ENOENT` in
+   `layer_timeline3.tar`; running `update-mime-database /usr/share/mime` (already known,
+   reproducible, present in the image) changes the failure mode from "Couldn't recognize the image
+   file format" (MIME-sniffing rejection, glycin never invoked) to `WARNING: Glycin running without
+   sandbox` followed by the ORIGINAL `Could not spawn glycin-image-rs ... Invalid argument (os
+   error 22)` message -- **confirming BOTH this pass's SEQPACKET analysis AND the peer's MIME-cache
+   finding are correct, describing two SEQUENTIAL layers of the same failure chain**, not competing
+   theories: mime.cache-missing blocks glycin from running at all; once fixed, SOMETHING further in
+   glycin's subprocess spawn (originally analyzed as `socket(type=5)`) is next.
+
+2. **With mime.cache present AND this pass's own `SockType::SeqPacket` fix built into the runner,
+   the SAME "Could not spawn ... Invalid argument (os error 22)" error STILL occurs** -- but a
+   fresh `LITEBOX_LOG=litebox_shim_linux::syscalls=debug` trace of this exact repro shows something
+   materially different from the ORIGINAL trace that identified `socket(type=5)`: **`sys_socket` is
+   never called at all in this run** (zero matches for the string anywhere in a ~204K-line trace).
+   Instead, glycin's `do_clone: about to duplicate address space for fork()` fires once (t≈2.795s)
+   and never reaches a matching `DIAG_TIMELINE execve` for `glycin-image-rs` -- the two resulting
+   threads (tid 8, tid 9) enter `futex: WAIT on CONTENDED lock` at t≈3.296s and never resolve
+   before the whole shell exits (`status=1`) at t≈5.179s. **This means the SEQPACKET gap this pass
+   fixed was never actually exercised by this specific repro run** -- the failure is happening
+   EARLIER, in the `clone()`/fork-then-exec sequence for glycin's subprocess itself, before it ever
+   gets to open a socket. Whether this is a genuine NEW litebox gap (a real fork/exec race or
+   deadlock specific to glycin's exact `posix_spawn`-style multi-threaded spawn pattern) or a
+   flaky/timing-sensitive manifestation of an already-known issue (this session's own earlier
+   `advisor-db`-reported, then RETRACTED, "sh wait hang" investigation showed real fork/wait
+   interactions with long-lived sibling threads can look deceptively hang-shaped without being
+   bugs -- worth checking whether this is the same false trail before spending real effort) is NOT
+   YET DETERMINED.
+
+**UPDATE, same pass: a peer session (advisor-db) subsequently settled this conclusively with a
+cleaner trace, and their finding supersedes the open question above.** Their syscall trace of the
+failing XPM case shows the real sequence precisely: `openat(loaders.cache)` -> read all 350 bytes
+-> read EOF -> write the error message -> exit, with **no `openat` of `libpixbufloader-xpm.so` or
+anything under `loaders/` at all** between reading the cache and reporting failure, and (separately)
+`ldd` resolves every one of the library's own `DT_NEEDED` entries with zero "not found". This means
+**no `dlopen` is ever attempted in the first place** -- gdk-pixbuf reads a valid, correctly-parsed
+cache naming a loader that genuinely exists on disk with all its own dependencies satisfied, and
+then simply never tries to open it. That conclusively eliminates glycin/bwrap/namespaces/seccomp
+(and, by extension, `SOCK_SEQPACKET`) from this specific failure path entirely -- there is no
+decoder invocation of any kind for gdk-pixbuf to need a sandboxed subprocess for. The peer also
+independently implemented and verified a real `membarrier` fix (commit `851f0425`) as the last
+unsupported syscall anywhere on this path, and confirmed it does NOT change the XPM/PNG failure
+either -- with that fixed too, there are zero remaining unsupported-syscall candidates. Their
+(and this session's) working conclusion: **this is not a litebox syscall gap at all** -- the defect
+is inside gdk-pixbuf's own in-process handling of the parsed cache, before any `dlopen`, most
+likely a silent validation check (an ABI/version field, a path-form check, a module-directory
+sanity check) rejecting an otherwise-valid entry. Root-causing that needs either a live
+`gdk_pixbuf_get_formats()` enumeration probe (verify empirically whether the format list ends up
+empty -- don't assume) or a direct read of `gdk-pixbuf-io.c`'s own loaders.cache-parsing/module-
+open decision logic to find the exact silent-rejection branch. **This pass's own `SOCK_SEQPACKET`
+fix stands on its own general merits (a real, correct, tested Linux capability litebox now
+supports, verified independently against real semantics) but is CONFIRMED NOT CONNECTED to the
+icon-loading gap** -- do not chase it further for that purpose; the earlier `do_clone`-stall
+finding just above was almost certainly this pass's own repro hitting a different, likely
+unrelated timing artifact (this session's own earlier, subsequently-RETRACTED "sh wait hang" false
+lead is a cautionary precedent for exactly this shape of finding) rather than a real second
+blocker -- treat it as unconfirmed, not as a lead to pursue.
