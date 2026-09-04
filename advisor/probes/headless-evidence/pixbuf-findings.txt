@@ -29,3 +29,37 @@ Runtime, with a live session bus, RUST_LOG=trace and G_MESSAGES_DEBUG=all
 
 The remaining question is why gdk-pixbuf's format sniffing rejects a valid PNG
 when its only PNG-capable loader is a built-in it should always have.
+
+UPDATE (same session): IT IS NOT ABOUT PNG, AND NOT ABOUT loaders.cache.
+
+Control comparison, PNG vs XPM. XPM is the one format this layer ships a real
+loader .so for (libpixbufloader-xpm.so, physically present in the loaders dir):
+
+  gdk-pixbuf-csource PNG  -> rc=1 "Couldn't recognize the image file format"
+  gdk-pixbuf-csource XPM  -> rc=1 "Couldn't recognize the image file format"
+
+BOTH fail. So no loader of any kind is being found -- this is the whole loader
+mechanism, not a PNG/glycin gap.
+
+And it is not a missing cache. Generating one and installing it changes nothing:
+
+  loaders.cache before          absent
+  gdk-pixbuf-query-loaders      rc=0, 350 bytes, correctly lists
+                                libpixbufloader-xpm.so with magic "/* XPM */"
+  cache copied into place       yes
+  retry XPM                     rc=1, same error
+  retry PNG                     rc=1, same error
+
+So a VALID cache, naming a loader .so that EXISTS, still yields "unrecognized"
+for that loader's own format. The defect is in loading/registering the module
+at runtime, downstream of both the cache and the file's format sniffing.
+
+This retires three theories at once: "missing loaders.cache" (generated, no
+change), "missing PNG loader plugin" (XPM has its plugin and fails identically),
+and the entire glycin/bwrap/namespace/sandbox path (never reached; no decoder
+of any kind runs).
+
+Next question, and it is now a litebox question rather than a packaging one:
+does dlopen of libpixbufloader-xpm.so actually succeed under litebox? gdk-pixbuf
+loads modules via gmodule/dlopen, and a silent dlopen failure would produce
+exactly this symptom for every format at once.
