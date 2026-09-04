@@ -3745,3 +3745,80 @@ with this file's already-documented host-load-driven non-determinism (see pass 3
 regression. Per that pass's own recommendation: the next clean full-launch verification pass
 should run in a fresh session/host state, not stacked on top of this session's own already-heavy
 cumulative load.
+
+## Pass — gui-x11-server-on-drm-future: real standalone Xorg progress, three genuine litebox VT-ioctl gaps found and fixed, blocked on a GBM/modesetting_drv NULL deref
+
+Investigated whether a real, standalone Xorg (not Xwayland) can launch as a guest process
+directly against litebox's DRM/KMS emulation, per this PRD row's rescoped guest-side-server
+architecture. Downloaded Alpine v3.20's `xorg-server-21.1.14-r0` + its bundled `modesetting`
+driver module (`provides = xf86-video-modesetting`, confirmed to actually ship as a separate
+`.so` in `usr/lib/xorg/modules/drivers/modesetting_drv.so`, NOT statically linked despite the
+package-metadata `provides` line implying otherwise) plus font packages, rewrote every ELF
+(`Xorg` itself and all 11 `.so` modules) with `litebox_syscall_rewriter.exe` directly (the
+higher-level `litebox_packager.exe` requires a real Linux host for its `ldd`-based dependency
+discovery, unavailable here -- confirmed every runtime dependency, down to `libgbm`/`libGL`/
+`libepoxy`/`libpciaccess`/`libxcvt`/`libxshmfence`, was already present in the working
+`layer31_direct_fixed.tar` from weston's own earlier dependency pull, so only the Xorg binary +
+modules + two font packages needed injecting via the established `./`-prefixed `tar -rf` append
+pattern). Zero trapped syscall sites on any of the 12 rewritten ELFs.
+
+**Real, live progress, in order, each with a real litebox gap found and fixed:**
+1. Xorg genuinely starts and runs against litebox (`Current Operating System: LiteBox litebox
+   5.11.0`), confirming the syscall-rewrite + injection approach is sound.
+2. `(EE) no screens found` — `modesetting_drv.so`/`fbdev`/`vesa` modules were simply missing from
+   the injected layer (only the `Xorg` binary itself had been added). Fixed by injecting the full
+   `usr/lib/xorg/modules/` tree, each `.so` individually rewritten.
+3. `(EE) parse_vt_settings: Cannot find a free VT: Invalid argument` — real, previously-
+   unimplemented litebox gap: `VT_OPENQRY` (real kernel value `0x5600`, confirmed by fetching
+   `torvalds/linux`'s actual `include/uapi/linux/vt.h`, not guessed -- an earlier attempt at this
+   value guessed `0x5601`, one off, and was silently wrong until checked against the real header)
+   was never implemented; `litebox_shim_linux/src/syscalls/vt.rs`'s existing VT device only
+   covered `seatd`'s own call path (`VT_GETSTATE`/`VT_SETMODE`), which never searches for a free
+   VT. Added `vt::open_qry` (always reports the device's one VT as free) plus the
+   `IoctlArg::VtOpenQry` decoder wiring and dispatch gate.
+4. `(EE) xf86OpenConsole: Switching VT failed` — a second real gap on the same call path:
+   `VT_GETMODE` (`0x5601`), `VT_ACTIVATE` (`0x5606`), `VT_WAITACTIVE` (`0x5607`) were also
+   unimplemented (also confirmed against the real kernel header, not guessed this time). Added
+   `vt::get_mode` (reports `VT_AUTO`, the correct "no process-controlled switching claimed"
+   answer since nothing tracks a real claim), `vt::activate`/`vt::wait_active` (unconditional
+   no-op success -- this device's one VT has no real switching to perform or wait for). All four
+   new VT ioctls, plus the pre-existing two, land in commit (see `git log` for the exact sha --
+   `litebox_common_linux/src/lib.rs` + `litebox_shim_linux/src/syscalls/{file,vt}.rs`).
+5. **Current blocker, precisely located but not yet root-caused:** a real `SIGSEGV` at `cr2=0x8`
+   (a `[base+8]`-shaped NULL-pointer dereference) inside a shared library shortly after
+   `modesetting_drv.so`, `libgbm.so.1`, and `libshadow.so` all successfully load and map --
+   `LITEBOX_DIAG_FATALDUMP`'s own "NO mapping overlaps cr2 (genuinely unmapped)" confirms this is
+   a real NULL-deref crash, not a litebox address-translation bug. The crash address (`rip`
+   inside a shared-library load range) has not yet been symbolized to an exact function; the
+   likely next call on `modesetting_drv`'s own init path is a GBM device open
+   (`gbm_create_device`) or render-node probe (`/dev/dri/renderD128`, distinct from
+   `/dev/dri/card0` which litebox's `DrmSubsystem` already serves) -- litebox's DRM emulation
+   (`litebox_shim_linux/src/syscalls/drm.rs`) has never been exercised by a GBM-based client
+   before (weston/Xwayland use `--use-pixman`, a software path that bypasses GBM entirely), so a
+   genuine, previously-unexercised gap in GBM/render-node support is the leading hypothesis, not
+   yet confirmed. This is real, substantial forward progress on a PRD row that was previously
+   pure architecture research with zero live verification -- three concrete litebox syscall gaps
+   found and fixed, a real Xorg binary now runs three stages further than at the start of this
+   pass -- but the row stays open pending a proper `LITEBOX_DIAG_FATALDUMP=1` symbol-resolved
+   crash dump against this exact repro (`.wfgy/xfce-build/layer_with_xorg.tar`,
+   `/usr/bin/Xorg -noreset -logfile /tmp/xorg.log -novtswitch`, `--gui` flag required) to name the
+   exact faulting function before further fixes are attempted.
+
+**Follow-up: captured a real `LITEBOX_DIAG_FATALDUMP=1` crash dump and partially symbolized it.**
+`[veh] RAWREGS` confirms `rip=0x7fefc16ac1f2`, `rsi=0x0`, faulting instruction bytes
+`48 83 7e 08 00` (`cmp qword [rsi+8], 0`) -- a NULL-pointer read at offset `+8` from a NULL `rsi`,
+not a litebox address-translation artifact (`cr2=0x8` correctly "genuinely unmapped"). The
+crash's `alloc_base` (`0x7fefc1690000`) sits exactly `0x14000` before `modesetting_drv.so`'s own
+tracked exec-mmap start, confirming the fault is inside `modesetting_drv.so` itself, roughly
+`0x4832` bytes past its `modesetting` driver-descriptor symbol (`nm -D`'s nearest preceding
+defined symbol, at file offset `0x179c0`) -- consistent with very early driver
+probe/PreInit-stage code, since no new DRM ioctl (`DrmModeGetResources`/etc) appears in the trace
+after the module loads, meaning the crash happens BEFORE the driver ever calls back into
+litebox's DRM emulation at all. `objdump -d` on the raw (unrewritten) `.so` found no
+instructions at the raw VA range tried (a section-vs.-segment offset mismatch in the lookup, not
+yet resolved) so the exact crashing C function is still not named. Real next step for whoever
+picks this up: either get a working disassembler pointed at the correct file offset (account for
+ELF segment `p_offset`/`p_vaddr` alignment, not raw VA) or attach a debugger to the guest process
+via litebox's own crash-correlation tooling to get a proper symbolized backtrace, then check
+whether the NULL is Xorg core's own callback table (a `ScrnInfoPtr` field not yet populated
+this early) or something specific to litebox's DRM/GBM emulation surface.

@@ -1075,13 +1075,23 @@ pub const DRM_CAP_CRTC_IN_VBLANK_EVENT: u64 = 0x12;
 /// VT (virtual terminal) ioctl request numbers, `include/uapi/linux/vt.h`. Unlike the DRM
 /// ioctls above, these are plain legacy-style constants (not `_IOWR`-encoded) -- verified live
 /// against the real kernel header (`torvalds/linux` master), not guessed. `seatd` (see
-/// `common/terminal.c`/`seatd/seat.c`) uses exactly these four to determine which VT is
-/// currently active (`VT_GETSTATE`) and to claim/release process-controlled VT switching
-/// (`VT_SETMODE`) around granting a client DRM device access; the remaining `VT_*` numbers
-/// (`VT_ACTIVATE`, `VT_WAITACTIVE`, ...) exist in the real kernel but are not on seatd's
-/// single-seat, no-real-hardware-switching call path and so are not implemented here.
-pub const VT_GETSTATE: u32 = 0x5603;
+/// `common/terminal.c`/`seatd/seat.c`) uses `VT_GETSTATE`/`VT_SETMODE` to determine which VT is
+/// currently active and to claim/release process-controlled VT switching around granting a
+/// client DRM device access; standalone Xorg's own `xf86OpenConsole` VT-claiming sequence
+/// additionally calls `VT_OPENQRY`, `VT_GETMODE`, `VT_ACTIVATE`, and `VT_WAITACTIVE`. The
+/// remaining `VT_*` numbers in the real kernel (`VT_RELDISP`, `VT_DISALLOCATE`, ...) are on
+/// neither call path and so are not implemented here.
+pub const VT_OPENQRY: u32 = 0x5600;
+pub const VT_GETMODE: u32 = 0x5601;
 pub const VT_SETMODE: u32 = 0x5602;
+pub const VT_GETSTATE: u32 = 0x5603;
+pub const VT_ACTIVATE: u32 = 0x5606;
+pub const VT_WAITACTIVE: u32 = 0x5607;
+/// `struct vt_mode.mode` value meaning "kernel-automatic VT switching" -- the only value
+/// [`VtGetMode`](crate::IoctlArg::VtGetMode) ever reports back, since nothing on this device
+/// tracks a client's own [`VT_SETMODE`](crate::IoctlArg::VtSetMode) request (see that ioctl's
+/// doc comment).
+pub const VT_AUTO: u8 = 0x00;
 /// KD (keyboard/display mode) ioctl request numbers, `include/uapi/linux/kd.h`.
 pub const KDSETMODE: u32 = 0x4B3A;
 pub const KDSKBMODE: u32 = 0x4B45;
@@ -1692,6 +1702,11 @@ pub enum IoctlArg {
     /// `DRM_IOCTL_GEM_CLOSE` -- release a local reference to a GEM handle. See
     /// [`DRM_IOCTL_GEM_CLOSE`]'s own doc comment.
     DrmGemClose(UserPtr<DrmGemClose>),
+    /// `VT_OPENQRY` -- report the number of a free (unused) VT. Standalone Xorg's own
+    /// `parse_vt_settings` (`hw/xfree86/os-support/linux/lnx_init.c`) calls this on `/dev/tty0`
+    /// before `VT_GETSTATE`/`VT_SETMODE`, unlike `seatd`'s call path which never queries for a
+    /// free VT at all (it always operates on a specific already-known `/dev/tty<N>`).
+    VtOpenQry(UserPtrMut<i32>),
     /// `VT_GETSTATE` -- report which VT is currently active. `seatd`'s `seat_update_vt` (see
     /// `seatd/seat.c`) calls this on `/dev/tty0` to learn which per-VT device (`/dev/tty<N>`)
     /// to subsequently open for a connecting client.
@@ -1699,6 +1714,22 @@ pub enum IoctlArg {
     /// `VT_SETMODE` -- claim (or release) process-controlled VT switching. `seatd`'s `vt_open`
     /// calls this on the client's assigned `/dev/tty<N>` once it grants the client the VT.
     VtSetMode(UserPtr<VtMode>),
+    /// `VT_GETMODE` -- read back the VT switching mode `VT_SETMODE` would set. Standalone Xorg's
+    /// `xf86OpenConsole` calls this on its assigned `/dev/tty<N>` as part of its own VT-claiming
+    /// sequence; `seatd` never reads this back (it only ever writes via `VT_SETMODE`).
+    VtGetMode(UserPtrMut<VtMode>),
+    /// `VT_ACTIVATE` -- switch to the given VT number (the target VT is the raw ioctl `arg`
+    /// value itself, not a pointer). Standalone Xorg's `xf86OpenConsole` calls this to activate
+    /// the VT it just opened; `seatd` never issues it (it has no VT-switch UI to trigger one).
+    /// This device has exactly one VT and no real switching to perform, so any request succeeds
+    /// unconditionally as a no-op.
+    VtActivate(i32),
+    /// `VT_WAITACTIVE` -- block until the given VT becomes the active one (same `arg`-is-the-
+    /// target-VT shape as `VT_ACTIVATE`). The usual immediate follow-up to `VT_ACTIVATE` in real
+    /// Xorg's own call sequence; since this device's one VT is always already "active" the
+    /// instant `VT_ACTIVATE` returns (see that variant's doc comment), this also succeeds
+    /// unconditionally with no actual wait.
+    VtWaitActive(i32),
     /// `KDSETMODE` -- switch a VT between text (`KD_TEXT`) and graphics (`KD_GRAPHICS`) mode.
     /// The third `ioctl()` argument is the mode value itself, not a pointer to one.
     KdSetMode(i32),
@@ -3914,8 +3945,12 @@ impl SyscallRequest {
                             IoctlArg::DrmPrimeFdToHandle(ctx.sys_req_ptr(2))
                         }
                         DRM_IOCTL_GEM_CLOSE => IoctlArg::DrmGemClose(ctx.sys_req_ptr(2)),
-                        VT_GETSTATE => IoctlArg::VtGetState(ctx.sys_req_ptr(2)),
+                        VT_OPENQRY => IoctlArg::VtOpenQry(ctx.sys_req_ptr(2)),
+                        VT_GETMODE => IoctlArg::VtGetMode(ctx.sys_req_ptr(2)),
                         VT_SETMODE => IoctlArg::VtSetMode(ctx.sys_req_ptr(2)),
+                        VT_GETSTATE => IoctlArg::VtGetState(ctx.sys_req_ptr(2)),
+                        VT_ACTIVATE => IoctlArg::VtActivate(ctx.sys_req_arg(2)),
+                        VT_WAITACTIVE => IoctlArg::VtWaitActive(ctx.sys_req_arg(2)),
                         KDSETMODE => IoctlArg::KdSetMode(ctx.sys_req_arg(2)),
                         KDSKBMODE => IoctlArg::KdSkbMode(ctx.sys_req_arg(2)),
                         EVIOCREVOKE => IoctlArg::EvdevRevoke,

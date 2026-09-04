@@ -4346,8 +4346,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY))?,
-            IoctlArg::VtGetState(..)
+            IoctlArg::VtOpenQry(..)
+            | IoctlArg::VtGetMode(..)
             | IoctlArg::VtSetMode(..)
+            | IoctlArg::VtGetState(..)
+            | IoctlArg::VtActivate(..)
+            | IoctlArg::VtWaitActive(..)
             | IoctlArg::KdSetMode(..)
             | IoctlArg::KdSkbMode(..) => files.run_on_raw_fd(
                 desc,
@@ -4676,8 +4680,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// caller) to [`crate::syscalls::vt`].
     fn vt_ioctl(&self, arg: &IoctlArg) -> Result<u32, Errno> {
         match arg {
-            IoctlArg::VtGetState(ptr) => crate::syscalls::vt::get_state::<Platform>(*ptr),
+            IoctlArg::VtOpenQry(ptr) => crate::syscalls::vt::open_qry::<Platform>(*ptr),
+            IoctlArg::VtGetMode(ptr) => crate::syscalls::vt::get_mode::<Platform>(*ptr),
             IoctlArg::VtSetMode(ptr) => crate::syscalls::vt::set_mode::<Platform>(*ptr),
+            IoctlArg::VtGetState(ptr) => crate::syscalls::vt::get_state::<Platform>(*ptr),
+            IoctlArg::VtActivate(vt) => crate::syscalls::vt::activate(*vt),
+            IoctlArg::VtWaitActive(vt) => crate::syscalls::vt::wait_active(*vt),
             IoctlArg::KdSetMode(mode) => crate::syscalls::vt::set_mode_kd(*mode),
             IoctlArg::KdSkbMode(mode) => crate::syscalls::vt::set_kbmode(*mode),
             _ => unreachable!("vt_ioctl only ever called for VT/KD ioctl variants"),

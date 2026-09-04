@@ -24,8 +24,15 @@
 //! GPU behind it. `VT_ACTIVATE`/`VT_WAITACTIVE` and the rest of the real kernel's `VT_*` surface
 //! are deliberately NOT implemented: they are not on `seatd`'s single-seat call path (confirmed
 //! by reading `seatd`'s real source directly, not guessed).
+//!
+//! Standalone Xorg's own VT startup path (`hw/xfree86/os-support/linux/lnx_init.c`'s
+//! `parse_vt_settings`) additionally opens `/dev/tty0` and calls `VT_OPENQRY` before
+//! `VT_GETSTATE`/`VT_SETMODE` -- `seatd` never does this (it always operates on an
+//! already-known VT number, never searching for a free one), so it needed its own handler
+//! (`open_qry`) once a real Xorg guest process was exercised against this device for the first
+//! time.
 
-use litebox_common_linux::{KD_GRAPHICS, KD_TEXT, VtMode, VtStat, errno::Errno};
+use litebox_common_linux::{KD_GRAPHICS, KD_TEXT, VT_AUTO, VtMode, VtStat, errno::Errno};
 
 use crate::{ShimPlatform, UserPtr, UserPtrMut};
 
@@ -34,6 +41,15 @@ use crate::{ShimPlatform, UserPtr, UserPtrMut};
 /// alias, never a VT number itself) -- `1` is the only value `VT_GETSTATE` on `/dev/tty0` needs
 /// to return for `seatd`'s `seat_update_vt` to then successfully open `/dev/tty1`.
 const ACTIVE_VT: u16 = 1;
+
+/// `VT_OPENQRY` on `/dev/tty0` -- reports the number of a free VT. This device has exactly one
+/// (`ACTIVE_VT`) and it is always considered free for a new client to claim (there is never a
+/// second concurrent VT-owning process to conflict with), so it is the only value ever returned.
+pub(crate) fn open_qry<Platform: ShimPlatform>(ptr: UserPtrMut<i32>) -> Result<u32, Errno> {
+    ptr.write_at_offset::<Platform>(0, i32::from(ACTIVE_VT))
+        .ok_or(Errno::EFAULT)?;
+    Ok(0)
+}
 
 /// `VT_GETSTATE` on `/dev/tty0`. Real Linux answers this on ANY open VT fd (not just `tty0`),
 /// but `seatd`'s own call sequence only ever issues it against `tty0` (see this module's doc
@@ -62,6 +78,41 @@ pub(crate) fn get_state<Platform: ShimPlatform>(
 /// need to consult them.
 pub(crate) fn set_mode<Platform: ShimPlatform>(ptr: UserPtr<VtMode>) -> Result<u32, Errno> {
     let _mode = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+    Ok(0)
+}
+
+/// `VT_GETMODE` on `/dev/tty1` -- reads back the VT switching mode. Since `set_mode` above
+/// discards whatever a client's own `VT_SETMODE` requested (there is no real switching behavior
+/// for the stored value to ever affect), this always reports `VT_AUTO` -- the same "no
+/// process-controlled switching in effect" answer a real kernel would give a VT nobody has
+/// claimed with `VT_PROCESS`, which is accurate here since no claim is ever actually tracked.
+pub(crate) fn get_mode<Platform: ShimPlatform>(ptr: UserPtrMut<VtMode>) -> Result<u32, Errno> {
+    let mode = VtMode {
+        mode: VT_AUTO,
+        waitv: 0,
+        relsig: 0,
+        acqsig: 0,
+        frsig: 0,
+    };
+    ptr.write_at_offset::<Platform>(0, mode)
+        .ok_or(Errno::EFAULT)?;
+    Ok(0)
+}
+
+/// `VT_ACTIVATE` on `/dev/tty1` -- switches to the given VT (real Linux passes the target VT
+/// number as the raw ioctl `arg`, not a pointer). This device has exactly one VT and no real
+/// switching to perform (see module doc comment), so any request unconditionally succeeds --
+/// there is nothing to validate the requested VT number against, since no other VT could ever
+/// exist for this device to reject a request for.
+pub(crate) fn activate(_vt: i32) -> Result<u32, Errno> {
+    Ok(0)
+}
+
+/// `VT_WAITACTIVE` on `/dev/tty1` -- blocks until the given VT becomes active (same raw-`arg`
+/// shape as `VT_ACTIVATE`). Since `activate` above completes the "switch" synchronously and
+/// unconditionally, the VT it targets is already active by the time any caller could issue this
+/// -- an immediate, unconditional success is the correct answer, not a real wait.
+pub(crate) fn wait_active(_vt: i32) -> Result<u32, Errno> {
     Ok(0)
 }
 
