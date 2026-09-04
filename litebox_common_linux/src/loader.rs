@@ -443,16 +443,24 @@ impl ElfParsedFile {
             let span = max
                 .checked_sub(min)
                 .ok_or(ElfLoadError::InvalidProgramHeader)?;
-            // Only meaningful when `align` (the reservation's own alignment, driven by the
-            // largest `p_align` among all segments) is at least as coarse as `cow_alignment`:
-            // otherwise `aligned_ptr` (picked `align`-aligned within the oversized mapping) has
-            // no guaranteed room `cow_padding_hint` bytes before it, and requesting padding
-            // would be pointless slack with no safety guarantee behind it. `align` for a real
-            // ET_DYN binary's largest PT_LOAD segment is typically >= 2MiB (`p_align`), far
-            // coarser than any realistic `cow_alignment` (64KiB), so this holds in practice; the
-            // check exists to fail safe (request no padding) rather than assume it always does.
+            // Pass 353 CORRECTION: this used to additionally require `align >= cow_alignment`
+            // (the reservation's own alignment being at least as coarse as the 64KiB CoW
+            // padding granularity), on the assumption that a real ET_DYN binary's largest
+            // `PT_LOAD` `p_align` is "typically >= 2MiB". That assumption is false for every
+            // musl-linked binary this project actually loads: `readelf -l` on the real
+            // `/bin/busybox` and `/lib/ld-musl-x86_64.so.1` in this project's own canonical
+            // layer shows `Align = 0x1000` (4KiB, the page size) on every `PT_LOAD`, not
+            // megabytes -- so the removed guard silently zeroed `cow_padding_hint` for every
+            // real exec in this codebase, which is why pass 352's live-wired CoW padding never
+            // fired (`verified_safe_padding` was always 0: no `PROT_NONE` slack was ever
+            // reserved to find, live-traced via a temporary per-branch diagnostic in
+            // `get_memory_permissions` and `try_cow_mmap_file`, both fully reverted before this
+            // commit). `nonzero_head_room_guarantees_room_before_aligned_ptr_with_page_size_align`
+            // (below) empirically confirms `compute_reserved_regions`'s own head-room guarantee
+            // holds identically at `align = PAGE_SIZE` as it does at `align = 2MiB` -- the guard
+            // was protecting against a geometry that was never actually at risk.
             let cow_padding_hint = match (cow_alignment, first_segment_offset) {
-                (Some(cow_alignment), Some(p_offset)) if align >= cow_alignment => {
+                (Some(cow_alignment), Some(p_offset)) => {
                     // The CoW attempt for this segment will want a view starting at file offset
                     // `p_offset` rounded DOWN to `cow_alignment`, so it needs exactly this many
                     // bytes of guest address space immediately before the segment's own vaddr.
@@ -1243,6 +1251,52 @@ mod reserve_regions_tests {
                     head_addr + head_size <= r.aligned_ptr - cow_padding,
                     "head_unmap [{head_addr:#x}, {:#x}) overlaps the guaranteed head-room \
                      range ending at {:#x}",
+                    head_addr + head_size,
+                    r.aligned_ptr - cow_padding,
+                );
+            }
+            assert!(r.aligned_ptr + len <= mapping_ptr + mapping_len);
+            assert_page_aligned(&r);
+        }
+    }
+
+    // Pass 353: same guarantee, but with `align == PAGE_SIZE` (4KiB) -- the REAL value every
+    // musl-linked binary in this project's own layers actually has (confirmed live via
+    // `readelf -l` on `/bin/busybox` and `/lib/ld-musl-x86_64.so.1`: every `PT_LOAD` reports
+    // `Align = 0x1000`, not the multi-megabyte value `MappingInfo::load`'s own `cow_padding_hint`
+    // guard comment assumed "typical" for a real ET_DYN binary). `nonzero_head_room_guarantees_
+    // room_before_aligned_ptr` above only ever exercised `align = 2MiB`, so this specific,
+    // now-known-to-be-the-common-case geometry was never actually tested -- this is exactly why
+    // the `align >= cow_alignment` guard silently zeroed `cow_padding_hint` for every real exec
+    // this session measured and nobody noticed sooner. This test exists to settle, with real
+    // evidence rather than a source comment's untested assumption, whether the SAME geometric
+    // guarantee (`compute_reserved_regions` leaves genuine, unmapped head-room before
+    // `aligned_ptr`) still holds when `align` is finer than `cow_padding`'s own 64KiB
+    // granularity -- if it does, the `align >= cow_alignment` guard in `MappingInfo::load` is
+    // unnecessarily conservative and should be relaxed; if it does NOT, the guard is load-bearing
+    // and must stay.
+    #[test]
+    fn nonzero_head_room_guarantees_room_before_aligned_ptr_with_page_size_align() {
+        let align = PAGE_SIZE; // 4 KiB -- the real value, not the 2MiB the other test exercises
+        let len = 0x123_000;
+        let cow_padding = 0x1_0000 - PAGE_SIZE; // max possible 64KiB-granularity padding
+        let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE) + cow_padding;
+        for offset_pages in 0..16 {
+            let mapping_ptr = 0x4000_0000 + offset_pages * PAGE_SIZE;
+            let r = compute_reserved_regions(mapping_ptr, mapping_len, len, align, cow_padding);
+            assert_eq!(r.aligned_ptr % align, 0);
+            assert!(
+                r.aligned_ptr >= mapping_ptr + cow_padding,
+                "aligned_ptr {:#x} does not leave {cow_padding:#x} bytes of room before it \
+                 (mapping_ptr {:#x}, align {align:#x})",
+                r.aligned_ptr,
+                mapping_ptr,
+            );
+            if let Some((head_addr, head_size)) = r.head_unmap {
+                assert!(
+                    head_addr + head_size <= r.aligned_ptr - cow_padding,
+                    "head_unmap [{head_addr:#x}, {:#x}) overlaps the guaranteed head-room \
+                     range ending at {:#x} (align {align:#x})",
                     head_addr + head_size,
                     r.aligned_ptr - cow_padding,
                 );

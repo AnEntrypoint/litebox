@@ -5990,3 +5990,97 @@ Files: `litebox/src/platform/page_mgmt.rs` (trait signature + doc comment),
 `litebox_platform_linux_userland/src/lib.rs` (mechanical signature update, NOT independently
 verified on Linux -- see above), `litebox_shim_linux/src/syscalls/mm.rs` (`try_cow_mmap_file`'s
 live-query + dual registration), `AGENTS.md` (this entry).
+
+## Pass 353 -- root-caused precisely why `verified_safe_padding` is always 0 (pass 352's own open
+question): NOT fragmentation, and NOT purely the `align >= cow_alignment` guard either -- the
+real problem is that pass 351's reservation-widening targets the WRONG segment, a design gap one
+level deeper than either prior pass characterized. One small, empirically-verified, genuinely
+correct fix landed; the deeper gap is left honestly documented, not force-fixed
+
+Live-traced `get_memory_permissions`'s exact decision for every real CoW attempt on a busybox
+exec via a temporary, fully-reverted diagnostic (distinct log lines for each of its three
+possible outcomes: no VMA at all, a VMA that partially overlaps the query, and a VMA that fully
+covers the query -- the third case had NO log line before this pass, since the pre-existing code
+only ever needed the boolean `is_empty()` result, not why). Result across every misaligned CoW
+attempt observed (`git stash`-free, both `--release` and unoptimized debug builds, confirmed
+identical to rule out a compiler-optimization artifact):
+
+- The FIRST PT_LOAD segment (file offset 0, already 64KiB-aligned, needs no padding) --
+  irrelevant to this investigation, included here only because it's what pass 351's own
+  `first_segment_offset` heuristic targets (see below).
+- The SECOND segment (busybox's `offset=24576`): the query hits a VMA that starts exactly at the
+  query's own upper bound (`vma_start == query_end`) -- zero real overlap. No `PROT_NONE` slack
+  was ever registered there at all.
+- Every LATER segment (busybox's `offset=651264`, ld-musl's `offset=81920`/`446464`/`663552`):
+  the query hits a VMA that FULLY covers the requested window -- but with REAL `READ|EXEC`
+  permissions, not `PROT_NONE`. This is the PREVIOUS segment's own already-mapped content: real
+  ELF binaries in this project (every musl-linked one checked) pack their `PT_LOAD` segments
+  back-to-back with zero gap between them, so "the bytes immediately before a later segment"
+  are never slack at all -- they're a neighboring segment's real, live data. `get_memory_
+  permissions`'s existing "any answer other than PROT_NONE means real content, refuse" logic is
+  working exactly as designed here; there is nothing to fix in it.
+
+**First real finding, and it's a genuine, if narrow, bug**: `litebox_common_linux/src/loader.rs`
+`MappingInfo::load`'s `cow_padding_hint` computation required `align >= cow_alignment` (the
+reservation's own alignment, driven by the largest `p_align` among all `PT_LOAD` segments, being
+at least as coarse as the 64KiB CoW padding granularity) before requesting ANY padding at all --
+justified by an unverified comment claiming a real ET_DYN binary's largest `p_align` is
+"typically >= 2MiB". **False for every binary actually checked**: `readelf -l` on this project's
+own real `/bin/busybox` and `/lib/ld-musl-x86_64.so.1` (from the canonical layer) shows `Align =
+0x1000` (4KiB, the page size) on every single `PT_LOAD`, not megabytes -- musl's own linker
+default, not an edge case. So the guard silently zeroed `cow_padding_hint` for every real exec in
+this codebase; it was never once actually exercised as `true`.
+
+Before removing the guard, empirically verified (not assumed) that `compute_reserved_regions`'s
+own head-room guarantee holds identically at `align = PAGE_SIZE` as it does at `align = 2MiB` --
+added `nonzero_head_room_guarantees_room_before_aligned_ptr_with_page_size_align`, the exact same
+assertions as the pre-existing `align = 2MiB` test, just at the real-world alignment value.
+Passes. The guard was protecting against a geometry that was never actually at risk; removed it.
+`cargo test -p litebox_common_linux --lib`: 10/10 (was 9/9 -- +1 new test), `cargo test -p
+litebox_shim_linux --lib`: 181/181 unchanged, `cargo test -p litebox --lib`: 124 passed / 26
+pre-existing-environmental failures, unchanged baseline. Live-verified: clean release rebuild,
+200 sequential `/bin/busybox true` execs in one guest process, exit 0, zero `fatal signal`
+lines, `LOOP_DONE` reached -- no regression.
+
+**Second, deeper finding: this fix alone has ZERO practical effect, and the real reason is a
+different, more fundamental design gap than either prior pass characterized.** Re-ran the live
+CoW-attempt trace after the fix: `verified_safe_padding` is STILL 0 for every attempt, identical
+distribution of the three `get_memory_permissions` outcomes as before the fix. Root cause: pass
+351's `first_segment_offset` (the ONLY segment `cow_padding_hint` is ever computed for) is
+defined as the `PT_LOAD` segment with the LOWEST `p_vaddr` -- which, for both real binaries
+checked, has file offset **0**, already trivially 64KiB-aligned. `cow_padding_hint` computes to
+`(0 % 65536) = 0` every time, by construction, regardless of the now-removed guard. Every segment
+that actually NEEDS padding (busybox's 2nd-4th segments, ld-musl's 2nd-4th) is, by definition,
+not the lowest-`p_vaddr` segment, so `first_segment_offset` never equals its own file offset --
+the reservation-widening machinery this whole thread has been trying to make fire was built to
+help a segment that structurally never needs the help it provides, and has no mechanism to help
+the segments that do.
+
+**Honest conclusion, per this project's standing discipline against overclaiming (pass
+317/321/343/347/349/351/352 as this session's own house style)**: one small, real, correctly-
+scoped, empirically-verified bug fixed (the `align >= cow_alignment` guard) -- genuinely correct
+groundwork, zero regression, but currently inert on its own. The actual blocker pass 352 left
+open ("VMA fragmentation, not yet traced to root cause") is now precisely understood and is NOT
+fragmentation at all -- it's that padding is only ever computed for the wrong segment. A real fix
+would need `MappingInfo::load` to compute (and `ElfFile::reserve`'s widened reservation to
+provide room for) padding for EVERY misaligned segment's own file offset, not just the
+lowest-`p_vaddr` one -- and since segments are packed contiguously in every binary checked, only
+the FIRST segment in `p_vaddr` order can ever benefit from reservation-level widening at all
+(later segments have no free space before them by construction, real content is always there --
+see the `FULL_COVER` finding above). This means the reservation-widening approach, EVEN IF fully
+generalized to try every segment, can geometrically only ever help ONE segment per binary (the
+lowest-`p_vaddr` one) -- not the "common case" pass 321/343's own framing assumed. Given: (a) this
+is a materially larger redesign than a "small, low-risk" follow-up (touching the reservation
+sizing for every segment individually, not just the whole-span up-front reservation), (b) the
+maximum possible benefit is now known to be geometrically bounded to at most one segment per
+exec, and (c) this session has already reached Option D (documented-and-unfixed) independently
+twice on this same thread today for smaller versions of this exact judgment call -- this pass
+recommends Option D remain the standing conclusion. The `align >= cow_alignment` fix is kept
+(real, tested, harmless, and removes a stale/false assumption from the code) but does not, by
+itself or combined with anything found this pass, unlock the CoW fast path for the actual
+busybox/ld-musl workload this whole investigation has targeted.
+
+Files: `litebox_common_linux/src/loader.rs` (guard removal + new test), `AGENTS.md` (this entry).
+Temporary diagnostics in `litebox/src/mm/linux.rs` and `litebox_shim_linux/src/syscalls/mm.rs`
+were added, used for live tracing, and fully reverted before this commit (confirmed via `git
+diff` showing zero net change to both files).
