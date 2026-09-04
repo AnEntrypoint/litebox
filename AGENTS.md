@@ -4751,3 +4751,68 @@ window/surface, exactly as expected -- no new wgpu plumbing was or needed to be 
 still-open shm-keymap crash happens inside the GUEST compositor (labwc) before it ever reaches a
 frame-present call, so wgpu itself was never actually exercised end-to-end with real rendered
 content in this pass; that verification remains for whoever fixes the keymap blocker next.
+
+## pass 320 -- /dev/shm root-caused and fixed, closing the exact gap pass 319 flagged
+
+Followed pass 319's own documented next hypothesis exactly: wrote `advisor/probes/shm_probe.c`, a
+freestanding raw-syscall probe reproducing glibc's `shm_open` recipe (`openat("/dev/shm/name",
+O_CREAT|O_RDWR|O_EXCL)` + `ftruncate` + `mmap(MAP_SHARED|PROT_WRITE)` + write + read-back), built
+via the established `clang --target=x86_64-unknown-linux-gnu -nostdlib -nostdinc -ffreestanding
+-fno-stack-protector -static -O1` recipe, rewritten with `litebox_syscall_rewriter.exe
+--allow-trapped-sites`, and run as the runner's top-level program layered over the canonical
+`.wfgy/xfce-build/layer31_direct_fixed.tar` via `--resume-from`/`--initial-files`.
+
+First run: `FAIL open /dev/shm/probe_name errno=2` (ENOENT) -- confirms `/dev/shm` did not exist as
+an openable directory at all, an EARLIER failure than pass 319's own guess (it suspected a
+`MAP_SHARED` gap, assuming the directory existed). Root cause: `/dev` itself is synthesized
+entirely by `litebox::fs::devices::Devices`, a fixed flat namespace (`stdin`, `stdout`, `null`,
+`urandom`, `tty0`, `tty1` -- see `litebox/src/fs/devices.rs`'s own doc comment) mounted read-only
+at `/dev` by `default_fs` in `litebox_shim_linux/src/lib.rs`; it has no `shm` entry and, being a
+synthetic backend, cannot hold arbitrary guest-created files the way a real tmpfs mount can. No
+canonical-layer tar (nor the stock webtop image, per pass 319) carries a real `dev/shm` tar entry
+either.
+
+Fix, in two parts (`/dev/shm` needs to be BOTH a real writable directory AND have its files treated
+as real shared memory, matching real Linux's own two-part `/dev/shm` semantics -- a genuine tmpfs
+mount, separate from devtmpfs):
+
+1. `litebox_runner_linux_on_windows_userland/src/lib.rs`'s `initialize_root_in_mem_layer` (the same
+   function that already creates `/tmp`, `/run`, `/var`, etc. in the writable in-mem upper layer)
+   now also `mkdir`s `/dev` (0755, matching real Linux) and `/dev/shm` (1777, world-writable +
+   sticky bit, matching real Linux) there. `/dev` must be created first -- the `/dev` a guest
+   normally sees is the SEPARATE `Devices` composer mount above, invisible to this in-mem layer's
+   own path resolution; omitting it panics `mkdir("/dev/shm")` with `PathError::MissingComponent`
+   (hit and fixed during this pass, kept as an inline comment warning against regressing it).
+2. `litebox_shim_linux/src/syscalls/file.rs`'s `insert_raw_file_fd_with_path` (the same function
+   already tagging `/dev/dri/card0`/`/dev/input/event0` opens with `DriFd`/`EvdevFd`) now also tags
+   any `/dev/shm/<name>` open with the EXISTING `MemfdMarker` (see that struct's own doc comment) --
+   the same tag `memfd_create` applies at creation and `sys_unlinkat`'s
+   `tag_unlinked_regular_file_as_shm_like` applies retroactively to any file unlinked-while-open.
+   This deliberately reuses `try_memfd_mmap`/`resize_memfd_shared_backing`'s already-tested real
+   `PageManagementProvider::create_shared_memory` machinery rather than building a parallel path --
+   a `/dev/shm` file IS real shared memory on real Linux, exactly memfd's own defining property,
+   just reached via a different creation idiom (a plain named `open()` under a well-known
+   directory, vs. the `memfd_create` syscall). New helper `is_dev_shm_path` mirrors
+   `is_dri_path`/`is_evdev_path`'s shape but matches a PREFIX (`/dev/shm/` + a non-empty
+   remainder), since (unlike those two fixed single paths) `/dev/shm` is a real directory that can
+   hold arbitrarily-named files.
+
+Re-ran the probe after each half of the fix: after step 1 alone, `open`+`ftruncate` PASS but
+`FAIL mmap errno=19` (ENODEV) -- exactly the OTHER hypothesis pass 319 raised, now confirmed as the
+SECOND real gap, not the first. After step 2, full PASS: `open fd=3` / `ftruncate` / `mmap
+addr=10485760` / `read-back matches` / `failures: 0`.
+
+Added `litebox_shim_linux/src/syscalls/mm.rs::test_dev_shm_file_supports_map_shared_write` as the
+unit-test-level equivalent (mirrors `test_map_shared_writable_file_returns_enodev_instead_of_panicking`
+as a deliberate contrast case -- same `MAP_SHARED|PROT_WRITE` shape, opposite expected outcome).
+Full suite results: `cargo test -p litebox_shim_linux` 181/181 passed (was 180; +1 new), `cargo test
+-p litebox --lib` unchanged at 124 passed / 26 failed -- the same pre-existing/environmental
+failures as before this pass (missing `diod` binary for all 24 nine_p tests, plus
+`test_vmm_mapping` and one `tar_ro` symlink test's own separate pre-existing logic bugs), confirming
+no regression.
+
+Not yet done: re-running the actual stock-image labwc boot end-to-end to confirm the shm-keymap
+crash itself is gone (would require re-pulling/re-rewriting the 2.586GB `webtop_seatd.tar`, which
+pass 319 left in scratch temp, not committed). The isolated probe passing cleanly is strong evidence
+the specific mechanism pass 319 identified (shm-backed keymap allocation) is fixed, but end-to-end
+confirmation with real rendered pixels through this path remains for whoever picks this up next.

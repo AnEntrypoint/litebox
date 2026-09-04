@@ -170,6 +170,42 @@ fn initialize_root_in_mem_layer<Platform: litebox::sync::RawSyncPrimitivesProvid
         .unwrap();
         fs.chown("/tmp", Some(1000), Some(1000)).unwrap();
 
+        // `/dev/shm` on real Linux is its own tmpfs mount, not part of devtmpfs (the fixed,
+        // read-only-shaped `{stdin,stdout,null,urandom,...}` set `litebox::fs::devices::Devices`
+        // provides at `/dev` -- see that module's own doc comment): a plain writable directory
+        // whose files are always real shared memory, which is exactly what a `/tmp`-shaped
+        // in-mem directory already gives every OTHER file created under it except for the
+        // `MAP_SHARED|PROT_WRITE` real-backing part (see `syscalls::file::MemfdMarker` and
+        // `syscalls::mm::try_memfd_mmap`'s own doc comments for why an ordinary in-mem file can't
+        // support that directly). Mode 1777 (world-writable + sticky bit) matches real Linux's
+        // `/dev/shm` exactly -- multiple unrelated users/processes must be able to create files
+        // here, but only the owner of a given file (or root) may unlink someone else's. Without
+        // this directory existing at all, glibc's `shm_open("/name", ...)` (which opens
+        // `/dev/shm/name` under the hood -- there is no real `shm_open` syscall) fails at the
+        // very first `open()` with `ENOENT`, before ever reaching the `MAP_SHARED` gap: confirmed
+        // via `advisor/probes/shm_probe.c`, which reproduced exactly this `ENOENT` against the
+        // canonical XFCE layer (no `/dev/shm` tar entry, no synthesized directory here either) --
+        // this is the blocker AGENTS.md documents as labwc's shm-keymap-allocation crash under
+        // the stock `linuxserver/webtop:alpine-mate` image's real Wayland/DRM (labwc) path.
+        //
+        // `/dev` itself must exist as a real ancestor directory IN THIS SAME in-mem layer before
+        // `/dev/shm` can be created under it -- the `/dev` a guest normally sees is synthesized
+        // entirely by the separate `Devices` composer mount in `default_fs` below (this
+        // function's own in-mem layer knows nothing about that), so without this the `mkdir`
+        // below panics with `PathError::MissingComponent` (confirmed live: first attempt at this
+        // fix, before adding this `mkdir("/dev", ...)`, crashed exactly this way). Mode 0755
+        // root-owned matches real Linux's own `/dev`.
+        fs.mkdir("/dev", litebox::fs::Mode::RWXU | litebox::fs::Mode::RGRP | litebox::fs::Mode::ROTH)
+            .unwrap();
+        fs.mkdir(
+            "/dev/shm",
+            litebox::fs::Mode::RWXU
+                | litebox::fs::Mode::RWXG
+                | litebox::fs::Mode::RWXO
+                | litebox::fs::Mode::SVTX,
+        )
+        .unwrap();
+
         // Standard FHS directories that tools like `apk` expect to already exist
         // (e.g. `apk` opens a log file under `/var/log`) but which don't survive
         // as empty-directory entries when an OCI image's rootfs is scanned into a

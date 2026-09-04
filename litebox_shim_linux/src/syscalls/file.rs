@@ -607,6 +607,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .descriptor_table_mut()
                 .set_entry_metadata(&file, DriFd);
         }
+        // `/dev/shm` is real Linux's own tmpfs mount (see the runner's `initialize_root_in_mem_layer`
+        // doc comment for the directory itself), so unlike an ordinary regular file, ANY file
+        // created under it is real shared memory as a matter of course -- glibc's `shm_open`
+        // (there is no real `shm_open` syscall; it is `open("/dev/shm/<name>", O_CREAT, ...)`
+        // under the hood) relies on exactly this property, which is otherwise reserved for
+        // `memfd_create`-tagged files (see [`MemfdMarker`]'s own doc comment). Tagging here at
+        // OPEN time (not just creation) mirrors `DriFd`/`EvdevFd` above and correctly handles a
+        // second process opening the SAME already-existing `/dev/shm` path (the real wl_shm
+        // pattern this exists to support: a compositor creates the keymap file, a client opens
+        // it by the SAME name to map it -- both fds need this tag, not just the creator's).
+        if let Some(path) = &path
+            && is_dev_shm_path(path)
+        {
+            let _ = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .set_entry_metadata(&file, MemfdMarker);
+        }
         let files = self.files.borrow();
         let raw_fd = files.insert_raw_fd(file).map_err(|file| {
             files.fs.close(&file).unwrap();
@@ -1697,6 +1716,15 @@ fn is_evdev_path(path: &CString) -> bool {
 /// Mirrors [`is_evdev_path`]'s shape for the one DRM device path this shim exposes.
 fn is_dri_path(path: &CString) -> bool {
     path.to_str() == Ok("/dev/dri/card0")
+}
+
+/// True for any path under `/dev/shm/` (but not `/dev/shm` itself, the directory) -- unlike
+/// [`is_evdev_path`]/[`is_dri_path`]'s single fixed path, `/dev/shm` is a real writable directory
+/// that can hold arbitrarily-named files (see `initialize_root_in_mem_layer`'s doc comment), so
+/// this checks a prefix rather than an exact match.
+fn is_dev_shm_path(path: &CString) -> bool {
+    path.to_str()
+        .is_ok_and(|p| p.strip_prefix("/dev/shm/").is_some_and(|rest| !rest.is_empty()))
 }
 
 const SEEK_SET: i16 = 0;
