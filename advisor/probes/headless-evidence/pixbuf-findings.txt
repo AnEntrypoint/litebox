@@ -63,3 +63,39 @@ Next question, and it is now a litebox question rather than a packaging one:
 does dlopen of libpixbufloader-xpm.so actually succeed under litebox? gdk-pixbuf
 loads modules via gmodule/dlopen, and a silent dlopen failure would produce
 exactly this symptom for every format at once.
+
+UPDATE 2: syscall-level trace -- the cache is READ IN FULL, then no module is
+ever opened. Not a dlopen failure either.
+
+Ruled out first: broken dependencies. `ldd` on libpixbufloader-xpm.so inside the
+guest resolves EVERY DT_NEEDED (libgdk_pixbuf, libgobject, libglib, libgmodule,
+libgio, libglycin, libffi, libpcre2, libz, libmount, liblcms2, libfontconfig,
+libseccomp, libgcc_s, libblkid, libfreetype, libexpat, musl) with ZERO
+"not found". So the module is loadable.
+
+Also ruled out: a cache-location mismatch. Setting GDK_PIXBUF_MODULE_FILE
+explicitly at a freshly generated cache fails identically.
+
+The trace (LITEBOX_LOG=debug), for the gdk-pixbuf-csource that fails:
+
+  2.964030  sys_openat  /tmp/lc  fd=4          <- our generated cache
+  2.964207  sys_read    fd=4  result=Ok(350)   <- reads all 350 bytes
+  2.964249  sys_read    fd=4  result=Ok(0)     <- clean EOF
+  2.964333  sys_mmap    4096
+  2.972180  sys_openat  /usr/lib/charset.alias  fd=None
+  2.972395  sys_write   fd=2  "failed to load ... Couldn't recognize the image
+                              file format"
+  2.972538  sys_exit_group status=Exit(1)
+
+Between reading the cache and reporting failure there is NO openat of
+libpixbufloader-xpm.so, and no openat of any loaders/ path at all. gdk-pixbuf
+consumes the cache and then declines to load the module it names.
+
+So the sequence is: cache present and valid -> read completely -> module never
+opened -> every format reported unrecognized. The failure is in gdk-pixbuf's
+handling of the parsed cache, before any dlopen is attempted.
+
+Only one unsupported syscall appears anywhere in these runs: membarrier (2x).
+glib uses memory barriers for its thread-safe one-time-init (g_once), which
+guards exactly this kind of module registration, so that is worth eliminating
+before looking further -- it is the one known litebox gap on this path.
