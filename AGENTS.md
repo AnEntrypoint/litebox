@@ -6084,3 +6084,73 @@ Files: `litebox_common_linux/src/loader.rs` (guard removal + new test), `AGENTS.
 Temporary diagnostics in `litebox/src/mm/linux.rs` and `litebox_shim_linux/src/syscalls/mm.rs`
 were added, used for live tracing, and fully reverted before this commit (confirmed via `git
 diff` showing zero net change to both files).
+
+## Pass 354 -- `run_xfce_xwm_fast.sh`: shrank `run_xfce_xwm.sh`'s hardcoded settle sleeps, tested
+8/8 clean, ~34% faster (91.4s -> 60.7s wall-clock) with no regression -- the documented
+concurrent-`fork_verify` race (`docs/AGENTS_ARCHIVE_2026-09-03.md` passes 168-172: a genuine,
+still-unfixed HOST-code AV race under heavy concurrent single-stepping, confirmed via a real
+`LITEBOX_VEH_TRACE=1` capture, explicitly NOT fixable at the script-timing level) is real and was
+NOT touched -- this pass only trims the MARGIN the original script adds on top of each stage's
+already-real readiness poll, not the underlying serialization discipline itself
+
+User watched a live `--gui` demo of `run_xfce_xwm.sh` and asked, correctly, whether the ~80-100s
+startup is necessary: "if it's running properly we don't need any sleeps right?" The premise
+needed testing, not assuming either direction. Read the original script's own header comment
+("every service is started ALONE and given time to settle... so at most one `fork_verify` healing
+pass is live at a time") plus the archived investigation it descends from (passes 168-172):
+pass 169's own conclusion, quoted directly, is decisive and was NOT going to be re-litigated this
+pass -- "the crash does not even reach that diagnostic branch cleanly... No further script-level,
+timing-level, or launch-sequencing change is likely to make progress; a real fix requires deeper
+`fork_verify`/VEH-level work." So the underlying race is real and NOT a stale workaround from
+before other fixes landed -- shrinking sleeps could not safely mean removing them.
+
+**What this pass actually did**: kept the exact same one-service-at-a-time serialization order and
+the exact same single-spawn-no-retry discipline (both hard-won lessons from the archived
+investigation), and shrank two specific things that are margin ON TOP of that discipline, not the
+discipline itself:
+1. The trailing fixed `sleep N` immediately after a stage's own readiness poll ALREADY succeeded
+   (e.g. `DBUS_READY`/`SEATD_READY`/`WESTON_READY`/`XWAYLAND_READY` polls already confirm the
+   resource exists before the following `sleep 2`/`sleep 2`/`sleep 3`/`sleep 5` even starts) --
+   shortened these five fixed sleeps from `2+2+3+5+4=16s` total to `0.5+0.5+1+2+2=6s`.
+2. The last four stages (`xfwm4`/`xfsettingsd`/`xfdesktop`/`xfce4-panel`) have NO readiness signal
+   to poll at all in the original script -- just a fixed iteration count (`16/10/20/24` x 0.5s =
+   `70` ticks = `35s`). Shortened to `8/5/10/12` = `35` ticks = `17.5s`.
+Total sleep-derived time removed: ~27.5s of the original's ~80-100s.
+
+**Test methodology**: new file `advisor/probes/run_xfce_xwm_fast.sh` (NOT baked into the canonical
+layer, injected via a small `--resume-from` overlay, `.wfgy/bench_scratch/fast_inject.tar`, same
+technique pass 346 established). Ran it 8 times back to back against the unmodified canonical
+`.wfgy/xfce-build/layer31_direct_fixed.tar` (matching the original script's own "8/8 runs" bar),
+no GUI window for the repeated tests (faster iteration, `--gui` not required for this
+script-timing question) except the final timed comparison pair.
+
+**Result: 8/8 clean, byte-identical stage progression across all 8 runs.** Every run reached all
+10 `STAGE_*` markers and `TEST_DONE`, exit code 0. Every run's readiness checks matched exactly:
+`DBUS_UP=yes`, `SEATD_READY=1`, `WESTON_READY=1`, `XWAYLAND_READY=0` (found immediately, first
+poll), `XCHECK_RC=0` (X genuinely accepts connections, not just socket-exists). The benign
+`at-spi-bus-launch`/`dbus-daemon` `Signal(5)`/`Signal(9)` exits the original script's own runs also
+show (real, expected, unrelated to the target crash class -- these are the SAME processes the
+original script's own captures show exiting the same way) appeared identically; no NEW crash
+signature, no silent component death, no "Connection refused" cascade (the archive's own signature
+for the dbus-lost-to-the-fork-race failure mode), no launcher-shell death.
+
+**Timed, direct comparison** (`time` around the full runner invocation, same layer, same host
+state, back to back): original `run_xfce_xwm.sh` = **91.4s** real time to `TEST_DONE`; new
+`run_xfce_xwm_fast.sh` = **60.7s** real time to `TEST_DONE` -- **30.7s faster, ~34% reduction**,
+both reaching the identical success state.
+
+**What this does NOT establish**: this is still sequential-stage-at-a-time, not true concurrency
+-- the underlying `fork_verify` race pass 169 documented remains real and unaddressed, and this
+script would NOT protect against it if someone removed the one-at-a-time discipline itself (only
+attempted trimming margin ON TOP of it). Also did not push the shrinking further than this one
+conservative pass -- the loop bounds/upper-limits themselves were left generous (unchanged), only
+the values actually likely to be exercised on a healthy run were shortened, so there is likely
+still room for a second, more aggressive pass if 8/8 clean here is treated as encouraging rather
+than exhaustive (would need its own fresh 8-run validation, not assumed from this pass's results).
+
+**Kept, not promoted**: `run_xfce_xwm.sh` remains the canonical, most-proven script (referenced
+throughout this session's own passes and the standing-goal verification); `run_xfce_xwm_fast.sh`
+is an additive, faster alternative for demos/iteration, not yet promoted to replace it in any
+existing test/doc reference.
+
+Files: `advisor/probes/run_xfce_xwm_fast.sh` (new), `AGENTS.md` (this entry).
