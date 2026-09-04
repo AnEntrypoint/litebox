@@ -182,6 +182,33 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// The default implementation returns unsupported CoW. Platforms that DO support COW should
     /// override this method to unlock better performance.
+    ///
+    /// `verified_safe_padding`: the number of bytes IMMEDIATELY BEFORE `suggested_start`, in
+    /// guest address space, that the CALLER has already confirmed (via a live query against its
+    /// own `Vmem` tracking, not a static inference) are a single, contiguous, `PROT_NONE`-
+    /// permission VMA belonging to this exact reservation -- i.e. genuinely safe for a platform
+    /// implementation to host-map into, PROVIDED it also registers that exact range back with
+    /// `Vmem` before returning (see `litebox_shim_linux::syscalls::mm::try_cow_mmap_file`'s own
+    /// query-then-register sequence, the only real caller of this contract today). A platform
+    /// with a strictly-page-offset-aligned CoW API (e.g. real Linux `mmap`) never needs any
+    /// padding and can ignore this parameter entirely. `0` means "no padding verified safe" --
+    /// every implementation MUST treat any padding need beyond this as unsafe and fall back to
+    /// [`CowAllocationError::Unaligned`], never inferring safety on its own. This is a deliberate
+    /// architectural split precisely because a same-day bug (Windows platform CoW padding,
+    /// tracked in this project's own history) was caused by a platform implementation host-
+    /// mapping padding memory `Vmem` never learned about -- the caller-verifies, platform-
+    /// executes-only-what-was-verified split makes that class of bug structurally impossible:
+    /// the platform crate has no `Vmem` access at all and can never itself decide "this is safe."
+    ///
+    /// On success, returns the content pointer (identical to `suggested_start` whenever
+    /// `fixed_address_behavior` was `Replace`/`NoReplace`) alongside `Some((padding_start,
+    /// padding_len))` if this call ALSO host-mapped a padding prefix within the caller-verified
+    /// range (always `None` when `verified_safe_padding` was unused, e.g. because the file
+    /// offset was already aligned). The caller MUST register `Some` padding with its own `Vmem`
+    /// (as an ordinary `PROT_NONE`/guest-inaccessible mapping) BEFORE any guest code can
+    /// possibly execute and reach that address range -- this return value is precisely how the
+    /// platform reports "I mapped extra host memory you don't know about yet" back across the
+    /// `Vmem`-access boundary it cannot cross itself.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
     fn try_allocate_cow_pages(
         &self,
@@ -189,7 +216,8 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         source_data: &'static [u8],
         permissions: MemoryRegionPermissions,
         fixed_address_behavior: FixedAddressBehavior,
-    ) -> Result<Self::RawMutPointer<u8>, CowAllocationError> {
+        verified_safe_padding: usize,
+    ) -> Result<(Self::RawMutPointer<u8>, Option<(usize, usize)>), CowAllocationError> {
         Err(CowAllocationError::UnsupportedByPlatform)
     }
 

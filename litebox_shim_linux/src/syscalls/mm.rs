@@ -305,6 +305,55 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             perms
         };
 
+        // How much padding space, immediately BEFORE `suggested_addr`, this call is willing to
+        // let a platform's `try_allocate_cow_pages` use for a misaligned-file-offset workaround
+        // (see that trait method's own doc comment in `litebox/src/platform/page_mgmt.rs` for
+        // the full contract, and `docs/cow-mmap-fixed-address-design.md` for the design this
+        // implements). Bounded at `MAX_COW_VERIFIED_PADDING` (60KiB): the largest padding ANY
+        // known platform constraint (Windows' 64KiB `MapViewOfFile3` allocation granularity
+        // minus one page) could ever need -- a generous upper bound to QUERY, not a promise that
+        // this much is actually free; the live query below determines the real, safe amount.
+        //
+        // THIS QUERY IS THE ENTIRE SAFETY BOUNDARY for the padding trick: it asks `Vmem`'s own,
+        // CURRENT, live state (not a static inference about what the ELF loader's reservation
+        // "should" contain) whether the exact byte range immediately preceding `suggested_addr`
+        // is a single, contiguous, `PROT_NONE` (fully inaccessible) mapping -- i.e. genuinely
+        // still part of this process's own untouched ELF reservation slack, never anything a
+        // platform implementation infers or assumes on its own (see that trait method's doc
+        // comment for why: it structurally has no `Vmem` access to check this itself). Any
+        // answer other than "yes, PROT_NONE, for the full requested window" makes
+        // `verified_safe_padding` clamp down to exactly how much (if any) genuinely qualifies --
+        // `try_allocate_cow_pages` NEVER receives a padding budget this call has not itself,
+        // just now, confirmed live.
+        const MAX_COW_VERIFIED_PADDING: usize = 0x1_0000 - PAGE_SIZE;
+        let verified_safe_padding = suggested_addr
+            .filter(|&addr| addr >= MAX_COW_VERIFIED_PADDING)
+            .and_then(|addr| {
+                // Query progressively smaller windows (in page steps) rather than only the
+                // maximal one: `get_memory_permissions` returns `None` for ANY partial overlap
+                // (see its own doc comment / `litebox/src/mm/linux.rs`), so a reservation that
+                // genuinely has, say, 8KiB of real PROT_NONE slack immediately before
+                // `suggested_addr` (not the full 60KiB max) would otherwise report "unsafe" for
+                // the whole window and get zero padding credit, even though a smaller amount is
+                // fully safe and would still unlock the common case. Try from the largest window
+                // down to one page, first `Some` hit wins.
+                (1..=MAX_COW_VERIFIED_PADDING / PAGE_SIZE)
+                    .rev()
+                    .map(|n| n * PAGE_SIZE)
+                    .find_map(|candidate| {
+                        let start = addr.checked_sub(candidate)?;
+                        let ptr = litebox::mm::linux::NonZeroAddress::<PAGE_SIZE>::new(start)?;
+                        let size = litebox::mm::linux::NonZeroPageSize::<PAGE_SIZE>::new(
+                            candidate,
+                        )?;
+                        let perms = self.process().pm().get_memory_permissions(ptr, size)?;
+                        // `PROT_NONE` == no permission bits set at all -- anything else (even a
+                        // READ-only mapping) is real content this call must not overwrite.
+                        perms.is_empty().then_some(candidate)
+                    })
+            })
+            .unwrap_or(0);
+
         // XXX: `try_allocate_cow_pages` and `register_existing_mapping` are not called under a
         // unified lock, so there is a theoretical race if two threads concurrently attempt a
         // fixed-address mapping with replacement at the same address. In practice this is benign:
@@ -316,8 +365,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             &static_data[offset..offset + len],
             permissions,
             fixed_behavior,
+            verified_safe_padding,
         ) {
-            Ok(ptr) => {
+            Ok((ptr, padding_range)) => {
                 // AGENTS.md pass 212: this CoW mapping path bypasses `litebox_common_linux::mm
                 // ::do_mmap`'s own shared fixed-address-mismatch check (this crate's other
                 // mmap path, `do_mmap_file_memcpy`, goes through it) by calling
@@ -334,6 +384,36 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     && ptr.as_usize() != requested
                 {
                     return Some(Err(MappingError::OutOfMemory));
+                }
+                // Register any padding prefix the platform ALSO host-mapped BEFORE registering
+                // (or letting the guest observe) the real content range -- this ordering is the
+                // whole point of the caller-verifies/platform-executes split (see the trait
+                // method's own doc comment): there must never be a window where `Vmem` doesn't
+                // yet know about host-mapped memory. `replace: true` mirrors the content
+                // registration below (a padding range can, in principle, coincide with a range
+                // this same reservation already holds -- an ordinary PROT_NONE-over-PROT_NONE
+                // overwrite is a correct no-op, never a real conflict, since this is
+                // this-process-owned slack by construction of the live query above, never
+                // another mapping's space).
+                if let Some((padding_start, padding_len)) = padding_range {
+                    let padding_range = PageRange::new(padding_start, padding_start + padding_len)
+                        .expect("platform-reported padding range must be page-aligned");
+                    // SAFETY: `padding_start..padding_start+padding_len` is exactly the host-
+                    // mapped-but-guest-inaccessible range `try_allocate_cow_pages` just created
+                    // (per its own contract) as part of the SAME view as the content range below
+                    // -- registering it here, before this function returns and before the guest
+                    // can resume, closes the pass-343/344 untracked-memory window by
+                    // construction.
+                    unsafe {
+                        self.process().pm().register_existing_mapping(
+                            padding_range,
+                            MemoryRegionPermissions::empty(),
+                            true,
+                            true,
+                            flags.contains(MapFlags::MAP_SHARED),
+                        )
+                    }
+                    .unwrap();
                 }
                 let range =
                     PageRange::new(ptr.as_usize(), ptr.as_usize().checked_add(len).unwrap())

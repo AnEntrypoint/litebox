@@ -2575,7 +2575,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         source_data: &'static [u8],
         permissions: MemoryRegionPermissions,
         fixed_address_behavior: FixedAddressBehavior,
-    ) -> Result<Self::RawMutPointer<u8>, CowAllocationError> {
+        // Real Linux `mmap(MAP_PRIVATE, fd, offset)` only requires `offset` to be page-aligned,
+        // which every real ELF `PT_LOAD` file offset already is -- no padding is ever needed on
+        // this platform, so this parameter is unused here (see the trait doc comment for why it
+        // exists at all: it's a Windows-specific `MapViewOfFile3` 64KiB-granularity workaround).
+        _verified_safe_padding: usize,
+    ) -> Result<(Self::RawMutPointer<u8>, Option<(usize, usize)>), CowAllocationError> {
         let Some((file_path, file_offset)) = self.lookup_cow_region(source_data) else {
             return Err(CowAllocationError::UnsupportedSourceRegion);
         };
@@ -2617,7 +2622,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         let _ = unsafe { syscalls::syscall1(syscalls::Sysno::close, fd) };
 
         match result {
-            Ok(ptr) => Ok(UserMutPtr::from_usize(ptr)),
+            Ok(ptr) => Ok((UserMutPtr::from_usize(ptr), None)),
             Err(_) => Err(CowAllocationError::InternalFailure),
         }
     }

@@ -6138,7 +6138,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         source_data: &'static [u8],
         permissions: MemoryRegionPermissions,
         fixed_address_behavior: FixedAddressBehavior,
-    ) -> Result<Self::RawMutPointer<u8>, CowAllocationError> {
+        verified_safe_padding: usize,
+    ) -> Result<(Self::RawMutPointer<u8>, Option<(usize, usize)>), CowAllocationError> {
         const ALLOCATION_GRANULARITY: usize = 0x1_0000;
 
         let Some((file_path, file_offset)) = self.lookup_cow_region(source_data) else {
@@ -6147,70 +6148,51 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         // `MapViewOfFile3` requires its `Offset` parameter to be a multiple of the allocation
         // granularity (64KiB), stricter than Linux `mmap`'s 4KiB page-offset requirement -- and
         // real ELF `PT_LOAD` segment file-offsets are only ever page-aligned (linker-controlled,
-        // not something a packer can fix, see AGENTS.md pass 321/342's sizing data). For a
-        // `FixedAddressBehavior::Hint` request (no exact address required), this is recoverable:
-        // map the containing 64KiB-aligned file region instead and return a pointer offset into
-        // that view -- the caller only cares about the CONTENT at the returned address, not
-        // where it lands.
+        // not something a packer can fix, see AGENTS.md pass 321/342's sizing data). The fix:
+        // map the containing 64KiB-aligned file region instead and place the view's HOST base
+        // `view_padding` bytes before `suggested_start`, so the returned content pointer still
+        // equals `suggested_start` exactly (satisfying `Replace`/`NoReplace`'s exact-address
+        // contract, see `try_cow_mmap_file` in `litebox_shim_linux/src/syscalls/mm.rs`).
         //
-        // This does NOT extend to `Replace`/`NoReplace` (`MAP_FIXED`/`MAP_FIXED_NOREPLACE`),
-        // which is the actual ELF-loader case (`litebox_shim_linux::loader::elf::map_file`
-        // always uses `MAP_FIXED` -- there is no `Hint` caller for PT_LOAD segments at all, so
-        // this optimization has zero effect on the busybox/ld-musl exec hot path this was
-        // written for; see the honest scope note below). A `Replace` mapping's own doc
-        // contract (`try_cow_mmap_file` in `litebox_shim_linux/src/syscalls/mm.rs`, `MAP_FIXED`
-        // handling) requires the returned pointer to equal `suggested_start` EXACTLY, which
-        // would require the `file_offset - aligned_offset` bytes of padding to additionally
-        // land at GUEST addresses immediately BEFORE `suggested_start`. Tracing
-        // `litebox_shim_linux::loader::elf::ElfFile::reserve`: an ELF's entire virtual span is
-        // reserved as ONE `PROT_NONE` block up front, and each `PT_LOAD` segment is then
-        // `MAP_FIXED`-mapped into a piece of that already-reserved span -- so for any segment
-        // after the first, the address range immediately preceding it is typically STILL PART
-        // OF THE SAME BINARY'S OWN RESERVATION (a neighboring segment's mapped span, or
-        // PROT_NONE padding between segments), not free host address space. A raw
-        // Windows-level collision probe there cannot distinguish "genuinely free" from
-        // "already claimed by this same reservation" -- `VirtualAlloc2`/`MapViewOfFile3`
-        // would see the latter as already-owned-by-this-process and could silently succeed by
-        // overwriting adjacent, real segment content. Rather than risk that, `Replace`/
-        // `NoReplace` always take the existing, safe `Unaligned` fallback below.
-        // AGENTS.md pass 344 CORRECTION: pass 343 attempted a `Hint`-only "map the containing
-        // 64KiB-aligned region and offset the returned pointer into it" optimization here. That
-        // is unsound as written and has been reverted: the `view_padding` bytes BEFORE the
-        // returned pointer are real, physically-mapped, guest-accessible memory (part of the
-        // same `MapViewOfFile3` view) that this function never reports to its caller --
-        // `litebox_shim_linux`'s `Vmem`/`register_existing_mapping` (see
-        // `syscalls::mm::try_cow_mmap_file`) only ever learns about `len = source_data.len()`
-        // bytes starting at the returned pointer, not the padding prefix. Confirmed live as a
-        // real, reproducible crash (not a hypothetical): a guest touching an address inside that
-        // untracked padding faults, and litebox's own SIGSEGV path reports it as "genuinely
-        // unmapped" (Vmem has no record of it) even though the OS itself has it mapped; worse,
-        // this codebase's crash-cleanup path then calls `VirtualFree(MEM_DECOMMIT)` on that same
-        // untracked address range, which fails outright (`os error 487`/`os error 6`) because the
-        // memory is backed by a `MapViewOfFile3` view, not a `VirtualAlloc` region --
-        // `VirtualFree(MEM_DECOMMIT)` is never valid on mapped-view memory, only
-        // `UnmapViewOfFileEx` is, and this function has no path to register/track the padding for
-        // that call either. Reproduced deterministically via `/usr/bin/labwc --help` against
-        // `webtop_seatd.tar` (`view_padding=61440`, `file_offset=1011216384`, fault at
-        // `cr2=0xa0f2a0`, inside the padding region, followed by the `os error 487` panic in
-        // `process_memory_range_by_regions`). This optimization was already confirmed to have
-        // zero effect on the ELF-load hot path it was written for (that path is always
-        // `Replace`/`NoReplace`, never `Hint` -- see the paragraph below), so disabling it
-        // entirely for `Hint` too costs nothing while removing a real, live memory-safety bug.
-        // A correct version of this optimization would need to register the padding prefix with
-        // `Vmem` (e.g. as a real tracked mapping the caller then immediately unmaps/truncates) or
-        // use a Windows API that can create a view starting exactly at `file_offset` without the
-        // 64KiB constraint -- neither of which exists today; left for whoever revisits this.
+        // AGENTS.md pass 344 history: an EARLIER version of this exact trick (`Hint` case only)
+        // shipped, then was found and reverted as a real, live memory-safety bug -- the
+        // `view_padding` bytes before the returned pointer are real, physically-mapped,
+        // host-present memory that `try_allocate_cow_pages` never reported to its caller, so
+        // `Vmem` never learned about them: a guest touching that range faulted as "genuinely
+        // unmapped" (no `Vmem` record) even though the OS had it mapped, and this codebase's
+        // crash-cleanup path then called `VirtualFree(MEM_DECOMMIT)` on it, which fails outright
+        // because the memory is a `MapViewOfFile3` view, not a `VirtualAlloc` region (only
+        // `UnmapViewOfFileEx` is valid there). Reproduced deterministically at the time via
+        // `/usr/bin/labwc --help` (`view_padding=61440`, fault at `cr2=0xa0f2a0`, `os error 487`).
+        //
+        // THIS FUNCTION NEVER MAKES THAT MISTAKE AGAIN BY CONSTRUCTION: it has NO `Vmem` access
+        // at all (it lives in this platform crate; `Vmem` lives in `litebox_shim_linux`/`litebox`
+        // core) and therefore cannot itself decide "this padding range is safe to host-map." The
+        // `verified_safe_padding` parameter is the CALLER's own live, runtime query result
+        // against its OWN `Vmem` state (see `try_cow_mmap_file`'s `get_memory_permissions` check,
+        // run immediately before calling this function) confirming the exact
+        // `[suggested_start - padding, suggested_start)` range is CURRENTLY a single, contiguous,
+        // `PROT_NONE` VMA belonging to this process's own ELF reservation -- not a static
+        // inference about what `ElfFile::reserve` "should" have left there, a live fact checked
+        // at the moment it matters. This function only ever uses padding UP TO that
+        // caller-verified amount (never more, regardless of what the file offset's own alignment
+        // would otherwise need) and, on success, reports the exact padding range it actually used
+        // back to the caller via `Ok`'s tuple so the caller can register it with `Vmem` BEFORE the
+        // guest can ever observe or fault on it -- see the `Ok` arm below and this trait method's
+        // own doc comment in `litebox/src/platform/page_mgmt.rs` for the full contract.
         let aligned_offset = file_offset - (file_offset % ALLOCATION_GRANULARITY);
-        let view_padding = file_offset - aligned_offset;
-        if view_padding != 0 {
+        let needed_padding = file_offset - aligned_offset;
+        if needed_padding > verified_safe_padding {
             if diag_mm_enabled() {
                 litebox_util_log::debug!(
-                    file_offset:% = file_offset, len:% = source_data.len();
-                    "diag-cow: file offset not 64KiB-aligned, falling back to memcpy path"
+                    file_offset:% = file_offset, len:% = source_data.len(),
+                    needed_padding:% = needed_padding, verified_safe_padding:% = verified_safe_padding;
+                    "diag-cow: file offset not 64KiB-aligned and caller did not verify enough safe padding, falling back to memcpy path"
                 );
             }
             return Err(CowAllocationError::Unaligned);
         }
+        let view_padding = needed_padding;
 
         let file_path_wide: alloc::vec::Vec<u16> = file_path
             .as_os_str()
@@ -6275,7 +6257,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         };
         let view_protect = prot_flags(permissions);
         let map_offset = aligned_offset as u64;
-        let map_len = source_data.len();
+        // The view must cover the padding prefix too when one is in use (`map_len` grows by
+        // `view_padding`, always 0 unless `needed_padding <= verified_safe_padding` above), so
+        // its OS-level `Offset` parameter can stay 64KiB-aligned while its CONTENT still starts
+        // exactly at `source_data`'s own first byte, `view_padding` bytes into the view.
+        let map_len = source_data.len() + view_padding;
         let mut try_map = |base_addr: *const c_void, constrained: bool| unsafe {
             if constrained {
                 MapViewOfFile3(
@@ -6303,10 +6289,15 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 )
             }
         };
+        // The VIEW's own base must sit `view_padding` bytes before `suggested_start` (so the
+        // padding fills the low end of the view and `suggested_start` lands exactly
+        // `view_padding` bytes into it) -- this is only meaningful/safe when `view_padding != 0`
+        // was itself derived from `verified_safe_padding`, the caller's own live-checked-safe
+        // range immediately preceding `suggested_start` (see the doc comment above).
         let base_addr = if suggested_start == 0 {
             core::ptr::null()
         } else {
-            suggested_start as *const c_void
+            (suggested_start - view_padding) as *const c_void
         };
         let mut view = try_map(base_addr, base_addr.is_null());
         if view.Value.is_null()
@@ -6334,17 +6325,31 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             }
             return Err(CowAllocationError::InternalFailure);
         }
-        // SAFETY: `view` covers exactly `map_len = source_data.len()` bytes starting at file
-        // offset `aligned_offset`, which equals `file_offset` since `view_padding == 0` is
-        // enforced above -- `view.Value` is the address of `source_data`'s own first byte.
-        let result_ptr = view.Value.cast::<u8>();
+        // SAFETY: `view` covers exactly `map_len = source_data.len() + view_padding` bytes
+        // starting at file offset `aligned_offset`; `view_padding` is exactly
+        // `file_offset - aligned_offset`, so `view.Value + view_padding` is the address of file
+        // offset `file_offset` -- the same content `source_data` itself starts at.
+        let content_ptr = unsafe { view.Value.cast::<u8>().add(view_padding) };
+        // Report the padding range this call ACTUALLY used back to the caller, computed from
+        // where the view ACTUALLY landed (`view.Value`), never assumed from `suggested_start` --
+        // the `Hint` unconstrained-retry path above can place the view anywhere Windows chooses,
+        // so `content_ptr` does not necessarily equal `suggested_start` in that case, and the
+        // padding range must be reported relative to the REAL returned pointer for the caller's
+        // `Vmem` registration to be correct. `view_padding == 0` makes this a no-op range that
+        // the caller correctly skips registering (see `try_cow_mmap_file`'s own handling).
+        let padding_range = if view_padding == 0 {
+            None
+        } else {
+            Some((view.Value as usize, view_padding))
+        };
         if diag_mm_enabled() {
             litebox_util_log::error!(
-                addr:% = result_ptr as usize, len:% = source_data.len(), file_offset:% = file_offset;
+                addr:% = content_ptr as usize, len:% = source_data.len(), file_offset:% = file_offset,
+                view_padding:% = view_padding;
                 "diag-cow: try_allocate_cow_pages OK"
             );
         }
-        Ok(UserMutPtr::from_ptr(result_ptr))
+        Ok((UserMutPtr::from_ptr(content_ptr), padding_range))
     }
 
     // A Windows file-mapping `HANDLE`, backed by the system paging file (no real file on disk)

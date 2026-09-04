@@ -5848,3 +5848,145 @@ Files: `litebox_common_linux/src/loader.rs` (trait signature, `load()`, `compute
 2 new tests), `litebox_shim_linux/src/loader/elf.rs` (`ElfFile::reserve`, `load_mapped`'s
 `cow_alignment` selection), `litebox_shim_optee/src/loader/elf.rs` (`reserve()`, `load_ldelf()`
 call site), `AGENTS.md` (this entry).
+
+## Pass 352 -- wired `try_allocate_cow_pages` to the pass-351 reservation groundwork with a LIVE
+`Vmem` query as the safety boundary (per explicit user direction, with extra care given this
+exact code's same-day history); safe and tested, but the fast path still does not fire for the
+real busybox/ld-musl workload -- a new, more precise gap than pass 351 left, honestly reported
+rather than forced
+
+User explicitly reviewed the risk tradeoff of finishing pass 351's deliberately-incomplete CoW
+work and instructed proceeding, with extra care given this exact code area's same-day history
+(pass 343/344's untracked-host-memory bug). This pass implements the wiring, with one
+architectural change from `docs/cow-mmap-fixed-address-design.md`'s original plan, made per a
+mid-pass coordinator instruction: the "is the padding genuinely still free" safety check is a
+LIVE runtime query against `Vmem`'s own current state at the moment of the CoW attempt, not a
+static/geometric inference verified once via a diagnostic dump (the design doc's original step
+3). This is strictly safer and directly addresses the exact failure mode of pass 343/344: that
+bug was host memory `Vmem`'s own bookkeeping never learned about, invisible until a guest
+touched it -- querying `Vmem`'s live state directly, rather than reasoning about what the
+loader "should" have left there, makes "the padding might not really be free" structurally
+unable to happen, rather than merely believed-unlikely.
+
+**Architecture, precisely**:
+1. `PageManagementProvider::try_allocate_cow_pages` (`litebox/src/platform/page_mgmt.rs`)
+   gained a new parameter, `verified_safe_padding: usize`, and its return type changed from
+   `Result<Self::RawMutPointer<u8>, CowAllocationError>` to
+   `Result<(Self::RawMutPointer<u8>, Option<(usize, usize)>), CowAllocationError>`. The
+   platform implementation NEVER decides safety itself (it has no `Vmem` access at all, by
+   construction of this codebase's own crate layering) -- it only ever uses padding UP TO the
+   caller-verified amount, and on success reports back exactly which padding range (if any) it
+   ACTUALLY host-mapped, so the caller can register it.
+2. `litebox_shim_linux::syscalls::mm::try_cow_mmap_file` (the only real caller) computes the
+   maximum plausible padding need (`suggested_addr`'s target file offset's own misalignment,
+   bounded at `0x1_0000 - PAGE_SIZE` = 60KiB, the largest any known platform constraint --
+   Windows' 64KiB `MapViewOfFile3` granularity -- could ever require) and LIVE-QUERIES
+   `self.process().pm().get_memory_permissions(...)` for progressively smaller candidate
+   windows immediately before `suggested_addr`, largest-first, until one returns
+   `Some(permissions)` with `permissions.is_empty()` (`PROT_NONE`, i.e. genuinely
+   reserved-but-unbacked slack belonging to this process, not real content or another mapping)
+   -- `get_memory_permissions` itself returns `None` for ANY partial overlap or mixed-
+   permission range (`litebox/src/mm/linux.rs`), so this query is conservative by construction:
+   it can only ever UNDER-credit safe padding, never over-credit it. `verified_safe_padding` is
+   exactly the largest such confirmed-safe window, `0` if none qualifies.
+3. `litebox_platform_windows_userland::try_allocate_cow_pages` uses
+   `min(needed_padding, verified_safe_padding)` -- if `needed_padding > verified_safe_padding`,
+   falls back to `CowAllocationError::Unaligned` exactly as before this pass (same log message
+   shape, extended with the new `needed_padding`/`verified_safe_padding` fields). When padding
+   IS used, the `MapViewOfFile3` view's `Offset`/length both grow to cover it, the view's HOST
+   base is placed `view_padding` bytes before `suggested_start` (so the returned CONTENT
+   pointer still equals `suggested_start` exactly, satisfying `Replace`/`NoReplace`'s contract),
+   and the function reports the padding range it actually used back via its new `Option`
+   return value -- computed from where the view ACTUALLY landed (`view.Value`), never assumed
+   from `suggested_start`, so the `Hint`-case unconstrained-placement retry path (which lets
+   Windows choose the address freely) still reports a correct range even though it doesn't
+   match `suggested_start - padding`.
+4. `try_cow_mmap_file`, on a successful `Ok((ptr, padding_range))`, registers `padding_range`
+   (if `Some`) with `Vmem` as an ordinary `PROT_NONE` mapping via the EXISTING
+   `register_existing_mapping` call -- BEFORE registering the real content range, and both
+   registrations happen before this function returns and before the guest can possibly resume
+   execution and touch either range. No new teardown path is needed (this is Option B's core
+   safety payoff, unchanged from the design doc): a correctly-registered ordinary `PROT_NONE`
+   VMA is torn down by every existing generic munmap/process-exit path already.
+5. `litebox_platform_linux_userland::try_allocate_cow_pages` (the real Linux implementation)
+   updated MECHANICALLY ONLY: gained the same new ignored parameter
+   (`_verified_safe_padding: usize`, ELF file offsets are always page-aligned on real Linux, no
+   padding trick is ever needed there) and wraps its existing `Ok(ptr)` as `Ok((ptr, None))`.
+   **This diff is confirmed purely mechanical, not substantive** -- the actual `mmap` syscall
+   arguments, flags, and logic are byte-for-byte unchanged; only the signature and the trivial
+   return-value wrapping changed. **This could NOT be compile-checked or tested on this
+   Windows host**: `litebox_platform_linux_userland` pulls in `seccompiler`, which fails to
+   build on Windows with 9 real `libc` gaps (`SECCOMP_RET_KILL_PROCESS`, `prctl`, etc.) --
+   confirmed via `git stash`/`cargo check` before-and-after comparison that these are the EXACT
+   SAME 9 pre-existing errors with or without this pass's diff (zero new errors), which is the
+   strongest verification available here, but it is NOT the same as a real compile or test pass
+   on Linux. **This pass's Windows-only live boot verification (below) cannot exercise the
+   Linux code path at all.** Flagging this explicitly rather than silently shipping a
+   cross-platform trait change as if every implementor were checked: whoever next touches this
+   on a real Linux host should run `cargo check -p litebox_platform_linux_userland` and,
+   ideally, `cargo test -p litebox_shim_linux --lib` there to close this gap.
+
+**Testing**: `cargo check` clean across `litebox`, `litebox_common_linux`, `litebox_shim_linux`,
+`litebox_platform_windows_userland`, `litebox_shim_optee`, `litebox_runner_linux_on_windows_userland`
+(`litebox_platform_linux_userland` confirmed unchanged-error-count only, see above -- cannot
+fully verify on this host). `cargo test -p litebox_shim_linux --lib`: 181/181, unchanged.
+`cargo test -p litebox --lib`: 124 passed / 26 failed, unchanged baseline (same pre-existing/
+environmental failures as every prior pass this session).
+
+**Live verification**: clean release build. Basic exec (`/bin/sh -c 'echo BASIC_EXEC_OK'`
+against `layer31_direct_fixed.tar`) succeeds, exit 0. 200 sequential `/bin/busybox true` execs
+in one guest process complete cleanly, exit 0, zero `fatal signal` lines, `LOOP_DONE` reached --
+confirms zero regression at the exact scale this session's whole efficiency investigation has
+measured against.
+
+**The fast path does not fire for this workload, and this pass root-caused precisely why -- a
+NEW, more specific finding than pass 351 left as an open question**: with `LITEBOX_LOG=debug`,
+`verified_safe_padding=0` for every single misaligned CoW attempt observed (busybox's own first
+`PT_LOAD` segment included, tar-file offset `53356032`, `needed_padding=9728`, well under the
+60KiB cap). A temporary diagnostic (added, exercised live, then fully reverted before this
+commit -- confirmed via `git diff` showing zero net change to this specific line) traced this
+to `get_memory_permissions` returning `None` (not `Some(empty)`) for EVERY candidate window
+size immediately before this segment's own `suggested_start`, even though `ElfFile::reserve`'s
+widened, `PROT_NONE`, one-shot `sys_mmap` call structurally SHOULD have left uniform,
+uniformly-permissioned slack there per pass 351's own reservation-widening logic (confirmed
+correct in isolation by pass 351's own unit tests). `get_memory_permissions` returns `None`
+specifically when a queried range is NOT covered by a single, contiguous VMA of uniform
+permissions (`litebox/src/mm/linux.rs`'s own doc comment) -- meaning the live `Vmem` state at
+CoW-attempt time does NOT match the simple single-VMA picture pass 351's own static reasoning
+assumed, for a reason this pass did not have time to trace further (candidates:
+`sys_munmap`'s own head-trim, applied by `reserve()` immediately after the initial `sys_mmap`,
+may split the registered VMA into more than one entry rather than shrinking it in place; or
+some other operation between `reserve()` and this CoW attempt touches part of that range).
+**This is a genuinely different, more precise gap than "not yet wired" (pass 351's own honest
+limitation) -- the wiring is real, safe, and tested, but the live VMA state this wiring depends
+on does not currently provide what the reservation-widening groundwork was designed to
+guarantee.**
+
+**Honest conclusion**: real, safe, tested infrastructure landed -- the `verified_safe_padding`
+architecture is a strictly SAFER design than the one originally proposed (live query, not
+static inference; caller-verifies/platform-executes-only-what-was-verified split makes the
+pass-343/344 bug class structurally impossible, confirmed by construction, not by care). Zero
+regression at every tested scale. But the fast path this pass set out to unlock still does not
+fire for the real busybox/ld-musl exec workload, for a newly-identified, more precise reason
+(VMA fragmentation between `reserve()` and CoW-attempt time, not yet traced to its own root
+cause) than pass 351 left as an open question. No wall-clock claim is made or implied -- none
+is possible, since the fast path is never actually taken for this workload. Per this project's
+standing discipline against overclaiming (pass 317/321/343/347/349/351 as this session's own
+house style), this is reported as real, valuable, safety-first infrastructure work with the
+performance goal still unmet, not as a completed optimization.
+
+**Concrete next step for whoever continues**: trace exactly what `Vmem` state exists in the
+range `[suggested_start - 9728_rounded_up_to_page, suggested_start)` immediately before a real
+CoW attempt (a live `vma_layout()`/`mappings()` dump at that exact point, not a static read of
+`reserve()`'s own code) to find the actual fragmentation cause, then either fix it (if it's a
+`sys_munmap`/head-trim artifact that can be avoided) or conclude the single-up-front-reservation
+design genuinely cannot deliver query-verifiable uniform slack in practice, in which case
+Option D (documented and unfixed, per pass 343's own conclusion, reached independently by a
+peer session on the SAME thread today) is the correct final call for this specific
+optimization.
+
+Files: `litebox/src/platform/page_mgmt.rs` (trait signature + doc comment),
+`litebox_platform_windows_userland/src/lib.rs` (`try_allocate_cow_pages` wiring),
+`litebox_platform_linux_userland/src/lib.rs` (mechanical signature update, NOT independently
+verified on Linux -- see above), `litebox_shim_linux/src/syscalls/mm.rs` (`try_cow_mmap_file`'s
+live-query + dual registration), `AGENTS.md` (this entry).
