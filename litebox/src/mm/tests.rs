@@ -43,6 +43,13 @@ impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
     // Matches `litebox_platform_macos_userland`'s deliberately conservative bound.
     #[cfg(target_vendor = "apple")]
     const TASK_ADDR_MAX: usize = 0x0000_4000_0000_0000;
+    // Matches `litebox_platform_windows_userland::WindowsUserland::TASK_ADDR_MIN`'s own value
+    // (this dummy backend has no real host allocator region to bound itself below, so it uses a
+    // fixed constant rather than that real impl's `HOST_ALLOCATOR_REGION_MIN`-derived one).
+    #[cfg(target_os = "windows")]
+    const TASK_ADDR_MIN: usize = 0x1_0000;
+    #[cfg(target_os = "windows")]
+    const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000;
 
     type SharedMemoryHandle = ();
 
@@ -157,6 +164,7 @@ fn test_vmm_mapping() {
             vmm.protect_mapping(
                 PageRange::new(start_addr + 2 * PAGE_SIZE, start_addr + 4 * PAGE_SIZE).unwrap(),
                 MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                "test",
             )
         },
         // Failed to protect, remain [(0x1_0000, 0x1_2000), (0x1_4000, 0x1_c000)]
@@ -183,6 +191,7 @@ fn test_vmm_mapping() {
             vmm.protect_mapping(
                 PageRange::new(start_addr, start_addr + 4 * PAGE_SIZE).unwrap(),
                 MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
+                "test",
             )
         },
         // Failed to protect, remain [(0x1_0000, 0x1_c000)]
@@ -194,6 +203,7 @@ fn test_vmm_mapping() {
             vmm.protect_mapping(
                 PageRange::new(start_addr + 2 * PAGE_SIZE, start_addr + 4 * PAGE_SIZE).unwrap(),
                 MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                "test",
             )
         }
         .is_ok()

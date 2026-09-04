@@ -778,15 +778,18 @@ fn test_nine_p_chmod() {
     fs.chmod("/chmod_test.txt", Mode::RUSR)
         .expect("chmod failed");
 
-    // Verify via host filesystem
-    let host_path = server.export_path().join("chmod_test.txt");
-    let metadata = std::fs::metadata(&host_path).unwrap();
-    let host_mode = std::os::unix::fs::PermissionsExt::mode(&metadata.permissions());
-    assert_eq!(
-        host_mode & 0o777,
-        0o400,
-        "permissions should be read-only for user"
-    );
+    // Verify via host filesystem (real Unix permission bits only make sense on a Unix host)
+    #[cfg(unix)]
+    {
+        let host_path = server.export_path().join("chmod_test.txt");
+        let metadata = std::fs::metadata(&host_path).unwrap();
+        let host_mode = std::os::unix::fs::PermissionsExt::mode(&metadata.permissions());
+        assert_eq!(
+            host_mode & 0o777,
+            0o400,
+            "permissions should be read-only for user"
+        );
+    }
 
     // Also verify via 9P file_status
     let status = fs
