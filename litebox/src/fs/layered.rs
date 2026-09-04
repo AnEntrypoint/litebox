@@ -717,6 +717,36 @@ impl<
                 }
             },
         }
+        // Before falling back to a raw re-query of the lower level under the ORIGINAL path: if
+        // the upper layer has a symlink at this exact path (its own `open()` attempt above failed
+        // trying to reach the symlink's TARGET, not because the symlink itself is missing), the
+        // correct fallback is to resolve that symlink and retry the open against the FULL layered
+        // view (`self`, not `self.lower` directly) under the resolved target path -- not to ask
+        // the lower layer whether it has a file with the SYMLINK's OWN name, which it structurally
+        // cannot: the symlink itself only exists on the upper layer.
+        //
+        // Confirmed live as a real bug this way: a `--resume-from` upper layer containing only a
+        // symlink (e.g. `to_base_etc -> /etc/passwd`) over a base/lower layer containing the real
+        // target correctly resolves `read_link`/`ls -la` (those already compose upper-then-lower,
+        // see this file's own `read_link` a few hundred lines up) but `open()` on the SAME path
+        // returned `ENOENT`, because the pre-existing fallback below re-queried `self.lower.open`
+        // for the symlink's literal name (`to_base_etc`) instead of its resolved target
+        // (`/etc/passwd`). `open(2)`'s `O_NOFOLLOW` semantics apply here exactly as they do to any
+        // other symlink-following decision in this codebase: skip this resolve-and-retry when the
+        // caller explicitly asked NOT to follow symlinks.
+        if !flags.contains(OFlags::NOFOLLOW)
+            && let Ok(target) = self.upper.read_link(path.as_str())
+        {
+            let resolved = if target.starts_with('/') {
+                target
+            } else {
+                let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
+                alloc::format!("{dir}/{target}")
+            };
+            if let Ok(resolved) = resolved.normalized() {
+                return self.open(resolved, flags, mode);
+            }
+        }
         // We must check the lower level, creating an entry if needed
         let original_flags = flags;
         let mut flags = flags;
