@@ -75,3 +75,46 @@ and is the question the archive never settled.
 Earlier framings, both wrong and corrected here: "mate-session --help crashes"
 (it returns rc=0 in isolation) and "a sequence of DIFFERENT large binaries is
 required" (one binary three times is enough).
+
+
+## Trigger-property bisection: THREE hypotheses tested, ALL REFUTED
+
+Three execs each, identical script shape, same layer, only the program varying:
+
+    binary            DT_NEEDED   size        LOAD  TLS  result
+    marco                  4       18 KB       4     0   clean
+    seatd                  1       43 KB       4     0   clean
+    mate-mouse-props       -       43 KB       -     -   clean
+    gst-play-1.0           9       51 KB       4     0   clean
+    mate-font-viewer      13       59 KB       4     0   clean
+    sudoreplay             -       81 KB       -     -   clean
+    loadkeys               -      138 KB       -     -   clean
+    find                   1      212 KB       4     0   clean
+    mate-session          19      215 KB       4     0   **FAULTS**
+    mate-panel            18      520 KB       4     0   clean
+    caja                  22    1,658 KB       4     0   clean
+
+REFUTED, each by a direct control:
+
+1. **Binary size** -- `find` (212 KB) is clean; `mate-session` (215 KB) faults.
+   `caja` at 1.6 MB is clean.
+2. **Shared-library count (DT_NEEDED)** -- `caja` has 22 (more than
+   mate-session's 19) and is clean; `mate-panel` at 18 is clean.
+3. **Relocation count / ELF structure** -- all of these are ET_DYN with 4 LOAD
+   segments, INTERP present, GNU_RELRO present, and ZERO TLS segments. Nothing
+   static separates the faulting binary from the clean ones.
+
+## What survives
+
+    deterministic          3rd exec, every time
+    count-independent      loop counts 3/4/5/6 all fault at exactly the 3rd
+    shell-shape-agnostic   straight-line and loop identical
+    not exec count         60 busybox execs clean
+    host-side              all events is_in_guest=false, is_verifying=true
+
+Because every static file property tested is ruled out, the trigger is more
+likely something `mate-session` does AT RUNTIME (which libraries it actually
+dlopens, what it touches during startup) than a property of the ELF on disk.
+That is a different investigation shape from the archive's static/unwind-metadata
+angle, and it is the honest open question -- not a mechanism anyone has yet
+established.
