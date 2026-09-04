@@ -519,26 +519,26 @@ impl ApplicationHandler for PresenterApp {
         }
         let window_attrs = Window::default_attributes()
             .with_title("litebox virtual display")
-            .with_inner_size(winit::dpi::PhysicalSize::new(1920u32, 1080u32))
-            // Lock the window to the guest's virtual display size. `present()` CLIPS the guest
-            // framebuffer into the surface (`frame.width.min(surface_size.width)`) rather than
-            // scaling it, and the guest's display is a COMPILE-TIME constant (`VIRTUAL_WIDTH`/
-            // `VIRTUAL_HEIGHT`, 1920x1080) that cannot follow the window. So any other window
-            // size silently breaks the correspondence between what the user sees and where the
-            // guest thinks the pointer is:
-            //
-            //   smaller window  -- the bottom/right of the guest display is simply not drawn,
-            //                      but RELATIVE motion still moves the guest cursor into it, so
-            //                      the pointer disappears into a region the user cannot see.
-            //   larger window   -- the extra area shows nothing, yet moving through it still
-            //                      generates motion, so the cursor stops at the guest edge while
-            //                      the user keeps moving.
-            //
-            // Rescaling deltas cannot fix either case: the unseen region does not become visible
-            // by scaling, and scaling relative motion would make pointer speed depend on window
-            // size. Matching the sizes is what actually keeps them in agreement. `Resized` still
-            // handles the cases the OS can force regardless (DPI change, snap, maximise).
-            .with_resizable(false);
+            .with_inner_size(winit::dpi::PhysicalSize::new(1920u32, 1080u32));
+        // The guest's display is a compile-time constant (`VIRTUAL_WIDTH`/`VIRTUAL_HEIGHT`,
+        // 1920x1080) with no hotplug or mode-change path, and `present()` CLIPS the guest
+        // framebuffer into the surface rather than scaling it. So the visible area is a 1:1
+        // top-left crop, and a window smaller than the guest leaves the bottom/right undrawn
+        // while RELATIVE motion still moves the guest cursor into it -- the pointer disappears
+        // somewhere the user cannot see.
+        //
+        // Locking the window to 1920x1080 makes tracking exact but is NOT acceptable on its own:
+        // on a smaller desktop (this host is 1536x864) that window does not fit, putting 36% of
+        // the guest display permanently off-screen with no way to reach it. That trades one real
+        // problem for a worse one.
+        //
+        // So the window stays RESIZABLE and `Resized` keeps `surface_size` truthful. What that
+        // buys: the crop always matches what is actually on screen, so cursor position and
+        // visible pixels never disagree about the region they share. What it cannot fix without
+        // a guest mode-change path: guest display area outside the window is still unreachable
+        // by sight, though relative motion can still move the cursor there. Rescaling deltas is
+        // NOT the answer -- it would make pointer speed depend on window size (x2.00 at 960px
+        // wide, x0.75 at 2560px) and still would not reveal the hidden region.
         let Ok(window) = event_loop.create_window(window_attrs) else {
             return;
         };
