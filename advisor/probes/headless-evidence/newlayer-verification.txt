@@ -1,0 +1,25 @@
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=0 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=0 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=0 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=0 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=0 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+  19.643491100s ERROR litebox_shim_linux::syscalls::mm: diag-exec-mmap: tracking for future crash-address correlation path=Some("/usr/lib/libgdk_pixbuf-2.0.so.0") start=1
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
