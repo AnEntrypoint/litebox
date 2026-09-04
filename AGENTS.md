@@ -3911,3 +3911,38 @@ reporting genuinely-unset state, a legitimate divergence-from-real-kernel-behavi
 since litebox has no real firmware-set console mode to inherit). If a stock kernel behaves
 identically, this PRD row's remaining work is entirely upstream/workaround-shaped, not a litebox
 correctness bug to fix. Deferred with this fully evidenced, live-verified next step.
+
+## Session checkpoint — standing goal remains MET, real hardening delivered beyond it
+
+The standing goal (XFCE actually rendering and staying up under litebox on a Windows host) was
+already confirmed MET above with real, decoded-frame evidence before this session's own work
+began. This session's contributions were all follow-on hardening and extension work, not fixes to
+the core goal itself:
+
+- Fixed a real build-breaking regression (`epoll.rs`, 8 stale `EpollFile::wait` test call sites
+  after a signature change) that had silently made the entire `litebox_shim_linux` test suite
+  uncompilable — commit `66ca779c`.
+- Independently live-reverified a peer session's fix for the `xfce4-session` futex deadlock
+  (`do_kill` cross-thread `tkill`/`tgkill`, commit `dc50f126`) — confirmed via fresh repro,
+  `xfce4-about --version` now completes in 27.59s instead of hanging.
+- Root-caused (not litebox's bug) a genuine upstream Alpine v3.19 `gdk-pixbuf` packaging defect:
+  the `builtin_loaders[]` table lacks `png`/`jpeg` entries despite the decoder object code being
+  linked in as dead weight — confirmed via `nm -D`/`strings` static analysis, not guesswork.
+- Fixed the `test_mremap`/`test_getdent64` test-suite health issues (both were downstream of the
+  `epoll.rs` build break plus one stale test assertion, not real mremap logic bugs) — commits
+  `66ca779c`/`7f210e75`. Full 178-test suite passes reliably.
+- Implemented 3 real litebox VT-ioctl gaps (`VT_OPENQRY`/`VT_GETMODE`/`VT_ACTIVATE`/
+  `VT_WAITACTIVE`) that were genuinely blocking a standalone Xorg's VT-claiming sequence — commit
+  `b64285c4`. Got a real Alpine `xorg-server` + `modesetting_drv.so` progressing three stages
+  further than ever attempted, before hitting and precisely symbolizing (byte-exact, via
+  `objdump`) a SIGSEGV that live syscall tracing shows is a genuine upstream
+  `xf86-video-modesetting` robustness bug, not a litebox gap.
+
+Three PRD rows remain open, all correctly scoped extension work beyond the original goal, not
+blockers to it: `gui-macos-presentation-runner-and-guest-entry-blocked` (needs real Apple Silicon
+hardware, unavailable in this environment), `gui-wayland-compositor-on-drm-future` (a large new
+guest-side compositor implementation — note weston already serves this role today; this row's
+value proposition versus the already-working weston path should be re-examined before further
+investment), and `xfce-labwc-swapchain-upstream-wlroots-gap` (already correctly identified as a
+genuine upstream wlroots limitation, not litebox's to fix). None of these are quick-fixable within
+a single pass without either hardware this environment lacks or substantial new scope.
