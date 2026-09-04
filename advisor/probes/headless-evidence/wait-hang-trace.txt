@@ -1,0 +1,60 @@
+   2.814028200s  WARN litebox_shim_linux::syscalls::process: drm-diag: sys_wait4 entry tid=1000 pid=-1 options=1
+   2.846442100s DEBUG litebox_shim_linux::syscalls::process: prepare_for_exit: entry (Task dropping) tid=21
+   2.847176600s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: calling parent.interrupt_all_threads() tid=21
+   2.847202300s  WARN litebox_shim_linux::syscalls::signal: drm-diag: process_signals entry with ctx tid=1000 rip=140668768810400 orig_rax=130
+   2.847671200s  WARN litebox_shim_linux::syscalls::signal: drm-diag: process_signals entry with ctx tid=1000 rip=530845402 orig_rax=130
+   2.848492000s DEBUG litebox_shim_linux::syscalls::process: prepare_for_exit: entry (Task dropping) tid=24
+   2.848792400s  WARN litebox_shim_linux::syscalls::process: drm-diag: sys_wait4 entry tid=1000 pid=-1 options=1
+   2.849679000s  WARN litebox_shim_linux::syscalls::process: drm-diag: sys_wait4 entry tid=1000 pid=-1 options=1
+   2.849732000s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: calling parent.interrupt_all_threads() tid=24
+   2.850860200s  WARN litebox_shim_linux::syscalls::process: drm-diag: sys_wait4 entry tid=1000 pid=-1 options=1
+   2.851254300s  WARN litebox_shim_linux::syscalls::process: drm-diag: sys_wait4 entry tid=1000 pid=-1 options=1
+   2.870539800s DEBUG litebox_shim_linux::syscalls::process: prepare_for_exit: entry (Task dropping) tid=25
+   2.870736700s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: calling parent.interrupt_all_threads() tid=25
+   2.870912600s  WARN litebox_shim_linux::syscalls::signal: drm-diag: process_signals entry with ctx tid=1000 rip=140668768810400 orig_rax=130
+   2.870989400s  WARN litebox_shim_linux::syscalls::signal: drm-diag: process_signals entry with ctx tid=1000 rip=530845402 orig_rax=130
+   2.871680000s  WARN litebox_shim_linux::syscalls::process: drm-diag: sys_wait4 entry tid=1000 pid=-1 options=1
+   2.871904500s  WARN litebox_shim_linux::syscalls::process: drm-diag: sys_wait4 entry tid=1000 pid=-1 options=1
+   2.872051900s  WARN litebox_shim_linux::syscalls::process: drm-diag: sys_wait4 entry tid=1000 pid=-1 options=1
+   2.875356600s DEBUG litebox_shim_linux::syscalls::process: prepare_for_exit: entry (Task dropping) tid=20
+   2.875833400s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: calling parent.interrupt_all_threads() tid=20
+   2.875916000s  WARN litebox_shim_linux::syscalls::signal: drm-diag: process_signals entry with ctx tid=1000 rip=140668768810400 orig_rax=130
+   2.876471400s  WARN litebox_shim_linux::syscalls::signal: drm-diag: process_signals entry with ctx tid=1000 rip=530845402 orig_rax=130
+   2.877390600s  WARN litebox_shim_linux::syscalls::process: drm-diag: sys_wait4 entry tid=1000 pid=-1 options=1
+   2.877933200s  WARN litebox_shim_linux::syscalls::process: drm-diag: sys_wait4 entry tid=1000 pid=-1 options=1
+   2.878478200s  WARN litebox_shim_linux::syscalls::process: drm-diag: sys_wait4 entry tid=1000 pid=-1 options=1
+   2.887819600s DEBUG litebox_shim_linux::syscalls::process: prepare_for_exit: entry (Task dropping) tid=11
+   2.887911900s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: calling parent.interrupt_all_threads() tid=11
+   2.888101900s  WARN litebox_shim_linux::syscalls::signal: drm-diag: process_signals entry with ctx tid=1000 rip=140668768810400 orig_rax=130
+   2.888222400s  WARN litebox_shim_linux::syscalls::signal: drm-diag: process_signals entry with ctx tid=1000 rip=530845402 orig_rax=130
+   2.888771300s  WARN litebox_shim_linux::syscalls::process: drm-diag: sys_wait4 entry tid=1000 pid=-1 options=1
+   2.888885500s  WARN litebox_shim_linux::syscalls::process: drm-diag: sys_wait4 entry tid=1000 pid=-1 options=1
+   2.888940400s  WARN litebox_shim_linux::syscalls::process: drm-diag: sys_wait4 entry tid=1000 pid=-1 options=1
+   2.893764100s DEBUG litebox_shim_linux::syscalls::process: prepare_for_exit: entry (Task dropping) tid=10
+   2.893885700s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: calling parent.interrupt_all_threads() tid=10
+   2.893908800s  WARN litebox_shim_linux::syscalls::signal: drm-diag: process_signals entry with ctx tid=1000 rip=140668768810400 orig_rax=130
+   2.894241600s  WARN litebox_shim_linux::syscalls::signal: drm-diag: process_signals entry with ctx tid=1000 rip=530845402 orig_rax=130
+   2.894523000s  WARN litebox_shim_linux::syscalls::process: drm-diag: sys_wait4 entry tid=1000 pid=-1 options=1
+   2.894688400s  WARN litebox_shim_linux::syscalls::process: drm-diag: sys_wait4 entry tid=1000 pid=-1 options=1
+   2.894856600s  WARN litebox_shim_linux::syscalls::process: drm-diag: sys_wait4 entry tid=1000 pid=-1 options=1
+   2.895371300s DEBUG litebox_shim_linux::syscalls::process: prepare_for_exit: entry (Task dropping) tid=26
+   2.895539000s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: calling parent.interrupt_all_threads() tid=26
+   2.895584700s  WARN litebox_shim_linux::syscalls::signal: drm-diag: process_signals entry with ctx tid=1000 rip=140668768810400 orig_rax=130
+   2.895642700s  WARN litebox_shim_linux::syscalls::signal: drm-diag: process_signals entry with ctx tid=1000 rip=530845402 orig_rax=130
+   2.895914200s  WARN litebox_shim_linux::syscalls::process: drm-diag: sys_wait4 entry tid=1000 pid=-1 options=1
+   2.896082000s  WARN litebox_shim_linux::syscalls::process: drm-diag: sys_wait4 entry tid=1000 pid=-1 options=1
+   2.896170800s  WARN litebox_shim_linux::syscalls::process: drm-diag: sys_wait4 entry tid=1000 pid=-1 options=1
+   2.896235700s DEBUG litebox_shim_linux::syscalls::process: prepare_for_exit: entry (Task dropping) tid=19
+   2.896398300s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: calling parent.interrupt_all_threads() tid=19
+   2.896430100s  WARN litebox_shim_linux::syscalls::signal: drm-diag: process_signals entry with ctx tid=1000 rip=140668768810400 orig_rax=130
+   2.896506900s  WARN litebox_shim_linux::syscalls::signal: drm-diag: process_signals entry with ctx tid=1000 rip=530845402 orig_rax=130
+   2.896709400s  WARN litebox_shim_linux::syscalls::process: drm-diag: sys_wait4 entry tid=1000 pid=-1 options=1
+   2.896781400s  WARN litebox_shim_linux::syscalls::process: drm-diag: sys_wait4 entry tid=1000 pid=-1 options=1
+   2.896809900s  WARN litebox_shim_linux::syscalls::process: drm-diag: sys_wait4 entry tid=1000 pid=-1 options=1
+   2.897985800s DEBUG litebox_shim_linux::syscalls::process: prepare_for_exit: entry (Task dropping) tid=18
+   2.898024500s DEBUG litebox_shim_linux::syscalls::process: DIAG prepare_for_exit: calling parent.interrupt_all_threads() tid=18
+   2.898042900s  WARN litebox_shim_linux::syscalls::signal: drm-diag: process_signals entry with ctx tid=1000 rip=140668768810400 orig_rax=130
+   2.898128200s  WARN litebox_shim_linux::syscalls::signal: drm-diag: process_signals entry with ctx tid=1000 rip=530845402 orig_rax=130
+   2.898282900s  WARN litebox_shim_linux::syscalls::process: drm-diag: sys_wait4 entry tid=1000 pid=-1 options=1
+   2.898340200s  WARN litebox_shim_linux::syscalls::process: drm-diag: sys_wait4 entry tid=1000 pid=-1 options=1
+   2.898381500s  WARN litebox_shim_linux::syscalls::process: drm-diag: sys_wait4 entry tid=1000 pid=-1 options=1
