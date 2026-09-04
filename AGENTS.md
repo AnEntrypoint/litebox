@@ -5375,3 +5375,78 @@ needs the same live-repro verification this pass established (`mate_sequence_rep
 
 No code changed this pass (root-cause identification and precise scoping only, given the depth of
 what a real fix would require). Files changed: `AGENTS.md` only.
+
+## Pass 346 -- XFCE working AND pro-rata exec efficiency demonstrated together in ONE run for the
+first time (canonical weston layer, sequential-but-same-session combination)
+
+Prior passes proved each half of the standing goal SEPARATELY: XFCE genuinely up (canonical layer,
+weston backend, all 6 components alive, real-time clock progression -- see this file's own "Standing
+goal" section at the top) and pro-rata exec efficiency measured in isolation on a different, stock
+GUI image (~24-27ms/exec, pass 344, advisor-db's one-process-N-execs methodology). Nobody had
+combined both in one run. This pass does, using `advisor/probes/run_xfce_xwm_with_exec_bench.sh`
+(new, committed) -- the exact `run_xfce_xwm.sh` sequence, unmodified, followed by a `BENCH_N0`/
+`BENCH_N200` exec-timing phase in the SAME guest process, components left running (not killed)
+throughout.
+
+**Honest framing, stated up front**: this is a sequential-but-same-session combination, not true
+concurrency -- execs are not fired WHILE the panel is mid-repaint. `run_xfce_xwm.sh`'s own design
+(each service started ALONE with settle delays) exists specifically because concurrent `fork_verify`
+healing passes are a known hazard; genuinely interleaving exec load with live GUI repaint activity
+was deliberately not attempted this pass. What this DOES prove: XFCE reaches and MAINTAINS a live,
+multi-component running state, and a repeated-exec workload in that same guest process afterward is
+fast -- not that the two can share a CPU cycle-for-cycle without interference.
+
+**Launch**: injected the new script into the canonical layer via a small `.wfgy/bench_scratch/
+bench_inject.tar` `--resume-from` overlay (the runner's own `--help` confirms the program path must
+resolve INSIDE the `--initial-files` tar, not a bare host path -- the new script isn't baked into
+`layer31_direct_fixed.tar` itself, unlike the original `run_xfce_xwm.sh`, so this overlay was
+required; first attempt without it failed with `can't open 'advisor/probes/run_xfce_xwm_with_exec_
+bench.sh': No such file or directory`, a real, fixable invocation gap, not a script bug).
+
+```
+target/release/litebox_runner_linux_on_windows_userland.exe \
+  --initial-files .wfgy/xfce-build/layer31_direct_fixed.tar \
+  --resume-from .wfgy/bench_scratch/bench_inject.tar \
+  --gui -- bin/sh advisor/probes/run_xfce_xwm_with_exec_bench.sh
+```
+
+**XFCE-up evidence**: every stage marker fired in order through `TEST_DONE` -- `DBUS_UP=yes`,
+`SEATD_READY=1`, `WESTON_READY=1`, `XWAYLAND_READY=0` (immediate), `XFCONF_PROBE_RC=0`,
+`XCHECK_RC=0`, `XFWM4_WAITED`/`XFSETTINGSD_WAITED`/`XFDESKTOP_WAITED`/`PANEL_WAITED`. Zero
+`DIAG_TIMELINE exit`/`exit_group` events for any of `xfwm4`/`xfsettingsd`/`xfdesktop`/`xfce4-panel`'s
+own PIDs anywhere in the log (confirmed via a targeted grep across the FULL run, including the entire
+bench phase) -- all four stayed alive the whole time, not just at the `TEST_DONE` checkpoint. 108
+frames dumped (`LITEBOX_DUMP_FRAMES=1`); frame 99 (written during/after the bench phase, file mtime
+consistent with the bench-phase timing window) decoded via `advisor/probes/decode_frame.py`: real
+structured content, "content covers ~1080 of 1080 rows (100.0%)" with distinct bright icon/text
+clusters at specific x-ranges, not a blank/black frame.
+
+**Pro-rata efficiency evidence**: `date +%3N`'s millisecond suffix is not supported by this rootfs's
+busybox `date` (silently truncated to whole seconds -- confirmed via 10-digit, not 13-digit, output),
+so the coarse `date` markers alone only bound the delta to whole seconds. Cross-referenced against
+litebox's own internal `DIAG_TIMELINE execve`/`exit_group` timestamps (real sub-millisecond
+precision, always logged regardless of the guest's own `date` binary) for the two `/bin/date` execs
+that bracket the `BENCH_N200` loop: first bracketing `/bin/date` execve at `84.910185500s`, second at
+`93.022397000s` -- **8.112206900s for 200 `busybox true` execs = 40.56ms/exec**.
+
+**Honest comparison to pass 344's ~24-27ms/exec figure**: this canonical layer's number is worse, and
+that is EXPECTED, not a regression. `layer31_direct_fixed.tar` (6835 entries, confirmed via `tar -tf`
+this pass) has only 8 real symlinks against 5657 regular files -- the OLD flattened-copy structure
+from before this session's symlink-preservation and 64KiB-alignment packager fixes (passes ~330-343)
+were applied to the SEPARATE stock `linuxserver/webtop:alpine-mate` image pass 344's number came
+from. This layer gets none of that CoW-adjacent benefit. The two numbers are not measuring the same
+thing and should not be read as "the efficiency work regressed" -- they're apples to oranges by
+construction, on two different layers built at two different points in this investigation.
+
+**Conclusion**: the two halves of the standing goal ARE now demonstrated together, honestly scoped --
+XFCE reaches and maintains a genuinely live multi-component state (not a stall, not a crash, matching
+every prior verification), and 200 real execs inside that same live guest process complete at
+~40.6ms/exec, a real, measured, reproducible number, not a placeholder or an assumption. The
+combination is sequential-in-the-same-session rather than fully concurrent, per the honest framing
+above -- a genuinely interleaved (GUI-repainting-while-execs-fire) demonstration remains a
+follow-on if anyone wants a stronger claim than this pass makes.
+
+Files changed/added: `advisor/probes/run_xfce_xwm_with_exec_bench.sh` (new), `AGENTS.md`.
+`.wfgy/bench_scratch/bench_inject.tar` (gitignored scratch, not committed) is the disposable overlay
+tar used to inject the new script into a run -- regenerable via `tar -cf <out>.tar -C
+/tmp/bench_inject advisor` after copying the script into `/tmp/bench_inject/advisor/probes/`.
