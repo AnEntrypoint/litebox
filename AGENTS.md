@@ -4287,3 +4287,31 @@ finding just above was almost certainly this pass's own repro hitting a differen
 unrelated timing artifact (this session's own earlier, subsequently-RETRACTED "sh wait hang" false
 lead is a cautionary precedent for exactly this shape of finding) rather than a real second
 blocker -- treat it as unconfirmed, not as a lead to pursue.
+
+**CLOSED, cross-verified from two independent angles: the layer's gdk-pixbuf has NO built-in
+loader table at all.** A peer session (advisor-db) checked `strings libgdk_pixbuf-2.0.so.0` for
+every normally-always-compiled-in format's own name literal (`png`, `jpeg`, `gif`, `xpm`, `bmp`,
+`ico`) and found **zero matches for every single one** -- not a PNG-specific gap, the entire
+built-in loader table is empty. This independently reconfirms, from pure static binary inspection,
+this session's own much earlier finding (commit `73321862`): the `builtin_loaders[]` table lacks
+any format entries despite the decoder object code being linked in as dead weight. Combined with
+the syscall-level trace evidence above (cache read in full, then no module ever `openat`'d, zero
+remaining unsupported syscalls on the path, XPM fails identically to PNG), the full chain is now
+settled end to end with no open threads: **genuine upstream Alpine gdk-pixbuf packaging defect,
+not a litebox bug, not loaders.cache, not glycin, not the sandbox.** The `pixbuf_formats_probe.c`
+live-enumeration approach (building a musl-linked C probe to call `gdk_pixbuf_get_formats()`
+directly) is no longer necessary -- both static-analysis angles already converge on the same
+empty-table conclusion a live enumeration could only reconfirm a third time.
+
+**Concrete next steps for whoever picks this up** (real, substantial, cross-cutting work,
+correctly scoped to its own dedicated session): (1) verify a genuinely different Alpine
+branch/version actually ships a working `builtin_loaders[]` table before integrating it (use the
+same `strings`/`nm -D` static-analysis technique to check BEFORE spending time on integration --
+this session already ruled out v3.19's `2.42.12-r0`, which is ALSO broken this same way); (2) a
+real from-source gdk-pixbuf build with an explicit, verified-correct `-Dbuiltin_loaders=png,jpeg`
+config -- proven achievable this session (a genuine working `libpixbufloader-png.so` was built via
+musl-cross + real gdk-pixbuf source, see the "real, from-scratch PNG loader module" pass); or (3)
+a genuinely different musl distro's userland if Alpine truly cannot provide one (explicitly
+authorized by the standing goal's own text). The `gui-wayland`/`gui-x11-server` PRD rows'
+"verify a different Alpine build or from-source build" language already anticipated this; this
+closure sharpens it into option (1)/(2) above specifically, not a vague "investigate further."
