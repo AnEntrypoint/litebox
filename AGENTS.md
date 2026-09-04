@@ -4481,3 +4481,20 @@ promoting `layer31_glycin_disabled.tar` to become the new canonical `layer31_dir
 verified working on its own terms, but leaving the new layer as a separate, clearly-named variant
 lets whoever picks up the `G_IS_FILE_INFO` follow-on verify that fix too before any promotion, so
 the eventual canonical-layer swap lands as one complete, fully-verified unit.
+
+**Independently re-confirmed with a full, untruncated XFCE launch (waited for genuine process exit
+via a `tasklist` poll loop, not an external timeout).** `TEST_DONE` reached, every stage clean,
+zero `SIGABRT`/panic. Confirms the fork's own finding exactly: the `Gtk-WARNING: Could not load a
+pixbuf from .../drive-harddisk.png` line -- present in literally every single prior run this whole
+session, across dozens of passes and two collaborating sessions -- is now COMPLETELY ABSENT from
+the log. The `xfdesktop_regular_file_icon_new: assertion 'G_IS_FILE_INFO(file_info)' failed`
+CRITICAL is still present (one occurrence), confirming this is now the sole, precisely-isolated
+remaining gap, cleanly separated from the now-genuinely-fixed image-decode path. Frame content
+(`92,036` → `94,953` non-black pixels) shows only a marginal change, consistent with the
+`GFileInfo` bug still preventing `xfdesktop` from populating its icon grid even though it can now
+successfully DECODE icons once it has a valid file-info object to work with -- the two bugs were
+independent and stacked, and only one is fixed so far. **Concrete next step for whoever picks up
+the `G_IS_FILE_INFO` follow-on:** trace `xfdesktop_regular_file_icon_new`'s caller to find where a
+NULL/invalid `GFileInfo*` is passed in -- likely a `g_file_query_info`/`g_file_enumerate_children`
+call whose result isn't validated before use, in `xfdesktop`'s own desktop-icon directory-listing
+code (`xfdesktop-file-icon-manager.c` or similar upstream source), not a gdk-pixbuf/glycin issue.
