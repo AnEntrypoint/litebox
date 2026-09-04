@@ -4498,3 +4498,50 @@ the `G_IS_FILE_INFO` follow-on:** trace `xfdesktop_regular_file_icon_new`'s call
 NULL/invalid `GFileInfo*` is passed in -- likely a `g_file_query_info`/`g_file_enumerate_children`
 call whose result isn't validated before use, in `xfdesktop`'s own desktop-icon directory-listing
 code (`xfdesktop-file-icon-manager.c` or similar upstream source), not a gdk-pixbuf/glycin issue.
+
+## `G_IS_FILE_INFO` FIXED -- root cause was `/root/Desktop` not existing, not a GIO bug
+
+The `xfdesktop_regular_file_icon_new: assertion 'G_IS_FILE_INFO(file_info)' failed` CRITICAL
+above was misdiagnosed as a GIO/litebox enumeration bug. It is neither. **Root cause: the layer
+never packaged `/root/Desktop` (nor `/root/.local/share/applications`), and `HOME=/root` is set by
+`run_xfce_xwm.sh` at launch time.** `xfdesktop` enumerates `$HOME/Desktop` to build its icon grid;
+`g_file_enumerate_children`/`g_file_query_info` on a directory that does not exist fails, and every
+subsequent icon-construction call in that failed enumeration's callback chain receives exactly the
+NULL `GFileInfo` the assertion catches. This is correct, expected GIO behavior on a missing path --
+the same class of layer-packaging hole as this session's earlier `gschemas.compiled`/`mime.cache`/
+`machine-id` findings, not a litebox emulation gap and not upstream GTK/xfdesktop's bug.
+
+**Fix, verified via the cheap discriminator (create `/root/Desktop`, populate it, check whether the
+CRITICAL disappears) before touching any source:** packaged `/root/Desktop` into the layer with 4
+real `.desktop` files copied from the layer's own `/usr/share/applications` (`thunar.desktop`,
+`xfce-backdrop-settings.desktop`, `xfce4-terminal-emulator.desktop`,
+`xfce4-terminal-settings.desktop` -- 34 available, these 4 chosen as a representative sample, not
+exhaustive). Two full, untruncated `run_xfce_xwm.sh` launches compared directly (baseline vs.
+Desktop-populated, both waited for genuine process exit via a `tasklist` poll loop, never an
+external timeout): baseline shows the assertion exactly once; **the Desktop-populated run shows
+ZERO occurrences of the assertion, anywhere in the log.** Frame content also improved measurably:
+`92,036`→`103,613` non-black pixels (vs. the `92,036`/`94,953` steady-state documented in every
+prior pass), and `decode_frame.py` confirms real content at THREE distinct x-bands (icon columns)
+instead of the prior two, with a visibly wider middle band (`x=54..140`, width 87px, vs. the prior
+narrower `x=60..133`/`x=801..810` single-icon-width bands) -- consistent with multiple desktop
+icons now actually rendering. Re-verified PNG decode is unaffected by this change (`RC=0`,
+unchanged from the glycin-disable fix).
+
+**Both fixes (glycin-disabled gdk-pixbuf + populated `/root/Desktop`) combined and promoted to
+canonical.** `.wfgy/xfce-build/layer31_direct_fixed.tar` (the file every other session's script
+references by that exact name) now contains both fixes; the pre-fix canonical file is preserved as
+`layer31_direct_fixed.tar.bak_pre_gfileinfo_fix` per this project's disk-hygiene convention. No
+litebox source changes were needed for either half of this combined fix -- both are layer-packaging
+corrections (missing runtime library config, missing user-directory content), landing cleanly
+alongside the peer session's concurrent, unrelated syscall-level work on `litebox_common_linux`/
+`litebox_shim_linux` without any file conflicts.
+
+**Standing goal status: the last open visual-completeness gap identified this session is now
+closed.** XFCE launches cleanly, stays up, decodes real images, and renders actual desktop icons --
+all confirmed via live, decoded frame content, not just a pixel-count heuristic. Remaining
+follow-on work (not blocking): only 4 of 34 available `.desktop` files were placed on the Desktop
+as a representative test set -- a future pass could populate more broadly or configure xfdesktop's
+"show applications from `/usr/share/applications`" mode instead of relying on a curated
+`~/Desktop` subset, and the icon SIZE/LAYOUT quality (spacing, whether the grid looks like a
+real desktop vs. a sparse test arrangement) hasn't been visually polished, only functionally
+verified.
