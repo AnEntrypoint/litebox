@@ -41,8 +41,12 @@ def main(src, dst):
             if n != keep:
                 canonical[n] = keep
 
-    offset = 0
+    # Do NOT predict the write offset: tarfile emits EXTRA header blocks for long
+    # paths (GNU/PAX longname) and for hardlink/device entries, so any arithmetic
+    # model drifts. A real layer showed a consistent 2048-byte error from exactly
+    # this, leaving only 4% aligned. Ask the writer where it actually is instead.
     with tarfile.open(src) as t, tarfile.open(dst, "w") as out:
+        fh = out.fileobj
         for m in t:
             if m.isfile() and m.name in canonical:
                 # Emit a symlink to the canonical copy instead of the bytes.
@@ -53,31 +57,27 @@ def main(src, dst):
                 li.mode = 0o777
                 out.addfile(li)
                 saved += m.size
-                offset += BLOCK
                 continue
 
             data = t.extractfile(m).read() if m.isfile() else b""
 
             if m.isfile() and len(data) >= ALIGN:
-                data_start = offset + BLOCK
+                data_start = fh.tell() + BLOCK
                 mis = data_start % ALIGN
                 if mis:
                     gap = ALIGN - mis
                     while gap < BLOCK * 2:
                         gap += ALIGN
                     pad_len = gap - BLOCK
-                    pi = tarfile.TarInfo("litebox/.align/%d" % offset)
+                    pi = tarfile.TarInfo("litebox/.align/%d" % fh.tell())
                     pi.size = pad_len
                     pi.mode = 0o644
                     out.addfile(pi, io.BytesIO(b"\0" * pad_len))
-                    offset += BLOCK + ((pad_len + BLOCK - 1) // BLOCK) * BLOCK
 
             if m.isfile():
                 out.addfile(m, io.BytesIO(data))
-                offset += BLOCK + ((len(data) + BLOCK - 1) // BLOCK) * BLOCK
             else:
                 out.addfile(m)
-                offset += BLOCK
 
     print("dedup groups: %d, bytes saved: %.1f MB" % (len(dupes), saved / 1048576))
 
