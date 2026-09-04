@@ -4816,3 +4816,81 @@ crash itself is gone (would require re-pulling/re-rewriting the 2.586GB `webtop_
 pass 319 left in scratch temp, not committed). The isolated probe passing cleanly is strong evidence
 the specific mechanism pass 319 identified (shm-backed keymap allocation) is fixed, but end-to-end
 confirmation with real rendered pixels through this path remains for whoever picks this up next.
+
+## Pass 321 -- Windows CoW-mmap implemented and verified reachable, but the real bottleneck for
+tar-backed execs (the busybox-via-329-symlinks workload) turns out to be a DIFFERENT, larger
+pre-existing gap that predates this pass and predates Windows entirely
+
+A peer session (advisor-db) measured a real ~27ms-per-exec cost on this host and traced it to
+`try_allocate_cow_pages` (`litebox/src/platform/page_mgmt.rs`) having no Windows override --
+inheriting the trait default (`UnsupportedByPlatform`), forcing every exec's PT_LOAD segment
+through `do_mmap_file_memcpy`'s page-by-page `sys_read` loop instead of a real CoW mmap. Handed off
+explicitly ("it's yours if you want it").
+
+**Implemented and verified reachable**: `WindowsUserland::try_allocate_cow_pages`
+(`litebox_platform_windows_userland/src/lib.rs`) -- the direct Win32 analogue of
+`litebox_platform_linux_userland`'s `mmap(MAP_PRIVATE, fd, offset)` impl: `CreateFileW` opens the
+real backing file, `CreateFileMappingW` with `PAGE_WRITECOPY`/`PAGE_EXECUTE_WRITECOPY` creates the
+section, `MapViewOfFile3` (reusing `map_shared_memory`'s own `TASK_ADDR_MIN..TASK_ADDR_MAX`-bounded
+`MEM_ADDRESS_REQUIREMENTS` placement pattern) maps the sub-range with true copy-on-write semantics.
+Added the matching `cow_regions`/`register_cow_region`/`lookup_cow_region` scaffolding (identical
+shape to `LinuxUserland`'s), wired `litebox_runner_linux_on_windows_userland::run()` to register the
+host-mmapped rootfs tar the same way the native-Linux runner already does.
+
+**Verifying this surfaced a real, separate, PLATFORM-INDEPENDENT gap that predates this pass**:
+`try_cow_mmap_file` (`litebox_shim_linux/src/syscalls/mm.rs`) only ever attempts CoW when
+`fs::backend::Backend::get_static_backing_data` returns `Some` for the mapped fd. Read every
+implementor: `in_mem.rs` has one (only fires for a `Cow::Borrowed` `FileX::data`, but NOTHING in the
+whole codebase ever constructs one that way -- every in-mem file is created via `Vec::new().into()`,
+i.e. `Cow::Owned`), `layered.rs`/`resolver.rs`/`composer.rs` all just delegate to whichever backend
+is underneath, and **`tar_ro.rs` -- the actual backend serving every rootfs-tar file, including
+`/bin/busybox` -- never overrode the trait default at all** (`backend.rs:127`, unconditional
+`None`). So CoW was structurally UNREACHABLE for any tar-backed exec on EITHER platform before this
+pass, confirmed by reading `litebox_runner_linux_userland/src/lib.rs`'s own `register_cow_region`
+call site: `cow_eligible_regions` only ever contains the one directly-specified `prog` binary (and
+only when `--rewrite-syscalls` is off), never the tar's contents. advisor-db's Linux-vs-Windows
+framing was itself incomplete -- this was never a Windows-specific gap.
+
+Fixed the missing piece too, minimally: `TarRo::get_static_backing_data`
+(`litebox/src/fs/tar_ro.rs`) now returns `Some(&tar_data[file.data_range])` when the backend's own
+`tar_data` is itself `Cow::Borrowed('static)` (i.e. host-mmapped, not copied/rewritten), `None`
+otherwise -- exactly mirroring `in_mem.rs`'s existing `Cow::Borrowed`-vs-`Cow::Owned` distinction,
+just against the tar backend's own already-tracked `data_range`.
+
+**Live-verified with `LITEBOX_LOG=debug LITEBOX_DIAG_MM=1` against `/bin/sh -c 'echo X'` on
+`.wfgy/xfce-build/alpine_symlinks_preserved.tar` (real Alpine image, real symlinks)**: confirmed the
+whole chain now works end-to-end -- `get_static_backing_data` resolves real busybox/musl-libc
+content (`static_len=804648` matches busybox's exact file size) and `try_allocate_cow_pages` is
+genuinely reached (previously impossible on any platform). But:
+
+**Honest result: the fast path essentially never fires against tar-packed content, for a real,
+structural reason, not a bug.** `MapViewOfFile3` requires the VIEW's FILE OFFSET to be a multiple of
+the system allocation granularity (64 KiB) -- not just page-aligned (4 KiB) like Linux's `mmap`
+offset requirement. A `.tar` file's internal layout is 512-byte-block-aligned; checked directly
+against `alpine_symlinks_preserved.tar` (88 files) via a small Python probe: **only 1 of 88 files'
+tar data offsets happen to land on a 64 KiB boundary** (`usr/lib/libssl.so.3` at byte 7733248 --
+pure coincidence of that file's position in the archive, not anything to do with its own content).
+Every real exec attempted in the live test (7 CoW attempts across `/bin/sh`'s own segments and its
+dynamic libraries) hit this alignment wall and correctly, safely fell back to the existing memcpy
+path (`diag-cow: file offset not 64KiB-aligned, falling back to memcpy path`, 7/7 -- zero
+`try_allocate_cow_pages OK`, zero `MapViewOfFile3 failed` API errors, i.e. the alignment check and
+fallback logic itself is working exactly as designed). This is NOT what advisor-db's ~27ms/exec
+measurement or this pass's own initial framing assumed would happen.
+
+**What this pass actually delivers**: a real, tested, working Windows CoW-mmap primitive (unit
+tests pass: `cargo test -p litebox_platform_windows_userland` 4/4,
+`cargo test -p litebox_runner_linux_on_windows_userland` 2/2, `cargo test -p litebox --lib` unchanged
+at 124/26 pre-existing-failures baseline -- no regression anywhere) that DOES help the one case
+`litebox_runner_linux_userland`'s own pre-existing `cow_eligible_regions` mechanism already
+exercises (a directly-specified, non-rewritten `prog` binary passed via CLI, not through a tar), and
+correctly, safely no-ops for tar-packed content rather than serving wrong/aliased data. It does NOT
+meaningfully close advisor-db's measured ~27ms/exec gap for the actual symlinked-busybox-via-tar
+workload -- that would need either (a) a tar-repacking step that pads each entry's data start to a
+64 KiB boundary (a real, format-level tradeoff: bigger tars, and would need coordinating with
+whatever writes these tars, e.g. `litebox_packager`), or (b) `MapViewOfFileEx`'s older, non-`*3` API
+family in case it has a looser offset-alignment contract on this Windows version (not checked this
+pass -- worth a follow-up look before assuming 64 KiB is truly unavoidable), or (c) accepting the
+memcpy fallback for tar content and instead attacking the ~19-overlapping-`protect_mapping`-calls-
+per-exec lead advisor-db's own trace already flagged as the more promising remaining cost driver.
+Per this project's standing honest-negative-result discipline: this is real, verified, committed
+progress on a real gap, not a fix for the specific number advisor-db measured.

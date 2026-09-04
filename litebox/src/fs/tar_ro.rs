@@ -226,6 +226,26 @@ impl super::backend::Backend for TarRo {
         Err(WriteError::NotForWriting)
     }
 
+    /// Exposes a file's bytes as a `'static` slice for `try_allocate_cow_pages`, when this
+    /// backend's own `tar_data` is itself `'static`-borrowed (i.e. the tar was host-mmapped and
+    /// passed in without a syscall-rewrite pass copying it into an owned buffer -- see
+    /// `litebox_runner_linux_userland`/`litebox_runner_linux_on_windows_userland`'s `mmapped_file`
+    /// helpers). Previously this always returned the trait default (`None`): every rootfs-tar-
+    /// backed exec (e.g. `/bin/busybox` through any of its many symlinks) skipped the CoW-mmap
+    /// fast path entirely and fell through to `do_mmap_file_memcpy`'s page-by-page `sys_read` loop,
+    /// regardless of platform CoW support -- a real, measured ~27ms/exec cost on Windows before a
+    /// platform CoW implementation even existed to receive this data. `Cow::Owned` (the in-mem
+    /// upper layer, or a rewritten/copied tar) correctly returns `None`: those bytes are not
+    /// `'static`-stable, so a caller cannot legally re-slice `&'static [u8]` out of them.
+    fn get_static_backing_data(&self, h: &FileHandle) -> Option<&'static [u8]> {
+        let idx = h.get_typed::<Self>().idx;
+        let range = self.tar_index.files[idx].data_range.clone();
+        match &self.tar_index.tar_data {
+            alloc::borrow::Cow::Borrowed(data) => Some(&data[range]),
+            alloc::borrow::Cow::Owned(_) => None,
+        }
+    }
+
     fn truncate(&self, _h: &FileHandle, _length: usize) -> Result<(), TruncateError> {
         Err(TruncateError::NotForWriting)
     }

@@ -111,10 +111,6 @@ pub struct CliArgs {
 
 struct MmappedFile {
     data: &'static [u8],
-    #[expect(
-        dead_code,
-        reason = "kept for parity with the native-Linux runner's identical helper"
-    )]
     abs_path: PathBuf,
 }
 
@@ -363,9 +359,17 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // Memory-mapped, not heap-copied: every concurrent runner process reading
     // the same rootfs archive shares its physical pages via the OS page cache
     // instead of each holding a private copy.
-    let tar_data = mmapped_file(tar_file)?.data;
+    let tar_mmap = mmapped_file(tar_file)?;
+    let tar_data = tar_mmap.data;
 
     let platform = Platform::new();
+    // Register the rootfs tar's host-mmapped bytes as CoW-eligible (see
+    // `TarRo::get_static_backing_data`'s doc comment and
+    // `WindowsUserland::try_allocate_cow_pages`): every regular file served out of this tar
+    // (e.g. `/bin/busybox`, reached through however many symlinks) can now take the fast CoW-mmap
+    // path on exec instead of `do_mmap_file_memcpy`'s page-by-page `sys_read` loop. Mirrors
+    // `litebox_runner_linux_userland`'s identical `register_cow_region` call for its own `tar_data`.
+    platform.register_cow_region(tar_data, tar_mmap.abs_path);
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
     let litebox = shim_builder.litebox();
 

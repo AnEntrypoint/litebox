@@ -19,13 +19,15 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use core::time::Duration;
 use std::cell::RefCell;
 use std::os::raw::c_void;
+use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::io::AsRawHandle as _;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::{
-    AllocationError, FixedAddressBehavior, MemoryRegionPermissions, SharedMemoryError,
+    AllocationError, CowAllocationError, FixedAddressBehavior, MemoryRegionPermissions,
+    SharedMemoryError,
 };
 use litebox::shim::{ContinueOperation, Exception};
 use litebox::utils::TruncateExt as _;
@@ -36,6 +38,9 @@ use windows_sys::Win32::{
     System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
         EXCEPTION_POINTERS, EXCEPTION_RECORD,
+    },
+    Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, OPEN_EXISTING,
     },
     System::Memory::{
         self as Win32_Memory, CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_EXTENDED_PARAMETER,
@@ -113,6 +118,19 @@ pub struct WindowsUserland {
     /// process-lifetime than a bare static would be, without adding to the crate's ratcheted
     /// bare-static count.
     console_stdin_reader: std::sync::OnceLock<ConsoleStdinReader>,
+    /// CoW-eligible memory regions, mirroring `litebox_platform_linux_userland::LinuxUserland`'s
+    /// identically-shaped field: maps the start address of a registered `'static` host-mmapped
+    /// slice to the info needed to re-open its backing file for [`Self::try_allocate_cow_pages`].
+    cow_regions: std::sync::RwLock<std::collections::BTreeMap<usize, CowRegionInfo>>,
+}
+
+/// Information about a CoW-eligible memory region backed by a file. Mirrors
+/// `litebox_platform_linux_userland::CowRegionInfo` exactly.
+struct CowRegionInfo {
+    /// The path to the backing file on the host filesystem.
+    file_path: std::path::PathBuf,
+    /// Length of the backing file.
+    file_length: usize,
 }
 
 impl core::fmt::Debug for WindowsUserland {
@@ -2311,6 +2329,7 @@ impl WindowsUserland {
             sys_info: std::sync::RwLock::new(sys_info),
             net_gateway: std::sync::OnceLock::new(),
             console_stdin_reader: std::sync::OnceLock::new(),
+            cow_regions: std::sync::RwLock::new(std::collections::BTreeMap::new()),
         };
 
         // Initialize it's own fs-base (for the main thread)
@@ -2364,6 +2383,50 @@ impl WindowsUserland {
         }
 
         Box::leak(Box::new(platform))
+    }
+
+    /// Register a CoW-eligible memory region backed by a file. Mirrors
+    /// `litebox_platform_linux_userland::LinuxUserland::register_cow_region` exactly.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an overlapping region is already registered.
+    pub fn register_cow_region(&self, data: &'static [u8], file_path: impl Into<std::path::PathBuf>) {
+        let start = data.as_ptr() as usize;
+        let info = CowRegionInfo {
+            file_path: file_path.into(),
+            file_length: data.len(),
+        };
+
+        let mut regions = self.cow_regions.write().unwrap();
+        assert!(
+            regions.range(start..start + data.len()).next().is_none(),
+            "Attempting to register an overlapping region"
+        );
+        let old = regions.insert(start, info);
+        assert!(old.is_none());
+    }
+
+    /// Look up the file backing a static slice for CoW mapping. Mirrors
+    /// `litebox_platform_linux_userland::LinuxUserland::lookup_cow_region` exactly.
+    ///
+    /// Returns `Some((file_path, offset_in_file))` if the slice is backed by a registered
+    /// CoW region, `None` otherwise.
+    fn lookup_cow_region(&self, source_data: &'static [u8]) -> Option<(std::path::PathBuf, usize)> {
+        let slice_start = source_data.as_ptr() as usize;
+        let slice_len = source_data.len();
+
+        let regions = self.cow_regions.read().unwrap();
+
+        if let Some((&region_start, info)) = regions.range(..=slice_start).next_back() {
+            let region_end = region_start.checked_add(info.file_length).unwrap();
+            let slice_end = slice_start.checked_add(slice_len).unwrap();
+
+            if slice_start >= region_start && slice_end <= region_end {
+                return Some((info.file_path.clone(), slice_start - region_start));
+            }
+        }
+        None
     }
 
     /// Reinterprets `&self` as `&'static Self`.
@@ -6034,6 +6097,190 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
 
     fn reserved_pages(&self) -> impl Iterator<Item = &std::ops::Range<usize>> {
         self.reserved_pages.iter()
+    }
+
+    /// Windows analogue of `litebox_platform_linux_userland::LinuxUserland::try_allocate_cow_pages`
+    /// (`mmap(MAP_PRIVATE, fd, offset)`'s direct equivalent): opens the real backing file
+    /// (looked up via [`Self::lookup_cow_region`], populated by [`Self::register_cow_region`] at
+    /// runner startup for the host-mmapped rootfs tar) with `CreateFileW`, creates a
+    /// `PAGE_WRITECOPY`/`PAGE_EXECUTE_WRITECOPY` file mapping over it with `CreateFileMappingW`,
+    /// and maps the requested sub-range with `MapViewOfFile3` -- giving the exact copy-on-write
+    /// semantics `mmap(MAP_PRIVATE)` does: pages are shared read-only against the file's own page
+    /// cache until a write occurs, at which point Windows privately copies just that one page.
+    /// Both handles are closed immediately after the view is created (mirroring the Linux impl's
+    /// `close(fd)` right after `mmap`) -- the OS keeps the mapping alive via the view itself, not
+    /// the handles.
+    ///
+    /// Reuses `map_shared_memory`'s own `TASK_ADDR_MIN..TASK_ADDR_MAX`-bounded
+    /// `MEM_ADDRESS_REQUIREMENTS`/`MEM_EXTENDED_PARAMETER` placement pattern (see that function's
+    /// doc comment for the real host-allocator-aliasing bug this constraint exists to prevent --
+    /// an unconstrained view placement is exactly as dangerous here) and the same
+    /// `FixedAddressBehavior::Hint` null-address retry / `NoReplace` alignment-error-as-collision
+    /// handling.
+    ///
+    /// # A real, permanent platform difference from the Linux impl
+    ///
+    /// `MapViewOfFile3` requires the VIEW's FILE OFFSET (not just its start address, which
+    /// `map_shared_memory` already handles) to be a multiple of the system allocation granularity
+    /// (64 KiB on every real Windows install), not merely page-aligned (4 KiB) the way Linux's
+    /// `mmap` offset requirement is. ELF `PT_LOAD` segment file offsets are typically only
+    /// 4 KiB-aligned, so this legitimately fails for many real segments -- there is no workaround
+    /// (unlike `map_shared_memory`'s address-collision retry, this is a hard API requirement on
+    /// the FILE offset itself, not a placement choice this code makes). On that failure this
+    /// returns `CowAllocationError::Unaligned`, and the caller (`litebox_shim_linux`'s
+    /// `try_cow_mmap_file`) falls back to the existing page-by-page memcpy path -- correct,
+    /// expected behavior, not a bug: this fast path is a partial-coverage optimization (fast for
+    /// however many real segments/mappings DO land on a 64 KiB-aligned file offset), not a
+    /// universal replacement for the memcpy fallback.
+    fn try_allocate_cow_pages(
+        &self,
+        suggested_start: usize,
+        source_data: &'static [u8],
+        permissions: MemoryRegionPermissions,
+        fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<Self::RawMutPointer<u8>, CowAllocationError> {
+        const ALLOCATION_GRANULARITY: usize = 0x1_0000;
+
+        let Some((file_path, file_offset)) = self.lookup_cow_region(source_data) else {
+            return Err(CowAllocationError::UnsupportedSourceRegion);
+        };
+        if !file_offset.is_multiple_of(ALLOCATION_GRANULARITY) {
+            if diag_mm_enabled() {
+                litebox_util_log::debug!(
+                    file_offset:% = file_offset, len:% = source_data.len();
+                    "diag-cow: file offset not 64KiB-aligned, falling back to memcpy path"
+                );
+            }
+            return Err(CowAllocationError::Unaligned);
+        }
+
+        let file_path_wide: alloc::vec::Vec<u16> = file_path
+            .as_os_str()
+            .encode_wide()
+            .chain(core::iter::once(0))
+            .collect();
+
+        let file_handle = unsafe {
+            CreateFileW(
+                file_path_wide.as_ptr(),
+                Win32_Foundation::GENERIC_READ,
+                FILE_SHARE_READ,
+                core::ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                Win32_Foundation::HANDLE::default(),
+            )
+        };
+        if file_handle == Win32_Foundation::INVALID_HANDLE_VALUE {
+            return Err(CowAllocationError::InternalFailure);
+        }
+
+        let map_protect = if permissions.contains(MemoryRegionPermissions::EXEC) {
+            Win32_Memory::PAGE_EXECUTE_WRITECOPY
+        } else {
+            Win32_Memory::PAGE_WRITECOPY
+        };
+        let mapping_handle = unsafe {
+            CreateFileMappingW(
+                file_handle,
+                core::ptr::null(),
+                map_protect,
+                0,
+                0,
+                core::ptr::null(),
+            )
+        };
+        unsafe {
+            let _ = windows_sys::Win32::Foundation::CloseHandle(file_handle);
+        }
+        if mapping_handle.is_null() {
+            return Err(CowAllocationError::InternalFailure);
+        }
+
+        let mut addr_req = MEM_ADDRESS_REQUIREMENTS {
+            LowestStartingAddress: <WindowsUserland as litebox::platform::PageManagementProvider<
+                ALIGN,
+            >>::TASK_ADDR_MIN as *mut c_void,
+            HighestEndingAddress: (<WindowsUserland as litebox::platform::PageManagementProvider<
+                ALIGN,
+            >>::TASK_ADDR_MAX
+                - 1) as *mut c_void,
+            Alignment: 0,
+        };
+        let mut ext_param = MEM_EXTENDED_PARAMETER {
+            Anonymous1: MEM_EXTENDED_PARAMETER_0 {
+                _bitfield: MemExtendedParameterAddressRequirements as u64,
+            },
+            Anonymous2: windows_sys::Win32::System::Memory::MEM_EXTENDED_PARAMETER_1 {
+                Pointer: (&raw mut addr_req).cast::<c_void>(),
+            },
+        };
+        let view_protect = prot_flags(permissions);
+        let mut try_map = |base_addr: *const c_void, constrained: bool| unsafe {
+            if constrained {
+                MapViewOfFile3(
+                    mapping_handle,
+                    GetCurrentProcess(),
+                    base_addr,
+                    file_offset as u64,
+                    source_data.len(),
+                    0,
+                    view_protect,
+                    &raw mut ext_param,
+                    1,
+                )
+            } else {
+                MapViewOfFile3(
+                    mapping_handle,
+                    GetCurrentProcess(),
+                    base_addr,
+                    file_offset as u64,
+                    source_data.len(),
+                    0,
+                    view_protect,
+                    core::ptr::null_mut(),
+                    0,
+                )
+            }
+        };
+        let base_addr = if suggested_start == 0 {
+            core::ptr::null()
+        } else {
+            suggested_start as *const c_void
+        };
+        let mut view = try_map(base_addr, base_addr.is_null());
+        if view.Value.is_null()
+            && !base_addr.is_null()
+            && fixed_address_behavior == FixedAddressBehavior::Hint
+        {
+            view = try_map(core::ptr::null(), true);
+        }
+        unsafe {
+            let _ = windows_sys::Win32::Foundation::CloseHandle(mapping_handle);
+        }
+        if view.Value.is_null() {
+            let err = unsafe { GetLastError() };
+            if diag_mm_enabled() {
+                litebox_util_log::error!(
+                    file_offset:% = file_offset, len:% = source_data.len(), win32_err:% = err;
+                    "diag-cow: MapViewOfFile3 failed"
+                );
+            }
+            if fixed_address_behavior == FixedAddressBehavior::NoReplace
+                && (err == Win32_Foundation::ERROR_INVALID_ADDRESS
+                    || err == Win32_Foundation::ERROR_MAPPED_ALIGNMENT)
+            {
+                return Err(CowAllocationError::InternalFailure);
+            }
+            return Err(CowAllocationError::InternalFailure);
+        }
+        if diag_mm_enabled() {
+            litebox_util_log::error!(
+                addr:% = view.Value as usize, len:% = source_data.len(), file_offset:% = file_offset;
+                "diag-cow: try_allocate_cow_pages OK"
+            );
+        }
+        Ok(UserMutPtr::from_ptr(view.Value.cast::<u8>()))
     }
 
     // A Windows file-mapping `HANDLE`, backed by the system paging file (no real file on disk)
