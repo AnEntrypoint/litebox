@@ -459,79 +459,160 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             ));
         }
 
-        let components: Vec<_> = path.components.iter().map(String::as_str).collect();
-        let walk = self.walk_path(
-            &context,
-            self.backend.root(),
-            &components,
-            #[cfg(debug_assertions)]
-            &components,
-        );
-        match walk {
-            Ok((outcome, _)) if outcome.stop_reason == WalkStopReason::CompleteDirectory => {
-                if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
-                    return Err(OpenError::AlreadyExists);
+        // `walk_path` (via `walk_path_following_symlinks`) deliberately leaves a FINAL-component
+        // symlink unresolved -- see that function's own doc comment, "callers that need the final
+        // component followed too ... do so themselves once they have the resolved parent + leaf
+        // name". This is that follow-up: real `open()` semantics (no `O_NOFOLLOW`) transparently
+        // open a symlink's TARGET, not the symlink node itself -- e.g. a package-manager-installed
+        // container image's `/bin/sh -> /bin/busybox` must open `busybox`'s own contents when a
+        // program is loaded via `/bin/sh`, exactly as it would on real Linux. Before this fix,
+        // `open_file_at` was called directly on the symlink's own directory entry, which is never
+        // `IndexedChild::File` for a symlink and surfaced as a generic `ComponentNotADirectory`
+        // (`ENOTDIR`) -- confirmed live: any real container/Docker-exported rootfs, where a single
+        // real binary (e.g. busybox, or a distro's coreutils) is fanned out through many symlinks,
+        // failed to even launch its shell. Bounded by `MAX_SYMLINK_HOPS`, matching the identical
+        // hop-limit idiom `walk_path_following_symlinks` already uses for intermediate symlinks.
+        let follow_final_symlink = !flags.contains(OFlags::NOFOLLOW);
+        let mut components: Vec<String> = path.components.into_iter().collect();
+        for _ in 0..MAX_SYMLINK_HOPS {
+            let component_refs: Vec<&str> = components.iter().map(String::as_str).collect();
+            let walk = self.walk_path(
+                &context,
+                self.backend.root(),
+                &component_refs,
+                #[cfg(debug_assertions)]
+                &component_refs,
+            );
+            match walk {
+                Ok((outcome, _)) if outcome.stop_reason == WalkStopReason::CompleteDirectory => {
+                    if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
+                        return Err(OpenError::AlreadyExists);
+                    }
+                    return Ok(insert(
+                        OwnedHandle::Dir(self.backend.owned_dir_at(outcome.last, flags)?),
+                        SeekBehavior::NonSeekable,
+                    ));
                 }
-                Ok(insert(
-                    OwnedHandle::Dir(self.backend.owned_dir_at(outcome.last, flags)?),
-                    SeekBehavior::NonSeekable,
-                ))
-            }
-            Ok((outcome, walked))
-                if outcome.stop_reason == WalkStopReason::StoppedAtNonDirectory =>
-            {
-                let name = components[walked];
-                // TODO(jayb): Reject O_CREAT | O_EXCL before invoking the backend, so open-time
-                // side effects like truncation cannot happen before AlreadyExists is returned.
-                let file = self.backend.open_file_at(outcome.last, name, flags)?;
-                if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
-                    return Err(OpenError::AlreadyExists);
-                }
-                if !path_only
-                    && let PermissionCheck::ByResolver(permissions) = &file.permissions
-                    && ((read_allowed && !context.can_read(permissions))
-                        || (write_allowed && !context.can_write(permissions)))
+                Ok((outcome, walked))
+                    if outcome.stop_reason == WalkStopReason::StoppedAtNonDirectory =>
                 {
-                    return Err(OpenError::AccessNotAllowed);
+                    let name = component_refs[walked];
+                    // `read_link_at` consumes `outcome.last` (same constraint the intermediate-
+                    // symlink walk above documents) -- when it turns out NOT to be a symlink (or
+                    // errors), `outcome.last` is gone, so the non-symlink path below re-walks to
+                    // get a fresh handle rather than trying to hold onto two live borrows of it.
+                    let link_target = if follow_final_symlink {
+                        self.backend.read_link_at(outcome.last, name).ok().flatten()
+                    } else {
+                        drop(outcome);
+                        None
+                    };
+                    if let Some(target) = link_target {
+                        let mut new_components: Vec<String> =
+                            if let Some(target) = target.strip_prefix('/') {
+                                target
+                                    .split('/')
+                                    .filter(|c| !c.is_empty() && *c != ".")
+                                    .map(String::from)
+                                    .collect()
+                            } else {
+                                // Relative target: resolve against the directory containing the
+                                // symlink, i.e. the already-walked prefix.
+                                let mut v: Vec<String> = component_refs[..walked]
+                                    .iter()
+                                    .map(|c| (*c).to_string())
+                                    .collect();
+                                for component in target.split('/') {
+                                    match component {
+                                        "" | "." => {}
+                                        ".." => {
+                                            v.pop();
+                                        }
+                                        c => v.push(c.to_string()),
+                                    }
+                                }
+                                v
+                            };
+                        new_components.extend(
+                            component_refs[walked + 1..].iter().map(|c| (*c).to_string()),
+                        );
+                        components = new_components;
+                        continue;
+                    }
+                    // Not a symlink (or `O_NOFOLLOW`/read-link failed): re-walk to get a fresh
+                    // handle -- `read_link_at` above may already have consumed the original.
+                    let (outcome, _) = self
+                        .walk_path(
+                            &context,
+                            self.backend.root(),
+                            &component_refs,
+                            #[cfg(debug_assertions)]
+                            &component_refs,
+                        )
+                        .map_err(|error| match error {
+                            WalkError::Io => OpenError::Io,
+                            WalkError::PathError(error) => error.into(),
+                        })?;
+                    // TODO(jayb): Reject O_CREAT | O_EXCL before invoking the backend, so open-time
+                    // side effects like truncation cannot happen before AlreadyExists is returned.
+                    let file = self.backend.open_file_at(outcome.last, name, flags)?;
+                    if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
+                        return Err(OpenError::AlreadyExists);
+                    }
+                    if !path_only
+                        && let PermissionCheck::ByResolver(permissions) = &file.permissions
+                        && ((read_allowed && !context.can_read(permissions))
+                            || (write_allowed && !context.can_write(permissions)))
+                    {
+                        return Err(OpenError::AccessNotAllowed);
+                    }
+                    let seek_behavior = self.backend.seek_behavior(&file.item);
+                    return Ok(insert(OwnedHandle::File(file.item), seek_behavior));
                 }
-                let seek_behavior = self.backend.seek_behavior(&file.item);
-                Ok(insert(OwnedHandle::File(file.item), seek_behavior))
-            }
-            Ok(_) => {
-                // `walk_path` validates stop reasons before returning.
-                unreachable!()
-            }
-            Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
-                if flags.contains(OFlags::CREAT) =>
-            {
-                let Some((parent_components, name)) = path.parent_and_name() else {
-                    unreachable!("root path was handled above")
-                };
-                let parent = self
-                    .walk_to_directory(
-                        &context,
-                        self.backend.root(),
-                        &parent_components,
-                        #[cfg(debug_assertions)]
-                        &parent_components,
-                    )
-                    .map_err(|error| match error {
+                Ok(_) => {
+                    // `walk_path` validates stop reasons before returning.
+                    unreachable!()
+                }
+                Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
+                    if flags.contains(OFlags::CREAT) =>
+                {
+                    let Some((name_idx, name)) = component_refs
+                        .len()
+                        .checked_sub(1)
+                        .map(|i| (i, component_refs[i]))
+                    else {
+                        unreachable!("root path was handled above")
+                    };
+                    let parent_components = &component_refs[..name_idx];
+                    let parent = self
+                        .walk_to_directory(
+                            &context,
+                            self.backend.root(),
+                            parent_components,
+                            #[cfg(debug_assertions)]
+                            parent_components,
+                        )
+                        .map_err(|error| match error {
+                            WalkError::Io => OpenError::Io,
+                            WalkError::PathError(error) => error.into(),
+                        })?;
+                    let parent = self.owned_parent_dir(parent).map_err(|error| match error {
                         WalkError::Io => OpenError::Io,
                         WalkError::PathError(error) => error.into(),
                     })?;
-                let parent = self.owned_parent_dir(parent).map_err(|error| match error {
-                    WalkError::Io => OpenError::Io,
-                    WalkError::PathError(error) => error.into(),
-                })?;
-                let file = self.backend.create_file_at(parent, name, mode)?;
-                let seek_behavior = self.backend.seek_behavior(&file);
-                Ok(insert(OwnedHandle::File(file), seek_behavior))
+                    let file = self.backend.create_file_at(parent, name, mode)?;
+                    let seek_behavior = self.backend.seek_behavior(&file);
+                    return Ok(insert(OwnedHandle::File(file), seek_behavior));
+                }
+                Err(error) => {
+                    return match error {
+                        WalkError::Io => Err(OpenError::Io),
+                        WalkError::PathError(error) => Err(error.into()),
+                    };
+                }
             }
-            Err(error) => match error {
-                WalkError::Io => Err(OpenError::Io),
-                WalkError::PathError(error) => Err(error.into()),
-            },
         }
+        Err(OpenError::PathError(PathError::TooManySymlinkHops))
     }
 
     fn close(&self, fd: &TypedFd<Self>) -> Result<(), CloseError> {
