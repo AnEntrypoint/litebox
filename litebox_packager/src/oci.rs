@@ -879,6 +879,33 @@ pub fn scan_rootfs(
         let tar_path = tar_path.replace('\\', "/");
 
         if entry.file_type().is_file() {
+            // A symlink extracted on a non-Unix host is MATERIALIZED as a regular file copy
+            // (see `materialize_symlinks`), because Windows cannot create one without
+            // elevation -- so `is_symlink()` below is never true here and the on-disk entry
+            // has lost its identity. `symlink_map` still holds the target verbatim from the
+            // layer's own tar header, so consult it FIRST and re-emit a real link.
+            //
+            // Without this the packager silently reproduces the flattening it is meant to fix:
+            // a repackaged alpine:latest came out with 417 entries, ZERO symlinks and 305
+            // copies of the same 804,648-byte busybox.
+            if let Some(target) = symlink_map.get(rel_path) {
+                let target = target.to_string_lossy().replace('\\', "/");
+                if verbose {
+                    eprintln!("  [symlink] {tar_path} -> {target}");
+                }
+                files.insert(
+                    entry.path().to_path_buf(),
+                    RootfsEntry {
+                        tar_path,
+                        read_path: entry.path().to_path_buf(),
+                        is_executable: false,
+                        mode: lookup_mode(rel_path, permissions),
+                        symlink_target: Some(target),
+                    },
+                );
+                continue;
+            }
+
             let mode = lookup_mode(rel_path, permissions);
             let is_executable = mode & 0o111 != 0;
 
