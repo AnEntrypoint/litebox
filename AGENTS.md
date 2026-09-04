@@ -5143,3 +5143,136 @@ concrete step in PRD row `windows-cow-mmap-unimplemented-forces-4kb-memcpy-per-e
 opened by advisor-db) for whoever picks it up next.
 
 Files changed: `litebox_platform_windows_userland/src/lib.rs`, `AGENTS.md`.
+
+## Pass 344 -- CoW view-padding regression found and fixed (a real memory-safety bug, not a
+labwc/DRM issue); "Failed to commit frame" root-caused to a genuinely cosmetic legacy-cursor-ioctl
+gap that does NOT block the boot; labwc reaches a fully healthy idle compositor state with a real
+Wayland client attach point, but a real session client (`mate-session`) crashes with repeated guest
+access violations before drawing anything
+
+**Before any DRM investigation could proceed, found and fixed a real, serious regression from pass
+343's own CoW work.** `MSYS_NO_PATHCONV=1 ... /usr/bin/labwc --help` against `webtop_seatd.tar`
+(the cheapest possible reproduction -- no full boot needed) crashed deterministically, twice in a
+row, with:
+```
+thread '<unnamed>' panicked at litebox_platform_windows_userland\src\lib.rs:5366:9:
+operation failed on region 0xa0f000-0xa10000: Attempt to access invalid address. (os error 487)
+```
+With `LITEBOX_DIAG_MM=1 LITEBOX_LOG=debug`, the full sequence was: `diag-cow: try_allocate_cow_pages
+OK addr=... len=3760128 file_offset=1011216384 view_padding=61440` (pass 343's `Hint`-path padding
+trick DID fire in practice, contrary to pass 343's own "zero effect" conclusion -- that conclusion
+was correct for the specific offsets checked at the time, not universally true), immediately followed
+by a real guest SIGSEGV (`cr2=0xa0f2a0`, squarely inside the 61440-byte padding region) and then the
+panic above when crash-cleanup tried `VirtualFree(MEM_DECOMMIT)` on that same untracked address range.
+
+Root cause: pass 343's `Hint`-only optimization returns a pointer `view.Value + view_padding` for
+`len = source_data.len()` bytes, but the padding bytes at `view.Value..view.Value+view_padding` are
+REAL, physically-mapped, guest-accessible memory (part of the same `MapViewOfFile3` view) that
+`litebox_shim_linux`'s `Vmem`/`register_existing_mapping` never learns about at all -- only the
+`view_padding`-adjusted pointer and its `len` get registered. Two independent failure modes follow
+from this single gap: (1) a guest access landing in the untracked padding faults, and litebox's own
+SIGSEGV handler reports it as "genuinely unmapped" even though the OS has it mapped, since `Vmem` has
+no record of it; (2) `VirtualFree(MEM_DECOMMIT)`, valid only on real `VirtualAlloc` memory, is never
+valid on `MapViewOfFile3`-backed view memory, so any cleanup path touching that untracked range
+(crash teardown, in this case) panics outright rather than failing gracefully.
+
+Fixed by reverting the `Hint`-path padding trick entirely (`litebox_platform_windows_userland/src/
+lib.rs`, commit `ccc18533`): `try_allocate_cow_pages` now always returns `CowAllocationError::
+Unaligned` when `file_offset` isn't 64KiB-aligned, matching pass 321's original safe behavior, for
+BOTH `Hint` and `Replace`/`NoReplace` alike. This costs nothing real: pass 343 itself already
+confirmed the optimization has zero effect on the actual ELF-load hot path (always `MAP_FIXED`, never
+`Hint`), so the only code path this removes was one that was actively unsafe. Verified fixed: the
+same `labwc --help` repro now exits 0 cleanly, no crash, no panic. No regression: `cargo test -p
+litebox_platform_windows_userland` 4/4 passed; `cargo test -p litebox --lib` unchanged at 124 passed
+/ 26 pre-existing-environmental failures (same baseline every prior pass this session has recorded).
+
+**Coordination note**: this bug was found while a peer session (advisor-db) had a concurrent boot in
+flight against the exact same layer -- flagged to them immediately as a possible cause of any
+unexplained crash in their run, per this project's own established "never run concurrent full-stack
+verifications" lesson (the two investigations turned out to be unrelated in the end, but the warning
+was appropriate given what was known at the time).
+
+**Redirected mid-pass by the coordinating session with new evidence from advisor-db**: `WLR_DEBUG` was
+never a real wlroots verbosity control (pass 342 already suspected this); the real one is
+`WLR_LOG_LEVEL=debug` (confirmed live: this session's own `labwc --help` output additionally showed
+labwc has its own `-d`/`--debug` and `-V`/`--verbose` CLI flags). advisor-db's own `WLR_LOG_LEVEL=
+debug` run reportedly showed EGL/Vulkan renderer-initialization failures (`Could not initialize EGL`,
+`Could not match drm and vulkan device`, `unable to create renderer`) with zero DRM-ioctl-dispatch
+errors, suggesting the "Failed to commit frame" symptom might be a downstream effect of no renderer
+ever initializing, not a KMS/protocol gap -- and that forcing `WLR_RENDERER=pixman` (the same software
+fallback weston already needed via `--use-pixman`) might resolve it outright.
+
+**Reproduced independently with `WLR_LOG_LEVEL=debug` AND `labwc -d` together, and the real picture is
+more specific than either prior finding alone**: with `WLR_RENDERER=pixman` forced from the start (as
+this session's boot recipe has done since pass 319), labwc's own renderer selection never touches EGL
+or Vulkan at all -- `[INFO] [util/env.c:25] Loading WLR_RENDERER option: pixman` / `[INFO] [render/
+pixman/renderer.c:328] Creating pixman renderer` succeed immediately, with zero EGL/Vulkan log lines
+anywhere in this run. advisor-db's EGL/Vulkan failure was very likely from a DIFFERENT boot attempt
+that didn't force `WLR_RENDERER=pixman` early enough (or not at all) -- not evidence against this
+session's own pixman-forced recipe, which was already the established approach since pass 319's own
+Vulkan-device-matching gap finding. **`WLR_RENDERER=pixman` does NOT change the "Failed to commit
+frame" outcome for this recipe**, because this recipe was already forcing pixman before advisor-db's
+suggestion arrived.
+
+The full debug log pinpoints the ACTUAL failing call, immediately preceding "Failed to commit frame"
+every time:
+```
+[DEBUG] [backend/drm/legacy.c:190] connector Virtual-1: drmModeSetCursor failed: Invalid argument
+[ERROR] [../src/output-state.c:39] Failed to commit frame
+```
+This is `DRM_IOCTL_MODE_CURSOR`/`DRM_IOCTL_MODE_CURSOR2` (the legacy hardware-cursor-plane ioctl) --
+confirmed via codesearch to be entirely unimplemented in `litebox_shim_linux/src/syscalls/drm.rs`
+(zero matches for "CURSOR" anywhere in that file's ioctl dispatch), falling through to the same
+default `_ => Err(Errno::EINVAL)` arm that caught the SETPROPERTY gap in pass 342 -- exactly matching
+the log's "Invalid argument".
+
+**Critical correction to pass 341/342's own framing**: "Failed to commit frame" is NOT fatal and does
+NOT block the boot. Reading the FULL debug log past this line (not just grepping for `ERROR`, which
+both prior passes did) shows labwc immediately and gracefully falls back: `[DEBUG] [types/output/
+cursor.c:424] Falling back to software cursor on output 'Virtual-1'`, then continues normally through
+`Starting headless backend`, `WAYLAND_DISPLAY=wayland-0`, and reaches a fully healthy idle compositor
+state -- exactly matching real hardware without a cursor plane (a genuinely common, non-broken
+real-world DRM configuration). The apparent "hang" both prior passes observed and had to force-kill
+was never a hang in the ERROR-triggering sense at all: it is labwc correctly idling as a Wayland
+compositor with a listening socket, waiting for a client to connect, because neither pass's boot
+recipe (`labwc -s "..."` was never used) ever launched one. Confirmed directly: `labwc -s "sleep 20"`
+(a trivial no-op startup command) produces the IDENTICAL "Failed to commit frame" + silent-afterward
+log shape, and it's just as "stuck" for the same reason -- `sleep 20` never draws anything -- ending
+in clean idle, not crash or deadlock. `LITEBOX_DUMP_FRAMES=1`'s own frame 1/frame 0 output
+(`non_black_pixels=0`) during this idle window was independently decoded via `advisor/probes/
+decode_frame.py`: `VERDICT: FLAT FILL. Nothing is drawn.` -- consistent with "compositor healthy, no
+client has drawn a surface yet," not "compositor broken."
+
+**Real client attempt**: launched with `labwc -s "mate-session"` (the actual session manager this
+stock image's own default boot path uses) to get real drawn content. This reaches a NEW, genuinely
+different failure -- NOT a DRM/labwc issue at all: repeated real guest access violations
+(`code=0xc0000005`/`STATUS_ACCESS_VIOLATION`, 260 exception-ring entries logged before litebox's own
+`diag-unrecov-av-giveup` handler stopped retrying) somewhere inside `mate-session`'s own execution,
+well past labwc's own healthy compositor bring-up (only one "Failed to commit frame" line, the same
+cosmetic cursor gap, appears before the crash storm starts). This is squarely `mate-session`-internal
+(likely its own GTK/DBus/session-management machinery hitting some other unimplemented or
+misbehaving syscall/library path under litebox) -- a different, deeper investigation than anything
+this pass characterized, out of scope to chase further here given time already spent on the CoW
+regression detour.
+
+**Honest conclusion, per this project's standing discipline against overclaiming**: this is real,
+substantial, multi-part progress, but NOT yet a rendered-pixels success.
+- Confirmed and fixed: a genuine, serious CoW memory-safety regression (unrelated to DRM/labwc, would
+  have affected ANY workload hitting a misaligned `Hint`-mode CoW mmap, not something that needed a
+  full GUI boot to surface -- the cheapest possible repro, `labwc --help`, was sufficient).
+- Confirmed: "Failed to commit frame" was NEVER the real blocker either prior pass thought it was --
+  it's a cosmetic, non-fatal legacy-cursor-ioctl gap, and labwc genuinely reaches a fully healthy idle
+  compositor state today. This reframes passes 341-342's "the boot hangs" conclusion: it wasn't
+  hanging, it was correctly idling with no client attached.
+- New, real, precisely-located blocker for whoever picks this up next: `mate-session` itself crashes
+  with real guest access violations before drawing any content. The concrete next step is getting a
+  crash backtrace/faulting-instruction identification for that specific access violation (the same
+  `diag-unrecov-av-*` diagnostic infrastructure already used throughout this session for other guest
+  crashes) rather than assuming it's DRM-related at all -- it almost certainly is not, given labwc's
+  own DRM/Wayland bring-up is confirmed clean by this point.
+- Optional, low-priority follow-up (purely cosmetic, not blocking): implementing `DRM_IOCTL_MODE_
+  CURSOR`/`CURSOR2` as a real or no-op-accepted handler (mirroring `obj_get_properties`'s established
+  pattern) would remove the one remaining spurious ERROR line, but is NOT needed for rendered pixels
+  since labwc already tolerates its absence correctly.
+
+Files changed: `litebox_platform_windows_userland/src/lib.rs`, `AGENTS.md`.
