@@ -1,14 +1,9 @@
-     20 feature=shared futex
-     13 feature=fcntl(cmd = 1033, arg = 2)
-     11 feature=fcntl(cmd = 1034, arg = 48)
-     10 feature=unsupported syscall fadvise64
      10 feature=setsockopt(level = 1, optname = 59)
      10 feature=setsockopt(level = 1, optname = 31)
       6 feature=unsupported syscall inotify_init1
       5 feature=ioctl with arg Raw { cmd: 3222823994, arg: UserPtrMut(491778624) }
       4 feature=unsupported syscall getresuid
       4 feature=prctl(GetDumpable)
-      4 feature=fcntl(cmd = 1034, arg = 0)
       3 feature=unsupported syscall inotify_init
       2 feature=unsupported syscall shmget
       2 feature=setsockopt(level = 1, optname = 26)
@@ -19,5 +14,3 @@
       1 feature=unsupported syscall get_mempolicy
       1 feature=unsupported syscall close_range
       1 feature=ioctl with arg Raw { cmd: 1074021792, arg: UserPtrMut(491778108) }
-      1 feature=fcntl(cmd = 1033, arg = 3)
-      1 feature=fcntl(cmd = 1033, arg = 14)

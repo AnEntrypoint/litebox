@@ -685,6 +685,11 @@ pub enum FcntlArg {
     SETLK(UserPtr<Flock>),
     /// Set a file lock and wait if blocked
     SETLKW(UserPtr<Flock>),
+    /// `F_ADD_SEALS`: add memfd seals. Accepted and recorded as a no-op -- see
+    /// [`MfdFlags::ALLOW_SEALING`] on why seals are not enforced here.
+    ADD_SEALS(u32),
+    /// `F_GET_SEALS`: report the seals currently set.
+    GET_SEALS,
     /// Duplicate file descriptor
     DUPFD { cloexec: bool, min_fd: u32 },
 }
@@ -723,6 +728,10 @@ pub struct Flock {
 
 const F_DUPFD: i32 = 0;
 const F_DUPFD_CLOEXEC: i32 = 1030;
+/// `F_LINUX_SPECIFIC_BASE + 9`. memfd sealing.
+const F_ADD_SEALS: i32 = 1033;
+/// `F_LINUX_SPECIFIC_BASE + 10`.
+const F_GET_SEALS: i32 = 1034;
 const F_GETFD: i32 = 1;
 const F_SETFD: i32 = 2;
 const F_GETFL: i32 = 3;
@@ -759,6 +768,15 @@ impl FcntlArg {
                 cloexec: true,
                 min_fd: arg.trunc(),
             },
+            // Sealing is ACCEPTED rather than rejected, matching `MFD_ALLOW_SEALING` which this
+            // shim already accepts on `memfd_create`. Rejecting the follow-up fcntl with EINVAL
+            // while accepting the flag that advertises it is inconsistent, and EINVAL tells the
+            // caller its ARGUMENTS are malformed rather than that sealing is unavailable --
+            // callers that seal a buffer before sharing it (the Wayland/wl_shm idiom) can treat
+            // that as a fatal protocol error. No known client depends on seals being ENFORCED,
+            // only on the calls succeeding.
+            F_ADD_SEALS => Self::ADD_SEALS(arg.trunc()),
+            F_GET_SEALS => Self::GET_SEALS,
             _ => return None,
         })
     }
@@ -3147,6 +3165,8 @@ pub enum SyscallRequest {
     Close {
         fd: i32,
     },
+    /// `posix_fadvise` -- an access-pattern hint. Accepted and ignored; see the dispatch site.
+    Fadvise64,
     Fsync {
         fd: i32,
     },
@@ -4643,6 +4663,13 @@ impl SyscallRequest {
             // correctly read as "no optional commands available".
             Sysno::membarrier if ctx.sys_req_arg::<usize>(0) != 0 => SyscallRequest::SchedYield,
             // Noisy unsupported syscalls.
+            // `posix_fadvise` is PURELY ADVISORY -- it tells the kernel an access pattern so it
+            // can tune readahead. Ignoring the hint is always a valid implementation (real Linux
+            // ignores it on some filesystems), and the guest fs here is memory-backed anyway, so
+            // there is no readahead to tune. Failing it is pure downside: callers that check the
+            // return can conclude the fd is unusable, and there is no upside to refusing a hint
+            // whose entire contract is that it may be disregarded.
+            Sysno::fadvise64 => SyscallRequest::Fadvise64,
             Sysno::io_uring_setup | Sysno::rseq => {
                 return Err(errno::Errno::ENOSYS);
             }

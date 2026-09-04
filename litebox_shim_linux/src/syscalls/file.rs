@@ -2932,6 +2932,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         let files = self.files.borrow();
         match arg {
+            // memfd sealing. `MFD_ALLOW_SEALING` is already accepted on `memfd_create`, so
+            // rejecting the follow-up fcntl would be inconsistent -- and EINVAL would claim the
+            // caller's arguments are malformed rather than that sealing is unavailable. Clients
+            // that seal a buffer before sharing it (the wl_shm idiom) can treat that as a fatal
+            // protocol error. Seals are accepted and reported back, but NOT enforced: nothing
+            // here can write to a guest's memfd behind its back, so the protection a seal buys
+            // on real Linux (guarding against a malicious peer shrinking a shared buffer) has no
+            // corresponding threat in this single-address-space shim.
+            FcntlArg::ADD_SEALS(_) => Ok(0),
+            // Report no seals set. Claiming seals we do not enforce would be worse: a caller
+            // that checks before trusting a buffer would get a false assurance.
+            FcntlArg::GET_SEALS => Ok(0),
             FcntlArg::GETFD => Ok(get_file_descriptor_flags(desc, &self.global, &files)?.bits()),
             FcntlArg::SETFD(flags) => {
                 set_file_descriptor_flags(desc, &self.global, &files, flags).map(|()| 0)

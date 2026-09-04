@@ -1887,6 +1887,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .ok_or(Errno::EFAULT)
                     .map(|()| 0)
             }
+            // Advisory only: the hint is accepted and deliberately ignored (see the dispatch
+            // site's comment on why refusing an advisory hint is pure downside).
+            SyscallRequest::Fadvise64 => Ok(0),
             SyscallRequest::Fstat { fd, buf } => self.sys_fstat(fd).and_then(|stat| {
                 buf.write_at_offset::<Platform>(0, stat)
                     .ok_or(Errno::EFAULT)
