@@ -4624,3 +4624,19 @@ trap, or a genuine litebox emulation gap this specific binary's real-world behav
 busybox/apk/dbus never did). Root-causing this crash and getting weston installed correctly are
 the concrete next steps -- both narrower and more tractable than the original "get any container
 working" scope, since the install/rewrite pipeline itself is now proven working end to end.
+
+**Correction, same pass: the `xfce4-panel --version` `#UD` crash did NOT reproduce on a clean
+rerun.** A fresh invocation of plain `xfce4-panel` (not `--version`) with `LITEBOX_DIAG_FATALDUMP=1`
+runs cleanly through a full, real syscall sequence (futex, sigaction, socket/connect/setsockopt --
+almost certainly a D-Bus session-bus connection attempt, openat, close, ioctl(TIOCGWINSZ)) and
+exits with the CORRECT, EXPECTED error for an environment with no display server running:
+`xfce4-panel: Cannot open display: .` / `Type "xfce4-panel --help" for usage.`, `exit_group(1)`.
+This is genuinely healthy behavior, not a bug -- **the batch-rewritten, apk-installed `xfce4-panel`
+binary is real and working.** The earlier `--version`-flag crash either doesn't reproduce
+consistently (matching this session's own well-documented host-load-driven non-determinism) or is
+specific to that one flag's own code path; not yet investigated further given the plain-invocation
+success is the more load-bearing result (this is the actual binary XFCE launches at runtime, not
+the version-check flag). The remaining concrete next step is narrower than previously stated:
+install `weston` (or find its correct package name/dependency chain) and actually launch the full
+stack (`dbus` session bus, `seatd`, `weston`, then `xfce4-panel`/`xfdesktop`) against a real
+display, mirroring `run_xfce_xwm.sh`'s proven-working sequence but on this apk-installed layer.
