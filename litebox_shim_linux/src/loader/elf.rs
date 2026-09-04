@@ -79,10 +79,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox_common_linux::loader::MapMemory
 {
     type Error = Errno;
 
-    fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
+    fn reserve(
+        &mut self,
+        len: usize,
+        align: usize,
+        cow_padding_hint: usize,
+    ) -> Result<usize, Self::Error> {
         // Allocate a mapping large enough that even if it's maximally misaligned we can
-        // still fit `len` bytes.
-        let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE);
+        // still fit `len` bytes, plus `cow_padding_hint` extra bytes of slack at the low end
+        // (see `MapMemory::reserve`'s own doc comment) so a CoW-mmap of the first PT_LOAD
+        // segment has genuinely `Vmem`-reserved room to place its padded, coarser-aligned view
+        // immediately before this reservation -- see `docs/cow-mmap-fixed-address-design.md`.
+        let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE) + cow_padding_hint;
         let hint = if self.load_high {
             // Reserve the interpreter top-down by passing no hint: LiteBox's
             // `get_unmmaped_area` then runs its top-down search and returns
@@ -137,6 +145,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox_common_linux::loader::MapMemory
             mapping_len,
             len,
             align,
+            cow_padding_hint,
         );
         if let Some((addr, size)) = regions.head_unmap {
             self.task.sys_munmap(UserPtrMut::from_usize(addr), size)?;
@@ -293,9 +302,21 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
                 "DIAG elf_load: PT_LOAD segment"
             );
         }
-        let result = self
-            .parsed
-            .load(&mut self.file, &mut &*platform, reserve, apply_relocations);
+        // `0x1_0000` (64KiB) is Windows' `MapViewOfFile3` allocation-granularity requirement --
+        // the only host this CoW-padding optimization currently supports (see
+        // `docs/cow-mmap-fixed-address-design.md`); every other host passes `None` and gets
+        // exactly today's behavior (`cow_padding_hint` always `0`).
+        #[cfg(target_os = "windows")]
+        let cow_alignment = Some(0x1_0000);
+        #[cfg(not(target_os = "windows"))]
+        let cow_alignment = None;
+        let result = self.parsed.load(
+            &mut self.file,
+            &mut &*platform,
+            reserve,
+            apply_relocations,
+            cow_alignment,
+        );
         Ok(result?)
     }
 }

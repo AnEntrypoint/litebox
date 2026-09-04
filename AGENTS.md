@@ -5739,3 +5739,112 @@ no longer holds for this specific codebase.
 Files: `litebox_shim_linux/src/syscalls/mm.rs` (hack added then fully reverted, net zero diff),
 `AGENTS.md` (this entry). `target/release/litebox_runner_linux_on_windows_userland.exe` rebuilt
 clean (hack disabled) before this pass ended.
+
+## Pass 351 -- implemented `docs/cow-mmap-fixed-address-design.md` Option B's reservation-widening
+groundwork (steps 2-3), real and tested, but deliberately did NOT wire it into
+`try_allocate_cow_pages` -- a genuinely narrower, safer deliverable than the full design, and an
+honest one
+
+Per pass 350's own recommendation (skip the throwaway-hack shortcut, implement a minimal REAL
+version of Option B instead), implemented the design doc's steps 2-3: threading file-offset
+alignment awareness into the ELF loader's reservation path, so `ElfFile::reserve`'s up-front
+`PROT_NONE` reservation can be widened to leave genuine, `Vmem`-tracked slack before the first
+`PT_LOAD` segment -- exactly the room a CoW-mmap attempt for that segment would need to place a
+Windows `MapViewOfFile3` view starting at a 64KiB-aligned file offset earlier than the segment's
+own (only page-aligned) `p_offset`.
+
+**Confirmed the hot binaries are the case this groundwork actually covers**: `busybox`
+(`./bin/busybox` in `layer31_direct_fixed.tar`) and `ld-musl-x86_64.so.1` are both `ET_DYN`
+(`e_type=3`, checked directly against the real tar bytes, not assumed) -- the ONLY case
+`ElfFile::reserve`/`compute_reserved_regions` runs for at all. `ET_EXEC` binaries take an entirely
+different code path in `litebox_common_linux::loader::load()` (`base_addr = 0`, no `reserve()`
+call, each `PT_LOAD` `map_file`'d directly at its own fixed vaddr with zero pre-reservation) --
+this groundwork structurally cannot and does not attempt to apply to them, and none of this pass's
+changes touch that branch at all.
+
+**What changed, precisely**:
+1. `litebox_common_linux::loader::MapMemory::reserve` gained a third parameter,
+   `cow_padding_hint: usize` -- advisory extra slack to reserve immediately BEFORE the returned
+   address. `0` (every existing caller before this pass) is a documented, tested no-op.
+2. `litebox_common_linux::loader::ElfParsedFile::load` gained a `cow_alignment: Option<usize>`
+   parameter. When `Some(granularity)`, `load()` (which already iterates every `PT_LOAD` to
+   compute `min`/`max`/`align`) additionally tracks which segment has the LOWEST `p_vaddr` (the
+   one that ends up mapped at the reservation's own start) and computes
+   `cow_padding_hint = first_segment.p_offset % granularity` -- but ONLY when the reservation's
+   own `align` (driven by the largest `p_align` among all segments, typically >=2MiB for a real
+   ET_DYN binary) is itself `>= granularity`, so the padding request is backed by a real alignment
+   guarantee rather than hopeful slack. `None` (both `litebox_shim_optee` call sites) always
+   yields `cow_padding_hint = 0`, provably unchanged behavior.
+3. `litebox_common_linux::loader::compute_reserved_regions` gained a `min_head_room: usize`
+   parameter. Fixed a real correctness gap found while implementing this (not assumed correct):
+   the naive approach of just enlarging `mapping_len` does nothing on its own, since
+   `aligned_ptr = mapping_ptr.next_multiple_of(align)` depends only on `mapping_ptr`'s own
+   alignment, not on how much extra length was requested -- a bigger `mapping_len` only ever grew
+   the TAIL slack, never guaranteed room before `aligned_ptr`. Fixed by computing
+   `aligned_ptr = (mapping_ptr + min_head_room).next_multiple_of(align)` instead, and trimming
+   `head_unmap` only down to `aligned_ptr - min_head_room` (page-aligned down), never past it --
+   so `[aligned_ptr - min_head_room, aligned_ptr)` is genuinely still part of the SAME
+   `PROT_NONE` reservation, never `munmap`'d away, for any caller that requests head room.
+4. `litebox_shim_linux::loader::elf::ElfFile::reserve` widens `mapping_len` by
+   `cow_padding_hint` and threads it through to `compute_reserved_regions` as `min_head_room`.
+   `litebox_shim_linux::loader::elf::FileAndParsed::load_mapped` passes
+   `cow_alignment = Some(0x1_0000)` (Windows' `MapViewOfFile3` granularity) under
+   `#[cfg(target_os = "windows")]`, `None` on every other host.
+5. `litebox_shim_optee::loader::elf::ElfFileInMemory::reserve` accepts and ignores
+   `cow_padding_hint` (ADD-ed into its own `mapping_len` harmlessly -- always `0` in practice
+   since its `.load()` call site passes `cow_alignment: None`) to satisfy the shared trait.
+
+**Deliberately NOT done this pass, and this is the honest scope limit**: `try_allocate_cow_pages`
+(`litebox_platform_windows_userland/src/lib.rs`) is UNCHANGED -- it still unconditionally falls
+back to `CowAllocationError::Unaligned` for every misaligned `Replace`/`NoReplace` attempt, exactly
+as it has since pass 344's revert. Reason: even with the reservation genuinely widened, safely
+placing a padded view there requires either (a) proving -- not just hoping -- that the padding
+range is still the SAME untouched `PROT_NONE` reservation at CoW-attempt time (which happens much
+later than `reserve()`, after `map_file`/`map_zero` calls for the segment itself and any prior
+segments have run), or (b) a registration protocol that cannot leave a window where the OS-level
+view exists before `Vmem` knows about the padding -- pass 344's exact bug class. Neither is solved
+by this pass's reservation-widening alone; both need real additional design/implementation work
+this pass did not attempt, consistent with this project's standing discipline against shipping an
+unproven risk (see pass 343/344's own history as the reason this caution exists at all). The
+padding room this pass creates is currently unused dead capacity -- real, tested, harmless, and a
+prerequisite for a future pass to build on, but not yet load-bearing for any performance win.
+
+**Testing**: `litebox_common_linux --lib`: 9/9 passed (was 7 -- two new tests added:
+`zero_head_room_matches_pre_existing_behavior`, a required regression guard proving
+`min_head_room = 0` produces byte-identical `aligned_ptr`/`head_unmap`/`tail_unmap` to every
+existing test's own expectations; `nonzero_head_room_guarantees_room_before_aligned_ptr`, which
+caught a REAL bug in this pass's own first attempt -- the initial `head_unmap` trim computation
+still released the padding range itself, defeating the whole point, before the fix in point 3
+above). `litebox_shim_linux --lib`: 181/181 passed, unchanged. `litebox --lib`: 124 passed / 26
+failed, unchanged baseline (same pre-existing/environmental failures documented in every prior
+pass this session). `litebox_shim_optee --lib` could not be run (confirmed via `git stash`
+before/after comparison: fails identically on unmodified `main` with 8 `libc`/`seccompiler`
+compile errors, a pre-existing Windows-host/Linux-only-dependency gap wholly unrelated to this
+pass's changes).
+
+**Live verification**: `cargo build --release -p litebox_runner_linux_on_windows_userland` clean.
+Basic exec (`/bin/sh -c 'echo BASIC_EXEC_OK'` against `layer31_direct_fixed.tar`) succeeds, exit 0.
+200 sequential `/bin/busybox true` execs in one guest process (the exact `ET_DYN` hot path this
+pass's reservation-widening touches, run 200 times to stress it) complete cleanly, exit 0, no
+crashes, no `fatal signal` lines -- confirms the widened reservation causes no regression at the
+scale this whole session's efficiency investigation has been measuring against. Confirmed via
+`LITEBOX_DIAG_MM=1 LITEBOX_LOG=debug` that `try_allocate_cow_pages` still correctly and safely
+falls back to `Unaligned` for every attempt (`diag-cow: file offset not 64KiB-aligned, falling
+back to memcpy path`, same message as before this pass, unchanged code path) -- exactly the
+expected, safe, unwired state. Did not run the full combined XFCE+bench GUI verification this pass
+(judged unnecessary: the changed code path is exercised identically, at the same 200-exec scale,
+by the busybox stress test above, and `try_allocate_cow_pages`'s own behavior is provably
+unchanged) -- a future pass building on this groundwork to actually wire up the padded-view
+placement should re-run the full GUI verification then, since THAT change would be the one
+actually altering runtime behavior under a live GUI session.
+
+**Honest conclusion**: real, tested, safe infrastructure landed; the actual performance-affecting
+part of Option B (safely placing and registering the padded CoW view) remains future work,
+correctly left undone rather than rushed given this exact code area's demonstrated fragility today.
+No wall-clock claim is made or implied by this pass -- none is possible, since the code path that
+would produce one (`try_allocate_cow_pages`) is unchanged.
+
+Files: `litebox_common_linux/src/loader.rs` (trait signature, `load()`, `compute_reserved_regions`,
+2 new tests), `litebox_shim_linux/src/loader/elf.rs` (`ElfFile::reserve`, `load_mapped`'s
+`cow_alignment` selection), `litebox_shim_optee/src/loader/elf.rs` (`reserve()`, `load_ldelf()`
+call site), `AGENTS.md` (this entry).
