@@ -1868,6 +1868,7 @@ pub enum SockType {
     Stream = 1,
     Datagram = 2,
     Raw = 3,
+    SeqPacket = 5,
 }
 
 bitflags::bitflags! {
@@ -4580,6 +4581,20 @@ impl SyscallRequest {
             Sysno::unshare | Sysno::setns => {
                 return Err(errno::Errno::EPERM);
             }
+            // `membarrier` asks the kernel to establish memory ordering across all threads of
+            // the process. Every guest thread here runs in ONE host process sharing one address
+            // space, and the syscall boundary this request crosses is itself a full barrier on
+            // the host, so the ordering the caller asks for already holds by the time we return.
+            // Reporting ENOSYS instead is not a neutral "unimplemented": glib uses membarrier
+            // for the fast side of its thread-safe one-time initialisation (g_once and friends),
+            // which guards module registration among much else, so a hard failure there can
+            // silently skip initialisation rather than merely running slower.
+            //
+            // Returning 0 for the QUERY command would be a lie (it must report a bitmask of
+            // supported commands), so only the actual barrier requests succeed here; a query
+            // still falls through to the unsupported path below and gets ENOSYS, which callers
+            // correctly read as "no optional commands available".
+            Sysno::membarrier if ctx.sys_req_arg::<usize>(0) != 0 => SyscallRequest::SchedYield,
             // Noisy unsupported syscalls.
             Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 return Err(errno::Errno::ENOSYS);
