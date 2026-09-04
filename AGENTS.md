@@ -5516,3 +5516,74 @@ one remaining methodology variance before concluding further.
 
 Files: `.wfgy/xfce-build/layer31_realigned.tar` (734MB, gitignored scratch, not committed, kept for
 follow-on work), `AGENTS.md` (this entry).
+
+## Pass 348 -- idle-background-process discriminator (no GUI at all): confirms fork_verify overhead
+is real and scales with process count, but is NOT the dominant explanation for pass 347's 3x
+regression by itself -- the picture is more complicated than the single-cause hypothesis
+
+Per advisor-db's suggested cheaper discriminator (isolate fork_verify's cost from anything
+GUI-specific -- no weston/xwayland/dbus at all, just N idle `sleep` background processes plus a
+200-`busybox true` timing loop in the same guest, using the same `DIAG_TIMELINE execve`
+timestamp-bracketing method pass 347 used). New script: `advisor/probes/bench_idle_bg.sh`
+(spawns N `sleep 300 &` background processes, then runs the identical N0/N200 busybox timing
+phase `run_xfce_xwm_with_exec_bench.sh` uses). Run against the UNALIGNED canonical layer
+(`layer31_direct_fixed.tar`) with `LITEBOX_LOG=error` (matching pass 347's setting, removing that
+methodology confound) for both N=0 and N=20.
+
+**Results** (bracketing the first-to-last of the 200 `argv0=/bin/busybox` `DIAG_TIMELINE execve`
+lines, 199 intervals):
+
+| N (idle bg procs) | delta / 199 execs | fixup_stale_elf_data_pointers fires | healed_count range |
+|---|---|---|---|
+| 0  | 12.469s -> **62.66ms/exec** | 205 | ~228-250 |
+| 20 | 14.523s -> **72.98ms/exec** | 225 | ~400-410 |
+
+**This does NOT cleanly confirm the single-cause hypothesis from pass 347.** Two things worth
+flagging honestly:
+
+1. **fork_verify fires heavily even at N=0 (zero background processes, no GUI at all)**: 205
+   `fixup_stale_elf_data_pointers` events for a 200-exec bare-shell loop, essentially one per exec,
+   with `healed_count` already in the low-to-mid 200s-300s range -- comparable in ORDER OF
+   MAGNITUDE to pass 347's GUI-combined 204 fires / mid-300s `healed_count`. This means fork_verify
+   overhead is NOT specifically triggered by a live GUI process tree's presence -- it fires just as
+   heavily on a completely bare shell loop with nothing else running. The `sh` while-loop's own
+   repeated fork+exec of `busybox true` is apparently sufficient to trigger it on every iteration,
+   independent of any other process activity.
+2. **Idle background process COUNT does have a real, measurable effect, but it's smaller than pass
+   347's 3x gap**: N=0 -> N=20 added ~10ms/exec (62.66 -> 72.98, a ~16% increase) and roughly
+   doubled `healed_count` magnitude (~240 -> ~405), but this alone cannot explain pass 347's full
+   40.56ms (pass 346, unaligned+GUI) -> 125.9ms (pass 347, realigned+GUI) gap, which is a much
+   larger jump (~3x) than 20 idle sleeps produced here. A live XFCE session has more than 20
+   processes/threads and very different memory/mapping shape than 20 idle `sleep`s, so this is not
+   a like-for-like upper bound on what a real GUI session could cost -- but the magnitude mismatch
+   means "fork_verify cost scales with process count, full stop" is not yet a sufficient
+   explanation on its own; something about the SPECIFIC realigned-layer-plus-live-GUI combination
+   (not measured directly by this bare-shell discriminator) may still be contributing separately.
+
+**Also notable**: N=0's OWN 62.66ms/exec (bare shell, unaligned layer, no GUI) is closer to pass
+347's 125.9ms figure than to pass 346's 40.56ms figure, despite pass 346 having a live GUI present
+and this run having none. This is a genuinely confusing data point that doesn't fit a simple
+"GUI presence is the driver" story either -- possible confounds not yet controlled: this run used
+`LITEBOX_LOG=error` matching pass 347, while pass 346 used no `LITEBOX_LOG` override at all (the
+exact confound pass 347 itself flagged and this pass was meant to remove for the GUI-combined
+comparison specifically, but this bare-shell N=0/N=20 pair does NOT include a pass-346-style
+no-GUI-no-log-override baseline for direct comparison -- that specific cell of the matrix is still
+missing).
+
+**Honest conclusion**: the tar-alignment win is real (isolated bare-shell measurement, advisor-db,
+independently reproduced). The GUI-combined regression (pass 347) is real (independently
+reproduced this session via a fresh regeneration + alignment re-verification). `fork_verify`
+overhead is real, non-trivial, and does scale somewhat with background process count (this pass).
+But the full causal chain connecting "tar alignment" -> "125.9ms/exec with GUI" is NOT yet fully
+isolated -- the idle-background-process count effect measured here (16% for 20 procs) is real but
+too small alone to explain pass 347's 3x gap, and the `LITEBOX_LOG` confound between pass 346 and
+this pass's own baseline is still not fully controlled. **Layer31_direct_fixed.tar remains
+canonical, untouched. layer31_realigned.tar remains NOT promoted.** Concrete next step: run pass
+346's EXACT original invocation (no `LITEBOX_LOG` override, matching its own documented command)
+against BOTH the unaligned and realigned layers, so all four matrix cells (aligned x GUI-present,
+unaligned x GUI-present, aligned x no-GUI, unaligned x no-GUI) share the exact same LITEBOX_LOG
+setting -- this pass only controlled the no-GUI pair, not the full 2x2.
+
+Files: `advisor/probes/bench_idle_bg.sh` (new), `AGENTS.md` (this entry). Raw logs kept at
+`.wfgy/bench_scratch/idle_bg_n0_log.log`, `.wfgy/bench_scratch/idle_bg_n20_log.log` (gitignored
+scratch, not committed).
