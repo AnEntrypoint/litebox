@@ -1259,7 +1259,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // `DrmSubsystem`'s event queue (a higher-crate-layer state, `litebox` cannot
                     // depend on `litebox_shim_linux`). Intercept here instead, the same layer
                     // that already special-cases DRI-fd `ioctl`/`mmap`.
-                    if self.is_dri_device(&files.fs, fd)? {
+                    // One stat answers both device questions (see `classify_device_fd`);
+                    // this read path previously paid two full fd_file_status lookups.
+                    let (is_dri, is_input) = self.classify_device_fd(&files.fs, fd)?;
+                    if is_dri {
                         let Some(event_bytes) = self.global.drm.pop_flip_event_bytes() else {
                             // Real Linux blocks here until an event arrives; this device
                             // completes every flip synchronously inside the PAGE_FLIP ioctl
@@ -1282,7 +1285,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // `litebox::fs::devices::InputDevices`'s own `read` deliberately rejects
                     // every read outright (it has no reach into `EvdevSubsystem`'s event queue,
                     // a higher-crate-layer state `litebox` cannot depend on), so intercept here.
-                    if self.is_input_device(&files.fs, fd)? {
+                    if is_input {
                         let Some(event_bytes) = self.global.evdev.pop_event_bytes() else {
                             // Real Linux blocks a blocking-mode `read()` here until an event
                             // arrives; this shim has no real blocking-wait wired for evdev yet
@@ -4092,6 +4095,42 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Whether `fd` refers to an evdev input device node (`/dev/input/event0`, major 13 -- see
     /// `litebox::fs::devices::InputDevice`'s node-info constants), mirroring
     /// [`Self::is_dri_device`]'s identical major-number-check shape.
+    /// Classify a file descriptor's special-device identity in ONE `fd_file_status` call.
+    ///
+    /// `read()` previously asked [`Self::is_dri_device`] and then [`Self::is_input_device`]
+    /// separately, and each performs its own full `fd_file_status` stat -- so every read of every
+    /// fd paid TWO stats purely to discover it was an ordinary file. Live trace of one busybox
+    /// exec: 386 reads, and the checks fire on each. Both tests read the same two fields
+    /// (`rdev`'s major number and `file_type`), so one lookup answers both.
+    ///
+    /// Returns `(is_dri, is_input)`.
+    pub(crate) fn classify_device_fd(
+        &self,
+        fs: &FS,
+        fd: &TypedFd<FS>,
+    ) -> Result<(bool, bool), Errno> {
+        match fs.fd_file_status(fd) {
+            Ok(status) => {
+                let is_char = status.file_type == litebox::fs::FileType::CharacterDevice;
+                // Non-character-device fds -- the overwhelming majority, every regular file,
+                // pipe and socket -- can skip the major-number arithmetic entirely.
+                if !is_char {
+                    return Ok((false, false));
+                }
+                let major = status.node_info.rdev.map_or(0, |v| v.get() >> 8);
+                litebox_util_log::debug!(
+                    tid:% = self.tid,
+                    rdev:? = status.node_info.rdev.map(|v| (v.get() >> 8, v.get() & 0xff)),
+                    file_type:? = status.file_type;
+                    "classify_device_fd: character device"
+                );
+                Ok((major == 226, major == 13))
+            }
+            Err(litebox::fs::errors::FileStatusError::ClosedFd) => Err(Errno::EBADF),
+            Err(_) => unimplemented!(),
+        }
+    }
+
     pub(crate) fn is_input_device(&self, fs: &FS, fd: &TypedFd<FS>) -> Result<bool, Errno> {
         match fs.fd_file_status(fd) {
             Ok(status) => {
