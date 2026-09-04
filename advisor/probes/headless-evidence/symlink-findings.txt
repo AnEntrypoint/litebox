@@ -48,3 +48,26 @@ packager to emit real symlink entries (and preserve modes) first, repackage,
 confirm a non-zero symlink count and a single busybox copy, then test
 resolution -- including the cross-layer case above, which is a genuine bug
 independent of the packager.
+
+ADDENDUM: the exec-bit half is PURELY the packager, litebox is correct.
+
+Packaging one static ELF twice, at mode 0755 and 0644, into a --resume-from tar:
+
+    -rwxr-xr-x  /exec_0755      test -x -> yes
+    -rw-r--r--  /exec_0644      test -x -> no
+
+litebox preserves tar header modes faithfully and `test -x` distinguishes them
+correctly. So nothing in litebox loses the exec bit -- the packager simply
+writes every file 0644 while HOLDING the real modes in its own
+`permissions: HashMap<PathBuf, u32>` (captured from the OCI tar headers
+precisely because non-Unix hosts lose mode bits).
+
+Interesting detail: BOTH files still RUN (rc=0) when invoked directly, because
+litebox's exec path does not check the mode. Only the shell's own -x test
+refuses. That is why a symlinked /bin/ls gives rc=126 (shell declines) while
+/bin/busybox runs despite being -rw-r--r--.
+
+So the packager discards two things it already has in hand:
+    symlink_map  -> resolved away into file copies
+    permissions  -> not applied, everything emitted 0644
+Both are needed for a faithful image; neither needs new plumbing.
