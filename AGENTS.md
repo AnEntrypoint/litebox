@@ -5075,3 +5075,71 @@ further detail at the log level exercised so far.
 
 Files changed: `litebox_common_linux/src/lib.rs`, `litebox_shim_linux/src/syscalls/drm.rs`,
 `litebox_shim_linux/src/syscalls/file.rs`, `AGENTS.md`.
+
+## Pass 343 -- CoW offset-within-64KiB-aligned-view extension: implemented safely, but honestly
+has ZERO effect on the actual busybox/ld-musl exec workload it was meant to help
+
+Pass 321 implemented `try_allocate_cow_pages` for Windows but fell back to
+`CowAllocationError::Unaligned` whenever a file's mmap offset wasn't a multiple of the Windows
+allocation granularity (64KiB) -- `MapViewOfFile3`'s own hard requirement, stricter than Linux
+`mmap`'s 4KiB page-offset rule. A peer session (advisor-db) sized this precisely on a real,
+production-scale, symlink-preserving, 64KiB-file-start-aligned packed image
+(`linuxserver/webtop:alpine-mate`, 59,067 entries, 2.9GB): busybox + ld-musl CoW candidates cover
+97.5% of every byte read per exec via the slow memcpy fallback, but the real requested FILE offsets
+(not just file-start positions, which the packager's alignment pass already controls) land at
+`0 (x3), 8192, 16384 (x2), 24576, 53248` mod 64KiB -- only 2 of 9 hit the existing aligned-file-start
+fast path. advisor-db's own conclusion: per-segment ELF relayout (to force every `PT_LOAD` onto a
+64KiB file boundary) is real but risky for `ET_EXEC` binaries with linker-fixed addresses, and
+handed off the alternative -- tolerate the misalignment by mapping the containing 64KiB-aligned
+region and returning a pointer offset within it -- as platform work.
+
+**Implemented in `litebox_platform_windows_userland::WindowsUserland::try_allocate_cow_pages`**
+(the same function pass 321 added): when `file_offset` isn't 64KiB-aligned, compute
+`aligned_offset = file_offset - (file_offset % 0x10000)` and `view_padding = file_offset -
+aligned_offset`, map `aligned_offset..aligned_offset+source_data.len()+view_padding` (a
+64KiB-aligned, OS-legal request) via `MapViewOfFile3`, and return `view.Value + view_padding` --
+the address of `source_data`'s own first byte -- to the caller, which never sees the padding.
+
+**But this only applies to `FixedAddressBehavior::Hint`, and here's the real finding**: read
+`litebox_shim_linux/src/syscalls/mm.rs`'s `try_cow_mmap_file` closely -- for
+`Replace`/`NoReplace` (`MAP_FIXED`/`MAP_FIXED_NOREPLACE`), the returned pointer is REQUIRED to
+equal the caller's `suggested_start` EXACTLY (a mismatch fails the whole mmap, not silently
+tolerated). Honoring that exact-address contract while ALSO shifting the view's base address
+backward by `view_padding` bytes (to keep the OS-level offset 64KiB-aligned) would require those
+`view_padding` bytes immediately BEFORE `suggested_start` in the GUEST's address space to be
+genuinely free host memory. Tracing `litebox_shim_linux::loader::elf::ElfFile::reserve`: an ELF's
+ENTIRE virtual span is reserved as one `PROT_NONE` block up front (`sys_mmap` with
+`MAP_ANONYMOUS|MAP_PRIVATE`, tracked by litebox's own `Vmem`/page-management bookkeeping, not
+released), and each `PT_LOAD` segment is then `MAP_FIXED`-mapped into a piece of that
+already-reserved span one at a time. So for any segment other than the file's very first byte, the
+address range immediately preceding it is typically STILL PART OF THE SAME BINARY'S OWN
+RESERVATION (a neighboring segment's real mapped content, or `PROT_NONE` inter-segment padding) --
+not free host address space a raw collision probe could safely distinguish. Confirmed by reading
+`litebox_shim_linux::loader::elf::map_file` (the ELF loader's segment mapper): it unconditionally
+passes `MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED` -- **there is no `Hint`-behavior caller for
+`PT_LOAD` segment loads at all**. `Replace`/`NoReplace` therefore keep the existing, safe
+`Unaligned` fallback unchanged; only `Hint` (which no ELF-segment caller ever uses) got the new
+aligned-view path.
+
+**Live-verified this precisely, not just reasoned about it**: ran `/bin/busybox true` against the
+existing `webtop_seatd.tar` layer (2.6GB, real stock-image busybox/ld-musl) with `LITEBOX_LOG=debug
+LITEBOX_DIAG_MM=1`. Every one of the 7 CoW attempts logged for this single exec hit the NEW
+diagnostic line verbatim: `"diag-cow: file offset not 64KiB-aligned and address is fixed, falling
+back to memcpy path"` at offsets `3072, 27648, 654336, 5084672, 5166592, 5531136, 5748224` -- every
+single one `Replace`/`NoReplace`, none reaching the new `Hint`-only fast path. The guest still runs
+correctly end-to-end (`exit_group status=0`), confirming no regression, but **this fix has zero
+measurable effect on the actual per-exec I/O cost advisor-db measured**. `cargo test -p
+litebox_platform_windows_userland` (4/4 passed) and `cargo test -p litebox --lib` (124 passed / 26
+pre-existing-environmental failures, unchanged baseline) both confirm no regression.
+
+**Honest conclusion, per this project's standing discipline against overclaiming (see pass
+317/321)**: this is a real, correctly-scoped, safely-implemented extension that closes zero
+practical gap for the workload it was written for. Making real progress on the 27ms/exec number
+would require deeper `Vmem`-level surgery -- tracking a CoW mapping's padding prefix as an explicit
+part of the registered mapping range (so a same-binary-reservation "collision" during the padded
+view's placement is provably safe rather than merely probed-and-hoped), not a pointer-offset trick
+at the `try_allocate_cow_pages` leaf alone. That is out of scope for this pass; flagged as the next
+concrete step in PRD row `windows-cow-mmap-unimplemented-forces-4kb-memcpy-per-exec` (originally
+opened by advisor-db) for whoever picks it up next.
+
+Files changed: `litebox_platform_windows_userland/src/lib.rs`, `AGENTS.md`.
