@@ -2006,11 +2006,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let no_hang = options & WNOHANG != 0;
         let process = self.process();
 
+        // `wait4(0, ...)` means "any child in MY process group". A process's children inherit
+        // its pgid at fork, and `setpgid` here can only ever retarget the CALLING process (there
+        // is no global pid registry to look another process up in -- see `pgid`'s doc comment),
+        // so a child can only be in a different group if it moved ITSELF after forking. For the
+        // shells and job-control callers that use this form, that has not happened by the time
+        // they wait, making "my process group" and "any of my children" the same set here.
+        //
+        // This previously fell into the rejection below and returned EINVAL, which is a lie
+        // about the CALLER's arguments -- they are perfectly valid -- rather than about our
+        // support, and a caller cannot distinguish it from a real usage error. Same
+        // errno-as-API problem as namespace clone flags returning EINVAL instead of EPERM.
+        let pid = if pid == 0 { -1 } else { pid };
+
         if !(pid > 0 || pid == -1) {
-            // Waiting for a specific process group (pid == 0 or pid < -1) is not
-            // supported yet -- every child we create is in its own group today anyway.
-            log_unsupported!("wait4 with pid={pid} (process-group wait)");
-            return Err(Errno::EINVAL);
+            // A wait for a DIFFERENT process group (pid < -1) genuinely cannot be answered: we
+            // track only our own `pgid`, never other processes', so we cannot tell which
+            // children belong to the requested group. ECHILD ("no child matched") is the honest
+            // report and is what real Linux returns for a group with no matching children;
+            // EINVAL would instead claim the caller passed something malformed.
+            log_unsupported!("wait4 with pid={pid} (wait for another process group)");
+            return Err(Errno::ECHILD);
         }
 
         // Cross-process children (pass 141, `LITEBOX_PROCESS_FORK=1`) are tracked in a separate
