@@ -34,3 +34,32 @@ Two observations worth keeping:
 Recommendation: realign only what is actually used. Most entries above are
 historical variants (_probe, _mimefix, _pngfix, glycin_disabled). At ~700 MB
 and ~90s each, realigning all nine would burn ~6 GB for layers nobody boots.
+
+
+## Alignment does NOT affect CoW (2026-09-04, deterministic)
+
+One busybox exec, same bench script, three layers differing only in alignment:
+
+    1% aligned    reads=386  cow_attempts=9  cow_successes=0
+    90% aligned   reads=386  cow_attempts=9  cow_successes=0
+    100% aligned  reads=386  cow_attempts=9  cow_successes=0
+
+Byte-identical. Syscall counts are deterministic and immune to the host timing
+noise that wrecked the wall-clock comparisons, so this is a real answer.
+
+CoW's blocker is the FIXED-ADDRESS requirement, not file alignment:
+try_cow_mmap_file's Replace/NoReplace path needs the returned pointer to equal
+suggested_start exactly, which is independent of where the file sits in the tar.
+Alignment cannot help it at any percentage. Closing that avenue.
+
+Two measurement traps hit while producing this, both worth remembering:
+
+- A first attempt showed reads=0 for the realigned layers, which looked like a
+  spectacular CoW win. It was `Error: Expected a .tar file` --
+  MSYS2_ARG_CONV_EXCL did not reach a loop variable, so the path was mangled
+  and the runner never opened the layer. A ZERO in a syscall count means
+  "verify the run happened" before it means anything else; check a guest-side
+  completion marker first.
+
+- The "700 MB vs 734 MB" discrepancy between two sessions was units, not a
+  race: 734,300,160 bytes = 700 MiB = 734 MB. Same file.
