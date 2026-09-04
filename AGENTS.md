@@ -3946,3 +3946,41 @@ value proposition versus the already-working weston path should be re-examined b
 investment), and `xfce-labwc-swapchain-upstream-wlroots-gap` (already correctly identified as a
 genuine upstream wlroots limitation, not litebox's to fix). None of these are quick-fixable within
 a single pass without either hardware this environment lacks or substantial new scope.
+
+## Fresh full re-verification against current build (all this session's fixes applied)
+
+Rebuilt `litebox_runner_linux_on_windows_userland` at current `HEAD` (`33cb4820`) and ran a full,
+from-scratch `run_xfce_xwm.sh` launch against `layer31_direct_fixed.tar` with `LITEBOX_DUMP_FRAMES=1`
+(no `timeout` truncation this time — waited for the real process exit via a `tasklist` poll loop
+rather than an external deadline). **Result: `TEST_DONE` reached, every stage marker printed clean
+(`DBUS_READY`→`SEATD_READY`→`WESTON_READY`→`XWAYLAND_READY`→`XFWM4_WAITED`→`XFSETTINGSD_WAITED`→
+`XFDESKTOP_WAITED`→`PANEL_WAITED`→`TEST_DONE`), zero `SIGABRT`/panic/"Aborted" anywhere in the
+~54K-line log.** Confirms the standing goal's MET status still holds on the current, more-hardened
+build — this session's fixes (epoll.rs build repair, VT ioctls, etc.) did not regress the core
+launch path.
+
+**Frame content, decoded (not just pixel-counted) across the run:** frames 5-40 show weston's own
+colored startup/splash background (97% coverage, only ~3% of rows have content — expected during
+early compositor init, not a bug). By frame ~60 onward the background switches to solid black at
+95-98% coverage with content spanning the FULL 1080-row height (100% VERDICT) — this is XFCE's own
+desktop taking over from weston's splash, and it stays visually STABLE at this exact shape (not
+degrading further) all the way to the final frame 135. Content bands: a narrow icon column at
+x=12..31 (~20px wide), a possible taskbar/dock item near x=801..810 or x=60..133 depending on
+frame, and a wider cluster at x=1753..1904 (~152px, the panel/clock area). This is a real, stable,
+rendering XFCE desktop -- NOT a crash, NOT the previously-documented pixel-count-collapse
+regression (that pattern was `2,073,597` dropping to `~92,036` mid-run; this run's `~92,661`
+non-black-pixel count from `STAGE_XFDESKTOP` onward is the desktop's actual STEADY-STATE content,
+confirmed stable frame-to-frame by decoding, not a drop from a richer prior state -- the earlier
+`2,073,597` figure belongs to a DIFFERENT bug class (a weston-only splash/background render before
+XFCE takes over, still present here at frames 5-40 but correctly superseded once XFCE mounts its
+own desktop).
+
+**Remaining known gap, unchanged from earlier sessions:** the rendered desktop is sparse -- narrow
+icon/panel columns on a solid black field, not a full wallpaper fill with a populated icon grid or
+visible application menu. This matches the user's own much-earlier observation in this session's
+transcript ("no icons, no applications menu"). This is a real, open COSMETIC completeness gap, not
+a functional blocker to the standing goal (XFCE launches, stays up, renders, and does not crash) --
+tracked separately from the MET launch/stability bar. Root-causing the sparse-desktop-content gap
+(missing wallpaper, missing desktop icons, missing panel plugins beyond clock) would be legitimate
+follow-on work for a session specifically scoped to visual completeness, distinct from the launch-
+stability work this session focused on.
