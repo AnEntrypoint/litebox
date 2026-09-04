@@ -166,6 +166,12 @@ pub enum InputSignal {
     Key(u16, i32),
     /// `(code, value)` for an `EV_REL` event -- relative motion, `value` the signed delta.
     Rel(u16, i32),
+    /// `(dx, dy)` for one 2D mouse movement, to be delivered as a SINGLE evdev report
+    /// (`REL_X`, `REL_Y`, one `SYN_REPORT`) rather than two separately-synced ones. Real
+    /// hardware groups the axes of one physical motion into one report; splitting them makes a
+    /// client run its pointer-motion path twice and briefly act on an X-only position the user
+    /// never pointed at. Either delta may be zero (that axis is then omitted).
+    RelMotion(i32, i32),
 }
 
 /// Translate a `winit` physical key into its Linux evdev `KEY_*` code, where a real, verified
@@ -720,11 +726,11 @@ impl ApplicationHandler for PresenterApp {
                     let dx = (position.x - last_x) as i32;
                     #[allow(clippy::cast_possible_truncation)]
                     let dy = (position.y - last_y) as i32;
-                    if dx != 0 {
-                        consumer(InputSignal::Rel(litebox_common_linux::REL_X, dx));
-                    }
-                    if dy != 0 {
-                        consumer(InputSignal::Rel(litebox_common_linux::REL_Y, dy));
+                    // ONE report for one physical movement, not two: see `InputSignal::RelMotion`.
+                    // A zero delta on an axis is omitted by the receiver, and an all-zero move
+                    // queues nothing at all.
+                    if dx != 0 || dy != 0 {
+                        consumer(InputSignal::RelMotion(dx, dy));
                     }
                     // Advance the reference by the whole pixels ACTUALLY SENT, not by the raw
                     // position. The cast above truncates toward zero, so storing `position`

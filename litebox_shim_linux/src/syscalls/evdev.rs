@@ -85,11 +85,31 @@ impl<Platform: ShimPlatform> EvdevSubsystem<Platform> {
     /// [`MAX_QUEUED_EVENTS`], matching a real kernel ring buffer's overflow behavior (newest
     /// events win, not silently refused).
     fn push(&self, event: InputEvent) {
-        let mut events = self.pending_events.lock();
-        if events.len() >= MAX_QUEUED_EVENTS {
-            events.pop_front();
+        self.push_batch(&[event]);
+    }
+
+    /// Queue N real events terminated by a SINGLE `SYN_REPORT`.
+    ///
+    /// `SYN_REPORT` is the marker an evdev client uses to decide "this input batch is complete,
+    /// act on it now". Real hardware groups everything belonging to one physical action into one
+    /// report -- a diagonal mouse movement is `REL_X, REL_Y, SYN_REPORT`, not two separate
+    /// reports. Emitting a sync after every individual event makes a compositor run its whole
+    /// pointer-motion path twice per movement, and briefly act on an X-only intermediate position
+    /// the user never pointed at.
+    ///
+    /// Drops oldest-first at [`MAX_QUEUED_EVENTS`], matching a real kernel ring buffer (newest
+    /// events win rather than being refused).
+    fn push_batch(&self, batch: &[InputEvent]) {
+        if batch.is_empty() {
+            return;
         }
-        events.push_back(event);
+        let mut events = self.pending_events.lock();
+        for event in batch {
+            if events.len() >= MAX_QUEUED_EVENTS {
+                events.pop_front();
+            }
+            events.push_back(*event);
+        }
         if events.len() >= MAX_QUEUED_EVENTS {
             events.pop_front();
         }
@@ -128,6 +148,36 @@ impl<Platform: ShimPlatform> EvdevSubsystem<Platform> {
             code,
             value,
         });
+    }
+
+    /// Queue one 2D relative motion as a SINGLE evdev report: `REL_X`, `REL_Y`, `SYN_REPORT`.
+    ///
+    /// This is what real mouse hardware emits for one physical movement. Sending the axes as two
+    /// separately-synced reports (which [`Self::push_rel`] called twice would do) makes a client
+    /// process the motion twice and briefly act on an X-only position that was never pointed at.
+    ///
+    /// A zero delta on an axis is omitted, matching real hardware, which does not report an axis
+    /// that did not move. If BOTH are zero nothing is queued at all -- no event, no sync.
+    pub(crate) fn push_rel_motion(&self, dx: i32, dy: i32) {
+        let mut batch: [InputEvent; 2] = [InputEvent {
+            tv_sec: 0,
+            tv_usec: 0,
+            r#type: litebox_common_linux::EV_REL,
+            code: 0,
+            value: 0,
+        }; 2];
+        let mut n = 0;
+        if dx != 0 {
+            batch[n].code = litebox_common_linux::REL_X;
+            batch[n].value = dx;
+            n += 1;
+        }
+        if dy != 0 {
+            batch[n].code = litebox_common_linux::REL_Y;
+            batch[n].value = dy;
+            n += 1;
+        }
+        self.push_batch(&batch[..n]);
     }
 
     /// Pop the oldest pending event, if any, encoded as the exact bytes a real `read()` on an

@@ -455,6 +455,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 litebox_platform_windows_userland::presentation::InputSignal::Rel(code, value) => {
                     input_shim.push_input_rel(code, value);
                 }
+                litebox_platform_windows_userland::presentation::InputSignal::RelMotion(dx, dy) => {
+                    input_shim.push_input_rel_motion(dx, dy);
+                }
             });
             let _ = sender_tx.send(presenter.sender());
             if let Err(e) = presenter.run() {

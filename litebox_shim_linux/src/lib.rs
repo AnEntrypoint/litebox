@@ -402,6 +402,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         self.0.evdev.push_rel(code, value);
     }
 
+    /// Push one 2D mouse movement as a SINGLE evdev report (`REL_X`, `REL_Y`, one `SYN_REPORT`),
+    /// which is what real hardware emits for one physical motion -- see
+    /// [`syscalls::evdev::EvdevSubsystem::push_rel_motion`]. Prefer this over two `push_input_rel`
+    /// calls for cursor movement: those produce two separately-synced reports, making a client
+    /// process the motion twice.
+    pub fn push_input_rel_motion(&self, dx: i32, dy: i32) {
+        self.0.evdev.push_rel_motion(dx, dy);
+    }
+
     /// Loads the program at `path` as the shim's initial task, returning the
     /// initial register state.
     pub fn load_program(
