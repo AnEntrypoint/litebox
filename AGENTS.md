@@ -4640,3 +4640,114 @@ the version-check flag). The remaining concrete next step is narrower than previ
 install `weston` (or find its correct package name/dependency chain) and actually launch the full
 stack (`dbus` session bus, `seatd`, `weston`, then `xfce4-panel`/`xfdesktop`) against a real
 display, mirroring `run_xfce_xwm.sh`'s proven-working sequence but on this apk-installed layer.
+
+## Pass 319: stock Docker image (linuxserver/webtop:alpine-mate) pulled wholesale, booted to a real, precisely-located litebox bug -- shm keymap allocation null-deref in labwc
+
+Per explicit user redirect this session ("whatever the stock images or containers implement is
+probably easiest to wrap because we don't have to worry about the state of the software itself"),
+pivoted away from hand-picking individual apk packages (weston's sub-package split had already
+proven non-obvious) to pulling a complete, maintained, real-hardware-proven container image and
+running it wholesale under litebox.
+
+New tool: `advisor/probes/pull_oci_image.py` -- pulls a multi-layer Docker/OCI image via the
+anonymous Registry V2 HTTP API (no `docker` CLI needed, reusing this session's already-proven
+token/manifest/blob curl pattern) and merges all layers into one litebox-loadable tar, correctly
+applying OCI whiteout semantics (`.wh.<name>` deletions, `.wh..wh..opq` opaque-directory markers)
+at the tar-stream level -- never extracting to the host filesystem, since this session's own
+hard-learned lesson is that Windows hosts silently flatten/drop symlinks on `tar -x`.
+
+Image chosen: linuxserver/webtop:alpine-mate (LinuxServer.io's well-maintained webtop family
+has no dedicated XFCE tag -- only mate/icewm/i3/openbox/kde -- so MATE was picked as the closest
+lightweight-GTK analog with the same underlying labwc/DRM/Wayland architecture an XFCE variant
+would have had). 16 real layers (excluding tiny metadata-only ones), one dominant 568MB layer
+(base Alpine + MATE + labwc + selkies), merged into a 2.586GB tar with 54,265 entries (1976 real
+ELFs, 8085 symlinks preserved intact, 3797 dirs, 40402 other files).
+
+Batch-rewritten cleanly: all 1976 ELFs via the existing `advisor/probes/batch_rewrite_layer.py`
+-- zero rewrite failures, zero trapped-syscall-site warnings, roughly 40 minutes wall-clock
+(dominated by subprocess-spawn overhead across ~2000 files, not CPU-bound).
+
+Architecture discovered (via reading the image's own `etc/s6-overlay/s6-rc.d/*` service tree
+and `defaults/*` configs, not assumption): this webtop image's default boot path is Xvfb (virtual
+X11 framebuffer, `svc-xorg`) + openbox + selkies (a WebRTC screen-streaming backend, nginx +
+node.js) -- built for browser-based remote access, not local GPU-accelerated display, and a poor
+fit for both litebox's wgpu/DRM integration and this session's own prior well-documented
+X-server/GBM difficulty. Setting `PIXELFLUX_WAYLAND=true` (an env var the image's own
+`init-selkies-config` script checks) switches the compositor to labwc (real Wayland/DRM
+compositor) instead -- the much better fit, and the one actually exercised below by launching
+labwc directly, bypassing the entire s6/selkies/nginx/pulseaudio/PAM supervision tree (dozens of
+unrelated services) rather than accepting that surface area for a first attempt.
+
+Real boot blockers found and fixed, in order (each one a genuine, reproducible litebox-facing
+or environment-facing gap, not guesswork):
+1. `MSYS_NO_PATHCONV` needed on the guest program path (`/usr/bin/labwc`) -- Git Bash mangled it
+   into a host path otherwise, this session's own oft-repeated harness lesson, reconfirmed.
+2. `XDG_RUNTIME_DIR` must be set AND the directory created with `chmod 700` -- labwc's own
+   `main.c:251` check exits immediately otherwise (status=1, no crash, just a clean bail).
+3. No `seatd` binary in the image at all (its production boot path relies on logind/systemd
+   inside a real container running privileged -- neither exists nor applies under litebox).
+   Pulled the two small missing packages (seatd 42KB, seatd-launch 14KB) directly from
+   Alpine's own package CDN (dl-cdn.alpinelinux.org, APKINDEX-queried for the right version),
+   rewrote both with `litebox_syscall_rewriter.exe` (clean, no trapped sites), and injected them
+   into the tar at `usr/bin/seatd`/`usr/bin/seatd-launch` via the same append-only tar-stream
+   technique `batch_rewrite_layer.py` uses.
+4. Running `seatd -n` as a backgrounded child before `exec labwc` is genuinely racy under litebox
+   (confirmed non-deterministic across repeated identical launches: one run reached
+   `/run/seatd.sock` successfully within ~2s and progressed all the way to Vulkan renderer
+   selection at ~10s; the very next identical-script run left seatd never listening, with
+   "Connection refused" every time labwc probed the socket) -- worth flagging as its own mutable
+   for a future session (is this seatd itself crash-looping under litebox, or a socket bind race
+   specific to this shim's process/fd emulation?), not chased further here since it stopped being
+   the load-bearing blocker once bypassed by DRM/renderer investigation below.
+5. `WLR_RENDERER` defaults to trying Vulkan first (libvulkan_lvp.so/libvulkan_radeon.so
+   loaded, real DRM session opened) and failed with "Could not match drm and vulkan device" --
+   forcing `WLR_RENDERER=pixman` (software rasterizer, wlroots' own documented fallback) sidesteps
+   this cleanly and is NOT a litebox bug -- it's an expected Vulkan/DRM-device-matching gap given
+   there's no real GPU-matching DRM node identity in this environment yet.
+
+Current, still-open, precisely-located blocker (the actual frontier, not vague "it crashes"):
+with `WLR_RENDERER=pixman`, DRM session open, seat granted, labwc reaches keyboard initialization
+and crashes with a real SIGSEGV. Log excerpt:
+`[types/wlr_keyboard.c:212] Failed to allocate shm file for keymap`, followed by a guest exception
+with `cr2=0x80`, "NO mapping overlaps cr2 (genuinely unmapped)", `fatal signal: terminating task
+signal=Signal(11) comm=labwc`.
+`cr2=0x80` (a small, fixed offset, not a wild address) strongly suggests a null-pointer-plus-offset
+struct field dereference immediately after a failed allocation -- i.e. wlroots checked an fd/ptr
+insufficiently after the shm-file-for-keymap call failed. `memfd_create` itself is NOT the likely
+culprit: `litebox_shim_linux/src/syscalls/mm.rs`'s `try_memfd_mmap` is thoroughly implemented with
+real cross-process-shared-memory semantics and has unit tests explicitly covering the exact
+`wl_shm`-style pattern (memfd_create + ftruncate + write + separate mmap() sees the bytes)
+this session's own code comments cite as "live-witnessed end-to-end against a real
+wayland-client/smithay probe." The more likely gap: xkbcommon/wlroots' keymap-shm-file path may
+probe for `memfd_create` availability and fall back to a `shm_open("/dev/shm/...")`-style POSIX
+shm path on failure or on older/different code paths -- a codesearch across `litebox_shim_linux`
+found ZERO references to `/dev/shm` or `shm_open` handling anywhere in the shim, despite `dev/shm`
+existing as a plain directory entry in the rootfs tar (not a real tmpfs-semantics mount as far as
+this session could verify). This is the concrete next hypothesis for whoever picks this up:
+confirm via a minimal standalone probe (a tiny C program calling shm_open+ftruncate+mmap
+directly, same cross-compile-freestanding technique this session already uses for guest probes)
+whether /dev/shm-path POSIX shm genuinely works under litebox today, independent of labwc/wlroots
+entirely.
+
+Comparison against the canonical layer (`.wfgy/xfce-build/layer31_direct_fixed.tar`, previously
+confirmed working with 5 rendered icons/taskbar/clock via weston): the stock-image approach reached
+a DIFFERENT and arguably MORE informative failure point (real DRM session + seat handoff + Vulkan
+device enumeration all succeeded; the blocker is now compositor-internal keymap shm allocation, not
+package/dependency/soname assembly) using dramatically less manual package-selection effort --
+validating the user's redirect. It is NOT yet ahead of the canonical layer in actual rendered
+output (canonical layer still holds the only session with confirmed on-screen pixels this session).
+Per the task's explicit instruction, canonical layer is NOT overwritten; this stock-image variant
+is documented here but not promoted. The merged/rewritten/seatd-augmented tar itself
+(webtop_seatd.tar, 2.586GB) was left in the session's own scratch temp dir, not committed to the
+repo (a 2.6GB binary blob has no place in git history) -- reproducible end-to-end from
+`pull_oci_image.py linuxserver/webtop alpine-mate <out>.tar` plus `batch_rewrite_layer.py` plus the
+two-small-package seatd injection documented above, all committed/documented, none requiring
+re-discovery.
+
+wgpu verification: the `[presenter-diag]` lines seen in every boot attempt above
+(request_adapter returned: true, request_device returned: true, surface configured) confirm
+litebox's existing wgpu presentation path activates automatically and correctly for this image's
+window/surface, exactly as expected -- no new wgpu plumbing was or needed to be written. The
+still-open shm-keymap crash happens inside the GUEST compositor (labwc) before it ever reaches a
+frame-present call, so wgpu itself was never actually exercised end-to-end with real rendered
+content in this pass; that verification remains for whoever fixes the keymap blocker next.
