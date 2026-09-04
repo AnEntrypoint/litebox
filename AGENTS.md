@@ -4545,3 +4545,42 @@ as a representative test set -- a future pass could populate more broadly or con
 `~/Desktop` subset, and the icon SIZE/LAYOUT quality (spacing, whether the grid looks like a
 real desktop vs. a sparse test arrangement) hasn't been visually polished, only functionally
 verified.
+
+## Cross-layer symlink bug (advisor-db's `sy5` finding): precise root cause located
+
+Confirmed live via `advisor/probes/symlink_layer_probe.py`'s `symlink_cross_layer.tar`
+(`--resume-from` a layer containing only symlinks, over a base layer with the real targets):
+`open()`ing a symlink whose NODE lives in the upper/resume layer but whose TARGET lives in the
+lower/base layer returns empty/`ENOENT`, while a direct read of the base-layer target file
+succeeds. `f412e342` (the same-layer final-component-symlink fix) does NOT resolve this -- it's a
+genuinely separate bug, confirmed unaffected by that commit.
+
+**Root cause, precisely located: `litebox/src/fs/layered.rs`'s `open()`, the `self.upper.open(&*path, flags, mode)`
+call around line 653.** The upper backend's own resolver (`resolver.rs`) correctly finds the
+symlink NODE in the upper layer and (since `NOFOLLOW` isn't set) attempts to follow it to its
+target -- but the target path (e.g. `/etc/passwd`) doesn't exist ON THE UPPER LAYER AT ALL, only
+in the lower layer. This makes the upper's own `open()` call fail with
+`PathError::NoSuchFileOrDirectory`, which `layered.rs`'s match arm (line 713-717) correctly
+recognizes as "fall through to check the lower level" -- but the fallthrough (line 720 onward)
+re-opens the ORIGINAL path (`to_base_etc`, the symlink's own name) against the LOWER layer, not
+the RESOLVED TARGET path (`/etc/passwd`). The lower layer has no file named `to_base_etc` (the
+symlink itself only exists on the upper layer), so this correctly-shaped fallback query asks the
+wrong question and returns not-found.
+
+**The real fix needs `layered.rs`'s `open()` to compose symlink resolution ACROSS both layers,
+not just within one:** when the upper layer's own open fails specifically because a symlink's
+target component is missing (not because the symlink itself is missing), the resolved target path
+needs to be tried against the FULL layered filesystem (checking upper-then-lower for the target
+too, recursively, since the target could itself be a symlink), not naively falling back to
+re-querying the lower layer for the symlink's own original name. This likely needs either (a) the
+upper backend's `open()` to expose enough information about "resolved through a symlink to target
+X, which doesn't exist here" for `layered.rs` to retry the target path through itself instead of
+through `lower` directly, or (b) `layered.rs` performing symlink resolution itself at the
+composed-filesystem level (calling its own `read_link`, which already correctly checks both
+layers per `read_link`'s existing upper-then-lower logic at line 1555) before delegating file
+opens to either individual layer. Option (b) is likely cleaner architecturally -- resolving the
+symlink chain once, up front, against the composed view, then opening the final resolved path
+against whichever layer actually has it -- and avoids leaking symlink-following semantics into
+each individual backend's own `open()`. Not yet attempted; this needs careful review against
+`layered.rs`'s existing tombstone/migrate-up semantics (a resolved-to-lower-layer target opened
+for writing still needs to correctly copy-up, for example) before landing.

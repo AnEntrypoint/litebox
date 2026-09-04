@@ -3211,6 +3211,20 @@ pub enum SyscallRequest {
         fd: u32,
         mode: u32,
     },
+    /// `chown`/`lchown`/`fchownat` -- see the dispatch site and handler for why this is always
+    /// a no-op success rather than genuinely tracking per-file ownership.
+    Fchownat {
+        dirfd: i32,
+        pathname: UserPtr<c_char>,
+        owner: u32,
+        group: u32,
+    },
+    /// `fchown` -- see `Fchownat`'s doc comment.
+    Fchown {
+        fd: u32,
+        owner: u32,
+        group: u32,
+    },
     Chdir {
         pathname: UserPtr<c_char>,
     },
@@ -3912,6 +3926,22 @@ impl SyscallRequest {
                 mode: ctx.sys_req_arg(2),
             },
             Sysno::fchmod => sys_req!(Fchmod { fd, mode }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::chown => SyscallRequest::Fchownat {
+                dirfd: AT_FDCWD,
+                pathname: ctx.sys_req_ptr(0),
+                owner: ctx.sys_req_arg(1),
+                group: ctx.sys_req_arg(2),
+            },
+            #[cfg(target_arch = "x86_64")]
+            Sysno::lchown => SyscallRequest::Fchownat {
+                dirfd: AT_FDCWD,
+                pathname: ctx.sys_req_ptr(0),
+                owner: ctx.sys_req_arg(1),
+                group: ctx.sys_req_arg(2),
+            },
+            Sysno::fchownat => sys_req!(Fchownat { dirfd, pathname:*, owner, group }),
+            Sysno::fchown => sys_req!(Fchown { fd, owner, group }),
             Sysno::chdir => sys_req!(Chdir { pathname:* }),
             Sysno::fchdir => sys_req!(Fchdir { fd }),
             Sysno::mmap => sys_req!(Mmap {

@@ -1869,6 +1869,56 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .flatten()
     }
 
+    /// Handle syscall `chown`/`lchown`/`fchownat`.
+    ///
+    /// litebox has no real multi-user model -- every guest process runs as a single simulated
+    /// uid/gid that already "owns" everything, exactly the way `chown(path, geteuid(), -1)` on
+    /// real Linux trivially succeeds as a no-op for a process chowning its own file. There is no
+    /// second user identity a real litebox layer could observe ownership actually changing for,
+    /// so genuinely tracking per-file owner/group (a new stat field, persisted across the tar-ro
+    /// and in-memory-writable backends, threaded through every existing `FileStatus` call site)
+    /// would be real, non-trivial plumbing purely to answer a question no caller in this
+    /// environment can meaningfully ask. Real callers (apk's `.apk` staging-file install,
+    /// observed live: `chown(".apk.<hash>", 0, 0)` while already running as uid 0) only care that
+    /// the call succeeds, not that a distinct ownership concept is tracked -- so validate the
+    /// path/fd resolves to a real file (so a genuinely missing target still reports `ENOENT`
+    /// correctly) and succeed, matching this project's established `fadvise64`/`membarrier`
+    /// pattern of an honest no-op over either a fake enforcement or a wrong `ENOSYS`/`EPERM`.
+    pub(crate) fn sys_fchownat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        _owner: u32,
+        _group: u32,
+    ) -> Result<(), Errno> {
+        let pathname = self.resolve_path_at(dirfd, pathname)?;
+        self.files.borrow().fs.file_status(pathname)?;
+        Ok(())
+    }
+
+    /// Handle syscall `fchown`. See [`Self::sys_fchownat`]'s doc comment for why this is a no-op.
+    pub(crate) fn sys_fchown(&self, fd: u32, _owner: u32, _group: u32) -> Result<(), Errno> {
+        let Ok(raw_fd) = usize::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |fd| files.fs.fd_file_status(fd).map(|_| ()).map_err(Errno::from),
+                |_fd| Ok(()),
+                |_fd| Ok(()),
+                |_fd| Ok(()),
+                |_fd| Ok(()),
+                |_fd| Ok(()),
+                |_fd| Ok(()),
+                |_fd| Ok(()),
+                |_fd| Ok(()),
+                |_fd| Ok(()),
+            )
+            .flatten()
+    }
+
     pub(crate) fn do_close(&self, raw_fd: usize) -> Result<(), Errno> {
         self.do_close_and_replace::<FS>(raw_fd, None)
     }
