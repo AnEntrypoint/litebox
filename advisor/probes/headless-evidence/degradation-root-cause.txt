@@ -1,0 +1,45 @@
+Desktop "degradation" root cause (2026-09-04, advisor) -- NOT a litebox bug.
+
+The 2073597 -> 92036 pixel drop has been treated all session as a regression
+where a working desktop degrades. That framing was wrong in two ways.
+
+1. THE 2073597 FRAME IS NOT XFCE. It appears BEFORE any XFCE component starts:
+
+     log line 2134   non_black_pixels=2073597     <- only weston running
+     log line 19349  STAGE_XFDESKTOP
+     log line 35720  non_black_pixels=92036       <- after xfdesktop starts
+     log line 39702  STAGE_PANEL
+
+   Background colour of the "good" frames is a uniform BGR(68,34,0) /
+   BGR(63,31,0) fill -- weston-desktop-shell's own background, matching the
+   long-standing note that 2,073,597 is weston's full-render count.
+
+2. SO NOTHING DEGRADES. xfdesktop takes over the root window and REPLACES
+   weston's background with its own, then fails to paint it. The drop is
+   xfdesktop starting successfully and rendering badly, not a working desktop
+   being destroyed.
+
+WHY xfdesktop paints black -- from its own stderr, captured mid-run:
+
+  xfdesktop-CRITICAL: xfdesktop_regular_file_icon_new:
+                      assertion 'G_IS_FILE_INFO(file_info)' failed
+  GLib-GObject-CRITICAL: g_object_unref: assertion 'G_IS_OBJECT (object)' failed
+  Gtk-WARNING: Could not load a pixbuf from
+               /org/gtk/libgtk/icons/16x16/actions/drive-harddisk.png
+  xfdesktop-WARNING: Failed to get system bus: Could not connect: Connection refused
+
+That pixbuf failure is the SAME gdk-pixbuf defect already root-caused this
+session: the layer's libgdk_pixbuf has zero built-in loader entries for any
+format, so no image decodes. xfdesktop cannot load its wallpaper or icons, so
+it renders a mostly-black desktop with only the few vector/solid elements it
+can draw.
+
+CONSEQUENCE FOR PRIORITISATION: the desktop-degradation bug and the
+gdk-pixbuf bug are ONE issue, not two, and it is an upstream Alpine packaging
+defect rather than anything in litebox. Fixing gdk-pixbuf (a different Alpine
+build, or the proven musl-cross from-source build) should resolve the visual
+result directly. No litebox memory, capture, or DRM work is indicated.
+
+Also retired: the earlier at-spi SIGTRAP correlation. In a run with the
+gschema fix applied (zero SIGTRAPs) the same drop still occurs, so at-spi's
+crash was coincidental timing, not a cause.
