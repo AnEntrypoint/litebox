@@ -388,6 +388,11 @@ struct GpuState {
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface_size: winit::dpi::PhysicalSize<u32>,
+    /// The exact configuration the surface was created with, kept so a `Resized` event can
+    /// re-apply it with only the dimensions changed. Rebuilding it from `get_capabilities()`
+    /// on every resize risks silently picking a DIFFERENT format/alpha mode than the one
+    /// deliberately chosen at startup (see the `Opaque` alpha-mode note in `resumed`).
+    surface_config: wgpu::SurfaceConfiguration,
 }
 
 struct PresenterApp {
@@ -514,7 +519,26 @@ impl ApplicationHandler for PresenterApp {
         }
         let window_attrs = Window::default_attributes()
             .with_title("litebox virtual display")
-            .with_inner_size(winit::dpi::PhysicalSize::new(1920u32, 1080u32));
+            .with_inner_size(winit::dpi::PhysicalSize::new(1920u32, 1080u32))
+            // Lock the window to the guest's virtual display size. `present()` CLIPS the guest
+            // framebuffer into the surface (`frame.width.min(surface_size.width)`) rather than
+            // scaling it, and the guest's display is a COMPILE-TIME constant (`VIRTUAL_WIDTH`/
+            // `VIRTUAL_HEIGHT`, 1920x1080) that cannot follow the window. So any other window
+            // size silently breaks the correspondence between what the user sees and where the
+            // guest thinks the pointer is:
+            //
+            //   smaller window  -- the bottom/right of the guest display is simply not drawn,
+            //                      but RELATIVE motion still moves the guest cursor into it, so
+            //                      the pointer disappears into a region the user cannot see.
+            //   larger window   -- the extra area shows nothing, yet moving through it still
+            //                      generates motion, so the cursor stops at the guest edge while
+            //                      the user keeps moving.
+            //
+            // Rescaling deltas cannot fix either case: the unseen region does not become visible
+            // by scaling, and scaling relative motion would make pointer speed depend on window
+            // size. Matching the sizes is what actually keeps them in agreement. `Resized` still
+            // handles the cases the OS can force regardless (DPI change, snap, maximise).
+            .with_resizable(false);
         let Ok(window) = event_loop.create_window(window_attrs) else {
             return;
         };
@@ -596,19 +620,17 @@ impl ApplicationHandler for PresenterApp {
             .find(|m| *m == wgpu::CompositeAlphaMode::Opaque)
             .unwrap_or(caps.alpha_modes[0]);
         eprintln!("[presenter-diag] configuring surface, alpha_mode={alpha_mode:?} (available: {:?})", caps.alpha_modes);
-        surface.configure(
-            &device,
-            &wgpu::SurfaceConfiguration {
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST,
-                format: surface_format,
-                width: size.width.max(1),
-                height: size.height.max(1),
-                present_mode,
-                desired_maximum_frame_latency: 2,
-                alpha_mode,
-                view_formats: vec![],
-            },
-        );
+        let surface_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST,
+            format: surface_format,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode,
+            desired_maximum_frame_latency: 2,
+            alpha_mode,
+            view_formats: vec![],
+        };
+        surface.configure(&device, &surface_config);
         eprintln!("[presenter-diag] surface configured, resumed() about to return");
         self.state = Some(GpuState {
             window,
@@ -616,6 +638,7 @@ impl ApplicationHandler for PresenterApp {
             device,
             queue,
             surface_size: size,
+            surface_config,
         });
         // Request a redraw of whatever frame arrived before this setup finished (see
         // `last_frame`'s own doc comment for why this race is real, not hypothetical, and
@@ -666,6 +689,33 @@ impl ApplicationHandler for PresenterApp {
     ) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(new_size) => {
+                // Without this the surface stays configured at its ORIGINAL size forever: the
+                // swapchain textures keep the old dimensions while the OS window does not, so
+                // presentation is stretched/clipped by the compositor and `surface_size` (used
+                // to bound the frame copy below) describes a window that no longer exists.
+                //
+                // This also keeps mouse tracking correct. `present()` CLIPS the guest
+                // framebuffer to the surface (`frame.width.min(surface_size.width)`) rather than
+                // scaling it, so the visible region is a 1:1 top-left crop of the guest display.
+                // A `CursorMoved` delta is therefore already in guest pixels and needs no
+                // rescaling -- but only while `surface_size` actually matches the window. A
+                // stale value silently changes which pixels are on screen without the guest's
+                // cursor tracking following.
+                let Some(state) = &mut self.state else {
+                    return;
+                };
+                if new_size.width == 0 || new_size.height == 0 {
+                    // A minimised window reports 0x0; configuring a zero-sized surface is
+                    // invalid, so keep the last good configuration until it is restored.
+                    return;
+                }
+                state.surface_size = new_size;
+                state.surface_config.width = new_size.width;
+                state.surface_config.height = new_size.height;
+                state.surface.configure(&state.device, &state.surface_config);
+                state.window.request_redraw();
+            }
             WindowEvent::RedrawRequested => {
                 // See `user_event`'s doc comment for why presentation happens HERE, not when a
                 // frame first arrives: this is the one callback `winit` guarantees runs with the
