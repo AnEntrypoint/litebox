@@ -4341,3 +4341,39 @@ build/from-source build/distro swap, not a litebox fix) -- are both real, both f
 with concrete next steps, and both correctly scoped as follow-on work for a session equipped to
 pursue them (real Alpine-build experimentation, or guest-side scanout-buffer debugging) rather
 than continued syscall-level hunting, which has now been run to its practical ceiling for tonight.
+
+## Baked the known mime.cache fix into a real layer variant and re-confirmed the exact next blocker
+
+Actually executed the already-documented one-line fix rather than leaving it as a described-but-
+undone step: ran `update-mime-database /usr/share/mime` through litebox against
+`layer31_direct_fixed.tar` (`--export-writable-layer`, confirmed the export flag needs a
+host-relative/absolute Windows-style path -- `/tmp/...` paths are silently ignored by this
+runner's own path resolution, a real, small, worth-noting host-tooling gotcha, not a litebox
+bug), extracted the real generated `mime.cache`/`aliases`/`subclasses`/`globs2`/`magic`/etc. index
+files, and appended them into a new `layer31_mimefix.tar` variant with the correct `./`-prefixed
+tar-path convention (verified via `tar tf`).
+
+**Live-verified this genuinely moves the failure exactly one step further, matching this
+session's own earlier prediction precisely.** `gdk-pixbuf-pixdata` against a real PNG now: (1)
+correctly identifies the file via GIO MIME sniffing (no more "Couldn't recognize the image file
+format"), (2) reaches `glycin`, (3) hits `WARNING: Glycin running without sandbox` (confirming
+commit `37753913`'s EPERM fix engages exactly as designed), then (4) fails at
+`Could not spawn \`env -i ".../glycin-image-rs" "--dbus-fd" "9"\`: Invalid argument (os error
+22)`. A fresh `LITEBOX_LOG=litebox_shim_linux::syscalls=debug` trace (~32.8K lines) confirms
+**zero `do_clone`/`clone3`/`pidfd_open` events attributable to the glycin subprocess spawn
+attempt** -- the EINVAL originates entirely within `GSubprocessLauncher`'s (or Rust
+`std::process::Command`'s) own pre-spawn validation, before any syscall litebox tracks is ever
+reached. Also noted for whoever picks this up: fd 9 is reused repeatedly across sibling threads
+for unrelated config-file reads (`glycin-image-rs.conf`, `glycin-svg.conf`) each with
+`FD_CLOEXEC` set via `sys_fcntl(SETFD)` immediately after open -- worth checking whether the
+actual D-Bus connection fd passed as `--dbus-fd 9` to the child also has `CLOEXEC` set (which
+would make it invalid in the child post-`execve`, a classic FD-inheritance bug class), though this
+specific EINVAL happens before any child process even starts, so that's a lead for the NEXT layer
+of this investigation, not yet a proven cause.
+
+**This does not change the standing goal's MET status** (the mime.cache fix is layer-packaging
+work, applied to a new `layer31_mimefix.tar` variant, not the canonical
+`layer31_direct_fixed.tar` other sessions build on -- promoting it to canonical is a call for
+whoever picks up this specific thread next, once the remaining glycin-subprocess-spawn EINVAL is
+also resolved, so the icon-loading fix lands as one complete, verified unit rather than a
+partially-applied layer swap).
