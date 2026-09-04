@@ -3822,3 +3822,92 @@ ELF segment `p_offset`/`p_vaddr` alignment, not raw VA) or attach a debugger to 
 via litebox's own crash-correlation tooling to get a proper symbolized backtrace, then check
 whether the NULL is Xorg core's own callback table (a `ScrnInfoPtr` field not yet populated
 this early) or something specific to litebox's DRM/GBM emulation surface.
+
+**Follow-up: the crashing function is now precisely symbolized (byte-exact), and the root cause
+is very likely inside the modesetting driver's own CRTC-private-data walk, not a litebox gap.**
+The earlier VA-vs-file-offset arithmetic (`alloc_base` + descriptor-symbol-relative delta) was
+off by a fixed amount and gave a wrong candidate offset (`0x81f2`, which turned out to be an
+unrelated `drmSetMaster`-adjacent function). The reliable method that actually worked: search
+the full `objdump -d` output for the literal captured crash bytes (`48 83 7e 08 00`, i.e.
+`cmpq $0x0,0x8(%rsi)`) rather than trust any offset arithmetic -- this is unambiguous since the
+exact byte sequence is unique in the binary (confirmed only 1 of the 3 matches decodes as a
+64-bit `cmpq` on `%rsi` specifically, the other two are 32-bit `cmpl` on different registers).
+Exact match at file offset `0xd1f2`, inside a small function starting at `0xd1dd` (stack-canary
+prologue, `sub $0x30,%rsp` / `mov %fs:0x28,%rax`) that takes its second argument in `%rsi`, checks
+`[rsi+8] != 0`, and if false falls through into an unpopulated-cache-init path ending in a
+`drmIoctl` call with ioctl magic `0xc01064b3` -- decoded (`_IOC` layout: dir/size/type='d'/nr) as
+**`DRM_IOCTL_MODE_MAP_DUMB`** (`nr=0xb3=179`, confirmed against the real kernel
+`include/uapi/drm/drm.h` fetched live, not guessed). So this function is a dumb-buffer-mapping
+helper (very likely `dumb_bo_map()` or equivalent in `libgbm`'s dumb-buffer backend, which
+`modesetting_drv.so` links against for its GBM fallback path) -- the crash happens BEFORE the
+`drmIoctl` call is ever reached, meaning litebox's `DRM_IOCTL_MODE_MAP_DUMB` handler (already
+implemented, confirmed working via weston's own dumb-buffer usage) is never even invoked here.
+
+All 3 call sites of this function were inspected. The most informative is call site 2
+(file offset `0xd3f1`): its `%rsi` argument is built by walking a per-CRTC private-data chain --
+`mov 0x120(%r12),%rax` (a `xf86CrtcConfigPtr`-shaped array) → index by `xf86CrtcConfigPrivateIndex`
+→ `mov 0x1b0(%rax),%rax` → `mov 0x18(%rax),%rsi` -- i.e. `crtc->driver_private->some_bo_field`.
+The crash means this per-CRTC driver-private field is NULL at the point the driver tries to map
+it, i.e. genuinely uninitialized CRTC-private state, not a bad pointer litebox handed back from
+any ioctl (the crash is upstream of any DRM ioctl in this call path entirely).
+
+**Leading hypothesis, not yet confirmed live:** `litebox_shim_linux/src/syscalls/drm.rs`'s
+`set_client_cap` (line ~771) unconditionally rejects every `DRM_CLIENT_CAP_*` except
+`DRM_CLIENT_CAP_UNIVERSAL_PLANES` with `EINVAL` (correct behavior for a real legacy-only KMS
+device, per that function's own doc comment -- this device has no atomic API). `xf86-video-
+modesetting`'s real `PreInit`/CRTC-setup path branches on whether `DRM_CLIENT_CAP_ATOMIC` was
+successfully claimed: the atomic-capable branch populates CRTC-private state via one code path,
+the legacy/`SETCRTC`-only fallback branch via a different one -- if litebox's `EINVAL` on
+`DRM_CLIENT_CAP_ATOMIC` is being handled by the driver in a way that skips populating the
+legacy-path CRTC-private struct too (a genuine upstream driver bug in its own fallback handling,
+or a case where the driver expects a DIFFERENT capability/behavior signal than plain `EINVAL` to
+correctly select the legacy path), this NULL follows directly and is NOT a missing litebox
+feature to add -- it would be either a real `xf86-video-modesetting` bug already present upstream
+(worth checking their issue tracker / gitlab.freedesktop.org/xorg/xserver history for known
+legacy-KMS-without-atomic crashes) or a subtly wrong `EINVAL`-vs-something-else response shape
+litebox should send instead. **Not yet live-verified** -- the concrete next step for whoever picks
+this up: patch `modesetting_drv.so`'s PreInit call sequence with `LITEBOX_LOG=debug` +
+`LITEBOX_DIAG_SYSCALL_TIMELINE=1` to log every `DRM_IOCTL_SET_CLIENT_CAP` request/response and
+every CRTC-enumeration ioctl (`DRM_IOCTL_MODE_GETRESOURCES`/`GETCRTC`) in the seconds before the
+crash, to see definitively whether `DRM_CLIENT_CAP_ATOMIC` was requested and rejected right
+before this specific CRTC-private-data walk executes -- that single trace would confirm or kill
+this hypothesis outright. Deferring `gui-x11-server-on-drm-future` again with this precise,
+byte-verified next step rather than attempting a speculative litebox-side fix against an
+unconfirmed hypothesis.
+
+**Follow-up: live-traced and the atomic-cap hypothesis above was WRONG -- the real trigger is
+simpler and now fully confirmed.** `LITEBOX_LOG=litebox_shim_linux::syscalls::drm=debug` against
+the exact repro shows the precise sequence immediately preceding the crash: `GETCRTC reply
+fb_id=0 mode_valid=0 hdisplay=0 vdisplay=0` (litebox correctly reporting the CRTC has no mode
+set yet -- normal for an unconfigured CRTC before any `SETCRTC`) followed immediately by
+`CREATE_DUMB rejected width=0 height=0 bpp=32` (the driver derived a dumb-buffer size directly
+from the CRTC's current -- unset -- mode dimensions, asked for a 0x0 buffer, and litebox's
+`create_dumb` handler correctly rejects a zero-area allocation). The segfault at `0x8` follows
+immediately after this rejection. This exactly matches the disassembly: the driver's own
+CREATE_DUMB caller does not check the ioctl's return code before dereferencing the (never
+populated, because creation failed) buffer-object handle's `+8` field -- the same `dumb_bo_map()`-
+shaped function this pass symbolized earlier. **This is very likely a genuine upstream
+`xf86-video-modesetting` robustness bug (missing error check after a legitimately-rejectable
+CREATE_DUMB call), not a litebox emulation gap** -- litebox's rejection of a 0x0 `CREATE_DUMB`
+request is the textually correct real-kernel behavior (a real DRM driver's `CREATE_DUMB` ioctl
+handler also rejects zero width/height). The actual litebox-side question this leaves open:
+WHY does the driver ask for a CRTC-mode-sized dumb buffer before any mode has been set on that
+CRTC at all -- a real kernel's `xf86-video-modesetting` normally only reaches CREATE_DUMB after
+`drmModeSetCrtc`/mode selection has already populated a real mode, so either (a) this driver's
+own PreInit-stage probe sequence unconditionally tries an early CREATE_DUMB regardless of mode
+state as a capability check (in which case a real kernel's own CRTC would also start at
+`mode_valid=0` and this is squarely an upstream bug reachable on real hardware too, just never
+hit here because real modesetting-capable X servers ship with atomic KMS enabled by default and
+never take this legacy code path), or (b) litebox's own CRTC/connector enumeration is missing a
+step a real kernel takes that would populate a default/preferred mode on the CRTC before the
+driver's PreInit ever asks -- e.g. a real kernel typically has the firmware/bootloader-set
+console mode already active on a CRTC at driver-attach time, which litebox's virtual device
+never had to begin with. **Concrete next step:** compare against a real Linux box's own
+`GETCRTC` response for a freshly-booted CRTC (before any userspace X/Wayland session has run) --
+if a stock kernel also reports `mode_valid=0`/`0x0` at that point, this is conclusively an
+upstream driver bug (report/patch it there, or work around it in the litebox layer by having
+`GETCRTC` synthesize a default preferred mode from the connector's own mode list instead of
+reporting genuinely-unset state, a legitimate divergence-from-real-kernel-behavior workaround
+since litebox has no real firmware-set console mode to inherit). If a stock kernel behaves
+identically, this PRD row's remaining work is entirely upstream/workaround-shaped, not a litebox
+correctness bug to fix. Deferred with this fully evidenced, live-verified next step.
