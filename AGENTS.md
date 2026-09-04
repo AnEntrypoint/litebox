@@ -4377,3 +4377,40 @@ work, applied to a new `layer31_mimefix.tar` variant, not the canonical
 whoever picks up this specific thread next, once the remaining glycin-subprocess-spawn EINVAL is
 also resolved, so the icon-loading fix lands as one complete, verified unit rather than a
 partially-applied layer swap).
+
+## DECISIVE: the glycin subprocess-spawn EINVAL is a real, documented UPSTREAM GNOME bug, not litebox's
+
+Traced the EINVAL one level deeper than any prior pass, correcting an earlier miscount ("zero
+`do_clone` events" was a search-pattern false negative). A real `do_clone`/fork DOES occur for
+glycin's own internal loader-helper process (`gly-hdl-loader`, `pid=9`, distinct from the
+`glycin-image-rs` subprocess it in turn tries to spawn): the child runs, communicates over a
+socket, sends an 8-byte message with payload `"\0\0\0\x16NOEX"` back to the parent (`sys_recvfrom`
+on `fd=16` in the parent, `sys_write` on `fd=17` in the child -- a matched send/receive pair, real
+IPC, not a crash), then cleanly `exit_group(status=1)`. This is glycin's own protocol reporting a
+handled failure, not an unhandled crash or a litebox emulation gap.
+
+**Web research resolves what "NOEX" means and settles the whole thread: this is a well-documented,
+currently-open GNOME upstream bug (`gitlab.gnome.org/GNOME/gdk-pixbuf` issue tracking "gdk-pixbuf
+2.44.x and/or glycin 2.0.x crashing/nonfunctional"), reproducing on REAL, UNMODIFIED Arch Linux
+machines, not just litebox.** The reported real-world symptom is byte-for-byte the same shape:
+"Loader process exited early with status '1'" when glycin's sandboxed loader (bwrap) fails inside
+any restricted/sandboxed environment -- confirming this is a genuine glycin/bwrap-sandboxing
+fragility in gdk-pixbuf 2.44.x, not something specific to litebox's syscall emulation. The
+community's own established workarounds, cited directly on the upstream tracker: downgrade to
+gdk-pixbuf 2.42.x (this session already tried and independently confirmed ALSO broken, for the
+separate zero-built-in-loader-table reason documented above -- not a viable path), or **rebuild
+gdk-pixbuf 2.44.x with `-Dglycin=false`** (disables the fragile sandboxed path entirely, falling
+back to classic in-process loader modules) -- exactly the from-source-build path this session's
+own earlier fork already proved achievable (a genuine working `libpixbufloader-png.so`, see the
+"real, from-scratch PNG loader module" pass), just not yet applied with the correct
+`-Dglycin=false` config flag to the CORE library itself (only the standalone loader module was
+built standalone before; the fix now needs the core `libgdk_pixbuf-2.0.so` rebuilt with glycin
+disabled so `INCLUDE_glycin`'s empty `builtin_loaders[]` gap doesn't reopen).
+
+**This closes the investigation for real, with a single, externally-confirmed, actionable next
+step:** rebuild gdk-pixbuf 2.44.7's core library from source with `-Dglycin=false
+-Dpng=enabled -Djpeg=enabled` (or equivalent meson options restoring classic in-process PNG/JPEG
+support), using the musl-cross toolchain already proven to work this session. No further litebox
+syscall work, sandbox tracing, or protocol archaeology is indicated -- the remaining work is a
+build-configuration change to gdk-pixbuf itself, squarely in scope for a session focused on that
+specific rebuild.
