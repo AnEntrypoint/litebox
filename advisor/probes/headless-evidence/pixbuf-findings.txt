@@ -1,0 +1,31 @@
+gdk-pixbuf PNG decode: binary-level facts (2026-09-04, advisor)
+
+libgdk_pixbuf-2.0.so.0, extracted from layer_timeline3.tar:
+
+  DT_NEEDED includes libglycin-2.so.0   -- glycin is a DIRECT dependency
+  376 exported FUNC symbols
+  ZERO exported glycin symbols          -- readelf --dyn-syms | grep -c glycin == 0
+  strings show gdk_pixbuf__glycin_image_begin_load / _load_increment / _stop_load
+  strings show ../gdk-pixbuf/io-glycin-utils.c
+
+=> The glycin loader is a BUILT-IN, compiled into libgdk_pixbuf and linked
+   against libglycin directly. It is not a dlopen'd module, so it needs no
+   loaders.cache entry. The "missing loaders.cache" theory is therefore wrong,
+   and so is any fix that writes one -- gdk-pixbuf-query-loaders scans the
+   loaders DIRECTORY and structurally cannot enumerate a built-in, which is why
+   it reports zero image/png entries even on a successful (rc=0) run.
+
+Runtime, with a live session bus, RUST_LOG=trace and G_MESSAGES_DEBUG=all
+(advisor/probes/pixbuf_decode_probe.sh):
+
+  failed to load "cursor.png": Couldn't recognize the image file format
+  process tree: NO glycin subprocess
+  glycin log lines: NONE
+
+=> gdk-pixbuf rejects the file BEFORE any decoder runs. glycin never executes,
+   so nothing about the sandbox, bwrap, namespaces or seccomp is reached on
+   this path. The EPERM fix (37753913) is correct and still needed for bwrap's
+   own errno, but it is NOT what gates PNG decoding.
+
+The remaining question is why gdk-pixbuf's format sniffing rejects a valid PNG
+when its only PNG-capable loader is a built-in it should always have.
