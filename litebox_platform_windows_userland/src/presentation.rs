@@ -726,8 +726,19 @@ impl ApplicationHandler for PresenterApp {
                     if dy != 0 {
                         consumer(InputSignal::Rel(litebox_common_linux::REL_Y, dy));
                     }
+                    // Advance the reference by the whole pixels ACTUALLY SENT, not by the raw
+                    // position. The cast above truncates toward zero, so storing `position`
+                    // would discard the sub-pixel remainder permanently. Carrying it forward
+                    // makes motion lossless: successive sub-pixel moves accumulate until they
+                    // cross a whole pixel instead of vanishing.
+                    //
+                    // Measured against the previous behaviour: 25 moves of 0.4px (10px of real
+                    // motion) delivered ZERO pixels to the guest; 10 moves of 3.7px (37px real)
+                    // delivered 30px. Slow mouse movement was silently dropped entirely.
+                    self.last_cursor_pos = Some((last_x + f64::from(dx), last_y + f64::from(dy)));
+                } else {
+                    self.last_cursor_pos = Some((position.x, position.y));
                 }
-                self.last_cursor_pos = Some((position.x, position.y));
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let Some(consumer) = &self.input_consumer else {
