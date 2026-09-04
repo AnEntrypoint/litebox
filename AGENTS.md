@@ -4894,3 +4894,87 @@ memcpy fallback for tar content and instead attacking the ~19-overlapping-`prote
 per-exec lead advisor-db's own trace already flagged as the more promising remaining cost driver.
 Per this project's standing honest-negative-result discipline: this is real, verified, committed
 progress on a real gap, not a fix for the specific number advisor-db measured.
+
+## Pass 341 -- stock-image labwc boot re-verified past the pass-320 shm-keymap crash; new,
+precisely-located blocker found: DRM connector reports zero properties, so labwc's DPMS-set and
+EDID-parse both fail
+
+Re-ran the actual labwc boot (not just the isolated probe) against the same `webtop_seatd.tar`
+(2,586,132,480 bytes, still on disk in scratch temp from pass 319, no re-pull needed) now that pass
+320's `/dev/shm` fix (`2dac1f5f`) and pass 340's Windows CoW-mmap work (`5f948a3d`) have both landed.
+Rebuilt `litebox_runner_linux_on_windows_userland` release first to pick up both.
+
+Coordinated with advisor-db (a peer session sharing this host) before starting, per this project's
+established "never run concurrent full-stack verifications" lesson -- confirmed clear to proceed.
+
+Boot command (after one earlier attempt failed on a harness-only mistake -- `seatd -n` needs an fd
+argument on this seatd build, confirmed via `seatd -h`; dropped `-n` entirely for a plain background
+`seatd`, which is sufficient here since there is exactly one client):
+
+```
+MSYS_NO_PATHCONV=1 litebox_runner_linux_on_windows_userland.exe \
+  --initial-files webtop_seatd.tar --forward-env \
+  --env PIXELFLUX_WAYLAND=true --env XDG_RUNTIME_DIR=/tmp/xdg \
+  --env WLR_RENDERER=pixman --env LITEBOX_DUMP_FRAMES=1 --gui -Z \
+  /bin/sh -c 'mkdir -p /tmp/xdg && chmod 700 /tmp/xdg && (/usr/bin/seatd &) && sleep 2 && exec /usr/bin/labwc'
+```
+
+**The pass-320 fix is confirmed working end-to-end, not just at the isolated-probe level**: this run
+gets meaningfully further than pass 319 ever did. `seatd` starts, labwc connects to it as a real
+client (`seatd/server.c:145 New client connected`, `seatd/seat.c:563 Opened client 1 on seat0`), and
+the DRM/Vulkan/wgpu backend setup that pass 319 reached (`[presenter-diag]` adapter/device/surface
+lines, all present again here) now proceeds PAST keyboard/keymap initialization entirely -- no
+`Failed to allocate shm file for keymap`, no `cr2=0x80` SIGSEGV, none of pass 319's crash signature
+anywhere in this run's log. The shm-keymap blocker pass 320 fixed is genuinely gone in the real
+boot path, not just in the standalone probe.
+
+**New, later, precisely-located blocker** (log excerpt, verbatim):
+```
+[ERROR] [backend/drm/util.c:65] Failed to parse EDID
+[ERROR] [backend/drm/legacy.c:115] connector Virtual-1: Failed to set DPMS property: Invalid argument
+[ERROR] [../src/output-state.c:39] Failed to commit frame
+```
+No crash follows -- the process stays alive but the log goes silent indefinitely after this point (no
+further lines after 10+ minutes of observation with `LITEBOX_DUMP_FRAMES=1` set; zero frame files
+ever appear on disk), i.e. labwc is stuck in some retry/wait state rather than exiting, which is why
+this needed to be force-killed (`taskkill /F`) rather than running to natural completion.
+
+Root-caused directly via code, not guesswork (`litebox_shim_linux/src/syscalls/drm.rs`):
+- `obj_get_properties`'s own doc comment (line ~829-844) states plainly that this device's virtual
+  connector reports `count_props = 0` unconditionally -- "no DPMS, no EDID blob, nothing a hardware
+  driver would register" -- a deliberate prior simplification, not an oversight introduced this pass.
+- There is no `DRM_IOCTL_MODE_CONNECTOR_SETPROPERTY` (the legacy DPMS-set ioctl) handling anywhere in
+  this file (confirmed via search: zero matches for "SETPROPERTY"/"set_property" in the whole ioctl
+  dispatch). Any call to it falls through the dispatch's final `_ => Err(Errno::EINVAL)` arm (line
+  775) -- exactly matching the log's "Invalid argument", not a coincidence.
+- The EDID failure is the same root cause from the other direction: with `count_props = 0`, there is
+  no EDID property/blob for a client to retrieve at all, so wlroots' `backend/drm/util.c` EDID-parse
+  path receives nothing to parse and fails immediately.
+
+This means labwc's legacy (non-atomic) DRM output-commit path unconditionally tries to read EDID and
+set DPMS as part of a normal output-state commit, and this virtual connector's honest "no properties"
+answer -- which pass 319 already flagged, correctly, as a deliberate real-kernel-accurate response
+for an object with a genuinely empty property list -- is exactly what breaks it: real hardware DRM
+connectors always have SOME properties (at minimum EDID + DPMS on legacy KMS), so `count_props = 0`
+is a states no real GPU driver produces, and clients built against real hardware don't defensively
+handle it.
+
+**Not yet fixed this pass** (scope: root-cause and characterize, per the explicit instruction driving
+this pass; the fix itself is follow-up work): the concrete next step is adding a synthetic DPMS
+property (accepting `DRM_IOCTL_MODE_CONNECTOR_SETPROPERTY`/`DRM_IOCTL_MODE_OBJ_SETPROPERTY` for the
+DPMS property id as a no-op success, mirroring how `get_magic`/`auth_magic` already accept-and-ignore
+values this single-client virtual device has no real use for) and a synthetic EDID blob property
+(even a minimal, spec-valid fake EDID -- 128 bytes, correct header/checksum, one basic timing mode --
+would likely be enough for wlroots to stop treating the connector as unusable; real EDID content is
+otherwise unused by a software-rendered virtual output). Both should follow `obj_get_properties`'s
+existing pattern for the plane's one real property (`type` = `"Primary"`, see that function's
+neighboring code) rather than a new parallel mechanism.
+
+No code changed this pass -- this is a boot-verification and root-cause pass only, per the explicit
+scope given. AGENTS.md is the only file modified.
+
+Per this project's standing honest-negative-result discipline: pass 320's `/dev/shm` fix is now
+confirmed genuinely correct and effective in the real end-to-end path (a real milestone -- the
+farthest any stock-image real-Wayland/DRM boot has reached this session), but full rendered pixels
+through labwc remain blocked on this new, different, now precisely-characterized gap. Not yet a
+success; a clean, actionable handoff for whoever implements the DPMS/EDID property fix next.
