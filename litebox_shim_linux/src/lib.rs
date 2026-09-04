@@ -1850,6 +1850,43 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         })
                     })
             }
+            // `statfs`/`fstatfs` describe the FILESYSTEM rather than a file. litebox's guest fs
+            // is a layered in-memory/tar-backed overlay with no fixed device behind it, so there
+            // are no true block counts to report -- but ENOSYS is the wrong answer: it is
+            // user-visible (`stat -f /` printed "Function not implemented") and library code
+            // that probes the filesystem can take a pessimistic path on failure rather than
+            // merely losing an optimisation. Report an honest description instead.
+            //
+            // `f_type` is TMPFS_MAGIC: the guest fs really does behave like a memory-backed
+            // filesystem (contents live in host memory, nothing is durable across runs), so
+            // callers that special-case tmpfs -- skipping fsync-heavy durability paths, or
+            // declining to place lock files -- get the behaviour that is actually correct here.
+            // Block counts are reported as a large, non-zero capacity rather than 0: callers
+            // routinely treat 0 free blocks as "disk full" and refuse to write.
+            SyscallRequest::Statfs { pathname: _, buf } | SyscallRequest::Fstatfs { fd: _, buf } => {
+                const TMPFS_MAGIC: i64 = 0x0102_1994;
+                const BSIZE: i64 = 4096;
+                // 16 GiB of 4 KiB blocks, all reported free. Any caller doing a real capacity
+                // check gets a plausible answer; nothing here is a durable store to fill up.
+                const BLOCKS: u64 = (16 * 1024 * 1024 * 1024) / 4096;
+                let statfs = litebox_common_linux::Statfs {
+                    f_type: TMPFS_MAGIC,
+                    f_bsize: BSIZE,
+                    f_blocks: BLOCKS,
+                    f_bfree: BLOCKS,
+                    f_bavail: BLOCKS,
+                    f_files: 1 << 20,
+                    f_ffree: 1 << 20,
+                    f_fsid: [0, 0],
+                    f_namelen: 255,
+                    f_frsize: BSIZE,
+                    f_flags: 0,
+                    f_spare: [0; 4],
+                };
+                buf.write_at_offset::<Platform>(0, statfs)
+                    .ok_or(Errno::EFAULT)
+                    .map(|()| 0)
+            }
             SyscallRequest::Fstat { fd, buf } => self.sys_fstat(fd).and_then(|stat| {
                 buf.write_at_offset::<Platform>(0, stat)
                     .ok_or(Errno::EFAULT)

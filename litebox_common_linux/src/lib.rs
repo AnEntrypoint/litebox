@@ -501,6 +501,41 @@ pub struct StatxTimestamp {
     pub __reserved: i32,
 }
 
+/// `struct statfs` as x86-64 Linux defines it, for `statfs`/`fstatfs`.
+///
+/// Callers use this to learn the filesystem's type and geometry. Reporting ENOSYS instead is
+/// user-visible (`stat -f /` prints "Function not implemented") and can make library code
+/// assume the worst about a path rather than merely lose an optimisation, so the honest
+/// answer -- a real description of the layered filesystem -- is better than a hard failure.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, FromBytes, IntoBytes, Immutable)]
+pub struct Statfs {
+    /// Filesystem type magic. See `f_type` values in `statfs(2)`.
+    pub f_type: i64,
+    /// Optimal transfer block size.
+    pub f_bsize: i64,
+    /// Total data blocks.
+    pub f_blocks: u64,
+    /// Free blocks.
+    pub f_bfree: u64,
+    /// Free blocks available to unprivileged users.
+    pub f_bavail: u64,
+    /// Total inodes.
+    pub f_files: u64,
+    /// Free inodes.
+    pub f_ffree: u64,
+    /// Filesystem id.
+    pub f_fsid: [i32; 2],
+    /// Maximum filename length.
+    pub f_namelen: i64,
+    /// Fragment size.
+    pub f_frsize: i64,
+    /// Mount flags.
+    pub f_flags: i64,
+    /// Padding, reserved by the kernel ABI.
+    pub f_spare: [i64; 4],
+}
+
 /// Linux's `struct statx` (256 bytes, `linux/stat.h`).
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, FromBytes, IntoBytes, Immutable)]
@@ -3122,6 +3157,16 @@ pub enum SyscallRequest {
         pathname: UserPtr<c_char>,
         buf: UserPtrMut<FileStat>,
     },
+    /// `statfs(path, buf)` -- filesystem statistics for the fs containing `pathname`.
+    Statfs {
+        pathname: UserPtr<c_char>,
+        buf: UserPtrMut<Statfs>,
+    },
+    /// `fstatfs(fd, buf)` -- filesystem statistics for the fs containing `fd`.
+    Fstatfs {
+        fd: i32,
+        buf: UserPtrMut<Statfs>,
+    },
     Fstat {
         fd: i32,
         buf: UserPtrMut<FileStat>,
@@ -3820,6 +3865,8 @@ impl SyscallRequest {
             Sysno::lseek => sys_req!(Lseek { fd, offset, whence }),
             #[cfg(target_arch = "x86_64")]
             Sysno::stat => sys_req!(Stat { pathname:*, buf:* }),
+            Sysno::statfs => sys_req!(Statfs { pathname:*, buf:* }),
+            Sysno::fstatfs => sys_req!(Fstatfs { fd, buf:* }),
             Sysno::fstat => sys_req!(Fstat { fd, buf:* }),
             #[cfg(target_arch = "x86_64")]
             Sysno::lstat => sys_req!(Lstat { pathname:*, buf:* }),
@@ -4596,7 +4643,7 @@ impl SyscallRequest {
             // correctly read as "no optional commands available".
             Sysno::membarrier if ctx.sys_req_arg::<usize>(0) != 0 => SyscallRequest::SchedYield,
             // Noisy unsupported syscalls.
-            Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
+            Sysno::io_uring_setup | Sysno::rseq => {
                 return Err(errno::Errno::ENOSYS);
             }
             sysno => {
