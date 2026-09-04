@@ -1,0 +1,36 @@
+Layer 64KiB-alignment audit (2026-09-04)
+
+Alignment of file data inside each layer tar. Files >=64KiB are the ones that
+matter -- smaller ones cannot fill a 64KiB view. Measured statically, no runs.
+
+layer                              MB   >=64K  algn    %   syms
+alpine-pinned2.tar                243     319     2    1      0
+layer_pngfix.tar                 2445    1440    12    1      0
+layer31_direct.tar                679     581     6    1    521
+xfce-layer31-nopanel.tar          679     581     6    1    521
+layer_with_xorg.tar              2454    1458    17    1      0
+layer31_direct_fixed.tar         2447    1444    17    1      0   <- canonical
+layer31_glycin_disabled.tar      2447    1444    17    1      0
+layer31_mimefix.tar              2445    1441    17    1      0
+layer31_direct_fixed_probe.tar   2445    1440    17    1      0
+alpine_symlinks_preserved.tar       8      11     1    9    329
+layer31_realigned.tar             700     574   518   90   2149
+
+Every layer except the last is ~1% aligned and therefore pays the full
+26.6 ms/exec host-side cost measured in dfb9c166 (realigned: ~0 ms/exec on
+identical content).
+
+Two observations worth keeping:
+
+- `layer31_direct.tar` and `xfce-layer31-nopanel.tar` already carry 521
+  symlinks yet remain 1% aligned. They are on-disk proof of the dedup-only
+  control: deduplication alone buys nothing here, alignment is the lever.
+
+- `alpine_symlinks_preserved.tar` reads 9% but was packed BY the fixed
+  packager. It has only 11 files >=64KiB, so one miss swings the percentage
+  hugely; a real image packed the same way (webtop, 3055 files >=64KiB)
+  measured 3055/3055 = 100%. Small-sample artefact, not a packager bug.
+
+Recommendation: realign only what is actually used. Most entries above are
+historical variants (_probe, _mimefix, _pngfix, glycin_disabled). At ~700 MB
+and ~90s each, realigning all nine would burn ~6 GB for layers nobody boots.
