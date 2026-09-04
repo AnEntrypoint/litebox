@@ -3984,3 +3984,55 @@ tracked separately from the MET launch/stability bar. Root-causing the sparse-de
 (missing wallpaper, missing desktop icons, missing panel plugins beyond clock) would be legitimate
 follow-on work for a session specifically scoped to visual completeness, distinct from the launch-
 stability work this session focused on.
+
+## Sparse-desktop gap ROOT-CAUSED: it is the same gdk-pixbuf PNG-registration defect, not a new bug
+
+Reproduced the sparse-desktop launch fresh (`run_xfce_xwm.sh` against `layer31_direct_fixed.tar`,
+waited for genuine process exit via a `tasklist` poll loop, no external `timeout` truncation) and
+read the script's own captured `xfdesktop.out`/`panel.out` logs (already dumped at the end of
+`TEST_DONE`, just never inspected for this specific question before). Found real, specific GTK/GLib
+errors, not silence:
+
+- `(xfdesktop:85): xfdesktop-CRITICAL **: xfdesktop_regular_file_icon_new: assertion
+  'G_IS_FILE_INFO(file_info)' failed` — desktop-icon creation receives a NULL/invalid `GFileInfo`,
+  so no desktop icons are ever added to the icon-view model.
+- `(xfdesktop:85): Gtk-WARNING **: Could not load a pixbuf from
+  /org/gtk/libgtk/icons/16x16/actions/drive-harddisk.png. This may indicate that pixbuf loaders or
+  the mime database could not be found.` — **this is the same gdk-pixbuf PNG-registration gap
+  documented above, now confirmed to also break GTK's own built-in GResource-embedded icons**, not
+  only the standalone `gdk-pixbuf-pixdata` CLI tool this session originally tested it with. Any GTK
+  widget that needs to render a themed/built-in icon (toolbar buttons, the desktop's own
+  drive/folder icons, panel plugin icons) silently gets no image at all.
+- `xfce4-panel` (pid 138, confirmed executing in the process tree) produced **zero** stdout/stderr
+  of its own — no crash, no GTK warning lines captured at all — meaning it is running and likely
+  rendering SOMETHING (consistent with the decoded frame's `x=1753..1904` bright cluster, plausibly
+  the clock widget, which XFCE renders as plain Pango text, not a themed icon) while every
+  icon-dependent panel plugin silently renders nothing, with no error surfaced anywhere to explain
+  why.
+
+**This is not a new, separate bug to root-cause — it is the sparse-desktop symptom of the already-
+documented, already-deferred gdk-pixbuf PNG-registration defect**, now confirmed to have a MUCH
+larger blast radius than originally scoped (not just one CLI tool's PNG decode, but every themed/
+built-in icon GTK ever tries to load, across `xfdesktop` AND `xfce4-panel` AND presumably every
+other GTK client in this session). `layer31_direct_fixed.tar` (the canonical layer used for the
+standing-goal MET verification and this repro) still ships the original, broken v2.44.7
+`libgdk_pixbuf-2.0.so` — the earlier v3.19-downgrade attempt was confirmed BYTE-LEVEL to not
+actually fix the underlying registration gap either (see the "ROOT CAUSE FOUND" section above: v3.19
+genuinely has zero `"png"` string literal in its binary, same defect, different version), so simply
+copying that swap into the canonical layer would not help.
+
+**Concrete next step, not yet attempted:** the three follow-on paths already named in the deferred
+`gdk-pixbuf-v3-19-downgrade-swap-...` PRD row apply directly here too — (1) find and verify a
+genuinely different Alpine build/version that DOES register PNG as a built-in loader (the meson
+default expects this to work; some Alpine version must actually ship it correctly, since Alpine
+ships GTK desktops elsewhere that clearly render icons) by directly downloading and byte-inspecting
+candidate `.apk` packages the same way this session did for v3.19 (`nm -D` alone is insufficient —
+the byte-level `strings`/format-string check is the one that's actually decisive), (2) implement
+real Linux namespace support so `glycin`/`bwrap`'s sandboxed-subprocess PNG-decode path (the
+architecturally-correct, currently-blocked path for the STOCK v2.44.7 build already in the canonical
+layer) can work as designed instead of working around it, or (3) stand up a musl cross-toolchain to
+build a known-working gdk-pixbuf from source with explicit `-Dpng=enabled -Dglycin=disabled`. Not
+attempted this pass — a real fix here is substantial, cross-cutting work (touches the canonical
+layer's core GTK stack, affects every GUI component, and needs the same byte-level verification
+rigor the earlier v3.19 attempt required) better scoped to its own dedicated session than squeezed
+into this repro-and-diagnose pass.
