@@ -1,0 +1,50 @@
+litebox symlink handling -- measured, not assumed (2026-09-04, advisor)
+
+BACKGROUND. Every litebox layer contains ZERO symlinks:
+    layer31_direct_fixed.tar   0 symlinks, 5,657 regular files
+    alpine-rootfs.tar          0
+    alpine-fresh-test.tar      0
+In-guest all 89 /bin entries are regular files; /bin/sh and /bin/busybox are
+separate 804,648-byte copies. 295 copies of busybox = 226 MB in one layer.
+
+CAUSE, and its premise is FALSE. litebox_packager/src/lib.rs (~line 178):
+    // The litebox tar RO filesystem does not support symlinks, so each file is
+    // placed as a regular file copy at every needed path.
+litebox/src/fs/tar_ro.rs has IndexedChild::Symlink, FileType::Symlink, a
+symlinks: Vec<IndexedSymlink> index, read_link returning the target, and the
+tar reader parsing symlink entries into RawEntry::Symlink (~line 546). The
+resolver follows them with ELOOP hop limits. The comment is stale.
+
+MEASURED (advisor/probes/symlink_layer_probe.py builds the tars):
+
+  same-layer symlink, relative target    WORKS
+  same-layer symlink, absolute target    WORKS
+  same-layer symlink CHAIN (link->link)  WORKS
+  reported correctly by ls               WORKS  (lrwxrwxrwx, target shown)
+
+  CROSS-LAYER symlink (upper layer -> base layer file)    FAILS, ENOENT
+      base file direct (/etc/passwd):    root:x:0:0:r
+      symlink -> /etc/passwd:            No such file or directory
+      symlink -> /bin/busybox:           No such file or directory
+    The target reads fine directly, so this is not a missing file -- the
+    resolver does not follow a symlink across the layer boundary.
+
+  EXECUTING through a symlink            FAILS rc=126
+    rc=126 is the SHELL refusing, not litebox: every packaged file is mode
+    0644, and litebox itself ignores the exec bit (/bin/busybox is
+    -rw-r--r-- and still runs), but a shell checks the mode first. So a
+    faithfully-packaged image needs the exec bit preserved too, not just the
+    symlink.
+
+WHY THIS MATTERS FOR THE CONTAINER GOAL. A real OCI image is largely DEFINED by
+its symlink structure (/bin/ls -> /bin/busybox, /lib64 -> /lib). Flattening
+produces a rootfs that is no longer the image. It also means litebox's symlink
+paths have never been exercised by any tested layer -- which is how a load-path
+failure on symlinked entry binaries survives undetected.
+
+SEQUENCING. A fix to symlink resolution CANNOT be validated against existing
+layers: they contain no symlinks, so a green test proves nothing. Fix the
+packager to emit real symlink entries (and preserve modes) first, repackage,
+confirm a non-zero symlink count and a single busybox copy, then test
+resolution -- including the cross-layer case above, which is a genuine bug
+independent of the packager.
