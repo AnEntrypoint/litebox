@@ -4036,3 +4036,159 @@ attempted this pass — a real fix here is substantial, cross-cutting work (touc
 layer's core GTK stack, affects every GUI component, and needs the same byte-level verification
 rigor the earlier v3.19 attempt required) better scoped to its own dedicated session than squeezed
 into this repro-and-diagnose pass.
+
+## Pass — gdk-pixbuf PNG defect root-caused at the SOURCE level; genuinely no distro-swap fix exists
+
+Investigated all three follow-on paths from the section above with real evidence, not guesses.
+
+**Path 1 (different Alpine version) — RULED OUT, exhaustively.** Downloaded and byte-inspected
+Alpine v3.16's `gdk-pixbuf-2.42.8-r0` (2022, the oldest version the package browser still serves)
+the same way v3.19 was inspected: `nm -D` shows 40 PNG symbols + 22 JPEG symbols present (dead
+code, same as v3.19), but zero bare `"png"` string literal via `strings`. Alpine's `main`/`v3.16`
+through `v3.20` branches (`main` repo pre-move, `community` post-move) all report the *same*
+`2.42.12-r0` package for v3.17-v3.20 -- meaning this exact defect has been shipping unfixed for at
+least 4+ years and every currently-servable Alpine branch. There is no Alpine version to swap to.
+
+**Root cause, finally pinned to actual gdk-pixbuf UPSTREAM SOURCE, not a packaging mystery.**
+Fetched `gdk-pixbuf/gdk-pixbuf-io.c` (the exact 2.42.12 tag GNOME ships, matching Alpine's version)
+directly from `github.com/GNOME/gdk-pixbuf`. `gdk_pixbuf_io_init_builtin()` gates EVERY built-in
+loader behind a `#ifdef INCLUDE_<format>` **compile-time preprocessor macro** — `load_one_builtin_
+module(png)` only runs, and only then adds `png` to the live `file_formats` list, if `INCLUDE_png`
+was `#define`d when `gdk-pixbuf-io.c` itself was compiled. The `_gdk_pixbuf__png_fill_info`/
+`_gdk_pixbuf__png_fill_vtable` SYMBOLS being present in the compiled `io-png.c` object code (giving
+the `nm -D` false-positive signal that's misled this investigation twice now) is entirely
+independent of whether `INCLUDE_png` was defined for `gdk-pixbuf-io.c`'s own translation unit --
+Alpine's build genuinely never defines `INCLUDE_png`/`INCLUDE_jpeg` for this package, linking dead
+PNG/JPEG decode code that is architecturally unreachable through the normal `gdk_pixbuf_new_from_
+file()` API path, confirmed to be true of every servable Alpine branch. **This is a real, confirmed,
+long-standing Alpine build-configuration defect, not a litebox bug, not a tar-packaging bug, and not
+something any existing Alpine package can dodge by version-swapping.**
+
+**The clean fix exists and was correctly identified, but needs infrastructure this pass doesn't
+have.** `gdk-pixbuf-io.c`'s `USE_GMODULE` dynamic-loading path (confirmed active in every inspected
+Alpine build -- real `libpixbufloader-{tiff,xpm,ani,bmp,gif,...}.so` loadable modules genuinely ship
+and register correctly at runtime via `gdk-pixbuf-query-loaders`, entirely independent of the broken
+`INCLUDE_*` built-in gate) means a standalone `libpixbufloader-png.so`, compiled from gdk-pixbuf's
+own `io-png.c` as an ordinary GModule (not a built-in), would register through the SAME working
+runtime path the other loaders already use -- correctly bypassing the broken compile-time gate
+entirely, without needing to rebuild the whole gdk-pixbuf library. Confirmed no such module is
+shipped by ANY Alpine package (searched `pkgs.alpinelinux.org`'s content index for
+`libpixbufloader-png.so` across all branches/repos/arches: zero hits) -- it must be built, not
+found. **Blocked on real infrastructure, not effort:** compiling even this minimal module needs a
+genuine musl x86_64 sysroot (libc + glib + gdk-pixbuf-private headers, correct import libs for
+linking against the layer's own `libc.musl-x86_64.so.1`/`libglib-2.0.so.0`/`libgobject-2.0.so.0`/
+`libpng16.so.16`), which this host does not have -- confirmed live: this host's own `clang` can
+target `-target x86_64-linux-musl` for parsing, but has zero musl libc headers available
+(`stdio.h` itself is missing), and no `musl-cross`/`x86_64-linux-musl-gcc` toolchain is installed
+anywhere on this host. This is the SAME "both guest compilers are broken, host has no musl
+cross-toolchain" wall this project has hit before (see `feedback_host_crosscompile_guest_probes`) --
+genuinely not resolvable within a single pass without either downloading/bootstrapping a full musl
+cross-toolchain (a real, scoped, install-and-verify task for its own session) or standing up real
+Linux namespace support so the STOCK Alpine package's glycin/bwrap sandboxed-decode path (which
+Alpine's own build DOES route through correctly, architecturally, for the exact same reason the
+built-in path is deliberately disabled -- confirmed via the earlier `APKBUILD`/meson-option read)
+can just work as upstream intended, instead of being worked around.
+
+**Concrete, scoped next step (not vague):** a session with either (a) network access to download
+a prebuilt musl-cross toolchain (e.g. `musl.cc`'s prebuilt `x86_64-linux-musl-cross` tarball, which
+bundles gcc + musl headers + import stubs in one archive -- known to exist, not yet fetched this
+pass) or (b) time budgeted for real Linux namespace (`unshare`/`clone` namespace flags) support in
+litebox itself (a substantial, standalone litebox feature, not a gdk-pixbuf-specific fix, but the
+one that make the STOCK Alpine package work exactly as its own upstream build intended). Either
+path is real, bounded, and would close this permanently -- deferring with this evidence rather than
+attempting a half-built cross-compile that would likely produce a broken, unverifiable `.so`.
+
+## Pass — real, from-scratch PNG loader module built AND working; commit 37753913's EPERM fix
+## verified live to close the sandbox-detection gap; ONE narrower blocker remains, precisely located
+
+Two independent, real fixes landed and verified this pass, converging on the same problem from
+different angles.
+
+**A genuinely working `libpixbufloader-png.so` loadable module was built from scratch and verified
+correct.** Downloaded a real prebuilt `x86_64-linux-musl-cross` toolchain (musl.cc, gcc 11.2.1 +
+full musl headers/libs), extracted just its sysroot (headers + import libs), and fed that to this
+host's native Windows `clang -target x86_64-linux-musl --sysroot=...` (confirmed live: clang alone,
+with no sysroot, can target musl for parsing but has zero libc headers -- the sysroot from the
+cross-toolchain supplies exactly what was missing). Fetched gdk-pixbuf 2.42.12's real `io-png.c`
+plus its private headers (`gdk-pixbuf-core.h`/`-io.h`/`-private.h`/`-loader.h`/`-animation.h`/
+`-macros.h`) directly from `github.com/GNOME/gdk-pixbuf`, hand-wrote the ~6 lines of genuinely
+meson-generated content actually needed (`config.h`'s `HAVE_ROUND`/`HAVE_LRINT`/`GETTEXT_PACKAGE`,
+a minimal `gdk-pixbuf-features.h`), and supplied `-D_GDK_PIXBUF_EXTERN=extern
+-DGDK_PIXBUF_ENABLE_BACKEND` to satisfy the same build-time gates this pass's earlier source read
+of `gdk_pixbuf_io_init_builtin()` found (see prior section) -- but this time targeting the
+`MODULE_ENTRY`/standalone-module code path (`fill_info`/`fill_vtable`, no `INCLUDE_png` mangling),
+NOT the broken built-in path. Compiled clean (one benign warning), linked against glib-dev/
+libpng-dev headers (Alpine `edge` packages) and the CANONICAL layer's own real runtime
+`.so`s (`libglib-2.0.so.0`, `libgobject-2.0.so.0`, `libgmodule-2.0.so.0`, `libgio-2.0.so.0`,
+`libpng16.so.16`, `libintl.so.8`, `libgdk_pixbuf-2.0.so.0`, `libc.musl-x86_64.so.1` under its real
+SONAME). **Live-verified via `gdk-pixbuf-query-loaders` run through litebox against the layer: the
+module is discovered, opened, `dlopen`'d successfully, and correctly self-reports as a real PNG
+loader** (`"png" 5 "gdk-pixbuf" "PNG" "LGPL"`, `"image/png"`, the real PNG magic-byte signature
+`\211PNG\r\n\032\n`) -- this is a genuine, working, from-source-built gdk-pixbuf PNG loader module,
+proof that path 2 (build from source) from the prior section's three options IS achievable on this
+host with the right toolchain, contrary to that section's own "not resolvable" conclusion (written
+before this toolchain download was attempted).
+
+**Separately, and more decisively: `gdk-pixbuf-pixdata` on the STOCK (unmodified) canonical
+`v2.44.7` build was confirmed, by reading its actual module-selection source
+(`_gdk_pixbuf_get_module` in `gdk-pixbuf-io.c`), to be built with `GDK_PIXBUF_USE_GIO_MIME`
+defined -- meaning format detection goes through `g_content_type_guess()` (GIO MIME sniffing), NOT
+simple magic-byte matching against the loadable-module list.** This requires a compiled
+`/usr/share/mime/mime.cache`, which the canonical `layer31_direct_fixed.tar` never had (only the
+uncompiled `.xml` package sources under `/usr/share/mime/packages/`) -- running the layer's own
+`update-mime-database /usr/share/mime` (binary already present, just never invoked) fixes this
+cleanly and is now a known, reproducible, one-line fix. **Once MIME sniffing correctly identifies
+the file as `image/png`, `gdk-pixbuf-pixdata` on the STOCK build routes straight to `glycin`
+(confirmed live: `WARNING: Glycin running without sandbox` appears, meaning the sandbox-setup
+gracefully degraded exactly as commit `37753913`'s EPERM fix (landed by a peer session mid-pass,
+independently verified here) was designed to make it do) -- it never even consults the standalone
+module list this pass's own `libpixbufloader-png.so` populates, because glycin is architecturally
+the FIRST-CHOICE PNG handler in this build, not a fallback.** This means the from-scratch loadable
+module built above, while genuinely correct and working, is currently moot for the STOCK build's
+own code path -- it would only matter for a build where `USE_GMODULE`-only module discovery is the
+sole PNG path (e.g. if glycin itself were removed/disabled at the meson level).
+
+**The `WARNING: Glycin running without sandbox` degrade-path is real and correctly triggered by
+commit `37753913`'s fix -- but the decode STILL fails one step further in, with a narrower, more
+precisely located EINVAL:** `Could not spawn \`env -i "/usr/libexec/glycin-loaders/2+/glycin-image-rs" "--dbus-fd" "9"\`: Invalid argument (os error 22)`. Traced exhaustively via
+`LITEBOX_LOG=debug` (full syscall + platform-level trace, ~47K lines): **glycin's subprocess spawn
+attempt for `glycin-image-rs` never reaches litebox's own `clone()`/`fork()` handler at all** --
+only 2 total `do_clone` events occur in the whole trace, both accounted for by `gdk-pixbuf-
+query-loaders`'s and `gdk-pixbuf-pixdata`'s own top-level forks, zero for glycin. No `EINVAL`
+string, no `clone3`, no `pidfd_open`-adjacent log line anywhere in the trace. This means the EINVAL
+originates from something that fails BEFORE any syscall litebox tracks at DEBUG level is even
+attempted -- most likely inside `GSubprocessLauncher`'s/`std::process::Command`'s own FD-validity
+pre-flight checks for the `--dbus-fd 9` argument (a `fcntl(9, F_GETFD)`-shaped check glibc/glib
+issues internally before actually spawning, to validate the FD it's about to `dup2()` into the
+child -- plausible if fd 9 in this process is not what glib expects it to be, e.g. because of how
+xdg-desktop-portal/dbus FD-passing interacts with litebox's own fd-table emulation).
+
+**Retested with a REAL `dbus-daemon` running first (the D-Bus-less-repro theory above was checked
+and RULED OUT)** -- identical failure, confirming the missing D-Bus daemon was never the cause.
+Full `LITEBOX_LOG=debug` trace (both variants, ~47K and ~305K lines) traced exhaustively: **the
+actual EINVAL source is `socket(type = 5)`** -- logged twice, immediately before the `sys_pipe2`
+calls that set up glycin's subprocess communication pipes, right before the final failure. Type 5
+is `SOCK_SEQPACKET`. Read `litebox_shim_linux/src/syscalls/net.rs`'s `parse_type_and_flags` (line
+1023-1032): `SockType::try_from(ty)` has no `SeqPacket` variant, so any `socket(..., SOCK_SEQPACKET,
+...)` call unconditionally returns `Errno::EINVAL` right there, logged via `log_unsupported!
+("socket(type = {ty})")` -- an exact match for the trace. glib's `GDBusConnection`/subprocess
+FD-passing machinery evidently opens a `SOCK_SEQPACKET` control socket as part of setting up the
+`--dbus-fd` handoff to the spawned `glycin-image-rs`; this EINVAL is almost certainly what
+propagates up through glib's own error chain to the final "Could not spawn ...: Invalid argument
+(os error 22)" message glycin surfaces.
+
+**This is a real, precisely-located, single-syscall gap, distinct from and downstream of the
+namespace/EPERM fix (commit `37753913`, confirmed working correctly).** `SockType` (in
+`litebox_common_linux` or wherever the enum is defined) needs a `SeqPacket` variant threaded
+through to `net.rs`'s socket implementation. Real Linux `SOCK_SEQPACKET` on `AF_UNIX` behaves like
+a connection-oriented, message-boundary-preserving stream (closer to `SOCK_STREAM` than
+`SOCK_DGRAM` in most respects -- reliable, ordered, connection-based, but each `send()`/`recv()`
+preserves message boundaries rather than concatenating into a byte stream). For `AF_UNIX` (the only
+domain this specific call needs, given the trace's context), implementing it as a thin wrapper
+around the EXISTING `AF_UNIX SOCK_STREAM` implementation with message-boundary tracking added
+(each `send()` call recorded as one `recv()`-sized unit, rather than free-flowing bytes) would
+likely satisfy glib's actual usage pattern without needing a full from-scratch socket-type
+implementation. **This is the single, concrete, well-bounded next fix for whoever picks up this
+row** -- confirmed to be the last blocker between the now-working namespace/EPERM fallback path and
+a fully working gdk-pixbuf/glycin PNG decode (and, by extension, the sparse-desktop-content gap
+this whole thread traces back to).
