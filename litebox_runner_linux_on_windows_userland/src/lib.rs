@@ -351,22 +351,14 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     let rootfs_source = if let Some(image_ref) = &cli_args.oci_image {
         eprintln!("Pulling OCI image (runtime, in-memory): {image_ref}");
+        // `pull_layers_in_memory` pulls, decompresses, AND rewrites each layer's ELFs one layer
+        // at a time internally -- never holding more than one layer's raw+rewritten bytes at
+        // once. Rewriting again here would be redundant (and re-introduce the same
+        // all-layers-at-once memory spike this function was changed to avoid).
         let pulled = litebox_packager::oci::pull_layers_in_memory(image_ref, true)
             .map_err(|e| anyhow!("failed to pull OCI image {image_ref}: {e}"))?;
-        eprintln!(
-            "  Rewriting syscalls in {} layer(s)...",
-            pulled.layers.len()
-        );
-        let rewritten_layers = pulled
-            .layers
-            .into_iter()
-            .map(|layer| {
-                litebox_packager::oci::rewrite_layer_elfs(&layer, true)
-                    .map_err(|e| anyhow!("failed to rewrite ELFs in OCI layer: {e}"))
-            })
-            .collect::<Result<Vec<Vec<u8>>>>()?;
         RootfsSource::OciLayers {
-            layers: rewritten_layers,
+            layers: pulled.layers,
         }
     } else {
         let tar_file = cli_args

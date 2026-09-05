@@ -304,11 +304,14 @@ pub struct PulledLayers {
 }
 
 /// Pull an OCI image's manifest and every layer's bytes into memory, decompressing gzip layers
-/// as they arrive, but performing NO extraction and NO filesystem writes whatsoever -- the
-/// runtime-loading counterpart to [`pull_and_extract`]. Layers are pulled and decompressed one
-/// at a time (never all buffered simultaneously beyond the two adjacent layers a single
-/// decompress step needs), matching the memory-usage fix already applied to
-/// `pull_and_extract`'s own layer loop.
+/// as they arrive and rewriting each layer's executable ELFs immediately afterward, before
+/// moving to the next layer -- the runtime-loading counterpart to [`pull_and_extract`]. Only ONE
+/// layer's decompressed bytes and its rewritten counterpart are ever alive at once; layers are
+/// never buffered as a batch across the whole image (a real multi-GB image, e.g.
+/// `linuxserver/webtop:debian-xfce`, was observed to fail a single ~5GB allocation when the
+/// pull step returned every decompressed layer at once and a separate rewrite step then held
+/// both the raw and rewritten copies of every layer simultaneously -- fusing pull+decompress+
+/// rewrite into one per-layer step, as done here, is the fix).
 pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<PulledLayers> {
     let reference: Reference = image_ref
         .parse()
@@ -415,14 +418,27 @@ pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<P
 
             if verbose {
                 eprintln!(
-                    "  Layer {}/{} ready in memory ({} bytes decompressed)",
+                    "  Layer {}/{} decompressed ({} bytes), rewriting ELFs...",
                     i + 1,
                     num_layers,
                     decompressed.len()
                 );
             }
 
-            layers.push(decompressed);
+            let rewritten = rewrite_layer_elfs(&decompressed, verbose)
+                .with_context(|| format!("failed to rewrite ELFs in layer {}", i + 1))?;
+            drop(decompressed);
+
+            if verbose {
+                eprintln!(
+                    "  Layer {}/{} ready in memory ({} bytes after rewrite)",
+                    i + 1,
+                    num_layers,
+                    rewritten.len()
+                );
+            }
+
+            layers.push(rewritten);
         }
 
         Ok::<_, anyhow::Error>((config, layers))
