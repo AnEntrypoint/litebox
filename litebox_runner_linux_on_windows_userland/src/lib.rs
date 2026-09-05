@@ -107,6 +107,17 @@ pub struct CliArgs {
     /// show and should never have a window pop up unexpectedly.
     #[arg(long = "gui")]
     pub gui: bool,
+
+    /// Run the GUI presenter with its window HIDDEN at startup. Implies `--gui`: the whole
+    /// display pipeline (window, wgpu surface, input wiring, frame capture) is created and
+    /// running, there is simply nothing on screen until it is shown.
+    ///
+    /// This exists because a guest's GUI must not depend on a window existing. A desktop session
+    /// can boot, render, and be captured (`LITEBOX_DUMP_FRAMES`) headlessly, then be revealed
+    /// later -- headless and headed become the same running system observed differently, rather
+    /// than two modes chosen before the guest starts.
+    #[arg(long = "gui-hidden")]
+    pub gui_hidden: bool,
 }
 
 struct MmappedFile {
@@ -409,7 +420,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // this, `std::process::exit` below tears the presenter thread down the instant the guest
     // process finishes, which reliably raced the presenter's own async `resumed()`/first-frame
     // setup and produced a window that never actually appeared, confirmed live.
-    let gui_presenter_thread = cli_args.gui.then(|| {
+    // `--gui-hidden` implies `--gui`: it selects the window's INITIAL visibility, not whether the
+    // presenter exists.
+    let gui_requested = cli_args.gui || cli_args.gui_hidden;
+    let gui_start_hidden = cli_args.gui_hidden;
+    let gui_presenter_thread = gui_requested.then(|| {
         // `winit::EventLoop` (inside `Presenter`) is genuinely not `Send` on Windows -- it must be
         // BOTH created and run on the same OS thread, per winit's own platform requirement -- so
         // `Presenter::new()` happens INSIDE the spawned closure, not before it. The `FrameSender`
@@ -444,6 +459,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                         return;
                     }
                 };
+            if gui_start_hidden {
+                presenter = presenter.hidden_at_startup();
+            }
             // Forward real keyboard/mouse events captured by winit into the guest's
             // `/dev/input/event0` queue, exactly mirroring how DRM page-flips are forwarded the
             // other way (guest -> host) via `add_drm_flip_callback` below. This is what makes a
@@ -466,6 +484,44 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         })
             .expect("failed to spawn GUI presenter thread");
         if let Ok(sender) = sender_rx.recv() {
+            // `LITEBOX_GUI_VISIBILITY_FILE`: a one-byte control file polled on a background
+            // thread, letting the window be hidden and shown WHILE THE GUEST RUNS, from outside
+            // the process (`echo 0 > file` hides, `echo 1 > file` shows).
+            //
+            // A control file rather than a keyboard shortcut or a signal: a shortcut cannot reach
+            // a window that is currently hidden (the case that most needs it), and this runner
+            // has no guest-facing control channel to overload. Polling rather than a filesystem
+            // watch keeps it dependency-free and is trivially cheap at this interval; the file's
+            // CONTENT is the desired state, not a toggle, so a repeated write is idempotent and a
+            // caller never has to know the current state.
+            if let Some(path) = std::env::var_os("LITEBOX_GUI_VISIBILITY_FILE") {
+                let sender = sender.clone();
+                std::thread::Builder::new()
+                    .name("litebox-gui-visibility".to_owned())
+                    .spawn(move || {
+                        let mut last: Option<bool> = None;
+                        loop {
+                            if let Ok(text) = std::fs::read_to_string(&path) {
+                                let want = match text.trim() {
+                                    "0" | "hide" | "hidden" => Some(false),
+                                    "1" | "show" | "visible" => Some(true),
+                                    // Anything else (including a partially-written file caught
+                                    // mid-write) is ignored rather than guessed at.
+                                    _ => None,
+                                };
+                                if let Some(want) = want
+                                    && last != Some(want)
+                                {
+                                    litebox_util_log::warn!(visible:? = want; "gui: visibility change requested");
+                                    sender.set_visible(want);
+                                    last = Some(want);
+                                }
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                        }
+                    })
+                    .expect("failed to spawn GUI visibility watcher thread");
+            }
             // Presentation ONLY. Frame capture is a separate observer registered below, not an
             // inline step here: when the flip slot held a single callback, capture had to be
             // smuggled into this closure (running before `sender.send` took ownership) so that a
