@@ -520,6 +520,19 @@ impl From<litebox::net::errors::RemoteAddrError> for Errno {
     }
 }
 
+impl From<litebox::net::errors::ShutdownError> for Errno {
+    fn from(value: litebox::net::errors::ShutdownError) -> Self {
+        match value {
+            litebox::net::errors::ShutdownError::InvalidFd => Errno::EBADF,
+            // Real Linux `shutdown(2)` reports ENOTCONN for a socket that is not connected --
+            // the errno a caller can actually act on, unlike a blanket EOPNOTSUPP.
+            litebox::net::errors::ShutdownError::NotConnected => Errno::ENOTCONN,
+
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::net::errors::ListenError> for Errno {
     fn from(value: litebox::net::errors::ListenError) -> Self {
         match value {

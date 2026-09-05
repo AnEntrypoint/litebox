@@ -804,6 +804,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         self.net.lock().listen(fd, backlog).map_err(Errno::from)
     }
 
+    fn shutdown(&self, fd: &SocketFd<Platform>, how: ShutdownHow) -> Result<(), Errno> {
+        self.net
+            .lock()
+            .shutdown(fd, how.is_shutdown_write())
+            .map_err(Errno::from)
+    }
+
     /// Send data via socket channel (lock-free path).
     ///
     /// This uses the channel-based approach where the user writes to a TX ring buffer,
@@ -2586,10 +2593,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
-            |_fd| {
-                ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;
-                log_unsupported!("shutdown on inet socket");
-                Err(Errno::EOPNOTSUPP)
+            |fd| {
+                let how = ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;
+                self.global.shutdown(fd, how)
             },
             |file| {
                 let how = ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;

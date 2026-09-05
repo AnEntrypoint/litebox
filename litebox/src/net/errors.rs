@@ -85,6 +85,16 @@ pub enum BindError {
     AlreadyBound,
 }
 
+/// Possible errors from [`Network::shutdown`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum ShutdownError {
+    #[error("Not a valid open file descriptor")]
+    InvalidFd,
+    #[error("Socket is not connected")]
+    NotConnected,
+}
+
 /// Possible errors from [`Network::listen`]
 #[non_exhaustive]
 #[derive(Error, Debug)]

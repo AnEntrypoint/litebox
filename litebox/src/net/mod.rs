@@ -26,7 +26,7 @@ pub mod socket_channel;
 mod tests;
 
 use errors::{
-    AcceptError, BindError, CloseError, ConnectError, ListenError, LocalAddrError, ReceiveError,
+    AcceptError, BindError, CloseError, ConnectError, ListenError, LocalAddrError, ReceiveError, ShutdownError,
     RemoteAddrError, SendError, SocketError,
 };
 use local_ports::{LocalPort, LocalPortAllocator};
@@ -1245,6 +1245,55 @@ where
 
         self.automated_platform_interaction(PollDirection::Both);
         Ok(())
+    }
+
+    /// Shut down part of a full-duplex connection (`shutdown(2)`).
+    ///
+    /// # Why this exists
+    ///
+    /// `shutdown(SHUT_WR)` is how a server signals "my response is complete" without closing the
+    /// socket: it sends a FIN while leaving the read half open. Essentially every HTTP server does
+    /// this at the end of a response -- Python's `http.server`, nginx, and websockify included --
+    /// so a stack that refuses it leaves the client waiting forever for bytes that were already
+    /// written. Confirmed live before this existed: a Python `http.server` inside the guest logged
+    /// `"GET / HTTP/1.1" 200` for a real host request, and the host client still timed out with
+    /// zero bytes received, because `shutdown` returned `EOPNOTSUPP` and the response was never
+    /// terminated.
+    ///
+    /// smoltcp models only the write half explicitly: `tcp::Socket::close()` sends the FIN, which
+    /// is exactly `SHUT_WR`. There is no separate "stop receiving" operation on a smoltcp socket
+    /// (a real kernel's `SHUT_RD` only affects local delivery, sending nothing on the wire), so
+    /// `SHUT_RD` is accepted and has no wire effect -- matching what a caller observes on Linux,
+    /// rather than failing a request this stack can honestly satisfy.
+    pub fn shutdown(
+        &mut self,
+        fd: &SocketFd<Platform>,
+        write_half: bool,
+    ) -> Result<(), ShutdownError> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let table_entry = descriptor_table
+            .get_entry(fd)
+            .ok_or(ShutdownError::InvalidFd)?;
+        let socket_handle = &table_entry.entry;
+        if !write_half {
+            // `SHUT_RD` alone: nothing to emit on the wire (see this function's doc comment).
+            return Ok(());
+        }
+        match &socket_handle.specific {
+            ProtocolSpecific::Tcp(_) => {
+                let tcp_socket: &mut tcp::Socket = self.socket_set.get_mut(socket_handle.handle);
+                // `close()` here is smoltcp's *send a FIN* operation, NOT a teardown: the socket
+                // stays in the set and the read half keeps delivering until the peer closes too.
+                // Releasing the fd remains `close_handle`'s job, unchanged.
+                tcp_socket.close();
+                Ok(())
+            }
+            // UDP/ICMP/raw are connectionless: real Linux reports `ENOTCONN` for `shutdown` on a
+            // socket that was never connected, which is what a caller can actually act on.
+            ProtocolSpecific::Udp(_) | ProtocolSpecific::Icmp(_) | ProtocolSpecific::Raw(_) => {
+                Err(ShutdownError::NotConnected)
+            }
+        }
     }
 
     /// Prepare a socket to accept incoming connections. Marks the socket as a passive socket, such
