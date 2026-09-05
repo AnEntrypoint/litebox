@@ -108,12 +108,20 @@ fn format_cpuinfo(cpu_count: usize) -> Vec<u8> {
 }
 
 /// Real `/proc/meminfo` key-value format (see `man 5 proc`), values in kB, `\n`-terminated.
-/// `mem_total_kb` is the real (or reasonably-approximated) host-visible memory; `MemFree`/
-/// `MemAvailable` are conservatively reported as most of the total (this shim does not track
-/// live guest memory pressure), which is a safe over-estimate for any allocation-sizing logic
-/// that reads this file (real Linux tools treat it as a hint, not a hard guarantee).
-fn format_meminfo(mem_total_kb: u64) -> Vec<u8> {
-    let free = mem_total_kb.saturating_mul(3) / 4;
+///
+/// Both figures come from the platform's real host query (see
+/// `crate::platform::SystemInfoProvider::memory_info_kb`), NOT from a formula over an invented
+/// total. The previous implementation derived `MemFree`/`MemAvailable` as a fixed 3/4 of
+/// `mem_total_kb` and described that as "a safe over-estimate... real Linux tools treat it as a
+/// hint, not a hard guarantee". That reasoning is wrong in the one direction that matters:
+/// over-estimating *free* memory is an instruction to the guest to allocate memory the host does
+/// not have. Measured live -- a 4 GiB total yielded exactly 3 GiB `MemFree`, and Xorg on
+/// `linuxserver/webtop:debian-xfce` allocated to precisely that figure (3104-3128 MiB across
+/// three runs), peaking near 8.9 GiB during its final growth step and repeatedly tripping the
+/// host's low-memory watchdog, which kills with no error and no exit status.
+fn format_meminfo(mem_total_kb: u64, mem_avail_kb: u64) -> Vec<u8> {
+    // Never advertise more available than total, whatever the platform reported.
+    let free = mem_avail_kb.min(mem_total_kb);
     format!(
         "MemTotal:\t{mem_total_kb} kB\nMemFree:\t{free} kB\nMemAvailable:\t{free} kB\nBuffers:\t0 kB\nCached:\t0 kB\nSwapCached:\t0 kB\nSwapTotal:\t0 kB\nSwapFree:\t0 kB\n"
     )
@@ -159,6 +167,7 @@ where
     _alloc: InodeAllocator,
     cpu_count: usize,
     mem_total_kb: u64,
+    mem_avail_kb: u64,
     boot_uptime_secs: u64,
 }
 
@@ -180,6 +189,7 @@ where
         allocator: InodeAllocator,
         cpu_count: usize,
         mem_total_kb: u64,
+        mem_avail_kb: u64,
         boot_uptime_secs: u64,
     ) -> Self {
         let root_inode = allocator.next();
@@ -189,6 +199,7 @@ where
             _alloc: allocator,
             cpu_count,
             mem_total_kb,
+            mem_avail_kb,
             boot_uptime_secs,
         }
     }
@@ -324,7 +335,7 @@ where
         }
         let content = match entry {
             ProcfsEntry::CpuInfo => format_cpuinfo(self.cpu_count),
-            ProcfsEntry::MemInfo => format_meminfo(self.mem_total_kb),
+            ProcfsEntry::MemInfo => format_meminfo(self.mem_total_kb, self.mem_avail_kb),
             ProcfsEntry::Mounts => format_mounts(),
             ProcfsEntry::Uptime => format_uptime(self.boot_uptime_secs),
         };

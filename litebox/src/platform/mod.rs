@@ -1048,6 +1048,30 @@ pub trait SystemInfoProvider {
     fn cpu_count(&self) -> usize {
         1
     }
+
+    /// Real host memory, as `(total_kb, available_kb)`, for `/proc/meminfo`.
+    ///
+    /// # Why this must be real, not a fixed value
+    ///
+    /// `/proc/meminfo`'s `MemFree`/`MemAvailable` are not decorative: allocation-sizing logic in
+    /// real guest programs reads them and sizes buffers/pools from them. Reporting a fixed
+    /// over-estimate is therefore not the "safe" choice it looks like -- it is an instruction to
+    /// the guest to allocate memory the host does not have.
+    ///
+    /// Measured live against `linuxserver/webtop:debian-xfce`: a hardcoded `MemTotal` of 4 GiB
+    /// with `MemFree` derived as 3/4 of it (exactly 3 GiB) produced an Xorg allocation that
+    /// plateaued at 3104-3128 MiB across three separate runs -- byte-for-byte the advertised
+    /// `MemFree` -- with a transient peak near 8.9 GiB while the final growth step held both old
+    /// and new buffers. On a 15 GiB host shared with other work that repeatedly tripped an
+    /// external low-memory watchdog, killing the guest with no error and no exit status, a
+    /// failure indistinguishable from a real hang.
+    ///
+    /// Default implementation reports a conservative 1 GiB total / 512 MiB available: safe on any
+    /// host, and low enough that a guest sizing from it cannot exhaust a real machine. Platforms
+    /// that can query the host (Windows: `GlobalMemoryStatusEx`) should override it.
+    fn memory_info_kb(&self) -> (u64, u64) {
+        (1024 * 1024, 512 * 1024)
+    }
 }
 
 /// A provider for thread-local storage.

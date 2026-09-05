@@ -8224,6 +8224,40 @@ impl litebox::platform::SystemInfoProvider for WindowsUserland {
         let count = self.sys_info.read().unwrap().dwNumberOfProcessors;
         usize::try_from(count).unwrap_or(1).max(1)
     }
+
+    /// Real host memory via `GlobalMemoryStatusEx`, with the AVAILABLE figure deliberately
+    /// discounted before it is reported to the guest.
+    ///
+    /// The discount is the point of this function, not an incidental detail. `ullAvailPhys` is
+    /// what the host has free *right now*, shared with every other process on the machine
+    /// (including this one's own rootfs page cache). Handing a guest that whole figure invites it
+    /// to size a buffer pool from memory that is already spoken for -- see `memory_info_kb`'s doc
+    /// comment for the measured Xorg case where advertising 3 GiB free produced 8.9 GiB peaks and
+    /// repeated watchdog kills. Reporting half, capped at 2 GiB, keeps a guest's own sizing logic
+    /// well inside what the host can actually satisfy while still being truthful in shape (it
+    /// tracks real pressure: report less when the host genuinely has less).
+    fn memory_info_kb(&self) -> (u64, u64) {
+        let mut status = windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX {
+            dwLength: u32::try_from(core::mem::size_of::<windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX>())
+                .unwrap_or(64),
+            ..Default::default()
+        };
+        // SAFETY: `status` is a correctly-sized, correctly-`dwLength`-tagged local, which is the
+        // entire contract of `GlobalMemoryStatusEx`.
+        let ok = unsafe { windows_sys::Win32::System::SystemInformation::GlobalMemoryStatusEx(&raw mut status) };
+        if ok == 0 {
+            // Fall back to the trait's conservative default rather than reporting anything
+            // invented: a failed query is not a reason to tell the guest it has memory.
+            return (1024 * 1024, 512 * 1024);
+        }
+        let total_kb = status.ullTotalPhys / 1024;
+        /// Never advertise more than this much available memory, however much the host has free.
+        /// A guest sizing a pool from a very large figure is the failure mode this whole function
+        /// exists to prevent; past this point more headroom buys nothing real.
+        const AVAIL_CEILING_KB: u64 = 2 * 1024 * 1024;
+        let avail_kb = (status.ullAvailPhys / 1024 / 2).min(AVAIL_CEILING_KB);
+        (total_kb.max(1), avail_kb.max(64 * 1024))
+    }
 }
 
 thread_local! {

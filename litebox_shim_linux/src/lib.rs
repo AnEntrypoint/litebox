@@ -838,7 +838,12 @@ fn default_fs<Platform: ShimPlatform>(
     // No live guest-visible memory-pressure tracking exists in this shim; a large fixed value
     // (4 GiB) is a safe, always-parseable `/proc/meminfo` stand-in -- see `format_meminfo`'s doc
     // comment for why the exact value is not load-bearing for any known consumer.
-    const MEM_TOTAL_KB: u64 = 4 * 1024 * 1024;
+    // Real host memory, queried from the platform (Windows: `GlobalMemoryStatusEx`), NOT a fixed
+    // constant. The previous hardcoded 4 GiB -- combined with `format_meminfo`'s old 3/4-of-total
+    // formula -- advertised exactly 3 GiB free to every guest regardless of what the host actually
+    // had. Xorg sized an allocation to precisely that figure and repeatedly got the whole guest
+    // killed by the host's low-memory watchdog. See `SystemInfoProvider::memory_info_kb`.
+    let (mem_total_kb, mem_avail_kb) = platform.memory_info_kb();
     // No live wall-clock uptime source is reachable from this `no_std` shim at `default_fs` time
     // (before `GlobalState::boot_time` exists) -- a fixed placeholder is fine, see
     // `format_uptime`'s doc comment.
@@ -875,7 +880,8 @@ fn default_fs<Platform: ShimPlatform>(
                     litebox,
                     allocator,
                     cpu_count,
-                    MEM_TOTAL_KB,
+                    mem_total_kb,
+                    mem_avail_kb,
                     BOOT_UPTIME_SECS,
                 )
             })
