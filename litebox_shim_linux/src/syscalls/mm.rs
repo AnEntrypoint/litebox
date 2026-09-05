@@ -1256,9 +1256,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Check if a file has the LITEBOX trampoline magic at its tail.
     /// Returns (is_pre_patched, file_offset, vaddr, trampoline_size).
+    ///
+    /// Parses the SAME `TrampolineHeader64` wire layout
+    /// `litebox_common_linux::loader::parse_trampoline` itself parses (via the same
+    /// `zerocopy::FromBytes` derive), rather than a second, independently-maintained
+    /// hand-rolled `from_le_bytes` decoder for the identical bytes -- two divergent parsers for
+    /// one on-disk format is how they'd silently disagree if either one were ever updated alone.
     #[cfg(target_arch = "x86_64")]
     fn check_trampoline_magic(&self, fd: i32) -> (bool, u64, u64, u64) {
-        const HEADER_SIZE: usize = 32; // TrampolineHeader64: magic(8) + file_offset(8) + vaddr(8) + size(8)
+        use litebox_common_linux::loader::TrampolineHeader64;
+        use zerocopy::FromBytes as _;
+
+        const HEADER_SIZE: usize = core::mem::size_of::<TrampolineHeader64>();
         let Ok(stat) = self.sys_fstat(fd) else {
             return (false, 0, 0, 0);
         };
@@ -1280,10 +1289,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if &tail[0..8] != litebox_syscall_rewriter::TRAMPOLINE_MAGIC {
             return (false, 0, 0, 0);
         }
-        let file_offset = u64::from_le_bytes(tail[8..16].try_into().unwrap());
-        let vaddr = u64::from_le_bytes(tail[16..24].try_into().unwrap());
-        let trampoline_size = u64::from_le_bytes(tail[24..32].try_into().unwrap());
-        (true, file_offset, vaddr, trampoline_size)
+        let Ok(header) = TrampolineHeader64::read_from_bytes(&tail) else {
+            return (false, 0, 0, 0);
+        };
+        (true, header.file_offset, header.vaddr, header.trampoline_size)
     }
 
     /// Apply the trap fallback to a mapped code segment: replace all `syscall`

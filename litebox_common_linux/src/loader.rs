@@ -75,13 +75,18 @@ struct TrampolineInfo {
 const TRAMPOLINE_MAGIC: u64 = u64::from_le_bytes(*b"LITEBOX0");
 
 /// Trampoline header for 64-bit: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size) = 32 bytes
+///
+/// `pub` so other guest-runtime crates (e.g. `litebox_shim_linux`, which independently needs to
+/// read this exact same tail-of-file layout to detect a pre-patched binary before this loader's
+/// own `parse_trampoline` ever runs) can parse it with `zerocopy::FromBytes` too, instead of
+/// hand-rolling a second, divergent parser for the identical on-disk format.
 #[repr(C, packed)]
 #[derive(FromBytes)]
-struct TrampolineHeader64 {
-    magic: u64,
-    file_offset: u64,
-    vaddr: u64,
-    trampoline_size: u64,
+pub struct TrampolineHeader64 {
+    pub magic: u64,
+    pub file_offset: u64,
+    pub vaddr: u64,
+    pub trampoline_size: u64,
 }
 
 /// Trampoline header for 32-bit: 8 (magic) + 4 (file_offset) + 4 (vaddr) + 4 (size) = 20 bytes
