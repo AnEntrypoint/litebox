@@ -58,7 +58,26 @@ impl TarRo {
         inode_allocator: InodeAllocator,
     ) -> Self {
         Self {
-            tar_index: TarIndex::new(tar_data, inode_allocator),
+            tar_index: TarIndex::from_layers(alloc::vec![tar_data], inode_allocator),
+        }
+    }
+
+    /// Construct a tar backend from multiple OCI-style layer tars, applied bottom-to-top
+    /// (`layers[0]` is the base layer, `layers[last]` the topmost). OCI whiteout files
+    /// (`.wh.<name>`, deleting a single sibling entry) and opaque whiteouts
+    /// (`.wh..wh..opq`, clearing every pre-existing entry under its own parent directory) in a
+    /// later layer are applied against everything indexed from earlier layers, exactly as the
+    /// OCI image spec's layer application order requires -- this is what lets a runtime image
+    /// load skip ever materializing a merged rootfs onto a real host directory (see
+    /// `litebox_packager/src/oci.rs`'s `extract_tar`, whose whiteout handling this ports into
+    /// this `no_std` index builder so the runtime can do the same merge purely in memory).
+    #[must_use]
+    pub fn from_layers(
+        layers: Vec<alloc::borrow::Cow<'static, [u8]>>,
+        inode_allocator: InodeAllocator,
+    ) -> Self {
+        Self {
+            tar_index: TarIndex::from_layers(layers, inode_allocator),
         }
     }
 }
@@ -239,9 +258,9 @@ impl super::backend::Backend for TarRo {
     /// `'static`-stable, so a caller cannot legally re-slice `&'static [u8]` out of them.
     fn get_static_backing_data(&self, h: &FileHandle) -> Option<&'static [u8]> {
         let idx = h.get_typed::<Self>().idx;
-        let range = self.tar_index.files[idx].data_range.clone();
-        match &self.tar_index.tar_data {
-            alloc::borrow::Cow::Borrowed(data) => Some(&data[range]),
+        let file = &self.tar_index.files[idx];
+        match &self.tar_index.layers[file.layer_idx] {
+            alloc::borrow::Cow::Borrowed(data) => Some(&data[file.data_range.clone()]),
             alloc::borrow::Cow::Owned(_) => None,
         }
     }
@@ -387,6 +406,8 @@ impl super::backend::Backend for TarRo {
 pub const EMPTY_TAR_FILE: &[u8] = &[0u8; 10240];
 
 struct IndexedFile {
+    /// Which layer's tar blob (index into `TarIndex::layers`) `data_range` refers into.
+    layer_idx: usize,
     data_range: Range<usize>,
     mode: Mode,
     owner: UserInfo,
@@ -413,20 +434,61 @@ struct IndexedSymlink {
 }
 
 struct TarIndex {
-    tar_data: alloc::borrow::Cow<'static, [u8]>,
+    layers: Vec<alloc::borrow::Cow<'static, [u8]>>,
     files: Vec<IndexedFile>,
     dirs: Vec<IndexedDir>,
     symlinks: Vec<IndexedSymlink>,
 }
 
-/// A single (path, kind) entry discovered while scanning the raw tar headers.
+/// A single (path, kind) entry discovered while scanning one layer's raw tar headers, still
+/// tagged with its originating layer index so a later layer's whiteout can remove exactly the
+/// entries an earlier layer contributed (and nothing from a still-later layer that re-created
+/// the same path).
 enum RawEntry {
-    File { path: String, file_idx: usize },
-    Symlink { path: String, symlink_idx: usize },
+    File {
+        path: String,
+        file_idx: usize,
+    },
+    Symlink {
+        path: String,
+        symlink_idx: usize,
+    },
+    /// `.wh.<name>`: delete the single sibling entry `<name>` (file, symlink, or whole directory
+    /// subtree) contributed by any earlier layer. Never removes an entry a later layer in the
+    /// same merge re-creates, since whiteouts are applied strictly in bottom-to-top layer order.
+    Whiteout { path: String },
+    /// `.wh..wh..opq`: clear every entry earlier layers contributed under this entry's own
+    /// parent directory (but not the directory itself), per the OCI opaque-whiteout spec.
+    OpaqueWhiteout { parent: String },
+    /// A POSIX hard link (`tar_no_std::TypeFlag::LINK`): `path` should alias whatever entry
+    /// currently exists at `link_target` once every layer has been folded. Real base images rely
+    /// on this -- e.g. busybox's official image ships `bin/busybox` itself as a hard link to
+    /// `bin/[` (the actual regular-file payload), with every other applet (`bin/ls`, `bin/mv`,
+    /// ...) as a *symlink* to `bin/busybox`; skipping hardlinks entirely (as this parser
+    /// previously did, since no earlier caller's images needed one) left `bin/busybox` itself
+    /// unindexed, which is fatal since it's the actual program every applet symlink chains to.
+    /// Resolved as a deferred alias after every layer's real files/symlinks/whiteouts are folded,
+    /// so a hard link to a path added by a later layer (unusual, but not disallowed by the tar
+    /// format) still resolves correctly.
+    HardLink {
+        path: String,
+        link_target: String,
+    },
 }
 
 impl TarIndex {
-    fn new(tar_data: alloc::borrow::Cow<'static, [u8]>, inode_allocator: InodeAllocator) -> Self {
+    /// Parse one layer's raw tar bytes into a flat list of `RawEntry`, tagging every file/symlink
+    /// with `layer_idx` so cross-layer merge order is preserved. Shared by both the single-tar
+    /// legacy path and the multi-layer OCI path -- parsing itself has no whiteout awareness; that
+    /// is applied afterward, once entries from every layer are in one bottom-to-top ordered list.
+    fn parse_layer(
+        data: &[u8],
+        layer_idx: usize,
+        files: &mut Vec<IndexedFile>,
+        symlinks: &mut Vec<IndexedSymlink>,
+        raw_entries: &mut Vec<RawEntry>,
+        inode_allocator: &InodeAllocator,
+    ) {
         // `tar_no_std::TarArchiveRef::entries()` silently *skips* every non-regular-file entry
         // (directories, symlinks, hardlinks, ...) -- see that crate's `ArchiveEntryIterator::next`,
         // which loops past any header whose `TypeFlag::is_regular_file()` is false. That means a
@@ -442,12 +504,6 @@ impl TarIndex {
         // exposes. `BLOCKSIZE` itself is `512` per the POSIX tar spec (`tar_no_std`'s own private
         // constant of the same value); it is not expected to ever change.
         const BLOCKSIZE: usize = 512;
-
-        let data = tar_data.as_ref();
-
-        let mut files = Vec::new();
-        let mut symlinks = Vec::new();
-        let mut raw_entries: Vec<RawEntry> = Vec::new();
 
         // A PAX extended header (`XHDTYPE`, typeflag `'x'`) precedes the one entry it applies to
         // and carries overrides -- most commonly `path=<full name>` -- for any field the following
@@ -528,6 +584,41 @@ impl TarIndex {
                 continue;
             }
 
+            // OCI whiteout files are named `.wh.<name>` (delete sibling `<name>`) or the special
+            // `.wh..wh..opq` (opaque whiteout: clear this entry's own parent directory). Detected
+            // by basename exactly as `litebox_packager/src/oci.rs::extract_tar` does, since a
+            // whiteout marker is itself shipped as a zero-length regular-file tar entry, not a
+            // distinct tar type flag.
+            {
+                let (parent, basename) = path
+                    .rsplit_once('/')
+                    .unwrap_or(("", path.as_str()));
+                if basename == ".wh..wh..opq" {
+                    let payload_blocks = header.payload_block_count().unwrap_or(0);
+                    block_index += payload_blocks;
+                    raw_entries.push(RawEntry::OpaqueWhiteout {
+                        parent: parent.into(),
+                    });
+                    continue;
+                }
+                if let Some(target_name) = basename.strip_prefix(".wh.") {
+                    let payload_blocks = header.payload_block_count().unwrap_or(0);
+                    block_index += payload_blocks;
+                    let whiteout_path = if parent.is_empty() {
+                        String::from(target_name)
+                    } else {
+                        let mut joined = String::from(parent);
+                        joined.push('/');
+                        joined.push_str(target_name);
+                        joined
+                    };
+                    raw_entries.push(RawEntry::Whiteout {
+                        path: whiteout_path,
+                    });
+                    continue;
+                }
+            }
+
             match typeflag {
                 tar_no_std::TypeFlag::REGTYPE | tar_no_std::TypeFlag::AREGTYPE => {
                     let payload_blocks = header.payload_block_count().unwrap_or(0);
@@ -538,6 +629,7 @@ impl TarIndex {
 
                     let file_idx = files.len();
                     files.push(IndexedFile {
+                        layer_idx,
                         data_range: content_start..content_end,
                         // A malformed octal mode field (e.g. from a tar repacked by a tool that
                         // doesn't preserve Unix permission bits faithfully) must never panic the
@@ -565,13 +657,95 @@ impl TarIndex {
                     });
                     raw_entries.push(RawEntry::Symlink { path, symlink_idx });
                 }
+                tar_no_std::TypeFlag::LINK => {
+                    let Ok(link_target) = header.linkname.as_str() else {
+                        continue;
+                    };
+                    raw_entries.push(RawEntry::HardLink {
+                        path,
+                        link_target: normalize_tar_filename(link_target).into(),
+                    });
+                }
                 _ => {
-                    // Directories are implied by file/symlink paths below; hardlinks, device nodes,
-                    // and FIFOs are not needed for the base-image use case this backend supports.
+                    // Directories are implied by file/symlink paths below; device nodes and FIFOs
+                    // are not needed for the base-image use case this backend supports.
                     let payload_blocks = header.payload_block_count().unwrap_or(0);
                     block_index += payload_blocks;
                 }
             }
+        }
+    }
+
+    /// Build an index from one or more OCI-style layer tars, applied bottom-to-top. `layers[0]`
+    /// is the base layer; each subsequent layer's whiteout/opaque-whiteout entries remove
+    /// entries contributed by any strictly-earlier layer (never a later one, since layers are
+    /// folded in order) before that layer's own real files/symlinks are added.
+    fn from_layers(
+        layers: Vec<alloc::borrow::Cow<'static, [u8]>>,
+        inode_allocator: InodeAllocator,
+    ) -> Self {
+        let mut files = Vec::new();
+        let mut symlinks = Vec::new();
+        let mut raw_entries: Vec<RawEntry> = Vec::new();
+
+        for (layer_idx, layer) in layers.iter().enumerate() {
+            Self::parse_layer(
+                layer.as_ref(),
+                layer_idx,
+                &mut files,
+                &mut symlinks,
+                &mut raw_entries,
+                &inode_allocator,
+            );
+        }
+
+        // Fold `raw_entries` (already in bottom-to-top, then within-layer tar order) into a
+        // path -> latest-contributing-entry map. A whiteout removes whatever the map currently
+        // holds for its target path (and, for a directory target, every path nested under it); an
+        // opaque whiteout removes everything currently nested under its parent. Because entries
+        // are folded strictly in layer order, a later layer's real file always naturally
+        // overwrites (not merely un-deletes) whatever an earlier layer's whiteout removed, and a
+        // whiteout can never remove something a *later* layer goes on to (re-)create.
+        let mut live: alloc::collections::BTreeMap<String, RawLiveEntry> =
+            alloc::collections::BTreeMap::new();
+        // Hard links are resolved in a second pass below, once every layer's real files,
+        // symlinks, and whiteouts have been folded -- a hard link's target is, in every real
+        // image observed, either an earlier entry in the very same layer or something an earlier
+        // layer already contributed, so deferring resolution to "whatever `live` holds once
+        // folding finishes" is at least as correct as resolving inline and additionally handles
+        // the (unusual but tar-legal) case of a link target introduced later in the same layer.
+        let mut deferred_hardlinks: Vec<(String, String)> = Vec::new();
+
+        for raw_entry in raw_entries {
+            match raw_entry {
+                RawEntry::File { path, file_idx } => {
+                    remove_path_and_descendants(&mut live, &path);
+                    live.insert(path, RawLiveEntry::File(file_idx));
+                }
+                RawEntry::Symlink { path, symlink_idx } => {
+                    remove_path_and_descendants(&mut live, &path);
+                    live.insert(path, RawLiveEntry::Symlink(symlink_idx));
+                }
+                RawEntry::Whiteout { path } => {
+                    remove_path_and_descendants(&mut live, &path);
+                }
+                RawEntry::OpaqueWhiteout { parent } => {
+                    remove_descendants_of(&mut live, &parent);
+                }
+                RawEntry::HardLink { path, link_target } => {
+                    remove_path_and_descendants(&mut live, &path);
+                    deferred_hardlinks.push((path, link_target));
+                }
+            }
+        }
+        for (path, link_target) in deferred_hardlinks {
+            if let Some(&resolved) = live.get(link_target.as_str()) {
+                live.insert(path, resolved);
+            }
+            // A hard link whose target never resolves (missing from every layer, e.g. a
+            // malformed or truncated image) is silently dropped, matching this backend's
+            // existing tolerance for other malformed tar fields elsewhere in this file (a
+            // best-effort read-only filesystem view, not a validating extractor).
         }
 
         let mut dirs = alloc::vec![IndexedDir {
@@ -581,9 +755,9 @@ impl TarIndex {
         }];
         let mut dirs_by_path: HashMap<String, usize> = [(String::new(), 0)].into_iter().collect();
 
-        for raw_entry in raw_entries {
-            match raw_entry {
-                RawEntry::File { path, file_idx } => {
+        for (path, entry) in live {
+            match entry {
+                RawLiveEntry::File(file_idx) => {
                     let owner = files[file_idx].owner;
                     let (parent_dir_idx, name) = ensure_ancestors(
                         &mut dirs,
@@ -596,7 +770,7 @@ impl TarIndex {
                         .children
                         .insert(name, IndexedChild::File(file_idx));
                 }
-                RawEntry::Symlink { path, symlink_idx } => {
+                RawLiveEntry::Symlink(symlink_idx) => {
                     let owner = symlinks[symlink_idx].owner;
                     let (parent_dir_idx, name) = ensure_ancestors(
                         &mut dirs,
@@ -613,7 +787,7 @@ impl TarIndex {
         }
 
         Self {
-            tar_data,
+            layers,
             files,
             dirs,
             symlinks,
@@ -621,9 +795,48 @@ impl TarIndex {
     }
 
     fn file_data(&self, file_idx: usize) -> &[u8] {
-        let range = self.files[file_idx].data_range.clone();
-        &self.tar_data[range]
+        let file = &self.files[file_idx];
+        &self.layers[file.layer_idx][file.data_range.clone()]
     }
+}
+
+/// The entry currently "live" (visible in the final merged tree) at a given path, tracked while
+/// folding every layer's raw entries in bottom-to-top order. Directories themselves have no
+/// entry here -- they're implied purely by the paths of the files/symlinks that survive the
+/// fold, exactly as the pre-multi-layer single-tar builder already worked.
+#[derive(Clone, Copy)]
+enum RawLiveEntry {
+    File(usize),
+    Symlink(usize),
+}
+
+/// Remove `path` itself, plus every currently-live entry whose path is nested under it (i.e.
+/// `path` was itself a directory in an earlier layer), from `live`. Used both by an exact-path
+/// whiteout (`.wh.<name>`, which may target a whole directory subtree in an earlier layer) and
+/// before inserting a fresh file/symlink at `path` (a later layer's file may replace what was
+/// previously a directory at the same path, or vice versa).
+fn remove_path_and_descendants(live: &mut alloc::collections::BTreeMap<String, RawLiveEntry>, path: &str) {
+    live.remove(path);
+    remove_descendants_of(live, path);
+}
+
+/// Remove every currently-live entry nested strictly under `parent` (not `parent` itself). Used
+/// by opaque-whiteout handling, and as the subtree-removal half of
+/// [`remove_path_and_descendants`].
+fn remove_descendants_of(live: &mut alloc::collections::BTreeMap<String, RawLiveEntry>, parent: &str) {
+    if parent.is_empty() {
+        // An empty parent means "everything" would match `starts_with("")` unconditionally --
+        // only reachable via a root-level opaque whiteout, which legitimately does mean "clear
+        // the entire index built so far".
+        live.clear();
+        return;
+    }
+    let prefix = {
+        let mut p = String::from(parent);
+        p.push('/');
+        p
+    };
+    live.retain(|p, _| !p.starts_with(prefix.as_str()));
 }
 
 /// Extract the `path` record's value from a PAX extended header payload (POSIX.1-2001 `pax`

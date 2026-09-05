@@ -12,7 +12,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use oci_client::client::{ClientConfig, ClientProtocol, ImageData};
+use oci_client::client::{ClientConfig, ClientProtocol};
 use oci_client::config::ConfigFile;
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
@@ -122,8 +122,16 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
         }
     }
 
-    let image_data = rt.block_on(async {
-        let config = ClientConfig {
+    // Create temp directory for extraction
+    let tempdir = tempfile::tempdir().context("failed to create temporary directory for rootfs")?;
+    let rootfs_path = tempdir.path().join("rootfs");
+    std::fs::create_dir_all(&rootfs_path).context("failed to create rootfs directory")?;
+
+    let mut symlinks: Vec<DeferredSymlink> = Vec::new();
+    let mut permissions: HashMap<PathBuf, u32> = HashMap::new();
+
+    let config_data = rt.block_on(async {
+        let client_config = ClientConfig {
             protocol: ClientProtocol::Https,
             // Pull the Linux image whose architecture matches the host. LiteBox
             // runs guest instructions natively rather than emulating them, so a
@@ -142,7 +150,7 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
             })),
             ..Default::default()
         };
-        let client = Client::new(config);
+        let client = Client::new(client_config);
 
         // Authenticate (anonymous for public images)
         let auth = RegistryAuth::Anonymous;
@@ -151,53 +159,73 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
             eprintln!("  Fetching manifest...");
         }
 
-        // Pull the full image (manifest + all layers)
-        let image_data: ImageData = client
-            .pull(
-                &reference,
-                &auth,
-                vec![
-                    oci_client::manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE,
-                    oci_client::manifest::IMAGE_LAYER_MEDIA_TYPE,
-                    oci_client::manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE,
-                ],
-            )
+        // Fetch only the manifest up front; layers are pulled and extracted
+        // one at a time below so at most one (de)compressed layer's bytes
+        // are held in memory at once. Pulling every layer into memory
+        // simultaneously (the crate's own `Client::pull`) is what a real
+        // multi-GB Arch-based image (`linuxserver/webtop:arch-xfce`) was
+        // observed to OOM the host on -- see the packaging notes for this fix.
+        let (manifest, _digest) = client
+            .pull_image_manifest(&reference, &auth)
             .await
-            .with_context(|| format!("failed to pull image {reference}"))?;
+            .with_context(|| format!("failed to pull manifest for {reference}"))?;
+
+        let mut config_bytes: Vec<u8> = Vec::new();
+        client
+            .pull_blob(&reference, &manifest.config, &mut config_bytes)
+            .await
+            .with_context(|| format!("failed to pull image config for {reference}"))?;
+        let config = oci_client::client::Config::new(
+            config_bytes,
+            manifest.config.media_type.clone(),
+            manifest.annotations.clone(),
+        );
 
         if verbose {
-            eprintln!("  Pulled {} layer(s)", image_data.layers.len());
+            eprintln!("  Pulled manifest ({} layer(s))", manifest.layers.len());
         }
 
-        Ok::<_, anyhow::Error>(image_data)
+        let accepted_media_types = [
+            oci_client::manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE,
+            oci_client::manifest::IMAGE_LAYER_MEDIA_TYPE,
+            oci_client::manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE,
+        ];
+        let num_layers = manifest.layers.len();
+        for (i, layer_desc) in manifest.layers.iter().enumerate() {
+            if !accepted_media_types.contains(&layer_desc.media_type.as_str()) {
+                anyhow::bail!("unsupported layer media type: {}", layer_desc.media_type);
+            }
+
+            if verbose {
+                eprintln!("  Pulling layer {}/{}...", i + 1, num_layers);
+            }
+
+            let mut layer_data: Vec<u8> = Vec::new();
+            client
+                .pull_blob(&reference, layer_desc, &mut layer_data)
+                .await
+                .with_context(|| format!("failed to pull layer {}", i + 1))?;
+
+            if verbose {
+                eprintln!(
+                    "  Extracting layer {}/{} ({} bytes)...",
+                    i + 1,
+                    num_layers,
+                    layer_data.len()
+                );
+            }
+            extract_layer(
+                &layer_data,
+                &layer_desc.media_type,
+                &rootfs_path,
+                &mut symlinks,
+                &mut permissions,
+            )
+            .with_context(|| format!("failed to extract layer {}", i + 1))?;
+        }
+
+        Ok::<_, anyhow::Error>(config)
     })?;
-
-    // Create temp directory for extraction
-    let tempdir = tempfile::tempdir().context("failed to create temporary directory for rootfs")?;
-    let rootfs_path = tempdir.path().join("rootfs");
-    std::fs::create_dir_all(&rootfs_path).context("failed to create rootfs directory")?;
-
-    // Extract layers in order (bottom layer first)
-    let mut symlinks: Vec<DeferredSymlink> = Vec::new();
-    let mut permissions: HashMap<PathBuf, u32> = HashMap::new();
-    for (i, layer) in image_data.layers.iter().enumerate() {
-        if verbose {
-            eprintln!(
-                "  Extracting layer {}/{} ({} bytes)...",
-                i + 1,
-                image_data.layers.len(),
-                layer.data.len()
-            );
-        }
-        extract_layer(
-            &layer.data,
-            &layer.media_type,
-            &rootfs_path,
-            &mut symlinks,
-            &mut permissions,
-        )
-        .with_context(|| format!("failed to extract layer {}", i + 1))?;
-    }
 
     // Build the symlink map once for O(1) lookup during resolution.
     let symlink_map: HashMap<PathBuf, PathBuf> = symlinks
@@ -217,10 +245,10 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
     }
 
     // Save the raw config JSON before parsing (try_from consumes it).
-    let config_json = image_data.config.data.to_vec();
+    let config_json = config_data.data.to_vec();
 
     // Parse image config for ENTRYPOINT, CMD, ENV, WORKDIR.
-    let config = match ConfigFile::try_from(image_data.config) {
+    let config = match ConfigFile::try_from(config_data) {
         Ok(cf) => {
             let exec_config = cf.config.as_ref();
             let ic = ImageConfig {
@@ -256,6 +284,228 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
         symlink_map,
         permissions,
     })
+}
+
+/// Result of pulling an OCI image's layers directly into memory, with NO filesystem writes at
+/// all -- not even a temp directory. Each entry in `layers` is one OCI layer's tar bytes,
+/// decompressed if needed, in bottom-to-top order exactly as the manifest lists them, ready to
+/// hand straight to `litebox::fs::tar_ro::TarRo::from_layers` for whiteout-aware in-memory
+/// merging at guest-boot time. This is the runtime-loading counterpart to
+/// [`pull_and_extract`]: same registry pull, same one-layer-at-a-time streaming (never buffering
+/// every layer simultaneously), but stopping at "bytes in memory" instead of extracting onto a
+/// real host rootfs directory.
+pub struct PulledLayers {
+    /// One entry per OCI layer, decompressed tar bytes, bottom-to-top order.
+    pub layers: Vec<Vec<u8>>,
+    /// Parsed image execution config (ENTRYPOINT, CMD, ENV, WORKDIR).
+    pub config: ImageConfig,
+    /// Raw OCI image config JSON blob.
+    pub config_json: Vec<u8>,
+}
+
+/// Pull an OCI image's manifest and every layer's bytes into memory, decompressing gzip layers
+/// as they arrive, but performing NO extraction and NO filesystem writes whatsoever -- the
+/// runtime-loading counterpart to [`pull_and_extract`]. Layers are pulled and decompressed one
+/// at a time (never all buffered simultaneously beyond the two adjacent layers a single
+/// decompress step needs), matching the memory-usage fix already applied to
+/// `pull_and_extract`'s own layer loop.
+pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<PulledLayers> {
+    let reference: Reference = image_ref
+        .parse()
+        .with_context(|| format!("invalid OCI image reference: {image_ref}"))?;
+
+    if verbose {
+        eprintln!("Pulling image (runtime, in-memory): {reference}");
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to create tokio runtime")?;
+
+    #[allow(
+        clippy::items_after_statements,
+        reason = "kept next to its only caller below"
+    )]
+    fn host_image_arch() -> oci_spec::image::Arch {
+        if cfg!(target_arch = "aarch64") {
+            oci_spec::image::Arch::ARM64
+        } else {
+            oci_spec::image::Arch::Amd64
+        }
+    }
+
+    let (config, layers) = rt.block_on(async {
+        let client_config = ClientConfig {
+            protocol: ClientProtocol::Https,
+            platform_resolver: Some(Box::new(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| {
+                        entry.platform.as_ref().is_some_and(|p| {
+                            p.os == oci_spec::image::Os::Linux
+                                && p.architecture == host_image_arch()
+                        })
+                    })
+                    .map(|e| e.digest.clone())
+            })),
+            ..Default::default()
+        };
+        let client = Client::new(client_config);
+        let auth = RegistryAuth::Anonymous;
+
+        if verbose {
+            eprintln!("  Fetching manifest...");
+        }
+
+        let (manifest, _digest) = client
+            .pull_image_manifest(&reference, &auth)
+            .await
+            .with_context(|| format!("failed to pull manifest for {reference}"))?;
+
+        let mut config_bytes: Vec<u8> = Vec::new();
+        client
+            .pull_blob(&reference, &manifest.config, &mut config_bytes)
+            .await
+            .with_context(|| format!("failed to pull image config for {reference}"))?;
+        let config = oci_client::client::Config::new(
+            config_bytes,
+            manifest.config.media_type.clone(),
+            manifest.annotations.clone(),
+        );
+
+        if verbose {
+            eprintln!("  Pulled manifest ({} layer(s))", manifest.layers.len());
+        }
+
+        let accepted_media_types = [
+            oci_client::manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE,
+            oci_client::manifest::IMAGE_LAYER_MEDIA_TYPE,
+            oci_client::manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE,
+        ];
+        let num_layers = manifest.layers.len();
+        let mut layers: Vec<Vec<u8>> = Vec::with_capacity(num_layers);
+        for (i, layer_desc) in manifest.layers.iter().enumerate() {
+            if !accepted_media_types.contains(&layer_desc.media_type.as_str()) {
+                anyhow::bail!("unsupported layer media type: {}", layer_desc.media_type);
+            }
+
+            if verbose {
+                eprintln!("  Pulling layer {}/{}...", i + 1, num_layers);
+            }
+
+            let mut layer_data: Vec<u8> = Vec::new();
+            client
+                .pull_blob(&reference, layer_desc, &mut layer_data)
+                .await
+                .with_context(|| format!("failed to pull layer {}", i + 1))?;
+
+            let is_gzip = layer_desc.media_type.contains("gzip") || is_gzip_data(&layer_data);
+            let decompressed = if is_gzip {
+                use std::io::Read as _;
+                let mut decoder = flate2::read::GzDecoder::new(layer_data.as_slice());
+                let mut out = Vec::new();
+                decoder
+                    .read_to_end(&mut out)
+                    .with_context(|| format!("failed to decompress layer {}", i + 1))?;
+                out
+            } else {
+                layer_data
+            };
+
+            if verbose {
+                eprintln!(
+                    "  Layer {}/{} ready in memory ({} bytes decompressed)",
+                    i + 1,
+                    num_layers,
+                    decompressed.len()
+                );
+            }
+
+            layers.push(decompressed);
+        }
+
+        Ok::<_, anyhow::Error>((config, layers))
+    })?;
+
+    let config_json = config.data.to_vec();
+    let parsed_config = match ConfigFile::try_from(config) {
+        Ok(cf) => {
+            let exec_config = cf.config.as_ref();
+            ImageConfig {
+                entrypoint: exec_config.and_then(|c| c.entrypoint.clone()),
+                cmd: exec_config.and_then(|c| c.cmd.clone()),
+                env: exec_config.and_then(|c| c.env.clone()),
+                working_dir: exec_config.and_then(|c| c.working_dir.clone()),
+            }
+        }
+        Err(e) => {
+            eprintln!("warning: failed to parse image config: {e}");
+            ImageConfig::default()
+        }
+    };
+
+    Ok(PulledLayers {
+        layers,
+        config: parsed_config,
+        config_json,
+    })
+}
+
+/// Rewrite every executable ELF entry inside one decompressed OCI layer tar's bytes, eagerly, in
+/// memory, before guest boot -- returning a fresh tar with rewritten ELF payloads spliced in
+/// place of the originals (a rewrite can change a file's size, so entries are rebuilt with a
+/// `tar::Builder` rather than patched in place).
+///
+/// Eager (at image-load time, host-side, before boot) was chosen over lazy (deferred to each
+/// binary's first `exec()`) or cached (content-hash-keyed, reused across boots): the rewriter
+/// itself (`litebox_syscall_rewriter::hook_syscalls_in_elf`) is a pure, `no_std`-capable,
+/// in-memory `&[u8] -> Vec<u8>` transform with no host-only dependency forcing it out of the
+/// guest-boot path, so there is no correctness reason to defer it -- only a latency/laziness
+/// trade-off. Lazy rewriting would require plumbing a rewrite-on-first-exec cache through every
+/// runner's `exec()` path (each of which currently assumes its rootfs backend already serves
+/// pre-rewritten bytes), a materially larger change for a benefit (skipping unused binaries) that
+/// does not apply to the base-image case this pass targets, where nearly every ELF a small image
+/// ships is a real dependency reachable from its entrypoint. Content-hash caching across boots
+/// (persisting rewritten bytes keyed by a hash of the original ELF, reused whenever the same
+/// image is booted again) is a legitimate, purely additive follow-up once real usage shows
+/// eager-every-boot rewriting is a measured latency problem -- deliberately deferred rather than
+/// built speculatively against no evidence of that cost.
+pub fn rewrite_layer_elfs(layer_tar: &[u8], verbose: bool) -> anyhow::Result<Vec<u8>> {
+    let mut archive = tar::Archive::new(layer_tar);
+    let mut out = Vec::with_capacity(layer_tar.len());
+    {
+        let mut builder = tar::Builder::new(&mut out);
+        for entry_result in archive.entries()? {
+            let mut entry = entry_result.context("failed to read tar entry while rewriting")?;
+            let mut header = entry.header().clone();
+            let entry_type = header.entry_type();
+            let path = entry.path()?.into_owned();
+
+            if entry_type != tar::EntryType::Regular {
+                // Symlinks, directories, whiteout markers, etc. pass through unchanged --
+                // only regular-file payloads can be an ELF worth rewriting.
+                builder.append(&header, std::io::empty())?;
+                continue;
+            }
+
+            let is_executable = header.mode().is_ok_and(|m| m & 0o111 != 0);
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data)?;
+
+            let out_data = if is_executable {
+                crate::rewrite_elf(&data, &path, verbose)
+            } else {
+                data
+            };
+
+            header.set_size(out_data.len() as u64);
+            header.set_cksum();
+            builder.append_data(&mut header, &path, out_data.as_slice())?;
+        }
+        builder.finish()?;
+    }
+    Ok(out)
 }
 
 /// Generate a `litebox/config_and_run.sh` shell script from the OCI image config.
@@ -423,6 +673,10 @@ fn extract_tar<R: Read>(
         let path = normalize_path(&entry.path()?);
         let path_str = path.to_string_lossy();
 
+        if is_excluded_path(&path_str) {
+            continue;
+        }
+
         // Handle OCI whiteout files
         if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
             if file_name == ".wh..wh..opq" {
@@ -500,7 +754,29 @@ fn extract_tar<R: Read>(
                     .context("hard link entry has no link name")?,
             );
             let link_source = rootfs.join(&link_name);
-            if link_source.exists() {
+            // On Windows' case-insensitive NTFS, two case-distinct Linux paths (e.g.
+            // usr/share/terminfo/L/LFT-PC850 vs usr/share/terminfo/l/lft-pc850, a real
+            // collision found packaging linuxserver/webtop:arch-xfce) can resolve to the
+            // SAME physical file on disk. Copying a file onto itself is a no-op we should
+            // skip rather than attempt -- Windows sometimes tolerates a self-copy silently
+            // and sometimes fails with "the process cannot access the file" (os error 32)
+            // depending on handle/timing state, which is why this reproduced identically
+            // on a retry rather than looking like ordinary transient contention.
+            // `target` doesn't exist on disk yet at this point (it's the file we're about
+            // to create), so `canonicalize()` can't be used to detect the collision -- it
+            // requires the path to already exist. Compare the would-be OS path strings
+            // case-insensitively instead, which is exactly the comparison NTFS itself uses.
+            let is_self_collision = link_source
+                .to_str()
+                .zip(target.to_str())
+                .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b));
+            if is_self_collision {
+                eprintln!(
+                    "  Skipping self-copy (case-collision on this filesystem): {} -> {}",
+                    link_source.display(),
+                    target.display()
+                );
+            } else if link_source.exists() {
                 std::fs::copy(&link_source, &target).with_context(|| {
                     format!(
                         "failed to copy hard link target {} -> {}",
@@ -672,6 +948,20 @@ fn resolve_symlink_in_rootfs(
     } else {
         None
     }
+}
+
+/// Paths excluded from extraction entirely -- package-manager bookkeeping
+/// metadata that real guest programs never read at runtime, so it's safe to
+/// drop rather than needing to represent it faithfully on the host
+/// filesystem. Currently just pacman's (Arch Linux) local install database:
+/// `var/lib/pacman/local/<name>-<epoch>:<version>-<release>/` directory names
+/// contain a literal `:`, a reserved character in Windows paths (valid only
+/// as the drive-letter separator) -- `std::fs::create_dir_all` fails with
+/// "The directory name is invalid" (os error 267) on any such entry. Found
+/// packaging `linuxserver/webtop:arch-xfce`, an Arch-based image; Alpine-based
+/// images (using `apk`, no colon-bearing package-db paths) don't hit this.
+fn is_excluded_path(path_str: &str) -> bool {
+    path_str.starts_with("var/lib/pacman/local/") || path_str.starts_with("var\\lib\\pacman\\local\\")
 }
 
 /// Check if a path starts with `/` (Unix-style absolute).

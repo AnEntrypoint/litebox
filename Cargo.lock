@@ -887,6 +887,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "dev_util",
  "glob",
  "libc",
  "petname",
@@ -900,8 +901,16 @@ name = "dev_tests"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dev_util",
  "fs-err",
  "ignore",
+]
+
+[[package]]
+name = "dev_util"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
 ]
 
 [[package]]
@@ -2191,9 +2200,11 @@ dependencies = [
  "bitflags 2.13.1",
  "cms",
  "const-oid",
+ "der",
  "digest",
  "elf",
  "hashbrown 0.15.5",
+ "hmac",
  "libc",
  "litebox",
  "litebox_common_linux",
@@ -2270,6 +2281,7 @@ dependencies = [
  "clap",
  "litebox",
  "litebox_common_linux",
+ "litebox_packager",
  "litebox_platform_windows_userland",
  "litebox_session_daemon",
  "litebox_shim_linux",
@@ -2296,7 +2308,6 @@ dependencies = [
  "memmap2",
  "sha2",
  "tar",
- "tracing-subscriber",
  "walkdir",
 ]
 
@@ -2336,7 +2347,6 @@ dependencies = [
  "litebox_util_log",
  "serde",
  "serde_json",
- "tracing-subscriber",
 ]
 
 [[package]]

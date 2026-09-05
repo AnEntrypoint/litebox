@@ -73,8 +73,26 @@ pub struct CliArgs {
     ///
     /// All ELF binaries should be pre-rewritten with the syscall rewriter
     /// (e.g., via `litebox-packager`).
-    #[arg(long = "initial-files", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath)]
-    pub initial_files: PathBuf,
+    #[arg(
+        long = "initial-files",
+        value_name = "PATH_TO_TAR",
+        value_hint = clap::ValueHint::FilePath,
+        required_unless_present = "oci_image",
+        conflicts_with = "oci_image"
+    )]
+    pub initial_files: Option<PathBuf>,
+
+    /// Pull an OCI container image reference directly at boot time and use it as the rootfs,
+    /// instead of a pre-built `--initial-files` tar. NO real host directory is ever created for
+    /// the image's rootfs: layers are pulled into memory, merged (OCI whiteout-aware) and
+    /// syscall-rewritten entirely in memory, and mounted straight into the guest's read-only tar
+    /// filesystem backend -- see `litebox::fs::tar_ro::TarRo::from_layers` and
+    /// `litebox_packager::oci::pull_layers_in_memory`. This replaces the ahead-of-time
+    /// `litebox-packager --oci-image` + `--initial-files` two-step pipeline for the common case;
+    /// that pipeline still works unchanged for callers that want a pre-built, reusable tar file.
+    /// Only public (anonymous) registries are currently supported.
+    #[arg(long = "oci-image", value_name = "IMAGE_REF", conflicts_with = "initial_files")]
+    pub oci_image: Option<String>,
     /// After the program exits, export the writable upper layer (every file the guest created or
     /// modified during this run) to a tar archive at this path, so a later run can resume from it
     /// via `--resume-from`.
@@ -318,73 +336,118 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         )
         .init();
 
-    let tar_file = &cli_args.initial_files;
-    if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
-        anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
+    // Two mutually-exclusive rootfs sources (enforced by clap's `conflicts_with` on both args):
+    // a pre-built `--initial-files` tar (host-mmapped, unchanged from before), or a live
+    // `--oci-image` reference pulled and merged entirely in memory at this exact point, with NO
+    // real host directory ever created for its rootfs -- see `litebox_packager::oci`'s
+    // `pull_layers_in_memory`/`rewrite_layer_elfs` and `TarRo::from_layers`. Both paths converge
+    // on the same `Cow<'static, [u8]>` layer list before the shared `default_fs`-family call
+    // below, so everything downstream of rootfs construction (in-mem upper layer, resume-from
+    // import, guest boot) is identical regardless of which source was used.
+    enum RootfsSource {
+        Tar { mmap: MmappedFile },
+        OciLayers { layers: Vec<Vec<u8>> },
     }
-    // Pass 136: carry this run's tar path across the CreateProcessW-spawned diagnostic-fork-
-    // child boundary (inherited automatically via `lpEnvironment: null`) so a child built with
-    // `LITEBOX_DIAG_PROCESS_FORK_GLOBALSTATE=1` can remount the SAME rootfs a real GlobalState-
-    // reconstruction probe needs -- see `process_fork::FORK_CHILD_TAR_PATH_ENV_VAR`'s doc
-    // comment. Set unconditionally (cheap, a single env var) rather than gated behind the probe's
-    // own flag, matching this module's existing precedent of computing cheap diagnostic inputs
-    // unconditionally while gating only the logging/behavior that consumes them.
-    if let Ok(abs_tar) = std::path::absolute(tar_file) {
-        unsafe {
-            std::env::set_var(
-                litebox_platform_windows_userland::process_fork::FORK_CHILD_TAR_PATH_ENV_VAR,
-                &abs_tar,
-            );
+
+    let rootfs_source = if let Some(image_ref) = &cli_args.oci_image {
+        eprintln!("Pulling OCI image (runtime, in-memory): {image_ref}");
+        let pulled = litebox_packager::oci::pull_layers_in_memory(image_ref, true)
+            .map_err(|e| anyhow!("failed to pull OCI image {image_ref}: {e}"))?;
+        eprintln!(
+            "  Rewriting syscalls in {} layer(s)...",
+            pulled.layers.len()
+        );
+        let rewritten_layers = pulled
+            .layers
+            .into_iter()
+            .map(|layer| {
+                litebox_packager::oci::rewrite_layer_elfs(&layer, true)
+                    .map_err(|e| anyhow!("failed to rewrite ELFs in OCI layer: {e}"))
+            })
+            .collect::<Result<Vec<Vec<u8>>>>()?;
+        RootfsSource::OciLayers {
+            layers: rewritten_layers,
         }
-    }
-    if let Some(export_path) = &cli_args.export_writable_layer {
-        // `tar_file` stays memory-mapped for this process's entire lifetime (see
-        // `mmapped_file` below), and Windows generally refuses to open a file
-        // for writing while a mapping of it is still active. Catch the
-        // self-defeating case of exporting onto the same file being read from
-        // with a clear error up front, rather than a confusing failure deep in
-        // `export_writable_layer` after the whole guest session has already run.
-        let initial_files_abs = std::path::absolute(tar_file).map_err(|e| {
-            anyhow!(
-                "Could not get absolute path for {}: {}",
-                tar_file.display(),
-                e
-            )
-        })?;
-        let export_path_abs = std::path::absolute(export_path).map_err(|e| {
-            anyhow!(
-                "Could not get absolute path for {}: {}",
-                export_path.display(),
-                e
-            )
-        })?;
-        if initial_files_abs == export_path_abs {
-            anyhow::bail!(
-                "--export-writable-layer must not point at the same file as --initial-files ({}): \
-                 the rootfs archive stays memory-mapped for the whole run, so exporting onto it \
-                 would try to overwrite a file that's still open for reading",
-                initial_files_abs.display()
-            );
+    } else {
+        let tar_file = cli_args
+            .initial_files
+            .as_ref()
+            .expect("clap required_unless_present=oci_image guarantees this is Some");
+        if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
+            anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
         }
-    }
-    // Memory-mapped, not heap-copied: every concurrent runner process reading
-    // the same rootfs archive shares its physical pages via the OS page cache
-    // instead of each holding a private copy.
-    let tar_mmap = mmapped_file(tar_file)?;
-    let tar_data = tar_mmap.data;
+        // Pass 136: carry this run's tar path across the CreateProcessW-spawned diagnostic-fork-
+        // child boundary (inherited automatically via `lpEnvironment: null`) so a child built with
+        // `LITEBOX_DIAG_PROCESS_FORK_GLOBALSTATE=1` can remount the SAME rootfs a real
+        // GlobalState-reconstruction probe needs -- see
+        // `process_fork::FORK_CHILD_TAR_PATH_ENV_VAR`'s doc comment. Set unconditionally (cheap,
+        // a single env var) rather than gated behind the probe's own flag, matching this module's
+        // existing precedent of computing cheap diagnostic inputs unconditionally while gating
+        // only the logging/behavior that consumes them. Not meaningful for the `--oci-image`
+        // path (no single on-disk tar file exists to remount), so left unset there.
+        if let Ok(abs_tar) = std::path::absolute(tar_file) {
+            unsafe {
+                std::env::set_var(
+                    litebox_platform_windows_userland::process_fork::FORK_CHILD_TAR_PATH_ENV_VAR,
+                    &abs_tar,
+                );
+            }
+        }
+        if let Some(export_path) = &cli_args.export_writable_layer {
+            // `tar_file` stays memory-mapped for this process's entire lifetime (see
+            // `mmapped_file` below), and Windows generally refuses to open a file
+            // for writing while a mapping of it is still active. Catch the
+            // self-defeating case of exporting onto the same file being read from
+            // with a clear error up front, rather than a confusing failure deep in
+            // `export_writable_layer` after the whole guest session has already run.
+            let initial_files_abs = std::path::absolute(tar_file).map_err(|e| {
+                anyhow!(
+                    "Could not get absolute path for {}: {}",
+                    tar_file.display(),
+                    e
+                )
+            })?;
+            let export_path_abs = std::path::absolute(export_path).map_err(|e| {
+                anyhow!(
+                    "Could not get absolute path for {}: {}",
+                    export_path.display(),
+                    e
+                )
+            })?;
+            if initial_files_abs == export_path_abs {
+                anyhow::bail!(
+                    "--export-writable-layer must not point at the same file as --initial-files \
+                     ({}): the rootfs archive stays memory-mapped for the whole run, so exporting \
+                     onto it would try to overwrite a file that's still open for reading",
+                    initial_files_abs.display()
+                );
+            }
+        }
+        // Memory-mapped, not heap-copied: every concurrent runner process reading
+        // the same rootfs archive shares its physical pages via the OS page cache
+        // instead of each holding a private copy.
+        RootfsSource::Tar {
+            mmap: mmapped_file(tar_file)?,
+        }
+    };
 
     let platform = Platform::new();
-    // Register the rootfs tar's host-mmapped bytes as CoW-eligible (see
-    // `TarRo::get_static_backing_data`'s doc comment and
-    // `WindowsUserland::try_allocate_cow_pages`): every regular file served out of this tar
-    // (e.g. `/bin/busybox`, reached through however many symlinks) can now take the fast CoW-mmap
-    // path on exec instead of `do_mmap_file_memcpy`'s page-by-page `sys_read` loop. Mirrors
-    // `litebox_runner_linux_userland`'s identical `register_cow_region` call for its own `tar_data`.
-    platform.register_cow_region(tar_data, tar_mmap.abs_path);
+    if let RootfsSource::Tar { mmap } = &rootfs_source {
+        // Register the rootfs tar's host-mmapped bytes as CoW-eligible (see
+        // `TarRo::get_static_backing_data`'s doc comment and
+        // `WindowsUserland::try_allocate_cow_pages`): every regular file served out of this tar
+        // (e.g. `/bin/busybox`, reached through however many symlinks) can now take the fast
+        // CoW-mmap path on exec instead of `do_mmap_file_memcpy`'s page-by-page `sys_read` loop.
+        // Mirrors `litebox_runner_linux_userland`'s identical `register_cow_region` call for its
+        // own `tar_data`. Not applicable to the `--oci-image` path: those layer bytes are
+        // heap-owned (`Cow::Owned`), which `get_static_backing_data` already correctly reports as
+        // CoW-ineligible.
+        platform.register_cow_region(mmap.data, mmap.abs_path.clone());
+    }
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
     let litebox = shim_builder.litebox();
 
-    // The program path is a Unix-style path inside the tar archive. Owned (not a borrow of
+    // The program path is a Unix-style path inside the merged rootfs. Owned (not a borrow of
     // `cli_args`) so it can cross into the spawned initial-guest-thread closures below (see
     // `INITIAL_GUEST_THREAD_STACK_SIZE`'s doc comment) with a `'static` bound.
     let prog_path = cli_args.program_and_arguments[0].clone();
@@ -399,7 +462,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             });
         }
 
-        shim_builder.default_fs(in_mem, tar_data.into())
+        match rootfs_source {
+            RootfsSource::Tar { mmap } => shim_builder.default_fs(in_mem, mmap.data.into()),
+            RootfsSource::OciLayers { layers } => shim_builder.default_fs_multi_layer(
+                in_mem,
+                layers.into_iter().map(std::borrow::Cow::Owned).collect(),
+            ),
+        }
     };
     let initial_file_system = std::sync::Arc::new(initial_file_system);
 

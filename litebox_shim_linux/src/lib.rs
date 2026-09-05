@@ -329,7 +329,22 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
         tar_data: Cow<'static, [u8]>,
     ) -> DefaultFS<Platform> {
-        default_fs(&self.litebox, in_mem_fs, tar_data)
+        default_fs(&self.litebox, in_mem_fs, vec![tar_data])
+    }
+
+    /// Create a default layered file system whose read-only lower layer is built from MULTIPLE
+    /// OCI-style layer tars (bottom-to-top), rather than a single pre-merged tar -- the runtime
+    /// OCI-image-loading path's entrypoint (see
+    /// `litebox_runner_linux_on_windows_userland`'s `--oci-image` option and
+    /// `litebox::fs::tar_ro::TarRo::from_layers`). Whiteout/opaque-whiteout merging across
+    /// `tar_layers` happens entirely inside `TarRo::from_layers`, so this crate never sees or
+    /// needs a pre-merged single tar for this path.
+    pub fn default_fs_multi_layer(
+        &self,
+        in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
+        tar_layers: Vec<Cow<'static, [u8]>>,
+    ) -> DefaultFS<Platform> {
+        default_fs(&self.litebox, in_mem_fs, tar_layers)
     }
 
     /// Build the shim.
@@ -788,11 +803,12 @@ impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
     }
 }
 
-/// Create a default layered file system with the given in-memory layer and tar data.
+/// Create a default layered file system with the given in-memory layer and one or more
+/// (bottom-to-top) tar layers backing the read-only lower layer.
 fn default_fs<Platform: ShimPlatform>(
     litebox: &LiteBox<Platform>,
     in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
-    tar_data: Cow<'static, [u8]>,
+    tar_layers: Vec<Cow<'static, [u8]>>,
 ) -> LinuxFS<Platform> {
     let dev_stdio = litebox::fs::resolver::Resolver::new(
         litebox,
@@ -828,7 +844,7 @@ fn default_fs<Platform: ShimPlatform>(
         litebox,
         litebox::fs::composer::Composer::builder()
             .mount("/", |allocator| {
-                litebox::fs::tar_ro::TarRo::new(tar_data, allocator)
+                litebox::fs::tar_ro::TarRo::from_layers(tar_layers, allocator)
             })
             .build()
             .unwrap(),

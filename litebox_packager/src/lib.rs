@@ -628,7 +628,12 @@ fn target_elf_machine() -> u16 {
 /// through the rewriter. For actual ELF files, benign rewriter errors (already
 /// hooked, no syscalls, unsupported object, missing `.text`) are treated as
 /// warnings and the original bytes are returned.
-fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> Vec<u8> {
+///
+/// `pub` (rather than crate-private) so the runtime OCI-loading path
+/// (`litebox_runner_linux_on_windows_userland`'s `--oci-image` option) can rewrite each layer's
+/// executable ELFs the same way this crate's own ahead-of-time packaging path already does,
+/// without duplicating the ELF-magic/architecture-check/rewriter-error-handling logic.
+pub fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> Vec<u8> {
     // Fast-path: skip the rewriter entirely for non-ELF files.
     if data.len() < 4 || data[..4] != ELF_MAGIC {
         if verbose {
