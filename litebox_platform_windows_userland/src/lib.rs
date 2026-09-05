@@ -464,10 +464,22 @@ unsafe extern "system" fn vectored_exception_handler_entry(
         jmp     {vectored_exception_handler}
 
     .Lsearch:
+        // DIAG (this investigation pass): this is the ONE exit in the whole fault path that
+        // previously logged absolutely nothing -- the trampoline returns
+        // EXCEPTION_CONTINUE_SEARCH without ever entering Rust, so the exception table is never
+        // consulted and no diagnostic in `vectored_exception_handler` can possibly observe it.
+        // It is reached both when `veh_depth` is at `VEH_DEPTH_CAP` and from the earlier
+        // non-AV/no-TLS guards above. `lock inc` on a plain static is the only instrumentation
+        // safe here: no stack, no registers clobbered (flags are dead on this path -- the very
+        // next instruction loads `eax` with a constant and returns), no call, no allocation.
+        // Rust-side diagnostics read this counter to report how many faults took this invisible
+        // exit.
+        lock inc QWORD PTR [rip + {LSEARCH_COUNT}]
         mov     eax, {EXCEPTION_CONTINUE_SEARCH}
         ret
         .seh_endproc
         ",
+        LSEARCH_COUNT = sym LSEARCH_EXIT_COUNT,
         EXCEPTION_ACCESS_VIOLATION = const Win32_Foundation::EXCEPTION_ACCESS_VIOLATION,
         EXCEPTION_CONTINUE_EXECUTION = const EXCEPTION_CONTINUE_EXECUTION,
         EXCEPTION_CONTINUE_SEARCH = const EXCEPTION_CONTINUE_SEARCH,
@@ -872,7 +884,21 @@ unsafe extern "system" fn vectored_exception_handler(
     }
 
     let Some(tls) = get_tls_ptr() else {
-        // TLS slot not initialized yet; cannot be in guest
+        // TLS slot not initialized yet; cannot be in guest.
+        //
+        // DIAG (this investigation pass): this bail-out is one of the ways an access violation
+        // with a perfectly valid, covering exception-table entry reaches
+        // EXCEPTION_CONTINUE_SEARCH without the table ever being consulted -- the lookup lives
+        // ~680 lines below this point. It was previously completely silent, which is precisely
+        // why the "a covering entry exists but recovery never happens" paradox was so hard to
+        // localise. Allocation-free and only reachable on an actual fault with no usable TLS.
+        let rec = unsafe { &*(*exception_info).ExceptionRecord };
+        diag_raw_print(
+            b"[diag-veh-no-tls] code=0x",
+            rec.ExceptionCode as usize,
+            b" fault_addr=0x",
+            rec.ExceptionInformation[1],
+        );
         return EXCEPTION_CONTINUE_SEARCH;
     };
     let tls = unsafe { &*tls };
@@ -1731,6 +1757,33 @@ unsafe extern "system" fn vectored_exception_handler(
                         }
                     }
                 }
+                // Ungated, allocation-free: the trampoline bails out to `.Lsearch`
+                // (EXCEPTION_CONTINUE_SEARCH, Rust never entered, exception table never
+                // consulted) once `veh_depth` reaches `VEH_DEPTH_CAP`, and that bail-out is
+                // completely silent today. A fault cascade that climbs toward the cap therefore
+                // stops being recoverable partway through, with no trace of why -- exactly the
+                // "a covering entry exists but recovery never happens" shape this investigation
+                // is chasing. This file's own trampoline comment records a live repro hitting
+                // 3000+ nested reentries, well past the 512 cap, so this is not hypothetical.
+                // Print the depth reached on this invocation so a capture shows directly whether
+                // the cascade is depth-driven.
+                diag_raw_print(
+                    b"[diag-unrecov-av-depth] veh_depth=0x",
+                    tls.veh_depth.get() as usize,
+                    b" cap=0x",
+                    VEH_DEPTH_CAP as usize,
+                );
+                // Companion to the depth print: how many faults have taken the trampoline's
+                // invisible `.Lsearch` exit process-wide (see `LSEARCH_EXIT_COUNT`). A non-zero
+                // count here means faults ARE bypassing the exception table entirely without
+                // Rust ever running -- the mechanism that would make a covering entry look like
+                // it simply failed to recover.
+                diag_raw_print(
+                    b"[diag-lsearch-exits] count=0x",
+                    LSEARCH_EXIT_COUNT.load(Ordering::Relaxed) as usize,
+                    b" veh_depth=0x",
+                    tls.veh_depth.get() as usize,
+                );
                 unsafe extern "C" {
                     safe static __ImageBase: c_void;
                 }
@@ -3085,6 +3138,20 @@ const EXCEPTION_RECORD_RESERVE: usize = 65536;
 /// hitting this cap in practice would itself indicate a still-unexplained separate bug worth
 /// investigating on its own, not a ceiling to raise blindly.
 const VEH_DEPTH_CAP: u32 = 512;
+
+/// Diagnostic-only: how many times `vectored_exception_handler_entry`'s `.Lsearch` path has
+/// returned `EXCEPTION_CONTINUE_SEARCH` straight from the naked-asm trampoline, without ever
+/// entering `vectored_exception_handler`.
+///
+/// This exit is the single blind spot in the whole fault path: because Rust never runs, the
+/// exception table is never consulted, and none of the `[diag-unrecov-av]`-family diagnostics can
+/// observe that it happened. An access violation with a perfectly valid, covering exception-table
+/// entry that takes this exit is silently unrecoverable, which is exactly the "a covering entry
+/// exists but recovery never happens" shape this investigation is chasing.
+///
+/// Incremented by a `lock inc` directly in the trampoline (see `.Lsearch`); read only by
+/// diagnostics. `u64` because the asm increments a full QWORD.
+static LSEARCH_EXIT_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 impl TlsState {
     /// Creates a new `TlsState` with all fields zeroed / defaulted.
