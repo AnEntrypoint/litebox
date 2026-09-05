@@ -4545,6 +4545,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             | IoctlArg::DrmModeCreateDumb(..)
             | IoctlArg::DrmModeMapDumb(..)
             | IoctlArg::DrmModeDestroyDumb(..)
+            | IoctlArg::DrmModeAddFb(..)
             | IoctlArg::DrmModeAddFb2(..)
             | IoctlArg::DrmModePageFlip(..)
             | IoctlArg::DrmModeGetPlaneResources(..)
@@ -4953,6 +4954,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             IoctlArg::DrmModeDestroyDumb(ptr) => {
                 self.global.drm.destroy_dumb(self.global.platform, *ptr)
             }
+            IoctlArg::DrmModeAddFb(ptr) => self.global.drm.add_fb(*ptr),
             IoctlArg::DrmModeAddFb2(ptr) => self.global.drm.add_fb2(*ptr),
             IoctlArg::DrmModePageFlip(ptr) => {
                 self.global

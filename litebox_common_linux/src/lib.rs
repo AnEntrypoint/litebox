@@ -949,6 +949,11 @@ pub const DRM_IOCTL_MODE_DESTROY_DUMB: u32 = 0xC004_64B4;
 pub const DRM_IOCTL_MODE_GETPLANERESOURCES: u32 = 0xC010_64B5;
 pub const DRM_IOCTL_MODE_GETPLANE: u32 = 0xC020_64B6;
 pub const DRM_IOCTL_MODE_SETPLANE: u32 = 0xC030_64B7;
+/// `DRM_IOCTL_MODE_ADDFB = DRM_IOWR(0xae, struct drm_mode_fb_cmd)`, `size=28` -- legacy v1
+/// framebuffer attach, still sent by `xf86-video-modesetting` as a fallback when it does not use
+/// `DRM_IOCTL_MODE_ADDFB2` (see [`DrmModeFbCmd`]'s doc comment for the live evidence that this
+/// path is genuinely exercised, not dead).
+pub const DRM_IOCTL_MODE_ADDFB: u32 = 0xC01C_64AE;
 pub const DRM_IOCTL_MODE_ADDFB2: u32 = 0xC068_64B8;
 pub const DRM_IOCTL_MODE_PAGE_FLIP: u32 = 0xC018_64B0;
 /// `DRM_IOCTL_VERSION = DRM_IOWR(0x00, struct drm_version)`. `nr`/struct shape fetched live from
@@ -1325,6 +1330,23 @@ pub struct DrmModeMapDumb {
 #[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
 #[repr(C)]
 pub struct DrmModeDestroyDumb {
+    pub handle: u32,
+}
+
+/// `struct drm_mode_fb_cmd` -- the legacy (v1, pre-multi-plane) `DRM_IOCTL_MODE_ADDFB` request.
+/// `xf86-video-modesetting`'s `drmmode_do_addfb` falls back to this ioctl when it decides not to
+/// (or cannot) use `drmModeAddFB2WithModifiers` -- observed live: a real Xorg run against this
+/// device sent exactly this ioctl (nr=0xAE, size=28) with no preceding ADDFB2 attempt at all, so
+/// this is a real, load-bearing call shape this device must answer, not a dead legacy path.
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmModeFbCmd {
+    pub fb_id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+    pub bpp: u32,
+    pub depth: u32,
     pub handle: u32,
 }
 
@@ -1846,6 +1868,9 @@ pub enum IoctlArg {
     DrmModeMapDumb(UserPtrMut<DrmModeMapDumb>),
     /// `DRM_IOCTL_MODE_DESTROY_DUMB`.
     DrmModeDestroyDumb(UserPtr<DrmModeDestroyDumb>),
+    /// `DRM_IOCTL_MODE_ADDFB` -- legacy v1 attach of a dumb buffer as a scanout framebuffer,
+    /// still sent by real userspace (see [`DrmModeFbCmd`]'s doc comment).
+    DrmModeAddFb(UserPtrMut<DrmModeFbCmd>),
     /// `DRM_IOCTL_MODE_ADDFB2` -- attach a dumb buffer as a scanout framebuffer.
     DrmModeAddFb2(UserPtrMut<DrmModeFbCmd2>),
     /// `DRM_IOCTL_MODE_PAGE_FLIP`.
@@ -4154,6 +4179,7 @@ impl SyscallRequest {
                         DRM_IOCTL_MODE_DESTROY_DUMB => {
                             IoctlArg::DrmModeDestroyDumb(ctx.sys_req_ptr(2))
                         }
+                        DRM_IOCTL_MODE_ADDFB => IoctlArg::DrmModeAddFb(ctx.sys_req_ptr(2)),
                         DRM_IOCTL_MODE_ADDFB2 => IoctlArg::DrmModeAddFb2(ctx.sys_req_ptr(2)),
                         DRM_IOCTL_MODE_PAGE_FLIP => IoctlArg::DrmModePageFlip(ctx.sys_req_ptr(2)),
                         DRM_IOCTL_MODE_GETPLANERESOURCES => {

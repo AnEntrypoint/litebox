@@ -48,8 +48,9 @@ use litebox_common_linux::{
     DRM_MODE_OBJECT_PLANE, DRM_MODE_PAGE_FLIP_EVENT, DRM_MODE_PROP_BLOB, DRM_MODE_PROP_ENUM,
     DRM_PRIME_CAP_EXPORT, DRM_PRIME_CAP_IMPORT, DrmAuth, DrmEvent, DrmEventVblank, DrmGetCap,
     DrmModeCardRes, DrmModeConnectorSetProperty, DrmModeCreateDumb, DrmModeCrtc,
-    DrmModeCrtcPageFlip, DrmModeDestroyDumb, DrmModeFbCmd2, DrmModeGetBlob, DrmModeGetConnector,
-    DrmModeGetEncoder, DrmModeGetPlane, DrmModeGetPlaneRes, DrmModeGetProperty, DrmModeMapDumb,
+    DrmModeCrtcPageFlip, DrmModeDestroyDumb, DrmModeFbCmd, DrmModeFbCmd2, DrmModeGetBlob,
+    DrmModeGetConnector, DrmModeGetEncoder, DrmModeGetPlane, DrmModeGetPlaneRes, DrmModeGetProperty,
+    DrmModeMapDumb,
     DrmModeModeinfo, DrmModeObjGetProperties, DrmModePropertyEnum, DrmModeSetPlane,
     DrmSetClientCap, DrmVersion, VIRTUAL_CONNECTOR_DPMS_PROP_ID, VIRTUAL_CONNECTOR_DPMS_VALUE,
     VIRTUAL_CONNECTOR_EDID_BLOB_ID, VIRTUAL_CONNECTOR_EDID_PROP_ID, VIRTUAL_PLANE_TYPE_PROP_ID,
@@ -1272,6 +1273,51 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         // userspace is responsible for removing the framebuffer first via
         // `DRM_IOCTL_MODE_RMFB`, not implemented in this pass) -- leaving `framebuffers` as-is
         // matches that real-kernel behavior rather than silently diverging from it.
+        Ok(0)
+    }
+
+    /// `DRM_IOCTL_MODE_ADDFB` (v1, legacy) -- attach a dumb buffer as a scanout framebuffer using
+    /// the pre-multi-plane request shape (`bpp`/`depth` instead of a fourcc `pixel_format`).
+    ///
+    /// Real userspace still sends this: a live capture of `xf86-video-modesetting` driving this
+    /// exact device showed it calling `DRM_IOCTL_MODE_ADDFB` (ioctl nr `0xAE`, 28-byte
+    /// `struct drm_mode_fb_cmd`) directly, with NO preceding `DRM_IOCTL_MODE_ADDFB2` attempt at
+    /// all for that mode-set -- `drmmode_do_addfb`'s real fallback path, not a dead legacy call.
+    /// Before this handler existed, that ioctl fell through to the generic unmatched-ioctl case
+    /// and returned `EINVAL` with no framebuffer created, which is exactly the `failed to add fb
+    /// -22` / `(EE) modeset(0): failed to set mode: Invalid argument` failure this fixes.
+    pub(crate) fn add_fb(&self, ptr: UserPtrMut<DrmModeFbCmd>) -> Result<u32, Errno> {
+        let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        // This device's dumb buffers are always 32bpp/depth-24 `XRGB8888` (see `create_dumb`'s
+        // own `bpp == 32` case and `DRM_FORMAT_XRGB8888`'s doc comment) -- the legacy ADDFB
+        // request has no fourcc field, so bpp/depth are the only way a caller can name a
+        // format, and rejecting any other combination here (rather than silently reinterpreting
+        // the buffer's bytes under a format the caller didn't ask for) matches how a real kernel
+        // driver that only implements one hardware format would answer this ioctl.
+        if req.bpp != 32 || req.depth != 24 {
+            return Err(Errno::EINVAL);
+        }
+        let handle = req.handle;
+        if !self.buffers.lock().contains_key(&handle) {
+            return Err(Errno::ENOENT);
+        }
+        litebox_util_log::warn!(
+            width:? = req.width, height:? = req.height, pitch:? = req.pitch,
+            bpp:? = req.bpp, depth:? = req.depth, handle:? = handle;
+            "drm-ioctl: ADDFB (v1) request"
+        );
+        let fb_id = self.next_fb_id.fetch_add(1, Ordering::Relaxed);
+        self.framebuffers.lock().insert(
+            fb_id,
+            Framebuffer {
+                width: req.width,
+                height: req.height,
+                pixel_format: DRM_FORMAT_XRGB8888,
+                handle,
+            },
+        );
+        req.fb_id = fb_id;
+        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
         Ok(0)
     }
 
