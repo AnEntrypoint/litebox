@@ -108,17 +108,19 @@ ad-hoc Python script this project previously hand-rolled for the same purpose (`
 `batch_rewrite_layer.py`, `fetch_container.py` -- all retired, do not recreate them).
 
 **`linuxserver/webtop:alpine-mate` ships MATE, not XFCE** (see standing lessons above).
-`linuxserver/webtop:alpine-xfce` does NOT exist (404) -- do not pull it. `debian-xfce` genuinely
-ships an XFCE-family image but its actual window manager/desktop content is Selkies/pixelflux +
-Wayland (labwc/openbox), NOT a plain xfce4-session/xfwm4/xfdesktop stack -- confirmed live by
-tar-listing every rewritten binary across all 17 layers of `debian-xfce`: zero `xfwm4`,
-`xfdesktop`, `xfsettingsd`, `xfce4-panel`, `xfce4-session`, `startxfce4` anywhere; only
-`xfconfd` (a settings daemon other desktops also depend on) and two each of `openbox`/`labwc`.
-This is the alpine-mate lesson repeating a third time -- **always verify a desktop image's actual
-WM/session binaries by direct registry manifest + blob tar-listing BEFORE pulling for a boot**,
-never trust the tag name. A registry pull token + manifest/blob fetch via plain `curl` (no docker/
-skopeo needed) is enough to check this in seconds, at zero litebox-side cost, before committing to
-a 20-minute pull.
+`linuxserver/webtop:alpine-xfce` does NOT exist (404) -- do not pull it. **`debian-xfce` DOES ship
+a real, plain xfce4-session/xfwm4/xfdesktop stack** -- an earlier pass's tar-listing claiming zero
+`xfwm4`/`xfdesktop`/`xfsettingsd`/`xfce4-panel`/`xfce4-session`/`startxfce4` anywhere was WRONG
+(likely an incomplete/truncated pull, per this project's own repeated "truncated pull looks like a
+missing binary" lesson) and has since been corrected by a live `/usr/bin` listing inside a fully
+booted guest: all of the above are present, plus 26 `xfce4-*` binaries, `xfwm4`, `xfdesktop`,
+`xfsettingsd`, and `startxfce4` itself, alongside `labwc`/`openbox`/`Xwayland`/`selkies-desktop`
+(the image supports multiple session types, not just one). Still, **always verify a desktop
+image's actual WM/session binaries by direct registry manifest + blob tar-listing, or a live
+`/usr/bin` listing inside a fully booted guest, BEFORE assuming either way** -- never trust the tag
+name, and never trust a single tar-listing pass without confirming the pull actually completed in
+full. A registry pull token + manifest/blob fetch via plain `curl` (no docker/skopeo needed) is
+enough to check this in seconds, at zero litebox-side cost, before committing to a 20-minute pull.
 
 **Runtime OCI images are structurally the wrong shape for this project's actual DRM device.**
 `litebox`'s virtual DRM device (`litebox_shim_linux/src/syscalls/drm.rs`) is legacy-KMS + dumb-
