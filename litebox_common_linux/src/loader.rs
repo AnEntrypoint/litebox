@@ -364,14 +364,9 @@ impl ElfParsedFile {
         let mut buf = alloc::vec![0u8; len + 1];
         file.read_at(ph.p_offset, &mut buf[..len])
             .map_err(ElfParseError::Io)?;
-        buf.truncate(
-            buf.iter()
-                .position(|&b| b == 0)
-                .expect("we null terminated it at allocation time"),
-        );
-        Ok(Some(
-            alloc::ffi::CString::new(buf).expect("truncated away null bytes"),
-        ))
+        let cstr = core::ffi::CStr::from_bytes_until_nul(&buf)
+            .expect("we null terminated it at allocation time");
+        Ok(Some(alloc::borrow::ToOwned::to_owned(cstr)))
     }
 
     fn pt_loads(&self) -> impl Iterator<Item = elf::segment::ProgramHeader> + '_ {
