@@ -4555,22 +4555,49 @@ fn release_claim_range_for_current_thread(range: core::ops::Range<usize>) {
 /// own doc comment for the full hazard this guards against.
 ///
 /// This is deliberately approximate rather than exact: without loading real debug symbols at
-/// runtime, there is no cheap way to get `alloc`/`dealloc`'s precise compiled extents. Instead,
-/// this checks whether `rip` falls within a generous fixed window around `<SafeZoneAllocator as
-/// GlobalAlloc>::alloc`'s own entry address -- wide enough to comfortably cover that function,
-/// `dealloc`, and their monomorphized/inlined callees (`slabmalloc`'s `ZoneAllocator::allocate`/
-/// `deallocate`, `refill`, the buddy allocator) as laid out by the compiler, at the cost of also
-/// covering some unrelated nearby code. A false positive here only costs a few extra retry
+/// runtime, there is no cheap way to get these functions' precise compiled extents. Instead,
+/// this checks whether `rip` falls within a window around the entry address of EACH function
+/// that actually mutates allocator state. A false positive here only costs a few extra retry
 /// iterations (capped, see `MAX_ALLOCATOR_SUSPEND_RETRIES`); a false negative just means this
 /// guard doesn't help for that particular call, matching today's un-guarded behavior exactly --
 /// so this heuristic can only make things safer or neutral, never worse.
+///
+/// # Why this checks several addresses rather than one window
+///
+/// This function originally checked a single 512 KiB window centered on `<SafeZoneAllocator as
+/// GlobalAlloc>::alloc`'s entry, on the stated assumption that one window was "wide enough to
+/// comfortably cover that function, `dealloc`, and their monomorphized/inlined callees
+/// (`slabmalloc`'s `ZoneAllocator::allocate`/`deallocate`, `refill`, the buddy allocator)".
+///
+/// That assumption was confirmed live to be FALSE, and it made this guard a no-op for almost
+/// all of the time a thread genuinely spends mutating slab state. Symbolizing a real release
+/// build of this runner (`llvm-symbolizer` over the shipped `.exe`) shows `alloc` at RVA
+/// `0x523c00..0x524f40` and `dealloc` at `0x524f80..0x525240` -- so the old window covered
+/// `0x4a3c00..0x5a3c00` -- while the linker placed every `slabmalloc::ZoneAllocator` method
+/// about 4.3 MB away, entirely outside it (`deallocate` `0x9bfc00..0x9c0380`, `refill_large`
+/// `0x9c03c0..0x9c06c0`, `refill` `0x9c0700..0x9c0a00`, `allocate` `0x9c0a40..0x9c27c0`). They
+/// are genuinely out-of-line, not inlined as the window's author expected.
+///
+/// `ZoneAllocator::allocate` alone is ~7.6 KiB of code, and it is exactly where the
+/// `SpinMutex`-protected page-list walks, `first_fit` bitfield scans, and partial/full/empty
+/// list migrations happen. A thread suspended anywhere in that range was never detected here,
+/// got its `Rip` redirected to `interrupt_callback` by the caller, and abandoned its mutation
+/// partway -- corrupting the process-wide global allocator for every other thread. See
+/// [`litebox::mm::allocator::slab_allocator_code_addrs`] for the addresses this now consults.
 fn rip_in_global_allocator(rip: usize) -> bool {
-    // 512 KiB centered on `alloc`'s entry: comfortably covers a monomorphized slab/buddy
-    // allocator implementation (a few KiB of real code) with wide margin for compiler-chosen
-    // layout, while still being narrow enough to rarely false-positive against unrelated code.
-    const WINDOW: usize = 512 * 1024;
+    // 128 KiB around each real entry point. Smaller than the old single 512 KiB window because
+    // there are now several anchors covering the code that actually matters, so each one can be
+    // tighter (less unrelated code false-positived) while covering strictly more allocator code
+    // in total. Still comfortably larger than the largest of these functions (~7.6 KiB).
+    const WINDOW: usize = 128 * 1024;
     let alloc_addr = <litebox::mm::allocator::SafeZoneAllocator<'static, 34, WindowsUserland> as core::alloc::GlobalAlloc>::alloc as *const () as usize;
-    rip.abs_diff(alloc_addr) < WINDOW
+    let dealloc_addr = <litebox::mm::allocator::SafeZoneAllocator<'static, 34, WindowsUserland> as core::alloc::GlobalAlloc>::dealloc as *const () as usize;
+    if rip.abs_diff(alloc_addr) < WINDOW || rip.abs_diff(dealloc_addr) < WINDOW {
+        return true;
+    }
+    litebox::mm::allocator::slab_allocator_code_addrs()
+        .iter()
+        .any(|&a| rip.abs_diff(a) < WINDOW)
 }
 
 impl ThreadHandle {

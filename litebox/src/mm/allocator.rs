@@ -154,6 +154,53 @@ impl<const ORDER: usize, M: MemoryProvider> SafeZoneAllocator<'_, ORDER, M> {
     }
 }
 
+/// Entry addresses of every out-of-line function that mutates [`SafeZoneAllocator`]'s internal
+/// slab/buddy state, for callers that must detect "is this thread's `rip` currently inside the
+/// global allocator?"
+///
+/// This exists because the platform layer's own guard against suspending a thread mid-allocation
+/// (`litebox_platform_windows_userland`'s `rip_in_global_allocator`/`ThreadHandle::interrupt`)
+/// originally approximated that check as "is `rip` within a fixed 512 KiB window centered on
+/// `<SafeZoneAllocator as GlobalAlloc>::alloc`'s entry", on the stated assumption that the
+/// window was "wide enough to comfortably cover that function, `dealloc`, and their
+/// monomorphized/inlined callees (`slabmalloc`'s `ZoneAllocator::allocate`/`deallocate`,
+/// `refill`, the buddy allocator)".
+///
+/// **That assumption was confirmed live to be false.** In a real release build of
+/// `litebox_runner_linux_on_windows_userland.exe`, `llvm-symbolizer` over the shipped binary
+/// places `<SafeZoneAllocator as GlobalAlloc>::alloc` at RVA `0x523c00..0x524f40` and `dealloc`
+/// at `0x524f80..0x525240` (so the 512 KiB window spans `0x4a3c00..0x5a3c00`), but the linker
+/// placed every `slabmalloc::ZoneAllocator` method roughly 4.3 MB away, far outside it:
+///
+/// * `ZoneAllocator::deallocate` -- RVA `0x9bfc00..0x9c0380`
+/// * `ZoneAllocator::refill_large` -- RVA `0x9c03c0..0x9c06c0`
+/// * `ZoneAllocator::refill` -- RVA `0x9c0700..0x9c0a00`
+/// * `ZoneAllocator::allocate` -- RVA `0x9c0a40..0x9c27c0`
+///
+/// They are genuinely out-of-line (not inlined into `alloc`/`dealloc` as the window's author
+/// expected), so the guard was a no-op for the overwhelming majority of the time a thread
+/// actually spends mutating slab state -- `ZoneAllocator::allocate` alone is ~7.6 KiB of code
+/// and holds the `SpinMutex` across page-list walks, `first_fit` bitfield scans, and
+/// partial/full/empty list migrations. A thread suspended anywhere in that range was never
+/// detected, had its `Rip` redirected to the interrupt callback, and abandoned the mutation
+/// partway, corrupting the shared allocator for every other thread.
+///
+/// Returning the real addresses here replaces that proximity guess with ground truth. Callers
+/// still apply their own conservative per-function window (function *extents* are not knowable
+/// without runtime debug symbols), but now anchored on every relevant function rather than on
+/// one of them.
+#[doc(hidden)]
+pub fn slab_allocator_code_addrs() -> [usize; 4] {
+    // `as` casts through a concrete monomorphization; the trait methods are the real out-of-line
+    // symbols the linker emitted, which is exactly what a `rip` comparison needs.
+    [
+        <ZoneAllocator<'static> as Allocator<'static>>::allocate as *const () as usize,
+        <ZoneAllocator<'static> as Allocator<'static>>::deallocate as *const () as usize,
+        <ZoneAllocator<'static> as Allocator<'static>>::refill as *const () as usize,
+        <ZoneAllocator<'static> as Allocator<'static>>::refill_large as *const () as usize,
+    ]
+}
+
 unsafe impl<const ORDER: usize, M: MemoryProvider> GlobalAlloc
     for SafeZoneAllocator<'static, ORDER, M>
 {
