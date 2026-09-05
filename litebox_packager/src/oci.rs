@@ -9,7 +9,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -353,7 +353,7 @@ pub mod cache {
 
     /// Directory holding cached rewritten OCI layers, relative to the current working directory.
     /// Gitignored (see `.gitignore`'s "Local tooling state" section).
-    const CACHE_DIR: &str = ".litebox-cache";
+    pub(crate) const CACHE_DIR: &str = ".litebox-cache";
 
     /// Build the cache file path for a given layer digest (e.g. `sha256:abcd...`) and rewriter
     /// version. The digest's `:` is replaced with `_` since `:` is a reserved character in
@@ -709,17 +709,72 @@ pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<P
                 .with_context(|| format!("failed to pull layer {}", i + 1))?;
 
             let is_gzip = layer_desc.media_type.contains("gzip") || is_gzip_data(&layer_data);
-            let decompressed = if is_gzip {
-                use std::io::Read as _;
-                let mut decoder = flate2::read::GzDecoder::new(layer_data.as_slice());
-                let estimated_decompressed_size = layer_data.len().saturating_mul(4);
-                let mut out = Vec::with_capacity(estimated_decompressed_size);
-                decoder
-                    .read_to_end(&mut out)
-                    .with_context(|| format!("failed to decompress layer {}", i + 1))?;
-                out
+
+            // Decompress to a temp file and mmap it, rather than holding the full decompressed
+            // layer (~2.5GB for a real large layer, e.g. `linuxserver/webtop:debian-xfce`) as a
+            // second simultaneous ordinary heap `Vec` alongside `rewrite_layer_elfs`'s own
+            // internal output buffer (also ~2.5GB). Before this, BOTH buffers were alive at once
+            // for the whole `rewrite_layer_elfs` call -- a genuine ~5GB simultaneous peak of
+            // non-evictable heap memory, confirmed live to push the host over its low-memory
+            // watchdog threshold even after every other buffer in this pipeline had already been
+            // pre-sized or made cache-mmap-backed. An mmap'd temp file is backed by the OS page
+            // cache, so the host can evict its pages under memory pressure instead of the
+            // allocation being unconditionally resident -- see `cache::write_and_map_cached_layer`
+            // and `litebox_runner_linux_on_windows_userland::mmapped_file` for the identical
+            // established pattern this reuses.
+            enum DecompressedSource {
+                Mmapped { mmap: memmap2::Mmap, tmp_path: PathBuf },
+                InMemory(Vec<u8>),
+            }
+
+            let source = if is_gzip {
+                let tmp_dir = Path::new(cache::CACHE_DIR);
+                std::fs::create_dir_all(tmp_dir).with_context(|| {
+                    format!("failed to create cache directory {}", tmp_dir.display())
+                })?;
+                let pid = std::process::id();
+                let unique = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or_default();
+                let tmp_path = tmp_dir.join(format!(".tmp-decompress-{pid}-{unique}"));
+
+                {
+                    let mut decoder = flate2::read::GzDecoder::new(layer_data.as_slice());
+                    let tmp_file = std::fs::File::create(&tmp_path).with_context(|| {
+                        format!(
+                            "failed to create temp decompression file {}",
+                            tmp_path.display()
+                        )
+                    })?;
+                    let mut writer = std::io::BufWriter::new(tmp_file);
+                    std::io::copy(&mut decoder, &mut writer)
+                        .with_context(|| format!("failed to decompress layer {}", i + 1))?;
+                    writer
+                        .flush()
+                        .with_context(|| format!("failed to flush decompressed layer {}", i + 1))?;
+                }
+                // Drop the compressed input now -- it's no longer needed once decompression into
+                // the temp file has finished, so it doesn't stay alive alongside the mmap below.
+                drop(layer_data);
+
+                let tmp_file = std::fs::File::open(&tmp_path).with_context(|| {
+                    format!("failed to reopen decompressed temp file {}", tmp_path.display())
+                })?;
+                // SAFETY: mirrors `cache::read_cached_layer` / `mmapped_file` -- this temp file is
+                // exclusive to this process and this call (unique pid+timestamp name), never
+                // mutated externally while mapped.
+                let mmap = unsafe { memmap2::Mmap::map(&tmp_file) }.with_context(|| {
+                    format!("failed to mmap decompressed temp file {}", tmp_path.display())
+                })?;
+                DecompressedSource::Mmapped { mmap, tmp_path }
             } else {
-                layer_data
+                DecompressedSource::InMemory(layer_data)
+            };
+
+            let decompressed_slice: &[u8] = match &source {
+                DecompressedSource::Mmapped { mmap, .. } => &mmap[..],
+                DecompressedSource::InMemory(v) => &v[..],
             };
 
             if verbose {
@@ -727,13 +782,16 @@ pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<P
                     "  Layer {}/{} decompressed ({} bytes), rewriting ELFs...",
                     i + 1,
                     num_layers,
-                    decompressed.len()
+                    decompressed_slice.len()
                 );
             }
 
-            let rewritten = rewrite_layer_elfs(&decompressed, verbose)
+            let rewritten = rewrite_layer_elfs(decompressed_slice, verbose)
                 .with_context(|| format!("failed to rewrite ELFs in layer {}", i + 1))?;
-            drop(decompressed);
+            if let DecompressedSource::Mmapped { mmap, tmp_path } = source {
+                drop(mmap);
+                let _ = std::fs::remove_file(&tmp_path);
+            }
 
             if verbose {
                 eprintln!(
