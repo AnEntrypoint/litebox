@@ -355,6 +355,52 @@ pub mod cache {
     /// Gitignored (see `.gitignore`'s "Local tooling state" section).
     pub(crate) const CACHE_DIR: &str = ".litebox-cache";
 
+    /// Delete orphaned `.tmp-{pull,decompress,rewrite}-<pid>-<nanos>` scratch files left behind
+    /// by a run that was killed (e.g. by an external low-memory watchdog) before it could clean
+    /// up its own temp files -- a `SIGKILL`/`TerminateProcess` never runs a destructor, so these
+    /// accumulate across repeated killed attempts (observed live: ~4GB of orphans from five
+    /// killed runs, silently making the very memory/disk pressure that killed them worse for the
+    /// next attempt). A conservative age threshold (rather than a per-platform live-PID check,
+    /// which would need a new dependency for a Windows API call) avoids ever deleting a file a
+    /// genuinely-still-running sibling process is actively writing: a single layer's pull+
+    /// decompress+rewrite is observed to take at most a few minutes even for a very large layer,
+    /// so anything older than that is safe to treat as abandoned.
+    pub fn sweep_orphaned_temp_files(verbose: bool) {
+        const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+        let dir = Path::new(CACHE_DIR);
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let now = std::time::SystemTime::now();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.starts_with(".tmp-") {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            let Ok(modified) = metadata.modified() else {
+                continue;
+            };
+            let Ok(age) = now.duration_since(modified) else {
+                continue;
+            };
+            if age < STALE_AFTER {
+                continue;
+            }
+            if verbose {
+                eprintln!(
+                    "  Removing orphaned temp file from a killed run ({} bytes, {}min old): {name}",
+                    metadata.len(),
+                    age.as_secs() / 60
+                );
+            }
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+
     /// Build the cache file path for a given layer digest (e.g. `sha256:abcd...`) and rewriter
     /// version. The digest's `:` is replaced with `_` since `:` is a reserved character in
     /// Windows paths (valid only as the drive-letter separator) -- same constraint already
@@ -668,6 +714,8 @@ pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<P
     if verbose {
         eprintln!("Pulling image (runtime, in-memory): {reference}");
     }
+
+    cache::sweep_orphaned_temp_files(verbose);
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
