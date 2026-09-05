@@ -296,11 +296,16 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
 /// every layer simultaneously), but stopping at "bytes in memory" instead of extracting onto a
 /// real host rootfs directory.
 pub struct PulledLayers {
-    /// One entry per OCI layer, rewritten tar bytes, bottom-to-top order. A layer served from
-    /// the on-disk rewritten-layer cache (see [`cache`]) is `Cow::Borrowed` over a leaked
-    /// memory-map (mirrors `litebox_runner_linux_on_windows_userland`'s `mmapped_file` for
-    /// `--initial-files`, so every concurrent process reading the same cached layer shares its
-    /// physical pages via the OS page cache); a freshly pulled+rewritten layer is `Cow::Owned`.
+    /// One entry per OCI layer, rewritten tar bytes, bottom-to-top order. EVERY layer here is
+    /// `Cow::Borrowed` over a leaked memory-map (mirrors
+    /// `litebox_runner_linux_on_windows_userland`'s `mmapped_file` for `--initial-files`, so every
+    /// concurrent process reading the same cached layer shares its physical pages via the OS page
+    /// cache) -- both a cache-HIT layer (served directly from the on-disk cache, see [`cache`])
+    /// and a cache-MISS layer (rewritten this run, written to the cache, then immediately
+    /// re-opened as an mmap via `cache::write_and_map_cached_layer` so it becomes just as
+    /// page-cache-evictable as a hit, instead of staying a resident heap `Vec` for the guest's
+    /// whole lifetime). Only on the rare failure to write/mmap the cache file does a layer fall
+    /// back to `Cow::Owned` (heap-resident) as a correctness-preserving degradation.
     pub layers: Vec<Cow<'static, [u8]>>,
     /// Parsed image execution config (ENTRYPOINT, CMD, ENV, WORKDIR).
     pub config: ImageConfig,
@@ -480,6 +485,64 @@ pub mod cache {
                 data.len(),
                 final_path.display()
             );
+        }
+    }
+
+    /// Write a freshly rewritten layer to the cache, then immediately re-open and mmap the
+    /// JUST-WRITTEN file, returning that mmap'd `Cow::Borrowed` slice instead of leaving the
+    /// caller holding the original in-memory `Vec<u8>`.
+    ///
+    /// This exists so a CACHE-MISS run is exactly as memory-cheap as a cache-hit run, immediately,
+    /// in the very same process run that produced the rewritten bytes -- not just on a later run.
+    /// Without this, `PulledLayers::layers` would hold every cache-miss layer's rewritten bytes as
+    /// a real heap `Vec` for the guest's entire lifetime, which is what caused the OOM-kill
+    /// observed pulling `linuxserver/webtop:debian-xfce` (17 layers, ~2.6GB decompressed): every
+    /// layer's rewritten bytes stayed resident simultaneously, summed across the whole image,
+    /// instead of being page-cache-evictable like a cache-hit layer already is.
+    ///
+    /// On any failure to write or mmap (read-only filesystem, disk full, etc.) this falls back to
+    /// `Cow::Owned(data)` -- the caller still gets correct bytes, just not the memory-cheap path
+    /// for this one layer. That failure is exactly what `write_cached_layer` already tolerates
+    /// (best-effort, never fails the boot), so this must tolerate it too.
+    pub fn write_and_map_cached_layer(
+        layer_digest: &str,
+        rewriter_version: u32,
+        data: Vec<u8>,
+        verbose: bool,
+    ) -> Cow<'static, [u8]> {
+        let final_path = cache_path(layer_digest, rewriter_version);
+        if let Err(e) = write_cached_layer_inner(&final_path, &data) {
+            if verbose {
+                eprintln!(
+                    "  [cache] failed to write cache entry for {layer_digest} (v{rewriter_version}): {e:#}; keeping in-memory copy"
+                );
+            }
+            return Cow::Owned(data);
+        }
+        if verbose {
+            eprintln!(
+                "  [cache] wrote {} bytes to {}",
+                data.len(),
+                final_path.display()
+            );
+        }
+        // The in-memory Vec is no longer needed once the write succeeded -- drop it before
+        // (re-)opening the file so the two copies (heap Vec + mmap) never coexist longer than
+        // this brief window.
+        let expected_len = data.len();
+        drop(data);
+
+        match read_cached_layer(layer_digest, rewriter_version, verbose) {
+            Some(mmapped) => mmapped,
+            None => {
+                // Extremely unlikely (we just wrote this file successfully) but not impossible
+                // (e.g. concurrent external deletion). Re-reading from disk to recover the bytes
+                // would defeat the purpose of avoiding a second heap copy, and we've already
+                // dropped the original -- so this is a hard failure for this layer.
+                panic!(
+                    "  [cache] wrote {expected_len} bytes for {layer_digest} (v{rewriter_version}) but immediately failed to re-read/mmap them"
+                );
+            }
         }
     }
 
@@ -667,11 +730,15 @@ pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<P
                 );
             }
 
-            // Write-through: populate the cache so the NEXT boot of this same image (same
-            // digest, same rewriter version) hits the cache path above instead.
-            cache::write_cached_layer(&layer_desc.digest, rewriter_version, &rewritten, verbose);
+            // Write-through: populate the cache, then immediately re-open it as an mmap and use
+            // THAT instead of the in-memory `rewritten` Vec -- so this cache-MISS layer becomes
+            // page-cache-evictable exactly like a cache-hit layer, in this very run, rather than
+            // staying resident for the guest's whole lifetime (see
+            // `cache::write_and_map_cached_layer`'s doc comment).
+            let mapped =
+                cache::write_and_map_cached_layer(&layer_desc.digest, rewriter_version, rewritten, verbose);
 
-            layers.push(Cow::Owned(rewritten));
+            layers.push(mapped);
         }
 
         Ok::<_, anyhow::Error>((config, layers))
