@@ -227,3 +227,9 @@ litebox_runner_linux_on_windows_userland/tests/test-bins/*.hooked
 /advisor/probes/xwire_probe
 /advisor/probes/bigfork_probe
 /advisor/probes/tramp_fork_probe
+
+### Scratch scripts/layers injected into a guest run (--resume-from overlays, frame dumps, etc.) --
+### these are throwaway build artifacts, never committed source; regenerate as needed
+/probe_*.tar
+/*.bmp
+/*.log
