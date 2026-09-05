@@ -7,6 +7,7 @@
 //! extracts its filesystem layers into a temporary rootfs directory, then
 //! walks the rootfs to discover all ELF files for syscall rewriting.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -295,12 +296,221 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
 /// every layer simultaneously), but stopping at "bytes in memory" instead of extracting onto a
 /// real host rootfs directory.
 pub struct PulledLayers {
-    /// One entry per OCI layer, decompressed tar bytes, bottom-to-top order.
-    pub layers: Vec<Vec<u8>>,
+    /// One entry per OCI layer, rewritten tar bytes, bottom-to-top order. A layer served from
+    /// the on-disk rewritten-layer cache (see [`cache`]) is `Cow::Borrowed` over a leaked
+    /// memory-map (mirrors `litebox_runner_linux_on_windows_userland`'s `mmapped_file` for
+    /// `--initial-files`, so every concurrent process reading the same cached layer shares its
+    /// physical pages via the OS page cache); a freshly pulled+rewritten layer is `Cow::Owned`.
+    pub layers: Vec<Cow<'static, [u8]>>,
     /// Parsed image execution config (ENTRYPOINT, CMD, ENV, WORKDIR).
     pub config: ImageConfig,
     /// Raw OCI image config JSON blob.
     pub config_json: Vec<u8>,
+}
+
+/// On-disk cache of rewritten OCI layers, keyed by `(layer_digest, rewriter_version)`.
+///
+/// # Why cache the REWRITTEN bytes, not the raw pulled layer
+///
+/// The expensive, repeatable-per-boot costs are the network pull, gzip decompression, AND the
+/// ELF rewrite -- caching only the raw pulled bytes would still pay the rewrite cost (the
+/// dominant compute cost, though not the dominant wall-clock cost against a slow network) on
+/// every boot. Caching the rewritten output skips all three.
+///
+/// # Why the cache key is `(layer_digest, rewriter_version)`, not `layer_digest` alone
+///
+/// `layer_digest` (a `sha256:...` string from the manifest) is a real, content-addressed digest
+/// of the layer's RAW content -- a correct and natural key for "is this the same input". But the
+/// cached ARTIFACT is `litebox_syscall_rewriter`'s output for that input, which also depends on
+/// the exact rewriting logic in effect when the cache entry was written. If that logic ever
+/// changes (a bug fix, a newly handled instruction pattern, a trampoline layout change), an old
+/// cache entry keyed on `layer_digest` alone would be silently stale and WRONG: the guest would
+/// run old, incorrect rewritten code while every other part of the system believes the cache is
+/// authoritative. Folding `litebox_syscall_rewriter::REWRITER_CACHE_VERSION` into the key makes a
+/// rewriter-logic change (bumping that constant) invalidate every existing cache entry at once,
+/// with no silent-staleness window -- see that constant's own doc comment for the bump discipline.
+///
+/// # Why a project-relative `.litebox-cache/` directory
+///
+/// This project has no existing durable-but-not-source-controlled artifact directory convention
+/// beyond the harness's own `.gm/` (unrelated tooling state, not a place for build artifacts) --
+/// no `dirs`/`directories` crate dependency exists anywhere in the workspace to reach a
+/// platform user-cache directory, and introducing one purely for this cache would be a bigger
+/// footprint than the problem needs. A project-relative, gitignored directory (matching this
+/// repo's existing precedent of gitignored local artifact directories like `target-myfork/`) is
+/// simple, requires no new dependency, and is trivially discoverable/clearable by a developer
+/// (`rm -rf .litebox-cache`).
+pub mod cache {
+    use std::borrow::Cow;
+    use std::path::{Path, PathBuf};
+
+    use anyhow::Context;
+
+    /// Directory holding cached rewritten OCI layers, relative to the current working directory.
+    /// Gitignored (see `.gitignore`'s "Local tooling state" section).
+    const CACHE_DIR: &str = ".litebox-cache";
+
+    /// Build the cache file path for a given layer digest (e.g. `sha256:abcd...`) and rewriter
+    /// version. The digest's `:` is replaced with `_` since `:` is a reserved character in
+    /// Windows paths (valid only as the drive-letter separator) -- same constraint already
+    /// documented on this module's sibling `is_excluded_path` for pacman's local-install-db
+    /// paths.
+    fn cache_path(layer_digest: &str, rewriter_version: u32) -> PathBuf {
+        let safe_digest = layer_digest.replace(':', "_");
+        Path::new(CACHE_DIR).join(format!("{safe_digest}_v{rewriter_version}.tar"))
+    }
+
+    /// Look up a cached rewritten layer for `(layer_digest, rewriter_version)`.
+    ///
+    /// Returns `Ok(None)` on ANY doubt about validity -- missing file, zero-byte file (a crashed
+    /// writer's leftover, since a real writer never finalizes an empty file this way), or any I/O
+    /// error reading it -- rather than risk serving stale/corrupt content. A cache implementation
+    /// that silently serves wrong data would be worse than no cache at all (see this module's own
+    /// top-level doc comment).
+    ///
+    /// The returned bytes are memory-mapped, not heap-copied (mirrors
+    /// `litebox_runner_linux_on_windows_userland`'s `mmapped_file` helper for `--initial-files`),
+    /// so every concurrent runner process reading the same cached layer shares its physical pages
+    /// via the OS page cache instead of each holding a private copy. The mapping is intentionally
+    /// leaked (`Box::leak`) to obtain the `'static` lifetime `PulledLayers::layers` requires --
+    /// this matches the process-lifetime leak `mmapped_file` already performs for the
+    /// `--initial-files` tar, and is bounded (once per distinct layer actually read this process
+    /// run), not unbounded.
+    pub fn read_cached_layer(
+        layer_digest: &str,
+        rewriter_version: u32,
+        verbose: bool,
+    ) -> Option<Cow<'static, [u8]>> {
+        let path = cache_path(layer_digest, rewriter_version);
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if verbose {
+                    eprintln!("  [cache] MISS {layer_digest} (v{rewriter_version}): not cached");
+                }
+                return None;
+            }
+            Err(e) => {
+                if verbose {
+                    eprintln!(
+                        "  [cache] MISS {layer_digest} (v{rewriter_version}): failed to open cache file {}: {e}",
+                        path.display()
+                    );
+                }
+                return None;
+            }
+        };
+        let meta = match file.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                if verbose {
+                    eprintln!(
+                        "  [cache] MISS {layer_digest} (v{rewriter_version}): failed to stat cache file: {e}"
+                    );
+                }
+                return None;
+            }
+        };
+        if meta.len() == 0 {
+            // A zero-byte file can only be a crashed/killed writer's leftover (see
+            // `write_cached_layer`'s atomic-rename discipline below -- a properly finished write
+            // is never empty for a real tar). Treat as a miss, and best-effort clean it up so a
+            // future run isn't confused by it either.
+            if verbose {
+                eprintln!(
+                    "  [cache] MISS {layer_digest} (v{rewriter_version}): cache file is empty (stale partial write?)"
+                );
+            }
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+        // SAFETY: mirrors `litebox_runner_linux_on_windows_userland::mmapped_file` -- we assume
+        // the cache file is not mutated externally while mapped. Cache files are written via the
+        // atomic write-temp-then-rename pattern in `write_cached_layer`, so any process that has
+        // this file open for reading always sees either a complete prior version (if the file was
+        // replaced, rename atomically retargets the directory entry, leaving this mapping's own
+        // inode's contents untouched) or nothing (if this is the first read after a fresh write).
+        let mmap = match unsafe { memmap2::Mmap::map(&file) } {
+            Ok(m) => m,
+            Err(e) => {
+                if verbose {
+                    eprintln!(
+                        "  [cache] MISS {layer_digest} (v{rewriter_version}): failed to mmap cache file: {e}"
+                    );
+                }
+                return None;
+            }
+        };
+        if verbose {
+            eprintln!(
+                "  [cache] HIT {layer_digest} (v{rewriter_version}): {} bytes from {}",
+                mmap.len(),
+                path.display()
+            );
+        }
+        // Leak to get the 'static lifetime PulledLayers::layers requires -- see this function's
+        // doc comment.
+        let leaked: &'static memmap2::Mmap = Box::leak(Box::new(mmap));
+        Some(Cow::Borrowed(&leaked[..]))
+    }
+
+    /// Write a freshly rewritten layer to the cache for `(layer_digest, rewriter_version)`,
+    /// atomically: write to a temp file in the SAME directory, then rename into place. Rename is
+    /// atomic on the same filesystem, so a concurrent reader (a second runner process pulling the
+    /// same image at the same time -- plausible in this project's actual usage) can never observe
+    /// a partially-written cache file: it either doesn't exist yet, or is fully present.
+    ///
+    /// Best-effort: any failure here (e.g. read-only filesystem, disk full) is logged
+    /// (verbose-gated) and swallowed rather than propagated -- failing to populate the cache must
+    /// never fail the boot that produced the data, since the freshly rewritten bytes are already
+    /// available to the caller regardless of whether they get persisted.
+    pub fn write_cached_layer(layer_digest: &str, rewriter_version: u32, data: &[u8], verbose: bool) {
+        let final_path = cache_path(layer_digest, rewriter_version);
+        if let Err(e) = write_cached_layer_inner(&final_path, data) {
+            if verbose {
+                eprintln!(
+                    "  [cache] failed to write cache entry for {layer_digest} (v{rewriter_version}): {e:#}"
+                );
+            }
+            return;
+        }
+        if verbose {
+            eprintln!(
+                "  [cache] wrote {} bytes to {}",
+                data.len(),
+                final_path.display()
+            );
+        }
+    }
+
+    fn write_cached_layer_inner(final_path: &Path, data: &[u8]) -> anyhow::Result<()> {
+        let dir = final_path
+            .parent()
+            .context("cache file path has no parent directory")?;
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create cache directory {}", dir.display()))?;
+
+        // Unique temp file name per (process, call) so two concurrent writers for the SAME layer
+        // never collide on the temp path itself -- only the final atomic rename needs to be race-
+        // safe, which `std::fs::rename` already guarantees on the same filesystem.
+        let pid = std::process::id();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let tmp_path = dir.join(format!(".tmp-{pid}-{unique}"));
+
+        std::fs::write(&tmp_path, data)
+            .with_context(|| format!("failed to write temp cache file {}", tmp_path.display()))?;
+        std::fs::rename(&tmp_path, final_path).with_context(|| {
+            format!(
+                "failed to atomically rename {} -> {}",
+                tmp_path.display(),
+                final_path.display()
+            )
+        })?;
+        Ok(())
+    }
 }
 
 /// Pull an OCI image's manifest and every layer's bytes into memory, decompressing gzip layers
@@ -387,10 +597,29 @@ pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<P
             oci_client::manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE,
         ];
         let num_layers = manifest.layers.len();
-        let mut layers: Vec<Vec<u8>> = Vec::with_capacity(num_layers);
+        let mut layers: Vec<Cow<'static, [u8]>> = Vec::with_capacity(num_layers);
+        let rewriter_version = litebox_syscall_rewriter::REWRITER_CACHE_VERSION;
         for (i, layer_desc) in manifest.layers.iter().enumerate() {
             if !accepted_media_types.contains(&layer_desc.media_type.as_str()) {
                 anyhow::bail!("unsupported layer media type: {}", layer_desc.media_type);
+            }
+
+            // Cache read path: a hit here skips network pull, gzip decompression, AND ELF
+            // rewriting entirely for this layer -- see `cache`'s own doc comment for the key
+            // scheme and validity discipline.
+            if let Some(cached) =
+                cache::read_cached_layer(&layer_desc.digest, rewriter_version, verbose)
+            {
+                if verbose {
+                    eprintln!(
+                        "  Layer {}/{} served from cache ({} bytes)",
+                        i + 1,
+                        num_layers,
+                        cached.len()
+                    );
+                }
+                layers.push(cached);
+                continue;
             }
 
             if verbose {
@@ -438,7 +667,11 @@ pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<P
                 );
             }
 
-            layers.push(rewritten);
+            // Write-through: populate the cache so the NEXT boot of this same image (same
+            // digest, same rewriter version) hits the cache path above instead.
+            cache::write_cached_layer(&layer_desc.digest, rewriter_version, &rewritten, verbose);
+
+            layers.push(Cow::Owned(rewritten));
         }
 
         Ok::<_, anyhow::Error>((config, layers))

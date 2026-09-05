@@ -82,6 +82,23 @@ const BUN_FOOTER_MARKER: &[u8] = b"\n---- Bun! ----\n";
 /// This is checked by the loader to verify that the trampoline is valid.
 pub const TRAMPOLINE_MAGIC: &[u8; 8] = b"LITEBOX0";
 
+/// Manual cache-invalidation counter for this crate's ELF-rewriting behavior.
+///
+/// Consumers that cache rewritten ELF/layer output across process runs (e.g.
+/// `litebox_packager::oci`'s on-disk rewritten-OCI-layer cache) MUST fold this value into their
+/// cache key alongside the input's own content digest. A cached rewritten artifact is only valid
+/// for the exact `(input_digest, REWRITER_CACHE_VERSION)` pair that produced it -- the crate's
+/// `Cargo.toml` semver is NOT a reliable substitute (a patch-level bump or a dependency-only
+/// change wouldn't normally change this number, and forgetting to bump semver for a real behavior
+/// change is exactly the failure mode this exists to avoid).
+///
+/// Bump this by 1 (never reuse an old value) whenever a change to this crate's rewriting logic
+/// (new instruction pattern handled, a bug fix that changes emitted bytes for existing inputs,
+/// trampoline layout changes, etc.) could make previously-cached rewritten output stale or wrong.
+/// A dependency-only bump, a comment/doc change, or a change that provably cannot alter emitted
+/// bytes for any input does NOT require bumping this.
+pub const REWRITER_CACHE_VERSION: u32 = 1;
+
 /// Trampoline header for 64-bit: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size) = 32 bytes
 #[repr(C, packed)]
 #[derive(FromBytes, IntoBytes, Immutable)]

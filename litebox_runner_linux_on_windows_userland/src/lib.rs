@@ -346,7 +346,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // import, guest boot) is identical regardless of which source was used.
     enum RootfsSource {
         Tar { mmap: MmappedFile },
-        OciLayers { layers: Vec<Vec<u8>> },
+        OciLayers {
+            layers: Vec<std::borrow::Cow<'static, [u8]>>,
+        },
     }
 
     let rootfs_source = if let Some(image_ref) = &cli_args.oci_image {
@@ -456,10 +458,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
         match rootfs_source {
             RootfsSource::Tar { mmap } => shim_builder.default_fs(in_mem, mmap.data.into()),
-            RootfsSource::OciLayers { layers } => shim_builder.default_fs_multi_layer(
-                in_mem,
-                layers.into_iter().map(std::borrow::Cow::Owned).collect(),
-            ),
+            RootfsSource::OciLayers { layers } => {
+                shim_builder.default_fs_multi_layer(in_mem, layers)
+            }
         }
     };
     let initial_file_system = std::sync::Arc::new(initial_file_system);

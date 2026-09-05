@@ -204,6 +204,11 @@ dev_bench/unixbench/*.zip
 .agentplug/
 .wfgyxfce-*.ps1
 
+### On-disk cache of rewritten OCI layers (litebox_packager::oci::cache) --
+### keyed by (layer_digest, rewriter_version); safe to delete any time, a
+### repeat boot just re-pulls+re-rewrites and repopulates it ###
+/.litebox-cache/
+
 ### Stray local build/test artifacts (not committed products) ###
 target-myfork/
 alpine-fresh-test.tar
