@@ -861,12 +861,44 @@ pub struct Termios {
     pub c_cc: [cc_t; 19usize],
 }
 
-/// `c_oflag` bit: enable implementation-defined output processing.
-pub const OPOST: tcflag_t = 0o0000001;
-/// `c_oflag` bit: map `\n` to `\r\n` on output. Only meaningful together with [`OPOST`].
-pub const ONLCR: tcflag_t = 0o0000004;
-/// `c_lflag` bit: echo input characters back to the terminal as they're typed.
-pub const ECHO: tcflag_t = 0o0000010;
+bitflags::bitflags! {
+    /// `c_oflag` bits this codebase actually interprets. `Termios.c_oflag` itself stays a plain
+    /// `tcflag_t` (not this type) since the struct must stay `#[repr(C)]`/`FromBytes`/`IntoBytes`
+    /// -- an exact-layout transmute target for the real Linux `termios` ABI, not a place to
+    /// introduce a differently-shaped wrapper type. Callers wrap a raw `c_oflag` value with
+    /// `OFlagBits::from_bits_retain` at the point of use instead.
+    #[derive(Debug, Clone, Copy)]
+    pub struct OFlagBits: tcflag_t {
+        /// Enable implementation-defined output processing.
+        const OPOST = 0o0000001;
+        /// Map `\n` to `\r\n` on output. Only meaningful together with [`Self::OPOST`].
+        const ONLCR = 0o0000004;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+bitflags::bitflags! {
+    /// `c_lflag` bits this codebase actually interprets -- see [`OFlagBits`]'s own doc comment
+    /// for why `Termios.c_lflag` itself stays a plain `tcflag_t`, not this type.
+    #[derive(Debug, Clone, Copy)]
+    pub struct LFlagBits: tcflag_t {
+        /// Echo input characters back to the terminal as they're typed.
+        const ECHO = 0o0000010;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+/// `c_oflag` bit: enable implementation-defined output processing. Prefer [`OFlagBits::OPOST`]
+/// for new code; this bare constant remains for callers that only need the raw numeric value.
+pub const OPOST: tcflag_t = OFlagBits::OPOST.bits();
+/// `c_oflag` bit: map `\n` to `\r\n` on output. Only meaningful together with [`OPOST`]. Prefer
+/// [`OFlagBits::ONLCR`] for new code.
+pub const ONLCR: tcflag_t = OFlagBits::ONLCR.bits();
+/// `c_lflag` bit: echo input characters back to the terminal as they're typed. Prefer
+/// [`LFlagBits::ECHO`] for new code.
+pub const ECHO: tcflag_t = LFlagBits::ECHO.bits();
 
 #[derive(Debug, Clone, Default, FromBytes, IntoBytes)]
 #[repr(C)]

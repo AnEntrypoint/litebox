@@ -15,7 +15,7 @@ use crate::{
         HV_X64_MSR_HYPERCALL_ENABLE, HV_X64_MSR_SCONTROL, HV_X64_MSR_SCONTROL_ENABLE,
         HV_X64_MSR_SIMP, HV_X64_MSR_SIMP_ENABLE, HV_X64_MSR_SINT0, HV_X64_MSR_VP_ASSIST_PAGE,
         HV_X64_MSR_VP_ASSIST_PAGE_ENABLE, HYPERV_CPUID_IMPLEMENT_LIMITS, HYPERV_CPUID_INTERFACE,
-        HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS, HYPERV_HYPERVISOR_PRESENT_BIT,
+        HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS,
         HYPERVISOR_CALLBACK_VECTOR, HvSynicSint, vsm,
     },
 };
@@ -26,7 +26,6 @@ use thiserror::Error;
 #[cfg(debug_assertions)]
 use crate::mshv::HV_REGISTER_VP_INDEX;
 
-const CPU_VERSION_INFO: u32 = 1;
 const HV_CPUID_SIGNATURE_EAX: u32 = 0x31237648;
 
 // TODO: use real vendor IDs and version code
@@ -48,11 +47,17 @@ fn generate_guest_id(dinfo1: u64, kernver: u64, dinfo2: u64) -> u64 {
 fn check_hyperv() -> Result<(), HypervError> {
     use core::arch::x86_64::__cpuid_count as cpuid_count;
 
-    let result = cpuid_count(CPU_VERSION_INFO, 0x0);
-    if result.ecx & HYPERV_HYPERVISOR_PRESENT_BIT == 0 {
+    let has_hypervisor = raw_cpuid::CpuId::new()
+        .get_feature_info()
+        .is_some_and(|finfo| finfo.has_hypervisor());
+    if !has_hypervisor {
         return Err(HypervError::NonVirtualized);
     }
 
+    // HYPERV_CPUID_INTERFACE/HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS are Hyper-V-vendor-specific
+    // leaves with no typed accessor in `raw-cpuid` (which only models the generic
+    // hypervisor-presence/vendor-string leaf, not arbitrary vendor feature leaves) -- raw CPUID
+    // reads remain correct here.
     let result = cpuid_count(HYPERV_CPUID_INTERFACE, 0x0);
     if result.eax != HV_CPUID_SIGNATURE_EAX {
         return Err(HypervError::NonHyperv);

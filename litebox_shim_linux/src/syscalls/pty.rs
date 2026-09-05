@@ -395,16 +395,15 @@ impl<Platform: ShimPlatform> PtyEnd<Platform> {
     /// this only ever fires for a consumer that explicitly opts in via `TCSETS`.
     pub(crate) fn write(&self, cx: &WaitContext<'_, Platform>, buf: &[u8]) -> Result<usize, Errno> {
         let termios = self.pair().get_termios();
-        let onlcr = !self.is_master() && {
-            termios.c_oflag & (litebox_common_linux::OPOST | litebox_common_linux::ONLCR)
-                == (litebox_common_linux::OPOST | litebox_common_linux::ONLCR)
-        };
+        let oflags = litebox_common_linux::OFlagBits::from_bits_retain(termios.c_oflag);
+        let lflags = litebox_common_linux::LFlagBits::from_bits_retain(termios.c_lflag);
+        let onlcr_wanted = oflags.contains(
+            litebox_common_linux::OFlagBits::OPOST | litebox_common_linux::OFlagBits::ONLCR,
+        );
+        let onlcr = !self.is_master() && onlcr_wanted;
         let n = self.half().write(cx, buf, onlcr)?;
-        if self.is_master() && termios.c_lflag & litebox_common_linux::ECHO != 0 {
-            let echo_onlcr = termios.c_oflag
-                & (litebox_common_linux::OPOST | litebox_common_linux::ONLCR)
-                == (litebox_common_linux::OPOST | litebox_common_linux::ONLCR);
-            self.half().echo(&buf[..n], echo_onlcr);
+        if self.is_master() && lflags.contains(litebox_common_linux::LFlagBits::ECHO) {
+            self.half().echo(&buf[..n], onlcr_wanted);
         }
         if self.is_slave() {
             self.half().maybe_reply_to_dsr(&buf[..n]);

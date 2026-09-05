@@ -227,14 +227,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
 pub(crate) type FlockRegistry<Platform> =
     alloc::collections::BTreeMap<(usize, usize), alloc::sync::Arc<FlockFile<Platform>>>;
 
-/// `flock(2)` operation: request a shared lock.
-const LOCK_SH: i32 = 1;
-/// `flock(2)` operation: request an exclusive lock.
-const LOCK_EX: i32 = 2;
-/// `flock(2)` operation: release an existing lock.
-const LOCK_UN: i32 = 8;
-/// `flock(2)` operation flag: don't block if the lock can't be acquired immediately.
-const LOCK_NB: i32 = 4;
+bitflags::bitflags! {
+    /// `flock(2)` `operation` argument bits. `SH`/`EX`/`UN` are mutually exclusive operations while
+    /// `NB` is a modifier flag that can be OR'd onto any of them.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct FlockOp: i32 {
+        /// Request a shared lock.
+        const SH = 1;
+        /// Request an exclusive lock.
+        const EX = 2;
+        /// Don't block if the lock can't be acquired immediately.
+        const NB = 4;
+        /// Release an existing lock.
+        const UN = 8;
+    }
+}
 
 /// Identifies a single open file description to a [`FlockFile`], so that `flock()` calls made
 /// through fds that are `dup()`-derived from the same `open()` (which share one `FlockHolder`, as
@@ -3315,9 +3322,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EBADF);
         };
 
-        let nonblock = operation & LOCK_NB != 0;
-        let op = operation & !LOCK_NB;
-        if !matches!(op, LOCK_SH | LOCK_EX | LOCK_UN) {
+        let flags = FlockOp::from_bits_retain(operation);
+        let nonblock = flags.contains(FlockOp::NB);
+        let op = flags & !FlockOp::NB;
+        if !matches!(op, FlockOp::SH | FlockOp::EX | FlockOp::UN) {
             return Err(Errno::EINVAL);
         }
 
@@ -3342,7 +3350,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .flatten()
     }
 
-    fn do_flock(&self, fd: &TypedFd<FS>, op: i32, nonblock: bool) -> Result<u32, Errno> {
+    fn do_flock(&self, fd: &TypedFd<FS>, op: FlockOp, nonblock: bool) -> Result<u32, Errno> {
         let node_info = self
             .files
             .borrow()
@@ -3383,9 +3391,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         drop(dt);
 
         match op {
-            LOCK_SH => flock_file.lock_shared(&self.wait_cx(), holder.id, nonblock),
-            LOCK_EX => flock_file.lock_exclusive(&self.wait_cx(), holder.id, nonblock),
-            LOCK_UN => {
+            FlockOp::SH => flock_file.lock_shared(&self.wait_cx(), holder.id, nonblock),
+            FlockOp::EX => flock_file.lock_exclusive(&self.wait_cx(), holder.id, nonblock),
+            FlockOp::UN => {
                 flock_file.unlock(holder.id);
                 Ok(0)
             }
