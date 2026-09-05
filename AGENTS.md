@@ -6,10 +6,101 @@ lines of retracted hypotheses alongside real findings. The full prior history (e
 including every dead end) is preserved at `docs/AGENTS_ARCHIVE_2026-09-03.md` for anyone who
 needs the detailed forensic trail — but start here, not there.
 
+This file (not a separate cross-session memory store) is the single source of truth for standing
+rules, hard constraints, and durable lessons — the section immediately below. Any future
+"remember this" should be added HERE, not to a separate memory file.
+
+## Standing lessons and hard constraints (read before doing anything)
+
+- **No WSL or hypervisor, ever, for anything litebox-related** (building, running, verifying) --
+  litebox's whole premise is running unmodified Linux ELF binaries directly on bare Windows via
+  syscall rewriting; reaching for WSL2/Hyper-V/any VM undermines that. Cross-compiling FOR Linux
+  from any host is fine; RUNNING the result inside a VM/WSL is not -- always run it as a real
+  litebox guest process via the matching runner (`litebox_runner_linux_on_windows_userland.exe`
+  on Windows, `litebox_runner_linux_userland` on native Linux).
+- **`fork_verify.rs` and its whole stale-pointer-healing bug class are Windows-only** -- real
+  Linux/macOS `fork()` gives the child identical virtual addresses, so this bug class structurally
+  cannot occur there. Never assume a `fork_verify`-attributed crash needs Linux/macOS work, never
+  port a `fork_verify.rs` fix to another platform's crate.
+- **Never enable `bcdedit /debug on`** without a real kernel debugger already attached and
+  confirmed working first -- caused two genuine full-host freezes (hard power-cycle required)
+  combined with litebox's exception-heavy workload.
+- **For `--gui` visual verification, always use `LITEBOX_DUMP_FRAMES=1`** (numbered `.bmp` +
+  non-black-pixel count to stderr), never Windows `PrintWindow`/`CopyFromScreen` (unreliable,
+  interfered with by overlapping windows).
+- **A pixel/non-black count never identifies WHO painted a frame.** Decode frame structure
+  (`advisor/probes/decode_frame.py`) and correlate against `DIAG_TIMELINE execve` log lines
+  showing the real argv0 that actually ran, before attributing rendered content to a specific
+  component. Cost this project real time twice: once attributing weston's own background fill to
+  XFCE, once attributing real panel-shaped pixels to `xfce4-panel` on an image that turned out to
+  ship MATE (`xfdesktop`/`xfce4-panel` never existed in that layer at all -- see Pass 358).
+- **Never run two full-stack litebox verifications concurrently on this host** (including across
+  sessions/peers) -- they starve each other, and the failure (log truncated mid-line, no crash, no
+  exit) is indistinguishable from a real hang or regression. Check
+  `Get-Process litebox_runner_linux_on_windows_userland` (or `tasklist | grep litebox_runner`) and
+  coordinate with any peer session before booting.
+- **Never time litebox with one host process per datapoint.** A bare process spawn costs
+  1.6-2.3s on this host -- that dwarfs real per-exec differences. Hold host-process count
+  constant: run N iterations inside ONE guest process and take the delta (n0 vs n_large), never
+  compare separate runner invocations. Also hold host load constant (check for a concurrent boot
+  or heavy pull skewing the baseline).
+- **`log_unsupported!`/refusal errno choice is part of the API contract, not incidental.** EPERM
+  ("you may not") lets callers degrade gracefully; EINVAL/ENOSYS ("this is broken/unknown") makes
+  them fail hard. Getting this wrong for a legitimately-unsupported-but-refusable capability can
+  break unrelated features entirely (a `clone()` namespace-flag EINVAL once silently broke ALL
+  PNG/JPEG decoding via glycin's own bwrap-sandboxing fallback logic). Report what's actually
+  true, never a fake success or an overly-broad failure.
+- **Always build general debug/observability tooling proactively while investigating**, not just
+  enough to explain the current bug -- e.g. separating guest stdout from litebox's own log
+  stream, capturing a component's own stderr instead of letting it get redirected to an unread
+  file (a real, repeated blind spot this project hit more than once: weston's, Xwayland's, and
+  xfdesktop's own stderr each went unread for a long stretch before someone finally checked it).
+- **Prefer premade, mature libraries over hand-rolled code for well-known problem classes**
+  (OCI/registry clients, binary-format parsing, Windows unwind-info construction, crash/minidump
+  handling, etc.) -- research what already exists before writing or iterating further on custom
+  logic for a solved problem. Standing default, not a one-off.
+- **Isolate the harness before blaming litebox.** Launch guest test probes directly from their own
+  minimal tar layer as the runner's top-level program, never through a runtime-built `/bin/sh -c`
+  wrapper -- two separate harness bugs (MSYS2 path-mangling, a shell SIGILL) each produced a false
+  "litebox is fundamentally broken" claim (including a bogus ~65% launch-failure rate) that
+  disappeared once the harness variable was removed.
+- **Build freestanding guest test binaries on the HOST**, not the guest toolchain (both the
+  guest's clang and gcc are broken as of this writing) -- `clang --target=x86_64-unknown-linux-gnu
+  -nostdlib -nostdinc -ffreestanding -fno-stack-protector -static -O1`, producing a static
+  `ET_EXEC` with raw `syscall` instructions, no libc.
+- **Inject a new probe/script into a multi-GB layer via a small `--resume-from` overlay tar**
+  (just the new file, `tar cf overlay.tar -C <dir> file`), never by rebuilding the whole layer.
+  Needs a real Windows path (not MSYS `/tmp/...`) and `MSYS2_ARG_CONV_EXCL='*'`/
+  `MSYS_NO_PATHCONV=1` set, or it fails in two different misleading ways (an ENOENT that looks
+  like a missing shebang resolver, or a stack-overflow panic).
+- **`linuxserver/webtop:alpine-mate` ships MATE desktop, not XFCE** -- confirmed via direct tar
+  listing, zero `xfdesktop`/`xfce4-panel`/`xfsettingsd`/real-`xfwm4` anywhere in the layer. Use
+  `linuxserver/webtop:alpine-xfce` for an actual XFCE image. The MATE path's own remaining
+  blocker, if MATE support is still wanted, is the unresolved `mate-session`
+  `RtlpUnwindPrologue` crash (see below), not an xfconf/wallpaper config gap.
+- **Windows CoW mmap (`try_allocate_cow_pages`) was unimplemented**, forcing every guest exec to
+  page-by-page `sys_read`+memcpy the whole binary through userspace (~27ms/exec on busybox). Now
+  implemented but structurally can't help tar-packed execs in practice (Windows' `MapViewOfFile3`
+  needs 64KiB file-offset alignment; real ELF segment offsets are only page-aligned, and only the
+  FIRST PT_LOAD segment can ever benefit from realignment since segments pack contiguously) --
+  see the CoW passes (~343-353) for the full, hard-won negative result before re-attempting this.
+- **The `ntdll!RtlpUnwindPrologue` crash remains genuinely unresolved** as of this writing: a
+  real, host-side (not guest, not litebox's own emulation logic per se) Windows platform bug in
+  `litebox/src/mm/exception_table.rs`'s fallible-memory-access primitives, deterministically
+  triggered by 3 consecutive execs of a large binary. 30+ archived investigation passes plus
+  several fresh attempts this session; one root-cause theory already retracted. Do not attempt a
+  fix without genuinely new diagnostic evidence -- see Pass 345/355/356/358 and whichever pass
+  follows for the current state of this investigation.
+
+Older, project-specific findings not restated above (advisor-role history, specific bug repro
+scripts, superseded pipeline details) are preserved in the pass-by-pass history below and in
+`docs/AGENTS_ARCHIVE_2026-09-03.md` -- this section is a durable-lessons summary, not a full
+replacement for the detailed record.
+
 ## Standing goal
 
 Get XFCE actually rendering and staying up under litebox on a Windows host (no WSL, no
-hypervisor — see `feedback_no_wsl_or_hypervisor` in project memory).
+hypervisor — see the standing lessons above).
 
 **MET — CONFIRMED, this time with real frame-content verification, not just a pixel count.**
 `a63e8ca59285f5871` ran the full XFCE launch (`advisor/probes/run_xfce_xwm.sh`,
