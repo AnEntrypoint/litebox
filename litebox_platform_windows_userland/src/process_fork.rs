@@ -808,6 +808,19 @@ pub fn serialize_full_gprs(g: &litebox::platform::ForkFullGprSnapshot) -> String
 /// mismatch or a non-hex field) rather than panicking -- data crossing a process boundary must
 /// degrade gracefully, matching every other `deserialize_for_diagnostic`-style helper in this
 /// investigation.
+///
+/// `fs_base` is additionally validated here (`is_valid_user_fs_base` + `TASK_ADDR_MAX`), the same
+/// two checks `WindowsUserland::set_arch_specific_register`'s `FsBase` arm applies to
+/// `arch_prctl`/`clone` -- defense in depth for the fork-resume path: today's only production
+/// caller (`spawn_process_fork_child` -> the re-exec'd child's `diag_process_fork_task_resume_
+/// probe` -> `set_arch_specific_register`) already re-validates this value before it is ever
+/// applied to the child's real FS base, but that downstream re-validation is indirect (a
+/// consequence of routing through the same function, not a guarantee of THIS deserializer's
+/// contract), so this deserializer rejects a corrupted value at the earliest point it enters this
+/// crate rather than relying solely on a later caller happening to revalidate it. A rejection here
+/// is logged via `diag_raw_print` (never `eprintln!`, which is known to re-fault on the corrupted
+/// thread state this exact bug produces -- see `lib.rs`'s `vectored_exception_handler_entry` doc
+/// comment) so a corrupted cross-process line is never silently swallowed.
 #[must_use]
 pub fn deserialize_full_gprs(line: &str) -> Option<litebox::platform::ForkFullGprSnapshot> {
     let mut it = line.split(',');
@@ -837,6 +850,19 @@ pub fn deserialize_full_gprs(line: &str) -> Option<litebox::platform::ForkFullGp
         fs_base: next()?,
     };
     if it.next().is_some() {
+        return None;
+    }
+    let task_addr_max = <crate::WindowsUserland as litebox::platform::PageManagementProvider<
+        { litebox::mm::linux::PAGE_SIZE },
+    >>::TASK_ADDR_MAX;
+    if !litebox_common_linux::arch::is_valid_user_fs_base(g.fs_base) || g.fs_base >= task_addr_max
+    {
+        crate::diag_raw_print(
+            b"[fsbase-reject] deserialize_full_gprs: fs_base=0x",
+            g.fs_base,
+            b" task_addr_max=0x",
+            task_addr_max,
+        );
         return None;
     }
     Some(g)

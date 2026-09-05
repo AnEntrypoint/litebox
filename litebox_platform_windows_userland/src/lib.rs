@@ -701,10 +701,23 @@ unsafe extern "system" fn vectored_exception_handler(
         }
         let raw_cr2 =
             unsafe { (*(*exception_info).ExceptionRecord).ExceptionInformation[1] } as u64;
+        let is_access_violation =
+            raw_exception_code == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION;
         if this_is_in_guest
             && std::env::var_os("LITEBOX_DIAG_FAULT_VQ").is_some()
-            && (rip == raw_cr2 || is_ud_fault)
+            && (rip == raw_cr2 || is_ud_fault || is_access_violation)
         {
+            // Widened (peer investigation, this pass): the musl dtv-clear shape this
+            // investigation has chased (`mov rdx, [rax+0x80]`) is a DATA read at a perfectly
+            // valid `rip`, so it satisfies neither `rip == raw_cr2` (jump-to-bad-address) nor
+            // `is_ud_fault` (undefined instruction) -- this diagnostic previously stayed silent
+            // for exactly the fault this investigation cares about. `is_access_violation` widens
+            // it to also fire on any `EXCEPTION_ACCESS_VIOLATION` while `this_is_in_guest`,
+            // regardless of `rip == cr2`, so `raw_cr2` (the actual faulting DATA address, not
+            // `rip`) gets `VirtualQuery`'d and printed for this fault class too -- the decisive
+            // check for whether the faulting address lies inside `HOST_ALLOCATOR_REGION_MIN`'s
+            // reserved span (confirms a guest thread dereferencing host heap through a corrupted
+            // FS base) versus ordinary guest/unmapped memory (kills that theory for this run).
             let cr2 = if is_ud_fault { rip } else { raw_cr2 };
             let mut cr2_mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
             let cr2_queried = unsafe {
@@ -5178,13 +5191,31 @@ impl litebox::platform::ArchSpecificProvider for WindowsUserland {
                 // `TASK_ADDR_MAX` up through `HOST_ALLOCATOR_REGION_MIN`'s reserved 64 GiB span
                 // belongs to the HOST process (its own stack, modules, and the host global
                 // allocator's own reserved region -- see `HOST_ALLOCATOR_REGION_MIN`'s doc
-                // comment), never to the guest. Every caller that can set a thread's FS base
-                // (`arch_prctl(ARCH_SET_FS)`, `clone(CLONE_SETTLS)`, and `fork()`'s own
-                // parent-to-child FS-base propagation) funnels through this one function, so
-                // rejecting an out-of-range value here closes off, at a single choke point, the
-                // musl dtv-clear crash this investigation has chased for many passes (`mov rdx,
-                // [rax+0x80]` on a `rax` proven to be a live `HOST_ALLOCATOR_REGION_MIN`-range
-                // address) regardless of how such a value could ever have been computed upstream.
+                // comment), never to the guest. `arch_prctl(ARCH_SET_FS)` and `clone(CLONE_SETTLS)`
+                // both funnel through this one function, so rejecting an out-of-range value here
+                // closes off, at that chokepoint, the musl dtv-clear crash this investigation has
+                // chased for many passes (`mov rdx, [rax+0x80]` on a `rax` proven to be a live
+                // `HOST_ALLOCATOR_REGION_MIN`-range address) for those two callers. It does NOT
+                // cover `fork()`'s own parent-to-child FS-base propagation, which does NOT funnel
+                // through this function -- see the three actual fork-path sites instead:
+                // `litebox_platform_windows_userland::process_fork::deserialize_full_gprs` (parses
+                // `fs_base` off a cross-process text protocol with no validation of its own),
+                // `litebox_runner_linux_on_windows_userland`'s `diag_process_fork_task_resume_probe`
+                // (applies `gprs.fs_base` to the freshly-spawned child -- routed through THIS
+                // function, so it inherits this validation and fails closed via `.expect(..)` on
+                // rejection, panicking only the fresh child process), and
+                // `litebox_shim_linux::syscalls::process`'s `do_clone` (computes
+                // `cross_process_fs_base` from this platform's own already-validated live FS base
+                // before handing it to `spawn_cross_process_fork_child`). Each of those sites either
+                // routes through this function already or is fed a value this function already
+                // validated when it was first set -- but they are validated INDIRECTLY, not by a
+                // second direct call at the fork boundary itself, so a defect anywhere in that
+                // chain (e.g. the raw, diagnostic-only `SetThreadContext` injection in
+                // `real_resume_and_observe`, gated off by default and never used to resume a child
+                // in production) would not be caught here. Diagnostic rejection logging
+                // (`diag_raw_print`) is emitted below so a future pass can tell, from hard evidence,
+                // whether this chokepoint or the fork-path sites are where a corrupted value is
+                // actually being produced.
                 let task_addr_max = <Self as litebox::platform::PageManagementProvider<
                     { litebox::mm::linux::PAGE_SIZE },
                 >>::TASK_ADDR_MAX;
@@ -5193,6 +5224,12 @@ impl litebox::platform::ArchSpecificProvider for WindowsUserland {
                     Self::set_thread_fs_base(val);
                     Ok(())
                 } else {
+                    diag_raw_print(
+                        b"[fsbase-reject] set_arch_specific_register: val=0x",
+                        val,
+                        b" task_addr_max=0x",
+                        task_addr_max,
+                    );
                     Err(litebox::platform::ArchSpecificError::RegisterUnpermittedValue)
                 }
             }
@@ -8159,6 +8196,11 @@ impl litebox::platform::SystemInfoProvider for WindowsUserland {
 
     fn env_flag(&self, name: &str) -> bool {
         std::env::var_os(name).is_some_and(|v| !v.is_empty())
+    }
+
+    fn cpu_count(&self) -> usize {
+        let count = self.sys_info.read().unwrap().dwNumberOfProcessors;
+        usize::try_from(count).unwrap_or(1).max(1)
     }
 }
 

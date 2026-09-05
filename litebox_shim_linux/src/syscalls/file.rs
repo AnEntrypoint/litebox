@@ -47,6 +47,76 @@ impl From<litebox::fs::UserInfo> for AccessUserInfo {
     }
 }
 
+/// LOUD, allocation-free diagnostic for an `open`/`openat` on a `/proc/` or `/sys/` path that
+/// falls through to a generic error (almost always `ENOENT`) instead of being served by one of
+/// the synthesized entries in `litebox::fs::procfs`/`litebox::fs::devices` -- see this codebase's
+/// established convention for exactly this kind of "make an otherwise-silent failure observable"
+/// print (`litebox_platform_windows_userland::diag_raw_print`,
+/// `common_providers::userspace_pointers::diag_near_null_write`,
+/// `litebox::fs::devices`'s own `diag_raw_print_dev_open_miss` for `/dev/<name>`). Without this, a
+/// guest desktop session (XFCE/GLib/dbus) failing to start over a missing `/proc`/`/sys` path
+/// surfaces no clue which path was missing -- only a generic ENOENT indistinguishable from any
+/// other missing-file failure. Writes directly to stderr via
+/// [`litebox::platform::StdioProvider::write_to`] using a fixed stack buffer -- no `format!`, no
+/// heap allocation -- so this is safe to call from any open path, however early/constrained.
+fn diag_raw_print_proc_sys_open_miss<Platform: litebox::platform::StdioProvider>(
+    platform: &Platform,
+    path: &str,
+    errno: Errno,
+) {
+    if !(path.starts_with("/proc/") || path.starts_with("/sys/")) {
+        return;
+    }
+    const PREFIX: &[u8] = b"[diag-proc-sys-open-miss] unregistered path opened: ";
+    const ERRNO_MARK: &[u8] = b" errno=";
+    let mut line = [0u8; 256];
+    let mut pos = 0usize;
+    let n = PREFIX.len().min(line.len());
+    line[..n].copy_from_slice(&PREFIX[..n]);
+    pos += n;
+    let path_bytes = path.as_bytes();
+    let avail = line.len().saturating_sub(pos).saturating_sub(1);
+    let take = path_bytes.len().min(avail);
+    line[pos..pos + take].copy_from_slice(&path_bytes[..take]);
+    pos += take;
+    let avail = line.len().saturating_sub(pos).saturating_sub(1);
+    let n = ERRNO_MARK.len().min(avail);
+    line[pos..pos + n].copy_from_slice(&ERRNO_MARK[..n]);
+    pos += n;
+    // Errno's numeric value, formatted by hand (no `format!`) -- at most 3 decimal digits for
+    // every real errno value, so a small fixed local buffer suffices.
+    let errno_val = i32::from(errno);
+    let mut digits = [0u8; 10];
+    let mut digit_count = 0usize;
+    let mut v = errno_val.unsigned_abs();
+    if v == 0 {
+        digits[0] = b'0';
+        digit_count = 1;
+    } else {
+        while v > 0 && digit_count < digits.len() {
+            digits[digit_count] = b'0' + u8::try_from(v % 10).unwrap_or(0);
+            v /= 10;
+            digit_count += 1;
+        }
+    }
+    if errno_val < 0 && pos < line.len() {
+        line[pos] = b'-';
+        pos += 1;
+    }
+    for i in (0..digit_count).rev() {
+        if pos >= line.len() {
+            break;
+        }
+        line[pos] = digits[i];
+        pos += 1;
+    }
+    if pos < line.len() {
+        line[pos] = b'\n';
+        pos += 1;
+    }
+    let _ = platform.write_to(litebox::platform::StdioOutStream::Stderr, &line[..pos]);
+}
+
 /// Task state shared by `CLONE_FS`.
 pub(crate) struct FsState<Platform: ShimPlatform> {
     umask: core::sync::atomic::AtomicU32,
@@ -708,7 +778,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let slave = self.global.pts_open(id)?;
             return self.insert_raw_pty_fd(slave, flags, path);
         }
-        let file = self.do_open(path.clone(), flags, mode)?;
+        let file = match self.do_open(path.clone(), flags, mode) {
+            Ok(file) => file,
+            Err(errno) => {
+                diag_raw_print_proc_sys_open_miss(self.global.platform, path_str, errno);
+                return Err(errno);
+            }
+        };
         self.insert_raw_file_fd_with_path(file, flags, Some(path))
     }
 

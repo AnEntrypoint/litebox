@@ -441,6 +441,13 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfLoader<'a, Platform, FS> {
     pub fn comm(&self) -> &[u8] {
         self.path.rsplit('/').next().unwrap_or("unknown").as_bytes()
     }
+
+    /// Returns the resolved absolute guest path this loader was constructed with -- the same
+    /// path `execve` resolved the running binary to. Backs `/proc/self/exe`'s symlink target
+    /// (see `litebox::fs::procfs::ProcSelfInfo::exe_path`'s doc comment).
+    pub fn path(&self) -> &str {
+        self.path
+    }
 }
 
 #[derive(Error, Debug)]

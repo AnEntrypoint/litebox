@@ -1036,6 +1036,18 @@ pub trait SystemInfoProvider {
     fn env_flag(&self, _name: &str) -> bool {
         false
     }
+
+    /// Returns the number of logical CPUs the host makes available to this process.
+    ///
+    /// Backs the guest-visible `/proc/cpuinfo` synthesis (see `litebox::fs::procfs::Procfs`):
+    /// GLib's `g_get_num_processors()` and several GUI toolkits size internal thread pools by
+    /// counting `processor` lines in that file, so an inaccurate count here silently yields a
+    /// wrongly-sized thread pool rather than a visible error. Default implementation reports `1`
+    /// (a safe, always-correct-if-conservative lower bound) so existing platform implementations
+    /// that don't override this keep working, just without the real host core count.
+    fn cpu_count(&self) -> usize {
+        1
+    }
 }
 
 /// A provider for thread-local storage.

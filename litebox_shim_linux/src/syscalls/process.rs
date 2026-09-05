@@ -2436,6 +2436,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             if !litebox_common_linux::arch::is_valid_user_fs_base(addr)
                 || addr >= Platform::TASK_ADDR_MAX
             {
+                litebox_util_log::warn!(
+                    tid:% = self.tid, addr:% = addr;
+                    "clone(SETTLS): rejected out-of-range TLS base"
+                );
                 return Err(Errno::EPERM);
             }
             let desc = UserPtrMut::from_usize(addr);
@@ -3113,6 +3117,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .map_err(Errno::from)?;
             #[cfg(not(target_arch = "x86_64"))]
             let cross_process_fs_base: usize = 0;
+
+            // Defense in depth: `cross_process_fs_base` is read back from THIS thread's own live
+            // FS base, which can only ever have been set by a previously-validated
+            // `set_arch_specific_register`/`arch_prctl` call, so this check should never actually
+            // fire in practice -- but this value is about to be handed, via `full_gprs.fs_base`
+            // below, to a genuinely separate Windows process's re-exec'd child (a different crate,
+            // `litebox_platform_windows_userland::process_fork`, with its own re-validation at
+            // `deserialize_full_gprs`), so re-checking it here, at the point this crate hands it
+            // off, catches a defect in that chain closer to its source rather than relying solely
+            // on the far end to catch it.
+            if !litebox_common_linux::arch::is_valid_user_fs_base(cross_process_fs_base)
+                || cross_process_fs_base >= Platform::TASK_ADDR_MAX
+            {
+                litebox_util_log::warn!(
+                    tid:% = self.tid, fs_base:% = cross_process_fs_base;
+                    "do_clone: cross-process fork rejected out-of-range live FS base, \
+                     falling back to thread-based fork"
+                );
+                return Err(Errno::EPERM);
+            }
 
             // Pass 142/143: production process-based fork(), opt-in via `LITEBOX_PROCESS_FORK=1`
             // (checked platform-side, inside `spawn_cross_process_fork_child` itself -- this
@@ -4654,6 +4678,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
     ) -> Result<(), crate::loader::elf::ElfLoaderError> {
+        // Snapshot for `/proc/self/*` synthesis (see `litebox::fs::procfs::ProcSelf`'s doc
+        // comment) BEFORE `loader.load` consumes `argv`/`envp` below -- real Linux updates
+        // `/proc/[pid]/{cmdline,environ,exe}` at exactly this point in `execve`, so this mirrors
+        // that ordering (a crash during `load` below leaves the OLD process's `/proc/self`
+        // state, matching how a real kernel's `execve` never partially commits these either).
+        {
+            let mut cmdline = alloc::vec::Vec::new();
+            for arg in &argv {
+                cmdline.extend_from_slice(arg.as_bytes_with_nul());
+            }
+            let mut environ = alloc::vec::Vec::new();
+            for var in &envp {
+                environ.extend_from_slice(var.as_bytes_with_nul());
+            }
+            let comm = alloc::string::String::from_utf8_lossy(loader.comm()).into_owned();
+            *self.global.proc_self_info.write() = litebox::fs::procfs::ProcSelfInfo {
+                exe_path: alloc::string::String::from(loader.path()),
+                cmdline,
+                environ,
+                pid: self.pid,
+                comm,
+            };
+        }
+
         let load_info = loader.load(argv, envp, self.init_auxv())?;
 
         self.set_task_comm(loader.comm());
