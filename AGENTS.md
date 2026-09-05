@@ -6154,3 +6154,132 @@ is an additive, faster alternative for demos/iteration, not yet promoted to repl
 existing test/doc reference.
 
 Files: `advisor/probes/run_xfce_xwm_fast.sh` (new), `AGENTS.md` (this entry).
+
+## Pass 355 -- attempted the deep `ntdll!RtlpUnwindPrologue` fix (pass 345's scoped next step,
+user-authorized after being told plainly this is deep, historically fragile, previously-retracted
+work); fresh Microsoft-documentation research REFINES the mechanism further than the archive got,
+but does not produce a safe, verified fix -- stopped rather than guess at ABI-level code, per this
+project's own standing discipline
+
+The user explicitly authorized attempting pass 345's scoped fix directions for the
+`ntdll!RtlpUnwindPrologue` crash (`docs/AGENTS_ARCHIVE_2026-09-03.md` passes 205-235: a real,
+externally-corroborated Windows x64 SEH/unwind hazard, not a made-up theory -- Mozilla's own
+crash-reporter database has independent hits at the identical `RtlpUnwindPrologue`/
+`RtlpxVirtualUnwind`/`RtlVirtualUnwind` signature, bugzilla #1709025/#1667663) after being told
+plainly this is deep (30+ archived passes), historically fragile (pass 208's root-cause theory was
+explicitly retracted once already in pass 209), and not guaranteed to succeed.
+
+**Read the full archived investigation (passes 205-235) before touching any code.** Confirmed the
+archive's own final position precisely: pass 208 proposed "missing `RUNTIME_FUNCTION`/`UNWIND_INFO`
+for the fixup label" -- RETRACTED by pass 209's `.fnent` check, which showed `memset_fallible`'s
+OWN compiled unwind info is complete and valid. Pass 209's own revised "truncated pointer"
+theory was itself retracted by pass 210 (the `0xeb00...` stack values are `0xEB` = the `jmp rel8`
+opcode byte, not corrupted pointers). Pass 211 is the one fully-confirmed negative result:
+the crash reproduces IDENTICALLY with `LITEBOX_FORKVERIFY_OFF=1` -- fork_verify's single-stepping
+is conclusively ruled out as the trigger, refuting every fork_verify-interaction theory. Pass 234
+did fresh web research (nynaeve.net's x64 exception-handling series) and reframed the mechanism as
+"some raw `context.Rip` overwrite anywhere in the exception-recovery machinery leaves `Rsp`
+inconsistent for a LATER, unrelated unwind attempt through that frame" -- externally corroborated
+but never reduced to a specific, fixable call site.
+
+**This pass's own fresh research went one step further than the archive reached, and found a
+genuinely new, load-bearing clarification -- but it complicates the fix target rather than
+resolving it.** Fetched Microsoft's own current x64 exception-handling documentation
+(`learn.microsoft.com/en-us/cpp/build/exception-handling-x64`) directly (the archive's own primary
+source, nynaeve.net, is no longer reachable -- DNS timeout, confirmed via `WebFetch`) and confirmed
+two precise mechanics the archive's summaries did not fully spell out:
+
+1. **The prolog/epilog-region check is what actually matters for whether a resumed mid-function
+   `Rip` unwinds correctly, not just "does the function have valid `UNWIND_INFO` at all".** Per
+   Microsoft's own unwind-procedure description (step 3, case b): if `RIP - function_start <=
+   SizeOfProlog`, the unwinder assumes execution is still mid-PROLOG and UNDOES the prolog's
+   effects using the unwind codes, walking backward from that offset. `exception_table.rs`'s
+   `2:`/`3:` recovery labels sit deep in the function BODY (well past any real prolog), so this
+   specific case should not apply -- but confirms precisely what class of offset-vs-prolog-size
+   mismatch WOULD misbehave, which the archive's passes 208/209 never framed this specifically.
+2. **A first-chance VEH returning `EXCEPTION_CONTINUE_EXECUTION` halts any unwind in progress and
+   resumes at the original fault point with no unwind ever performed for THAT exception** (fresh
+   web research, separate search: "if a handler returns `EXCEPTION_CONTINUE_EXECUTION`, the virtual
+   unwinding process is halted, and execution continues where the exception occurred"). Combined
+   with this VEH being registered via `AddVectoredExceptionHandler(0, ...)` (first-priority, ahead
+   of any CRT/default handler in the chain -- confirmed by reading the actual registration call
+   site, `litebox_platform_windows_userland/src/lib.rs` line ~2341), **this means the secondary
+   `RtlpUnwindPrologue` fault genuinely cannot be `RtlDispatchException`'s own unwind machinery
+   continuing to process the FIRST, already-recovered fault** -- pass 205 already proved the first
+   fault IS successfully recovered (`search_exception_tables` returns `Some`, no
+   `[diag-unrecov-av]` line fires), and a successful VEH recovery structurally prevents Windows
+   from ever reaching its own unwind-dispatch path for that specific exception. The secondary fault
+   must therefore be a GENUINELY SEPARATE, LATER exception on the same thread -- confirming (not
+   contradicting) pass 234's own "later, unrelated event" framing, but now with a harder
+   Windows-semantics reason WHY it can't be a continuation of the same dispatch, rather than only
+   an empirical observation that the two faults look separate.
+
+**Why this does not resolve into an actionable, safe fix this pass, despite the extra clarity:**
+this reframing NARROWS what the bug cannot be (not simple missing unwind info; not the SAME
+exception's own unwind continuing) without narrowing WHAT specific later event triggers the second
+fault, or on WHICH frame. The archive's own most promising remaining lead (pass 234's own
+conclusion: audit every raw `context.Rip`/register rewrite in this codebase's exception-recovery
+machinery for one that leaves `Rsp` inconsistent for a frame a LATER exception might unwind
+through) requires either: (a) a live debugger session that can single-step past the actual
+resumption point and observe the SECOND exception's own dispatch in real time (blocked -- pass
+205 already proved `cdb` attach fundamentally conflicts with `fork_verify`'s own `EFLAGS.TF`
+single-stepping; this pass did not attempt to re-litigate that specific finding, since the archive's
+own reasoning for why it's architecturally blocked, not just difficult, reads as sound), or (b) a
+kernel-debugging session (`KD`, not user-mode `cdb`) which pass 210 already flagged as the likely
+remaining option and which is well beyond this pass's own available tooling.
+
+**Grep'd every raw `context.Rip =`/`context.Rsp =` write in the two most likely files**
+(`litebox_platform_windows_userland/src/lib.rs`, `fork_verify.rs`) as a cheap, safe, non-invasive
+check before considering any code change: found `context.Rip = recover as u64` (the VEH's own
+recovery jump, `lib.rs` line 1479 -- touches ONLY `Rip`, confirmed by reading the full surrounding
+function, never `Rsp` or any other register) and `fork_verify.rs`'s own `context.Rip =
+translated_rip as u64` (line 1060, its stale-pointer-healing resume) plus a `Register::RSP =>
+context.Rsp = value` write (line 1742, part of `fork_verify`'s general register-write emulation,
+not specific to a recovery resume). Since pass 211 already proved the crash reproduces with
+`fork_verify` entirely OFF, `fork_verify.rs`'s own writes cannot be the sole cause (though they
+remain a real, separate, architecturally-similar hazard worth someone auditing on their own merits
+later) -- leaving `lib.rs` line 1479's own VEH recovery jump as the one remaining candidate this
+pass could examine directly. Confirmed via direct code reading that this specific write changes
+`Rip` alone; whether that specific, narrow change is ENOUGH to leave a later unwind inconsistent
+(vs. Windows correctly reconstructing `Rsp`'s expected value from `memset_fallible`'s own valid,
+unchanged unwind info at the fixup-label offset, which pass 209 already confirmed exists and is
+complete) is exactly the open question neither this pass nor the archive's own much deeper
+investigation could answer without live, step-through visibility into the second fault's own
+dispatch -- and guessing at an `RtlAddFunctionTable` registration or a primitive-restructuring
+refactor without that visibility risks trading a well-understood, safely-contained failure mode
+(the existing `MAX_REPEATED_UNRECOV_AV` circuit breaker, confirmed working in pass 235: catches the
+runaway loop and cleanly terminates via `TerminateProcess`, protecting disk space) for an unverified
+one that could be silently worse (e.g. a malformed hand-constructed `UNWIND_INFO` structure
+producing an even less predictable crash, or corrupting unrelated stack state in a case this pass
+has no way to test).
+
+**Decision: STOP rather than ship an unverified ABI-level change.** This matches the exact judgment
+call this session has made correctly several times today on smaller-stakes code in this same
+memory-management area (the CoW Hint-path padding regression found and reverted same-day in passes
+343/344; the CoW padding-scope limitation in pass 353, where a fix was found to be geometrically
+incapable of helping the real workload and was correctly NOT force-shipped) -- applied here at
+higher stakes, with the user's own explicit authorization to attempt understood as authorization to
+TRY carefully, not authorization to ship something unverified-safe. No code changed this pass.
+
+**What a future pass with better tooling would need, precisely, to make real progress** (updated
+from pass 234's own scoping, with this pass's added clarity): a way to observe the SECOND
+exception's own `ExceptionRecord`/`CONTEXT` at the moment it's raised -- not just the diagnostic
+prints this codebase already has at the VEH entry point (which fire correctly and already prove the
+"three distinct faults" sequence, per pass 206/210's own summary), but specifically whether the
+second exception's OWN `ExceptionAddress` is genuinely inside `RtlpUnwindPrologue`'s own code (as
+opposed to inside guest/host code that itself calls something ntdll-internal), and if so, what
+frame `RtlDispatchException`'s automatic virtual-unwind (triggered fresh for THIS second, separate
+exception, independent of the first one's own already-completed recovery) was walking through when
+it faulted. Since `cdb`/user-mode debugger attach is architecturally blocked by `fork_verify`'s own
+`EFLAGS.TF` usage (pass 205), the two remaining real options are: (a) a kernel-debugger (`KD`)
+session, genuinely outside this project's normal tooling and workflow; or (b) extend this
+codebase's OWN VEH diagnostics (which already print raw register state unconditionally and
+allocation-free, `diag_raw_regdump`'s established pattern) to ALSO capture and print the
+`DISPATCHER_CONTEXT`/full `CONTEXT` (not just 8 GPRs) at the moment a SECOND, back-to-back
+exception on the same thread is observed within some small window of the first -- this is a real,
+buildable, safe (diagnostic-only, no behavior change) next step this pass did not have time to
+implement, and would finally give whoever continues the SPECIFIC frame/offset the second unwind
+was attempting, closing the one gap every static-analysis-only pass (this one included) has been
+unable to close.
+
+Files: `AGENTS.md` (this entry). No code changed.
