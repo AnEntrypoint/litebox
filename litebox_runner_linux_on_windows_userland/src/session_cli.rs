@@ -14,6 +14,7 @@
 //! `argv` first, matching how `--session-daemon` (this binary's own daemon-mode entry point) is
 //! already intercepted the same way.
 
+use clap::{Parser, Subcommand};
 use litebox_session_daemon::client::connect_or_spawn;
 use litebox_session_daemon::protocol::Response;
 
@@ -33,23 +34,54 @@ fn current_exe_string() -> String {
         .into_owned()
 }
 
-fn usage() -> ! {
-    eprintln!(
-        "usage: litebox_runner_linux_on_windows_userland session <subcommand>\n\
-         \n\
-         subcommands:\n\
-         \x20 start --rootfs <path.tar> [--] <program> [args...]\n\
-         \x20 send <id> <key-string>\n\
-         \x20 screen <id> [--ansi]\n\
-         \x20 history <id> [--since <offset>]\n\
-         \x20 list\n\
-         \x20 kill <id>"
-    );
-    std::process::exit(2);
+#[derive(Parser)]
+#[command(name = "litebox_runner_linux_on_windows_userland session", no_binary_name = true)]
+struct SessionCli {
+    #[command(subcommand)]
+    sub: SessionSub,
+}
+
+#[derive(Subcommand)]
+enum SessionSub {
+    /// Start a new session running `program` inside `rootfs`.
+    Start {
+        #[arg(long, alias = "initial-files")]
+        rootfs: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        program_and_args: Vec<String>,
+    },
+    /// Send a key-string to a running session.
+    Send { session_id: String, key_string: String },
+    /// Print a session's current screen contents.
+    Screen {
+        session_id: String,
+        /// Not yet exposed by the daemon's `GetScreen` response (plain-text only, per
+        /// `docs/session-daemon-design.md`'s phase 3 follow-up list) -- accepted and silently
+        /// ignored today rather than a hard parse error, so scripts written against the eventual
+        /// flag don't need editing once it lands.
+        #[arg(long)]
+        ansi: bool,
+    },
+    /// Print a session's scrollback history.
+    History {
+        session_id: String,
+        #[arg(long)]
+        since: Option<u64>,
+    },
+    /// List all known sessions.
+    List,
+    /// Kill a running session.
+    Kill { session_id: String },
 }
 
 fn run(args: &[String]) -> i32 {
-    let Some(sub) = args.first() else { usage() };
+    let cli = match SessionCli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(e) => {
+            e.print().ok();
+            return 2;
+        }
+    };
     let runner_exe = current_exe_string();
     let client = match connect_or_spawn(&runner_exe) {
         Ok(c) => c,
@@ -59,51 +91,32 @@ fn run(args: &[String]) -> i32 {
         }
     };
 
-    match sub.as_str() {
-        "start" => cmd_start(&client, &args[1..]),
-        "send" => cmd_send(&client, &args[1..]),
-        "screen" => cmd_screen(&client, &args[1..]),
-        "history" => cmd_history(&client, &args[1..]),
-        "list" => cmd_list(&client),
-        "kill" => cmd_kill(&client, &args[1..]),
-        other => {
-            eprintln!("error: unknown session subcommand '{other}'");
-            usage()
+    match cli.sub {
+        SessionSub::Start { rootfs, program_and_args } => {
+            cmd_start(&client, rootfs, program_and_args)
         }
+        SessionSub::Send { session_id, key_string } => cmd_send(&client, &session_id, &key_string),
+        SessionSub::Screen { session_id, .. } => cmd_screen(&client, &session_id),
+        SessionSub::History { session_id, since } => cmd_history(&client, &session_id, since),
+        SessionSub::List => cmd_list(&client),
+        SessionSub::Kill { session_id } => cmd_kill(&client, &session_id),
     }
 }
 
-fn cmd_start(client: &litebox_session_daemon::client::DaemonClient, args: &[String]) -> i32 {
-    let mut rootfs: Option<String> = None;
-    let mut rest: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--rootfs" | "--initial-files" => {
-                i += 1;
-                rootfs = args.get(i).cloned();
-            }
-            "--" => {
-                rest.extend_from_slice(&args[i + 1..]);
-                break;
-            }
-            other => rest.push(other.to_string()),
-        }
-        i += 1;
-    }
-    let Some(rootfs) = rootfs else {
-        eprintln!("error: session start requires --rootfs <path.tar>");
-        return 2;
-    };
-    if rest.is_empty() {
+fn cmd_start(
+    client: &litebox_session_daemon::client::DaemonClient,
+    rootfs: String,
+    mut program_and_args: Vec<String>,
+) -> i32 {
+    if program_and_args.is_empty() {
         eprintln!("error: session start requires a program to run");
         return 2;
     }
-    let program = rest.remove(0);
+    let program = program_and_args.remove(0);
     let req = litebox_session_daemon::protocol::Request::CreateSession {
         rootfs,
         program,
-        args: rest,
+        args: program_and_args,
     };
     match client.call_with_timeout(
         &req,
@@ -128,11 +141,11 @@ fn cmd_start(client: &litebox_session_daemon::client::DaemonClient, args: &[Stri
     }
 }
 
-fn cmd_send(client: &litebox_session_daemon::client::DaemonClient, args: &[String]) -> i32 {
-    let [session_id, key_string] = args else {
-        eprintln!("error: session send requires <id> <key-string>");
-        return 2;
-    };
+fn cmd_send(
+    client: &litebox_session_daemon::client::DaemonClient,
+    session_id: &str,
+    key_string: &str,
+) -> i32 {
     let bytes = match litebox_session_daemon::keys::encode(key_string) {
         Ok(b) => b,
         Err(e) => {
@@ -141,7 +154,7 @@ fn cmd_send(client: &litebox_session_daemon::client::DaemonClient, args: &[Strin
         }
     };
     let req = litebox_session_daemon::protocol::Request::SendInput {
-        session_id: session_id.clone(),
+        session_id: session_id.to_string(),
         bytes,
     };
     match client.call(&req) {
@@ -165,17 +178,9 @@ fn cmd_send(client: &litebox_session_daemon::client::DaemonClient, args: &[Strin
     }
 }
 
-fn cmd_screen(client: &litebox_session_daemon::client::DaemonClient, args: &[String]) -> i32 {
-    let Some(session_id) = args.first() else {
-        eprintln!("error: session screen requires <id>");
-        return 2;
-    };
-    // `--ansi` (ANSI-preserving render) is not yet exposed by the daemon's `GetScreen` response
-    // (plain-text only, per `docs/session-daemon-design.md`'s phase 3 follow-up list) -- accepted
-    // and silently ignored today rather than a hard parse error, so scripts written against the
-    // eventual flag don't need editing once it lands.
+fn cmd_screen(client: &litebox_session_daemon::client::DaemonClient, session_id: &str) -> i32 {
     let req = litebox_session_daemon::protocol::Request::GetScreen {
-        session_id: session_id.clone(),
+        session_id: session_id.to_string(),
     };
     match client.call(&req) {
         Ok(Response::GetScreen { text, .. }) => {
@@ -197,22 +202,13 @@ fn cmd_screen(client: &litebox_session_daemon::client::DaemonClient, args: &[Str
     }
 }
 
-fn cmd_history(client: &litebox_session_daemon::client::DaemonClient, args: &[String]) -> i32 {
-    let Some(session_id) = args.first() else {
-        eprintln!("error: session history requires <id>");
-        return 2;
-    };
-    let mut since: Option<u64> = None;
-    let mut i = 1;
-    while i < args.len() {
-        if args[i] == "--since" {
-            i += 1;
-            since = args.get(i).and_then(|s| s.parse().ok());
-        }
-        i += 1;
-    }
+fn cmd_history(
+    client: &litebox_session_daemon::client::DaemonClient,
+    session_id: &str,
+    since: Option<u64>,
+) -> i32 {
     let req = litebox_session_daemon::protocol::Request::GetHistory {
-        session_id: session_id.clone(),
+        session_id: session_id.to_string(),
         since,
     };
     match client.call(&req) {
@@ -261,13 +257,9 @@ fn cmd_list(client: &litebox_session_daemon::client::DaemonClient) -> i32 {
     }
 }
 
-fn cmd_kill(client: &litebox_session_daemon::client::DaemonClient, args: &[String]) -> i32 {
-    let Some(session_id) = args.first() else {
-        eprintln!("error: session kill requires <id>");
-        return 2;
-    };
+fn cmd_kill(client: &litebox_session_daemon::client::DaemonClient, session_id: &str) -> i32 {
     let req = litebox_session_daemon::protocol::Request::KillSession {
-        session_id: session_id.clone(),
+        session_id: session_id.to_string(),
     };
     match client.call(&req) {
         Ok(Response::KillSession { ok: true }) => 0,
