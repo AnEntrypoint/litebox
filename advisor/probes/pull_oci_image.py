@@ -45,11 +45,10 @@ def fetch_bytes(url, token):
         return r.read()
 
 
-def main():
-    if len(sys.argv) < 4:
-        print(__doc__)
-        sys.exit(1)
-    repo, tag, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+def pull_and_merge(repo, tag, out_path):
+    """Pull <repo>:<tag> and write the merged, whiteout-resolved layer tar to
+    out_path. Extracted from main() so fetch_container.py can call this
+    directly instead of shelling out -- identical logic, just callable."""
     token = get_token(repo)
 
     index_url = f"{REGISTRY}/v2/{repo}/manifests/{tag}"
@@ -125,6 +124,13 @@ def main():
             else:
                 out.addfile(member)
     print("done")
+
+
+def main():
+    if len(sys.argv) < 4:
+        print(__doc__)
+        sys.exit(1)
+    pull_and_merge(sys.argv[1], sys.argv[2], sys.argv[3])
 
 
 if __name__ == "__main__":

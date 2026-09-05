@@ -28,22 +28,12 @@ import io
 ELF_MAGIC = b"\x7fELF"
 
 
-def main():
-    if len(sys.argv) < 3:
-        print(__doc__)
-        sys.exit(1)
-
-    in_tar = sys.argv[1]
-    out_tar = sys.argv[2]
-    rewriter = sys.argv[3] if len(sys.argv) > 3 else (
-        r"target\release\litebox_syscall_rewriter.exe"
-        if os.name == "nt"
-        else "target/release/litebox_syscall_rewriter.exe"
-    )
-    if not os.path.isfile(rewriter):
-        print(f"rewriter not found: {rewriter}", file=sys.stderr)
-        sys.exit(1)
-
+def rewrite_layer(in_tar, out_tar, rewriter):
+    """Rewrite every real ELF in in_tar, writing the result to out_tar.
+    Extracted from main() so fetch_container.py can call this directly
+    instead of shelling out -- identical logic, just callable. Caller is
+    responsible for confirming `rewriter` exists first (main() below still
+    does this check for the standalone-script entry point)."""
     scratch = tempfile.mkdtemp(prefix="batch_rewrite_")
     print(f"scratch dir: {scratch}")
 
@@ -112,6 +102,25 @@ def main():
         for name in trapped_sites[:20]:
             print(f"  {name}")
     print(f"wrote {out_tar}")
+
+
+def main():
+    if len(sys.argv) < 3:
+        print(__doc__)
+        sys.exit(1)
+
+    in_tar = sys.argv[1]
+    out_tar = sys.argv[2]
+    rewriter = sys.argv[3] if len(sys.argv) > 3 else (
+        r"target\release\litebox_syscall_rewriter.exe"
+        if os.name == "nt"
+        else "target/release/litebox_syscall_rewriter.exe"
+    )
+    if not os.path.isfile(rewriter):
+        print(f"rewriter not found: {rewriter}", file=sys.stderr)
+        sys.exit(1)
+
+    rewrite_layer(in_tar, out_tar, rewriter)
 
 
 if __name__ == "__main__":
