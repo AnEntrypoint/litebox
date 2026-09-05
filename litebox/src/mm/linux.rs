@@ -1335,6 +1335,94 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 _ => groups.push(r),
             }
         }
+        // DIAGNOSTIC (temporary): answer, directly rather than by inference, whether the guest
+        // STACK merges into the same group as heap/ELF regions at the current
+        // `max_intra_group_gap`. The design doc (`docs/fork-region-grouping-design.md`) asserts
+        // that over-merging is harmless for correctness; a competing hypothesis blames
+        // stack-merging for post-fork pre-execve child crashes. This logs, per group, its span and
+        // whether it contains a `VM_GROWSDOWN` (stack) region alongside non-stack regions -- so
+        // "did the stack merge" is a read, not a guess. Emitted at `error!` level because the
+        // fork-timeline diagnostics this correlates with are only visible at `LITEBOX_LOG=error`.
+        for (gi, group) in groups.iter().enumerate() {
+            let mut stack_regions = 0usize;
+            let mut nonstack_regions = 0usize;
+            for (r, vma) in &regions {
+                if vma.shared_handle.is_some() {
+                    continue;
+                }
+                if r.start >= group.start && r.end <= group.end {
+                    if vma.flags.contains(VmFlags::VM_GROWSDOWN) {
+                        stack_regions += 1;
+                    } else {
+                        nonstack_regions += 1;
+                    }
+                }
+            }
+            litebox_util_log::error!(
+                group_index:% = gi,
+                group_count:% = groups.len(),
+                start:% = group.start,
+                end:% = group.end,
+                span_bytes:% = group.end - group.start,
+                gap_constant:% = max_intra_group_gap,
+                stack_regions:% = stack_regions,
+                nonstack_regions:% = nonstack_regions,
+                stack_merged_with_nonstack:% = (stack_regions > 0 && nonstack_regions > 0);
+                "DIAG_GROUPS duplicate"
+            );
+        }
+        // Counterfactual sweep: the partition is a pure function of the parent's sorted region
+        // list and the gap constant, so every candidate value's grouping can be computed from THIS
+        // run without rebuilding or rebooting once per value. Reports, per candidate, the group
+        // count and whether the stack would merge with non-stack regions -- turning the whole
+        // 16/64/128/256/512MiB bisection's *static* question into one boot's log lines.
+        for candidate_mib in [16usize, 64, 128, 256, 512] {
+            let candidate = candidate_mib * 1024 * 1024;
+            let mut cand_groups: Vec<Range<usize>> = Vec::new();
+            let mut sorted: Vec<Range<usize>> = regions
+                .iter()
+                .filter(|(_, vma)| vma.shared_handle.is_none())
+                .map(|(r, _)| r.clone())
+                .collect();
+            sorted.sort_by_key(|r| r.start);
+            for r in sorted {
+                match cand_groups.last_mut() {
+                    Some(last) if r.start <= last.end.saturating_add(candidate) => {
+                        last.end = last.end.max(r.end);
+                    }
+                    _ => cand_groups.push(r),
+                }
+            }
+            let mut merged_groups = 0usize;
+            let mut max_span = 0usize;
+            for g in &cand_groups {
+                max_span = max_span.max(g.end - g.start);
+                let mut st = 0usize;
+                let mut ns = 0usize;
+                for (r, vma) in &regions {
+                    if vma.shared_handle.is_some() {
+                        continue;
+                    }
+                    if r.start >= g.start && r.end <= g.end {
+                        if vma.flags.contains(VmFlags::VM_GROWSDOWN) {
+                            st += 1;
+                        } else {
+                            ns += 1;
+                        }
+                    }
+                }
+                if st > 0 && ns > 0 {
+                    merged_groups += 1;
+                }
+            }
+            litebox_util_log::error!(
+                gap_mib:% = candidate_mib,
+                group_count:% = cand_groups.len(),
+                stack_merged_groups:% = merged_groups,
+                max_group_span:% = max_span;
+                "DIAG_GROUPS counterfactual"
+            );
+        }
         // For each source address, the `(group_source_base, group_dest_base)` of the group it
         // falls in -- looked up per-region in the main loop below via a linear scan (`groups` is
         // small: one entry per ELF image / stack / independent mmap cluster, not per region).
