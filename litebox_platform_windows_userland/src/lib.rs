@@ -1607,7 +1607,41 @@ unsafe extern "system" fn vectored_exception_handler(
                     b" State=0x",
                     if ok { mbi.State as usize } else { 0xdead },
                 );
+                // The FS base AT THE MOMENT OF RECOVERY, and the value this thread should have.
+                //
+                // The fixup this branch is about to jump to is not a bare `jmp`: `write_fn!`
+                // declares it as `fault = label { return Err(Fault) }` (see
+                // `litebox::mm::exception_table`), i.e. real Rust that returns through the
+                // function's own epilogue. Any stack-protector cookie load, TLS access or
+                // `__chkstk` probe on that path is FS-relative -- so resuming there while Windows
+                // has zeroed FS_BASE (the documented condition this whole VEH exists to repair)
+                // would fault immediately at a small offset from zero. That is exactly the
+                // observed `addr=0x0`, host-side, inside `write_u32_fallible`. Note the sibling
+                // FS_BASE-reset branch above DOES `wrfsbase` before resuming; this branch does
+                // not, which is the asymmetry this print exists to confirm or refute.
+                diag_raw_print(
+                    b"[diag-recovered-av3] rdfsbase=0x",
+                    unsafe { litebox_common_linux::rdfsbase() } as usize,
+                    b" saved_fs=0x",
+                    WindowsUserland::get_thread_fs_base(),
+                );
             }
+            // DIAG (this investigation): the sibling FS_BASE-reset branch immediately above does
+            // real repair work (`wrfsbase` + a bounded verify loop) before resuming, but THIS
+            // branch resumes at `recover` with no FS_BASE handling at all. `recover` is the
+            // compiler-generated `Err(Fault)` fixup block inside a real Rust function, whose
+            // epilogue can perform FS-relative accesses (stack-protector / TLS). If FS_BASE reads
+            // back as 0 here, resuming at `recover` would fault again at a small offset from zero
+            // -- exactly the `addr=0x0`, host-side, `is_in_guest=false` signature this
+            // investigation captured. Ungated and allocation-free: this only runs on an actual
+            // recovered fault, never on ordinary execution, and the gated `diag_fataldump_enabled`
+            // block above is not on by default in the runs that reproduce this crash.
+            diag_raw_print(
+                b"[diag-recover-fsbase] recover_rip=0x",
+                recover as usize,
+                b" fsbase=0x",
+                unsafe { litebox_common_linux::rdfsbase() } as usize,
+            );
             context.Rip = recover as u64;
             return EXCEPTION_CONTINUE_EXECUTION;
         } else {
