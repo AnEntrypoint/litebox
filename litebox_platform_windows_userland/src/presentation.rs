@@ -819,6 +819,7 @@ impl PresenterApp {
     /// current size is, matching what a real display's own scanout-to-monitor scaling would do
     /// rather than silently truncating the picture.
     fn present(&mut self, frame: &Frame) {
+        let present_started = std::time::Instant::now();
         let Some(state) = &mut self.state else {
             return;
         };
@@ -903,7 +904,78 @@ impl PresenterApp {
         }
         state.queue.submit(Some(encoder.finish()));
         surface_texture.present();
+        // Real present-side accounting, always on (two relaxed atomic adds per frame -- far below
+        // the cost of the GPU work just submitted, and never allocating). Exists because the
+        // PRODUCER side alone cannot measure this path: `FrameSender::send` writes into the
+        // single-slot `FrameSlot` and returns immediately, so a producer-side counter increments
+        // identically whether this function ran once or ten thousand times. Without these, a
+        // regression that stalled the presenter entirely (or silently disabled the texture pool)
+        // would leave every producer-side number unchanged, which is exactly the blind spot that
+        // makes a "throughput" figure meaningless. See `present_stats`.
+        let elapsed_nanos = present_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        PRESENTS_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        PRESENT_NANOS_TOTAL.fetch_add(elapsed_nanos, core::sync::atomic::Ordering::Relaxed);
+        // Bounded recent-latency ring, so a caller (e.g. `presenter_bench`) can compute a real
+        // p99 rather than only a running mean -- a mean alone hides exactly the kind of
+        // occasional-stall regression a percentile is meant to catch. Fixed capacity, oldest
+        // overwritten first: this is diagnostic sampling, not an audit log, so unbounded growth
+        // would be the wrong tradeoff for a per-frame hot path.
+        if let Ok(mut ring) = PRESENT_LATENCY_RING.lock() {
+            if ring.len() == PRESENT_LATENCY_RING_CAPACITY {
+                ring.pop_front();
+            }
+            ring.push_back(elapsed_nanos);
+        }
     }
+}
+
+/// Fixed capacity for [`PRESENT_LATENCY_RING`] -- far more than any reasonable benchmark window
+/// needs for a stable p99 (a few thousand recent samples), while bounding worst-case memory for
+/// this always-on per-present hot-path instrumentation.
+const PRESENT_LATENCY_RING_CAPACITY: usize = 4096;
+
+/// Recent per-present latencies in nanoseconds, newest at the back, oldest dropped once
+/// [`PRESENT_LATENCY_RING_CAPACITY`] is reached. See [`present_latency_samples_nanos`].
+static PRESENT_LATENCY_RING: std::sync::Mutex<std::collections::VecDeque<u64>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// A snapshot copy of the recent per-present latency samples (nanoseconds), oldest first. A
+/// caller wanting a percentile (e.g. p99) should sort a snapshot and index it directly -- this
+/// module intentionally does not compute percentiles itself since "recent window" semantics are
+/// caller-specific (a benchmark wants the whole run; a live diagnostic might want just the last
+/// second).
+#[must_use]
+pub fn present_latency_samples_nanos() -> Vec<u64> {
+    PRESENT_LATENCY_RING
+        .lock()
+        .map(|ring| ring.iter().copied().collect())
+        .unwrap_or_default()
+}
+
+/// Count of `present()` calls that reached the end of the function (i.e. actually submitted GPU
+/// work and called `SurfaceTexture::present`), NOT the number of frames a producer sent -- see
+/// [`present_stats`].
+static PRESENTS_COMPLETED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Cumulative wall-clock nanoseconds spent inside `present()`, summed across every completed
+/// present. Divided by [`PRESENTS_COMPLETED`] this gives the mean per-present cost.
+static PRESENT_NANOS_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Real, present-side throughput/latency accounting: `(presents_completed, total_nanos_in_present)`.
+///
+/// # Why this exists separately from any producer-side count
+///
+/// Frames are deliberately COALESCED (`FrameSlot`, a single `Mutex<Option<Frame>>` slot that keeps
+/// only the newest frame): a producer that outruns the GPU simply overwrites the pending frame, so
+/// "sends per second" is bounded by how fast a mutex lock plus a wake returns, not by how fast
+/// anything is actually drawn. Both numbers are worth having -- their RATIO is how many frames
+/// coalescing dropped -- but only this one describes the present path's real cost, and only this
+/// one changes if the texture pool, the sampled blit, or the present mode regresses.
+pub fn present_stats() -> (u64, u64) {
+    (
+        PRESENTS_COMPLETED.load(core::sync::atomic::Ordering::Relaxed),
+        PRESENT_NANOS_TOTAL.load(core::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 impl ApplicationHandler<PresenterCommand> for PresenterApp {

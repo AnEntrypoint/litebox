@@ -136,6 +136,22 @@ pub struct CliArgs {
     /// than two modes chosen before the guest starts.
     #[arg(long = "gui-hidden")]
     pub gui_hidden: bool,
+
+    /// Publish a port from the guest to the host, `host_port:guest_port` (mirrors `docker run
+    /// -p`). Can be given multiple times. Binds a real `127.0.0.1:<host_port>` listener on the
+    /// host and forwards every accepted connection into the guest's virtual network at
+    /// `<guest_port>` -- the inbound counterpart to this runner's existing transparent *outbound*
+    /// NAT (guest-initiated `curl`/`apk`/etc already just work; a guest-run **server**, e.g. a web
+    /// UI, needs this explicit opt-in instead, exactly like a NAT gateway with no configured
+    /// port-forwarding rule cannot otherwise be reached from outside).
+    ///
+    /// A bare `port` is shorthand for `port:port`. Implemented via
+    /// `litebox_platform_windows_userland`'s `net` module (see its module doc comment for the
+    /// full inbound-forwarding design); threaded down via the `LITEBOX_PUBLISH` environment
+    /// variable the gateway already reads (`host:guest` pairs, comma-separated), so this flag is
+    /// just this runner's user-facing surface for that same mechanism.
+    #[arg(long = "publish", short = 'p', value_name = "HOST_PORT:GUEST_PORT")]
+    pub publish: Vec<String>,
 }
 
 struct MmappedFile {
@@ -424,6 +440,20 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             mmap: mmapped_file(tar_file)?,
         }
     };
+
+    // `--publish` must be set BEFORE `Platform::new()` -- more precisely, before anything ever
+    // touches `net_gateway` (the `OnceLock<NatGateway>` field) -- since the NAT gateway reads
+    // `LITEBOX_PUBLISH` exactly once, at its own lazy-init time, to decide which host listeners to
+    // spawn (see `litebox_platform_windows_userland::net`'s module doc comment). `Platform::new()`
+    // itself never touches networking, but setting this first, unconditionally, keeps this code
+    // from depending on that staying true.
+    if !cli_args.publish.is_empty() {
+        // SAFETY: single-threaded at this point in `run` (no guest thread, no worker thread, no
+        // presenter thread has been spawned yet) -- no concurrent reader of the environment exists.
+        unsafe {
+            std::env::set_var("LITEBOX_PUBLISH", cli_args.publish.join(","));
+        }
+    }
 
     let platform = Platform::new();
     if let RootfsSource::Tar { mmap } = &rootfs_source {
