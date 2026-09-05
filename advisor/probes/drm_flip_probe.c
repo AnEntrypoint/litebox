@@ -55,8 +55,9 @@ static void outn(i64 v) {
 #define DRM_IOCTL_MODE_MAP_DUMB     0xc01064b3
 // ADDFB2, not the legacy ADDFB: litebox implements only the former (`add_fb2` in drm.rs), and a
 // legacy `DRM_IOCTL_MODE_ADDFB` (0xc01c64ae) returns EINVAL as an unsupported ioctl. Worth
-// knowing when reading a stock client's failure -- plenty of real userspace still tries legacy
-// ADDFB first and falls back, so a client that never falls back will fail here.
+// knowing when reading a client's failure: that EINVAL reads like a bad argument rather than a
+// missing feature. No client in this tree actually calls legacy ADDFB (weston and every probe
+// here use ADDFB2), so it is an unproven gap, not a known blocker.
 #define DRM_IOCTL_MODE_ADDFB2       0xc06864b8
 #define DRM_IOCTL_MODE_PAGE_FLIP    0xc01864b0
 
