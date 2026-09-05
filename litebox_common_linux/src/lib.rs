@@ -1203,6 +1203,38 @@ pub struct DrmPrimeHandle {
 /// simply true, not a fabrication -- no legacy no-`crtc_id` code path exists to preserve.
 pub const DRM_CAP_CRTC_IN_VBLANK_EVENT: u64 = 0x12;
 
+/// `DRM_CAP_CURSOR_WIDTH` / `DRM_CAP_CURSOR_HEIGHT` (`include/uapi/drm/drm.h`) -- the real Linux
+/// kernel's `drm_ioctl_get_cap` (`drivers/gpu/drm/drm_ioctl.c`) special-cases these two: unlike
+/// every other unregistered capability (which falls through to reporting `0`), a driver that
+/// never sets `dev->mode_config.cursor_width`/`cursor_height` still gets back the kernel's own
+/// hardcoded default of `64`, never `0` -- these two are the one pair of "capabilities" whose
+/// unset value is a real, usable size rather than a boolean/bitmask "unsupported" signal.
+/// xf86-video-modesetting's `probe_hw`/`GetRec` path (`ms->cursor_width`/`cursor_height`, driver.c)
+/// queries exactly this: it seeds a sane 64x64 default, then does
+/// `ret = drmGetCap(fd, DRM_CAP_CURSOR_WIDTH, &value); if (!ret) ms->cursor_width = value;` --
+/// so an ioctl that succeeds (as this device's `get_cap` unconditionally does for every
+/// capability) with `value=0` REPLACES the driver's own safe default with a genuine zero. The
+/// driver then allocates each CRTC's hardware-cursor dumb buffer as
+/// `dumb_bo_create(fd, 0, 0, 32)` (`drmmode_allocate_bos`), which this device's own `create_dumb`
+/// correctly rejects (`width == 0 || height == 0` -> `EINVAL`) -- but `drmmode_allocate_bos`
+/// itself never checks `dumb_bo_create`'s return value, so `crtc->driver_private->cursor_bo`
+/// silently stays `NULL`. The very next `EnterVT` (real KMS re-entry, e.g. right after
+/// `SetMaster`) calls `drmmode_map_cursor_bos`, which unconditionally calls
+/// `dumb_bo_map(fd, drmmode_crtc->cursor_bo)` with NO null check either -- `dumb_bo_map`'s first
+/// line reads `bo->ptr` through the now-NULL `bo`, a genuine SIGSEGV at `NULL+8`. Live-confirmed
+/// as the exact root cause of a crash previously (mis)localized to a "DRI2 gate-check": the
+/// crashing instruction (`cmp qword [rsi+8], 0` inside `modesetting_drv.so`, matching
+/// `dumb_bo_map`'s `if (bo->dumb->ptr)`/inlined `bo->ptr` check byte-for-byte) always has
+/// `rsi == 0`, reached via `xf86_config->crtc[i]->driver_private->cursor_bo` with every
+/// intermediate pointer genuinely valid and non-null -- only `cursor_bo` itself is the
+/// unexpected `NULL`, exactly matching this capability-query gap. Reporting the kernel's real
+/// default of `64` for both caps (this device has no actual hardware cursor-size limit to report
+/// otherwise, and 64x64 matches every other software-only virtual DRM device's convention, e.g.
+/// `vkms`) closes the gap at its true source rather than papering over the upstream driver's own
+/// missing null-check.
+pub const DRM_CAP_CURSOR_WIDTH: u64 = 0x8;
+pub const DRM_CAP_CURSOR_HEIGHT: u64 = 0x9;
+
 /// VT (virtual terminal) ioctl request numbers, `include/uapi/linux/vt.h`. Unlike the DRM
 /// ioctls above, these are plain legacy-style constants (not `_IOWR`-encoded) -- verified live
 /// against the real kernel header (`torvalds/linux` master), not guessed. `seatd` (see

@@ -41,8 +41,9 @@ use litebox::mm::linux::PAGE_SIZE;
 use litebox::platform::Instant as _;
 use litebox::platform::RawConstPointer;
 use litebox_common_linux::{
-    DRM_AUTH_MAGIC_VALUE, DRM_CAP_CRTC_IN_VBLANK_EVENT, DRM_CAP_DUMB_BUFFER, DRM_CAP_PRIME,
-    DRM_CAP_TIMESTAMP_MONOTONIC, DRM_CLIENT_CAP_UNIVERSAL_PLANES, DRM_EVENT_FLIP_COMPLETE,
+    DRM_AUTH_MAGIC_VALUE, DRM_CAP_CRTC_IN_VBLANK_EVENT, DRM_CAP_CURSOR_HEIGHT,
+    DRM_CAP_CURSOR_WIDTH, DRM_CAP_DUMB_BUFFER, DRM_CAP_PRIME, DRM_CAP_TIMESTAMP_MONOTONIC,
+    DRM_CLIENT_CAP_UNIVERSAL_PLANES, DRM_EVENT_FLIP_COMPLETE,
     DRM_MODE_CONNECTOR_VIRTUAL, DRM_MODE_ENCODER_VIRTUAL, DRM_MODE_OBJECT_CONNECTOR,
     DRM_MODE_OBJECT_PLANE, DRM_MODE_PAGE_FLIP_EVENT, DRM_MODE_PROP_BLOB, DRM_MODE_PROP_ENUM,
     DRM_PRIME_CAP_EXPORT, DRM_PRIME_CAP_IMPORT, DrmAuth, DrmEvent, DrmEventVblank, DrmGetCap,
@@ -452,6 +453,8 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         req.mm_height = 0;
         litebox_util_log::warn!(
             count_modes:? = req.count_modes,
+            count_encoders:? = req.count_encoders,
+            encoders_ptr:? = req.encoders_ptr,
             connection:? = req.connection,
             connector_type:? = req.connector_type;
             "drm-ioctl: GETCONNECTOR reply"
@@ -462,6 +465,10 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
 
     pub(crate) fn get_encoder(&self, ptr: UserPtrMut<DrmModeGetEncoder>) -> Result<u32, Errno> {
         let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        litebox_util_log::warn!(
+            encoder_id:? = req.encoder_id;
+            "drm-ioctl: GETENCODER request"
+        );
         if req.encoder_id != 0 && req.encoder_id != VIRTUAL_ENCODER_ID {
             return Err(Errno::ENOENT);
         }
@@ -792,7 +799,12 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     /// `DRM_CAP_CRTC_IN_VBLANK_EVENT` (see those constants' own doc comments) -- real
     /// compositors including weston's and wlroots' DRM backends require these capabilities to
     /// be present just to initialize at all, and `DRM_CAP_PRIME` (see its own doc comment,
-    /// handled separately below since its value is a bitmask, not a boolean). Any other
+    /// handled separately below since its value is a bitmask, not a boolean). `DRM_CAP_CURSOR_WIDTH`
+    /// / `DRM_CAP_CURSOR_HEIGHT` report the real kernel's own hardcoded default of `64` (see their
+    /// own doc comment for why `0` here is not a safe "unsupported" fallback the way it is for
+    /// every other capability below -- xf86-video-modesetting takes a successful `0` at face
+    /// value, allocates a 0x0 cursor dumb buffer, and a later unconditional, unchecked
+    /// `dumb_bo_map` on the resulting `NULL` `cursor_bo` SIGSEGVs during `EnterVT`). Any other
     /// capability (dumb-buffer preferred-depth,
     /// async page-flip, atomic modesetting, etc.) reports `0` (unsupported), the real kernel's own
     /// behavior for a capability a driver never registered, rather than fabricating support this
@@ -804,6 +816,10 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             || req.capability == DRM_CAP_CRTC_IN_VBLANK_EVENT
         {
             1
+        } else if req.capability == DRM_CAP_CURSOR_WIDTH
+            || req.capability == DRM_CAP_CURSOR_HEIGHT
+        {
+            64
         } else if req.capability == DRM_CAP_PRIME {
             // wlroots' `check_drm_features()` treats neither import nor export bit set as
             // fatal (see `DRM_CAP_PRIME`'s own doc comment) -- report both so backend

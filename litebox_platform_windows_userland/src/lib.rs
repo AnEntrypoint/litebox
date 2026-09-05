@@ -1027,7 +1027,27 @@ unsafe extern "system" fn vectored_exception_handler(
                     || exception_record.ExceptionInformation[1] == usize::MAX)
                 && !(unsafe { litebox_common_linux::rdfsbase() } == 0
                     && context.Rip != 0
-                    && WindowsUserland::get_thread_fs_base() != 0)))
+                    && WindowsUserland::get_thread_fs_base() != 0
+                    // Pass (DRI2/modesetting_drv.so investigation): this exclusion's whole
+                    // purpose is to skip the dump for the common, auto-repaired "Windows cleared
+                    // FS_BASE" condition -- but until now it used a strictly weaker check than the
+                    // ACTUAL repair path a few hundred lines below (both the guest-mode and
+                    // host-mode occurrences of this fix gate on
+                    // `faulting_instruction_has_fs_override`, requiring the faulting instruction to
+                    // genuinely carry a `0x64` FS-segment-override prefix). Without that same check
+                    // here, a real, unrelated, non-FS-relative fault that merely happens to
+                    // coincide with `rdfsbase() == 0` (confirmed live: a modesetting_drv.so
+                    // DRI2/master-check crash with `rip` pointing at ordinary non-FS-relative code)
+                    // was being silently misclassified as the benign FS_BASE case and its full
+                    // diagnostic dump (register/byte dump below) was never printed -- exactly the
+                    // opposite of this gate's intent, since that repair path's own `Rip != 0` guard
+                    // doc comment already establishes this exact false-positive risk as the reason
+                    // for requiring narrower conditions. Adding the identical
+                    // `faulting_instruction_has_fs_override` check here makes the diagnostic
+                    // exclusion consistent with the real repair logic: only ever excluded when this
+                    // fault would ACTUALLY be repaired-and-retried, never for an unrelated fault
+                    // that merely shares the same `rdfsbase()==0` signature.
+                    && faulting_instruction_has_fs_override(context.Rip.trunc()))))
         // A second exception raised while this thread is ALREADY inside this diagnostic block
         // (see `IN_VEH_DIAG_BLOCK`'s doc comment) means the diagnostic code itself is the thing
         // that just faulted -- skip straight past it and let the exception propagate normally
@@ -2421,6 +2441,12 @@ impl WindowsUserland {
             console_stdin_reader: std::sync::OnceLock::new(),
             cow_regions: std::sync::RwLock::new(std::collections::BTreeMap::new()),
         };
+
+        // Start the NAT gateway eagerly IF a port is published (`LITEBOX_PUBLISH`). The gateway is
+        // otherwise lazy, initialized by the guest's first outbound packet -- but a guest that only
+        // `listen()`s never sends one, so a published port would never bind. See
+        // `net::init_published_ports`.
+        net::init_published_ports(&platform.net_gateway);
 
         // Initialize it's own fs-base (for the main thread)
         WindowsUserland::init_thread_fs_base();
