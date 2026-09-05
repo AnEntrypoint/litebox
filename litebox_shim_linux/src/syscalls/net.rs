@@ -1730,7 +1730,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let payload = &control[offset + size_of::<CmsgHdr>()..offset + hdr.cmsg_len];
             if hdr.cmsg_level == SOL_SOCKET && hdr.cmsg_type == SCM_RIGHTS {
                 for raw_fd_bytes in payload.chunks_exact(size_of::<i32>()) {
-                    let raw_fd = i32::from_ne_bytes(raw_fd_bytes.try_into().unwrap());
+                    let raw_fd = i32::read_from_bytes(raw_fd_bytes).map_err(|_| Errno::EINVAL)?;
                     let raw_fd = usize::try_from(raw_fd).map_err(|_| Errno::EBADF)?;
                     let files = self.files.borrow();
                     let any = files

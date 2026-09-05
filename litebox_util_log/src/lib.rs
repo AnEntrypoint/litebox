@@ -97,6 +97,9 @@ pub use backend_log::SpanGuard;
 #[cfg(feature = "backend_tracing")]
 pub use backend_tracing::SpanGuard;
 
+#[cfg(feature = "tracing_subscriber_init")]
+pub use backend_tracing::init_env_filtered_subscriber;
+
 /// Converts a [`log::Record`] into the compact host-console format.
 ///
 /// Formats the record as `[LEVEL] message key=value ...\n` into `writer`.

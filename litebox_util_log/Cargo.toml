@@ -8,6 +8,10 @@ description = "Logging facade for LiteBox that supports multiple backends"
 default = ["backend_log"]
 backend_log = ["dep:log", "log/kv"]
 backend_tracing = ["dep:tracing"]
+# Shared `tracing-subscriber` bootstrap for binaries that want the standard
+# uptime-timestamped, `LITEBOX_LOG`-env-filtered stderr subscriber this crate's `backend_tracing`
+# callers otherwise each set up by hand.
+tracing_subscriber_init = ["backend_tracing", "dep:tracing-subscriber"]
 
 # Key-value capture features (mirrors log's kv features)
 kv_std = ["log?/kv_std"]
@@ -17,6 +21,7 @@ kv_serde = ["log?/kv_serde"]
 [dependencies]
 log = { version = "0.4", optional = true, default-features = false }
 tracing = { version = "0.1", optional = true, default-features = false }
+tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter"] }
 litebox_util_log_macros = { path = "../litebox_util_log_macros" }
 
 [dev-dependencies]

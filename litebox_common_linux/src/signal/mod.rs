@@ -119,6 +119,12 @@ pub enum SignalDisposition {
     Continue,
 }
 
+// Not converted to `bitvec` (or another general bitset crate): this is `#[repr(transparent)]` over
+// a single `u64` with `FromBytes`/`IntoBytes` for direct zerocopy transmutation onto the real Linux
+// `sigset_t` wire layout, its methods are all `const fn` (used in signal-delivery hot paths), and
+// `as_u64`/`from_u64` are a deliberate raw-bits escape hatch for wire encoding. `bitvec` targets
+// growable/runtime-sized bit-vectors, not a fixed 64-bit ABI-transparent const-fn type, so it does
+// not fit better than the current hand-rolled bit ops here.
 #[derive(Clone, Copy, FromBytes, IntoBytes)]
 #[repr(transparent)]
 pub struct SigSet(u64);

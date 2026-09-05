@@ -10,6 +10,27 @@
 //! The macros in this module transform our unified key-value syntax into
 //! tracing's native field syntax using a tt-muncher pattern.
 
+/// Installs the standard `tracing-subscriber` bootstrap shared by LiteBox's runner binaries:
+/// uptime timestamps, level names, and an `env_var_name`-driven [`tracing_subscriber::EnvFilter`]
+/// (`from_env_lossy`, so a missing/invalid value falls back rather than panicking).
+///
+/// # Panics
+///
+/// Panics if a global subscriber has already been installed (mirrors
+/// `tracing_subscriber::fmt().init()`'s own panic behavior).
+#[cfg(feature = "tracing_subscriber_init")]
+pub fn init_env_filtered_subscriber(env_var_name: &str) {
+    tracing_subscriber::fmt()
+        .with_timer(tracing_subscriber::fmt::time::uptime())
+        .with_level(true)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_env_var(env_var_name)
+                .from_env_lossy(),
+        )
+        .init();
+}
+
 impl crate::Level {
     /// Converts this level to the corresponding `tracing::Level`.
     #[doc(hidden)]
