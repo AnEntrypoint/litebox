@@ -764,26 +764,57 @@ pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<P
                 eprintln!("  Pulling layer {}/{}...", i + 1, num_layers);
             }
 
-            // Pre-size both buffers instead of growing from `Vec::new()` -- for a
-            // multi-hundred-MB layer, repeated doubling-reallocation transiently holds BOTH the
-            // old and new buffer live at once, which for a ~900MB compressed / ~2.5GB
-            // decompressed layer (observed live: `linuxserver/webtop:debian-xfce`'s largest
-            // layer) can spike well past what the final buffer alone would need and has been
-            // observed to OOM-kill the whole process with no error, or occasionally surface as a
-            // clean pull failure depending on exactly when the allocator gives up. The manifest
-            // already tells us the exact compressed size (`layer_desc.size`); gzip layers
-            // commonly compress 2-4x for the kind of binary+text content a container layer holds,
-            // so a 4x estimate for the decompressed buffer avoids most doubling without wildly
-            // over-reserving for a layer that happens to compress better than that.
-            let mut layer_data: Vec<u8> = Vec::with_capacity(
-                usize::try_from(layer_desc.size).unwrap_or(0),
-            );
-            client
-                .pull_blob(&reference, layer_desc, &mut layer_data)
-                .await
-                .with_context(|| format!("failed to pull layer {}", i + 1))?;
+            // Pull the compressed blob DIRECTLY to a temp file rather than into a `Vec<u8>` --
+            // for a real large layer (e.g. `linuxserver/webtop`'s ~500MB-900MB compressed
+            // layers), the pulled bytes themselves are a genuine, avoidable in-memory buffer:
+            // this codebase already learned (see the decompression step below) that even a
+            // "correctly sized" `Vec` is still ordinary, non-page-cache-evictable heap memory
+            // for its whole lifetime. Streaming the pull straight to disk means the compressed
+            // bytes never exist as a heap allocation at all -- `oci_client::Client::pull_blob`
+            // is generic over any `tokio::io::AsyncWrite` target, so a `tokio::fs::File` works
+            // exactly like the `Vec<u8>` it replaces, with zero change to the pull call itself.
+            let tmp_dir = Path::new(cache::CACHE_DIR);
+            std::fs::create_dir_all(tmp_dir)
+                .with_context(|| format!("failed to create cache directory {}", tmp_dir.display()))?;
+            let pid = std::process::id();
+            let pull_unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default();
+            let compressed_tmp_path = tmp_dir.join(format!(".tmp-pull-{pid}-{pull_unique}"));
+            {
+                let compressed_tmp_file = tokio::fs::File::create(&compressed_tmp_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to create temp pull file {}",
+                            compressed_tmp_path.display()
+                        )
+                    })?;
+                let mut compressed_writer = tokio::io::BufWriter::new(compressed_tmp_file);
+                client
+                    .pull_blob(&reference, layer_desc, &mut compressed_writer)
+                    .await
+                    .with_context(|| format!("failed to pull layer {}", i + 1))?;
+                use tokio::io::AsyncWriteExt as _;
+                compressed_writer
+                    .flush()
+                    .await
+                    .with_context(|| format!("failed to flush pulled layer {}", i + 1))?;
+            }
 
-            let is_gzip = layer_desc.media_type.contains("gzip") || is_gzip_data(&layer_data);
+            // Sniff gzip-ness from the first few bytes on disk rather than needing the whole
+            // blob in memory just to check a magic number.
+            let is_gzip = layer_desc.media_type.contains("gzip") || {
+                let mut magic = [0u8; 2];
+                std::fs::File::open(&compressed_tmp_path)
+                    .ok()
+                    .and_then(|mut f| {
+                        use std::io::Read as _;
+                        f.read_exact(&mut magic).ok()
+                    });
+                magic == [0x1f, 0x8b]
+            };
 
             // Decompress to a temp file and mmap it, rather than holding the full decompressed
             // layer (~2.5GB for a real large layer, e.g. `linuxserver/webtop:debian-xfce`) as a
@@ -799,15 +830,11 @@ pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<P
             // established pattern this reuses.
             enum DecompressedSource {
                 Mmapped { mmap: memmap2::Mmap, tmp_path: PathBuf },
+                #[allow(dead_code, reason = "both branches now mmap; kept for fallback shape")]
                 InMemory(Vec<u8>),
             }
 
             let source = if is_gzip {
-                let tmp_dir = Path::new(cache::CACHE_DIR);
-                std::fs::create_dir_all(tmp_dir).with_context(|| {
-                    format!("failed to create cache directory {}", tmp_dir.display())
-                })?;
-                let pid = std::process::id();
                 let unique = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos())
@@ -815,7 +842,15 @@ pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<P
                 let tmp_path = tmp_dir.join(format!(".tmp-decompress-{pid}-{unique}"));
 
                 {
-                    let mut decoder = flate2::read::GzDecoder::new(layer_data.as_slice());
+                    let compressed_file = std::fs::File::open(&compressed_tmp_path)
+                        .with_context(|| {
+                            format!(
+                                "failed to reopen pulled layer {}",
+                                compressed_tmp_path.display()
+                            )
+                        })?;
+                    let mut decoder =
+                        flate2::read::GzDecoder::new(std::io::BufReader::new(compressed_file));
                     let tmp_file = std::fs::File::create(&tmp_path).with_context(|| {
                         format!(
                             "failed to create temp decompression file {}",
@@ -829,9 +864,8 @@ pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<P
                         .flush()
                         .with_context(|| format!("failed to flush decompressed layer {}", i + 1))?;
                 }
-                // Drop the compressed input now -- it's no longer needed once decompression into
-                // the temp file has finished, so it doesn't stay alive alongside the mmap below.
-                drop(layer_data);
+                // The compressed temp file is no longer needed once decompression has finished.
+                let _ = std::fs::remove_file(&compressed_tmp_path);
 
                 let tmp_file = std::fs::File::open(&tmp_path).with_context(|| {
                     format!("failed to reopen decompressed temp file {}", tmp_path.display())
@@ -844,7 +878,26 @@ pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<P
                 })?;
                 DecompressedSource::Mmapped { mmap, tmp_path }
             } else {
-                DecompressedSource::InMemory(layer_data)
+                // Not gzip -- the pulled bytes on disk already ARE the tar to rewrite, so mmap
+                // that file directly rather than reading it into memory at all.
+                let tmp_file = std::fs::File::open(&compressed_tmp_path).with_context(|| {
+                    format!(
+                        "failed to reopen pulled (uncompressed) layer {}",
+                        compressed_tmp_path.display()
+                    )
+                })?;
+                // SAFETY: same discipline as the gzip branch above -- unique pid+timestamp name,
+                // exclusive to this process and call.
+                let mmap = unsafe { memmap2::Mmap::map(&tmp_file) }.with_context(|| {
+                    format!(
+                        "failed to mmap pulled layer {}",
+                        compressed_tmp_path.display()
+                    )
+                })?;
+                DecompressedSource::Mmapped {
+                    mmap,
+                    tmp_path: compressed_tmp_path,
+                }
             };
 
             let decompressed_slice: &[u8] = match &source {
