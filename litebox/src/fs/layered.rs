@@ -110,6 +110,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         &self.upper
     }
 
+
     /// (private-only) check if the lower level has the path; if there is an I/O or path failure,
     /// propagate the relevant error.
     fn ensure_lower_contains(&self, path: &str) -> Result<FileType, FileStatusError> {
@@ -1226,6 +1227,36 @@ impl<
             }
             EntryX::Tombstone => unreachable!(),
         }
+    }
+
+    fn open_flags(&self, fd: &FileFd<Platform, Upper, Lower>) -> Option<OFlags> {
+        // `Descriptor::flags` (set correctly at `open()`, and already relied on internally by
+        // `write()`'s `OFlags::WRONLY`/`RDWR` check above) is the real, per-fd open-time access
+        // mode -- exactly what `fcntl(F_GETFL)` needs, and (before this override existed) the only
+        // caller (`litebox_shim_linux`'s `sys_fcntl`) had no way to reach it: this field is
+        // private to this module, wrapped in the fd-subsystem machinery's own `DescriptorEntry`
+        // (see `crate::fd::enable_fds_for_subsystem!`'s generated wrapper), which exposes no
+        // `get_status`/`set_status` pair the way every OTHER fd-enabled subsystem in this codebase
+        // does (eventfd, epoll, unix, pty, signalfd, timerfd all provide one via
+        // `common_functions_for_file_status!` -- a regular file never got the same treatment).
+        // Lacking any accessor, `sys_fcntl`'s `GETFL` fell back to looking up `StdioStatusFlags`
+        // *metadata* for the fd instead -- metadata that is only ever attached to a re-opened
+        // `/dev/stdin`/`/dev/stdout`/`/dev/stderr` fd (see `insert_raw_file_fd_with_path`'s
+        // `stdio_stream_for_path` check), never to an ordinary file. For every other regular file,
+        // that lookup silently missed and defaulted to `OFlags::empty()` -- reporting `O_RDONLY`
+        // (0) regardless of whether the fd was actually opened `O_WRONLY`/`O_RDWR`. Confirmed live
+        // as the real root cause of Xorg's "Cannot open ... to write keyboard description":
+        // `xkbcomp` opens `/var/lib/xkb/server-0.xkm` with `O_WRONLY|O_CREAT|O_EXCL` (succeeds),
+        // then glibc's `fdopen(fd, "w")` calls `fcntl(F_GETFL)` to confirm the fd's access mode is
+        // compatible with `"w"` -- got back 0 (`O_RDONLY`) here, so `fdopen` refused and returned
+        // `NULL`, which is exactly what `xkbcomp`'s own C code reports as "Cannot open <path> to
+        // write" (a wrapper around a failed `fdopen`, not a failed `open`) before exiting --
+        // confirmed via a live instrumented probe showing the raw `open()` syscall succeeding and
+        // creating the (0-byte) file, immediately followed by `fcntl(F_GETFL)` returning `Ok(0)`,
+        // with no `write()`/`close()` ever reaching this fs in between.
+        self.litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| descriptor.entry.flags & OFlags::STATUS_FLAGS_MASK)
     }
 
     fn chmod(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), ChmodError> {

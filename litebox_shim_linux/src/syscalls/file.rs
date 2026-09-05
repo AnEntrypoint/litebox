@@ -3160,7 +3160,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(files
                     .run_on_raw_fd(
                         desc,
-                        |fd| getfl_from_metadata!(fd, crate::StdioStatusFlags),
+                        // A plain regular-file fd has no `StdioStatusFlags` metadata attached
+                        // (that's only ever set on a re-opened `/dev/stdin`/`/dev/stdout`/
+                        // `/dev/stderr` fd -- see `insert_raw_file_fd_with_path`), so
+                        // `getfl_from_metadata!` here always missed and silently reported
+                        // `O_RDONLY` (0) regardless of the fd's real access mode. Read the actual
+                        // open-time flags the layered fs itself already tracks per fd instead --
+                        // see `layered::FileSystem::open_flags`'s doc comment for the real bug
+                        // this fixes (confirmed live: `xkbcomp`'s `fdopen(fd, "w")` failing on an
+                        // `O_WRONLY`-opened fd because `F_GETFL` lied and reported `O_RDONLY`).
+                        |fd| Ok(files.fs.open_flags(fd).unwrap_or(OFlags::empty())),
                         |fd| getfl_from_metadata!(fd, crate::syscalls::net::SocketOFlags),
                         |fd| self.global.linux_pipe_status_flags(fd),
                         |fd| getfl_from_handle!(fd),

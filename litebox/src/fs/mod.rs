@@ -132,6 +132,25 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// `NoSuchFileOrDirectory`, which is the bug this method exists to avoid.
     fn chmod_fd(&self, fd: &TypedFd<Self>, mode: Mode) -> Result<(), ChmodError>;
 
+    /// The access-mode/status flags `fd` was actually opened with (the `O_RDONLY`/`O_WRONLY`/
+    /// `O_RDWR` bits plus whatever of [`OFlags::STATUS_FLAGS_MASK`] applied at `open()` time),
+    /// for `fcntl(F_GETFL)` to report correctly.
+    ///
+    /// Defaults to `None` (caller falls back to reporting `O_RDONLY`/0, the pre-existing
+    /// behavior) since not every implementor of this trait is a real, fd-table-backed regular
+    /// file (e.g. [`devices::Devices`], [`procfs`] synthesize their entries differently) --
+    /// override this wherever the implementation actually tracks per-fd open flags, as
+    /// [`layered::FileSystem`] does. Added specifically because the previous fallback used by
+    /// every caller (`litebox_shim_linux`'s `sys_fcntl`), looking up `StdioStatusFlags`
+    /// *metadata* on the fd, is only ever populated for a re-opened `/dev/stdin`/`/dev/stdout`/
+    /// `/dev/stderr` fd -- for an ordinary regular file it silently missed and always reported
+    /// `O_RDONLY` regardless of the fd's real access mode, which is exactly what broke
+    /// `xkbcomp`'s `fdopen(fd, "w")` on an `O_WRONLY`-opened fd (see `layered::FileSystem::
+    /// open_flags`'s doc comment for the full, confirmed-live root-cause trace).
+    fn open_flags(&self, _fd: &TypedFd<Self>) -> Option<OFlags> {
+        None
+    }
+
     /// Change the owner of a file
     fn chown(
         &self,

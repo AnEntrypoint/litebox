@@ -253,7 +253,26 @@ fn initialize_root_in_mem_layer<Platform: litebox::sync::RawSyncPrimitivesProvid
         // file-based tar (an empty directory has no file contents, so it produces
         // no tar entry, and `TarRo`'s directory tree is inferred purely from file
         // paths -- see litebox/src/fs/tar_ro.rs).
-        for dir in ["/run", "/var", "/var/log", "/var/cache", "/var/tmp"] {
+        // `/var/lib` and `/var/lib/xkb` are added to this same list for the identical reason:
+        // `/var/lib/xkb` exists in the read-only tar layer (it ships a `README.compiled`), but a
+        // NEW file inside a directory that exists ONLY in the read-only layer has nowhere to
+        // land -- `TarRo::open_file_at` (litebox/src/fs/tar_ro.rs) refuses a writable open of a
+        // tar-layer directory, so `xkbcomp` (spawned by `Xorg` to compile the keyboard keymap)
+        // fails to create `/var/lib/xkb/server-0.xkm`, which `Xorg` treats as fatal ("Failed to
+        // activate virtual core keyboard"). Confirmed live: this was the concrete blocker after
+        // the DRM_CAP_CURSOR_WIDTH/HEIGHT and legacy ADDFB fixes let `Xorg` boot against
+        // `linuxserver/webtop:debian-xfce`. `/var/lib` must precede `/var/lib/xkb` in this list
+        // (same ancestor-ordering requirement as `/dev` before `/dev/shm` above) or `mkdir`
+        // panics with `PathError::MissingComponent`.
+        for dir in [
+            "/run",
+            "/var",
+            "/var/log",
+            "/var/cache",
+            "/var/tmp",
+            "/var/lib",
+            "/var/lib/xkb",
+        ] {
             fs.mkdir(
                 dir,
                 litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
