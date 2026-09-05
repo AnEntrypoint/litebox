@@ -371,24 +371,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Clone for LinuxShim<Platform, FS> {
 
 impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
     /// Install (or replace) the host-side callback invoked on every real DRM page-flip (see
-    /// [`syscalls::drm::DrmSubsystem::set_flip_callback`]'s doc comment for the exact contract and
+    /// [`syscalls::drm::DrmSubsystem::add_flip_callback`]'s doc comment for the exact contract and
     /// why it deliberately takes plain pixel bytes rather than a platform-specific handle) -- the
     /// sole public entry point into the shim's own `/dev/dri/card0` emulation, since
     /// `DrmSubsystem` itself stays a private implementation detail. A runner binary that depends
     /// on a concrete presentation layer (e.g. `litebox_platform_windows_userland`'s wgpu-backed
     /// `Presenter`) calls this once, right after [`LinuxShimBuilder::build`], to make flipped
     /// frames actually visible; a runner target with no GUI story simply never calls it.
-    pub fn set_drm_flip_callback(
+    ///
+    /// ADDITIVE: each call installs an ADDITIONAL observer rather than replacing the previous
+    /// one, so a `--gui` window and a `LITEBOX_DUMP_FRAMES` capture can both watch the same
+    /// frames. See [`syscalls::drm::DrmSubsystem::flip_callbacks`] for why that matters.
+    pub fn add_drm_flip_callback(
         &self,
         callback: impl Fn(&[u8], u32, u32, u32, u32) + Send + Sync + 'static,
     ) {
-        self.0.drm.set_flip_callback(callback);
+        self.0.drm.add_flip_callback(callback);
     }
 
     /// Push a real keyboard/mouse-button transition into the shim's `/dev/input/event0` queue --
     /// see [`syscalls::evdev::EvdevSubsystem::push_key`]'s doc comment for the `code`/`value`
     /// contract. The sole public entry point into the shim's own evdev emulation, mirroring
-    /// [`Self::set_drm_flip_callback`]'s role for DRM; a runner binary with a concrete
+    /// [`Self::add_drm_flip_callback`]'s role for DRM; a runner binary with a concrete
     /// presentation/input layer (e.g. `litebox_platform_windows_userland`'s winit-backed window)
     /// calls this from its own keyboard/mouse-button event handler.
     pub fn push_input_key(&self, code: u16, value: i32) {

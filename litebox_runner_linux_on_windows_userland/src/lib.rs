@@ -414,7 +414,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         // BOTH created and run on the same OS thread, per winit's own platform requirement -- so
         // `Presenter::new()` happens INSIDE the spawned closure, not before it. The `FrameSender`
         // handle (which IS `Send`+`Clone`, see its own doc comment) crosses the thread boundary
-        // the other way, via a one-shot channel, so `set_drm_flip_callback` below can be wired up
+        // the other way, via a one-shot channel, so `add_drm_flip_callback` below can be wired up
         // on the main thread without blocking on the presenter thread's own startup.
         let (sender_tx, sender_rx) = std::sync::mpsc::channel();
         let input_shim = shim.clone();
@@ -446,7 +446,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 };
             // Forward real keyboard/mouse events captured by winit into the guest's
             // `/dev/input/event0` queue, exactly mirroring how DRM page-flips are forwarded the
-            // other way (guest -> host) via `set_drm_flip_callback` below. This is what makes a
+            // other way (guest -> host) via `add_drm_flip_callback` below. This is what makes a
             // `--gui` guest genuinely interactive rather than render-only.
             presenter.set_input_consumer(move |signal| match signal {
                 litebox_platform_windows_userland::presentation::InputSignal::Key(code, value) => {
@@ -466,36 +466,39 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         })
             .expect("failed to spawn GUI presenter thread");
         if let Ok(sender) = sender_rx.recv() {
-            let dump_frames = std::env::var_os("LITEBOX_DUMP_FRAMES").is_some();
-            shim.set_drm_flip_callback(move |bytes, width, height, pitch, _pixel_format| {
+            // Presentation ONLY. Frame capture is a separate observer registered below, not an
+            // inline step here: when the flip slot held a single callback, capture had to be
+            // smuggled into this closure (running before `sender.send` took ownership) so that a
+            // stuck presenter could not starve it. Observers are additive now, so capture is
+            // genuinely independent -- it no longer depends on this closure running at all, and
+            // duplicating it here would write every frame twice.
+            shim.add_drm_flip_callback(move |bytes, width, height, pitch, _pixel_format| {
                 let frame = litebox_platform_windows_userland::presentation::Frame {
                     width,
                     height,
                     pitch,
                     bytes: bytes.to_vec(),
                 };
-                // Dump BEFORE handing `frame` to the presenter's channel (which takes ownership),
-                // so `LITEBOX_DUMP_FRAMES` observes every real page-flip even if the presenter
-                // thread itself is stuck/slow/never got past `resumed()` -- confirmed live this
-                // session as a real, frequent failure mode independent of this fix, not
-                // hypothetical (see AGENTS.md's own `--gui` presenter-race entries).
-                if dump_frames {
-                    litebox_platform_windows_userland::presentation::dump_frame_diagnostic(&frame);
-                }
                 sender.send(frame);
             });
         }
         handle
     });
-    // Headless (`--gui` omitted) verification path: `LITEBOX_DUMP_FRAMES` must not require a
-    // working host window/wgpu presenter at all -- the presenter thread is a genuinely separate,
-    // independently flaky subsystem (real Win32 window + wgpu device/surface setup racing guest
-    // DRM startup, see the `--gui` doc comments above), and tying frame verification to it means
-    // a presenter hang silently blocks every other diagnostic too. When `--gui` was NOT
-    // requested, register the SAME dump-only callback directly (no `Presenter`, no window, no
-    // wgpu) so a headless run still writes numbered `.bmp` frames whenever real page-flips occur.
-    if gui_presenter_thread.is_none() && std::env::var_os("LITEBOX_DUMP_FRAMES").is_some() {
-        shim.set_drm_flip_callback(move |bytes, width, height, pitch, _pixel_format| {
+    // `LITEBOX_DUMP_FRAMES` verification path, registered INDEPENDENTLY of `--gui`:
+    // frame capture must not require a working host window/wgpu presenter at all -- the presenter
+    // thread is a genuinely separate, independently flaky subsystem (real Win32 window + wgpu
+    // device/surface setup racing guest DRM startup, see the `--gui` doc comments above), and
+    // tying frame verification to it means a presenter hang silently blocks every other
+    // diagnostic too.
+    //
+    // This deliberately no longer excludes the `--gui` case. Flip observers are ADDITIVE (see
+    // `add_drm_flip_callback`), so a windowed run can capture the very same frames it displays.
+    // Previously the single-callback slot meant registering this one REPLACED the presenter's,
+    // so the two had to be gated against each other -- which disabled capture in exactly the
+    // situation it is most useful: proving what the on-screen window is actually showing, and
+    // telling "the guest never drew" apart from "the guest drew and presentation lost it".
+    if std::env::var_os("LITEBOX_DUMP_FRAMES").is_some() {
+        shim.add_drm_flip_callback(move |bytes, width, height, pitch, _pixel_format| {
             let frame = litebox_platform_windows_userland::presentation::Frame {
                 width,
                 height,

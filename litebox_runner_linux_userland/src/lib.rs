@@ -387,7 +387,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             }
         });
         if let Ok(sender) = sender_rx.recv() {
-            shim.set_drm_flip_callback(move |bytes, width, height, pitch, _pixel_format| {
+            shim.add_drm_flip_callback(move |bytes, width, height, pitch, _pixel_format| {
                 sender.send(litebox_platform_linux_userland::presentation::Frame {
                     width,
                     height,

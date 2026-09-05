@@ -25,8 +25,8 @@
 //!   shared memory buffer. `DRM_IOCTL_MODE_MAP_DUMB` assigns a unique offset which is mapped via
 //!   `mmap()` directly into the guest address space.
 //! - **Framebuffer & Page Flipping**: `DRM_IOCTL_MODE_ADDFB2` attaches the dumb buffer to a framebuffer handle.
-//!   `DRM_IOCTL_MODE_PAGE_FLIP` sets the CRTC scanout framebuffer and triggers the `flip_callback`.
-//! - **wgpu Host Presentation Pipeline**: When `set_flip_callback` is registered (such as by
+//!   `DRM_IOCTL_MODE_PAGE_FLIP` sets the CRTC scanout framebuffer and triggers every registered flip callback.
+//! - **wgpu Host Presentation Pipeline**: When a flip callback is registered via `add_flip_callback` (such as by
 //!   `litebox_platform_windows_userland::presentation::Presenter`), every `DRM_IOCTL_MODE_PAGE_FLIP`
 //!   transfers the active framebuffer's pixels to the host `wgpu` surface for real window presentation.
 //! - **Page-flip Events**: `DRM_MODE_PAGE_FLIP_EVENT` pushes `DrmEventVblank` into the pending queue,
@@ -268,13 +268,23 @@ pub(crate) struct DrmSubsystem<Platform: ShimPlatform> {
     /// `(width, height, pitch, pixel_format)`. `litebox_shim_linux` is platform-agnostic and
     /// cannot depend on a concrete presentation layer (e.g.
     /// `litebox_platform_windows_userland`'s wgpu-backed `Presenter`), so this stays a generic
-    /// callback set post-construction (see [`Self::set_flip_callback`]) by whichever runner
+    /// callbacks set post-construction (see [`Self::add_flip_callback`]) by whichever runner
     /// binary DOES depend on both crates and wants to actually display flipped frames -- a runner
     /// that never calls the setter (or a non-GUI runner target) simply never invokes it, at zero
     /// cost beyond one extra `Option` check per flip.
-    flip_callback: litebox::sync::Mutex<
+    /// A LIST, not a single slot. Frame observers are genuinely independent subsystems and
+    /// more than one is routinely wanted at once: a `--gui` window presenting to the user AND a
+    /// `LITEBOX_DUMP_FRAMES` capture recording the exact same frames for verification. When this
+    /// was a single `Option`, installing either one silently REPLACED the other, so the runner
+    /// had to gate them against each other (`if gui_presenter_thread.is_none()`) and the two
+    /// modes were mutually exclusive by construction -- you could watch the display or capture
+    /// it, never both, which is precisely when capture matters most (proving what the window is
+    /// showing). Appending keeps each observer independent: one that hangs or panics cannot
+    /// deprive the others of frames, matching the runner's own established reasoning that frame
+    /// verification must never be hostage to the flakier windowing/wgpu path.
+    flip_callbacks: litebox::sync::Mutex<
         Platform,
-        Option<alloc::boxed::Box<dyn Fn(&[u8], u32, u32, u32, u32) + Send + Sync>>,
+        alloc::vec::Vec<alloc::boxed::Box<dyn Fn(&[u8], u32, u32, u32, u32) + Send + Sync>>,
     >,
 }
 
@@ -296,22 +306,26 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             flip_pollee: Pollee::new(),
             next_vblank_sequence: AtomicU32::new(0),
             is_master: core::sync::atomic::AtomicBool::new(false),
-            flip_callback: litebox::sync::Mutex::new(None),
+            flip_callbacks: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
         }
     }
 
-    /// Install (or replace) the host-side flip callback -- see [`Self::flip_callback`]'s doc
+    /// Append a host-side frame observer -- see [`Self::flip_callbacks`]'s doc
     /// comment for when/why a runner calls this, and why it takes plain pixel bytes rather than
     /// the platform-specific shared-memory handle. Not part of [`Self::new`] itself since
     /// `litebox_shim_linux` has no presentation layer of its own to default to; a runner that
     /// wants flipped frames actually displayed calls this once, right after
     /// [`crate::LinuxShimBuilder::build`], with a closure that forwards the bytes to its own
     /// window/GPU-surface presentation code.
-    pub fn set_flip_callback(
+    /// Observers are ADDITIVE: calling this twice installs two, both invoked per flip in
+    /// registration order. It does not replace a previously-installed one.
+    pub fn add_flip_callback(
         &self,
         callback: impl Fn(&[u8], u32, u32, u32, u32) + Send + Sync + 'static,
     ) {
-        *self.flip_callback.lock() = Some(alloc::boxed::Box::new(callback));
+        self.flip_callbacks
+            .lock()
+            .push(alloc::boxed::Box::new(callback));
     }
 
     /// Pop the oldest pending flip-completion event, if any, encoded as the exact bytes a real
@@ -546,9 +560,9 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     /// fails, matching `page_flip`'s own established "a host-side presentation miss must never
     /// fail the guest's own ioctl" contract.
     fn notify_flip_callback(&self, platform: &Platform, fb_id: u32) {
-        let has_callback = self.flip_callback.lock().is_some();
-        litebox_util_log::warn!(has_callback:? = has_callback; "drm-diag: notify_flip_callback called");
-        if !has_callback {
+        let callback_count = self.flip_callbacks.lock().len();
+        litebox_util_log::warn!(callback_count:? = callback_count; "drm-diag: notify_flip_callback called");
+        if callback_count == 0 {
             return;
         }
         let Some((handle, size, width, height, pitch, pixel_format)) = ({
@@ -628,7 +642,10 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
                         "diag-drm-flip-source-bytes"
                     );
                 }
-                if let Some(callback) = self.flip_callback.lock().as_ref() {
+                // Every observer sees the same frame. The SAFETY note below depends on all of
+                // them having returned before the mapping is torn down, which this loop
+                // guarantees exactly as the previous single call did.
+                for callback in self.flip_callbacks.lock().iter() {
                     callback(bytes, width, height, pitch, pixel_format);
                 }
                 // SAFETY: `addr..addr+size` is exactly the range just mapped above, and the
