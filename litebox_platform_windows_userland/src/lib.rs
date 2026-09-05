@@ -906,6 +906,24 @@ unsafe extern "system" fn vectored_exception_handler(
         context = &mut *info.ContextRecord;
     }
 
+    // TORN-READ FIX: `context` is a live pointer into the OS-owned `CONTEXT` record. Other
+    // machinery in this process (`ThreadHandle::interrupt`'s `SuspendThread`/`SetThreadContext`,
+    // `ctxwatch_arm_other_threads`' debug-register rewrites) can write that memory concurrently.
+    // Every diagnostic below that read `context.<field>` MORE THAN ONCE in a single statement was
+    // therefore capable of printing an internally inconsistent ("torn") register set -- e.g. an
+    // `eprintln!` whose printed `rip` and printed `rva` (both derived from `context.Rip`) do not
+    // algebraically agree via `module_base`. That is not hypothetical: it is exactly how the
+    // long-chased phantom `rip=0x2e` crash signature was manufactured across many prior
+    // investigation passes (AGENTS archive "pass-644" and siblings chased it directly).
+    //
+    // Take ONE plain struct copy up front and print from that. `CONTEXT` is `Copy` and this is a
+    // fixed-size stack copy of already-valid, already-mapped memory -- no allocation, no locks, no
+    // call that can itself fault, which is precisely what real crash handlers do first. It is
+    // deliberately used for LOGGING ONLY: reads that feed real control flow (the `context.Rip == 0`
+    // gates, `rip_in_global_allocator`, exception-table lookup) and all `context.<field> = ...`
+    // writes still go through the live `context`, so this change cannot alter behaviour.
+    let context_snapshot: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = *context;
+
     // Pass (2026-08-27 XFCE session, take 2): call the raw, allocation-free, lock-free
     // `diag_raw_regdump` (WriteFile-on-stack, same mechanism the global allocator's own
     // diagnostics use) as the UNCONDITIONAL, LITERAL FIRST thing this handler does with
@@ -929,15 +947,15 @@ unsafe extern "system" fn vectored_exception_handler(
         diag_raw_regdump(
             exception_record.ExceptionCode.cast_unsigned(),
             exception_record.ExceptionInformation[1],
-            context.Rip as usize,
-            context.Rax as usize,
-            context.Rbx as usize,
-            context.Rcx as usize,
-            context.Rdx as usize,
-            context.Rsi as usize,
-            context.Rdi as usize,
-            context.Rsp as usize,
-            context.Rbp as usize,
+            context_snapshot.Rip as usize,
+            context_snapshot.Rax as usize,
+            context_snapshot.Rbx as usize,
+            context_snapshot.Rcx as usize,
+            context_snapshot.Rdx as usize,
+            context_snapshot.Rsi as usize,
+            context_snapshot.Rdi as usize,
+            context_snapshot.Rsp as usize,
+            context_snapshot.Rbp as usize,
         );
     }
 
@@ -1686,17 +1704,17 @@ unsafe extern "system" fn vectored_exception_handler(
                 eprintln!(
                     "[diag-unrecov-av] tid={:?} rip={:#x} rva={:#x} addr={:#x} rsp={:#x} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x} is_in_guest={} is_verifying={} -- no exception-table entry found",
                     std::thread::current().id(),
-                    context.Rip,
-                    (context.Rip as usize).wrapping_sub(module_base),
+                    context_snapshot.Rip,
+                    (context_snapshot.Rip as usize).wrapping_sub(module_base),
                     exception_record.ExceptionInformation[1],
-                    context.Rsp,
-                    context.Rax,
-                    context.Rbx,
-                    context.Rcx,
-                    context.Rdx,
-                    context.Rsi,
-                    context.Rdi,
-                    context.Rbp,
+                    context_snapshot.Rsp,
+                    context_snapshot.Rax,
+                    context_snapshot.Rbx,
+                    context_snapshot.Rcx,
+                    context_snapshot.Rdx,
+                    context_snapshot.Rsi,
+                    context_snapshot.Rdi,
+                    context_snapshot.Rbp,
                     tls.is_in_guest.get(),
                     fork_verify::is_verifying(tls),
                 );
@@ -1711,22 +1729,22 @@ unsafe extern "system" fn vectored_exception_handler(
                     // fault, without needing full per-instruction register-history tracing.
                     let fault_addr_val = exception_record.ExceptionInformation[1] as u64;
                     let matches: alloc::vec::Vec<&str> = [
-                        ("rax", context.Rax),
-                        ("rbx", context.Rbx),
-                        ("rcx", context.Rcx),
-                        ("rdx", context.Rdx),
-                        ("rsi", context.Rsi),
-                        ("rdi", context.Rdi),
-                        ("rbp", context.Rbp),
-                        ("rsp", context.Rsp),
-                        ("r8", context.R8),
-                        ("r9", context.R9),
-                        ("r10", context.R10),
-                        ("r11", context.R11),
-                        ("r12", context.R12),
-                        ("r13", context.R13),
-                        ("r14", context.R14),
-                        ("r15", context.R15),
+                        ("rax", context_snapshot.Rax),
+                        ("rbx", context_snapshot.Rbx),
+                        ("rcx", context_snapshot.Rcx),
+                        ("rdx", context_snapshot.Rdx),
+                        ("rsi", context_snapshot.Rsi),
+                        ("rdi", context_snapshot.Rdi),
+                        ("rbp", context_snapshot.Rbp),
+                        ("rsp", context_snapshot.Rsp),
+                        ("r8", context_snapshot.R8),
+                        ("r9", context_snapshot.R9),
+                        ("r10", context_snapshot.R10),
+                        ("r11", context_snapshot.R11),
+                        ("r12", context_snapshot.R12),
+                        ("r13", context_snapshot.R13),
+                        ("r14", context_snapshot.R14),
+                        ("r15", context_snapshot.R15),
                     ]
                     .iter()
                     .filter(|(_, v)| *v == fault_addr_val)
@@ -1768,7 +1786,7 @@ unsafe extern "system" fn vectored_exception_handler(
                 // to recover the call chain even though `rip` itself is a wild jump into
                 // non-code memory and cannot be symbolized or unwound normally.
                 {
-                    let rsp = context.Rsp as usize;
+                    let rsp = context_snapshot.Rsp as usize;
                     for i in 0..32usize {
                         let addr = rsp.wrapping_add(i * 8);
                         // `read_unaligned`, not `read_volatile`: this code runs precisely when
