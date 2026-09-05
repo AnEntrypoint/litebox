@@ -200,6 +200,12 @@ unrelated host processes (browser automation, stale sessions) or waiting for loa
 further litebox-side memory work. A small image (e.g. `busybox:latest`, or any image whose largest
 layer is under a few hundred MB) remains reliable regardless of host load.
 
+**Every `linuxserver/webtop:*` flavor shares the same ~519MB blocking layer** (digest
+`sha256:22809eee...`, confirmed identical across `alpine-openbox` and `alpine-icewm`'s manifests --
+almost certainly the common base rootfs all flavors build on). This means picking a different
+desktop flavor within the webtop family does NOT avoid the memory constraint; only a genuinely
+different, non-webtop image (or waiting for host memory to clear) does.
+
 **Canonical layer for the (older, hand-assembled, weston-based) XFCE path**:
 `.wfgy/xfce-build/layer31_direct_fixed.tar` -- superseded in priority by the stock-image path
 above, but still the one confirmed-working weston/XFCE combination from earlier in this project
