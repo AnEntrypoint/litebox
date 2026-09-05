@@ -3298,6 +3298,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             is_process_clone:% = is_process_clone;
             "clone: spawned new task"
         );
+        // Always-on process-timeline diagnostic, the fork-side counterpart to `DIAG_TIMELINE
+        // execve`/`exit`/`exit_signal`. Without it, a child that dies in the window BETWEEN
+        // `clone()` and `execve()` -- exactly the window `Vmem::duplicate`'s region-relocation
+        // grouping governs -- is invisible except as a pid missing from the execve list, which
+        // has to be inferred by hand. Emitting the clone side makes "every forked child reached
+        // execve" a direct count comparison instead of an inference. `error` level for the same
+        // reason as its siblings: always visible regardless of the configured log filter.
+        if is_process_clone {
+            litebox_util_log::error!(
+                pid:% = self.pid,
+                comm:? = self.comm.get(),
+                child_tid:% = child_tid;
+                "DIAG_TIMELINE clone"
+            );
+        }
 
         // `vfork()`'s POSIX contract: the calling thread is suspended until the child calls
         // `execve` or exits. Block AFTER the child's host thread has been successfully spawned
