@@ -307,6 +307,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShimEntrypoints<Platform, FS> {
 pub struct LinuxShimBuilder<Platform: ShimPlatform> {
     platform: &'static Platform,
     litebox: LiteBox<Platform>,
+    /// Shared with `GlobalState::proc_self_info` once `build()` runs -- created here (rather than
+    /// in `build()`) because `default_fs` (which mounts the `/proc/self` backend sharing this
+    /// same cell) always runs before `build()`. See `GlobalState::proc_self_info`'s doc comment.
+    proc_self_info: Arc<litebox::sync::RwLock<Platform, litebox::fs::procfs::ProcSelfInfo>>,
 }
 
 impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
@@ -315,6 +319,9 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         Self {
             platform,
             litebox: LiteBox::new(platform),
+            proc_self_info: Arc::new(litebox::sync::RwLock::new(
+                litebox::fs::procfs::ProcSelfInfo::default(),
+            )),
         }
     }
 
@@ -329,7 +336,13 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
         tar_data: Cow<'static, [u8]>,
     ) -> DefaultFS<Platform> {
-        default_fs(&self.litebox, in_mem_fs, vec![tar_data])
+        default_fs(
+            &self.litebox,
+            self.platform,
+            in_mem_fs,
+            vec![tar_data],
+            self.proc_self_info.clone(),
+        )
     }
 
     /// Create a default layered file system whose read-only lower layer is built from MULTIPLE
@@ -344,7 +357,13 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
         tar_layers: Vec<Cow<'static, [u8]>>,
     ) -> DefaultFS<Platform> {
-        default_fs(&self.litebox, in_mem_fs, tar_layers)
+        default_fs(
+            &self.litebox,
+            self.platform,
+            in_mem_fs,
+            tar_layers,
+            self.proc_self_info.clone(),
+        )
     }
 
     /// Build the shim.
@@ -372,6 +391,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             drm: syscalls::drm::DrmSubsystem::new(),
             evdev: syscalls::evdev::EvdevSubsystem::new(),
             memfds: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+            proc_self_info: self.proc_self_info,
         });
         LinuxShim(global)
     }
@@ -807,9 +827,22 @@ impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
 /// (bottom-to-top) tar layers backing the read-only lower layer.
 fn default_fs<Platform: ShimPlatform>(
     litebox: &LiteBox<Platform>,
+    platform: &'static Platform,
     in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
     tar_layers: Vec<Cow<'static, [u8]>>,
+    proc_self_info: Arc<litebox::sync::RwLock<Platform, litebox::fs::procfs::ProcSelfInfo>>,
 ) -> LinuxFS<Platform> {
+    // Real host logical-CPU count -- see `litebox::platform::SystemInfoProvider::cpu_count`'s doc
+    // comment for why GLib's thread-pool sizing needs this to be accurate, not just present.
+    let cpu_count = platform.cpu_count();
+    // No live guest-visible memory-pressure tracking exists in this shim; a large fixed value
+    // (4 GiB) is a safe, always-parseable `/proc/meminfo` stand-in -- see `format_meminfo`'s doc
+    // comment for why the exact value is not load-bearing for any known consumer.
+    const MEM_TOTAL_KB: u64 = 4 * 1024 * 1024;
+    // No live wall-clock uptime source is reachable from this `no_std` shim at `default_fs` time
+    // (before `GlobalState::boot_time` exists) -- a fixed placeholder is fine, see
+    // `format_uptime`'s doc comment.
+    const BOOT_UPTIME_SECS: u64 = 0;
     let dev_stdio = litebox::fs::resolver::Resolver::new(
         litebox,
         litebox::fs::composer::Composer::builder()
@@ -836,6 +869,18 @@ fn default_fs<Platform: ShimPlatform>(
             })
             .mount("/proc/sys/kernel", |allocator| {
                 litebox::fs::devices::ProcSysKernel::new(litebox, allocator)
+            })
+            .mount("/proc", |allocator| {
+                litebox::fs::procfs::Procfs::new(
+                    litebox,
+                    allocator,
+                    cpu_count,
+                    MEM_TOTAL_KB,
+                    BOOT_UPTIME_SECS,
+                )
+            })
+            .mount("/proc/self", |allocator| {
+                litebox::fs::procfs::ProcSelf::new(litebox, allocator, proc_self_info)
             })
             .build()
             .unwrap(),
@@ -2287,6 +2332,12 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// `dup()`/`fork()`, must resolve to the SAME real shared-memory handle, not a fresh one per
     /// fd number). See `syscalls::mm::MemfdRegistry`'s own doc comment for the full shape.
     memfds: litebox::sync::Mutex<Platform, syscalls::mm::MemfdRegistry<Platform>>,
+    /// Backing cell for the guest-visible `/proc/self/*` synthesis (see
+    /// `litebox::fs::procfs::ProcSelf`), updated on every `execve` (see
+    /// `Task::load_program`). Shared (not owned solely by the mounted backend) so
+    /// `Task::load_program` -- which has no reference to the mounted `Backend` trait object, only
+    /// to `GlobalState` -- can update it.
+    proc_self_info: Arc<litebox::sync::RwLock<Platform, litebox::fs::procfs::ProcSelfInfo>>,
 }
 
 struct Task<Platform: ShimPlatform, FS: ShimFS> {
