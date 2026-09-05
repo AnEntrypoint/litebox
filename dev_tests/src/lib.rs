@@ -4,31 +4,13 @@
 //! This crate only makes sense in testing mode
 #![cfg(test)]
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use std::path::PathBuf;
+
+use dev_util::project_root;
 
 mod boilerplate;
 mod ratchet;
-
-/// Finds and switches to the project root directory.
-///
-/// This is to make the rest of the reasoning easier.
-pub(crate) fn project_root() -> Result<PathBuf> {
-    let mut dir = std::env::current_dir().ok().unwrap();
-    loop {
-        if dir.join("target").is_dir() {
-            std::env::set_current_dir(&dir)?;
-            eprintln!(
-                "Changed working directory to project root: {}",
-                dir.display()
-            );
-            return Ok(dir);
-        }
-        if !dir.pop() {
-            return Err(anyhow!("Could not find project root"));
-        }
-    }
-}
 
 /// Get all source files by taking all files that are not ignored by `.gitignore`.
 pub(crate) fn all_source_files() -> Result<Vec<PathBuf>> {

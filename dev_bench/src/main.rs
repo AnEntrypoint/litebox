@@ -3,6 +3,7 @@
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
+use dev_util::project_root;
 use std::sync::atomic::Ordering::Relaxed;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -192,23 +193,6 @@ fn list_benchmarks() {
     println!("Available benchmarks:");
     for (name, _func) in BENCHMARKS {
         println!(" - {name}");
-    }
-}
-
-/// Finds and switches to the project root directory.
-///
-/// This is to make the rest of the reasoning easier.
-fn project_root() -> Result<PathBuf> {
-    let mut dir = std::env::current_dir().ok().unwrap();
-    loop {
-        if dir.join("target").is_dir() {
-            std::env::set_current_dir(&dir)?;
-            debug!(dir = %dir.display(), "Changed working directory to project root");
-            return Ok(dir);
-        }
-        if !dir.pop() {
-            return Err(anyhow!("Could not find project root"));
-        }
     }
 }
 
