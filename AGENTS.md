@@ -236,6 +236,22 @@ unavailable, and `lib.rs:1014` already special-cases exactly that value. Also: `
 revisions of this section was never a real function name; fixed here to avoid sending a future
 pass looking for one.
 
+**Second correction (2026-09-05, live evidence this time, not code-reading)**: the `lib.rs:869`
+comment cited just above -- asserting the causative first fault is `is_in_guest=true, addr=
+usize::MAX` -- is now itself suspect. A live repro (`mate-session --version` x3 against
+`webtop_seatd.tar`, `LITEBOX_DIAG_FAULT_VQ=1` widened to fire on any guest-mode access violation
+regardless of `rip == cr2`, no `LITEBOX_VEH_TRACE`) captured 154 real access-violation events
+across two runs. EVERY one showed `is_in_guest=false, addr=0x2` -- the opposite of what that
+comment claims, and none in `HOST_ALLOCATOR_REGION_MIN`'s range (ruling out a separate,
+now-refuted "corrupt guest FS-base reads host heap" hypothesis this same investigation raised and
+tested). `is_in_guest=false` means the fault is in HOST-side code, not guest code -- consistent
+with the SEH-unwind-cascade theory (a small-integer deref like `0x2` fits an unwinder walking
+through a garbage pointer), but flatly inconsistent with `lib.rs:869`'s own claimed evidence.
+Either that comment describes a genuinely different fault than the one that reproduces via this
+repro, or it's stale/wrong. Treat `lib.rs:869`'s specific claim as unverified until someone
+re-examines it directly against fresh evidence -- do not build further theory on top of it without
+first resolving this contradiction.
+
 **Concrete next step, not yet attempted, and cheaper than either of the two below**: capture
 depth-0 (`is_in_guest=true`) via the already-existing allocation-free `RECENT_FAULTS` ring
 (`lib.rs:587`) or `diag_raw_regdump`, against the exact `mate-session --version` x3 repro --
