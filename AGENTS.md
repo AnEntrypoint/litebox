@@ -108,24 +108,97 @@ ad-hoc Python script this project previously hand-rolled for the same purpose (`
 `batch_rewrite_layer.py`, `fetch_container.py` -- all retired, do not recreate them).
 
 **`linuxserver/webtop:alpine-mate` ships MATE, not XFCE** (see standing lessons above).
-`linuxserver/webtop:alpine-xfce` does NOT exist (404) -- do not pull it. For a genuine XFCE
-desktop, use `debian-xfce` or `ubuntu-xfce` (preferred over `arch-xfce`: pacman-built Arch layers
-are the most Windows-path-hostile of the real XFCE tags). Status: pull/boot attempted against
-`arch-xfce` this session, not yet finalized -- check `git log` for the most recent commit before
-assuming either success or failure, and prefer retrying against `debian-xfce`/`ubuntu-xfce` over
-continuing to fight arch's layer shape.
+`linuxserver/webtop:alpine-xfce` does NOT exist (404) -- do not pull it. `debian-xfce` genuinely
+ships an XFCE-family image but its actual window manager/desktop content is Selkies/pixelflux +
+Wayland (labwc/openbox), NOT a plain xfce4-session/xfwm4/xfdesktop stack -- confirmed live by
+tar-listing every rewritten binary across all 17 layers of `debian-xfce`: zero `xfwm4`,
+`xfdesktop`, `xfsettingsd`, `xfce4-panel`, `xfce4-session`, `startxfce4` anywhere; only
+`xfconfd` (a settings daemon other desktops also depend on) and two each of `openbox`/`labwc`.
+This is the alpine-mate lesson repeating a third time -- **always verify a desktop image's actual
+WM/session binaries by direct registry manifest + blob tar-listing BEFORE pulling for a boot**,
+never trust the tag name. A registry pull token + manifest/blob fetch via plain `curl` (no docker/
+skopeo needed) is enough to check this in seconds, at zero litebox-side cost, before committing to
+a 20-minute pull.
 
-**Runtime, in-memory OCI loading (in progress)**: extracting an OCI image's layers onto a real
-host directory before packaging is fundamentally the wrong approach on Windows -- NTFS case-
+**Runtime OCI images are structurally the wrong shape for this project's actual DRM device.**
+`litebox`'s virtual DRM device (`litebox_shim_linux/src/syscalls/drm.rs`) is legacy-KMS + dumb-
+buffer + XRGB8888 only, one fixed 1920x1080 mode, no atomic modeset, no GBM/EGL. A modern
+Selkies/Wayland/GBM-first compositor (what `debian-xfce`/`alpine-openbox` actually ship) is
+pushed onto its least-tested software-rendering fallback path. **`Xorg` with the `modesetting`
+driver is the correct target, not `Xvfb`** -- `Xvfb` renders into a private buffer and NEVER
+touches DRM/KMS at all, so it produces zero page-flips and zero frames, indistinguishable from "the
+guest never drew" (confirmed by reading `drm.rs`'s own flip-callback wiring: it fires only from
+`DRM_IOCTL_MODE_PAGE_FLIP`/`SETCRTC`, no fbdev fallback exists). `modesetting` drives DRM/KMS dumb
+buffers directly -- the exact shape this device implements. Also: **don't boot the container's own
+s6-overlay/selkies entrypoint** -- launch the target binary (`Xorg`, `openbox`, whatever) directly
+as the runner's top-level program via `--oci-image ... -- /usr/bin/Xorg :0 ...`, per this project's
+own harness-isolation lesson one level up; the container's init pulls in Python, WebRTC, hardware
+video encoders, and process supervision that contribute zero pixels and add hundreds of syscalls
+of irrelevant surface.
+
+**Runtime, in-memory OCI loading (implemented, working)**: extracting an OCI image's layers onto a
+real host directory before packaging was fundamentally the wrong approach on Windows -- NTFS case-
 insensitivity, reserved colons in pacman package-db paths, and dir/file type collisions across
-layers each independently broke `litebox_packager`'s real-directory extraction this session (three
-distinct bugs, patched one at a time, until the pattern itself was recognized as the problem).
-The fix in progress: teach `litebox`'s existing no_std, in-memory `tar_ro.rs` filesystem backend to
-merge multiple OCI layer tars itself (bottom-to-top, whiteout/opaque-whiteout aware) and never
-touch a real host directory at all. **Perf constraint that must hold**: `tar_ro.rs` is on the hot
-path for every guest file read -- the multi-layer index must be built ONCE at mount time (a single
-path -> (layer, offset) map with whiteouts resolved at index-build time), not re-scanned per
-lookup; an O(layers × entries) per-`open()` walk would silently regress every guest file access.
+layers each independently broke `litebox_packager`'s real-directory extraction (three distinct
+bugs, patched one at a time, until the pattern itself was recognized as the problem). Fixed:
+`litebox_runner_linux_on_windows_userland --oci-image <ref>` pulls, merges (OCI whiteout-aware,
+hard-link-aware), and syscall-rewrites every layer entirely in memory via `litebox::fs::tar_ro::
+TarRo::from_layers` + `litebox_packager::oci::{pull_layers_in_memory, rewrite_layer_elfs}` -- NO
+real host directory is ever created for the rootfs. Verified live: `docker.io/library/busybox:
+latest` pulled, merged, rewritten, booted, real guest output. The ahead-of-time
+`litebox_packager --oci-image <ref> --output <tar>` path still exists unchanged for callers that
+want a pre-built, reusable flat tar (used e.g. by `litebox_runner_linux_on_windows_userland
+--initial-files`).
+
+**Real, load-bearing perf constraint already satisfied**: `tar_ro.rs` is on the hot path for every
+guest file read -- the multi-layer index is built ONCE at mount time (a single path ->
+(layer, offset) map with whiteouts resolved at index-build time), not re-scanned per lookup.
+
+**Memory: pulling a large image's largest layer can OOM -- four real, independent, now-fixed bugs,
+plus a genuine remaining constraint that ISN'T a litebox bug.** All four were found via a real
+`RUST_BACKTRACE=1`/live-process-monitoring investigation on a real large image
+(`linuxserver/webtop:debian-xfce`, largest layer ~910MB compressed / ~2.56GB decompressed):
+1. `rewrite_layer_elfs`'s output buffer was sized to the INPUT's exact byte length
+   (`Vec::with_capacity(layer_tar.len())`), but the rewritten output is always slightly larger
+   (trampoline code, 512-byte tar block rounding) -- the first overflow triggered `Vec`'s
+   capacity-DOUBLING policy on an already-multi-GiB buffer (reproduced exactly:
+   2,565,094,400 -> 5,130,188,800 bytes, precisely 2x). Fixed: reserve proportional headroom
+   (5%, 1MiB floor) instead of an exact-fit capacity.
+2. The initial network-pull buffer and the gzip-decompression output buffer both grew from
+   `Vec::new()` via the same doubling pattern. Fixed: pre-size both using the manifest's already-
+   known compressed size (`layer_desc.size`) and a 4x gzip-ratio estimate.
+3. Even with (1)+(2), the decompressed layer (a full ordinary heap `Vec`, ~2.56GB) and
+   `rewrite_layer_elfs`'s own output buffer (~2.56GB) were BOTH resident simultaneously during the
+   rewrite call -- a genuine ~5.1GB peak of ordinary, non-page-cache-evictable heap memory. Fixed:
+   decompression now streams via `std::io::copy` into a temp file, which is then mmap'd and passed
+   as the rewrite's `&[u8]` input (zero signature change needed) -- the input is now page-cache-
+   evictable under memory pressure instead of hard-pinned.
+4. `rewrite_layer_elfs`'s OUTPUT was still a full in-memory `Vec` even after (3). Fixed: it now
+   writes its output tar directly to a file on disk (streaming, via a generic `<W: Write>` sink)
+   which becomes the on-disk cache file directly (atomic rename into place) -- **the success path
+   now holds no whole-layer-sized heap buffer at all**, only a small `BufWriter` chunk plus one
+   file's worth of per-entry rewrite data at a time (already true before this fix). A digest+
+   rewriter-version-keyed on-disk cache (`.litebox-cache/<digest>_v<version>.tar`, gitignored) also
+   means a repeat pull of the same image+layer skips network+decompress+rewrite entirely (verified
+   live: cold pull ~7.3s, warm cache-hit ~4.4s for a small image; wins scale with layer size).
+   All four fixes verified via real busybox boots on both the runtime and ahead-of-time paths.
+
+**What's left is NOT a litebox bug -- it's host memory exhaustion, confirmed by direct evidence.**
+Even with all four fixes landed and active (confirmed via log lines: "rewritten directly to disk,
+... streamed directly, no in-memory copy"), pulling `debian-xfce`'s and `alpine-openbox`'s largest
+layer still gets the whole process killed by an external low-memory watchdog -- but the killed
+process itself showed smooth, unremarkable linear memory growth (not a runaway allocation), and,
+decisively, a completely unrelated trivial PowerShell monitoring script running concurrently was
+ALSO killed by the same watchdog at the same moment -- ruling out a Rust-specific allocation
+failure and confirming genuine physical-memory-threshold contention from OTHER processes. Measured
+directly: Chrome (under `chrome-devtools-mcp` browser-automation control) grew ~1.9GB in one
+20-minute window while every other process stayed flat, which alone accounted for the entire
+free-memory decline on a 16GB host. **Do not chase this as a litebox bug** -- if a large-image pull
+gets killed and free host memory is already low (check `Get-CimInstance Win32_OperatingSystem |
+Select FreePhysicalMemory` before assuming a regression), the fix is closing memory-hungry
+unrelated host processes (browser automation, stale sessions) or waiting for load to clear, not
+further litebox-side memory work. A small image (e.g. `busybox:latest`, or any image whose largest
+layer is under a few hundred MB) remains reliable regardless of host load.
 
 **Canonical layer for the (older, hand-assembled, weston-based) XFCE path**:
 `.wfgy/xfce-build/layer31_direct_fixed.tar` -- superseded in priority by the stock-image path
