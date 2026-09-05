@@ -546,6 +546,81 @@ pub mod cache {
         }
     }
 
+    /// Build a fresh, process-and-call-unique temp file path inside the cache directory
+    /// (creating the directory if needed), for a caller that wants to write the rewritten bytes
+    /// itself (streaming) rather than handing this module an already-built `Vec<u8>`. Pair with
+    /// [`finalize_temp_into_cache`] to atomically publish it as the real cache entry.
+    pub fn temp_path_in_cache_dir() -> anyhow::Result<PathBuf> {
+        let dir = Path::new(CACHE_DIR);
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create cache directory {}", dir.display()))?;
+        let pid = std::process::id();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        Ok(dir.join(format!(".tmp-rewrite-{pid}-{unique}")))
+    }
+
+    /// Atomically publish a caller-written temp file (see [`temp_path_in_cache_dir`]) as the real
+    /// cache entry for `(layer_digest, rewriter_version)`, then immediately re-open and mmap it --
+    /// the streaming-output counterpart to [`write_and_map_cached_layer`]. Since the caller
+    /// already wrote the rewritten bytes directly to `tmp_path` (rather than building a `Vec<u8>`
+    /// and handing it to this module), this is JUST the atomic rename-into-place plus mmap, with
+    /// no second copy of the bytes ever created -- the file the rewrite produced BECOMES the
+    /// cache file.
+    ///
+    /// On any failure (rename, reopen, or mmap), removes the leftover temp file best-effort and
+    /// returns `Err` so the caller can fall back to an in-memory `Cow::Owned` rewrite, exactly as
+    /// `write_and_map_cached_layer` does for its own failure path.
+    pub fn finalize_temp_into_cache(
+        tmp_path: &Path,
+        layer_digest: &str,
+        rewriter_version: u32,
+        verbose: bool,
+    ) -> anyhow::Result<Cow<'static, [u8]>> {
+        let final_path = cache_path(layer_digest, rewriter_version);
+        let result = (|| -> anyhow::Result<Cow<'static, [u8]>> {
+            std::fs::rename(tmp_path, &final_path).with_context(|| {
+                format!(
+                    "failed to atomically rename {} -> {}",
+                    tmp_path.display(),
+                    final_path.display()
+                )
+            })?;
+            let file = std::fs::File::open(&final_path).with_context(|| {
+                format!("failed to reopen cache file {}", final_path.display())
+            })?;
+            // SAFETY: mirrors `read_cached_layer` -- this file was just renamed into place from a
+            // process-and-call-unique temp path, so no other writer can be mutating it.
+            let mmap = unsafe { memmap2::Mmap::map(&file) }
+                .with_context(|| format!("failed to mmap cache file {}", final_path.display()))?;
+            let leaked: &'static memmap2::Mmap = Box::leak(Box::new(mmap));
+            Ok(Cow::Borrowed(&leaked[..]))
+        })();
+
+        match &result {
+            Ok(mmapped) => {
+                if verbose {
+                    eprintln!(
+                        "  [cache] wrote {} bytes to {} (streamed directly, no in-memory copy)",
+                        mmapped.len(),
+                        final_path.display()
+                    );
+                }
+            }
+            Err(e) => {
+                if verbose {
+                    eprintln!(
+                        "  [cache] failed to finalize streamed cache entry for {layer_digest} (v{rewriter_version}): {e:#}"
+                    );
+                }
+                let _ = std::fs::remove_file(tmp_path);
+            }
+        }
+        result
+    }
+
     fn write_cached_layer_inner(final_path: &Path, data: &[u8]) -> anyhow::Result<()> {
         let dir = final_path
             .parent()
@@ -786,8 +861,71 @@ pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<P
                 );
             }
 
-            let rewritten = rewrite_layer_elfs(decompressed_slice, verbose)
-                .with_context(|| format!("failed to rewrite ELFs in layer {}", i + 1))?;
+            // Stream the rewritten OUTPUT tar directly to a temp file on disk instead of building
+            // it as an in-memory `Vec<u8>` -- for a large layer (~2.6GB decompressed, e.g.
+            // `linuxserver/webtop:debian-xfce`'s largest layer) that Vec would be potentially the
+            // largest single allocation in the process, sitting in ordinary non-evictable heap
+            // memory for the whole rewrite. The temp file IS the eventual cache file: on success,
+            // `finalize_temp_into_cache` just renames it into place (atomic, same as
+            // `write_cached_layer`'s own discipline) and mmaps it -- no second copy of the bytes
+            // is ever created. Only if opening the temp file fails do we fall back to the
+            // original in-memory `Vec<u8>` path, preserving correctness on any real host where the
+            // streaming path can't be used (read-only cache dir, disk full, etc.).
+            let mapped = match cache::temp_path_in_cache_dir().and_then(|tmp_path| {
+                let tmp_file = std::fs::File::create(&tmp_path)
+                    .with_context(|| format!("failed to create temp rewrite file {}", tmp_path.display()))?;
+                let mut writer = std::io::BufWriter::new(tmp_file);
+                rewrite_layer_elfs(decompressed_slice, &mut writer, verbose)
+                    .with_context(|| format!("failed to rewrite ELFs in layer {}", i + 1))?;
+                writer
+                    .flush()
+                    .with_context(|| format!("failed to flush rewritten layer {}", i + 1))?;
+                drop(writer);
+                Ok(tmp_path)
+            }) {
+                Ok(tmp_path) => {
+                    if verbose {
+                        eprintln!(
+                            "  Layer {}/{} rewritten directly to disk, publishing to cache...",
+                            i + 1,
+                            num_layers
+                        );
+                    }
+                    match cache::finalize_temp_into_cache(
+                        &tmp_path,
+                        &layer_desc.digest,
+                        rewriter_version,
+                        verbose,
+                    ) {
+                        Ok(mmapped) => mmapped,
+                        Err(_) => {
+                            // The streamed file couldn't be published as the cache entry (rename,
+                            // reopen, or mmap failed). Fall back to an in-memory rewrite so
+                            // correctness is preserved regardless -- this re-runs the (pure,
+                            // in-memory) rewrite once more, which is the same cost the old
+                            // always-in-memory path always paid, not a regression.
+                            let mut out = Vec::new();
+                            rewrite_layer_elfs(decompressed_slice, &mut out, verbose).with_context(|| {
+                                format!("failed to rewrite ELFs in layer {} (fallback)", i + 1)
+                            })?;
+                            cache::write_and_map_cached_layer(&layer_desc.digest, rewriter_version, out, verbose)
+                        }
+                    }
+                }
+                Err(e) => {
+                    if verbose {
+                        eprintln!(
+                            "  [cache] failed to open temp rewrite file for layer {}: {e:#}; rewriting in memory instead",
+                            i + 1
+                        );
+                    }
+                    let mut out = Vec::new();
+                    rewrite_layer_elfs(decompressed_slice, &mut out, verbose)
+                        .with_context(|| format!("failed to rewrite ELFs in layer {}", i + 1))?;
+                    cache::write_and_map_cached_layer(&layer_desc.digest, rewriter_version, out, verbose)
+                }
+            };
+
             if let DecompressedSource::Mmapped { mmap, tmp_path } = source {
                 drop(mmap);
                 let _ = std::fs::remove_file(&tmp_path);
@@ -795,20 +933,12 @@ pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<P
 
             if verbose {
                 eprintln!(
-                    "  Layer {}/{} ready in memory ({} bytes after rewrite)",
+                    "  Layer {}/{} ready ({} bytes after rewrite)",
                     i + 1,
                     num_layers,
-                    rewritten.len()
+                    mapped.len()
                 );
             }
-
-            // Write-through: populate the cache, then immediately re-open it as an mmap and use
-            // THAT instead of the in-memory `rewritten` Vec -- so this cache-MISS layer becomes
-            // page-cache-evictable exactly like a cache-hit layer, in this very run, rather than
-            // staying resident for the guest's whole lifetime (see
-            // `cache::write_and_map_cached_layer`'s doc comment).
-            let mapped =
-                cache::write_and_map_cached_layer(&layer_desc.digest, rewriter_version, rewritten, verbose);
 
             layers.push(mapped);
         }
@@ -840,10 +970,10 @@ pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<P
     })
 }
 
-/// Rewrite every executable ELF entry inside one decompressed OCI layer tar's bytes, eagerly, in
-/// memory, before guest boot -- returning a fresh tar with rewritten ELF payloads spliced in
-/// place of the originals (a rewrite can change a file's size, so entries are rebuilt with a
-/// `tar::Builder` rather than patched in place).
+/// Rewrite every executable ELF entry inside one decompressed OCI layer tar's bytes, eagerly,
+/// before guest boot -- streaming a fresh tar with rewritten ELF payloads spliced in place of the
+/// originals directly into `out` (a rewrite can change a file's size, so entries are rebuilt with
+/// a `tar::Builder` rather than patched in place).
 ///
 /// Eager (at image-load time, host-side, before boot) was chosen over lazy (deferred to each
 /// binary's first `exec()`) or cached (content-hash-keyed, reused across boots): the rewriter
@@ -859,57 +989,46 @@ pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<P
 /// image is booted again) is a legitimate, purely additive follow-up once real usage shows
 /// eager-every-boot rewriting is a measured latency problem -- deliberately deferred rather than
 /// built speculatively against no evidence of that cost.
-pub fn rewrite_layer_elfs(layer_tar: &[u8], verbose: bool) -> anyhow::Result<Vec<u8>> {
+///
+/// Generic over the output sink (`W: Write`) rather than fixed to `Vec<u8>`: the caller
+/// (`pull_layers_in_memory`) streams the OUTPUT tar directly to a file (`BufWriter<File>`) so the
+/// rewritten layer -- potentially the largest single allocation in the process for a big layer
+/// (~2.6GB observed for `linuxserver/webtop:debian-xfce`'s largest layer) -- is never held as one
+/// giant ordinary heap `Vec` at all. On any failure to open that file, the caller falls back to
+/// passing a `Vec<u8>` as `out` instead, so correctness is preserved regardless of which sink is
+/// used; this function itself has no opinion on which sink backs a real file vs. memory.
+pub fn rewrite_layer_elfs<W: Write>(layer_tar: &[u8], out: &mut W, verbose: bool) -> anyhow::Result<()> {
     let mut archive = tar::Archive::new(layer_tar);
-    // Root cause of a real, deterministic OOM on large images (e.g.
-    // `linuxserver/webtop:debian-xfce`'s ~2.4GiB layer): `Vec::with_capacity(layer_tar.len())`
-    // sizes `out` to exactly the INPUT layer's size, but the rewritten OUTPUT tar is always a
-    // little bigger (ELF rewriting adds trampoline code, and every entry is re-emitted through a
-    // fresh `tar::Builder` header, each rounded up to a 512-byte block). The moment `out` needs
-    // even one more byte past that exact capacity, `Vec`'s growth policy doesn't add a little
-    // headroom -- it DOUBLES an already-multi-GiB buffer (reproduced live: input
-    // 2,565,094,400 bytes -> a 5,130,188,800-byte, i.e. exactly 2x, reservation that fails to
-    // allocate; confirmed via `RUST_BACKTRACE=1`, the failing allocation is
-    // `alloc::raw_vec::RawVec::reserve` inside `tar::builder::append`'s `io::copy` into this same
-    // `out` buffer -- not tar-entry corruption, not gzip corruption, not cross-layer
-    // accumulation). Reserving headroom proportional to the input size up front (the rewrite
-    // overhead scales with layer content, not a fixed constant) keeps ordinary per-entry growth
-    // inside the initial allocation, so the doubling-from-huge-buffer path is never hit for a
-    // real layer.
-    let headroom = (layer_tar.len() / 20).max(1024 * 1024); // 5%, floor 1 MiB
-    let mut out = Vec::with_capacity(layer_tar.len().saturating_add(headroom));
-    {
-        let mut builder = tar::Builder::new(&mut out);
-        for entry_result in archive.entries()? {
-            let mut entry = entry_result.context("failed to read tar entry while rewriting")?;
-            let mut header = entry.header().clone();
-            let entry_type = header.entry_type();
-            let path = entry.path()?.into_owned();
+    let mut builder = tar::Builder::new(out);
+    for entry_result in archive.entries()? {
+        let mut entry = entry_result.context("failed to read tar entry while rewriting")?;
+        let mut header = entry.header().clone();
+        let entry_type = header.entry_type();
+        let path = entry.path()?.into_owned();
 
-            if entry_type != tar::EntryType::Regular {
-                // Symlinks, directories, whiteout markers, etc. pass through unchanged --
-                // only regular-file payloads can be an ELF worth rewriting.
-                builder.append(&header, std::io::empty())?;
-                continue;
-            }
-
-            let is_executable = header.mode().is_ok_and(|m| m & 0o111 != 0);
-            let mut data = Vec::new();
-            entry.read_to_end(&mut data)?;
-
-            let out_data = if is_executable {
-                crate::rewrite_elf(&data, &path, verbose)
-            } else {
-                data
-            };
-
-            header.set_size(out_data.len() as u64);
-            header.set_cksum();
-            builder.append_data(&mut header, &path, out_data.as_slice())?;
+        if entry_type != tar::EntryType::Regular {
+            // Symlinks, directories, whiteout markers, etc. pass through unchanged --
+            // only regular-file payloads can be an ELF worth rewriting.
+            builder.append(&header, std::io::empty())?;
+            continue;
         }
-        builder.finish()?;
+
+        let is_executable = header.mode().is_ok_and(|m| m & 0o111 != 0);
+        let mut data = Vec::new();
+        entry.read_to_end(&mut data)?;
+
+        let out_data = if is_executable {
+            crate::rewrite_elf(&data, &path, verbose)
+        } else {
+            data
+        };
+
+        header.set_size(out_data.len() as u64);
+        header.set_cksum();
+        builder.append_data(&mut header, &path, out_data.as_slice())?;
     }
-    Ok(out)
+    builder.finish()?;
+    Ok(())
 }
 
 /// Generate a `litebox/config_and_run.sh` shell script from the OCI image config.
