@@ -6420,3 +6420,81 @@ pass, now that the stock webtop path (`webtop_seatd.tar` and its lineage) is the
 going forward -- see the immediately following commit for exactly what was deleted and why.
 
 Files: `AGENTS.md` (this entry). No code changed.
+
+## Pass 358 -- decisive discovery: this is a MATE image, not XFCE. `xfdesktop` genuinely does not
+exist in the layer at all -- Pass 357's "panel" was never `xfce4-panel`, and the real fix requires
+launching MATE's own components, which routes straight back into the unresolved `mate-session`
+`RtlpUnwindPrologue` crash (Pass 345/355/356) -- reframes remaining scope, does not close it
+
+Investigated Pass 357's own stated next step (xfdesktop wallpaper/icon gap) by first reading
+`xfdesktop.out`'s actual captured stderr (already dumped by `run_xfce_noxwm.sh` before `TEST_DONE`,
+just never read by any prior pass -- same blind spot pattern as weston/Xwayland's own stderr earlier
+in this investigation). One line, decisive: `line 224: xfdesktop: not found`. Not a runtime failure,
+not an xfconf property gap -- the shell could not find the binary at all.
+
+**Confirmed via direct tar listing of `webtop_seatd.tar` (54,275 entries) -- zero occurrences of
+`xfdesktop`, `xfce4-panel`, `xfsettingsd`, or a real `xfwm4` executable anywhere in the layer.** The
+only `xfwm4`-named entries are theme ART ASSETS (`usr/share/themes/*/xfwm4/*.xpm`/`*.png` -- window-
+decoration graphics that `marco`, MATE's own window manager, can reuse) and one `xfconfd` binary
+(`usr/lib/xfce4/xfconf/xfconfd` -- MATE also uses xfconf as its config-storage backend). The REAL
+desktop-environment binaries genuinely present: `usr/bin/mate-session`, `usr/bin/marco`,
+`usr/bin/mate-panel`, `usr/bin/caja` (MATE's file manager, doubles as desktop-icon renderer), plus
+the full `mate-*`/`caja-*`/`marco-*` utility set. **`linuxserver/webtop:alpine-mate` ships MATE, not
+XFCE** -- exactly what its own tag name says, which every prior pass in this investigation (319
+through 357) missed by launching XFCE-named binaries that were never actually there.
+
+**What this means for Pass 357's own "panel" evidence**: the structured, panel-shaped content
+(app-menu-icon cluster at the far left, clock/tray cluster at the far right, ~99-100% row coverage)
+decoded in three separate frame captures was NOT `xfce4-panel` -- that binary never ran, confirmed
+above. The actual source of that rendered content is not yet identified in this pass; candidates
+worth checking (not yet checked): weston's own compositor chrome/background pattern (per this
+project's own established `pixel-count-does-not-identify-the-painter` lesson, memory
+`feedback_pixel_count_does_not_identify_the_painter` -- exactly the same class of mistake), or
+`mate-panel`/`marco` painting something despite `run_xfce_noxwm.sh` never launching them by name
+(unlikely, but not ruled out without more direct evidence). This is a genuine, open question this
+pass does not resolve -- flagged honestly rather than assumed away.
+
+**The real fix requires rewriting the launch script around MATE's own components** (`mate-session`
+or, more conservatively, launching `marco` + `mate-panel` + `caja --force-desktop`/whatever caja's
+own desktop-icon-rendering invocation is called, individually, matching this investigation's own
+established "one component at a time, settle before the next" discipline rather than a monolithic
+`mate-session`). **This routes directly back into the still-unresolved `mate-session`
+`RtlpUnwindPrologue` crash** (Pass 345: deterministic 3rd-consecutive-exec-of-a-large-binary crash;
+Pass 355/356: two fresh attempts at the underlying `litebox/src/mm/exception_table.rs` fault, both
+correctly stopped short of a fix given the depth and an already-once-retracted root-cause theory from
+a 30+-pass archived investigation) -- `mate-session` itself is exactly the kind of large binary that
+trips this bug on its 3rd exec in a sequence, and a real MATE desktop launch will very likely involve
+launching several large MATE binaries (`marco`, `mate-panel`, `caja`, `mate-session` itself) in
+immediate sequence, precisely the trigger shape Pass 345 characterized.
+
+**Not attempted in this pass**: writing the MATE-native launch script, given (a) it would need its
+own careful, incremental construction and live verification (a genuinely new script, not a copy-paste
+fix), and (b) it very plausibly walks straight into the unresolved platform crash rather than
+producing a clean result, which this project's own standing discipline (surfaced explicitly in Pass
+345's own scoping and reaffirmed in Pass 355/356) says should not be attempted a fourth time without
+new diagnostic evidence beyond what's already been tried. This is exactly the kind of scope-reframing
+discovery that belongs back with whoever is coordinating this investigation rather than a unilateral
+attempt in one more pass.
+
+**Honest conclusion**: Pass 357's milestone (`TEST_DONE`, real panel-shaped content, zero crashes)
+still stands as genuinely observed -- but its own interpretation ("XFCE panel confirmed rendering")
+was wrong, since the binaries it attributed that content to don't exist in this image. This pass does
+not fix the wallpaper/icon gap; it discovers that the gap's real shape is "wrong desktop environment
+entirely," which is a more fundamental finding than an xfconf config gap. Recommended concrete next
+steps for whoever continues, in order of increasing risk: (1) identify the actual source of the
+panel-shaped rendered content (cheap, no boot needed -- read weston's own source/config for what it
+paints by default, or diff against a `xfdesktop`-free boot that ALSO skips `xfce4-panel`/`xfsettingsd`
+to see if the same content still appears with literally nothing but weston+Xwayland running); (2) if
+MATE's own desktop is still wanted on this specific image, build a MATE-native equivalent of
+`run_xfce_noxwm.sh` (`marco` in place of `xfwm4`, `mate-panel` in place of `xfce4-panel`, `caja
+--force-desktop`-shaped invocation in place of `xfdesktop`, likely no `xfsettingsd`-equivalent needed
+or a MATE-specific settings daemon instead) and accept the real risk that `mate-session`-shaped
+launch sequences may trip the unresolved `RtlpUnwindPrologue` crash, in which case that crash --
+not xfdesktop, not xfconf -- becomes the actual last blocker; (3) alternatively, pull a genuinely
+XFCE-flavored stock image instead of `alpine-mate` (LinuxServer.io's webtop family also ships
+`alpine-xfce`; a real, different image tag, not a relaunch of the same one under a different script)
+if the goal is specifically an XFCE desktop rather than "whichever DE this particular stock image
+ships."
+
+Files: `AGENTS.md` (this entry). No code changed -- diagnosis only, given the depth of what a real
+fix now requires and the explicit risk of re-triggering an already-scoped-as-too-deep platform bug.
