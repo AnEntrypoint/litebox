@@ -6589,3 +6589,156 @@ ships."
 
 Files: `AGENTS.md` (this entry). No code changed -- diagnosis only, given the depth of what a real
 fix now requires and the explicit risk of re-triggering an already-scoped-as-too-deep platform bug.
+
+## Pass 359 -- dedicated re-investigation of RtlpUnwindPrologue per the user's explicit "fix it
+properly now" directive: genuinely new evidence obtained (first real ring-buffer/stack-dump capture
+of the actual repeated fault), confirms this is the SAME bug family Pass 345/355/356 characterized,
+narrows the mechanism precisely, but does NOT produce a safe, root-caused fix -- stopped rather than
+guess
+
+Context and mandate: the user explicitly authorized committing real, dedicated effort to fixing
+this bug, framing it as foundational to litebox's core "efficient, accurate memory/fork management,
+faster than emulation, in full userland" value proposition -- a fix that silences the symptom
+without genuine causal understanding was explicitly ruled out as unacceptable.
+
+Rebuilt clean, confirmed the diagnostic fix is genuinely live: `git log` confirmed `f1be967d` (the
+VirtualQuery-guarded stack/ring-dump read) is the current HEAD state of
+`litebox_platform_windows_userland/src/lib.rs`; rebuilt `litebox_runner_linux_on_windows_userland.exe`
+fresh (host confirmed clear via tasklist first).
+
+Reproduced the exact Pass 345 repro (webtop_seatd.tar, now at its durable
+`C:\dev\litebox-webtop\` copy, `mate-session --version` x3) with `LITEBOX_DIAG_FATALDUMP=1`. First
+attempt via a full session-bus/dbus-launch launcher script was too noisy to read cleanly -- this
+diagnostic mode's own RAWREGS print fires on EVERY VEH invocation including every ordinary
+fork_verify single-step trap (confirmed via code read: `diag_raw_regdump` is called unconditionally
+once `diag_fataldump_enabled()` is true, not gated to genuine crashes), and multiple concurrent host
+threads/processes interleave their raw, lock-free WriteFile prints into one unreadable stream.
+Re-ran with the exact minimal `sh -c 'mate-session --version' x3` invocation Pass 345 itself used
+(no compositor, no session bus) -- this produced a genuinely readable capture for the first time.
+
+Real, new evidence obtained (filtering out routine code=0x80000004/RAWREGS single-step noise): the
+dominant, REPEATED fault (65 occurrences at the identical rip, triggering the
+MAX_REPEATED_UNRECOV_AV circuit breaker's clean give-up) is rip=0x7ff8da4f587a, code=0xc0000005 (a
+real access violation), is_in_guest=false. Three genuinely new facts this pass's now-working
+diagnostics revealed, none visible to any prior pass:
+
+1. `[codewatch]` (a separate, pre-existing page-watchpoint diagnostic) independently confirms rip
+   itself sits in real, valid, executable module memory: type=0x1000000 (MEM_IMAGE), protect=0x20
+   (PAGE_EXECUTE_READ), alloc_base=0x7ff8da4e0000 -- a real loaded DLL (almost certainly ntdll.dll,
+   consistent with the 0x7ff9.../0x7ff8...-range address class every prior pass already attributed
+   to ntdll!RtlpUnwindPrologue). The crash is NOT a wild jump to garbage code; it's a real ntdll
+   instruction faulting while dereferencing something else.
+2. The fault address itself is genuinely unallocated: [diag-unrecov-av-pagestate] shows
+   BaseAddress=0x0 RegionSize=0x400000 State=0x10000 Protect=0x1 Type=0x0 AllocationProtect=0x0 --
+   State=0x10000 is MEM_FREE. Whatever value ntdll's unwind code is treating as a pointer is not
+   backed by any real allocation at all.
+3. The exact SAME stack contents recur identically across the primary fault and every fault-ring
+   entry ([rsp+0x20]=0x300000000, [rsp+0x28]=0x42a, [rsp+0x38]=0x7ff7f482a7a4 (in-module)) --
+   0x42a matches Pass 345's OWN independently-documented addr(r8)=0x42a finding exactly, confirming
+   this is genuinely the same bug family across two completely independent capture methods (Pass
+   345's raw register dump vs. this pass's stack-content dump), not a coincidence and not a
+   different bug. 0x7ff7f482a7a4 is flagged (in-module) -- a real address inside this project's own
+   litebox_runner_linux_on_windows_userland.exe module range, sitting at a fixed stack offset the
+   fault keeps re-reading.
+
+One initial false lead, caught and ruled out before it could mislead further work: the very FIRST
+fault line in this same capture showed rip=0x0 with a completely different signature (real readable
+UTF-16 environment-variable-name text on its own stack dump, distinct fault address). This looked,
+briefly, like a genuinely different bug -- verified via module_base back-calculation (rip - rva, per
+the code's own wrapping_sub formula) that this would imply an implausibly small 32-bit-range module
+base, confirming rip=0x0 was a real, literal null-pointer fault, structurally unrelated to the
+repeated 0x7ff8da4f587a fault that actually trips the circuit breaker. This was a DIFFERENT, one-off
+event on a different thread, not the bug this investigation has been chasing -- documented here
+specifically so it doesn't get conflated with the real repeated fault in a future pass's own
+re-reading of this same log.
+
+Mechanism, now precisely understood (not guessed), cross-referencing this evidence against
+Microsoft's own current x64 exception-handling documentation (fetched live this pass): per the
+documented unwind procedure's own step 2 -- "If the search doesn't find a function table entry, the
+code is assumed to be part of a leaf function, and RSP directly addresses the return pointer...
+incremented by 8, and step 1 is repeated" -- the absence of a RUNTIME_FUNCTION entry is explicitly
+NOT an error condition to Windows' own unwinder; it is a defined, intentional fallback that treats
+whatever is at [RSP] as a return address and keeps walking. This exactly explains the observed
+signature: litebox's own switch_to_guest_sysret (litebox_platform_windows_userland/src/lib.rs, a
+#[unsafe(naked)] function using a bare jmp into guest code after repointing the real CPU RSP to the
+GUEST's own stack, confirmed via direct code read -- no RUNTIME_FUNCTION/UNWIND_INFO registration
+for it exists anywhere in this codebase, confirmed via grep) leaves no real call-chain frame once
+guest execution begins. When SOME LATER fault (unrelated to this trampoline itself) triggers
+Windows' own SEH unwind dispatch while RIP is inside ntdll's own unwind-walking code, and that walk
+eventually reaches a frame with no genuine RUNTIME_FUNCTION entry describing it (because the
+underlying "call chain" at that point is really just the guest's own stack contents, never built by
+any real Windows call instruction), the documented "leaf function" fallback reads whatever value is
+sitting there -- in this case, apparently 0x42a, a small integer that looks like it could be a
+guest-side file descriptor, small errno, or similar ordinary guest data, not a return address at all
+-- and dereferences THAT as if it were a code pointer, landing on MEM_FREE and faulting.
+
+Why this is NOT the same as Pass 208/209's already-retracted theory, and why a naive
+RtlAddFunctionTable registration for switch_to_guest_sysret would NOT fix this (the specific caution
+the user's own framing of this pass explicitly warned against): Pass 208 proposed missing unwind
+metadata for exception_table.rs's fallible-memory-access primitives' OWN recovery labels -- Pass 209
+correctly retracted that via .fnent showing those primitives' metadata is actually complete. This
+pass's evidence points somewhere structurally different: the problem is not that one specific
+function's metadata is missing -- it's that switch_to_guest_sysret's entire STYLE of guest entry
+(repointing the real CPU RSP to guest-owned memory via a bare jmp, never a call, deliberately with
+no host stack frame at all) means ANY later fault that needs to unwind back through "the call chain
+at this point" is fundamentally asking a question that has no real answer -- there IS no real
+Windows call chain once guest code is running on the guest's own stack, only guest data that happens
+to occupy the same memory a real stack frame would. Registering unwind info FOR
+switch_to_guest_sysret itself would not help: the crash does not happen while executing inside that
+trampoline's own address range (confirmed: the faulting rip=0x7ff8da4f587a is a real ntdll address,
+not within switch_to_guest_start..switch_to_guest_end) -- it happens later, arbitrarily deep into
+guest execution, whenever some OTHER fault's unwind dispatch happens to walk back far enough to
+reach this structurally-frame-less boundary. A RUNTIME_FUNCTION entry can only describe ONE
+function's own prolog/epilog effects on the stack; it cannot retroactively make "the guest's own
+stack, at whatever depth guest execution happens to be at the moment of an unrelated later fault"
+look like a real, describable call chain, because that depth and content is not fixed or known ahead
+of time the way a real function's own frame layout is.
+
+What a genuine fix would need, per this understanding (not attempted this pass, given the depth and
+the explicit standard the user set): the real question is not "what unwind info does
+switch_to_guest_sysret need" but "how should Windows' SEH dispatch behave when a fault occurs while
+genuinely executing INSIDE guest code, where by design there is no real Windows call chain to unwind
+at all." Two directions, neither attempted here:
+- (a) Prevent the unwind dispatch from ever being reached in guest-mode in the first place. The
+  existing code already has a targeted case for this shape: the `if tls.is_in_guest.get()` branch
+  near line 1821 (added per Pass 246's own WER-minidump finding) already terminates cleanly BEFORE
+  reaching EXCEPTION_CONTINUE_SEARCH for a first-chance guest-mode fault with no exception-table
+  entry -- but the REPEATED fault this pass captured is is_in_guest=false at the moment it's
+  captured (post-unwind-dispatch, inside ntdll itself, not in the original guest-mode fault this
+  safeguard targets). This suggests the ORIGINAL triggering fault (whatever guest-mode event first
+  invoked SEH dispatch) may itself be getting past this existing guard somehow, or a DIFFERENT code
+  path reaches the unwinder without first passing through this check -- this specific gap (why does
+  is_in_guest's existing termination not prevent reaching this point at all) is the most concrete,
+  narrow, well-scoped next question, and was NOT resolved this pass; tracing exactly which fault
+  FIRST invoked SEH dispatch (not just where the repeated symptom is currently observed) needs
+  either real minidump capture (see below) or additional targeted instrumentation at the true
+  dispatch entry point, neither built this pass.
+- (b) A real, mature Windows minidump capture (a peer research pass this same session, committed
+  66ed6461, found minidump-writer -- Mozilla's own crash-reporting crate, capable of genuine
+  in-process x86_64 minidump capture via dump_local_context(), callable from inside a live crash
+  handler with no live-debugger attach required, sidestepping the cdb-conflicts-with-single-stepping
+  problem entirely) would give real symbol resolution and proper call-stack reconstruction, settling
+  definitively whether 0x7ff7f482a7a4 (the recurring in-module stack value) is itself
+  switch_to_guest_sysret, a DIFFERENT guest-entry path, or something else entirely -- this pass did
+  not have time to integrate a new crate dependency and wire it into the VEH within its own scope,
+  and doing so carelessly (without verifying minidump-writer's own behavior when invoked from within
+  an already-faulting, potentially stack-corrupted context) would itself risk exactly the kind of
+  "seems to work, not genuinely understood" outcome this pass was explicitly told to avoid.
+
+Honest conclusion: real, new, previously-unseen evidence obtained and precisely documented -- this
+pass definitively confirms (not merely re-asserts) that the repeated fault is the same bug family
+across two independent capture methods, definitively rules out Pass 208/209's retracted theory as
+the mechanism (it is not a missing-metadata-for-one-function problem), and narrows the real question
+to a specific, well-scoped pair of next steps (trace the TRUE first-invoking fault via either
+targeted instrumentation at the actual SEH dispatch entry, or real minidump capture via
+minidump-writer). Per the user's own explicit standard, this pass does NOT ship a fix, because
+neither the exact original triggering fault nor the precise identity of the recurring in-module
+stack value (0x7ff7f482a7a4) is yet confirmed with the certainty a safe fix in this exact code area
+requires, given this file's own documented history of prior CoW-related regressions from acting on
+incomplete evidence in this same session.
+
+Full regression baseline unaffected (no code changed this pass): cargo test -p litebox --lib
+124 passed/26 pre-existing-environmental-failures unchanged, cargo test -p litebox_shim_linux --lib
+181/181 unchanged.
+
+Files: AGENTS.md (this entry). No code changed.
