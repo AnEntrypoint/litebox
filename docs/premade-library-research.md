@@ -147,6 +147,234 @@ right" risk this whole investigation has repeatedly hit.
 | 4. Crash-dump tooling | Yes -- `minidump-writer` (Mozilla) | **Prototype now** -- directly unblocks the stuck diagnostic-visibility problem |
 | 5. `windows-sys` vs `windows` | N/A (pattern observation, not a gap) | Low-priority, revisit opportunistically |
 
+## Part 2: whole-codebase audit
+
+Broader pass per the user's own elevation of this into a standing project mantra
+("go over everything in the project and make sure this is the case... dont
+replace well written libs with code anywhere"). Read every `Cargo.toml` in the
+workspace as the baseline; findings below are organized by the same numbered
+areas requested.
+
+### 1. Workspace dependency baseline (read in full)
+
+All `[workspace] members` Cargo.toml files were read directly:
+`litebox`, `litebox_common_linux`, `litebox_shim_linux`,
+`litebox_platform_windows_userland`, `litebox_platform_linux_userland`,
+`litebox_platform_macos_userland`, `litebox_packager`,
+`litebox_runner_linux_on_windows_userland`, `litebox_runner_linux_userland`,
+`litebox_syscall_rewriter`, `litebox_util_log`, `litebox_util_log_macros`,
+`litebox_termemu`, `litebox_session_daemon` (plus `litebox_common_optee`,
+`litebox_common_lvbs`, `litebox_platform_lvbs`, `litebox_platform_multiplex`,
+and the OP-TEE/SNP/LVBS runners exist but are out of this pass's scope --
+different deployment targets, not touched by any work this session).
+
+### 2. Tar/archive handling -- MAJOR FINDING: a complete, correct Rust implementation already exists and was duplicated in Python this session
+
+**`litebox_packager` already depends on the `tar` crate (`tar = "0.4"`)** and
+**already implements a complete OCI-image-to-litebox-tar pipeline in Rust**,
+including real whiteout-file handling. Confirmed by reading `litebox_packager/
+src/oci.rs` directly:
+- `pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<ExtractedImage>`
+  (line 96) -- pulls a real OCI image via `oci_client::Client`.
+- A documented function (line 88) explicitly states: "Layers are applied in
+  order (bottom-up), handling whiteout files for..." -- the EXACT logic this
+  session's own `advisor/probes/pull_oci_image.py` hand-rolled in Python.
+- Real opaque-whiteout (`.wh..wh..opq`) and regular-whiteout (`.wh.<name>`)
+  handling, confirmed at lines 349-463.
+- `litebox_packager`'s own CLI (`litebox_packager --oci-image
+  docker.io/library/alpine:latest --output out.tar`, confirmed via its
+  `CliArgs` struct at `lib.rs:34-47`, `#[arg(long = "oci-image", ...
+  conflicts_with = "input_files")]`) is **already the complete tool**
+  `advisor/probes/fetch_container.py` was built to be this session, in Python,
+  with a hand-rolled Registry V2 client -- duplicating existing, tested,
+  in-tree Rust functionality.
+
+**This directly changes Part 1's own recommendation** ("worth a follow-up pass
+IF this pulling logic moves into Rust... not worth adopting as a Python
+dependency swap"): the Rust port isn't hypothetical future work, it already
+exists and is a first-class part of this project. `litebox_packager`'s own
+doc comment on its role ("offline tool that converts a pulled OCI/Docker image
+... into a litebox-loadable tar") was quoted correctly in Part 1's own text,
+but its ACTUAL CAPABILITY (pulling directly from a registry ref, not just
+converting an already-pulled image) was under-checked before recommending a
+Python tool be built alongside it.
+
+**Verified live, not just theorized** (this pass, no other litebox process
+running at the time, confirmed via `tasklist` first): `target/release/
+litebox_packager.exe --oci-image docker.io/library/busybox:latest --output
+packager_test.tar` completed in well under 90 seconds --
+
+```
+Pulling OCI image: docker.io/library/busybox:latest
+Scanning rootfs...
+Found 436 files (416 executables to rewrite)
+Rewriting 416 executable ELF files...
+Creating .../packager_test.tar...
+Created .../packager_test.tar (438 entries, 417.8 MB)
+```
+
+-- then that exact output tar was booted directly:
+`litebox_runner_linux_on_windows_userland.exe --initial-files
+packager_test.tar -- bin/sh -c 'echo PACKAGER_WORKS'` printed
+**`PACKAGER_WORKS`**, confirming the pulled-rewritten-packaged tar is
+genuinely, immediately litebox-bootable -- pull, rewrite, and package all in
+one existing command, no Python, no manual multi-step chain. Test artifact
+deleted after verification.
+
+**Recommendation, now confirmed rather than theorized**: retire
+`advisor/probes/pull_oci_image.py`, `advisor/probes/batch_rewrite_layer.py`,
+and `advisor/probes/fetch_container.py` in favor of `litebox_packager
+--oci-image <ref> --output <tar>`, which is the ALREADY-BUILT, ALREADY-WORKING
+equivalent -- verified live in this same pass, not assumed. Document
+`litebox_packager --oci-image` as the one, real, supported way to fetch a
+container image going forward. This is the single highest-value finding in
+this whole research pass: real, working, in-tree tooling was sitting unused
+while new Python tooling duplicating it was built this session.
+
+Also confirmed: no hand-rolled tar-structure parsing exists anywhere in the
+Rust codebase outside `litebox_packager`, `litebox_runner_linux_on_windows_userland`,
+and `litebox_runner_linux_userland` -- all three depend on and use the `tar`
+crate directly (`grep` confirmed `use tar::` in all three). Nothing to
+change here beyond retiring the Python duplication above.
+
+### 3. Compression -- already correct
+
+`litebox_packager` depends on `flate2 = "1.1"` (gated to
+`x86_64`/Apple-Silicon targets alongside its OCI support) for gzip layer
+decompression. No hand-rolled decompression found anywhere. No action needed.
+
+### 4. HTTP/networking for OCI pulling -- superseded by finding #2 above
+
+Given `litebox_packager` already has a real, in-tree Rust OCI puller using
+`oci-client` + `reqwest`(-shaped, via `oci-client`'s own HTTP layer) +
+`native-tls`, the original Part 1 question ("should `pull_oci_image.py` move
+to Rust eventually") is moot -- it already has moved, in a different file,
+and this session simply didn't check for it first. The Python script's own
+`urllib`-only constraint was a reasonable call for what it was (a standalone
+probe script avoiding new Python deps) but the standing recommendation now is
+to use `litebox_packager` instead of maintaining ANY Python OCI-pull path
+going forward, per finding #2.
+
+### 5. ELF parsing beyond the syscall rewriter -- one real inconsistency found, worth a closer look
+
+`litebox_syscall_rewriter` and `litebox_packager` both correctly use the
+`object` crate (`0.36.7`, `elf`+`read_core` features, `no_std`-compatible --
+confirmed `litebox_shim_linux` is itself `#![no_std]` and depends on `object`
+directly with `default-features = false`, so `object`'s no_std-compatibility
+is independently proven elsewhere in this exact workspace, not a
+hypothetical).
+
+**But `litebox_common_linux`'s own ELF LOADING code (`src/loader.rs`, the
+guest-side program-header parsing that actually loads a binary into guest
+memory, a different concern from the rewriter's syscall-site scanning) uses a
+DIFFERENT crate: the `elf` crate (`elf = "0.8.0", default-features = false`),
+not `object`.** Confirmed via `litebox_common_linux/src/loader.rs:12-13`
+(`use elf::file::FileHeader; use elf::parse::ParseAt as _;`) and its own
+Cargo.toml. `litebox_common_linux` is ALSO `#![no_std]` (confirmed via its
+`src/lib.rs`), so the no_std constraint applies equally to both crates in
+this workspace and cannot explain the inconsistency on its own -- `object`
+already proves itself no_std-capable one crate over, in
+`litebox_shim_linux`, which itself depends on `litebox_common_linux`.
+
+**Recommendation**: this is a real, worth-investigating inconsistency --
+either there's a genuine reason `loader.rs` needs `elf` specifically (e.g. a
+particular no_std API shape `object` doesn't offer for program-header
+iteration, or historical reasons predating `object`'s adoption elsewhere) or
+this is exactly the kind of accumulated duplication the user's mantra is
+about: two different, both-mature ELF-parsing crates in the same workspace
+for closely-related purposes. Worth a dedicated follow-up pass to read
+`loader.rs`'s actual usage of the `elf` crate's API surface and check whether
+`object`'s own program-header/segment iteration API covers the same need,
+BEFORE assuming a migration is warranted (a real API gap would justify
+keeping `elf`; if none exists, consolidating onto `object` alone removes one
+whole dependency from the workspace). Not attempted in this pass -- flagged
+for a dedicated follow-up given `litebox_common_linux` is core, widely-used,
+guest-agnostic code that deserves careful, isolated verification of any
+change, not a rushed swap alongside this research pass.
+
+### 6. Windows API usage -- `windows-sys` only, confirmed consistent; no `region`-crate gap found
+
+Confirmed via direct Cargo.toml reads: `litebox` (target `cfg(windows)`) and
+`litebox_platform_windows_userland` both depend on `windows-sys` only, never
+the higher-level `windows` crate. This is a workspace-wide, consistent
+choice, not an isolated oversight -- both files that touch Windows FFI make
+the same call. Confirmed no `region`-crate-shaped gap: no repeated
+hand-rolled `VirtualQuery`-result post-processing logic was found OUTSIDE the
+crash-diagnostic code already flagged in Part 1's own Area 4 finding (the
+`pagestate`/stack-dump `VirtualQuery` guard blocks) -- those are few,
+already-consistent-with-each-other call sites, not a proliferating pattern a
+crate like `region` would meaningfully simplify. No new recommendation beyond
+Part 1's own existing "low-priority, revisit opportunistically" note on
+`windows-sys` vs `windows`.
+
+### 7. Logging/tracing infrastructure -- already correct, thin wrapper as intended
+
+`litebox_util_log` (read `Cargo.toml` and confirmed via its own
+`description = "Logging facade for LiteBox that supports multiple backends"`)
+is a thin facade over the two real, standard Rust logging ecosystems:
+`log` (`backend_log` feature, `log/kv` for structured key-value logging) and
+`tracing` (`backend_tracing` feature) -- selected via Cargo features, not
+reimplemented. Dev-dependencies confirm real backends are used for testing:
+`env_logger` and `tracing-subscriber`. This is exactly the correct shape (a
+thin facade allowing either standard backend, not a custom logging engine)
+-- no action needed, confirmed rather than assumed.
+
+### 8. Argument parsing -- already using `clap` everywhere it matters
+
+Confirmed via `grep` across every `Cargo.toml`: `litebox_packager`,
+`litebox_runner_linux_on_windows_userland`, `litebox_runner_linux_userland`,
+`litebox_syscall_rewriter`, and `dev_bench` all depend on `clap` (`4.5.3x`,
+`features = ["derive"]`) for their CLI surfaces. No hand-rolled
+`std::env::args()` parsing found in any binary crate checked. **The one real
+gap is on the Python side**: `advisor/probes/pull_oci_image.py`,
+`batch_rewrite_layer.py`, and the newer `fetch_container.py` (this session's
+own work) use positional `sys.argv`/`argparse` rather than being retired in
+favor of `litebox_packager`'s own already-`clap`-based CLI -- see finding #2
+above, the real actionable item here is retiring the Python tools, not adding
+`clap` to them.
+
+### 9. JSON/serialization -- already using `serde`/`serde_json` where structured data crosses a boundary
+
+Confirmed via `grep`: `litebox_session_daemon` and `litebox_util_log`
+(dev-only) depend on `serde`+`serde_json` directly. `litebox_packager`'s own
+OCI-manifest handling goes through `oci_client`'s and `oci_spec`'s own typed
+Rust structs (`oci_spec = { version = "0.9", features = ["image"] }` --
+`oci-spec` is itself a mature, dedicated OCI-manifest-schema crate, a further
+confirmation of finding #2's "already solved" theme), not hand-rolled JSON
+parsing. No gap found.
+
+### 10. Random/UUID/hashing -- minimal surface, nothing hand-rolled found
+
+`litebox_platform_windows_userland` and `litebox_platform_linux_userland`
+both depend on `getrandom = "0.3.4"` (the standard, minimal, audited Rust
+crate for OS-backed randomness) for whatever real entropy litebox's platform
+layer needs. `litebox_runner_linux_userland`'s dev-dependencies include
+`sha2` (real hashing, used in test/verification code, per its dev-only
+scoping). No hand-rolled RNG, UUID generation, or hashing logic was found
+anywhere in the Rust codebase checked. No action needed.
+
+### Part 2 summary table
+
+| Area | Finding | Recommendation |
+|---|---|---|
+| 2. Tar/OCI pull | **`litebox_packager` ALREADY has a complete, correct Rust OCI-pull-to-tar pipeline** (`oci-client` + `tar` + whiteout handling + syscall rewriting, all wired together) | **Verify and retire the Python `pull_oci_image.py`/`batch_rewrite_layer.py`/`fetch_container.py` chain in favor of `litebox_packager --oci-image`** -- highest-value finding this pass |
+| 3. Compression | Already using `flate2` | No action |
+| 5. ELF loading (`litebox_common_linux::loader`) | Uses `elf` crate, while the rest of the workspace (including its own no_std sibling `litebox_shim_linux`) uses `object` | Real inconsistency, worth a dedicated follow-up to check for a genuine API gap before consolidating |
+| 6. Windows API (`windows-sys` vs `windows`) | Confirmed consistent workspace-wide choice; no `region`-crate-shaped gap | No new action beyond Part 1's existing low-priority note |
+| 7. Logging | Already a correct thin facade over `log`/`tracing` | No action |
+| 8. CLI arg parsing | Already `clap` everywhere in Rust; gap is Python tooling not yet retired (see #2) | Retire Python tools per #2 |
+| 9. JSON/serialization | Already `serde`/`serde_json`/`oci-spec` where needed | No action |
+| 10. Random/hashing | Already `getrandom`/`sha2`, nothing hand-rolled | No action |
+
+Sources for Part 2 (in-repo, read directly, no external fetches needed):
+- `litebox_packager/Cargo.toml`, `litebox_packager/src/oci.rs`, `litebox_packager/src/lib.rs`
+- `litebox_common_linux/Cargo.toml`, `litebox_common_linux/src/loader.rs`, `litebox_common_linux/src/lib.rs`
+- `litebox_shim_linux/Cargo.toml`
+- `litebox_platform_windows_userland/Cargo.toml`, `litebox_platform_linux_userland/Cargo.toml`
+- `litebox_util_log/Cargo.toml`
+- `litebox_session_daemon/Cargo.toml`
+- Every other workspace-member `Cargo.toml` read directly for the baseline survey
+
 Sources:
 - [oci-client on GitHub](https://github.com/oras-project/rust-oci-client)
 - [oci-client on crates.io](https://crates.io/crates/oci-client)
