@@ -689,7 +689,20 @@ pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<P
                 eprintln!("  Pulling layer {}/{}...", i + 1, num_layers);
             }
 
-            let mut layer_data: Vec<u8> = Vec::new();
+            // Pre-size both buffers instead of growing from `Vec::new()` -- for a
+            // multi-hundred-MB layer, repeated doubling-reallocation transiently holds BOTH the
+            // old and new buffer live at once, which for a ~900MB compressed / ~2.5GB
+            // decompressed layer (observed live: `linuxserver/webtop:debian-xfce`'s largest
+            // layer) can spike well past what the final buffer alone would need and has been
+            // observed to OOM-kill the whole process with no error, or occasionally surface as a
+            // clean pull failure depending on exactly when the allocator gives up. The manifest
+            // already tells us the exact compressed size (`layer_desc.size`); gzip layers
+            // commonly compress 2-4x for the kind of binary+text content a container layer holds,
+            // so a 4x estimate for the decompressed buffer avoids most doubling without wildly
+            // over-reserving for a layer that happens to compress better than that.
+            let mut layer_data: Vec<u8> = Vec::with_capacity(
+                usize::try_from(layer_desc.size).unwrap_or(0),
+            );
             client
                 .pull_blob(&reference, layer_desc, &mut layer_data)
                 .await
@@ -699,7 +712,8 @@ pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<P
             let decompressed = if is_gzip {
                 use std::io::Read as _;
                 let mut decoder = flate2::read::GzDecoder::new(layer_data.as_slice());
-                let mut out = Vec::new();
+                let estimated_decompressed_size = layer_data.len().saturating_mul(4);
+                let mut out = Vec::with_capacity(estimated_decompressed_size);
                 decoder
                     .read_to_end(&mut out)
                     .with_context(|| format!("failed to decompress layer {}", i + 1))?;
