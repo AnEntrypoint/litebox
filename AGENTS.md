@@ -82,10 +82,16 @@ narrative appended to the bottom.
   `MSYS_NO_PATHCONV=1` set, or it fails in two different misleading ways (an ENOENT that looks
   like a missing shebang resolver, or a stack-overflow panic).
 - **`linuxserver/webtop:alpine-mate` ships MATE desktop, not XFCE** -- confirmed via direct tar
-  listing, zero `xfdesktop`/`xfce4-panel`/`xfsettingsd`/real-`xfwm4` anywhere in the layer. Use
-  `linuxserver/webtop:alpine-xfce` for an actual XFCE image (see "Container images" below for
-  current status). The MATE path's own remaining blocker, if MATE support is still wanted, is the
-  unresolved `mate-session` `RtlpUnwindPrologue` crash (see below), not an xfconf/wallpaper gap.
+  listing, zero `xfdesktop`/`xfce4-panel`/`xfsettingsd`/real-`xfwm4` anywhere in the layer.
+  `linuxserver/webtop:alpine-xfce` does NOT exist as a tag (404) -- Alpine-based webtop flavors are
+  mate/icewm/kde/openbox only, no xfce. Real XFCE tags that do exist: `arch-xfce`, `debian-xfce`,
+  `ubuntu-xfce`, `fedora-xfce`. Prefer `debian-xfce` (or `ubuntu-xfce`) over `arch-xfce`: Arch's
+  pacman-built layers are the most Windows-path-hostile of the four (colons in package-db dir names,
+  case-variant sibling paths), which matters only if extracting to a real host directory -- with
+  runtime in-memory OCI loading (see "Container images" below) this stops mattering, but there is no
+  reason to prefer arch's layer shape over debian's/ubuntu's regardless. The MATE path's own
+  remaining blocker, if MATE support is still wanted, is the unresolved `mate-session`
+  `RtlpUnwindPrologue` crash (see below), not an xfconf/wallpaper gap.
 - **Repo hygiene**: large binary artifacts (packed layer tars, frame dumps, debug logs) never
   belong in git -- keep them in `.wfgy/` (gitignored) or a durable-but-untracked sibling directory
   like `../litebox-webtop/`. Root-level scratch files (`probe_*.tar`, `*.bmp`, `*.log`) are
@@ -101,10 +107,25 @@ files, rewrites every ELF, and produces a bootable tar in one command. It supers
 ad-hoc Python script this project previously hand-rolled for the same purpose (`pull_oci_image.py`,
 `batch_rewrite_layer.py`, `fetch_container.py` -- all retired, do not recreate them).
 
-**`linuxserver/webtop:alpine-mate` ships MATE, not XFCE** (see standing lessons above). For a
-genuine XFCE desktop, pull `linuxserver/webtop:alpine-xfce` instead. Status of that specific
-image as of this writing: pull/boot attempted, result not yet finalized in this file -- check
-`git log` for the most recent commit on this topic before assuming either success or failure.
+**`linuxserver/webtop:alpine-mate` ships MATE, not XFCE** (see standing lessons above).
+`linuxserver/webtop:alpine-xfce` does NOT exist (404) -- do not pull it. For a genuine XFCE
+desktop, use `debian-xfce` or `ubuntu-xfce` (preferred over `arch-xfce`: pacman-built Arch layers
+are the most Windows-path-hostile of the real XFCE tags). Status: pull/boot attempted against
+`arch-xfce` this session, not yet finalized -- check `git log` for the most recent commit before
+assuming either success or failure, and prefer retrying against `debian-xfce`/`ubuntu-xfce` over
+continuing to fight arch's layer shape.
+
+**Runtime, in-memory OCI loading (in progress)**: extracting an OCI image's layers onto a real
+host directory before packaging is fundamentally the wrong approach on Windows -- NTFS case-
+insensitivity, reserved colons in pacman package-db paths, and dir/file type collisions across
+layers each independently broke `litebox_packager`'s real-directory extraction this session (three
+distinct bugs, patched one at a time, until the pattern itself was recognized as the problem).
+The fix in progress: teach `litebox`'s existing no_std, in-memory `tar_ro.rs` filesystem backend to
+merge multiple OCI layer tars itself (bottom-to-top, whiteout/opaque-whiteout aware) and never
+touch a real host directory at all. **Perf constraint that must hold**: `tar_ro.rs` is on the hot
+path for every guest file read -- the multi-layer index must be built ONCE at mount time (a single
+path -> (layer, offset) map with whiteouts resolved at index-build time), not re-scanned per
+lookup; an O(layers × entries) per-`open()` walk would silently regress every guest file access.
 
 **Canonical layer for the (older, hand-assembled, weston-based) XFCE path**:
 `.wfgy/xfce-build/layer31_direct_fixed.tar` -- superseded in priority by the stock-image path
@@ -166,8 +187,9 @@ progress on this image (MATE-native session, actual desktop content) is blocked 
 `RtlpUnwindPrologue` crash below, since `mate-session`'s own launch sequence is exactly the shape
 that triggers it.
 
-**Stock XFCE webtop image (`webtop:alpine-xfce`)**: see "Container images" above -- check `git
-log` for the latest status before assuming a result either way.
+**Stock XFCE webtop image**: see "Container images" above (`debian-xfce`/`ubuntu-xfce` preferred,
+`alpine-xfce` does not exist, `arch-xfce` deprioritized) -- check `git log` for the latest status
+before assuming a result either way.
 
 ## The `RtlpUnwindPrologue` crash (genuinely unresolved, do not attempt a fix without new evidence)
 
@@ -198,19 +220,44 @@ one was about one specific function's own missing metadata; this one is structur
 `RUNTIME_FUNCTION` entry could ever describe "the guest's own stack contents at an arbitrary,
 unpredictable depth").
 
-**Two concrete next steps identified, neither attempted yet**: (a) trace the TRUE, original fault
-that first invokes SEH dispatch (not just where the repeated symptom is currently observed) --
-the existing `is_in_guest` guard that should terminate a guest-mode fault cleanly doesn't appear
-to be preventing this path from being reached, and why is not yet understood; (b) integrate
-`minidump-writer` (Mozilla's crash-reporting crate, confirmed capable of genuine in-process
-x86_64 Windows minidump capture with no live-debugger attach needed -- see
-`docs/premade-library-research.md`) for real symbol resolution and proper call-stack
-reconstruction, which would settle definitively what the recurring in-module stack value actually
-is. Neither has been done carefully enough yet to trust; do not guess at a fix (e.g. blindly
-registering `RtlAddFunctionTable` entries) without first getting one of these two pieces of real
-evidence -- this bug has already produced one retracted theory from acting on incomplete
-understanding, and the user's own explicit standard for this bug is a genuinely root-caused fix,
-not one that merely stops the observed symptom.
+**Correction (2026-09-05, cross-session review found this by re-reading the code's own comments,
+not by new investigation)**: the SEH-unwind theory above has the SAME SHAPE as three already-
+retracted theories (`0x4e12c0`, `0xfefefefefefefeff`, "-libcalls") -- it describes where the
+repeated symptom is observed, not the true first fault. `litebox_platform_windows_userland/src/
+lib.rs:869`'s own comment records that live captures identified the real causative first fault as
+`is_in_guest=true, addr=usize::MAX`, and that the reason it kept getting misattributed is that
+`eprintln!` inside the trace block re-faults on an already-corrupted thread before the print
+completes -- so a LATER fault in the resulting cascade gets logged as "the" crash instead. `addr=
+usize::MAX` (`0xFFFF_FFFF_FFFF_FFFF`) is not a stack-unwind artifact (an unwinder dereferencing
+guest data would fault on an arbitrary small integer, e.g. the `0x42a` observed elsewhere) --
+it's the sentinel Windows uses when `ExceptionInformation[1]` (faulting address) is genuinely
+unavailable, and `lib.rs:1014` already special-cases exactly that value. Also: `is_in_guest` is a
+`Cell<bool>` field on `TlsState`, not a function -- "the existing `is_in_guest` guard" in earlier
+revisions of this section was never a real function name; fixed here to avoid sending a future
+pass looking for one.
+
+**Concrete next step, not yet attempted, and cheaper than either of the two below**: capture
+depth-0 (`is_in_guest=true`) via the already-existing allocation-free `RECENT_FAULTS` ring
+(`lib.rs:587`) or `diag_raw_regdump`, against the exact `mate-session --version` x3 repro --
+**do NOT run this under `LITEBOX_VEH_TRACE=1`**, the archive already records ~12 consecutive
+traced runs where the crash never reproduced, meaning tracing's own overhead dodges the race this
+bug depends on. Also worth a one-line experiment first: `AddVectoredExceptionHandler(0, ...)` at
+`lib.rs:2418` registers LAST in the process's VEH chain (`0` means last, `1` means first) --
+confirm whether that's deliberate; if another VEH in the process (CRT, a loaded DLL, a nested
+litebox fork child) registers with `1`, it sees the exception first and can
+`EXCEPTION_CONTINUE_EXECUTION` out from under this trace, silently hiding exactly the fault being
+hunted.
+
+**Two older next-step options, lower priority now that the above is known**: (a) generic tracing
+of "the true original fault" via new diagnostics (largely superseded by the depth-0-capture step
+above, which needs no new code); (b) integrate `minidump-writer` (Mozilla's crash-reporting crate,
+confirmed capable of genuine in-process x86_64 Windows minidump capture with no live-debugger
+attach needed -- see `docs/premade-library-research.md`) for real symbol resolution and full
+call-stack reconstruction. Do not guess at a fix (e.g. blindly registering `RtlAddFunctionTable`
+entries) without first getting real evidence from the depth-0 capture -- this bug has already
+produced multiple retracted theories from acting on incomplete understanding, and the user's own
+explicit standard for this bug is a genuinely root-caused fix, not one that merely stops the
+observed symptom.
 
 ## Windows CoW-mmap performance (investigated thoroughly, not worth pursuing further)
 
