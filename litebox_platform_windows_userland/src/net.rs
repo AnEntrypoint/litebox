@@ -250,6 +250,20 @@ struct GatewayState {
     /// cycle, since a `connect` on a port already in use fails cleanly rather than corrupting
     /// anything.
     next_ephemeral_port: u16,
+    /// Gateway-side local ports currently owned by an INBOUND (published-port) flow's own
+    /// connecting socket.
+    ///
+    /// These must never get a wildcard listening socket created for them. The guest's replies on
+    /// such a flow are addressed *to* this port, and `ensure_listeners_for_queued_packets`
+    /// otherwise treats any unseen destination port as "a guest dialing out" and opens a listener
+    /// on it -- which then competes with the real connecting socket for those very packets, so the
+    /// response is delivered to a socket nothing is pumping and the host client waits forever.
+    /// Confirmed live: a guest HTTP server logged `"GET / HTTP/1.1" 200` while the host client
+    /// received zero bytes.
+    inbound_local_ports: std::collections::HashSet<u16>,
+    /// Which local port each inbound flow owns, so the reservation above can be released when
+    /// that flow is reaped (otherwise a long-lived process leaks one port per connection served).
+    inbound_flow_ports: HashMap<SocketHandle, u16>,
 }
 
 impl GatewayState {
@@ -303,6 +317,8 @@ impl GatewayState {
             zero_time: std::time::Instant::now(),
             inbound_rx,
             next_ephemeral_port: 49152,
+            inbound_local_ports: std::collections::HashSet::new(),
+            inbound_flow_ports: HashMap::new(),
         }
     }
 
@@ -337,6 +353,8 @@ impl GatewayState {
                 // which is honest -- far better than silently accepting bytes nothing will read.
                 continue;
             };
+            self.inbound_local_ports.insert(local_port);
+            self.inbound_flow_ports.insert(handle, local_port);
             self.tcp_flows.insert(
                 handle,
                 TcpFlow {
@@ -382,7 +400,10 @@ impl GatewayState {
             match ipv4.next_header() {
                 IpProtocol::Tcp => {
                     if let Ok(tcp) = TcpPacket::new_checked(ipv4.payload()) {
-                        self.ensure_listening(tcp.dst_port());
+                        // Skip ports owned by an inbound flow -- see `inbound_local_ports`.
+                        if !self.inbound_local_ports.contains(&tcp.dst_port()) {
+                            self.ensure_listening(tcp.dst_port());
+                        }
                     }
                 }
                 IpProtocol::Udp => {
@@ -619,6 +640,9 @@ impl GatewayState {
         }
         for handle in to_remove {
             self.tcp_flows.remove(&handle);
+            if let Some(port) = self.inbound_flow_ports.remove(&handle) {
+                self.inbound_local_ports.remove(&port);
+            }
             self.sockets.remove(handle);
         }
     }
