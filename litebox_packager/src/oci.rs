@@ -489,7 +489,23 @@ pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<P
 /// built speculatively against no evidence of that cost.
 pub fn rewrite_layer_elfs(layer_tar: &[u8], verbose: bool) -> anyhow::Result<Vec<u8>> {
     let mut archive = tar::Archive::new(layer_tar);
-    let mut out = Vec::with_capacity(layer_tar.len());
+    // Root cause of a real, deterministic OOM on large images (e.g.
+    // `linuxserver/webtop:debian-xfce`'s ~2.4GiB layer): `Vec::with_capacity(layer_tar.len())`
+    // sizes `out` to exactly the INPUT layer's size, but the rewritten OUTPUT tar is always a
+    // little bigger (ELF rewriting adds trampoline code, and every entry is re-emitted through a
+    // fresh `tar::Builder` header, each rounded up to a 512-byte block). The moment `out` needs
+    // even one more byte past that exact capacity, `Vec`'s growth policy doesn't add a little
+    // headroom -- it DOUBLES an already-multi-GiB buffer (reproduced live: input
+    // 2,565,094,400 bytes -> a 5,130,188,800-byte, i.e. exactly 2x, reservation that fails to
+    // allocate; confirmed via `RUST_BACKTRACE=1`, the failing allocation is
+    // `alloc::raw_vec::RawVec::reserve` inside `tar::builder::append`'s `io::copy` into this same
+    // `out` buffer -- not tar-entry corruption, not gzip corruption, not cross-layer
+    // accumulation). Reserving headroom proportional to the input size up front (the rewrite
+    // overhead scales with layer content, not a fixed constant) keeps ordinary per-entry growth
+    // inside the initial allocation, so the doubling-from-huge-buffer path is never hit for a
+    // real layer.
+    let headroom = (layer_tar.len() / 20).max(1024 * 1024); // 5%, floor 1 MiB
+    let mut out = Vec::with_capacity(layer_tar.len().saturating_add(headroom));
     {
         let mut builder = tar::Builder::new(&mut out);
         for entry_result in archive.entries()? {
