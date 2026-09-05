@@ -311,6 +311,37 @@ unsafe extern "system" fn vectored_exception_handler_entry(
 ) -> i32 {
     core::arch::naked_asm!(
         "
+        // UNWIND INFO (`.seh_proc`/`.seh_endproc` with an empty prologue): without these, this
+        // naked function emits NO `.pdata`/`.xdata` entry at all, and Windows' own stack
+        // unwinder (`RtlVirtualUnwind` -> `RtlpxVirtualUnwind` -> `RtlpUnwindPrologue`) treats
+        // any frame it finds here as a LEAF function -- i.e. it assumes the return address sits
+        // at `[rsp]` and that no non-volatile register was saved. Neither assumption holds once
+        // `.Lswap` below has switched `rsp` to this thread's separate host stack, so the
+        // unwinder reads a return address and a frame chain out of unrelated stack bytes and
+        // then keeps walking from that garbage. Confirmed live (this pass) via `cdb .fnent`
+        // against the release binary: this function reported `No function entry`, while its
+        // immediate neighbour `run_thread_arch` (which DOES carry `.seh_proc run_thread`)
+        // reported a correct entry -- and the captured fatal fault in a real XFCE repro was
+        // exactly `ntdll!RtlpUnwindPrologue+0x11a` (`mov rcx, qword ptr [r8]`) with `r8 = 0x2`,
+        // reached from `ntdll!RtlpxVirtualUnwind+0x109`, i.e. the unwinder itself dereferencing
+        // a garbage unwind-info pointer it derived from this missing entry. The characteristic
+        // split-word register damage seen in that investigation (`rsp=0x2f00000030`,
+        // `rsi=0xffffffff00000000`, `rdi=0x401000001` -- plausible low halves, garbage high
+        // halves) is the same unwinder restoring non-volatile registers from misidentified
+        // stack slots, NOT a truncation bug in this crate's own code.
+        //
+        // An EMPTY prologue (`.seh_endprologue` immediately after `.seh_proc`, no
+        // `.seh_pushreg`/`.seh_stackalloc`/`.seh_setframe`) is the ACCURATE description here,
+        // not a placeholder: this function never pushes a non-volatile register and never
+        // establishes a frame pointer on the CALLER stack. Everything it saves (the caller's
+        // `rsp`/`rbp`/`r8`) is stored into the per-depth scratch slot on the SEPARATE host
+        // stack it switches to, and every one of those is restored before the `ret` below, so
+        // at both entry and exit the caller-visible state is exactly a frameless function's.
+        // Declaring that truthfully is what lets the unwinder skip straight to the real return
+        // address at `[rsp]` on entry instead of inventing one.
+        .seh_proc vectored_exception_handler_entry
+        .seh_endprologue
+
         // rcx = exception_info (EXCEPTION_POINTERS*), per the x64 'extern system' ABI. No stack
         // use yet, so no shadow space/alignment to establish for this first, read-only portion.
         mov     rax, [rcx]           // rax = ExceptionRecord*
@@ -435,6 +466,7 @@ unsafe extern "system" fn vectored_exception_handler_entry(
     .Lsearch:
         mov     eax, {EXCEPTION_CONTINUE_SEARCH}
         ret
+        .seh_endproc
         ",
         EXCEPTION_ACCESS_VIOLATION = const Win32_Foundation::EXCEPTION_ACCESS_VIOLATION,
         EXCEPTION_CONTINUE_EXECUTION = const EXCEPTION_CONTINUE_EXECUTION,
