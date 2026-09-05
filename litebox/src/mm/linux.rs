@@ -1313,7 +1313,13 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // crash. 16 MiB comfortably covers realistic single-process heap growth while still
         // leaving the guest stack (placed far from the heap, with no RIP-relative relationship to
         // it) in its own separate group.
-        let max_intra_group_gap: usize = 16 * 1024 * 1024;
+        // DIAGNOSTIC (temporary, do not commit): 16 MiB was chosen for musl's mallocng, whose
+        // group/meta_area spacing it reasons about explicitly above. A glibc guest (Debian) has a
+        // different layout entirely -- per-thread arenas each reserve 64 MiB of address space, so
+        // inter-arena gaps routinely exceed 16 MiB by design, splitting them into separately-placed
+        // groups and breaking exactly the cross-region pointer arithmetic this grouping exists to
+        // preserve. Raised to test whether the XFCE/dbus glibc heap corruption is this same bug.
+        let max_intra_group_gap: usize = 512 * 1024 * 1024;
         let mut sorted_non_shared: Vec<Range<usize>> = regions
             .iter()
             .filter(|(_, vma)| vma.shared_handle.is_none())
