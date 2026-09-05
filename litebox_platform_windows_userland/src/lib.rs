@@ -1701,6 +1701,30 @@ unsafe extern "system" fn vectored_exception_handler(
                     safe static __ImageBase: c_void;
                 }
                 let module_base = (&raw const __ImageBase) as usize;
+                // The on-disk `.extable` section of this very binary was verified to contain an
+                // entry whose [start, stop) range covers this exact faulting RVA, yet the lookup
+                // above reported no match. Print the table the process ACTUALLY walks, relocated
+                // into live addresses, so the two can be compared directly instead of assumed
+                // identical. Fixed-size stack buffer, no allocation -- safe inside this handler.
+                {
+                    let mut entries = [(0usize, 0usize, 0usize); 32];
+                    let n = litebox::mm::exception_table::debug_snapshot_table(&mut entries);
+                    eprintln!(
+                        "[diag-extable] module_base={module_base:#x} rip={:#x} rva={:#x} table_len={} shown={n}",
+                        context_snapshot.Rip,
+                        (context_snapshot.Rip as usize).wrapping_sub(module_base),
+                        litebox::mm::exception_table::debug_table_len(),
+                    );
+                    for (i, (s, e, f)) in entries.iter().take(n).enumerate() {
+                        let covers = (context_snapshot.Rip as usize) >= *s
+                            && (context_snapshot.Rip as usize) < *e;
+                        eprintln!(
+                            "[diag-extable]   [{i}] start={s:#x} (rva {:#x}) stop={e:#x} (rva {:#x}) fixup={f:#x} covers={covers}",
+                            s.wrapping_sub(module_base),
+                            e.wrapping_sub(module_base),
+                        );
+                    }
+                }
                 eprintln!(
                     "[diag-unrecov-av] tid={:?} rip={:#x} rva={:#x} addr={:#x} rsp={:#x} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x} is_in_guest={} is_verifying={} -- no exception-table entry found",
                     std::thread::current().id(),

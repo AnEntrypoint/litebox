@@ -620,6 +620,34 @@ fn exception_table() -> &'static [ExceptionTableEntry] {
     }
 }
 
+/// Diagnostic-only: reports what the exception table looks like AT RUNTIME, as
+/// absolute (already relocated) `(start, stop, fixup)` addresses in this
+/// module's live address space.
+///
+/// This exists because a real captured fault landed on an instruction that the
+/// on-disk `.extable` section provably covers, yet `search_exception_tables`
+/// reported no match -- so the on-disk table and the table this process
+/// actually walks must be compared directly rather than assumed identical.
+/// Allocation-free: writes into a caller-provided buffer and returns how many
+/// entries were filled, so it is safe to call from inside an exception handler.
+pub fn debug_snapshot_table(out: &mut [(usize, usize, usize)]) -> usize {
+    let table = exception_table();
+    let reloc = |addr: &i32| -> usize {
+        let base = &raw const *addr as usize;
+        base.wrapping_add_signed(*addr as isize)
+    };
+    let n = table.len().min(out.len());
+    for (slot, entry) in out.iter_mut().zip(table.iter()).take(n) {
+        *slot = (reloc(&entry.start), reloc(&entry.stop), reloc(&entry.fixup));
+    }
+    n
+}
+
+/// Diagnostic-only: the number of entries the runtime exception table holds.
+pub fn debug_table_len() -> usize {
+    exception_table().len()
+}
+
 /// Search the exception table for a matching instruction address.
 /// If found, returns the corresponding recovery address.
 pub fn search_exception_tables(addr: usize) -> Option<usize> {
