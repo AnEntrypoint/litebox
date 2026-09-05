@@ -1657,7 +1657,15 @@ unsafe extern "system" fn vectored_exception_handler(
                     let rsp = context.Rsp as usize;
                     for i in 0..32usize {
                         let addr = rsp.wrapping_add(i * 8);
-                        let val = unsafe { (addr as *const usize).read_volatile() };
+                        // `read_unaligned`, not `read_volatile`: this code runs precisely when
+                        // `rip` was a wild jump, and such a fault can leave `rsp` itself
+                        // misaligned. `read_volatile` REQUIRES alignment, and a debug build's UB
+                        // check turns that into a non-unwinding abort -- so the diagnostic meant
+                        // to explain an unrecoverable AV was instead killing the process before
+                        // printing anything, destroying the evidence it exists to capture.
+                        // Confirmed live: "unsafe precondition(s) violated: ptr::read_volatile
+                        // requires that the pointer argument is aligned", aborting mid-dump.
+                        let val = unsafe { (addr as *const usize).read_unaligned() };
                         let in_module = val.wrapping_sub(module_base) < 0x0200_0000;
                         eprintln!(
                             "[diag-unrecov-av-stack] [rsp+{:#x}]={:#x}{}",
@@ -1693,7 +1701,9 @@ unsafe extern "system" fn vectored_exception_handler(
                             {
                                 for j in 0..8usize {
                                     let addr = (*fault_rsp as usize).wrapping_add(j * 8);
-                                    let val = unsafe { (addr as *const usize).read_volatile() };
+                                    // See the alignment note on the primary stack dump above:
+                                    // a recorded `fault_rsp` has the same misalignment hazard.
+                                    let val = unsafe { (addr as *const usize).read_unaligned() };
                                     let in_module = val.wrapping_sub(module_base) < 0x0200_0000;
                                     eprintln!(
                                         "[diag-unrecov-av-ring-stack] [{i}][rsp+{:#x}]={val:#x}{}",
