@@ -302,11 +302,31 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> Result<i64, VsmError> {
 }
 
 fn parse_certs(mut buf: &[u8]) -> Result<Vec<Certificate>, VsmError> {
+    use der::{Encode, Header, Reader, SliceReader};
+
     let mut certs = Vec::new();
 
-    while buf.len() >= 4 && buf[0] == 0x30 && buf[1] == 0x82 {
-        let der_len = ((buf[2] as usize) << 8) | (buf[3] as usize);
-        let total_len = der_len + 4;
+    while !buf.is_empty() {
+        // Read the real TLV (tag-length-value) header rather than hand-matching one specific
+        // length-encoding form (the previous code only handled the 2-byte long-form length,
+        // `0x30 0x82`, silently failing to split any cert using short-form or 3/4-byte
+        // long-form length encoding -- a real parsing bug against attacker-influenceable VTL0
+        // data). `Header::encoded_len()` gives the header's own on-wire size regardless of
+        // which length form was used, so `total_len` below is correct for ANY valid DER length
+        // encoding, not just the one form the old code happened to match.
+        let reader = SliceReader::new(buf).map_err(|_| VsmError::CertificateParseFailed)?;
+        let header: Header = reader
+            .peek_header()
+            .map_err(|_| VsmError::CertificateParseFailed)?;
+        let header_len: usize = header
+            .encoded_len()
+            .and_then(usize::try_from)
+            .map_err(|_| VsmError::CertificateParseFailed)?;
+        let content_len: usize = usize::try_from(header.length)
+            .map_err(|_| VsmError::CertificateParseFailed)?;
+        let total_len = header_len
+            .checked_add(content_len)
+            .ok_or(VsmError::CertificateParseFailed)?;
 
         if buf.len() < total_len {
             return Err(VsmError::CertificateDerLengthInvalid {

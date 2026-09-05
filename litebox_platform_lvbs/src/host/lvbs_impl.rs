@@ -7,10 +7,12 @@ use crate::{
     Errno, HostInterface, arch::ioport::serial_print_string,
     host::per_cpu_variables::with_per_cpu_variables,
 };
-use digest::Digest;
+use hmac::{Hmac, Mac};
 use litebox_common_lvbs::PRK_LEN;
 use rand_core::{RngCore, SeedableRng};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
+
+type HmacSha256 = Hmac<sha2::Sha256>;
 
 pub type LvbsLinuxKernel = crate::LinuxKernel<HostLvbsInterface>;
 
@@ -235,13 +237,26 @@ fn rdrand_seed() -> Option<CrngSeed> {
     Some(seed)
 }
 
+// HMAC-based extract/expand (an HKDF-shaped construction) rather than plain hash
+// concatenation: naive `SHA256(domain || secret || ...)` lacks the domain-separation and
+// extract/expand security properties a reviewed KDF provides. `prk`/`current_state` (the
+// higher-entropy, confidential material) key the HMAC; the domain label and the remaining
+// public-ish inputs (rdrand output, reseed counter) are the authenticated message -- the same
+// shape already used correctly elsewhere in this codebase, see
+// `litebox_shim_optee::syscalls::pta::huk_subkey_derive_inner`. `HmacSha256::new_from_slice`
+// never fails for HMAC (it accepts any key length, hashing it down first if needed), so the
+// `expect` below can never actually panic; it exists only to surface a genuine library-contract
+// violation loudly rather than silently propagate a wrong seed.
 fn crng_seed_from_prk_and_rdrand(prk: &[u8; PRK_LEN], rdrand_seed: CrngSeed) -> CrngSeed {
-    sha2::Sha256::new()
+    let mut mac_bytes = HmacSha256::new_from_slice(prk)
+        .expect("HMAC accepts a key of any length")
         .chain_update(b"litebox-lvbs-crng-seed-v1")
-        .chain_update(prk)
         .chain_update(rdrand_seed)
         .finalize()
-        .into()
+        .into_bytes();
+    let seed = CrngSeed::from(<[u8; 32]>::from(mac_bytes));
+    mac_bytes.zeroize();
+    seed
 }
 
 fn crng_reseed_from_rdrand_and_state(
@@ -249,13 +264,16 @@ fn crng_reseed_from_rdrand_and_state(
     reseed_counter: usize,
     current_state: &[u8; CRNG_RESEED_STATE_BYTES],
 ) -> CrngSeed {
-    sha2::Sha256::new()
+    let mut mac_bytes = HmacSha256::new_from_slice(current_state)
+        .expect("HMAC accepts a key of any length")
         .chain_update(b"litebox-lvbs-crng-reseed-v1")
         .chain_update(rdrand_seed)
         .chain_update(reseed_counter.to_le_bytes())
-        .chain_update(current_state)
         .finalize()
-        .into()
+        .into_bytes();
+    let seed = CrngSeed::from(<[u8; 32]>::from(mac_bytes));
+    mac_bytes.zeroize();
+    seed
 }
 
 pub struct HostLvbsInterface;
