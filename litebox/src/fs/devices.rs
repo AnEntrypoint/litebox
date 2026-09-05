@@ -30,6 +30,12 @@ const STDIO_BLOCK_SIZE: usize = 1024;
 const NULL_BLOCK_SIZE: usize = 0x1000;
 /// Block size for /dev/urandom
 const URANDOM_BLOCK_SIZE: usize = 0x1000;
+/// Block size for /dev/zero
+const ZERO_BLOCK_SIZE: usize = 0x1000;
+/// Block size for /dev/random
+const RANDOM_BLOCK_SIZE: usize = 0x1000;
+/// Block size for /dev/full
+const FULL_BLOCK_SIZE: usize = 0x1000;
 
 /// Constant node information for all 3 stdio devices:
 /// ```console
@@ -77,6 +83,53 @@ const TTY1_NODE_INFO: NodeInfo = NodeInfo {
     // major=4, minor=1
     rdev: core::num::NonZeroUsize::new(0x0401),
 };
+/// Node info for `/dev/zero` (major=1 "memory devices", minor=5 -- real Linux
+/// `Documentation/admin-guide/devices.txt` convention). Reads deliver an endless stream of
+/// NUL bytes; writes are discarded. Used by GTK/GLib/Xorg allocation paths (mmap'ing
+/// `/dev/zero` as an anonymous-memory substitute) and by many programs' zero-fill idioms.
+const ZERO_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 23,
+    // major=1, minor=5
+    rdev: core::num::NonZeroUsize::new(0x105),
+};
+/// Node info for `/dev/random` (major=1, minor=8 -- real Linux convention). libgcrypt/GnuTLS
+/// (used by dbus, at-spi, gvfs) opens this directly; this backend treats it identically to
+/// `/dev/urandom` (see [`Device::URandom`]) since litebox has no real entropy-starvation
+/// model to distinguish blocking-until-seeded from always-ready.
+const RANDOM_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 24,
+    // major=1, minor=8
+    rdev: core::num::NonZeroUsize::new(0x108),
+};
+/// Node info for `/dev/full` (major=1, minor=7 -- real Linux convention). Reads behave like
+/// `/dev/zero`; every write fails with `ENOSPC`, matching real Linux semantics some programs'
+/// error-handling paths depend on.
+const FULL_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 25,
+    // major=1, minor=7
+    rdev: core::num::NonZeroUsize::new(0x107),
+};
+/// Node info for `/dev/console` (major=5 "TTY devices", minor=1 -- real Linux convention;
+/// matches the major:minor already observed in the real webtop image's own tar device-node
+/// entry for this path). Session/init-shaped guest code opens this directly.
+const CONSOLE_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 26,
+    // major=5, minor=1
+    rdev: core::num::NonZeroUsize::new(0x501),
+};
+/// Node info for `/dev/tty` (major=5, minor=0 -- real Linux convention). This is the
+/// controlling-terminal alias, distinct from the numbered VT devices (`tty0`/`tty1`); see
+/// [`Device::Tty`]'s doc comment for what this backend actually implements for it.
+const TTY_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 27,
+    // major=5, minor=0
+    rdev: core::num::NonZeroUsize::new(0x500),
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Device {
@@ -90,6 +143,32 @@ enum Device {
     /// `/dev/tty1` -- the one numbered VT this virtual device ever reports as active (see
     /// [`TTY1_NODE_INFO`]).
     Tty1,
+    /// `/dev/zero` -- endless NUL-byte stream on read, discards writes.
+    Zero,
+    /// `/dev/random` -- treated identically to [`Device::URandom`] (see [`RANDOM_NODE_INFO`]
+    /// doc comment: this backend has no entropy-starvation model to distinguish the two).
+    Random,
+    /// `/dev/full` -- reads behave like [`Device::Zero`]; every write fails with `ENOSPC`.
+    Full,
+    /// `/dev/console` -- opens and stats successfully; real byte-stream I/O is not
+    /// implemented (mirrors [`Device::Tty0`]/[`Device::Tty1`]'s identical "fail loud, not
+    /// silently wrong" rationale for a device-node shape this backend doesn't implement the
+    /// full protocol for).
+    Console,
+    /// `/dev/tty` -- the controlling-terminal alias. Real Linux resolves this dynamically to
+    /// whichever tty is the *calling process's* current controlling terminal (session/ctty
+    /// state that lives in `litebox_shim_linux`'s process/session subsystem, not in this
+    /// backend, which is a stateless, per-process-agnostic filesystem shim). A fully faithful
+    /// implementation would need this backend to consult that shim-layer session state per
+    /// open, which the current `Backend`/`open_file_at` signature (no caller-identity
+    /// parameter) does not plumb through. As a deliberate, disclosed simplification, this
+    /// registers `/dev/tty` as a fixed node with the same open/stat/directory-listing shape
+    /// real Linux always has, and the same read/write behavior as [`Device::Tty0`]/
+    /// [`Device::Tty1`] (reject, not silently wrong) -- sufficient for `isatty`/`ctermid`/
+    /// stat-based probing (the common case: existence + character-device-ness), but NOT a
+    /// real per-session ctty redirect. Making this fully correct is out of scope for this
+    /// pass; see this device's own file/module doc comment for why.
+    Tty,
 }
 
 impl Device {
@@ -101,6 +180,11 @@ impl Device {
         ("urandom", Device::URandom),
         ("tty0", Device::Tty0),
         ("tty1", Device::Tty1),
+        ("zero", Device::Zero),
+        ("random", Device::Random),
+        ("full", Device::Full),
+        ("console", Device::Console),
+        ("tty", Device::Tty),
     ];
 
     fn from_name(name: &str) -> Option<Self> {
@@ -156,8 +240,95 @@ impl Device {
                 atime: Timestamp::default(),
                 mtime: Timestamp::default(),
             },
+            Device::Zero | Device::Full => FileStatus {
+                file_type: FileType::CharacterDevice,
+                mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
+                size: 0,
+                owner: UserInfo::ROOT,
+                node_info: if self == Device::Zero {
+                    ZERO_NODE_INFO
+                } else {
+                    FULL_NODE_INFO
+                },
+                blksize: if self == Device::Zero {
+                    ZERO_BLOCK_SIZE
+                } else {
+                    FULL_BLOCK_SIZE
+                },
+                atime: Timestamp::default(),
+                mtime: Timestamp::default(),
+            },
+            Device::Random => FileStatus {
+                file_type: FileType::CharacterDevice,
+                mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
+                size: 0,
+                owner: UserInfo::ROOT,
+                node_info: RANDOM_NODE_INFO,
+                blksize: RANDOM_BLOCK_SIZE,
+                atime: Timestamp::default(),
+                mtime: Timestamp::default(),
+            },
+            Device::Console => FileStatus {
+                file_type: FileType::CharacterDevice,
+                // Real /dev/console is `crw-------` (mode 0600), owner root -- matches the
+                // real webtop image's own tar entry for this path (major:minor 5:1).
+                mode: Mode::RUSR | Mode::WUSR,
+                size: 0,
+                owner: UserInfo::ROOT,
+                node_info: CONSOLE_NODE_INFO,
+                blksize: STDIO_BLOCK_SIZE,
+                atime: Timestamp::default(),
+                mtime: Timestamp::default(),
+            },
+            Device::Tty => FileStatus {
+                file_type: FileType::CharacterDevice,
+                // Real /dev/tty is `crw-rw-rw-` (mode 0666) -- world-writable/readable since
+                // any process's own controlling terminal is meant to always be reachable via
+                // this path regardless of the tty's own group-restricted permissions.
+                mode: Mode::RUSR
+                    | Mode::WUSR
+                    | Mode::RGRP
+                    | Mode::WGRP
+                    | Mode::ROTH
+                    | Mode::WOTH,
+                size: 0,
+                owner: UserInfo::ROOT,
+                node_info: TTY_NODE_INFO,
+                blksize: STDIO_BLOCK_SIZE,
+                atime: Timestamp::default(),
+                mtime: Timestamp::default(),
+            },
         }
     }
+}
+
+/// LOUD, allocation-free diagnostic for an `open("/dev/<name>")` on a path this backend does
+/// not register as a device (see the call site in `open_file_at`). Writes directly to stderr
+/// via [`crate::platform::StdioProvider::write_to`] using a fixed stack buffer -- no `format!`,
+/// no heap allocation -- so this is safe to call even from constrained/early-in-startup
+/// contexts, matching this codebase's established raw-diagnostic convention (see
+/// `litebox_platform_windows_userland::diag_raw_print` and
+/// `common_providers::userspace_pointers::diag_near_null_write`).
+fn diag_raw_print_dev_open_miss<Platform: crate::platform::StdioProvider>(
+    platform: &Platform,
+    name: &str,
+) {
+    const PREFIX: &[u8] = b"[diag-dev-open-miss] unregistered /dev/ path opened: /dev/";
+    let mut line = [0u8; 192];
+    let mut pos = 0usize;
+    let n = PREFIX.len().min(line.len());
+    line[..n].copy_from_slice(&PREFIX[..n]);
+    pos += n;
+    let name_bytes = name.as_bytes();
+    let avail = line.len().saturating_sub(pos).saturating_sub(1);
+    let take = name_bytes.len().min(avail);
+    line[pos..pos + take].copy_from_slice(&name_bytes[..take]);
+    pos += take;
+    if pos < line.len() {
+        line[pos] = b'\n';
+        pos += 1;
+    }
+    let _ = platform.write_to(crate::platform::StdioOutStream::Stderr, &line[..pos]);
 }
 
 /// A [`super::backend::Backend`] that supports Unix-y devices.
@@ -281,8 +452,22 @@ where
         flags: OFlags,
     ) -> Result<Permissioned<FileHandle>, OpenError> {
         let _dir = dir.into_typed::<Self>();
-        let device = Device::from_name(name)
-            .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+        let device = match Device::from_name(name) {
+            Some(device) => device,
+            None => {
+                // LOUD, allocation-free diagnostic: a guest tried to open a `/dev/<name>`
+                // path this backend does not register as a device. Without this, the guest
+                // simply sees a generic ENOENT indistinguishable from any other missing-file
+                // failure, and a desktop session failing to start surfaces no clue which
+                // device was missing. Allocation-free (stack buffer + `StdioProvider::write_to`
+                // directly, no `format!`), matching this codebase's established convention for
+                // a diagnostic that must survive being reached from a path where heap
+                // allocation may not be trustworthy (see `litebox_platform_windows_userland`'s
+                // `diag_raw_print` / `userspace_pointers.rs`'s `diag_near_null_write`).
+                diag_raw_print_dev_open_miss(self.litebox.x.platform, name);
+                return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
+            }
+        };
 
         if flags.contains(OFlags::DIRECTORY) {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
@@ -350,8 +535,15 @@ where
                 // /dev/null read returns EOF
                 Ok(0)
             }
-            Device::URandom => {
+            Device::URandom | Device::Random => {
+                // /dev/random is treated identically to /dev/urandom -- see `RANDOM_NODE_INFO`
+                // doc comment for why.
                 self.litebox.x.platform.fill_bytes_crng(buf);
+                Ok(buf.len())
+            }
+            Device::Zero | Device::Full => {
+                // /dev/zero and /dev/full both deliver an endless NUL-byte stream on read.
+                buf.fill(0);
                 Ok(buf.len())
             }
             // Real Linux VT devices support read()/write() (raw keyboard/console I/O); no
@@ -360,8 +552,11 @@ where
             // ever reads or writes these nodes, so this deliberately rejects rather than
             // silently returning zero bytes -- matching `DriDevices::read`'s identical
             // "fail loud, not silently wrong" rationale for a device-node shape this backend
-            // does not implement the full byte-stream protocol for.
-            Device::Tty0 | Device::Tty1 => Err(ReadError::NotForReading),
+            // does not implement the full byte-stream protocol for. `Console`/`Tty` share this
+            // same rationale (see their own `Device` variant doc comments).
+            Device::Tty0 | Device::Tty1 | Device::Console | Device::Tty => {
+                Err(ReadError::NotForReading)
+            }
         }
     }
 
@@ -371,7 +566,7 @@ where
             Device::Stdin => return Err(WriteError::NotForWriting),
             Device::Stdout => crate::platform::StdioOutStream::Stdout,
             Device::Stderr => crate::platform::StdioOutStream::Stderr,
-            Device::Null | Device::URandom => {
+            Device::Null | Device::URandom | Device::Random => {
                 // /dev/null discards data: report as if written fully
                 //
                 // Writing to /dev/random or /dev/urandom will update the entropy
@@ -382,8 +577,23 @@ where
                 // /dev/urandom here.
                 return Ok(buf.len());
             }
+            Device::Zero => {
+                // /dev/zero discards writes, same as /dev/null.
+                return Ok(buf.len());
+            }
+            Device::Full => {
+                // Real /dev/full: every write fails with ENOSPC. This backend's `WriteError`
+                // has no dedicated no-space variant (adding one would widen every `Backend`
+                // implementor's error surface for a single device), so this deliberately
+                // reuses `WriteError::Io` as the closest existing mapping -- disclosed here
+                // rather than silently reported as success, which would hide the exact
+                // behavior real programs' error-handling paths depend on.
+                return Err(WriteError::Io);
+            }
             // See `Device::Tty0 | Device::Tty1`'s identical rationale in `read` above.
-            Device::Tty0 | Device::Tty1 => return Err(WriteError::NotForWriting),
+            Device::Tty0 | Device::Tty1 | Device::Console | Device::Tty => {
+                return Err(WriteError::NotForWriting);
+            }
         };
         self.litebox
             .x
@@ -405,10 +615,16 @@ where
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior {
         let h = h.get_typed::<Self>();
         match h.device {
-            Device::Stdin | Device::Stdout | Device::Stderr | Device::Tty0 | Device::Tty1 => {
-                SeekBehavior::NonSeekable
+            Device::Stdin
+            | Device::Stdout
+            | Device::Stderr
+            | Device::Tty0
+            | Device::Tty1
+            | Device::Console
+            | Device::Tty => SeekBehavior::NonSeekable,
+            Device::Null | Device::URandom | Device::Zero | Device::Random | Device::Full => {
+                SeekBehavior::ZeroPosition
             }
-            Device::Null | Device::URandom => SeekBehavior::ZeroPosition,
         }
     }
 

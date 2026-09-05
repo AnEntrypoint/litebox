@@ -55,7 +55,7 @@ use winit::window::{Window, WindowId};
 /// the Windows window-capture path entirely). BMP (not PNG) because it needs no compression/CRC
 /// library -- a raw `BITMAPFILEHEADER`+`BITMAPINFOHEADER` plus the pixel bytes verbatim (already
 /// `BGRA8`, matching BMP's own native 32bpp row order once rows are flipped bottom-to-top).
-pub fn dump_frame_diagnostic(frame: &Frame) {
+fn dump_frame_diagnostic(frame: &Frame) {
     let width = frame.width as usize;
     let height = frame.height as usize;
     let pitch = frame.pitch as usize;
@@ -68,15 +68,7 @@ pub fn dump_frame_diagnostic(frame: &Frame) {
             let Some(px) = frame.bytes.get(px_start..px_start + 4) else {
                 continue;
             };
-            // "Black" means the RGB channels alone, regardless of alpha -- confirmed live
-            // (advisor-db cross-session review) that the previous exact-match check against only
-            // `[0, 0, 0, 0]` and `[0, 0, 0, 255]` produced a false-positive whole-frame
-            // `non_black_pixels` count on a real capture whose actual bytes were `[0, 0, 0, 1]`
-            // (visually indistinguishable from black, just an off-by-one alpha value neither
-            // exact match caught) -- a scanout framebuffer's alpha byte carries no visual meaning
-            // for this diagnostic's own purpose (spotting real drawn RGB content), so it should
-            // never be part of the "is this black" test at all.
-            if px[0] != 0 || px[1] != 0 || px[2] != 0 {
+            if px != [0, 0, 0, 0] && px != [0, 0, 0, 255] {
                 non_black_pixels += 1;
             }
             if distinct_colors.len() < 64 {
@@ -93,15 +85,8 @@ pub fn dump_frame_diagnostic(frame: &Frame) {
         distinct_colors.len()
     );
 
-    // AGENTS.md pass 270: number each dumped frame so a run that transitions through multiple
-    // distinct states (e.g. black -> real content -> black again, confirmed live this pass) can
-    // be inspected frame-by-frame instead of only ever seeing the LAST write, which silently
-    // overwrote every earlier, potentially more interesting frame.
-    static FRAME_COUNTER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-    let n = FRAME_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let out_path = std::env::var("LITEBOX_DUMP_FRAMES_PATH")
-        .map(|base| format!("{base}.{n}"))
-        .unwrap_or_else(|_| format!("litebox_frame_dump_{n}.bmp"));
+        .unwrap_or_else(|_| "litebox_frame_dump.bmp".to_owned());
     let row_bytes = width * 4;
     let pixel_data_size = row_bytes * height;
     let file_header_size = 14;
@@ -166,12 +151,6 @@ pub enum InputSignal {
     Key(u16, i32),
     /// `(code, value)` for an `EV_REL` event -- relative motion, `value` the signed delta.
     Rel(u16, i32),
-    /// `(dx, dy)` for one 2D mouse movement, to be delivered as a SINGLE evdev report
-    /// (`REL_X`, `REL_Y`, one `SYN_REPORT`) rather than two separately-synced ones. Real
-    /// hardware groups the axes of one physical motion into one report; splitting them makes a
-    /// client run its pointer-motion path twice and briefly act on an X-only position the user
-    /// never pointed at. Either delta may be zero (that axis is then omitted).
-    RelMotion(i32, i32),
 }
 
 /// Translate a `winit` physical key into its Linux evdev `KEY_*` code, where a real, verified
@@ -285,23 +264,6 @@ fn winit_mouse_button_to_evdev(button: MouseButton) -> Option<u16> {
 /// later pass, `DrmSubsystem::page_flip`). Sending after the presenter's window has closed is a
 /// silent no-op (matching how writing to a closed real display would simply have no visible
 /// effect, rather than being a caller-visible error condition to handle).
-/// A control message delivered to the presenter's event loop from any other thread.
-///
-/// The window's VISIBILITY is runtime state, not a startup decision. A guest GUI must be able to
-/// run with no window on screen and have one shown later (and hidden again) without restarting
-/// the guest or disturbing the frame pipeline: the display is an observer of the guest, never a
-/// prerequisite for it. Page-flips, frame capture, and input all keep working while hidden --
-/// only presentation stops, which is exactly what an unmapped display does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PresenterCommand {
-    /// A frame was queued; drain and redraw. (Previously the event type was `()`, carrying only
-    /// this meaning implicitly.)
-    Wake,
-    /// Show (`true`) or hide (`false`) the window. Idempotent -- setting the current state again
-    /// is harmless, so callers need not track it.
-    SetVisible(bool),
-}
-
 #[derive(Clone)]
 pub struct FrameSender {
     frames: mpsc::Sender<Frame>,
@@ -309,7 +271,7 @@ pub struct FrameSender {
     // the next unrelated OS event (mouse move, timer tick, ...) to happen to pump the loop --
     // `EventLoopProxy::send_event` is `winit`'s own documented mechanism for exactly this, safe to
     // call from any thread.
-    wake: EventLoopProxy<PresenterCommand>,
+    wake: EventLoopProxy<()>,
 }
 
 impl FrameSender {
@@ -320,20 +282,8 @@ impl FrameSender {
     /// presenter can drain).
     pub fn send(&self, frame: Frame) {
         if self.frames.send(frame).is_ok() {
-            let _ = self.wake.send_event(PresenterCommand::Wake);
+            let _ = self.wake.send_event(());
         }
-    }
-
-    /// Show or hide the window at runtime, from any thread. A no-op if the presenter's window has
-    /// already closed, matching `send`'s own "writing to a closed display simply has no effect"
-    /// contract rather than surfacing an error the caller cannot act on.
-    ///
-    /// Hiding does NOT pause the guest, page-flips, frame capture, or input delivery -- the guest
-    /// keeps rendering into its virtual display exactly as before, and `LITEBOX_DUMP_FRAMES` keeps
-    /// capturing. This is what makes headless and headed the same running system rather than two
-    /// modes chosen at startup.
-    pub fn set_visible(&self, visible: bool) {
-        let _ = self.wake.send_event(PresenterCommand::SetVisible(visible));
     }
 }
 
@@ -341,14 +291,10 @@ impl FrameSender {
 /// window is closed. Call [`Presenter::run`] on a dedicated thread (see this module's doc
 /// comment for why); it blocks for the window's entire lifetime.
 pub struct Presenter {
-    event_loop: EventLoop<PresenterCommand>,
+    event_loop: EventLoop<()>,
     frames_rx: mpsc::Receiver<Frame>,
     sender: FrameSender,
     input_consumer: Option<Box<dyn Fn(InputSignal) + Send>>,
-    /// Whether the window is mapped when it is first created. `false` gives a fully-running
-    /// presenter with nothing on screen -- the guest renders, frames are captured, and a later
-    /// `FrameSender::set_visible(true)` reveals the current contents.
-    start_visible: bool,
 }
 
 impl Presenter {
@@ -364,9 +310,7 @@ impl Presenter {
     /// `litebox_runner_linux_on_windows_userland` spawns for it (required, since that binary's own
     /// main thread is permanently occupied running the guest via `run_thread`).
     pub fn new() -> Result<Self, winit::error::EventLoopError> {
-        let event_loop = EventLoop::<PresenterCommand>::with_user_event()
-            .with_any_thread(true)
-            .build()?;
+        let event_loop = EventLoopBuilder::default().with_any_thread(true).build()?;
         let wake = event_loop.create_proxy();
         let (frames_tx, frames_rx) = mpsc::channel();
         let sender = FrameSender {
@@ -378,23 +322,12 @@ impl Presenter {
             frames_rx,
             sender,
             input_consumer: None,
-            // Visible by default: `--gui` means "show me a window".
-            start_visible: true,
         })
     }
 
     /// A cloneable handle to push frames into this presenter from any other thread, valid for the
     /// presenter's whole lifetime (including before [`Self::run`] is called -- frames sent early
     /// simply queue until the window exists and starts draining them).
-    /// Start with the window hidden. Combined with [`FrameSender::set_visible`] this makes the
-    /// window a runtime-toggleable view of a guest that is already running, rather than something
-    /// the guest's GUI depends on existing.
-    #[must_use]
-    pub fn hidden_at_startup(mut self) -> Self {
-        self.start_visible = false;
-        self
-    }
-
     pub fn sender(&self) -> FrameSender {
         self.sender.clone()
     }
@@ -418,7 +351,6 @@ impl Presenter {
     pub fn run(self) -> Result<(), winit::error::EventLoopError> {
         self.event_loop.set_control_flow(ControlFlow::Wait);
         let mut app = PresenterApp {
-            start_visible: self.start_visible,
             frames_rx: self.frames_rx,
             state: None,
             last_frame: None,
@@ -435,17 +367,9 @@ struct GpuState {
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface_size: winit::dpi::PhysicalSize<u32>,
-    /// The exact configuration the surface was created with, kept so a `Resized` event can
-    /// re-apply it with only the dimensions changed. Rebuilding it from `get_capabilities()`
-    /// on every resize risks silently picking a DIFFERENT format/alpha mode than the one
-    /// deliberately chosen at startup (see the `Opaque` alpha-mode note in `resumed`).
-    surface_config: wgpu::SurfaceConfiguration,
 }
 
 struct PresenterApp {
-    /// See [`Presenter::hidden_at_startup`]. Applied to the window at creation time in
-    /// `resumed()`; runtime changes arrive as [`PresenterCommand::SetVisible`] instead.
-    start_visible: bool,
     frames_rx: mpsc::Receiver<Frame>,
     state: Option<GpuState>,
     /// The most recently received frame, kept regardless of whether [`Self::state`] exists yet.
@@ -562,34 +486,14 @@ impl PresenterApp {
     }
 }
 
-impl ApplicationHandler<PresenterCommand> for PresenterApp {
+impl ApplicationHandler for PresenterApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() {
             return;
         }
         let window_attrs = Window::default_attributes()
             .with_title("litebox virtual display")
-            .with_visible(self.start_visible)
             .with_inner_size(winit::dpi::PhysicalSize::new(1920u32, 1080u32));
-        // The guest's display is a compile-time constant (`VIRTUAL_WIDTH`/`VIRTUAL_HEIGHT`,
-        // 1920x1080) with no hotplug or mode-change path, and `present()` CLIPS the guest
-        // framebuffer into the surface rather than scaling it. So the visible area is a 1:1
-        // top-left crop, and a window smaller than the guest leaves the bottom/right undrawn
-        // while RELATIVE motion still moves the guest cursor into it -- the pointer disappears
-        // somewhere the user cannot see.
-        //
-        // Locking the window to 1920x1080 makes tracking exact but is NOT acceptable on its own:
-        // on a smaller desktop (this host is 1536x864) that window does not fit, putting 36% of
-        // the guest display permanently off-screen with no way to reach it. That trades one real
-        // problem for a worse one.
-        //
-        // So the window stays RESIZABLE and `Resized` keeps `surface_size` truthful. What that
-        // buys: the crop always matches what is actually on screen, so cursor position and
-        // visible pixels never disagree about the region they share. What it cannot fix without
-        // a guest mode-change path: guest display area outside the window is still unreachable
-        // by sight, though relative motion can still move the cursor there. Rescaling deltas is
-        // NOT the answer -- it would make pointer speed depend on window size (x2.00 at 960px
-        // wide, x0.75 at 2560px) and still would not reveal the hidden region.
         let Ok(window) = event_loop.create_window(window_attrs) else {
             return;
         };
@@ -649,39 +553,20 @@ impl ApplicationHandler<PresenterCommand> for PresenterApp {
         // guarantees this); no measured need for `Immediate`/`Mailbox`'s lower latency in this
         // module's own use case (a guest's DRM page-flip rate, not a real-time renderer).
         let present_mode = wgpu::PresentMode::Fifo;
-        // AGENTS.md pass 270: this previously took `caps.alpha_modes[0]` -- whatever alpha mode
-        // the GPU/driver happens to report FIRST, with no preference for `Opaque`. Live evidence
-        // (a real weston/XFCE frame captured via `LITEBOX_DUMP_FRAMES`, byte-inspected directly)
-        // showed genuine, distinct, non-default pixel content (uniform RGB=0 with a low but
-        // non-zero alpha, 0x13/255) being copied into this surface correctly by `present()`'s own
-        // plain `copy_texture_to_texture` (which does not itself blend), yet appearing visually
-        // black in the actual displayed window -- consistent with the SURFACE ITSELF being
-        // configured in a non-opaque alpha mode, letting Windows' own compositor (DWM) blend the
-        // low-alpha content against whatever is behind the window instead of showing it as-is.
-        // `Opaque` is what a real DRM scanout always is (the whole reason DRM's own dumb-buffer
-        // format doesn't even carry a meaningful alpha channel for display purposes -- `XRGB8888`,
-        // not `ARGB8888`) -- explicitly prefer it here, falling back to whatever the GPU actually
-        // offers only if `Opaque` genuinely isn't supported (extremely unlikely on any real
-        // Windows GPU/driver, but `caps.alpha_modes` is not guaranteed non-empty of `Opaque`
-        // specifically by the wgpu spec).
-        let alpha_mode = caps
-            .alpha_modes
-            .iter()
-            .copied()
-            .find(|m| *m == wgpu::CompositeAlphaMode::Opaque)
-            .unwrap_or(caps.alpha_modes[0]);
-        eprintln!("[presenter-diag] configuring surface, alpha_mode={alpha_mode:?} (available: {:?})", caps.alpha_modes);
-        let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST,
-            format: surface_format,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode,
-            desired_maximum_frame_latency: 2,
-            alpha_mode,
-            view_formats: vec![],
-        };
-        surface.configure(&device, &surface_config);
+        eprintln!("[presenter-diag] configuring surface");
+        surface.configure(
+            &device,
+            &wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST,
+                format: surface_format,
+                width: size.width.max(1),
+                height: size.height.max(1),
+                present_mode,
+                desired_maximum_frame_latency: 2,
+                alpha_mode: caps.alpha_modes[0],
+                view_formats: vec![],
+            },
+        );
         eprintln!("[presenter-diag] surface configured, resumed() about to return");
         self.state = Some(GpuState {
             window,
@@ -689,7 +574,6 @@ impl ApplicationHandler<PresenterCommand> for PresenterApp {
             device,
             queue,
             surface_size: size,
-            surface_config,
         });
         // Request a redraw of whatever frame arrived before this setup finished (see
         // `last_frame`'s own doc comment for why this race is real, not hypothetical, and
@@ -704,23 +588,7 @@ impl ApplicationHandler<PresenterCommand> for PresenterApp {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: PresenterCommand) {
-        if let PresenterCommand::SetVisible(visible) = event {
-            // Visibility is applied here, on the event-loop thread, because `winit` requires
-            // window methods to be called from the thread that owns the loop -- the whole reason
-            // this travels as an event rather than being a direct method call from the caller.
-            if let Some(state) = &self.state {
-                state.window.set_visible(visible);
-                if visible {
-                    // A window shown after frames have already arrived would otherwise stay blank
-                    // until the guest's NEXT page-flip, which for an idle desktop can be a long
-                    // time (an idle compositor legitimately flips zero times). Redraw immediately
-                    // so showing the window presents the current scanout contents.
-                    state.window.request_redraw();
-                }
-            }
-            return;
-        }
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
         // A `FrameSender::send` wake-up: drain every queued frame, keeping only the last one (the
         // most recent frame is the only one still worth showing -- matching how a real display
         // only ever shows the CURRENT scanout buffer, never a backlog of stale ones). Deliberately
@@ -756,33 +624,6 @@ impl ApplicationHandler<PresenterCommand> for PresenterApp {
     ) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(new_size) => {
-                // Without this the surface stays configured at its ORIGINAL size forever: the
-                // swapchain textures keep the old dimensions while the OS window does not, so
-                // presentation is stretched/clipped by the compositor and `surface_size` (used
-                // to bound the frame copy below) describes a window that no longer exists.
-                //
-                // This also keeps mouse tracking correct. `CursorMoved`'s handler scales its
-                // window-pixel delta by `frame resolution / surface_size` so cursor motion
-                // always covers the same fraction of the window that it covered on screen (see
-                // that handler's own doc comment) -- but that scale factor is only correct while
-                // `surface_size` actually matches the window. A stale value would scale against a
-                // window that no longer exists, desyncing cursor tracking from the real window
-                // the same way a stale render size would desync what's on screen.
-                let Some(state) = &mut self.state else {
-                    return;
-                };
-                if new_size.width == 0 || new_size.height == 0 {
-                    // A minimised window reports 0x0; configuring a zero-sized surface is
-                    // invalid, so keep the last good configuration until it is restored.
-                    return;
-                }
-                state.surface_size = new_size;
-                state.surface_config.width = new_size.width;
-                state.surface_config.height = new_size.height;
-                state.surface.configure(&state.device, &state.surface_config);
-                state.window.request_redraw();
-            }
             WindowEvent::RedrawRequested => {
                 // See `user_event`'s doc comment for why presentation happens HERE, not when a
                 // frame first arrives: this is the one callback `winit` guarantees runs with the
@@ -835,63 +676,22 @@ impl ApplicationHandler<PresenterCommand> for PresenterApp {
                 // doc comment). `winit`'s own `CursorMoved` reports the new absolute position, so
                 // the delta is derived here against the last-seen position, matching what a real
                 // mouse's own relative-motion sensor would have reported for the same movement.
-                // `present()` CLIPS the guest framebuffer into the surface rather than scaling
-                // it (see `present`'s own doc comment): the visible area is
-                // `min(frame, surface_size)` guest pixels, top-left-anchored -- NOT the window's
-                // full pixel size when the window is larger than the guest, and NOT the guest's
-                // full resolution when the window is smaller. `CursorMoved` reports positions in
-                // WINDOW pixels regardless of window size, so sending window-pixel deltas
-                // straight through only tracks correctly when the window happens to exactly match
-                // the guest's own resolution; at any other size the cursor drifts out of sync
-                // with where the user is actually pointing. Scale the delta by
-                // visible-guest-pixels-over-window-pixels (NOT guest-resolution-over-window-size
-                // -- that direction was tried first and is backwards: for a window SMALLER than
-                // the guest, scaling by the full guest/window ratio sends a delta that overshoots
-                // past the visible crop into guest area that isn't drawn at all, exactly
-                // reproducing the bug this fix exists to remove) so "move all the way across the
-                // window" always means "move all the way across the CROP actually on screen",
-                // matching the user's own requirement that on-screen mouse position track the
-                // window regardless of shape.
-                let (scale_x, scale_y) = self.last_frame.as_ref().map_or((1.0, 1.0), |frame| {
-                    self.state.as_ref().map_or((1.0, 1.0), |state| {
-                        let visible_w = frame.width.min(state.surface_size.width);
-                        let visible_h = frame.height.min(state.surface_size.height);
-                        (
-                            f64::from(visible_w) / f64::from(state.surface_size.width.max(1)),
-                            f64::from(visible_h) / f64::from(state.surface_size.height.max(1)),
-                        )
-                    })
-                });
                 if let Some((last_x, last_y)) = self.last_cursor_pos {
-                    let scaled_x = position.x * scale_x;
-                    let scaled_y = position.y * scale_y;
                     // A real mouse's per-event motion never approaches a delta anywhere near
                     // `i32`'s range, so this narrowing is exact in practice, not a real precision
                     // loss to guard against.
                     #[allow(clippy::cast_possible_truncation)]
-                    let dx = (scaled_x - last_x) as i32;
+                    let dx = (position.x - last_x) as i32;
                     #[allow(clippy::cast_possible_truncation)]
-                    let dy = (scaled_y - last_y) as i32;
-                    // ONE report for one physical movement, not two: see `InputSignal::RelMotion`.
-                    // A zero delta on an axis is omitted by the receiver, and an all-zero move
-                    // queues nothing at all.
-                    if dx != 0 || dy != 0 {
-                        consumer(InputSignal::RelMotion(dx, dy));
+                    let dy = (position.y - last_y) as i32;
+                    if dx != 0 {
+                        consumer(InputSignal::Rel(litebox_common_linux::REL_X, dx));
                     }
-                    // Advance the reference by the whole GUEST pixels ACTUALLY SENT (already
-                    // scaled), not by the raw scaled position. The cast above truncates toward
-                    // zero, so storing `scaled_x`/`scaled_y` directly would discard the
-                    // sub-pixel remainder permanently. Carrying it forward makes motion lossless:
-                    // successive sub-pixel moves accumulate until they cross a whole pixel
-                    // instead of vanishing.
-                    //
-                    // Measured against the previous behaviour: 25 moves of 0.4px (10px of real
-                    // motion) delivered ZERO pixels to the guest; 10 moves of 3.7px (37px real)
-                    // delivered 30px. Slow mouse movement was silently dropped entirely.
-                    self.last_cursor_pos = Some((last_x + f64::from(dx), last_y + f64::from(dy)));
-                } else {
-                    self.last_cursor_pos = Some((position.x * scale_x, position.y * scale_y));
+                    if dy != 0 {
+                        consumer(InputSignal::Rel(litebox_common_linux::REL_Y, dy));
+                    }
                 }
+                self.last_cursor_pos = Some((position.x, position.y));
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let Some(consumer) = &self.input_consumer else {

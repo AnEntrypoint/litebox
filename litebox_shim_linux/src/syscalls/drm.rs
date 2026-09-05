@@ -515,6 +515,30 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         if req.fb_id != 0 && !self.framebuffers.lock().contains_key(&req.fb_id) {
             return Err(Errno::ENOENT);
         }
+        // This device advertises exactly ONE mode (`VIRTUAL_WIDTH`x`VIRTUAL_HEIGHT`, see
+        // `GETCONNECTOR`'s `modes` array and `min_width`/`max_width`/`min_height`/`max_height` in
+        // `get_resources`) -- there is no real hardware behind this to somehow honor a different
+        // one. Real DRM validates a `mode_valid` SETCRTC's requested mode against what the CRTC
+        // can actually drive and returns `EINVAL` for one it can't (a real client already knows to
+        // fall back on that error); this device previously stored ANY `hdisplay`/`vdisplay` the
+        // guest asked for unconditionally and always reported success, silently accepting a
+        // resolution it cannot actually scan out at. That mismatch then had to be quietly absorbed
+        // downstream (the host presenter's own frame/surface-size handling) instead of ever being
+        // reported to the one place -- the guest -- that could have chosen a supported mode
+        // instead. Reject it here, loudly, the same way real DRM would.
+        if req.mode_valid != 0
+            && (u32::from(req.mode.hdisplay) != VIRTUAL_WIDTH
+                || u32::from(req.mode.vdisplay) != VIRTUAL_HEIGHT)
+        {
+            litebox_util_log::error!(
+                requested_hdisplay:? = req.mode.hdisplay,
+                requested_vdisplay:? = req.mode.vdisplay,
+                advertised_width:% = VIRTUAL_WIDTH,
+                advertised_height:% = VIRTUAL_HEIGHT;
+                "drm-ioctl: SETCRTC rejected -- requested mode does not match the device's one advertised mode"
+            );
+            return Err(Errno::EINVAL);
+        }
         litebox_util_log::warn!(
             fb_id:? = req.fb_id,
             mode_valid:? = req.mode_valid,

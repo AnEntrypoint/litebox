@@ -598,11 +598,25 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             // genuinely independent -- it no longer depends on this closure running at all, and
             // duplicating it here would write every frame twice.
             shim.add_drm_flip_callback(move |bytes, width, height, pitch, _pixel_format| {
+                // The dumb buffer this slice points into is host-visible shared memory the guest
+                // can `mmap` and keep writing to, and `DrmSubsystem::notify_flip_callback` (see
+                // its own SAFETY note) unmaps it the instant every registered callback -- this one
+                // included -- returns. `sender.send` only QUEUES the frame for later, async
+                // presentation on a different thread, well after this callback (and the mapping
+                // backing `bytes`) is gone -- so a copy out of `bytes` is genuinely required here,
+                // not an incidental cost to shave off. What IS avoidable is a FRESH heap
+                // allocation for that copy on every single flip: `take_free_buffer` reclaims the
+                // `Vec` a previous, already-superseded frame no longer needs (see `FrameSender`'s
+                // own doc comment for the free-list this comes from), so steady-state flipping at
+                // a fixed resolution allocates only once, not per frame.
+                let mut owned = sender.take_free_buffer();
+                owned.clear();
+                owned.extend_from_slice(bytes);
                 let frame = litebox_platform_windows_userland::presentation::Frame {
                     width,
                     height,
                     pitch,
-                    bytes: bytes.to_vec(),
+                    bytes: owned,
                 };
                 sender.send(frame);
             });
@@ -909,6 +923,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     if let Some(handle) = gui_presenter_thread {
         let _ = handle.join();
     }
+
+    // Loud, not silent: disclose any `LITEBOX_DUMP_FRAMES` frames dropped due to background-
+    // writer backpressure before the process tears everything down (`std::process::exit` below
+    // does not run destructors, so this must happen here, not in a `Drop` impl).
+    litebox_platform_windows_userland::presentation::dump_frame_diagnostic_report_drops();
 
     std::process::exit(exit_code)
 }
