@@ -490,6 +490,55 @@ unsafe extern "system" fn vectored_exception_handler_entry(
 /// rather than a silent hang; false-positives (wrongly treating a non-FS-relative fault as
 /// FS-relative) are what this function exists to eliminate, and requiring the exact `0x64` byte to
 /// be genuinely present in the prefix run has none.
+/// Read one `usize` from `addr`, but ONLY after confirming the page is committed and readable.
+///
+/// The unrecoverable-AV diagnostics walk memory pointed at by registers captured at a fault whose
+/// whole nature is that those registers may be garbage. Confirmed live: `context.Rsp` at one such
+/// fault was `0xc0000008` -- not a misaligned stack address but an NTSTATUS-shaped value
+/// (`STATUS_INVALID_HANDLE`) sitting where a pointer should be. Dereferencing that raises a
+/// SECOND access violation from inside the VEH itself, which silently kills the dump: the handler
+/// produces no further output and the evidence it exists to capture is lost.
+///
+/// So validity is checked BEFORE the read rather than recovered afterwards -- a fault inside a
+/// fault handler has no good recovery path. `VirtualQuery` is the same primitive the neighbouring
+/// `diag-unrecov-av-pagestate` block already uses. Returns `None` when the address is not
+/// committed or not readable, so the caller can print why it stopped instead of dying.
+fn diag_probe_read_usize(addr: usize) -> Option<usize> {
+    // A null address cannot be mapped; skip the syscall entirely.
+    if addr == 0 {
+        return None;
+    }
+    let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+    let queried = unsafe {
+        Win32_Memory::VirtualQuery(
+            addr as *const c_void,
+            &mut mbi,
+            core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if queried == 0 || mbi.State != Win32_Memory::MEM_COMMIT {
+        return None;
+    }
+    // PAGE_NOACCESS/PAGE_GUARD would fault on read just as surely as an unmapped page does.
+    const READABLE: u32 = Win32_Memory::PAGE_READONLY
+        | Win32_Memory::PAGE_READWRITE
+        | Win32_Memory::PAGE_WRITECOPY
+        | Win32_Memory::PAGE_EXECUTE_READ
+        | Win32_Memory::PAGE_EXECUTE_READWRITE
+        | Win32_Memory::PAGE_EXECUTE_WRITECOPY;
+    if mbi.Protect & READABLE == 0 || mbi.Protect & Win32_Memory::PAGE_GUARD != 0 {
+        return None;
+    }
+    // The 8 bytes must not straddle out of the committed region.
+    let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+    if addr.saturating_add(8) > region_end {
+        return None;
+    }
+    // SAFETY: the page is committed and readable per the query above. `read_unaligned` because a
+    // register captured mid-fault carries no alignment guarantee.
+    Some(unsafe { (addr as *const usize).read_unaligned() })
+}
+
 fn faulting_instruction_has_fs_override(rip: usize) -> bool {
     let mut buf = [0u8; 4];
     let n = fork_verify::read_code_bytes_for_diagnostics(rip, &mut buf);
@@ -1665,7 +1714,16 @@ unsafe extern "system" fn vectored_exception_handler(
                         // printing anything, destroying the evidence it exists to capture.
                         // Confirmed live: "unsafe precondition(s) violated: ptr::read_volatile
                         // requires that the pointer argument is aligned", aborting mid-dump.
-                        let val = unsafe { (addr as *const usize).read_unaligned() };
+                        // `rsp` may not be a stack pointer at all at a wild-jump fault, so probe
+                        // before dereferencing and stop at the first unreadable slot: the reason
+                        // IS the diagnostic, and silently skipping would hide it.
+                        let Some(val) = diag_probe_read_usize(addr) else {
+                            eprintln!(
+                                "[diag-unrecov-av-stack] [rsp+{:#x}] addr={addr:#x} NOT READABLE (rsp={rsp:#x} is not a usable stack pointer) -- stopping stack walk",
+                                i * 8,
+                            );
+                            break;
+                        };
                         let in_module = val.wrapping_sub(module_base) < 0x0200_0000;
                         eprintln!(
                             "[diag-unrecov-av-stack] [rsp+{:#x}]={:#x}{}",
@@ -1703,7 +1761,16 @@ unsafe extern "system" fn vectored_exception_handler(
                                     let addr = (*fault_rsp as usize).wrapping_add(j * 8);
                                     // See the alignment note on the primary stack dump above:
                                     // a recorded `fault_rsp` has the same misalignment hazard.
-                                    let val = unsafe { (addr as *const usize).read_unaligned() };
+                                    // A recorded `fault_rsp` carries the identical garbage-value
+                                    // hazard; guarding only the primary walk would still let this
+                                    // one take out the handler.
+                                    let Some(val) = diag_probe_read_usize(addr) else {
+                                        eprintln!(
+                                            "[diag-unrecov-av-ring-stack] [{i}][rsp+{:#x}] addr={addr:#x} NOT READABLE -- stopping",
+                                            j * 8,
+                                        );
+                                        break;
+                                    };
                                     let in_module = val.wrapping_sub(module_base) < 0x0200_0000;
                                     eprintln!(
                                         "[diag-unrecov-av-ring-stack] [{i}][rsp+{:#x}]={val:#x}{}",
