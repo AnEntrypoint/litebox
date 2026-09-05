@@ -40,7 +40,7 @@ const LINUX_DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/
 /// hungry initialization overflows this one.
 const INITIAL_GUEST_THREAD_STACK_SIZE: usize = 32 * 1024 * 1024;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use litebox_platform_windows_userland::WindowsUserland as Platform;
 use memmap2::Mmap;
@@ -329,7 +329,120 @@ impl std::io::Write for FlushingStderr {
 /// Can panic if any particulars of the environment are not set up as expected. Ideally, would not
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
+/// Held for a `litebox_runner_linux_on_windows_userland` process's entire lifetime to make
+/// concurrent boots on this host structurally impossible. See `acquire_boot_lock`'s own doc
+/// comment for why this exists.
+struct BootLock {
+    path: PathBuf,
+}
+
+impl Drop for BootLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Keep re-touching the lockfile's mtime every 60s for as long as this process is alive, so a
+/// long-running-but-genuinely-live boot's lock never looks stale (its age reflects how long ago
+/// the last heartbeat landed, not how long ago the boot started), while a hard-killed process
+/// (which takes this thread down with it -- no `Drop` runs, but no more heartbeats either) still
+/// lets its lock go stale and reclaimable within `STALE_LOCK_AFTER` of the last real heartbeat.
+fn spawn_boot_lock_heartbeat(lock_path: PathBuf) {
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            // Truncating write (not append) reliably updates mtime on every platform without a
+            // new dependency (unlike append-only reopen, which some filesystems don't guarantee
+            // bumps mtime with zero bytes written). If the file is already gone (e.g. removed
+            // out-of-band), there's nothing left to keep alive -- stop quietly rather than
+            // recreate a lock this process's own BootLock guard didn't create.
+            if !lock_path.exists() {
+                break;
+            }
+            let _ = std::fs::write(&lock_path, format!("{}\n", std::process::id()));
+        }
+    });
+}
+
+/// Acquire the single, host-wide boot lock, refusing to proceed if another live boot already
+/// holds it. A lockfile in `.litebox-cache/` (the same directory the OCI-pull cache already
+/// uses) holds this process's PID and creation timestamp; a lock older than
+/// `STALE_LOCK_AFTER` is treated as abandoned (e.g. from a process that was hard-killed by an
+/// external low-memory watchdog, which never runs a `Drop` impl) and is safely stolen, matching
+/// this codebase's existing `sweep_orphaned_temp_files` convention of using file age rather than
+/// a cross-platform PID-liveness check (which would need a new dependency for a single Win32
+/// API call) to decide staleness -- a real boot is observed to take at most a few minutes even
+/// for a very large image, so anything older than that is safe to treat as abandoned.
+fn acquire_boot_lock() -> Result<BootLock> {
+    // Short enough that a watchdog-killed run's stale lock doesn't block the next boot for long,
+    // but safe for a genuinely long-running live boot because of the heartbeat thread spawned
+    // below, which keeps re-touching this file's mtime for as long as this process is actually
+    // alive -- so staleness reflects liveness, not merely how long ago the boot started.
+    const STALE_LOCK_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+    let lock_dir = Path::new(".litebox-cache");
+    std::fs::create_dir_all(lock_dir)
+        .with_context(|| format!("failed to create lock directory {}", lock_dir.display()))?;
+    let lock_path = lock_dir.join("boot.lock");
+
+    for attempt in 0..2 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut f) => {
+                use std::io::Write as _;
+                let _ = writeln!(f, "{}", std::process::id());
+                drop(f);
+                spawn_boot_lock_heartbeat(lock_path.clone());
+                return Ok(BootLock { path: lock_path });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
+                let is_stale = std::fs::metadata(&lock_path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+                    .is_some_and(|age| age >= STALE_LOCK_AFTER);
+                if is_stale {
+                    let _ = std::fs::remove_file(&lock_path);
+                    continue; // retry the create_new on the next loop iteration
+                }
+                let holder = std::fs::read_to_string(&lock_path).unwrap_or_default();
+                return Err(anyhow!(
+                    "another litebox_runner_linux_on_windows_userland boot is already in \
+                     progress on this host (lock held by pid {}, {}) -- concurrent boots \
+                     silently starve each other (host memory/CPU contention) and produce \
+                     symptoms indistinguishable from a real hang or crash; wait for it to \
+                     finish, or if you're certain it's genuinely dead, remove {} manually",
+                    holder.trim(),
+                    lock_path.display(),
+                    lock_path.display()
+                ));
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("failed to acquire boot lock at {}", lock_path.display())
+                });
+            }
+        }
+    }
+    unreachable!("loop always returns Ok or Err within its two iterations")
+}
+
 pub fn run(cli_args: CliArgs) -> Result<()> {
+    // Real boot lock, not a remembered rule: two concurrent litebox_runner processes
+    // sharing this host silently starve each other (host memory/CPU contention),
+    // producing a symptom -- truncated log, no crash, no exit -- that is
+    // indistinguishable from a real hang or regression. Every prior session had this
+    // as a documented discipline everyone was supposed to remember and check for
+    // manually; that discipline was repeatedly violated under pressure across many
+    // concurrent sessions/forks this project has run, each time producing a real,
+    // costly misdiagnosis (an "intermittent" bug that was actually just contention).
+    // A held file lock makes concurrent boots structurally impossible instead of a
+    // rule to remember. Held for this process's entire lifetime (dropped, and the
+    // lockfile removed, on any exit path via the guard's Drop impl).
+    let _boot_lock = acquire_boot_lock()?;
+
     // The shim is `no_std` and cannot read the environment itself, so translate
     // `LITEBOX_DRM_TRACE=1` here. This logs every DRM ioctl at its single dispatch
     // point, which is what answers "is the guest still page-flipping?" -- the
