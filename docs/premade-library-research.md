@@ -375,6 +375,169 @@ Sources for Part 2 (in-repo, read directly, no external fetches needed):
 - `litebox_session_daemon/Cargo.toml`
 - Every other workspace-member `Cargo.toml` read directly for the baseline survey
 
+## Part 3: core syscall-emulation logic audit (`litebox`, `litebox_common_linux`, `litebox_shim_linux`)
+
+Neither Part 1 nor Part 2 looked past tooling/infrastructure into the actual guest-facing
+emulation logic itself -- the real algorithmic/data-structure/ABI-definition code most likely to
+hide genuine reinvention, and the code this whole session's own bug history traces back to most
+often. Per the user's further-reinforced mantra ("make extra sure we're not reinventing any
+wheels in any of our codebase"), this pass reads the actual source for each area, not just
+`grep`, to confirm whether hand-rolling is genuinely justified (usually: `#![no_std]` + guest-ABI
+byte-exactness, both real constraints in this workspace) or incidental.
+
+**Baseline constraint, confirmed directly**: `litebox`, `litebox_common_linux`, and
+`litebox_shim_linux` are ALL `#![no_std]` (confirmed via each crate's own `src/lib.rs`). This is
+the single biggest fact shaping what's genuinely hand-rollable-by-necessity here -- most
+std-oriented crates (`nix`, `rustix`'s higher-level API, `region`) are simply not usable in this
+code at all, independent of maturity. Findings below account for this throughout.
+
+### 1. Data structures -- mostly ALREADY correct, one real gap found
+
+**`rangemap` is ALREADY a direct dependency of `litebox`** (`Cargo.toml`: `rangemap = { version =
+"1.5.1", features = ["const_fn"] }`) and is genuinely used, confirmed via `grep -rl
+"rangemap::" litebox/src/` -> `litebox/src/mm/linux.rs` (the VMA-tracking code the "VmArea/
+rangemap coalescing bug" commit message refers to). **This refutes the premise of investigating
+this as a gap** -- it's not hand-rolled `BTreeMap`-based range logic, it's the real, maintained
+crate, already in use, already the subject of at least one bug FIX (not a reinvention) this
+session's own history references. No action needed.
+
+**`ringbuf` is ALSO already a direct dependency of BOTH `litebox` and `litebox_shim_linux`**
+(confirmed in both `Cargo.toml`s) and genuinely used: `litebox/src/net/socket_channel.rs`,
+`litebox/src/pipes.rs`, `litebox_shim_linux/src/channel.rs`. No action needed for these.
+
+**`buddy_system_allocator` and `slabmalloc` are already direct dependencies of `litebox`**,
+confirmed used in `litebox/src/mm/allocator.rs` -- this IS the guest heap allocator, genuinely
+using two real, purpose-built allocator crates (`buddy_system_allocator` for the buddy allocator,
+`slabmalloc` -- pinned to an unreleased git rev with fixes on top of 0.11.0, a deliberate,
+documented choice, not accidental -- for slab allocation) rather than hand-rolled free-list logic.
+No action needed.
+
+**`bitflags` is already used 30+ times across `litebox`/`litebox_common_linux`/
+`litebox_shim_linux`** (confirmed via `grep -c "bitflags::bitflags!"`) for exactly the
+`OFlags`/`ProtFlags`/`MapFlags`/`MemoryRegionPermissions`-shaped types this pass set out to check
+-- already the standard crate, not hand-rolled bit manipulation. No action needed.
+
+**The one real, concrete, low-risk gap found**: the crash-diagnostic "fault ring buffer"
+(`RECENT_FAULTS` in `litebox_platform_windows_userland/src/lib.rs:596`) IS genuinely hand-rolled
+-- `static RECENT_FAULTS: RefCell<[(i32, u64, u64, bool); 4]>`, a raw fixed-size array with manual
+wraparound logic, not a ring-buffer crate. This is notable specifically because `ringbuf` is
+ALREADY a proven, working dependency one crate over in the very same workspace (`litebox`,
+`litebox_shim_linux`) -- there's no `no_std` or FFI-boundary reason this one instance couldn't use
+it too; `litebox_platform_windows_userland` would just need to add the dependency.
+**Recommendation**: low-risk, well-scoped swap candidate for a future pass -- replace the raw
+4-element array + manual index wraparound with `ringbuf`'s `HeapRb`/const-generic ring buffer,
+using the exact same tested crate this workspace already trusts elsewhere. Not attempted here
+(this file is actively owned by a concurrent fork's platform-bug investigation this session --
+flagging for whoever picks it up next, not touching it now).
+
+### 2. Linux syscall ABI/struct definitions -- genuinely hand-rolled, and this is where a real historical bug came from
+
+**`litebox_common_linux/src/lib.rs` hand-defines every Linux/DRM/input ABI struct this codebase
+needs**: `FileStat`, `Statx`, `StatxTimestamp`, `Statfs`, `Flock`, `Termios`, `Winsize`,
+`InputId`, `InputEvent`, `VtStat`, `VtMode`, and ~20 separate `DrmMode*` structs (`DrmModeCreateDumb`,
+`DrmModeGetConnector`, `DrmModeObjGetProperties`, etc.) -- confirmed by listing every top-level
+`pub struct` in the file. These are `zerocopy`-derived (the crate is already a dependency,
+`zerocopy = { version = "0.8", features = ["derive"] }`) for guest-ABI-exact byte layout, which is
+a real, defensible reason to hand-define rather than pull in a std-oriented crate like `libc`
+(wrong target -- `libc` describes the HOST's libc ABI, not an arbitrary guest's) -- `libc` IS
+already a dependency of `litebox_shim_linux`, but only as a **dev-dependency** for test code
+running against a real host, confirmed via its Cargo.toml scoping, not for the actual guest-ABI
+struct definitions themselves. So this part is genuinely, structurally justified: no existing
+crate provides "the Linux syscall ABI struct layouts, no_std, independent of host libc" in the
+exact shape this project needs, and `zerocopy`-derived hand-definitions are a reasonable way to
+get byte-exact guest-visible structs.
+
+**But the DRM ioctl NUMBER/constant definitions specifically are a different, more concrete
+case**, and this is the one place in this whole audit where hand-rolling has a DOCUMENTED, REAL
+bug in this exact session's own history (the DPMS/EDID connector-property work, which shipped a
+wrong, hand-remembered ioctl number before being caught and fixed via live kernel-header
+verification). The file's own comments show real diligence (`"fetched live from the real kernel
+drm.h (torvalds/linux master), not guessed"`, `"size independently re-verified"`) -- meaning past
+mistakes weren't from carelessness, they're the INHERENT risk of hand-transcribing kernel-header
+constants even when done carefully, every single time a new ioctl is added. Confirmed via `grep`:
+**no `drm-fourcc`/`drm-rs` dependency exists anywhere in this workspace** -- there's instead a
+companion doc, `docs/drm-dumb-buffer-ioctl-reference.md`, that exists specifically to track "gaps"
+in this manual transcription process (its own name says so).
+
+**Recommendation**: [`drm-fourcc`](https://crates.io/crates/drm-fourcc) (a small, focused,
+maintained crate providing DRM pixel-format constants -- confirmed lightweight enough to plausibly
+be `no_std`-portable, though this specific claim needs verifying before adoption, not assumed) is
+worth a real look for at least the pixel-format-constant subset of this problem. For the ioctl
+NUMBER constants specifically (the actual `DRM_IOCTL_MODE_*` values, the class that caused the
+real bug), check whether `linux-raw-sys` (the `no_std`-compatible, actively-maintained crate that
+underlies `rustix` itself, providing exactly "raw Linux kernel ABI constants/structs, no host libc
+required") has full DRM ioctl coverage -- it's the single best-shaped candidate found in this pass
+for eliminating this entire bug CLASS (a maintained crate's constants get fixed by the crate
+maintainers when the kernel ABI changes; a hand-transcribed comment doesn't). Not adopted in this
+pass -- this is genuinely core, live-tested code (the whole XFCE/labwc DRM investigation this
+session depends on it), so swapping constant sources deserves its own dedicated, carefully-
+verified follow-up pass, not a rushed change alongside this research.
+
+### 3. Errno handling -- hand-rolled, but for a real, structural reason (not incidental)
+
+`litebox_common_linux::errno::Errno` (`src/errno/mod.rs:28`) is a hand-rolled
+`NonZeroU8`-wrapping struct with a large generated constant table (`mod generated`), not
+`rustix`'s or `nix`'s `Errno` type. **This is genuinely justified, not incidental**: both `rustix`
+and `nix` represent the HOST's own errno (whatever the compiling/running platform's libc defines),
+while this `Errno` represents the GUEST Linux ABI's errno values -- litebox's whole architecture
+runs guest Linux syscalls under Windows/macOS/other hosts, so a guest-Linux-specific errno type
+that's independent of host platform is structurally necessary, not a missed opportunity. No
+action recommended -- confirmed, not assumed, via reading the actual type definition and its own
+doc comment ("This is a transparent wrapper around Linux error numbers... intended to provide
+some type safety").
+
+### 4. ELF loading (`litebox_common_linux::loader`) -- Part 2's flagged inconsistency, now with a
+concrete API-shape reason found (not fully resolved, but narrowed)
+
+Part 2 flagged `loader.rs` using the `elf` crate while the rest of the workspace uses `object`,
+recommending a dedicated follow-up before assuming a migration is warranted. This pass read
+`loader.rs`'s actual `elf`-crate usage (lines 12-13, 55-56, 97-106, 183-203, 336-338) and found a
+concrete, plausible reason for the divergence: `loader.rs` parses INCREMENTALLY, against a
+fallible `ReadAt`-style trait over a live guest file descriptor (`elf::file::parse_ident`, then
+`FileHeader::parse_tail` against a manually-sized stack buffer, then a lazy
+`elf::parse::ParsingIterator` over program headers) -- i.e. streaming, no-alloc, I/O-driven
+parsing directly against syscall reads, not parsing an already-in-memory byte slice. `object`'s
+own typical API shape (used by both `litebox_syscall_rewriter` and `litebox_packager`) parses
+against an in-memory `&[u8]` -- a genuinely different access pattern, since those two callers
+already have the whole file's bytes on the host side before parsing, while `loader.rs` is loading
+a guest program by streaming reads through the GUEST's own file-descriptor emulation, which is a
+real, structural difference, not an accident.
+
+**This narrows but does not fully resolve Part 2's own open question**: whether `object` ALSO
+exposes an incremental/streaming parsing mode that could cover this exact need is still unchecked
+(this pass ran out of scope to verify `object`'s full API surface for a no-alloc streaming
+program-header iterator equivalent to `elf`'s `ParsingIterator`). **Recommendation unchanged from
+Part 2**: still worth a dedicated follow-up specifically to check `object`'s streaming-parse
+capability before concluding either way -- this pass adds real evidence (the streaming-vs-in-memory
+distinction) rather than resolving the question, since a rushed swap of core guest-loading logic
+without confirming API-shape parity would be exactly the kind of risky, unverified change this
+session's own standing discipline (see the CoW-mmap and RtlpUnwindPrologue passes) argues against.
+
+### Part 3 summary table
+
+| Area | Finding | Recommendation |
+|---|---|---|
+| Range-map/VMA tracking | Already `rangemap`, genuinely used, not hand-rolled | No action |
+| Ring buffers (pipes/sockets) | Already `ringbuf`, genuinely used in `litebox`/`litebox_shim_linux` | No action |
+| Crash-diagnostic fault ring (`RECENT_FAULTS`) | Hand-rolled fixed array, while `ringbuf` is already proven one crate over | **Low-risk swap candidate** -- adopt `ringbuf` here too |
+| Guest heap allocator | Already `buddy_system_allocator` + `slabmalloc`, genuinely used | No action |
+| Bit-flag types (`OFlags`/`ProtFlags`/etc.) | Already `bitflags`, 30+ real usages | No action |
+| Linux/DRM/input ABI structs | Hand-rolled (`zerocopy`-derived), structurally justified for `no_std` guest-ABI-exact layout | No action on the struct layouts themselves |
+| DRM ioctl NUMBER constants specifically | Hand-transcribed from kernel headers, ALREADY caused one real documented bug this session | **Worth a dedicated pass**: check `linux-raw-sys`/`drm-fourcc` coverage and `no_std` fit |
+| Guest-Linux `Errno` type | Hand-rolled, but structurally justified (guest ABI ≠ host errno, `rustix`/`nix` represent the wrong platform) | No action |
+| ELF loading (`loader.rs` vs. rewriter/packager) | Uses `elf` crate for streaming I/O-driven parsing, a real API-shape difference from `object`'s in-memory usage elsewhere | Still worth a follow-up to check if `object` has an equivalent streaming mode, not yet confirmed either way |
+
+Sources for Part 3 (in-repo, read directly):
+- `litebox/Cargo.toml`, `litebox/src/mm/linux.rs`, `litebox/src/mm/allocator.rs`,
+  `litebox/src/net/socket_channel.rs`, `litebox/src/pipes.rs`
+- `litebox_common_linux/Cargo.toml`, `litebox_common_linux/src/lib.rs`,
+  `litebox_common_linux/src/errno/mod.rs`, `litebox_common_linux/src/loader.rs`
+- `litebox_shim_linux/Cargo.toml`, `litebox_shim_linux/src/channel.rs`
+- `litebox_platform_windows_userland/src/lib.rs` (`RECENT_FAULTS` at line 596)
+- `litebox_shim_linux/src/syscalls/drm.rs`, `docs/drm-dumb-buffer-ioctl-reference.md`
+- [drm-fourcc on crates.io](https://crates.io/crates/drm-fourcc)
+- [linux-raw-sys on crates.io](https://crates.io/crates/linux-raw-sys) (the crate underlying `rustix`)
+
 Sources:
 - [oci-client on GitHub](https://github.com/oras-project/rust-oci-client)
 - [oci-client on crates.io](https://crates.io/crates/oci-client)
