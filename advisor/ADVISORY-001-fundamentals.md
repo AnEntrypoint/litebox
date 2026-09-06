@@ -1548,3 +1548,93 @@ corruption. The correct fix RESERVES the span without populating or copying it -
 change from the one 3K warned against, but one that still shifts every child's address-space
 layout, so it wants its own pass with its own before/after capture rather than being appended to
 this one. Eleventh mechanism, and the first that is a located defect rather than an elimination.
+
+## 3M. REFUTED: the short group reservation. The 16 MiB hole is INTERIOR to a correct group.
+
+3L.2 located a real defect -- `Vmem::duplicate` builds groups from VMA extents, so a group's span
+ends at its last VMA's end while the parent additionally holds `ENSURE_SPACE_AFTER`'s
+`DEFAULT_RESERVED_SPACE_SIZE` headroom past it. That defect is real and was fixed this pass
+(`VmArea::reserved_extra`, recorded by `create_mapping`, consumed by the group-span computation).
+**It is not the cause of these faults**, and this section records the measurement that settles it
+so it is not re-derived a third time.
+
+**Direct before/after, same oracle, two genuinely different binaries.** 30-concurrent-`/bin/true`
+on `webtop:debian-xfce`, `LITEBOX_LOG=error`, pre-fix and post-fix builds (md5 confirmed distinct;
+logs diverge at line 39, the first guest-execution line):
+
+    pre-fix : 30 deaths, 25 distinct cr2
+    post-fix: 30 deaths, 25 distinct cr2
+    addresses eliminated: 0    addresses new/moved: 0    identical: 25/25
+
+The two address sets hash identically (`md5 b693b869...` both). Not a reduction, not a relocation
+-- the fault geometry is byte-for-byte unchanged. Earlier single-run observations of a death-count
+drop (3-6 to 2) and of individual addresses "disappearing" were run-to-run variance on far too
+small a sample, and are retracted.
+
+**Why the fix cannot apply here, from the run's own `DIAG_GROUPS` output.** Every fork reserves
+group 0 as `268,697,600..286,953,472` = `0x10040000..0x111A9000`, span 18,255,872 bytes, holding 7
+non-stack regions. The 16 MiB hole is `0x10188000..0x11188000`. The hole is **entirely INTERIOR to
+that group**, with real VMAs on both sides of it inside the same reservation -- it is not at the
+group's end. `reserved_extra` only ever extends a group's END boundary, so a boundary fix cannot
+change an interior gap, and the byte-identical geometry above is exactly what that predicts.
+
+**What this reframes.** The child faithfully reproduces the parent's own hole: the group
+placeholder is inserted with `populate_pages_immediately = false`, and nothing backs the interior
+gap in EITHER process, because there is no VMA there to copy. This returns to, and now explains,
+the very first finding of this investigation -- `cr2` was never mapped in the parent either. The
+remaining question is therefore not about fork/duplicate/relocation mechanics at all, all of which
+are now measured correct. It is: **what does the guest believe lives at `0x11181620-0x111ef900`?**
+That span is a loader-created `ENSURE_SPACE_AFTER` reservation that is deliberately never backed.
+If a guest structure spans it as though it were usable memory, something TOLD the guest it was
+valid -- pointing at `mmap` return values, `/proc/self/maps` synthesis, or ELF program-header
+interpretation, not at fork's copy path. Twelfth eliminated mechanism.
+
+**Methodology note, learned the hard way this pass.** Raw `cr2` values are NOT a valid before/after
+measure for any layout-affecting change: they move with the layout, so turnover proves nothing
+either way. Compare offsets from a stable landmark instead -- the hole's own boundaries
+(`0x10188000`/`0x11188000`) have been constant across every capture, so "distance below
+`0x11188000`" is the comparable measure.
+
+**Also fixed this pass, on its own merits, NOT a fix for the above:** `duplicate`'s per-region copy
+rebuilt each child VMA via `VmArea::new`, which takes only flags and `is_file_backed` and so reset
+`reserved_extra` to 0 on every child. A fork-of-a-fork would then size its groups from a zeroed
+value, reintroducing the 3L.2 defect one generation down -- reachable in the real workload, since
+shells and dbus fork repeatedly.
+
+**Known rough edge, unrelated to the bug but repeatedly costly tonight:** `.litebox-cache/boot.lock`
+is left behind whenever a runner is hard-killed rather than exiting cleanly, and its heartbeat
+cannot detect that. Three separate boots this pass were rejected by locks whose owning pids were
+long dead. Worth making the lock self-healing on a confirmed-dead owner.
+
+### 3M.1 All 25 faults are ONE instruction, in the child only
+
+Two measurements from the same capture, both cheap and both decisive about where to look next.
+
+**Every fault is the same guest instruction.** Attributing all 25 faulting `rip` values against the
+run's 870 `DIAG_VMA fork-relocation` destination ranges gives a unanimous answer:
+
+    off=+502,790 (0x7ac06)  exec=true  file_backed=true  srclen=1,454,080  src=0x7feffc2e3000
+
+`src=0x7feffc2e3000` len 1,454,080 is glibc's text segment -- the same source range 3L.2 named.
+So there are not two clusters and never were: the low ("padding band") and high ("libc text")
+faults are the SAME single instruction, executing in each child's own correctly-relocated libc
+copy. `rip & 0xffff == 0x2c06` holds in all 25 cases, but that is an artifact of every relocation
+base being 64 KiB-aligned; the real code offset is `0x7ac06`, which 3L.2 had already measured for
+the high cluster alone. The `0x171b0` near-null outlier folds in as the same instruction with a
+smaller garbage operand.
+
+This retires the "irregular offsets, no constant stride" signature that misdirected 3K and 3L: the
+varying `cr2` values were only the varying pointer OPERAND of one fixed instruction, never a
+distribution to be explained. All 25 carry `error_code=0x4` (read of a not-present page) -- note
+NOT `0x6`, so the write-to-libc-text sub-case 3L.2 recorded does not occur in this capture.
+
+**The parent never faults, and not because it died early.** Parent `pid=1` logs
+`exit_group pid=1 ... status=0`, prints `ORACLE_DONE_ALL_30`, and takes zero fatal signals; all 30
+children (`pid=2..31`) die. The parent runs the same code over the same layout and simply never
+reaches that instruction, so "the address is unmapped in the parent too" is irrelevant -- the
+parent never dereferences it. The bad pointer is therefore produced or first followed by the act of
+forking, in code that runs ONLY in a child: the post-clone return path, `fork_verify`'s healing
+(child-context only), or libc's own work between `fork()` returning 0 and `execve`.
+
+Next: symbolize glibc `+0x7ac06` and identify which pointer operand that one instruction
+dereferences -- that operand is garbage in every child and correct in the parent.

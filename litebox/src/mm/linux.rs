@@ -325,6 +325,42 @@ pub(super) struct VmArea<Platform: PageManagementProvider<ALIGN>, const ALIGN: u
     /// created (see `create_pages`), so no `VmArea` on such a platform ever reaches this struct
     /// with `VM_SHARED` set and this field `None` -- that combination cannot occur.
     shared_handle: Option<Platform::SharedMemoryHandle>,
+    /// Extra address space RESERVED immediately after this VMA's end but deliberately left with
+    /// no `VmArea` of its own: [`CreatePagesFlags::ENSURE_SPACE_AFTER`]'s growth headroom, of
+    /// [`DEFAULT_RESERVED_SPACE_SIZE`] bytes. `0` when this mapping has no such headroom.
+    ///
+    /// Recorded by [`Vmem::create_mapping`], which claims `length + reserved_extra` of address
+    /// space via `get_unmmaped_area` but inserts a VMA covering only `length`. That asymmetry is
+    /// intentional (the headroom must stay unbacked so a later `brk`/`mremap` can grow into it),
+    /// but it makes the reservation invisible to every consumer that reasons from VMA extents.
+    ///
+    /// [`Vmem::duplicate`] is the consumer that must not be fooled. It builds a fork's coherent
+    /// groups from VMA extents, so without this field a group's span ends at its last VMA's end
+    /// while the PARENT actually holds a further `reserved_extra` bytes. The child's reservation
+    /// is then short by exactly that much, and `insert_mapping(FixedAddressBehavior::Hint)` is
+    /// free to place a LATER group inside what was an EARLIER group's headroom -- so relative
+    /// offsets that were valid in the parent do not survive the fork, which is precisely the
+    /// invariant coherent-group relocation exists to preserve.
+    ///
+    /// This is a real defect, fixed here on its own merits and correct by construction. It is NOT
+    /// the cause of the `webtop:debian-xfce` fork faults it was originally written to address --
+    /// see advisory section 3M. Measured directly: a 30-concurrent-`/bin/true` capture before and
+    /// after this change produced a byte-identical fault set (25 distinct `cr2`, 30 deaths, zero
+    /// addresses eliminated or moved), because the 16 MiB hole those faults land in is INTERIOR
+    /// to a group whose span was already correct, not past a group's end. Do not read this field
+    /// as having fixed that bug.
+    ///
+    /// # Propagation rule -- deliberately NOT the same as `view_base`/`view_len`
+    ///
+    /// The sibling fields below must be propagated UNCHANGED through every clone, split and
+    /// reconstruction. This field must NOT. The headroom sits immediately AFTER the original
+    /// mapping's end, so when a VMA is split (see `protect_mapping`'s split logic) only the slice
+    /// that still ends exactly where the ORIGINAL pre-split mapping ended still owns it. A
+    /// leading or middle slice inheriting a nonzero `reserved_extra` would claim reserved space
+    /// that no longer follows it, extending a fork group past address space it does not own --
+    /// a fresh instance of the very bug this field exists to fix, not a fix for it. Every other
+    /// slice therefore gets `0`. Do not "simplify" this to match its neighbours.
+    reserved_extra: usize,
     /// For a `shared_handle` mapping only: the REAL Windows/platform view's own base address and
     /// length, exactly as returned by the `map_shared_memory` call that created it -- NOT the
     /// VMA's current tracked range in `self.vmas` (a `rangemap::RangeMap`), which can SHRINK
@@ -413,6 +449,7 @@ impl<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> VmArea<Platfor
             shared_handle: None,
             view_base: 0,
             view_len: 0,
+            reserved_extra: 0,
         }
     }
 
@@ -435,6 +472,7 @@ impl<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> VmArea<Platfor
             shared_handle: Some(shared_handle),
             view_base: 0,
             view_len: 0,
+            reserved_extra: 0,
         }
     }
 
@@ -688,6 +726,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                         shared_handle: None,
                         view_base: 0,
                         view_len: 0,
+                        reserved_extra: 0,
                     },
                 );
             }
@@ -771,6 +810,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     shared_handle: None,
                     view_base: 0,
                     view_len: 0,
+                    reserved_extra: 0,
                 },
             );
             adopted += 1;
@@ -1323,10 +1363,19 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // groups and breaking exactly the cross-region pointer arithmetic this grouping exists to
         // preserve. Raised to test whether the XFCE/dbus glibc heap corruption is this same bug.
         let max_intra_group_gap: usize = 64 * 1024 * 1024;
+        // Each entry's `end` is the region's RESERVED extent, not its VMA extent: a mapping
+        // created with `CreatePagesFlags::ENSURE_SPACE_AFTER` holds `reserved_extra` further
+        // bytes of address space past its VMA that carry no VMA of their own (see
+        // `VmArea::reserved_extra`). Grouping on VMA extents alone made every child's group
+        // reservation short by exactly that headroom, so `insert_mapping(Hint)` could place a
+        // later group inside what was an earlier group's headroom and silently break the
+        // pairwise relative offsets this grouping exists to preserve. The headroom still gets no
+        // VMA and no copied content in the child -- only the reserved SPAN is sized to match the
+        // parent's, exactly as the parent itself holds it: reserved, unpopulated address space.
         let mut sorted_non_shared: Vec<Range<usize>> = regions
             .iter()
             .filter(|(_, vma)| vma.shared_handle.is_none())
-            .map(|(r, _)| r.clone())
+            .map(|(r, vma)| r.start..r.end.saturating_add(vma.reserved_extra))
             .collect();
         sorted_non_shared.sort_by_key(|r| r.start);
         let mut groups: Vec<Range<usize>> = Vec::new();
@@ -1613,10 +1662,17 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             // elsewhere in this module solves the identical problem via its `before_perms` /
             // `after_perms` split; do the same here by protecting down to `vma`'s real flags
             // only after the copy succeeds.
-            let writable_vma = VmArea::new(
+            let mut writable_vma = VmArea::new(
                 (vma.flags & !VmFlags::VM_ACCESS_FLAGS) | VmFlags::VM_READ | VmFlags::VM_WRITE,
                 vma.is_file_backed,
             );
+            // Carry the source's growth headroom into the child's own VMA. `VmArea::new` cannot
+            // know it (it takes only flags and `is_file_backed`), so without this the child's
+            // copy records `reserved_extra = 0` and a FORK OF THIS CHILD would compute its group
+            // spans from a zeroed value -- reintroducing, one generation down, exactly the
+            // short-reservation bug this field exists to prevent. Shells and dbus fork
+            // repeatedly, so the grandchild case is reachable in the real workload.
+            writable_vma.reserved_extra = vma.reserved_extra;
             // Place at this region's fixed position within `non_shared_span` (reserved above),
             // preserving its exact relative offset from every other non-shared region -- see
             // `non_shared_span`'s doc comment for why this must NOT be independently relocated.
@@ -1652,6 +1708,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 shared:? = vma.shared_handle.is_some(),
                 growsdown:? = vma.flags.contains(VmFlags::VM_GROWSDOWN),
                 is_brk:? = (self.brk != 0 && range.contains(&self.brk)),
+                reserved_extra:% = vma.reserved_extra,
                 flags:% = vma.flags.bits();
                 "DIAG_VMA fork-relocation"
             );
@@ -1722,16 +1779,22 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         &mut self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
         length: NonZeroPageSize<ALIGN>,
-        vma: VmArea<Platform, ALIGN>,
+        mut vma: VmArea<Platform, ALIGN>,
         flags: CreatePagesFlags,
     ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
-        let total_length = (length
-            + if flags.contains(CreatePagesFlags::ENSURE_SPACE_AFTER) {
-                DEFAULT_RESERVED_SPACE_SIZE
-            } else {
-                0
-            })
-        .unwrap();
+        let reserved_extra = if flags.contains(CreatePagesFlags::ENSURE_SPACE_AFTER) {
+            DEFAULT_RESERVED_SPACE_SIZE
+        } else {
+            0
+        };
+        // Record the headroom on the VMA itself. `get_unmmaped_area` below claims
+        // `length + reserved_extra` of address space but `insert_mapping` tracks only `length`,
+        // deliberately (see `ENSURE_SPACE_AFTER`'s doc comment) -- so without this field the
+        // trailing reservation is invisible to everything that reasons from VMA extents, most
+        // consequentially `Vmem::duplicate`'s group-span computation. See
+        // `VmArea::reserved_extra`'s doc comment for the live fault this caused.
+        vma.reserved_extra = reserved_extra;
+        let total_length = (length + reserved_extra).unwrap();
         let new_addr = self
             .get_unmmaped_area(
                 suggested_address,
@@ -2124,21 +2187,41 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 VmemProtectError::ProtectError(e)
             })?;
 
+            // `end` is the ORIGINAL (pre-split) mapping's end. Growth headroom sits immediately
+            // after it, so exactly one of the slices below -- whichever still ends at `end` --
+            // owns it; every other slice must get `0`. See `VmArea::reserved_extra`'s doc
+            // comment: this is deliberately the opposite of `view_base`/`view_len`'s
+            // propagate-unchanged rule, and getting it wrong would let a fork group extend past
+            // address space it does not own.
+            let with_headroom = |slice_end: usize, mut v: VmArea<Platform, ALIGN>| {
+                if slice_end != end {
+                    v.reserved_extra = 0;
+                }
+                v
+            };
+
+            let intersection_end = intersection.end;
             self.vmas.insert(
                 intersection,
-                VmArea {
-                    flags: new_flags,
-                    is_file_backed: vma.is_file_backed,
-                    shared_handle: vma.shared_handle,
-                    view_base: vma.view_base,
-                    view_len: vma.view_len,
-                },
+                with_headroom(
+                    intersection_end,
+                    VmArea {
+                        flags: new_flags,
+                        is_file_backed: vma.is_file_backed,
+                        shared_handle: vma.shared_handle,
+                        view_base: vma.view_base,
+                        view_len: vma.view_len,
+                        reserved_extra: vma.reserved_extra,
+                    },
+                ),
             );
             if !before.is_empty() {
-                self.vmas.insert(before, vma);
+                let before_end = before.end;
+                self.vmas.insert(before, with_headroom(before_end, vma));
             }
             if !after.is_empty() {
-                self.vmas.insert(after, vma);
+                let after_end = after.end;
+                self.vmas.insert(after, with_headroom(after_end, vma));
             }
         }
 
