@@ -1319,7 +1319,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // inter-arena gaps routinely exceed 16 MiB by design, splitting them into separately-placed
         // groups and breaking exactly the cross-region pointer arithmetic this grouping exists to
         // preserve. Raised to test whether the XFCE/dbus glibc heap corruption is this same bug.
-        let max_intra_group_gap: usize = 512 * 1024 * 1024;
+        let max_intra_group_gap: usize = 64 * 1024 * 1024;
         let mut sorted_non_shared: Vec<Range<usize>> = regions
             .iter()
             .filter(|(_, vma)| vma.shared_handle.is_none())
