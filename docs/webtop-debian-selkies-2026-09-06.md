@@ -1017,3 +1017,179 @@ non-hanging, via the exact `wt_xvfb.sh` repro
    `#[cfg]`-unconditional but purely additive/read-only (no behavior change
    on any path that doesn't already log `diag-guest-exception`) -- run it
    before building on this further regardless, per repo policy.
+
+---
+
+# 2026-09-07: `touch` crashed the HOST, not the guest -- one VEH nesting level was 64 bytes wide
+
+## Symptom and the framing it invited
+
+`touch` on a not-yet-existing path killed the whole runner with a genuine,
+unrecoverable Windows access violation in litebox's own host-side code:
+
+```
+MSYS_NO_PATHCONV=1 litebox_runner_linux_on_windows_userland.exe -Z \
+  --oci-image docker.io/linuxserver/webtop:debian-i3 --env HOME=/config \
+  -- /bin/touch /tmp/direct_touch
+```
+
+`mkdir -p` worked, `echo` worked, a `base64 -d | sh` pipe worked. Only `touch`
+of a new path died, under `--oci-image` and under `--initial-files` alike, which
+made "new-file creation is broken" the obvious reading. **That reading is
+wrong, and the bisection that produced it stopped one step too early.**
+
+## The one bisection step that reframes everything
+
+`touch` issues two syscalls: `openat(O_CREAT)` then `utimensat`. Splitting them:
+
+```
+> /tmp/redir_new && echo MARKER          # pure open(O_CREAT), no utimensat
+```
+
+**succeeds.** File creation was never broken. Adding `utimensat` back crashes,
+and it crashes on every shape of target, not just a new one:
+
+| case | result |
+| --- | --- |
+| `> /tmp/redir_new` (O_CREAT only, no utimensat) | OK |
+| `touch /tmp/direct_touch` (new file) | CRASH |
+| `> /tmp/a && touch /tmp/a` (exists in UPPER) | CRASH |
+| `touch /etc/hostname` (exists in LOWER only) | CRASH |
+| `mkdir -p /tmp/newdir && touch /tmp/newdir/f` | CRASH |
+
+So the crasher is `utimensat`, and the layer its target lives in is irrelevant
+to whether it fires. That in turn means the fault is not in any filesystem code
+path -- it is in whatever runs when `utimensat`'s guest-pointer read takes a
+page fault.
+
+## Refuted along the way (recorded so it is not re-tried)
+
+`LayeredFs::set_times` (`litebox/src/fs/layered.rs:1401`) ends in an unguarded
+self-recursive call, which looks exactly like an unbounded-recursion /
+stack-overflow candidate. It is not this bug: an instrumented build counting
+that recursion emitted **zero** entries while still crashing with the identical
+signature. The `migrate_file_up`-then-retry assumption holds in practice here.
+The recursion is still unguarded and still worth a defensive bound, but it is
+not what this section fixes.
+
+## Root cause: the trampoline's per-depth slot was one frame wide, not one per level
+
+`vectored_exception_handler_entry` (`litebox_platform_windows_userland/src/lib.rs`)
+swaps onto the thread's real host stack before calling the full handler, and
+gives each VEH nesting level its own scratch slot so a nested fault cannot
+clobber a still-live outer invocation. The slot was **64 bytes**.
+
+64 bytes covers exactly what the trampoline itself stores -- guest `rsp`/`rbp`,
+`r8`, and the callee's 32-byte shadow space. It does not cover the callee. And
+the callee's frame grows downward from that slot: `vectored_exception_handler`
+plus `fork_verify::on_single_step`'s instruction decode, the `VirtualQuery`
+diagnostic blocks and `eprintln!`'s formatting machinery are kilobytes deep. So
+at `veh_depth == 1` the nested invocation began its frame 64 bytes below the
+outer one's and wrote straight through it.
+
+The captured evidence is unambiguous. At the crash, `veh_depth=0x1`, and the
+outer invocation read back:
+
+```
+[diag-unrecov-av-ring] [2] code=0x470041 rip=... rva=0x8b0fc6 is_in_guest=false
+[diag-unrecov-av-ring] [3] code=0xc0000005 rip=0x22 rva=... is_in_guest=false
+[diag-unrecov-av-giveup] rip=0x7ff8da4f587a repeat_count=0x41
+```
+
+`0x470041` is **not a Windows status code**. Its severity bits are `00`, which
+marks a SUCCESS code -- the kernel never delivers one as a fault -- and its four
+bytes are UTF-16LE for the characters A and G. It is raw string data from the
+nested frame, sitting where the outer frame's `ExceptionCode` used to be.
+Dispatch then followed the equally garbage `rip` beside it (`0x22`, then `0x40`)
+into the wild-jump cascade, until the repeat circuit breaker fired.
+
+`rva=0x8b0fc6` disassembles (llvm-objdump, release binary, ImageBase
+`0x140000000`) to `movzbl (%rcx), %edx` -- `read_u8_fallible`'s single faulting
+load, i.e. `to_cstring`'s byte-at-a-time guest-string scan
+(`litebox/src/platform/mod.rs:446`). That is an ordinary, expected,
+exception-table-recoverable fault. It only became fatal because the recovery
+machinery corrupted itself the moment it nested once.
+
+## Second, independent overlap in the same region
+
+`EXC_RECORD_SLOT_SIZE` was a hardcoded `128` while `EXCEPTION_RECORD` is **152**
+bytes on x86_64 (`4 + 4 + 8 + 8 + 4 + 4 pad + 15*8`). Consecutive
+exception-record slots therefore overlapped by 24 bytes -- the exact corruption
+the per-depth scheme exists to prevent. The comment above it described 128 as
+rounding 152 up.
+
+The prose describing the two regions as "comfortably clear" of each other was
+also wrong, by 64 bytes at the deepest level.
+
+## Fix (commit `5cacf7f`)
+
+`litebox_platform_windows_userland/src/lib.rs`:
+
+- `VEH_FRAME_STRIDE` (new, 4096) replaces the hardcoded 64 as the
+  per-nesting-level stride, sized to hold a real handler frame rather than only
+  the saved registers.
+- `VEH_DEPTH_CAP` 512 -> 7, the number of 4 KiB frames that fit the
+  already-committed `EXCEPTION_RECORD_RESERVE`. Not a robustness regression: 512
+  never gave 512 usable levels, it gave one usable level and 511 that silently
+  corrupted each other.
+- `EXC_RECORD_SLOT_SIZE` derived from `size_of::<EXCEPTION_RECORD>()` rounded up
+  to 16, instead of a hardcoded constant that had drifted below the struct it
+  sizes.
+- Both non-overlap requirements are now `const`-asserted at the definition site
+  rather than claimed in a doc comment that was measurably wrong twice.
+- `mov r9, r9` (a 64-bit no-op commented as a zero-extend) -> `mov r9d, r9d`.
+
+## Result
+
+The host-level crash is gone. Same repro, after the fix:
+
+```
+[diag-recover-fsbase] recover_rip=0x7ff7fcc30fdb fsbase=0x7feffffb0740
+touch: setting times of '/tmp/direct_touch': Bad address
+EXIT=1
+```
+
+Zero `[diag-unrecov-av]`, no wild `rip`, no `[diag-unrecov-av-giveup]`
+`TerminateProcess`. `[diag-recover-fsbase]` now fires where it never did before,
+i.e. the exception table recovers the fallible read normally. The process
+survives and reports an ordinary errno to the guest.
+
+**This is a general fix, not a `touch` fix.** Any recoverable guest fault that
+nested once was hitting this. It plausibly underlies other
+"unrecoverable-AV-with-nonsense-`rip`" reports elsewhere in this investigation,
+and any of those should be re-tested against this commit before being chased
+independently.
+
+## Still open
+
+`utimensat` now fails cleanly with `EFAULT` instead of crashing. That is a real,
+separate, guest-visible bug -- the `times` pointer read at
+`litebox_shim_linux/src/lib.rs` (`SyscallRequest::Utimensat`, the two
+`times.read_at_offset::<Platform>(0|1)` calls) returns `None`. `Timespec` is 16
+bytes, so those take `read_at_offset`'s `memcpy_fallible` branch rather than the
+small-aligned-read fast path. Not yet root-caused.
+
+Note for whoever instruments this next: adding an `alloc::format!`-based log line
+at that call site **reintroduces a crash of its own** (confirmed live -- first
+fault at an allocator address, `rip=0x2c8f4ae1f40`). The syscall path can be
+reached with the guest allocator's state already suspect; use the existing
+allocation-free `diag_raw_print`-style helper (see
+`diag_raw_print_proc_sys_open_miss`, `litebox_shim_linux/src/syscalls/file.rs:62`)
+instead, exactly as the VEH diagnostics already do for the same reason.
+
+`nginx`-as-pid-1 and the browser check of the Selkies dashboard were not reached
+this pass -- `touch` no longer takes the host down, but `utimensat` still returns
+`EFAULT`, so the `touch /var/log/nginx/error.log`-style setup that section needs
+is still not functional. That is the next step, and it is now an ordinary
+errno-level bug rather than a host crash.
+
+## Test status
+
+`cargo test` scoped to the four crates does not build, for a **pre-existing**
+reason unrelated to this change: `litebox_platform_windows_userland/src/lib.rs:4021`
+declares `fn run_test_thread` as a member of `litebox::platform::ThreadProvider`,
+which the trait does not have (`E0407`), and `litebox_shim_linux`'s test code
+calls the same missing associated function (`E0576`, 11 errors). Confirmed
+pre-existing by checking out the parent commit (`ca942c5`) -- `cargo test
+--no-run` succeeds there only because it skips doctests, which is where `E0407`
+surfaces. This session's change touches neither site.
