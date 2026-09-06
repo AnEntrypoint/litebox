@@ -129,7 +129,26 @@ Run:
 | `DIAG_DIRTYFB` never appears | **hypothesis REFUTED** — Xorg is not using DIRTYFB and the real gap is elsewhere. Report as such. |
 | digest CHANGES phase 1 → 2 | pixels genuinely reaching the presenter; the display path works end to end |
 | digest constant, `nonzero_bytes=0` | presents happening but content black — a third, different problem |
-| `DIAG_DIRTYFB` present, no digest lines | `notify_flip_callback` early-returned at drm.rs:616 with zero registered callbacks — the presenter never registered |
+| `DIAG_DIRTYFB` present, no digest lines, **both env vars set** | `notify_flip_callback` early-returned at drm.rs:616 with zero registered callbacks — a real finding |
+| `DIAG_DIRTYFB` present, no digest lines, **either var missing** | **test configuration error, not a result** — re-run with both |
+
+## Both env vars are REQUIRED, for different reasons
+
+`LITEBOX_DRM_TRACE=1` gates the digest lines themselves (`drm_trace_enabled()`).
+
+`LITEBOX_DUMP_FRAMES=1` is *not* optional either. The runner registers a flip
+observer only inside `if std::env::var_os("LITEBOX_DUMP_FRAMES").is_some()`
+(`litebox_runner_linux_on_windows_userland/src/lib.rs:836`) — independent of
+`--gui`, since flip observers are additive. Without it a `--gui-hidden` run can have
+*zero* registered callbacks, and `notify_flip_callback` early-returns at
+`drm.rs:616` **before** reaching the digest code at `:668`. DIRTYFB could then be
+working perfectly, `DIAG_DIRTYFB` printing, and the digest still silent — because
+nothing registered to observe it.
+
+**The general rule, and this is the fifth instance tonight** (log levels, the
+`no_std` cfg gate, two emit sites sharing one message string, flip-driven dumps, and
+now this): before trusting the *absence* of a diagnostic, verify every condition on
+the path that produces it — not just the one it is named for.
 
 Phase 3's `xclock &` is a background fork, i.e. the case `placement_floor` repaired.
 If phase 3 alone fails while 1-2 pass, look there first.
