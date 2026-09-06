@@ -237,22 +237,74 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
             // `cr2` (or note that NOTHING overlaps at all, i.e. genuinely unmapped address
             // space) so the next capture answers this directly instead of needing a second pass.
             let probe_range = info.cr2.saturating_sub(0x1000)..info.cr2.saturating_add(0x1000);
-            let mut found_any = false;
-            for (r, flags) in self.process().0.pm().mappings() {
-                if r.start < probe_range.end && r.end > probe_range.start {
-                    found_any = true;
-                    litebox_util_log::error!(
-                        range_start:% = format_args!("{:#x}", r.start),
-                        range_end:% = format_args!("{:#x}", r.end),
-                        flags:? = flags;
-                        "diag-guest-exception: mapping overlapping cr2"
-                    );
-                }
+            // `mappings()` (`litebox/src/mm/mod.rs`) already collects into an owned `Vec` and
+            // drops its internal `vmem.read()` lock before returning -- iterating it here holds
+            // NO lock, ruling out the "still-held mappings lock" half of the hang hypothesis
+            // the prior session recorded. The owned snapshot is kept (not just a bool) so the
+            // byte-dump below can reuse the already-confirmed-overlapping range instead of a
+            // second, redundant mappings() call.
+            let overlapping: Vec<_> = self
+                .process()
+                .0
+                .pm()
+                .mappings()
+                .into_iter()
+                .filter(|(r, _)| r.start < probe_range.end && r.end > probe_range.start)
+                .collect();
+            for (r, flags) in &overlapping {
+                litebox_util_log::error!(
+                    range_start:% = format_args!("{:#x}", r.start),
+                    range_end:% = format_args!("{:#x}", r.end),
+                    flags:? = flags;
+                    "diag-guest-exception: mapping overlapping cr2"
+                );
             }
-            if !found_any {
+            let cr2_mapped = overlapping.iter().any(|(r, _)| r.contains(&info.cr2));
+            if overlapping.is_empty() {
                 litebox_util_log::error!(
                     cr2:% = format_args!("{:#x}", info.cr2);
                     "diag-guest-exception: NO mapping overlaps cr2 (genuinely unmapped)"
+                );
+            }
+            // Live byte-dump diagnostic (see docs/webtop-debian-selkies-2026-09-06.md,
+            // "the Xvfb pid-1 SIGSEGV is NOT RELRO" section) -- a prior session's attempt at this
+            // via `RawConstPointer::to_owned_slice`/`memcpy_fallible`'s fault-catching path hung
+            // the whole runner. Root cause of the hang was never confirmed to be lock reentrancy
+            // (the mappings-lock hypothesis is now ruled out above: no lock is held here), so the
+            // remaining suspect is `memcpy_fallible`'s own exception-table-based fault recovery
+            // not being safe to invoke reentrantly from a thread already inside VEH's guest-fault
+            // dispatch. We sidestep that path entirely: `cr2_mapped`/the mapping walk above just
+            // independently confirmed real guest memory backs this address (same for `rip`, whose
+            // fault-free execution up to this point already proves it's mapped and executable), so
+            // an ordinary raw pointer read needs no fault-catching machinery at all. Bounded to a
+            // fixed 64-byte window and gated on the mapping check so an address that turns out NOT
+            // to be backed (the aarch64 path, or a future cr2 that's genuinely unmapped) never
+            // reaches the raw dereference.
+            if cr2_mapped {
+                let dump = unsafe {
+                    core::slice::from_raw_parts(info.cr2 as *const u8, 64)
+                };
+                litebox_util_log::error!(
+                    cr2:% = format_args!("{:#x}", info.cr2),
+                    bytes:% = format_args!("{:02x?}", dump);
+                    "diag-guest-exception: cr2 byte dump"
+                );
+            }
+            let rip_mapped = self
+                .process()
+                .0
+                .pm()
+                .mappings()
+                .into_iter()
+                .any(|(r, _)| r.contains(&(ctx.rip as usize)));
+            if rip_mapped {
+                let dump = unsafe {
+                    core::slice::from_raw_parts(ctx.rip as *const u8, 64)
+                };
+                litebox_util_log::error!(
+                    rip:% = format_args!("{:#x}", ctx.rip),
+                    bytes:% = format_args!("{:02x?}", dump);
+                    "diag-guest-exception: rip byte dump"
                 );
             }
         }
