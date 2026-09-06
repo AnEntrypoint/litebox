@@ -398,8 +398,22 @@ fn acquire_boot_lock() -> Result<BootLock> {
     // below, which keeps re-touching this file's mtime for as long as this process is actually
     // alive -- so staleness reflects liveness, not merely how long ago the boot started.
     const STALE_LOCK_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-    let lock_dir = Path::new(".litebox-cache");
-    std::fs::create_dir_all(lock_dir)
+    // Resolve against the executable's own directory, not the process's current working
+    // directory: the old `Path::new(".litebox-cache")` was cwd-relative, so two runner
+    // invocations launched from different directories (or even the same binary invoked via a
+    // relative vs. absolute path) each got their own `.litebox-cache/boot.lock` and happily ran
+    // concurrently -- confirmed live tonight (2026-09-06): a peer session launched a second
+    // runner from a different cwd and had two full boots live simultaneously with zero code
+    // change, each pulling a multi-GB OCI image, which is exactly the "concurrent boots produce
+    // symptoms indistinguishable from a real hang or crash" scenario this lock exists to
+    // prevent. Anchoring to the exe's own directory makes the lock host-wide for any normal
+    // invocation of this binary, matching what its own error message already promises.
+    let lock_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".litebox-cache");
+    std::fs::create_dir_all(&lock_dir)
         .with_context(|| format!("failed to create lock directory {}", lock_dir.display()))?;
     let lock_path = lock_dir.join("boot.lock");
 
