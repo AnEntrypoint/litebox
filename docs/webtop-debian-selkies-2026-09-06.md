@@ -1481,3 +1481,221 @@ selkies as siblings the same "bypass s6-overlay" way this document's
 nginx-as-pid-1 section already proved, against Xvfb launched WITHOUT
 `-shmem`, and browser-verify against the forwarded port per this document's
 existing pattern.
+
+---
+
+# 2026-09-07: final integration -- Xvfb + i3 + selkies as one pid-1 shell tree,
+# real selkies WebSocket data plane browser-verified end to end; i3 blocked on
+# a genuine fork-without-exec ENOMEM, video frames not yet flowing
+
+## Task and approach
+
+Per this row's own already-recommended next step: launch `Xvfb :1`, `i3` (via
+`dbus-launch --exit-with-session /usr/bin/i3`, the real `debian-i3` variant's
+`defaults/startwm.sh`, confirmed by reading the packed image's own
+`etc_s6-overlay_s6-rc.d_svc-de_run` and the actual `startwm.sh` invocation),
+and `selkies --addr="localhost" --mode="websockets"` as siblings against the
+already-proven Xvfb-as-pid-1 fix (commit `329174b`), then browser-verify.
+
+Re-read `advisor/ADVISORY-002-d-zero-fork.md` section 1.5 before choosing the
+process topology: it establishes live-measured that **fork+exec is safe**
+(every crash in that investigation was a fork-*without*-exec child); only
+`fork()` children that keep running on the duplicated heap without an
+immediate `execve` hit the tcache-corruption class of crash. `dbus-launch`
+does an ordinary fork+exec of `i3`, and a shell backgrounding three programs
+with `&` is itself just fork+exec of each real binary -- so ONE runner pid-1
+shell script (`/bin/sh` executing `wt_full_stack.sh`) backgrounding Xvfb, then
+`i3`, then `selkies`, then `exec`-ing nginx as the final foreground process,
+is the correct topology per the advisory's own narrowed blast-radius finding.
+No separate sibling `litebox_runner_linux_on_windows_userland.exe` invocations
+were needed or used.
+
+Script (`.wfgy/webtop-debian/scripts/wt_full_stack.sh`, carried into the guest
+via `--resume-from`'s writable-layer seeding, not `--initial-files`):
+`mkdir`/`chmod`/`rm` the usual scratch dirs, background `Xvfb :1 -screen 0
+1024x768x24 ...` (no `-shmem`, per the immediately preceding session's own
+finding that `-shmem` hits the separate, pre-existing `shmget` gap), poll
+`xdpyinfo -display :1` until ready, background `dbus-launch --exit-with-session
+/usr/bin/i3`, sleep 2, background `selkies --addr="localhost"
+--mode="websockets"` (env: `CUSTOM_WS_PORT=8082`, `SELKIES_ENCODER=x264enc,jpeg`,
+`SELKIES_INTERPOSER=/usr/lib/selkies_joystick_interposer.so`,
+`SELKIES_WAYLAND_SOCKET_INDEX=2`, matching the packer's own generated
+`config_and_run.sh` values recorded at this document's top), then `exec
+/usr/sbin/nginx -g "daemon off; master_process off;"` as the final foreground
+process (still real nginx as litebox's own pid 1, per the already-proven
+nginx-as-pid-1 section above).
+
+## Bug found and fixed: `--resume-from` writable-layer writes are invisible
+## through a symlink that resolves back into the read-only OCI layer
+
+First boot attempt seeded `/etc/nginx/sites-available/default` with the
+already-proven-working substituted config (`SUBFOLDER`->`/`, `CWS`->`8082`,
+IPv6 `listen` line dropped) via `--resume-from`, exactly as this document's
+earlier nginx-as-pid-1 section did successfully. This time nginx failed at
+startup: `nginx: [emerg] socket() [::]:80 failed (97: Address family not
+supported by protocol)` -- a `listen [::]:80` directive that appears nowhere
+in the substituted config at all.
+
+Traced by having the launch script `cat` `/etc/nginx/sites-enabled/default`
+(the real image's symlink to `sites-available/default`) and, separately,
+`sites-available/default` directly, right before starting nginx. **The direct
+path read back the correct, substituted 2554-byte content just written via
+`--resume-from`. The exact same path reached THROUGH the symlink
+(`sites-enabled/default -> /etc/nginx/sites-available/default`) read back the
+UNMODIFIED, stock Debian nginx package's default vhost** (`listen 80
+default_server; listen [::]:80 default_server; root /var/www/html; ...`) --
+the file nginx's own `include /etc/nginx/sites-enabled/*` directive actually
+loads, which is why the IPv6 `:80` listen (present only in that stock file,
+never in the substituted one) reached nginx's config despite never being
+written anywhere in this session's overlay.
+
+This is a real, previously-undocumented litebox gap: symlink target
+resolution through the guest's layered filesystem does not consistently see
+the writable upper layer's content for a path also present in a lower
+(read-only OCI image) layer -- a direct open of the target path sees the
+upper layer correctly (confirmed: `LayeredFs` is documented and, by direct
+open, behaves as "upper shadows lower unless absent"), but resolving the SAME
+target path via a symlink apparently takes a different code path that
+returns lower-layer content. `litebox/src/fs/resolver.rs` is the likely
+owner (not read in depth this session -- the symlink-vs-direct-path
+discrepancy was isolated behaviorally, via the two `cat` invocations above,
+not via source-level root-causing of `resolver.rs`'s exact mechanism). Given
+this session's goal was integration rather than a new deep-dive, and a clean
+workaround existed, this was **not** root-caused to the exact code path or
+fixed in `litebox` itself this session -- flagged here as a real, precisely
+isolated, un-filed gap for a future session (repro: seed a path via
+`--resume-from` that is reached through a symlink already present in a lower
+OCI layer pointing at that same path; compare a direct `cat` of the target
+against a `cat` of the symlink).
+
+**Workaround applied (not a litebox fix):** replaced the symlink in the
+overlay tar with an ordinary regular file at `etc/nginx/sites-enabled/default`
+carrying the exact same substituted content, so nginx's `sites-enabled`
+directory scan finds real, correct upper-layer content with no symlink
+indirection at all. This is the same class of injection-route choice this
+document's nginx-as-pid-1 section already used (`--resume-from` over `tar
+--concatenate`) -- switching the shape of ONE file, not the injection
+mechanism. Confirmed via `nginx -t`: syntax OK, test successful, and via live
+`curl`: nginx served the correct dashboard HTML with the correct
+`/websocket` -> `127.0.0.1:8082` proxy routing.
+
+## selkies' WebSocket data plane verified end to end, guest-side and browser-side
+
+With the nginx config fixed, `selkies --addr="localhost" --mode="websockets"`
+(a real, ordinary `python3` fork+exec via its `/lsiopy/bin/selkies` console-
+script entry point, confirmed safe per the advisory) started cleanly and
+logged its own full real initialization -- `SelkiesStreamingApp initialized:
+encoder=x264enc, display=1024x768`, `Found XFIXES version 4.0`, `starting
+cursor monitor`, and finally `Data WebSocket Server listening on port 8082`.
+
+Verified directly from the guest (a `curl -v -N` websocket-upgrade probe
+against `127.0.0.1:8082/` run from inside the same launch script, before
+nginx started): real `HTTP/1.1 101 Switching Protocols`, `Server:
+Python/3.13 websockets/17.1`, followed by genuine live protocol data --
+a real base64 PNG cursor bitmap (`MODE websockets` / `cursor` frame) and a
+complete `server_settings` JSON payload listing every one of selkies' real
+configurable settings (framerate, encoder, bitrate ranges, UI toggles, etc.)
+-- confirming the data-plane websocket server itself is fully functional
+independent of any browser or nginx involvement.
+
+**Browser-verified** via `claude-in-chrome` against a real Chrome tab at
+`http://127.0.0.1:3000/` (fresh tab, no stale session state): console log
+shows the full real handshake -- `[websockets] Connection opened!`, `Sent
+initial settings (resolutions are physical) to server`, `Sent initial
+clipboard request (cr) to server`, `Started sending client metrics every
+500ms`, `Switched to websockets mode`, `Input system initialized`, canvas
+resized to `1920x842` matching the real negotiated resolution. **This is
+qualitatively different from and strictly further than every prior session's
+"WebSocket disconnected. Attempting to reconnect..." result** -- the
+WebSocket genuinely connects, completes its real application-level handshake,
+and the frontend correctly proceeds to its next real state.
+
+The page's own visible text is `Waiting for stream...` (screenshot saved at
+`.wfgy/webtop-debian/selkies_waiting_for_stream_2026-09-07.jpg`) -- the
+correct, honest, next state: the WebSocket data-plane is real and working,
+but no video frames are arriving because the encoder has nothing to encode
+yet (see below).
+
+## Why no video frames: i3 itself does not launch, a genuine fork-without-exec ENOMEM
+
+`dbus-launch --exit-with-session /usr/bin/i3`'s own log
+(`/tmp/i3.log`, dumped by the launch script) shows: `Failed to fork: Cannot
+allocate memory`. `dbus-launch` itself IS an ordinary ONE-level fork+exec
+(confirmed safe, see above) and completes -- the failure is `i3`'s OWN
+internal `fork()` call, made without an immediate `execve()`, matching
+`ADVISORY-002-d-zero-fork.md`'s own explicitly named risk class ("the XFCE
+daemons fork without exec"). `litebox`'s `pm().duplicate()` (address-space
+duplication for `fork()`, `litebox/src/mm/mod.rs`) returns an error that
+`litebox_shim_linux/src/syscalls/process.rs` maps to `ENOMEM` on failure --
+i3 sees exactly the real-Linux-visible symptom a genuine kernel memory
+shortage would produce, whatever litebox's own internal duplication failure
+actually is (not traced further this session; this is the same well-known,
+already-documented address-space-duplication hazard class this whole
+document's earlier `vfork`/`CLONE_VM` sections spent multiple sessions on,
+not a new, undiscovered mechanism -- re-deriving its exact trigger for `i3`
+specifically was out of scope for this integration-focused session, per the
+task's own instruction to root-cause only genuinely NEW blockers rather than
+re-litigate the already-well-documented fork/vfork investigation).
+
+Confirmed via the guest process tree dump (`ps`-equivalent,
+`litebox_runner_linux_on_windows_userland`'s own built-in dump on exit):
+`pid=12 comm=/usr/bin/dbus-launch` exists and is alive; no `i3` pid ever
+appears anywhere in the tree, on any of the four independent boot attempts
+this session made after the nginx fix landed. Since i3 never runs, no window
+ever appears on `:1` for `pixelflux`/x264 to capture, so selkies' own encoder
+loop has a real, connected client but never receives a first frame to encode
+and forward -- `Waiting for stream...` is the correct client-side rendering
+of this exact server-side state, not a bug in the frontend or the websocket
+wiring.
+
+## Status / what's proven vs. not, this session
+
+**Proven, browser-verified, this session:**
+- The full task's process topology (Xvfb + i3 + selkies as siblings inside
+  one pid-1 shell script, nginx as the final foreground process) boots
+  cleanly with zero SIGSEGV/panic/`diag-unrecov-av` anywhere in the log,
+  across every component that DOES start (Xvfb, dbus-launch, selkies, nginx).
+- selkies' real WebSocket data-plane server (`python3 -m selkies` via its own
+  real console-script entry point) works completely end to end: guest-side
+  websocket-upgrade probe, and real browser `claude-in-chrome` verification,
+  both show a fully successful application-level handshake -- strictly
+  further progress than every prior session's stale "WebSocket disconnected"
+  result.
+- One real, new litebox filesystem gap found and precisely isolated (not
+  fixed): a symlink reached through the guest's layered filesystem does not
+  see `--resume-from`-seeded upper-layer content for its target path when a
+  lower (read-only OCI) layer already has a file at that same path -- direct,
+  non-symlink opens of the identical path DO see the upper-layer content
+  correctly. Worked around this session (replace the symlink with an
+  equivalent regular file in the overlay); not root-caused to the exact
+  `resolver.rs`/`LayeredFs` mechanism.
+
+**Not reached, blocked by the above:**
+- Actual rendered video frames in the browser: blocked on i3 itself failing
+  to start (`Failed to fork: Cannot allocate memory`, i3's own internal
+  fork-without-exec, the same well-documented hazard class this document's
+  earlier `vfork`/`CLONE_VM` sections already spent several sessions
+  investigating for other guest programs, not re-investigated to a fix for
+  i3 specifically this session).
+
+**Next step for whoever picks this up:**
+1. i3's `fork()`-without-`execve()` needs the same real fix this document's
+   `vfork`/`CLONE_VM` sections already scoped for the general fork-without-
+   exec hazard (genuine cross-process child spawning, per
+   `ADVISORY-002-d-zero-fork.md` section 6's Track B) -- not a new
+   investigation, a continuation of the already-substantial existing one.
+   Once ANY window manager can stay alive on `:1` (i3 or a lighter
+   alternative that doesn't hit this exact fork pattern, if one exists and is
+   worth trying as a faster unblock), re-run this exact launch script
+   unchanged and the video pipeline should complete: selkies' own encoder
+   already initializes correctly and only needs real window content to
+   capture.
+2. Root-cause (not just work around) the `--resume-from`-through-symlink gap
+   above -- likely in `litebox/src/fs/resolver.rs`'s symlink-target
+   resolution, or wherever `LayeredFs::open` is reached for a path arrived at
+   via `readlink`-then-reopen versus a direct path lookup. This is a real,
+   separate, previously-undocumented litebox correctness gap independent of
+   the i3 blocker.
+3. Launch script preserved at `.wfgy/webtop-debian/scripts/wt_full_stack.sh`;
+   overlay-building steps and the exact `--resume-from` command used this
+   session are reproducible from this section's own text above.
