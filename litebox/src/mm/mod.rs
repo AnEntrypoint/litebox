@@ -859,6 +859,20 @@ where
             let mut vmem = self.vmem.write();
             unsafe { vmem.create_pages(suggested_address, length, flags, before_perms) }?
         };
+        // DIAGNOSTIC (temporary, do not commit): the single chokepoint every page creation goes
+        // through, guest `mmap` and otherwise. A live capture showed the parent holding exactly one
+        // 135168-byte anonymous mapping in the band the faults cluster in, created by NONE of the
+        // 53 guest mmap calls in the whole run -- so it was made here, by an internal caller. This
+        // names every creation with its requested vs actual address and its length, so a mapping
+        // that is the wrong SIZE (the current suspicion: the guest addresses ~450KB across a region
+        // only 135KB of which is backed) is attributable to its real creation site.
+        litebox_util_log::error!(
+            requested:? = suggested_address.map(|a| a.as_usize()),
+            actual:% = addr.as_usize(),
+            len:% = length.as_usize(),
+            end:% = addr.as_usize() + length.as_usize();
+            "DIAG_CREATE_PAGES"
+        );
         // call the user function with the pages
         // Note `op` may trigger page fault handler which requires write lock to `vmem`.
         if let Err(e) = op(addr) {

@@ -472,24 +472,11 @@ impl<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> VmArea<Platfor
 ///   within a bounded window above `rsp` -- by the shim's separate stack fixup pass, for reasons
 ///   that pass documents at length.
 ///
-/// - **not the `brk` heap**: like the stack, the heap is dominated by live allocator-managed
-///   payload data (strings, buffers, arbitrary program structures) that a scanning consumer cannot
-///   distinguish from the allocator's own bookkeeping pointers by inspecting the range alone.
-///   Originally the heap WAS included here on the theory that mallocng's own bookkeeping
-///   "genuinely holds pointers that must be relocated" and "never transient stack-style buffers" --
-///   disproven live: a real fork()-then-execve() repro (`apk add nodejs` followed by
-///   `node --version` in an interactive shell) showed the fork-time fixup pass that consumes this
-///   range corrupting the NUL terminator of a live heap-allocated argv string (`"--version\0"`)
-///   because its terminator byte shared an 8-byte-aligned scan word with an adjacent, unrelated,
-///   genuinely-stale pointer value elsewhere in the same allocation's slack/neighboring bytes --
-///   the pass "fixed" the pointer-shaped word and silently destroyed the live string byte(s) that
-///   word also happened to cover. This is exactly the same false-positive hazard the stack pass was
-///   narrowed to avoid (see [`Vmem`]'s stack-scan-window doc comment in
-///   `litebox_shim_linux::syscalls::process::fixup_stale_stack_pointers`), just manifesting in the
-///   heap instead of the stack. No real repro has ever required heap coverage specifically (the
-///   only repro that motivated adding [`super::AddressRelocations::private_data_ranges`] at all --
-///   busybox `ash`'s `.bss` file-stack sentinel -- lives in an ELF's `PF_W` `PT_LOAD` segment, not
-///   the heap), so excluding it here closes the argv-corruption bug with no known regression.
+/// The `brk` heap is NOT excluded: it satisfies every clause above (private, writable,
+/// non-executable, not `VM_GROWSDOWN`) and is deliberately included -- see
+/// [`is_private_data_range`]'s own doc comment for the live 20/20-vs-0/20 crash evidence behind
+/// that, and for why the argv-corruption repro once blamed on heap inclusion was actually caused
+/// by a since-removed byte-pattern heuristic rather than by scanning the heap as such.
 ///
 /// See [`super::AddressRelocations::private_data_ranges`].
 /// `(source range, destination base address, was executable in source, is a private data region,
@@ -1266,6 +1253,22 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // readable) -- `dest` gets its own copy of those from its own construction, so skip them
         // here rather than trying to copy host-runtime memory that is none of the guest's
         // business.
+        // DIAGNOSTIC (temporary, do not commit): a region the child never receives is
+        // indistinguishable, from a fault address alone, from one relocated incorrectly -- a
+        // pointer into a SKIPPED mapping is well-formed in the parent and dereferences nothing in
+        // the child, which is exactly the shape of a fault that lands in no source range, no dest
+        // range, and is reconstructible via no relocation delta. The two `continue` paths inside
+        // the loop below already emit `DIAG_VMA fork-relocation`, so this pre-loop filter is the
+        // ONLY place a VMA can vanish without leaving a trace. Name every one it drops.
+        for (r, vma) in self.vmas.iter() {
+            if vma.flags.is_empty() {
+                litebox_util_log::error!(
+                    src_start:% = r.start, src_end:% = r.end,
+                    reason:% = "empty-flags host-reserved placeholder (pre-loop filter)";
+                    "DIAG_VMA skipped"
+                );
+            }
+        }
         let regions: Vec<(Range<usize>, VmArea<Platform, ALIGN>)> = self
             .vmas
             .iter()
@@ -1633,6 +1636,25 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             if self.brk != 0 && range.contains(&self.brk) {
                 brk_relocation = Some((range.clone(), dest_ptr.as_usize()));
             }
+            // DIAGNOSTIC (temporary, do not commit): the two `continue` paths above (guard pages
+            // and `VM_SHARED` regions) already emit this, but the MAIN copy path -- every
+            // non-shared region, i.e. the ELF segments, the `brk` heap, anonymous mmap arenas and
+            // the stack -- did not, which is precisely the set a fault at a never-relocated
+            // address has to be attributed against. `is_brk` names the heap explicitly so the
+            // question "is the heap scanned?" is answered by the running code rather than by a
+            // doc comment (one of which was already found stale on exactly this question).
+            litebox_util_log::error!(
+                src_start:% = range.start, src_end:% = range.end,
+                dest:% = dest_ptr.as_usize(),
+                exec:? = vma.flags.contains(VmFlags::VM_EXEC),
+                private_data:? = is_private_data_range(&vma),
+                file_backed:? = vma.is_file_backed(),
+                shared:? = vma.shared_handle.is_some(),
+                growsdown:? = vma.flags.contains(VmFlags::VM_GROWSDOWN),
+                is_brk:? = (self.brk != 0 && range.contains(&self.brk)),
+                flags:% = vma.flags.bits();
+                "DIAG_VMA fork-relocation"
+            );
             relocations.push((
                 range.clone(),
                 dest_ptr.as_usize(),

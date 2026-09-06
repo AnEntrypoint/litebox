@@ -842,6 +842,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
+        let diag_flag_bits = flags.bits();
         let result = if flags.contains(MapFlags::MAP_ANONYMOUS) {
             self.do_mmap_anonymous(suggested_addr, aligned_len, prot, flags)
         } else {
@@ -851,12 +852,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // return value landing in the host allocator's own reserved region (a bug this
         // investigation is actively chasing) is caught the moment it is produced, not just
         // later when something dereferences the resulting bad pointer.
-        if let Ok(r) = &result {
-            litebox_util_log::debug!(
-                tid:% = self.tid, host_tid:% = self.global.platform.host_debug_tid(),
-                addr:% = addr, len:% = aligned_len, returned:% = r.as_usize();
-                "sys_mmap: returned"
-            );
+        // DIAGNOSTIC (temporary, do not commit): promoted from `debug!` to `error!` and extended
+        // to cover the FAILURE case too. A fault address that is unmapped in the parent as well as
+        // the child was never valid anywhere, so it cannot be a fork/relocation artifact -- it has
+        // to have been produced by an earlier mapping request that either failed, or was satisfied
+        // somewhere other than where the guest expected. Neither is visible at `debug!` under the
+        // `LITEBOX_LOG=error` the fork oracle runs at, so this pairs each request (addr/len/flags)
+        // with what the guest was actually handed back.
+        match &result {
+            Ok(r) => litebox_util_log::error!(
+                tid:% = self.tid, addr:% = addr, len:% = aligned_len, flags:% = diag_flag_bits,
+                returned:% = r.as_usize(),
+                relocated:? = (addr != 0 && r.as_usize() != addr);
+                "DIAG_MMAP returned"
+            ),
+            Err(e) => litebox_util_log::error!(
+                tid:% = self.tid, addr:% = addr, len:% = aligned_len, flags:% = diag_flag_bits,
+                error:? = e;
+                "DIAG_MMAP failed"
+            ),
         }
         result.map_err(Errno::from)
     }

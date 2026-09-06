@@ -1656,23 +1656,27 @@ fn fixup_stale_elf_data_pointers<Platform: ShimPlatform>(
         while addr < dest_top {
             let slot = UserPtrMut::<usize>::from_usize(addr);
             if let Some(value) = slot.read_at_offset::<Platform>(0) {
-                // DIAG (this pass's `ctx.active[]` investigation): log every slot near the
-                // computed `ctx.active[]` destination address (0x1388b10, +/- 0x200 bytes) so
-                // whoever reads this can see exactly what this scan observed/did at that exact
-                // location, at this exact point in time (right after fork, before the child ever
-                // resumes).
-                const TARGET: usize = 0x1388bf8;
-                let dist = if addr >= TARGET { addr - TARGET } else { TARGET - addr };
-                if dist < 0x10 {
-                    litebox_util_log::error!(
-                        addr:% = addr, value:% = value,
-                        translated:? = relocations.translate(value);
-                        "diag: fixup_stale_elf_data_pointers slot near ctx.active[]"
-                    );
-                }
                 if value.is_multiple_of(MIN_POINTER_ALIGN)
                     && let Some(translated) = relocations.translate(value)
                 {
+                    // DIAGNOSTIC (temporary, do not commit): test the over-healing theory
+                    // directly rather than by inference. `translate` is a RANGE-MEMBERSHIP check,
+                    // not a value-identity check, so an ordinary integer that happens to fall in
+                    // some tracked range's numeric span is rewritten in place -- the hazard
+                    // `AddressRelocations::private_data_ranges_excluding_anonymous_mmap`'s doc
+                    // comment already documents for mmap arenas. Live cr2 capture on the
+                    // 30-concurrent oracle shows children faulting at addresses inside
+                    // correctly-relocated FILE-BACKED, non-private-data destination regions (some
+                    // executable) and at no source range at all -- i.e. not stale pointers. This
+                    // names every heal whose WRITTEN value points into such a region, which is the
+                    // shape a false-positive heal would take: a live non-pointer datum rewritten
+                    // into a plausible-looking address the child later dereferences.
+                    if relocations.is_in_destination_executable_range(translated) {
+                        litebox_util_log::error!(
+                            slot:% = addr, old:% = value, new:% = translated;
+                            "DIAG_HEAL wrote a pointer into an executable dest range"
+                        );
+                    }
                     let _ = slot.write_at_offset::<Platform>(0, translated);
                     healed_count += 1;
                 }

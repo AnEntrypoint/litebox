@@ -1270,3 +1270,71 @@ source range at fork time, and test whether the un-relocated `cr2` values fall i
 range that was relocated but excluded from `private_data_ranges` (i.e. the heap). If they do,
 the fix is scoped heap healing that can distinguish allocator bookkeeping from payload bytes --
 NOT simply re-including the heap, which is what caused the argv corruption that got it excluded.
+
+## 3J. REFUTED: 3I's heap-exclusion premise, AND the stale-pointer reading itself
+
+3I's "prime suspect" paragraph rests on `litebox/src/mm/linux.rs:475-492`, a doc comment stating
+`private_data_ranges` excludes the `brk` heap. **That comment was stale and has been deleted.**
+The predicate it purported to describe, `is_private_data_range`, is:
+
+    vma.shared_handle.is_none()
+        && !vma.flags().contains(VmFlags::VM_GROWSDOWN)
+        && vma.flags().contains(VmFlags::VM_WRITE)
+        && !vma.flags().contains(VmFlags::VM_EXEC)
+
+There is no `brk` clause. A heap VMA is anonymous, private, writable, non-exec and grows UP (not
+`VM_GROWSDOWN`, which marks the stack), so it satisfies every clause and IS included. The
+authoritative comment directly above the predicate (`linux.rs:583-610`, retained) says so
+explicitly and carries the evidence: excluding the heap reproduced a `STATUS_PRIVILEGED_INSTRUCTION`
+crash 20/20 and 3/3, versus 0/20 with it included. History: the heap was excluded to fix an argv
+corruption, that exclusion regressed busybox `ash`'s file-stack sentinel, the exclusion was
+reverted, and only the comment was left behind. The argv corruption's real cause was a
+since-removed whole-heap byte-pattern heuristic, not heap scanning as such.
+
+**The stale-pointer conclusion is refuted too**, by direct measurement rather than by inference.
+Instrumentation added: `DIAG_VMA fork-relocation` on `Vmem::duplicate`'s MAIN non-shared copy path
+(it previously existed only on the two `continue` paths -- guard pages and `VM_SHARED` -- so every
+ELF segment, heap, mmap arena and the stack left no trace at all), `DIAG_VMA skipped` on the
+pre-loop empty-flags filter, `DIAG_MMAP` at `sys_mmap`'s return (it existed only at `debug!`,
+invisible under the `LITEBOX_LOG=error` every capture runs at, and logged only the `Ok` case).
+
+Two full 30-concurrent-`/bin/true` captures on `webtop:debian-xfce`, 30 fatal signals each
+(46 SIGSEGV + 14 SIGABRT), 23 distinct `cr2` values **bit-identical across both runs and across a
+rebuilt binary with different instrumentation**. Cross-referencing every `cr2` against every
+source range, destination range, and skipped region:
+
+- **0 of 23 fall in ANY source range.** No fault is a pre-`fork()` parent address that survived
+  untranslated. This is the direct refutation of 3I's conclusion.
+- **0 of 23 fall in any skipped region.** Not a dropped mapping.
+- **11 land inside correctly-relocated DESTINATION ranges**, all uniformly `is_brk=false`
+  `private_data=false` `file_backed=true` (five `exec=true`). None heap-resident.
+- The remaining 8 fall in no range at all.
+
+**Over-healing / wrong-delta is refuted arithmetically.** `translate` returns
+`dest_base + (addr - source_range.start)` only for `addr` inside that source range, so its image
+always lies inside a destination range, for every range, by construction. Inverting it over all
+899 captured ranges: for each fault address, no range has a preimage `ss + (v - d)` inside its own
+source span. A heal with the wrong base cannot produce an address outside every destination range.
+
+**mmap request handling is refuted.** Across all 53 guest `mmap` calls in a full run: zero
+returned an address other than the one requested, and zero failed, while the fault still
+reproduced 30/30. `mm.rs:382-387` already guards the `MAP_FIXED`-silently-relocated case (returns
+`OutOfMemory`), added by an earlier pass for exactly this failure mode.
+
+**This guest has NO `brk` heap.** `is_brk=true` never appears in either capture: glibc here uses
+mmap arenas exclusively, so `heap_top == 0`, `heap_range()` is `None`, and
+`is_in_destination_heap_range`'s `brk` half is a permanent no-op for this workload. The entire
+heap-inclusion question -- both doc comments, and the original brief built on them -- is moot here.
+
+**What the evidence actually shows.** In the whole `0x11000000`-`0x11200000` band the parent holds
+exactly ONE mapping: `[0x11188000, 0x111a9000)`, 135,168 bytes, anonymous private writable
+non-exec, created by none of the run's 53 guest `mmap` calls. The 15 low faults straddle it: two
+below its start (by 27,104 and 7,200 bytes), thirteen above its end (by 138KB to 424KB), spanning
+`0x11181620`-`0x111ef900` = 451,296 bytes. The guest dereferences pointers across a contiguous
+~450KB structure of which only the middle ~135KB is backed. That is a mapping of the wrong SIZE,
+not a relocation error -- and it explains every negative above simultaneously, since an address
+that was never mapped in either address space trivially satisfies all of them.
+
+Next: attribute that region to its creation site (a `DIAG_CREATE_PAGES` trace at
+`PageManager::create_pages`, the single chokepoint all page creation passes through) and determine
+why its length is 135,168 rather than covering what the guest addresses.
