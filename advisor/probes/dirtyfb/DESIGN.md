@@ -75,3 +75,61 @@ flip; `xsetroot -solid navy; xrefresh` forces a root repaint, and `xclock` redra
 its own timer. Compare captured frames against
 `advisor/probes/baseline_xorg_pid1_black.bmp` — a pass needs content the black
 baseline cannot produce, and successive captures must *differ* from each other.
+
+---
+
+# IMPLEMENTED (commit 2dfc4d5a) — verification plan
+
+Implemented exactly as designed above. **Not yet verified against a live guest.**
+
+Design point confirmed while writing it: `notify_flip_callback` (drm.rs:613) resolves
+`handle`/`size`/`width`/`height`/`pitch`/`pixel_format` from `fb_id` alone, via
+`self.framebuffers` then `self.buffers`. It never reads `crtc_fb`. So the handler
+declining to touch `crtc_fb` is *correct*, not merely safe — a damage flush must not
+retarget the scanout.
+
+## Use the digest, not the frame dumps
+
+`drm.rs:668-676`, inside `notify_flip_callback`, already emits at **error** level:
+
+    litebox_util_log::error!(fb_id, digest = sum; "diag-drm-digest");
+    litebox_util_log::error!(fb_id, bytes_len, nonzero_bytes, first8 = ...);
+
+It samples the framebuffer and reports a content digest plus a nonzero-byte count on
+every notify. This is strictly better than the BMP dumps for this question: it fires
+per-notify (so DIRTYFB-driven presents are captured even when the flip-driven dump
+path never triggers), it measures content directly, and it survives
+`LITEBOX_LOG=error`. **It is gated behind `drm_trace_enabled()`, so the run needs
+`LITEBOX_DRM_TRACE=1`.**
+
+## The test
+
+`r9.sh` (in this directory). Xorg runs as a *forked child* — deliberately the case the
+`placement_floor` fix repaired, not the easy pid-1 path. It polls for
+`/tmp/.X11-unix/X0` rather than sleeping a fixed time. Every client is a plain
+`fork+exec`: no wrapper, no retry loop, no second runner.
+
+    phase 1  xsetroot -solid navy ; xrefresh
+    phase 2  xsetroot -solid red  ; xrefresh    (a DIFFERENT colour, so a real
+                                                 capture must differ from phase 1)
+    phase 3  xclock for 15s                     (redraws on its own timer, not just
+                                                 a property setter)
+
+Run:
+
+    LITEBOX_LOG=error LITEBOX_DRM_TRACE=1 LITEBOX_DUMP_FRAMES=1 <runner> --unstable \
+      --oci-image linuxserver/webtop:debian-xfce --gui-hidden \
+      --resume-from r9.tar -- /bin/sh /r9.sh
+
+## Pre-registered readings
+
+| observation | conclusion |
+|---|---|
+| `DIAG_DIRTYFB` lines appear | Xorg does issue DIRTYFB; the handler is on the live path |
+| `DIAG_DIRTYFB` never appears | **hypothesis REFUTED** — Xorg is not using DIRTYFB and the real gap is elsewhere. Report as such. |
+| digest CHANGES phase 1 → 2 | pixels genuinely reaching the presenter; the display path works end to end |
+| digest constant, `nonzero_bytes=0` | presents happening but content black — a third, different problem |
+| `DIAG_DIRTYFB` present, no digest lines | `notify_flip_callback` early-returned at drm.rs:616 with zero registered callbacks — the presenter never registered |
+
+Phase 3's `xclock &` is a background fork, i.e. the case `placement_floor` repaired.
+If phase 3 alone fails while 1-2 pass, look there first.
