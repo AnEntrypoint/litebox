@@ -195,6 +195,7 @@ but pays for it:
 | `MAP_SHARED` | `Vmem::duplicate` **fails outright** on any `VM_SHARED` mapping (`mm/mod.rs:770`) | section views survive the clone (probe-proven) |
 | handles | only stdio; everything else lost | whole table replicated, **same handle values** |
 | threads | child image freshly loaded, state rebuilt | exact replica of the calling thread |
+| image base / ASLR | child is a fresh load at a *different* base, so `dyn` vtable pointers in shared state are invalid; needs `/DYNAMICBASE:NO` on the runner (not set today) | same image, same base, by construction — ASLR stays on |
 
 The `MAP_SHARED` and handle rows are the significant ones. Today a fork by any guest holding a
 shared mapping fails; under clone it works. And "same handle values in the child" is exactly
@@ -296,9 +297,19 @@ and the per-process fd tables.
 - **Trait-object vtables.** `DescriptorEntry` holds `Box<dyn FdEnabledSubsystemEntry>`
   (`litebox/src/fd/mod.rs:915`). A vtable pointer points into the runner image's `.rodata`, so
   it is only valid in another process if the runner is loaded at the **same base**. A clone
-  inherits the base for free; a freshly-spawned process does not, and would need
-  `/DYNAMICBASE:NO` or equivalent. Under clone this is a non-issue — another reason clone beats
-  the `CreateProcess` mechanism.
+  inherits the base for free; a freshly-spawned process does not.
+
+  Verified: the workspace sets **no** `/DYNAMICBASE:NO` or `/FIXED` anywhere — the runner is
+  built with default ASLR today. So the current `CreateProcess`-based path would need one added
+  (the mechanism is already in use and cheap: `litebox_runner_linux_on_windows_userland/build.rs:28`
+  already emits a `cargo:rustc-link-arg-bin=...=/STACK:...`, so a second link arg is a one-line
+  change). Note that disabling ASLR on the runner is a real, if modest, security regression, and
+  it applies to the *host* binary, not the guest.
+
+  **Under `RtlCloneUserProcess` this problem does not exist at all** — the clone is the same
+  image at the same base by construction, so ASLR can stay on. This is a concrete, previously
+  unstated argument for clone over the `CreateProcess` mechanism, independent of the CoW and
+  `MAP_SHARED` advantages already listed.
 - **Reserve size and placement.** Neither an official maximum reserved-section size nor a
   guaranteed collision-free high-VA band is documented; place high in the 64-bit space and
   verify at runtime rather than assuming.
