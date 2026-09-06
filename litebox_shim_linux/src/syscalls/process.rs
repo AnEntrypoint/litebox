@@ -2463,7 +2463,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         } else {
             None
         };
-        let clear_child_tid = if flags.contains(CloneFlags::CHILD_CLEARTID) {
+        // `mut` because a `fork()` child's `ctid` names an address in the PARENT's address space
+        // and has to be re-pointed at the child's own copy -- see where it is translated, below.
+        let mut clear_child_tid = if flags.contains(CloneFlags::CHILD_CLEARTID) {
             child_tid
         } else {
             None
@@ -3235,6 +3237,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // `fs_base` was already computed above (before the cross-process branch), fixing up
             // the ABI self-pointer slot at the same time -- reused verbatim here for the
             // thread-based path, exactly as before pass 143 moved the computation earlier.
+            //
+            // `CLONE_CHILD_CLEARTID`'s `ctid` is `&THREAD_SELF->tid` in the CALLER's address
+            // space (glibc's `_Fork` passes the forking thread's own TCB slot), and this shim
+            // gives the child a relocated copy rather than the parent's addresses. Stored
+            // untranslated, the child's exit would write its zero -- and issue its futex wake --
+            // into the PARENT's live TCB, clearing the thread id libc caches there: libc reads
+            // that cached id back as an identity, and `pthread_rwlock_rdlock`/`_wrlock` return
+            // `EDEADLK` whenever it equals the lock's recorded writer, which an unlocked lock
+            // records as 0. An address the duplication did not produce is dropped rather than
+            // written through: the child has no copy of that slot, and the parent's is not the
+            // child's to clear.
+            clear_child_tid = clear_child_tid.and_then(|ctid| {
+                relocations
+                    .translate(ctid.as_usize())
+                    .filter(|addr| relocations.is_in_destination(*addr))
+                    .map(UserPtrMut::<i32>::from_usize)
+            });
             (
                 thread,
                 ThreadInitState::ForkedChild(
