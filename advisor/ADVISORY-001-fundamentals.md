@@ -1439,3 +1439,112 @@ cannot clean up state the child cannot see. That leaks; it does not produce a pa
 Consistent with the offset data in 3K: two fixed trampoline layouts differing by one constant would
 put the faults at a constant stride, and the measured offsets are irregular (ratios smeared 1.026 to
 3.138). Ninth eliminated mechanism.
+
+## 3L. REFUTED: torn-copy race. FOUND: the group reservation is 16 MiB too SHORT.
+
+Two results this pass, one negative and one positive. The positive one is a mechanism, measured
+end to end, that no earlier pass had on the table.
+
+### 3L.1 Refuted by direct measurement: the concurrent-mutation / torn-copy hypothesis
+
+A proposed mechanism (independently reached by two sessions): `Vmem::duplicate`'s per-region copy
+(`linux.rs:1605-1608`) is a plain `to_owned_slice` of live parent memory, taken on the forking
+thread with NOTHING suspending the process's other guest threads -- unlike real `fork()`, which
+copies page tables with the process stopped. If a sibling thread mutated a region mid-copy, the
+child would receive a torn mixture of pre- and mid-write bytes: CORRECT addresses over WRONG
+content, the one fault class nine address-focused eliminations could not reach.
+
+**Measured false.** A second `to_owned_slice` of the same region was taken immediately after the
+first and compared byte-for-byte (`DIAG_TORN`). Over a full 30-concurrent-`/bin/true` capture on
+`webtop:debian-xfce` -- **900 region copies, 30 fatal signals, fault reproducing at full strength**
+-- `DIAG_TORN` fired **ZERO** times. No region mutated during its own copy.
+
+This is weaker evidence than a positive would have been (two back-to-back reads can both land after
+a mutation completes), but it does not stand alone: 3L.2 below independently explains every fault
+without needing a race, and the fault set is bit-identical across boots, which a free-running race
+does not produce. Tenth eliminated mechanism.
+
+Worth recording so it is not re-derived: this race is REAL in this codebase but was already found
+and narrowly fixed for its one known writer. `process.rs:2576-2599` holds `elf_patch_cache` across
+the eager copy specifically because `maybe_patch_exec_segment` writes trampoline stubs into that
+same region under that same lock, and the read side had no lock at all. That fix is live and
+correct; the present faults are not another instance of it.
+
+### 3L.2 The mechanism: `duplicate` reserves each group's VMA span, not its reserved-space span
+
+**Every fault, at last, attributed.** Fresh capture, 900 `DIAG_VMA fork-relocation` lines,
+23 faults. Every single fault's `rip` lies inside the child's own correctly-relocated **libc TEXT**
+(source `0x7feffc2e3000`, len 1,454,080), at exactly ONE of two fixed offsets: `0x7ac06` (reads,
+`error_code=0x4`) and `0x7ac11` (writes, `error_code=0x6`). Same code site every time, in every
+child, across boots.
+
+The `VirtualQuery`-at-fault-time verdicts partition the faults cleanly:
+
+    17  NO mapping overlaps cr2 (genuinely unmapped)
+     3  mapping overlapping cr2 ... flags=VmFlags(VM_OWN_FORK_PADDING)
+     3  mapping overlapping cr2 ... flags=VM_READ | VM_EXEC | ...   (the child's own libc TEXT)
+
+**The three `VM_OWN_FORK_PADDING` hits are the tell.** Those spans are
+`0x795e8000..0x7a5e8000`, `0x8dbd8000..0x8ebd8000`, `0x92a88000..0x93a88000` -- each **exactly
+`0x1000000` = 16 MiB = `DEFAULT_RESERVED_SPACE_SIZE`**. `VM_OWN_FORK_PADDING` is the placeholder
+`Vmem::duplicate` inserts at `linux.rs:1442-1443` to reserve a coherent group's span, with
+`populate_pages_immediately = false` and empty access flags. The guest is dereferencing addresses
+that fall inside a group reservation the child holds but never populated.
+
+**Why they are unpopulated: the group span is computed from VMAs only.** `duplicate` builds
+`groups` from `sorted_non_shared`, which comes from `regions` -- i.e. from real VMAs. But
+`create_mapping` (`linux.rs:1728-1744`) deliberately reserves `length + DEFAULT_RESERVED_SPACE_SIZE`
+via `get_unmmaped_area` while inserting a VMA covering only `length`. That 16 MiB of growth
+headroom has NO VMA, so it is invisible to `regions`, invisible to `groups`, and invisible to
+`Vmem::new_excluding`. The child's group reservation therefore ends 16 MiB short of the parent's,
+and `insert_mapping(Hint)` is free to place the NEXT group inside the address range that, in
+relative-offset terms, is the previous group's headroom.
+
+Measured in the parent's own layout: group 0 spans `0x10040000..0x111a9000`; its last real VMA
+ends at `270,041,088`; the trampoline mapping sits at `286,818,304..286,953,472`. The gap between
+them is **16,777,216 bytes exactly** -- the headroom -- and the 17 "genuinely unmapped" faults land
+inside it (e.g. `cr2=0x11186840`, 6,080 bytes below the trampoline start).
+
+**This subsumes 3K's "16 MiB hole is deliberate headroom" reading without contradicting it.** The
+hole IS deliberate. The bug is that `fork()` does not reproduce it: the parent's headroom is real
+reserved address space, and the child gets a group reservation sized to VMAs alone, so relative
+offsets that were valid in the parent -- exactly the invariant coherent-group relocation exists to
+preserve -- are NOT preserved across the headroom. That is why the offsets are irregular with no
+constant stride (3K's finding, and the reason the stale-size hypothesis was correctly refuted):
+they are not an arithmetic error at all, they are the guest reaching into space the child never
+reserved.
+
+**It also explains the three write faults into the child's own libc TEXT.**
+`is_in_destination_executable_range`'s own doc comment states a write there "is never legitimate
+guest behavior". `error_code=0x6` is write-to-NOT-PRESENT, not write-to-readonly (`0x7`), so those
+libc TEXT pages are not committed in the child at all -- the same unpopulated-reservation
+condition, landing inside a range whose VMA bookkeeping says TEXT. Their offsets from the libc
+text base (+138,680, +165,816, +218,392) reproduce 3K's own measured libc-text offsets
+(+138,440, +163,976, +218,120) to within 240-1,840 bytes: the SAME three sites, across boots and
+across rebuilt binaries.
+
+**Also confirmed clean, so it is not re-searched:** there is NO division, multiplication, ratio or
+proportion anywhere in the fork relocation path. `AddressRelocations::translate` is
+`dest_base + (addr - source_range.start)`; per-region placement is
+`group_dest_base + (range.start - group_source_base)`; `is_in_destination` uses
+`source_range.len()`. The "scaling arithmetic bug" theory is dead by inspection.
+
+**One real caveat on `merge_ancestor_ranges`** (`mod.rs:451-465`), not yet implicated but adjacent:
+it carries an ancestor range forward as `(ancestor_source_range, translate(ancestor_dest_base))`.
+`translate` maps a POINT. If the ancestor's destination image is longer than the `self` range
+containing its base, or straddles two `self` ranges, the merged entry claims a contiguous image
+that does not exist. Worth checking in a nested-fork workload.
+
+### 3L.3 The fix, and why it was not landed in this pass
+
+The shape is clear: the child's coherent-group reservation must cover the same span the parent
+actually reserved, headroom included, so relative offsets are preserved across it. Concretely,
+either extend each group's reserved span by `DEFAULT_RESERVED_SPACE_SIZE` past its last VMA before
+`insert_mapping`, or track the headroom explicitly so `groups` can see it.
+
+Not landed here, deliberately. 3K already warns that giving the reserve a real VMA would copy 16 MiB
+of untouched address space per mapping per fork AND convert a loud page fault into silent
+corruption. The correct fix RESERVES the span without populating or copying it -- a different
+change from the one 3K warned against, but one that still shifts every child's address-space
+layout, so it wants its own pass with its own before/after capture rather than being appended to
+this one. Eleventh mechanism, and the first that is a located defect rather than an elimination.
