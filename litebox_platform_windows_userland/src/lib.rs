@@ -5793,8 +5793,16 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         //
         // To ensure future MEM_COMMIT calls on sub-ranges succeed, we always reserve the entire aligned range
         // (i.e., MEM_RESERVE size is also made aligned to system allocation granularity).
+        // `floor` raises `MEM_ADDRESS_REQUIREMENTS::LowestStartingAddress` for the
+        // OS-picks-the-address (`r.start == 0`) path. Windows satisfies an unconstrained
+        // request BOTTOM-UP from the lowest free address, so a caller that had a perfectly
+        // good high address and merely lost it to a foreign-claim collision would otherwise
+        // be relocated to the very bottom of the guest range -- see the `hint_foreign_claim`
+        // fallback below for the packing that causes. Passing the discarded hint as `floor`
+        // keeps the retry in the same neighbourhood instead.
         let reserve_and_commit = |r: core::ops::Range<usize>,
-                                  flags: Win32_Memory::PAGE_PROTECTION_FLAGS|
+                                  flags: Win32_Memory::PAGE_PROTECTION_FLAGS,
+                                  floor: usize|
          -> *mut c_void {
             let aligned_start_addr = self.round_down_to_granu(r.start);
             let aligned_end_addr = self.round_up_to_granu(r.end);
@@ -5813,8 +5821,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             // corrupting both sides with no page fault to signal it. Constrain this path
             // symmetrically to `TASK_ADDR_MIN..TASK_ADDR_MAX` so the two regions can never
             // overlap.
+            let lowest_start = core::cmp::max(
+                <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::TASK_ADDR_MIN,
+                self.round_down_to_granu(floor),
+            );
             let mut addr_req = MEM_ADDRESS_REQUIREMENTS {
-                LowestStartingAddress: <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::TASK_ADDR_MIN as *mut c_void,
+                LowestStartingAddress: lowest_start as *mut c_void,
                 HighestEndingAddress: (<WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::TASK_ADDR_MAX - 1) as *mut c_void,
                 Alignment: 0,
             };
@@ -5878,6 +5890,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         };
 
         let mut base_addr = suggested_range.start as *mut c_void;
+        // See the `hint_foreign_claim` fallback below: set to the discarded hint so the
+        // OS-picks-the-address retry stays in the same region instead of restarting from
+        // `TASK_ADDR_MIN`. Zero means "no preference" (the ordinary `mmap(NULL, ...)` case).
+        let mut placement_floor = 0usize;
         let size = suggested_range.len();
         // TODO: For Windows, there is no MAP_GROWDOWN features so far.
         let _ = can_grow_down;
@@ -5978,6 +5994,23 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             {
                 // If any page in the suggested range is already committed, and the caller
                 // did not request a fixed address, we ask the OS to allocate a new region.
+                //
+                // Remember the address we are discarding. `get_unmmaped_area` chose it
+                // top-down and it is very likely still the right NEIGHBOURHOOD even though
+                // this exact range collided; an unconstrained retry, by contrast, is served
+                // bottom-up by Windows and lands at the very bottom of the guest range.
+                // Confirmed live: a forked Xorg had 45 of 48 allocator-chosen mappings placed
+                // low this way (vs 0 of 118 for the same binary as pid 1), packing ~180
+                // mappings into 177 MB with 125 of 133 gaps under 64 KB -- several exactly
+                // zero -- until glibc's `sysmalloc` grew the heap straight into an adjacent
+                // library's text segment and SIGSEGV'd. `MAP_SHARED` was unaffected precisely
+                // because `map_shared_memory` never reaches this fallback.
+                // `LITEBOX_NO_PLACEMENT_FLOOR=1` disables the floor at RUNTIME, so one binary
+                // can be A/B'd with and without this fix. A build-vs-build comparison confounds
+                // the fix with every other tree change between the two builds; this does not.
+                if std::env::var_os("LITEBOX_NO_PLACEMENT_FLOOR").is_none() {
+                    placement_floor = suggested_range.start;
+                }
                 base_addr = core::ptr::null_mut();
             } else if has_committed_page
                 && fixed_address_behavior == FixedAddressBehavior::NoReplace
@@ -6197,7 +6230,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                 // reservation, so a former mapped view needs the same
                                 // reserve-and-commit path as a genuinely free region.
                                 let ptr = if was_mapped_view {
-                                    reserve_and_commit(r.clone(), prot_flags(initial_permissions))
+                                    reserve_and_commit(r.clone(), prot_flags(initial_permissions), 0)
                                 } else {
                                     if diag_mm_enabled() {
                                         litebox_util_log::error!(
@@ -6224,7 +6257,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                             // In case the region is free, we need to reserve and commit it.
                             Win32_Memory::MEM_FREE => {
                                 let ptr =
-                                    reserve_and_commit(r.clone(), prot_flags(initial_permissions));
+                                    reserve_and_commit(r.clone(), prot_flags(initial_permissions), 0);
                                 !ptr.is_null()
                             }
                             _ => unimplemented!(
@@ -6287,7 +6320,23 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         let _fixed_addr_guard = ALLOCATE_PAGES_FIXED_ADDR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let ptr = reserve_and_commit(0..size, prot_flags(initial_permissions));
+        let mut ptr = reserve_and_commit(0..size, prot_flags(initial_permissions), placement_floor);
+        if ptr.is_null() && placement_floor != 0 {
+            // The constrained retry could not be satisfied above `placement_floor` (genuinely
+            // no room up there). Fall back to the original unconstrained behaviour rather than
+            // turning a placement preference into an allocation failure -- a low address is
+            // still correct, merely worse for locality.
+            // `error!`, not `debug!`: the oracle and every repro script run with
+            // `LITEBOX_LOG=error`, and this investigation repeatedly lost diagnostics to
+            // `EnvFilter` at lower levels. A run that starts taking this path is silently
+            // regressing to the old bottom-up packed layout -- the exact condition this fix
+            // exists to prevent -- so it must be visible where anyone is actually looking.
+            litebox_util_log::error!(
+                floor:% = placement_floor, size:% = size;
+                "allocate_pages: constrained retry above discarded hint failed, retrying unconstrained"
+            );
+            ptr = reserve_and_commit(0..size, prot_flags(initial_permissions), 0);
+        }
         assert!(
             !ptr.is_null(),
             "VirtualAlloc2(RESERVE|COMMIT size=0x{:x}) failed: {}",
