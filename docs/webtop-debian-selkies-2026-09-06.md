@@ -315,3 +315,132 @@ which is genuine forward progress even without new code this pass. `.gm/prd.yml`
 `vfork-parent-wakes-during-nested-child-execve` row has the full technical
 trace. Full regression test suite (`cargo test --workspace`) was not run this
 session since no code changed.
+
+## Follow-up session: investigated extending `spawn_cross_process_fork_child` to
+## `CLONE_VFORK` specifically -- found it structurally cannot work yet, no code changed
+
+Task brief for this session: extend the cross-process fork mechanism
+(`spawn_cross_process_fork_child`) to cover the `s6-mkdir` vfork case specifically,
+reasoning that vfork's simpler fd-sharing contract (child only touches its own stack
+before execve/exit, parent fully suspended for the whole window) might let it dodge
+the `fd_complexity.beyond_stdio == 0` gate that blocks general `fork()`. Read
+`advisor/ADVISORY-002-d-zero-fork.md` in full and traced every `fd_complexity`/
+`beyond_stdio` call site plus the actual `spawn_cross_process_fork_child`/
+`spawn_process_fork_child` implementation before writing any code. Conclusion:
+**do not implement this yet -- three independent, load-bearing gaps make it unsafe
+to ship, not merely hard.** No code changed this session.
+
+### Gap 1: vfork's own relocation map is empty, and the cross-process spawner needs
+### a real one
+
+Today's vfork path (`do_clone`, `litebox_shim_linux/src/syscalls/process.rs` ~2529-2542)
+deliberately does NOT call `pm().duplicate()` at all for `CLONE_VFORK` -- it shares
+the parent's `Arc<PageManager>` directly and builds an explicitly EMPTY
+`AddressRelocations` (`from_raw_parts_for_diagnostic` with every vec `Vec::new()`),
+because there is nothing to relocate when nothing was duplicated. But
+`spawn_cross_process_fork_child` (`litebox_platform_windows_userland/src/lib.rs:8403`)
+feeds that same `relocations` object's `.group_relocations()` and `.vma_layout()`
+straight into `spawn_process_fork_child` as the literal list of memory ranges to
+`WriteProcessMemory` into the new child process (`process_fork.rs:1106-1135`). For
+vfork's empty relocations, both of those are empty vectors -- the mechanism as it
+exists today would spawn a new Windows process and copy **zero bytes of guest
+memory** into it. Routing vfork through this path requires first building a real
+enumeration of the parent's VMAs for the vfork case (identity-mapped, since nothing
+should relocate) -- not just flipping the `beyond_stdio` gate. This is new work, not
+a two-line change.
+
+### Gap 2: the cross-process path has no vfork-suspend/signal contract at all, and
+### returns before the code that implements one
+
+`do_clone`'s cross-process branch (`process.rs:3190-3209`) `return`s immediately on
+success, before ever reaching `vfork_child_process.wait_for_vfork_done()` at
+`process.rs:3394-3396` -- that call only exists on the thread-based path taken
+further down the same function. Wiring a vforked call into the cross-process branch
+today would silently skip the entire "parent blocks until child execve/exits"
+contract vfork's whole point depends on: the parent would return from `vfork()`
+immediately, racing the child exactly the way real Linux never allows and exactly
+the hazard `wait_for_vfork_done`/`signal_vfork_done` exist to prevent. There is no
+existing cross-process signal for "child reached execve" (as distinct from "child
+exited", which the existing `cross_process_children`/`wait4` HANDLE-wait bridge
+already covers) -- this would need a new primitive built on
+`litebox_platform_windows_userland/src/xproc_sync.rs`'s `CrossProcessEvent` (a named
+Windows event; the primitive exists and is well-suited, but nothing wires it to an
+execve-success or _exit callback in the child today), plumbed through both the
+child's `sys_execve`/exit path and the parent's `wait_for_vfork_done`.
+
+### Gap 3: the cross-process child has no shim-level state at all -- it cannot
+### actually run `s6-mkdir`'s execve, only a diagnostic no-op
+
+This is the decisive gap. Traced `spawn_process_fork_child`
+(`process_fork.rs:1106`) through to what the spawned child process actually runs:
+it re-execs the runner binary itself with `LITEBOX_PROCESS_FORK_CHILD=1`-style env
+vars, landing in `run_diagnostic_resume_child()` (`process_fork.rs:143`), which
+constructs a bare `WindowsUserland` platform instance and parks for a raw
+`SetThreadContext` register injection (`park_for_real_resume_injection`) -- the
+guest's CPU resumes mid-instruction with **no `Task`, no `Process`, no fd table, no
+mount/VFS state, no `GlobalState` at all** reconstructed for it. The one place that
+DOES build a fresh shim stack in the child,
+`diag_process_fork_globalstate_probe`/`diag_process_fork_vmem_adopt_probe`/
+`diag_process_fork_task_resume_probe` (`litebox_runner_linux_on_windows_userland/
+src/lib.rs:1152-1334`), is explicitly diagnostic-only (gated behind three separate
+`LITEBOX_DIAG_PROCESS_FORK_*` env vars, never set by the production
+`spawn_cross_process_fork_child` call path) and even then constructs a **brand new,
+empty** `GlobalState`/`DefaultFS` by re-reading the guest rootfs tar from scratch
+(`FORK_CHILD_TAR_PATH_ENV_VAR`) -- it does not, and structurally cannot yet,
+transplant the parent's live mount state (any writes/mounts already made during
+boot), its live fd table (fds 0/1/2 need to resolve to the SAME pipe/tty/socket
+objects the parent has open, not fresh ones), or its pid/tid so `wait4` continues
+working. `s6-mkdir`'s real execve needs exactly this state to resolve its own path
+and inherit working stdio. This confirms `advisor/ADVISORY-002-d-zero-fork.md`
+section 3.3/3.4's "the hard part is the pointer-rich kernel-equivalent state living
+in one process's private heap" is not merely a general-fork concern -- vfork's
+simpler fd contract does not remove the need for the child to have *some* working
+shim state to make its next syscall at all, and today it has none.
+
+### Why this rules out a narrow vfork-only carve-out, per this session's own brief
+
+The task brief explicitly asked me to determine whether vfork's simpler semantics
+(no long-lived shared-fd-table concurrency, child immediately execve/_exit-bound)
+make cross-process spawning safer or easier than the general fork case. The answer,
+confirmed by tracing the actual code rather than assuming from the contract alone:
+vfork's semantics remove the *concurrency* problem (no racing writer on a shared fd
+table, since the parent is fully suspended) but do **not** remove the *existence*
+problem -- the child still needs a real, working shim-level process object
+(`Task`/`Process`/fd table/mount state) to execute even its own imminent `execve`
+syscall, and building that transplant is exactly `ADVISORY-002`'s Track B items 2-4
+(cross-process `RawMutex`, fixed-base shared kernel heap behind `SafeZoneAllocator`,
+HANDLE indirection for fd objects) -- none of which exist yet, for vfork or general
+fork alike. `ADVISORY-002` section 6 says explicitly: "Do not build the vfork-only
+shortcut as the general fork: the XFCE daemons fork without exec and the 'parent
+parked until child exits' semantic deadlocks them" -- read in light of this
+session's tracing, that warning is really about not diverging from Track B's
+ordered plan, and the same ordered plan (presenter split -> cross-process
+`RawMutex` -> fixed-base shared kernel heap -> relax `beyond_stdio` incrementally)
+is the correct path for the vfork case too, not a shortcut around it. Attempting a
+narrow vfork-specific version of steps 2-4 above, scoped smaller than the full
+general-fork version, might be tractable as dedicated future work, but is a
+substantial new design-and-build effort in its own right (a new cross-process
+execve-done signal, a real vfork-specific VMA enumeration, and at minimum a
+transplanted fd 0/1/2 + mount-state-visible-enough-for-path-resolution shim child)
+-- not a gate flip, and not safely forceable blind in one session per this
+project's own standing discipline (three prior fix attempts already failed on this
+exact row; a fourth blind one would compound the debt, which is exactly what this
+session's brief asked me to avoid if the design didn't hold up).
+
+### Status
+
+No code changed this session (`git status --porcelain` clean, confirmed). The
+`vfork-parent-wakes-during-nested-child-execve` PRD row's real blocker (single
+shared real Windows address space, identified by the immediately preceding session)
+stands unchanged; this session adds that the previously-suggested next step
+("investigate extending `spawn_cross_process_fork_child` for vfork") is not a
+small follow-up but requires Track B's cross-process kernel-state infrastructure to
+exist first, for either vfork or general fork. The webtop boot repro
+(`linuxserver/webtop:debian-i3`'s real `/init`) was not re-run this session, since
+no code changed that could affect its outcome -- it remains blocked at the exact
+point documented in the immediately preceding session (s6-mkdir's execve hitting
+`AddressInUse`/`EEXIST` at `0x400000`). Recommended next step for a dedicated
+session: start Track B at the top (`docs/presenter-process-design.md`'s presenter
+split, ADVISORY-002 section 6 step 1), not at the `beyond_stdio` gate -- the gate is
+a downstream consequence of the missing shared-kernel-state infrastructure, not an
+independent knob.
