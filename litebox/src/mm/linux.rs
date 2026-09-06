@@ -40,6 +40,24 @@ pub const PAGE_SIZE: usize = 4096;
 #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
 pub const PAGE_SIZE: usize = 16384;
 
+/// Runtime kill-switch for `Vmem::MAPPING_GUARD_GAP` -- see that constant's doc comment for what
+/// the gap is for and what it does and does not guarantee.
+///
+/// This crate is `#![no_std]` and cannot read an environment variable itself, so the switch lives
+/// here and is set once at startup by the runner (from `LITEBOX_NO_MAPPING_GUARD_GAP`) through
+/// [`set_mapping_guard_gap_disabled`]. It exists so one binary can A/B the guard gap without a
+/// rebuild, matching `LITEBOX_NO_PLACEMENT_FLOOR`'s rationale on the platform side: comparing two
+/// separately-built binaries confounds the measurement with every other difference between them.
+static MAPPING_GUARD_GAP_DISABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Disable (or re-enable) the inter-mapping guard gap. See [`MAPPING_GUARD_GAP_DISABLED`].
+///
+/// Intended to be called once, at startup, before any guest mapping is placed.
+pub fn set_mapping_guard_gap_disabled(disabled: bool) {
+    MAPPING_GUARD_GAP_DISABLED.store(disabled, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Windows' `dwAllocationGranularity` (the platform's own
 /// `WindowsUserland::round_up_to_granu`/`round_down_to_granu` in
 /// `litebox_platform_windows_userland/src/lib.rs` read this same value dynamically from
@@ -440,6 +458,7 @@ impl<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> VmArea<Platfor
         self.is_file_backed
     }
 
+
     /// Create a new private (non-shared) [`VmArea`] with the given flags.
     #[inline]
     pub(super) fn new(flags: VmFlags, is_file_backed: bool) -> Self {
@@ -658,6 +677,64 @@ pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const 
 impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem<Platform, ALIGN> {
     pub(super) const STACK_GUARD_GAP: usize = 256 << 12;
 
+    /// Minimum separation kept between two independently-placed guest mappings.
+    ///
+    /// Without this, `get_unmmaped_area` is free to place a fresh mapping so its end touches the
+    /// next mapping's start exactly, and nothing downstream objects -- the VMA bookkeeping is
+    /// perfectly consistent, the two mappings simply have no space between them. That is fine for
+    /// a mapping of fixed size, and wrong for one the guest intends to GROW.
+    ///
+    /// glibc's `sysmalloc` is exactly such a caller: extending the top chunk writes a chunk header
+    /// just past the current end of the heap. Two separate faults tonight are that write landing in
+    /// the neighbour, in the same glibc function, differing only in what happened to be next door:
+    ///
+    /// - `libc+0xa0b98` (`mov %r9,0x8(%rcx)`), forked Xorg: neighbour was a library's R+X text, so
+    ///   the write hit a non-writable, non-present page -- `error_code=0x6`, SIGSEGV.
+    /// - `libc+0xa0966` (`mov %rax,0x8(%rsi)`), Xorg as pid 1: neighbour was ordinary R+W data, so
+    ///   the write succeeded, corrupted it, and glibc's own consistency check aborted -- SIGABRT.
+    ///
+    /// The pid-1 case is the clearer proof, because the placement decision is visible in the log:
+    /// the mapping that was overrun spans `0x11421000..0x1142d000` (289542144..289591296), and the
+    /// allocation immediately before the crash recorded `chosen=289591296` -- the search picked
+    /// literally the next byte after that mapping's end.
+    ///
+    /// A stack already gets [`Self::STACK_GUARD_GAP`] for the same reason, in the same function.
+    /// This is the non-stack equivalent, deliberately much smaller: a stack grows without bound and
+    /// needs real headroom, whereas this only has to ensure two mappings never touch, so a
+    /// heap-extension write past the end lands in a hole and faults instead of silently corrupting
+    /// a neighbour.
+    ///
+    /// WHAT THIS DOES AND DOES NOT GUARANTEE. It guarantees two independently-placed mappings are
+    /// never adjacent, which converts the OBSERVED fault class -- a chunk-header write a few bytes
+    /// past the end (`+0x8`, `+0x18`) -- from silent corruption of a neighbour into a clean fault
+    /// on an unmapped hole. It does NOT guarantee that no allocation can ever reach a neighbour:
+    /// `sysmalloc` can extend the heap by much more than a page in one call, and a large enough
+    /// single extension can still jump a one-page hole. Enlarging the constant would only move that
+    /// theoretical hole outward, not close it -- the real protection is that the search should not
+    /// be placing growable mappings flush against their neighbours in the first place, and this
+    /// constant enforces exactly that minimum.
+    ///
+    /// Set `LITEBOX_NO_MAPPING_GUARD_GAP=1` to disable at runtime, so one binary can A/B this
+    /// (matching `LITEBOX_NO_PLACEMENT_FLOOR`'s own rationale).
+    pub(super) const MAPPING_GUARD_GAP: usize = 1 << 12;
+
+    /// Whether [`Self::MAPPING_GUARD_GAP`] is in force. See that constant's doc comment.
+    ///
+    /// `litebox` is `#![no_std]` and has no environment access of its own, so the switch is a
+    /// static set once at startup by whoever DOES have an environment (the runner, from
+    /// `LITEBOX_NO_MAPPING_GUARD_GAP`) via [`set_mapping_guard_gap_disabled`]. An earlier revision
+    /// of this read `std::env` inside a `cfg(feature = "std")` block, which -- there being no such
+    /// feature on this crate -- compiled to nothing and left the A/B gate silently inert. That is
+    /// exactly the class of lying instrument this investigation kept tripping over, so it is
+    /// recorded here rather than quietly corrected.
+    fn mapping_guard_gap() -> usize {
+        if MAPPING_GUARD_GAP_DISABLED.load(core::sync::atomic::Ordering::Relaxed) {
+            0
+        } else {
+            Self::MAPPING_GUARD_GAP
+        }
+    }
+
     /// Create a new [`Vmem`] instance with the given memory [backend](PageManagementProvider).
     pub(super) fn new(platform: &'static Platform) -> Self {
         Self::new_excluding(platform, core::iter::empty())
@@ -731,6 +808,22 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 );
             }
         }
+        // Measures the outcome the `duplicate` headroom-exclusion fix targets: how much of the
+        // HIGH end of the guest address space this new `Vmem` starts life with already covered by
+        // `VmFlags::empty()` host placeholders. `get_unmmaped_area` walks top-down, so a high
+        // `top_placeholder_end` (at or near `TASK_ADDR_MAX`) is exactly the condition that pushes
+        // every subsequent private mapping down into a low gap -- the packing that produced the
+        // forked-Xorg `sysmalloc`-into-adjacent-text SIGSEGV. Logged at `error` so it is visible
+        // under `LITEBOX_LOG=error` alongside the `DIAG_VMA`/`DIAG_GROUPS` fork lines.
+        let placeholder_count = vmem.vmas.iter().count();
+        let top_placeholder_end = vmem.vmas.last_range_value().map_or(0, |r| r.0.end);
+        litebox_util_log::error!(
+            placeholder_count:% = placeholder_count,
+            top_placeholder_end:% = top_placeholder_end,
+            task_addr_max:% = Platform::TASK_ADDR_MAX,
+            pins_high_limit:? = (top_placeholder_end >= Platform::TASK_ADDR_MAX);
+            "DIAG_VMEM new_excluding placeholders"
+        );
         vmem
     }
 
@@ -1805,22 +1898,46 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .ok_or(AllocationError::OutOfMemory)?;
         // new_addr must be ALIGN aligned
         let new_range = PageRange::new(new_addr, new_addr + length.as_usize()).unwrap();
-        unsafe {
+        let behavior = if flags.contains(CreatePagesFlags::FIXED_ADDR) {
+            if flags.contains(CreatePagesFlags::NOREPLACE) {
+                FixedAddressBehavior::NoReplace
+            } else {
+                FixedAddressBehavior::Replace
+            }
+        } else {
+            FixedAddressBehavior::Hint
+        };
+        let result = unsafe {
             self.insert_mapping(
                 new_range,
                 vma,
                 flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY),
-                if flags.contains(CreatePagesFlags::FIXED_ADDR) {
-                    if flags.contains(CreatePagesFlags::NOREPLACE) {
-                        FixedAddressBehavior::NoReplace
-                    } else {
-                        FixedAddressBehavior::Replace
-                    }
-                } else {
-                    FixedAddressBehavior::Hint
-                },
+                behavior,
             )
+        };
+        // THE DISCRIMINATING MEASUREMENT for the forked-Xorg packed-low-window investigation.
+        // Three separate mechanisms have been proposed for why a forked child's mappings land in a
+        // cramped low window while the same binary as pid 1 gets the high region, and each was
+        // argued from placement addresses alone. This records the two numbers that actually settle
+        // it, for the SAME call:
+        //   `chosen`  -- what `get_unmmaped_area` (litebox's own top-down search) decided.
+        //   `actual`  -- what the platform ultimately handed back after `insert_mapping`.
+        // If `chosen` is itself low, the defect is in the search and the VMA tree it walks. If
+        // `chosen` is high but `actual` is low, the search is fine and something below it (the
+        // Hint-mode foreign-claim fallback in the Windows platform's `allocate_pages`, which
+        // discards the hint and reissues an unconstrained bottom-up request) is overriding it.
+        // `overridden` states that comparison directly so no arithmetic is needed to read it.
+        if let Ok(ptr) = &result {
+            let actual = ptr.as_usize();
+            litebox_util_log::error!(
+                chosen:% = new_addr, actual:% = actual,
+                overridden:? = (actual != new_addr),
+                len:% = length.as_usize(), total_len:% = total_length.as_usize(),
+                behavior:? = behavior, ensure_space_after:? = (reserved_extra != 0);
+                "DIAG_PLACE chosen-vs-actual"
+            );
         }
+        result
     }
 
     /// Resize a range in the virtual address space.
@@ -2385,6 +2502,19 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         debug_assert_eq!(Platform::TASK_ADDR_MIN % ALIGN, 0);
         debug_assert_eq!(Platform::TASK_ADDR_MAX % ALIGN, 0);
         let last_end = self.vmas.last_range_value().map_or(low_limit, |r| r.0.end);
+        // Attributes a placement to the branch that produced it. The forked-Xorg packed-low-window
+        // investigation repeatedly reasoned about which branch was firing from placement addresses
+        // alone and got it wrong three times; this records the answer instead. Only the failing
+        // case is logged -- logging every call would drown a run in thousands of lines -- so a
+        // line here means the all-or-nothing test below has actually foreclosed the upper region.
+        if last_end > high_limit {
+            litebox_util_log::error!(
+                size:% = size, last_end:% = last_end, high_limit:% = high_limit,
+                low_limit:% = low_limit, is_growsdown:? = is_growsdown,
+                task_addr_max:% = Platform::TASK_ADDR_MAX;
+                "DIAG_UNMAPPED fast-path foreclosed"
+            );
+        }
         if last_end <= high_limit {
             // A growsdown (stack) region must keep a guard gap below whatever is already
             // mapped above it -- gap #2 below already reserves this in the OTHER direction
@@ -2399,7 +2529,87 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     return Some(gapped_high_limit);
                 }
             } else {
+                // The fast path places at `high_limit`, i.e. flush against the top of the usable
+                // range. Keep the same non-touching guarantee step 2 applies below, so a mapping
+                // placed here cannot abut whatever sits above it either. See `MAPPING_GUARD_GAP`.
+                let gap = Self::mapping_guard_gap();
+                let gapped = high_limit.saturating_sub(gap);
+                if gap == 0 || gapped >= last_end {
+                    return Some(gapped);
+                }
                 return Some(high_limit);
+            }
+        }
+
+        // 1.5. HELD BACK, NOT YET ENABLED -- see the `if false` guard below. This addresses a
+        // REAL, separately-measured defect, but not the one that causes the forked-Xorg crash, and
+        // it is kept dark so the primary fix (the Hint-mode foreign-claim fallback in the Windows
+        // platform's `allocate_pages`) can be measured in isolation rather than two changes being
+        // confounded in one boot. Enable and verify on its own merits afterwards.
+        //
+        // The population this governs, established by measurement: the 36 `DIAG_UNMAPPED` events
+        // in a failing run all carry sizes between ~16.79MB and ~18.83MB, which resolve exactly to
+        // a real ELF segment length plus `DEFAULT_RESERVED_SPACE_SIZE` (e.g. 18825216 - 16MiB =
+        // 2048000, glibc's own span). That is `create_mapping` passing
+        // `total_length = length + reserved_extra` for `ENSURE_SPACE_AFTER` reservations, i.e. the
+        // ELF loader's path only. The ordinary guest `mmap` sizes in the same run (233472, 40960,
+        // 8192, 2048000, 12288) appear nowhere in that set -- the two populations are disjoint, so
+        // this branch is not what places ordinary anonymous/private mappings low.
+        //
+        // The defect it fixes is nonetheless genuine: the fast path above is all-or-nothing
+        // (`high_limit`), and if the single topmost VMA reaches past that point it declines the
+        // upper region ENTIRELY. Step 2 below cannot recover it, because every candidate it
+        // considers is derived as `r.start - size` -- strictly BELOW some existing mapping -- so
+        // no code path ever examines the space between the topmost mapping's neighbours near the
+        // top of the address space. One mapping ending above `high_limit` therefore condemns the
+        // whole process, for its entire lifetime, to whatever gaps exist further down.
+        //
+        // Measured live on a forked-then-`execve`'d Xorg: 36 foreclosures in one run, with
+        // `last_end` landing on `TASK_ADDR_MAX` to the byte. The consequence is not merely
+        // untidy placement -- the process's mappings get packed into a ~120MB low window with
+        // inter-library gaps as small as a single page (against the same libraries sitting
+        // megabytes apart when the same binary runs as pid 1 and never trips this). glibc's
+        // `sysmalloc` then extended its top chunk straight across into an adjacent library's R+X
+        // text segment and faulted writing the chunk header (`mov %r9,0x8(%rcx)`), surfacing as a
+        // user-mode WRITE to a NOT-PRESENT page (`error_code=0x6`) inside a `VM_READ | VM_EXEC`
+        // mapping -- deterministic to the byte across runs, since the packing is deterministic.
+        //
+        // So rather than give up on the upper region, walk DOWN from `high_limit` past the
+        // mappings that occupy it, taking the first gap that fits. This is the same top-down
+        // intent the fast path already has, just no longer restricted to a single candidate. The
+        // guard-gap rules are the same ones steps 1 and 2 apply: a growsdown (stack) region keeps
+        // `STACK_GUARD_GAP` below whatever sits above it, and needs a doubled gap when the region
+        // it is being placed under is itself a stack growing down into the same space.
+        #[expect(
+            clippy::overly_complex_bool_expr,
+            reason = "deliberately dark until the primary fix is measured in isolation"
+        )]
+        if false && last_end > high_limit {
+            let mut probe = high_limit;
+            for (r, flags) in self.vmas.iter().rev() {
+                if r.start >= probe.saturating_add(size) {
+                    // Entirely above the window under consideration -- cannot constrain it.
+                    continue;
+                }
+                if probe >= low_limit && !self.vmas.overlaps(&(probe..probe + size)) {
+                    return Some(probe);
+                }
+                // `r` blocks this candidate: drop the window to sit fully below `r`, plus
+                // whichever guard gap the pair of regions requires.
+                let gap = if flags.flags.contains(VmFlags::VM_GROWSDOWN) {
+                    Self::STACK_GUARD_GAP << 1
+                } else if is_growsdown {
+                    Self::STACK_GUARD_GAP
+                } else {
+                    0
+                };
+                let Some(next) = r.start.checked_sub(size + gap) else {
+                    break;
+                };
+                probe = next;
+                if probe < low_limit {
+                    break;
+                }
             }
         }
 
@@ -2417,7 +2627,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             let gap_above_new = if is_growsdown {
                 Self::STACK_GUARD_GAP
             } else {
-                0
+                // Never zero: two ordinary mappings must not touch, or a guest that grows one of
+                // them (glibc's `sysmalloc` extending the heap) writes straight into the other.
+                // See `MAPPING_GUARD_GAP`.
+                Self::mapping_guard_gap()
             };
             // `checked_sub` underflowing here means `r` sits too close to address 0 for a
             // region of this `size` to fit BELOW it -- not that no region anywhere can fit.
