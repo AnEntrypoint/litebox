@@ -1412,3 +1412,30 @@ releasing the pages and failing the call, because `brk`'s contract requires cont
 guard exists from a prior live-confirmed cross-process heap-corruption fix.
 
 So there is no path by which usable content exists in the headroom without a VMA covering it.
+
+### 3K.2 Refuted by measurement: forked children do NOT re-patch (elf_patch_cache theory)
+
+A proposed mechanism: `ElfPatchKey` is `(pid, fd)` (`mm.rs:90-105`, whose own doc comment calls the
+`pid` "load-bearing" because `ElfPatchState` holds absolute guest addresses while the cache lives on
+`Arc`-shared global state), and nothing re-keys a parent's entries onto the child's pid at `fork()`
+-- both facts verified. The theory was that a child therefore misses its own lookup, re-patches from
+scratch, computes a fresh `trampoline_addr`, and ends up with two conflicting trampoline layouts over
+one code region.
+
+**Measured false.** `DIAG_ELF_PATCH init-from-scratch` was added at `init_elf_patch_state`'s
+cache-miss path, logging `(pid, fd)` plus the keys already in the shared cache. Over a full
+30-concurrent-`/bin/true` run with all 30 children dying, only NINE from-scratch inits occur, and
+they belong to exactly TWO pids: pid 1 (the initial `bash`) and pid 32 (the `sleep` that reached
+`execve`). **Not one of the 30 dying children (pids 2-31) ever appears.** Children never re-patch.
+
+The structural reason, confirmed at source: `maybe_patch_exec_segment` is reachable only from the
+`mmap` path (`mm.rs:195`) and the `mprotect` path (`mm.rs:1098`). A plain forked child inherits its
+address space and does neither before dying, so the re-patch this theory requires cannot occur.
+
+The underlying asymmetry is real but is a resource leak, not a fault: a child holds inherited
+patched code with no cache entry of its own, and `finalize_elf_patch`'s keyed `remove` therefore
+cannot clean up state the child cannot see. That leaks; it does not produce a page fault.
+
+Consistent with the offset data in 3K: two fixed trampoline layouts differing by one constant would
+put the faults at a constant stride, and the measured offsets are irregular (ratios smeared 1.026 to
+3.138). Ninth eliminated mechanism.

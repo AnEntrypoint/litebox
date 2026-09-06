@@ -1132,6 +1132,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         {
             return;
         }
+        // DIAGNOSTIC (temporary, do not commit): `ElfPatchKey` is `(pid, fd)` and nothing re-keys
+        // a parent's entries onto the child's pid at `fork()`. So a forked child, whose address
+        // space already holds the parent's ALREADY-PATCHED code copied byte for byte, looks its
+        // own pid up, misses, and re-initializes patch state from scratch -- computing a fresh
+        // `trampoline_addr` while the copied code still jumps to the parent's. Log every
+        // (pid, fd) that reaches a from-scratch init, with the pids already present in the shared
+        // cache, so a child re-patching a binary its parent already patched is directly observed
+        // rather than inferred.
+        let existing: alloc::vec::Vec<(i32, i32)> =
+            self.global.elf_patch_cache.lock().keys().copied().collect();
+        litebox_util_log::error!(
+            pid:% = self.pid, fd:% = fd, mapped_addr:% = mapped_addr,
+            existing_keys:? = existing;
+            "DIAG_ELF_PATCH init-from-scratch (cache miss)"
+        );
 
         // Read the ELF header (64 bytes for Elf64).
         let mut ehdr_buf = [0u8; core::mem::size_of::<FileHeader64<LittleEndian>>()];
