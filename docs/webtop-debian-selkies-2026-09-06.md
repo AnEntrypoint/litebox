@@ -1160,28 +1160,88 @@ nested once was hitting this. It plausibly underlies other
 and any of those should be re-tested against this commit before being chased
 independently.
 
+## Second bug, uncovered by the first: a NULL `utimensat` path is `futimens`, not `EFAULT`
+
+With the host crash gone, the same repro failed cleanly instead:
+
+```
+touch: setting times of '/tmp/direct_touch': Bad address
+```
+
+An allocation-free `diag_raw_print`-style probe at the dispatch site (NOT
+`alloc::format!` -- see the warning below) gave the answer immediately:
+
+```
+[diag-utimensat] pathname=0x0 path_ok=0x0
+```
+
+The guest passed a **NULL** path. That is legal: `utimensat(dirfd, NULL, times,
+flags)` operates on `dirfd` itself and is exactly what musl's
+`futimens(fd, times)` compiles down to -- something `sys_utimensat`'s own doc
+comment already stated. Two independent gates rejected it anyway:
+
+1. The dispatch arm in `litebox_shim_linux/src/lib.rs`
+   (`SyscallRequest::Utimensat`) called `pathname.to_cstring::<Platform>()`
+   unconditionally and mapped the resulting `None` to `EFAULT`. A NULL path
+   therefore never reached `sys_utimensat` at all.
+2. `sys_utimensat` (`litebox_shim_linux/src/syscalls/file.rs`) then gated its
+   `FsPath::Cwd` and `FsPath::Fd(fd)` arms on `AT_EMPTY_PATH`, returning `ENOENT`
+   without it. Unlike most `*at` syscalls, `utimensat` does not require that flag
+   for the empty/NULL-path form. This gate is why fixing only (1) would have left
+   the `FsPath::Fd` handling as dead code.
+
+Fixed in commit `caaac79`: forward a NULL `pathname` as an EMPTY path (which
+`FsPath::new` already maps to `FsPath::Fd(dirfd)`/`FsPath::Cwd`), and drop the
+`AT_EMPTY_PATH` requirement in `sys_utimensat` (the flag is still accepted, just
+no longer required).
+
+### Result
+
+The exact repro from the report now exits 0 with no output and no crash:
+
+```
+litebox_runner_linux_on_windows_userland.exe -Z \
+  --oci-image docker.io/linuxserver/webtop:debian-i3 --env HOME=/config \
+  -- /bin/touch /tmp/direct_touch
+EXIT=0
+```
+
+Re-run of the bisection matrix, all passing, zero `[diag-unrecov-av]`:
+
+| case | before | after |
+| --- | --- | --- |
+| `> /tmp/redir_new` (O_CREAT only) | OK | OK |
+| `touch /tmp/direct_touch` (new file) | CRASH | `EXIT=0`, file created and stat-able |
+| `> /tmp/a && touch /tmp/a` (exists in UPPER) | CRASH | `rc=0`, `EXIT=0` |
+| `touch /etc/hostname` (exists in LOWER only) | CRASH | `rc=0`, `EXIT=0` |
+| `mkdir -p /var/log/nginx && touch /var/log/nginx/error.log` | CRASH | `rc=0`, file created |
+
+That last row is the specific prerequisite the `nginx-as-pid-1` section needs.
+It now works end to end:
+
+```
+touch_rc=0
+lower_rc=0
+-rw-r--r-- 1 root root 0 Sep  6 22:13 /var/log/nginx/error.log
+EXIT=0
+```
+
+### Instrumentation warning
+
+Adding an `alloc::format!`-based log line at that dispatch site **crashes on its
+own** (confirmed live -- first fault at an allocator address,
+`rip=0x2c8f4ae1f40`). The syscall path can be reached with the guest allocator's
+state already suspect. Use the allocation-free `diag_raw_print`-style helper
+pattern (see `diag_raw_print_proc_sys_open_miss`,
+`litebox_shim_linux/src/syscalls/file.rs`) instead, exactly as the VEH
+diagnostics already do for the same reason.
+
 ## Still open
 
-`utimensat` now fails cleanly with `EFAULT` instead of crashing. That is a real,
-separate, guest-visible bug -- the `times` pointer read at
-`litebox_shim_linux/src/lib.rs` (`SyscallRequest::Utimensat`, the two
-`times.read_at_offset::<Platform>(0|1)` calls) returns `None`. `Timespec` is 16
-bytes, so those take `read_at_offset`'s `memcpy_fallible` branch rather than the
-small-aligned-read fast path. Not yet root-caused.
-
-Note for whoever instruments this next: adding an `alloc::format!`-based log line
-at that call site **reintroduces a crash of its own** (confirmed live -- first
-fault at an allocator address, `rip=0x2c8f4ae1f40`). The syscall path can be
-reached with the guest allocator's state already suspect; use the existing
-allocation-free `diag_raw_print`-style helper (see
-`diag_raw_print_proc_sys_open_miss`, `litebox_shim_linux/src/syscalls/file.rs:62`)
-instead, exactly as the VEH diagnostics already do for the same reason.
-
 `nginx`-as-pid-1 and the browser check of the Selkies dashboard were not reached
-this pass -- `touch` no longer takes the host down, but `utimensat` still returns
-`EFAULT`, so the `touch /var/log/nginx/error.log`-style setup that section needs
-is still not functional. That is the next step, and it is now an ordinary
-errno-level bug rather than a host crash.
+this pass. Both `touch` bugs that blocked it are fixed and file creation plus
+timestamp setting now work, so that section is the next thing to retry; it was
+not itself re-run here.
 
 ## Test status
 
