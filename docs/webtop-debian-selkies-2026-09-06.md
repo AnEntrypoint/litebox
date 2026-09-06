@@ -672,3 +672,139 @@ session: start Track B at the top (`docs/presenter-process-design.md`'s presente
 split, ADVISORY-002 section 6 step 1), not at the `beyond_stdio` gate -- the gate is
 a downstream consequence of the missing shared-kernel-state infrastructure, not an
 independent knob.
+
+## 2026-09-06, continued again: the Xvfb pid-1 SIGSEGV is NOT RELRO -- corrected,
+## precisely re-localized, root cause still open
+
+Task brief for this session: root-cause and fix the Xvfb-as-pid-1 SIGSEGV the
+immediately preceding session left as "RELRO-correlated" (readelf showed Xvfb as the
+only tested binary with a `PT_GNU_RELRO` segment). Reproduced the exact repro from
+that session (`wt_xvfb.sh`/`wt_xvfb2.sh` injected into
+`.wfgy/webtop-debian/webtop-debian-i3-with-scripts.tar`, launched directly as pid 1
+via `litebox_runner_linux_on_windows_userland.exe -Z --initial-files ... -- /bin/sh
+/wt_xvfb.sh`) and captured full fault detail via `LITEBOX_LOG=error`/`=debug` (the
+existing `diag-guest-exception` logging in `litebox_shim_linux/src/lib.rs`, plus the
+pre-existing `diag-exec-mmap`/`DIAG_ELF_PATCH`/`DIAG_REGISTER_EXISTING` correlation
+logging already in `litebox_shim_linux/src/syscalls/mm.rs` and
+`litebox/src/mm/mod.rs`).
+
+**The RELRO hypothesis is wrong.** `cr2` does not fall anywhere near Xvfb's own (or
+any loaded library's) `PT_GNU_RELRO` range. Cross-referencing `diag-exec-mmap`'s
+path<->address correlation against `readelf -lW` on the actual binaries pulled from
+the packed tar shows the fault address is always exactly
+`<reservation-base> + 0x200` -- inside the FIRST `PT_LOAD` segment (`p_vaddr=0`,
+`R`-only, ELF header + rodata) of whichever shared library's ELF reservation
+happened to land there, reproduced identically with two different libraries at two
+different addresses (`libepoxy.so.0` at `0x2320000+0x200=0x2320200` with the full
+extension list; the same library, transitively pulled in even with `+extension
+GLX`/`COMPOSITE`/`DAMAGE` omitted, at `0x1260000+0x200=0x1260200` in a second run).
+`libepoxy.so.0`'s real `PT_GNU_RELRO` is at file offset `0x121e60`, nowhere close.
+`error_code=0x4` (write fault); the overlapping mapping's flags are `VM_READ |
+VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC` -- `VM_WRITE` genuinely absent, matching a
+plain `R`-only `PT_LOAD` segment (`p_flags=4`) exactly as `readelf` reports it, not
+a RELRO-then-relocked segment (which would show a RW segment that regressed to R).
+
+**`rip` is inside `/lib64/ld-linux-x86-64.so.2` itself** (`0x7feffffbe932`, ~0x7932
+into its own load base per `diag-exec-mmap`'s tracked range) -- this is the guest's
+own dynamic linker executing a write whose target address resolves into the wrong
+segment. This is consistent with either (a) a genuine glibc `ld.so` bug that would
+also crash on real Linux (ruled unlikely: this is a completely ordinary, unmodified
+Debian `libepoxy0` package, loaded the same way on every real Debian system running
+Xvfb+GLX without incident), or (b) litebox reporting/placing a base address for one
+of the loaded libraries that doesn't match what `ld.so`'s own bookkeeping (link_map,
+TLS `dtv`, or GOT/PLT-adjacent metadata) computed, causing a write meant for a
+writable region (this library's own RW/RELRO segment, or another library's TLS
+block) to land at a small, suspiciously fixed offset into this library's read-only
+first segment instead.
+
+**Ruled out this session, by direct code reading (not the RELRO/mprotect-timing
+class of bug the task brief expected):**
+- litebox performs **no eager RELRO protection of its own** -- confirmed
+  `litebox_common_linux::mm::sys_mprotect` (`litebox_common_linux/src/mm.rs`) is a
+  thin, generic forward of whatever `PROT_READ`/`PROT_WRITE`/`PROT_EXEC`
+  combination the *guest* requests via its own `mprotect(2)` syscall, with no
+  RELRO-specific logic, no early/eager narrowing, and (per that function's own
+  extensive comment, written by an earlier session for an unrelated weston bug) it
+  was specifically extended to stop silently EINVAL'ing "unusual" prot
+  combinations like the bare `PROT_WRITE` a real RELRO-lock/unlock sequence uses.
+  This is architecturally already what the task brief predicted litebox *should* be
+  doing (never touching RELRO itself, only guest-driven mprotect) -- it already does
+  that; there was nothing eager to find or remove.
+- **No `guest_mprotect` call touches this address at all before the fault**,
+  confirmed by a full `LITEBOX_LOG=debug` trace of this exact repro grepped for
+  every `mprotect`/`diag-protect-mapping` line -- rules out any mprotect-timing race
+  (early lock, late unlock, or otherwise) as the mechanism, since no mprotect
+  syscall for this range was ever issued by the guest in the first place.
+- `litebox_common_linux::loader::ElfParsedFile::load`'s per-`PT_LOAD`-segment
+  mapping loop (`litebox_common_linux/src/loader.rs` ~394-542) computes
+  `load_start`/`file_end`/`load_end` correctly for every segment observed in this
+  repro (cross-checked by hand against `readelf -lW`'s real `p_vaddr`/`p_filesz`/
+  `p_memsz` for both Xvfb and libepoxy) -- no off-by-one or page-rounding bug found.
+- `try_allocate_cow_pages`'s real `MapViewOfFile3`-based Windows CoW implementation
+  (`litebox_platform_windows_userland/src/lib.rs` ~6523) is NOT the pass-344
+  padding-decommit bug its own doc comment describes (that bug's signature --
+  `VirtualFree(MEM_DECOMMIT)` failing on a `MapViewOfFile3` view during crash
+  cleanup -- IS present as a secondary, cosmetic panic in this repro's own crash
+  logs, confirmed via full backtrace to originate in `deallocate_pages` during
+  post-SIGSEGV teardown, NOT during the original fault -- but the pass-344 fix
+  already prevents it from being the primary cause here, since `verified_safe_padding`
+  is computed correctly for every mapping in this repro).
+- The runtime syscall-rewriter's trampoline-patch path
+  (`maybe_patch_exec_segment`, `litebox_shim_linux/src/syscalls/mm.rs` ~1387) never
+  writes outside `[mapped_addr, mapped_addr+len)` of the specific executable
+  segment it is patching (checked by direct code reading) -- ruled out as a source
+  of spillover into the adjacent, non-executable first segment.
+- `init_elf_patch_state`'s own `sys_read(fd, ..., Some(offset))` calls
+  (`litebox_shim_linux/src/syscalls/mm.rs` ~1125) use pread-style explicit-offset
+  reads that, per `litebox::fs::FileSystem::read`'s own documented contract ("If
+  `offset` is Some, the file offset is not changed"), do not disturb the fd's
+  shared position -- ruled out as a source of `ld.so`'s own sequential reads of the
+  same fd going out of sync.
+
+**A live byte-dump diagnostic added this session (dumping the raw bytes at `cr2`
+and `rip` via `RawConstPointer::to_owned_slice` from inside the
+`diag-guest-exception` handler in `litebox_shim_linux/src/lib.rs`) caused the whole
+runner to HANG instead of printing** -- the process never exits and must be
+force-killed. This was reverted without committing (confirmed `git diff` clean
+afterward) rather than shipped broken, per this project's standing discipline
+against forcing an unverified change. This is itself a real, disclosed finding:
+something about reading raw guest memory from inside this specific exception-path
+callback re-enters a lock or a nested-fault condition that deadlocks -- most likely
+the `self.process().0.pm().mappings()` iteration a few lines above already holds a
+read lock on the same `Vmem` state a subsequent raw pointer dereference needs, or
+the raw read itself takes a second guest-side page fault that this handler (already
+mid-fault) cannot re-enter safely. This needs its own fix before a live byte-dump at
+this call site is safe to add.
+
+**Root cause NOT FOUND this session.** This is a real, precisely-relocalized
+litebox gap -- confirmed NOT the RELRO-timing bug the task brief targeted, confirmed
+NOT any of the six mechanisms above -- but the actual mechanism producing a wrong
+write target from inside the guest's own `ld.so` remains open. No fix was applied;
+forcing one blind, given how many plausible-looking mechanisms were already ruled
+out by direct reading, would risk exactly the kind of unverified, papered-over
+change this project's standing discipline exists to prevent. `cargo test
+--workspace` was not run since no functional code change was made (the reverted
+diagnostic left the tree clean).
+
+**Next step for whoever picks this up:**
+1. Fix the hang-on-read bug in the `diag-guest-exception` path first (check lock
+   re-entrancy around `pm().mappings()` and whatever raw-pointer read helper is
+   used to dump memory from inside a guest exception callback) -- this blocks any
+   further live-memory-dump diagnostic at this exact, most-useful capture point.
+2. Once safe, dump the actual bytes at `cr2` (all-zero fresh page vs. real, corrupt
+   content tells "never touched" from "wrong write already happened once before")
+   and get a byte-exact disassembly of the REWRITTEN in-memory code at `rip` (not
+   the on-disk `ld-linux-x86-64.so.2`, since litebox's syscall rewriter patches
+   `syscall` instructions in place and can shift subsequent byte offsets within the
+   same function -- this session's naive file-offset disassembly attempt hit
+   exactly that trap and was discarded as unreliable).
+3. Once the real faulting instruction is confirmed, trace what guest-visible value
+   it's computing as its write target and why that computation lands inside a
+   different (or the same, wrong-offset) library's read-only segment -- the leading
+   candidates are litebox's TLS/`dtv` bookkeeping (if it does any on the guest's
+   behalf) and any base-address reporting litebox exposes to the guest (`AT_BASE`,
+   `AT_PHDR`, or similar auxv entries) that might not match where the library was
+   actually mapped.
+4. The nginx-as-pid-1 and selkies-stack continuation work this document's prior
+   sections describe remains valid and unblocked by this session's findings --
+   Xvfb specifically is what needs this fix before video capture can start.
