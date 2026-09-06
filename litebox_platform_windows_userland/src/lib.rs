@@ -415,16 +415,35 @@ unsafe extern "system" fn vectored_exception_handler_entry(
                                       // EXCEPTION_CONTINUE_SEARCH rather than keep calling the
                                       // full handler unbounded on a stack that is not being swapped.
         inc     DWORD PTR [r8 + {VEH_DEPTH}]
-        imul    r9d, r9d, 64
-        mov     r9, r9               // zero-extend the 32-bit product into a usable 64-bit index
+        imul    r9d, r9d, {VEH_FRAME_STRIDE}
+        mov     r9d, r9d             // zero-extend the 32-bit product into a usable 64-bit index
 
         mov     r10, rsp
         mov     rax, rbp
         mov     rbp, QWORD PTR [r8 + {HOST_BP}]
-        // Reserve 64 bytes at this depth's own slot (still a multiple of 16, preserving the
-        // Win64 ABI's required alignment at the `call` below): 32 for the shadow space the
+        // Reserve `VEH_FRAME_STRIDE` bytes at this depth's own slot (a multiple of 16, preserving
+        // the Win64 ABI's required alignment at the `call` below): 32 for the shadow space the
         // callee is entitled to write into, 16 to save the original guest rsp/rbp across the
-        // call, and 16 more to save `r8` (this thread's `TlsState*`) itself -- `r8` is a
+        // call, 16 more to save `r8` (this thread's `TlsState*`) itself, and -- critically -- the
+        // remainder as the actual STACK `vectored_exception_handler` and everything it calls will
+        // consume below this point.
+        //
+        // This stride was previously 64, which covered only the three saved values above and gave
+        // the callee NO reserved stack of its own. Since the callee's frame grows down from
+        // `rsp`, at `veh_depth == 1` the nested invocation's slot (`host_sp - 128`) sat only 64
+        // bytes below the outer invocation's (`host_sp - 64`) while the outer's live frame was
+        // kilobytes deep -- so the nested handler's locals overwrote the still-live outer
+        // handler's own frame, `exception_record` copy and fault ring included. Confirmed live:
+        // a `touch` repro crashed with `veh_depth=0x1` and the outer invocation then read an
+        // `ExceptionCode` of `0x470041`, which is not a Windows status code at all (severity bits
+        // 00 = success, and its bytes are UTF-16LE for the two characters A and G, i.e. raw string
+        // data from the nested frame), after which dispatch followed a garbage `rip` (`0x22`,
+        // `0x40`) into the
+        // wild-jump cascade ending at `[diag-unrecov-av-giveup]`. Giving each nesting level a
+        // real, frame-sized slice is what makes the per-depth scheme actually mean what its name
+        // says.
+        //
+        // `r8` is a
         // CALLER-SAVED/volatile register per the Win64 ABI, so `vectored_exception_handler` (an
         // ordinary Rust function, not obligated to preserve it) is free to clobber it, and this
         // trampoline still needs a valid `r8` AFTER the call to `dec` the depth counter back
@@ -434,7 +453,7 @@ unsafe extern "system" fn vectored_exception_handler_entry(
         // landed exactly on that `dec`) -- not a pre-existing bug, but one this depth-tracking
         // fix introduced and is corrected here in the same pass.
         sub     r11, r9
-        lea     rsp, [r11 - 64]
+        lea     rsp, [r11 - {VEH_FRAME_STRIDE}]
         mov     QWORD PTR [rsp + 32], r10
         mov     QWORD PTR [rsp + 40], rax
         mov     QWORD PTR [rsp + 48], r8
@@ -495,6 +514,7 @@ unsafe extern "system" fn vectored_exception_handler_entry(
         HOST_BP = const core::mem::offset_of!(TlsState, host_bp),
         VEH_DEPTH = const core::mem::offset_of!(TlsState, veh_depth),
         VEH_DEPTH_CAP = const VEH_DEPTH_CAP,
+        VEH_FRAME_STRIDE = const VEH_FRAME_STRIDE,
         vectored_exception_handler = sym vectored_exception_handler,
     );
 }
@@ -2437,8 +2457,34 @@ unsafe extern "system" fn vectored_exception_handler(
     // that fall back to slot 0, matching this reserve's own pre-existing size headroom rather
     // than growing the reservation itself, since a fault that deep already indicates a separate,
     // still-open bug per `VEH_DEPTH_CAP`'s own doc comment, not a case worth optimizing for).
-    const EXC_RECORD_SLOT_SIZE: usize = 128;
+    // The slot stride MUST be at least `size_of::<EXCEPTION_RECORD>()`, or consecutive nesting
+    // levels' records physically overlap and each nested dispatch corrupts the tail of the record
+    // the still-live outer invocation is reading through -- the exact "give each level its own
+    // slice" hazard this per-depth scheme exists to prevent, reintroduced by an under-sized
+    // stride. It was previously a hardcoded 128 while `EXCEPTION_RECORD` is 152 bytes on x86_64
+    // (4 + 4 + 8 + 8 + 4 + 4 pad + 15*8), so slot N+1 began 24 bytes INSIDE slot N. Confirmed
+    // live: a `touch` repro faulted at `veh_depth=1` and the outer invocation then read a
+    // `ExceptionCode` of `0x470041` -- not any Windows status code, but UTF-16LE `"AG"`, i.e. raw
+    // string bytes written over the outer record by the nested one -- after which dispatch
+    // followed a garbage `ExceptionAddress`/`Rip` (observed `rip=0x22`, `0x40`) into the wild-jump
+    // cascade that ends at the `[diag-unrecov-av-giveup]` circuit breaker. Derive the stride from
+    // the type instead of restating it, rounded up to 16 so every slot stays 16-byte aligned, so
+    // this can never silently drift out of sync with the struct again.
+    const EXC_RECORD_SLOT_SIZE: usize = size_of::<EXCEPTION_RECORD>().next_multiple_of(16);
     const EXC_RECORD_SLOTS: usize = EXCEPTION_RECORD_RESERVE / EXC_RECORD_SLOT_SIZE / 2;
+    // The slot region grows UP from `host_sp - EXCEPTION_RECORD_RESERVE`; the trampoline's own
+    // per-depth scratch frames grow DOWN from `host_sp - 64` to `host_sp - 64 - VEH_DEPTH_CAP*64`.
+    // These two regions must not meet. Enforced here rather than left to the prose that previously
+    // asserted (incorrectly, by 64 bytes at the deepest level) that they were "comfortably clear".
+    const _: () = assert!(
+        EXC_RECORD_SLOT_SIZE >= size_of::<EXCEPTION_RECORD>(),
+        "exception-record slot stride must not be smaller than the record it holds"
+    );
+    const _: () = assert!(
+        EXCEPTION_RECORD_RESERVE - (EXC_RECORD_SLOTS * EXC_RECORD_SLOT_SIZE)
+            >= (VEH_DEPTH_CAP as usize + 1) * VEH_FRAME_STRIDE as usize,
+        "exception-record slots and the trampoline's per-depth handler frames must not overlap"
+    );
     let depth = tls.veh_depth.get() as usize;
     let slot = depth.min(EXC_RECORD_SLOTS.saturating_sub(1));
     let exception_record_ptr = tls
@@ -3123,22 +3169,53 @@ unsafe impl Send for TlsState {}
 /// fraction of 64KiB even accounting for every diagnostic branch's locals.
 const EXCEPTION_RECORD_RESERVE: usize = 65536;
 
-/// Maximum nesting depth `vectored_exception_handler_entry`'s per-depth scratch slot (see that
-/// function's doc comment) will use before giving up on the host-stack swap and falling through
-/// to `.Lcall_here` instead. Each slot is 64 bytes; `VEH_DEPTH_CAP * 64` (32 KiB for 512 slots)
-/// must stay comfortably below, and clear of, `EXCEPTION_RECORD_RESERVE` (64 KiB) -- the region
-/// already committed below `host_sp` -- since `exception_callback`'s own dispatch path ALSO now
-/// uses a depth-indexed slice of that same reserve (see the `EXC_RECORD_SLOT_SIZE`/`EXC_RECORD_
-/// SLOTS` computation near `exception_record_ptr`'s definition): the trampoline's own slots occupy
-/// `[host_sp - 32832, host_sp - 64)` (512 * 64 bytes plus the depth-0 base offset) and the
-/// exception-record slots occupy `[host_sp - 65536, host_sp - 32768)` -- these two ranges do not
-/// overlap, with a small gap between them. A live `LITEBOX_PROCESS_FORK=1` repro was observed
-/// reaching depth ~3271 before segfaulting under the OLD single-fixed-slot bug this cap's sibling
-/// fix (per-depth slots) addresses -- 512 is deliberately far below that runaway figure, since a
-/// healthy handler should never need anywhere near that many nested entries for one guest fault;
-/// hitting this cap in practice would itself indicate a still-unexplained separate bug worth
-/// investigating on its own, not a ceiling to raise blindly.
-const VEH_DEPTH_CAP: u32 = 512;
+/// Bytes of host stack `vectored_exception_handler_entry` reserves for EACH nesting level before
+/// `call`ing `vectored_exception_handler`.
+///
+/// This is a whole stack frame per level, not a save-slot. The trampoline saves three values
+/// (guest `rsp`/`rbp` and `r8`) at `[rsp + 32..56)` plus the callee's 32-byte shadow space, but
+/// the callee's OWN frame -- and every frame beneath it: `fork_verify::on_single_step`'s
+/// instruction decode, the `VirtualQuery` diagnostic blocks, `eprintln!`'s formatting machinery --
+/// grows DOWNWARD from `rsp`. So the distance between one level's slot and the next must cover
+/// that entire subtree, not just the saved registers.
+///
+/// It was previously 64, which covered only the saved registers. At `veh_depth == 1` the nested
+/// invocation therefore started its frame 64 bytes below the outer invocation's, while the outer
+/// frame was kilobytes deep -- the nested handler's locals wrote straight through the outer
+/// handler's live frame. Confirmed live via a `touch` repro (`veh_depth=0x1` at the crash): the
+/// outer invocation read back an `ExceptionCode` of `0x470041`, which is not a Windows status
+/// code at all -- severity bits `00` mark it a SUCCESS code, and its four bytes are UTF-16LE
+/// `"AG"`, i.e. raw string data from the nested frame -- and then dispatched on the equally
+/// garbage `rip` beside it (`0x22`, `0x40`), producing the wild-jump cascade that terminates at
+/// the `[diag-unrecov-av-giveup]` circuit breaker.
+///
+/// 4 KiB matches the sizing rationale `EXCEPTION_RECORD_RESERVE`'s own doc comment already
+/// records for `exception_handler`'s frame ("a fraction of 64KiB even accounting for every
+/// diagnostic branch's locals"), with room to spare for the deepest diagnostic path.
+const VEH_FRAME_STRIDE: u32 = 4096;
+
+/// Maximum nesting depth `vectored_exception_handler_entry`'s per-depth frame (see
+/// `VEH_FRAME_STRIDE`) will use before giving up on the host-stack swap and bailing out via
+/// `.Lsearch`.
+///
+/// The trampoline's per-depth frames occupy
+/// `[host_sp - VEH_FRAME_STRIDE * (VEH_DEPTH_CAP + 1), host_sp)`, growing down; the
+/// exception-record slots occupy the bottom of the same `EXCEPTION_RECORD_RESERVE` region,
+/// growing up from `host_sp - EXCEPTION_RECORD_RESERVE` (see the `EXC_RECORD_SLOT_SIZE`/
+/// `EXC_RECORD_SLOTS` computation near `exception_record_ptr`'s definition). Both of those
+/// non-overlap requirements are enforced by `const` assertions at that definition rather than
+/// asserted only in prose -- the previous prose claim that the two ranges were "comfortably
+/// clear" was wrong by 64 bytes at the deepest level, and the slot stride it described (128) was
+/// itself smaller than the 152-byte `EXCEPTION_RECORD` it was sizing.
+///
+/// Now that each level costs a real 4 KiB frame rather than 64 bytes, the cap that fits the same
+/// already-committed reserve is 7, not 512. That is not a regression in robustness: the old 512
+/// never actually gave 512 usable levels, it gave one usable level and 511 that silently
+/// corrupted each other. A fault nesting deeper than a handful of levels indicates a separate,
+/// still-unexplained bug (a live `LITEBOX_PROCESS_FORK=1` repro was once observed reaching depth
+/// ~3271 under the older single-fixed-slot bug), and `.Lsearch` is the correct, honest response
+/// to it -- not a deeper stack of frames that overlap anyway.
+const VEH_DEPTH_CAP: u32 = 7;
 
 /// Diagnostic-only: how many times `vectored_exception_handler_entry`'s `.Lsearch` path has
 /// returned `EXCEPTION_CONTINUE_SEARCH` straight from the naked-asm trampoline, without ever
