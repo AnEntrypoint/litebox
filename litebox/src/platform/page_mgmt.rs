@@ -174,6 +174,16 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// Note that the returned ranges should be `ALIGN`-aligned.
     fn reserved_pages(&self) -> impl Iterator<Item = &Range<usize>>;
 
+    /// Re-read the host's own mappings, so [`Self::reserved_pages`] reflects memory the host
+    /// mapped after this provider was constructed.
+    ///
+    /// Called before duplicating an address space (`fork()`), where a stale answer is not merely
+    /// imprecise: the duplicate is placed with `MAP_FIXED` around the reserved set, so a host
+    /// mapping missing from it can be overwritten -- or, equivalently, left to be written through
+    /// by the host thread that owns it after the guest has been placed on top. The default is a
+    /// no-op, for a platform whose host mappings cannot change behind its back.
+    fn refresh_reserved_pages(&self) {}
+
     /// Attempt to allocate pages with copy-on-write semantics backed by static data.
     ///
     /// This method allows platforms that support it to create CoW mappings instead of performing

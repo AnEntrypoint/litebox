@@ -684,6 +684,9 @@ where
 {
     /// Create a new `PageManager` instance.
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
+        // Same reason as in `duplicate`: this address space is placed around whatever the host
+        // has mapped, and the host keeps mapping memory after the platform was constructed.
+        litebox.x.platform.refresh_reserved_pages();
         let vmem = RwLock::new(linux::Vmem::new(litebox.x.platform));
         Self { vmem }
     }
@@ -780,6 +783,14 @@ where
         let source_vmem = self.vmem.read();
         let source_ranges: Vec<Range<usize>> = source_vmem.iter().map(|(r, _)| r.clone()).collect();
         let heap_top = source_vmem.brk;
+        // The host's own mappings are what the destination must be placed around, and they are
+        // not fixed: on Linux the `--gui` presenter loads a Vulkan driver and spawns worker
+        // threads long after this provider was constructed. Reading them once at startup let a
+        // forked child's address space land on top of live host memory, which showed up as the
+        // child's heap being corrupted from underneath it -- glibc's own
+        // `malloc.c:2601 (sysmalloc): assertion failed` in a `dbus-daemon` forked under `--gui`,
+        // and not once in the identical run without it.
+        litebox.x.platform.refresh_reserved_pages();
         let mut dest_vmem =
             linux::Vmem::new_excluding(litebox.x.platform, source_ranges.into_iter());
         let linux::DuplicateOutcome {

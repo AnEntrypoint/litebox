@@ -107,8 +107,15 @@ macro_rules! saved_tls {
 /// traits.
 pub struct LinuxUserland {
     tun_socket_fd: std::sync::RwLock<Option<std::os::fd::OwnedFd>>,
-    /// Reserved pages that are not available for guest programs to use.
-    reserved_pages: Vec<core::ops::Range<usize>>,
+    /// Host mappings that are not available for guest programs to use, read from
+    /// `/proc/self/maps`.
+    ///
+    /// Append-only and refreshed by [`Self::refresh_reserved_pages`]: the host keeps mapping
+    /// memory after startup (the `--gui` presenter alone pulls in Mesa, a Vulkan driver and its
+    /// worker threads' stacks), and a guest mapping placed on top of one of those is silent
+    /// corruption. Each range is leaked so the borrow this hands out can outlive the lock; the
+    /// set converges once the host's own allocations settle, so the leak is bounded in practice.
+    reserved_pages: std::sync::RwLock<Vec<&'static core::ops::Range<usize>>>,
     /// CoW-eligible memory regions. Maps start address of the static slice, to the info needed to
     /// re-mmap the file.
     cow_regions: std::sync::RwLock<std::collections::BTreeMap<usize, CowRegionInfo>>,
@@ -269,7 +276,12 @@ impl LinuxUserland {
             })
             .into();
 
-        let reserved_pages = Self::read_maps();
+        let reserved_pages = std::sync::RwLock::new(
+            Self::read_maps()
+                .into_iter()
+                .map(|r| &*Box::leak(Box::new(r)))
+                .collect(),
+        );
         let platform = Self {
             tun_socket_fd,
             reserved_pages,
@@ -353,19 +365,20 @@ impl LinuxUserland {
     }
 
     fn read_maps() -> alloc::vec::Vec<core::ops::Range<usize>> {
-        // TODO: this function is not guaranteed to return all allocated pages, as it may
-        // allocate more pages after the mapping file is read. Missing allocated pages may
-        // cause the program to crash when calling `mmap` or `mremap` with the `MAP_FIXED` flag later.
-        // We should either fix `mmap` to handle this error, or let global allocator call this function
-        // whenever it get more pages from the host.
         let path = c"/proc/self/maps";
         let fd = unsafe { raw_open(path.as_ptr() as usize, OFlags::RDONLY.bits() as usize, 0) };
         let Ok(fd) = fd else {
             return alloc::vec::Vec::new();
         };
-        let mut buf = [0u8; 8192];
+        // Read to EOF rather than into a fixed buffer: `/proc/self/maps` for a process that has
+        // loaded a Vulkan driver runs well past the 8 KiB this used to assume, and the assertion
+        // that caught that turned an oversized map list into a panic.
+        let mut buf = alloc::vec![0u8; 65536];
         let mut total_read = 0;
-        while total_read < buf.len() {
+        loop {
+            if total_read == buf.len() {
+                buf.resize(buf.len() * 2, 0);
+            }
             let n = unsafe {
                 syscalls::syscall3(
                     syscalls::Sysno::read,
@@ -380,7 +393,6 @@ impl LinuxUserland {
             }
             total_read += n;
         }
-        assert!(total_read < buf.len(), "buffer too small");
         unsafe { syscalls::syscall1(syscalls::Sysno::close, fd) }.expect("close failed");
 
         let mut reserved_pages = alloc::vec::Vec::new();
@@ -2447,9 +2459,12 @@ fn prot_flags(flags: MemoryRegionPermissions) -> ProtFlags {
         ProtFlags::PROT_EXEC,
         flags.contains(MemoryRegionPermissions::EXEC),
     );
-    if flags.contains(MemoryRegionPermissions::SHARED) {
-        unimplemented!()
-    }
+    // `SHARED` is not a protection bit: on Linux it selects `MAP_SHARED` vs `MAP_PRIVATE` at the
+    // `mmap` flags argument, which each caller sets for itself (`allocate_pages` below, and
+    // `map_shared_memory`, which always passes `MAP_SHARED`). Panicking here instead took down
+    // the whole runner the first time a guest asked for a shared mapping -- which every Wayland
+    // client does for its `wl_shm` buffers, so the first XFCE client to connect to a compositor
+    // killed the process.
     res
 }
 
@@ -2475,8 +2490,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
-        let flags = MapFlags::MAP_PRIVATE
-            | MapFlags::MAP_ANONYMOUS
+        let flags = if initial_permissions.contains(MemoryRegionPermissions::SHARED) {
+            MapFlags::MAP_SHARED
+        } else {
+            MapFlags::MAP_PRIVATE
+        } | MapFlags::MAP_ANONYMOUS
             | match fixed_address_behavior {
                 FixedAddressBehavior::Hint => MapFlags::empty(),
                 FixedAddressBehavior::Replace => MapFlags::MAP_FIXED,
@@ -2566,7 +2584,26 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     }
 
     fn reserved_pages(&self) -> impl Iterator<Item = &core::ops::Range<usize>> {
-        self.reserved_pages.iter()
+        self.reserved_pages
+            .read()
+            .unwrap()
+            .clone()
+            .into_iter()
+            .map(|r| r as &core::ops::Range<usize>)
+    }
+
+    fn refresh_reserved_pages(&self) {
+        let current = Self::read_maps();
+        let mut known = self.reserved_pages.write().unwrap();
+        for range in current {
+            if known
+                .iter()
+                .any(|k| k.start <= range.start && range.end <= k.end)
+            {
+                continue;
+            }
+            known.push(Box::leak(Box::new(range)));
+        }
     }
 
     fn try_allocate_cow_pages(
