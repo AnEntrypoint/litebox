@@ -2057,8 +2057,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 pathname,
                 times,
                 flags,
-            } => pathname
-                .to_cstring::<Platform>()
+            } => {
+                // `utimensat(dirfd, NULL, times, flags)` is legal and means "operate on `dirfd`
+                // itself" -- it is exactly what `futimens(fd, times)` compiles down to on musl
+                // (see `sys_utimensat`'s own doc comment, which already documents this), and
+                // coreutils' `touch` reaches it too. A NULL `pathname` is therefore NOT a bad
+                // address: it must be forwarded as an EMPTY path, which `FsPath::new` already
+                // maps to `FsPath::Fd(dirfd)`/`FsPath::Cwd`, rather than rejected.
+                //
+                // Previously this arm called `to_cstring()` unconditionally and returned
+                // `EFAULT` on the resulting `None`, so every `futimens`/NULL-path `utimensat`
+                // failed with `Bad address` without ever reaching `sys_utimensat`, whose
+                // `AT_EMPTY_PATH` handling for this case was consequently dead code. Confirmed
+                // live via `touch` under `--oci-image webtop:debian-i3`: `pathname=0x0`,
+                // `path_ok=0x0`, guest reports "setting times of '/tmp/direct_touch': Bad
+                // address".
+                let path = if pathname.is_null() {
+                    Some(alloc::ffi::CString::default())
+                } else {
+                    pathname.to_cstring::<Platform>()
+                };
+                path
+            }
                 .map_or(Err(Errno::EFAULT), |path| {
                     let times = if times.is_null() {
                         None

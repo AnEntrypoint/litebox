@@ -3077,13 +3077,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
         let path = match fs_path {
             FsPath::Absolute { path } => path,
-            FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
-                get_cwd().as_str().to_c_str()?.into_owned()
-            }
-            FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
-                self.resolve_dirfd_path(fd)?
-            }
-            FsPath::Cwd | FsPath::Fd(_) => return Err(Errno::ENOENT),
+            // Unlike most `*at` syscalls, `utimensat` does NOT require `AT_EMPTY_PATH` for the
+            // empty/NULL-path form: `utimensat(fd, NULL, times, 0)` is defined to operate on
+            // `fd` itself, and is exactly what musl's `futimens(fd, times)` compiles down to
+            // (see this function's own doc comment). Gating it on `AT_EMPTY_PATH` made every
+            // such call return `ENOENT`. The flag is still accepted, it is just not required.
+            FsPath::Cwd => get_cwd().as_str().to_c_str()?.into_owned(),
+            FsPath::Fd(fd) => self.resolve_dirfd_path(fd)?,
             FsPath::FdRelative { fd, path } => {
                 let dir_path = self.resolve_dirfd_path(fd)?;
                 Self::join_dir_relative_path(&dir_path, &path)?
