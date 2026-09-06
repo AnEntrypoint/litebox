@@ -1072,6 +1072,51 @@ where
         }
     }
 
+    /// Create pages with an arbitrary combination of read/write/exec permissions.
+    ///
+    /// Real `mmap(2)` accepts any combination of `PROT_READ`/`PROT_WRITE`/`PROT_EXEC` -- not just
+    /// the four combinations [`create_executable_pages`](Self::create_executable_pages),
+    /// [`create_writable_pages`](Self::create_writable_pages),
+    /// [`create_readable_pages`](Self::create_readable_pages) and
+    /// [`create_inaccessible_pages`](Self::create_inaccessible_pages) each hardcode.
+    /// `PROT_READ|PROT_WRITE|PROT_EXEC` in particular is the combination every GTK program asks
+    /// for to hold its closure trampolines. Pages are created writable (unless the requested
+    /// permissions are empty, which keeps its own never-briefly-writable behavior) so `op` can
+    /// populate them, then protected down to whatever was actually asked for.
+    ///
+    /// `suggested_address` is the hint address for where to create the pages if it is not `None`.
+    /// Otherwise, let the kernel choose an available memory region.
+    ///
+    /// `length` is the size of the pages to be created.
+    ///
+    /// Set `flags` to control options such as fixed address, stack, and populate pages.
+    ///
+    /// `op` is a callback for caller to initialize the created pages.
+    ///
+    /// # Safety
+    ///
+    /// If the suggested start address is given (i.e., not zero) and `fixed_addr` is set to `true`,
+    /// the kernel uses it directly without checking if it is available, causing overlapping
+    /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
+    pub unsafe fn create_pages_with_permissions<F>(
+        &self,
+        suggested_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        flags: CreatePagesFlags,
+        permissions: MemoryRegionPermissions,
+        op: F,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError>
+    where
+        F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
+    {
+        let before_perms = if permissions.is_empty() {
+            MemoryRegionPermissions::empty()
+        } else {
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE
+        };
+        unsafe { self.create_pages(suggested_address, length, flags, before_perms, permissions, op) }
+    }
+
     /// Create stack pages.
     ///
     /// `suggested_address` is the hint address for where to create the pages if it is not `None`.

@@ -60,30 +60,17 @@ pub fn do_mmap<
     };
     let length = NonZeroPageSize::new(len).ok_or(MappingError::UnAligned)?;
     let is_fixed_addr = flags.contains(CreatePagesFlags::FIXED_ADDR);
-    let result = match prot {
-        ProtFlags::PROT_READ_EXEC => unsafe {
-            pm.create_executable_pages(suggested_addr, length, flags, op)
-        },
-        ProtFlags::PROT_READ_WRITE => unsafe {
-            pm.create_writable_pages(suggested_addr, length, flags, op)
-        },
-        ProtFlags::PROT_READ => unsafe {
-            pm.create_readable_pages(suggested_addr, length, flags, op)
-        },
-        ProtFlags::PROT_NONE => unsafe {
-            pm.create_inaccessible_pages(suggested_addr, length, flags, op)
-        },
-        _ => {
-            #[cfg(debug_assertions)]
-            todo!("Unsupported prot flags {:?}", prot);
-            // TODO: create inaccessible pages for now. Creating mapping
-            // for both executable and writable might be needed for JIT.
-            #[cfg(not(debug_assertions))]
-            unsafe {
-                pm.create_inaccessible_pages(suggested_addr, length, flags, op)
-            }
-        }
-    };
+    // Every combination of the three protection bits, not the four this used to name. An
+    // unmatched combination previously created the pages INACCESSIBLE (and, in a debug build,
+    // hit a `todo!`), so `mmap(PROT_READ|PROT_WRITE|PROT_EXEC)` -- what every GTK program asks
+    // for to hold its closure trampolines -- returned a successful mapping the guest then took
+    // SIGSEGV on at the first byte it wrote. See
+    // `PageManager::create_pages_with_permissions`'s own doc comment.
+    let mut permissions = MemoryRegionPermissions::empty();
+    permissions.set(MemoryRegionPermissions::READ, prot.contains(ProtFlags::PROT_READ));
+    permissions.set(MemoryRegionPermissions::WRITE, prot.contains(ProtFlags::PROT_WRITE));
+    permissions.set(MemoryRegionPermissions::EXEC, prot.contains(ProtFlags::PROT_EXEC));
+    let result = unsafe { pm.create_pages_with_permissions(suggested_addr, length, flags, permissions, op) };
     // AGENTS.md pass 212: a `MAP_FIXED`/`MAP_FIXED_NOREPLACE` request must place the mapping at
     // EXACTLY the requested address or fail -- that is real Linux `mmap(2)`'s contract, and
     // every caller (the ELF loader chief among them) computes all subsequent addresses from the
