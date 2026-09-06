@@ -3298,6 +3298,34 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             is_process_clone:% = is_process_clone;
             "clone: spawned new task"
         );
+        // DIAG_TIMELINE FIELD SEMANTICS -- the single reference for all four emit sites. Read this
+        // before drawing any conclusion from a timeline log; misreading `comm` has already cost one
+        // full investigation cycle.
+        //
+        // The correlation key is NOT uniform across the four lines:
+        //   * `clone` (here): `pid` is the PARENT's pid. The child is named by `child_tid`. For a
+        //     process clone (`is_process_clone`) the child's tid IS its pid, so `child_tid` is the
+        //     key that joins to the other three lines' `pid`. Grepping `pid=` across all four
+        //     line kinds therefore matches the PARENT on this one and silently mis-joins.
+        //   * `execve`/`exit`/`exit_group`/`exit_signal`: `pid` is that task's OWN pid.
+        //
+        // `comm` per line, and what each does and does not prove:
+        //   * `clone`: the PARENT's name (the child inherits it verbatim -- `comm: self.comm.clone()`
+        //     below). Real-Linux behavior: `comm` does NOT change on fork.
+        //   * `execve`: the OLD, pre-exec name, because this line is emitted BEFORE `load_program`
+        //     runs (deliberately, so a death mid-exec still leaves a trace). `argv0` is the program
+        //     being ATTEMPTED. So an `execve` line proves an exec was attempted with a resolved
+        //     path -- NOT that it succeeded.
+        //   * `exit*`: the CURRENT name at death -- the new name iff exec completed, else the old one.
+        //
+        // Therefore `comm` alone NEVER establishes where a task died. The two sound discriminators:
+        //   1. Pre-execve vs. reached-execve: does an `execve` line exist for that EXACT pid at all?
+        //   2. For a pid that did reach execve, mid-exec vs. post-exec: compare its TERMINAL line's
+        //      `comm` against that same pid's own `execve` `argv0`. Terminal comm == the new program
+        //      => exec completed and it died afterward, running as that program. Terminal comm still
+        //      the old name => it died inside `load_program`, never becoming the new program (a
+        //      loader/relocation bug, a different class entirely from a post-exec runtime bug).
+        //
         // Always-on process-timeline diagnostic, the fork-side counterpart to `DIAG_TIMELINE
         // execve`/`exit`/`exit_signal`. Without it, a child that dies in the window BETWEEN
         // `clone()` and `execve()` -- exactly the window `Vmem::duplicate`'s region-relocation
