@@ -62,3 +62,38 @@ govern: `MAP_FIXED`/`Replace` placements never consult `get_unmmaped_area`
 (measured at 5 residual abutting pairs of 112 mappings). Xorg and both `xsetroot`
 clients survived; only `xclock` died, and only after the paints, so it does not
 affect the result above.
+
+## Scoping the residual `xclock` SIGSEGV (not fixed; follow-up item)
+
+Traced far enough to characterise it, deliberately not fixed tonight.
+
+The overrun mapping (`0x1138d000..0x113ae000`, 135168 bytes) is itself one of a
+long series of **`behavior=Replace` (MAP_FIXED) allocations, all exactly 135168
+bytes**, that the guest issues repeatedly while `xclock` runs -- one was placed
+at t=108.250, 19 ms before the fault at t=108.269. Sorting every 135168-byte
+`Replace` placement in the run and checking neighbours shows they routinely
+**abut and even overlap** each other:
+
+    ABUT:    287408128
+    ABUT:    287543296
+    OVERLAP: 287592448  prev end 287678464
+    OVERLAP: 287678464  prev end 287727616
+    OVERLAP: 287715328  prev end 287813632
+    ...
+
+`cr2` lands 24 bytes (`0x18`) into the region past the mapping's end -- the same
+`sysmalloc` chunk-header write (`libc+0xa0966`) as the earlier pid-1 SIGABRT.
+
+Why the guard gap cannot help here: `MAP_FIXED`/`Replace` placements go where the
+guest names and never consult `get_unmmaped_area`, so no policy in the search can
+separate them. Real Linux behaves the same way. The interesting part is not the
+adjacency but the **overlaps** -- a fixed-address request landing inside a live
+mapping is not something a correct guest should be doing, so the next question for
+whoever picks this up is what issues these repeated same-sized `MAP_FIXED` requests
+and whether litebox is reporting the wrong result to an earlier one (an `mmap`
+whose return address is not what the guest asked for, or a stale VMA that makes a
+subsequent fixed request look free). That is a different investigation from the two
+placement bugs fixed tonight, with a different shape.
+
+Impact is limited: `Xorg` and both `xsetroot` clients survived the whole run, and
+`xclock` died only after both paints had already been captured.
