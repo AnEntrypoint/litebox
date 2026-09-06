@@ -74,3 +74,37 @@ If it paints, the server's frame goes from `non_black_pixels=0` (see
 
 NOT YET RUN -- the host was handed to the fork investigating the SIGSEGV before
 this could execute. Worth trying; it needs no fix to any litebox code.
+
+### RESULT of the pid-1-with-client route: FAILED (and the timing theory RETRACTED)
+
+Ran twice. The spawn mechanism WORKS -- a real client (`xsetroot`) executes and
+runs as a descendant of a pid-1 Xorg via Xorg's own `xkbcomp` spawn path, and
+reaches an X connection attempt. That part is proven and is independent of the
+layout bug below.
+
+But it never painted. Both runs died identically:
+
+    exception=Exception(14) rip=0x669ff36 cr2=0x8 error_code=0x4
+    NO mapping overlaps cr2 (genuinely unmapped)
+
+`cr2=0x8` is a NULL dereference -- `XOpenDisplay()` returned NULL and `xsetroot`
+dereferenced it unchecked.
+
+**A retry loop does not help, and the first attempt to add one was a bad probe.**
+`xsetroot` does not return non-zero on a failed connection, it SEGFAULTS, which
+killed the wrapper shell (`pid 7`, `exit_signal`) before the loop could iterate.
+Only 1 of 40 attempts ever ran.
+
+**RETRACTED: the "client fired too early, before Xorg's socket was up" timing
+hypothesis.** The `rip` is byte-identical (`0x669ff36`) across two runs with
+completely different timing -- one firing during keyboard init, one after the
+real `xkbcomp` had finished. A race would not reproduce to the byte. This is a
+deterministic layout problem, and it is explained by the separate finding that a
+forked child's address space is packed into a ~120MB low window (a high-address
+`VM_OWN_FORK_PADDING` placeholder defeats the high-region placement fast path),
+so libraries land single-digit-KB apart and glibc's `sysmalloc` heap growth
+writes a chunk header into an adjacent library's text. In such a process,
+libX11's setup returning NULL is an ordinary downstream symptom, not evidence
+about socket readiness.
+
+Do not build a workaround on the timing theory.
