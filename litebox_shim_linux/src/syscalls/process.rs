@@ -994,6 +994,7 @@ enum ThreadInitState {
         Box<litebox_common_linux::PtRegs>,
         usize,
         alloc::sync::Arc<litebox::mm::AddressRelocations>,
+        Option<UserPtrMut<i32>>,
     ),
 }
 
@@ -3240,6 +3241,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     Box::new(child_ctx),
                     fs_base,
                     alloc::sync::Arc::new(relocations),
+                    set_child_tid,
                 ),
                 child_tid,
                 self.pid,
@@ -4916,7 +4918,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     );
                 }
             }
-            ThreadInitState::ForkedChild(mut parent_ctx, fs_base, relocations) => {
+            ThreadInitState::ForkedChild(mut parent_ctx, fs_base, relocations, set_child_tid) => {
                 #[cfg(target_arch = "x86_64")]
                 {
                     parent_ctx.rax = 0;
@@ -4931,6 +4933,35 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .unwrap();
                 }
                 *ctx = *parent_ctx;
+                // `fork()` reaches this shim as `clone(CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID
+                // | SIGCHLD)` whose `ctid` argument points at libc's own cached copy of the
+                // thread id, inside the calling thread's TCB (glibc's `_Fork` passes
+                // `&THREAD_SELF->tid`); the kernel writes the CHILD's tid there. Honouring
+                // `CLONE_CHILD_SETTID` only on the thread-clone path left every `fork()` child
+                // believing it was still its parent, and libc reads that cached id back as an
+                // identity (e.g. `pthread_rwlock_rdlock`/`_wrlock` return `EDEADLK` when the
+                // lock's recorded writer equals it).
+                //
+                // Written here, on the child's own host thread, against the child's
+                // *translated* address: the slot lives in the TLS block `Vmem::duplicate`
+                // relocates, and `is_in_destination` re-checks that the translated address
+                // really belongs to a range this duplication produced before anything is
+                // written through it.
+                if let Some(ctid) = set_child_tid {
+                    let child_ctid = relocations
+                        .translate(ctid.as_usize())
+                        .filter(|addr| relocations.is_in_destination(*addr));
+                    match child_ctid {
+                        Some(addr) => {
+                            let slot = UserPtrMut::<i32>::from_usize(addr);
+                            let _ = slot.write_at_offset::<Platform>(0, self.tid);
+                        }
+                        None => litebox_util_log::debug!(
+                            ctid:% = ctid.as_usize(), child_tid:% = self.tid;
+                            "fork: CLONE_CHILD_SETTID slot did not relocate, child keeps the parent's cached thread id"
+                        ),
+                    }
+                }
                 // This runs on the child's own (brand-new) host thread, immediately before it
                 // first resumes into guest code -- ask the platform to verify that the child
                 // never executes at, nor writes through, a stale pointer into the parent's
