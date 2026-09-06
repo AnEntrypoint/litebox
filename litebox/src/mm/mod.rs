@@ -781,7 +781,6 @@ where
         litebox: &LiteBox<Platform>,
     ) -> Result<(Self, AddressRelocations), VmemDuplicateError> {
         let source_vmem = self.vmem.read();
-        let source_ranges: Vec<Range<usize>> = source_vmem.iter().map(|(r, _)| r.clone()).collect();
         let heap_top = source_vmem.brk;
         // The host's own mappings are what the destination must be placed around, and they are
         // not fixed: on Linux the `--gui` presenter loads a Vulkan driver and spawns worker
@@ -790,9 +789,16 @@ where
         // child's heap being corrupted from underneath it -- glibc's own
         // `malloc.c:2601 (sysmalloc): assertion failed` in a `dbus-daemon` forked under `--gui`,
         // and not once in the identical run without it.
+        //
+        // The destination `Vmem` used to be built with the PARENT's own live ranges excluded
+        // from the platform's reserved set (`Vmem::new_excluding`), on the reasoning that the
+        // child was going to claim those exact addresses as its own copy. It does not, and
+        // cannot: the copy is placed wherever the platform finds room (this function's own
+        // group placement, below). What the exclusion did instead was leave the child believing
+        // the parent's live memory was free, so after the child's own `execve` its new image
+        // could be loaded straight on top of it. See `Vmem::new`'s own doc comment.
         litebox.x.platform.refresh_reserved_pages();
-        let mut dest_vmem =
-            linux::Vmem::new_excluding(litebox.x.platform, source_ranges.into_iter());
+        let mut dest_vmem = linux::Vmem::new(litebox.x.platform);
         let linux::DuplicateOutcome {
             relocations,
             group_relocations,

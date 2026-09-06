@@ -103,7 +103,7 @@ bitflags::bitflags! {
         /// Bytes covered by a `VM_OWN_FORK_PADDING` range but NOT overwritten by any subsequent
         /// `Replace` (inter-region alignment/coherent-group padding within the group's span) stay
         /// tracked under this flag for the lifetime of the process. Without a distinct tag, such
-        /// a range is indistinguishable, by `VmFlags` alone, from [`Vmem::new_excluding`]'s own
+        /// a range is indistinguishable, by `VmFlags` alone, from [`Vmem::new`]'s own
         /// placeholders -- which represent OTHER, foreign host-reserved memory this process must
         /// never touch. Confusing the two here was the confirmed root cause of the long-standing
         /// fork()+execve() mallocng `.meta=0` crash: `release_memory`'s `!vm.is_empty()`
@@ -735,27 +735,20 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         }
     }
 
-    /// Create a new [`Vmem`] instance with the given memory [backend](PageManagementProvider).
-    pub(super) fn new(platform: &'static Platform) -> Self {
-        Self::new_excluding(platform, core::iter::empty())
-    }
-
-    /// Create a new [`Vmem`] instance, treating any of the platform's reported
-    /// [`PageManagementProvider::reserved_pages`] that overlap a range in `excluded` as NOT
-    /// reserved.
+    /// Create a new [`Vmem`] instance with the given memory [backend](PageManagementProvider),
+    /// with every range the platform reports as [`PageManagementProvider::reserved_pages`]
+    /// recorded as already taken.
     ///
-    /// This exists for `fork()` (see [`Self::duplicate`]): since the platform backend reports
-    /// `reserved_pages()` as a snapshot of the whole host process's committed/reserved memory
-    /// (there being only one host process backing every guest "process" in this architecture),
-    /// a plain [`Self::new`] for a to-be-forked-into child `Vmem` would incorrectly treat the
-    /// PARENT's own already-committed guest memory as pre-reserved host state -- even though the
-    /// child is meant to claim those exact same addresses as its own independent copy. Passing
-    /// the parent's currently-tracked guest ranges as `excluded` here lets the child `Vmem`
-    /// legitimately allocate over them.
-    pub(super) fn new_excluding(
-        platform: &'static Platform,
-        excluded: impl Iterator<Item = Range<usize>> + Clone,
-    ) -> Self {
+    /// A `fork()` child's `Vmem` used to be built with the PARENT's own live ranges subtracted
+    /// back out of that set (via a since-removed `new_excluding`), on the reasoning that the
+    /// child was going to claim those exact addresses as its own copy. It does not, and cannot:
+    /// every guest process shares one host address space, so the copy is placed wherever the
+    /// platform finds room (see [`Self::duplicate`]'s group placement). What the subtraction did
+    /// instead was leave the child believing the parent's live memory was free, so after the
+    /// child's own `execve` its new image could be loaded straight on top of it. Confirmed live:
+    /// `dbus-daemon`, forked from a shell that then `exec`'d its last command, took SIGSEGV on an
+    /// address inside the shell's released heap -- memory `dbus-daemon` had loaded ITSELF into.
+    pub(super) fn new(platform: &'static Platform) -> Self {
         let mut vmem = Self {
             vmas: RangeMap::new(),
             brk: 0,
@@ -766,47 +759,20 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 each.start % ALIGN == 0 && each.end % ALIGN == 0,
                 "Vmem: reserved range is not aligned to {ALIGN} bytes"
             );
-            // Subtract every excluded range from `each`, inserting whatever (possibly
-            // discontiguous) pieces remain as still-reserved.
-            let mut pieces = alloc::vec![each.clone()];
-            for excl in excluded.clone() {
-                pieces = pieces
-                    .into_iter()
-                    .flat_map(|p| {
-                        let mut out = Vec::new();
-                        let overlap_start = p.start.max(excl.start);
-                        let overlap_end = p.end.min(excl.end);
-                        if overlap_start >= overlap_end {
-                            // No overlap with this exclusion.
-                            out.push(p);
-                        } else {
-                            if p.start < overlap_start {
-                                out.push(p.start..overlap_start);
-                            }
-                            if overlap_end < p.end {
-                                out.push(overlap_end..p.end);
-                            }
-                        }
-                        out
-                    })
-                    .collect();
+            if each.start >= each.end {
+                continue;
             }
-            for piece in pieces {
-                if piece.start >= piece.end {
-                    continue;
-                }
-                vmem.vmas.insert(
-                    piece,
-                    VmArea {
-                        flags: VmFlags::empty(),
-                        is_file_backed: false,
-                        shared_handle: None,
-                        view_base: 0,
-                        view_len: 0,
-                        reserved_extra: 0,
-                    },
-                );
-            }
+            vmem.vmas.insert(
+                each.clone(),
+                VmArea {
+                    flags: VmFlags::empty(),
+                    is_file_backed: false,
+                    shared_handle: None,
+                    view_base: 0,
+                    view_len: 0,
+                    reserved_extra: 0,
+                },
+            );
         }
         // Measures the outcome the `duplicate` headroom-exclusion fix targets: how much of the
         // HIGH end of the guest address space this new `Vmem` starts life with already covered by
@@ -822,7 +788,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             top_placeholder_end:% = top_placeholder_end,
             task_addr_max:% = Platform::TASK_ADDR_MAX,
             pins_high_limit:? = (top_placeholder_end >= Platform::TASK_ADDR_MAX);
-            "DIAG_VMEM new_excluding placeholders"
+            "DIAG_VMEM new placeholders"
         );
         vmem
     }
@@ -831,11 +797,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// the given addresses, in this process's address space -- performing no allocation, no
     /// reservation, no commit, and no copying of any kind.
     ///
-    /// # Why this exists (and why it is NOT [`Self::new`] or [`Self::new_excluding`])
+    /// # Why this exists (and why it is NOT [`Self::new`])
     ///
     /// The normal startup path builds an EMPTY `Vmem` ([`Self::new`]) and grows it as the ELF
     /// loader's `PT_LOAD` segments, then the guest's own `mmap`/`brk` calls, allocate real pages
-    /// through it. [`Self::new_excluding`] is the `fork()`-into-the-same-host-process variant,
+    /// through it. [`Self::new`] is also the `fork()`-into-the-same-host-process variant,
     /// which still allocates every destination page itself (see [`Self::duplicate`]).
     ///
     /// A genuine process-based `fork()` child (this repo's `FINDINGS.txt` passes 107-137) needs
@@ -858,7 +824,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// whole host process's committed memory, which in an adopting child ALREADY INCLUDES the
     /// pre-populated guest regions this function is being asked to describe. Folding it in would
     /// overwrite each adopted region's real flags with `VmFlags::empty()` (the placeholder
-    /// [`Self::new_excluding`] inserts for host-reserved space) and so silently destroy exactly
+    /// [`Self::new`] inserts for host-reserved space) and so silently destroy exactly
     /// the information this constructor exists to preserve.
     ///
     /// `brk` is the parent's program break at fork() time, or `0` if it had no heap yet -- the
@@ -1154,13 +1120,13 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     if self.vmas.gaps(&(start..end)).next().is_some()
                         // A partial overlap is only unsafe to blindly `Replace` over when some
                         // piece of it is a REAL guest mapping (non-empty flags) this shim doesn't
-                        // own the full picture of. An empty-flags entry is one of `new_excluding`'s
+                        // own the full picture of. An empty-flags entry is one of `Vmem::new`'s
                         // own reserved-but-not-guest-visible placeholders -- reserved specifically
                         // so *some* guest allocation doesn't land there and silently alias host
                         // memory, not a promise that no guest allocation may ever legitimately need
                         // that exact address. A `MAP_FIXED` request (real Linux: unconditionally
                         // overwrites whatever is there) whose target happens to straddle one of
-                        // these placeholders is exactly the case `new_excluding`'s own reservation
+                        // these placeholders is exactly the case `Vmem::new`'s own reservation
                         // was defending against becoming unrepresentable -- allow it through rather
                         // than rejecting a legitimate ELF segment placement (confirmed live: cc1's
                         // own large BSS/data segment straddling a small reserved placeholder,
@@ -1382,7 +1348,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // copying without restructuring this loop.
         //
         // Ranges with empty flags are the platform's host-reserved placeholders inserted by
-        // `Self::new`/`Self::new_excluding` (not real guest mappings, and not necessarily even
+        // `Self::new` (not real guest mappings, and not necessarily even
         // readable) -- `dest` gets its own copy of those from its own construction, so skip them
         // here rather than trying to copy host-runtime memory that is none of the guest's
         // business.
@@ -2636,7 +2602,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             // region of this `size` to fit BELOW it -- not that no region anywhere can fit.
             // `self.vmas.iter().rev()` walks from the highest mapped range down to the lowest,
             // so a later (lower-address) `r` is exactly where this underflow becomes likely
-            // (e.g. one of `new_excluding`'s own low, small reserved-placeholder pieces) while
+            // (e.g. one of `Vmem::new`'s own low, small reserved-placeholder pieces) while
             // an earlier, higher-address `r` may already have offered a perfectly good gap this
             // early-return would otherwise discard, or a still-lower `r` might. Skip this one
             // candidate and keep searching rather than aborting the whole scan -- mirroring the
