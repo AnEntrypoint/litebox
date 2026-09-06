@@ -1236,12 +1236,64 @@ pattern (see `diag_raw_print_proc_sys_open_miss`,
 `litebox_shim_linux/src/syscalls/file.rs`) instead, exactly as the VEH
 diagnostics already do for the same reason.
 
+## nginx-as-pid-1 re-verified against both fixes
+
+Re-ran the `nginx-as-pid-1` setup from this document's earlier section against
+the two fixes above, to confirm neither regressed it. It still works, end to
+end, with no crash:
+
+```
+litebox_runner_linux_on_windows_userland.exe -Z \
+  --oci-image docker.io/linuxserver/webtop:debian-i3 \
+  --resume-from <overlay>.tar -p 3000:3000 --env HOME=/config \
+  -- /start-nginx.sh
+```
+
+The overlay carries only the pre-substituted
+`/etc/nginx/sites-{available,enabled}/default` (the same config recorded
+earlier), the `/var/log/nginx` and `/run` directories, and a one-line launcher.
+`--resume-from` seeds the writable layer, which is a cleaner injection route than
+the earlier `tar --concatenate` trick.
+
+Two operational notes for a re-run:
+
+- `--resume-from` takes a **host** path, and `MSYS_NO_PATHCONV=1` (required for
+  the guest-side `/`-paths) also suppresses translation of that host path. Pass
+  it as an explicit Windows path (`C:/...`), or the runner panics with "failed to
+  open ... The system cannot find the file specified" -- and then, notably,
+  *overflows its stack while panicking*, exiting 139. A panic in that path
+  producing a stack overflow rather than a clean abort is itself worth a look.
+- `-g "worker_processes 1; ..."` collides with the image's own `nginx.conf:2`
+  (`"worker_processes" directive is duplicate`). Use `-g "daemon off;
+  master_process off;"` only.
+
+Serving confirmed:
+
+```
+$ curl -D - http://127.0.0.1:3000/
+HTTP/1.1 200 OK
+Server: nginx
+Content-Length: 762
+<!doctype html>...<script type="module" crossorigin src="./assets/index-BTp9L9Xk.js">
+```
+
+Guest process tree shows `pid=1 ppid=0 comm=/usr/sbin/nginx` -- real nginx as
+litebox's own pid 1, no s6-overlay anywhere.
+
+**Browser-verified** via `claude-in-chrome` against a real Chrome tab at
+`http://127.0.0.1:3000/`: page title is genuinely `Selkies`, and `get_page_text`
+returns the real dashboard shell -- Video Settings, Screen Settings, Audio
+Settings, Stats, Clipboard, Files, Apps, Sharing, Gamepads -- plus
+`WebSocket disconnected. Attempting to reconnect...`, which is the correct
+behavior with no selkies node.js backend running. Identical to the result this
+document's earlier section recorded, i.e. unregressed.
+
 ## Still open
 
-`nginx`-as-pid-1 and the browser check of the Selkies dashboard were not reached
-this pass. Both `touch` bugs that blocked it are fixed and file creation plus
-timestamp setting now work, so that section is the next thing to retry; it was
-not itself re-run here.
+Unchanged by this pass: the desktop/video half is still blocked on the Xvfb
+pid-1 SIGSEGV, and selkies' node.js backend was not started, so the dashboard's
+WebSocket has nothing to connect to. Neither is related to the two bugs fixed
+here.
 
 ## Test status
 
