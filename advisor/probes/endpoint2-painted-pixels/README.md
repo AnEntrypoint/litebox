@@ -32,6 +32,41 @@ a monotonic drift artifact:
 `DIAG_DIRTYFB` fires six times (`fb_id=2 num_clips=1`), confirming Xorg really
 does issue `DRM_IOCTL_MODE_DIRTYFB` and that the handler is on the live path.
 
+## Scope of this result -- what it does and does not demonstrate
+
+Stated plainly so "endpoint 2 achieved" is not read as more than it is.
+
+DEMONSTRATED: a single guest X client painting the root window, end to end, through
+litebox's own DRM/wgpu path, with Xorg as a forked child. Verified independently
+twice (see below).
+
+NOT DEMONSTRATED: a stable multi-client desktop. A full XFCE session runs many
+clients concurrently, and the `xclock` fault recorded at the bottom of this file is
+very likely what they would hit -- fixed-placement (`MAP_FIXED`) adjacency, which
+the general mapping guard gap structurally cannot reach. Treat this as the first
+pixel, not a working desktop.
+
+Suggested next work item if anyone continues: `brk`/`sysmalloc` placement
+specifically. The fault family is now 3-for-3 the same glibc function
+(`libc+0xa0b98` forked-child SIGSEGV, `libc+0xa0966` pid-1 SIGABRT,
+`libc+0xa0966` again for `xclock`), and the remaining exposure is exactly the
+fixed-placement adjacency a search-side gap cannot govern.
+
+## Independent verification
+
+The colour sequence was decoded twice, by two sessions, from the same captured
+BMPs, without one taking the other's word for it.
+
+    this session   frames 3 / 5 / 9    sampled at 5/25/50/75/95% of the pixel array
+    sdv            frames 0-3 / 4-7 / 8-11, 2,080 points spread across the full
+                   1920x1080 surface for three representative frames
+
+sdv's is the stronger check and it came back `distinct=1` with 100% coverage of the
+expected colour in every case: 0 non-black before the paint, 2080/2080 navy,
+2080/2080 red. So this is a genuinely uniform full-screen fill, not a corner
+artifact or a partial blit. Frame numbering differs by one between the two decodes
+(different sample points); nothing turns on it.
+
 ## What had to be fixed, all three
 
     d057bd37  keep a discarded Hint address as a placement floor
