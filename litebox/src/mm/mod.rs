@@ -1481,6 +1481,18 @@ where
             VmFlags::from(permissions) | VmFlags::may_flags_for_mapping(shared, is_file_backed),
             is_file_backed,
         );
+        // DIAGNOSTIC (temporary, do not commit): the THIRD way a range enters the VMA table,
+        // besides `create_pages` and `Vmem::duplicate`. A live capture found the region the fork
+        // faults straddle -- [0x11188000, 0x111a9000), 135168 bytes -- present 31 times in the
+        // fork relocation dump while appearing as the output of NO `create_pages` call and as the
+        // destination of NO fork. Registration without creation is the only remaining path it can
+        // have arrived by, so name every one.
+        litebox_util_log::error!(
+            start:% = range.start, end:% = range.end,
+            len:% = range.end - range.start,
+            file_backed:? = is_file_backed, shared:? = shared, replace:? = replace;
+            "DIAG_REGISTER_EXISTING"
+        );
         let mut vmem = self.vmem.write();
         if !replace && vmem.overlapping(range.into()).next().is_some() {
             return None;

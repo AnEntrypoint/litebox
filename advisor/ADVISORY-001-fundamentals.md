@@ -1338,3 +1338,59 @@ that was never mapped in either address space trivially satisfies all of them.
 Next: attribute that region to its creation site (a `DIAG_CREATE_PAGES` trace at
 `PageManager::create_pages`, the single chokepoint all page creation passes through) and determine
 why its length is 135,168 rather than covering what the guest addresses.
+
+## 3K. The 16 MiB hole is deliberate growth headroom, not a bug. Case (b): a stray pointer.
+
+Follow-up to 3J, which ended pointing at a 135,168-byte mapping the faults straddle.
+
+**Where that mapping comes from.** `maybe_patch_exec_segment`
+(`litebox_shim_linux/src/syscalls/mm.rs:1401-1415`) maps the trampoline stub region with
+`do_mmap_anonymous(Some(tramp_addr), align_up(trampoline_file_size, PAGE_SIZE),
+PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_PRIVATE|MAP_FIXED)`. Its own comment explains the
+`MAP_FIXED`: "the region may already be reserved as PROT_NONE by the ElfLoader's reserve() call".
+It calls `do_mmap_anonymous` DIRECTLY, bypassing `sys_mmap` -- which is why none of the 53 traced
+guest `mmap` calls ever showed it, and why its absence from that trace is not evidence of anything.
+
+**The region is ordinary and IS copied by fork.** Its `VmFlags` word is 115 in every capture, the
+same read+write word ordinary data regions carry (113 file-backed RO, 117 exec, 371 stack). It
+appears in the fork relocation dump 31 times with 31 distinct destinations -- one per fork.
+`duplicate`'s `to_owned_slice` read of it is just the ordinary per-region byte copy; there is no
+special-cased trampoline copy path, and none is needed.
+
+**The surrounding 16 MiB hole is by design.** `create_mapping` (`linux.rs:1728-1744`) reserves
+`length + DEFAULT_RESERVED_SPACE_SIZE` via `get_unmmaped_area` but inserts a VMA covering only
+`length`. `CreatePagesFlags::ENSURE_SPACE_AFTER`'s own doc comment states the purpose: "Ensure
+there is more space... after the mapping so that user can grow the mapping later." Address space
+claimed, no VMA, deliberately. Measured: the parent hole is `0x10188000`-`0x11188000` = exactly
+`0x1000000` = 16 MiB = `DEFAULT_RESERVED_SPACE_SIZE`, and the trampoline mapping begins exactly at
+the hole's end.
+
+**Therefore case (b).** The reserve is meant to stay empty; nothing legitimate lives there and
+fork is not dropping content. Something computes and dereferences a pointer INTO the empty
+headroom. **Do not give the reserve a VMA to "fix" this** -- besides copying 16 MiB of untouched
+address space per mapping per fork, it would make the bad address happen to be backed, converting
+a loud page fault into silent corruption.
+
+**Refuted here: the stale-size/stride hypothesis.** If a pre-fork LENGTH (not a pointer, hence
+never relocated by any pointer-based healer) were being added to a base, the faults would sit at
+regular multiples or a fixed stride. Measured offsets from the trampoline mapping's base are
+-27,104 and -7,200 below it, then +138,640, +149,600, +172,144, +199,920, +225,360, +253,712,
++255,936, +265,136, +278,352, +289,136, +318,912, +397,184, +424,192 -- irregular, continuously
+distributed, no multiple of the 135,168-byte length and no constant stride.
+
+**The other fault cluster tracks the relocation base.** The eight high faults are spaced ~82.5 MB
+apart, matching the per-fork relocation stride, i.e. one per child at a similar relative position.
+Three fall inside destination ranges whose SOURCE is `0x7feffc2e3000` (`exec=true`,
+`file_backed=true`) -- the libc text segment -- at irregular offsets (+138,440, +163,976,
++218,120). So those children fault inside their own correctly-relocated libc copy.
+
+**Net state.** Both clusters are irregular offsets into regions that WERE relocated correctly.
+Every mechanism-level explanation tried so far is eliminated by direct measurement: unhealed stale
+pointer (0/23 in any source range), over-healing with a wrong delta (arithmetically impossible --
+`translate`'s image always lands in a destination range), a skipped mapping (0/23 in any of 2,976
+skipped VMAs), mmap misbehaviour (0/53 relocated, 0 failed), the heap (no `brk` heap exists in this
+guest at all), a missing copy of the trampoline reserve (it is empty by design), and a stale
+size/stride (offsets are irregular). What remains is a stray address computed by something that
+indexes off a correctly-relocated base -- the trampoline stub indexing/patching logic being the
+best-fitting candidate, since the low cluster is centred on the trampoline mapping and overruns it
+in BOTH directions.
