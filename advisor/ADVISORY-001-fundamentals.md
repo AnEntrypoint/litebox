@@ -1197,3 +1197,76 @@ against the traced thread needs care -- that is why this was not attempted from 
 - **`LITEBOX_VEH_TRACE=1` does NOT suppress this crash and makes it WORSE**: 1,7,13 faults vs
   5,3,3 without. This contradicts the earlier session belief that VEH_TRACE mitigates crashes;
   that belief does not generalise to this failure.
+
+## 3I. REFUTED: trampoline corruption. The fault is a stale UN-RELOCATED pointer read.
+
+Direct capture, `--oci-image linuxserver/webtop:debian-xfce`, 30-concurrent-`/bin/true` oracle,
+`LITEBOX_LOG=error`. Two independent boots, 20 fatal signals each, 15 with a full pre-signal
+CONTEXT snapshot. **The two runs are BIT-IDENTICAL** -- every `rip`, `rsp` and `cr2` matches
+across boots. This failure is deterministic, not a timing race.
+
+    Exception(14) rip=0x1c12c06  rsp=0x57a3350   cr2=0x11186c60 ec=0x4
+    Exception(14) rip=0x6ac2c06  rsp=0xa653350   cr2=0x111810a0 ec=0x4
+    Exception(14) rip=0x2ad32c06 rsp=0x2e8c3350  cr2=0x111acee0 ec=0x4
+    Exception(14) rip=0x2fbe2c06 rsp=0x33773350  cr2=0x111a9e10 ec=0x4
+    Exception(14) rip=0x34a92c06 rsp=0x38623350  cr2=0x111b2df0 ec=0x4
+    Exception(14) rip=0x39942c06 rsp=0x3d4d3350  cr2=0x111bffd0 ec=0x4
+    Exception(14) rip=0x3e7f2c06 rsp=0x42383350  cr2=0x111b8170 ec=0x4
+    Exception(14) rip=0x436a2c06 rsp=0x47233350  cr2=0x111c5c90 ec=0x4
+    Exception(14) rip=0x48552c06 rsp=0x4c0e3350  cr2=0x111cecf0 ec=0x4
+    Exception(14) rip=0x50562c06 rsp=0x540f3350  cr2=0x111cb9d0 ec=0x4
+    Exception(14) rip=0x542a2c06 rsp=0x57e33350  cr2=0x111c8930 ec=0x4
+    Exception(14) rip=0x57fe2c06 rsp=0x5bb73350  cr2=0x111c9a40 ec=0x4
+    Exception(14) rip=0x5ce92c06 rsp=0x60a23350  cr2=0x111da340 ec=0x4
+    Exception(14) rip=0x61d42c06 rsp=0x658d3350  cr2=0x111e8d00 ec=0x4
+
+**3F's trampoline hypothesis is refuted.** 3F rested on `Exception(6)` (#UD) with `cr2=0` at a
+fixed rip in the trampoline band. Nothing here is #UD: every fault is `Exception(14)`, a PAGE
+FAULT, with `error_code=0x4` -- user-mode READ of a NOT-PRESENT page -- and a nonzero `cr2`.
+No `0xc0000096` either. The check 3F proposed ("dump 16 bytes at the faulting rip and diff
+against what `maybe_patch_exec_segment` wrote") is moot: rip is not in the trampoline band and
+the code at rip decoded and executed fine. The faulting instruction is a normal load; what is
+wrong is the ADDRESS it loaded from.
+
+**The signature identifies the bug exactly.** Two invariants hold across all 15 deaths:
+
+- `rip & 0xffff == 0x2c06` and `rsp & 0xffff == 0x3350` in every case, while the high bits of
+  both track each child's own relocation base. So every child dies at the SAME guest code
+  offset, at the SAME call depth, in its own correctly-relocated address space. The child's
+  code and stack were relocated properly.
+- `cr2` does NOT track the relocation base. Child bases span `0x01c10000`-`0x61d40000` (1.6 GB
+  apart), yet every `cr2` falls in a 0.4 MB window at `0x11180000`-`0x111e8000`, and litebox
+  reports `NO mapping overlaps cr2 (genuinely unmapped)` for each.
+
+A pointer that stays fixed while everything around it moves is a pointer that was NOT
+relocated. The child is dereferencing a pre-`fork()` address that `Vmem::duplicate` moved and
+`fork_verify` never healed. This is a HEALING GAP -- fork_verify failing to fix a stale
+pointer -- not fork_verify corrupting anything.
+
+**Independently corroborated in-tree.** `litebox_shim_linux/src/syscalls/process.rs:2789-2796`
+already records, from a prior session's own measurement against this same oracle, that
+`LITEBOX_FORKVERIFY_OFF=1` (reactive healing fully disabled) "reproduces the SAME fault rate as
+with both enabled", and that adding `lock_fork_verify_heal()` around the proactive pass "alone
+did not reduce the fault rate". If healing were the corrupting agent, disabling it would have
+to help. It does not. Combined with the bit-identical reproduction above, the
+concurrent-healing-race mechanism proposed in 3H is not the cause of these deaths.
+
+3H's concurrency correlation is still real and is NOT retracted -- serialising forks does
+reduce deaths. But the reason is not that concurrent healers corrupt each other. Concurrency
+changes WHICH ranges `Vmem::duplicate` groups and relocates, and therefore which stale
+pointers exist to be missed.
+
+**Prime suspect, straight from the source's own doc comment.** `litebox/src/mm/linux.rs:475-492`
+documents that `private_data_ranges` -- the set fork_verify's proactive pass scans --
+**deliberately EXCLUDES the `brk` heap**, and that the stack is covered only within a bounded
+window above `rsp`. The exclusion was added to fix a real argv-string-corruption bug and is
+correct as far as it goes, but it means a stale pointer stored in heap memory is never healed
+by any pass. `cr2` clustering in one small window, identical across boots, with no mapping,
+is the shape of exactly that: one heap-resident pointer field, written before `fork()`,
+never relocated, dereferenced by every child at the same code offset.
+
+**Next check, cheapest first:** log the parent's `brk` range and each `AddressRelocations`
+source range at fork time, and test whether the un-relocated `cr2` values fall inside a source
+range that was relocated but excluded from `private_data_ranges` (i.e. the heap). If they do,
+the fix is scoped heap healing that can distinguish allocator bookkeeping from payload bytes --
+NOT simply re-including the heap, which is what caused the argv corruption that got it excluded.
