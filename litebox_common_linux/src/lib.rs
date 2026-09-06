@@ -4475,6 +4475,11 @@ impl SyscallRequest {
             Sysno::getpid => SyscallRequest::Getpid,
             Sysno::getppid => SyscallRequest::Getppid,
             Sysno::getpgid => sys_req!(Getpgid { pid }),
+            // `getpgrp()` is defined as exactly `getpgid(0)` -- it is the older, argument-less
+            // spelling of the same call. Without it, `dash`'s job-control setup compares
+            // `tcgetpgrp(fd)` against a failed `getpgrp()`, decides it is a background process,
+            // and sends itself SIGTTIN.
+            Sysno::getpgrp => SyscallRequest::Getpgid { pid: 0 },
             Sysno::setpgid => sys_req!(Setpgid { pid, pgid }),
             Sysno::setsid => SyscallRequest::Setsid,
             Sysno::getuid => SyscallRequest::Getuid,

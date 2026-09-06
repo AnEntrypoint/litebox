@@ -76,6 +76,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         aux.insert(AuxKey::AT_EUID, user_info.euid as usize);
         aux.insert(AuxKey::AT_GID, user_info.gid as usize);
         aux.insert(AuxKey::AT_EGID, user_info.egid as usize);
+        // Always 0: this shim has no setuid/setgid execution to make a program "secure" in the
+        // kernel's sense. Leaving the entry out entirely is not equivalent -- glibc's
+        // `getauxval(AT_SECURE)` reports a missing entry as `ENOENT`, and GLib treats that as
+        // fatal, so every GTK program died at startup with
+        // `GLib-ERROR **: getauxval () failed: No such file or directory`.
+        aux.insert(AuxKey::AT_SECURE, 0);
 
         if let Some(vdso_base) = self.global.platform.get_vdso_address() {
             aux.insert(AuxKey::AT_SYSINFO_EHDR, vdso_base);
