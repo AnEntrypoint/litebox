@@ -1122,7 +1122,16 @@ where
     ///
     /// ## Returns
     ///
-    /// If the operation is successful, it returns the new program break address.
+    /// The program break after the call: the requested address when the change was made, and the
+    /// UNCHANGED break when it could not be. Growth that cannot be satisfied is not an error --
+    /// real Linux's `brk(2)` returns an address on every path (`SYSCALL_DEFINE1(brk, ...)` falls
+    /// through to `out: return origbrk` for each of its failure cases) and never a negative
+    /// errno, and glibc's `__brk` relies on exactly that: it stores whatever the syscall returned
+    /// into `__curbrk` and only *then* compares it against the address it asked for to decide
+    /// whether to report `ENOMEM`. An `Err` here reaches that wrapper as `-12`, which it records
+    /// as the process's current break, and every subsequent heap computation runs off that
+    /// garbage -- observed as `malloc(): corrupted top size` and an abort in a guest whose only
+    /// real problem was a heap with no room above it to grow into.
     ///
     /// # Panics
     ///
@@ -1160,19 +1169,21 @@ where
         }
 
         if vmem.overlapping(old_brk..new_brk).next().is_some() {
-            return Err(MappingError::OutOfMemory);
+            return Ok(vmem.brk);
         }
         if let Some(range) = PageRange::<ALIGN>::new(old_brk, new_brk) {
             let (suggested_address, length) = range.start_and_length();
             let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
-            let placed = unsafe {
+            let Ok(placed) = (unsafe {
                 vmem.create_pages(
                     Some(suggested_address),
                     length,
                     CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
                     perms,
                 )
-            }?;
+            }) else {
+                return Ok(vmem.brk);
+            };
             // `create_pages`'s `FIXED_ADDR` request is `FixedAddressBehavior::Replace`, which the
             // platform is allowed to silently RELOCATE away from the requested address (e.g. when
             // a sibling guest process's live claim occupies the target range -- see
@@ -1200,7 +1211,7 @@ where
                     )
                 }
                 .ok();
-                return Err(MappingError::OutOfMemory);
+                return Ok(vmem.brk);
             }
         }
         vmem.brk = brk;
