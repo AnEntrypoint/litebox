@@ -48,7 +48,37 @@ Client (needs `build_min_x_client.sh` first):
     litebox_runner --unstable --initial-files clmin.tar \
       --env DISPLAY=10.0.2.2:0 -- /usr/bin/xsetroot -solid navy
 
-## Blocker
+## RESULT: THE TWO-RUNNER APPROACH IS STRUCTURALLY IMPOSSIBLE
+
+Ran to completion 2026-09-06. The client boots, loads all libraries, and reaches
+the X connection attempt -- then fails:
+
+    /usr/bin/xsetroot:  unable to open display '10.0.0.1:0'
+
+This is NOT a configuration error and no address works. Two runners cannot reach
+each other, by construction, per `litebox_platform_windows_userland/src/net.rs`
+`send_ip_packet` (~line 999):
+
+- `127.0.0.1` is intercepted and looped straight back into the guest's OWN
+  smoltcp receive queue. It never leaves the guest. The comment is explicit:
+  "nothing is ever listening on a real Windows 127.0.0.1 socket on the guest's
+  behalf -- the guest's own listening socket lives entirely inside this same
+  process's smoltcp stack."
+- `10.0.0.1` (the gateway, `GATEWAY_IP_ADDR`) is not loopback, so it goes to the
+  NAT gateway thread -- which "only knows how to proxy to REAL external
+  destinations via REAL Windows sockets". The host's own `127.0.0.1:6000` is not
+  a real external destination.
+
+So `--publish` is strictly INBOUND (host -> guest) and outbound NAT is strictly
+OUTBOUND-to-external. There is no guest -> host-loopback path. The server's
+`127.0.0.1:6000` listener is reachable from a host browser (that is how endpoint
+1 works) but NOT from another guest.
+
+Closing this route would need a real change: teach the NAT gateway to proxy
+guest-initiated connections to host loopback, or give the two runners a shared
+transport. Neither is a configuration tweak.
+
+## Superseded blocker (resolved, kept for history)
 
 The boot lock is host-wide (correctly, as of 828f726c) and refuses the second
 runner. This test needs a narrow opt-in (e.g. `LITEBOX_ALLOW_CONCURRENT_BOOT=1`)
