@@ -12,6 +12,7 @@ mod fork_verify;
 mod net;
 pub mod presentation;
 pub mod process_fork;
+pub mod xproc_sync;
 
 use core::cell::Cell;
 use core::panic;
