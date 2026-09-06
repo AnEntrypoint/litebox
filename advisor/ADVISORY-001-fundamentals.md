@@ -1638,3 +1638,138 @@ forking, in code that runs ONLY in a child: the post-clone return path, `fork_ve
 
 Next: symbolize glibc `+0x7ac06` and identify which pointer operand that one instruction
 dereferences -- that operand is garbage in every child and correct in the parent.
+
+## 3N. SYMBOLIZED, AND THE ROOT CAUSE: glibc tcache SAFE-LINKING is XOR-encoded, so relocation-based fork healing structurally cannot heal it
+
+3M.1's question is answered. The instruction is `__libc_malloc+0x76`, the `REVEAL_PTR` of glibc's
+inlined `tcache_get`. This is not a fork/relocation *mechanics* bug -- 3J through 3M correctly
+measured every one of those correct. It is the failure class `1.2` predicted in advance and named
+verbatim: "pointers ... XOR-encoded".
+
+### The symbolization (offline, no boot needed, fully reproducible)
+
+Binary: `usr/lib/x86_64-linux-gnu/libc.so.6` extracted from the `linuxserver/webtop:debian-xfce`
+OCI layer `sha256_20704bbc788eb659439d8872872c6979de8e157a1956d7759fef07d5c6f0db90` in
+`.litebox-cache/`.
+
+The `+0x7ac06` offset is measured from the START OF THE MAPPED TEXT REGION, not from the file. The
+R+E `LOAD` segment is `Offset 0x028000 VirtAddr 0x28000 FileSiz 0x1628fd`, and
+`align_up(0x1628fd, 0x1000) = 0x163000 = 1,454,080` -- an EXACT match for the captured
+`srclen=1,454,080`, which confirms the region-base identification. So:
+
+    library vaddr = 0x28000 + 0x7ac06 = 0xa2c06
+
+`objdump -d` gives `__libc_malloc@@GLIBC_2.2.5` at `0xa2b90`, so the faulting instruction is
+`__libc_malloc+0x76`:
+
+    a2bc9: mov    0x1421b8(%rip),%r12     # tcache TLS offset
+    a2bd0: mov    %fs:(%r12),%rdx         # rdx = tcache  (thread-local)
+    a2bd8: je     a2c28                   # tcache NULL -> init path
+    a2bda: cmp    0x142607(%rip),%rbp     # tc_idx vs TCACHE_MAX_BINS
+    a2be3: movzwl (%rdx,%rbp,2),%ecx      # ecx = tcache->counts[tc_idx]
+    a2bea: je     a2c50                   # count == 0 -> general malloc
+    a2bec: lea    0x10(%rbp),%rdi
+    a2bf0: mov    (%rdx,%rdi,8),%rax      # rax = e = tcache->entries[tc_idx]
+    a2bf4: test   $0xf,%al
+    a2bf6: jne    a2e50                   # -> "unaligned tcache chunk detected" ABORT
+    a2bfc: mov    %rax,%rsi
+    a2bff: sub    $0x1,%ecx
+    a2c02: shr    $0xc,%rsi               # rsi = (uintptr_t)e >> 12
+    a2c06: xor    (%rax),%rsi             # <<<< THE FAULT: REVEAL_PTR(e->next)
+    a2c09: mov    %rsi,(%rdx,%rdi,8)      # tcache->entries[tc_idx] = revealed next
+    a2c0d: mov    %cx,(%rdx,%rbp,2)       # tcache->counts[tc_idx]--
+
+The faulting read is `e->next`, where `e` is a chunk pointer popped from this thread's tcache
+freelist. `%rax` is the garbage operand 3M.1 asked us to identify.
+
+### Why it is garbage in the child and correct in the parent
+
+Since glibc 2.32, tcache freelist `next` pointers are stored **safe-linked**, i.e. XOR-masked with
+the address of the slot holding them:
+
+    PROTECT_PTR(pos, ptr) = ((uintptr_t)(pos) >> 12) ^ (uintptr_t)(ptr)
+    REVEAL_PTR(ptr)       = PROTECT_PTR(&ptr, ptr)          // involution
+
+Let a chunk sit at parent address `P` with successor `N`. The memory word actually stored at `P` is
+
+    W = (P >> 12) ^ N
+
+`Vmem::duplicate` relocates the child's copy of that region by some delta `D`, and the healing
+passes rewrite any word that IS a pointer into a source range. `W` is **not** a pointer -- it is a
+masked value, and by construction it does not fall inside any source range. So healing correctly
+leaves it alone (this is precisely why 3J measured **0 of 23 faults in any source range**, and why
+every address-focused elimination in 3I-3M came back negative: the corrupt value was never an
+un-relocated address to be found).
+
+But the chunk itself moved. In the child the slot is at `P + D`, so the child computes
+
+    REVEAL = ((P + D) >> 12) ^ W
+           = ((P + D) >> 12) ^ (P >> 12) ^ N
+           = N ^ ( (P >> 12) ^ ((P+D) >> 12) )
+
+which is `N` corrupted in its high bits by the relocation delta -- **not** `N + D`, and not any
+address that exists. The child stores that into `tcache->entries[tc_idx]` (`a2c09`) and the NEXT
+`malloc` of that size class pops it as `e` and dereferences it at `a2c06`. That is the fault.
+
+Safe-linking is an involution *keyed by the slot's own address*. Any fork that preserves content
+but changes addresses breaks it. Real `fork()` never does, which is why glibc has been correct on
+Linux for decades; litebox's relocating in-process fork does, by design.
+
+### Six independent facts this explains that nothing else did
+
+1. **Child-only.** The parent never re-executes a post-fork tcache pop with a relocated
+   freelist; only children inherit a freelist whose masks were computed at other addresses.
+   3M.1's hardest constraint.
+2. **One single instruction, always.** Every corrupted `next` surfaces at the one `REVEAL_PTR`
+   site. There was never a distribution of sites to explain.
+3. **Irregular, non-strided `cr2` values** (the signature that misdirected 3K and 3L). They are
+   `N ^ ((P>>12) ^ ((P+D)>>12))` for varying `P`, `N`, `D` -- deterministic per layout, but
+   arithmetically unrelated to any stride.
+4. **Bit-identical across boots.** Every input (`P`, `N`, `D`) is deterministic in a deterministic
+   layout, so the corrupt operands are too. A free-running race cannot do this; 3L.1's
+   `DIAG_TORN`-negative is fully consistent.
+5. **`error_code=0x4`, read of a not-present page, `cr2` unmapped in BOTH processes.** An XOR of
+   unrelated bit patterns lands essentially anywhere; it has no reason to be mapped anywhere.
+   3M's reframed question -- "what does the guest believe lives at `0x11181620-0x111ef900`?" --
+   dissolves: the guest believes *nothing* lives there. It never computed an address into the
+   `ENSURE_SPACE_AFTER` headroom on purpose; the headroom is a coincidence of where the XOR
+   happened to land, which is why it straddled a real mapping in both directions (3J) and why the
+   `VM_OWN_FORK_PADDING` hits (3L.2) were incidental.
+6. **The 14 SIGABRTs alongside the 46 SIGSEGVs** (3J's own counts, never previously explained).
+   `a2bf4: test $0xf,%al` / `jne a2e50` is glibc's `malloc(): unaligned tcache chunk detected`
+   abort. A garbage `%rax` that happens to be 16-byte aligned faults on the read at `a2c06`; one
+   that is not aborts at `a2e50`. Same corruption, two exits, in roughly the 15:1 ratio a random
+   low nibble predicts against a population also containing unrelated aborts.
+
+### Confirmed absent in-tree
+
+`grep -rniE "tcache|safe.?link|PROTECT_PTR|REVEAL_PTR|xor.?encod|obfuscat" --include=*.rs` over the
+whole repository returns **nothing** relevant. No pass has ever been aware of safe-linking.
+
+### Why this is not fixable within the relocating-fork design
+
+It is not a gap in coverage that a wider scan closes. The corrupt word is *indistinguishable from
+data* by inspection -- that is the entire security purpose of safe-linking. To heal it one must know
+that a given 8-byte slot is a tcache/fastbin `next` field, which requires modelling glibc's internal
+allocator layout: walking `tcache_perthread_struct` through the child's FS-base TLS, for the right
+glibc version, for every size class, plus the equivalent `fastbin` chain in every `malloc_state`
+arena (fastbins are safe-linked too). That is exactly the "per-program workaround" road `1.2`
+warns against, and it would still be defeated by the next XOR-encoded structure (glibc's
+`PTR_MANGLE`d `setjmp`/`atexit`/`pthread` function pointers are ROR+XOR against a TLS-resident
+guard, same class).
+
+**This is therefore a direct, measured vindication of `1.2`.** The relocating in-process fork
+cannot be made correct; the child needs the parent's addresses. `RtlCloneUserProcess` (1.2's
+recommended design) makes the whole class vanish at once, because `D == 0` and every encoded
+pointer stays valid without anyone having to understand it.
+
+Recommended next step is NOT another healing pass. It is 1.2 staging step (b): a standalone probe
+that clones the runner with `RtlCloneUserProcess` and runs guest code in the child.
+
+**Cheap decisive confirmation available if wanted** (one boot, no design change): run the
+30-concurrent oracle with `GLIBC_TUNABLES=glibc.malloc.tcache_count=0`. That disables the tcache
+fast path entirely, so `a2be3`'s count is always 0 and `a2c06` is never reached. If the fault rate
+goes to 0/30 while everything else is unchanged, the attribution is closed experimentally as well
+as analytically. Note this is a DIAGNOSTIC, not a fix -- glibc's fastbins are safe-linked by the
+same macro and the same corruption exists there; a tcache-free run is expected to move the fault,
+not remove the class.
