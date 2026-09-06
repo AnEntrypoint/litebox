@@ -1394,3 +1394,21 @@ size/stride (offsets are irregular). What remains is a stray address computed by
 indexes off a correctly-relocated base -- the trampoline stub indexing/patching logic being the
 best-fitting candidate, since the low cluster is centred on the trampoline mapping and overruns it
 in BOTH directions.
+
+### 3K.1 Refuted: `brk()`/`mremap()` growing into the reserve without extending a VMA
+
+Two independent grounds, either sufficient.
+
+**This guest never calls `brk` successfully at all.** `is_brk=true` appears in none of the three
+captures, `heap_top == 0`, and `heap_range()` is `None` -- glibc here allocates via mmap arenas
+exclusively. There is no heap growth to land anywhere.
+
+**And the growth path would be correct regardless.** `PageManager::brk` (`litebox/src/mm/mod.rs`
+~1134) does not write into reserved space. It checks `vmem.overlapping(old_brk..new_brk)` and
+refuses on any overlap, then calls `create_pages(FIXED_ADDR | POPULATE_PAGES_IMMEDIATELY)` for
+`old_brk..new_brk` -- which inserts a real VMA, exactly what `duplicate` iterates. It further
+rejects a silently-relocated placement (`placed.as_usize() != suggested_address.as_usize()`),
+releasing the pages and failing the call, because `brk`'s contract requires contiguous growth. That
+guard exists from a prior live-confirmed cross-process heap-corruption fix.
+
+So there is no path by which usable content exists in the headroom without a VMA covering it.
