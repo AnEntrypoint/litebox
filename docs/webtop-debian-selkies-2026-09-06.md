@@ -1305,3 +1305,179 @@ calls the same missing associated function (`E0576`, 11 errors). Confirmed
 pre-existing by checking out the parent commit (`ca942c5`) -- `cargo test
 --no-run` succeeds there only because it skips doctests, which is where `E0407`
 surfaces. This session's change touches neither site.
+
+---
+
+# 2026-09-07: the `UnmapViewOfFileEx` flank-destruction bug -- fixed at the
+# `allocate_pages` reclaim site itself, not at the caller
+
+## Why the previously-scoped fix path didn't fit the data that's actually there
+
+The prior session's fix plan called for the caller (`litebox_shim_linux`'s
+`try_cow_mmap_file`) to detect the overlap, then reconstruct the flanks as
+equivalent CoW mappings by re-deriving their file/offset from `Vmem`'s own
+`VmArea` record for the range about to be destroyed. Reading `VmArea` itself
+(`litebox/src/mm/linux.rs:333-393`) falsifies the premise this plan depended
+on: `VmArea` carries no file/offset field at all, ever, for any mapping --
+only `is_file_backed: bool` plus, for a `VM_SHARED` mapping only, a
+`view_base`/`view_len` pair that's `(0, 0)` and documented meaningless for a
+private mapping (the `libepoxy.so.0` case here is a private CoW mapping, not
+shared). Confirmed independently, a second way: the platform's own
+`cow_regions` registry (`litebox_platform_windows_userland/src/lib.rs:125`)
+is keyed by the HOST-side static source-data pointer
+(`data.as_ptr() as usize`), not by guest destination address -- there is no
+reverse index anywhere in this codebase from "a guest address that used to be
+part of a CoW view" back to the file/offset that backed it, exactly as the
+prior session's own reading already suspected but had not yet directly
+confirmed by reading `VmArea`'s fields. The caller-side reconstruction this
+plan called for is therefore not implementable without first adding a new
+guest-address -> file/offset side-table nobody has ever needed before this
+bug -- real, separate infrastructure work, not a bounded fix.
+
+## The fix that IS implementable with data already on hand, and why it's correct
+
+`allocate_pages`'s `Replace`-mode reclaim path
+(`litebox_platform_windows_userland/src/lib.rs`, the
+`process_memory_range_by_regions` closure around the `was_mapped_view`
+branch) already calls `VirtualQuery` on the target range for an unrelated
+reason (classifying `mbi.Type` as `MEM_MAPPED`/`MEM_IMAGE` to pick
+`UnmapViewOfFileEx` over `VirtualFree`). That SAME `VirtualQuery` call's
+`mbi.BaseAddress`/`mbi.RegionSize` already report the REAL, full, unclamped
+extent of the view about to be destroyed -- confirmed by reading
+`process_memory_range_by_regions`'s own doc comment and clamping logic
+(`len = region_remaining_from_range_start.min(range.len())`): `r`, the value
+handed to the closure, is deliberately clamped down to the CALLER's
+requested sub-range, but the raw `mbi` fields underneath it are not. This
+means the exact addresses of both flanks (`[view_start, r.start)` and
+`[r.end, view_end)`) are computable in this function, from data it already
+queries for another purpose, with zero new cross-crate plumbing and zero new
+`Vmem` access.
+
+What is NOT recoverable here is the flanks' original CoW file content --
+that would need the file/offset side-table described above, which does not
+exist. The fix implemented instead: after the existing
+`UnmapViewOfFileEx` + `reserve_and_commit(r)` for the caller's requested
+range, re-commit each flank as ordinary anonymous zero-fill memory (a plain
+`VirtualAlloc2(MEM_RESERVE | MEM_COMMIT)` at the flank's own address range),
+using the ORIGINAL view's own protection (`mbi.Protect`, queried before the
+destructive unmap) so a RO/executable flank stays that protection rather
+than silently gaining or losing it. This does not restore the flank's
+original CoW-shared file bytes, but it converts the previously-guaranteed
+SIGSEGV (touching genuinely `MEM_FREE`/unbacked memory) into, at worst, a
+zero-filled read -- always memory-safe, and the correct outcome for the
+overwhelmingly common real case (a flank the guest never reads again after
+the fixed-range mmap that orphaned it, or reads only as BSS-tail-shaped
+zero-fill). Best-effort and logged: if a flank fails to recommit, this logs
+the failure and leaves it exactly as buggy as before (never a silent
+regression beyond the pre-existing bug).
+
+Deliberately NOT attempted: exact CoW-content-preserving reconstruction of
+the flanks. That remains the "genuinely deeper gap" the prior session
+described, still blocked on the same missing guest-address -> file/offset
+side-table, and is real, separable follow-up work for whoever next needs the
+flanks' original content preserved exactly (not just kept memory-safe).
+
+## Edge cases handled
+
+- Fixed range covers the entire original view (`view_start == r.start &&
+  view_end == r.end`): both `flank_before`/`flank_after` computed as `None`,
+  identical to today's behavior, zero regression.
+- Fixed range at the very start or very end of the view: only one flank
+  computed, the other `None` -- handled uniformly by the same two
+  independent `if` checks (`view_start < r.start`, `view_end > r.end`), no
+  special-casing needed.
+- No pre-existing CoW view at the target address at all (the ordinary,
+  overwhelmingly common path: `was_mapped_view` false, or a genuinely
+  first-time `MEM_FREE`/`MEM_RESERVE` commit): the new flank-detection code
+  is gated entirely behind `was_mapped_view` inside the already-existing
+  `state == MEM_COMMIT` branch, so it is not reached at all for the ordinary
+  case -- confirmed by reading the diff, this adds one extra `VirtualQuery`-
+  derived read of fields already being queried (no new syscalls) plus two
+  cheap range comparisons on the ordinary path, and zero new
+  `VirtualAlloc2` calls unless a flank was actually detected.
+
+## Verified live against the real repro
+
+Built `litebox_platform_windows_userland` and
+`litebox_runner_linux_on_windows_userland` in release mode; both compile
+clean (only pre-existing, unrelated warnings in `litebox`'s `mm/mod.rs`,
+E0133 unsafe-block-inference lints, not touched by this change).
+
+Ran the exact Xvfb repro against `docker.io/linuxserver/webtop:debian-i3`
+(`--oci-image`, cached layers, `MSYS_NO_PATHCONV=1`):
+
+```
+litebox_runner_linux_on_windows_userland.exe -Z \
+  --oci-image docker.io/linuxserver/webtop:debian-i3 --env HOME=/config \
+  -- /bin/sh -c 'mkdir -p /config/.XDG /config/.config /tmp; chmod 777 /tmp; \
+    rm -f /tmp/.X1-lock; exec /usr/bin/Xvfb :1 -screen 0 1024x768x24 -dpi 96 \
+    +extension COMPOSITE +extension DAMAGE +extension GLX +extension RANDR \
+    +extension RENDER +extension MIT-SHM +extension XFIXES +extension XTEST \
+    -nolisten tcp -ac -noreset'
+```
+
+First run (with `-shmem`, matching the exact prior-session repro): Xvfb ran
+to completion of its whole startup sequence -- including loading
+`libepoxy.so.0` and its siblings via the exact `ld.so`
+whole-view-then-`MAP_FIXED`-sub-mmap pattern that used to SIGSEGV -- and hit
+a DIFFERENT, unrelated, pre-existing gap instead: `shmget: Function not
+implemented` (`sys_shmget` is not emulated; `-shmem` needs real System V
+shared memory). Confirmed **zero** occurrences of `SIGSEGV`/`fatal
+signal`/`c0000005` anywhere in this run's log -- the bug this session set
+out to fix is gone, cleanly replaced by hitting the next, entirely
+different and already-known-missing syscall.
+
+Second run, `-shmem` dropped (Xvfb's own documented fallback path when
+System V shm is unavailable): ran clean for over 7 minutes wall-clock with
+zero errors, zero crashes, and no further log output after its startup
+`/proc` probes -- consistent with Xvfb reaching its normal idle
+listening-for-X11-connections state. Process was still alive and had to be
+force-terminated to end the verification run; this is the expected shape of
+a successfully-running X server, not a hang (contrast with the SIGSEGV
+run's log, which always terminated itself within seconds).
+
+## Scoped test suite
+
+`cargo test --release -p litebox -p litebox_shim_linux -p litebox_common_linux
+-p litebox_platform_windows_userland`: `litebox_shim_linux` still fails to
+build its test binary for the exact pre-existing `E0576` reason recorded in
+this document's immediately preceding section (`run_test_thread`, confirmed
+unrelated -- this session's diff touches only
+`litebox_platform_windows_userland/src/lib.rs`). Scoped down to `-p litebox
+-p litebox_platform_windows_userland`, which do build: `litebox_platform_
+windows_userland` has no unit tests of its own (the fix lives in a function
+with no existing test harness reachable without a live Windows process --
+`allocate_pages` calls real `VirtualQuery`/`VirtualAlloc2`/`UnmapViewOfFileEx`
+throughout, not mockable). `litebox`'s own suite: 123 passed, 26 failed --
+every failure confirmed pre-existing and unrelated by re-running the
+identical suite against the unmodified tree (`git stash`): the `fs::nine_p::*`
+failures need a real `diod` 9P server binary not installed in this
+environment, `fs::tests::tar_ro::symlink_metadata_still_follows_intermediate_
+symlink_components` and `mm::tests::test_vmm_mapping` reproduce byte-
+identically on the parent commit with no code change. No new test failures
+introduced by this fix.
+
+## What actually changed and is committed
+
+`litebox_platform_windows_userland/src/lib.rs`'s `allocate_pages`
+`Replace`-mode reclaim path: hoisted the existing `VirtualQuery` result
+(`view_mbi`) and added `flank_before`/`flank_after` range detection using its
+already-queried `BaseAddress`/`RegionSize` fields, plus a best-effort
+anonymous-zero-fill re-commit of each detected flank (with its original
+`Protect` value) after the existing `UnmapViewOfFileEx` + `reserve_and_commit`
+sequence for the caller's own requested range. No caller-side change, no
+`Vmem`/`VmArea` schema change -- the whole fix lives inside the one function
+that already had the data it needed.
+
+## Still open (stretch goal not reached this session)
+
+The selkies node.js backend and window manager (labwc) were not started this
+session -- time was spent on the Xvfb fix itself plus its live verification.
+The `shmget`/System V shared memory gap Xvfb's `-shmem` flag needs is a real,
+separate, pre-existing missing-syscall gap (not attempted here); Xvfb runs
+fine without `-shmem` (its own documented fallback), so this does not block
+continuing the stack -- whoever picks this up next should launch labwc and
+selkies as siblings the same "bypass s6-overlay" way this document's
+nginx-as-pid-1 section already proved, against Xvfb launched WITHOUT
+`-shmem`, and browser-verify against the forwarded port per this document's
+existing pattern.

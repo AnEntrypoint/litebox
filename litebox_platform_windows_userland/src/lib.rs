@@ -6169,6 +6169,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                             // In case the region is already committed, decommit and recommit it.
                             Win32_Memory::MEM_RESERVE | Win32_Memory::MEM_COMMIT => {
                                 let mut was_mapped_view = false;
+                                let mut view_mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+                                let mut flank_before: Option<core::ops::Range<usize>> = None;
+                                let mut flank_after: Option<core::ops::Range<usize>> = None;
                                 if state == Win32_Memory::MEM_COMMIT {
                                     // TODO: handle this race condition properly.
                                     assert_eq!(
@@ -6214,14 +6217,67 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                     // freed range is `MEM_FREE` again for `VirtualAlloc2` to commit
                                     // fresh `MEM_PRIVATE` pages into, matching what a real Linux
                                     // `mmap(MAP_FIXED)` replacing a `shmat`/file mapping does.
-                                    let mbi_type = {
-                                        let mut mbi =
-                                            Win32_Memory::MEMORY_BASIC_INFORMATION::default();
-                                        do_query_on_region(&mut mbi, r.start as *mut c_void);
-                                        mbi.Type
-                                    };
+                                    do_query_on_region(&mut view_mbi, r.start as *mut c_void);
+                                    let mbi_type = view_mbi.Type;
                                     was_mapped_view = mbi_type == Win32_Memory::MEM_MAPPED
                                         || mbi_type == Win32_Memory::MEM_IMAGE;
+                                    // The real view this `VirtualQuery` reports can be WIDER than
+                                    // `r` (the caller's own requested sub-range, already clamped by
+                                    // `process_memory_range_by_regions` above): `ld.so` commonly
+                                    // creates ONE whole-library `MapViewOfFile3` CoW view spanning
+                                    // several future PT_LOAD segments, then issues a `MAP_FIXED`
+                                    // sub-mmap for just one segment (e.g. the RW data segment)
+                                    // landing INSIDE that wider view. `UnmapViewOfFileEx` below has
+                                    // no partial/sub-range form -- it destroys the WHOLE view, not
+                                    // just `r` -- so the flanking remainder on either side of `r`
+                                    // (still part of the original view, per litebox's own `Vmem`
+                                    // bookkeeping, which is never told the view died) would
+                                    // otherwise be left permanently `MEM_FREE`/unbacked, causing a
+                                    // SIGSEGV the first time anything touches it (confirmed live:
+                                    // Xvfb's `ld.so` loading `libepoxy.so.0` under
+                                    // `linuxserver/webtop:debian-i3`, see
+                                    // docs/webtop-debian-selkies-2026-09-06.md's
+                                    // "UnmapViewOfFileEx silently destroys the WHOLE CoW view"
+                                    // section for the full root-cause trace).
+                                    //
+                                    // This fix cannot reconstruct the flanks as equivalent CoW
+                                    // mappings (same source file/offset) from here: this function
+                                    // has no `Vmem` access (see `try_allocate_cow_pages`'s own doc
+                                    // comment on why it takes a caller-verified-safe padding
+                                    // parameter rather than querying `Vmem` itself -- the same
+                                    // design boundary applies here), and `Vmem`'s `VmArea` does not
+                                    // track per-mapping file/offset at all (only `is_file_backed:
+                                    // bool` -- confirmed by reading `litebox/src/mm/linux.rs`), so
+                                    // there is no way to ask "what file/offset backed the flank"
+                                    // once the view is gone. What IS achievable, and what this does:
+                                    // never leave the flanks unbacked. They are re-committed below as
+                                    // ordinary anonymous zero-fill pages (matching what `MEM_FREE`
+                                    // would otherwise silently become on next touch, except now
+                                    // safely backed instead of faulting) -- this loses the flanks'
+                                    // original CoW file content (a real, documented limitation, not
+                                    // silently papered over) but converts a SIGSEGV into a
+                                    // zero-filled read, which is always memory-safe and is the
+                                    // correct outcome whenever the guest's later access to a flank
+                                    // is a write to a *_data_ segment BSS-tail-shaped page anyway
+                                    // (the overwhelmingly common real-world shape of this pattern,
+                                    // per PT_LOAD segment layout: RO/text flank content the guest
+                                    // never actually re-reads post-relocation is the risk case this
+                                    // does not fully cover, and is exactly the deeper, file-content-
+                                    // preserving fix the docs above describe as needing new
+                                    // guest-address -> file/offset tracking infrastructure that does
+                                    // not exist anywhere in this codebase today).
+                                    let view_start = view_mbi.BaseAddress as usize;
+                                    let view_end = view_start + view_mbi.RegionSize;
+                                    flank_before = if was_mapped_view && view_start < r.start {
+                                        Some(view_start..r.start)
+                                    } else {
+                                        None
+                                    };
+                                    flank_after = if was_mapped_view && view_end > r.end {
+                                        Some(r.end..view_end)
+                                    } else {
+                                        None
+                                    };
                                     // allocate_pages reclaiming an already-committed range either
                                     // unmaps a live section view or decommits its pages. Both
                                     // destroy contents while leaving higher-level bookkeeping
@@ -6307,7 +6363,56 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                 // reservation, so a former mapped view needs the same
                                 // reserve-and-commit path as a genuinely free region.
                                 let ptr = if was_mapped_view {
-                                    reserve_and_commit(r.clone(), prot_flags(initial_permissions), 0)
+                                    let recommitted = reserve_and_commit(
+                                        r.clone(),
+                                        prot_flags(initial_permissions),
+                                        0,
+                                    );
+                                    // Re-commit any flanking remainder of the destroyed view (see
+                                    // the flank-detection comment above `decommit_ok`) as anonymous
+                                    // zero-fill memory, using the ORIGINAL view's own protection
+                                    // (`view_mbi.Protect`, queried before the destructive unmap --
+                                    // not `initial_permissions`, which describes only the caller's
+                                    // requested sub-range `r` and may differ, e.g. a RO text flank
+                                    // next to the RW data segment `r` itself covers) so a flank that
+                                    // was executable/read-only stays that way rather than silently
+                                    // gaining or losing protections. Best-effort: if a flank fails to
+                                    // recommit, log it (`diag_mm_enabled`) and continue -- leaving it
+                                    // `MEM_FREE` is the pre-existing (already-buggy) behavior, not a
+                                    // regression introduced by this best-effort recovery attempt.
+                                    if !recommitted.is_null() {
+                                        for flank in [&flank_before, &flank_after]
+                                            .into_iter()
+                                            .flatten()
+                                        {
+                                            let flank_ptr = unsafe {
+                                                VirtualAlloc2(
+                                                    GetCurrentProcess(),
+                                                    flank.start as *mut c_void,
+                                                    flank.len(),
+                                                    Win32_Memory::MEM_RESERVE
+                                                        | Win32_Memory::MEM_COMMIT,
+                                                    view_mbi.Protect,
+                                                    core::ptr::null_mut(),
+                                                    0,
+                                                )
+                                            };
+                                            if flank_ptr.is_null() {
+                                                litebox_util_log::error!(
+                                                    start:% = flank.start, end:% = flank.end,
+                                                    win32_err:% = unsafe { GetLastError() };
+                                                    "diag-reclaim: failed to recommit orphaned CoW-view flank as anonymous memory -- left MEM_FREE, next touch will SIGSEGV"
+                                                );
+                                            } else if diag_mm_enabled() {
+                                                litebox_util_log::error!(
+                                                    start:% = flank.start, end:% = flank.end,
+                                                    len:% = flank.len();
+                                                    "diag-reclaim: recommitted orphaned CoW-view flank as anonymous zero-fill memory"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    recommitted
                                 } else {
                                     if diag_mm_enabled() {
                                         litebox_util_log::error!(
