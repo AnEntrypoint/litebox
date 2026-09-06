@@ -216,3 +216,102 @@ in the boot sequence -- this is genuinely the very first non-trivial syscall
 interaction of the whole container). The inbound-UDP-forwarding gap noted above will
 also need addressing before WebRTC video can reach a real browser, once boot
 progresses far enough to matter.
+
+## 2026-09-06, continued: the genuine CLONE_VM fix was already on `main` -- and still does not fix this
+
+Picked this up expecting to implement fix option 2 above (genuine temporary `CLONE_VM`
+sharing for `CLONE_VFORK`). Before writing any code, `grep`'d for `CLONE_VFORK`/
+`pm.duplicate` in `litebox_shim_linux/src/syscalls/process.rs` per this row's own
+standing instruction to read the current state first -- and found that fix **already
+implemented and committed**, apparently by a session that ran concurrently with or
+just after this doc's own initial boot-repro session and never cross-referenced it:
+commits `99a49a5` ("Implement genuine CLONE_VM address-space sharing for
+CLONE_VFORK", 2026-08-26) and `38231f0` ("Detach vfork()'d child's PageManager
+before ordinary exit, not just execve", 2026-08-28) -- both **before** this very
+doc's initial boot-repro session (2026-09-06), meaning that session hit the bug on a
+binary that already had the fix compiled in and did not realize it, or built from a
+stale binary. Neither this doc nor the PRD row's own history mentioned the fix
+existing, so this continuation re-discovered it via source inspection rather than
+being told.
+
+The implementation itself is well-designed and matches this row's own "NEXT STEP"
+sketch closely: `Process::pm` became `Mutex<Arc<PageManager>>`; a `CLONE_VFORK`
+clone (regardless of whether `CLONE_VM` is also set -- confirmed correct, since real
+`vfork()` sometimes issues just `CLONE_VFORK` alone, e.g. s6-overlay's own
+`preinit`-to-`s6-mkdir` clone, flags `0x4000`, no `CLONE_VM` bit) sets the child's
+`dest_pm` to `Arc::clone` of the parent's live `pm` instead of duplicating it;
+`Process::detach_pm_for_vfork_execve` swaps in a brand-new, empty `PageManager` at
+the top of `sys_execve`'s point-of-no-return section (and, per the second commit,
+also on ordinary `_exit`/thread-drop, covering the "child crashes/exits without
+execve" case this row's own task brief flagged as a real risk) -- so the child never
+touches the parent's live memory during its own execve or exit teardown.
+
+**Rebuilt fresh and re-ran the exact boot command from this doc's top section.**
+`cargo build --release` against the default `target/` failed with a Windows
+`Access is denied` removing the old `.exe` -- a genuinely unkillable zombie
+`litebox_runner_linux_on_windows_userland.exe` process (PID 7640, `Get-Process`
+reported `HasExited: True` yet `tasklist`/file-lock behavior said otherwise) was
+holding a handle; worked around by building into a separate `CARGO_TARGET_DIR`
+(`target-vforkfix/`) rather than fighting the zombie. **The identical crash from
+this doc's very first section reproduces byte-for-byte on top of the already-landed
+fix**: `s6-mkdir` (pid 3) still dies with `DIAG_MMAP failed ... error=MapError(AddressInUse)`
+/ `sys_execve: load_program failed after point of no return, killing process with
+SIGSEGV ... error=LoadError(Map(Errno(17 = EEXIST)))` at guest address `4194304`
+(`0x400000`). Full log: `.wfgy/webtop-debian/boot3.log`.
+
+**Root-caused precisely why the already-landed fix doesn't work**, via
+`allocate_pages: DIAG claim_range` correlation in the debug log:
+`litebox_platform_windows_userland` runs every guest "process" as an ordinary host
+**thread sharing one real Windows process's own address space** (the crate's own
+comments confirm this explicitly, lib.rs ~3993-4206) -- guest virtual addresses
+literally ARE host virtual addresses, with no per-guest-process real address-space
+isolation at all. This is the entire reason `fork()` needs `Vmem::duplicate()`'s
+address-relocation machinery to begin with. Genuine `CLONE_VM` sharing (same
+`Arc<PageManager>`, same real memory) is completely fine for the SHARING half of
+vfork's contract -- but the DETACH half is structurally impossible to satisfy in
+this model: `detach_pm_for_vfork_execve` swaps in a bookkeeping-empty
+`PageManager::new()`, but the REAL Windows memory the old shared `pm` had mapped
+(e.g. wherever `s6-overlay-suexec`'s own ELF was originally loaded, inherited
+transitively through the vfork chain to `s6-mkdir`) is never actually freed --
+it CAN'T be, because that same physical memory still legitimately belongs to the
+live, merely-suspended PARENT (`preinit`), which will resume using it once the
+child execve's or exits. So `s6-mkdir`'s own `NoReplace`-mode fixed mapping at its
+ET_EXEC link address genuinely, physically collides with real committed Windows
+memory -- `allocate_pages`'s `has_committed_page && NoReplace => AddressInUse` check
+(lib.rs ~6015-6018) consults only the OS's real page-commit state, never the
+`PageManager`/`CLAIMED_RANGES` bookkeeping this fix operates on -- so the collision
+happens one full layer below where a `PageManager`-object swap can ever reach.
+Traced further: there is no way to distinguish "memory only the detaching child's
+old view needed" from "memory the still-live parent needs kept", because before
+detach both processes held literally the same `Arc<PageManager>` (same allocation,
+same refcount) -- dropping the child's clone of that `Arc` on detach correctly
+leaves the parent's own reference (and the real memory it points to) fully intact,
+but there was never a child-exclusive subset of that memory to reclaim in the first
+place. A `PageManager`-level fix structurally cannot close this gap.
+
+**This means the real fix needs actual OS-level process separation for the vfork
+child once it detaches, not another address-space bookkeeping change** --
+`litebox_shim_linux`/`litebox_platform_windows_userland` already has exactly this
+mechanism, just not wired up for vfork: `spawn_cross_process_fork_child` (behind
+`LITEBOX_PROCESS_FORK=1`) spawns a REAL separate Windows process for a plain
+`fork()` child when its fd table is simple enough (`fd_complexity.beyond_stdio ==
+0`). This exact `s6-mkdir` repro fails that eligibility gate (`beyond_stdio=1`,
+confirmed in this session's own log) so it never reaches that path today even
+though it exists. The most promising next step for a dedicated follow-up session is
+investigating whether that mechanism can be extended (or a vfork-specific sibling
+built) to cover the vfork-detach-at-execve moment specifically, since vfork's own
+narrow contract (parent fully suspended, child only touches its own stack before
+execve/exit) may make its fd/register-transfer precondition easier to satisfy than
+general `fork()`'s.
+
+**No code was changed or reverted this session** -- the existing fix
+(99a49a5/38231f0) remains committed on `main`, is a correct and reasonable partial
+step (its bookkeeping/safety half is sound), just insufficient alone to fix the
+actual collision. Consistent with this row's own standing discipline (and this
+session's own task brief) against forcing a fourth fix attempt blind without full
+understanding: the real blocker (litebox's single shared real address space,
+previously unidentified by any prior session on this row) is now precisely located,
+which is genuine forward progress even without new code this pass. `.gm/prd.yml`'s
+`vfork-parent-wakes-during-nested-child-execve` row has the full technical
+trace. Full regression test suite (`cargo test --workspace`) was not run this
+session since no code changed.
