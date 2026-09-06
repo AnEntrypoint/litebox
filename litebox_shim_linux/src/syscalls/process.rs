@@ -3164,6 +3164,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // `fs_base` computed just above, so the cross-process child can call
             // `arch_prctl(SetFs(..))` on itself before ever resuming guest code -- see
             // `diag_process_fork_task_resume_probe`'s use of this field.
+            // Pass 158: make the gate's decision LOUD rather than silent. A silent fall-through
+            // here has already produced one false historical conclusion (the 94th-pass claim that
+            // `LITEBOX_PROCESS_FORK=1` "reproduced the crash IDENTICALLY", recorded in
+            // `docs/AGENTS_ARCHIVE_2026-09-03.md` -- that repro held a socket, so `beyond_stdio`
+            // was nonzero and the cross-process path was never actually entered at all; the run
+            // measured the ordinary thread-based relocating fork and attributed the result to a
+            // mechanism it never exercised). Anyone setting `LITEBOX_PROCESS_FORK=1` and reading
+            // the log can now see, per fork() call, whether the path was taken or why not.
+            // See `advisor/ADVISORY-002-d-zero-fork.md` sections 1 and 1.5.
+            if fd_complexity.beyond_stdio != 0 {
+                litebox_util_log::warn!(
+                    tid:% = self.tid,
+                    beyond_stdio:% = fd_complexity.beyond_stdio,
+                    total_alive:% = fd_complexity.total_alive;
+                    "clone: cross-process (D==0) fork() NOT eligible -- guest holds fd(s) at or \
+                     above 3 and none of this shim's fd subsystems are backed by a real Windows \
+                     HANDLE; falling back to the thread-based relocating fork (which is known \
+                     incompatible with glibc safe-linking -- see ADVISORY-001 section 3N)"
+                );
+            }
             if fd_complexity.beyond_stdio == 0
                 && let Some(mut full_gprs) = cross_process_gprs
                 && {
