@@ -48,7 +48,8 @@ use litebox_common_linux::{
     DRM_MODE_OBJECT_PLANE, DRM_MODE_PAGE_FLIP_EVENT, DRM_MODE_PROP_BLOB, DRM_MODE_PROP_ENUM,
     DRM_PRIME_CAP_EXPORT, DRM_PRIME_CAP_IMPORT, DrmAuth, DrmEvent, DrmEventVblank, DrmGetCap,
     DrmModeCardRes, DrmModeConnectorSetProperty, DrmModeCreateDumb, DrmModeCrtc,
-    DrmModeCrtcPageFlip, DrmModeDestroyDumb, DrmModeFbCmd, DrmModeFbCmd2, DrmModeGetBlob,
+    DrmModeCrtcPageFlip, DrmModeDestroyDumb, DrmModeFbCmd, DrmModeFbCmd2, DrmModeFbDirtyCmd,
+    DrmModeGetBlob,
     DrmModeGetConnector, DrmModeGetEncoder, DrmModeGetPlane, DrmModeGetPlaneRes, DrmModeGetProperty,
     DrmModeMapDumb,
     DrmModeModeinfo, DrmModeObjGetProperties, DrmModePropertyEnum, DrmModeSetPlane,
@@ -79,6 +80,24 @@ pub fn set_drm_trace(enabled: bool) {
 }
 
 static DRM_TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether `DRM_IOCTL_MODE_DIRTYFB` actually presents. See `DrmSubsystem::dirty_fb`.
+pub(crate) fn dirty_fb_enabled() -> bool {
+    DIRTY_FB_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set by the runner from `LITEBOX_NO_DIRTYFB`, so one binary can be A/B'd with and without
+/// DIRTYFB presentation. This crate is `#![no_std]` and cannot read the environment itself --
+/// a `std::env` read here compiles to nothing, or fails to compile, rather than silently
+/// defaulting; the flag must be pushed in from the runner, which does have an environment.
+pub fn set_dirty_fb_enabled(enabled: bool) {
+    DIRTY_FB_ENABLED.store(enabled, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Defaults to `true`: DIRTYFB presenting is the intended behaviour, and the env var only
+/// turns it OFF. A default of `false` would make an unset runner silently disable it.
+static DIRTY_FB_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
 
 
 /// The virtual display's fixed mode. 1920x1080@60 is a reasonable, widely-compatible default
@@ -1349,6 +1368,58 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         );
         req.fb_id = fb_id;
         ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        Ok(0)
+    }
+
+    /// `DRM_IOCTL_MODE_DIRTYFB` -- the guest reports damaged regions of the framebuffer it is
+    /// ALREADY scanning out, instead of flipping to a different one.
+    ///
+    /// # Why this exists
+    ///
+    /// Presentation here is driven solely by `PAGE_FLIP` (see this module's own header): every
+    /// flip hands the active framebuffer's pixels to the host `wgpu` surface. But Xorg's
+    /// `modesetting` driver only page-flips when it has a second buffer to flip to. With a single
+    /// framebuffer and no compositor -- the configuration this runs in -- its steady state is to
+    /// draw into its shadow buffer and flush the damage with THIS ioctl. Unhandled, the guest
+    /// paints continuously and nothing ever reaches the display: a healthy X server, a client that
+    /// connects and succeeds, and no frames after startup.
+    ///
+    /// # Why it is smaller than `page_flip`
+    ///
+    /// `page_flip` must retarget the CRTC (`*self.crtc_fb.lock() = Some(req.fb_id)`) because the
+    /// scanout framebuffer is CHANGING. A damage flush does not change it -- `fb_id` is already
+    /// the current scanout -- so this only has to notify the presenter. Deliberately does NOT
+    /// touch `crtc_fb`: doing so on a stale or unrelated `fb_id` would silently repoint the
+    /// scanout, which is exactly the "different fb being scanned out than the one being drawn
+    /// into" failure `page_flip`'s own `diag-drm-flip` comment exists to distinguish.
+    ///
+    /// Clip rectangles (`clips_ptr`/`num_clips`) are ignored: the whole framebuffer is presented.
+    /// A superset of the damaged region is always correct, merely not minimal.
+    ///
+    /// Set `LITEBOX_NO_DIRTYFB=1` to make this a no-op returning success, so one binary can be
+    /// A/B'd with and without it (matching `LITEBOX_NO_PLACEMENT_FLOOR` /
+    /// `LITEBOX_NO_MAPPING_GUARD_GAP`).
+    pub(crate) fn dirty_fb(
+        &self,
+        platform: &Platform,
+        ptr: UserPtr<DrmModeFbDirtyCmd>,
+    ) -> Result<u32, Errno> {
+        let req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        // Always-on, `error!` level: every repro runs `LITEBOX_LOG=error`, and this line answers
+        // "does Xorg actually issue DIRTYFB at all" -- the question that decides whether this
+        // path matters. A diagnostic that is invisible at the level investigations actually run
+        // at has repeatedly cost real time in this codebase.
+        litebox_util_log::error!(
+            fb_id:% = req.fb_id, num_clips:% = req.num_clips;
+            "DIAG_DIRTYFB"
+        );
+        if !self.framebuffers.lock().contains_key(&req.fb_id) {
+            return Err(Errno::ENOENT);
+        }
+        if !dirty_fb_enabled() {
+            return Ok(0);
+        }
+        self.notify_flip_callback(platform, req.fb_id);
         Ok(0)
     }
 

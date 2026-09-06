@@ -393,6 +393,16 @@ fn spawn_boot_lock_heartbeat(lock_path: PathBuf) {
 /// API call) to decide staleness -- a real boot is observed to take at most a few minutes even
 /// for a very large image, so anything older than that is safe to treat as abandoned.
 fn acquire_boot_lock() -> Result<BootLock> {
+    // Explicit, narrow escape hatch for deliberate multi-runner testing (e.g. an Xorg server in
+    // one runner and an X client connecting to it via --publish in another -- both need to be
+    // their own pid 1, so a single-runner arrangement can't express this). The caller is
+    // responsible for the resulting memory footprint (a full OCI image load is several GB); this
+    // does not relax anything else about the lock's own correctness, it just skips acquiring it.
+    if std::env::var_os("LITEBOX_ALLOW_CONCURRENT_BOOT").is_some() {
+        return Ok(BootLock {
+            path: PathBuf::new(),
+        });
+    }
     // Short enough that a watchdog-killed run's stale lock doesn't block the next boot for long,
     // but safe for a genuinely long-running live boot because of the heartbeat thread spawned
     // below, which keeps re-touching this file's mtime for as long as this process is actually
@@ -463,6 +473,15 @@ fn acquire_boot_lock() -> Result<BootLock> {
 }
 
 pub fn run(cli_args: CliArgs) -> Result<()> {
+    // `litebox` is `#![no_std]` and cannot read an environment variable itself, so the runner
+    // forwards this one on its behalf, here -- before any guest mapping is placed. It disables the
+    // inter-mapping guard gap (see `litebox::mm::linux::MAPPING_GUARD_GAP`) so the gap can be A/B'd
+    // on ONE binary, the same way `LITEBOX_NO_PLACEMENT_FLOOR` is handled on the platform side.
+    // Comparing two separately-built binaries confounds the measurement with every unrelated
+    // difference between them, which has already produced at least one wrong conclusion tonight.
+    litebox::mm::linux::set_mapping_guard_gap_disabled(
+        std::env::var_os("LITEBOX_NO_MAPPING_GUARD_GAP").is_some(),
+    );
     // Real boot lock, not a remembered rule: two concurrent litebox_runner processes
     // sharing this host silently starve each other (host memory/CPU contention),
     // producing a symptom -- truncated log, no crash, no exit -- that is
@@ -483,6 +502,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // presenting an empty buffer.
     litebox_shim_linux::syscalls::set_drm_trace(
         std::env::var_os("LITEBOX_DRM_TRACE").is_some(),
+    );
+
+    // Same `no_std` reason as `set_drm_trace` above: the shim cannot read the environment, so
+    // translate `LITEBOX_NO_DIRTYFB=1` here. Note the sense -- the flag DISABLES DIRTYFB
+    // presentation, so an unset environment leaves it ENABLED, which is the intended behaviour.
+    // Gating it this way lets one binary be A/B'd with and without DIRTYFB, matching
+    // `LITEBOX_NO_PLACEMENT_FLOOR` and `LITEBOX_NO_MAPPING_GUARD_GAP`.
+    litebox_shim_linux::syscalls::set_dirty_fb_enabled(
+        std::env::var_os("LITEBOX_NO_DIRTYFB").is_none(),
     );
 
     litebox_platform_windows_userland::install_memcpy_watch_from_env();

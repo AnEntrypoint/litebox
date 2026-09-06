@@ -956,6 +956,19 @@ pub const DRM_IOCTL_MODE_SETPLANE: u32 = 0xC030_64B7;
 pub const DRM_IOCTL_MODE_ADDFB: u32 = 0xC01C_64AE;
 pub const DRM_IOCTL_MODE_ADDFB2: u32 = 0xC068_64B8;
 pub const DRM_IOCTL_MODE_PAGE_FLIP: u32 = 0xC018_64B0;
+
+/// `DRM_IOCTL_MODE_DIRTYFB` -- the guest reports damaged regions of a framebuffer that is
+/// ALREADY being scanned out, rather than flipping to a different one.
+///
+/// Xorg's `modesetting` driver uses this, not `PAGE_FLIP`, whenever it is not double-buffering:
+/// with a single framebuffer and no compositor it draws into its shadow buffer and then flushes
+/// the damage with this ioctl. Without it the guest can paint continuously and nothing ever
+/// reaches the host surface, because presentation is driven solely by `PAGE_FLIP`.
+///
+/// Encoding derived from `DRM_IOCTL_MODE_PAGE_FLIP` above (`nr` `0xB0`, 24-byte payload):
+/// `DIRTYFB` is `nr` `0xB1` and `struct drm_mode_fb_dirty_cmd` is also 24 bytes, so only the
+/// `nr` byte differs.
+pub const DRM_IOCTL_MODE_DIRTYFB: u32 = 0xC018_64B1;
 /// `DRM_IOCTL_VERSION = DRM_IOWR(0x00, struct drm_version)`. `nr`/struct shape fetched live from
 /// the real kernel `drm.h` (`torvalds/linux` master), not guessed; `size=64` is `sizeof(struct
 /// drm_version)` on the LP64 ABI litebox targets (3 `int`s + 4 bytes of compiler-inserted padding
@@ -1641,6 +1654,21 @@ pub struct DrmModeCrtcPageFlip {
     pub user_data: u64,
 }
 
+/// `struct drm_mode_fb_dirty_cmd` (`DRM_IOCTL_MODE_DIRTYFB`).
+///
+/// `clips_ptr` points at `num_clips` `drm_clip_rect`s in guest memory. This shim ignores them
+/// and treats every damage report as covering the whole framebuffer: a superset of the damaged
+/// region is always correct to present, merely not minimal.
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmModeFbDirtyCmd {
+    pub fb_id: u32,
+    pub flags: u32,
+    pub color: u32,
+    pub num_clips: u32,
+    pub clips_ptr: u64,
+}
+
 /// `DRM_MODE_PAGE_FLIP_EVENT` flag bit -- caller wants a `DRM_EVENT_FLIP_COMPLETE` event queued
 /// for delivery via `read()` on the DRM device fd once the flip completes.
 pub const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
@@ -1875,6 +1903,7 @@ pub enum IoctlArg {
     DrmModeAddFb2(UserPtrMut<DrmModeFbCmd2>),
     /// `DRM_IOCTL_MODE_PAGE_FLIP`.
     DrmModePageFlip(UserPtr<DrmModeCrtcPageFlip>),
+    DrmModeDirtyFb(UserPtr<DrmModeFbDirtyCmd>),
     /// `DRM_IOCTL_MODE_GETPLANERESOURCES` -- enumerate the virtual card's plane object IDs
     /// (two-call size-probe pattern, see [`DrmModeGetPlaneRes`]'s doc comment).
     DrmModeGetPlaneResources(UserPtrMut<DrmModeGetPlaneRes>),
@@ -4182,6 +4211,7 @@ impl SyscallRequest {
                         DRM_IOCTL_MODE_ADDFB => IoctlArg::DrmModeAddFb(ctx.sys_req_ptr(2)),
                         DRM_IOCTL_MODE_ADDFB2 => IoctlArg::DrmModeAddFb2(ctx.sys_req_ptr(2)),
                         DRM_IOCTL_MODE_PAGE_FLIP => IoctlArg::DrmModePageFlip(ctx.sys_req_ptr(2)),
+                        DRM_IOCTL_MODE_DIRTYFB => IoctlArg::DrmModeDirtyFb(ctx.sys_req_ptr(2)),
                         DRM_IOCTL_MODE_GETPLANERESOURCES => {
                             IoctlArg::DrmModeGetPlaneResources(ctx.sys_req_ptr(2))
                         }

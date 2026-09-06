@@ -4557,6 +4557,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             | IoctlArg::DrmModeAddFb(..)
             | IoctlArg::DrmModeAddFb2(..)
             | IoctlArg::DrmModePageFlip(..)
+            | IoctlArg::DrmModeDirtyFb(..)
             | IoctlArg::DrmModeGetPlaneResources(..)
             | IoctlArg::DrmModeGetPlane(..)
             | IoctlArg::DrmModeSetPlane(..)
@@ -4970,6 +4971,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .drm
                     .page_flip(self.global.platform, &self.global.boot_time, *ptr)
             }
+            IoctlArg::DrmModeDirtyFb(ptr) => self.global.drm.dirty_fb(self.global.platform, *ptr),
             IoctlArg::DrmModeGetPlaneResources(ptr) => self.global.drm.get_plane_resources(*ptr),
             IoctlArg::DrmModeGetPlane(ptr) => self.global.drm.get_plane(*ptr),
             IoctlArg::DrmModeSetPlane(ptr) => self.global.drm.set_plane(*ptr),
