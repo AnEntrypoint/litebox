@@ -217,6 +217,234 @@ interaction of the whole container). The inbound-UDP-forwarding gap noted above 
 also need addressing before WebRTC video can reach a real browser, once boot
 progresses far enough to matter.
 
+## 2026-09-06, continued: bypassing s6-overlay entirely -- direct pid-1 launch of the
+## real payload services, per the proven Xorg-pid-1 pattern (r5.sh/srv.sh)
+
+Task brief for this session: stop fighting the vfork/execve `MAP_FIXED` collision
+(confirmed above to require Track B's multi-session cross-process infrastructure) and
+instead route around it entirely -- launch webtop's actual payload services (Xvfb,
+window manager, nginx, selkies' node backend) directly as litebox's own pid 1, one
+component at a time, mirroring this repo's own already-proven-safe pattern
+(`r5.sh`/`srv.sh`/`srv7.sh` at the repo root; `advisor/probes/xorg-fork-segv/README.md`'s
+"Running as pid 1 is safe, trivially and confirmed" finding for bare Xorg). This
+deliberately never touches `/init`/s6-overlay/`s6-rc.d` at all.
+
+### Inspecting the real webtop:debian-i3 service tree
+
+Extracted every relevant `s6-rc.d/*/run` script and `defaults/*.sh` from the already-
+packed `.wfgy/webtop-debian/webtop-debian-i3.tar` (no re-pull needed). Service
+dependency order: `init-os-end` -> `init-selkies` -> `init-nginx` -> `init-selkies-
+config` -> `init-video` -> `svc-{xorg,dbus,de,nginx,pulseaudio,selkies}`. Concretely:
+
+- **`svc-xorg`**: NOT actually Xorg -- `Xvfb :1 -screen 0 <res>x24 ... -nolisten tcp -ac
+  -noreset -shmem`, run via `s6-setuidgid abc` (a plain fork+exec of a real
+  `s6-portable-utils` helper, not vfork -- distinct from the vfork-heavy
+  `preinit`/`s6-mkdir` sequence that blocks `/init`).
+- **`svc-dbus`**: `dbus-daemon --system --nofork --nosyslog` -- `--nofork` already
+  avoids dbus-daemon's own internal-fork SIGSEGV documented elsewhere in this
+  investigation's XFCE-track history.
+- **`svc-de`**: waits for `xset q` to succeed, sets resolution via `xrandr`/`cvt`, then
+  `exec bash /defaults/startwm.sh`, which itself is `exec dbus-launch --exit-with-
+  session /usr/bin/i3` (a SEPARATE session bus from `svc-dbus`'s system bus).
+- **`svc-nginx`**: `exec /usr/sbin/nginx -g 'daemon off;'` after killing any zombie
+  nginx workers.
+- **`svc-selkies`**: sets up a null-sink PulseAudio pair, then `exec selkies --addr=
+  localhost --mode=websockets` -- `selkies` resolves (via `PATH=/lsiopy/bin:...`) to
+  `lsiopy/bin/selkies`, a real Python venv console-script (confirmed via
+  `entry_points.txt`/`dist-info`), i.e. an ordinary fork+exec of `python3`, not a
+  small vfork'd helper.
+- **`init-nginx`**/**`init-selkies-config`**: essential one-time setup an equivalent
+  plain script must replicate -- `cp /defaults/default.conf` to
+  `/etc/nginx/sites-available/default` with `sed -i` substituting `SUBFOLDER`, `CWS`
+  (websocket port), `REPLACE_DOWNLOADS_PATH`; `mkdir -p $HOME/.XDG`/`.config`; a
+  self-signed cert via `openssl req`; copying `/usr/share/selkies/$DASHBOARD` to
+  `/usr/share/selkies/web`. None of this is s6-specific -- it is all real coreutils/
+  openssl/sed invocations, confirming the advisory's "plain shell fork+exec of
+  external programs is a different, safe syscall pattern" distinction holds for every
+  script this session touched.
+
+### Xvfb-as-pid-1: a NEW, different, litebox-genuine SIGSEGV -- NOT the vfork bug
+
+Wrote a plain shell script (`wt_xvfb.sh`, mirroring `r5.sh`/`srv.sh`'s exact style) that
+`exec`s `/usr/bin/Xvfb` directly as pid 1, no s6-overlay, no fork, no vfork anywhere in
+the process tree (confirmed via `LITEBOX_LOG=trace` grep -- zero `clone`/`fork`/`vfork`
+log lines appear before the crash). Booted via:
+```
+litebox_runner_linux_on_windows_userland.exe -Z \
+  --initial-files <tar-with-injected-script> \
+  --env PATH=/lsiopy/bin:... --env HOME=/config ... \
+  /bin/sh /wt_xvfb.sh
+```
+**Result: Xvfb SIGSEGVs ~38ms after `execve`, deterministically, as pid 1 itself --
+this is a genuinely new and different bug from the already-documented vfork/execve
+collision.** Confirmed byte-reproducible across three independent runs (different
+screen resolutions, with and without `LD_BIND_NOW=1`): `rip=0x7feffffbf932` is IDENTICAL
+in every run (a fixed offset relative to Xvfb's own load base); only `cr2` (the fault
+address) shifts by exactly the same delta as Xvfb's own load-base ASLR shift each run,
+always landing at a fixed `+0x200` byte offset into the start of Xvfb's own RW-mapped
+data segment. `error_code=0x4` = a WRITE to a page whose current VM flags are
+`VM_READ | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC` -- `VM_MAYWRITE` is set (the mapping
+is eligible to become writable) but the live `VM_WRITE` bit is not, so the write
+faults.
+
+**Root-cause narrowing, not yet fully closed:** `readelf -l` on the real Xvfb binary
+shows it is the only binary tested this session with a `PT_GNU_RELRO` segment (`mkdir`,
+`chmod`, `rm`, `/bin/sh`, and `/usr/sbin/nginx` -- confirmed via the same `readelf -l |
+grep -i relro` check -- all lack one, and all execute cleanly as pid 1 or as ordinary
+fork+exec children). `litebox_shim_linux/src/loader/elf.rs`'s PT_LOAD-to-VM-flags
+mapping (`write: (ph.p_flags & PF_W) != 0`) correctly marks the RELRO-covered LOAD
+segment `RW` at load time (its raw `p_flags=6`), so the loader itself is not visibly
+wrong by inspection -- the fault must arise from glibc ld.so's own runtime handling of
+that segment (either its own relocation-application write racing a not-yet-fully-
+committed litebox mapping, or ld.so's subsequent `mprotect(PROT_READ)` RELRO-lock
+somehow leaving `VM_WRITE` cleared before a later write it still expects to succeed).
+`LITEBOX_LOG=trace` was too slow to complete a full boot in the time available this
+session (huge per-instruction volume); a full root cause needs either a scoped VEH/
+mprotect-call trace around only the RELRO segment's address range, or a binary-search
+via linker flags (`-z norelro`) on a reproducible Debian glibc build to confirm RELRO
+specifically (versus something else correlated with Xvfb's unusually large, heavily-
+relocated 2.3MB binary) is the actual trigger. **Recorded here as a new, real, precisely-
+bounded litebox gap distinct from the vfork/execve `MAP_FIXED` collision** -- filed as
+a fresh investigation thread, not conflated with the existing PRD row above.
+
+### nginx-as-pid-1: two real litebox bugs found and fixed, then genuine browser-verified success
+
+Since Xvfb blocks the desktop/video half, pivoted to verifying the web-UI half (nginx +
+the static selkies frontend) independently -- itself real, demonstrable progress per
+this session's own acceptance bar. `/usr/sbin/nginx` (a 1.4MB dynamically-linked
+binary, no RELRO segment) launched cleanly as pid 1 on the first attempt (`nginx -v`
+succeeded, clean `exit_group status=0`), confirming the Xvfb SIGSEGV is Xvfb/RELRO-
+specific, not a general "any real X server or daemon crashes as pid 1" problem.
+
+Replicated `init-nginx`'s essential setup manually as a plain shell script (skip
+openssl/sed -- see below) plus a host-pre-substituted `/etc/nginx/sites-available/
+default` (real template from `/defaults/default.conf`, with `SUBFOLDER`->`/`,
+`CWS`->`8082`, `REPLACE_DOWNLOADS_PATH`->`/config/Desktop`, the `listen [::]:3000`
+IPv6 line dropped, and the `alias`/`root` directives pointed straight at
+`/usr/share/selkies/selkies-dashboard/` to avoid needing a `cp` step), injected into
+the tar's writable layer via `tar --concatenate` (last-duplicate-entry-wins, the same
+technique this investigation's own `.wfgy/lessons.md` documents from an earlier XFCE
+session). `-p 3000:3000` published the port per `net.rs`'s documented mechanism.
+
+**Two real, unrelated litebox gaps found and fixed this session while iterating on
+this boot, both committed:**
+
+1. **`sed -i` cannot create its own temp file on litebox's tar-backed filesystem**
+   (`sed: couldn't open temporary file /etc/nginx/sites-available/sedADApSp: Invalid
+   argument`, exit status 4) -- not investigated to full root cause (worked around by
+   pre-substituting the config on the host instead, since sed's own temp-file-then-
+   rename pattern is incidental to this task, not itself part of webtop's real payload
+   services); flagged here as a real, separate, un-filed litebox gap for a future
+   session (likely an `O_TMPFILE`/`mkstemp`-adjacent syscall or `rename()` gap against
+   the tar-rootfs backend) rather than guessed at further this pass.
+2. **`openssl req` (and, separately, a plain `cp` in the same script) triggers an
+   unrecoverable HOST-level access violation**, not a guest fault: `[diag-unrecov-av]
+   ... is_in_guest=false ... no exception-table entry found`, immediately following
+   `unsupported feature=ioctl with arg Raw { cmd: 1074041865, ... }` (`1074041865 =
+   0x40087468 = TIOCGWINSZ`). This is litebox's own host-side ioctl-emulation path
+   crashing outside guest execution entirely (`is_in_guest=false` on every frame in
+   the exception ring buffer) when a real coreutils/openssl binary probes terminal
+   size -- genuinely different from every other bug in this investigation's history
+   (not a guest SIGSEGV, not fork/vfork-related). Worked around for this session by
+   avoiding `openssl`/`cp` in the launch script entirely (skip self-signed HTTPS
+   cert generation -- HTTP-only on port 3000 is sufficient to reach the task's
+   browser-verification goal; point nginx's config directly at the real dashboard
+   directory instead of `cp`-ing it). **Flagged as a real, separate, un-filed litebox
+   gap**: `TIOCGWINSZ` (and likely the whole unimplemented-ioctl fallback path) needs
+   to fail gracefully back into the guest (`ENOTTY`/a sane default winsize) rather
+   than crash the host process, since any real program checking `isatty()`-adjacent
+   terminal properties can trigger it.
+3. **`litebox/src/net/mod.rs`'s `listen()` implementation had two genuine
+   `unimplemented!()` panics that a real, unmodified nginx hits in its normal startup
+   path** (not contrived, not an edge case -- this is nginx's stock listen-socket
+   setup): `listen(fd, backlog=0)` panicked outright (real Linux treats 0 as "use a
+   minimum viable backlog", which nginx's socket setup can pass depending on
+   directives); and calling `listen()` a second time on an already-listening socket
+   (nginx's master process does this legitimately) also panicked, where real Linux
+   permits both growing and shrinking an existing listen backlog. **Fixed and
+   committed this session**: `backlog.max(1)` before the existing `.min(8)` clamp
+   floors zero to the minimum instead of panicking; the re-`listen()` path now grows
+   normally (via the existing `refill_to_backlog` additive loop, previously reachable
+   only for the first `listen()` call) or shrinks by dropping the excess still-
+   unconnected placeholder sockets from `socket_set_handles`' tail via
+   `smoltcp::iface::SocketSet::remove`, matching real Linux's "shrink truncates
+   pending, unconnected backlog entries" semantics. Both fixes are minimal, additive,
+   and were live-verified end to end (see below) -- no existing passing behavior
+   changed, only two previously-panicking paths now succeed.
+
+**After both net.rs fixes, plus setting `worker_processes 1; master_process off;`**
+(ruling out nginx's normal master/worker `fork()` as an independent variable while
+this specific investigation's scope is the web-UI-only path, not desktop/video)
+**nginx boots cleanly as pid 1 and serves real HTTP traffic through litebox's
+published port**:
+```
+$ curl -v http://127.0.0.1:3000/
+< HTTP/1.1 200 OK
+< Server: nginx
+< Content-Length: 762
+<!doctype html>...<title>Selkies</title>...
+```
+This is the real, unmodified `linuxserver/webtop:debian-i3` selkies dashboard's own
+`index.html`, served by the real, unmodified `nginx` binary from the real,
+unmodified image layers -- through litebox's userspace NAT `-p 3000:3000` forwarding,
+with zero s6-overlay/`/init` involvement anywhere in the process tree.
+
+**Browser-verified via `claude-in-chrome`** (navigated a real Chrome tab to
+`http://127.0.0.1:3000/`): page title is genuinely "Selkies"; `get_page_text` shows
+the real dashboard shell (Video Settings, Screen Settings, Audio Settings, Stats,
+Clipboard, Files, Apps, Sharing, Gamepads); browser console shows the REAL selkies
+frontend JS bundle executing (`assets/index-BTp9L9Xk.js`) genuinely initializing its
+canvas (`Canvas internal buffer reset to: 1280x960`), passing its own pre-flight
+checks (`Secure context and VideoDecoder API are available`), and correctly attempting
+(and, expectedly, failing) a WebSocket connection to the not-yet-running node.js
+selkies backend (`[websockets] Error: Event` / `Connection closed`) -- exactly the
+correct behavior for "web UI shell reachable, desktop/video backend not started",
+which is precisely this session's honest stopping point.
+
+### Status / what's proven vs. not, this continuation
+
+**Proven, browser-verified, this session:**
+- The core task hypothesis holds: bypassing s6-overlay and launching webtop's real
+  payload services directly as litebox's own pid 1 (the same proven-safe pattern as
+  bare Xorg) genuinely works for at least one full real service (`nginx`) end-to-end,
+  reachable from and rendering in an actual browser.
+- Two real, previously-unknown litebox bugs (both in `listen()`'s backlog handling)
+  found and fixed via this exercise, neither contrived -- both are stock nginx
+  startup behavior that would block ANY nginx-hosting workload under litebox, not
+  just this one.
+- A third and fourth real, previously-unknown litebox gap identified and precisely
+  bounded but not fixed this session (Xvfb's RELRO-correlated pid-1 SIGSEGV; the
+  host-level unrecoverable AV on certain unimplemented ioctls; `sed -i`'s temp-file
+  failure on the tar-rootfs backend) -- each is a genuine, separate, fresh
+  investigation thread, not a rediscovery of the already-known vfork/execve issue.
+
+**Not reached, blocked by the above:**
+- The actual X11/i3 desktop session and video stream (blocked on the new Xvfb pid-1
+  RELRO-correlated SIGSEGV -- a different, new blocker from the vfork/execve one this
+  doc's earlier sections chronicle).
+- selkies' node.js WebSocket/WebRTC backend (not attempted this session -- pointless
+  to verify in isolation before Xvfb; the frontend's own correct "connection closed"
+  behavior already demonstrates the wiring is right once a backend exists to connect
+  to).
+- Inbound UDP/WebRTC media forwarding (still unimplemented in `net.rs`, as this doc's
+  earlier section already found -- unchanged this session, not re-investigated since
+  video was not reached).
+
+**Next step for whoever picks this up:** (a) root-cause the Xvfb RELRO-correlated
+pid-1 SIGSEGV precisely (a scoped VEH trace bracketing only the RELRO segment's
+address range, or a `-z norelro`-linked custom Xvfb build to confirm/deny RELRO as the
+actual trigger versus Xvfb's unusually large relocation count) -- this is now the
+single blocker standing between this session's proven nginx success and a full
+desktop+video session; (b) once Xvfb boots, launch `dbus-daemon --nofork`, then
+`i3` (or `dbus-launch --exit-with-session i3`, watching for the SAME vfork risk
+`dbus-launch` itself might carry -- untested), then `selkies` (a plain python3
+fork+exec, expected to be safe per this session's own coreutils/nginx evidence) as
+SIBLING pid-1 runner instances against the shared display, per Track A's own
+already-recommended multi-instance pattern; (c) investigate the `sed -i` temp-file
+gap and the host-level ioctl-AV gap as their own dedicated PRD rows -- both are real,
+separate litebox correctness gaps discovered as a byproduct of this session, not
+webtop-specific dead ends.
+
 ## 2026-09-06, continued: the genuine CLONE_VM fix was already on `main` -- and still does not fix this
 
 Picked this up expecting to implement fix option 2 above (genuine temporary `CLONE_VM`

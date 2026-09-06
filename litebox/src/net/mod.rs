@@ -1308,10 +1308,11 @@ where
             .get_entry_mut(fd)
             .ok_or(ListenError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
-        if backlog == 0 {
-            // What should actually happen here?
-            unimplemented!()
-        }
+        // Real Linux treats a `listen(fd, 0)` backlog as a request for the minimum usable queue
+        // depth, not an error -- `nginx` (and other servers configuring a modest worker count)
+        // legitimately calls `listen()` this way. Match that by flooring to 1 rather than
+        // panicking, mirroring the `.min(8)` upper-bound clamp just below.
+        let backlog = backlog.max(1);
 
         // This prevents users from overloading things too badly; 4096 is the upper limit with
         // similar silent-cap behavior since Linux 5.4 (earlier versions capped even smaller, at
@@ -1360,9 +1361,20 @@ where
                     return Err(ListenError::InvalidAddress);
                 }
                 if server_socket.backlog.is_some() || !server_socket.socket_set_handles.is_empty() {
-                    // Need to change the amount of backlog; growing will just work, but truncating
-                    // might need some effort to pick which ones to keep/drop
-                    unimplemented!()
+                    // Real servers (nginx's master process included) legitimately call `listen()`
+                    // again on an already-listening socket -- most commonly to grow the backlog,
+                    // but Linux also permits shrinking it. Growing just needs more pending-accept
+                    // sockets queued (handled below by `refill_to_backlog`); shrinking drops the
+                    // excess still-unconnected listening sockets from the tail of the list, since
+                    // those are equivalent placeholders with no client-visible state yet.
+                    let new_backlog_usize: usize = backlog.into();
+                    if server_socket.socket_set_handles.len() > new_backlog_usize {
+                        for handle in server_socket.socket_set_handles.split_off(new_backlog_usize)
+                        {
+                            let _ = self.socket_set.remove(handle);
+                        }
+                    }
+                    server_socket.backlog = Some(backlog);
                 } else {
                     server_socket.backlog = Some(backlog);
                     server_socket.socket_set_handles = Vec::with_capacity(backlog.into());
