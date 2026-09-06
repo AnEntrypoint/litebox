@@ -56,3 +56,21 @@ At fork time, dump the parent's VMA flags AND host page protection for the
 mapping containing this offset, then the child's immediately after
 `duplicate()`. If the parent has `VM_WRITE` and the child does not, that is the
 bug, located in one step.
+
+## UNTESTED IDEA: get a client under a pid-1 Xorg (`srv7`/`wrap`)
+
+The fork bug above blocks Xorg *as a child*. But a **pid-1 Xorg** demonstrably
+forks children that SURVIVE: it runs `/bin/sh -c "xkbcomp ..."` and both the
+shell (pid 2) and xkbcomp (pid 3) exit `status=0` in the control log.
+
+So a pid-1 Xorg can host a surviving client. `srv7-pid1-with-client.sh` +
+`xkbcomp-paint-wrap.sh` exploit that: move the real binary to `xkbcomp.real`,
+drop in a wrapper that runs it and then also runs
+`xsetroot -solid navy` on `:0`. Xorg stays pid 1 (never forked, never faults),
+and the painting client rides in on the one fork path already proven to work.
+
+If it paints, the server's frame goes from `non_black_pixels=0` (see
+`baseline_xorg_pid1_black.bmp`) to a solid navy fill.
+
+NOT YET RUN -- the host was handed to the fork investigating the SIGSEGV before
+this could execute. Worth trying; it needs no fix to any litebox code.
