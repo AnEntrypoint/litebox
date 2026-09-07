@@ -187,3 +187,137 @@ discovered, apparently pre-existing host-crash bug in the unconditional pre-gate
 Re-running Step 0 cleanly, informed by the lessons above, remains the correct next action before
 committing to the rest of the Track B ordered plan -- this session narrowed *how* to do that
 correctly but did not produce the decisive result itself.
+
+---
+
+## 2026-09-07 (later): fixed the DIAG_HEAL-logging host crash; Step 0 still blocked by a
+## separate, deeper exception-table bug
+
+### Goal
+
+Root-cause and fix the `fixup_stale_elf_data_pointers` host crash from the prior entry above,
+then re-attempt Step 0 to a clean CONFIRMED/REFUTED verdict.
+
+### Root cause found: the "temporary, do not commit" DIAG_HEAL logging was never removed
+
+`litebox_shim_linux/src/syscalls/process.rs`'s `fixup_stale_elf_data_pointers` (~line 1606)
+contained an unconditional `litebox_util_log::error!` call on every heal whose translated value
+landed in an executable destination range -- its own comment already said "DIAGNOSTIC
+(temporary, do not commit)" but it shipped anyway, with no env-var gate. On this repro it fired
+hundreds of times in one fork (`healed_count=2460` total, confirmed in the prior entry's log
+excerpt). Each call is a real `tracing`-backed formatted log event (allocation + I/O), executed
+from inside the fork-time relocation-healing window -- the same window
+`litebox_platform_windows_userland`'s own `!is_in_guest` VEH branch doc comments already
+document as prone to a transient Windows FS_BASE-clear race for host code. The crash's captured
+`addr=0xc0000100` is `STATUS_VARIABLE_NOT_FOUND`, a leaked-NTSTATUS-in-register signature this
+codebase's own `docs/AGENTS_ARCHIVE_2026-09-03.md` already ties to Windows API activity reached
+from host code, not guest memory content -- consistent with the logging burst being the
+proximate trigger, not the pointer-healing arithmetic itself.
+
+### Fix applied (minimal, targeted)
+
+Removed the unconditional `litebox_util_log::error!` calls (both the per-heal one and the
+per-pass summary) from `fixup_stale_elf_data_pointers`. Could not gate behind a
+`LITEBOX_DIAG_HEAL_LOG`-style host env-var check instead, as first attempted: this crate
+(`litebox_shim_linux`) is `#![no_std]`, so `std::env::var_os` does not compile there. Removing
+the diagnostic outright (rather than half-wiring an env gate that would not build) was the
+correct minimal fix given it was already marked as not meant to be committed. Left a doc comment
+at the call site pointing any future investigator at a `static AtomicBool`/host-side toggle
+instead of a direct `std::env` read, if the diagnostic is needed again.
+
+Commit: `373c79f` "fork: stop the DIAG_HEAL diagnostic from crashing the host mid-fork".
+
+### Verified: the logging-burst crash is gone; a DIFFERENT, deeper, pre-existing crash remains
+
+Rebuilt (`cargo build --release --bin litebox_runner_linux_on_windows_userland`), re-ran the
+identical `bash -c` `tcache_fork_repro.sh`-equivalent inline repro under
+`LITEBOX_PROCESS_FORK=1 LITEBOX_LOG=debug` (both real host env vars). Result: **zero
+`DIAG_HEAL`/`healed_count` log lines this run** (confirms the fix removed that logging burst
+entirely), but the host runner still crashed -- earlier in the fork sequence than before, inside
+`PageManager::duplicate()`'s own page-allocation/relocation step (`DIAG_VMA fork-relocation`
+lines were still being emitted when the crash hit), not inside either proactive healing pass at
+all:
+
+```
+[diag-extable] module_base=0x7ff658a40000 rip=0x7ff6592f0198 rva=0x8b0198 table_len=12 shown=12
+[diag-extable]   [3] start=0x7ff6592f0198 (rva 0x8b0198) stop=0x7ff6592f01a0 (rva 0x8b01a0) fixup=0x7ff6592f01a2 covers=true
+[diag-unrecov-av] tid=ThreadId(6) rip=0x7ff6592f0198 rva=0x8b0198 addr=0x10188000 rsp=0x1f8d9fdfc0
+  rax=0x1 rbx=0x1000 rcx=0x200 rdx=0x10188000 rsi=0x10188000 rdi=0x7ff00049c000 rbp=0x1f8d9fe030
+  is_in_guest=false is_verifying=false -- no exception-table entry found
+```
+
+The `[diag-extable]` dump is the load-bearing detail: entry `[3]`'s own printed range
+(`start=0x7ff6592f0198`, `stop=0x7ff6592f01a0`) DOES contain the faulting `rip`
+(`0x7ff6592f0198`), and the diagnostic's own `covers` computation says `covers=true` for that
+exact entry -- yet `search_exception_tables` (called moments earlier at
+`litebox_platform_windows_userland/src/lib.rs:1598-1600`, on the identical `context.Rip`, before
+this diagnostic even runs) returned `None`, driving the fault into the unrecoverable
+`[diag-unrecov-av]` path instead of resuming at the fixup address. This is not a new bug this
+session introduced -- `litebox/src/mm/exception_table.rs`'s own `debug_snapshot_table` doc
+comment (predating this session) already documents this exact class as previously observed and
+unexplained: "a real captured fault landed on an instruction that the on-disk `.extable` section
+provably covers, yet `search_exception_tables` reported no match". `search_exception_tables`
+and `debug_snapshot_table` share the identical `reloc()` closure and the identical
+`exception_table()` PE-section lookup, so the divergence is not an obvious textual bug in either
+function; not root-caused further this session (would need a live debugger attached at the
+fault to compare the two calls' actual table contents/addresses side by side, since static
+reasoning from the source does not explain the mismatch).
+
+A second, immediately following fault in the SAME run
+(`rip=0x7ff8da4f587a addr=0xa is_in_guest=false`, an ntdll-range address, `fault_addr=0xa`) is
+consistent with the process already being in a corrupted, post-first-crash state and is not
+treated as independent evidence.
+
+### Step 0 verdict: STILL INCONCLUSIVE (not CONFIRMED, not REFUTED) -- blocked one layer deeper
+
+The DIAG_HEAL logging-burst crash that blocked the previous session's Step 0 attempt is fixed
+and confirmed gone. But `LITEBOX_PROCESS_FORK=1` still cannot be exercised end-to-end on this
+repro: the process now crashes even earlier, inside `PageManager::duplicate()` itself, before
+either proactive healing pass runs and long before the `beyond_stdio` gate (~line 3190) is
+reached. **No run this session reached the `spawn_cross_process_fork_child` success path
+either** -- so step 9 (long-running cross-process child survival) could not be attempted at all;
+there was never a live cross-process child to observe.
+
+### Baseline reconfirmation (step 8b): CONFIRMED, unchanged
+
+Re-ran the same repro with `LITEBOX_PROCESS_FORK` unset (default fork path),
+`LITEBOX_LOG=warn`. Clean SIGABRT as expected, no change from prior sessions:
+
+```
+fatal signal: terminating task signal=Signal(6) pid=2 tid=2 comm=bash...
+/bin/bash: line 1:     2 Aborted   ( declare -a bufs; ... )
+TCACHE_REPRO_SUBSHELL_STATUS=134
+TCACHE_REPRO_DONE
+```
+
+### Test results (step 7)
+
+`cargo test --release -p litebox -p litebox_shim_linux -p litebox_common_linux -p
+litebox_platform_windows_userland`:
+- `litebox_shim_linux` (test/doctest build) and `litebox_platform_windows_userland` (doctest
+  build only) fail to compile: `E0576`/`E0407`, "cannot find method `run_test_thread` in trait
+  `ThreadProvider`". Confirmed via `git stash` that this is 100% pre-existing on `main` before
+  this session's change -- not a regression from the `fixup_stale_elf_data_pointers` fix (a
+  trait/test-infrastructure drift unrelated to `process.rs`).
+- `litebox` lib tests: 123 passed, 26 failed. Confirmed via the same `git stash` comparison to
+  be the identical pass/fail count on unmodified `main` -- all 26 failures are pre-existing
+  (missing `diod` binary for the `nine_p` suite, one `tar_ro` symlink test, one `mm::tests::
+  test_vmm_mapping` range-merging assertion), none touching code this session changed.
+- `litebox_common_linux`: 4 passed, 0 failed, 1 doctest passed -- clean.
+
+No regression from this session's fix in any of the four crates.
+
+### What remains open for a future session
+
+- Root-cause the `search_exception_tables`/`debug_snapshot_table` divergence itself (both
+  compute from the identical PE `.extable` section and the identical `reloc()` logic, yet
+  disagree on whether the same `rip` is covered) -- this is now the concrete, precisely
+  evidenced blocker standing between this investigation and a clean Step-0 run, more fundamental
+  than anything in the fork-time healing passes. A live debugger session that breaks at the
+  `[diag-unrecov-av]` print and inspects both call sites' actual `exception_table()` return
+  values side by side is the most direct next step.
+- Step 0's central claim (does `LITEBOX_PROCESS_FORK=1` avoid the tcache fault for a
+  `beyond_stdio==0` guest) remains neither confirmed nor refuted -- no run in this investigation
+  to date has ever reached the cross-process child successfully.
+- Step 9 (long-running cross-process child survival) is untouched -- there has never been a live
+  cross-process child to observe in any session so far.
