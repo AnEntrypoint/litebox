@@ -2440,9 +2440,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
+        // `ENOPROTOOPT`, not `EINVAL` -- same contract as `sys_getsockopt`, whose own comment
+        // records the failure that exposed it.
         let optname = SocketOptionName::try_from(level, optname).ok_or_else(|| {
             log_unsupported!("setsockopt(level = {level}, optname = {optname})");
-            Errno::EINVAL
+            Errno::ENOPROTOOPT
         })?;
         self.do_setsockopt(sockfd, optname, optval, optlen)
     }
@@ -2473,9 +2475,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
+        // `ENOPROTOOPT`, not `EINVAL`. Callers branch on exactly this distinction: `ENOPROTOOPT`
+        // means "this kernel does not know that option", which every portable caller is written
+        // to shrug off, while `EINVAL` means "your arguments are malformed", which is a bug on
+        // the caller's side and is escalated as a hard error. Linux itself answers an unknown
+        // level/optname with `ENOPROTOOPT`.
+        //
+        // Found via a real failure, not by reading the manual: `getsockopt(SOL_SOCKET, 77)` is
+        // `SO_PEERPIDFD` (Linux 6.5+), which zbus queries to identify a D-Bus peer without a
+        // pid-reuse race. On any older kernel it returns `ENOPROTOOPT` and zbus falls back to
+        // `SO_PEERCRED`, which this shim already implements and answers correctly. Returning
+        // `EINVAL` instead turned that optional probe into a fatal transport error, surfacing to
+        // the user as `D-Bus error: I/O error: Invalid argument (os error 22)` -- which is how a
+        // MATE desktop under LiteBox lost ALL icon and image decoding: GdkPixbuf delegates to
+        // glycin, glycin decodes out-of-process over a D-Bus peer connection, so every PNG load
+        // failed and `mate-panel` aborted outright (`Gtk:ERROR ... ensure_surface_for_gicon`)
+        // while `marco` respawned in a loop.
         let optname = SocketOptionName::try_from(level, optname).ok_or_else(|| {
-            log_unsupported!("setsockopt(level = {level}, optname = {optname})");
-            Errno::EINVAL
+            log_unsupported!("getsockopt(level = {level}, optname = {optname})");
+            Errno::ENOPROTOOPT
         })?;
         let len = optlen.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         if len > i32::MAX as u32 {
