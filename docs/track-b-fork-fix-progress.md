@@ -1,0 +1,189 @@
+# Track B fork-without-exec fix: running progress log
+
+This is the running log for the Track B architectural effort (D==0 cross-process fork,
+per `advisor/ADVISORY-002-d-zero-fork.md`), broader in scope than the webtop-specific
+investigation in `docs/webtop-debian-selkies-2026-09-06.md`. That file remains the log for
+the webtop/XFCE demo-path investigation (Track A); this file is the log for Track B (the
+architectural fork fix) going forward. Future sessions continuing Track B should append here.
+
+---
+
+## 2026-09-07: Step 0 decisive experiment -- INCONCLUSIVE, plus a new blocking finding
+
+### Goal
+
+Per ADVISORY-002 section 6, step 0: run a `beyond_stdio == 0` (stdio-only fd table) glibc
+fork-without-exec repro under `LITEBOX_PROCESS_FORK=1` and confirm the `__libc_malloc+0x76`
+tcache-corruption fault (ADVISORY-001 section 3N) does not occur, as a cheap, decisive
+before-funding-anything-else gate for the whole Track B rewrite.
+
+### Repro built
+
+`advisor/probes/tcache_fork_repro.sh` (committed). Uses a stock, already-present, dynamically
+linked `bash` from the `linuxserver/webtop:debian-xfce` image: a `( ... )` grouped subshell
+forks without ever calling `execve()`, and inside it, repeated same-size-class shell-array
+allocation/deallocation bursts drive glibc malloc/free hard enough to populate and drain
+tcache freelists for that size class -- the exact `REVEAL_PTR` pop pattern that safe-linking
+protects and that ADVISORY-001 3N symbolized as the fault site. No guest compiler is needed
+(this repo's guest gcc/cc1 are broken, confirmed by earlier sessions), and no new host
+cross-compilation toolchain was needed either, since bash's own subshell fork is a completely
+realistic, unmodified glibc fork-without-exec workload already present in the target image.
+
+### Baseline (default fork path): CONFIRMED corrupt, as expected
+
+Command: `litebox_runner --unstable --oci-image linuxserver/webtop:debian-xfce --resume-from
+tcache_fork_repro.tar -- /bin/bash /tcache_fork_repro.sh` (no `LITEBOX_PROCESS_FORK`).
+
+Result:
+```
+TCACHE_REPRO_START pid=1
+malloc(): unaligned tcache chunk detected
+/tcache_fork_repro.sh: line 56:     2 Aborted     ( declare -a bufs; ... )
+TCACHE_REPRO_SUBSHELL_STATUS=134
+```
+glibc's own tcache consistency check (`e->next` failing the `test $0xf,%al` alignment check
+neighboring the `__libc_malloc+0x76` `REVEAL_PTR` site) aborts the child with SIGABRT
+(status 134). This is a genuine, clean repro of the corruption class: confirms the repro is
+real and matches the predicted failure mode.
+
+### `LITEBOX_PROCESS_FORK=1` attempts: two runs, neither reached a clean verdict
+
+**Critical environment-variable-plumbing lesson (costly, worth recording prominently):**
+`--env LITEBOX_LOG=... --env LITEBOX_PROCESS_FORK=1` sets variables in the **guest's**
+environment, passed to the launched Linux program. Both `LITEBOX_LOG` (read by the runner's
+own `tracing_subscriber::EnvFilter` at `litebox_runner_linux_on_windows_userland/src/lib.rs:524`)
+and `LITEBOX_PROCESS_FORK` (read via `std::env::var_os` on the **host** side, inside
+`spawn_cross_process_fork_child` in `litebox_platform_windows_userland/src/lib.rs:8590`) must
+be set as real Windows/host environment variables on the process launching the runner, NOT via
+`--env`. The first two attempts at this experiment silently ran with the gate permanently
+unexercised and zero tracing output, because both flags were passed the wrong way. Any future
+session repeating this experiment: `export LITEBOX_LOG=... LITEBOX_PROCESS_FORK=1` (or
+PowerShell `$env:...=`) on the host shell, never `--env`.
+
+**Attempt 1** (`bash /tcache_fork_repro.sh`, host env correctly set, `LITEBOX_LOG=debug`):
+reached the gate, and it fired loudly and exactly as pass 158's logging promises:
+```
+clone: cross-process (D==0) fork() NOT eligible -- guest holds fd(s) at or above 3 ...
+beyond_stdio=1 total_alive=4
+```
+Root cause: `bash /path/to/script.sh` (as opposed to `bash -c '...'`) keeps the script file
+itself open as an extra fd (confirmed via the surrounding `sys_openat path=/tcache_fork_repro.sh
+fd=Some(3)` with no matching close before the fork). So this run's repro was NOT actually
+`beyond_stdio == 0` -- it fell through to the same broken thread-based path, and its
+tcache-abort crash (identical signature to baseline) is not evidence about `LITEBOX_PROCESS_FORK`
+at all. This is exactly the false-negative trap ADVISORY-002 section 1 warns about (the 94th-pass
+historical conclusion made the identical mistake with a held socket instead of a held script fd).
+
+**Attempt 2** (fixed: `bash -c '<inline command>'`, no script file, host env set,
+`LITEBOX_LOG=warn`): this should have been genuinely `beyond_stdio == 0` (no script fd, no
+`/dev/tty` fd alive at fork time in this invocation shape). But the run never reached the
+`beyond_stdio` gate at all -- it hard-crashed the **host** runner process first, inside the
+proactive relocation-healing pass (`fixup_stale_elf_data_pointers`, `litebox_shim_linux/src/
+syscalls/process.rs:1606` and its caller around line 2813) that runs unconditionally for
+*every* real fork, before the code ever reaches the `beyond_stdio` gate at line ~3190. The
+crash:
+```
+[several hundred] DIAG_HEAL wrote a pointer into an executable dest range (slot=... old=... new=...)
+diag: fixup_stale_elf_data_pointers summary ranges_seen=10 healed_count=2460
+[diag-unrecov-av] tid=ThreadId(6) rip=0x7ff8da4f5492 addr=0xc0000100 ... is_in_guest=false
+  -- no exception-table entry found
+```
+`is_in_guest=false` and "no exception-table entry found" mark this as a **host**-side
+unrecoverable access violation inside litebox's own Rust code (not a guest fault, not the
+`__libc_malloc+0x76` signature at all), during the pointer-healing sweep of the *thread-based*
+relocating duplicate that fork() unconditionally performs before the `LITEBOX_PROCESS_FORK`
+gate is ever consulted.
+
+### The load-bearing architectural finding this surfaces
+
+Read together with the code (`litebox_shim_linux/src/syscalls/process.rs`): the eager
+`PageManager::duplicate()` call (line ~2604) and both proactive fixup passes
+(`fixup_stale_stack_pointers`/`fixup_stale_elf_data_pointers`, lines ~2808-2813) run
+**unconditionally for every real fork**, strictly *before* the `fd_complexity.beyond_stdio == 0`
+gate check (line ~3190) and the `spawn_cross_process_fork_child` call (line ~3196) that follow
+much later in the same function. In other words: **`LITEBOX_PROCESS_FORK=1` does not skip the
+costly, glibc-unsafe, and (per this run) sometimes host-crashing relocating duplicate/heal
+step at all** -- it only decides, after that step has already run to completion (or, this run,
+crashed the host partway through), which artifact the child process actually resumes from
+(the just-built, possibly-corrupt-for-glibc relocated copy in a new thread, vs a
+freshly-spawned separate Windows process at identity/source addresses per
+`spawn_cross_process_fork_child`). This matches ADVISORY-002 section 3's own description of the
+mechanism (the duplicate always happens; the cross-process artifact is discarded rather than
+resumed-from when the gate passes), but the practical consequence -- that the SAME
+duplicate/heal call can crash the *host* runner process outright, independent of whether a
+`beyond_stdio == 0` guest would go on to take the cross-process branch -- was not previously
+measured or flagged as a Step-0-relevant risk, and it means a genuinely clean `beyond_stdio==0`
+D==0 verification run needs either (a) a repro small/simple enough that the proactive fixup
+passes do not themselves crash the host before the gate is reached, or (b) the relocating
+duplicate/heal step's own reliability fixed/bypassed first.
+
+### Verdict: INCONCLUSIVE, not CONFIRMED and not REFUTED
+
+Four runs total this session:
+1. Default fork path, `bash script.sh`: tcache abort, as expected (real evidence, but not
+   about `LITEBOX_PROCESS_FORK`).
+2 & 3. `LITEBOX_PROCESS_FORK=1`, `bash script.sh`, wrong-then-right env plumbing: gate fired,
+   `beyond_stdio=1` (script-file fd held), fell through to the broken path -- not a valid test
+   of the cross-process path.
+4. `LITEBOX_PROCESS_FORK=1`, `bash -c '...'` (intended to be genuinely `beyond_stdio==0`):
+   host-side crash in the always-run relocation-healing step, before the gate was ever reached.
+
+**No run in this session actually exercised the `spawn_cross_process_fork_child` success path
+with a confirmed `beyond_stdio == 0` guest end to end.** The central claim of ADVISORY-002
+step 0 -- that a `beyond_stdio==0` guest under `LITEBOX_PROCESS_FORK=1` avoids the
+`__libc_malloc+0x76` tcache fault -- is therefore **neither confirmed nor refuted** by this
+session's runs. What IS newly established is the separate, real finding above: the
+unconditional pre-gate duplicate/heal step is itself a host-crash risk on this exact repro
+shape, independent of the gate's own logic, and needs to be understood/fixed (or the repro
+adjusted to avoid tripping it) before a clean Step-0 verdict is reachable.
+
+**Recommended next step for a future session:** retry with the `bash -c` (or an even smaller,
+non-bash) `beyond_stdio==0` repro, but first either (a) capture a full `LITEBOX_LOG=debug`
+trace of the host crash at line 1244 of `processfork_clean.log` (preserved on disk this
+session for exactly this purpose) and root-cause the `DIAG_HEAL`/`fixup_stale_elf_data_pointers`
+host AV, since it may itself be a real, previously-uncharacterized bug worth fixing regardless
+of Track B; or (b) shrink the repro's address-space footprint (fewer/smaller allocations,
+avoid loading bash's full library set if a smaller dynamically-linked glibc binary can be found
+or built) so the proactive healing pass has less surface to crash on, and re-run to completion.
+
+### Open questions from ADVISORY-002 section 7 -- partial closure this session
+
+- **`QueueUserAPC2` availability on this exact build: CONFIRMED.** Compiled and ran
+  `advisor/probes/apc_probe.c` fresh this session (`clang -O1 -o apc_probe.exe apc_probe.c
+  -lkernel32 -lntdll`). Output: `QueueUserAPC2 export: 00007FF8D7EDB2C0`,
+  `parent: QueueUserAPC2(special) on child thread -> ok=1 err=0`,
+  `parent: child result: shared1=1234 (expect 1234) shared2=1 (1=APC interrupted user-mode
+  spin)`. This closes the open question -- the probe was previously only "appears to discharge
+  it" per the advisory; it is now confirmed actually run, successfully, on this exact host
+  (Windows 11 10.0.26200) and this exact build.
+- **Whether `spawn_cross_process_fork_child`'s child survives long-running execution, or only
+  to `execve`: NOT closed this session.** No run reached the point of having a live
+  cross-process child to observe over time -- see the INCONCLUSIVE verdict above. Still open.
+- Reserve size / collision-free high-VA band for the eventual shared section: not addressed
+  this session (out of scope for Step 0 specifically).
+- Byte-level confirmation of `PROTECT_PTR` in raw 2.41/2.42 `malloc.c` source: not addressed
+  this session.
+
+### Artifacts from this session
+
+- `advisor/probes/tcache_fork_repro.sh` -- the repro script, committed.
+- `advisor/probes/apc_probe.exe` -- compiled probe binary confirming `QueueUserAPC2`, NOT
+  committed (binary artifact; rebuild via the one-line `clang` command in the probes README
+  pattern any time it's needed again).
+- Raw run logs (`baseline_default_fork.log`, `processfork_run.log`, `processfork_run2.log`,
+  `processfork_debug.log`, `processfork_debug2.log`, `processfork_clean.log`) were left in the
+  repo root during the session for inspection; NOT committed (large, session-local debug
+  output, several with full DEBUG-level traces). A future session picking this up should look
+  for them there or regenerate as needed, and should clean them up if committing other changes
+  from the same working tree.
+
+### Overall go/no-go read for the large Track B investment
+
+**Do not treat this session's runs as either a green light or a red light for Track B.** The
+one clean, unambiguous result (baseline default-path tcache abort) only reconfirms already-known
+behavior. The `LITEBOX_PROCESS_FORK=1` side of the experiment was compromised twice by tooling
+mistakes (env-var plumbing, then an accidentally-nonzero `beyond_stdio`) and once by a newly
+discovered, apparently pre-existing host-crash bug in the unconditional pre-gate healing step.
+Re-running Step 0 cleanly, informed by the lessons above, remains the correct next action before
+committing to the rest of the Track B ordered plan -- this session narrowed *how* to do that
+correctly but did not produce the decisive result itself.
