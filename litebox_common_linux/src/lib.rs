@@ -4942,6 +4942,47 @@ impl SyscallRequest {
         let op_and_flags: i32 = ctx.sys_req_arg(1);
         let op = op_and_flags & FutexFlags::FUTEX_CMD_MASK.bits();
         let flags = op_and_flags & !FutexFlags::FUTEX_CMD_MASK.bits();
+        // Priority-inheritance futexes are genuinely unimplemented here, and the errno chosen to
+        // say so is part of the API contract rather than incidental -- the same lesson AGENTS.md
+        // records from a `clone()` namespace-flag `EINVAL` that silently broke ALL image decoding
+        // through glycin's sandbox fallback.
+        //
+        // musl's `pthread_mutexattr_setprotocol(a, PTHREAD_PRIO_INHERIT)` probes for support by
+        // issuing `futex(FUTEX_LOCK_PI)` and, in this image's musl, reports the probe's errno
+        // straight back to its caller. Measured in-guest with ctypes, which is what pinned this
+        // down -- the value the guest sees tracks this syscall's errno exactly:
+        //
+        //     futex PI errno        setprotocol(PRIO_INHERIT) returns
+        //     EINVAL  (22)   ->     22      (original behaviour)
+        //     ENOSYS  (38)   ->     38
+        //     ENOTSUP (95)   ->     95      <-- what callers actually handle
+        //
+        //     (for reference, PRIO_PROTECT already returns 95 from musl itself, and PRIO_NONE 0)
+        //
+        // PulseAudio's `pa_mutex_new` asserts `r == 0 || r == ENOTSUP` on exactly that call and
+        // aborts the process otherwise: `Assertion 'r == 0 || r == 95' failed at
+        // ../src/pulsecore/mutex-posix.c:57`. That abort killed selkies -- and with it the
+        // webtop's whole video path -- the instant a browser client connected.
+        //
+        // `EINVAL` claims the request was malformed, which is false and is what broke PulseAudio.
+        // `ENOTSUP`/`EOPNOTSUPP` says this OPERATION is not supported -- the accurate statement
+        // for an unimplemented futex op on an otherwise-implemented syscall, and the one value
+        // both musl and PulseAudio already know how to degrade on. (`ENOSYS`, "syscall not
+        // implemented", would be the right answer for a missing syscall; `futex` is implemented,
+        // just not these six operations.)
+        const FUTEX_PI_OPS: [i32; 6] = [
+            6,  // FUTEX_LOCK_PI
+            7,  // FUTEX_UNLOCK_PI
+            8,  // FUTEX_TRYLOCK_PI
+            11, // FUTEX_WAIT_REQUEUE_PI
+            12, // FUTEX_CMP_REQUEUE_PI
+            13, // FUTEX_LOCK_PI2
+        ];
+        if FUTEX_PI_OPS.contains(&op) {
+            // Still routed through the unsupported-feature census; only the errno differs.
+            let _ = unsupported_einval(format_args!("futex(priority-inheritance op = {op})"));
+            return Err(errno::Errno::EOPNOTSUPP);
+        }
         let cmd = FutexOperation::try_from(op)
             .map_err(|_| unsupported_einval(format_args!("futex(op = {op})")))?;
         let flags = FutexFlags::from_bits(flags)

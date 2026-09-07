@@ -424,21 +424,41 @@ process on any other errno.
 "Attempting to establish PulseAudio connection..." line still runs on client connect, so this
 path is not gated by those settings.
 
-**A hypothesis was formed, implemented, and REVERTED as unverified.** musl's
-`pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT)` probes kernel support by issuing
-`futex(FUTEX_LOCK_PI)` and maps ONLY `ENOSYS` to `ENOTSUP`; litebox's `parse_futex`
-(`litebox_common_linux/src/lib.rs`) rejects every unknown futex op with `EINVAL`, which would
-propagate and trip exactly this assertion. Returning `ENOSYS` for the PI ops (6, 7, 8, 11, 12, 13)
-was implemented and tested -- **the assertion did not change**, and no log line ever showed the PI
-path being reached, so there is no evidence the probe is what fails. The change was reverted
-rather than shipped on a guess; this project has paid for unverified fixes before.
+**Root-caused by direct measurement, and fixed.** No compiler is needed to settle this: Python's
+`ctypes` can call the pthread functions directly in-guest, which pins the value exactly.
 
-**Next step, precisely:** identify which call inside `pa_mutex_new` actually returns the
-offending errno, rather than assuming. The cheapest route is a guest-side `ltrace`/`strace`
-equivalent around the abort, or a freestanding probe binary (built on the HOST per AGENTS.md)
-that calls `pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT)` + `pthread_mutex_init` directly
-and prints both return values. That single number decides whether the futex-errno theory is right
-or whether the failure is somewhere else entirely.
+```
+python3 -c "import ctypes; libc=ctypes.CDLL(None); ...
+            libc.pthread_mutexattr_setprotocol(a, proto)"
+
+   proto 0 (PRIO_NONE)     setprotocol -> 0
+   proto 1 (PRIO_INHERIT)  setprotocol -> 22   <-- EINVAL, and PulseAudio aborts on it
+   proto 2 (PRIO_PROTECT)  setprotocol -> 95   (ENOTSUP, from musl itself)
+```
+
+`pa_mutex_new` asserts `r == 0 || r == ENOTSUP` on exactly the `PRIO_INHERIT` call, so 22 kills
+the process. musl gets that 22 from litebox: it probes support by issuing `futex(FUTEX_LOCK_PI)`,
+and `parse_futex` rejected every unknown futex op with `EINVAL`.
+
+Re-running the probe against each candidate errno showed the guest-visible value tracks this
+syscall's errno one-for-one (`EINVAL 22 -> 22`, `ENOSYS 38 -> 38`, `ENOTSUP 95 -> 95`) -- this
+musl reports the probe's errno straight through rather than mapping it. So the fix is to return
+**`ENOTSUP`/`EOPNOTSUPP` (95)** for the six priority-inheritance futex ops (6, 7, 8, 11, 12, 13).
+That is also the accurate errno on its own terms: `ENOSYS` means "syscall not implemented", but
+`futex` *is* implemented -- just not these operations.
+
+**Verified:** with the change, `setprotocol(PRIO_INHERIT)` returns 95, the value PulseAudio
+accepts.
+
+This is the same errno-contract class AGENTS.md already records, where a `clone()` namespace-flag
+`EINVAL` silently broke all PNG/JPEG decoding through glycin's sandbox fallback. Getting a
+refusal errno wrong breaks unrelated features.
+
+**Still to confirm end to end:** that selkies now survives the PulseAudio connect and streams
+frames to the browser. The syscall-level fix is measured, but the full-stack confirmation was not
+obtained, because by this point free host memory had fallen to ~1.3 GB (from 6.6 GB at session
+start) and every run became unreliable regardless of code -- see the measurement caveat below.
+Re-run the stack with more free memory; the remaining path is short.
 
 If it does turn out to be an errno-contract bug, note that it is the SAME class AGENTS.md already
 records: a `clone()` namespace-flag `EINVAL` once silently broke all PNG/JPEG decoding through
