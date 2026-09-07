@@ -531,6 +531,23 @@ Fixing that -- Track B's genuine cross-process child spawning, per `ADVISORY-002
 section 6 -- is what stands between this project and a live desktop in the browser. Everything
 else on the path is now done and verified.
 
+### Three-way A/B of every available fork mode -- all three break, differently
+
+Run against the same stack, same binary, one variable changed each time. This is the clearest
+statement of the blocker, and it is measured rather than argued:
+
+| mode | result |
+|---|---|
+| **default** (fork_verify healing ON) | `[diag-unrecov-av] is_in_guest=false is_verifying=true` -- litebox's OWN host-side code faults inside the healing path. Non-deterministic: the same config survived one run and died the next. |
+| **`LITEBOX_FORKVERIFY_OFF=1`** | **Zero host AVs** -- the crash genuinely disappears. But the forked child then runs with unhealed stale pointers and dies guest-side instead: `[diag-ud-entry] ... raw_code=0xc0000096`, `Illegal instruction`, `Segmentation fault`, and Xvfb never comes up (`XVFB_FAIL`). |
+| **`LITEBOX_PROCESS_FORK=1`** (Track B, cross-process) | Immediate `[diag-unrecov-av-terminate]`, before Xvfb starts. Matches this repo's own code comments recording prior `LITEBOX_PROCESS_FORK=1` runs crashing on this host. |
+
+The second row is the important one: it shows the healing pass is **load-bearing**, not merely
+defensive -- turning it off does not reveal a working fork underneath, it reveals the stale
+pointers the healing exists to paper over. That is `ADVISORY-001`'s "unsound by construction"
+claim demonstrated directly rather than reasoned about, and it is why no amount of avoiding
+individual spawn sites fixes this: the class cannot be dodged, only made rarer.
+
 ## Next steps, in dependency order
 
 1. Fix the flank recommit properly, using the view's real allocation base and mapping
