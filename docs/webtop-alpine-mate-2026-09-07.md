@@ -464,6 +464,73 @@ If it does turn out to be an errno-contract bug, note that it is the SAME class 
 records: a `clone()` namespace-flag `EINVAL` once silently broke all PNG/JPEG decoding through
 glycin's sandbox fallback. Getting a refusal errno wrong breaks unrelated features.
 
+## Final state: everything up to the encoder works; frames blocked on the fork_verify AV
+
+With the PulseAudio abort fixed, the chain was walked all the way to selkies' capture path, and
+the remaining blocker is unambiguous.
+
+### A trimmed rootfs, because host memory decides whether a run completes at all
+
+`advisor/probes/make_webtop_min_rootfs.py` cuts the 2.4 GiB payload to **1.1 GiB** by dropping
+Chromium, mesa's Vulkan drivers, the Docker/containerd/cmake toolchain, and locale/icon/theme/
+wallpaper data -- none of which this stack reaches. With it, a full stack comes up in ~50 s
+instead of timing out. Two things must NOT be dropped, both learned by breaking them:
+
+* **libgallium + libLLVM + /usr/lib/dri.** Xvfb links `libGL` even when started without GLX, and
+  `libGL` needs gallium, which needs LLVM. Removing them fails Xvfb at load.
+* **GNU tar long-name headers.** Writing the trimmed archive with Python's default
+  `GNU_FORMAT` produced files that were present in the archive but *unresolvable at runtime*:
+  `Error loading shared library libglslang-default-resource-limits-24bc816e.so.15.2.0 ... (needed
+  by libplacebo-...so)`, for a file the archive demonstrably contained at the right path and size.
+  GNU format stores an over-long name (>100 chars) in a separate `././@LongLink` header, and
+  **litebox's tar reader does not implement that extension** -- it sees a truncated name. Writing
+  `USTAR_FORMAT`, which splits long names across the `prefix`/`name` fields, fixes it completely.
+  That is a real, previously-unrecorded litebox gap in its own right: any GNU-format tar with
+  paths over 100 characters will silently lose those files.
+
+### Three more litebox gaps found on the way
+
+* **`waitid` is unimplemented** (`OSError: [Errno 38]`). CPython's asyncio uses it to reap
+  subprocesses, so `proc.communicate()` never completes; selkies' clipboard monitor then times out
+  after 1 s and retries forever, which floods the log and starves the process. `--clipboard-enabled=false`
+  avoids it; implementing `waitid` is the real fix.
+* **`--resume-from` cannot shadow a path that already exists in the base layer.** A patched
+  `selkies/display_utils.py` placed in the overlay was simply not seen -- the guest kept executing
+  the base-layer version. The previous session recorded this for symlinks; it holds for ordinary
+  regular files too. The workaround used here is a `PYTHONPATH=/patch` `sitecustomize.py` at a
+  path with no base-layer counterpart.
+* **`/proc/stat` is absent**, so psutil's system monitor raises. Non-fatal.
+
+### The blocker: every subprocess spawn is a dice roll on the fork_verify AV
+
+`[diag-unrecov-av] ... is_in_guest=false is_verifying=true` -- litebox's own host-side code
+faulting inside the fork-verify stale-pointer healing path. It was hit at three independent
+points, and removing each one only moved the failure to the next:
+
+1. **PulseAudio autospawn.** `pulsectl.Pulse(...)` connects with `autospawn=True`, which forks to
+   start a daemon. Avoided with `PULSE_SERVER=unix:/nonexistent/pulse.sock`, after which the
+   connection fails cleanly and selkies continues.
+2. **DPI application on client connect.** selkies probes for a DE session binary and shells out to
+   xrdb/gsettings/xfconf-query. Removing those binaries is NOT sufficient -- the "generic xrdb
+   fallback" still forks before failing to exec. Neutralised via the `sitecustomize` shim.
+3. **Clipboard.** `xclip` spawned once a second, forever (see `waitid` above).
+
+Each fix got further; none removed the class. The AV is non-deterministic -- the same
+configuration reached "PulseAudio connection failed" cleanly on one run and AV'd on the next --
+which matches this bug's long-recorded character.
+
+**So the honest statement is:** the webtop's dashboard, WebSocket upgrade, control plane, input
+system, gamepad/evdev interposers and selkies' own encoder initialisation all work under litebox
+and are browser-verified. Video frames do not flow because selkies cannot survive long enough to
+start capturing, and what kills it is the pre-existing `fork_verify` host-side access violation on
+subprocess spawn -- the same architectural gap
+`webtop-debian-selkies-2026-09-06.md` identifies as the single blocking item, and which
+`ADVISORY-001` argues the in-process relocated-copy fork cannot be made correct for.
+
+Fixing that -- Track B's genuine cross-process child spawning, per `ADVISORY-002-d-zero-fork.md`
+section 6 -- is what stands between this project and a live desktop in the browser. Everything
+else on the path is now done and verified.
+
 ## Next steps, in dependency order
 
 1. Fix the flank recommit properly, using the view's real allocation base and mapping
