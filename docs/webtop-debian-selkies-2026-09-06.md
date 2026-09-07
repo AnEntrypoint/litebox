@@ -1962,3 +1962,141 @@ as the single most important open item for whoever picks this up next.
    already established for `.wfgy/webtop-debian/`) and are trivially
    reproducible from this section's own text; no long-lived script asset
    from this session needs preserving beyond the `layered.rs` fix itself.
+
+## 2026-09-07: the `-p`-vs-loopback `ECONNREFUSED` reframed -- it is not a
+## `net.rs`/NAT bug at all; `net.rs` cleared by direct construction
+
+Picked this up specifically to root-cause the loopback `ECONNREFUSED`
+narrowed by the previous session. Read `litebox_platform_windows_userland/
+src/net.rs` in full (`NatGateway`, `accept_inbound_flows`,
+`new_connecting_tcp_socket`, `send_ip_packet`'s loopback fast-path) and
+`litebox/src/net/mod.rs` in full (`connect`, `listen`, `accept`,
+`LocalPortAllocator`, `automated_platform_interaction`). Conclusion from
+code reading alone, later confirmed live: the gateway's inbound-flow
+ephemeral-port table (`inbound_local_ports`/`next_ephemeral_port`, address
+space `10.0.0.1:49152-65535`) and the guest's own `LocalPortAllocator`
+(address space `10.0.0.2`/`127.0.0.1`, independent RNG-seeded instance
+per-`Network`) share no state, no lock, and no code path -- a NAT-forwarded
+inbound flow and a guest-internal loopback `connect()` are handled by two
+structurally disjoint smoltcp interfaces connected only by an in-memory
+`LoopbackQueue`, and nothing in either file's per-connection bookkeeping
+(listener refill, backlog, socket-set handles) is keyed or gated on "did
+this request originate via `-p`". No plausible interaction point was found
+by direct reading of every line either file spends on connect/listen/accept.
+
+**Built the two networking crates (`litebox`, `litebox_platform_windows_
+userland`, `litebox_runner_linux_on_windows_userland`) unmodified from
+current `main`** (target-dir `target-natfix/`, the same isolated-target-dir
+workaround prior sessions used) and re-ran the exact repro shape, but
+isolated one variable at a time instead of jumping straight to the full
+i3+selkies stack:
+
+1. **Control: nginx proxying to itself.** Overlay with nginx's real
+   `/websocket` location (`proxy_pass http://127.0.0.1:8082;`) unchanged,
+   plus a *second* `server { listen 127.0.0.1:8082; }` block in the SAME
+   nginx config returning a static `200`. This makes nginx its own
+   backend -- the exact `connect()` call this whole investigation is about,
+   with the real guest network stack and the real `-p` NAT path, but with
+   **zero forking anywhere in the guest** (nginx's one already-running
+   process serves both the frontend and backend sockets). Booted via
+   `--oci-image docker.io/linuxserver/webtop:debian-i3 --resume-from
+   <overlay>.tar -p 3000:3000 -- /start-full-stack.sh`.
+
+   Result: **`curl http://127.0.0.1:3000/websocket` from the HOST, through
+   the published `-p` port, returned `200 backend-ok` every time** --
+   including with the real WebSocket upgrade headers
+   (`Connection: Upgrade`, `Upgrade: websocket`, `Sec-WebSocket-Key`, etc.),
+   across repeated requests on the same boot, and again after the process
+   had been sitting idle. `net.rs`'s NAT gateway correctly bridges an
+   external `-p`-arrived request into nginx, and nginx's own outbound
+   `connect()` back to its sibling loopback listener succeeds every time.
+   This is the same code path the previous session found `ECONNREFUSED` on
+   -- just with a backend that never forks.
+
+2. **Same repro, but with the real `selkies` backend (or even a plain
+   `python3 -m http.server` / `busybox httpd` substitute) in place of
+   nginx's self-proxy.** Every attempt to get a forking backend process
+   established via the launch script's own shell logic (readiness poll
+   loops using `while`/`grep`/`sleep`, i.e. exactly what the original
+   `webtop_launch.sh`/`wt_full_stack.sh` scripts do) hit the SAME
+   pre-existing, already-documented `[diag-unrecov-av]` host-level crash
+   this doc's `i3`/`fork-without-exec ENOMEM` section already flagged as a
+   known, deep, separately-tracked architectural gap -- except it is **not
+   scoped to i3**. It reproduces on `sh`'s own subshell forking for a
+   `while ! xdpyinfo; do sleep; done`-style readiness loop, on `python3 -m
+   http.server`'s own startup, and on `selkies`'s own launcher (a wrapper
+   that forks many short-lived helper processes, `grep`/`unamed`/`sleep`-
+   named children observed in `DIAG_TIMELINE clone`/`exit_group` pairs,
+   well after the point where `selkies.log` already contains `Data
+   WebSocket Server listening on port 8082`). The crash (`tid=<N>
+   ... addr=0x0 ... is_in_guest=false ... no exception-table entry found`)
+   hits a HOST-side thread outside the guest's own instruction stream, and
+   is not consistently fatal to the whole process on the first occurrence,
+   but accumulates: in every observed boot that reached this point, the
+   guest shell's forward progress eventually stalled permanently a few
+   crashes in (confirmed via `tasklist` showing the runner process still
+   alive, non-zero, stable memory, with zero new log lines for over a
+   minute -- a genuine hang, not a slow boot).
+
+**This reframes the previous session's four-boot paired comparison.** The
+"internal curl (before nginx starts) succeeds, external curl (after nginx
+starts) fails" split it found is real and reproducible, but the causal
+variable is almost certainly **elapsed wall-clock time / accumulated fork
+attempts since selkies started**, not **which path the triggering request
+arrived by**. The internal probe runs immediately after selkies' own
+readiness grep matches (`~3s`, iteration 6 per that session's own numbers)
+-- before the fork-crash storm from selkies' background/per-connection
+helper processes has had time to accumulate and eventually wedge the
+process. The external probe necessarily runs later (after the launch
+script finishes, execs nginx, and a human/tool issues a separate `curl`),
+by which point selkies' own listening socket, while still technically
+`bind()`+`listen()`-ed at the OS level, may belong to a process whose
+other threads are already deadlocked or crashed -- explaining a real,
+deterministic-per-boot `ECONNREFUSED`/hang with NO code-level involvement
+of `net.rs` or the guest's own TCP stack at all. A dead or wedged listening
+process, not a NAT-provenance bug, is a completely sufficient explanation
+for everything both sessions observed, including the previous session's
+own "not simple non-determinism... 100% reproducible in both directions
+within a single boot" finding (same boot, same elapsed-time ordering, every
+time).
+
+**No fix was made to `net.rs` or `litebox/src/net`, because none is
+warranted by the evidence.** Both files were read in full and independently
+confirmed clean (the control test above is a direct, positive proof that
+the `-p` NAT path's outbound-adjacent loopback `connect()` handling works
+correctly, not just an absence-of-bug argument from code reading). Forcing
+a change to files that direct construction shows are already correct,
+purely to have "done something" about the reported symptom, would be
+exactly the kind of unverified change this project's own standing
+discipline (see this doc's repeated "genuinely blocked, not forced"
+framing) warns against. The real, actionable bug is the fork-without-exec
+crash -- already tracked in this doc under the `i3` heading, but now known
+to be broader than i3 specifically (it hits plain `sh` subshells and
+`python3`'s own startup too), and it is what's actually standing between
+this project and a browser-verified live video stream, not the NAT/
+websocket routing this session was tasked with.
+
+### Status
+
+- `-p`/`LITEBOX_PUBLISH` inbound NAT forwarding to a loopback `proxy_pass`
+  backend: **confirmed working**, live, via a zero-fork control repro
+  (nginx proxying to itself) run multiple times against the exact
+  `location /websocket { proxy_pass http://127.0.0.1:8082; }` config the
+  real image ships. No code change needed or made.
+- The originally reported `ECONNREFUSED`/502-masked-as-404 against the REAL
+  `selkies` backend: **not reproduced in isolation from the fork-crash
+  bug** in this session's repro attempts -- every attempt to get a real
+  forking backend (selkies, `python3 -m http.server`, even plain shell
+  readiness-poll loops) up long enough to test hit the pre-existing
+  `[diag-unrecov-av]` crash first. This session's own evidence points at
+  that crash (not NAT provenance) as the true root cause of the original
+  symptom, but this was not proven by directly catching the same process
+  transition from "working" to "refused" under a controlled clock -- a
+  genuinely stronger confirmation (start selkies, curl successfully via
+  `-p` immediately, then curl again via `-p` after a longer idle period on
+  the SAME boot, with no NAT-path difference at all) is the next step and
+  was not completed this session due to time spent on the isolation work
+  above.
+- Whoever picks this up next should treat the fork-without-exec crash as
+  the single blocking item for both this bug AND the i3/video-frames goal
+  -- it is the same underlying architectural gap, not two separate bugs.
