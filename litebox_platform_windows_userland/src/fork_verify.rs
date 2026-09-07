@@ -1851,7 +1851,17 @@ fn readable_and_writable(addr: usize) -> (bool, bool) {
     if !ok || mbi.State != Win32_Memory::MEM_COMMIT {
         return (false, false);
     }
-    (mbi.Protect & NO_ACCESS == 0, mbi.Protect & WRITABLE != 0)
+    // A `MEM_IMAGE` region is a loaded module -- litebox's own executable or a DLL. Guest
+    // mappings are never `MEM_IMAGE` (they come from `VirtualAlloc2`/`MapViewOfFile3`, i.e.
+    // `MEM_PRIVATE`/`MEM_MAPPED`), so a heal that wants to WRITE one is always wrong. It is
+    // reported as not-writable here rather than not-readable: this same query backs `is_readable`,
+    // and reading an image page is perfectly legitimate (`read_code_bytes` does it for guest-code
+    // diagnostics), so suppressing readability too would break unrelated callers.
+    let is_image = mbi.Type == Win32_Memory::MEM_IMAGE;
+    (
+        mbi.Protect & NO_ACCESS == 0,
+        !is_image && mbi.Protect & WRITABLE != 0,
+    )
 }
 
 /// If `instruction` writes to memory, computes the effective address it writes to from its
@@ -1957,6 +1967,39 @@ fn read_usize_fault_tolerant(addr: usize) -> Option<usize> {
 fn write_usize_fault_tolerant(addr: usize, value: usize) {
     use windows_sys::Win32::System::Memory as Win32_Memory;
 
+    // NEVER heal outside the guest's own address range.
+    //
+    // Everything this function exists to patch is guest memory: a stale pointer sitting in a
+    // forked child's data. The address it is handed, though, is derived from decoded guest
+    // instruction operands and live register values, so a misdecode or a register that does not
+    // hold what the decoder assumed produces an address that is simply not guest memory at all.
+    // The checks below this point only ask "is it committed and can I make it writable" -- and
+    // litebox's OWN loaded image answers yes to both, because the widen step happily flips
+    // `PAGE_EXECUTE_READ` to `PAGE_EXECUTE_READWRITE`. The result is this function scribbling a
+    // guest pointer into the middle of litebox's own code.
+    //
+    // That is exactly what was observed: `mate-session` (via `dbus-launch`'s fork) died in
+    // `[diag-unrecov-av] ... is_in_guest=false is_verifying=true` with the faulting address at
+    // `0x7ff733827285` -- a `MEM_IMAGE` page with `PAGE_EXECUTE_READ`, well ABOVE
+    // `TASK_ADDR_MAX` -- and a `rip` of `0xffff_ffff_ffff_ffff`, i.e. control had already
+    // transferred into corrupted code by the time anything noticed.
+    //
+    // The guest occupies `TASK_ADDR_MIN..TASK_ADDR_MAX` by construction (see
+    // `PageManagementProvider`), and litebox's own image and heap live above it. So a target
+    // outside that window is never a legitimate heal, and refusing it costs nothing: the
+    // alternative is not "heal something useful", it is "corrupt the host".
+    const TASK_MIN: usize =
+        <crate::WindowsUserland as litebox::platform::PageManagementProvider<0x1000>>::TASK_ADDR_MIN;
+    const TASK_MAX: usize =
+        <crate::WindowsUserland as litebox::platform::PageManagementProvider<0x1000>>::TASK_ADDR_MAX;
+    if addr < TASK_MIN || addr.saturating_add(core::mem::size_of::<usize>()) > TASK_MAX {
+        litebox_util_log::warn!(
+            addr:% = addr, value:% = value, task_min:% = TASK_MIN, task_max:% = TASK_MAX;
+            "fork_verify: refusing to heal an address outside the guest address space"
+        );
+        return;
+    }
+
     // Hold the process-wide `VIRTUAL_PROTECT_LOCK` for the entire query-flip-write-restore span,
     // not just around the `VirtualProtect` calls: an ordinary guest `mprotect()` on an unrelated
     // thread (`WindowsUserland::update_permissions`, which takes the same lock) can otherwise
@@ -1983,6 +2026,27 @@ fn write_usize_fault_tolerant(addr: usize, value: usize) {
     if !readable {
         // Not committed/accessible at all: nothing to patch.
         return;
+    }
+    // Readable but not writable can still mean "a loaded module's read-only page", which the
+    // widen-and-write path below would happily flip to `PAGE_EXECUTE_READWRITE` and scribble
+    // into. `readable_and_writable` already refuses to call an image page writable; re-check the
+    // region type here so the fallback cannot route around that.
+    {
+        let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+        let queried = unsafe {
+            Win32_Memory::VirtualQuery(
+                addr as *const core::ffi::c_void,
+                &raw mut mbi,
+                core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+            ) != 0
+        };
+        if queried && mbi.Type == Win32_Memory::MEM_IMAGE {
+            litebox_util_log::warn!(
+                addr:% = addr, protect:% = mbi.Protect;
+                "fork_verify: refusing to heal inside a loaded module (MEM_IMAGE)"
+            );
+            return;
+        }
     }
 
     // Committed and readable but not currently writable: temporarily flip to
