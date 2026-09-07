@@ -350,74 +350,68 @@ impl std::io::Write for FlushingStderr {
 /// message could be thrown instead.
 /// Held for a `litebox_runner_linux_on_windows_userland` process's entire lifetime to make
 /// concurrent boots on this host structurally impossible. See `acquire_boot_lock`'s own doc
-/// comment for why this exists.
+/// comment for why this exists, and why liveness is tied to a held OS file handle rather than to
+/// this type's `Drop`.
 struct BootLock {
-    path: PathBuf,
-}
-
-impl Drop for BootLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-/// Keep re-touching the lockfile's mtime every 60s for as long as this process is alive, so a
-/// long-running-but-genuinely-live boot's lock never looks stale (its age reflects how long ago
-/// the last heartbeat landed, not how long ago the boot started), while a hard-killed process
-/// (which takes this thread down with it -- no `Drop` runs, but no more heartbeats either) still
-/// lets its lock go stale and reclaimable within `STALE_LOCK_AFTER` of the last real heartbeat.
-fn spawn_boot_lock_heartbeat(lock_path: PathBuf) {
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(60));
-            // Truncating write (not append) reliably updates mtime on every platform without a
-            // new dependency (unlike append-only reopen, which some filesystems don't guarantee
-            // bumps mtime with zero bytes written). If the file is already gone (e.g. removed
-            // out-of-band), there's nothing left to keep alive -- stop quietly rather than
-            // recreate a lock this process's own BootLock guard didn't create.
-            if !lock_path.exists() {
-                break;
-            }
-            let _ = std::fs::write(&lock_path, format!("{}\n", std::process::id()));
-        }
-    });
+    /// The exclusively-held lockfile handle. Windows closes it -- and so releases the lock --
+    /// when this process exits by ANY route: a normal `std::process::exit` (which calls
+    /// `ExitProcess` and runs no destructors at all), a panic, a hard kill by an external
+    /// low-memory watchdog, or an outright crash. That is the entire point: this runner reaches
+    /// none of its exits by unwinding, so a `Drop`-based release is unreachable by construction
+    /// (see `acquire_boot_lock`).
+    ///
+    /// `None` only for the `LITEBOX_ALLOW_CONCURRENT_BOOT` escape hatch, which holds no lock.
+    _file: Option<std::fs::File>,
 }
 
 /// Acquire the single, host-wide boot lock, refusing to proceed if another live boot already
-/// holds it. A lockfile in `.litebox-cache/` (the same directory the OCI-pull cache already
-/// uses) holds this process's PID and creation timestamp; a lock older than
-/// `STALE_LOCK_AFTER` is treated as abandoned (e.g. from a process that was hard-killed by an
-/// external low-memory watchdog, which never runs a `Drop` impl) and is safely stolen, matching
-/// this codebase's existing `sweep_orphaned_temp_files` convention of using file age rather than
-/// a cross-platform PID-liveness check (which would need a new dependency for a single Win32
-/// API call) to decide staleness -- a real boot is observed to take at most a few minutes even
-/// for a very large image, so anything older than that is safe to treat as abandoned.
+/// holds it.
+///
+/// The lock IS the lockfile's own open handle, held with a share mode that admits readers but no
+/// second writer, so a competing acquirer is refused by the OS with `ERROR_SHARING_VIOLATION`.
+/// Liveness is therefore a property the kernel maintains, not one this code has to infer.
+///
+/// It is deliberately NOT a `Drop` guard plus an mtime heartbeat, which is what this function
+/// used to be. That arrangement was broken in two independent ways, both confirmed live rather
+/// than reasoned about:
+///
+/// 1. `run` terminates via `std::process::exit`, which on Windows calls `ExitProcess` directly
+///    and runs no destructors (`main`'s own doc comment records this, having confirmed it against
+///    this exact binary and toolchain). So `BootLock::drop` never ran on the ordinary success
+///    path and every clean run leaked its lockfile -- the previous doc comment's claim that the
+///    lock was "dropped, and the lockfile removed, on any exit path via the guard's Drop impl"
+///    was simply false.
+/// 2. Because the leaked file's heartbeat thread died with the process, the stale-by-age fallback
+///    then blocked the NEXT boot for the full staleness window (five minutes) after every
+///    successful run. Observed directly: a clean `busybox ls` run exited with status 0 and left
+///    behind a lock that refused the very next boot.
+///
+/// A held handle fixes both at once, and needs no heartbeat thread, no staleness window, and no
+/// PID-liveness check -- the previous implementation's doc comment rejected a PID check as
+/// needing "a new dependency for a single Win32 API call", but with an OS-held handle that
+/// question never has to be asked, so no dependency is needed either.
 fn acquire_boot_lock() -> Result<BootLock> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
     // Explicit, narrow escape hatch for deliberate multi-runner testing (e.g. an Xorg server in
     // one runner and an X client connecting to it via --publish in another -- both need to be
-    // their own pid 1, so a single-runner arrangement can't express this). The caller is
+    // their own pid 1, so a single-runner arrangement cannot express this). The caller is
     // responsible for the resulting memory footprint (a full OCI image load is several GB); this
     // does not relax anything else about the lock's own correctness, it just skips acquiring it.
     if std::env::var_os("LITEBOX_ALLOW_CONCURRENT_BOOT").is_some() {
-        return Ok(BootLock {
-            path: PathBuf::new(),
-        });
+        return Ok(BootLock { _file: None });
     }
-    // Short enough that a watchdog-killed run's stale lock doesn't block the next boot for long,
-    // but safe for a genuinely long-running live boot because of the heartbeat thread spawned
-    // below, which keeps re-touching this file's mtime for as long as this process is actually
-    // alive -- so staleness reflects liveness, not merely how long ago the boot started.
-    const STALE_LOCK_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
     // Resolve against the executable's own directory, not the process's current working
     // directory: the old `Path::new(".litebox-cache")` was cwd-relative, so two runner
     // invocations launched from different directories (or even the same binary invoked via a
     // relative vs. absolute path) each got their own `.litebox-cache/boot.lock` and happily ran
-    // concurrently -- confirmed live tonight (2026-09-06): a peer session launched a second
-    // runner from a different cwd and had two full boots live simultaneously with zero code
-    // change, each pulling a multi-GB OCI image, which is exactly the "concurrent boots produce
-    // symptoms indistinguishable from a real hang or crash" scenario this lock exists to
-    // prevent. Anchoring to the exe's own directory makes the lock host-wide for any normal
-    // invocation of this binary, matching what its own error message already promises.
+    // concurrently -- confirmed live (2026-09-06): a peer session launched a second runner from a
+    // different cwd and had two full boots live simultaneously with zero code change, which is
+    // exactly the "concurrent boots produce symptoms indistinguishable from a real hang or crash"
+    // scenario this lock exists to prevent. Anchoring to the exe's own directory makes the lock
+    // host-wide for any normal invocation of this binary, matching what its own error message
+    // already promises.
     let lock_dir = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
@@ -427,49 +421,55 @@ fn acquire_boot_lock() -> Result<BootLock> {
         .with_context(|| format!("failed to create lock directory {}", lock_dir.display()))?;
     let lock_path = lock_dir.join("boot.lock");
 
-    for attempt in 0..2 {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            Ok(mut f) => {
-                use std::io::Write as _;
-                let _ = writeln!(f, "{}", std::process::id());
-                drop(f);
-                spawn_boot_lock_heartbeat(lock_path.clone());
-                return Ok(BootLock { path: lock_path });
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
-                let is_stale = std::fs::metadata(&lock_path)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
-                    .is_some_and(|age| age >= STALE_LOCK_AFTER);
-                if is_stale {
-                    let _ = std::fs::remove_file(&lock_path);
-                    continue; // retry the create_new on the next loop iteration
-                }
-                let holder = std::fs::read_to_string(&lock_path).unwrap_or_default();
-                return Err(anyhow!(
-                    "another litebox_runner_linux_on_windows_userland boot is already in \
-                     progress on this host (lock held by pid {}, {}) -- concurrent boots \
-                     silently starve each other (host memory/CPU contention) and produce \
-                     symptoms indistinguishable from a real hang or crash; wait for it to \
-                     finish, or if you're certain it's genuinely dead, remove {} manually",
-                    holder.trim(),
-                    lock_path.display(),
-                    lock_path.display()
-                ));
-            }
-            Err(e) => {
-                return Err(e).with_context(|| {
-                    format!("failed to acquire boot lock at {}", lock_path.display())
-                });
-            }
+    // Readers admitted, a second writer refused. Sharing READ is what lets the error path below
+    // still read the current holder's PID out of the file while the holder keeps the lock.
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    // `ERROR_SHARING_VIOLATION` -- the OS refusing this open precisely because another live
+    // process holds the file. This, not a timestamp, is the lock's contention signal.
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+
+    // `create(true)` + `truncate(true)`, deliberately not `create_new(true)`: a lockfile left on
+    // disk by a previous run is not itself the lock (the handle is), so an unheld leftover file
+    // must be reclaimed silently rather than mistaken for contention.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&lock_path)
+    {
+        Ok(mut f) => {
+            use std::io::Write as _;
+            // Recorded purely so a human -- or the error message below, running in the other
+            // process -- can see who holds the lock. Nothing about the lock's correctness
+            // depends on this value.
+            let _ = writeln!(f, "{}", std::process::id());
+            let _ = f.flush();
+            Ok(BootLock { _file: Some(f) })
+        }
+        Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
+            let holder = std::fs::read_to_string(&lock_path).unwrap_or_default();
+            let holder = holder.trim().to_owned();
+            let holder = if holder.is_empty() {
+                "unknown".to_owned()
+            } else {
+                holder
+            };
+            Err(anyhow!(
+                "another litebox_runner_linux_on_windows_userland boot is already in progress \
+                 on this host (lock held by pid {holder}, {}) -- concurrent boots silently \
+                 starve each other (host memory/CPU contention) and produce symptoms \
+                 indistinguishable from a real hang or crash; wait for it to finish. The lock \
+                 is the lockfile's open handle, so it is released automatically the moment that \
+                 process exits, however it exits -- if this persists, that process is genuinely \
+                 still alive, and deleting the file will NOT release the lock",
+                lock_path.display(),
+            ))
+        }
+        Err(e) => {
+            Err(e).with_context(|| format!("failed to acquire boot lock at {}", lock_path.display()))
         }
     }
-    unreachable!("loop always returns Ok or Err within its two iterations")
 }
 
 pub fn run(cli_args: CliArgs) -> Result<()> {
@@ -491,8 +491,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // concurrent sessions/forks this project has run, each time producing a real,
     // costly misdiagnosis (an "intermittent" bug that was actually just contention).
     // A held file lock makes concurrent boots structurally impossible instead of a
-    // rule to remember. Held for this process's entire lifetime (dropped, and the
-    // lockfile removed, on any exit path via the guard's Drop impl).
+    // rule to remember. Held for this process's entire lifetime: the lock is the
+    // lockfile's own open OS handle, which Windows closes on every exit path this
+    // process actually takes -- including `std::process::exit`/`ExitProcess` and a
+    // hard kill, neither of which runs any destructor. See `acquire_boot_lock`.
     let _boot_lock = acquire_boot_lock()?;
 
     // The shim is `no_std` and cannot read the environment itself, so translate
