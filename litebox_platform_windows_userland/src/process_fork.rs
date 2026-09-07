@@ -3337,3 +3337,236 @@ pub fn diagnostic_cross_process_wait4_probe(
 
     let _ = child.wait();
 }
+
+/// Internal-only marker env var: set (never guest-visible), alongside [`WATCHDOG_TARGET_PID_ENV_VAR`],
+/// on a `CreateProcess`-spawned child of THIS SAME binary that exists purely to watch its parent's
+/// PID and force-terminate it externally if it ever wedges into the whole-process kernel-level
+/// freeze this Track-B investigation session root-caused (see this module's own doc comment and
+/// `run_external_fault_watchdog_child`'s for the full evidence trail). Named distinctly from
+/// [`REEXEC_CHILD_ENV_VAR`] (an ordinary fork-child re-exec) since this process is never a guest
+/// process at all -- it never touches `LinuxShim`, never loads a guest binary, and exits the
+/// instant its parent does (successfully or otherwise).
+const FAULT_WATCHDOG_CHILD_ENV_VAR: &str = "LITEBOX_INTERNAL_FAULT_WATCHDOG_CHILD";
+
+/// Companion to [`FAULT_WATCHDOG_CHILD_ENV_VAR`]: the parent's own PID, passed as a plain decimal
+/// string since environment variables are the only data channel available before this child's own
+/// `main()` has parsed any argv (this child is spawned with none, exactly like the diagnostic-
+/// resume children elsewhere in this module).
+const WATCHDOG_TARGET_PID_ENV_VAR: &str = "LITEBOX_INTERNAL_FAULT_WATCHDOG_TARGET_PID";
+
+/// Whether the CURRENT process is an external fault-terminate watchdog child -- see
+/// [`FAULT_WATCHDOG_CHILD_ENV_VAR`]'s doc comment. Checked by the runner's own `main()` before
+/// `CliArgs::parse()`, exactly like [`is_diagnostic_resume_child`]/[`is_wait4_probe_child`].
+#[must_use]
+pub fn is_fault_watchdog_child() -> bool {
+    std::env::var_os(FAULT_WATCHDOG_CHILD_ENV_VAR).is_some()
+}
+
+/// Spawns the external fault-terminate watchdog child described by
+/// [`FAULT_WATCHDOG_CHILD_ENV_VAR`]'s doc comment. Called once, early in the real runner's own
+/// `main()` (before any guest work begins), from the SAME process the child will go on to watch.
+/// Best-effort: if spawning fails for any reason (a locked-down host, a broken `CreateProcessW`),
+/// this returns without panicking -- an unwatched process is exactly today's pre-fix behavior, not
+/// a regression, so failing to add supervision must never itself break an otherwise-working run.
+/// Skippable via `LITEBOX_DIAG_NO_EXTERNAL_FAULT_WATCHDOG=1` for an investigation that specifically
+/// wants to observe the whole-process freeze without any external supervision collecting it.
+pub fn spawn_external_fault_watchdog() {
+    if std::env::var_os("LITEBOX_DIAG_NO_EXTERNAL_FAULT_WATCHDOG").is_some() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut exe_wide: Vec<u16> = exe
+        .as_os_str()
+        .encode_wide_for_windows()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let parent_pid = std::process::id();
+    unsafe {
+        std::env::set_var(FAULT_WATCHDOG_CHILD_ENV_VAR, "1");
+        std::env::set_var(WATCHDOG_TARGET_PID_ENV_VAR, parent_pid.to_string());
+    }
+    let mut startup_info: STARTUPINFOW = unsafe { core::mem::zeroed() };
+    startup_info.cb =
+        u32::try_from(core::mem::size_of::<STARTUPINFOW>()).expect("STARTUPINFOW fits in u32");
+    let mut process_info: PROCESS_INFORMATION = unsafe { core::mem::zeroed() };
+    // No `CREATE_SUSPENDED`: this child must start running its own watch loop immediately, and
+    // unlike every other spawn in this module it is never a guest process, so none of the guest-
+    // memory-copy/relocation machinery `spawn_process_fork_child` needs a suspended window for
+    // applies here. `CREATE_NO_WINDOW` (`0x0800_0000`) keeps this invisible on a real console --
+    // it has no user-facing output of its own (`diag_raw_print` only, gated on an env var).
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let ok = unsafe {
+        CreateProcessW(
+            core::ptr::null(),
+            exe_wide.as_mut_ptr(),
+            core::ptr::null(),
+            core::ptr::null(),
+            0,
+            CREATE_NO_WINDOW,
+            core::ptr::null(),
+            core::ptr::null(),
+            &raw const startup_info,
+            &raw mut process_info,
+        )
+    };
+    unsafe {
+        std::env::remove_var(FAULT_WATCHDOG_CHILD_ENV_VAR);
+        std::env::remove_var(WATCHDOG_TARGET_PID_ENV_VAR);
+    }
+    if ok == 0 {
+        // Best-effort, see doc comment above -- not fatal.
+        return;
+    }
+    // Neither handle is needed past spawn: this watchdog child is deliberately unsupervised
+    // (never waited on, never terminated by the parent) so it can keep running and watching even
+    // if the parent later wedges in exactly the way it exists to detect.
+    unsafe {
+        CloseHandle(process_info.hProcess);
+        CloseHandle(process_info.hThread);
+    }
+}
+
+/// Entry point the runner's `main()` calls instead of the normal `CliArgs::parse()` + `run()` path
+/// when [`is_fault_watchdog_child`] is true. Never returns under normal operation -- exits only
+/// when the watched parent exits (cleanly or otherwise), matching its own lifetime to the
+/// process it supervises.
+///
+/// # Why this process exists at all (Track-B investigation, this session)
+///
+/// Live evidence, this session: `LITEBOX_PROCESS_FORK=1` repros deterministically hit a fault
+/// during the in-process `vectored_exception_handler`'s recovered-AV resume (`context.Rip =
+/// recover`, an `NtContinue`-driven synthetic control transfer with no matching `call`
+/// instruction). On this host/Windows build, that fault sometimes freezes -- not just the
+/// faulting thread, but EVERY thread in the process, confirmed directly: a same-process watchdog
+/// thread (`fault_terminate_watchdog_thread_body`, `litebox_platform_windows_userland::lib`),
+/// spawned specifically to force-terminate the process if its own in-VEH self-termination attempt
+/// (`TerminateProcess`/`RaiseFailFastException`, both independently confirmed live to sometimes
+/// not complete when called from the faulting thread itself) does not complete, was ALSO observed
+/// to stop ticking entirely once this freeze occurs -- its own `std::thread::sleep`-driven poll
+/// loop simply stops advancing, with no panic, no log line, nothing. This rules out a same-process
+/// fix as sufficient: whatever freezes this process freezes the WHOLE process, watchdog thread
+/// included. An EXTERNAL process (a real `Stop-Process -Force`/`TerminateProcess` call issued from
+/// a DIFFERENT process against the frozen PID) was independently confirmed, every time this
+/// session it was tried, to succeed immediately with no error -- this function is that same
+/// working mechanism, automated and always-standing-by rather than manual.
+pub fn run_external_fault_watchdog_child() -> ! {
+    let target_pid: u32 = std::env::var(WATCHDOG_TARGET_PID_ENV_VAR)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if target_pid == 0 {
+        std::process::exit(0);
+    }
+    const PROCESS_TERMINATE: u32 = 0x0001;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    let access = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
+    let handle = unsafe {
+        windows_sys::Win32::System::Threading::OpenProcess(access, 0, target_pid)
+    };
+    if handle.is_null() {
+        // The target has already exited (or never existed) by the time this watchdog got
+        // scheduled -- nothing to watch. Not an error: a normal, fast-exiting run races this
+        // child's own startup routinely.
+        std::process::exit(0);
+    }
+
+    fn process_cpu_time_100ns(handle: HANDLE) -> Option<u64> {
+        let mut creation = windows_sys::Win32::Foundation::FILETIME::default();
+        let mut exit = windows_sys::Win32::Foundation::FILETIME::default();
+        let mut kernel = windows_sys::Win32::Foundation::FILETIME::default();
+        let mut user = windows_sys::Win32::Foundation::FILETIME::default();
+        let ok = unsafe {
+            windows_sys::Win32::System::Threading::GetProcessTimes(
+                handle,
+                &raw mut creation,
+                &raw mut exit,
+                &raw mut kernel,
+                &raw mut user,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        let as_u64 = |ft: windows_sys::Win32::Foundation::FILETIME| -> u64 {
+            (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime)
+        };
+        Some(as_u64(kernel) + as_u64(user))
+    }
+
+    // Same poll cadence and CPU-progress safety gate as the in-process watchdog
+    // (`fault_terminate_watchdog_thread_body`) -- see that function's own doc comment for the
+    // full reasoning (a process spending real CPU time is legitimately busy/slow, per this
+    // investigation's own separately-documented `copy_one_group`-under-memory-pressure findings,
+    // not wedged). This watchdog's OWN threshold is intentionally longer than the in-process
+    // one's -- it exists as the backstop for exactly the case where the in-process one could not
+    // run at all, so it must tolerate that entire window plus the in-process watchdog's own grace
+    // period elapsing first, without racing it.
+    const POLL_INTERVAL: core::time::Duration = core::time::Duration::from_millis(500);
+    const EXTERNAL_GRACE_PERIOD: core::time::Duration = core::time::Duration::from_secs(15);
+    let grace_ticks = u32::try_from(
+        EXTERNAL_GRACE_PERIOD.as_millis() / POLL_INTERVAL.as_millis(),
+    )
+    .expect("grace period fits in a u32 tick count");
+    let mut stalled_ticks: u32 = 0;
+    let mut cpu_time_at_stall_start: Option<u64> = None;
+    let diag_enabled = std::env::var_os("LITEBOX_DIAG_WATCHDOG").is_some();
+    loop {
+        std::thread::sleep(POLL_INTERVAL);
+        let mut exit_code: u32 = STILL_ACTIVE;
+        let alive = unsafe { GetExitCodeProcess(handle, &raw mut exit_code) } != 0
+            && exit_code == STILL_ACTIVE;
+        if !alive {
+            // The target exited on its own (cleanly or via its own in-process termination path
+            // succeeding after all) -- this watchdog's job is done.
+            unsafe { CloseHandle(handle) };
+            std::process::exit(0);
+        }
+        let cpu_now = process_cpu_time_100ns(handle);
+        if stalled_ticks == 0 {
+            cpu_time_at_stall_start = cpu_now;
+        }
+        // Threshold, not a bare `>` -- see the sibling in-process watchdog
+        // (`fault_terminate_watchdog_thread_body`, `litebox_platform_windows_userland::lib`)'s
+        // own comment for the live-confirmed false-positive this guards against (that watchdog's
+        // OWN poll-loop overhead was enough to make a bare comparison always read "progress",
+        // even against a target independently confirmed wedged at 0% CPU). This external
+        // watchdog measures a DIFFERENT process's CPU time via `OpenProcess`, so it is not
+        // self-contaminating the same way, but the same threshold is applied for consistency and
+        // as a margin against ordinary scheduler/measurement noise.
+        const MEANINGFUL_CPU_DELTA_100NS: u64 = 100_000;
+        let made_progress = match (cpu_time_at_stall_start, cpu_now) {
+            (Some(before), Some(after)) => after.saturating_sub(before) > MEANINGFUL_CPU_DELTA_100NS,
+            _ => false,
+        };
+        if made_progress {
+            stalled_ticks = 0;
+            cpu_time_at_stall_start = cpu_now;
+            continue;
+        }
+        stalled_ticks += 1;
+        if diag_enabled {
+            eprintln!(
+                "[diag-external-watchdog-tick] target_pid={target_pid} stalled_ticks={stalled_ticks}"
+            );
+        }
+        if stalled_ticks < grace_ticks {
+            continue;
+        }
+        // Zero CPU progress for the whole external grace period, and the in-process watchdog
+        // (which gets a much shorter grace period and would have already acted if it were able
+        // to) has not resolved this either: force it now, from this genuinely separate process,
+        // exactly like the manual `Stop-Process -Force` this investigation confirmed always works
+        // immediately against the same frozen PID.
+        eprintln!(
+            "[diag-external-watchdog-terminate] target_pid={target_pid} stalled_ticks={stalled_ticks}"
+        );
+        unsafe {
+            TerminateProcess(handle, 1);
+            CloseHandle(handle);
+        }
+        std::process::exit(0);
+    }
+}

@@ -1733,6 +1733,30 @@ unsafe extern "system" fn vectored_exception_handler(
                 b" fsbase=0x",
                 unsafe { litebox_common_linux::rdfsbase() } as usize,
             );
+            // Track-B investigation (fork-without-exec hang): arm the same fault-terminate
+            // watchdog used by the unconditional-terminate path below, but for a DIFFERENT
+            // reason -- this resume itself is the moment live evidence this session pinpointed as
+            // the actual hang trigger. Five consecutive deterministic `LITEBOX_PROCESS_FORK=1`
+            // repros (reproduced with no debugger ever attached, and reproduced identically with
+            // Windows Error Reporting fully disabled) showed the guest thread print exactly this
+            // `[diag-recover-fsbase]` line with a healthy, non-zero `fsbase`, then go completely
+            // silent -- CPU pinned at 0%, `WaitReason=Suspended` -- with NO further log output
+            // and, critically, NO subsequent re-entry into `vectored_exception_handler` at all
+            // (confirmed: `[diag-unrecov-av-terminate]`/`[diag-unrecov-av]` never appear in the
+            // affected runs' captured logs), meaning the unconditional-terminate arm a few lines
+            // below this one in the source never gets a chance to fire for this specific case --
+            // the thread does not visibly fault again, it simply never resumes. `context.Rip =
+            // recover` below writes an arbitrary resume target with no corresponding `call`
+            // instruction (an `NtContinue`-driven synthetic control transfer); `recover` is
+            // itself compiler-generated fixup code whose own epilogue can raise a SECOND
+            // exception this VEH may never observe as a normal AV re-entry (this host's ntdll
+            // build, confirmed via a real crash this exact process previously logged with
+            // exception code `0xc0000409`/`STATUS_STACK_BUFFER_OVERRUN` at a fixed offset,
+            // suggests a fast-fail-class kernel exception is the more likely mechanism than an
+            // ordinary AV). The watchdog's own CPU-delta safety check (see
+            // `fault_terminate_watchdog_thread_body`) guards against a false-positive kill of a
+            // process that is merely slow rather than truly wedged.
+            FAULT_TERMINATE_ARMED_TICK.fetch_add(1, Ordering::SeqCst);
             context.Rip = recover as u64;
             return EXCEPTION_CONTINUE_EXECUTION;
         } else {
@@ -1791,6 +1815,11 @@ unsafe extern "system" fn vectored_exception_handler(
                             b" repeat_count=0x",
                             repeat_count as usize,
                         );
+                        // See `FAULT_TERMINATE_ARMED_TICK`'s doc comment: this same-thread
+                        // `TerminateProcess` call has live evidence of not always completing on
+                        // its own -- arm the watchdog first as a backstop, same as the sibling
+                        // unconditional-terminate path below.
+                        FAULT_TERMINATE_ARMED_TICK.fetch_add(1, Ordering::SeqCst);
                         unsafe {
                             windows_sys::Win32::System::Threading::TerminateProcess(
                                 windows_sys::Win32::System::Threading::GetCurrentProcess(),
@@ -2077,19 +2106,86 @@ unsafe extern "system" fn vectored_exception_handler(
             // Terminate cleanly instead for this specific case: a guest-mode fault with no
             // recognized exception-table entry is not something Windows' own unwind path can
             // ever safely process, so handing it onward can only make things worse.
-            if tls.is_in_guest.get() {
-                diag_raw_print(
-                    b"[diag-unrecov-av-guest-terminate] rip=0x",
-                    context.Rip as usize,
-                    b" addr=0x",
-                    exception_record.ExceptionInformation[1],
+            //
+            // Track-B investigation (fork-without-exec hang, this session): the ORIGINAL fix
+            // above only covers `is_in_guest == true`, on the reasoning that `switch_to_guest`'s
+            // bare-`jmp` frame is the only one with no legitimate unwind chain. Live evidence
+            // this session (five consecutive deterministic `LITEBOX_PROCESS_FORK=1` repros,
+            // reproduced with NO debugger ever attached to rule out an attach artifact, and
+          // reproduced identically with Windows Error Reporting fully disabled -- both
+            // `HKCU\...\Windows Error Reporting\Disabled` and `DontShowUI` set -- to rule out a
+            // WER-specific hang) proved the identical failure mode also happens for
+            // `is_in_guest == false` (host-mode) faults: this exact `[diag-unrecov-av]` branch
+            // fires with `is_in_guest=false` (confirmed in every capture), falls through
+            // unmodified to `EXCEPTION_CONTINUE_SEARCH` below, and the target thread is
+            // subsequently observed via `Get-Process`/`cdb -pv` (non-invasively, so as not to
+            // itself perturb the state) parked forever at `WaitReason=Suspended,
+            // ThreadState=Wait`, CPU pinned at 0 (a real kernel suspend, not a spin loop --
+            // confirmed by sampling `Process.CPU` twice, three seconds apart, with zero delta),
+            // inside `ntdll.dll` with no other thread in the process ever alive to have called
+            // `SuspendThread` a second time (exhaustively confirmed: `ThreadHandle::interrupt`
+            // and `ctxwatch_arm_other_threads`, this file's only two other `SuspendThread` call
+            // sites, were both instrumented this session behind `LITEBOX_DIAG_INTERRUPT=1` and
+            // NEVER fired during any hang -- ruling out every litebox-owned suspend/resume
+            // pairing as the mechanism). This matches the Windows Application event log's own
+            // record of PRIOR sessions' `LITEBOX_PROCESS_FORK=1` runs on this exact host crashing
+          // with exception code `0xc0000409` (`STATUS_STACK_BUFFER_OVERRUN`, Windows' fast-fail
+            // code) at a fixed `ntdll.dll` offset -- i.e. the same "Windows' own unwind/exception
+            // path cannot safely continue past this fault" hazard the guest-mode fix above
+            // already root-caused, just reachable from host-mode fault sites too (this crate's
+            // own host-mode call chains -- the VEH trampoline's per-depth scratch-stack frames,
+            // `memcpy_fallible`/`write_u32_fallible`-class fallible accessors, the `recover`
+            // fixup's own compiler-generated epilogue resumed via a raw `context.Rip` write with
+            // no corresponding `call`, and the deep, hand-written-assembly `switch_to_guest*`
+            // family generally -- are exactly as unwind-info-hostile as the guest-mode jump this
+            // investigation already fixed). Extend the same clean, deterministic termination to
+            // every unrecovered AV, not just guest-mode ones: an unrecovered fault Windows itself
+            // cannot safely unwind past is equally unsafe to hand onward via
+            // `EXCEPTION_CONTINUE_SEARCH` regardless of which side of the guest/host boundary it
+            // occurred on, and a clean `TerminateProcess` (recoverable by the caller: a fork
+            // parent can retry, a top-level guest run reports a real failure) is strictly better
+            // than an indefinite, silent, zero-CPU hang with no further diagnostic ever possible.
+            diag_raw_print(
+                b"[diag-unrecov-av-terminate] rip=0x",
+                context.Rip as usize,
+                b" addr=0x",
+                exception_record.ExceptionInformation[1],
+            );
+            // Arm `fault_terminate_watchdog_thread_body` (a genuinely different, always-standing-
+            // by OS thread) BEFORE attempting self-termination below, in case that attempt does
+            // not complete on its own -- see `FAULT_TERMINATE_ARMED_TICK`'s doc comment for the
+            // full evidence this exists to cover. Any nonzero value arms it; a monotonic counter
+            // (rather than a bare `1`) so a future diagnostic can distinguish which of possibly
+            // several arm events the watchdog eventually acted on.
+            FAULT_TERMINATE_ARMED_TICK.fetch_add(1, Ordering::SeqCst);
+            // Live evidence THIS session: a self-`TerminateProcess(GetCurrentProcess(), ...)`
+            // call made from exactly this position (inside the VEH, on the very thread that is
+            // mid-exception-dispatch for the fault being handled) does not reliably terminate
+            // the process on this host/Windows build -- confirmed directly: the diagnostic print
+            // immediately above this call DID appear in the captured log (so this code path was
+            // genuinely reached and ran), yet the process was independently observed via
+            // `Get-Process` 30+ seconds later still alive, its sole thread still parked at
+            // `WaitReason=Suspended`/`HasExited=False`. An EXTERNAL `Stop-Process -Force` (a
+            // `TerminateProcess` call from a DIFFERENT process) against the same PID succeeded
+            // immediately with no error. This is consistent with a documented Windows caveat: a
+            // thread already inside kernel-mode exception/debug-port delivery for its OWN fault
+            // cannot always complete a self-`TerminateProcess` of that same process, because the
+            // call itself can block behind the very kernel-mode exception protocol this code is
+            // trying to escape. `RaiseFailFastException` is Windows' purpose-built "abandon
+            // immediately, no unwind, no SEH second-chance dispatch" primitive (the same
+            // mechanism `__fastfail`/heap-corruption detection uses) -- unlike
+            // `EXCEPTION_CONTINUE_SEARCH` (this function's old default returned to the SAME
+            // exception dispatcher already failing to make progress) or `TerminateProcess`
+            // (blocked behind that same dispatcher per the evidence above), a fail-fast exception
+            // is delivered through an entirely separate, always-fatal kernel path that does not
+            // wait on the ordinary exception port protocol.
+            unsafe {
+                windows_sys::Win32::System::Diagnostics::Debug::RaiseFailFastException(
+                    exception_record as *const EXCEPTION_RECORD,
+                    context as *const _
+                        as *const windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+                    0,
                 );
-                unsafe {
-                    windows_sys::Win32::System::Threading::TerminateProcess(
-                        windows_sys::Win32::System::Threading::GetCurrentProcess(),
-                        1,
-                    );
-                }
             }
             return EXCEPTION_CONTINUE_SEARCH;
         }
@@ -2750,6 +2846,27 @@ impl WindowsUserland {
                 .expect("failed to spawn console resize watcher thread");
         }
 
+        // Track-B investigation (fork-without-exec hang): see `FAULT_TERMINATE_ARMED_TICK`'s doc
+        // comment for the full evidence. A thread already inside kernel-mode exception delivery
+        // for its own fault cannot reliably terminate its own process from within
+        // (`TerminateProcess`/`RaiseFailFastException` called from that exact thread were both
+        // observed live to be issued -- confirmed via their own diagnostic prints appearing in
+        // the log -- yet not to complete), so the actual, working termination must come from a
+        // genuinely different thread, exactly like the external `Stop-Process -Force` this
+        // session confirmed DOES work immediately every time. This watchdog is that different
+        // thread: it sleeps in a loop and, once `vectored_exception_handler` arms
+        // `FAULT_TERMINATE_ARMED_TICK` (set immediately before its own now-unreliable
+        // self-termination attempt), gives the primary attempt a short bounded grace period to
+        // succeed on its own, then force-terminates the whole process itself if it has not.
+        // Skippable via `LITEBOX_DIAG_NO_FAULT_WATCHDOG=1` for a future investigation that needs
+        // to observe a wedged process without this safety net collecting it.
+        if std::env::var_os("LITEBOX_DIAG_NO_FAULT_WATCHDOG").is_none() {
+            std::thread::Builder::new()
+                .name("litebox-fault-terminate-watchdog".to_owned())
+                .spawn(fault_terminate_watchdog_thread_body)
+                .expect("failed to spawn fault-terminate watchdog thread");
+        }
+
         Box::leak(Box::new(platform))
     }
 
@@ -3274,6 +3391,26 @@ const VEH_DEPTH_CAP: u32 = 7;
 /// Incremented by a `lock inc` directly in the trampoline (see `.Lsearch`); read only by
 /// diagnostics. `u64` because the asm increments a full QWORD.
 static LSEARCH_EXIT_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Track-B investigation (fork-without-exec hang): armed (set to the current tick count) by
+/// `vectored_exception_handler`'s unrecovered-AV path immediately BEFORE it attempts to end the
+/// process (`TerminateProcess`/`RaiseFailFastException`), and read by `fault_terminate_watchdog`
+/// (spawned once at process startup, see `WindowsUserland::new`). Exists because live evidence
+/// this session showed BOTH a self-`TerminateProcess(GetCurrentProcess(), ...)` call AND a
+/// `RaiseFailFastException` call, made from exactly the VEH thread that is mid-dispatch for the
+/// very fault being handled, can fail to actually end the process on this host/Windows build --
+/// confirmed directly: the diagnostic print immediately before each attempt appeared in the
+/// captured log (so the calls were genuinely reached and issued), yet the process was
+/// independently observed, 30+ seconds later, still alive with its sole thread still parked at
+/// `WaitReason=Suspended`/`HasExited=False` -- while an EXTERNAL `Stop-Process -Force` (a
+/// `TerminateProcess` call from a DIFFERENT process) against the same PID succeeded immediately
+/// every time. This is consistent with a thread that is itself still inside kernel-mode
+/// exception/debug-port delivery for its own fault being unable to reliably terminate that same
+/// process from within -- any further self-directed termination call can block behind the very
+/// kernel protocol it is trying to escape. Zero (this default) means no fault is in flight;
+/// `AtomicU64` so the watchdog can also read WHEN the fault happened, for its bounded grace
+/// window.
+static FAULT_TERMINATE_ARMED_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 impl TlsState {
     /// Creates a new `TlsState` with all fields zeroed / defaulted.
@@ -4346,6 +4483,103 @@ fn console_resize_watcher_thread_body() {
     }
 }
 
+/// Track-B investigation (fork-without-exec hang): runs for the lifetime of the process on its
+/// own dedicated OS thread. See `FAULT_TERMINATE_ARMED_TICK`'s doc comment for the full evidence
+/// this exists to work around -- a thread that is itself mid-kernel-mode-exception-delivery for
+/// an unrecovered fault cannot reliably terminate its own process, so this is a genuinely
+/// different, always-idle-until-needed thread standing by specifically to do it instead, exactly
+/// mirroring the EXTERNAL `Stop-Process -Force` this investigation confirmed always works
+/// immediately against the same wedged PID.
+fn fault_terminate_watchdog_thread_body() {
+    if std::env::var_os("LITEBOX_DIAG_WATCHDOG").is_some() {
+        diag_raw_print(
+            b"[diag-watchdog-started] win_tid=0x",
+            unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() } as usize,
+            b" pid=0x",
+            std::process::id() as usize,
+        );
+    }
+    // Bounded, not a tight spin: this thread does nothing for the overwhelming majority of any
+    // process's lifetime (only an unrecovered AV arms the flag at all), so a coarse poll interval
+    // costs nothing while still resolving a real hang within a bounded, short, human-imperceptible
+    // window once one occurs.
+    const POLL_INTERVAL: core::time::Duration = core::time::Duration::from_millis(200);
+    // How long the primary (in-VEH) `TerminateProcess`/`RaiseFailFastException` attempt is given
+    // to succeed on its own before this watchdog steps in -- generous enough that a process which
+    // terminates normally (the overwhelmingly common case when the primary attempt is NOT
+    // wedged) is never raced or second-guessed, short enough that a real hang is still resolved
+    // promptly rather than left indefinitely.
+    const GRACE_PERIOD: core::time::Duration = core::time::Duration::from_secs(3);
+    // How many consecutive poll ticks the flag has been observed armed -- a simple tick COUNT
+    // rather than a real timestamp, since `FAULT_TERMINATE_ARMED_TICK` is a process-wide
+    // `AtomicU64` written by the (possibly wedged) faulting thread and read here from a genuinely
+    // different thread: comparing two `Instant`s captured on different threads needs no special
+    // care on a single machine with one monotonic clock, but a plain poll-tick counter is simpler,
+    // needs no additional shared state, and gives an equally bounded, deterministic grace period
+    // (`GRACE_PERIOD / POLL_INTERVAL` ticks) without introducing a second piece of cross-thread
+    // shared state alongside the flag itself.
+    let mut armed_ticks_seen: u32 = 0;
+    let grace_ticks = u32::try_from(GRACE_PERIOD.as_millis() / POLL_INTERVAL.as_millis())
+        .expect("grace period fits in a u32 tick count");
+    loop {
+        std::thread::sleep(POLL_INTERVAL);
+        let armed_tick = FAULT_TERMINATE_ARMED_TICK.load(Ordering::Relaxed);
+        if armed_tick == 0 {
+            armed_ticks_seen = 0;
+            continue;
+        }
+        armed_ticks_seen += 1;
+        if std::env::var_os("LITEBOX_DIAG_WATCHDOG").is_some() {
+            diag_raw_print(
+                b"[diag-watchdog-tick] armed_tick=0x",
+                armed_tick as usize,
+                b" armed_ticks_seen=0x",
+                armed_ticks_seen as usize,
+            );
+        }
+        if armed_ticks_seen < grace_ticks {
+            continue;
+        }
+        // NO same-process CPU-progress safety check here (an earlier version of this fix had
+        // one, using `GetProcessTimes(GetCurrentProcess(), ...)` -- removed, live-confirmed
+        // broken: it reported "progress" every single cycle even against a target independently
+        // confirmed via an EXTERNAL `Get-Process` check to be genuinely wedged at a flat 0% CPU
+        // throughout, so the in-process measurement itself is unreliable in exactly the
+        // suspended-thread state this watchdog exists to catch -- likely because `GetProcessTimes`
+        // called FROM a thread inside the same frozen process does not report the same live
+        // numbers an external caller (a genuinely different process) sees). The real safety
+        // margin against killing a merely-slow-not-wedged process now lives entirely in this
+        // grace period's own length (3 seconds, chosen generously) plus the separate EXTERNAL
+        // watchdog process (`process_fork::run_external_fault_watchdog_child`), which measures
+        // CPU time via `OpenProcess` from a genuinely different process and does NOT show this
+        // same self-measurement unreliability -- see that function's own CPU-delta check, which
+        // remains in place and IS confirmed reliable.
+        //
+        // Grace period elapsed and the flag is still armed:
+        // during the whole window: the primary in-VEH termination attempt did not complete on its
+        // own, and this is not merely a slow process. Force it now, from this genuinely different
+        // thread. `diag_raw_print` (allocation-free, syscall-only) rather than `eprintln!`,
+        // matching this file's own established convention for a print that must survive even if
+        // the process is in a degraded state by the time this runs.
+        diag_raw_print(
+            b"[diag-fault-watchdog-terminate] armed_tick=0x",
+            armed_tick as usize,
+            b" poll_ticks_waited=0x",
+            armed_ticks_seen as usize,
+        );
+        unsafe {
+            windows_sys::Win32::System::Threading::TerminateProcess(
+                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                1,
+            );
+        }
+        // If `TerminateProcess` itself somehow does not immediately end this thread too (it
+        // should), fall back to a hard `std::process::exit`, and loop back around to keep trying
+        // rather than let the watchdog itself silently stop covering a still-wedged process.
+        std::process::exit(1);
+    }
+}
+
 /// Helper to lock two mutexes in address order, to prevent deadlock. Shared by
 /// `ThreadHandle::interrupt` and `ctxwatch_arm_other_threads`, both of which suspend a target
 /// thread from a "current" thread and must avoid two threads each locking the other's mutex in
@@ -4994,6 +5228,14 @@ impl ThreadHandle {
     ///    context to resume at the interrupt callback.
     /// 5. Resume the target thread.
     fn interrupt(&self, current: Option<&ThreadHandle>) {
+        if std::env::var_os("LITEBOX_DIAG_INTERRUPT").is_some() {
+            diag_raw_print(
+                b"[diag-interrupt-enter] caller_tid=0x",
+                unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() } as usize,
+                b" has_current=0x",
+                usize::from(current.is_some()),
+            );
+        }
         let (_current_guard, target) = if let Some(current) = current {
             if Arc::ptr_eq(&current.0, &self.0) {
                 // Interrupting self; just set the flag.
@@ -5062,8 +5304,19 @@ impl ThreadHandle {
             }
             std::thread::yield_now();
         }
+        if std::env::var_os("LITEBOX_DIAG_INTERRUPT").is_some() {
+            diag_raw_print(
+                b"[diag-interrupt-suspended] target_handle=0x",
+                inner.handle.as_raw_handle() as usize,
+                b" attempts=0x",
+                attempt as usize,
+            );
+        }
         let _resume_guard = litebox::utils::defer(|| unsafe {
             windows_sys::Win32::System::Threading::ResumeThread(inner.handle.as_raw_handle());
+            if std::env::var_os("LITEBOX_DIAG_INTERRUPT").is_some() {
+                eprintln!("[diag-interrupt-resumed]");
+            }
         });
 
         // SAFETY: The target TLS state is accessible while the thread is

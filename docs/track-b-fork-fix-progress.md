@@ -1,5 +1,199 @@
 # Track B fork-without-exec fix: running progress log
 
+## 2026-09-07 (yet another later session): the leaked-suspend hang is NOT a missing
+## `ResumeThread` -- it is Windows itself refusing to complete self-termination, in two distinct
+## ways. Fixed both with defense-in-depth; the dominant crash path is now confirmed reliably
+## self-terminating, the rarer whole-process-freeze path is mitigated but not exhaustively proven
+
+### Task brief vs. reality
+
+The task brief characterized the remaining blocker as "the exact `SuspendThread` call ... and the
+matching `ResumeThread` that should pair with it" -- i.e. a leaked suspend/resume pairing
+somewhere in `process_fork.rs`/`lib.rs`. This session instrumented BOTH of this file's only two
+`SuspendThread` call sites (`ThreadHandle::interrupt`, `ctxwatch_arm_other_threads`) behind
+`LITEBOX_DIAG_INTERRUPT=1` and reproduced the hang multiple times with that instrumentation
+active: **neither call site ever fires during the hang.** This rules out the task brief's own
+hypothesis directly, with live evidence, rather than by inspection alone.
+
+### Root cause #1 (real, fixed, confirmed reliably working): the VEH's own termination attempts
+### don't reliably terminate the process when called from the faulting thread itself
+
+`vectored_exception_handler`'s unrecovered-AV path already had a `TerminateProcess` call for the
+`is_in_guest == true` case (a prior session's pass 246 fix, described in this doc's own earlier
+entries). Every hang this session captured showed `is_in_guest == false` (host-mode) instead --
+outside that fix's coverage -- falling through to bare `EXCEPTION_CONTINUE_SEARCH`, exactly the
+"Windows' own unwind path cannot safely process this" hazard pass 246 already root-caused for the
+guest-mode case.
+
+**Fix, part 1**: extended the same termination to the `is_in_guest == false` case (the branch is
+now unconditional, not gated on `is_in_guest` at all -- see the new doc comment at the fix site in
+`litebox_platform_windows_userland/src/lib.rs`).
+
+**Live evidence this fix alone was insufficient**: a self-`TerminateProcess(GetCurrentProcess(),
+1)` call issued from exactly this position -- the VEH thread, still mid-dispatch for the fault
+being handled -- was confirmed NOT to reliably complete. Confirmed directly: the diagnostic print
+immediately before the call appeared in the captured log (so the call was genuinely reached and
+issued), yet the process was independently observed via `Get-Process` 30+ seconds later still
+alive, `HasExited=False`, its sole thread still `WaitReason=Suspended`. An EXTERNAL
+`Stop-Process -Force` (a `TerminateProcess` call from a DIFFERENT process) against the same PID
+succeeded immediately, every time this was tried.
+
+**Fix, part 2**: replaced the same-thread `TerminateProcess` call with `RaiseFailFastException`
+(Windows' purpose-built "abandon immediately, no unwind, no SEH second-chance dispatch"
+primitive -- the same mechanism `__fastfail`/heap-corruption detection uses). This resolved the
+DOMINANT observed crash shape (a direct, first-instruction unrecovered AV, `is_verifying=false`,
+no exception-table entry) reliably: confirmed via `Get-CimInstance Win32_Process` polling across
+roughly six separate repro runs after this fix that the process cleanly disappears within a few
+seconds of `[diag-unrecov-av-terminate]` printing, every time this exact path was hit.
+
+### Root cause #2 (real, confirmed, only partially fixed): a genuine WHOLE-PROCESS kernel-level
+### freeze after the `recover`-fixup resume, that even a dedicated same-process watchdog THREAD
+### cannot escape
+
+The rarer hang variant (the one that matches this doc's own prior-session description most
+closely): `[diag-recover-fsbase]` prints a healthy, non-zero `fsbase`, `context.Rip = recover` is
+written, `EXCEPTION_CONTINUE_EXECUTION` is returned -- and NO further log line ever appears, not
+even `[diag-unrecov-av]`/`[diag-unrecov-av-terminate]`. This means `vectored_exception_handler` is
+never re-entered at all after this resume; whatever fault (if any) occurs next is not being
+delivered as an ordinary Windows AV this VEH ever sees.
+
+Suspecting this might be a CET (Control-Flow Enforcement Technology / hardware shadow stack)
+violation -- `context.Rip = recover` is a synthetic control transfer via `NtContinue`/
+`SetThreadContext` with no matching `call` instruction, and `cdb`'s own attach banner on this host
+explicitly flagged "This target supports Hardware-enforced Stack Protection" -- a
+`SetProcessMitigationPolicy(ProcessUserShadowStackPolicy, ...)` self-mitigation was tried (added to
+`main()`, called before any other initialization) and did NOT fix the hang; reverted. The
+Windows Application event log's own historical record (`Get-WinEvent`, `Application` log, event ID
+1000) shows PRIOR sessions' `LITEBOX_PROCESS_FORK=1` runs on this exact host crashing with
+exception code `0xc0000409` (`STATUS_STACK_BUFFER_OVERRUN`, Windows' fast-fail code) at a FIXED
+`ntdll.dll` offset across multiple separate runs -- consistent with a fast-fail-class kernel
+exception being the real mechanism, though the CET-specific mitigation attempt did not resolve it,
+so the precise trigger remains unconfirmed.
+
+**Definitively ruled out as the cause**: Windows Error Reporting (reproduced identically with
+`HKCU\...\Windows Error Reporting\Disabled=1` and `DontShowUI=1` both set); a JIT/`AeDebug`
+debugger (`HKLM\...\AeDebug` has no `Debugger`/`Auto` value configured); an artifact of `cdb -pv`
+non-invasive attach itself (reproduced with literally zero debugger ever attached, confirmed via a
+run observed purely through `Get-Process`/`Get-CimInstance`); every litebox-owned
+`SuspendThread` call site (both instrumented, neither fires).
+
+**What IS confirmed, via live `cdb -pv` attach**: the process's sole thread shows kernel-reported
+`Suspend: 2` (not 1), frozen at the very entry of a small ntdll thunk (`test rax,rax; je ...; call
+...`, a lazy-init-flag-check shape) with all GPRs zeroed -- consistent with having genuinely never
+executed a real instruction after the resume, not a spin loop (`Process.CPU` sampled twice, three
+seconds apart: zero delta). Critically: **the same-process watchdog thread this session added
+specifically to force-terminate a wedged process (`fault_terminate_watchdog_thread_body`, spawned
+once at `WindowsUserland::new()`) was independently confirmed, via `LITEBOX_DIAG_WATCHDOG=1`'s own
+tick log, to ALSO completely stop advancing once this specific freeze occurs** -- it prints
+`[diag-watchdog-started]` at startup, then nothing further, ever, for a process later confirmed via
+external `Get-Process` to still be alive and frozen. This proves the freeze is process-wide, not
+limited to the one thread whose `WaitReason` happens to be externally visible as `Suspended` --
+Windows itself is not scheduling ANY thread in this process during the freeze, which rules out a
+same-process fix (of any kind, not just a suspend/resume pairing) as sufficient on its own.
+
+**Fix, part 3 (mitigation, not a root-cause fix)**: added a genuinely EXTERNAL watchdog --
+`process_fork::spawn_external_fault_watchdog`/`run_external_fault_watchdog_child` -- a hidden,
+detached child process (re-executing this same binary with an internal-only marker env var,
+mirroring this module's existing `REEXEC_CHILD_ENV_VAR` pattern) spawned at the very start of
+`main()`, before any other initialization. It polls its parent's PID via `OpenProcess`/
+`GetExitCodeProcess`/`GetProcessTimes` from a genuinely different process (confirmed, unlike the
+same-process watchdog, NOT to suffer the same measurement/scheduling starvation) and force-
+terminates it if it observes zero CPU-time progress for 15 seconds. Confirmed live in this session
+that this external process DOES spawn correctly (two `litebox_runner_linux_on_windows_userland.exe`
+processes visible via `Get-CimInstance Win32_Process`, parent/child PID relationship confirmed) and
+DOES poll (`[diag-external-watchdog-tick]` observed). **Not exhaustively confirmed to actually
+terminate a genuinely frozen target within this session** -- the whole-process-freeze variant
+proved harder to reliably reproduce on demand than the dominant direct-crash variant (roughly 1 in
+6 observed runs this session, vs. the direct path's much higher rate), and the runs that did hit it
+were not all re-observed for the full 15-second external grace period before this session's time
+budget was reached. This is recorded honestly as a real gap, not glossed over.
+
+**A real bug found and fixed IN this mitigation itself, worth recording**: the first version of
+the same-process watchdog's safety gate (skip the kill if the target spent real CPU time during
+the grace window, to avoid false-positiving a merely-slow-not-wedged process) measured CPU time via
+`GetProcessTimes(GetCurrentProcess(), ...)` -- i.e. the watchdog measuring ITS OWN process, from
+inside it. This was live-confirmed broken: the watchdog thread's own poll-loop overhead (the
+`sleep`/wake/`GetProcessTimes` cycle, plus its own `diag_raw_print` calls) was enough scheduler-
+quantum noise to make `after > before` true on literally every cycle, resetting the grace window
+forever and permanently disabling the kill -- even against a target independently confirmed via
+`Get-Process` to be at a flat 0% CPU the entire time. Removed the same-process CPU check entirely
+(the 3-second grace period's own length is the remaining safety margin there); the EXTERNAL
+watchdog's equivalent check (measuring a genuinely DIFFERENT process via `OpenProcess`) does not
+share this self-contamination problem and was kept, with a meaningful-delta threshold added for
+consistency.
+
+### What was fixed, concretely (commit `<see git log>`)
+
+1. `litebox_platform_windows_userland/src/lib.rs`: `vectored_exception_handler`'s unrecovered-AV
+   termination now covers `is_in_guest == false` too (previously guest-mode-only), and uses
+   `RaiseFailFastException` instead of `TerminateProcess` (the latter confirmed unreliable when
+   called from the faulting thread itself). Added `FAULT_TERMINATE_ARMED_TICK` (armed both at this
+   termination attempt and at the `recover`-fixup resume) and `fault_terminate_watchdog_thread_body`
+   (a same-process backstop thread, spawned once in `WindowsUserland::new()`, `LITEBOX_DIAG_
+   NO_FAULT_WATCHDOG=1` to disable). Instrumented `ThreadHandle::interrupt` behind
+   `LITEBOX_DIAG_INTERRUPT=1` (kept as a durable diagnostic, zero-cost when unset).
+2. `litebox_platform_windows_userland/src/process_fork.rs`: added
+   `spawn_external_fault_watchdog`/`run_external_fault_watchdog_child`/`is_fault_watchdog_child`,
+   the external-process backstop described above (`LITEBOX_DIAG_NO_EXTERNAL_FAULT_WATCHDOG=1` to
+   disable, `LITEBOX_DIAG_WATCHDOG=1` for its own tick log).
+3. `litebox_runner_linux_on_windows_userland/src/main.rs`: dispatches to the external watchdog's
+   own entry point first (before any other `main()` logic) when `is_fault_watchdog_child()`, and
+   unconditionally spawns this run's own external watchdog otherwise, as the very first action in
+   `main()`.
+
+### Step 0 verdict: still not CONFIRMED -- but the dominant crash-shaped failure mode is now
+### reliably self-healing, narrowing what remains to the rarer freeze variant
+
+No run this session reached `TCACHE_REPRO_CHILD_OK`/`TCACHE_REPRO_DONE` -- Step 0's central claim
+(the forked child runs its tcache workload and exits cleanly) is still not CONFIRMED. But the
+nature of what blocks it has changed materially: the DOMINANT observed failure this session (a
+direct, first-instruction unrecovered host-mode AV) now reliably self-terminates within a few
+seconds instead of hanging forever -- a real, verified improvement, turning an indefinite hang into
+a fast, clean, diagnosable failure. The rarer whole-process-freeze variant (after a successful
+FS_BASE recovery) is mitigated by defense-in-depth (two independent watchdogs) but not proven to
+always resolve within this session's time budget.
+
+### Step 9 (long-running cross-process child survival): still NOT REACHED
+
+Unchanged -- no run this session reached a live, running, resumed cross-process child; every run
+still terminates (now cleanly, rather than hanging) before that point.
+
+### Regression check
+
+`cargo test --release -p litebox --lib`: 123 passed, 26 failed -- identical to the documented
+baseline (missing `diod` binary, one `tar_ro` symlink test, one `mm::tests::test_vmm_mapping`
+assertion). No regression.
+
+`cargo test --release -p litebox_common_linux`: 10 passed, 1 doctest passed, 0 failed -- clean.
+
+`cargo test --release -p litebox_platform_windows_userland --lib`: 4 passed, 0 failed -- clean.
+
+`cargo test -p litebox_shim_linux` (test/doctest build): still fails to compile, `E0576` "cannot
+find method `run_test_thread` in trait `ThreadProvider`" -- confirmed pre-existing (identical to
+every prior session's documented finding), unrelated to this session's diff.
+
+### What remains open for a future session
+
+- **Exhaustively confirm the external watchdog actually terminates a genuinely frozen target.**
+  This session confirmed it spawns and polls correctly but did not observe a full 15-second grace
+  period elapse against a live, confirmed-frozen target before running out of time. Reproduce the
+  whole-process-freeze variant specifically (it appears to correlate with, but not be guaranteed
+  by, taking the `recover`-fixup resume path -- most runs down that path this session actually hit
+  a DIFFERENT unrecovered AV shortly after and self-terminated cleanly via fix #1/#2 instead) and
+  watch it through to the external watchdog's own kill.
+- **Root-cause WHY the whole-process freeze happens at all**, not just mitigate it. The
+  `0xc0000409`/`STATUS_STACK_BUFFER_OVERRUN` fast-fail signature in the Windows Application event
+  log (prior sessions, same host) and the frozen ntdll thunk's lazy-init-flag-check shape both
+  point at a fast-fail/CET-adjacent kernel mechanism, but the specific `SetProcessMitigationPolicy`
+  attempt to disable CET did not resolve it -- worth investigating whether this needs a build-time
+  linker flag (`/CETCOMPAT:NO`) instead of a runtime API call (CET policy may need to be decided
+  before the loader ever runs, not adjustable this late), or whether the real mechanism is
+  unrelated to CET entirely.
+- Everything else this doc's prior entries left open (Step 9, the `ElfPatchKey`-not-rekeyed-on-fork
+  bug) remains exactly as open.
+
+---
+
 ## 2026-09-07 (later session): Step 0 verdict -- still INCONCLUSIVE, but with two more real bugs
 ## found, fixed and confirmed, and the remaining blocker now precisely localized
 

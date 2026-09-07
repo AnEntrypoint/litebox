@@ -9,6 +9,24 @@ fn main() -> anyhow::Result<()> {
     use clap::Parser as _;
     use litebox_runner_linux_on_windows_userland::CliArgs;
 
+    // Track-B investigation (fork-without-exec hang), checked FIRST, before even
+    // `is_wait4_probe_child`/`is_diagnostic_resume_child`: see `process_fork::
+    // run_external_fault_watchdog_child`'s own doc comment for the full evidence trail behind
+    // this process's existence -- a same-process watchdog thread was independently confirmed
+    // live to also stop ticking during the exact whole-process kernel-level freeze this exists to
+    // recover from, so only a genuinely external process (this one) can reliably terminate a
+    // wedged run. Never returns.
+    if litebox_platform_windows_userland::process_fork::is_fault_watchdog_child() {
+        litebox_platform_windows_userland::process_fork::run_external_fault_watchdog_child();
+    }
+
+    // Spawn this run's own external fault-terminate watchdog (a hidden, detached child of THIS
+    // process, re-executing this same binary) before any other initialization -- as early as
+    // possible, so the supervision window covers as much of this process's lifetime as it
+    // reasonably can. Best-effort/non-fatal; see `spawn_external_fault_watchdog`'s own doc
+    // comment.
+    litebox_platform_windows_userland::process_fork::spawn_external_fault_watchdog();
+
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
 
     // `--session-daemon <runner-exe>` is this binary's own daemon-mode entry point (spawned
