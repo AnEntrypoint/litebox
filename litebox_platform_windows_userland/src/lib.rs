@@ -7055,12 +7055,34 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             }
             ptr = reserve_and_commit(0..size, prot_flags(initial_permissions), 0);
         }
-        assert!(
-            !ptr.is_null(),
-            "VirtualAlloc2(RESERVE|COMMIT size=0x{:x}) failed: {}",
-            size,
-            std::io::Error::last_os_error()
-        );
+        if ptr.is_null() {
+            // Out of memory is a condition the GUEST asked for and the guest can be told about;
+            // it is not a bug in this runtime, so it must not panic the host. `allocate_pages`
+            // already returns `Result<_, AllocationError>`, `AllocationError::OutOfMemory`
+            // already exists, and callers already handle it (`mm::allocator` retries against it,
+            // and `mm::linux` maps it onward for the guest) -- the `assert!` that used to be here
+            // simply bypassed all of that and took the whole process down instead of failing one
+            // `mmap`.
+            //
+            // Observed live: a MATE desktop plus selkies encoding 1920x842 H.264 on a 16 GiB host
+            // reached genuine Windows commit exhaustion, and a single 631 MiB request
+            // (`VirtualAlloc2(RESERVE|COMMIT size=0x25a80000) failed: The paging file is too small
+            // for this operation to complete. (os error 1455)`) killed the entire guest -- every
+            // process in it, since they all share one address space -- at the moment video
+            // capture had just started. Linux would have returned `ENOMEM` from that one `mmap`
+            // and let the caller cope. This is the same defect class as `resize_mapping`'s
+            // `unreachable!()` on an out-of-space expand, fixed earlier for the same reason.
+            //
+            // Deliberately logged, not silent: an allocation this large failing is worth seeing
+            // even though it is now recoverable, and unlike the diagnostics above this path is by
+            // definition rare, so the logging hazard those comments describe does not apply.
+            litebox_util_log::error!(
+                size:% = size,
+                os_error:% = std::io::Error::last_os_error();
+                "allocate_pages: VirtualAlloc2(RESERVE|COMMIT) failed, reporting OutOfMemory"
+            );
+            return Err(AllocationError::OutOfMemory);
+        }
 
         // Prefetch the memory range if requested
         if populate_pages_immediately {
