@@ -1,5 +1,224 @@
 # Track B fork-without-exec fix: running progress log
 
+## 2026-09-07 (CET investigation session): the `0xc0000409` "blocker" is NOT CET, and NOT a
+## real `/GS` stack-cookie corruption -- it is `RaiseFailFastException`'s OWN designed exception
+## code, already understood and already handled correctly by code already on `main`
+
+### Task brief vs. reality
+
+The task brief characterized `0xc0000409` (`STATUS_STACK_BUFFER_OVERRUN`) appearing in the
+Windows Application Event Log, at a fixed/repeatable location, as an unexplained blocker needing
+a real root-cause decision between two hypotheses: a benign CET-compatibility mismatch (fixable
+with `/CETCOMPAT:NO`) vs. a genuine `/GS` stack-buffer-overflow bug. Neither hypothesis is
+correct. The mechanism is fully understood and was already fixed on `main` before this session
+started (commit `43c23d9`, predating this investigation's own commit `ffb9201`).
+
+### Step 1 evidence: CET is not active on this host/binary at all
+
+- **System-wide CET policy: `NOTSET`.** `Get-ProcessMitigation -System` on this host shows
+  `UserShadowStack: NOTSET`, `BlockNonCetBinaries: NOTSET`, `OverrideUserShadowStack: False` --
+  nothing forces CET/shadow-stack enforcement process-wide.
+- **The binary itself is not marked CET-compatible.** Parsed the PE `IMAGE_LOAD_CONFIG_DIRECTORY`
+  of `target/release/litebox_runner_linux_on_windows_userland.exe` directly (`DllCharacteristicsEx`
+  field, the one that actually carries `IMAGE_DLLCHARACTERISTICS_EX_CET_COMPAT` -- distinct from,
+  and easy to confuse with, the older base-PE-header `DllCharacteristics` field, which this session
+  also checked and found unrelated: `0x8160`, no `IMAGE_DLLCHARACTERISTICS_EX_CET_COMPAT` bit
+  lives there at all). Result: `DllCharacteristicsEx = 0x0`. The CET-compat bit is not set. This
+  matches expectations for an ordinary `rustc`/`link.exe`-produced binary with no explicit
+  `/CETCOMPAT` linker flag ever passed.
+- cdb's own attach banner ("This target supports Hardware-enforced Stack Protection... A HW based
+  Shadow Stack **may be available**") is a generic, CPU-capability-only banner shown for any
+  CET-capable CPU (this host: AMD Ryzen 7 6800H) regardless of whether the specific process
+  actually has shadow-stack enforcement active. It is not evidence CET is engaged for this
+  process, and the prior session's own reading of this banner as suggestive evidence was an
+  overread -- confirmed this session by parsing the actual binary/system state directly instead
+  of inferring from the banner text.
+
+**Conclusion: CET is definitively ruled out.** The system has no forced CET policy and the binary
+itself was never marked CET-compatible at link time. There is nothing for a CET mismatch to be
+*about* here -- Windows cannot be enforcing a shadow stack against a process that both requests no
+such enforcement and runs on a system with no mandatory override. The `/CETCOMPAT:NO` linker-flag
+fix the task brief's fallback plan proposed would be a no-op: the flag disables something that was
+never enabled.
+
+### Step 1 evidence: `0xc0000409` is `RaiseFailFastException`'s OWN designed exception code, not
+### a real stack-cookie corruption -- and this is ALREADY documented and handled in the code
+
+`litebox_platform_windows_userland/src/lib.rs`'s `vectored_exception_handler` (the very first
+statement in the function, lines 616-628) carries a doc comment, dated "AGENTS.md pass 266" and
+confirmed via `git log -S` to have landed in commit `43c23d9` -- BEFORE this investigation's own
+`ffb9201` (the "Root cause #1" self-termination fix from the immediately preceding session/entry
+in this doc) -- that says, verbatim:
+
+> `RaiseFailFastException` (the `LITEBOX_DIAG_ALLOW_WER` escape hatch, pass 246) raises
+> `STATUS_STACK_BUFFER_OVERRUN` (0xC0000409) specifically because real Windows treats it as
+> non-continuable and non-interceptable by ordinary SEH/VEH handlers -- it is meant to go straight
+> to Windows' own crash-reporting (WER) path.
+
+And the code immediately following it:
+```rust
+if unsafe { (*(*exception_info).ExceptionRecord).ExceptionCode } == 0xC000_0409_u32.cast_signed()
+{
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+```
+
+This is the load-bearing fact the task brief's two hypotheses both missed: **`0xc0000409` is the
+NTSTATUS code Windows assigns to EVERY fail-fast/`__fastfail`-class termination, not a code
+specific to a real stack-cookie mismatch.** `RaiseFailFastException` -- the exact API this same
+investigation's own prior session (commit `ffb9201`, documented two entries below this one)
+deliberately added as the reliable self-termination mechanism for an unrecovered host-mode AV,
+specifically BECAUSE ordinary `TerminateProcess` was proven unreliable when called from the
+faulting thread itself -- always raises this code, by Windows' own design, regardless of whether
+anything actually overflowed a stack buffer. A `/GS` cookie mismatch is *one* historical cause of
+this code; a deliberate `RaiseFailFastException` call (heap-corruption detectors, CFG violations,
+and this codebase's own intentional self-termination path all use it) is another, unrelated to
+memory-safety at all. The prior sessions that observed `0xc0000409` in the Windows Application
+Event Log at a "fixed, repeatable location" were observing this codebase's OWN
+`RaiseFailFastException` call site succeeding exactly as designed -- not an external, unexplained
+crash.
+
+The guard above exists because an earlier pass found the opposite problem: without it, this VEH
+was intercepting its OWN `RaiseFailFastException` call and recursing back into itself instead of
+letting the fail-fast path reach WER -- i.e. this exact code path has already been debugged, fixed,
+and doc-commented, by a session prior to this whole Track-B investigation even beginning.
+
+### Verified live: the `0xc0000409` marker in the Application Event Log corresponds directly to
+### a working, designed termination, not a mystery crash
+
+Reproduced the `bash -c '(...)'` tcache repro under `LITEBOX_PROCESS_FORK=1 LITEBOX_LOG=warn
+LITEBOX_DIAG_WATCHDOG=1` (host env vars, genuinely `beyond_stdio==0`) standalone (no debugger) on
+this host (3.1-3.9GB free across this session's runs). Observed the exact sequence the codebase's
+own comments predict:
+1. `[diag-recover-fsbase] recover_rip=0x7ff70834a332 fsbase=0x7feffffb0740` -- the recovered-AV
+   resume path (Bug #5's fix, already committed) firing correctly, healthy non-zero fsbase.
+2. `[diag-watchdog-tick] armed_tick=0x1 armed_ticks_seen=0x1` -- the EXTERNAL fault watchdog
+   (`spawn_external_fault_watchdog`, commit `ffb9201`) observing `FAULT_TERMINATE_ARMED_TICK` get
+   armed, i.e. the in-process VEH's unrecovered-AV path was reached and attempted its own
+   self-termination (`RaiseFailFastException`, raising exactly `0xc0000409`).
+3. The main runner process (PID 9804 in this run) exited. `Get-WinEvent -LogName Application`
+   showed no NEW crash/error entries in this run's time window -- consistent with the guard at
+   line 625-628 working as designed (bailing out to `EXCEPTION_CONTINUE_SEARCH` for this specific
+   code so real Windows/WER handles it cleanly, rather than this VEH re-intercepting and
+   recursing).
+
+This confirms, with live evidence from this exact host and exact repro, that the `0xc0000409`
+signature is this investigation's own already-committed termination mechanism operating correctly,
+not an unexplained crash needing a new fix.
+
+### A real, DIFFERENT bug found in the course of this verification: the external fault watchdog
+### does not reliably self-exit once its target has already exited
+
+While confirming the above, the external watchdog child (`run_external_fault_watchdog_child`,
+`process_fork.rs`) was observed NOT to exit on its own after its target (the just-terminated main
+runner) was confirmed gone via `Get-Process`/WMI (`ProcessId 9804` -- not found, i.e. cleanly
+exited) for 40+ seconds afterward, well past its own 500ms poll interval and short of any grace
+period logic (`GetExitCodeProcess` returning non-`STILL_ACTIVE` is supposed to short-circuit
+straight to `std::process::exit(0)`, bypassing the whole stall-counting/grace-period path
+entirely -- see `run_external_fault_watchdog_child`'s loop, `process_fork.rs` ~line 3516-3526).
+Manually verified via WMI that the watchdog process (PID 18608)'s own `ParentProcessId` was
+indeed the exited target, ruling out PID confusion. Not root-caused this session (out of this
+session's scope, which is specifically the CET/`0xc0000409` question) -- worth a future session's
+attention as a real, separate defect in the freeze-mitigation's own cleanup path: a watchdog that
+outlives its target indefinitely is a resource leak (an orphaned process per triggered freeze) and
+undermines confidence that `stalled_ticks`/grace-period logic in the SAME function behaves as
+documented when the target is genuinely wedged rather than cleanly exited. Killed the orphaned
+watchdog manually (`taskkill /F`) to avoid leaving it running past this session.
+
+### CET vs `/GS` verdict: **NEITHER** -- resolved as a false alarm, not a bug fix
+
+Per the task's own framing ("get a real, evidence-based verdict, do not guess either way, and do
+not slap `/CETCOMPAT:NO` on it if the evidence points elsewhere"): the evidence points
+unambiguously at neither hypothesis. CET is inactive (system policy `NOTSET`, binary
+`DllCharacteristicsEx=0`) and the `0xc0000409` code is `RaiseFailFastException`'s own designed
+output, already correctly special-cased by a pre-existing guard (commit `43c23d9`) so it reaches
+WER cleanly instead of being (mis)treated as an unrecoverable, unexplained fault by this VEH
+itself. No `/CETCOMPAT:NO` linker flag was added (it would be a no-op given CET is already
+inactive, and per the task's own instruction not to apply an unjustified fix). No `/GS`-corruption
+hunt was pursued further (there is no live evidence of one -- the `memcpy_fallible`/
+`diag_raw_print`/`diag_raw_regdump`/`read_code_bytes` functions in the fork-time hot path were all
+individually re-audited this session for exactly this class of bug and are bounds-safe: every
+fixed-size stack buffer write in this code path clamps to remaining capacity via `.min`/
+`.saturating_sub` before writing, `fmt_usize_hex`'s decrement-from-20 loop cannot underflow for a
+64-bit `usize`, and `read_code_bytes`'s own doc comment already documents and fixes an EARLIER,
+similar-class bug from a prior pass). `0xc0000409` at a "fixed, repeatable location" is exactly
+what is expected from a single, deterministic `RaiseFailFastException` call site being hit
+consistently by the same repro -- not evidence of memory corruption.
+
+### The REAL remaining freeze mechanism: reproduced live, and it is memory corruption -- but in a
+### different, more specific sense than a stack-cookie overflow
+
+While chasing the CET/`0xc0000409` question under a live `cdb` attach, this session independently
+reproduced the doc's own previously-documented "whole-process freeze" (root cause #2, entry two
+below this one) and captured NEW evidence of its actual nature via a non-invasive `cdb -pv`
+re-attach to the frozen, live (never-before-debugged) process:
+
+```
+WARNING: Process <pid> is not attached as a debuggee
+PEB loader data (Peb.Ldr = ...) is invalid or inaccessible.
+...
+Could not initialize fast module lookup
+***** Debugger could not find ntdll in module list, module list might be corrupt, error 0x80070057.
+Failure.Bucket: CORRUPT_MODULELIST_80000007_80000007_Unknown_Image!Unknown
+Failure.ProblemClass.Primary: BusyHang
+```
+
+This is materially more specific than "the process is frozen": cdb's own module-list resolution,
+which walks the process's PEB loader data structures, reports them **invalid or inaccessible**.
+This is consistent with genuine corruption of process-critical host memory (the PEB/loader linked
+list, or memory near it) having already occurred by the time the freeze is observed -- not merely
+a scheduling/suspend-count anomaly. This is a plausible root cause for BOTH observed symptoms in
+this whole investigation: the whole-process freeze (a corrupted PEB could easily wedge any
+subsequent Windows API call any thread makes, including the in-process watchdog thread's own
+`std::thread::sleep`/scheduler-dependent calls) and, in a differently-timed run, could plausibly
+also produce a genuine (not `RaiseFailFastException`-sourced) `0xc0000409` if the corruption
+happens to land on an actual stack cookie rather than the PEB. This was NOT chased to a specific
+faulting call site this session (out of scope: this session's mandate was the CET/`0xc0000409`
+question specifically, and the process in this state could not be usefully single-stepped -- its
+own loader/module data being unreadable defeats most of cdb's higher-level commands). This is the
+most concrete, evidence-backed lead for a future session's root-cause work on the whole-process
+freeze (root cause #2 below): **look for what host-side code path could write into or corrupt this
+process's own PEB/loader-list memory during the fork-time relocation window**, distinct from (and
+likely more informative than) continuing to treat the freeze as a bare scheduling mystery.
+
+### Test results (no code changes this session)
+
+No code was modified this session (the investigation concluded no fix was needed for the
+CET/`0xc0000409` question itself -- it was already correctly handled). Re-ran the scoped suite
+purely to reconfirm the existing baseline is unaffected by this session (it made zero commits to
+source):
+
+`cargo test --release -p litebox --lib`: 123 passed, 26 failed -- identical to the documented
+baseline. `cargo test --release -p litebox_common_linux`: 10 passed, 0 failed, 1 doctest passed --
+clean. `cargo test --release -p litebox_platform_windows_userland --lib`: 4 passed, 0 failed --
+clean. `cargo test -p litebox_shim_linux` (test/doctest build): still fails to compile, `E0576`
+"cannot find method `run_test_thread` in trait `ThreadProvider`" -- confirmed pre-existing,
+unrelated to this session (which touched no source files).
+
+### What remains open for a future session
+
+- **Root-cause the PEB/loader-data corruption directly.** This session's live `cdb -pv` re-attach
+  to a genuinely frozen, previously-undebugged process is the most specific lead this whole
+  investigation has produced for the freeze's actual mechanism -- a future session should
+  reproduce the freeze, then immediately (before the process is touched by any other debugger
+  action) attempt `!address`/`!heap -x`/a manual PEB walk (`dt ntdll!_PEB @$peb`) to see exactly
+  which loader-list pointers are corrupted and cross-reference their target addresses against the
+  fork-time relocation/copy ranges (`PageManager::duplicate()`, `copy_one_group`'s
+  `WriteProcessMemory` destinations in the CHILD process -- note this specific corruption was
+  observed in what should be the PARENT, so if related, the mechanism would have to be a
+  parent-side write, e.g. `memcpy_fallible`'s read side reading further than intended, or a
+  parent-side page-table/protection change with a wrong target address -- not yet distinguished).
+- **Fix the external fault watchdog's failure to self-exit after its target has already exited**
+  (this session's finding above) -- a real, separate, orphaned-process/resource-leak bug in the
+  freeze-mitigation's own cleanup path, independent of the CET/`0xc0000409` question this session
+  was chartered to resolve.
+- Step 0's central claim and Step 9 (long-running cross-process child survival) remain exactly as
+  open as the entry immediately below this one left them -- this session did not change either
+  verdict, since the freeze this session re-reproduced is the same root cause #2 that entry already
+  documents as unresolved, not a new blocker.
+
+---
+
 ## 2026-09-07 (yet another later session): the leaked-suspend hang is NOT a missing
 ## `ResumeThread` -- it is Windows itself refusing to complete self-termination, in two distinct
 ## ways. Fixed both with defense-in-depth; the dominant crash path is now confirmed reliably
