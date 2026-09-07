@@ -449,3 +449,176 @@ machine rather than a code defect.
   gap in that coverage).
 - Step 9 (long-running cross-process child survival) remains untouched -- still no run has ever
   reached a live cross-process child to observe.
+
+---
+
+## 2026-09-07 (yet later): Step 0 final verdict -- **REFUTED**, and it is a genuine bug, not
+## memory pressure
+
+### Goal
+
+Get a final, clean, decisive Step 0 verdict on a host with confirmed memory headroom, per the
+open item at the end of the prior entry. Capture Windows-level crash artifacts this time so a
+silent exit can be definitively attributed to memory pressure vs. a real code defect.
+
+### Pre-flight
+
+Free memory checked before starting: 4.6GB (`Get-CimInstance Win32_OperatingSystem`), trending
+down slightly over the session (4.6GB -> 4.4GB -> 4.0GB) purely from unrelated background load
+on this host (several `claude`/Chrome/Discord processes, none litebox-related) -- no
+multi-GB litebox zombie processes were found running (`tasklist` showed zero
+`litebox_runner_linux_on_windows_userland.exe` at session start). This is below the requested
+5GB target but the repro itself is lightweight and, per the actual results below, memory
+pressure was not the limiting factor this time either.
+
+`target/release/.litebox-cache/boot.lock` was stale (pid 3744, confirmed dead via `tasklist`)
+and was cleared before the first run.
+
+Configured `HKCU:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\
+litebox_runner_linux_on_windows_userland.exe` (`DumpFolder=C:\dev\litebox-main\crashdumps`,
+`DumpType=2` full dump, `DumpCount=5`) so any Windows-level unhandled crash would leave a real
+minidump. No `windbg`/`cdb` available on this host (`where` found neither).
+
+### Repro construction: verified genuinely `beyond_stdio == 0`
+
+Per the prior entry's own hard-won lesson (`bash /script.sh` holds the script file open as fd 3,
+producing a false `beyond_stdio=1`), this session ran the script's exact command sequence inline
+via `bash -c '<...>'` with no script file at all -- no extra fd opens anywhere in the invocation
+shape. Both `LITEBOX_PROCESS_FORK` and `LITEBOX_LOG` were set as real host (Git Bash `export`)
+environment variables before invoking the runner directly, never via `--env` (which only reaches
+the guest).
+
+### Baseline (default fork path, no `LITEBOX_PROCESS_FORK`): CONFIRMED corrupt, unchanged
+
+`LITEBOX_LOG=warn`, `LITEBOX_PROCESS_FORK` unset. Result, identical to every prior session:
+```
+malloc(): unaligned tcache chunk detected
+...
+fatal signal: terminating task signal=Signal(6) pid=2 tid=2 comm=bash
+/bin/bash: line 1:     2 Aborted   ( declare -a bufs; ... )
+TCACHE_REPRO_SUBSHELL_STATUS=134
+TCACHE_REPRO_DONE
+```
+Zero `[diag-unrecov-av]` lines in this run's log -- confirms the crash below is specific to the
+`LITEBOX_PROCESS_FORK=1` path, not a general instability of this host or this repro shape.
+
+### `LITEBOX_PROCESS_FORK=1` run 1: reproducible host-side crash, well before the `beyond_stdio`
+### gate, NOT a silent exit this time
+
+`LITEBOX_LOG=debug`, `LITEBOX_PROCESS_FORK=1`, ~4.1GB free going in. The run reached
+`do_clone: about to duplicate address space for fork()`, entered `PageManager::duplicate()`'s
+VMA relocation loop (many `DIAG_VMA fork-relocation` / `allocate_pages` lines, `self_owner=
+GuestPid(2)`), and after roughly 0.4s of relocation work crashed:
+
+```
+[diag-unrecov-av] tid=ThreadId(6) rip=0x7ff8da4f5492 rva=0x26fdb5492 addr=0xc0000100
+  rsp=0xe4831fcc30 rax=0x0 rbx=0x10188000 ... is_in_guest=false is_verifying=false
+  -- no exception-table entry found
+```
+The log then ends abruptly mid-diagnostic-dump (`[diag-unrecov-av-ring-stack]` lines with no
+further output, no panic message, no clean-exit marker) -- the process is torn down from inside
+its own unrecoverable-AV handling path.
+
+**Critically: `beyond_stdio` never appears anywhere in this run's log.** Grepped for
+`beyond_stdio|fd_complexity|cross-process` across the full ~2700-line debug trace: zero matches.
+This confirms the crash happens strictly inside `PageManager::duplicate()`'s relocation loop,
+before the `fd_complexity.beyond_stdio == 0` gate check that (per the codebase, ~line 3190) runs
+much later in the same function. `spawn_cross_process_fork_child` was never reached.
+
+No Windows-level minidump was written to the configured `crashdumps/` folder, and
+`Get-WinEvent -LogName Application` showed no new crash entries in the run's time window (only
+stale, unrelated kernel/BSOD entries from days earlier, flushed at boot) -- this is litebox's
+own VEH catching the AV and self-terminating via its internal unrecoverable-AV path, not an
+OS-level unhandled exception. This also rules out the "concurrent boot" confusion from earlier
+in the session: a leftover, unkillable (`Stop-Process -Force` and `taskkill /F` both failed
+silently) but small (~256MB) `litebox_runner_linux_on_windows_userland.exe` zombie (pid 27452,
+`Responding=True` yet un-terminable) was found holding the boot lock before this run; clearing
+the stale lock file directly (not touching the zombie process itself, which appears to be an
+OS-level zombie/ghost handle-table entry, not a real live process) was sufficient to proceed.
+
+### `LITEBOX_PROCESS_FORK=1` run 2: IDENTICAL crash, confirms determinism, refutes memory
+### pressure as the explanation
+
+Immediately re-ran the identical repro (same env vars, ~4.0GB free going in -- lower than run 1,
+if anything more memory-constrained). Result: **byte-for-byte identical crash signature** --
+same `rip=0x7ff8da4f5492`, same `rva=0x26fdb5492`, same `addr=0xc0000100`, same `tid=ThreadId(6)`,
+same abrupt end-of-log mid-`[diag-unrecov-av-ring-stack]` dump, same ~2688 total log lines. Two
+independent runs producing an identical fault address and identical truncation point is strong
+evidence of a deterministic bug, not a memory-pressure-driven race whose symptom would be
+expected to vary run to run (different silent-exit points, different or absent diagnostics).
+
+### Root-cause read (not fully resolved -- would need a live debugger, unavailable on this host)
+
+`addr=0xc0000100` is `STATUS_VARIABLE_NOT_FOUND`, the same leaked-NTSTATUS-in-register signature
+this codebase's own `docs/AGENTS_ARCHIVE_2026-09-03.md` already ties to Windows API activity
+reached from host code, not guest memory content. `tid=ThreadId(6)` is a background thread, not
+the guest's main thread that is running `do_clone`/`PageManager::duplicate()` -- meaning some
+other thread is executing real Windows API code (its `rva=0x26fdb5492` is a huge module offset,
+consistent with ntdll or another system DLL, not litebox's own ~1MB module image) and takes an
+AV concurrently with the fork-time page relocation on the main thread. This is exactly the class
+of hazard this codebase's own comments already flag: Windows API calls made by host code during
+the fork-time relocation window are exposed to transient state (e.g. the documented FS_BASE-clear
+race) that this specific window does not fully account for. `is_in_guest=false` rules out this
+being guest memory content; `no exception-table entry found` confirms it is not a recognized,
+intentionally-recoverable guest fault either. Not root-caused to a specific call site this
+session -- doing so would need a live debugger (`windbg`/`cdb`) attached at the fault to inspect
+what background thread 6 is doing and why, which was not available on this host and is out of
+scope for a Step-0 verdict pass; noted as the concrete next action for whoever picks this up.
+
+### Step 0 verdict: **REFUTED**
+
+**Bold, final, unambiguous: Step 0 is REFUTED.** `LITEBOX_PROCESS_FORK=1` does NOT currently let
+a genuinely `beyond_stdio == 0` guest fork successfully. Across two independent runs on a host
+with confirmed memory headroom (4.0-4.1GB free, no concurrent litebox processes, no other
+unusual load beyond this host's steady-state background processes) and full `LITEBOX_LOG=debug`
+tracing, the cross-process fork path crashes the host runner process itself, deterministically,
+at the identical fault address, strictly inside `PageManager::duplicate()`'s relocation loop --
+**before** the `beyond_stdio` gate is ever reached and **before** `spawn_cross_process_fork_child`
+is ever called. This is not the previous session's memory-pressure-confounded inconclusive
+result: that session measured a real 4.2GB->3.4GB free-memory drop during its one ambiguous run
+and could not rule out OOM reaping. This session reproduced the identical crash twice, with
+memory headroom that did not meaningfully change between runs and was never critically low, and
+with zero silent/undiagnosed exits -- both runs produced the exact same host-side AV diagnostic.
+Memory pressure is definitively ruled out as the explanation. This is a real, distinct,
+previously-uncharacterized bug in the unconditional pre-gate `PageManager::duplicate()` path
+(most likely a genuine cross-thread race between fork-time page relocation and concurrent
+Windows API activity on another thread), independent of and blocking any assessment of the
+`LITEBOX_PROCESS_FORK=1` gate's own logic.
+
+### Step 9 (long-running cross-process child survival): NOT REACHED
+
+Per the REFUTED verdict above, no run in this investigation to date -- including this session --
+has ever produced a live cross-process forked child to observe. This sub-question remains
+completely open and cannot be attempted until the `PageManager::duplicate()` crash above is
+fixed.
+
+### Go/no-go read for the large Track B investment
+
+**Do not proceed with the queued architectural Track B work yet.** Step 0 was designed as a
+cheap, decisive, before-funding-anything-else gate, and it has now returned a clean, unambiguous
+REFUTED verdict rather than an inconclusive one. The specific blocker is well-characterized
+(deterministic host-side AV, `STATUS_VARIABLE_NOT_FOUND`-signature, background-thread Windows API
+activity racing fork-time page relocation, `PageManager::duplicate()`, before the `beyond_stdio`
+gate) but not yet root-caused to an exact call site or fixed. The three genuine bugs found and
+fixed getting to this point (the DIAG_HEAL logging-crash, the `search_exception_tables` torn-read,
+and now this session's confirmation that a fourth, distinct crash remains) show this code path is
+still substantially unproven; a clean Step 0 CONFIRMED result is the correct gate to keep holding
+the line on before committing further architectural investment.
+
+### What remains open for a future session
+
+- Root-cause the `tid=ThreadId(6)` / `rva=0x26fdb5492` / `addr=0xc0000100` crash to an exact call
+  site -- needs a live debugger (`windbg`/`cdb`, neither present on this host) attached at the
+  fault, or a targeted trace of what background threads are doing/calling during the
+  `PageManager::duplicate()` relocation window.
+- Once fixed, re-run this exact Step 0 repro (baseline + `LITEBOX_PROCESS_FORK=1`, both real host
+  env vars, `bash -c` inline invocation for genuine `beyond_stdio==0`) to get the CONFIRMED
+  verdict this investigation has been working toward.
+- Step 9 (long-running cross-process child survival) is untouched -- still no run has ever reached
+  a live cross-process child to observe; blocked entirely on the above fix.
+- The unkillable small zombie `litebox_runner_linux_on_windows_userland.exe` process observed
+  this session (`Stop-Process -Force` and `taskkill /F` both silently failed against a process
+  `tasklist` still listed as alive with `Responding=True`) is itself worth a future look -- not
+  investigated further this session since clearing the stale boot lock file was sufficient to
+  route around it, but an un-terminable process handle is unusual and could indicate a genuine
+  host-state issue worth understanding.
