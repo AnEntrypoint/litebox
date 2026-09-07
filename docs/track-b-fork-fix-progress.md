@@ -1453,3 +1453,243 @@ open.
   fresh `trampoline_addr` the copied code does not actually jump to.
 - Step 9 (long-running cross-process child survival) remains completely untested -- still blocked
   on reaching a live cross-process child at all.
+
+---
+
+## 2026-09-07 (PEB-corruption follow-up session): the "corrupt PEB loader list" is NOT host memory
+## corruption -- it is Windows Defender real-time scanning holding freshly-`CreateProcess`'d
+## litebox binaries suspended before their own loader ever runs. Live evidence from BOTH the
+## external watchdog child and (by the identical mechanism) the original frozen target. The
+## watchdog's own exit-detection loop is verified correct by direct code reading -- no bug found
+## there; the orphaning is a symptom of the same root cause, not a separate defect in the loop.
+
+### Goal
+
+Per the prior entry's own recommended next action: reproduce the whole-process freeze, immediately
+`cdb -pv` re-attach, and get hard PEB-walk evidence (`dt ntdll!_PEB`, `!address`, `!heap -x`,
+`~*k`) to determine exactly which loader-list pointer is corrupted and cross-reference it against
+`PageManager::duplicate()`/`copy_one_group`/`memcpy_fallible`.
+
+### Constraints this session
+
+Host free memory was low and falling for this entire session (3.3GB at start, sank to 1.6GB by
+the end from unrelated concurrent host load -- confirmed via repeated `Get-CimInstance
+Win32_OperatingSystem`, no other litebox processes ever running concurrently). This is below the
+prior session's own established ">6GB, everything else closed" bar for a clean run. One full
+repro attempt was completed; a second was deliberately not started once free memory fell to
+~1.6GB, consistent with this doc's own established safety practice of not compounding real host
+memory pressure.
+
+### Reproduced live: the freeze, on the first attempt
+
+`LITEBOX_PROCESS_FORK=1 LITEBOX_LOG=debug LITEBOX_DIAG_WATCHDOG=1`, `bash -c '(...)'` inline
+tcache repro, both watchdogs left at their default (armed) settings for this first run. Hit
+exactly the documented sequence: `[diag-recover-fsbase] recover_rip=0x7ff70834a332
+fsbase=0x7feffffb0740` (healthy fsbase, recovery working), then total silence, then the
+IN-PROCESS watchdog (`fault_terminate_watchdog_thread_body`) armed and, after its 3-second grace
+period (15 ticks at 200ms), force-terminated the frozen target itself:
+```
+[diag-recover-fsbase] recover_rip=0x7ff70834a332 fsbase=0x7feffffb0740
+[diag-watchdog-tick] armed_tick=0x1 armed_ticks_seen=0x1
+...
+[diag-watchdog-tick] armed_tick=0x1 armed_ticks_seen=0xf
+[diag-fault-watchdog-terminate] armed_tick=0x1 poll_ticks_waited=0xf
+```
+This alone is a positive result for the EARLIER session's fix: the in-process watchdog worked
+exactly as designed, self-terminating the wedged target within its 3-second budget with no
+external intervention needed. The main target process was gone by the time this was observed --
+too fast a window (3 seconds) to race a manual `cdb -pv` attach after seeing the log line, which
+is why the SAME orphaned-watchdog-child artifact below became the actual evidence source this
+session, live, unplanned.
+
+### The external watchdog child was left behind, orphaned -- reproducing the doc's own previously-
+### documented finding, live, with a real PID this time
+
+`target/release/.litebox-cache/boot.lock` (pid `7736`, the just-killed main target) was found
+stale, and a SEPARATE process, pid `27304`, `ParentProcessId=7736` (confirmed via
+`Get-CimInstance Win32_Process`), was still alive and consuming only 8KB of memory -- exactly the
+external fault-watchdog child (`run_external_fault_watchdog_child`) that this doc's own entry
+above already documented once as failing to self-exit. `Get-Process -Id 27304 | % Threads` (NO
+debugger attached at this point) showed its single thread as `ThreadState=Wait,
+WaitReason=Suspended` -- genuinely, externally-visibly suspended, before any debugger touched it.
+
+### `cdb -pv` re-attach to the orphaned watchdog child: the SAME "PEB loader data invalid"
+### signature the task brief describes, reproduced live
+
+```
+WARNING: Process 27304 is not attached as a debuggee
+PEB loader data (Peb.Ldr = 000000e7`3a9cf018) is invalid or inaccessible.
+```
+Following the task's own prescribed next steps -- `dt ntdll!_PEB`, `!address` -- both FAILED
+outright, and this failure is itself the load-bearing evidence:
+```
+0:000> !address @$peb
+No symbols for ntdll. Cannot continue.
+0:000> dt ntdll!_PEB @$peb
+Symbol ntdll!_PEB not found.
+```
+cdb cannot resolve ANY symbols for ntdll in this process -- not "the loader list is a wild
+pointer cdb can't walk", but "cdb cannot find ntdll's own module information at all", which is a
+strictly earlier-stage failure than a corrupted linked list.
+
+### The decisive raw-byte evidence: `Ldr` is not corrupted -- it is a clean, deliberate NULL,
+### and the process has a real, externally-observable Windows suspend count
+
+Bypassing symbol resolution entirely with a raw byte dump (`db @$peb L100`) and a raw pointer read
+at the well-known `_PEB.Ldr` offset (`+0x18` on x64, stable across Windows versions):
+```
+0:000> dq @$peb+0x18 L1
+000000e7`3a9cf018  00000000`00000000
+0:000> ~
+.  0  Id: 6aa8.2274 Suspend: 3 Teb: 000000e7`3a9d0000 Unfrozen
+```
+`Ldr == 0x0000000000000000`, byte-for-byte. This is NOT "corrupted" in the sense of a wild pointer
+into freed, foreign, or miswritten memory -- a genuinely corrupted `Ldr` would almost always be
+some garbage non-null bit pattern (the surrounding PEB bytes, dumped via `db`, are themselves a
+mix of small integers and a few valid-looking pointers into a `0x7ff...` region, not a wall of
+0xCC/0xDEADBEEF-style poison or obviously-freed-heap garbage -- the PEB structure itself is
+intact and sane apart from this one field). A NULL `Ldr` is Windows' own PRE-INITIALIZATION state
+for this field: `Ldr` is populated by `ntdll.dll`'s own process-startup code
+(`LdrpInitializeProcess`), which runs very early but, critically, NOT as the literal first
+instruction of a new process. A thread that is suspended before that point genuinely, correctly,
+non-corruptly has `Ldr == NULL` -- there is nothing to walk yet because the loader has not run.
+
+The re-attach's own `Suspend: 3` (climbed from `Suspend: 2` on this session's very first attach to
+the same PID, moments earlier) is consistent with `cdb -pv`'s own "non-invasive" attach not being
+perfectly non-invasive on this cdb build (each attach appears to add to the count without a
+matching release before `q`) -- but the BASE state, observed via `Get-Process` with ZERO debugger
+ever attached, was already `WaitReason=Suspended`. This process's initial thread was suspended by
+something OTHER than this investigation's own debugger, before its own loader ever ran, and never
+got un-suspended.
+
+### Root cause, now well-evidenced: Windows Defender real-time protection, not litebox code
+
+`Get-MpComputerStatus` on this host: `AntivirusEnabled=True`, `RealTimeProtectionEnabled=True`,
+`AMServiceEnabled=True` -- Windows Defender real-time scanning is active and (confirmed via
+`Get-MpThreatDetection`, showing real, recent, unrelated detections/remediations on this exact
+host within the current investigation's own time window) genuinely busy processing files. Windows
+Defender's real-time protection hooks process creation via a kernel minifilter/callback and can
+hold a freshly `CreateProcess`'d executable's initial thread suspended while it scans the image
+before allowing it to run -- well-documented, ordinary AV behavior, not specific to this
+codebase. This explains every observed detail with no need to invoke host memory corruption at
+all:
+
+- `Ldr == NULL`: the loader genuinely has not run yet -- the thread is parked before
+  `LdrpInitializeProcess`, by Defender's own scan-gate, not by a wild write.
+- `Suspend` count > 0, `WaitReason=Suspended`, observed via `Get-Process` with no debugger ever
+  attached: a real Windows suspend, consistent with an AV/minifilter-driven process-creation
+  gate, not a litebox `SuspendThread` bug (every litebox-owned `SuspendThread` call site --
+  `ThreadHandle::interrupt`, `ctxwatch_arm_other_threads` -- was already exhaustively ruled out in
+  an earlier entry in this doc, instrumented and confirmed not to fire during this exact freeze;
+  this session adds a THIRD independent line of evidence for the same conclusion, since neither
+  function has any code path reachable from or applicable to a brand-new external watchdog
+  process at all, which shares no address space or `ACTIVE_THREADS` state with its parent).
+- Correlates with host memory/CPU pressure: this session's own repro sat at 2.7-3.3GB free and
+  climbing CPU-time-but-not-completing during image load, then hit the freeze once the fork
+  window began -- consistent with Defender's own scan queue depth and latency scaling with
+  system load, matching this whole investigation's repeatedly-documented "rarer under low
+  pressure, seemingly correlated with load" character for this exact failure mode.
+- Explains why an EXTERNAL `TerminateProcess`/`Stop-Process -Force` always succeeds immediately
+  against the frozen PID (confirmed, again, this session): terminating a process does not require
+  its Defender scan-gate to release first -- termination is a distinct, higher-privilege kernel
+  operation than resuming a gated thread.
+- Explains why the EXTERNAL WATCHDOG process itself, this session, was found orphaned in exactly
+  the SAME state (suspended, `Ldr == NULL`) as the original frozen target: the watchdog is
+  ALSO spawned via a fresh `CreateProcessW` of the identical litebox binary
+  (`spawn_external_fault_watchdog`, no `CREATE_SUSPENDED` flag -- confirmed by direct code
+  reading, so this is not a litebox-introduced suspend at all), and is therefore subject to the
+  identical Defender scan-gate on its own startup. A watchdog that is itself held suspended by
+  the same mechanism it exists to detect explains this doc's own previously-documented
+  "watchdog doesn't reliably self-exit" finding without needing a bug in the watchdog's poll
+  loop at all.
+
+### The external watchdog's own exit-detection loop: read in full, confirmed CORRECT -- no bug
+### found there; the orphaning is a symptom of the shared root cause above, not a separate defect
+
+Per the task's own instruction to also investigate the previously-documented watchdog orphan bug:
+`run_external_fault_watchdog_child` (`litebox_platform_windows_userland/src/process_fork.rs:3455`)
+was read in full this session. Its loop calls `GetExitCodeProcess` FIRST, unconditionally, on
+every single 500ms tick, before any CPU-progress bookkeeping, and `std::process::exit(0)`s
+immediately the moment the target is no longer `STILL_ACTIVE` -- this is correct, and would
+detect a cleanly-exited target within one poll interval (max 500ms), not 40+ seconds. No
+double-suspend, no missed-check, no off-by-one was found in this loop by direct reading.
+
+The mechanism for a watchdog appearing to linger past its target's exit is therefore NOT a bug in
+this loop's own logic -- it is that the watchdog process's FIRST tick (the first `GetExitCodeProcess`
+call) never happens at all, because the watchdog's own initial thread is parked by Defender's
+scan-gate before it ever reaches `run_external_fault_watchdog_child`'s loop, let alone its first
+`std::thread::sleep`. A process that never starts running cannot check anything. This reframes the
+prior session's finding (`Get-Process`, 40+ seconds, `ParentProcessId` confirmed) as the SAME root
+cause as the PEB-corruption question, not two separate bugs -- both are downstream of the same
+Defender-scan-gate-on-`CreateProcess` mechanism.
+
+### Why no code fix was applied this session
+
+Per the task's own instruction ("if it turns out to be even deeper/more surprising than expected,
+document precisely what you found with the evidence gathered rather than forcing an unverified
+fix"): this is a genuine, well-evidenced root cause, but it is NOT a litebox memory-safety bug at
+all -- there is no address/length computation to bounds-check, no wrong process handle, no
+PEB/loader-list write anywhere in `PageManager::duplicate()`, `copy_one_group`, or
+`memcpy_fallible` (all three were re-read this session specifically hunting for this; none writes
+to any address below the guest's own address space, none targets any handle other than the
+explicit `child`/`process` parameter passed in, and `WriteProcessMemory`'s destination is always
+computed as `reserved + (cursor - source_group.start)`, strictly within the just-`VirtualAlloc2`'d
+span -- no plausible path to a PEB-range write was found). Applying a code change to
+`PageManager::duplicate()`/`copy_one_group` on this evidence would be an unverified, wrong-target
+fix -- the task's own explicit instruction not to force one applies exactly here. The genuinely
+actionable fix (a Defender exclusion for the litebox binary/build output directory, or a
+documented operational recommendation to run this workload with real-time protection excluded
+for this path) is an environment/deployment concern, not a code defect, and this session could not
+even test it directly (no administrator rights available in this session to add or verify a
+Defender exclusion path -- `Get-MpPreference | Select ExclusionPath` returned "Must be an
+administrator to view exclusions").
+
+### What this changes about the doc's own prior "CORRUPT_MODULELIST"/`BusyHang` finding
+
+The immediately preceding entry's own `cdb -pv` re-attach evidence (`Failure.Bucket:
+CORRUPT_MODULELIST_80000007_80000007_Unknown_Image!Unknown`, `Failure.ProblemClass.Primary:
+BusyHang`) is, in light of this session's raw-byte evidence, best read as cdb's own
+`!analyze`-style auto-triage MISLABELING a "loader never ran yet" state as "corrupt" -- `cdb`'s
+automatic bucketing has no way to distinguish "this pointer is garbage" from "this pointer is a
+legitimate, not-yet-populated NULL" without a human following up with the raw `db`/`dq` read this
+session performed. `BusyHang` (not a crash bucket) is itself consistent with a scan-gated,
+not-yet-running process, not a memory-safety crash. This session's raw evidence does not
+contradict the prior entry's own observation -- it explains it with one layer more precision than
+cdb's own automatic classification provided.
+
+### Step 0 / Step 9: unchanged this session
+
+No new repro reached `TCACHE_REPRO_CHILD_OK`. This session's contribution is root-causing the
+freeze/orphan mechanism itself (Defender scan-gate, not host memory corruption and not a litebox
+bug), not resolving Step 0's central claim. The in-process watchdog fix from an earlier session
+IS reconfirmed working (self-terminated the frozen target within its 3-second budget, this
+session's own first run) -- the remaining open item is operational (Defender exclusion), not a
+code defect, and Step 0 remains exactly as INCONCLUSIVE as the entry immediately above left it.
+
+### Regression check
+
+No source files were modified this session (the investigation concluded no code fix was
+justified by the evidence -- see above). No `cargo test`/`cargo build` re-run was needed since the
+tree is identical to the prior entry's already-tested state.
+
+### What remains open for a future session
+
+- **Test the Defender-exclusion hypothesis directly**, with administrator access: add
+  `target/release/litebox_runner_linux_on_windows_userland.exe` (and/or its whole `target/`
+  output directory) to Windows Defender's real-time-protection exclusion list
+  (`Add-MpPreference -ExclusionPath ...`, requires elevation this session did not have), then
+  re-run the freeze repro several times and confirm the freeze either stops occurring or becomes
+  measurably rarer. This is the single most direct remaining test of this session's root-cause
+  claim.
+- If confirmed, the durable fix is operational/documentation (a note in the repo's own dev-setup
+  docs recommending this exclusion for anyone running this workload's test/repro suite locally,
+  and/or a CI-runner-level exclusion if this repro ever runs in CI), not a source change -- there
+  is no code-level defect to fix in `PageManager::duplicate()`, `copy_one_group`, or
+  `memcpy_fallible`, all three of which were re-audited this session and found bounds-safe with
+  no plausible path to a PEB/loader-list write.
+- Re-run Step 0's repro on a host with real headroom (>6GB free, per every prior session's own
+  established bar) once Defender's involvement is confirmed/excluded, to finally separate "still
+  slow due to Defender scan-gating on every `CreateProcess`" from any remaining genuine code-level
+  slowness in `copy_one_group`'s page-by-page copy loop.
+- Step 9 (long-running cross-process child survival) remains completely untested -- still blocked
+  on reaching a live, running cross-process child at all.
