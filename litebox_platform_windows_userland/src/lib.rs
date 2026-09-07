@@ -1595,9 +1595,30 @@ unsafe extern "system" fn vectored_exception_handler(
 
         // This might be a faulting guest memory access in LiteBox code. Try to
         // recover.
+        //
+        // TORN-READ FIX (root cause, track-b investigation): this call MUST search on
+        // `context_snapshot.Rip`, not a live re-read of `context.Rip`. `context` is a pointer into
+        // the OS-owned in-flight `CONTEXT` record, which -- per this function's own "TORN-READ FIX"
+        // comment above `context_snapshot`'s definition -- other machinery in this process
+        // (`ThreadHandle::interrupt`'s `SuspendThread`/`SetThreadContext`, `ctxwatch_arm_other_
+        // threads`' debug-register rewrites) can write concurrently. A live capture (this
+        // investigation) proved this is not hypothetical here either: `search_exception_tables` was
+        // observed being invoked with `context.Rip` already equal to the fault's *memory* address
+        // (`ExceptionInformation[1]`/`Rdx`/`Rsi`, e.g. `0x10188000`) rather than the instruction
+        // pointer, while `context_snapshot.Rip` -- captured once, immediately on entry, before any
+        // of this function's own logic runs -- still held the correct, in-table-covered `rip`
+        // (`0x7ff6d80efad8`, confirmed by the sibling unrecovered-branch diagnostic's own
+        // `debug_snapshot_table` dump to have `covers=true` for entry `[3]`). Searching on the live,
+        // racing `context.Rip` therefore fed `search_exception_tables` a value that never belonged
+        // to this fault's instruction pointer at all, guaranteeing a spurious `None` and diverting a
+        // genuinely recoverable AV into the fatal `[diag-unrecov-av]` path. `context_snapshot` was
+        // already captured for exactly this reason (see its own doc comment); this call was simply
+        // never updated to use it.
         if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
             && let Some(recover) =
-                litebox::mm::exception_table::search_exception_tables(context.Rip.trunc())
+                litebox::mm::exception_table::search_exception_tables(
+                    context_snapshot.Rip.trunc(),
+                )
         {
             // Found a matching exception table entry.
             //

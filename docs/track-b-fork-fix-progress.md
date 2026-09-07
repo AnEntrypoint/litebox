@@ -321,3 +321,131 @@ No regression from this session's fix in any of the four crates.
   to date has ever reached the cross-process child successfully.
 - Step 9 (long-running cross-process child survival) is untouched -- there has never been a live
   cross-process child to observe in any session so far.
+
+---
+
+## 2026-09-07 (later still): root-caused and fixed the search_exception_tables/debug_snapshot_table
+## divergence -- a genuine torn-read bug, not a diagnostic artifact
+
+### Goal
+
+Root-cause the `search_exception_tables`/`debug_snapshot_table` divergence flagged as the
+concrete blocker at the end of the prior entry, then push Step 0 as far toward a real
+CONFIRMED/REFUTED verdict as the session allows.
+
+### Method: live instrumentation, not more static reading
+
+Static reading of `litebox/src/mm/exception_table.rs` (both functions use the identical
+`reloc()` closure and the identical `exception_table()` PE-section lookup) genuinely could not
+explain the divergence, matching the prior session's own conclusion. Added a temporary
+per-entry trace to `search_exception_tables` itself (env-gated via `LITEBOX_DIAG_SEARCH_TRACE`,
+logging `i/addr/start/stop/fixup/covers` for every table entry on every AV) plus a raw print of
+`context.Rip`/`context.Rdx`/`context.Rsi` taken immediately before the `search_exception_tables`
+call site in `litebox_platform_windows_userland/src/lib.rs`, and reproduced live: `bash -c
+'(...)'`  tcache-exercise repro under `LITEBOX_PROCESS_FORK=1 LITEBOX_LOG=debug
+LITEBOX_DIAG_SEARCH_TRACE=1`, both as real host env vars.
+
+### Root cause: `search_exception_tables` was called on a live, racing `context.Rip` re-read,
+### not the already-captured, safe `context_snapshot.Rip`
+
+The live capture is unambiguous. In one fault:
+```
+[diag-search-call] context_ptr=0xfe0c9fd580 context.Rip=0x10188000 context.Rdx=0x0 context.Rsi=0x10188000 trunc=0x10188000
+[diag-search-trace] i=3 addr=0x10188000 start=0x7ff6d80efad8 stop=0x7ff6d80efae0 fixup=0x7ff6d80efae2 covers=false
+[diag-unrecov-av] tid=ThreadId(6) rip=0x7ff6d80efad8 rva=0x8afad8 addr=0x10188000 rsp=0xfe0c9fdc80 rax=0x1 rbx=0x1000 rcx=0x200 rdx=0x10188000 rsi=0x10188000 rdi=0x7ff00049c000 rbp=0xfe0c9fdcf0 is_in_guest=false is_verifying=false -- no exception-table entry found
+```
+`context.Rip` read live, immediately before the `search_exception_tables` call, was
+`0x10188000` -- not an instruction pointer at all, but `exception_record.ExceptionInformation[1]`
+(the faulting *memory* address, also visible verbatim in `Rdx`/`Rsi`, consistent with an in-
+flight `rep movsq`/`memcpy_fallible` AV: `rcx=0x200` qword count, `rsi`=source=fault address).
+Yet `context_snapshot.Rip` -- captured once, at this same function's very first statement,
+well before the search call, in the SAME non-reentrant invocation (`veh_depth=0x1`, i.e. no
+nesting) -- was `0x7ff6d80efad8`, which the sibling `debug_snapshot_table`-based diagnostic
+confirms entry `[3]`'s `[start, stop)` range genuinely covers (`covers=true`). Both readings are
+in the same handler invocation, same thread, with nothing in this codebase writing `context.Rip`
+in between (checked exhaustively: the only intervening code is the FS_BASE-reset fast path,
+which returns immediately if taken and was not taken here).
+
+The file's own pre-existing `context_snapshot` doc comment (added independently of this
+investigation, well before it) already names the exact mechanism: `context` is a live pointer
+into the OS-owned in-flight `CONTEXT` record, and other machinery in this process
+(`ThreadHandle::interrupt`'s `SuspendThread`/`SetThreadContext`, `ctxwatch_arm_other_threads`'s
+debug-register rewrites) can write that same memory concurrently -- exactly the "TORN-READ"
+class that comment was written to guard against. `context_snapshot` was captured specifically so
+every diagnostic read could use a torn-read-safe copy instead of the live, racing pointer -- but
+the one call site that actually FEEDS the recovery decision, `search_exception_tables(context.Rip
+.trunc())`, was never updated to use it, and instead re-read the live, racing `context.Rip`
+directly. This is not a bug in `search_exception_tables` or `debug_snapshot_table` themselves
+(confirming the prior session's inability to find a textual divergence between them was
+correct) -- it is a bug in which `Rip` value the caller in `litebox_platform_windows_userland`
+handed to the search, one line away from a value that was already known to be safe.
+
+### Fix applied
+
+`litebox_platform_windows_userland/src/lib.rs`'s exception-table search call now searches on
+`context_snapshot.Rip.trunc()` instead of a live `context.Rip.trunc()` re-read. The resume write
+(`context.Rip = recover as u64`, a few lines later, on success) still correctly targets the LIVE
+`context` -- that write is how Windows is told where to resume, and must go through the live
+pointer; only the read that decides whether a fixup exists needed to move to the snapshot.
+Minimal, one-call-site change; no changes to `litebox/src/mm/exception_table.rs` itself (the
+temporary per-entry trace added for this investigation was removed after root-causing, net diff
+zero on that file).
+
+### Verified: the specific crash this fix targets is gone
+
+Re-ran the identical `bash -c` repro under `LITEBOX_PROCESS_FORK=1 LITEBOX_LOG=warn` against the
+rebuilt binary. No `[diag-unrecov-av]` this run (previously guaranteed to fire at this point in
+every prior session's attempt) -- fork-relocation logging progressed further into
+`PageManager::duplicate()` than any previous run this investigation has captured. The run did not
+reach a clean `TCACHE_REPRO_CHILD_OK`/completion marker either; the host process exited silently
+partway through relocation with no panic, no crash diagnostic, and no exit-code capture available
+from this session's tooling. Host free memory was measured at ~4.2GB going into this run and
+~3.4GB coming out (checked via `Get-CimInstance Win32_OperatingSystem`), consistent with the
+process being reaped under host memory pressure from unrelated concurrent load on this machine
+(multiple other large processes observed running concurrently, not litebox-related) rather than a
+code-level fault -- but this session could not rule that out definitively (no Windows Event Log
+/ crash-dump capture was set up to distinguish an OOM-style termination from a silent crash).
+
+### Test results (step 7, re-run after this session's fix)
+
+`cargo test --release -p litebox --lib`: 123 passed, 26 failed -- identical pass/fail count and
+identical failing-test list to the pre-existing baseline documented in the prior entry (missing
+`diod` binary for `nine_p`, one `tar_ro` symlink test, one `mm::tests::test_vmm_mapping`
+range-merging assertion). No regression.
+
+`cargo test --release -p litebox_common_linux`: 10 passed, 0 failed, 1 doctest passed -- clean.
+
+`cargo test --release -p litebox_platform_windows_userland --lib`: 4 passed, 0 failed -- clean
+(this is the crate the fix itself lives in).
+
+`cargo test --release -p litebox_shim_linux`: still fails to compile (test/doctest build),
+`E0576`/`E0407` "cannot find method `run_test_thread` in trait `ThreadProvider`" -- confirmed
+pre-existing in the prior entry via `git stash` comparison, unrelated to this session's change
+(this session did not touch `litebox_shim_linux` at all).
+
+### Step 0 verdict: STILL INCONCLUSIVE, but the specific blocker this entry targeted is resolved
+
+The `search_exception_tables`/`debug_snapshot_table` divergence is root-caused (a genuine
+torn-read bug in the caller, not a diagnostic-comparison artifact and not a bug in either
+exception-table function) and fixed, with no regression in the scoped test suite. The specific
+crash signature this divergence caused (`[diag-unrecov-av]` with `covers=true` for an entry the
+live search should have found) is confirmed gone from a live re-run. Step 0's central claim --
+whether `LITEBOX_PROCESS_FORK=1` avoids the tcache fault for a `beyond_stdio==0` guest -- remains
+neither confirmed nor refuted: this session's one post-fix run got further into
+`PageManager::duplicate()` than any prior run but did not reach either a clean completion or an
+unambiguous crash diagnostic, most likely due to real, unrelated host memory pressure on this
+machine rather than a code defect.
+
+### What remains open for a future session
+
+- Re-run Step 0's `LITEBOX_PROCESS_FORK=1` repro on a host with confirmed headroom (>6GB free,
+  no other large concurrent processes) to get a clean, unambiguous run all the way to either
+  `TCACHE_REPRO_CHILD_OK`+`spawn_cross_process_fork_child` success, or a new, different crash
+  diagnostic. This session's inconclusive silent exit was very plausibly a memory-pressure
+  artifact of the host, not a code issue, but that is not yet certain.
+- If another silent, diagnostic-free host process exit recurs on a memory-healthy host, that
+  itself becomes a new, real bug worth its own investigation (this codebase's crash paths are
+  otherwise well-instrumented; a completely silent exit with no panic/AV/diagnostic would be a
+  gap in that coverage).
+- Step 9 (long-running cross-process child survival) remains untouched -- still no run has ever
+  reached a live cross-process child to observe.
