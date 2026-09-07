@@ -2857,6 +2857,79 @@ fn spawn_suspended(
             }
             startup_info.hStdInput = stdin_read;
         }
+    } else {
+        // FIX (track-b investigation, confirmed live): this function's own doc comment claims
+        // "the child inherits the parent's real console session's stdio the ordinary way a
+        // genuine `fork()` child would" via `bInheritHandles=0` and no `STARTF_USESTDHANDLES` --
+        // but that reasoning is backwards. `bInheritHandles=0` means NONE of the parent's open
+        // handles (including its stdio) are inherited; omitting `STARTF_USESTDHANDLES` then just
+        // leaves the child's stdio unset, which `CreateProcessW` only fills in with a fresh
+        // console/NUL default, never the parent's real stream. A real POSIX `fork()` child always
+        // keeps the exact same fd table (including stdio) as its parent -- this was silently
+        // dropping every cross-process fork child's stdout/stderr, live-confirmed against the
+        // `tcache_fork_repro.sh`-equivalent `bash -c` repro under `LITEBOX_PROCESS_FORK=1`: the
+        // child's own `echo`-produced `TCACHE_REPRO_*` marker lines, and every `eprintln!` in this
+        // module's own child-side diagnostic chain, never appeared anywhere -- not lost output
+        // from a hang, genuinely never delivered anywhere observable. Explicitly duplicate the
+        // CURRENT process's real `STD_OUTPUT_HANDLE`/`STD_ERROR_HANDLE`/`STD_INPUT_HANDLE` into
+        // the child via `STARTF_USESTDHANDLES` with `bInheritHandles=1`, matching real `fork()`
+        // semantics, so the child's own stdout writes (and any guest `write(1, ..)`/`write(2, ..)`
+        // this platform routes through the real Windows stdio handles) become visible the same way
+        // a normal, non-fork guest program's output already is.
+        unsafe {
+            let stdout_h = windows_sys::Win32::System::Console::GetStdHandle(
+                windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE,
+            );
+            let stderr_h = windows_sys::Win32::System::Console::GetStdHandle(
+                windows_sys::Win32::System::Console::STD_ERROR_HANDLE,
+            );
+            let stdin_h = windows_sys::Win32::System::Console::GetStdHandle(
+                windows_sys::Win32::System::Console::STD_INPUT_HANDLE,
+            );
+            // `GetStdHandle` returns THIS process's own stdio handles, which may not themselves be
+            // marked inheritable (e.g. when a pipe was created upstream, by a shell or another
+            // launcher, without `bInheritHandle` set) -- `CreateProcessW`'s `bInheritHandles=1`
+            // below only propagates handles that are ALREADY marked inheritable, silently skipping
+            // any that are not, so mark each one explicitly (`HANDLE_FLAG_INHERIT = 1`) before
+            // relying on it; a failed `SetHandleInformation` just leaves that handle exactly as
+            // inheritable as it already was, no worse than the pre-fix behavior.
+            const HANDLE_FLAG_INHERIT: u32 = 1;
+            if !stdout_h.is_null()
+                && stdout_h != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE
+            {
+                windows_sys::Win32::Foundation::SetHandleInformation(
+                    stdout_h,
+                    HANDLE_FLAG_INHERIT,
+                    HANDLE_FLAG_INHERIT,
+                );
+                startup_info.hStdOutput = stdout_h;
+                startup_info.dwFlags |= STARTF_USESTDHANDLES;
+            }
+            if !stderr_h.is_null()
+                && stderr_h != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE
+            {
+                windows_sys::Win32::Foundation::SetHandleInformation(
+                    stderr_h,
+                    HANDLE_FLAG_INHERIT,
+                    HANDLE_FLAG_INHERIT,
+                );
+                startup_info.hStdError = stderr_h;
+                startup_info.dwFlags |= STARTF_USESTDHANDLES;
+            }
+            if !stdin_h.is_null() && stdin_h != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE
+            {
+                windows_sys::Win32::Foundation::SetHandleInformation(
+                    stdin_h,
+                    HANDLE_FLAG_INHERIT,
+                    HANDLE_FLAG_INHERIT,
+                );
+                startup_info.hStdInput = stdin_h;
+                startup_info.dwFlags |= STARTF_USESTDHANDLES;
+            }
+        }
+        if startup_info.dwFlags & STARTF_USESTDHANDLES != 0 {
+            inherit_handles = 1;
+        }
     }
 
     let ok = unsafe {

@@ -1,5 +1,165 @@
 # Track B fork-without-exec fix: running progress log
 
+## 2026-09-07 (later session): Step 0 verdict -- still INCONCLUSIVE, but with two more real bugs
+## found, fixed and confirmed, and the remaining blocker now precisely localized
+
+### Goal for this session
+
+Get a final, clean Step 0 CONFIRMED/REFUTED verdict, being careful about the shared host's real
+memory contention (checked before every boot attempt: 4.8GB, 5.2GB, 3.9GB, 4.7GB, 4.8GB free
+across this session's runs -- never below the "small `bash -c` repro doesn't need much" floor the
+task brief itself set). No stale `litebox_runner*` processes or `boot.lock` at session start.
+
+### Bug #5 (real, fixed, confirmed via live capture): FS_BASE not repaired before resuming at an
+### exception-table `recover` fixup
+
+`vectored_exception_handler`'s recovered-AV branch (`litebox_platform_windows_userland/src/lib.rs`,
+around the `[diag-recover-fsbase]` diagnostic a PRIOR session already added but never acted on)
+jumps `context.Rip` to the exception table's `recover` fixup address and resumes -- but, unlike
+the sibling FS_BASE-reset repair branch immediately above it in the same function (which does a
+bounded `wrfsbase`-and-verify loop before resuming), this branch did no such repair. The prior
+session's own comment explicitly predicted this: `recover` is compiler-generated `Err(Fault)`
+fixup code inside a real Rust function, whose epilogue can perform FS-relative accesses
+(stack-protector checks, TLS) -- resuming there with `FS_BASE` still cleared (`rdfsbase()==0`,
+the exact condition this whole VEH exists to repair) re-faults immediately.
+
+This session's first `LITEBOX_PROCESS_FORK=1 LITEBOX_LOG=debug` run of the `bash -c` inline
+`tcache_fork_repro.sh`-equivalent repro hit exactly this: `[diag-recover-fsbase] recover_rip=...
+fsbase=0x0` -- the predicted zero. The process then went silent and idle (8MB working set, 1
+thread, 0% CPU, `tasklist`/`Get-Process` visible for 5+ minutes with zero further log output) --
+a real, reproducible hang, not resource pressure (confirmed via a clean re-run at ~4-5GB free with
+no debugger attached).
+
+**Fix**: before resuming at `recover`, apply the exact same bounded `wrfsbase`-and-verify repair
+the sibling branch already uses, keyed off the same trusted `THREAD_FS_BASE`-shadowed value
+(`WindowsUserland::get_thread_fs_base()`, never repairing to an untrusted 0). Confirmed live:
+rebuilt, re-ran the identical repro -- the SAME recovery point now prints
+`[diag-recover-fsbase] recover_rip=... fsbase=0x7feffffb0740` (a real, healthy FS base) instead of
+`0x0`, on every run since.
+
+### Bug #6 (real, fixed, but NOT the reason for the remaining hang): cross-process fork child's
+### stdio was never actually wired to anything observable
+
+While chasing the still-open hang (see below), found that `spawn_process_fork_child`
+(`litebox_platform_windows_userland/src/process_fork.rs`) calls `spawn_suspended(&mut exe_wide,
+false, false)` -- no stdout/stdin pipe -- and its own doc comment claims this makes the child
+"inherit the parent's real console session's stdio the ordinary way a genuine `fork()` child
+would" via `bInheritHandles=0` and no `STARTF_USESTDHANDLES`. That reasoning is backwards:
+`bInheritHandles=0` means NONE of the parent's handles (stdio included) are inherited, and
+omitting `STARTF_USESTDHANDLES` just leaves `CreateProcessW` to assign fresh default handles, not
+the parent's real stream. Confirmed live: none of the child-side diagnostic chain's own
+unconditional `eprintln!` lines (`[process_fork_diag] task-resume-probe (child, winpid=...)`,
+etc.) ever appeared in ANY of this session's captured logs, across multiple runs, even ones that
+otherwise made it deep into the fork machinery -- not lost output from a hang, genuinely never
+delivered anywhere.
+
+**Fix**: when `spawn_suspended` is called without a pipe (the production `spawn_process_fork_child`
+path), explicitly duplicate the CURRENT process's real `STD_OUTPUT_HANDLE`/`STD_ERROR_HANDLE`/
+`STD_INPUT_HANDLE` into the child via `STARTF_USESTDHANDLES` + `bInheritHandles=1` (marking each
+handle `HANDLE_FLAG_INHERIT` first, since a handle inherited from an upstream pipe/launcher is not
+always already marked inheritable) -- matching real `fork()` semantics, where the child keeps the
+exact same fd table as the parent. This is a real, independently-justified observability/semantic
+fix (a forked child's own guest output should reach the same place the parent's does) but, per the
+next section, did NOT resolve the remaining hang -- the hang reproduces identically with this fix
+in place, confirming it is a separate bug from Bug #6.
+
+### The remaining blocker: a real, deterministic hang, NOT resource pressure, NOT either bug above
+
+With both fixes applied and rebuilt, five consecutive clean runs (varying free memory 3.9-5.2GB,
+one deliberately run with zero debugger ever attached, to rule out the possibility that an earlier
+session's `cdb -pv` non-invasive attach was itself leaving the target thread suspended) all show
+the IDENTICAL signature:
+
+1. Image loads, `bash` ELF loads, `TCACHE_REPRO_START pid=1` prints (~60-75s in, consistent with
+   this repo's documented normal image-load time -- not itself evidence of slowness).
+2. `[diag-recover-fsbase] recover_rip=... fsbase=0x7feffffb0740` -- a healthy fsbase, confirming
+   Bug #5's fix is working as intended.
+3. Total silence for 5-8+ minutes (multiple runs let sit this long or longer) -- no further log
+   line, no CPU usage, no growth in working set.
+4. `Get-Process -Id <pid> | % Threads | select WaitReason,ThreadState` on the live, untouched (no
+   debugger ever attached) process shows the sole thread as `WaitReason=Suspended,
+   ThreadState=Wait` -- i.e. the thread has a nonzero Windows suspend count and nothing is ever
+   resuming it. This is not a fault loop, not CPU-bound slowness, not I/O wait: something in this
+   process's own code path calls `SuspendThread` (directly, or via a scope-guard pattern like
+   `ctxwatch_arm_other_threads`'s `defer`-paired `SuspendThread`/`ResumeThread`) and the matching
+   `ResumeThread` never runs.
+
+`ctxwatch_arm_other_threads` (`litebox_platform_windows_userland/src/lib.rs`) was inspected as the
+most likely suspect (it explicitly suspends "other" threads while arming a context watchpoint, and
+this investigation's `run_thread_with_fork_verification` call newly engages `fork_verify`'s
+single-step verification machinery in this exact run for the first time this whole investigation
+has reached this deep) -- but this repro is single-threaded (a `bash -c` subshell with no forked
+grandchildren), so `ACTIVE_THREADS` filtered to "other than current" would be empty and this
+specific function would suspend nothing. The `defer`-guard pattern used there (and in the sibling
+`ThreadHandle::interrupt`) looks structurally sound on read -- the real culprit is still unlocated
+and needs a live debugger attach (accepting the small risk of again leaving the thread suspended,
+this time with an explicit `~*e ResumeThread` step before detaching) or, better, a
+`LITEBOX_DIAG_*`-style instrumentation point logging every `SuspendThread`/`ResumeThread` pair by
+call site, to distinguish `fork_verify`'s own single-step arming from `ctxwatch`/`interrupt` from
+something else entirely.
+
+### Step 0 verdict: still INCONCLUSIVE -- REFUTED-by-crash is now doubly ruled out (two more real
+### bugs fixed, both confirmed not to be the deterministic ntdll crash class), but a new, different,
+### equally real hang blocks completion
+
+Baseline (no `LITEBOX_PROCESS_FORK`) reconfirmed this session: identical `TCACHE_REPRO_START` ->
+SIGABRT (signal 6, `Aborted`, subshell status 134) corruption, exactly as every prior session
+documented -- the corruption this whole track exists to fix is real and the repro is trustworthy.
+
+`LITEBOX_PROCESS_FORK=1`: the two bugs fixed this session are both real, both independently
+justified by direct evidence (not speculative), and neither was previously known -- this is
+genuine progress, not a wash. But Step 0's central claim (the forked child runs its tcache
+workload and exits cleanly) is still not reachable: every run past the FS_BASE fix now hits a
+NEW, different, equally deterministic hang (a leaked thread suspend), rather than either the old
+ntdll crash or a resource-pressure stall. This is real progress along the same trajectory every
+session in this investigation has followed -- each session's fix exposes the next layer -- but the
+verdict cannot honestly be called CONFIRMED, and REFUTED no longer fits either (there is no crash;
+this is a hang with a specific, if not yet located, mechanism).
+
+### Step 9 (long-running cross-process child survival): still NOT REACHED
+
+Unchanged from the prior entry -- still blocked on reaching a live, resumed, running cross-process
+child at all.
+
+### Regression check (this session's two fixes)
+
+`cargo build --release --bin litebox_runner_linux_on_windows_userland`: clean (pre-existing,
+unrelated `unsafe fn`/E0133 warnings in `litebox/src/mm/mod.rs` only).
+
+`cargo test --release -p litebox --lib`: 123 passed, 26 failed -- identical to every prior
+session's documented baseline (missing `diod` binary, one `tar_ro` symlink test, one
+`mm::tests::test_vmm_mapping` assertion). No regression.
+
+`cargo test --release -p litebox_common_linux`: 10 passed, 1 doctest passed, 0 failed -- clean.
+
+`cargo test --release -p litebox_platform_windows_userland --lib`: 4 passed, 0 failed -- clean.
+
+`cargo test -p litebox_shim_linux` (test/doctest build): still fails to compile, `E0576` "cannot
+find method `run_test_thread` in trait `ThreadProvider`" -- confirmed pre-existing (identical to
+every prior session's documented finding), unrelated to this session's two-file diff.
+
+### What remains open for a future session
+
+- **Locate the leaked `SuspendThread`/missing `ResumeThread`** behind the new hang. Suspect areas
+  to instrument first: `fork_verify::begin`/`on_single_step`'s single-step arming (newly exercised
+  end-to-end for the first time this investigation has reached this far), and
+  `run_thread_with_fork_verification`'s own setup sequence in
+  `litebox_platform_windows_userland/src/lib.rs`. A live debugger attach is the fastest path but
+  must explicitly `ResumeThread` (or issue cdb's own thread-resume, if any) before detaching, to
+  avoid the debugger's own non-invasive attach compounding the exact symptom being diagnosed (this
+  session confirmed, by attaching then detaching cleanly and re-running from scratch, that the
+  hang is NOT a debugger artifact -- it reproduces with no debugger ever attached -- but a future
+  session's own attach should still be careful not to leave the process suspended, since that
+  would produce an indistinguishable false signal).
+- Bug #6's stdio fix, once the hang above is resolved, should let a future session actually SEE
+  `TCACHE_REPRO_CHILD_OK`/`TCACHE_REPRO_DONE` from the forked child directly (previously
+  impossible regardless of whether the child's own logic was correct) -- this closes a real
+  observability gap that likely masked information in every prior session's runs too.
+- The real, still-unfixed `ElfPatchKey`-not-rekeyed-on-fork bug and Step 9 (long-running
+  cross-process child survival) remain exactly as open as the prior entry left them.
+
+---
+
 This is the running log for the Track B architectural effort (D==0 cross-process fork,
 per `advisor/ADVISORY-002-d-zero-fork.md`), broader in scope than the webtop-specific
 investigation in `docs/webtop-debian-selkies-2026-09-06.md`. That file remains the log for

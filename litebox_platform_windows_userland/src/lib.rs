@@ -1704,6 +1704,29 @@ unsafe extern "system" fn vectored_exception_handler(
             // investigation captured. Ungated and allocation-free: this only runs on an actual
             // recovered fault, never on ordinary execution, and the gated `diag_fataldump_enabled`
             // block above is not on by default in the runs that reproduce this crash.
+            //
+            // FIX (track-b investigation, confirmed live): the comment above predicted, and a
+            // live `bash -c` fork repro under `LITEBOX_PROCESS_FORK=1` then actually hit,
+            // `rdfsbase()==0` at exactly this point -- FS_BASE cleared by Windows, about to
+            // resume at `recover`'s FS-relative stack-protector/TLS epilogue code with no
+            // repair. That produced a silent hang (no further log output, process alive but
+            // idle) rather than a clean crash, because the re-fault this causes does not
+            // reliably match the same guarded conditions (`faulting_instruction_has_fs_override`
+            // plus the sibling branch's placement earlier in this function) on every retry.
+            // Apply the exact same bounded `wrfsbase`-and-verify repair the sibling
+            // FS_BASE-reset branch above already uses, using the same trusted
+            // `THREAD_FS_BASE`-shadowed value (never repairing to an untrusted 0), before
+            // resuming -- so `recover`'s epilogue observes a real FS_BASE instead of faulting
+            // again immediately.
+            let saved_for_recover = WindowsUserland::get_thread_fs_base();
+            if saved_for_recover != 0 && unsafe { litebox_common_linux::rdfsbase() } == 0 {
+                for _ in 0..8 {
+                    unsafe { litebox_common_linux::wrfsbase(saved_for_recover) };
+                    if unsafe { litebox_common_linux::rdfsbase() } == saved_for_recover {
+                        break;
+                    }
+                }
+            }
             diag_raw_print(
                 b"[diag-recover-fsbase] recover_rip=0x",
                 recover as usize,
