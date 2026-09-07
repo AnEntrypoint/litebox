@@ -251,6 +251,127 @@ changes and is not explained here — but it means the harness shape changes the
 compare like with like when measuring this area (this project's own standing
 "isolate the harness" lesson, in a new place).
 
+## RESOLVED: the CoW path was the cause, and it is now off by default
+
+The flank work above eventually paid off, but the shipped fix is simpler than the flank repair
+itself.
+
+**Fourth attempt at the flank fix worked.** Two pieces were both required, and each is useless
+without the other:
+
+1. Recover the view's true extent from `AllocationBase` (granularity-aligned, unlike
+   `BaseAddress`) by walking `VirtualQuery` forward while `AllocationBase` matches, then reserve
+   the whole former view in ONE call -- **with its end rounded UP to allocation granularity**.
+   That round-up is the piece attempts 2 and 3 were missing: leaving the reservation at the
+   view's exact end strands the remainder of the final granule as free-but-unreservable, so the
+   next `mmap` landing there can neither reserve it (our reservation already occupies the
+   granule) nor commit into it (that tail was never reserved).
+2. Let `reserve_and_commit` fall through to `MEM_COMMIT` when its `MEM_RESERVE` fails with
+   `ERROR_INVALID_ADDRESS` at an explicit address, since the granule may already be reserved by
+   the whole-view reservation above.
+
+With both, `import pixelflux` stopped SIGSEGVing and produced an honest Python error instead:
+`ImportError: Error relocating .../libplacebo-...so.338: dovi_rpu_get_header: symbol not found`
+-- with `libdovi-867af97d.so.3.3.1` present and correct in the very same directory. Memory-safe,
+but the flanks are restored as ZERO-FILL, and for a shared library the lost bytes are real
+content. The symbol was missing because the pages holding it had been zeroed.
+
+**So the flank repair converts a crash into silent data loss.** That is strictly better, and it
+is as far as this approach can go: reconstructing a flank as an equivalent CoW mapping needs
+guest-address -> file/offset tracking that does not exist anywhere in this codebase (`VmArea`
+records only `is_file_backed: bool`).
+
+**Decisive A/B.** Bypassing `try_cow_mmap_file` entirely:
+
+```
+CoW enabled  -> import pixelflux: ImportError (symbol not found);  import pcmflux: SIGSEGV
+CoW disabled -> import pixelflux: PX_OK (rc 0);                    import pcmflux: PC_OK (rc 0)
+```
+
+**Shipped fix: `LITEBOX_COW_MMAP`, defaulting OFF.** The CoW fast path is now opt-in. Two
+independent reasons, both measured rather than argued:
+
+- It is **incorrect** here, per the above.
+- It is **not buying anything**. AGENTS.md's own "Windows CoW-mmap performance" section already
+  records the optimisation as having "zero practical effect" on real tar-packed execs, because
+  `MapViewOfFile3` needs 64 KiB file-offset alignment while real ELF `PT_LOAD` offsets are only
+  page-aligned. It succeeds mainly on deliberately realignment-padded images -- precisely where
+  it now does damage.
+
+The flank fix is kept, because it is a genuine correctness improvement for anyone who opts back
+in with `LITEBOX_COW_MMAP=1` to continue the alignment/CoW investigation the open PRD rows
+describe.
+
+### With CoW off, selkies runs
+
+`selkies.log` reaches, in full:
+
+```
+INFO:data_websocket:pcmflux library found. Audio capture is available.
+INFO:data_websocket:pixelflux library found. Striped encoding modes available.
+INFO:main:SelkiesStreamingApp initialized: encoder=x264enc, display=1024x768
+INFO:main:All main components initialized. Running server...
+'port': 8082
+```
+
+and it goes on to spawn its real `xdotool`/`xclip` helper processes. A TCP connect to the
+published 8082 from the host succeeds, so the listener is genuinely up.
+
+### A second packaging bug found on the way: empty-file dedup corrupts the image
+
+`webtop_seatd_realigned.tar` deduplicates content-identical files into symlinks. That includes
+**zero-byte** files, so every empty file in the image was symlinked to an arbitrary other empty
+file. Concretely:
+
+```
+/usr/lib/python3.14/urllib/__init__.py -> /lib/apk/db/lock
+```
+
+which made `import urllib.parse` fail with `PermissionError: [Errno 13]`, killing selkies before
+it started. Use `C:\dev\litebox-webtop\webtop_seatd.tar` (not deduplicated) instead. With CoW
+off, the realigned tar's alignment padding buys nothing anyway. **The packager's dedup pass must
+exclude zero-length files** -- they are "content-identical" to each other only vacuously.
+
+## The remaining blocker: guest loopback is not shared between guest processes
+
+With everything above, the dashboard serves and selkies runs, but the browser still shows
+`WebSocket disconnected`. The console gives the exact reason:
+
+```
+WebSocket connection to 'ws://127.0.0.1:3000/websockets' failed:
+  Error during WebSocket handshake: Unexpected response code: 502
+```
+
+502 means nginx could not reach selkies at `127.0.0.1:8082`. Evidence that this is a
+cross-process loopback gap, not a NAT or nginx bug:
+
+- From the HOST, through `--publish`, nginx serves `/` with HTTP 200 reliably, including under
+  four concurrent requests and across a keep-alive session.
+- From the HOST, a TCP connect to a published 8082 reaches selkies' listener fine.
+- From INSIDE the guest, `wget http://127.0.0.1:3000/` fails every single time (`HTTP_LOCAL_FAIL`
+  in every staged run in this document), even though that is the very nginx that answers the host
+  correctly.
+- The previous session's control test -- nginx proxying to a second `server` block **inside the
+  same nginx process** -- succeeded. That is intra-process loopback.
+
+Taken together: loopback works within one guest process and not between two. That is consistent
+with `litebox/src/net/mod.rs`'s own structure, where the `LocalPortAllocator` is an
+"independent RNG-seeded instance per-`Network`" -- each guest process gets its own network stack,
+so one process's `127.0.0.1` listener is simply not in another process's namespace.
+
+**Do not re-investigate `net.rs`'s NAT path for this.** The previous session cleared it by direct
+construction and this session's host-side 200s corroborate that independently. The gap is that
+guest processes do not share a loopback namespace.
+
+Binding selkies to `0.0.0.0` and proxying to the guest's own `10.0.0.2` was tried and is NOT a
+workaround: it stopped nginx serving the host correctly as well.
+
+**Measurement caveat for whoever picks this up:** by the end of this session free host memory had
+fallen from 6.6 GB to 1.67 GB (runner ~1.5 GB + Chrome ~1.5 GB + editors), and at that point every
+run began timing out including configurations that had been reliable minutes earlier. That is the
+host-exhaustion condition AGENTS.md already warns not to misattribute to litebox. Check
+`FreePhysicalMemory` before trusting any timing or hang observed in this area.
+
 ## Next steps, in dependency order
 
 1. Fix the flank recommit properly, using the view's real allocation base and mapping

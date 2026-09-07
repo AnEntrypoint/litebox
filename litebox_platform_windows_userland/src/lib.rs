@@ -6260,7 +6260,30 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     )
                 }
             };
-            if ptr.is_null() {
+            // A failed `MEM_RESERVE` at an EXPLICIT address is not necessarily fatal: the
+            // granule may already be reserved, by us. Windows reservations are always
+            // granularity-granular, so two mappings whose pages share one 64 KiB granule
+            // CANNOT hold separate reservations -- they must live inside the same one. The
+            // reservation above is rounded out to granularity precisely so it can serve
+            // arbitrary page-aligned addresses, which means it routinely collides with a granule
+            // some neighbouring mapping already owns. In particular the whole-view reservation
+            // that restores a destroyed CoW view's flanks (see `allocate_pages`) deliberately
+            // holds entire granules that later, unrelated `mmap`s will land in.
+            //
+            // Windows reports that collision as `ERROR_INVALID_ADDRESS`, the same code it uses
+            // for a genuinely unusable address, so the two cannot be told apart from the error
+            // alone. Distinguish them by simply attempting the commit: if the address space is
+            // already ours, `MEM_COMMIT` succeeds; if it is not, the commit fails and this
+            // returns null exactly as it did before.
+            //
+            // This is load-bearing for the flank restoration, not a tidy-up: without it,
+            // restoring a flank correctly BREAKS the next allocation that rounds into the same
+            // granule, turning a latent SIGSEGV into an immediate panic.
+            let maybe_already_reserved = ptr.is_null()
+                && r.start != 0
+                && unsafe { GetLastError() }
+                    == windows_sys::Win32::Foundation::ERROR_INVALID_ADDRESS;
+            if ptr.is_null() && !maybe_already_reserved {
                 core::ptr::null_mut()
             } else {
                 let commit_addr = if r.start == 0 { ptr } else { r.start as *mut c_void };
@@ -6492,6 +6515,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                 let mut view_mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
                                 let mut flank_before: Option<core::ops::Range<usize>> = None;
                                 let mut flank_after: Option<core::ops::Range<usize>> = None;
+                                // The destroyed view's TRUE extent, when it can be recovered.
+                                // `None` means fall back to the old per-range behaviour.
+                                let mut view_span: Option<core::ops::Range<usize>> = None;
                                 if state == Win32_Memory::MEM_COMMIT {
                                     // TODO: handle this race condition properly.
                                     assert_eq!(
@@ -6586,18 +6612,79 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                     // preserving fix the docs above describe as needing new
                                     // guest-address -> file/offset tracking infrastructure that does
                                     // not exist anywhere in this codebase today).
-                                    let view_start = view_mbi.BaseAddress as usize;
-                                    let view_end = view_start + view_mbi.RegionSize;
-                                    flank_before = if was_mapped_view && view_start < r.start {
-                                        Some(view_start..r.start)
+                                    // `view_mbi.BaseAddress`/`RegionSize` describe only the
+                                    // maximal run of pages sharing one state+protection, which for
+                                    // a multi-segment view is just ONE of its segments -- not the
+                                    // view. Using them here under-reported the view's extent, so
+                                    // the flanks missed whatever lay outside that one run and those
+                                    // bytes had nothing even attempting to restore them.
+                                    //
+                                    // `AllocationBase` IS the view's own base, and because the view
+                                    // came from `MapViewOfFile3` it is allocation-granularity
+                                    // aligned -- exactly what `MEM_RESERVE` requires and what a
+                                    // page-aligned flank boundary can never be relied on to be.
+                                    // Walk `VirtualQuery` forward from it while `AllocationBase`
+                                    // keeps matching to recover the view's true end.
+                                    let view_base = view_mbi.AllocationBase as usize;
+                                    let mut view_limit = view_base;
+                                    if was_mapped_view && view_base != 0 {
+                                        loop {
+                                            let mut m = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+                                            let queried = unsafe {
+                                                Win32_Memory::VirtualQuery(
+                                                    view_limit as *mut c_void,
+                                                    &raw mut m,
+                                                    core::mem::size_of::<
+                                                        Win32_Memory::MEMORY_BASIC_INFORMATION,
+                                                    >(),
+                                                )
+                                            } != 0;
+                                            if !queried || m.AllocationBase as usize != view_base {
+                                                break;
+                                            }
+                                            let next = m.BaseAddress as usize + m.RegionSize;
+                                            // Defensive: never spin if Windows reports no forward
+                                            // progress.
+                                            if next <= view_limit {
+                                                break;
+                                            }
+                                            view_limit = next;
+                                        }
+                                    }
+                                    // Only trust the walk if it produced a span that actually
+                                    // contains the caller's range; otherwise leave `view_span` as
+                                    // `None` and let the recommit take the old path rather than act
+                                    // on bounds that cannot be justified.
+                                    if was_mapped_view
+                                        && view_base != 0
+                                        && view_base <= r.start
+                                        && view_limit >= r.end
+                                    {
+                                        view_span = Some(view_base..view_limit);
+                                        flank_before = if view_base < r.start {
+                                            Some(view_base..r.start)
+                                        } else {
+                                            None
+                                        };
+                                        flank_after = if view_limit > r.end {
+                                            Some(r.end..view_limit)
+                                        } else {
+                                            None
+                                        };
                                     } else {
-                                        None
-                                    };
-                                    flank_after = if was_mapped_view && view_end > r.end {
-                                        Some(r.end..view_end)
-                                    } else {
-                                        None
-                                    };
+                                        let view_start = view_mbi.BaseAddress as usize;
+                                        let view_end = view_start + view_mbi.RegionSize;
+                                        flank_before = if was_mapped_view && view_start < r.start {
+                                            Some(view_start..r.start)
+                                        } else {
+                                            None
+                                        };
+                                        flank_after = if was_mapped_view && view_end > r.end {
+                                            Some(r.end..view_end)
+                                        } else {
+                                            None
+                                        };
+                                    }
                                     // allocate_pages reclaiming an already-committed range either
                                     // unmaps a live section view or decommits its pages. Both
                                     // destroy contents while leaving higher-level bookkeeping
@@ -6683,66 +6770,103 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                 // reservation, so a former mapped view needs the same
                                 // reserve-and-commit path as a genuinely free region.
                                 let ptr = if was_mapped_view {
-                                    let recommitted = reserve_and_commit(
-                                        r.clone(),
-                                        prot_flags(initial_permissions),
-                                        0,
-                                    );
-                                    // Re-commit any flanking remainder of the destroyed view (see
-                                    // the flank-detection comment above `decommit_ok`) as anonymous
-                                    // zero-fill memory, using the ORIGINAL view's own protection
-                                    // (`view_mbi.Protect`, queried before the destructive unmap --
-                                    // not `initial_permissions`, which describes only the caller's
-                                    // requested sub-range `r` and may differ, e.g. a RO text flank
-                                    // next to the RW data segment `r` itself covers) so a flank that
-                                    // was executable/read-only stays that way rather than silently
-                                    // gaining or losing protections. Best-effort: if a flank fails to
-                                    // recommit, log it (`diag_mm_enabled`) and continue -- leaving it
-                                    // `MEM_FREE` is the pre-existing (already-buggy) behavior, not a
-                                    // regression introduced by this best-effort recovery attempt.
+                                    // `UnmapViewOfFileEx` above dropped the WHOLE view to
+                                    // `MEM_FREE` (a mapped view has no partial-unmap form), not to
+                                    // `MEM_RESERVE` as `VirtualFree(MEM_DECOMMIT)` would. So every
+                                    // byte of the former view -- the caller's own sub-range `r` AND
+                                    // the flanking remainder either side of it -- must be reserved
+                                    // again before anything can be committed into it.
                                     //
-                                    // KNOWN BROKEN, root-caused but NOT yet fixed (2026-09-07): this
-                                    // `VirtualAlloc2` fails with `ERROR_INVALID_ADDRESS` (487) on
-                                    // essentially every real flank, leaving it `MEM_FREE` exactly as
-                                    // the log line says. `MEM_RESERVE` requires an ALLOCATION-
-                                    // GRANULARITY-aligned (64 KiB) base, but a flank boundary is only
-                                    // page-aligned -- it is wherever the caller's sub-range `r`
-                                    // happens to begin or end. Observed live: three flanks in one
-                                    // run, all page-aligned, none granularity-aligned (0xA57000,
-                                    // 0xAB1000, 0xB6B000), while CPython loaded its `pixelflux`
-                                    // native extension -- which is why `import pixelflux` dies with
-                                    // SIGSEGV and no traceback, and with it all of selkies and the
-                                    // webtop video path. A second latent defect sits behind it: a
-                                    // view's `Protect` may be `PAGE_WRITECOPY`/
-                                    // `PAGE_EXECUTE_WRITECOPY`, which is not a legal protection for
-                                    // PRIVATE anonymous memory and would fail even once the address
-                                    // is accepted; it needs mapping down to `PAGE_READWRITE`/
-                                    // `PAGE_EXECUTE_READWRITE`.
+                                    // Reserve the ENTIRE former view in ONE call, then `MEM_COMMIT`
+                                    // each piece inside that reservation. Reserving each flank at
+                                    // its OWN base (what this code used to do) fails with
+                                    // `ERROR_INVALID_ADDRESS` (487) essentially every time:
+                                    // `MEM_RESERVE` demands an allocation-granularity-aligned
+                                    // (64 KiB) base and a flank boundary is only page-aligned --
+                                    // it is wherever `r` happens to begin or end. Observed live,
+                                    // three flanks in one run, every one page-aligned and none
+                                    // granularity-aligned (0xA57000, 0xAB1000, 0xB6B000), each left
+                                    // `MEM_FREE`. That is what made CPython SIGSEGV, with no
+                                    // traceback, while loading selkies' `pixelflux`/`pcmflux`
+                                    // native extensions -- and with them the whole webtop video
+                                    // path.
                                     //
-                                    // The obvious fix -- reserve the whole former view once, then
-                                    // MEM_COMMIT each piece inside it -- was attempted and REVERTED:
-                                    // it panicked in `do_query_on_region` ("The handle is invalid",
-                                    // os error 6). `view_mbi.BaseAddress` is NOT the view's
-                                    // allocation base: `VirtualQuery` reports the base of the
-                                    // contiguous same-attribute page range, which can start
-                                    // mid-view, so the "whole view" bounds derived from it are
-                                    // themselves unaligned and the single reservation is no more
-                                    // legal than the per-flank ones. A correct fix must obtain the
-                                    // real allocation base (`view_mbi.AllocationBase`, or track the
-                                    // view's own base at map time) and reserve from there.
-                                    if !recommitted.is_null() {
-                                        for flank in [&flank_before, &flank_after]
-                                            .into_iter()
-                                            .flatten()
+                                    // The reservation is rounded UP to granularity at its end. That
+                                    // detail is load-bearing: leaving it at the view's exact end
+                                    // strands the remainder of the final granule as free-but-
+                                    // unreservable, so the next `mmap` landing there cannot reserve
+                                    // it (our reservation already occupies the granule) and cannot
+                                    // commit into it either (that tail was never reserved) -- an
+                                    // immediate panic instead of the old latent SIGSEGV. Taking the
+                                    // whole granule is safe: it was all part of this same view's
+                                    // own reservation, which `UnmapViewOfFileEx` just released.
+                                    // `reserve_and_commit` is what then commits into it, via its
+                                    // already-reserved fallback.
+                                    //
+                                    // A view's `Protect` may be `PAGE_WRITECOPY` /
+                                    // `PAGE_EXECUTE_WRITECOPY`, meaningful only for a mapped section
+                                    // and rejected outright for PRIVATE anonymous memory. Map
+                                    // copy-on-write down to its plain read/write equivalent: the
+                                    // flank is being re-created as ordinary anonymous memory, so
+                                    // there is no section left for copy-on-write to refer to.
+                                    // (`MEM_FREE` reports `Protect == 0`, not a legal commit
+                                    // protection either.)
+                                    let anon_prot = match view_mbi.Protect {
+                                        Win32_Memory::PAGE_WRITECOPY => Win32_Memory::PAGE_READWRITE,
+                                        Win32_Memory::PAGE_EXECUTE_WRITECOPY => {
+                                            Win32_Memory::PAGE_EXECUTE_READWRITE
+                                        }
+                                        0 => Win32_Memory::PAGE_READWRITE,
+                                        other => other,
+                                    };
+                                    let reserved_whole = view_span.clone().is_some_and(|span| {
+                                        let lo = span.start;
+                                        let hi = self.round_up_to_granu(span.end);
+                                        let got = unsafe {
+                                            VirtualAlloc2(
+                                                GetCurrentProcess(),
+                                                lo as *mut c_void,
+                                                hi - lo,
+                                                Win32_Memory::MEM_RESERVE,
+                                                Win32_Memory::PAGE_NOACCESS,
+                                                core::ptr::null_mut(),
+                                                0,
+                                            )
+                                        };
+                                        if got.is_null() {
+                                            litebox_util_log::error!(
+                                                start:% = lo, end:% = hi,
+                                                win32_err:% = unsafe { GetLastError() };
+                                                "diag-reclaim: whole-view MEM_RESERVE failed, falling back to per-range reserve"
+                                            );
+                                            false
+                                        } else {
+                                            true
+                                        }
+                                    });
+                                    if reserved_whole {
+                                        // Inside our own reservation now, so each piece is a plain
+                                        // `MEM_COMMIT` at its exact page-aligned bounds -- no
+                                        // granularity constraint applies to a commit.
+                                        //
+                                        // The flanks cannot be restored as equivalent CoW mappings
+                                        // (same file/offset): nothing here tracks which file backed
+                                        // a given guest address once the view is gone (`VmArea`
+                                        // records only `is_file_backed: bool`). They are therefore
+                                        // re-created as anonymous zero-fill pages, which loses the
+                                        // flanks' original file content -- a real, documented
+                                        // limitation -- but converts a guaranteed SIGSEGV into a
+                                        // zero-filled read, which is always memory-safe.
+                                        for flank in
+                                            [&flank_before, &flank_after].into_iter().flatten()
                                         {
                                             let flank_ptr = unsafe {
                                                 VirtualAlloc2(
                                                     GetCurrentProcess(),
                                                     flank.start as *mut c_void,
                                                     flank.len(),
-                                                    Win32_Memory::MEM_RESERVE
-                                                        | Win32_Memory::MEM_COMMIT,
-                                                    view_mbi.Protect,
+                                                    Win32_Memory::MEM_COMMIT,
+                                                    anon_prot,
                                                     core::ptr::null_mut(),
                                                     0,
                                                 )
@@ -6751,18 +6875,39 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                                 litebox_util_log::error!(
                                                     start:% = flank.start, end:% = flank.end,
                                                     win32_err:% = unsafe { GetLastError() };
-                                                    "diag-reclaim: failed to recommit orphaned CoW-view flank as anonymous memory -- left MEM_FREE, next touch will SIGSEGV"
+                                                    "diag-reclaim: failed to commit orphaned CoW-view flank as anonymous memory -- next touch will SIGSEGV"
                                                 );
                                             } else if diag_mm_enabled() {
                                                 litebox_util_log::error!(
                                                     start:% = flank.start, end:% = flank.end,
                                                     len:% = flank.len();
-                                                    "diag-reclaim: recommitted orphaned CoW-view flank as anonymous zero-fill memory"
+                                                    "diag-reclaim: committed orphaned CoW-view flank as anonymous zero-fill memory"
                                                 );
                                             }
                                         }
+                                        unsafe {
+                                            VirtualAlloc2(
+                                                GetCurrentProcess(),
+                                                r.start as *mut c_void,
+                                                r.len(),
+                                                Win32_Memory::MEM_COMMIT,
+                                                prot_flags(initial_permissions),
+                                                core::ptr::null_mut(),
+                                                0,
+                                            )
+                                        }
+                                    } else {
+                                        // Either the view's true extent could not be recovered or
+                                        // its reservation could not be taken. Fall back to the
+                                        // previous behaviour: reserve-and-commit just `r` and leave
+                                        // the flanks unbacked. Strictly worse, but it is what this
+                                        // code did before and it keeps the allocation succeeding.
+                                        reserve_and_commit(
+                                            r.clone(),
+                                            prot_flags(initial_permissions),
+                                            0,
+                                        )
                                     }
-                                    recommitted
                                 } else {
                                     if diag_mm_enabled() {
                                         litebox_util_log::error!(

@@ -482,6 +482,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     litebox::mm::linux::set_mapping_guard_gap_disabled(
         std::env::var_os("LITEBOX_NO_MAPPING_GUARD_GAP").is_some(),
     );
+    // Same arrangement, for the copy-on-write file-mapping fast path: the shim is `no_std` and
+    // cannot read the environment itself. Defaults OFF -- see `set_cow_mmap_enabled`'s own doc
+    // comment for the measurement showing the path is both lossy (it silently zero-fills the
+    // flanks of a destroyed CoW view, which for a shared library is real content -- it is what
+    // makes `import pixelflux` fail to resolve a symbol that is present on disk) and, per
+    // AGENTS.md's own closed investigation, of no practical benefit on real images.
+    litebox_shim_linux::set_cow_mmap_enabled(std::env::var_os("LITEBOX_COW_MMAP").is_some());
     // Real boot lock, not a remembered rule: two concurrent litebox_runner processes
     // sharing this host silently starve each other (host memory/CPU contention),
     // producing a symptom -- truncated log, no crash, no exit -- that is

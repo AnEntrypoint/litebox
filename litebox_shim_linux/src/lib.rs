@@ -2633,3 +2633,8 @@ mod tests {
         assert_eq!(&buf[..n], b"hello");
     }
 }
+
+/// Re-exported so the runner can forward `LITEBOX_COW_MMAP` into this `no_std` crate, mirroring
+/// how `litebox::mm::linux::set_mapping_guard_gap_disabled` is forwarded for
+/// `LITEBOX_NO_MAPPING_GUARD_GAP`. See `syscalls::mm::COW_MMAP_ENABLED` for why it defaults off.
+pub use syscalls::mm::set_cow_mmap_enabled;

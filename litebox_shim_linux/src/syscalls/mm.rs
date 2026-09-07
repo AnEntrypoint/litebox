@@ -24,6 +24,51 @@ use object::elf::{ET_DYN, FileHeader64, PT_LOAD, ProgramHeader64};
 #[cfg(target_arch = "x86_64")]
 use object::endian::LittleEndian;
 
+/// Whether the copy-on-write file-mapping fast path is allowed to run. Default **off**.
+///
+/// Off by default because the path is currently INCORRECT on Windows, and separately is not
+/// buying anything. Both halves are measured, not assumed:
+///
+/// * **Incorrect.** A `MapViewOfFile3` CoW view can only be destroyed whole -- Windows has no
+///   partial-unmap for a mapped view -- so when the guest `mmap(MAP_FIXED)`s a sub-range of a
+///   view (exactly what `ld.so` does: one whole-library view, then a fixed sub-mmap per
+///   `PT_LOAD`), the flanking remainder either side of that sub-range dies with it. Nothing in
+///   this codebase can reconstruct those flanks as equivalent CoW mappings, because no
+///   guest-address -> file/offset tracking exists (`VmArea` records only `is_file_backed: bool`),
+///   so the best available recovery re-creates them as anonymous ZERO-FILL pages. That is
+///   memory-safe but silently lossy, and for a shared library the lost bytes are real content.
+///   Measured directly: with this path enabled, `python3 -c "import pixelflux"` fails with
+///   `ImportError: Error relocating .../libplacebo-...so: dovi_rpu_get_header: symbol not found`
+///   even though `libdovi-...so` is present and correct in the same directory -- the symbol is
+///   missing because the pages holding it were zero-filled. With this path disabled, the same
+///   import succeeds, as does `import pcmflux`. That is selkies' entire capture/encode layer, and
+///   therefore the webtop's whole video path.
+/// * **Not buying anything.** See AGENTS.md, "Windows CoW-mmap performance": the optimisation was
+///   investigated to a conclusion and found to have "zero practical effect" on real tar-packed
+///   execs, because `MapViewOfFile3` requires 64 KiB file-offset alignment while real ELF
+///   `PT_LOAD` file offsets are only page-aligned. It succeeds mainly on deliberately
+///   realignment-padded images -- which is precisely where it now does damage.
+///
+/// Set `LITEBOX_COW_MMAP=1` to opt back in (e.g. to continue the alignment/CoW investigation the
+/// open PRD rows describe). Nothing else about the CoW implementation is changed by this flag; it
+/// only decides whether the fast path is attempted at all.
+static COW_MMAP_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Enable (or disable) the copy-on-write file-mapping fast path. See [`COW_MMAP_ENABLED`].
+///
+/// The shim is `no_std` and cannot read an environment variable itself, so the runner forwards
+/// `LITEBOX_COW_MMAP` on its behalf -- the same arrangement `set_mapping_guard_gap_disabled`
+/// already uses for `LITEBOX_NO_MAPPING_GUARD_GAP`.
+pub fn set_cow_mmap_enabled(enabled: bool) {
+    COW_MMAP_ENABLED.store(enabled, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the copy-on-write file-mapping fast path may be attempted.
+fn cow_mmap_enabled() -> bool {
+    COW_MMAP_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Per-memfd real shared-memory state, keyed by the backing in-mem file's own `(dev, ino)` (see
 /// `GlobalState::memfds`'s doc comment for why this lives shim-wide, mirroring
 /// `syscalls::file::FlockRegistry`'s identical `(dev, ino)`-keying rationale).
@@ -166,8 +211,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let is_exec = prot.contains(ProtFlags::PROT_EXEC);
 
         // Perform the normal mmap first (CoW or memcpy fallback).
-        let result = if let Some(cow_result) =
-            self.try_cow_mmap_file(suggested_addr, len, &prot, &flags, fd, offset)
+        let result = if let Some(cow_result) = cow_mmap_enabled()
+            .then(|| self.try_cow_mmap_file(suggested_addr, len, &prot, &flags, fd, offset))
+            .flatten()
         {
             cow_result?
         } else {
