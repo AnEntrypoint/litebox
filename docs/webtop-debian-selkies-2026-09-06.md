@@ -1699,3 +1699,266 @@ wiring.
 3. Launch script preserved at `.wfgy/webtop-debian/scripts/wt_full_stack.sh`;
    overlay-building steps and the exact `--resume-from` command used this
    session are reproducible from this section's own text above.
+
+---
+
+# 2026-09-07: the "non-deterministic nginx 404" investigation -- real
+# filesystem cache bug found and fixed (unrelated, latent), but the ACTUAL
+# reported symptom is a genuinely different, still-open networking bug: a
+# loopback `proxy_pass` from nginx to a same-guest backend is deterministically
+# refused when the ORIGINAL client request arrived via the `-p`-published NAT
+# path, and deterministically succeeds when the original request is itself a
+# loopback probe
+
+## Task brief and starting hypothesis
+
+Picked up a report (not yet written up when this session started) of
+`curl -H "Connection: Upgrade" ... http://<host>/websockets` returning `101`
+on some boots of the `wt_full_stack.sh`-style launch script and a flat `404`
+on other boots of the exact same script/image/host, with `/devmode` (another
+proxied `location`) showing the same split while `location /` and
+`location /files` (static, non-proxied) always worked. The brief's own
+hypothesis: a write-then-read visibility race in `litebox`'s layered
+filesystem, where the heredoc's `cat > /etc/nginx/sites-enabled/default`
+write is not always durable/visible before nginx's own subsequent read of
+that path, landing on the stock (pre-substitution) Debian default config on
+"broken" boots.
+
+## A real, separate filesystem cache bug found and fixed by code reading
+
+Read `litebox/src/fs/layered.rs`'s `open`/`write`/`migrate_file_up` in full
+before reproducing anything, per this project's own standing discipline.
+Found a genuine bug independent of any live repro: `LayeredFs::open`'s
+fast-path cache check (`self.root.read().entries.get(&path)`, `open`
+~line 614) returns a cached `EntryX::Lower` entry for any path that was ever
+opened before its first migration to the upper (writable) layer -- and
+`migrate_file_up`'s own cleanup of that cache entry only fires inside its
+`to_migrate` loop's `Arc::strong_count == 3` arm (`layered.rs` ~line 439).
+`write()`'s own migration fallback (the common, no-other-fd-open case: a
+plain `cat >` truncate-then-write) explicitly `drop(entry)`s its local `Arc`
+clone *before* calling `migrate_file_up` (`write`, ~line 1054) -- so by the
+time `migrate_file_up`'s `to_migrate` loop inspects the writer's own fd, the
+observed strong count is 2, not 3 (the `to_migrate`-collection-time doc
+comment's own "guaranteed >= 3" assumption is wrong for exactly this caller).
+That routes into the `0..=2` arm, which the code's own comment describes as
+"normally unreachable" and treats as "nothing to migrate" -- it closes the
+freshly-opened upper fd and moves on, **never removing the stale
+`EntryX::Lower` entry from `root.entries`**. Any later, fresh `open()` of
+that exact path (a different process's first-ever open, or the same
+process's second open) then hits the fast-path cache and is served the
+stale, pre-migration (lower-layer) content forever -- a real, latent,
+cross-process write-then-read visibility bug, precisely matching the shape
+of bug this session set out to find.
+
+**Fixed**: after `migrate_file_up`'s `to_migrate` loop completes (every
+branch of which either already skips a non-`Lower` entry or replaces/closes
+one), any `Lower` entry still sitting in `root_entries` for `path` is by
+construction stale (the path is now migrated to `Upper`) -- remove it
+unconditionally before returning, still under the same `root_guard` write
+lock the loop already holds for its whole duration. Change is additive, ~20
+lines, entirely inside `migrate_file_up`'s tail in
+`litebox/src/fs/layered.rs`.
+
+**Verified via the scoped test suite**
+(`cargo test --release -p litebox -p litebox_platform_windows_userland`,
+`litebox_shim_linux`/`litebox_common_linux` skipped -- both still hit the
+same pre-existing `E0576` `run_test_thread` build failure this doc's
+earlier sections already recorded, confirmed unrelated: this session's diff
+touches only `litebox/src/fs/layered.rs`): **123 passed, 26 failed**, the
+exact same pass/fail split and exact same failing test names as the
+already-recorded pre-existing baseline (9P tests need a real `diod` binary
+not installed here; `tar_ro::symlink_metadata_still_follows_intermediate_
+symlink_components` and `mm::tests::test_vmm_mapping` are pre-existing,
+unrelated). Zero new failures, zero regressions.
+
+## The fix does NOT eliminate the reported 404 -- because it was never the
+## cause: root-caused via debug tracing to a genuinely different bug
+
+Built the fixed binary into a separate `CARGO_TARGET_DIR` (`target-nginxfix/`,
+avoiding this environment's own recurring unkillable-zombie-`.exe` lock
+issue, same workaround this doc's earlier sessions already used) and re-ran
+the exact repro repeatedly. **The 404 reproduced identically on the fixed
+binary, every single time** -- not reduced in frequency, not intermittent.
+This already falsified the write-visibility hypothesis before any deeper
+trace: if stale-cache-poisoning were the mechanism, the fix should have
+changed the observed rate from "sometimes 404" to "never 404"; instead nginx
+kept 404ing 100% of the time regardless of the fix.
+
+Diagnosed by embedding the launch script's own diagnostics (per this row's
+own task brief) directly into the guest boot: a `cat` of
+`/etc/nginx/sites-enabled/default` immediately after the heredoc write, and
+`nginx -T` run just before the final `exec nginx`. **Both showed the
+correct, fully-substituted config, including the `location /websockets`
+block, on every boot** -- ruling out any stale-file-read at the config-file
+level entirely, confirming the fs layer (both before and after this
+session's own fix) was never the problem for this specific symptom.
+
+Added `error_log /dev/stdout debug;` (and, in a variant, `nginx -g '...
+error_log /tmp/nginx_error.log debug;'` with the launch script `cat`-ing that
+log to stdout before exiting) to get nginx's own live request trace. The
+trace is unambiguous and 100% reproducible:
+
+```
+test location: "/"
+test location: "files"
+test location: "websockets"
+using configuration "/websockets"
+...
+connect to 127.0.0.1:8082, fd:11 #3
+http upstream connect: -2
+...
+connect() failed (111: Connection refused) while connecting to upstream,
+  client: 10.0.0.1, server: , request: "GET /websockets HTTP/1.1",
+  upstream: "http://127.0.0.1:8082/websockets", host: "127.0.0.1:13021"
+http next upstream, 2
+finalize http upstream request: 502
+internal redirect: "/50x.html?"
+test location: "/", "files", "devmode", "50x.html"
+using configuration "=/50x.html"
+open() "/usr/share/selkies/selkies-dashboard/50x.html" failed
+  (2: No such file or directory)
+```
+
+**nginx's own `location` matching is completely correct on every boot,
+external or internal, working or "broken"**: it reaches `location
+/websockets`'s `proxy_pass http://127.0.0.1:8082;` every time. The 404 is
+`error_page 500 502 503 504 /50x.html;`'s own fallback: nginx's real,
+correct response to the failed proxy is a `502`, but the `location =
+/50x.html { root .../selkies-dashboard/; }` page doesn't actually exist at
+that path in this launch script (never copied there, a corner this session's
+scripts happened to cut), so the 502 error page itself 404s and that's the
+final status code the client sees. **A 404 for a proxied websocket location
+is therefore never really "404" -- it is always a masked 502**, a
+presentation-layer red herring the original bug report's own framing
+(comparing it against the *working* `location /`/`location /files`, which
+never proxy anywhere and so can never hit this path) could not distinguish
+from a real routing failure.
+
+## The real, narrowed bug: nginx's own loopback `connect()` to `127.0.0.1:8082`
+## is refused, deterministically, if and only if the ORIGINAL inbound request
+## arrived via the `-p`-published NAT path
+
+With the true signal identified (`connect() failed (111: Connection
+refused)`, not a config-routing problem), isolated the trigger precisely via
+four paired boots of the *same* script/image, varying only how the request
+reaches nginx:
+
+- **Request via `curl` run INSIDE the guest itself** (the launch script's own
+  `curl ... http://127.0.0.1:3000/websockets`, before `exec`ing nginx as the
+  final foreground process): **`101 Switching Protocols`, every time**,
+  confirmed selkies' real "Data WebSocket Server listening on port 8082" log
+  line had already printed well before this probe ran (selkies' own readiness
+  wait loop, `grep -qi "listening on port 8082"`, completed in ~3s, iteration
+  6 of a 120-iteration/60s budget) -- nginx's `connect()` to its own
+  loopback-listening sibling process succeeds cleanly.
+- **The exact same request, from the HOST, through `-p <host>:3000`**
+  (ordinary `curl` from Windows against the published port): **`404` (masked
+  `502`), every time**, same boot, same nginx process, same selkies process,
+  requested only seconds apart. Retried 3x in a tight loop on one single
+  already-up boot: `404` all three times, no eventual success, no
+  intermittency *within* a boot -- this specific split (internal-request
+  succeeds / external-`-p`-request fails) is itself perfectly deterministic,
+  not flaky.
+- `location /` and `location /files` (verified alongside `/websockets` on the
+  same external-`-p` boots) return their correct `200`/`301` externally,
+  every time -- confirming the published port itself, and nginx's own HTTP
+  handling of it, are otherwise completely healthy. Only a `proxy_pass` to
+  a same-guest loopback backend is affected.
+
+This means the bug is real, but it is **not** the filesystem bug the task
+brief hypothesized, and **not** simple non-determinism across boots either
+(within a single boot it is 100% reproducible in both directions) -- it is a
+structural interaction between litebox's `-p`/`LITEBOX_PUBLISH` inbound NAT
+forwarding path and the guest's own kernel-level loopback TCP stack. Traced
+`litebox_platform_windows_userland/src/net.rs`'s `NatGateway` in full: an
+inbound `-p`-forwarded connection is bridged via `accept_inbound_flows`
+(allocates an ephemeral *source* port from `self.next_ephemeral_port` and a
+`new_connecting_tcp_socket`-based smoltcp socket, tracked in
+`inbound_local_ports`/`inbound_flow_ports`), entirely separate machinery
+from `send_ip_packet`'s own loopback fast-path (any packet addressed to
+`127.0.0.0/8` or the guest's own IP is looped directly into the `to_guest`
+queue, `net.rs` ~line 1003-1012, bypassing the gateway thread and its real
+Windows sockets entirely) -- confirming by direct code reading that nginx's
+own outbound loopback `connect()` to `127.0.0.1:8082` should never touch the
+NAT gateway's ephemeral-port allocator or socket bookkeeping AT ALL, and
+should be handled purely inside `litebox/src/net/mod.rs` (the guest's own
+in-process kernel TCP stack) regardless of whether an unrelated `-p` flow is
+concurrently active. That the observed behavior contradicts this reading --
+an external-origin request measurably changes whether a same-guest loopback
+`connect()` succeeds -- means either (a) there is a real, not-yet-found path
+by which the two allocators/socket tables DO interact (a shared port range,
+a `SocketSet` handle collision, or `ensure_listeners_for_queued_packets`'s
+per-tick bookkeeping perturbing an unrelated port's listening-socket state),
+or (b) the actual differentiator is something this session's four-boot
+comparison didn't fully isolate (e.g. TCP flag/timing differences between a
+`curl` issued by the SAME shell process that later `exec`s nginx, versus a
+brand-new external TCP connection whose SYN/ACK timing interacts with
+selkies' or nginx's own listen-backlog refill differently) -- not yet
+distinguished.
+
+## Status: real fix landed (unrelated latent bug), real reported symptom
+## root-caused to "masked 502, not 404" but its OWN underlying networking
+## bug NOT fixed this session -- genuinely blocked, not forced
+
+Per this project's standing discipline against forcing an unverified change:
+the actual `net.rs`/`litebox/src/net` interaction producing the loopback
+`ECONNREFUSED` was narrowed precisely (four-boot paired comparison, full
+code reading of both the NAT gateway and the loopback fast-path, live debug
+tracing pinpointing the exact `connect() failed` line) but not fully
+root-caused to a specific line this session changed with confidence -- no
+speculative networking fix was applied. The one fix that WAS made
+(`litebox/src/fs/layered.rs`'s stale-`root.entries`-cache-on-migration bug)
+is real, verified via full scoped-suite re-run (123 passed / 26 failed,
+identical to the pre-existing baseline), and worth keeping regardless: it is
+a genuine cross-process write-then-read visibility bug in the layered
+filesystem's caching, just not the one causing THIS session's reported
+symptom. `--resume-from`-seeded, `--initial-files`-seeded, or purely
+in-guest `cat >`-written paths that get their first write via `write()`'s
+migration fallback (i.e. no other fd already open on the path, the common
+case) are all covered by the same fix, since the bug lived in
+`migrate_file_up` itself, not in the specific write mechanism.
+
+**A practical workaround exists for the ACTUAL webtop task**, even without
+the networking root cause: since the failure is specifically "the original
+client request came in via `-p`", and a browser reaching the dashboard
+necessarily always comes in via `-p` (there is no other way for a Windows
+Chrome tab to reach the guest), a websocket proxy_pass will hit this bug
+whenever exercised through the intended real end-to-end path -- there is
+**no known workaround that avoids it** while still serving the browser
+through the published port, unlike the earlier `--resume-from`-through-
+symlink bug (which had a clean same-file-shape workaround). This is flagged
+as the single most important open item for whoever picks this up next.
+
+## Next steps for whoever picks this up
+
+1. **Root-cause the `-p`-vs-loopback interaction precisely.** Start by
+   instrumenting `litebox/src/net/mod.rs`'s own `connect()`/`ephemeral_port()`
+   path (not `net.rs`, which this session's code reading already shows
+   should be uninvolved for a loopback destination) with a trace of every
+   ephemeral port allocated and every listening-socket lookup, correlated
+   against `net.rs`'s own `inbound_flow_ports`/`next_ephemeral_port`
+   activity on the SAME boot, to find the actual shared state (if any) the
+   two allocators touch. If none is found, re-examine hypothesis (b) above
+   (timing/backlog-refill interaction) with a packet-level
+   `LITEBOX_LOG=trace` capture bracketing the exact `connect()`/`SYN`
+   sequence for both the inbound `-p` flow's own handshake and nginx's
+   concurrent loopback connect attempt.
+2. Once fixed, re-run this session's exact four-boot paired comparison
+   (internal curl vs. external `-p` curl, same boot) to confirmthe fix; then
+   run the full 6-8-boot repeated-boot test the original task brief asked
+   for, this time expecting genuine determinism (100% `101` via `-p`, not
+   100% `404`).
+3. Separately (lower priority, cosmetic): add a real `50x.html` at
+   `/usr/share/selkies/selkies-dashboard/50x.html` in the launch script's
+   own setup so a genuine 502 upstream failure (e.g. selkies not yet
+   listening) surfaces as an honest 502 rather than a misleading 404 --
+   this does not fix the underlying networking bug but stops it from being
+   mistaken for a routing/config bug in the way this session's own starting
+   report was.
+4. This session's diagnostic launch scripts (`nginx -g '... error_log
+   /dev/stdout debug;'`, the internal-vs-external curl comparison scripts)
+   were assembled in a scratch location outside the repo (not committed --
+   see the git-ignored-scratch convention this doc's earlier sessions
+   already established for `.wfgy/webtop-debian/`) and are trivially
+   reproducible from this section's own text; no long-lived script asset
+   from this session needs preserving beyond the `layered.rs` fix itself.

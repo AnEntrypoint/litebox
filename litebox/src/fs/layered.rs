@@ -506,6 +506,31 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             }
         }
 
+        // A caller that triggers migration via `write()`'s fallback (the common, unshared-fd
+        // case) explicitly `drop(entry)`s its own clone before calling this function, so the
+        // `to_migrate` loop's own strong-count arithmetic above (which assumes the caller's
+        // clone is still alive, see the `0..=2` arm's comment) systematically undercounts by
+        // one in exactly that case: the writer's own fd is the ONLY entry in `to_migrate`, its
+        // observed count is 2 (this function's local `entry` + `root_entries`'s own reference),
+        // never 3 -- so it always takes the `0..=2` "nothing to migrate" branch and leaves the
+        // stale `EntryX::Lower` entry sitting in `root_entries` untouched. `open()`'s own
+        // fast-path cache check (`self.root.read().entries.get(&path)`) then keeps returning
+        // that stale Lower entry to every FUTURE `open()` of this exact path forever, even
+        // though the file was just migrated to the upper layer and the correct content lives
+        // there now -- a cross-process, write-then-read visibility bug: a second process's
+        // fresh `open()` of a just-migrated path can still observe pre-migration (lower-layer)
+        // content indefinitely. Since `path` is unconditionally migrated to `EntryX::Upper` by
+        // the time we reach here (every branch of the loop above either already skipped a
+        // non-Lower entry or replaced/closed a Lower one), any `Lower` entry still cached in
+        // `root_entries` for `path` is now stale by construction -- remove it unconditionally
+        // so the next `open()` re-resolves fresh (and correctly reaches the upper layer) rather
+        // than serving a cache built before this migration happened.
+        if let Some(existing) = root_entries.get(path) {
+            if matches!(**existing, EntryX::Lower { .. }) {
+                root_entries.remove(path);
+            }
+        }
+
         Ok(())
     }
 
