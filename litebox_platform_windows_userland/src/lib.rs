@@ -1047,13 +1047,13 @@ unsafe extern "system" fn vectored_exception_handler(
             "[veh] tid={:?} code={:#x} rip={:#x} rva={:#x} addr={:#x} is_in_guest={} is_verifying={} rdfsbase={:#x} thread_fs_base={:#x}",
             std::thread::current().id(),
             exception_record.ExceptionCode,
-            context.Rip,
+            context_snapshot.Rip,
             {
                 #[allow(
                     clippy::cast_possible_truncation,
                     reason = "diagnostic-only; this platform is x86_64-only, rip fits in usize"
                 )]
-                (context.Rip as usize).wrapping_sub(image_base)
+                (context_snapshot.Rip as usize).wrapping_sub(image_base)
             },
             exception_record.ExceptionInformation[1],
             {
@@ -1067,7 +1067,7 @@ unsafe extern "system" fn vectored_exception_handler(
                     && exception_record.ExceptionInformation[1] >= 0x1_0000
                 {
                     #[allow(clippy::cast_possible_truncation)]
-                    let crip = context.Rip as usize;
+                    let crip = context_snapshot.Rip as usize;
                     let mut buf16 = [0u8; 16];
                     let n = fork_verify::read_code_bytes_for_diagnostics(crip, &mut buf16);
                     eprintln!("[diag_bigfault] rip bytes ({n}): {:02x?}", &buf16[..n]);
@@ -1123,7 +1123,7 @@ unsafe extern "system" fn vectored_exception_handler(
                     // root-caused.
                     || exception_record.ExceptionInformation[1] == usize::MAX)
                 && !(unsafe { litebox_common_linux::rdfsbase() } == 0
-                    && context.Rip != 0
+                    && context_snapshot.Rip != 0
                     && WindowsUserland::get_thread_fs_base() != 0
                     // Pass (DRI2/modesetting_drv.so investigation): this exclusion's whole
                     // purpose is to skip the dump for the common, auto-repaired "Windows cleared
@@ -1144,7 +1144,7 @@ unsafe extern "system" fn vectored_exception_handler(
                     // exclusion consistent with the real repair logic: only ever excluded when this
                     // fault would ACTUALLY be repaired-and-retried, never for an unrelated fault
                     // that merely shares the same `rdfsbase()==0` signature.
-                    && faulting_instruction_has_fs_override(context.Rip.trunc()))))
+                    && faulting_instruction_has_fs_override(context_snapshot.Rip.trunc()))))
         // A second exception raised while this thread is ALREADY inside this diagnostic block
         // (see `IN_VEH_DIAG_BLOCK`'s doc comment) means the diagnostic code itself is the thing
         // that just faulted -- skip straight past it and let the exception propagate normally
@@ -1164,18 +1164,18 @@ unsafe extern "system" fn vectored_exception_handler(
         eprintln!(
             "[veh-regs] ENTRY tid={:?} rip={:#x} rdi={:#x} rsi={:#x} rdx={:#x} rax={:#x} rsp={:#x}",
             std::thread::current().id(),
-            context.Rip,
-            context.Rdi,
-            context.Rsi,
-            context.Rdx,
-            context.Rax,
-            context.Rsp,
+            context_snapshot.Rip,
+            context_snapshot.Rdi,
+            context_snapshot.Rsi,
+            context_snapshot.Rdx,
+            context_snapshot.Rax,
+            context_snapshot.Rsp,
         );
         #[allow(
             clippy::cast_possible_truncation,
             reason = "diagnostic-only; this platform is x86_64-only, rip fits in usize"
         )]
-        let rip = context.Rip as usize;
+        let rip = context_snapshot.Rip as usize;
         let mut buf = [0u8; 16];
         let n = fork_verify::read_code_bytes_for_diagnostics(rip, &mut buf);
         eprintln!("[veh] rip bytes ({n}): {:02x?}", &buf[..n]);
@@ -1331,7 +1331,7 @@ unsafe extern "system" fn vectored_exception_handler(
     // the one that was armed/validated (an aliasing/wrong-pointer-read bug). If it reads back 0
     // too, the field really was zeroed by a write the watchpoint should have caught but didn't,
     // pointing at a watchpoint/CPU-level gap instead.
-    if context.Rip == 0 && diag_rip0_enabled() {
+    if context_snapshot.Rip == 0 && diag_rip0_enabled() {
         eprintln!(
             "[diag-rip0] tid={:?} exc_code={:#x} rsp={:#x} rax={:#x} is_in_guest={} is_verifying={}",
             std::thread::current().id(),
@@ -1422,7 +1422,7 @@ unsafe extern "system" fn vectored_exception_handler(
         // guest-visible SIGSEGV) targets `faulting_rsp - 8` -- see that arm site's own comment.
         diag_pending_watch_addr(context.Rsp);
     }
-    if ctxwatch::enabled() && context.Rip == 0 {
+    if ctxwatch::enabled() && context_snapshot.Rip == 0 {
         let watched = ctxwatch::current_armed_addr();
         if watched != 0 {
             let live_value = unsafe { core::ptr::read_unaligned(watched as *const u64) };
@@ -1535,15 +1535,15 @@ unsafe extern "system" fn vectored_exception_handler(
             // investigator sees "unreadable, inconclusive" rather than a false "not FS-relative".
             let mut probe = [0u8; 4];
             let rip_readable =
-                fork_verify::read_code_bytes_for_diagnostics(context.Rip.trunc(), &mut probe) > 0;
+                fork_verify::read_code_bytes_for_diagnostics(context_snapshot.Rip.trunc(), &mut probe) > 0;
             eprintln!(
                 "[diag-avfull] tid={:?} rip={:#x} fsbase={:#x} fault_addr={:#x} rip_readable={} has_fs_override={}",
                 std::thread::current().id(),
-                context.Rip,
+                context_snapshot.Rip,
                 unsafe { litebox_common_linux::rdfsbase() },
                 exception_record.ExceptionInformation[1],
                 rip_readable,
-                faulting_instruction_has_fs_override(context.Rip.trunc()),
+                faulting_instruction_has_fs_override(context_snapshot.Rip.trunc()),
             );
         }
         if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
@@ -1559,14 +1559,20 @@ unsafe extern "system" fn vectored_exception_handler(
             // progress). Skip the repair here so this falls through to the exception-table lookup /
             // `EXCEPTION_CONTINUE_SEARCH` below instead, turning the silent livelock into a
             // diagnosable crash.
-            && context.Rip != 0
+            //
+            // TORN-READ FIX (track-b sweep): uses `context_snapshot.Rip`, not a live re-read of
+            // `context.Rip` -- see this function's own "TORN-READ FIX" comment above
+            // `context_snapshot`'s definition. This is a real control-flow gate (decides whether
+            // the FS_BASE repair below fires), not a diagnostic, so a torn value here can
+            // misroute a genuinely repairable fault into the fatal/unrecovered path.
+            && context_snapshot.Rip != 0
             // The fault must actually be an FS-relative access -- see
             // `faulting_instruction_has_fs_override`'s doc comment for why this guard exists: an
             // unrelated real fault (e.g. a null-pointer dereference with no FS prefix at all)
             // coinciding with `rdfsbase() == 0` was being misdiagnosed as FS_BASE-reset and
             // retried forever, since `wrfsbase` does nothing to fix a fault that was never about
             // FS_BASE in the first place.
-            && faulting_instruction_has_fs_override(context.Rip.trunc())
+            && faulting_instruction_has_fs_override(context_snapshot.Rip.trunc())
         {
             let saved = WindowsUserland::get_thread_fs_base();
             if saved != 0 {
@@ -1574,7 +1580,7 @@ unsafe extern "system" fn vectored_exception_handler(
                     eprintln!(
                         "[veh] tid={:?} host-mode FS_BASE-reset in-place repair (rip={:#x})",
                         std::thread::current().id(),
-                        context.Rip,
+                        context_snapshot.Rip,
                     );
                 }
                 // Confirmed live via `cdb`-attached exception-record capture (AGENTS.md pass
@@ -1632,7 +1638,7 @@ unsafe extern "system" fn vectored_exception_handler(
             RECOVERY_LOG.with(|cell| {
                 if let Ok(mut ring) = cell.try_borrow_mut() {
                     ring.rotate_left(1);
-                    ring[3] = (context.Rip, recover as u64);
+                    ring[3] = (context_snapshot.Rip, recover as u64);
                 }
             });
             // DIAG (pass 205 follow-up): the fatal-fault investigation (AGENTS.md pass 205)
@@ -1791,13 +1797,19 @@ unsafe extern "system" fn vectored_exception_handler(
                         const { core::cell::Cell::new((0, 0)) };
                 }
                 const MAX_REPEATED_UNRECOV_AV: u32 = 64;
+                // TORN-READ FIX (track-b sweep): `context_snapshot.Rip`, not a live re-read of
+                // `context.Rip` -- this repeat-count comparison directly gates whether the
+                // process self-terminates via `TerminateProcess`/`RaiseFailFastException` below,
+                // so a torn value here can either falsely reset the counter (masking a genuine
+                // livelock forever) or falsely advance it (terminating on unrelated faults that
+                // merely raced this field).
                 let (last_rip, repeat_count) = LAST_UNRECOV_AV.get();
-                let repeat_count = if last_rip == context.Rip {
+                let repeat_count = if last_rip == context_snapshot.Rip {
                     repeat_count + 1
                 } else {
                     1
                 };
-                LAST_UNRECOV_AV.set((context.Rip, repeat_count));
+                LAST_UNRECOV_AV.set((context_snapshot.Rip, repeat_count));
                 if repeat_count > MAX_REPEATED_UNRECOV_AV {
                     // Diagnostic escape hatch: `TerminateProcess` exits cleanly and never
                     // reaches Windows Error Reporting, so WER's LocalDumps (configured
@@ -1811,7 +1823,7 @@ unsafe extern "system" fn vectored_exception_handler(
                     if std::env::var_os("LITEBOX_DIAG_ALLOW_WER").is_none() {
                         diag_raw_print(
                             b"[diag-unrecov-av-giveup] rip=0x",
-                            context.Rip as usize,
+                            context_snapshot.Rip as usize,
                             b" repeat_count=0x",
                             repeat_count as usize,
                         );
@@ -1837,7 +1849,7 @@ unsafe extern "system" fn vectored_exception_handler(
                         // handler chain to recurse through.
                         diag_raw_print(
                             b"[diag-unrecov-av-allow-wer] rip=0x",
-                            context.Rip as usize,
+                            context_snapshot.Rip as usize,
                             b" repeat_count=0x",
                             repeat_count as usize,
                         );
@@ -2147,7 +2159,7 @@ unsafe extern "system" fn vectored_exception_handler(
             // than an indefinite, silent, zero-CPU hang with no further diagnostic ever possible.
             diag_raw_print(
                 b"[diag-unrecov-av-terminate] rip=0x",
-                context.Rip as usize,
+                context_snapshot.Rip as usize,
                 b" addr=0x",
                 exception_record.ExceptionInformation[1],
             );
@@ -2242,7 +2254,12 @@ unsafe extern "system" fn vectored_exception_handler(
         // a genuine FS_BASE-reset fault at a real instruction, and blindly repairing-and-resuming
         // would just re-fault at address 0 forever. Fall through to the normal exception path
         // below (single-step triage / `exception_callback`) instead of looping silently.
-        && context.Rip != 0
+        //
+        // TORN-READ FIX (track-b sweep): `context_snapshot.Rip`, not a live re-read of
+        // `context.Rip` -- mirrors the identical fix just above in the `!is_in_guest` (host-mode)
+        // branch. This is a real control-flow gate for the guest-mode FS_BASE repair, not a
+        // diagnostic.
+        && context_snapshot.Rip != 0
         // Same guard as the host-mode repair above -- see
         // `faulting_instruction_has_fs_override`'s doc comment. Without this, a real guest fault
         // (e.g. a null-pointer dereference with no FS-segment prefix) coinciding with
@@ -2250,7 +2267,7 @@ unsafe extern "system" fn vectored_exception_handler(
         // via a `process.title = <string>` repro under Node.js, where a plain `mov rdx,
         // [rdx+0x788]` (no FS override) with `rdx` already null was being "repaired" and retried
         // unboundedly on a background guest thread.
-        && faulting_instruction_has_fs_override(context.Rip.trunc())
+        && faulting_instruction_has_fs_override(context_snapshot.Rip.trunc())
     {
         let saved = WindowsUserland::get_thread_fs_base();
         if saved != 0 {
@@ -2258,7 +2275,7 @@ unsafe extern "system" fn vectored_exception_handler(
                 eprintln!(
                     "[veh] tid={:?} FS_BASE-reset in-place repair (rip={:#x})",
                     std::thread::current().id(),
-                    context.Rip,
+                    context_snapshot.Rip,
                 );
             }
             // See the host-mode repair site above (AGENTS.md pass 302): a single write can lose
@@ -2349,8 +2366,14 @@ unsafe extern "system" fn vectored_exception_handler(
     if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
         && fork_verify::is_verifying(tls)
     {
+        // TORN-READ FIX (track-b sweep): `context_snapshot.Rip`, not a live re-read of
+        // `context.Rip` -- this value drives the whole stale-pointer healing decision tree below
+        // (`translate_stale_source_rip` and its three siblings), all real control flow. No write
+        // to `context.Rip` occurs on this path before this point, so the snapshot and the live
+        // value are still guaranteed identical here absent a torn read -- using the snapshot
+        // removes the torn-read hazard with no behavior change on the non-torn path.
         #[allow(clippy::cast_possible_truncation)]
-        let rip = context.Rip as usize;
+        let rip = context_snapshot.Rip as usize;
         // Livelock breaker: if this exact `(rip, translated_rip)` pair has already been "healed"
         // via the `[rsp-8]`/`[rsp]`/GPR fixups below many times in a row with no forward progress,
         // something else keeps re-supplying the identical stale value from a slot those fixups
@@ -6677,6 +6700,36 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                     // recommit, log it (`diag_mm_enabled`) and continue -- leaving it
                                     // `MEM_FREE` is the pre-existing (already-buggy) behavior, not a
                                     // regression introduced by this best-effort recovery attempt.
+                                    //
+                                    // KNOWN BROKEN, root-caused but NOT yet fixed (2026-09-07): this
+                                    // `VirtualAlloc2` fails with `ERROR_INVALID_ADDRESS` (487) on
+                                    // essentially every real flank, leaving it `MEM_FREE` exactly as
+                                    // the log line says. `MEM_RESERVE` requires an ALLOCATION-
+                                    // GRANULARITY-aligned (64 KiB) base, but a flank boundary is only
+                                    // page-aligned -- it is wherever the caller's sub-range `r`
+                                    // happens to begin or end. Observed live: three flanks in one
+                                    // run, all page-aligned, none granularity-aligned (0xA57000,
+                                    // 0xAB1000, 0xB6B000), while CPython loaded its `pixelflux`
+                                    // native extension -- which is why `import pixelflux` dies with
+                                    // SIGSEGV and no traceback, and with it all of selkies and the
+                                    // webtop video path. A second latent defect sits behind it: a
+                                    // view's `Protect` may be `PAGE_WRITECOPY`/
+                                    // `PAGE_EXECUTE_WRITECOPY`, which is not a legal protection for
+                                    // PRIVATE anonymous memory and would fail even once the address
+                                    // is accepted; it needs mapping down to `PAGE_READWRITE`/
+                                    // `PAGE_EXECUTE_READWRITE`.
+                                    //
+                                    // The obvious fix -- reserve the whole former view once, then
+                                    // MEM_COMMIT each piece inside it -- was attempted and REVERTED:
+                                    // it panicked in `do_query_on_region` ("The handle is invalid",
+                                    // os error 6). `view_mbi.BaseAddress` is NOT the view's
+                                    // allocation base: `VirtualQuery` reports the base of the
+                                    // contiguous same-attribute page range, which can start
+                                    // mid-view, so the "whole view" bounds derived from it are
+                                    // themselves unaligned and the single reservation is no more
+                                    // legal than the per-flank ones. A correct fix must obtain the
+                                    // real allocation base (`view_mbi.AllocationBase`, or track the
+                                    // view's own base at map time) and reserve from there.
                                     if !recommitted.is_null() {
                                         for flank in [&flank_before, &flank_after]
                                             .into_iter()

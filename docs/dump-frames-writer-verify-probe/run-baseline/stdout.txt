@@ -1,0 +1,28 @@
+OPEN_OK fd=3
+CONNECTOR(fill) mode[0]=1920x1080
+CREATE_DUMB handle=1 pitch=7680 size=8294400
+ADDFB2 fb_id=1
+SETCRTC_OK
+MULTIFLIP_START flip_count=20 flip_delay_ms=0
+PAGE_FLIP i=0 rc=0 color=0,0,0
+PAGE_FLIP i=1 rc=0 color=5,7,11
+PAGE_FLIP i=2 rc=0 color=10,14,22
+PAGE_FLIP i=3 rc=0 color=15,21,33
+PAGE_FLIP i=4 rc=0 color=20,28,44
+PAGE_FLIP i=5 rc=0 color=25,35,55
+PAGE_FLIP i=6 rc=0 color=30,42,66
+PAGE_FLIP i=7 rc=0 color=35,49,77
+PAGE_FLIP i=8 rc=0 color=40,56,88
+PAGE_FLIP i=9 rc=0 color=45,63,99
+PAGE_FLIP i=10 rc=0 color=50,70,110
+PAGE_FLIP i=11 rc=0 color=55,77,121
+PAGE_FLIP i=12 rc=0 color=60,84,132
+PAGE_FLIP i=13 rc=0 color=65,91,143
+PAGE_FLIP i=14 rc=0 color=70,98,154
+PAGE_FLIP i=15 rc=0 color=75,105,165
+PAGE_FLIP i=16 rc=0 color=80,112,176
+PAGE_FLIP i=17 rc=0 color=85,119,187
+PAGE_FLIP i=18 rc=0 color=90,126,198
+PAGE_FLIP i=19 rc=0 color=95,133,209
+MULTIFLIP_DONE
+DONE

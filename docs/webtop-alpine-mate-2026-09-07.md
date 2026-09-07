@@ -1,0 +1,200 @@
+# 2026-09-07: `linuxserver/webtop:alpine-mate` under litebox — Xvfb unblocked, dashboard served to the host, video path still blocked
+
+This session's target was the browser-facing webtop: get it working and verify it live from a
+real browser on the Windows host. That end state was **not reached**. What follows is exactly
+what is now proven working, what is still broken, and the precise root causes found — including
+one fix attempt that was made and then reverted, and why.
+
+Companion doc: `webtop-debian-selkies-2026-09-06.md` covers the **debian-i3** image. This one is
+the **alpine-mate** image (`.wfgy/webtop_seatd_realigned.tar`). They are different binaries on
+different libcs; conclusions do not transfer automatically, and at least one previously-recorded
+blocker turned out not to apply here at all (see "Refuted" below).
+
+## The image's real launch recipe (read out of the image, not guessed)
+
+`s6-overlay` is bypassed, per this project's standing rule. The authoritative commands come from
+the image's own service definitions:
+
+- **`svc-xorg` runs `Xvfb`, not `Xorg`.** Despite the name. `/usr/bin/Xorg` is a 275-byte `sh`
+  wrapper no service ever invokes. Xvfb's argv is taken verbatim from
+  `/etc/s6-overlay/s6-rc.d/svc-xorg/run`.
+- **The web server is nginx**, serving the static dashboard on **port 3000** and proxying
+  `/websocket` to selkies on **127.0.0.1:8082**.
+- **selkies is pure Python** (`/lsiopy/bin/selkies`, a venv console script on CPython 3.14.7).
+  There is no Node.js in this image at all; `node` only appears under `DEV_MODE`, which must not
+  be set.
+- **The desktop is MATE**, started as `dbus-launch --exit-with-session /usr/bin/mate-session`.
+- Required env: `DISPLAY=:1`, `HOME=/config`, `USER=abc`, `XDG_RUNTIME_DIR=/config/.XDG`,
+  `PATH` including `/lsiopy/bin`, and **`CUSTOM_WS_PORT=8082`** — selkies' own default is 8081
+  (`selkies/settings.py`), while nginx proxies to 8082, so bypassing s6 without setting this
+  yields a 502 that reads like a 404.
+
+A reproducible overlay generator (nginx config, directories, staged launch script) is committed
+at `advisor/probes/make_webtop_overlay.py`. It writes `.wfgy/webtop_overlay.tar`, used via
+`--resume-from`. `STACK_STAGE=1..4` adds Xvfb / nginx / selkies / MATE one at a time, which is
+how every attribution below was made.
+
+## Proven working, live
+
+- **Xvfb runs and stays up.** `xset q` succeeds against `:1`. This required the `fork()` fix
+  below; before it, Xvfb died every time.
+- **nginx serves the real selkies dashboard to the Windows host** through `--publish 3000:3000`:
+  HTTP **200**, 762 bytes of the genuine dashboard `index.html`, repeatable, and correct under
+  four concurrent requests and across a keep-alive session.
+
+## Fixed this session
+
+1. **`fork()` failed with ENOMEM because an out-of-range address *hint* was rejected outright.**
+   `insert_mapping` (`litebox/src/mm/linux.rs`) refused any suggested range ending past
+   `TASK_ADDR_MAX`, including for `FixedAddressBehavior::Hint`, which documents itself as a hint
+   the platform may ignore — and which the rest of that function already treats that way.
+   `Vmem::duplicate` sizes each fork group to include `reserved_extra` headroom, so a parent
+   whose topmost group sits near the top of the address space produced a span ending just past
+   the limit: measured live at 1,055,973,376 bytes overshooting by exactly 20,480 bytes, while
+   ~128 TiB sat free. An out-of-range hint now slides down instead of failing.
+
+   **This is the failure `webtop-debian-selkies-2026-09-06.md` calls "the single blocking item".**
+   It recorded the resulting ENOMEM as "the same well-known, already-documented
+   address-space-duplication hazard class" and did not trace it. It was not that hazard; it was
+   an ordinary bounds bug. With it fixed, Xvfb forks `xkbcomp`, the keymap compiles, and the X
+   server stays up.
+
+2. **The host-wide `boot.lock` was leaked by every clean run.** Its release lived in a `Drop`
+   impl, but `run()` exits via `std::process::exit`/`ExitProcess`, which runs no destructors —
+   a fact `main.rs`'s own comment already recorded. Every successful run therefore blocked the
+   next boot for the full five-minute staleness window. The lock is now the lockfile's own held
+   OS handle, which Windows releases on every exit path including a hard kill.
+
+## Refuted
+
+**The Xvfb pid-1 SIGSEGV recorded in mutable `webtop-xvfb-crash-not-relro` does not occur on this
+image.** That investigation (cr2 at `reserve_base+0x200`, `rip` inside `ld.so`) was against the
+**Debian/glibc** Xvfb. The alpine/musl Xvfb never reaches a fault: with the image's own `-shmem`
+flag it exits *cleanly*, self-diagnosed —
+
+```
+shmget: Function not implemented
+(EE) Couldn't add screen 0
+```
+
+— because **litebox implements no SysV shared memory at all** (`shmget`/`shmat`/`shmdt`/`shmctl`
+have zero references anywhere in `litebox_shim_linux`). Dropping `-shmem` lets Xvfb allocate its
+framebuffer normally and it starts. Whether selkies' capture path ultimately needs real SysV shm
+(and therefore MIT-SHM) is open and untested, because selkies does not get that far.
+
+## Still blocked, with root causes
+
+### 1. `import pixelflux` SIGSEGVs — this is what stops the video path
+
+Isolated to a 30-second repro, no full stack needed:
+
+```
+python3 -c "print(42)"      -> 42            (CPython 3.14.7 itself is fine)
+python3 -c "import selkies" -> ok            (pure-Python package is fine)
+python3 -c "import pixelflux" -> Segmentation fault (139)
+python3 -c "import pcmflux"   -> Segmentation fault (139)
+```
+
+`pixelflux`/`pcmflux` are selkies' native capture/encode extensions. With `LITEBOX_LOG=error`
+the cause is explicit:
+
+```
+diag-reclaim: failed to recommit orphaned CoW-view flank as anonymous memory
+              -- left MEM_FREE, next touch will SIGSEGV  win32_err=487
+```
+
+then a guest read of a page inside that freed range.
+
+**Root cause: `win32_err=487` is `ERROR_INVALID_ADDRESS`, and it is an alignment failure.** The
+flank recommit in `litebox_platform_windows_userland/src/lib.rs` calls `VirtualAlloc2(...,
+MEM_RESERVE | MEM_COMMIT, ...)` at the flank's own base. `MEM_RESERVE` requires an
+**allocation-granularity-aligned (64 KiB)** base, but a flank boundary is only ever page-aligned
+— it is wherever the caller's sub-range happens to begin or end. All three flanks observed in one
+run were page-aligned and none was granularity-aligned (`0xA57000`, `0xAB1000`, `0xB6B000`), so
+the reservation failed every time and the flank was left `MEM_FREE`, exactly as the log says.
+
+A **second latent defect** sits behind it: the call passes `view_mbi.Protect`, which for a CoW
+view is `PAGE_WRITECOPY`/`PAGE_EXECUTE_WRITECOPY` — not a legal protection for *private*
+anonymous memory. It needs mapping down to `PAGE_READWRITE`/`PAGE_EXECUTE_READWRITE`, or the
+commit fails even once the address is accepted.
+
+**A fix was attempted and REVERTED.** The obvious approach — reserve the whole former view once,
+then `MEM_COMMIT` each piece inside it — panicked in `do_query_on_region` ("The handle is
+invalid", os error 6). The reason is instructive and is now recorded as a comment at the site:
+`view_mbi.BaseAddress` is **not** the view's allocation base. `VirtualQuery` reports the base of
+the contiguous *same-attribute* page range, which can begin mid-view, so bounds derived from it
+are themselves unaligned and a single "whole view" reservation is no more legal than the
+per-flank ones. **A correct fix must use the real allocation base** (`view_mbi.AllocationBase`,
+or track each view's base at map time) and reserve from there. The tree is left at the original
+behaviour plus that explanation; no half-fix is in place.
+
+### 2. MATE trips the `fork_verify` host-side access violation
+
+`dbus-launch --exit-with-session mate-session` reproduces
+`[diag-unrecov-av] ... is_in_guest=false is_verifying=true`. Both flags together mean the fault
+is in litebox's **own host-side code**, inside the fork-verify stale-pointer healing path — not
+in guest code. This matches the existing PRD row
+`mate-session-avs-are-in-fork-verify-not-guest` and is unchanged by this session's fork fix,
+which addressed allocation, not verification. A daemonizing nginx reproduces the same fault,
+which is why the committed nginx config sets `master_process off`.
+
+### 3. Chrome cannot reach `localhost` on this host — verification gap, not a litebox bug
+
+Isolated by direct construction:
+
+| target | PowerShell | Chrome (claude-in-chrome) |
+|---|---|---|
+| litebox webtop, `127.0.0.1:3000` | 200 | error page |
+| plain host Python server, `127.0.0.1:8099` | 200 | error page |
+| `https://example.com` | — | renders fine |
+
+Chrome fails on a **host-native** server just as it fails on litebox's published port, and
+succeeds on an external site. So this is a Chrome/extension localhost restriction, entirely
+independent of litebox, and it is the reason no browser screenshot of the dashboard exists in
+this session despite the dashboard being served correctly.
+
+## Lying instruments found (each cost real time here)
+
+Consistent with this project's recurring theme, four diagnostics reported nothing or something
+false:
+
+1. **`xdpyinfo` is not in this image.** Using it as the Xvfb readiness probe reported a perfectly
+   healthy X server as `XVFB_FAILED`. `xset` is present and is the correct probe.
+2. **`netstat` reports nothing** because litebox does not emulate `/proc/net/tcp`; it prints
+   headers and an error, so "no listeners" was meaningless.
+3. **Python block-buffers stdout when not a tty**, so `selkies.log` was empty for 25 s of a live
+   run. `PYTHONUNBUFFERED=1` is required to see anything.
+4. **A shell pipeline hides the exit code of the command that matters.** `cargo build ... | tail`
+   reported success while `cargo` was in fact not on `PATH` at all. Use `${PIPESTATUS[0]}`.
+
+Separately, a parallel review lane established that on Windows the `error_code` in guest-fault
+diagnostics is **synthesized, not hardware** (`4 | (write << 1)`, with present-bit hardcoded to
+0), so its not-present half is fabricated. On the fork-verify path it is synthesized twice, from
+litebox's own `is_write` guess. Several open mutables reason from that field; their conclusions
+need other evidence.
+
+## Environment note
+
+`C:\\Users\\user\\.cargo` was missing entirely this session (no shim, no registry cache) while
+`.rustup` was intact, so `cargo` was not on `PATH`. Builds were run through the toolchain binary
+directly:
+
+```
+CARGO_HOME=C:\\Users\\user\\.cargo RUSTUP_HOME=C:\\Users\\user\\.rustup \\
+  ~/.rustup/toolchains/stable-x86_64-pc-windows-msvc/bin/cargo.exe build --release -p <crate>
+```
+
+Also: an orphaned no-argument `litebox_runner` process (a fault-watchdog child that outlived its
+parent) held an exclusive lock on the runner `.exe` and made every rebuild fail with "Access is
+denied (os error 5)". Worth checking for before blaming the build.
+
+## Next steps, in dependency order
+
+1. Fix the flank recommit properly, using the view's real allocation base and mapping
+   copy-on-write protections down to their private-memory equivalents. Repro is
+   `python3 -c "import pixelflux"`, ~30 s. This unblocks selkies, and selkies is the whole video
+   path.
+2. Then bring up MATE, which needs the `fork_verify` host-side AV addressed
+   (`mate-session-avs-are-in-fork-verify-not-guest`). A lighter WM already present in the image
+   (`openbox`, `labwc`) may be worth trying first purely to get window content on `:1`.
+3. Browser verification needs Chrome to be allowed to reach `localhost` on this host.

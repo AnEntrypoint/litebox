@@ -1,0 +1,10 @@
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=0 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_0.bmp (8294454 bytes, frame 0)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_5.bmp (8294454 bytes, frame 5)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_10.bmp (8294454 bytes, frame 10)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_15.bmp (8294454 bytes, frame 15)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] end of run: 5 frames enqueued for writing, 0 dropped due to writer backpressure
