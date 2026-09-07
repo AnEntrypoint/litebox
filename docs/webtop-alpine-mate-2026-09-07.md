@@ -604,6 +604,90 @@ stage got further than the one before it.
 16 GB), then re-run the recipe below. The trimmed rootfs plus the fixes above are all committed;
 nothing else is known to be missing between here and a frame.
 
+## Two more real blockers found and fixed; the video pipeline's own abort is now root-caused
+
+Continuing past the `waitid` fix, selkies got far enough to reveal two further defects.
+
+### `resize_mapping` panicked on an ordinary out-of-space condition
+
+```
+thread '<unnamed>' panicked at litebox\src\mm\linux.rs:1906:22:
+internal error: entered unreachable code
+```
+
+`resize_mapping`'s in-place-expand path treated `AboveMaxAddress`/`BelowMinAddress` from
+`insert_mapping` as `unreachable!()`. They are not: `new_end` comes from the caller's requested
+size, so an `mremap`-style growth near the top of the address space reaches them normally. Real
+Linux answers that with `ENOMEM`. This turned an ordinary capacity condition into a host-side
+panic that killed the whole guest, and it fired the moment selkies grew a mapping there. Now
+reported as `OutOfMemory`; only genuine misalignment (impossible by construction here) stays
+`unreachable!()`. With it fixed, selkies reaches "All main components initialized. Running
+server..." in ~25 s with **zero** host AVs.
+
+### The video pipeline aborted because selkies' process had no `DISPLAY`
+
+This is the one that was actually stopping frames, and it took a diagnostic wrapper to see rather
+than inference:
+
+```
+[shim] get_new_res returned no screen_name; DISPLAY=None IS_WAYLAND=False
+[shim] raw xrandr rc=1 len=20: b"Can't open display 
+"
+```
+
+selkies determines its screen name by running `xrandr` and matching `(\S+) connected`
+(`selkies/selkies.py`'s `get_new_res`). With no `DISPLAY` in its environment that call returns
+"Can't open display", no screen name is found, and the pipeline aborts outright:
+
+```
+WARNING:gst_app_resize:Could not determine connected screen from xrandr.
+ERROR:data_websocket:CRITICAL: Could not determine screen name from xrandr. Aborting.
+ERROR:data_websocket:FATAL: Initial reconfiguration completed, but video pipeline did not start.
+```
+
+Everything else in the stack sees `:1` correctly -- `xterm` renders, `xset q` succeeds, and a
+standalone asyncio `xrandr` from the same guest returns the full 129-byte output including
+`screen connected 1024x768+0+0`. So this is specific to selkies' own environment handling, not a
+litebox gap. `advisor/probes/webtop_sitecustomize.py` restores it (overridable with
+`SELKIES_DISPLAY`).
+
+**Two of my own mistakes are recorded here because they cost real time and would cost it again:**
+first, an earlier revision of that shim also neutered `resize_display`/`generate_xrandr_gtf_modeline`,
+which looks harmless and silently removes the very call the video pipeline depends on; second, I
+dropped `+extension RANDR` from the Xvfb argv while simplifying, which produces the *identical*
+"Could not determine connected screen" symptom for a completely different reason. Both are easy
+to reintroduce.
+
+### The reproducible recipe
+
+```
+python advisor/probes/make_webtop_min_rootfs.py     # 2.4 GiB -> ~983 MiB
+python advisor/probes/make_webtop_overlay.py        # nginx conf + dirs + launch script
+#   ... then append advisor/probes/webtop_sitecustomize.py into the overlay as patch/sitecustomize.py
+
+litebox_runner_linux_on_windows_userland.exe --unstable   --initial-files .wfgy/webtop_min.tar --resume-from .wfgy/webtop_overlay.tar   --publish 8081:8081   --env PYTHONPATH=/patch --env DISPLAY=:1 --env HOME=/config   --env PATH=/lsiopy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin   -- /bin/sh -c 'Xvfb :1 -screen 0 1024x768x24 -dpi 96        +extension COMPOSITE +extension DAMAGE +extension RANDR +extension RENDER        +extension XFIXES +extension XTEST -nolisten tcp -ac -noreset & sleep 12;      xterm -geometry 100x30+30+30 -bg black -fg green -e sh -c "while true; do date; sleep 1; done" &      sleep 6; selkies --addr=localhost --mode=websockets        --audio-enabled=false --microphone-enabled=false --clipboard-enabled=false'
+
+SELKIES_PORT=8081 python advisor/probes/hostproxy.py   # then open http://127.0.0.1:8090/
+```
+
+**Watch the port.** selkies binds its own default 8081 here; `CUSTOM_WS_PORT` did not take effect
+in this configuration, so the proxy must target whatever
+`data_websocket:... listening on port N` actually reports.
+
+### Honest status
+
+Not confirmed: frames rendering in the browser. Every code-level blocker found has been fixed and
+each fix verified on its own, and the last one (`DISPLAY`) was identified from its own diagnostic
+rather than guessed -- but no run after that fix stayed healthy long enough to reach the client's
+first frame.
+
+The obstacle is the host, not a known defect. Free memory oscillated between ~2.9 GB and ~0.4 GB
+across these runs as the runner (~1.4 GB), Chrome and the editors competed; below roughly 2 GB the
+guest stalls mid-startup -- consistently at gamepad initialisation in the last attempts -- in a
+way indistinguishable from a hang. Runs that had the memory reached "Running server" in 25 s;
+runs that did not never got there at all. Re-run the recipe above with more free memory to
+confirm.
+
 ## Next steps, in dependency order
 
 1. Fix the flank recommit properly, using the view's real allocation base and mapping

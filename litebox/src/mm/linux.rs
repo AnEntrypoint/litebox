@@ -1899,11 +1899,29 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     | AllocationError::AddressInUseByPlatform
                     | AllocationError::AddressPartiallyInUse,
                 ) => return Err(VmemResizeError::RangeOccupied(range.into())),
-                Err(
-                    AllocationError::Unaligned
-                    | AllocationError::BelowMinAddress
-                    | AllocationError::AboveMaxAddress,
-                ) => unreachable!(),
+                // An in-place expansion that would run past either end of the usable address
+                // space is a genuine capacity answer, not an impossible one: `new_end` comes
+                // from the caller's requested size, so `mremap`-style growth near the top of
+                // the address space reaches it normally. Real Linux answers that with `ENOMEM`.
+                //
+                // This used to be `unreachable!()`, which turned an ordinary out-of-space
+                // condition into a host-side panic that killed the whole guest. Reached live
+                // once selkies got far enough into its own startup to grow a mapping there:
+                // `internal error: entered unreachable code` at this line, with no other
+                // symptom to point at the real cause.
+                Err(AllocationError::BelowMinAddress | AllocationError::AboveMaxAddress) => {
+                    litebox_util_log::debug!(
+                        expand_start:% = range.start, expand_end:% = new_end,
+                        cur_range_start:% = diag_cur_start, cur_range_end:% = diag_cur_end;
+                        "resize_mapping: in-place expand fell outside the usable address space"
+                    );
+                    return Err(VmemResizeError::OutOfMemory);
+                }
+                // `range` is built from page-aligned bounds by construction, so a misalignment
+                // here really would be a bug in this function rather than a caller error.
+                Err(AllocationError::Unaligned) => unreachable!(
+                    "resize_mapping builds `range` from page-aligned bounds"
+                ),
             }
             return Ok(());
         }
