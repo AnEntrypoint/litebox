@@ -2005,6 +2005,158 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// blocking until the child exits or, with `WNOHANG` set, returning `0` immediately if no
     /// child has exited yet (no `WUNTRACED`/`WCONTINUED` support yet -- only `WNOHANG` is
     /// recognized in `options`). `rusage` is accepted but never populated.
+    /// `waitid(idtype, id, infop, options, rusage)`.
+    ///
+    /// Implemented because CPython's asyncio uses it for every subprocess it reaps
+    /// (`asyncio/unix_events.py`'s `_do_waitpid`: `os.waitid(os.P_PID, pid, WEXITED | WNOWAIT)`,
+    /// then a separate `waitpid` to actually collect). Without it that thread dies with
+    /// `OSError: [Errno 38] Function not implemented`, `proc.communicate()` never completes, and
+    /// every asyncio subprocess appears to hang forever -- observed live as selkies' clipboard
+    /// monitor respawning `xclip` once a second indefinitely, and as its display reconfiguration
+    /// never finishing, which is what kept the webtop from ever starting video capture.
+    ///
+    /// `WNOWAIT` is the reason this cannot simply forward to `sys_wait4`: it means "report the
+    /// child's status but leave it waitable", and reaping early would make the caller's own
+    /// follow-up `waitpid` fail with `ECHILD`. The child is therefore only removed from
+    /// `children` when `WNOWAIT` is absent.
+    pub(crate) fn sys_waitid(
+        &self,
+        idtype: i32,
+        id: u32,
+        infop: Option<UserPtrMut<i32>>,
+        options: i32,
+        _rusage: Option<UserPtrMut<u8>>,
+    ) -> Result<usize, Errno> {
+        const P_ALL: i32 = 0;
+        const P_PID: i32 = 1;
+
+        const WNOHANG: i32 = 0x1;
+        const WEXITED: i32 = 0x4;
+        const WSTOPPED: i32 = 0x2;
+        const WCONTINUED: i32 = 0x8;
+        const WNOWAIT: i32 = 0x0100_0000;
+
+        // Linux requires at least one state to wait for; without this a caller that forgot
+        // `WEXITED` would block forever instead of being told its arguments are wrong.
+        if options & (WEXITED | WSTOPPED | WCONTINUED) == 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        let no_hang = options & WNOHANG != 0;
+        let no_reap = options & WNOWAIT != 0;
+        let process = self.process();
+
+        let target_pid: i32 = match idtype {
+            P_ALL => -1,
+            P_PID => i32::try_from(id).map_err(|_| Errno::EINVAL)?,
+            // `P_PGID`/`P_PIDFD`: this shim tracks only its own `pgid` and has no registry to
+            // resolve another group with, exactly as `sys_wait4` documents for `pid < -1`.
+            // `ECHILD` ("no child matched") is the honest answer; `EINVAL` would blame the
+            // caller's arguments, which are fine.
+            _ => {
+                log_unsupported!("waitid idtype={idtype}");
+                return Err(Errno::ECHILD);
+            }
+        };
+
+        let (child_pid, exit_status) = if target_pid == -1 {
+            if process.children.lock().is_empty() {
+                return Err(Errno::ECHILD);
+            }
+            let mut found = None;
+            let mut poll_once = || {
+                let children = process.children.lock();
+                for (p, c) in children.iter() {
+                    if let Some(status) = c.try_wait_for_exit() {
+                        found = Some((*p, status));
+                        return true;
+                    }
+                }
+                false
+            };
+            if no_hang {
+                if !poll_once() {
+                    // `WNOHANG` with nothing ready: Linux returns success with a zeroed
+                    // `si_pid`, which is how the caller distinguishes it from a real result.
+                    if let Some(infop) = infop {
+                        for i in 0..7 {
+                            let _ = infop.write_at_offset::<Platform>(i, 0);
+                        }
+                    }
+                    return Ok(0);
+                }
+            } else {
+                match self.wait_cx().wait_until(&mut poll_once) {
+                    Ok(()) => {}
+                    Err(litebox::event::wait::WaitError::Interrupted) => {
+                        // Same race `sys_wait4` documents at length: the SIGCHLD that announces
+                        // the exit is itself observed as a pending interrupt, so re-poll once
+                        // before surfacing EINTR.
+                        if !poll_once() {
+                            return Err(Errno::EINTR);
+                        }
+                    }
+                    Err(litebox::event::wait::WaitError::TimedOut) => {
+                        unreachable!("wait_until with no deadline never returns TimedOut")
+                    }
+                }
+            }
+            found.expect("poll_once only returns true after `found` is set")
+        } else {
+            let child_process = {
+                let children = process.children.lock();
+                let Some(idx) = children.iter().position(|(p, _)| *p == target_pid) else {
+                    return Err(Errno::ECHILD);
+                };
+                children[idx].1.clone()
+            };
+            let exit_status = if no_hang {
+                let Some(exit_status) = child_process.try_wait_for_exit() else {
+                    if let Some(infop) = infop {
+                        for i in 0..7 {
+                            let _ = infop.write_at_offset::<Platform>(i, 0);
+                        }
+                    }
+                    return Ok(0);
+                };
+                exit_status
+            } else {
+                child_process.wait_for_exit()
+            };
+            (target_pid, exit_status)
+        };
+
+        if !no_reap {
+            process.children.lock().retain(|(p, _)| *p != child_pid);
+        }
+
+        // `siginfo_t` on x86-64: si_signo, si_errno, si_code are the first three 32-bit words,
+        // then 4 bytes of padding, then the SIGCHLD arm of `_sifields` at byte offset 16 --
+        // si_pid, si_uid, si_status. Indices below are in 32-bit units, so 4/5/6 are bytes
+        // 16/20/24. Unlike `wait4`'s packed status word, si_status carries the RAW exit code
+        // (or signal number), not an encoded value.
+        const SIGCHLD: i32 = 17;
+        const CLD_EXITED: i32 = 1;
+        const CLD_KILLED: i32 = 2;
+        if let Some(infop) = infop {
+            let (code, status) = match exit_status {
+                ExitStatus::Exit(c) => (CLD_EXITED, i32::from(c)),
+                ExitStatus::Signal(sig) => (CLD_KILLED, sig.as_i32()),
+            };
+            let _ = infop.write_at_offset::<Platform>(0, SIGCHLD);
+            let _ = infop.write_at_offset::<Platform>(1, 0);
+            let _ = infop.write_at_offset::<Platform>(2, code);
+            let _ = infop.write_at_offset::<Platform>(3, 0);
+            let _ = infop.write_at_offset::<Platform>(4, child_pid);
+            let _ = infop.write_at_offset::<Platform>(5, 0);
+            let _ = infop.write_at_offset::<Platform>(6, status);
+        }
+
+        // `waitid` reports the child through `infop` and returns 0, unlike `wait4` which
+        // returns the pid.
+        Ok(0)
+    }
+
     pub(crate) fn sys_wait4(
         &self,
         pid: i32,

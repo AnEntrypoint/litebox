@@ -1464,6 +1464,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 | SyscallRequest::Clone3 { .. }
                 | SyscallRequest::Execve { .. }
                 | SyscallRequest::Wait4 { .. }
+            | SyscallRequest::Waitid { .. }
                 | SyscallRequest::Exit { .. }
                 | SyscallRequest::ExitGroup { .. }
                 | SyscallRequest::Openat { .. }
@@ -2281,6 +2282,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 options,
                 rusage,
             } => self.sys_wait4(pid, wstatus, options, rusage),
+            SyscallRequest::Waitid {
+                idtype,
+                id,
+                infop,
+                options,
+                rusage,
+            } => self.sys_waitid(idtype, id, infop, options, rusage),
             SyscallRequest::Kill { pid, sig } => self.sys_kill(pid, sig),
             SyscallRequest::Tkill { tid, sig } => self.sys_tkill(tid, sig),
             SyscallRequest::Tgkill { tgid, tid, sig } => self.sys_tgkill(tgid, tid, sig),

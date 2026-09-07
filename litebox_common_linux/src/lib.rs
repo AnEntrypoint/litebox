@@ -3473,6 +3473,23 @@ pub enum SyscallRequest {
         options: i32,
         rusage: Option<UserPtrMut<u8>>,
     },
+    /// `waitid(idtype, id, infop, options, rusage)`.
+    ///
+    /// Distinct from `wait4` in three ways that matter to callers: it selects children by
+    /// `(idtype, id)` rather than an overloaded signed pid, it reports the result as a
+    /// `siginfo_t` rather than a packed status word, and it can observe a child WITHOUT
+    /// reaping it (`WNOWAIT`). CPython's asyncio relies on exactly that combination --
+    /// `waitid(P_PID, pid, WEXITED | WNOWAIT)` to await the exit, then a separate `waitpid`
+    /// to reap -- so an unimplemented `waitid` silently breaks every asyncio subprocess.
+    Waitid {
+        idtype: i32,
+        id: u32,
+        /// `siginfo_t*`. Typed as `i32` because every field this fills is a 32-bit word at a
+        /// fixed offset (see `sys_waitid`).
+        infop: Option<UserPtrMut<i32>>,
+        options: i32,
+        rusage: Option<UserPtrMut<u8>>,
+    },
     Kill {
         pid: i32,
         sig: i32,
@@ -4165,6 +4182,13 @@ impl SyscallRequest {
             Sysno::wait4 => sys_req!(Wait4 {
                 pid,
                 wstatus:*,
+                options,
+                rusage:*
+            }),
+            Sysno::waitid => sys_req!(Waitid {
+                idtype,
+                id,
+                infop:*,
                 options,
                 rusage:*
             }),

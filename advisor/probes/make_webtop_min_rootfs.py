@@ -41,6 +41,16 @@ EXCLUDE_PREFIXES = (
     'usr/share/perl5/',
     'usr/share/themes/',
     'usr/share/cmake/',
+    # Fonts: 142 MiB of TTF/OTF families for a desktop that is not running here. The
+    # bitmap `misc` family (which carries `fixed`, xterm's default) and `encodings` are
+    # kept below by the more specific rule -- everything else goes.
+    'usr/share/fonts/truetype/',
+    'usr/share/fonts/opentype/',
+    'usr/share/fonts/Type1/',
+    'usr/share/fonts/dejavu/',
+    'usr/share/fonts/liberation/',
+    'usr/share/fonts/noto/',
+    'usr/share/fonts/terminus-font/',
     'usr/share/doc/',
     'usr/share/man/',
     'usr/share/info/',

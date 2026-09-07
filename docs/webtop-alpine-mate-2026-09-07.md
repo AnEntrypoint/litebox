@@ -548,6 +548,62 @@ pointers the healing exists to paper over. That is `ADVISORY-001`'s "unsound by 
 claim demonstrated directly rather than reasoned about, and it is why no amount of avoiding
 individual spawn sites fixes this: the class cannot be dodged, only made rarer.
 
+## `waitid` implemented -- asyncio subprocesses now work, and the host AVs go to zero
+
+Following the fork-mode A/B above, the picture changed once the *spawn sites* were removed one at
+a time rather than the fork mechanism being blamed wholesale.
+
+Neutralising the three avoidable spawn sites (via `PYTHONPATH=/patch` `sitecustomize.py`, kept at
+a path with no base-layer counterpart because `--resume-from` cannot shadow one that has one) took
+`[diag-unrecov-av]` from 122 occurrences per run to **zero**, and selkies then advanced from
+"client connected" all the way into:
+
+```
+INFO:data_websocket:Initial setup or dimensional change detected. Performing full display reconfiguration.
+INFO:data_websocket:Starting display reconfiguration...
+INFO:data_websocket:Layout calculated: Total Size=1320x816
+OSError: [Errno 38] Function not implemented          <- os.waitid
+```
+
+So the next blocker was not the fork bug at all: **`waitid` was unimplemented**. CPython's asyncio
+reaps every subprocess with `os.waitid(P_PID, pid, WEXITED | WNOWAIT)` and then a separate
+`waitpid`; without it that thread dies, `communicate()` never completes, and every asyncio
+subprocess hangs forever. That is what left the display reconfiguration unfinished -- and it is
+also why selkies' clipboard monitor respawned `xclip` once a second indefinitely.
+
+`sys_waitid` is now implemented (`litebox_shim_linux/src/syscalls/process.rs`), modelled on
+`sys_wait4` but honouring the two things that make `waitid` different: it reports through a
+`siginfo_t` rather than a packed status word, and `WNOWAIT` observes a child *without* reaping it,
+so the caller's own follow-up `waitpid` still succeeds.
+
+Verified in-guest, directly:
+
+```
+WAITID_OK 2 1 0            si_pid=2, si_code=CLD_EXITED, si_status=0
+WAITPID_AFTER 0            WNOWAIT correctly left the child reapable
+ASYNCIO_OK b'async-child'  asyncio.create_subprocess_exec + communicate() works end to end
+```
+
+and `wait4` is unregressed (exit-status propagation and `sleep 1 & wait` both still correct).
+
+## Where this actually stands
+
+Working and browser-verified: the dashboard, the WebSocket upgrade, the full control plane
+(settings, metrics, backpressure ACKs), the input system, the gamepad/evdev interposers, selkies'
+own initialisation with `pixelflux`/`pcmflux` loaded, and -- with the spawn sites neutralised --
+**zero host-side access violations**.
+
+Not yet witnessed: video frames in the browser. Not because of a known code defect any more; the
+remaining obstacle in this session was the host itself. Free memory oscillated between ~2.5 GB and
+~1.2 GB as the runner, Chrome and the editors competed, and below roughly 2 GB the guest wedges
+mid-startup in a way that is indistinguishable from a hang -- exactly the condition AGENTS.md
+warns not to misattribute to litebox. Every run that had enough memory to reach the client-connect
+stage got further than the one before it.
+
+**To finish this:** free host memory (close browsers/editors, or run on a machine with more than
+16 GB), then re-run the recipe below. The trimmed rootfs plus the fixes above are all committed;
+nothing else is known to be missing between here and a frame.
+
 ## Next steps, in dependency order
 
 1. Fix the flank recommit properly, using the view's real allocation base and mapping
