@@ -614,6 +614,16 @@ impl<
             | OFlags::LARGEFILE
             | OFlags::NOFOLLOW
             | OFlags::APPEND
+            // `O_NOATIME` asks the kernel not to update the file's access time on read. It is a
+            // pure performance hint with no effect on what `open` returns or what the caller can
+            // then do, and this filesystem does not maintain a meaningful atime to suppress in
+            // the first place -- so honouring it is exactly the same as ignoring it.
+            //
+            // It was previously absent, and because the check below turns any unlisted flag into
+            // an `unimplemented!()` that panics the HOST process, a guest simply opening a file
+            // with a hint flag took the whole thing down. Reached live by `mate-session`'s
+            // startup: `not implemented: OFlags(LARGEFILE | NOATIME)`.
+            | OFlags::NOATIME
             | OFlags::PATH;
         if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!("{flags:?}")

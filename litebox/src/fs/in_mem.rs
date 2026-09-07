@@ -275,6 +275,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             | OFlags::LARGEFILE
             | OFlags::NOFOLLOW
             | OFlags::APPEND
+            // `O_NOATIME` is a pure hint ("do not update the access time on read") with no
+            // bearing on what `open` returns or what the caller may then do, and this filesystem
+            // keeps no meaningful atime to suppress -- honouring it and ignoring it are the same
+            // thing. `nine_p` already accepted it; this whitelist and `layered`'s did not, and
+            // because an unlisted flag becomes an `unimplemented!()` that panics the HOST, a
+            // guest merely opening a file with a hint flag brought the whole process down.
+            // Reached live by `mate-session` startup: `not implemented: OFlags(LARGEFILE |
+            // NOATIME)`.
+            | OFlags::NOATIME
             | OFlags::PATH;
         if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!("{flags:?}")
