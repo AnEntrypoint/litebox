@@ -188,6 +188,69 @@ Also: an orphaned no-argument `litebox_runner` process (a fault-watchdog child t
 parent) held an exclusive lock on the runner `.exe` and made every rebuild fail with "Access is
 denied (os error 5)". Worth checking for before blaming the build.
 
+## Second and third fix attempts on the flank bug — also reverted, but they narrowed it a lot
+
+After the first attempt (above), two further attempts were made and reverted. They are worth
+recording because they convert "the flank recommit is misaligned" into a much sharper statement
+of what the real obstacle is.
+
+**Attempt 2 — recover the view's true extent, then reserve it once.** `view_mbi.AllocationBase`
+*is* the view's own base and *is* allocation-granularity aligned; the view's true end can be
+recovered by walking `VirtualQuery` forward from it while `AllocationBase` keeps matching. That
+part worked and is the right technique. It also fixes a second, previously-unnoticed defect in
+the existing code: the flanks were computed from `BaseAddress`/`RegionSize`, i.e. only the
+maximal same-attribute run, so for a multi-segment view the flanks *under-reported* the destroyed
+area and some orphaned bytes had nothing even attempting to restore them.
+
+**It still panicked**, and the reason is the real finding:
+
+```
+diag-region-op-fail: operation failed on region start=0xAC6000 end=0xAC7000
+                     mbi_state=MEM_FREE last_error=487
+panicked at lib.rs:6102: operation failed on region 0xAC6000-0xAC7000
+```
+
+with a backtrace through `allocate_pages <- insert_mapping <- create_mapping <- create_pages <-
+do_mmap` — i.e. an ordinary later guest `mmap`. `0xAC6000` is exactly the END of a flank that had
+just been restored successfully.
+
+**Restoring a flank correctly BREAKS the next allocation that rounds into the same 64 KiB
+granule.** `reserve_and_commit` rounds its `MEM_RESERVE` *out* to allocation granularity
+(`round_down_to_granu(start) .. round_up_to_granu(end)`), which is what makes it work for
+arbitrary page-aligned addresses in the first place. Once a flank occupies part of that granule,
+the rounded reservation overlaps it, Windows refuses with `ERROR_INVALID_ADDRESS` (487), the
+operation returns false, and `process_memory_range_by_regions` asserts. So the pre-existing
+behaviour — the flank silently failing to be restored and staying `MEM_FREE` — is precisely what
+was keeping subsequent allocations working. The latent SIGSEGV and the panic are two faces of the
+same missing design.
+
+**Attempt 3 — let `reserve_and_commit` tolerate an already-reserved granule** (on a failed
+`MEM_RESERVE` at an explicit address, fall through and try `MEM_COMMIT` anyway, on the theory
+that the space is already ours). Insufficient: the commit fails too, because the granule is only
+*partly* covered by the flank reservation, so the remainder is genuinely `MEM_FREE` and there is
+nothing to commit into.
+
+### What a correct fix therefore has to do
+
+Not a local patch to the recommit call. The allocator needs reservation bookkeeping that these
+two paths share, so that "this granule is already reserved, and here is how much of it" is a
+question with an answer — either by tracking reservations explicitly, or by making
+`reserve_and_commit` reserve *only* the granule remainder it actually needs rather than the whole
+rounded-out span. Until then, restoring flanks and keeping later `mmap`s working are mutually
+exclusive in this code.
+
+The tree is left at the original behaviour, verified like-for-like after the revert:
+`import pixelflux` SIGSEGVs (139), the runner exits 0, and **zero** panics; Xvfb still comes up.
+
+### One more pre-existing bug found while doing this
+
+Running `python3` **directly as pid 1** (`runner ... -- /lsiopy/bin/python3 -c "import
+pixelflux"`) panics at HEAD with exit 101, where the same command wrapped in `/bin/sh -c` gives a
+clean guest-side SIGSEGV and a 0 exit. That difference is present without any of this session's
+changes and is not explained here — but it means the harness shape changes the failure mode, so
+compare like with like when measuring this area (this project's own standing
+"isolate the harness" lesson, in a new place).
+
 ## Next steps, in dependency order
 
 1. Fix the flank recommit properly, using the view's real allocation base and mapping
