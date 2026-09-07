@@ -372,6 +372,78 @@ run began timing out including configurations that had been reliable minutes ear
 host-exhaustion condition AGENTS.md already warns not to misattribute to litebox. Check
 `FreePhysicalMemory` before trusting any timing or hang observed in this area.
 
+## BROWSER-VERIFIED: the WebSocket control plane works end to end; video is blocked on one abort
+
+Routing the reverse proxy to the HOST removes the only hop that needed guest-internal
+networking, and with that the stack is verifiable from a real browser. `advisor/probes/hostproxy.py`
+serves the dashboard's static files and tunnels `/websockets` straight to selkies via its
+`--publish`ed port. Everything that makes the desktop -- Xvfb, xterm, selkies, pixelflux/pcmflux
+-- still runs entirely inside litebox; only the reverse proxy moved, and litebox's own `--publish`
+is already a host-side NAT.
+
+**Verified live in Chrome** (`http://127.0.0.1:8090/`), from the browser console:
+
+```
+[websockets] Connection opened!
+[websockets] Sent initial settings (resolutions are physical) to server
+[websockets] Sent initial clipboard request (cr) to server.
+[websockets] Started sending client metrics every 500ms.
+[websockets] Started sending backpressure ACKs every 50ms.
+Initializing Input system...
+```
+
+and server-side:
+
+```
+INFO:data_websocket:Data WebSocket Server listening on port 8082
+INFO:data_websocket:Legacy client ('10.0.0.1', 49158) connected. Role: controller
+INFO:data_websocket:Data WebSocket connected from ('10.0.0.1', 49158)
+```
+
+The client renders its cursor and reaches **"Waiting for stream..."** -- the correct client-side
+rendering of "connected, no frames yet". So the dashboard, the WebSocket upgrade, the control
+plane, the metrics/backpressure loop and the input system all work through litebox.
+
+### The one remaining blocker: PulseAudio aborts selkies the instant a client connects
+
+```
+INFO:data_websocket:Sending last known cursor to new client
+INFO:data_websocket:Attempting to establish PulseAudio connection...
+Assertion 'r == 0 || r == 95' failed at ../src/pulsecore/mutex-posix.c:57,
+  function pa_mutex_new(). Aborting.
+```
+
+selkies dies there, before any frame is captured. That is why the client sits at "Waiting for
+stream...".
+
+`95` is `ENOTSUP`. `pa_mutex_new` tolerates only success or `ENOTSUP` and aborts the whole
+process on any other errno.
+
+**Disabling audio does not avoid it.** `--audio-enabled=false --microphone-enabled=false
+--clipboard-enabled=false` (and the matching `SELKIES_*` env vars) were all tried; the
+"Attempting to establish PulseAudio connection..." line still runs on client connect, so this
+path is not gated by those settings.
+
+**A hypothesis was formed, implemented, and REVERTED as unverified.** musl's
+`pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT)` probes kernel support by issuing
+`futex(FUTEX_LOCK_PI)` and maps ONLY `ENOSYS` to `ENOTSUP`; litebox's `parse_futex`
+(`litebox_common_linux/src/lib.rs`) rejects every unknown futex op with `EINVAL`, which would
+propagate and trip exactly this assertion. Returning `ENOSYS` for the PI ops (6, 7, 8, 11, 12, 13)
+was implemented and tested -- **the assertion did not change**, and no log line ever showed the PI
+path being reached, so there is no evidence the probe is what fails. The change was reverted
+rather than shipped on a guess; this project has paid for unverified fixes before.
+
+**Next step, precisely:** identify which call inside `pa_mutex_new` actually returns the
+offending errno, rather than assuming. The cheapest route is a guest-side `ltrace`/`strace`
+equivalent around the abort, or a freestanding probe binary (built on the HOST per AGENTS.md)
+that calls `pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT)` + `pthread_mutex_init` directly
+and prints both return values. That single number decides whether the futex-errno theory is right
+or whether the failure is somewhere else entirely.
+
+If it does turn out to be an errno-contract bug, note that it is the SAME class AGENTS.md already
+records: a `clone()` namespace-flag `EINVAL` once silently broke all PNG/JPEG decoding through
+glycin's sandbox fallback. Getting a refusal errno wrong breaks unrelated features.
+
 ## Next steps, in dependency order
 
 1. Fix the flank recommit properly, using the view's real allocation base and mapping
