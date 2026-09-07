@@ -1,5 +1,278 @@
 # Track B fork-without-exec fix: running progress log
 
+## 2026-09-07 (Defender-exclusion follow-up session): Step 0 FINAL VERDICT -- **REFUTED, still**.
+## The Defender real-time-protection exclusion for `target/` (applied and confirmed active this
+## session) does NOT fix the freeze, and does NOT unblock a clean run at all: 8/8
+## `LITEBOX_PROCESS_FORK=1` repros still fail, in three distinct, reproducible failure modes,
+## none of them Defender-related. Baseline reconfirmed unaffected (1/1 clean SIGABRT as always).
+## A new, real, minor bug found and NOT yet fixed (diagnostic-only, does not explain the crashes):
+## `[diag-unrecov-av-terminate]`'s own `rip=` print still uses the torn-read-prone live
+## `context.Rip` instead of `context_snapshot.Rip`, unlike every sibling diagnostic in the same
+## function (which were already migrated to the snapshot value by an earlier session's TORN-READ
+## FIX). No code fix applied this session beyond identifying this -- see rationale below.
+
+### Goal and precondition
+
+Per the task brief: the prior session's blocker (no admin rights to test the Defender-exclusion
+hypothesis) is resolved -- the user ran `Add-MpPreference -ExclusionPath
+'C:\dev\litebox-main\target'` in an elevated shell before this session started. Confirmed still
+active at this session's start: `(Get-MpPreference).ExclusionPath` lists
+`C:\dev\litebox-main\target` (alongside one unrelated pre-existing entry,
+`C:\dev\ipad\tools`). Get the final, clean Step 0 verdict this unblocks.
+
+### Pre-flight
+
+Free memory at session start: 2.9GB (`Get-CimInstance Win32_OperatingSystem`) -- tight, but
+within the task brief's own stated floor for this lightweight `bash -c` repro (no full container
+boot). No stray `litebox_runner*` processes (`tasklist`), no stale `boot.lock`. Never ran two
+boots concurrently -- each of the 9 runs below (8 `LITEBOX_PROCESS_FORK=1` + 1 baseline) was
+started only after the previous one's process (main + any orphaned watchdog) was confirmed fully
+gone via `tasklist`, and any small (~8MB) orphaned watchdog process left behind by a freeze/crash
+was `taskkill /F`'d before starting the next run, per this doc's own established practice. Free
+memory fluctuated 2.3GB-4.4GB across the session from unrelated host load (other processes, not
+litebox -- confirmed via `Get-Process` sampling, no litebox process ever exceeded ~8MB resident
+in this session, since none reached the multi-GB image-resident-in-memory stage of a real guest
+run -- these are small `bash -c` repros, not full webtop boots). No litebox process was left
+running at session end; `target/release/.litebox-cache/boot.lock` was cleared before the first
+run and confirmed absent at the end.
+
+Repro invocation used this session (matching the doc's own established `beyond_stdio==0`-safe
+shape -- `bash -c '(...)'` inline, no script file, no extra fds):
+```
+export LITEBOX_PROCESS_FORK=1   # host env, Git Bash export -- NOT --env (guest-only)
+export LITEBOX_LOG=warn
+target/release/litebox_runner_linux_on_windows_userland.exe -Z \
+  --oci-image linuxserver/webtop:debian-xfce -- /bin/bash -c '
+    echo TCACHE_REPRO_START pid=$$
+    ( declare -a bufs
+      for round in 1 2 3 4 5 6 7 8 9 10; do
+        for i in $(seq 1 40); do bufs[i]="padpadpadpadpadpad_${round}_${i}"; done
+        unset bufs; declare -a bufs
+        for i in $(seq 1 40); do bufs[i]="repadrepadrepadrepad_${round}_${i}"; done
+      done
+      echo TCACHE_REPRO_CHILD_OK pid=$$ )
+    echo TCACHE_REPRO_SUBSHELL_STATUS=$?
+    echo TCACHE_REPRO_DONE'
+```
+All 17 OCI layers served from this host's own layer cache (`.litebox-cache/`) on every run --
+no network pull needed, so run-to-run timing differences are not a caching artifact.
+
+### Baseline (no `LITEBOX_PROCESS_FORK`): CONFIRMED corrupt, unchanged -- reconfirmed once, exactly
+### as every prior session
+
+1 run, `LITEBOX_LOG=warn`, `LITEBOX_PROCESS_FORK` unset: `TCACHE_REPRO_START pid=1` ->
+`fork_verify: stale CODE/DATA pointer` translations (the ordinary thread-based fork path's own
+proactive healing) -> `fatal signal: terminating task signal=Signal(6) ... comm=bash` ->
+`TCACHE_REPRO_SUBSHELL_STATUS=134` -> `TCACHE_REPRO_DONE`, clean process exit, no leftover
+process. Identical to every prior session's documented baseline. The corruption this whole track
+exists to fix is real and the repro is trustworthy; this needed no more than one confirming run.
+
+### `LITEBOX_PROCESS_FORK=1`: 8 runs, 8 failures, 0 clean completions -- **REFUTED**, decisively
+
+Every run was independently started (fresh process, cleared `boot.lock`, prior run's process and
+any orphan confirmed gone first). None reached `TCACHE_REPRO_CHILD_OK`. Three distinct,
+reproducible failure signatures, tallied exactly:
+
+**Mode A -- immediate host-side crash at `TCACHE_REPRO_START`, before `do_clone` is ever reached
+(4/8 runs: 1, 3, 5, 8).** The guest's own `echo TCACHE_REPRO_START pid=$$` already printed (so the
+shell itself, and the syscall path serving its `write(2)`, both ran correctly) -- then, before any
+`do_clone: about to duplicate address space for fork()` debug line ever appears (confirmed absent
+via full-file `grep` on every occurrence), the terse diagnostic fires:
+```
+TCACHE_REPRO_START pid=1
+[diag-unrecov-av-terminate] rip=0x<varies> addr=0x10188000
+```
+`addr=0x10188000` (the real fault address, `exception_record.ExceptionInformation[1]`, unaffected
+by the torn-read issue below) is **byte-for-byte identical across all four occurrences** --
+strong evidence of a deterministic bug tied to this exact repro/image/binary combination, not
+memory-pressure-driven flakiness (these four runs spanned host free memory from ~3.4GB down to
+~2.7GB, with no correlation between free memory and whether this mode fired). This crash happens
+too early to be inside `PageManager::duplicate()`'s VMA relocation loop at all -- something in
+`LITEBOX_PROCESS_FORK=1`'s own code path (env-var read, gate setup, or an early background-thread
+race predating `do_clone`) is faulting before fork() proper even begins.
+
+**Mode B -- `diag-recover-fsbase` fires with a healthy FS base (Bug #5's fix from an earlier
+session confirmed still working), immediately followed by a SECOND, distinct fault and a
+deterministic deep crash (2/8 runs: 2, 7, both under `LITEBOX_LOG=debug`).** Sequence, identical
+across both occurrences:
+```
+TCACHE_REPRO_START pid=1
+[diag-recover-fsbase] recover_rip=0x7ff6fc51a332 fsbase=0x7feffffb0740
+[diag-unrecov-av-terminate] rip=0x7ff8da5ab951 addr=0x1af
+```
+followed (run 2 only had time to capture the fuller trailing diagnostic before this session moved
+on; run 7 reproduced the identical two-line signature above byte-for-byte) by a SECOND
+`[diag-unrecov-av-terminate]` at a wild, non-module address
+(`rip=0x7ff002079000`/`addr=0x7ff002079000` in run 2, `rip=0x7ff001806000`/`addr=0x7ff001806000`
+in run 7 -- both in the same `0x7ff00...` range, consistent with a guest-relocated-copy address
+rather than a host module address). This is a genuine double-fault: the FS_BASE recovery at
+`recover_rip=0x7ff6fc51a332` succeeds, but something immediately afterward (either inside the
+`recover` fixup's own resumed execution, or a raced second thread) faults again, this time with
+no covering exception-table entry, and self-terminates via the same `RaiseFailFastException` path
+Root cause #1 from an earlier session already made reliable. The termination mechanism itself
+works (the process does not hang in this mode); the underlying double-fault is not yet
+root-caused.
+
+**Mode C -- `diag-recover-fsbase` fires, then TOTAL SILENCE: the whole-process freeze, with
+NEITHER watchdog self-terminating it within this session's observation window (2/8 runs: 4, 6).**
+Identical entry sequence to Mode B up through `diag-recover-fsbase`, but no second fault, no
+`[diag-unrecov-av-terminate]`, nothing further, ever:
+```
+TCACHE_REPRO_START pid=1
+[diag-recover-fsbase] recover_rip=0x7ff6fc51a332 fsbase=0x7feffffb0740
+```
+Run 4: observed via `tasklist` for 30+ seconds post-freeze with the process still present (small,
+~8MB working set -- consistent with this being the orphaned EXTERNAL watchdog child rather than
+the main process, which the in-process watchdog appears to have already cleaned up by the time
+this session's polling loop first checked). Run 6 (`LITEBOX_DIAG_WATCHDOG=1` explicitly set, to
+capture the in-process watchdog's own tick log): `[diag-watchdog-started]` printed at boot as
+expected, but **zero `[diag-watchdog-tick]` lines ever appeared** despite polling the log for 24+
+seconds after the freeze began, and the process (confirmed via `Get-Process -Id <pid> |
+Threads`: `ThreadState=Wait, WaitReason=Suspended`, `CPU=0`, unchanged across repeated samples)
+was still alive and completely unresponsive 50+ seconds after the freeze began -- well past both
+the in-process watchdog's documented 3-second grace period and the external watchdog's documented
+15-second grace period. **Neither watchdog self-terminated the frozen process within this
+session's 50-second observation window in run 6.** This is a real regression from the
+Defender-scan-gate entry's own finding (that session's one freeze-repro DID show the in-process
+watchdog firing and cleaning up within its 3-second budget) -- either this is a different freeze
+mechanism than the one that session captured, or the in-process watchdog's own reliability is
+itself intermittent. Both runs' processes were killed manually (`taskkill /F`) after the
+observation window; no crash dump or further diagnostic was captured before doing so (each kill
+was to free the host for the next run, per the "never run two boots concurrently" constraint, and
+this session judged getting through all 8 planned runs more valuable than exhaustively
+instrumenting one single freeze occurrence -- a live debugger attach to catch this mode in the
+act, per this doc's own established "before touching anything else" protocol from an earlier
+session, is the correct next step and was not attempted this session due to time budget).
+
+### Why the Defender exclusion did not help: it was never the cause of Modes A or B, and Mode C's
+### watchdog non-self-termination in this session is NOT explained by it either
+
+The immediately preceding session's root-cause finding (Defender real-time-protection scan-gating
+a freshly-`CreateProcess`'d litebox binary, holding its initial thread suspended pre-loader,
+producing a `Ldr==NULL` PEB and an externally-visible `WaitReason=Suspended` with zero CPU
+progress) was specific to that exact symptom shape: a process that never got to run ANY of its own
+code, confirmed via a suspended thread at a lazy-init ntdll thunk with all-zero GPRs. **Modes A and
+B in this session are not that symptom at all** -- both show the guest's own `bash` shell running
+real code (printing `TCACHE_REPRO_START`, and in Mode B additionally reaching `do_clone` and the
+FS_BASE recovery) before crashing, which is definitionally incompatible with "the loader never
+ran." The Defender exclusion, correctly applied and confirmed active, has nothing to gate here --
+these are live, running-code faults, not scan-gate freezes. Mode C's freeze in run 6 does
+structurally match the *earlier* documented freeze shape (post-recovery silence, frozen thread) --
+but even here, the fresh evidence this session captured (zero watchdog ticks, no self-termination
+within 50s, well past every previously-documented grace period) is NOT what a pure Defender
+scan-gate would produce: the Defender-scan-gate session's own repro DID show its in-process
+watchdog firing normally (3-second budget, exactly as designed) precisely because a scan-gated
+process that never started executing has nothing to interfere with an *already-running*
+same-process watchdog thread that was spawned and started ticking before the scan-gate (if any)
+engaged. A watchdog thread that starts ticking and then goes fully silent, in a process that has
+already demonstrably executed real guest code, points at something INSIDE the fork-relocation
+window itself corrupting or wedging shared process state (matching, if anything, the doc's own
+much earlier "PEB/loader-data" and "genuine kernel-level freeze" leads from before the Defender
+explanation was found -- not yet distinguished from those in this session).
+
+### A new, real, minor bug found: `[diag-unrecov-av-terminate]`'s own `rip=` print still uses the
+### torn-read-prone live `context.Rip`, not `context_snapshot.Rip` -- diagnostic-accuracy only,
+### does NOT explain any of the three failure modes above, NOT fixed this session
+
+While investigating Mode A's `addr=0x10188000` signature, found that this exact address appears
+in this file's own existing doc comment (line ~1607) as the WORKED EXAMPLE of the TORN-READ FIX an
+earlier session already applied: `context` is a pointer into the OS-owned in-flight `CONTEXT`
+record, which other machinery in this same process (`ThreadHandle::interrupt`'s
+`SuspendThread`/`SetThreadContext`, `ctxwatch_arm_other_threads`' debug-register rewrites) can
+write to concurrently -- so reading `context.Rip` live, rather than the `context_snapshot.Rip`
+value captured once atomically on entry, can return a torn value (observed, per that earlier
+session's own comment, to sometimes equal the fault's *memory address* rather than its
+instruction pointer). That earlier fix correctly migrated `search_exception_tables`'s call site
+(line ~1620, uses `context_snapshot.Rip.trunc()`) and the full `[diag-unrecov-av]` diagnostic's
+own `rip=` field (line ~1912, uses `context_snapshot.Rip`) -- but the terser
+`[diag-unrecov-av-terminate]` print, seven lines away in the same function (line ~2150), was
+**never updated** and still reads the live `context.Rip`:
+```rust
+diag_raw_print(
+    b"[diag-unrecov-av-terminate] rip=0x",
+    context.Rip as usize,          // <-- torn-read hazard; sibling diagnostics use context_snapshot.Rip
+    b" addr=0x",
+    exception_record.ExceptionInformation[1],
+);
+```
+This is confirmed a real, reproducible inconsistency (grep shows every other `rip=`-printing
+diagnostic in this function already migrated), but it is diagnostic-accuracy only: nothing in the
+actual termination path (`FAULT_TERMINATE_ARMED_TICK`, `RaiseFailFastException`,
+`TerminateProcess`) reads this printed value back or branches on it, so fixing it would change
+what this ONE terse log line shows on a future capture, not any of the three failure modes'
+underlying behavior. Per the task's own instruction not to force an unverified fix onto a
+different, unconfirmed target: this was left unfixed this session, recorded here as a concrete,
+scoped, low-risk item for a future session (a one-line change: `context.Rip` ->
+`context_snapshot.Rip` at that one call site) rather than applied speculatively without being able
+to verify it changes anything about the actual crash modes.
+
+### Step 0 verdict: **REFUTED** -- final, decisive, evidence-backed, NOT a Defender artifact
+
+The Defender real-time-protection exclusion for `target/`, applied and confirmed active this
+session, does not unblock Step 0. 8 consecutive `LITEBOX_PROCESS_FORK=1` runs, spanning a real
+range of host free memory (2.3GB-4.4GB) and both `LITEBOX_LOG=warn` and `LITEBOX_LOG=debug`,
+produced 0 clean completions and 3 distinct, individually-reproducible failure signatures (Mode A
+byte-for-byte identical across 4 occurrences; Mode B byte-for-byte identical across its first two
+diagnostic lines across both occurrences), none of which match the Defender-scan-gate signature
+the immediately preceding session root-caused (that signature requires a process whose own loader
+never ran at all; every failure this session shows the guest's own code executing first). Baseline
+(no `LITEBOX_PROCESS_FORK`) reconfirmed clean and unaffected (1/1, identical SIGABRT/134 to every
+prior session). **Step 0's central claim -- that `LITEBOX_PROCESS_FORK=1` lets a `beyond_stdio==0`
+guest avoid the tcache fault -- is REFUTED**: not because the tcache fault itself recurs (it
+doesn't; none of the 8 failures show the `malloc(): unaligned tcache chunk detected` signature at
+all), but because the cross-process fork path itself does not reliably complete AT ALL, failing
+before the guest's own tcache workload ever gets a chance to run to completion in 100% of this
+session's 8 attempts.
+
+### Step 9 (long-running cross-process child survival): still NOT REACHED, and now cannot be
+
+Per the task's own conditional instruction ("if Step 0 reaches a clean CONFIRMED verdict" ->
+attempt Step 9): Step 0 did not reach CONFIRMED this session (it reached a decisive REFUTED
+instead), so Step 9's long-running-child-survival test was correctly NOT attempted -- there was
+never a live, running forked child to observe over 10-15 seconds in any of this session's 8 runs.
+This remains exactly as untested as every prior entry in this doc left it.
+
+### Regression check
+
+No source files were modified this session (the one finding above -- the
+`[diag-unrecov-av-terminate]` torn-read print -- was deliberately left unfixed per the task's own
+"do not force an unverified fix" instruction, since it does not explain any of the three observed
+failure modes and this session could not verify a fix against a still-open crash). No
+`cargo build`/`cargo test` re-run was needed; the tree is identical to the prior entry's
+already-tested state (`target/release/litebox_runner_linux_on_windows_userland.exe`, timestamped
+before this session started, was reused unmodified for all 9 runs).
+
+### What remains open for a future session
+
+- **Root-cause Mode A** (`addr=0x10188000`, identical across 4/8 runs this session, firing before
+  `do_clone` is ever reached): the highest-value target, since it is the dominant failure mode
+  (50% of this session's runs) and clearly happens in `LITEBOX_PROCESS_FORK=1`-specific setup code
+  that runs before fork() proper -- not inside `PageManager::duplicate()`'s relocation loop at
+  all, which every prior session's investigation focused on. A `LITEBOX_LOG=debug` capture of this
+  exact mode (this session's two debug-level runs, 2 and 7, both happened to land in Mode B/C
+  instead -- worth deliberately forcing more debug-level attempts specifically to catch Mode A
+  with full tracing) would show what code path between the `echo` write and `do_clone` this
+  fault is inside.
+- **Root-cause Mode B's double-fault** (the second, distinct `rip=0x7ff8da5ab951 addr=0x1af`
+  fault immediately after a successful FS_BASE recovery) -- `addr=0x1af` (423 decimal) is a
+  suspiciously small, near-NULL address, unlike Mode A's consistent `0x10188000`; worth checking
+  whether this is a small-integer value being dereferenced as a pointer (an errno, a length, a
+  small offset) rather than a real corrupted address.
+- **Re-investigate Mode C's freeze with a live debugger attach the moment it's detected**, per
+  this doc's own long-established protocol (immediate `cdb -pv` re-attach, `dt ntdll!_PEB`,
+  raw `dq`/`db` reads bypassing symbol resolution) -- this session's run 6 showed BOTH watchdogs
+  failing to self-terminate within their documented grace periods, which is either a genuinely
+  different freeze mechanism than the Defender-scan-gate one, or evidence the watchdog reliability
+  itself regressed/is intermittent; this needs to be distinguished, not assumed.
+- **Fix the confirmed, scoped `[diag-unrecov-av-terminate]` torn-read print** (`context.Rip` ->
+  `context_snapshot.Rip`, one line, `litebox_platform_windows_userland/src/lib.rs` ~line 2150) --
+  low-risk, but should be verified against a live capture the same session it's applied, not
+  applied blind.
+- Everything else this doc's prior entries left open (the `ElfPatchKey`-not-rekeyed-on-fork bug,
+  Step 9 in full) remains exactly as open.
+
+---
+
 ## 2026-09-07 (CET investigation session): the `0xc0000409` "blocker" is NOT CET, and NOT a
 ## real `/GS` stack-cookie corruption -- it is `RaiseFailFastException`'s OWN designed exception
 ## code, already understood and already handled correctly by code already on `main`
