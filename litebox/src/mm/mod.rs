@@ -876,20 +876,6 @@ where
             let mut vmem = self.vmem.write();
             unsafe { vmem.create_pages(suggested_address, length, flags, before_perms) }?
         };
-        // DIAGNOSTIC (temporary, do not commit): the single chokepoint every page creation goes
-        // through, guest `mmap` and otherwise. A live capture showed the parent holding exactly one
-        // 135168-byte anonymous mapping in the band the faults cluster in, created by NONE of the
-        // 53 guest mmap calls in the whole run -- so it was made here, by an internal caller. This
-        // names every creation with its requested vs actual address and its length, so a mapping
-        // that is the wrong SIZE (the current suspicion: the guest addresses ~450KB across a region
-        // only 135KB of which is backed) is attributable to its real creation site.
-        litebox_util_log::error!(
-            requested:? = suggested_address.map(|a| a.as_usize()),
-            actual:% = addr.as_usize(),
-            len:% = length.as_usize(),
-            end:% = addr.as_usize() + length.as_usize();
-            "DIAG_CREATE_PAGES"
-        );
         // call the user function with the pages
         // Note `op` may trigger page fault handler which requires write lock to `vmem`.
         if let Err(e) = op(addr) {
@@ -1553,18 +1539,6 @@ where
         let vma = VmArea::new(
             VmFlags::from(permissions) | VmFlags::may_flags_for_mapping(shared, is_file_backed),
             is_file_backed,
-        );
-        // DIAGNOSTIC (temporary, do not commit): the THIRD way a range enters the VMA table,
-        // besides `create_pages` and `Vmem::duplicate`. A live capture found the region the fork
-        // faults straddle -- [0x11188000, 0x111a9000), 135168 bytes -- present 31 times in the
-        // fork relocation dump while appearing as the output of NO `create_pages` call and as the
-        // destination of NO fork. Registration without creation is the only remaining path it can
-        // have arrived by, so name every one.
-        litebox_util_log::error!(
-            start:% = range.start, end:% = range.end,
-            len:% = range.end - range.start,
-            file_backed:? = is_file_backed, shared:? = shared, replace:? = replace;
-            "DIAG_REGISTER_EXISTING"
         );
         let mut vmem = self.vmem.write();
         if !replace && vmem.overlapping(range.into()).next().is_some() {

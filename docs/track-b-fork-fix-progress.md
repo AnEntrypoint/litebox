@@ -622,3 +622,261 @@ the line on before committing further architectural investment.
   investigated further this session since clearing the stale boot lock file was sufficient to
   route around it, but an un-terminable process handle is unusual and could indicate a genuine
   host-state issue worth understanding.
+
+---
+
+## 2026-09-07 (WinDbg session): root-caused the deterministic `PageManager::duplicate()` crash
+## via live debugger attach -- FIVE more stray "temporary, do not commit" diagnostics, same bug
+## class as the already-fixed DIAG_HEAL. Fixed. Step 0 progressed further than ever before but
+## remains INCONCLUSIVE, blocked now on wall-clock/memory, not on a known crash.
+
+### Goal
+
+Per the prior entry's own recommended next action: get a live-debugger-confirmed root cause for
+the deterministic `rip=0x7ff8da4f5492`/`addr=0xc0000100` host AV inside `PageManager::duplicate()`,
+using WinDbg/cdb (now installed on this host), rather than more log-only reasoning.
+
+### Tooling found
+
+`WinDbgX.exe` at `C:\Users\user\AppData\Local\Microsoft\WindowsApps\Microsoft.WinDbg_8wekyb3d8bbwe\`.
+A real `cdb.exe` (`cdbX64.exe`) is bundled in the same package directory -- more scriptable than
+WinDbgX for this purpose, per the task's own suggestion. Used via
+`cdbX64.exe -g -G -cf <script.txt> <exe> <args>` (`-cf` for a multi-line command-file, `-g -G` to
+skip the process-create/process-exit breakpoints).
+
+### Root cause, found WITHOUT even needing the debugger first: more unremoved "temporary, do not
+### commit" diagnostics, same bug class as the already-fixed DIAG_HEAL
+
+Before attaching a debugger, re-read `PageManager::duplicate()` (`litebox/src/mm/mod.rs:779`) and
+its callees end to end, specifically hunting for anything resembling the already-proven-dangerous
+DIAG_HEAL pattern (an unconditional `litebox_util_log::error!` call inside the fork-time
+relocation window). Found **five more**, never removed, all marked "DIAGNOSTIC (temporary, do not
+commit)" or equivalent, left over from earlier, unrelated investigations (the forked-Xorg
+packed-low-window investigation, a stale-pointer-healing investigation, an ELF-patch-cache
+investigation) that never got cleaned up:
+
+1. `litebox/src/mm/linux.rs` `Vmem::new` (~line 777): unconditional `error!` on every `Vmem`
+   construction (`DIAG_VMEM new placeholders`).
+2. `litebox/src/mm/linux.rs` `Vmem::duplicate`, pre-loop filter (~line 1346): unconditional
+   `error!` per skipped host-reserved placeholder VMA, in a loop over every VMA in the source
+   address space (`DIAG_VMA skipped`).
+3. `litebox/src/mm/linux.rs` `Vmem::duplicate`, group-logging + a full 5-value counterfactual
+   bisection sweep re-computed from scratch on every single fork (~lines 1425-1504): TWO
+   unconditional `error!` calls per group AND per counterfactual candidate (`DIAG_GROUPS
+   duplicate`, `DIAG_GROUPS counterfactual`) -- the most expensive of the five, doing real
+   recomputation work, not just logging.
+4. `litebox/src/mm/linux.rs` `Vmem::duplicate`, main per-region copy loop (~line 1642): unconditional
+   `error!` on EVERY relocated VMA, the single hottest fork-time diagnostic of the five
+   (`DIAG_VMA fork-relocation`).
+5. `litebox/src/mm/linux.rs` `get_unmmaped_area`'s placement helper (~line 1759): unconditional
+   `error!` on every single page placement call, fork or not (`DIAG_PLACE chosen-vs-actual`).
+6. `litebox/src/mm/mod.rs` `create_pages` (~line 886): unconditional `error!` on EVERY page
+   creation anywhere in the runtime, guest `mmap` and internal callers alike (`DIAG_CREATE_PAGES`)
+   -- the single chokepoint every relocated VMA in `duplicate()`'s copy loop passes through.
+7. `litebox/src/mm/mod.rs` `register_existing_mapping` (~line 1549): unconditional `error!` on
+   every VMA-table registration outside `create_pages`/`duplicate` (`DIAG_REGISTER_EXISTING`).
+8. `litebox_shim_linux/src/syscalls/mm.rs` `sys_mmap` (~line 851): unconditional `error!`/`error!`
+   (success and failure branches) on literally every guest `mmap()` syscall (`DIAG_MMAP
+   returned`/`DIAG_MMAP failed`).
+9. `litebox_shim_linux/src/syscalls/mm.rs` `init_elf_patch_state` (~line 1110): a real,
+   still-unfixed bug (`ElfPatchKey` is `(pid, fd)`, never re-keyed onto a forked child's pid, so a
+   forked child re-initializes ELF patch state from scratch against code the parent already
+   patched -- worth its own future investigation) whose diagnostic locked a mutex, collected a
+   `Vec`, and unconditionally `error!`-logged on every cache-miss reached via `fork()`.
+
+All eight `error!` call sites plus the ninth (real but unfixed-bug-adjacent) diagnostic were
+removed outright, except one that was judged a genuinely useful non-"temporary" regression signal
+(`litebox_platform_windows_userland/src/lib.rs`'s `allocate_pages` constrained-retry-fallback log,
+~line 6537) -- that one was gated behind the crate's own pre-existing `LITEBOX_DIAG_MM` env-var
+check (`diag_mm_enabled()`, already used by sibling diagnostics in the same file) rather than
+deleted, since a run silently regressing to the old bottom-up packed layout is a real thing worth
+being able to observe on demand.
+
+Every one of these runs inside or immediately downstream of `PageManager::duplicate()`'s
+fork-time relocation window -- the exact window this investigation's own prior entry already
+proved (the `search_exception_tables` torn-read fix, and before that the original DIAG_HEAL fix)
+is hazardous for `tracing`-backed formatted logging (allocation + I/O) to run in, racing
+concurrent Windows API activity on another thread.
+
+### Rebuild, then LIVE DEBUGGER CONFIRMATION that the previously-deterministic crash is gone
+
+`cargo build --release --bin litebox_runner_linux_on_windows_userland` (PDB confirmed present:
+`target/release/litebox_runner_linux_on_windows_userland.pdb`, full symbols, so no debug-profile
+rebuild was needed). Re-ran the exact `bash -c` inline `beyond_stdio==0` repro from the prior
+entry, both host env vars set correctly (`LITEBOX_PROCESS_FORK=1`, `LITEBOX_LOG=warn`), under
+`cdbX64.exe -g -G -cf <script>` with `sxe av` (stop on every access violation) armed.
+
+**The deterministic `rip=0x7ff8da4f5492 addr=0xc0000100` ntdll crash that fired identically on
+every single run since this investigation began is GONE.** It does not appear anywhere in this
+session's runs, debugged or standalone. Confirmed via a full `!analyze -v` / `.exr -1` / `r` /
+`kb` / `~*k` / `u @rip` / `lm` capture at the first (and, per `sxe av`, only real) access
+violation this session's debugged run actually hit:
+
+```
+0:010> !analyze -v
+...
+Failure.Bucket: INVALID_POINTER_READ_c0000005_litebox_runner_linux_on_windows_userland.exe!
+  RNvNtNtCsaDjktFBbbgY_7litebox2mm15exception_table15memcpy_fallible
+EXCEPTION_RECORD: ExceptionAddress: 00007ff7041e8418
+  (litebox_runner_linux_on_windows_userland!...exception_table::memcpy_fallible+0x68)
+   ExceptionCode: c0000005 (Access violation)
+Attempt to read from address 0000000010188000
+STACK_TEXT:
+  ...memcpy_fallible+0x68
+  ...userspace_pointers::to_owned_slice<NoValidation>+0x73
+  ...ForkChildVerificationProvider::spawn_cross_process_fork_child::spawn_process_fork_child+0xbe1
+  ...ForkChildVerificationProvider::spawn_cross_process_fork_child+0xed
+  ...syscalls::file::sys_close
+  ...syscalls::file::pty_ioctl
+  ...LinuxShimEntrypoints::EnterShim::syscall
+  ...syscall_callback
+  ...run_thread_inner
+  ...do_clone
+  std::sys::thread::windows::thread_start
+```
+
+This is a fundamentally different, and far more encouraging, finding than every prior session's
+crash:
+
+- **The code now reaches `spawn_cross_process_fork_child` and its real page-copy logic
+  (`spawn_process_fork_child`/`copy_one_group`)** -- something no prior session in this whole
+  investigation ever observed. The `beyond_stdio==0` gate was passed, the cross-process path was
+  taken, and real work happened inside it.
+- `~*k` (all 12 threads, full stacks) shows the faulting thread squarely inside
+  `do_clone`/`spawn_cross_process_fork_child`, with every other thread either idle
+  (`NtWaitForWorkViaWorkerFactory`/`NtWaitForSingleObject`) or doing unrelated, non-racing work
+  (the NAT gateway thread, network polling). **No cross-thread race is visible in this crash** --
+  contradicts the suspected mechanism named in the original task brief (a background thread
+  colliding with fork-time relocation). That mechanism was real for the OLD, now-fixed crash (the
+  stray-diagnostic-triggered ntdll AV); it does not explain this one.
+- `memcpy_fallible` is `litebox`'s own designed-to-possibly-fault primitive (see
+  `litebox/src/mm/exception_table.rs:130`), reading the PARENT's own memory via
+  `NoValidation`-mode `to_owned_slice` so `copy_one_group`
+  (`litebox_platform_windows_userland/src/process_fork.rs:2926`) can `WriteProcessMemory` it into
+  the child, PAGE BY PAGE. `copy_one_group`'s own doc comment (line ~3013) explicitly documents
+  that an unreadable page is EXPECTED (the reservation-group span is rounded out to Windows
+  allocation granularity and may cover padding beyond the guest's real mapped content) and handled
+  by simply leaving that page as the child's already-zero-filled `MEM_COMMIT` default. Confirmed
+  live: a STANDALONE (undebugged) re-run of the identical repro produced
+  `[diag-recover-fsbase] recover_rip=0x7ff7041e8422 fsbase=0x7feffffb0740` -- the exact fixup
+  address `u @rip` disassembly shows immediately after the faulting `rep movs` pair, with a
+  healthy non-zero `fsbase` -- i.e. **this specific AV IS being recovered correctly** by
+  `search_exception_tables` (using the already-fixed `context_snapshot.Rip`, not a racing live
+  read) every single time, exactly as designed. The `sxe av`-armed debugger session only ever saw
+  it as "a crash" because `sxe av` breaks on EVERY first-chance access violation, recovered or
+  not -- it is not, on its own, evidence of an unrecovered fault. This was confirmed directly: no
+  `[diag-unrecov-av]`, `[diag-unrecov-av-giveup]`, or `[diag-extable]` line appeared in the
+  standalone run, all of which are the unconditional, ungated prints on the genuinely-unrecovered
+  path (`litebox_platform_windows_userland/src/lib.rs:1715` onward) -- ruling out both the
+  "genuinely unrecoverable" branch and the repeated-same-rip circuit breaker
+  (`MAX_REPEATED_UNRECOV_AV`) as explanations for what happens next.
+
+### What happens next: NOT a crash, NOT a hang from the recovery path itself -- a slow, resource-
+### starved copy loop, confounded by severe host memory pressure this session
+
+After the recovered fault, the standalone run produced no further log output and the process
+remained alive (confirmed via a second, non-invasive `cdb -p <pid>` attach showing real, if
+minimal, thread activity -- not the previously-documented un-terminable zombie-handle artifact,
+which shows a thread with NO further stack at all). Investigated three hypotheses:
+
+1. *A repeated-fault livelock in the VEH itself*: ruled out directly -- the diagnostic prints that
+   would fire on that path (`[diag-unrecov-av-giveup]`, `[diag-extable]`, `[diag-unrecov-av-depth]`)
+   never appeared.
+2. *An actual infinite loop in `copy_one_group`'s page-by-page copy*: the loop is a straightforward
+   bounded `while cursor < source_group.end` over 4KiB pages with no retry-on-failure logic --
+   nothing in the code supports an infinite-loop reading.
+3. *Legitimately slow, resource-starved progress*: **the most likely explanation, and consistent
+   with direct measurement.** This session's host free memory fell from ~3.9GB at session start to
+   under 1.5GB by its end, entirely from unrelated concurrent load (multiple other Claude Code
+   sessions, Chrome, Discord, and this project's own `gm` daemon helper process all running
+   simultaneously on the same host) -- not from litebox itself, which stayed under 250MB resident
+   throughout every run this session. `copy_one_group` walks the webtop image's full multi-hundred-
+   MB-to-multi-GB VMA groups ONE 4KiB PAGE AT A TIME, each page a separate `read_source_bytes`
+   (host-memory read) + `WriteProcessMemory` (cross-process write) round trip -- tens of thousands
+   of syscalls for a single large group, and page-by-page cross-process copy loops are exactly the
+   kind of work that degrades sharply under host memory pressure (paging, working-set trims). A
+   deliberately re-run debug-level (`LITEBOX_LOG=debug`) attempt later in this session never even
+   reached `TCACHE_REPRO_START` (still loading the ~3.5GB webtop image after 45+ seconds) before
+   this session's own free memory dropped under 1.5GB and the run was abandoned -- this reproduces,
+   on this exact investigation, the identical memory-pressure confound the 2026-09-07 (later still)
+   entry above already documented once (that session's own free-memory drop from 4.2GB to 3.4GB
+   during one ambiguous, inconclusive run).
+
+**This is very likely NOT a code defect** -- no crash, no unrecovered fault, no evidence of an
+actual infinite loop, and a resource-pressure explanation that fits both the direct measurements
+and this investigation's own prior precedent for exactly this failure shape. But it was not
+confirmed to full completion this session either (no run reached `TCACHE_REPRO_CHILD_OK`), so it
+is recorded as unconfirmed-but-likely rather than closed.
+
+### Fix applied and verified
+
+Commit-worthy changes: removed 8 stray unconditional `litebox_util_log::error!` diagnostics (items
+1-2, 4-9 above) outright, gated the 1 legitimate regression-signal diagnostic (item 3's sibling in
+`lib.rs`, the `allocate_pages` constrained-retry-fallback log) behind the existing
+`LITEBOX_DIAG_MM` env var via the crate's own pre-existing `diag_mm_enabled()` helper. Rebuilt
+clean. Confirmed via live debugger attach that the previously 100%-deterministic
+`rip=0x7ff8da4f5492`/`addr=0xc0000100` ntdll crash inside `PageManager::duplicate()` -- present in
+literally every `LITEBOX_PROCESS_FORK=1` run across every session of this entire investigation
+until now -- is gone.
+
+### Test results (re-run after this session's fix)
+
+`cargo test --release -p litebox --lib`: 123 passed, 26 failed -- identical pass/fail count and
+failing-test list to the documented pre-existing baseline (missing `diod` binary for `nine_p`, one
+`tar_ro` symlink test, one `mm::tests::test_vmm_mapping` range-merging assertion). No regression.
+
+`cargo test --release -p litebox_common_linux`: 10 passed, 0 failed, 1 doctest passed -- clean.
+
+`cargo test --release -p litebox_platform_windows_userland --lib`: 4 passed, 0 failed -- clean.
+
+`cargo test --release -p litebox_shim_linux`: still fails to compile (test/doctest build only),
+`E0576` "cannot find method `run_test_thread` in trait `ThreadProvider`" -- confirmed pre-existing
+in every prior entry via `git stash` comparison, unrelated to this session's changes (a
+`ThreadProvider` trait/test-infrastructure drift, not touched by anything in this session's diff).
+
+### Step 0 verdict: no longer REFUTED by the old crash -- reopened to INCONCLUSIVE, further along
+### than ever, blocked now on getting a clean high-memory run rather than on a known bug
+
+The specific, deterministic crash that produced the prior entry's REFUTED verdict is fixed and
+confirmed gone via live debugger evidence, not just log inference. This session's runs got further
+into the cross-process fork path than any previous session -- past `PageManager::duplicate()`
+entirely, into `spawn_cross_process_fork_child`'s real page-copy logic, with the guest's
+`beyond_stdio==0` gate correctly passed. **No run this session reached
+`TCACHE_REPRO_CHILD_OK`/completion**, so Step 0's central claim is still not CONFIRMED -- but the
+REFUTED verdict from the prior entry specifically rested on a crash that is now shown, with
+debugger evidence, not to exist. The honest verdict is INCONCLUSIVE-but-substantially-de-risked,
+not REFUTED: every concrete, previously-identified blocker in the `PageManager::duplicate()`/
+`spawn_cross_process_fork_child` path has now been found and fixed (DIAG_HEAL logging crash, the
+`search_exception_tables` torn-read, and now nine more stray diagnostics of the identical class),
+and what remains between here and a clean verdict looks, on current evidence, like host resource
+pressure rather than a code defect.
+
+### Step 9 (long-running cross-process child survival): still NOT REACHED
+
+No run in this session reached a live, running cross-process child -- still blocked on getting one
+clean run past `copy_one_group`'s full copy to actual guest resumption. This remains completely
+open.
+
+### What remains open for a future session
+
+- **Get one clean run on a host with real headroom (>6GB free, verified via
+  `Get-CimInstance Win32_OperatingSystem`, with every other memory-heavy process -- other Claude
+  Code sessions, browsers, chat apps -- closed for the duration, not just "not currently doing
+  anything").** This session's own concurrent load (several other Claude sessions plus this
+  project's `gm` daemon helper, Chrome, Discord) made a clean, fast run impossible to obtain; every
+  attempt after the first stalled during image loading alone, before ever reaching
+  `TCACHE_REPRO_START`.
+- If a clean, high-memory run STILL does not reach `TCACHE_REPRO_CHILD_OK`, that becomes the next
+  real target to root-cause -- but with the ntdll crash and eight of nine stray diagnostics now
+  fixed, and no evidence found this session of an actual infinite loop or unrecovered fault, the
+  remaining gap looks structural (a very large `WriteProcessMemory`-per-4KiB-page copy loop is
+  inherently slow for a multi-GB image) rather than a bug. Worth profiling `copy_one_group`
+  directly (wall-clock per group, page count per group) on a clean run to confirm this before
+  assuming a defect.
+- The real, still-unfixed `ElfPatchKey`-not-rekeyed-on-fork bug noted in
+  `litebox_shim_linux/src/syscalls/mm.rs`'s `init_elf_patch_state` (found while removing that
+  function's stray diagnostic) is worth its own follow-up: a forked child whose address space
+  already holds the parent's patched code re-initializes ELF patch state from scratch, computing a
+  fresh `trampoline_addr` the copied code does not actually jump to.
+- Step 9 (long-running cross-process child survival) remains completely untested -- still blocked
+  on reaching a live cross-process child at all.

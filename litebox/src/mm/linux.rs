@@ -774,22 +774,6 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 },
             );
         }
-        // Measures the outcome the `duplicate` headroom-exclusion fix targets: how much of the
-        // HIGH end of the guest address space this new `Vmem` starts life with already covered by
-        // `VmFlags::empty()` host placeholders. `get_unmmaped_area` walks top-down, so a high
-        // `top_placeholder_end` (at or near `TASK_ADDR_MAX`) is exactly the condition that pushes
-        // every subsequent private mapping down into a low gap -- the packing that produced the
-        // forked-Xorg `sysmalloc`-into-adjacent-text SIGSEGV. Logged at `error` so it is visible
-        // under `LITEBOX_LOG=error` alongside the `DIAG_VMA`/`DIAG_GROUPS` fork lines.
-        let placeholder_count = vmem.vmas.iter().count();
-        let top_placeholder_end = vmem.vmas.last_range_value().map_or(0, |r| r.0.end);
-        litebox_util_log::error!(
-            placeholder_count:% = placeholder_count,
-            top_placeholder_end:% = top_placeholder_end,
-            task_addr_max:% = Platform::TASK_ADDR_MAX,
-            pins_high_limit:? = (top_placeholder_end >= Platform::TASK_ADDR_MAX);
-            "DIAG_VMEM new placeholders"
-        );
         vmem
     }
 
@@ -1352,22 +1336,6 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // readable) -- `dest` gets its own copy of those from its own construction, so skip them
         // here rather than trying to copy host-runtime memory that is none of the guest's
         // business.
-        // DIAGNOSTIC (temporary, do not commit): a region the child never receives is
-        // indistinguishable, from a fault address alone, from one relocated incorrectly -- a
-        // pointer into a SKIPPED mapping is well-formed in the parent and dereferences nothing in
-        // the child, which is exactly the shape of a fault that lands in no source range, no dest
-        // range, and is reconstructible via no relocation delta. The two `continue` paths inside
-        // the loop below already emit `DIAG_VMA fork-relocation`, so this pre-loop filter is the
-        // ONLY place a VMA can vanish without leaving a trace. Name every one it drops.
-        for (r, vma) in self.vmas.iter() {
-            if vma.flags.is_empty() {
-                litebox_util_log::error!(
-                    src_start:% = r.start, src_end:% = r.end,
-                    reason:% = "empty-flags host-reserved placeholder (pre-loop filter)";
-                    "DIAG_VMA skipped"
-                );
-            }
-        }
         let regions: Vec<(Range<usize>, VmArea<Platform, ALIGN>)> = self
             .vmas
             .iter()
@@ -1415,12 +1383,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // crash. 16 MiB comfortably covers realistic single-process heap growth while still
         // leaving the guest stack (placed far from the heap, with no RIP-relative relationship to
         // it) in its own separate group.
-        // DIAGNOSTIC (temporary, do not commit): 16 MiB was chosen for musl's mallocng, whose
-        // group/meta_area spacing it reasons about explicitly above. A glibc guest (Debian) has a
-        // different layout entirely -- per-thread arenas each reserve 64 MiB of address space, so
-        // inter-arena gaps routinely exceed 16 MiB by design, splitting them into separately-placed
-        // groups and breaking exactly the cross-region pointer arithmetic this grouping exists to
-        // preserve. Raised to test whether the XFCE/dbus glibc heap corruption is this same bug.
+        // 16 MiB (the original constant, sized for musl's mallocng group/meta_area spacing
+        // reasoned about above) was too small for a glibc guest (Debian): per-thread arenas each
+        // reserve 64 MiB of address space, so inter-arena gaps routinely exceed 16 MiB by design,
+        // splitting them into separately-placed groups and breaking exactly the cross-region
+        // pointer arithmetic this grouping exists to preserve. Raised to 64 MiB to cover that.
         let max_intra_group_gap: usize = 64 * 1024 * 1024;
         // Each entry's `end` is the region's RESERVED extent, not its VMA extent: a mapping
         // created with `CreatePagesFlags::ENSURE_SPACE_AFTER` holds `reserved_extra` further
@@ -1446,94 +1413,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 _ => groups.push(r),
             }
         }
-        // DIAGNOSTIC (temporary): answer, directly rather than by inference, whether the guest
-        // STACK merges into the same group as heap/ELF regions at the current
-        // `max_intra_group_gap`. The design doc (`docs/fork-region-grouping-design.md`) asserts
-        // that over-merging is harmless for correctness; a competing hypothesis blames
-        // stack-merging for post-fork pre-execve child crashes. This logs, per group, its span and
-        // whether it contains a `VM_GROWSDOWN` (stack) region alongside non-stack regions -- so
-        // "did the stack merge" is a read, not a guess. Emitted at `error!` level because the
-        // fork-timeline diagnostics this correlates with are only visible at `LITEBOX_LOG=error`.
-        for (gi, group) in groups.iter().enumerate() {
-            let mut stack_regions = 0usize;
-            let mut nonstack_regions = 0usize;
-            for (r, vma) in &regions {
-                if vma.shared_handle.is_some() {
-                    continue;
-                }
-                if r.start >= group.start && r.end <= group.end {
-                    if vma.flags.contains(VmFlags::VM_GROWSDOWN) {
-                        stack_regions += 1;
-                    } else {
-                        nonstack_regions += 1;
-                    }
-                }
-            }
-            litebox_util_log::error!(
-                group_index:% = gi,
-                group_count:% = groups.len(),
-                start:% = group.start,
-                end:% = group.end,
-                span_bytes:% = group.end - group.start,
-                gap_constant:% = max_intra_group_gap,
-                stack_regions:% = stack_regions,
-                nonstack_regions:% = nonstack_regions,
-                stack_merged_with_nonstack:% = (stack_regions > 0 && nonstack_regions > 0);
-                "DIAG_GROUPS duplicate"
-            );
-        }
-        // Counterfactual sweep: the partition is a pure function of the parent's sorted region
-        // list and the gap constant, so every candidate value's grouping can be computed from THIS
-        // run without rebuilding or rebooting once per value. Reports, per candidate, the group
-        // count and whether the stack would merge with non-stack regions -- turning the whole
-        // 16/64/128/256/512MiB bisection's *static* question into one boot's log lines.
-        for candidate_mib in [16usize, 64, 128, 256, 512] {
-            let candidate = candidate_mib * 1024 * 1024;
-            let mut cand_groups: Vec<Range<usize>> = Vec::new();
-            let mut sorted: Vec<Range<usize>> = regions
-                .iter()
-                .filter(|(_, vma)| vma.shared_handle.is_none())
-                .map(|(r, _)| r.clone())
-                .collect();
-            sorted.sort_by_key(|r| r.start);
-            for r in sorted {
-                match cand_groups.last_mut() {
-                    Some(last) if r.start <= last.end.saturating_add(candidate) => {
-                        last.end = last.end.max(r.end);
-                    }
-                    _ => cand_groups.push(r),
-                }
-            }
-            let mut merged_groups = 0usize;
-            let mut max_span = 0usize;
-            for g in &cand_groups {
-                max_span = max_span.max(g.end - g.start);
-                let mut st = 0usize;
-                let mut ns = 0usize;
-                for (r, vma) in &regions {
-                    if vma.shared_handle.is_some() {
-                        continue;
-                    }
-                    if r.start >= g.start && r.end <= g.end {
-                        if vma.flags.contains(VmFlags::VM_GROWSDOWN) {
-                            st += 1;
-                        } else {
-                            ns += 1;
-                        }
-                    }
-                }
-                if st > 0 && ns > 0 {
-                    merged_groups += 1;
-                }
-            }
-            litebox_util_log::error!(
-                gap_mib:% = candidate_mib,
-                group_count:% = cand_groups.len(),
-                stack_merged_groups:% = merged_groups,
-                max_group_span:% = max_span;
-                "DIAG_GROUPS counterfactual"
-            );
-        }
+        // Per `docs/fork-region-grouping-design.md`, the guest STACK merging into the same group
+        // as heap/ELF regions at the current `max_intra_group_gap` is harmless for correctness.
         // For each source address, the `(group_source_base, group_dest_base)` of the group it
         // falls in -- looked up per-region in the main loop below via a linear scan (`groups` is
         // small: one entry per ELF image / stack / independent mmap cluster, not per region).
@@ -1751,26 +1632,6 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             if self.brk != 0 && range.contains(&self.brk) {
                 brk_relocation = Some((range.clone(), dest_ptr.as_usize()));
             }
-            // DIAGNOSTIC (temporary, do not commit): the two `continue` paths above (guard pages
-            // and `VM_SHARED` regions) already emit this, but the MAIN copy path -- every
-            // non-shared region, i.e. the ELF segments, the `brk` heap, anonymous mmap arenas and
-            // the stack -- did not, which is precisely the set a fault at a never-relocated
-            // address has to be attributed against. `is_brk` names the heap explicitly so the
-            // question "is the heap scanned?" is answered by the running code rather than by a
-            // doc comment (one of which was already found stale on exactly this question).
-            litebox_util_log::error!(
-                src_start:% = range.start, src_end:% = range.end,
-                dest:% = dest_ptr.as_usize(),
-                exec:? = vma.flags.contains(VmFlags::VM_EXEC),
-                private_data:? = is_private_data_range(&vma),
-                file_backed:? = vma.is_file_backed(),
-                shared:? = vma.shared_handle.is_some(),
-                growsdown:? = vma.flags.contains(VmFlags::VM_GROWSDOWN),
-                is_brk:? = (self.brk != 0 && range.contains(&self.brk)),
-                reserved_extra:% = vma.reserved_extra,
-                flags:% = vma.flags.bits();
-                "DIAG_VMA fork-relocation"
-            );
             relocations.push((
                 range.clone(),
                 dest_ptr.as_usize(),
@@ -1881,28 +1742,6 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 behavior,
             )
         };
-        // THE DISCRIMINATING MEASUREMENT for the forked-Xorg packed-low-window investigation.
-        // Three separate mechanisms have been proposed for why a forked child's mappings land in a
-        // cramped low window while the same binary as pid 1 gets the high region, and each was
-        // argued from placement addresses alone. This records the two numbers that actually settle
-        // it, for the SAME call:
-        //   `chosen`  -- what `get_unmmaped_area` (litebox's own top-down search) decided.
-        //   `actual`  -- what the platform ultimately handed back after `insert_mapping`.
-        // If `chosen` is itself low, the defect is in the search and the VMA tree it walks. If
-        // `chosen` is high but `actual` is low, the search is fine and something below it (the
-        // Hint-mode foreign-claim fallback in the Windows platform's `allocate_pages`, which
-        // discards the hint and reissues an unconstrained bottom-up request) is overriding it.
-        // `overridden` states that comparison directly so no arithmetic is needed to read it.
-        if let Ok(ptr) = &result {
-            let actual = ptr.as_usize();
-            litebox_util_log::error!(
-                chosen:% = new_addr, actual:% = actual,
-                overridden:? = (actual != new_addr),
-                len:% = length.as_usize(), total_len:% = total_length.as_usize(),
-                behavior:? = behavior, ensure_space_after:? = (reserved_extra != 0);
-                "DIAG_PLACE chosen-vs-actual"
-            );
-        }
         result
     }
 
@@ -2468,19 +2307,6 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         debug_assert_eq!(Platform::TASK_ADDR_MIN % ALIGN, 0);
         debug_assert_eq!(Platform::TASK_ADDR_MAX % ALIGN, 0);
         let last_end = self.vmas.last_range_value().map_or(low_limit, |r| r.0.end);
-        // Attributes a placement to the branch that produced it. The forked-Xorg packed-low-window
-        // investigation repeatedly reasoned about which branch was firing from placement addresses
-        // alone and got it wrong three times; this records the answer instead. Only the failing
-        // case is logged -- logging every call would drown a run in thousands of lines -- so a
-        // line here means the all-or-nothing test below has actually foreclosed the upper region.
-        if last_end > high_limit {
-            litebox_util_log::error!(
-                size:% = size, last_end:% = last_end, high_limit:% = high_limit,
-                low_limit:% = low_limit, is_growsdown:? = is_growsdown,
-                task_addr_max:% = Platform::TASK_ADDR_MAX;
-                "DIAG_UNMAPPED fast-path foreclosed"
-            );
-        }
         if last_end <= high_limit {
             // A growsdown (stack) region must keep a guard gap below whatever is already
             // mapped above it -- gap #2 below already reserves this in the OTHER direction

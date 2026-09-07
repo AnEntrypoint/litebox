@@ -6529,15 +6529,22 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             // no room up there). Fall back to the original unconstrained behaviour rather than
             // turning a placement preference into an allocation failure -- a low address is
             // still correct, merely worse for locality.
-            // `error!`, not `debug!`: the oracle and every repro script run with
-            // `LITEBOX_LOG=error`, and this investigation repeatedly lost diagnostics to
-            // `EnvFilter` at lower levels. A run that starts taking this path is silently
-            // regressing to the old bottom-up packed layout -- the exact condition this fix
-            // exists to prevent -- so it must be visible where anyone is actually looking.
-            litebox_util_log::error!(
-                floor:% = placement_floor, size:% = size;
-                "allocate_pages: constrained retry above discarded hint failed, retrying unconstrained"
-            );
+            // Was unconditional `error!` here (any run taking this path silently regresses to
+            // the old bottom-up packed layout, so it used to be logged unconditionally to make
+            // that visible). Found, via a live WinDbg-confirmed fork-time crash, to itself be a
+            // hazard: this call runs on the fork-relocation path inside `PageManager::duplicate`,
+            // where a `tracing`-backed formatted log event (allocation + I/O) racing concurrent
+            // Windows API activity on another thread has already been root-caused once before
+            // (see `docs/track-b-fork-fix-progress.md`'s DIAG_HEAL entry) to crash the host with
+            // an AV inside ntdll on a background thread. Gated behind `LITEBOX_DIAG_MM` like the
+            // sibling diagnostic above, instead of removed outright, since this one is a real
+            // regression signal worth keeping available on demand.
+            if diag_mm_enabled() {
+                litebox_util_log::error!(
+                    floor:% = placement_floor, size:% = size;
+                    "allocate_pages: constrained retry above discarded hint failed, retrying unconstrained"
+                );
+            }
             ptr = reserve_and_commit(0..size, prot_flags(initial_permissions), 0);
         }
         assert!(

@@ -842,36 +842,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
-        let diag_flag_bits = flags.bits();
         let result = if flags.contains(MapFlags::MAP_ANONYMOUS) {
             self.do_mmap_anonymous(suggested_addr, aligned_len, prot, flags)
         } else {
             self.do_mmap_file(suggested_addr, aligned_len, prot, flags, fd, offset)
         };
-        // Temporary (see FINDINGS.txt PASS 48): trace every mmap's returned guest address so a
-        // return value landing in the host allocator's own reserved region (a bug this
-        // investigation is actively chasing) is caught the moment it is produced, not just
-        // later when something dereferences the resulting bad pointer.
-        // DIAGNOSTIC (temporary, do not commit): promoted from `debug!` to `error!` and extended
-        // to cover the FAILURE case too. A fault address that is unmapped in the parent as well as
-        // the child was never valid anywhere, so it cannot be a fork/relocation artifact -- it has
-        // to have been produced by an earlier mapping request that either failed, or was satisfied
-        // somewhere other than where the guest expected. Neither is visible at `debug!` under the
-        // `LITEBOX_LOG=error` the fork oracle runs at, so this pairs each request (addr/len/flags)
-        // with what the guest was actually handed back.
-        match &result {
-            Ok(r) => litebox_util_log::error!(
-                tid:% = self.tid, addr:% = addr, len:% = aligned_len, flags:% = diag_flag_bits,
-                returned:% = r.as_usize(),
-                relocated:? = (addr != 0 && r.as_usize() != addr);
-                "DIAG_MMAP returned"
-            ),
-            Err(e) => litebox_util_log::error!(
-                tid:% = self.tid, addr:% = addr, len:% = aligned_len, flags:% = diag_flag_bits,
-                error:? = e;
-                "DIAG_MMAP failed"
-            ),
-        }
         result.map_err(Errno::from)
     }
 
@@ -1132,21 +1107,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         {
             return;
         }
-        // DIAGNOSTIC (temporary, do not commit): `ElfPatchKey` is `(pid, fd)` and nothing re-keys
-        // a parent's entries onto the child's pid at `fork()`. So a forked child, whose address
-        // space already holds the parent's ALREADY-PATCHED code copied byte for byte, looks its
-        // own pid up, misses, and re-initializes patch state from scratch -- computing a fresh
-        // `trampoline_addr` while the copied code still jumps to the parent's. Log every
-        // (pid, fd) that reaches a from-scratch init, with the pids already present in the shared
-        // cache, so a child re-patching a binary its parent already patched is directly observed
-        // rather than inferred.
-        let existing: alloc::vec::Vec<(i32, i32)> =
-            self.global.elf_patch_cache.lock().keys().copied().collect();
-        litebox_util_log::error!(
-            pid:% = self.pid, fd:% = fd, mapped_addr:% = mapped_addr,
-            existing_keys:? = existing;
-            "DIAG_ELF_PATCH init-from-scratch (cache miss)"
-        );
+        // NOTE (not yet fixed): `ElfPatchKey` is `(pid, fd)` and nothing re-keys a parent's
+        // entries onto the child's pid at `fork()`. So a forked child, whose address space
+        // already holds the parent's ALREADY-PATCHED code copied byte for byte, looks its own pid
+        // up, misses, and re-initializes patch state from scratch -- computing a fresh
+        // `trampoline_addr` while the copied code still jumps to the parent's. Worth revisiting.
 
         // Read the ELF header (64 bytes for Elf64).
         let mut ehdr_buf = [0u8; core::mem::size_of::<FileHeader64<LittleEndian>>()];
