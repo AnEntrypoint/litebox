@@ -10,7 +10,10 @@ client, and selkies with its own bundled encoders under /lsiopy. The big items a
 install, mesa's Vulkan drivers (pixelflux encodes on the CPU using libraries it bundles itself),
 the Docker/containerd/cmake toolchain, and locale/icon/theme/wallpaper data.
 
-NOT droppable, learned the hard way: libgallium, libLLVM and /usr/lib/dri must stay. Xvfb links
+NOT droppable, learned the hard way: /usr/libexec must stay for a MATE session -- it holds
+mate-session-check-accelerated, at-spi-bus-launcher and dconf-service, and without it
+mate-session logs "Failed to execute child process" and never brings the desktop up. Also
+libgallium, libLLVM and /usr/lib/dri must stay. Xvfb links
 against libGL even when started without the GLX extension, and libGL pulls in gallium, which
 pulls in LLVM -- removing them makes Xvfb fail at load with
 "Error loading shared library libgallium-...so ... (needed by /usr/lib/libGL.so.1)".
@@ -26,31 +29,18 @@ import sys
 import tarfile
 
 SRC = sys.argv[1] if len(sys.argv) > 1 else r'C:\dev\litebox-webtop\webtop_seatd.tar'
-DST = sys.argv[2] if len(sys.argv) > 2 else r'C:\dev\litebox-main\.wfgy\webtop_min.tar'
+DST = sys.argv[2] if len(sys.argv) > 2 else r'C:\dev\litebox-main\.wfgy\webtop_mate.tar'
 
 # Whole subtrees with nothing the stack reaches.
 EXCLUDE_PREFIXES = (
     'usr/lib/chromium/',
     'usr/lib/perl5/',
-    'usr/libexec/',          # Xorg proper; svc-xorg actually runs Xvfb
     'usr/share/locale/',
-    'usr/share/icons/',
     'usr/share/libmateweather/',
     'usr/share/backgrounds/',
     'usr/share/icu/',
     'usr/share/perl5/',
-    'usr/share/themes/',
     'usr/share/cmake/',
-    # Fonts: 142 MiB of TTF/OTF families for a desktop that is not running here. The
-    # bitmap `misc` family (which carries `fixed`, xterm's default) and `encodings` are
-    # kept below by the more specific rule -- everything else goes.
-    'usr/share/fonts/truetype/',
-    'usr/share/fonts/opentype/',
-    'usr/share/fonts/Type1/',
-    'usr/share/fonts/dejavu/',
-    'usr/share/fonts/liberation/',
-    'usr/share/fonts/noto/',
-    'usr/share/fonts/terminus-font/',
     'usr/share/doc/',
     'usr/share/man/',
     'usr/share/info/',
@@ -64,7 +54,6 @@ EXCLUDE_PREFIXES = (
 # Individual files matched by prefix of their basename-bearing path.
 EXCLUDE_FILE_PREFIXES = (
     'usr/lib/libvulkan',
-    'usr/lib/libx265',
     'usr/bin/dockerd',
     'usr/bin/containerd',
     'usr/bin/docker',
@@ -72,27 +61,6 @@ EXCLUDE_FILE_PREFIXES = (
     'usr/bin/ctest',
     'usr/bin/cpack',
     'usr/bin/cmake',
-    # Desktop-environment session binaries and the DPI-tweaking helpers selkies reaches for.
-    #
-    # On the first client connection selkies applies the browser-reported DPI "system-wide": it
-    # probes for a DE session binary (KDE -> XFCE -> MATE -> i3 -> Openbox, see
-    # selkies/display_utils.py) and, on a hit, shells out to `gsettings` twice and `xrdb` once.
-    # This stack runs no desktop environment at all -- just Xvfb and one X client -- so that work
-    # is pure cost, and each spawn is another roll of litebox's fork_verify stale-pointer healing
-    # path, which is the remaining host-side crash on this platform. Observed directly: the run
-    # reached "MATE detected. Applying MATE gsettings and xrdb for DPI 120" and then died in
-    # `[diag-unrecov-av] ... is_in_guest=false is_verifying=true`.
-    #
-    # With none of these present, selkies logs "gsettings not found, skipping" / "No specific DE
-    # session binary found" and carries on to the capture path, which is what we actually want.
-    'usr/bin/mate-session',
-    'usr/bin/xfce4-session',
-    'usr/bin/startxfce4',
-    'usr/bin/startplasma',
-    'usr/bin/openbox',
-    'usr/bin/i3',
-    'usr/bin/gsettings',
-    'usr/bin/xrdb',
 )
 
 

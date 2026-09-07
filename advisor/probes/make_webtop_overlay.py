@@ -1,4 +1,5 @@
 import io
+import os
 import tarfile
 import time
 
@@ -134,6 +135,18 @@ sleep "$HOLD"
 """
 
 
+def read_probe(name):
+    """Read a sibling probe file so the overlay is reproducible from the repo alone.
+
+    These three files used to be injected into the overlay tar by hand, which meant the committed
+    builder produced an overlay that was missing them and the working overlay could not be
+    regenerated from source. Reading them here makes this script the single definition of what the
+    overlay contains.
+    """
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), name), encoding='utf-8') as f:
+        return f.read()
+
+
 def add(tar, name, data, mode=0o644, isdir=False):
     ti = tarfile.TarInfo(name)
     ti.mtime = int(time.time())
@@ -163,5 +176,12 @@ with tarfile.open(OUT, 'w', format=tarfile.GNU_FORMAT) as tar:
         add(tar, d, None, isdir=True)
     add(tar, 'etc/nginx/nginx.conf', NGINX_CONF)
     add(tar, 'start-webtop.sh', LAUNCH, mode=0o755)
+    # `/patch` goes on the guest's PYTHONPATH, so CPython's own `site` module imports
+    # `sitecustomize` before any application code runs -- the only hook that reaches selkies
+    # early enough to fix its environment.
+    add(tar, 'patch', None, isdir=True)
+    add(tar, 'patch/sitecustomize.py', read_probe('webtop_sitecustomize.py'))
+    add(tar, 'paint_root.py', read_probe('webtop_paint_root.py'))
+    add(tar, 'grab_root.py', read_probe('webtop_grab_root.py'))
 
 print('wrote', OUT)
