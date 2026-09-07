@@ -1648,10 +1648,7 @@ fn fixup_stale_elf_data_pointers<Platform: ShimPlatform>(
     // isn't a fresh 16-byte-aligned mallocng chunk start (e.g. a pointer stored inside a struct
     // field, as this one is, rather than a malloc() return value used directly).
     const MIN_POINTER_ALIGN: usize = 8;
-    let mut ranges_seen = 0usize;
-    let mut healed_count = 0usize;
     for (source_range, dest_base) in relocations.private_data_ranges() {
-        ranges_seen += 1;
         let mut addr = dest_base;
         let dest_top = dest_base + source_range.len();
         while addr < dest_top {
@@ -1660,35 +1657,41 @@ fn fixup_stale_elf_data_pointers<Platform: ShimPlatform>(
                 if value.is_multiple_of(MIN_POINTER_ALIGN)
                     && let Some(translated) = relocations.translate(value)
                 {
-                    // DIAGNOSTIC (temporary, do not commit): test the over-healing theory
-                    // directly rather than by inference. `translate` is a RANGE-MEMBERSHIP check,
-                    // not a value-identity check, so an ordinary integer that happens to fall in
-                    // some tracked range's numeric span is rewritten in place -- the hazard
+                    // Was a DIAGNOSTIC here (temporary, per its own since-removed comment: "do not
+                    // commit"): an unconditional `litebox_util_log::error!` on every heal whose
+                    // translated value lands in an executable destination range, meant to test the
+                    // over-healing theory directly (`translate` is a RANGE-MEMBERSHIP check, not a
+                    // value-identity one, so an ordinary integer that happens to fall in some
+                    // tracked range's numeric span gets rewritten -- the same hazard
                     // `AddressRelocations::private_data_ranges_excluding_anonymous_mmap`'s doc
-                    // comment already documents for mmap arenas. Live cr2 capture on the
-                    // 30-concurrent oracle shows children faulting at addresses inside
-                    // correctly-relocated FILE-BACKED, non-private-data destination regions (some
-                    // executable) and at no source range at all -- i.e. not stale pointers. This
-                    // names every heal whose WRITTEN value points into such a region, which is the
-                    // shape a false-positive heal would take: a live non-pointer datum rewritten
-                    // into a plausible-looking address the child later dereferences.
-                    if relocations.is_in_destination_executable_range(translated) {
-                        litebox_util_log::error!(
-                            slot:% = addr, old:% = value, new:% = translated;
-                            "DIAG_HEAL wrote a pointer into an executable dest range"
-                        );
-                    }
+                    // comment documents for mmap arenas).
+                    //
+                    // Removed as the root cause of a real host crash, not just log noise: this
+                    // crate is `#![no_std]`, so the diagnostic could not even be gated behind a
+                    // host env-var check the way sibling diagnostics elsewhere in this codebase
+                    // are. A `bash -c` fork-without-exec repro under `LITEBOX_PROCESS_FORK=1` hit
+                    // this branch hundreds of times in one fork (`healed_count=2460` total over the
+                    // whole pass), each firing a full `tracing`-backed formatted log event
+                    // (allocation + I/O) from inside the fork-time relocation-healing window -- the
+                    // same window `litebox_platform_windows_userland`'s own `!is_in_guest` VEH
+                    // branch doc comments already document as prone to a transient Windows
+                    // FS_BASE-clear race for host code. The crash this triggered
+                    // (`[diag-unrecov-av] ... addr=0xc0000100 ... is_in_guest=false -- no
+                    // exception-table entry found`) carries `0xc0000100` == `STATUS_VARIABLE_
+                    // NOT_FOUND`, a leaked-NTSTATUS-in-register signature this codebase's own
+                    // archived investigation notes (`docs/AGENTS_ARCHIVE_2026-09-03.md`) already
+                    // tie to Windows API activity reached from host code, not to guest memory
+                    // content -- consistent with the logging burst, not the pointer-healing
+                    // arithmetic itself, being the proximate trigger. If this diagnostic is needed
+                    // again, prefer a `static AtomicBool`/`OnceLock` toggled from the host side
+                    // (e.g. via a platform hook), not a direct `std::env` read, since this module
+                    // has no `std`.
                     let _ = slot.write_at_offset::<Platform>(0, translated);
-                    healed_count += 1;
                 }
             }
             addr += core::mem::size_of::<usize>();
         }
     }
-    litebox_util_log::error!(
-        ranges_seen:% = ranges_seen, healed_count:% = healed_count;
-        "diag: fixup_stale_elf_data_pointers summary"
-    );
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
