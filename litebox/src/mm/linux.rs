@@ -1083,11 +1083,72 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
+        // A `Hint` means exactly what `FixedAddressBehavior::Hint` documents: "the platform may
+        // choose a different address if the hint is not available". The rest of this function
+        // already assumes precisely that -- it records wherever the allocation ACTUALLY landed
+        // (`new_start = ret.as_usize()` below) rather than assuming the suggestion was honored.
+        // So a hint whose end falls past `TASK_ADDR_MAX` describes an unusable SUGGESTION, not an
+        // impossible REQUEST: only the LENGTH has to fit in the address space. Slide such a hint
+        // down to the top of the usable range and let the platform place it, instead of failing
+        // the caller outright.
+        //
+        // This is not hypothetical tidying. `Vmem::duplicate` reserves each fork group as one
+        // contiguous span sized to the parent's own extent INCLUDING each `VmArea`'s
+        // `reserved_extra` headroom, so a parent whose topmost group sits near the top of the
+        // address space hands down a span ending just past `TASK_ADDR_MAX`. Rejecting it failed
+        // the ENTIRE `fork()` with `ENOMEM` while ~128 TiB of address space sat free. Observed
+        // live: a 1,055,973,376-byte group span overshooting the limit by exactly 20,480 bytes,
+        // which is what stopped `Xvfb` from forking `xkbcomp` (keymap compilation then fails and
+        // the X server aborts with "Failed to activate virtual core keyboard"). That ENOMEM had
+        // previously been read as the general "fork-without-exec is architecturally unsound"
+        // hazard rather than this specific, ordinary, fixable bounds bug -- the two are not the
+        // same thing, and this one costs nothing to get right.
+        let suggested_range = if suggested_range.end > Platform::TASK_ADDR_MAX
+            && fixed_address_behavior == FixedAddressBehavior::Hint
+        {
+            let len = suggested_range.len();
+            let slid = Platform::TASK_ADDR_MAX
+                .checked_sub(len)
+                .map(|s| s & !(ALIGN - 1))
+                .filter(|s| *s >= Platform::TASK_ADDR_MIN)
+                .and_then(|s| PageRange::<ALIGN>::new(s, s + len));
+            match slid {
+                Some(slid) => {
+                    litebox_util_log::warn!(
+                        orig_start:% = suggested_range.start, orig_end:% = suggested_range.end,
+                        slid_start:% = slid.start, max:% = Platform::TASK_ADDR_MAX, len:% = len;
+                        "insert_mapping: hint ended above TASK_ADDR_MAX, sliding it down rather than failing the allocation"
+                    );
+                    slid
+                }
+                // The length itself does not fit between `TASK_ADDR_MIN` and `TASK_ADDR_MAX`, so
+                // no position exists and this is a genuine capacity failure, not a bad hint --
+                // fall through to the unconditional rejection below, which reports it as such.
+                None => suggested_range,
+            }
+        } else {
+            suggested_range
+        };
         let (start, end) = (suggested_range.start, suggested_range.end);
+        // Both bounds rejections are logged unconditionally, for the same reason the two other
+        // rare-path rejections in this function are (see their comments): the caller only ever
+        // sees an opaque `AllocationError`, and by the time it surfaces -- e.g. as `fork()`'s
+        // "failed to allocate destination mapping" -- every number needed to tell a genuinely
+        // out-of-bounds request apart from a merely unusable *hint* has been thrown away.
         if start < Platform::TASK_ADDR_MIN {
+            litebox_util_log::warn!(
+                start:% = start, end:% = end, min:% = Platform::TASK_ADDR_MIN,
+                behavior:? = fixed_address_behavior;
+                "insert_mapping: rejecting range starting below TASK_ADDR_MIN"
+            );
             return Err(AllocationError::BelowMinAddress);
         }
         if end > Platform::TASK_ADDR_MAX {
+            litebox_util_log::warn!(
+                start:% = start, end:% = end, max:% = Platform::TASK_ADDR_MAX,
+                len:% = end.wrapping_sub(start), behavior:? = fixed_address_behavior;
+                "insert_mapping: rejecting range ending above TASK_ADDR_MAX"
+            );
             return Err(AllocationError::AboveMaxAddress);
         }
         let platform_fixed_address_behavior = match fixed_address_behavior {
