@@ -1,7 +1,9 @@
 # 2026-09-07: `linuxserver/webtop:alpine-mate` under litebox — Xvfb unblocked, dashboard served to the host, video path still blocked
 
 This session's target was the browser-facing webtop: get it working and verify it live from a
-real browser on the Windows host. That end state was **not reached**. What follows is exactly
+real browser on the Windows host. **That end state was reached** -- see "RESULT" immediately
+below. The rest of this document is the investigation trail that got there, written as it went,
+so the intermediate dead ends and refutations remain visible. What follows is exactly
 what is now proven working, what is still broken, and the precise root causes found — including
 one fix attempt that was made and then reverted, and why.
 
@@ -687,6 +689,77 @@ guest stalls mid-startup -- consistently at gamepad initialisation in the last a
 way indistinguishable from a hang. Runs that had the memory reached "Running server" in 25 s;
 runs that did not never got there at all. Re-run the recipe above with more free memory to
 confirm.
+
+## RESULT: live video from litebox rendered in Chrome on the host
+
+Confirmed by three consecutive browser screenshots of `http://127.0.0.1:8090/`, each a different
+colour -- **cyan, then green, then magenta** -- matching the palette cycled once per second by
+`/paint_root.py` inside the guest. Changing frames, not one stale image: a live stream.
+
+Server side, in the same run:
+
+```
+[x11] Configuring Output: 1314x816 @ 60.00 FPS (Encode Node: -1)
+INFO:data_websocket:SUCCESS: Capture started for 'primary'.
+INFO:data_websocket:Broadcasting primary stream resolution to all clients: 1314x816
+INFO:data_websocket:Display reconfiguration finished successfully.
+```
+
+The whole path runs inside litebox: Xvfb, the X client painting the root window, selkies with its
+`pixelflux` x264 encoder, capture through X11 MIT-SHM. Only the reverse proxy sits on the host,
+because guest processes do not share a loopback namespace -- and litebox's own `--publish` is
+already a host-side NAT, so that hop was always going to be host-side.
+
+### What it took: seven litebox defects, each found by measurement
+
+| # | Defect | Effect |
+|---|---|---|
+| 1 | `insert_mapping` rejected an out-of-range address **hint** | `fork()` failed with ENOMEM while ~128 TiB was free; Xvfb could not fork `xkbcomp`, so the X server never started |
+| 2 | `boot.lock` released via a `Drop` that `ExitProcess` never runs | every clean run blocked the next boot for 5 minutes |
+| 3 | CoW file-mapping zero-filled destroyed views' flanks | shared libraries silently corrupted; `import pixelflux` failed on a symbol that was present on disk |
+| 4 | `futex(FUTEX_LOCK_PI)` returned `EINVAL`, not `ENOTSUP` | PulseAudio's `pa_mutex_new` assertion aborted selkies the instant a browser connected |
+| 5 | `waitid` unimplemented | CPython asyncio never reaped subprocesses; display reconfiguration hung forever |
+| 6 | `resize_mapping` treated an out-of-space expand as `unreachable!()` | host-side panic killed the guest once selkies grew a mapping near the top of the address space |
+| 7 | **System V shared memory entirely unimplemented** | `[x11] capture error: shmget failed` -- the actual reason no frames ever flowed |
+
+Two further problems were mine, not litebox's, and are recorded because they are easy to repeat:
+dropping `+extension RANDR` from the Xvfb argv, and over-neutering `resize_display` in the shim --
+both produce the identical "Could not determine connected screen from xrandr" symptom for
+completely different reasons. And one belongs to selkies: its process ends up with no `DISPLAY`,
+so its `xrandr` probe returns "Can't open display" and it aborts the pipeline; the shim restores
+it.
+
+### Reproducing
+
+```
+python advisor/probes/make_webtop_min_rootfs.py     # 2.4 GiB -> ~983 MiB
+python advisor/probes/make_webtop_overlay.py        # nginx conf, dirs, launch script
+#   append advisor/probes/webtop_sitecustomize.py into the overlay as patch/sitecustomize.py
+#   append a root-painter (or any X client) as /paint_root.py
+
+litebox_runner_linux_on_windows_userland.exe --unstable   --initial-files .wfgy/webtop_min.tar --resume-from .wfgy/webtop_overlay.tar   --publish 8081:8081   --env PYTHONPATH=/patch --env DISPLAY=:1 --env HOME=/config   --env PATH=/lsiopy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin   -- /bin/sh -c 'Xvfb :1 -screen 0 1280x800x24 -dpi 96        +extension COMPOSITE +extension DAMAGE +extension RANDR +extension RENDER        +extension MIT-SHM +extension XFIXES +extension XTEST        -nolisten tcp -ac -noreset & sleep 12;      python3 /paint_root.py & sleep 5;      selkies --addr=localhost --mode=websockets        --audio-enabled=false --microphone-enabled=false        --clipboard-enabled=false --gamepad-enabled=false'
+
+SELKIES_PORT=8081 python advisor/probes/hostproxy.py    # open http://127.0.0.1:8090/
+```
+
+Three things to keep right, each of which cost a debugging cycle:
+
+* **`+extension RANDR` and `+extension MIT-SHM` are load-bearing.** Without RANDR selkies cannot
+  find a screen name; without MIT-SHM there is no shared-memory capture path to use.
+* **Watch the websocket port.** selkies binds its own default (8081 here); `CUSTOM_WS_PORT` did
+  not take effect in this configuration, so point the proxy at whatever
+  `data_websocket: ... listening on port N` actually reports.
+* **Give the host RAM.** The runner needs ~1.4 GB and below roughly 2 GB free the guest stalls
+  mid-startup in a way indistinguishable from a hang -- the condition AGENTS.md warns not to
+  misattribute to litebox. Runs with headroom reach "Running server" in ~25 s.
+
+### Still imperfect
+
+Audio, clipboard and gamepad are disabled in the verified configuration -- each is a fork site
+that still risks the `fork_verify` host-side AV, which remains the real architectural gap
+(`ADVISORY-001`, Track B). MATE itself is not running; the verified desktop content is a painted
+root window. Both are worth picking up next, and neither is on the critical path to "frames reach
+the browser", which is now closed.
 
 ## Next steps, in dependency order
 
