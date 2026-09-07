@@ -3481,6 +3481,32 @@ pub enum SyscallRequest {
     /// reaping it (`WNOWAIT`). CPython's asyncio relies on exactly that combination --
     /// `waitid(P_PID, pid, WEXITED | WNOWAIT)` to await the exit, then a separate `waitpid`
     /// to reap -- so an unimplemented `waitid` silently breaks every asyncio subprocess.
+    /// `shmget(key, size, shmflg)` -- System V shared memory.
+    ///
+    /// Needed by X11's MIT-SHM extension, which is how real screen-capture clients move
+    /// framebuffer bytes: selkies' `pixelflux` capture fails outright with "shmget failed" if
+    /// this is unimplemented, so no video ever reaches the browser.
+    Shmget {
+        key: i32,
+        size: usize,
+        shmflg: i32,
+    },
+    /// `shmat(shmid, shmaddr, shmflg)`.
+    Shmat {
+        shmid: i32,
+        shmaddr: usize,
+        shmflg: i32,
+    },
+    /// `shmdt(shmaddr)`.
+    Shmdt {
+        shmaddr: usize,
+    },
+    /// `shmctl(shmid, cmd, buf)`.
+    Shmctl {
+        shmid: i32,
+        cmd: i32,
+        buf: Option<UserPtrMut<u8>>,
+    },
     Waitid {
         idtype: i32,
         id: u32,
@@ -4185,6 +4211,14 @@ impl SyscallRequest {
                 options,
                 rusage:*
             }),
+            Sysno::shmget => sys_req!(Shmget { key, size, shmflg }),
+            Sysno::shmat => sys_req!(Shmat {
+                shmid,
+                shmaddr,
+                shmflg
+            }),
+            Sysno::shmdt => sys_req!(Shmdt { shmaddr }),
+            Sysno::shmctl => sys_req!(Shmctl { shmid, cmd, buf:* }),
             Sysno::waitid => sys_req!(Waitid {
                 idtype,
                 id,

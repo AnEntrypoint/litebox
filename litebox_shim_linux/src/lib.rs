@@ -433,6 +433,8 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+            sysv_shm: litebox::sync::Mutex::new(syscalls::mm::SysvShmTable::new()),
+            next_shmid: core::sync::atomic::AtomicI32::new(1),
             flock_registry: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
             next_flock_holder_id: core::sync::atomic::AtomicU64::new(1),
             pty_registry: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
@@ -2282,6 +2284,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 options,
                 rusage,
             } => self.sys_wait4(pid, wstatus, options, rusage),
+            SyscallRequest::Shmget { key, size, shmflg } => self.sys_shmget(key, size, shmflg),
+            SyscallRequest::Shmat {
+                shmid,
+                shmaddr,
+                shmflg,
+            } => self.sys_shmat(shmid, shmaddr, shmflg),
+            SyscallRequest::Shmdt { shmaddr } => self.sys_shmdt(shmaddr),
+            SyscallRequest::Shmctl { shmid, cmd, buf } => self.sys_shmctl(shmid, cmd, buf),
             SyscallRequest::Waitid {
                 idtype,
                 id,
@@ -2340,6 +2350,13 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<Platform, FS>>,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.
     elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
+    /// System V shared-memory segments, keyed by `shmid`.
+    ///
+    /// Shim-wide because SysV shm is a global namespace by definition -- any process that knows
+    /// the key or id can attach. See [`syscalls::mm::SysvShmSegment`].
+    sysv_shm: litebox::sync::Mutex<Platform, syscalls::mm::SysvShmTable>,
+    /// Next `shmid` to hand out.
+    next_shmid: core::sync::atomic::AtomicI32,
     /// Registry of `flock(2)` advisory-lock state, keyed by the underlying file's `(dev, ino)`.
     ///
     /// This is deliberately shim-wide (not per-`FilesState`/per-process): real `flock()` locks

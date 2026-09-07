@@ -69,6 +69,220 @@ fn cow_mmap_enabled() -> bool {
     COW_MMAP_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// One System V shared-memory segment.
+///
+/// litebox runs every guest process inside ONE real host address space (see `Vmem::duplicate`'s
+/// "Known deviation" section), which makes SysV shm unusually simple here: a segment is just an
+/// ordinary anonymous mapping, and because the address is valid in every guest process, `shmat`
+/// can hand back the same pointer to all of them instead of establishing a second mapping. That
+/// is genuine sharing, not an approximation -- writes through one attachment are immediately
+/// visible to the others, which is exactly what callers rely on.
+pub(crate) struct SysvShmSegment {
+    /// Base address of the backing anonymous mapping.
+    addr: usize,
+    /// Size in bytes, rounded up to a page.
+    size: usize,
+    /// The `key` this segment was created for, or `IPC_PRIVATE` (0).
+    key: i32,
+    /// Number of live `shmat` attachments.
+    attaches: usize,
+    /// Set by `shmctl(IPC_RMID)`. Real Linux keeps a removed segment alive until the last
+    /// detach, and so does this.
+    removed: bool,
+}
+
+/// All System V shared-memory segments, plus the key -> id index `shmget` needs.
+pub(crate) struct SysvShmTable {
+    segments: BTreeMap<i32, SysvShmSegment>,
+    by_key: BTreeMap<i32, i32>,
+}
+
+impl SysvShmTable {
+    pub(crate) fn new() -> Self {
+        Self {
+            segments: BTreeMap::new(),
+            by_key: BTreeMap::new(),
+        }
+    }
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    /// `shmget(key, size, shmflg)`.
+    ///
+    /// System V shared memory was entirely unimplemented, which is what stopped the webtop's
+    /// video: X11's MIT-SHM extension is how a screen-capture client moves framebuffer bytes, and
+    /// selkies' `pixelflux` capture aborts with a bare "shmget failed" without it -- the browser
+    /// then sits on "Waiting for stream..." forever with no other diagnostic.
+    pub(crate) fn sys_shmget(&self, key: i32, size: usize, shmflg: i32) -> Result<usize, Errno> {
+        const IPC_PRIVATE: i32 = 0;
+        const IPC_CREAT: i32 = 0o1000;
+        const IPC_EXCL: i32 = 0o2000;
+
+        let mut table = self.global.sysv_shm.lock();
+
+        if key != IPC_PRIVATE
+            && let Some(&existing) = table.by_key.get(&key)
+        {
+            if shmflg & (IPC_CREAT | IPC_EXCL) == (IPC_CREAT | IPC_EXCL) {
+                return Err(Errno::EEXIST);
+            }
+            // A caller asking for MORE than the existing segment holds cannot be satisfied by
+            // handing it back, and silently returning a too-small segment would corrupt whatever
+            // wrote past the end.
+            let seg = table
+                .segments
+                .get(&existing)
+                .expect("by_key only ever indexes live segments");
+            if size > seg.size {
+                return Err(Errno::EINVAL);
+            }
+            return Ok(usize::try_from(existing).unwrap());
+        }
+
+        if key != IPC_PRIVATE && shmflg & IPC_CREAT == 0 {
+            return Err(Errno::ENOENT);
+        }
+        if size == 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        let page = litebox::mm::linux::PAGE_SIZE;
+        let rounded = size.checked_next_multiple_of(page).ok_or(Errno::EINVAL)?;
+
+        // Ordinary anonymous, readable/writable guest memory -- see this type's doc comment for
+        // why that is sufficient to be genuinely shared here.
+        let ptr = self
+            .do_mmap_anonymous(
+                None,
+                rounded,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
+            )
+            .map_err(|_| Errno::ENOMEM)?;
+
+        let shmid = self
+            .global
+            .next_shmid
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        table.segments.insert(
+            shmid,
+            SysvShmSegment {
+                addr: ptr.as_usize(),
+                size: rounded,
+                key,
+                attaches: 0,
+                removed: false,
+            },
+        );
+        if key != IPC_PRIVATE {
+            table.by_key.insert(key, shmid);
+        }
+        litebox_util_log::debug!(
+            key:% = key, shmid:% = shmid, size:% = rounded, addr:% = ptr.as_usize();
+            "sysv shm: created segment"
+        );
+        Ok(usize::try_from(shmid).unwrap())
+    }
+
+    /// `shmat(shmid, shmaddr, shmflg)`.
+    ///
+    /// Returns the segment's existing address. A non-null `shmaddr` asking to place the segment
+    /// somewhere specific is refused with `EINVAL` rather than honoured: there is one address
+    /// space here, so the segment already lives at exactly one address and cannot also appear at
+    /// another. Callers that pass `NULL` -- which is every caller in practice, including Xlib's
+    /// MIT-SHM -- are unaffected.
+    pub(crate) fn sys_shmat(
+        &self,
+        shmid: i32,
+        shmaddr: usize,
+        _shmflg: i32,
+    ) -> Result<usize, Errno> {
+        let mut table = self.global.sysv_shm.lock();
+        let Some(seg) = table.segments.get_mut(&shmid) else {
+            return Err(Errno::EINVAL);
+        };
+        if shmaddr != 0 && shmaddr != seg.addr {
+            log_unsupported!("shmat with a caller-chosen address ({shmaddr:#x})");
+            return Err(Errno::EINVAL);
+        }
+        seg.attaches += 1;
+        Ok(seg.addr)
+    }
+
+    /// `shmdt(shmaddr)`.
+    pub(crate) fn sys_shmdt(&self, shmaddr: usize) -> Result<usize, Errno> {
+        let mut table = self.global.sysv_shm.lock();
+        let Some((&shmid, _)) = table.segments.iter().find(|(_, s)| s.addr == shmaddr) else {
+            return Err(Errno::EINVAL);
+        };
+        let seg = table
+            .segments
+            .get_mut(&shmid)
+            .expect("id just located in this same table");
+        seg.attaches = seg.attaches.saturating_sub(1);
+        let drop_now = seg.removed && seg.attaches == 0;
+        if drop_now {
+            let key = seg.key;
+            table.segments.remove(&shmid);
+            table.by_key.remove(&key);
+        }
+        Ok(0)
+    }
+
+    /// `shmctl(shmid, cmd, buf)`.
+    ///
+    /// `IPC_RMID` and `IPC_STAT` are implemented; both are what MIT-SHM clients use (they attach,
+    /// immediately mark the segment removed so it cannot leak, and keep using it until detach).
+    pub(crate) fn sys_shmctl(
+        &self,
+        shmid: i32,
+        cmd: i32,
+        buf: Option<UserPtrMut<u8>>,
+    ) -> Result<usize, Errno> {
+        const IPC_RMID: i32 = 0;
+        const IPC_STAT: i32 = 2;
+
+        let mut table = self.global.sysv_shm.lock();
+        let Some(seg) = table.segments.get_mut(&shmid) else {
+            return Err(Errno::EINVAL);
+        };
+
+        match cmd {
+            IPC_RMID => {
+                seg.removed = true;
+                let drop_now = seg.attaches == 0;
+                if drop_now {
+                    let key = seg.key;
+                    table.segments.remove(&shmid);
+                    table.by_key.remove(&key);
+                }
+                Ok(0)
+            }
+            IPC_STAT => {
+                // `struct shmid_ds` on x86-64: a 48-byte `ipc_perm` followed by `shm_segsz`.
+                // Only the size is meaningfully knowable here; the rest is zeroed rather than
+                // fabricated.
+                let Some(buf) = buf else {
+                    return Err(Errno::EFAULT);
+                };
+                let size = seg.size;
+                for i in 0..48isize {
+                    let _ = buf.write_at_offset::<Platform>(i, 0u8);
+                }
+                for (i, b) in size.to_le_bytes().iter().enumerate() {
+                    let off = 48isize + isize::try_from(i).unwrap();
+                    let _ = buf.write_at_offset::<Platform>(off, *b);
+                }
+                Ok(0)
+            }
+            other => {
+                log_unsupported!("shmctl cmd={other}");
+                Err(Errno::EINVAL)
+            }
+        }
+    }
+}
+
 /// Per-memfd real shared-memory state, keyed by the backing in-mem file's own `(dev, ino)` (see
 /// `GlobalState::memfds`'s doc comment for why this lives shim-wide, mirroring
 /// `syscalls::file::FlockRegistry`'s identical `(dev, ino)`-keying rationale).
