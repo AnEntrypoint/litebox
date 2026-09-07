@@ -5138,6 +5138,30 @@ fn release_claim_range_for_current_thread(range: core::ops::Range<usize>) {
 /// got its `Rip` redirected to `interrupt_callback` by the caller, and abandoned its mutation
 /// partway -- corrupting the process-wide global allocator for every other thread. See
 /// [`litebox::mm::allocator::slab_allocator_code_addrs`] for the addresses this now consults.
+/// Whether `LITEBOX_DIAG_INTERRUPT` is set, read once per process and cached.
+///
+/// Deliberately not a `std::env::var_os` call at the use site. [`ThreadHandle::interrupt`] reads
+/// this flag while its target thread is SUSPENDED, and on Windows `std::env::var_os` is not a
+/// cheap read: it allocates (`fill_utf16_buf` grows a `Vec`, then the `OsString`) and it enters
+/// ntdll's process-wide environment critical section via `RtlQueryEnvironmentVariable`. Either is
+/// unrecoverable inside the suspend window -- `SuspendThread` stops the target at an arbitrary
+/// instruction boundary, so it may itself be holding the environment lock or the process heap
+/// lock, and a suspending thread that then blocks on one can never reach its own `ResumeThread`.
+/// That is a true deadlock, not a stall: the holder cannot run until it is resumed, and the only
+/// code that would resume it is the code now blocked.
+///
+/// Observed live, not theorised. A full MATE session under LiteBox froze with all 20 host threads
+/// in `Wait`; `cdb -pv` showed exactly one thread at `Suspend: 2` (a non-invasive attach adds 1 to
+/// every thread, so this one was genuinely `SuspendThread`ed) parked inside
+/// `ntdll!RtlQueryEnvironmentVariable`, six more queued behind it in
+/// `RtlpEnterCriticalSectionContended` on that same critical section, and the rest blocked in
+/// `ThreadHandle::interrupt`. The freeze landed at a different guest pid on each run, which is
+/// what a lock race looks like and what resource exhaustion does not.
+fn diag_interrupt_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("LITEBOX_DIAG_INTERRUPT").is_some())
+}
+
 fn rip_in_global_allocator(rip: usize) -> bool {
     // 128 KiB around each real entry point. Smaller than the old single 512 KiB window because
     // there are now several anchors covering the code that actually matters, so each one can be
@@ -5251,7 +5275,7 @@ impl ThreadHandle {
     ///    context to resume at the interrupt callback.
     /// 5. Resume the target thread.
     fn interrupt(&self, current: Option<&ThreadHandle>) {
-        if std::env::var_os("LITEBOX_DIAG_INTERRUPT").is_some() {
+        if diag_interrupt_enabled() {
             diag_raw_print(
                 b"[diag-interrupt-enter] caller_tid=0x",
                 unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() } as usize,
@@ -5293,6 +5317,16 @@ impl ThreadHandle {
         // running host allocator code is never expected to run there for more than a handful of
         // instructions, so a short bounded retry loop (capped, to guarantee `interrupt` still
         // makes forward progress even if this heuristic race-loses every time) is safe and cheap.
+        // Prime every lazily-initialised thing the suspend window below touches, BEFORE the
+        // first `SuspendThread`. Between that suspend and its matching `ResumeThread` this thread
+        // must neither allocate nor block on any lock the target could be holding -- see
+        // [`diag_interrupt_enabled`] for the deadlock this prevents and how it was observed.
+        // `diag_interrupt_enabled` primed itself in this function's first statement; a `OnceLock`
+        // and a thread-local latch are the other two, and both take a real lock (or allocate) on
+        // first touch while being a plain load afterwards.
+        let _ = diag_rip0_enabled();
+        let _ = is_in_ntdll_or_this(0);
+
         const MAX_ALLOCATOR_SUSPEND_RETRIES: u32 = 8;
         let mut attempt = 0u32;
         loop {
@@ -5327,7 +5361,7 @@ impl ThreadHandle {
             }
             std::thread::yield_now();
         }
-        if std::env::var_os("LITEBOX_DIAG_INTERRUPT").is_some() {
+        if diag_interrupt_enabled() {
             diag_raw_print(
                 b"[diag-interrupt-suspended] target_handle=0x",
                 inner.handle.as_raw_handle() as usize,
@@ -5337,7 +5371,7 @@ impl ThreadHandle {
         }
         let _resume_guard = litebox::utils::defer(|| unsafe {
             windows_sys::Win32::System::Threading::ResumeThread(inner.handle.as_raw_handle());
-            if std::env::var_os("LITEBOX_DIAG_INTERRUPT").is_some() {
+            if diag_interrupt_enabled() {
                 eprintln!("[diag-interrupt-resumed]");
             }
         });
@@ -9153,7 +9187,30 @@ impl litebox::platform::SystemInfoProvider for WindowsUserland {
     }
 
     fn env_flag(&self, name: &str) -> bool {
-        std::env::var_os(name).is_some_and(|v| !v.is_empty())
+        // Cached per thread, because callers reasonably treat a trait method named `env_flag` as
+        // a predicate cheap enough to consult from a hot path -- the shim's syscall dispatch did
+        // exactly that, twice per syscall. On Windows it is not cheap: every call enters ntdll's
+        // process-wide environment critical section (`RtlQueryEnvironmentVariable`) and allocates
+        // twice. Across a multi-threaded guest that makes one OS-owned lock the busiest lock in
+        // the process, and it widens the window in which `ThreadHandle::interrupt` can suspend a
+        // thread that is holding it (see `diag_interrupt_enabled` for the deadlock that caused).
+        //
+        // Per-thread rather than process-wide on purpose: the cache is then read and written with
+        // no synchronisation at all, so a fix for lock contention cannot reintroduce any. Host
+        // environment variables do not change during a run, so the duplication is free.
+        thread_local! {
+            static CACHE: RefCell<std::vec::Vec<(std::string::String, bool)>> =
+                const { RefCell::new(std::vec::Vec::new()) };
+        }
+        CACHE.with(|c| {
+            let hit = c.borrow().iter().find(|(k, _)| k == name).map(|&(_, v)| v);
+            if let Some(v) = hit {
+                return v;
+            }
+            let v = std::env::var_os(name).is_some_and(|v| !v.is_empty());
+            c.borrow_mut().push((name.into(), v));
+            v
+        })
     }
 
     fn cpu_count(&self) -> usize {

@@ -56,12 +56,25 @@ static STRACE_SUMMARY: spin::Mutex<StraceSummary> = spin::Mutex::new(StraceSumma
 /// dedicated unsupported-commands report section.
 const NOTABLE_ERRNOS: &[&str] = &["ENOSYS", "EINVAL", "ENOTSUP", "EOPNOTSUPP", "EPERM"];
 
-/// Call once, early (e.g. from the first syscall dispatch), with the platform's `env_flag`
-/// result for `LITEBOX_STRACE_SUMMARY`. Idempotent and cheap after the first call.
-pub fn init_strace_summary(enabled: bool) {
-    if !STRACE_INIT.swap(true, Ordering::AcqRel) {
-        STRACE_ENABLED.store(enabled, Ordering::Release);
+/// Call once, early (e.g. from the first syscall dispatch), with a closure performing the
+/// platform's `env_flag` lookup for `LITEBOX_STRACE_SUMMARY`. Idempotent, and after the first
+/// call costs one acquire load -- the closure is never run again.
+pub fn init_strace_summary(enabled: impl FnOnce() -> bool) {
+    // The parameter is a closure, not a `bool`, so the caller's `env_flag` lookup is not
+    // evaluated on every call. It used to be: an eagerly-evaluated argument made this
+    // "idempotent and cheap after the first call" latch cost a full host environment-variable
+    // read per syscall per thread, which on Windows means a process-wide critical section and
+    // two allocations -- the exact opposite of what the call site's own comment promised. The
+    // `swap` is gone for the same reason: an unconditional read-modify-write on a shared cache
+    // line, once per syscall on every guest thread, is not free either.
+    if STRACE_INIT.load(Ordering::Acquire) {
+        return;
     }
+    // Racing callers are harmless: they read the same host environment and latch the same value.
+    // `ENABLED` is published before `INIT` so a reader that observes the latch also observes the
+    // value that was latched.
+    STRACE_ENABLED.store(enabled(), Ordering::Release);
+    STRACE_INIT.store(true, Ordering::Release);
 }
 
 pub fn strace_summary_enabled() -> bool {
@@ -130,13 +143,15 @@ pub fn record_unsupported_subcommand(description: &str, errno_name: &str, pid: i
 static SYSCALL_TIMELINE_ENABLED: AtomicBool = AtomicBool::new(false);
 static SYSCALL_TIMELINE_INIT: AtomicBool = AtomicBool::new(false);
 
-/// Call once, early, with the platform's `env_flag` result for
+/// Call once, early, with a closure performing the platform's `env_flag` lookup for
 /// `LITEBOX_DIAG_SYSCALL_TIMELINE`. Idempotent, same lazy-latch pattern as
-/// [`init_strace_summary`].
-pub fn init_syscall_timeline(enabled: bool) {
-    if !SYSCALL_TIMELINE_INIT.swap(true, Ordering::AcqRel) {
-        SYSCALL_TIMELINE_ENABLED.store(enabled, Ordering::Release);
+/// [`init_strace_summary`], including why the argument is a closure.
+pub fn init_syscall_timeline(enabled: impl FnOnce() -> bool) {
+    if SYSCALL_TIMELINE_INIT.load(Ordering::Acquire) {
+        return;
     }
+    SYSCALL_TIMELINE_ENABLED.store(enabled(), Ordering::Release);
+    SYSCALL_TIMELINE_INIT.store(true, Ordering::Release);
 }
 
 pub fn syscall_timeline_enabled() -> bool {

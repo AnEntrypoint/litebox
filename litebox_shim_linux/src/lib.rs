@@ -1337,7 +1337,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // process environment -- see `diag`'s module doc comment) and, when enabled, time this
         // dispatch and record the outcome. Zero overhead beyond one relaxed atomic load when
         // unset.
-        crate::diag::init_strace_summary(self.global.platform.env_flag("LITEBOX_STRACE_SUMMARY"));
+        crate::diag::init_strace_summary(|| self.global.platform.env_flag("LITEBOX_STRACE_SUMMARY"));
         let timed = crate::diag::strace_summary_enabled();
         #[cfg(target_arch = "x86_64")]
         let syscall_number = ctx.orig_rax;
@@ -1360,7 +1360,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // new `SystemInfoProvider` trait method -- avoided here specifically because that trait
         // is in `litebox/src/platform/mod.rs`, mid-edit by a peer session this pass) keeps this
         // proportional to the specific client processes under investigation.
-        crate::diag::init_syscall_timeline(self.global.platform.env_flag("LITEBOX_DIAG_SYSCALL_TIMELINE"));
+        crate::diag::init_syscall_timeline(|| self.global.platform.env_flag("LITEBOX_DIAG_SYSCALL_TIMELINE"));
         let comm_bytes = self.comm.get();
         let is_target = crate::diag::syscall_timeline_enabled()
             && crate::diag::is_syscall_timeline_target_comm(&comm_bytes);
