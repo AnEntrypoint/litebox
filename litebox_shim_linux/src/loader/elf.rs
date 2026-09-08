@@ -207,6 +207,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox_common_linux::loader::MapMemory
 pub struct ElfLoadInfo {
     pub entry_point: usize,
     pub user_stack_top: usize,
+    /// This process's auxiliary vector, serialized in `/proc/[pid]/auxv` form, exactly as written
+    /// to the initial stack -- see `UserStack::push_aux`. Carried out of the loader because the
+    /// complete vector only exists here: the caller supplies some entries, `load` adds the ones
+    /// that depend on where the image landed (`AT_PHDR`, `AT_ENTRY`, `AT_BASE`), and the stack
+    /// writer adds `AT_RANDOM` last.
+    pub auxv: Vec<u8>,
 }
 
 /// Loader for ELF files
@@ -427,13 +433,14 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfLoader<'a, Platform, FS> {
             super::DEFAULT_STACK_SIZE,
         )
         .ok_or(ElfLoaderError::InvalidStackAddr)?;
-        stack
-            .init(argv, envp, aux, global.platform)
+        let auxv = stack
+            .init(argv, envp, aux, global.platform, self.path)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
 
         Ok(ElfLoadInfo {
             entry_point: entry,
             user_stack_top: stack.get_cur_stack_top(),
+            auxv,
         })
     }
 

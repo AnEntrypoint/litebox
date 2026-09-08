@@ -5086,6 +5086,48 @@ const SHEBANG_MAX_LINE: usize = 256;
 /// contains a non-empty interpreter path. The optional argument, if present, is everything
 /// between the first whitespace after the interpreter and the end of the line
 /// (trimmed), treated as a single token — matching Linux kernel semantics.
+/// Render this process's address space in `/proc/[pid]/maps` format.
+///
+/// One line per mapping:
+/// `start-end perms offset dev inode path`, addresses and offset in lowercase hex, exactly as
+/// `fs/proc/task_mmu.c` emits them.
+///
+/// # Why the trailing fields are zeros
+///
+/// litebox's `Vmem` tracks a range and its `VmFlags`; it does not track which file a range was
+/// mapped from, so `offset`, `dev` and `inode` are reported as zero and no path is printed --
+/// i.e. every mapping looks anonymous. That is a truthful rendering of what is known rather than
+/// an invented one, and it is sufficient for the readers that made this file necessary: Rust's
+/// std parses only the address ranges, to find the mapping containing the stack pointer when it
+/// installs its stack-overflow SIGSEGV handler. A consumer wanting to attribute an address to a
+/// shared library still cannot, and would need the loader to record file provenance per range --
+/// deliberately not invented here.
+///
+/// The `p` in the permission field is private-vs-shared; `VM_SHARED` is reported honestly.
+fn render_proc_maps<Platform: ShimPlatform>(
+    pm: &litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
+) -> alloc::vec::Vec<u8> {
+    use litebox::mm::linux::VmFlags;
+
+    let mut out = alloc::string::String::new();
+    for (range, flags) in pm.mappings() {
+        let _ = core::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "{:x}-{:x} {}{}{}{} 00000000 00:00 0
+",
+                range.start,
+                range.end,
+                if flags.contains(VmFlags::VM_READ) { "r" } else { "-" },
+                if flags.contains(VmFlags::VM_WRITE) { "w" } else { "-" },
+                if flags.contains(VmFlags::VM_EXEC) { "x" } else { "-" },
+                if flags.contains(VmFlags::VM_SHARED) { "s" } else { "p" },
+            ),
+        );
+    }
+    out.into_bytes()
+}
+
 fn parse_shebang(buf: &[u8]) -> Option<(&str, Option<&str>)> {
     if buf.len() < 2 || buf[0] != b'#' || buf[1] != b'!' {
         return None;
@@ -5378,6 +5420,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Loads the specified program into the process's address space and prepares the thread
     /// to start executing it.
+    ///
+    /// See also [`render_proc_maps`], installed here as this process's `/proc/self/maps` source.
     pub(crate) fn load_program(
         &self,
         mut loader: crate::loader::elf::ElfLoader<'_, Platform, FS>,
@@ -5405,10 +5449,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 environ,
                 pid: self.pid,
                 comm,
+                // Both filled in below: the complete auxiliary vector does not exist until `load`
+                // has placed the image and written the stack, and the maps renderer is installed
+                // against this process's page manager once it exists.
+                auxv: alloc::vec::Vec::new(),
+                maps: None,
             };
         }
 
+        // A live `/proc/self/maps` renderer over THIS process's page manager. Installed here
+        // rather than at mount time because the memory manager is per-process and only exists
+        // once the process does; `pm()` hands back an `Arc`, so the closure keeps the mapping
+        // table alive and always reports the CURRENT layout rather than a snapshot.
+        {
+            let pm = self.process().pm();
+            self.global.proc_self_info.write().maps =
+                Some(alloc::sync::Arc::new(move || render_proc_maps(&pm)));
+        }
+
         let load_info = loader.load(argv, envp, self.init_auxv())?;
+        // Completes the snapshot above. Deliberately after `load`, because the full auxiliary
+        // vector does not exist until the image has been placed (`AT_PHDR`/`AT_ENTRY`/`AT_BASE`)
+        // and the stack written (`AT_RANDOM`), and deliberately not reconstructed here -- these
+        // are the very bytes `load` wrote to the initial stack.
+        self.global.proc_self_info.write().auxv = load_info.auxv.clone();
 
         self.set_task_comm(loader.comm());
 

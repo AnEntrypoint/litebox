@@ -11,6 +11,17 @@
 //! real client needs" pattern already used by [`super::devices::ProcSysKernel`] for
 //! `/proc/sys/kernel/{overflowuid,overflowgid}`.
 //!
+//! `/proc/self/auxv` is load-bearing rather than informational: rustix falls back to reading
+//! it when it cannot obtain the auxiliary vector from the initial stack, and it `unwrap()`s
+//! the result. Every Rust-coreutils (uutils) binary therefore ABORTS outright without this
+//! file -- on `linuxserver/webtop:ubuntu-xfce`, whose /bin/mkdir, /bin/cp and /bin/rm are
+//! uutils, that meant every shell script in the boot path failing at its first command.
+//!
+//! `/proc/self/maps` is load-bearing for the same image and the same reason: Rust's std
+//! locates the main thread's stack guard by parsing it when installing the SIGSEGV handler
+//! that reports stack overflow. With the file absent it proceeds on a guess, and the first
+//! thing the guest does after `rt_sigaction(SIGSEGV)` is take a real SIGSEGV.
+//!
 //! Two backends, mounted separately (like `/dev` + `/dev/dri` in [`super::devices`]):
 //! - [`Procfs`], mounted at `/proc`: static/host-derived flat files (`cpuinfo`, `meminfo`,
 //!   `mounts`, `uptime`) that need no per-process state.
@@ -55,6 +66,24 @@ pub struct ProcSelfInfo {
     /// Command name (`argv[0]`'s basename, truncated to 15 bytes on real Linux), for `stat`'s
     /// `comm` field and `status`'s `Name:` field.
     pub comm: String,
+    /// The process's auxiliary vector in `/proc/[pid]/auxv` form: `(a_type, a_val)` `usize` pairs
+    /// in native byte order, terminated by an `AT_NULL` pair.
+    ///
+    /// Supplied by the loader from the very bytes it wrote to the initial stack, rather than
+    /// rebuilt here, so the file and the stack cannot disagree -- see the shim's
+    /// `UserStack::push_aux`.
+    pub auxv: Vec<u8>,
+    /// Renders `/proc/[pid]/maps` for the CURRENT process, or `None` before any process has been
+    /// loaded.
+    ///
+    /// A callback rather than a snapshot, because unlike every other field here the address space
+    /// changes constantly -- every `mmap`, `munmap`, `mprotect`, `dlopen` and heap growth alters
+    /// it. A value captured at `execve` would be stale by the time anything read it, and the
+    /// readers that matter are asking precisely because they need the CURRENT layout.
+    ///
+    /// It is a closure because this crate cannot name the shim's per-process memory manager; the
+    /// shim installs one that holds an `Arc` to it (see `load_program`).
+    pub maps: Option<alloc::sync::Arc<dyn Fn() -> Vec<u8> + Send + Sync>>,
 }
 
 /// Real `/proc/[pid]/stat` (see `man 5 proc`) has 52 whitespace-separated fields as of Linux
@@ -555,6 +584,8 @@ enum ProcSelfEntry {
     MountInfo,
     Cgroup,
     OomScoreAdj,
+    Auxv,
+    Maps,
 }
 
 impl ProcSelfEntry {
@@ -567,6 +598,8 @@ impl ProcSelfEntry {
         ("mountinfo", ProcSelfEntry::MountInfo),
         ("cgroup", ProcSelfEntry::Cgroup),
         ("oom_score_adj", ProcSelfEntry::OomScoreAdj),
+        ("auxv", ProcSelfEntry::Auxv),
+        ("maps", ProcSelfEntry::Maps),
     ];
 
     fn from_name(name: &str) -> Option<Self> {
@@ -612,6 +645,16 @@ const PROC_SELF_CGROUP_NODE_INFO: NodeInfo = NodeInfo {
 const PROC_SELF_OOM_SCORE_ADJ_NODE_INFO: NodeInfo = NodeInfo {
     dev: 7,
     ino: 8,
+    rdev: None,
+};
+const PROC_SELF_AUXV_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 7,
+    ino: 9,
+    rdev: None,
+};
+const PROC_SELF_MAPS_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 7,
+    ino: 10,
     rdev: None,
 };
 
@@ -712,6 +755,8 @@ where
             ProcSelfEntry::MountInfo => format_mountinfo(),
             ProcSelfEntry::Cgroup => format_cgroup(),
             ProcSelfEntry::OomScoreAdj => format_oom_score_adj(),
+            ProcSelfEntry::Auxv => snapshot.auxv.clone(),
+            ProcSelfEntry::Maps => snapshot.maps.as_ref().map_or_else(Vec::new, |f| f()),
         };
         Ok(Permissioned {
             item: FileHandle::from_typed::<Self>(ProcSelfFileHandle { entry, content }),
@@ -798,6 +843,8 @@ where
                 ProcSelfEntry::MountInfo => PROC_SELF_MOUNTINFO_NODE_INFO,
                 ProcSelfEntry::Cgroup => PROC_SELF_CGROUP_NODE_INFO,
                 ProcSelfEntry::OomScoreAdj => PROC_SELF_OOM_SCORE_ADJ_NODE_INFO,
+                ProcSelfEntry::Auxv => PROC_SELF_AUXV_NODE_INFO,
+                ProcSelfEntry::Maps => PROC_SELF_MAPS_NODE_INFO,
             },
             blksize: 0x1000,
             atime: Timestamp::default(),
