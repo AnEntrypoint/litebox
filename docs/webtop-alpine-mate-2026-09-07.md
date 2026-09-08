@@ -1069,3 +1069,29 @@ NOTHING inside that window may allocate or take a lock the suspended threads cou
 `diag_interrupt_enabled`), or the child must fault its own pages in from the parent on demand
 rather than being handed an eager copy. Both are real designs; neither is a small change, and
 picking one should be a deliberate decision rather than the next thing tried.
+
+#### Correction to the section above
+
+The "races demand-commit from other guest threads" explanation is **wrong**, and is retracted
+here rather than left standing. The repro is `sh -c 'echo A; (echo B); echo C'` and `sh` is
+single-threaded: at the moment of the copy the only guest thread is the one executing `do_clone`,
+so there is no concurrent guest thread committing pages underneath it. What the page-by-page trace
+actually establishes is narrower, and still useful:
+
+* the copy reaches `0x10106000` -- the address behind every unexplained crash this session -- and
+  that page is genuinely `State=MEM_RESERVE`, not committed;
+* `read_source_bytes` consults `fork_verify::is_readable`, which correctly rejects a non-committed
+  page, so the read is skipped and no fault should occur there;
+* yet the process dies between that page's trace line and the next one.
+
+So the failure is somewhere in that window and is NOT explained by the reserved page alone. The
+final AV record captured is `rip=0x0 addr=0x0 rax=0xc0000005 is_in_guest=false` -- a jump to null
+with the access-violation status still in `rax`, i.e. a nested failure inside exception dispatch
+rather than a clean first fault. Instrumentation perturbs it (the failure mode, AV count and exit
+code all move between identical runs), which is what defeated eight successive attempts.
+
+What remains true and load-bearing from that section: the ten-second repro, the tiny-rootfs trick
+(`alpine:latest`, 8.8 MB, 84 MB copy plan instead of 1.5 GB) that makes per-page instrumentation
+practical, and the fact that every crash converges on the same address. What is NOT established is
+why. Anyone picking this up should start from the nested-dispatch failure, not from the reserved
+page, and should not trust the retracted race explanation.
