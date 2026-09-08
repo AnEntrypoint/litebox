@@ -825,19 +825,37 @@ fn hook_syscalls_in_section(
 /// `e_phoff` in the ELF header. Only ELF64 files are handled (ELF32 requires 4-byte alignment
 /// which is always satisfied when `e_phoff` is within a valid file).
 fn fixup_phdr_alignment(buf: &mut [u8]) {
-    // Minimum ELF header size for ELF64
-    if buf.len() < 64 {
+    use core::mem::offset_of;
+    use object::elf::FileHeader64;
+    use object::endian::LittleEndian;
+
+    // Field offsets come from `object`'s own `FileHeader64`, not from literals. The second half of
+    // this function already did exactly this for `ProgramHeader64` -- the first half used hand-
+    // counted offsets (`32..40`, `54..56`, `56..58`) for the same file's header, so one function
+    // held two different encodings of the same knowledge and only one of them was checkable.
+    const E_PHOFF: usize = offset_of!(FileHeader64<LittleEndian>, e_phoff);
+    const E_PHENTSIZE: usize = offset_of!(FileHeader64<LittleEndian>, e_phentsize);
+    const E_PHNUM: usize = offset_of!(FileHeader64<LittleEndian>, e_phnum);
+
+    if buf.len() < ELF_HEADER_LEN {
         return;
     }
 
     // Check ELF magic, class (must be ELF64), and byte order (must be little-endian).
-    if &buf[0..4] != b"\x7fELF" || buf[4] != 2 || buf[5] != 1 {
+    if &buf[0..4] != b"\x7fELF"
+        || buf[4] != object::elf::ELFCLASS64
+        || buf[5] != object::elf::ELFDATA2LSB
+    {
         return;
     }
 
-    let e_phoff = u64::from_le_bytes(buf[32..40].try_into().unwrap());
-    let e_phentsize = u64::from(u16::from_le_bytes(buf[54..56].try_into().unwrap()));
-    let e_phnum = u64::from(u16::from_le_bytes(buf[56..58].try_into().unwrap()));
+    let e_phoff = u64::from_le_bytes(buf[E_PHOFF..E_PHOFF + 8].try_into().unwrap());
+    let e_phentsize = u64::from(u16::from_le_bytes(
+        buf[E_PHENTSIZE..E_PHENTSIZE + 2].try_into().unwrap(),
+    ));
+    let e_phnum = u64::from(u16::from_le_bytes(
+        buf[E_PHNUM..E_PHNUM + 2].try_into().unwrap(),
+    ));
 
     if e_phoff == 0 || e_phnum == 0 || e_phentsize == 0 {
         return;
@@ -892,7 +910,7 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
 
     // Update e_phoff in the ELF header.
     let new_phoff = (e_phoff + padding as u64).to_le_bytes();
-    buf[32..40].copy_from_slice(&new_phoff);
+    buf[E_PHOFF..E_PHOFF + 8].copy_from_slice(&new_phoff);
 
     // Also update the PHDR segment's p_offset, p_vaddr, and p_paddr if present.
     // Shifting the phdr table forward in the file shifts it within the PT_LOAD
@@ -913,12 +931,14 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
         if entry_off + 32 > buf.len() {
             break;
         }
-        let p_type = u32::from_le_bytes(buf[entry_off..entry_off + 4].try_into().unwrap());
+        let p_type_off = entry_off + offset_of!(object::elf::ProgramHeader64<LittleEndian>, p_type);
+        if p_type_off + 4 > buf.len() {
+            break;
+        }
+        let p_type = u32::from_le_bytes(buf[p_type_off..p_type_off + 4].try_into().unwrap());
         if p_type == object::elf::PT_PHDR {
-            use core::mem::offset_of;
             use object::elf::ProgramHeader64;
-            use object::endian::LittleEndian;
-            // PT_PHDR — shift p_offset, p_vaddr, and p_paddr by `padding`.
+            // PT_PHDR -- shift p_offset, p_vaddr, and p_paddr by `padding`.
             for field_off in [
                 offset_of!(ProgramHeader64<LittleEndian>, p_offset),
                 offset_of!(ProgramHeader64<LittleEndian>, p_vaddr),

@@ -17,9 +17,23 @@ fn objdump(binary: &[u8]) -> String {
         .output()
         .unwrap();
 
+    // `objdump` names the file it was given in its header line, and the two calls this test makes
+    // (original vs rewritten) necessarily use two different temp files. That line must not reach
+    // the diff, or the snapshot records two random file names.
+    //
+    // This used to be `.filter(|l| !l.contains("/tmp/"))` -- a Unix-only guess at what a temp path
+    // looks like. On Windows `NamedTempFile` yields `C:\Users\...\AppData\Local\Temp\.tmpXXXXXX`,
+    // so the filter never matched, both names landed in the snapshot, and this test could not pass
+    // on Windows at all. The failure then read as a rewriter regression rather than a
+    // test-harness bug, which is exactly the wrong signal from the one test that guards the
+    // rewriter's output byte-for-byte.
+    //
+    // Filtering on the path this test itself created is exact, and needs no assumption about where
+    // the platform puts temporary files.
+    let temp_path = temp_file.path().to_string_lossy().into_owned();
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter(|l| !l.contains("/tmp/"))
+        .filter(|line| !line.contains(&temp_path))
         .map(|line| normalize_objdump_line(line, trampoline_range.as_ref()))
         .collect::<Vec<_>>()
         .join("\n")
