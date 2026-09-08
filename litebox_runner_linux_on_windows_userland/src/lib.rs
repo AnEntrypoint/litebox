@@ -940,6 +940,21 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         .is_some()
         .then(|| initial_file_system.clone());
 
+    // Teach the platform how to hand a cross-process `fork()` child this process's writable layer.
+    //
+    // Registered unconditionally: it costs one boxed closure, and the platform only ever calls it
+    // when a cross-process fork actually happens (`LITEBOX_PROCESS_FORK=1`). Uses the SAME tar
+    // writer `--export-writable-layer` uses, whose reader is the `import_writable_layer` the child
+    // calls -- see `FORK_CHILD_PARENT_LAYER_ENV_VAR` for why the child needs this at all.
+    {
+        let fs_for_fork = initial_file_system.clone();
+        litebox_platform_windows_userland::process_fork::register_parent_writable_layer_exporter(
+            Box::new(move |path| {
+                export_writable_layer(&fs_for_fork, path).map_err(|e| format!("{e}"))
+            }),
+        );
+    }
+
     let exit_code = if cli_args.pty_mode {
         let init_task = platform.init_task();
 
@@ -1201,6 +1216,34 @@ pub fn diag_process_fork_globalstate_probe() {
     // no handling for besides `unimplemented!` (`litebox/src/fs/layered.rs:243`).
     let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
     initialize_root_in_mem_layer(&mut in_mem);
+
+    // Adopt the parent's writable layer, so this child's filesystem is the one `fork()` promises
+    // rather than a pristine rootfs. Without it a child cannot see anything the parent -- or an
+    // earlier sibling, whose own export the parent has already imported -- has written; see
+    // `FORK_CHILD_PARENT_LAYER_ENV_VAR` for the exact `/init` failure that exposed this.
+    //
+    // Best-effort in the same way the child-to-parent export is: a missing or malformed archive
+    // degrades to the base rootfs rather than aborting a child that is otherwise ready to run.
+    // `with_root_privileges` because this child's adopted `Task` runs as root and the entries
+    // being restored are root-owned, matching `--resume-from`'s own import above.
+    if let Some(parent_layer) = std::env::var_os(
+        litebox_platform_windows_userland::process_fork::FORK_CHILD_PARENT_LAYER_ENV_VAR,
+    ) {
+        let parent_layer = PathBuf::from(&parent_layer);
+        in_mem.with_root_privileges(|fs| match import_writable_layer(fs, &parent_layer) {
+            Ok(()) => eprintln!(
+                "[process_fork_diag] globalstate-probe (child): adopted the parent's writable layer from {}",
+                parent_layer.display()
+            ),
+            Err(e) => eprintln!(
+                "[process_fork_diag] globalstate-probe (child): could not adopt the parent's writable layer from {}: {e}",
+                parent_layer.display()
+            ),
+        });
+        // Single-use, and this child is its only reader.
+        let _ = std::fs::remove_file(&parent_layer);
+    }
+
     let fs = shim_builder.default_fs(in_mem, tar_data.into());
     let fs = std::sync::Arc::new(fs);
 

@@ -784,6 +784,68 @@ pub const FORK_CHILD_GPRS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_GPRS";
 /// process's environment. Never guest-visible.
 pub const FORK_CHILD_PIPE_FDS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_PIPE_FDS";
 
+/// Carries the path of a tar holding the PARENT's writable filesystem layer at the instant of a
+/// cross-process `fork()`, for the child to import over its own freshly-built rootfs.
+///
+/// A cross-process child re-execs this binary and rebuilds its filesystem from the original
+/// `--initial-files` tar plus an empty in-memory upper layer, so without this it starts from a
+/// pristine rootfs and cannot see a single write the parent (or an earlier sibling, via the
+/// child-to-parent export this mirrors) has made. Real `fork()` gives the child the parent's exact
+/// filesystem view, and this is what restores that. Observed the gap directly: `/init`'s `preinit`
+/// creates `/run/s6` in one forked child, that child's export lands back in the parent, and then
+/// `s6-linux-init-maker` in the NEXT child died with `unable to mkdir /run/s6/basedir: No such
+/// file or directory`, because its rootfs had never heard of `/run/s6`.
+///
+/// The child deletes the file once it has imported it. Never guest-visible.
+pub const FORK_CHILD_PARENT_LAYER_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_PARENT_LAYER";
+
+/// Serializes the parent's current writable layer to `path`, or explains why it could not.
+type ParentWritableLayerExporter =
+    Box<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync + 'static>;
+
+static PARENT_WRITABLE_LAYER_EXPORTER: std::sync::OnceLock<ParentWritableLayerExporter> =
+    std::sync::OnceLock::new();
+
+/// Teach this crate how to serialize the parent's writable filesystem layer for a cross-process
+/// `fork()` child (see [`FORK_CHILD_PARENT_LAYER_ENV_VAR`]).
+///
+/// A registration seam rather than a direct call because the filesystem lives in the runner crate,
+/// which depends on this one -- and because the archive format is the runner's `tar` writer, the
+/// exact counterpart of the `import_writable_layer` the child will use to read it back. Called
+/// once from the runner's bootstrap; a second call is ignored.
+pub fn register_parent_writable_layer_exporter(exporter: ParentWritableLayerExporter) {
+    let _ = PARENT_WRITABLE_LAYER_EXPORTER.set(exporter);
+}
+
+/// Export the parent's writable layer for a child about to be spawned, returning the file's path.
+///
+/// Best-effort, and deliberately so: a failure here means the child sees only the base rootfs,
+/// which is exactly the behaviour before this existed -- strictly worse than a correct fork, but
+/// never worse than failing the fork outright.
+fn export_parent_writable_layer_for_child() -> Option<std::path::PathBuf> {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let exporter = PARENT_WRITABLE_LAYER_EXPORTER.get()?;
+    // Named by this process's pid plus a sequence number: several forks can be in flight from
+    // different guest threads, and a fixed name would let one overwrite another's archive.
+    let path = std::env::temp_dir().join(format!(
+        "litebox-forkparent-{}-{}.tar",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    match exporter(&path) {
+        Ok(()) => Some(path),
+        Err(e) => {
+            eprintln!(
+                "[process_fork] could not export the parent's writable layer for the fork child                  ({e}); it will start from the base rootfs only"
+            );
+            let _ = std::fs::remove_file(&path);
+            None
+        }
+    }
+}
+
 /// Write `buf` in full to an inherited Windows handle named by its raw value, returning whether
 /// every byte landed.
 ///
@@ -1241,6 +1303,16 @@ pub fn spawn_process_fork_child(
         (FORK_CHILD_VMA_LAYOUT_ENV_VAR, relocations_line.clone()),
         (FORK_CHILD_GPRS_ENV_VAR, serialize_full_gprs(&full_gprs)),
     ];
+    // Exported BEFORE the spawn: the path has to be in the child's environment block, and the
+    // contents have to reflect the parent as of this `fork()`, not as of whenever the child gets
+    // around to reading it.
+    let parent_layer = export_parent_writable_layer_for_child();
+    if let Some(path) = &parent_layer {
+        child_env.push((
+            FORK_CHILD_PARENT_LAYER_ENV_VAR,
+            path.to_string_lossy().into_owned(),
+        ));
+    }
     if !child_pipe_handles.is_empty() {
         let spec = child_pipe_handles
             .iter()
@@ -1283,7 +1355,14 @@ pub fn spawn_process_fork_child(
             }
         }
     };
-    let spawn_result = spawn_result.inspect_err(|_| close_child_side());
+    // The CHILD deletes the parent-layer archive once it has imported it, so it is removed here
+    // only when there will be no child to do so.
+    let spawn_result = spawn_result.inspect_err(|_| {
+        close_child_side();
+        if let Some(path) = &parent_layer {
+            let _ = std::fs::remove_file(path);
+        }
+    });
     let (process, thread, pid, _stdout_read, _stdin_write) = spawn_result?;
     close_child_side();
     if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
@@ -1301,6 +1380,11 @@ pub fn spawn_process_fork_child(
                 TerminateProcess(process, 1);
                 CloseHandle(thread);
                 CloseHandle(process);
+            }
+            // The child is being torn down before it ever ran, so it will never import (and
+            // therefore never delete) the parent-layer archive. Do it here instead.
+            if let Some(path) = &parent_layer {
+                let _ = std::fs::remove_file(path);
             }
             eprintln!($($arg)*);
             return Ok(None);
