@@ -467,6 +467,8 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+            segment_scan_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+            exec_ranges_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
             sysv_shm: litebox::sync::Mutex::new(syscalls::mm::SysvShmTable::new()),
             next_shmid: core::sync::atomic::AtomicI32::new(1),
             flock_registry: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
@@ -2445,6 +2447,22 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<Platform, FS>>,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.
     elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
+    /// One syscall-rewriter scan per FILE, shared by every mapping of it in every guest process.
+    ///
+    /// Keyed by content identity -- see [`syscalls::mm::SegmentScanKey`] -- never by `(pid, fd)`
+    /// like [`Self::elf_patch_cache`] beside it, because the scan is a pure function of the bytes
+    /// and nothing about it is per-process. Repeatedly `dlopen`-ing one library is ordinary,
+    /// page-cache-cheap behaviour on Linux and mesa does it constantly while probing DRI drivers;
+    /// without this, each repeat re-disassembled the whole segment. `xfwm4` mapped `libLLVM`
+    /// (130 MB) 74 times and spent 225.9 s patching, never finishing its own startup. See
+    /// `litebox_syscall_rewriter::SegmentScanTemplate`.
+    segment_scan_cache: litebox::sync::Mutex<Platform, syscalls::mm::SegmentScanCache>,
+    /// Which file-offset ranges of a file hold executable CODE, keyed by `(device, inode)`.
+    ///
+    /// Read from the ELF's own section headers once per file; see
+    /// `litebox_syscall_rewriter::executable_section_file_ranges` for why a `PROT_EXEC` mapping is
+    /// not itself a safe thing to rewrite.
+    exec_ranges_cache: litebox::sync::Mutex<Platform, syscalls::mm::ExecRangesCache>,
     /// System V shared-memory segments, keyed by `shmid`.
     ///
     /// Shim-wide because SysV shm is a global namespace by definition -- any process that knows

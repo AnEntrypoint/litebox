@@ -366,6 +366,22 @@ pub(crate) type ElfPatchKey = (i32, i32);
 
 pub(crate) type ElfPatchCache = BTreeMap<ElfPatchKey, ElfPatchState>;
 
+/// Identity of one code segment, as content rather than as a name.
+///
+/// `(device, inode)` identifies the FILE -- so the many hardlinked aliases of one library (mesa
+/// ships fourteen DRI driver names for a single megadriver) share one entry, and a path that is
+/// later replaced does not alias a stale scan -- and `(offset, len)` identifies the segment within
+/// it. Deliberately NOT the path: two paths can be one file, and one path can become two files.
+pub(crate) type SegmentScanKey = (u64, u64, usize, usize);
+
+/// Executable code ranges per file; see [`crate::GlobalState::exec_ranges_cache`].
+pub(crate) type ExecRangesCache =
+    BTreeMap<(u64, u64), alloc::sync::Arc<alloc::vec::Vec<core::ops::Range<u64>>>>;
+
+/// Scans shared by every mapping of a file; see [`crate::GlobalState::segment_scan_cache`].
+pub(crate) type SegmentScanCache =
+    BTreeMap<SegmentScanKey, alloc::sync::Arc<litebox_syscall_rewriter::SegmentScanTemplate>>;
+
 #[inline]
 fn align_up(addr: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());
@@ -2055,23 +2071,101 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let trampoline_write_vaddr = (state.trampoline_addr + state.trampoline_cursor) as u64;
         let syscall_entry_addr = state.trampoline_addr as u64;
 
-        let patch_result = litebox_syscall_rewriter::patch_code_segment(
-            &mut code_buf,
-            code_vaddr,
-            trampoline_write_vaddr,
-            syscall_entry_addr,
-        );
-        let patch_result = match patch_result {
-            Ok((stubs, skipped_addrs)) => {
-                if !skipped_addrs.is_empty() {
+        // Rewrite only the parts of this mapping that hold CODE, and scan each of them once per
+        // file rather than once per mapping.
+        //
+        // Two separate things, both forced by measurement, both about the same 130 MB library:
+        //
+        // * WHAT to patch. A `PROT_EXEC` mapping is not all code -- `libLLVM`'s first `PT_LOAD` is
+        //   `RX` and holds `.dynsym`, `.gnu.version*` and 42 MB of `.rodata` next to `.text`.
+        //   Patching all of it corrupted the symbol tables and broke every mesa consumer; see
+        //   `litebox_syscall_rewriter::executable_section_file_ranges` for the full chain.
+        // * HOW OFTEN to scan. The disassembly is a pure function of the bytes, so it is cached per
+        //   `(file, span)` and reused by every later mapping of that span, in any process; see
+        //   `litebox_syscall_rewriter::SegmentScanTemplate`.
+        //
+        // When the file's code ranges cannot be determined (no section headers, unreadable, not an
+        // ELF64) this falls back to treating the whole mapping as code -- the pre-existing
+        // behaviour, no worse than before, and still correct for the ordinary case where the
+        // mapping IS just a text segment.
+        let map_file_start = file_offset.unwrap_or(0) as u64;
+        let map_file_end = map_file_start.saturating_add(len as u64);
+        let mut spans: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
+        match self.executable_file_ranges(fd) {
+            Some(ranges) => {
+                for range in ranges.iter() {
+                    let start = range.start.max(map_file_start);
+                    let end = range.end.min(map_file_end);
+                    if start < end {
+                        spans.push((
+                            (start - map_file_start) as usize,
+                            (end - map_file_start) as usize,
+                        ));
+                    }
+                }
+            }
+            None => spans.push((0, len)),
+        }
+
+        let mut all_stubs: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        let mut all_skipped: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+        let mut patch_err = None;
+        for (span_start, span_end) in spans {
+            let span_len = span_end - span_start;
+            let scan_key =
+                self.segment_scan_key(fd, (map_file_start as usize) + span_start, span_len);
+            let cached = scan_key.and_then(|key| {
+                self.global
+                    .segment_scan_cache
+                    .lock()
+                    .get(&key)
+                    .map(alloc::sync::Arc::clone)
+            });
+            let template = match cached {
+                Some(template) => Ok(template),
+                None => litebox_syscall_rewriter::scan_code_segment(&code_buf[span_start..span_end])
+                    .map(|scanned| {
+                        let scanned = alloc::sync::Arc::new(scanned);
+                        if let Some(key) = scan_key {
+                            self.global
+                                .segment_scan_cache
+                                .lock()
+                                .insert(key, alloc::sync::Arc::clone(&scanned));
+                        }
+                        scanned
+                    }),
+            };
+            let outcome = template.and_then(|template| {
+                litebox_syscall_rewriter::patch_code_segment_scanned(
+                    &template,
+                    &mut code_buf[span_start..span_end],
+                    code_vaddr + span_start as u64,
+                    trampoline_write_vaddr + all_stubs.len() as u64,
+                    syscall_entry_addr,
+                )
+            });
+            match outcome {
+                Ok((stubs, skipped_addrs)) => {
+                    all_stubs.extend_from_slice(&stubs);
+                    all_skipped.extend_from_slice(&skipped_addrs);
+                }
+                Err(e) => {
+                    patch_err = Some(e);
+                    break;
+                }
+            }
+        }
+        let patch_result = match patch_err {
+            Some(e) => Err(e),
+            None => {
+                if !all_skipped.is_empty() {
                     litebox_util_log::warn!(
-                        count:? = skipped_addrs.len(), addrs:? = skipped_addrs;
+                        count:? = all_skipped.len(), addrs:? = all_skipped;
                         "syscall instruction(s) could not be patched"
                     );
                 }
-                Ok(stubs)
+                Ok(all_stubs)
             }
-            Err(e) => Err(e),
         };
         match patch_result {
             Ok(stubs) if !stubs.is_empty() => {
@@ -2168,6 +2262,86 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         );
         restore_trampoline_rx(self, state);
         true
+    }
+
+    /// The file-offset ranges of `fd`'s file that hold executable code, read from its ELF section
+    /// headers and cached per `(device, inode)`.
+    ///
+    /// `None` means "could not tell" -- not an ELF64, no section header table, or an unreadable
+    /// one. Callers must fall back to treating the whole mapping as code, never to skipping the
+    /// rewrite: an unpatched `syscall` instruction escapes to the host kernel.
+    fn executable_file_ranges(
+        &self,
+        fd: i32,
+    ) -> Option<alloc::sync::Arc<alloc::vec::Vec<core::ops::Range<u64>>>> {
+        let stat = self.sys_fstat(fd).ok()?;
+        let key = (stat.st_dev, stat.st_ino);
+        if let Some(cached) = self.global.exec_ranges_cache.lock().get(&key) {
+            return Some(alloc::sync::Arc::clone(cached));
+        }
+
+        let mut header = [0u8; 64];
+        if self.read_exact_at(fd, &mut header, 0).is_none() {
+            return None;
+        }
+        // ELF64, little-endian, or this parse does not apply.
+        if header[..4] != *b"\x7fELF" || header[4] != 2 || header[5] != 1 {
+            return None;
+        }
+        let e_shoff = u64::from_le_bytes(header[0x28..0x30].try_into().ok()?);
+        let e_shentsize = u16::from_le_bytes(header[0x3a..0x3c].try_into().ok()?) as usize;
+        let e_shnum = u16::from_le_bytes(header[0x3c..0x3e].try_into().ok()?) as usize;
+        // `e_shnum == 0` with a non-zero `e_shoff` means the real count lives in section 0's
+        // `sh_size` (the >65280-section escape). Rare enough to decline rather than half-support.
+        if e_shoff == 0 || e_shnum == 0 {
+            return None;
+        }
+        let total = e_shentsize.checked_mul(e_shnum)?;
+        // A sanity bound, so a corrupt header cannot ask for an unbounded allocation.
+        if total > 16 * 1024 * 1024 {
+            return None;
+        }
+        let mut section_headers = alloc::vec![0u8; total];
+        self.read_exact_at(fd, &mut section_headers, e_shoff as usize)?;
+
+        let ranges = alloc::sync::Arc::new(
+            litebox_syscall_rewriter::executable_section_file_ranges(
+                &section_headers,
+                e_shentsize,
+                e_shnum,
+            ),
+        );
+        if ranges.is_empty() {
+            return None;
+        }
+        self.global
+            .exec_ranges_cache
+            .lock()
+            .insert(key, alloc::sync::Arc::clone(&ranges));
+        Some(ranges)
+    }
+
+    /// Fill `buf` from `offset` in `fd`, looping over short reads. `None` if it cannot be filled.
+    fn read_exact_at(&self, fd: i32, buf: &mut [u8], offset: usize) -> Option<()> {
+        let mut done = 0;
+        while done < buf.len() {
+            match self.sys_read(fd, &mut buf[done..], Some(offset + done)) {
+                Ok(0) => return None,
+                Ok(n) => done += n,
+                Err(Errno::EINTR) => {}
+                Err(_) => return None,
+            }
+        }
+        Some(())
+    }
+
+    /// The [`SegmentScanCache`] key for the `len` bytes at `offset` in `fd`'s file.
+    ///
+    /// `None` when the descriptor has no stable `(dev, ino)` to key on, in which case the caller
+    /// simply scans for itself -- see the call site in `maybe_patch_exec_segment`.
+    fn segment_scan_key(&self, fd: i32, offset: usize, len: usize) -> Option<SegmentScanKey> {
+        let stat = self.sys_fstat(fd).ok()?;
+        Some((stat.st_dev, stat.st_ino, offset, len))
     }
 
     /// The [`ElfPatchCache`] key for `fd` in *this* task's process. See [`ElfPatchKey`].

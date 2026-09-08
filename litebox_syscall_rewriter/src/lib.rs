@@ -297,11 +297,18 @@ fn hook_syscalls_in_elf_impl(
     let mut section_scans = Vec::with_capacity(text_sections.len());
     let mut combined_targets = Vec::new();
     for s in &text_sections {
+        // Scanned at each section's real vaddr, so the offsets ARE absolute addresses here and the
+        // combined set below needs no rebasing (`base: 0` at the query site says exactly that).
+        // The guest-`mmap` path scans at 0 instead, because it reuses one scan across mappings.
         let scan = scan_section(arch, section_slice(&*buf, s)?, s.vaddr)?;
-        combined_targets.extend_from_slice(&scan.targets.0);
+        combined_targets.extend_from_slice(&scan.target_offsets);
         section_scans.push(scan);
     }
-    let control_transfer_targets = ControlTransferTargets::from_unsorted(combined_targets);
+    let combined_targets = sorted_deduped(combined_targets);
+    let control_transfer_targets = ControlTransferTargets {
+        offsets: &combined_targets,
+        base: 0,
+    };
 
     // Build the trampoline code (without header - header goes at the end)
     // The code starts with the syscall entry point placeholder (8 bytes for x86-64)
@@ -436,6 +443,85 @@ fn hook_aarch64_elf(
     Ok(out)
 }
 
+/// File-offset ranges of the sections that hold executable CODE, from an ELF64 section header
+/// table.
+///
+/// # Why a mapping is not a safe unit to patch
+///
+/// The guest `mmap` path sees only `(fd, offset, len, prot)`, and used to disassemble and patch
+/// the WHOLE mapping whenever `PROT_EXEC` was set. That is wrong, because a `PF_X` `PT_LOAD`
+/// segment is not all code. `libLLVM.so.19.1`'s first `PT_LOAD` is `RX` and 118 MB long, and holds
+/// `.dynsym`, `.dynstr`, `.gnu.hash`, `.gnu.version`, `.gnu.version_d`, `.gnu.version_r` and 42 MB
+/// of `.rodata` alongside `.text`. Linear disassembly does not know where code stops: it decodes
+/// the symbol table as instructions, finds byte pairs that happen to read as `syscall`, and writes
+/// a 5-byte jump over them.
+///
+/// Measured: mapping that library in a guest left **1984 bytes differing from the file**, the
+/// sampled ones all outside `.text` and inside `.dynsym` (e.g. file offsets `0x5dc4`, `0xa0c1c`).
+/// `ld.so` then could not resolve `_ZTSN4llvm11logicalview22LVScopeFunctionInlinedE, version
+/// LLVM_19.1` -- a symbol the file plainly defines -- so `libgallium`, `libGLX_mesa` and every
+/// mesa consumer failed to load. `xfwm4` retried that load about three times a second forever,
+/// never created a single X window, and the XFCE desktop stayed black.
+///
+/// The ahead-of-time [`patch_binary`] path never had this bug: it patches `text_sections` only.
+/// This function gives the runtime path the same notion of "code", from the same source of truth.
+///
+/// A section qualifies exactly when it is `SHF_ALLOC | SHF_EXECINSTR` and actually occupies file
+/// bytes (`SHT_NOBITS` has none to patch), matching `text_sections`'s filter above.
+///
+/// Returns an empty vector when the table is absent or unparseable; the caller must then decide
+/// what to do, and must NOT read that as "there is no code here".
+pub fn executable_section_file_ranges(
+    section_headers: &[u8],
+    shentsize: usize,
+    shnum: usize,
+) -> Vec<core::ops::Range<u64>> {
+    // Elf64_Shdr field offsets: sh_type 4 (u32), sh_flags 8 (u64), sh_offset 24 (u64),
+    // sh_size 32 (u64).
+    const SH_TYPE: usize = 4;
+    const SH_FLAGS: usize = 8;
+    const SH_OFFSET: usize = 24;
+    const SH_SIZE: usize = 32;
+    const SHDR_MIN: usize = 40;
+    const SHT_NOBITS: u32 = 8;
+    const SHF_ALLOC: u64 = 0x2;
+    const SHF_EXECINSTR: u64 = 0x4;
+
+    let mut ranges = Vec::new();
+    if shentsize < SHDR_MIN {
+        return ranges;
+    }
+    for i in 0..shnum {
+        let Some(base) = i.checked_mul(shentsize) else {
+            break;
+        };
+        let Some(shdr) = section_headers.get(base..base + shentsize) else {
+            break;
+        };
+        let read_u32 = |o: usize| u32::from_le_bytes(shdr[o..o + 4].try_into().unwrap());
+        let read_u64 = |o: usize| u64::from_le_bytes(shdr[o..o + 8].try_into().unwrap());
+
+        if read_u32(SH_TYPE) == SHT_NOBITS {
+            continue;
+        }
+        let flags = read_u64(SH_FLAGS);
+        if flags & SHF_ALLOC == 0 || flags & SHF_EXECINSTR == 0 {
+            continue;
+        }
+        let offset = read_u64(SH_OFFSET);
+        let size = read_u64(SH_SIZE);
+        if size == 0 {
+            continue;
+        }
+        let Some(end) = offset.checked_add(size) else {
+            continue;
+        };
+        ranges.push(offset..end);
+    }
+    ranges.sort_by_key(|r| r.start);
+    ranges
+}
+
 /// (private) Get metadata for executable sections
 fn text_sections(
     file: &object::File<'_>,
@@ -531,7 +617,7 @@ enum Arch {
 /// about 20x the segment's own size: ~2.6 GB of transient allocation for mesa's 130 MB `libLLVM`,
 /// and 11 s where one streaming pass does it in a fraction. See [`scan_section`].
 fn hook_syscalls_in_section(
-    control_transfer_targets: &ControlTransferTargets,
+    control_transfer_targets: &ControlTransferTargets<'_>,
     section_base_addr: u64,
     section_data: &mut [u8],
     trampoline_base_addr: u64,
@@ -899,17 +985,48 @@ pub fn patch_code_segment(
 
     // One streaming decode yields both the control-transfer targets and the `syscall` sites with
     // their local context; see `scan_section` for why this is not a whole-segment `Vec`.
-    let scan = scan_section(Arch::X86_64, code, code_vaddr)?;
+    let template = scan_code_segment(code)?;
+    patch_code_segment_scanned(
+        &template,
+        code,
+        code_vaddr,
+        trampoline_write_vaddr,
+        syscall_entry_addr,
+    )
+}
+
+/// Patch `code` using a [`SegmentScanTemplate`] already produced for these exact bytes.
+///
+/// Identical in effect to [`patch_code_segment`], minus the decode -- which is the whole point: a
+/// caller that maps the same file repeatedly scans it once and pays only the hooking pass (work
+/// proportional to the number of `syscall` sites) on every mapping after the first. See
+/// [`SegmentScanTemplate`] for the measurements that motivated this.
+///
+/// `template` MUST have come from [`scan_code_segment`] over the same bytes now in `code`; passing
+/// a template for different bytes is a caller bug, and the cache key must therefore identify the
+/// file contents (device, inode, offset and length), never merely the path.
+pub fn patch_code_segment_scanned(
+    template: &SegmentScanTemplate,
+    code: &mut [u8],
+    code_vaddr: u64,
+    trampoline_write_vaddr: u64,
+    syscall_entry_addr: u64,
+) -> Result<(Vec<u8>, Vec<u64>)> {
+    let targets = ControlTransferTargets {
+        offsets: &template.target_offsets,
+        base: code_vaddr,
+    };
+    let sites = rebased_sites(&template.sites, code_vaddr);
 
     let mut trampoline_data = Vec::new();
     match hook_syscalls_in_section(
-        &scan.targets,
+        &targets,
         code_vaddr,
         code,
         trampoline_write_vaddr,
         syscall_entry_addr,
         &mut trampoline_data,
-        &scan.sites,
+        &sites,
     ) {
         Ok(skipped_addrs) => Ok((trampoline_data, skipped_addrs)),
         Err(InternalError::NoSyscallInstructionsFound) => Ok((Vec::new(), Vec::new())),
@@ -983,22 +1100,32 @@ where
 /// sorted `Vec` plus `binary_search` answers the same question in the same asymptotic time with 8
 /// bytes per target instead of a node's worth. mesa's `libLLVM` has millions of them, and this runs
 /// inside a guest `mmap` where every transient byte competes with the guest's own memory.
-struct ControlTransferTargets(Vec<u64>);
+struct ControlTransferTargets<'a> {
+    /// Sorted, deduplicated, and relative to the start of the scanned segment.
+    offsets: &'a [u64],
+    /// The address the segment is mapped at, added to `offsets` to get real addresses.
+    base: u64,
+}
 
-impl ControlTransferTargets {
-    /// Sort and deduplicate `targets`, taking ownership.
-    fn from_unsorted(mut targets: Vec<u64>) -> Self {
-        targets.sort_unstable();
-        targets.dedup();
-        Self(targets)
-    }
-
+impl ControlTransferTargets<'_> {
     /// Whether any control transfer in the scanned code targets `addr`.
     ///
     /// Takes `&u64` so call sites read identically to the `BTreeSet::contains` this replaced.
+    /// `addr` is absolute; the stored offsets are not, which is what lets one scan of a file serve
+    /// every address that file is ever mapped at (see [`SegmentScanTemplate`]).
     fn contains(&self, addr: &u64) -> bool {
-        self.0.binary_search(addr).is_ok()
+        match addr.checked_sub(self.base) {
+            Some(offset) => self.offsets.binary_search(&offset).is_ok(),
+            None => false,
+        }
     }
+}
+
+/// Sort and deduplicate offsets collected during a scan.
+fn sorted_deduped(mut offsets: Vec<u64>) -> Vec<u64> {
+    offsets.sort_unstable();
+    offsets.dedup();
+    offsets
 }
 
 /// How many instructions of context on either side of a `syscall` the hooking code can need.
@@ -1016,6 +1143,7 @@ const SYSCALL_CONTEXT_INSTRUCTIONS: usize = 8;
 
 /// One `syscall` instruction found in a code segment, with just enough decoded context around it
 /// for the hooking code to work.
+#[derive(Clone)]
 struct SyscallSite {
     /// Index of the `syscall` instruction itself within [`Self::window`].
     idx: usize,
@@ -1024,11 +1152,31 @@ struct SyscallSite {
     window: Vec<iced_x86::Instruction>,
 }
 
-/// Everything one streaming decode of a code segment yields.
-struct SegmentScan {
-    /// Targets of every near control transfer in the segment.
-    targets: ControlTransferTargets,
-    /// Every `syscall` instruction in the segment, in address order.
+/// Everything one streaming decode of a code segment yields, in a form that does not depend on
+/// where the segment happens to be mapped.
+///
+/// # Why this is address-independent, and why that matters
+///
+/// Scanning is by far the expensive half of patching (see [`scan_section`]), and it is a pure
+/// function of the segment's BYTES. Keeping the result addressed relative to the segment start
+/// means one scan of a file can be reused every time that file is mapped, at whatever address.
+///
+/// That is not a micro-optimization. Repeatedly `dlopen`-ing the same library is ordinary,
+/// nearly-free behaviour on Linux -- the page cache already holds it -- and mesa does exactly that
+/// while probing DRI drivers. Measured on the webtop: **`xfwm4` mapped `libLLVM` (130 MB) 74
+/// times**, and with the patch state keyed per `(pid, fd)` it re-decoded all 130 MB every time:
+/// 368 large mappings, 233.7 s inside `mmap`, 225.9 s of it patching, against `Xvfb`'s single map
+/// of the same files. The window manager never finished starting, so the desktop stayed black.
+///
+/// Rebasing is sound because an `iced_x86::Instruction` derives every address it reports --
+/// `next_ip`, `near_branch_target`, RIP-relative memory operands -- from its own `ip` plus the
+/// displacement bytes it decoded. Those bytes are identical wherever the segment is loaded, so
+/// decoding at 0 and adding `base` to each `ip` yields exactly what decoding at `base` would have.
+pub struct SegmentScanTemplate {
+    /// Offsets, from the segment start, of every near control-transfer target.
+    target_offsets: Vec<u64>,
+    /// Every `syscall` instruction in the segment, in address order, with IPs relative to the
+    /// segment start.
     sites: Vec<SyscallSite>,
 }
 
@@ -1050,7 +1198,11 @@ struct SegmentScan {
 /// of this `syscall`" (see [`SYSCALL_CONTEXT_INSTRUCTIONS`]). Both are answerable in one forward
 /// pass holding a short ring buffer, which is what this does -- same decoder, same chunking, same
 /// instruction stream, bounded memory, and one pass where there were two.
-fn scan_section(arch: Arch, section_data: &[u8], section_base_addr: u64) -> Result<SegmentScan> {
+fn scan_section(
+    arch: Arch,
+    section_data: &[u8],
+    section_base_addr: u64,
+) -> Result<SegmentScanTemplate> {
     let mut targets = Vec::new();
     let mut sites: Vec<SyscallSite> = Vec::new();
     // The most recently decoded instructions, oldest first, capped at the context bound.
@@ -1092,10 +1244,43 @@ fn scan_section(arch: Arch, section_data: &[u8], section_base_addr: u64) -> Resu
         ring.push_back(inst);
     })?;
 
-    Ok(SegmentScan {
-        targets: ControlTransferTargets::from_unsorted(targets),
+    Ok(SegmentScanTemplate {
+        target_offsets: sorted_deduped(targets),
         sites,
     })
+}
+
+/// Scan `code` once, producing a [`SegmentScanTemplate`] reusable for every mapping of that file.
+///
+/// Decoded at address 0, so the result is expressed in segment-relative offsets; pass it to
+/// [`patch_code_segment_scanned`] together with the address the segment is actually mapped at.
+pub fn scan_code_segment(code: &[u8]) -> Result<SegmentScanTemplate> {
+    scan_section(Arch::X86_64, code, 0)
+}
+
+/// [`SyscallSite`]s rebased from a template's segment-relative IPs onto `base`.
+///
+/// See [`SegmentScanTemplate`] for why adding `base` to each instruction's `ip` is equivalent to
+/// having decoded the segment at `base` in the first place.
+fn rebased_sites(sites: &[SyscallSite], base: u64) -> Vec<SyscallSite> {
+    if base == 0 {
+        return sites.to_vec();
+    }
+    sites
+        .iter()
+        .map(|site| SyscallSite {
+            idx: site.idx,
+            window: site
+                .window
+                .iter()
+                .map(|inst| {
+                    let mut inst = *inst;
+                    inst.set_ip(inst.ip().wrapping_add(base));
+                    inst
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 const MAX_X86_INSTRUCTION_LEN: usize = 15;
@@ -1307,7 +1492,7 @@ fn reencode_instructions(
 
 #[allow(clippy::too_many_arguments)]
 fn hook_syscall_and_after(
-    control_transfer_targets: &ControlTransferTargets,
+    control_transfer_targets: &ControlTransferTargets<'_>,
     section_base_addr: u64,
     section_data: &mut [u8],
     trampoline_base_addr: u64,

@@ -209,6 +209,27 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         // race exists across the full open-lower/open-upper/copy/swap sequence, not just its tail.
         let _migrate_guard = self.migrate_lock.lock();
 
+        // Only a REGULAR file has byte contents whose copy is the same object.
+        //
+        // This function's whole method -- open the lower file, read it, write those bytes into a
+        // newly created upper-layer file -- silently changes WHAT AN OBJECT IS when the lower entry
+        // is a character device, FIFO or socket. `/dev/null` reads as immediate EOF, so migrating it
+        // produced an empty REGULAR file shadowing the character device, and everything downstream
+        // that asks `lstat` what kind of thing it is was then lied to. See the `O_TRUNC` guard in
+        // `open` for the full chain that took the XFCE desktop down.
+        //
+        // Refusing here is not merely defensive: no caller can want this. `write` and `truncate`
+        // both reach this function only as a fallback for "the lower layer would not take the
+        // change", and for a device the honest answer to that is the device's own error, never a
+        // fabricated regular file.
+        match self.ensure_lower_contains(path) {
+            Ok(FileType::RegularFile | FileType::Symlink) => {}
+            Ok(_) => return Err(MigrationError::NotAFile),
+            Err(FileStatusError::Io) => return Err(MigrationError::Io),
+            Err(FileStatusError::PathError(e)) => return Err(e)?,
+            Err(FileStatusError::ClosedFd) => unreachable!(),
+        }
+
         // This function's mechanics (open-for-read on `self.lower`, open/write on `self.upper`)
         // are agnostic to `self.layering_semantics` -- both `write`'s and `truncate`'s
         // `LowerLayerWritableFiles` branches now call this directly as a fallback when their own
@@ -839,13 +860,45 @@ impl<
                 our_entry
             }
         };
+        // `O_TRUNC` applies to REGULAR FILES ONLY -- exactly as on Linux, where `do_open()` gates
+        // its `handle_truncate()` call on `S_ISREG(...)`, so opening a character device, FIFO or
+        // socket with `O_TRUNC` succeeds and truncates nothing.
+        //
+        // This was unconditional, and truncating a NON-regular lower-layer file is what silently
+        // destroyed `/dev/null`. The chain, observed end to end on the webtop:
+        //
+        //   1. A shell redirect `> /dev/null` opens it `O_WRONLY|O_CREAT|O_TRUNC`. The open lands
+        //      on the lower layer (the `/dev` device mount), so this block then ran `truncate`.
+        //   2. `truncate` cannot truncate a device, so it fell through to `migrate_file_up`, which
+        //      copies the lower file's BYTES into a newly created upper-layer file. `/dev/null`
+        //      reads as immediate EOF, so what appeared on the writable layer was a REGULAR,
+        //      EMPTY FILE shadowing the character device.
+        //   3. `lstat("/dev/null")` from then on reported a regular file rather than a device.
+        //   4. GNU `ld` -- run by selkies at startup, with `/dev/null` as its output file -- calls
+        //      libiberty's `unlink_if_ordinary()`, which unlinks its target ONLY if `lstat` says
+        //      regular file or symlink, precisely so it can never delete a device node. Told it was
+        //      an ordinary file, it deleted it.
+        //   5. `unlink` left a tombstone, after which EVERY `open("/dev/null")` WITHOUT `O_CREAT`
+        //      returned `ENOENT`. `dash` opens `/dev/null` for a background job's stdin, so
+        //      `dbus-daemon ... &` never started, `DBUS_SESSION_BUS_ADDRESS` was empty, and
+        //      `xfce4-session` came up with no session bus and started no components at all.
+        //
+        // Every step after the first is a faithful consequence of the one before it; the only
+        // actual defect is truncating something that is not a regular file. `migrate_file_up` now
+        // refuses non-regular files as well (see its own guard), so the invariant is enforced at
+        // both ends rather than resting on this check alone.
+        let truncate_applies = original_flags.contains(OFlags::TRUNC)
+            && matches!(
+                self.ensure_lower_contains(&path),
+                Ok(FileType::RegularFile)
+            );
         let fd = self.litebox.descriptor_table_mut().insert(Descriptor {
             path,
             flags: original_flags,
             entry,
             position: 0.into(),
         });
-        if original_flags.contains(OFlags::TRUNC) {
+        if truncate_applies {
             // The only scenario where we need to manually trigger truncation is when a file does
             // not exist at the upper level but exists at the lower level; in that case, our
             // `truncate` functionality (at the layered FS itself) should correctly migrate things
@@ -1514,7 +1567,19 @@ impl<
                         FileType::Directory => {
                             return Err(UnlinkError::IsADirectory);
                         }
-                        FileType::CharacterDevice => unimplemented!(),
+                        // A device node is unlinkable, exactly like the regular file above: on
+                        // Linux `rm /dev/null` succeeds for a caller with write permission on
+                        // `/dev`, and the tombstone below reproduces that -- the entry disappears
+                        // from the composed view while the synthetic `/dev` mount, which has no
+                        // notion of removal, is left untouched.
+                        //
+                        // This was `unimplemented!()`, which panics the HOST process. Every guest
+                        // in the address space died together, from one guest running `rm -f
+                        // /dev/null` -- reproduced directly, and reachable from ordinary software:
+                        // GNU `ld` unlinks its output file before writing it.
+                        FileType::CharacterDevice => {
+                            // fallthrough
+                        }
                     }
                 }
             },
