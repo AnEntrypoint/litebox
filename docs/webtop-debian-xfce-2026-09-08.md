@@ -36,14 +36,37 @@ Reproducible: start Xvfb, then `xfce4-session`. Within ~45 s the session logs
                ff d0         call rax
 
 `rbx` is 0: Xvfb loads a function pointer from a structure at offset `0x20` and calls it, with the
-structure pointer NULL. The last syscalls before the fault are an ordinary server loop --
-`recvmsg`/`writev` on the client socket, `recvmsg` returning an error, then
-`setitimer(ITIMER_REAL)`, `clock_gettime`, `epoll_wait` -- and Xvfb's own backtrace has libc
-frames sandwiched between Xvfb frames, which is the shape of a signal handler. The working
-hypothesis is therefore SIGALRM delivery, not the X protocol path.
+structure pointer NULL. A second capture caught the next stage -- **`rip=0x0`, `cr2=0x0`**, i.e.
+Xvfb jumping through a NULL function pointer outright, then `(EE) Caught signal 11 (Segmentation
+fault). Server aborting`. This is memory corruption inside Xvfb, not a bad X request.
 
-Not the framebuffer, and not the trim: `xrandr`/`xset`/`xdpyinfo` all survive, and Xvfb alone
-(no clients) stays up indefinitely.
+### What it is NOT (each tested, not assumed)
+
+| hypothesis | test | result |
+|---|---|---|
+| framebuffer size | 320x240 vs 1024x768 | crashes either way |
+| trim removed a tool | `xrandr`/`xset`/`xdpyinfo` present | all present, all work |
+| SIGALRM / smart scheduler | `-dumbSched -s 0` | still crashes |
+| Composite extension | `-extension COMPOSITE`, `xfwm4 --compositor=off` | still crashes |
+| RandR / extension queries | `xrandr`, `xdpyinfo` standalone | both fine, Xvfb survives |
+| any X client | `paint_root.py` drawing client | Xvfb survives |
+| plain fork/exec churn | 40 foreground + 60 background forks | Xvfb survives |
+| two `ET_EXEC` binaries at one link-time base | ELF headers of Xvfb, xfwm4, xfce4-session, nginx | **all ET_DYN (PIE)** |
+
+### What it IS
+
+`xfwm4` run in the FOREGROUND (`timeout 40 xfwm4 --replace`) runs its full 40 s, takes SIGTERM,
+and leaves **Xvfb alive**. The same `xfwm4 --replace &` BACKGROUNDED kills Xvfb within 15 s. So
+the trigger is not what xfwm4 asks of the X server -- it is loading xfwm4 as a concurrent process
+while Xvfb is live.
+
+Every binary involved is PIE, so litebox chooses their load addresses; this is therefore a
+PLACEMENT problem in a single shared host address space, matching the pre-existing note in
+`allocate_pages` about `labwc`/`xfwm4`/`xfdesktop` SIGSEGV-ing under concurrent multi-process
+`mmap(NULL)`/`munmap()` load. `Vmem` placement only avoids a one-time startup snapshot plus its
+OWN mappings, and only `Replace`-mode (MAP_FIXED) allocations are ever entered in
+`CLAIMED_RANGES` -- so an ordinary `mmap(NULL)` in one guest process is invisible to every other
+guest process's placement search.
 
 ## Networking: the browser path that does work
 
