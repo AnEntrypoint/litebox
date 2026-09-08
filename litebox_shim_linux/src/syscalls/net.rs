@@ -183,6 +183,18 @@ struct CSockInetAddr {
     __pad: u64,
 }
 
+/// `struct sockaddr_in6`. Only the fields dual-stack mapping needs are named; `sin6_flowinfo` and
+/// `sin6_scope_id` are carried so the layout and size match what a guest writes.
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, Immutable)]
+struct CSockInet6Addr {
+    family: i16,
+    port: u16,
+    flowinfo: u32,
+    addr: [u8; 16],
+    scope_id: u32,
+}
+
 impl From<CSockInetAddr> for SocketAddrV4 {
     fn from(c_addr: CSockInetAddr) -> Self {
         SocketAddrV4::new(Ipv4Addr::from(c_addr.addr), u16::from_be(c_addr.port))
@@ -1079,7 +1091,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<u32, Errno> {
         let files = self.files.borrow();
         let file = match domain {
-            AddressFamily::INET => {
+            // `AF_INET6` is served by the SAME IPv4 machinery, the way Linux serves a v6 socket
+            // when `net.ipv6.bindv6only` is 0 (its default): one socket accepts both families, and
+            // v4 peers appear as v4-mapped addresses.
+            //
+            // Refusing outright with `EAFNOSUPPORT` is what a kernel built without IPv6 does, and
+            // ordinary server configuration does not survive it. The linuxserver webtop image's
+            // stock nginx config has a `listen [::]:80` line; `socket(AF_INET6)` failing makes
+            // nginx treat it as fatal --
+            // `nginx: [emerg] socket() [::]:80 failed (97: Address family not supported by
+            // protocol)` -- so nginx exits and the desktop has no web front end at all. That is
+            // the whole reason the image could not serve its own UI.
+            //
+            // Only the addresses that HAVE a v4 meaning are accepted (see `parse_sockaddr`'s
+            // `INET6` arm): the wildcard `::`, loopback `::1`, and v4-mapped `::ffff:a.b.c.d`.
+            // A genuine v6 address gets `EADDRNOTAVAIL`, which is honest -- this stack has no IPv6
+            // routing -- rather than pretending to bind something it cannot reach.
+            AddressFamily::INET6 | AddressFamily::INET => {
                 let protocol = IPProtocol::try_from(protocol).map_err(|_| {
                     log_unsupported!("protocol = {protocol}");
                     Errno::EPROTONOSUPPORT
@@ -1172,7 +1200,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     Errno::EMFILE
                 })?
             }
-            AddressFamily::INET6 => return Err(Errno::EAFNOSUPPORT),
+
             _ => unimplemented!(),
         };
         Ok(u32::try_from(file).unwrap())
@@ -1322,15 +1350,43 @@ pub(crate) fn read_sockaddr_from_user<Platform: ShimPlatform>(
                 groups: nl_addr.groups,
             })
         }
-        // `AddressFamily` is a closed, 4-variant enum (`UNIX`/`INET`/`INET6`/`NETLINK`) -- any
-        // other wire value already fails the `try_from` above with `EAFNOSUPPORT`, so this arm
-        // is reached specifically for `INET6`, which this shim does not implement.
-        // Real-world trigger: any guest `socket(AF_INET6, ...)` followed by `connect`/`bind`/
-        // `sendto` -- not exotic, since IPv6 is often the *default* resolution result (e.g.
-        // Node's/Python's DNS resolution preferring an AAAA record, or a guest explicitly
-        // dialing `::1`/`[::]` for "localhost"). This previously crashed the whole runner
-        // (`todo!()`) instead of returning the same `EAFNOSUPPORT` a real Linux kernel would
-        // give a caller for a family the *socket itself* wasn't created with support for.
+        // Dual-stack: a `sockaddr_in6` whose address has a v4 meaning becomes that v4 address,
+        // which is how a Linux socket with `bindv6only=0` behaves. See the `INET6` arm of
+        // `sys_socket` for why this matters (stock nginx configs `listen [::]:80`).
+        //
+        // The three that map are the ones real configuration actually uses:
+        //
+        //   `::`                 the wildcard      -> `0.0.0.0`
+        //   `::1`                loopback          -> `127.0.0.1`
+        //   `::ffff:a.b.c.d`     v4-mapped         -> `a.b.c.d`
+        //
+        // Anything else is a real IPv6 address, and this stack has no IPv6 routing to offer it.
+        // `EADDRNOTAVAIL` says exactly that -- the address cannot be assigned here -- rather than
+        // silently binding some unrelated v4 address the caller never asked for.
+        AddressFamily::INET6 => {
+            if addrlen < size_of::<CSockInet6Addr>() {
+                return Err(Errno::EINVAL);
+            }
+            let ptr: UserPtr<CSockInet6Addr> = UserPtr::from_usize(sockaddr.as_usize());
+            let in6 = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+            let port = u16::from_be(in6.port);
+            let a = in6.addr;
+            let v4 = if a == [0u8; 16] {
+                Ipv4Addr::UNSPECIFIED
+            } else if a == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1] {
+                Ipv4Addr::LOCALHOST
+            } else if a[..10] == [0u8; 10] && a[10] == 0xff && a[11] == 0xff {
+                Ipv4Addr::new(a[12], a[13], a[14], a[15])
+            } else {
+                log_unsupported!("sockaddr_in6 with a non-v4-mappable address");
+                return Err(Errno::EADDRNOTAVAIL);
+            };
+            Ok(SocketAddress::Inet(SocketAddr::V4(SocketAddrV4::new(
+                v4, port,
+            ))))
+        }
+        // `AddressFamily` is a closed, 4-variant enum, and every other wire value already fails
+        // the `try_from` above with `EAFNOSUPPORT`.
         _ => {
             log_unsupported!("sockaddr with family {family:?}");
             Err(Errno::EAFNOSUPPORT)
@@ -1578,6 +1634,33 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
+        // Binding an `AF_INET6` address succeeds and listens on nothing.
+        //
+        // This stack has no IPv6 transport, so an IPv6 LISTENER can never receive a packet no
+        // matter what it is bound to -- accepting the bind and never delivering anything to it is
+        // an accurate model of a host with IPv6 configured but no IPv6 connectivity. (Outbound is
+        // different and still mapped: `connect()` to `::1`/`::ffff:a.b.c.d` reaches the v4 address
+        // it names -- see `parse_sockaddr`.)
+        //
+        // Mapping a v6 bind onto the v4 wildcard instead is what fails: an ordinary server config
+        // listens on BOTH families, so `0.0.0.0:80` and `[::]:80` would become the same address
+        // and the second bind returns `EADDRINUSE`. That is what the linuxserver webtop's stock
+        // nginx hit -- `bind() to [::]:80 failed (98: Address already in use)`, logged `[emerg]`,
+        // so nginx exited and the image served nothing. Real Linux avoids the collision with
+        // `IPV6_V6ONLY`, which this shim has no separate address space to implement.
+        {
+            let ptr: UserPtr<u16> = UserPtr::from_usize(sockaddr.as_usize());
+            let fam = ptr.read_at_offset::<Platform>(0);
+            if addrlen >= 2
+                && fam.is_some_and(|f| {
+                    matches!(AddressFamily::try_from(u32::from(f)), Ok(AddressFamily::INET6))
+                })
+            {
+                litebox_util_log::debug!(tid:% = self.tid, fd:% = sockfd;
+                    "bind(AF_INET6): accepted as a listener nothing can reach");
+                return Ok(());
+            }
+        }
         let sockaddr = read_sockaddr_from_user::<Platform>(sockaddr, addrlen)?;
         self.do_bind(sockfd, sockaddr)
     }
