@@ -479,15 +479,41 @@ fn acquire_boot_lock() -> Result<BootLock> {
 /// too, a child produces no log output at all, which is exactly backwards: the child is where the
 /// interesting half of a cross-process fork happens, and "no lines from the child" reads as
 /// "nothing happened" rather than "logging was never switched on".
+/// What the log filter is when `LITEBOX_LOG` is unset.
+///
+/// `EnvFilter`'s own default (what `from_env_lossy()` gives with no directive supplied) is
+/// `ERROR` and nothing else, which silently discarded EVERY `warn!` in the tree -- 111 call sites,
+/// including ones deliberately written to report real, silent degradation: `claim_range` giving up
+/// a possibly-still-live memory claim when `CLAIMED_RANGES` fills (a hang seconds later was the
+/// only evidence it had happened), an `open` refusing an unsupported flag, `insert_mapping`
+/// rejecting an out-of-bounds range. A warning nobody can see is not a warning, and this project
+/// has repeatedly paid for that: `MAX_CLAIMS`'s own doc comment reconstructs eviction pressure
+/// after the fact from hang symptoms, because the event itself was logged below the visible level.
+///
+/// `fork_verify` is held at `error` here, and only it. Its warnings are genuinely per-instruction
+/// -- `on_single_step` runs for every single-stepped instruction during a fork heal and warns on
+/// each stale-pointer detection -- so including it would reintroduce exactly the log-volume
+/// regression that `MAX_CLAIMS`'s doc comment records breaking a live weston session's timing.
+/// `LITEBOX_LOG=litebox_platform_windows_userland::fork_verify=warn` turns it back on when a fork
+/// heal is what's being investigated.
+const DEFAULT_LOG_FILTER: &str = "warn,litebox_platform_windows_userland::fork_verify=error";
+
 pub fn init_logging() {
     let _ = tracing_subscriber::fmt()
         .with_writer(|| FlushingStderr)
         .with_timer(tracing_subscriber::fmt::time::uptime())
         .with_level(true)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::builder()
-                .with_env_var("LITEBOX_LOG")
-                .from_env_lossy(),
+            // Read `LITEBOX_LOG` here rather than via `with_env_var`/`from_env_lossy`, because
+            // the default is a MULTI-directive filter (see `DEFAULT_LOG_FILTER`) and
+            // `with_default_directive` accepts only a single `Directive`. An empty value is
+            // treated as unset, so `LITEBOX_LOG=` does not silence everything by accident.
+            tracing_subscriber::EnvFilter::builder().parse_lossy(
+                std::env::var("LITEBOX_LOG")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| DEFAULT_LOG_FILTER.to_owned()),
+            ),
         )
         .try_init();
 }
