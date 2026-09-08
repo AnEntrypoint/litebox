@@ -26,7 +26,7 @@ extern crate alloc;
 
 mod arm64;
 
-use alloc::collections::BTreeSet;
+use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -288,7 +288,20 @@ fn hook_syscalls_in_elf_impl(
         .map(HookResult::Output);
     }
 
-    let control_transfer_targets = get_control_transfer_targets(arch, &*buf, &text_sections)?;
+    // Scan every text section once. The targets must be COMBINED across sections before any
+    // section is hooked -- a branch in one section can land on a `syscall` in another, and
+    // extending a replacement range over such a target would send that branch into NOPs -- so the
+    // two loops cannot be merged into one. They are one decode pass in total all the same, where
+    // this path previously decoded each section twice (`get_control_transfer_targets`, then again
+    // inside `hook_syscalls_in_section`).
+    let mut section_scans = Vec::with_capacity(text_sections.len());
+    let mut combined_targets = Vec::new();
+    for s in &text_sections {
+        let scan = scan_section(arch, section_slice(&*buf, s)?, s.vaddr)?;
+        combined_targets.extend_from_slice(&scan.targets.0);
+        section_scans.push(scan);
+    }
+    let control_transfer_targets = ControlTransferTargets::from_unsorted(combined_targets);
 
     // Build the trampoline code (without header - header goes at the end)
     // The code starts with the syscall entry point placeholder (8 bytes for x86-64)
@@ -298,16 +311,16 @@ fn hook_syscalls_in_elf_impl(
     // Patch syscalls in-place in buf
     let mut skipped_addrs = Vec::new();
     let mut syscall_insns_found = false;
-    for s in &text_sections {
+    for (s, scan) in text_sections.iter().zip(&section_scans) {
         let section_data = section_slice_mut(buf, s)?;
         match hook_syscalls_in_section(
-            arch,
             &control_transfer_targets,
             s.vaddr,
             section_data,
             trampoline_base_addr,
             trampoline_base_addr, // entry point is at offset 0 of trampoline
             &mut trampoline_data,
+            &scan.sites,
         ) {
             Ok(addrs) => {
                 skipped_addrs.extend(addrs);
@@ -507,30 +520,36 @@ enum Arch {
 /// `trampoline_base_addr` is the virtual address corresponding to `trampoline_data[0]`.
 /// `syscall_entry_addr` is the address of the 8-byte entry-point value that each trampoline
 /// stub jumps to (via `JMP [RIP+disp32]` on x86-64).
+///
+/// `sites` are the `syscall` instructions [`scan_section`] found in `section_data`, each carrying
+/// the small window of decoded context the scans below can reach.
+///
+/// This function used to decode `section_data` itself, which meant every caller decoded the same
+/// bytes TWICE -- once to collect `control_transfer_targets`, then again in here -- and, because the
+/// caller's `Vec` stayed in scope across this call, held both results at once. At 40 bytes per
+/// `iced_x86::Instruction` against roughly 4 bytes of x86 per instruction, those two copies came to
+/// about 20x the segment's own size: ~2.6 GB of transient allocation for mesa's 130 MB `libLLVM`,
+/// and 11 s where one streaming pass does it in a fraction. See [`scan_section`].
 fn hook_syscalls_in_section(
-    arch: Arch,
-    control_transfer_targets: &BTreeSet<u64>,
+    control_transfer_targets: &ControlTransferTargets,
     section_base_addr: u64,
     section_data: &mut [u8],
     trampoline_base_addr: u64,
     syscall_entry_addr: u64,
     trampoline_data: &mut Vec<u8>,
+    sites: &[SyscallSite],
 ) -> core::result::Result<Vec<u64>, InternalError> {
-    let instructions = decode_section_instructions(arch, section_data, section_base_addr)?;
-    let mut found_any = false;
+    let found_any = !sites.is_empty();
     let mut skipped_addrs = Vec::new();
-    for (i, inst) in instructions.iter().enumerate() {
-        // Forward search for `syscall`
-        match arch {
-            Arch::X86_64 => {
-                if inst.code() != iced_x86::Code::Syscall {
-                    continue;
-                }
-            }
-            Arch::Aarch64 => unreachable!("AArch64 uses the arm64 module, not iced-x86"),
-        }
+    for site in sites {
+        // `scan_section` already established that this is a `syscall`, and captured the run of
+        // instructions around it that the backward and forward scans can reach before their own
+        // termination tests stop them -- see `SYSCALL_CONTEXT_INSTRUCTIONS`. Indexing into the
+        // window is therefore the same as indexing into a whole-segment decode would have been.
+        let instructions = &site.window[..];
+        let i = site.idx;
+        let inst = &instructions[i];
 
-        found_any = true;
         let replace_end = inst.next_ip();
 
         let mut replace_start = None;
@@ -564,7 +583,7 @@ fn hook_syscalls_in_section(
                 trampoline_base_addr,
                 syscall_entry_addr,
                 trampoline_data,
-                &instructions,
+                instructions,
                 i,
             ) {
                 Ok(()) => {}
@@ -857,7 +876,7 @@ pub fn patch_code_segment(
 ) -> Result<(Vec<u8>, Vec<u64>)> {
     // Fast reject before disassembling anything.
     //
-    // `decode_section_instructions` disassembles the WHOLE segment, and that cost is proportional
+    // `scan_section` disassembles the WHOLE segment, and that cost is proportional
     // to segment size, not to how much there is to patch. Measured on the webtop: 11.21 s for
     // mesa's 130 MB `libLLVM` mapping (~11.6 MB/s), paid AGAIN by every process that loads it --
     // the cache key is per (pid, fd) -- so six XFCE components plus selkies spent over a minute
@@ -878,25 +897,19 @@ pub fn patch_code_segment(
         return Ok((Vec::new(), Vec::new()));
     }
 
-    // Build control-transfer targets for this segment.
-    let instructions = decode_section_instructions(Arch::X86_64, code, code_vaddr)?;
-    let mut control_transfer_targets = BTreeSet::new();
-    for inst in &instructions {
-        let target = inst.near_branch_target();
-        if target != 0 {
-            control_transfer_targets.insert(target);
-        }
-    }
+    // One streaming decode yields both the control-transfer targets and the `syscall` sites with
+    // their local context; see `scan_section` for why this is not a whole-segment `Vec`.
+    let scan = scan_section(Arch::X86_64, code, code_vaddr)?;
 
     let mut trampoline_data = Vec::new();
     match hook_syscalls_in_section(
-        Arch::X86_64,
-        &control_transfer_targets,
+        &scan.targets,
         code_vaddr,
         code,
         trampoline_write_vaddr,
         syscall_entry_addr,
         &mut trampoline_data,
+        &scan.sites,
     ) {
         Ok(skipped_addrs) => Ok((trampoline_data, skipped_addrs)),
         Err(InternalError::NoSyscallInstructionsFound) => Ok((Vec::new(), Vec::new())),
@@ -912,15 +925,25 @@ pub fn patch_code_segment(
 ///
 /// Returns the number of syscall instructions that were patched.
 pub fn trap_all_syscalls_in_code(code: &mut [u8], code_vaddr: u64) -> Result<usize> {
-    let instructions = decode_section_instructions(Arch::X86_64, code, code_vaddr)?;
-    let mut count = 0;
-    for inst in &instructions {
+    // Collect only the `syscall` instructions, not the whole decode. This runs on the same guest
+    // `mmap` path as `patch_code_segment` and over the same segments, so it had the same ~10x
+    // blow-up `scan_section` documents -- ~1.3 GB of `Vec<iced_x86::Instruction>` for mesa's 130 MB
+    // `libLLVM`, on the fallback path taken precisely when things have already gone wrong.
+    //
+    // The two-phase shape is not stylistic: the mutation below needs `&mut code`, which cannot
+    // coexist with the `&code` the decoder borrows. Buffering just the matches keeps that separation
+    // while staying proportional to the number of syscalls rather than to the size of the segment.
+    let mut syscalls = Vec::new();
+    for_each_decoded_instruction(Arch::X86_64, code, code_vaddr, &mut |inst| {
         if inst.code() == iced_x86::Code::Syscall {
-            replace_with_trap(code, code_vaddr, inst);
-            count += 1;
+            syscalls.push(inst);
         }
+    })?;
+
+    for inst in &syscalls {
+        replace_with_trap(code, code_vaddr, inst);
     }
-    Ok(count)
+    Ok(syscalls.len())
 }
 
 fn find_addr_for_trampoline_code(file: &object::File<'_>) -> Result<u64> {
@@ -952,22 +975,127 @@ where
         .max()
 }
 
-fn get_control_transfer_targets(
-    arch: Arch,
-    input_binary: &[u8],
-    text_sections: &[TextSectionInfo],
-) -> Result<BTreeSet<u64>> {
-    let mut control_transfer_targets = BTreeSet::new();
-    for s in text_sections {
-        let section_data = section_slice(input_binary, s)?;
-        let instructions = decode_section_instructions(arch, section_data, s.vaddr)?;
-        control_transfer_targets.extend(instructions.into_iter().filter_map(|inst| {
-            let target = inst.near_branch_target();
-            (target != 0).then_some(target)
-        }));
+
+/// The control-transfer targets of some code, as a sorted, deduplicated list.
+///
+/// This replaced a `BTreeSet<u64>`, which is asked exactly one question -- `contains` -- and paid
+/// for a balanced tree's pointers to answer it. The set is built once and then never mutated, so a
+/// sorted `Vec` plus `binary_search` answers the same question in the same asymptotic time with 8
+/// bytes per target instead of a node's worth. mesa's `libLLVM` has millions of them, and this runs
+/// inside a guest `mmap` where every transient byte competes with the guest's own memory.
+struct ControlTransferTargets(Vec<u64>);
+
+impl ControlTransferTargets {
+    /// Sort and deduplicate `targets`, taking ownership.
+    fn from_unsorted(mut targets: Vec<u64>) -> Self {
+        targets.sort_unstable();
+        targets.dedup();
+        Self(targets)
     }
 
-    Ok(control_transfer_targets)
+    /// Whether any control transfer in the scanned code targets `addr`.
+    ///
+    /// Takes `&u64` so call sites read identically to the `BTreeSet::contains` this replaced.
+    fn contains(&self, addr: &u64) -> bool {
+        self.0.binary_search(addr).is_ok()
+    }
+}
+
+/// How many instructions of context on either side of a `syscall` the hooking code can need.
+///
+/// Both scans -- backward in [`hook_syscalls_in_section`], forward in [`hook_syscall_and_after`] --
+/// stop as soon as the range they are growing reaches 5 bytes (the length of the `JMP rel32` that
+/// replaces it), and otherwise at the first instruction that is a control-transfer target or does
+/// not fall through. `syscall` is 2 bytes, so either scan is satisfied by 3 further bytes, which in
+/// the worst case of single-byte instructions is 3 instructions. 8 is that bound with room to spare.
+///
+/// Note what this constant is NOT: it is not a correctness condition. Both scans' termination tests
+/// are unchanged and still decide where each replacement range ends. This only bounds how much of
+/// the decode is kept for them to look at.
+const SYSCALL_CONTEXT_INSTRUCTIONS: usize = 8;
+
+/// One `syscall` instruction found in a code segment, with just enough decoded context around it
+/// for the hooking code to work.
+struct SyscallSite {
+    /// Index of the `syscall` instruction itself within [`Self::window`].
+    idx: usize,
+    /// A contiguous run of decoded instructions centred on the `syscall`: up to
+    /// [`SYSCALL_CONTEXT_INSTRUCTIONS`] before it, the `syscall`, and up to that many after.
+    window: Vec<iced_x86::Instruction>,
+}
+
+/// Everything one streaming decode of a code segment yields.
+struct SegmentScan {
+    /// Targets of every near control transfer in the segment.
+    targets: ControlTransferTargets,
+    /// Every `syscall` instruction in the segment, in address order.
+    sites: Vec<SyscallSite>,
+}
+
+/// Decode `section_data` at `section_base_addr` and collect only what the hooking code needs.
+///
+/// # Why this exists instead of a `Vec<iced_x86::Instruction>`
+///
+/// The previous shape was `decode_section_instructions`: decode the whole segment into a `Vec` and
+/// hand that around. An `iced_x86::Instruction` is 40 bytes, against roughly 4 bytes of x86 per
+/// instruction, so that `Vec` runs about 10x the size of the code it describes -- **~1.3 GB for
+/// mesa's 130 MB `libLLVM`**, allocated inside a guest `mmap`, in a host process that shares one
+/// address space with every guest process at once. Worse, `patch_code_segment` kept its `Vec` alive
+/// across the call to `hook_syscalls_in_section`, which decoded the same bytes into a second `Vec`
+/// of its own: ~2.6 GB transient for one library. The repeated host OOM kills during webtop startup
+/// are the visible form of that.
+///
+/// Nothing needed the whole thing. The hooker asks the decode two questions: "is this address a
+/// control-transfer target" (a set of `u64`, small), and "what are the few instructions either side
+/// of this `syscall`" (see [`SYSCALL_CONTEXT_INSTRUCTIONS`]). Both are answerable in one forward
+/// pass holding a short ring buffer, which is what this does -- same decoder, same chunking, same
+/// instruction stream, bounded memory, and one pass where there were two.
+fn scan_section(arch: Arch, section_data: &[u8], section_base_addr: u64) -> Result<SegmentScan> {
+    let mut targets = Vec::new();
+    let mut sites: Vec<SyscallSite> = Vec::new();
+    // The most recently decoded instructions, oldest first, capped at the context bound.
+    let mut ring: VecDeque<iced_x86::Instruction> = VecDeque::new();
+    // Indices into `sites` whose forward context is not yet full.
+    let mut pending: Vec<usize> = Vec::new();
+
+    for_each_decoded_instruction(arch, section_data, section_base_addr, &mut |inst| {
+        let target = inst.near_branch_target();
+        if target != 0 {
+            targets.push(target);
+        }
+
+        // Extend the forward context of every site still waiting for it. Done before this
+        // instruction is considered as a new site of its own, so that a `syscall` immediately
+        // following another one lands in the earlier one's forward window -- exactly where it was
+        // when the whole segment was a single slice.
+        pending.retain(|&site_idx| {
+            let site = &mut sites[site_idx];
+            site.window.push(inst);
+            site.window.len() < site.idx + 1 + SYSCALL_CONTEXT_INSTRUCTIONS
+        });
+
+        let is_syscall = match arch {
+            Arch::X86_64 => inst.code() == iced_x86::Code::Syscall,
+            Arch::Aarch64 => false,
+        };
+        if is_syscall {
+            let mut window: Vec<iced_x86::Instruction> = ring.iter().copied().collect();
+            let idx = window.len();
+            window.push(inst);
+            sites.push(SyscallSite { idx, window });
+            pending.push(sites.len() - 1);
+        }
+
+        if ring.len() == SYSCALL_CONTEXT_INSTRUCTIONS {
+            ring.pop_front();
+        }
+        ring.push_back(inst);
+    })?;
+
+    Ok(SegmentScan {
+        targets: ControlTransferTargets::from_unsorted(targets),
+        sites,
+    })
 }
 
 const MAX_X86_INSTRUCTION_LEN: usize = 15;
@@ -984,17 +1112,24 @@ fn bytes_until_next_4g_boundary(ptr: *const u8) -> usize {
 // has been fixed (see https://github.com/icedland/iced/pull/697) but not
 // released onto crates.io.  We handle it by making sure that we are only ever
 // sending iced-x86 inputs that are fully within the 4GiB scope.
-fn decode_section_instructions(
+/// Decode `section_data` at `section_base_addr`, handing each instruction to `sink` in address
+/// order.
+///
+/// This is [`scan_section`]'s engine. The chunking below (4 GiB-boundary avoidance, overlapping
+/// windows) is exactly what `decode_section_instructions` did before it became a thin wrapper
+/// around this; only the destination changed, from a `Vec` to a callback, so that a caller which
+/// does not need every instruction at once need not hold every instruction at once.
+fn for_each_decoded_instruction(
     arch: Arch,
     section_data: &[u8],
     section_base_addr: u64,
-) -> Result<Vec<iced_x86::Instruction>> {
+    sink: &mut dyn FnMut(iced_x86::Instruction),
+) -> Result<()> {
     let bitness = match arch {
         Arch::X86_64 => 64,
         Arch::Aarch64 => unreachable!("AArch64 uses the arm64 module, not iced-x86"),
     };
 
-    let mut instructions = Vec::new();
     let mut offset = 0usize;
 
     while offset < section_data.len() {
@@ -1014,12 +1149,32 @@ fn decode_section_instructions(
             &remaining[..decode_window_len],
             chunk_start_ip,
             chunk_end_ip,
-            &mut instructions,
+            sink,
         )?;
 
         offset = offset.checked_add(chunk_advance_len).unwrap();
     }
 
+    Ok(())
+}
+
+/// Decode `section_data` at `section_base_addr` into one `Vec`.
+///
+/// Test-only, and deliberately so: materializing every instruction costs about 10x the size of the
+/// code it describes (see [`scan_section`] for the arithmetic and what it cost in practice), so no
+/// production path may use it. It survives because the 4 GiB-boundary regression test below needs to
+/// assert on a decoded instruction's length, which is a question about one instruction in a few
+/// dozen bytes.
+#[cfg(test)]
+fn decode_section_instructions(
+    arch: Arch,
+    section_data: &[u8],
+    section_base_addr: u64,
+) -> Result<Vec<iced_x86::Instruction>> {
+    let mut instructions = Vec::new();
+    for_each_decoded_instruction(arch, section_data, section_base_addr, &mut |inst| {
+        instructions.push(inst);
+    })?;
     Ok(instructions)
 }
 
@@ -1028,7 +1183,7 @@ fn append_decoded_instructions(
     window: &[u8],
     chunk_start_ip: u64,
     chunk_end_ip: u64,
-    instructions: &mut Vec<iced_x86::Instruction>,
+    sink: &mut dyn FnMut(iced_x86::Instruction),
 ) -> Result<()> {
     if bytes_until_next_4g_boundary(window.as_ptr()) > window.len() {
         return append_decoded_non_crossing_window(
@@ -1036,7 +1191,7 @@ fn append_decoded_instructions(
             window,
             chunk_start_ip,
             chunk_end_ip,
-            instructions,
+            sink,
         );
     }
 
@@ -1067,7 +1222,7 @@ fn append_decoded_instructions(
         scratch_window,
         chunk_start_ip,
         chunk_end_ip,
-        instructions,
+        sink,
     )
 }
 
@@ -1076,7 +1231,7 @@ fn append_decoded_non_crossing_window(
     window: &[u8],
     chunk_start_ip: u64,
     chunk_end_ip: u64,
-    instructions: &mut Vec<iced_x86::Instruction>,
+    sink: &mut dyn FnMut(iced_x86::Instruction),
 ) -> Result<()> {
     let mut decoder = iced_x86::Decoder::new(bitness, window, iced_x86::DecoderOptions::NONE);
     decoder.set_ip(chunk_start_ip);
@@ -1093,7 +1248,7 @@ fn append_decoded_non_crossing_window(
             break;
         }
 
-        instructions.push(inst);
+        sink(inst);
     }
 
     Ok(())
@@ -1152,7 +1307,7 @@ fn reencode_instructions(
 
 #[allow(clippy::too_many_arguments)]
 fn hook_syscall_and_after(
-    control_transfer_targets: &BTreeSet<u64>,
+    control_transfer_targets: &ControlTransferTargets,
     section_base_addr: u64,
     section_data: &mut [u8],
     trampoline_base_addr: u64,
