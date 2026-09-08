@@ -5410,14 +5410,32 @@ impl ThreadHandle {
         let _ = diag_rip0_enabled();
         let _ = is_in_ntdll_or_this(0);
 
-        const MAX_ALLOCATOR_SUSPEND_RETRIES: u32 = 8;
+        const MAX_ALLOCATOR_SUSPEND_RETRIES: u32 = 64;
         let mut attempt = 0u32;
+        // Whether the retry budget ran out with the target still inside the global allocator.
+        //
+        // This case used to fall straight through into the context manipulation below, which is
+        // exactly the thing the comment above calls out as unrecoverable: redirecting the `Rip` of
+        // a thread caught mid-mutation of the process-wide `SLAB_ALLOC` abandons that mutation
+        // partway and corrupts the allocator for every other thread. The budget existing at all
+        // says the situation is expected; proceeding anyway when it is exhausted made the
+        // expected case the fatal one.
+        //
+        // It is reached under real thread load. `mate-session` (dozens of threads, all
+        // allocating) died reproducibly with an access violation on a loaded pointer inside
+        // `fork_verify::on_single_step`, with `SafeZoneAllocator::dealloc` on the crash stack --
+        // the signature of an allocator corrupted earlier by someone else. The same run under
+        // `cdb` completed cleanly every time, because a debugger's serialised exception delivery
+        // slows the target enough that it always leaves the allocator within the budget: a
+        // Heisenbug, and the give-up path is what made it one.
+        let mut still_in_allocator = false;
         loop {
             unsafe {
                 windows_sys::Win32::System::Threading::SuspendThread(inner.handle.as_raw_handle());
             }
             attempt += 1;
             if attempt > MAX_ALLOCATOR_SUSPEND_RETRIES {
+                still_in_allocator = true;
                 break;
             }
             let mut probe_context = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT {
@@ -5442,7 +5460,16 @@ impl ThreadHandle {
             unsafe {
                 windows_sys::Win32::System::Threading::ResumeThread(inner.handle.as_raw_handle());
             }
-            std::thread::yield_now();
+            // `yield_now` alone only helps when the target is actually runnable on this core; with
+            // many runnable threads it can spin through the whole budget without the target ever
+            // being scheduled. Yield for the first few attempts (cheapest, and usually enough),
+            // then sleep so the target reliably gets to finish. Sleeping here is safe: the target
+            // is RESUMED at this point, and this thread holds no lock it needs to make progress.
+            if attempt <= 4 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(core::time::Duration::from_micros(50));
+            }
         }
         if diag_interrupt_enabled() {
             diag_raw_print(
@@ -5464,7 +5491,28 @@ impl ThreadHandle {
         let target_tls = unsafe { &*inner.tls.0 };
 
         // Write the target interrupt flag.
+        //
+        // Safe regardless of where the target was caught: it is a plain `Cell<bool>` store into
+        // the target's own TLS, touching no shared allocator or lock.
         target_tls.interrupt.set(true);
+
+        // The target is still inside the global allocator after the whole retry budget. Setting
+        // the flag above is all that may safely be done -- redirecting its `Rip` from here would
+        // abandon an in-progress allocator mutation and corrupt `SLAB_ALLOC` process-wide.
+        //
+        // Returning now is correct, not a fallback: the interrupt is advisory, and the flag is
+        // checked before the target next returns to the guest (the `!is_in_guest` case
+        // immediately below relies on exactly that property). The interrupt is therefore delivered
+        // at the target's next safe point instead of immediately -- later, never wrong.
+        if still_in_allocator {
+            if diag_interrupt_enabled() {
+                eprintln!(
+                    "[diag-interrupt-deferred] target still in global allocator after {attempt} \
+                     attempts; flag set, context left alone"
+                );
+            }
+            return;
+        }
 
         if !target_tls.is_in_guest.get() {
             // Not running in the guest. The interrupt flag will be checked
