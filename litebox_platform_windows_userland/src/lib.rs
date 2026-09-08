@@ -224,13 +224,28 @@ impl WindowsUserland {
 /// Diagnostic tracing gated by `LITEBOX_VEH_TRACE=1`, added to root-cause the intermittent
 /// hang/crash in the `apk add nodejs` repro. Temporary; remove once root-caused.
 ///
-/// Deliberately re-reads the environment on every call rather than caching the result behind a
-/// `static` (this crate's bare-static count is tracked by `dev_tests/src/ratchet.rs`'s
-/// `ratchet_globals`, which is actively trying to reduce, not grow, that count): this is only
-/// called on already-rare exception-handling paths, so the cost of an uncached env lookup is
-/// negligible relative to introducing another global.
+/// **Cached per thread, and that is load-bearing rather than an optimisation.** This used to
+/// re-read the environment on every call, justified by "only called on already-rare
+/// exception-handling paths". That premise was wrong: `fork_verify::on_single_step` calls it on
+/// EVERY single-step trap, and verification single-steps the guest instruction by instruction --
+/// thousands of calls per fork, every one of them inside a vectored exception handler.
+///
+/// `std::env::var_os` on Windows allocates (`std::sys::pal::windows::to_u16s`) and takes ntdll's
+/// process-wide environment critical section. Doing that from inside a VEH, on a thread whose
+/// `rsp` is still guest-address memory and with the guest mid-step, is the same hazard that made
+/// `ThreadHandle::interrupt` deadlock the whole guest earlier -- except here it faults instead:
+/// `mate-session` died reproducibly with an access violation inside `on_single_step` itself
+/// (`is_in_guest=false is_verifying=true`, `to_u16s` on the stack, `rax=0xc0000100` =
+/// `STATUS_VARIABLE_NOT_FOUND`), then a second fault at `rip=0x40` as the handler re-entered.
+///
+/// Cached in the existing per-thread `DIAG` state rather than behind a new `static`, so the
+/// bare-static count `dev_tests/src/ratchet.rs` tracks does not grow -- which is what the original
+/// comment was protecting, and is preserved.
 pub(crate) fn veh_trace_enabled() -> bool {
-    std::env::var_os("LITEBOX_VEH_TRACE").is_some()
+    DIAG.with_borrow_mut(|d| {
+        *d.veh_trace_enabled
+            .get_or_insert_with(|| std::env::var_os("LITEBOX_VEH_TRACE").is_some())
+    })
 }
 
 /// Whether the targeted `rip == 0` crash diagnostics (`LITEBOX_DIAG_WAIT4GATE=1`) are enabled.
@@ -3728,6 +3743,9 @@ struct DiagState {
     /// Cache of whether the diagnostics are enabled, `None` until first queried. Caching this
     /// per thread keeps the guest-resume path off the environment-lookup path when unset.
     enabled: Option<bool>,
+    /// Same, for `LITEBOX_VEH_TRACE`. See [`veh_trace_enabled`] for why caching this one is a
+    /// correctness requirement rather than a speed-up.
+    veh_trace_enabled: Option<bool>,
     /// Which resume path (`"sysret"`/`"ntcontinue"`) this thread last took, so a crash handler
     /// can report which one was in effect for the resume immediately preceding a fault.
     last_resume_path: &'static str,
@@ -3745,6 +3763,7 @@ impl DiagState {
     const fn new() -> Self {
         Self {
             enabled: None,
+            veh_trace_enabled: None,
             last_resume_path: "none",
             history: (0, [(0, 0, 0, 0, 0); DIAG_RESUME_HISTORY_LEN]),
             pending_watch_addr: None,

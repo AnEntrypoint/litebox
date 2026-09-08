@@ -2246,8 +2246,21 @@ mod codewatch {
         }
     }
 
+    /// Cached per thread, for the same reason [`crate::veh_trace_enabled`] is: this is reached
+    /// from the vectored exception handler on exception-handling paths where an environment
+    /// lookup allocates and takes ntdll's process-wide environment critical section.
     pub(super) fn enabled() -> bool {
-        std::env::var_os("LITEBOX_CODEWATCH").is_some()
+        thread_local! {
+            static ENABLED: core::cell::Cell<Option<bool>> = const { core::cell::Cell::new(None) };
+        }
+        ENABLED.with(|c| match c.get() {
+            Some(v) => v,
+            None => {
+                let v = std::env::var_os("LITEBOX_CODEWATCH").is_some();
+                c.set(Some(v));
+                v
+            }
+        })
     }
 
     /// Whether `addr` falls inside any currently watched region.
@@ -2536,8 +2549,19 @@ fn arm_codewatch(relocations: &litebox::mm::AddressRelocations) {
 /// since it is not CPU debug state at all, so this reuses `arm_codewatch`'s machinery instead of
 /// building that cross-thread plumbing. Same env var also gates `ctxwatch`'s Dr1 mechanism, which
 /// harmlessly still tries and fails to arm (logged, non-fatal) alongside this.
+/// Cached per thread; see [`codewatch::enabled`].
 fn watchaddr_data_enabled() -> bool {
-    std::env::var_os("LITEBOX_DIAG_WATCHADDR").is_some()
+    thread_local! {
+        static ENABLED: core::cell::Cell<Option<bool>> = const { core::cell::Cell::new(None) };
+    }
+    ENABLED.with(|c| match c.get() {
+        Some(v) => v,
+        None => {
+            let v = std::env::var_os("LITEBOX_DIAG_WATCHADDR").is_some();
+            c.set(Some(v));
+            v
+        }
+    })
 }
 
 fn arm_watchaddr_data() {
