@@ -281,3 +281,44 @@ executed as a script, not a damaged file.
 
 **The intermittent host access violation** remains, and now ends some runs during Xvfb startup
 rather than at ~100s.
+
+## Update 4: selkies found and reachable-in-principle; the stream is still not rendered
+
+**selkies was never listening where anything was looking.** Run with `--debug`, it reports
+`SelkiesStreamingApp initialized: encoder=x264enc`, `All main components initialized. Running
+server...`, and then:
+
+```
+INFO:data_websocket:Data WebSocket Server listening on port 8081
+```
+
+**Port 8081** -- not the 8082 that the launcher's `CUSTOM_WS_PORT`, the nginx `proxy_pass` and the
+host proxy were all aimed at. Every `502 Bad Gateway` and every `WebSocket disconnected` in this
+series was pointed at a port nothing was on. That single wrong number is why earlier readings here
+described selkies as "not answering the handshake": it was answering nowhere near where it was
+asked.
+
+The transport underneath is fine, and each layer was checked separately rather than assumed:
+
+* `--publish` round-trips to a server in **pid 1**: HTTP 200.
+* `--publish` round-trips to a server in a **forked child**: HTTP 200 (this refutes a per-process
+  network-namespace theory recorded during the investigation).
+* An **asyncio** server -- the shape selkies actually uses -- through `--publish`: HTTP 200,
+  `AIO_ACCEPTED` / `AIO_RECV 78` / `AIO_SENT`.
+* The image's own nginx serving its own dashboard to the host: `UI HTTP 200`, 762 bytes.
+
+With 8081 published and the host proxy corrected to it, selkies still returns nothing to a
+handshake, which points at its data WebSocket binding `127.0.0.1` rather than the wildcard --
+i.e. the image's intended path, where in-guest nginx reaches it over loopback.
+
+**A correction.** An earlier conclusion in this session that "a guest process connecting to another
+over 127.0.0.1 segfaults" is not established. The run it came from was degraded across the board --
+in the same run `cat` died with `libc.so.6: failed to map segment from shared object` -- so those
+segfaults are address-space/mapping exhaustion under several concurrent processes, not evidence
+about loopback. Whether cross-process loopback works is currently unknown, and needs testing in a
+run that is not already failing to map libc.
+
+**"Failed to map segment" under load is itself a finding**: with the desktop, selkies and a couple
+of python processes live, the shared address space stops being able to map an ordinary library.
+That is the same single-address-space pressure that the `ET_EXEC` collision comes from, and it is
+the most likely explanation for the intermittent host AV that ends runs at varying points.
