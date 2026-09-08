@@ -862,8 +862,25 @@ where
                         }
                         return true;
                     }
-                    CloseBehavior::Graceful => return true,
-                    CloseBehavior::GracefulIfNoPendingData => {}
+                    // Falls through to the pending-data check below, exactly like
+                    // `GracefulIfNoPendingData`. The two differ only in what the CALLER is told
+                    // when data is still queued (see the `Deferred` arm), never in whether that
+                    // data is allowed to be thrown away.
+                    //
+                    // This used to `return true`, closing the socket at once and discarding
+                    // anything the guest had written but that had not yet reached smoltcp. That is
+                    // not what `close(2)` does: with default linger settings Linux flushes queued
+                    // data in the background and sends FIN afterwards. And it is the DEFAULT path
+                    // -- `SO_LINGER` unset maps here -- so the ordinary
+                    // `write(fd, ...); close(fd);` a server does at the end of a response lost the
+                    // response whenever the drain had not run in between.
+                    //
+                    // Measured on a `--publish`ed port: the guest logged `GUEST_SENT 76`, the host
+                    // got nothing, and the only packets the guest ever transmitted were SYN-ACK,
+                    // FIN and ACK -- no payload at all. It reproduced as a RACE, working whenever
+                    // logging slowed the run enough for the drain to happen first, which is what a
+                    // discarded buffer looks like from the outside.
+                    CloseBehavior::Graceful | CloseBehavior::GracefulIfNoPendingData => {}
                 }
                 // check if there is pending data to be sent
                 let socket_handle = &entry.entry;
@@ -896,7 +913,19 @@ where
                 else {
                     unreachable!()
                 };
-                return Err(CloseError::DataPending);
+                // `close_pending_sockets` now owns this socket: it closes once the TX ring and
+                // smoltcp's send queue have both drained.
+                //
+                // Whether that is an ERROR depends on what the caller asked for, not on what
+                // happened. `GracefulIfNoPendingData` is `SO_LINGER` with a timeout -- the caller
+                // wants to know there is still data so it can wait -- while a plain `Graceful`
+                // close is `close(2)` with linger unset, which succeeds immediately and leaves
+                // the kernel to finish sending. Reporting `DataPending` for the latter would make
+                // an ordinary successful close look like a failure.
+                return match behavior {
+                    CloseBehavior::GracefulIfNoPendingData => Err(CloseError::DataPending),
+                    CloseBehavior::Graceful | CloseBehavior::Immediate => Ok(()),
+                };
             }
         }
         Ok(())
