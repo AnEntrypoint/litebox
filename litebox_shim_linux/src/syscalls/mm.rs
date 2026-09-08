@@ -890,6 +890,186 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         )
     }
 
+    /// If `fd` is an ordinary file and the guest asked for a WRITABLE `MAP_SHARED` mapping, back
+    /// it with a real shared-memory object -- keyed by the file's `(dev, ino)`, so every process
+    /// mapping the same file binds to the SAME object and sees the others' writes -- and return
+    /// `Some(result)`. Returns `None` when this does not apply, leaving read-only shared mappings
+    /// and every other case on their existing, cheaper paths.
+    ///
+    /// This exists because rejecting the combination outright with `ENODEV` (as the check just
+    /// below this call site used to do for every file) is not a survivable answer for the callers
+    /// that use it. `dconf` -- and therefore every GSettings write in a MATE, GNOME or XFCE
+    /// session -- does exactly this, in `shm/dconf-shm.c`:
+    ///
+    /// ```text
+    ///     fd  = open (".../dconf/user", O_RDWR | O_CREAT, 0600);
+    ///     ftruncate (fd, 1);
+    ///     shm = mmap (NULL, 1, PROT_WRITE, MAP_SHARED, fd, 0);
+    ///     close (fd);
+    ///     g_assert (shm != MAP_FAILED);
+    /// ```
+    ///
+    /// so `ENODEV` there is not graceful degradation, it is
+    /// `dconf:ERROR:../shm/dconf-shm.c:142:dconf_shm_flag: assertion failed: (shm != MAP_FAILED)`
+    /// and `dconf-service` aborting mid-call. Every dconf write afterwards then fails with
+    /// `GDBus.Error:...NoReply: Message recipient disconnected from message bus without replying`
+    /// -- which is precisely why `mate-panel` came up with no panels at all under LiteBox: a
+    /// panel's entire layout (`org.mate.panel`'s toplevel list) lives in dconf, and an empty
+    /// toplevel list means zero panels, with no error of its own to show for it.
+    ///
+    /// Note the `PROT_WRITE` with no `PROT_READ` above: that is legal on Linux and is what dconf
+    /// asks for, so this path must not assume a readable mapping. It does not -- the platform
+    /// layer already widens write-only to read/write, since Windows has no write-only page
+    /// protection.
+    ///
+    /// KNOWN LIMITATION, stated rather than papered over: writes through the mapping are visible
+    /// to every other MAPPER of the same file, but are not propagated back into the file's own
+    /// byte storage, so a later `read()` of that file still returns the pre-`mmap` contents.
+    /// Closing that gap needs a write-back path this shim has nowhere to hang -- the mapping
+    /// outlives the descriptor (POSIX requires that, and the dconf sequence above closes the fd
+    /// immediately after mapping), and there is no fd-to-path or open-by-inode route to reacquire
+    /// the file at `munmap`/`msync` time. Mapper-to-mapper coherence is the property this shape
+    /// of IPC-flag file actually depends on, and it is the property implemented here; a caller
+    /// wanting durable file bytes still has `write()`.
+    fn try_shared_file_mmap(
+        &self,
+        addr: usize,
+        len: usize,
+        prot: &ProtFlags,
+        flags: &MapFlags,
+        fd: i32,
+        offset: usize,
+    ) -> Option<Result<UserPtrMut<u8>, MappingError>> {
+        if flags.contains(MapFlags::MAP_ANONYMOUS)
+            || !flags.contains(MapFlags::MAP_SHARED)
+            || !prot.contains(ProtFlags::PROT_WRITE)
+        {
+            return None;
+        }
+        // Only whole-file mappings from offset 0 share an object here. A non-zero offset would
+        // need per-offset objects to stay coherent with each other, and nothing observed asks
+        // for one -- falling through leaves such a call on the old `ENODEV` answer rather than
+        // silently giving it an incoherent mapping.
+        if offset != 0 {
+            return None;
+        }
+        let raw_fd = u32::try_from(fd).ok().map(|v| v as usize)?;
+        let files = self.files.borrow();
+        // One lookup for both the identity key and the file's CURRENT bytes, exactly as
+        // `try_memfd_mmap` does -- the seed step below must not need a second fd resolution.
+        let (key, current_bytes) = files
+            .run_on_raw_fd(
+                raw_fd,
+                |typed_fd| {
+                    let status = files.fs.fd_file_status(typed_fd).ok()?;
+                    let key = (status.node_info.dev, status.node_info.ino);
+                    let mut buf = alloc::vec![0u8; status.size];
+                    let n = files.fs.read(typed_fd, &mut buf, Some(0)).unwrap_or(0);
+                    buf.truncate(n);
+                    Some((key, buf))
+                },
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None)
+            .ok()
+            .flatten()?;
+        drop(files);
+
+        let aligned_len = align_up(len, PAGE_SIZE);
+        let Some(length) = litebox::mm::linux::NonZeroPageSize::new(aligned_len) else {
+            return Some(Err(MappingError::UnAligned));
+        };
+
+        let mut shared = self.global.shared_files.lock();
+        let (handle, already_mapped) = match shared.get_mut(&key) {
+            // Reuse only when the existing object is big enough for what is being asked for.
+            // Handing back a shorter one would let the guest address past its end.
+            Some(entry) if entry.size >= aligned_len => {
+                let was = entry.mapped;
+                entry.mapped = true;
+                (entry.handle, was)
+            }
+            _ => {
+                let handle = self
+                    .global
+                    .platform
+                    .create_shared_memory(aligned_len)
+                    .ok()?;
+                shared.insert(
+                    key,
+                    MemfdEntry {
+                        handle,
+                        size: aligned_len,
+                        mapped: true,
+                    },
+                );
+                (handle, false)
+            }
+        };
+        drop(shared);
+
+        // Seed the object from the file's current bytes on the FIRST mapping only. After that the
+        // shared object is the sole source of truth, and re-copying the (now stale) file bytes
+        // over it would wipe whatever other mappers have written -- the same hazard
+        // `MemfdEntry::mapped` documents at length for memfds.
+        if !already_mapped && !current_bytes.is_empty() {
+            // SAFETY: a fresh, private, non-fixed mapping of `handle` -- no guest code has ever
+            // observed this address, so writing into it and unmapping it immediately is sound;
+            // `handle` itself outlives this transient mapping (owned by `shared_files`).
+            if let Ok(ptr) = unsafe {
+                self.process().pm().map_existing_shared_pages(
+                    None,
+                    length,
+                    litebox::mm::linux::CreatePagesFlags::empty(),
+                    handle,
+                )
+            } {
+                let copy_len = current_bytes.len().min(aligned_len);
+                let _ = ptr.write_slice_at_offset(0, &current_bytes[..copy_len]);
+                let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
+                let _ = litebox_common_linux::mm::sys_munmap(
+                    &self.process().pm(),
+                    user_ptr,
+                    aligned_len,
+                );
+            }
+        }
+
+        let create_flags = {
+            let mut f = litebox::mm::linux::CreatePagesFlags::empty();
+            f.set(
+                litebox::mm::linux::CreatePagesFlags::FIXED_ADDR,
+                flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE),
+            );
+            f.set(
+                litebox::mm::linux::CreatePagesFlags::NOREPLACE,
+                flags.contains(MapFlags::MAP_FIXED_NOREPLACE),
+            );
+            f
+        };
+        let suggested_addr = match if addr == 0 { None } else { Some(addr) } {
+            Some(a) => match litebox::mm::linux::NonZeroAddress::new(a) {
+                Some(n) => Some(n),
+                None => return Some(Err(MappingError::UnAligned)),
+            },
+            None => None,
+        };
+        Some(
+            unsafe {
+                self.process()
+                    .pm()
+                    .map_existing_shared_pages(suggested_addr, length, create_flags, handle)
+            }
+            .map(UserPtrMut::from_platform_ptr::<Platform>),
+        )
+    }
+
     /// If `fd` is a DRM device fd and `offset` is a fake offset a prior `DRM_IOCTL_MODE_MAP_DUMB`
     /// call handed out, map the guest's requested range directly onto that dumb buffer's real
     /// (host-backed) storage and return `Some(result)`. Returns `None` for any other `fd` (not a
@@ -1049,6 +1229,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // ordinary-file path, not of memfd specifically.
         if !flags.contains(MapFlags::MAP_ANONYMOUS)
             && let Some(result) = self.try_memfd_mmap(addr, len, &flags, fd, offset)
+        {
+            return result.map_err(Errno::from);
+        }
+
+        // An ordinary file mapped WRITABLE and MAP_SHARED gets a real shared-memory object,
+        // resolved before the rejection below -- see `try_shared_file_mmap` for why that
+        // rejection was fatal rather than degrading for the callers that hit it. Read-only
+        // shared mappings deliberately fall past this and keep their existing path.
+        if !flags.contains(MapFlags::MAP_ANONYMOUS)
+            && let Some(result) =
+                self.try_shared_file_mmap(addr, len, &prot, &flags, fd, offset)
         {
             return result.map_err(Errno::from);
         }

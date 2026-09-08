@@ -445,6 +445,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             drm: syscalls::drm::DrmSubsystem::new(),
             evdev: syscalls::evdev::EvdevSubsystem::new(),
             memfds: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+            shared_files: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
             proc_self_info: self.proc_self_info,
         });
         LinuxShim(global)
@@ -2435,6 +2436,13 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// `dup()`/`fork()`, must resolve to the SAME real shared-memory handle, not a fresh one per
     /// fd number). See `syscalls::mm::MemfdRegistry`'s own doc comment for the full shape.
     memfds: litebox::sync::Mutex<Platform, syscalls::mm::MemfdRegistry<Platform>>,
+
+    /// Real shared-memory backing for writable `MAP_SHARED` mappings of ORDINARY files, keyed by
+    /// the file's `(dev, ino)` exactly as [`syscalls::mm::MemfdRegistry`] is -- so that every
+    /// process mapping the same file binds to the same object and sees the others' writes. See
+    /// `syscalls::mm::try_shared_file_mmap` for why this exists and what it deliberately does not
+    /// do. Same entry shape as a memfd's, hence the shared type.
+    shared_files: litebox::sync::Mutex<Platform, syscalls::mm::MemfdRegistry<Platform>>,
     /// Backing cell for the guest-visible `/proc/self/*` synthesis (see
     /// `litebox::fs::procfs::ProcSelf`), updated on every `execve` (see
     /// `Task::load_program`). Shared (not owned solely by the mounted backend) so
