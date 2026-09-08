@@ -431,6 +431,46 @@ unsafe extern "system" fn vectored_exception_handler_entry(
         mov     rax, [rcx]           // rax = ExceptionRecord*
         mov     edx, [rax]           // edx = ExceptionRecord->ExceptionCode (i32)
 
+        // WHITELIST, not a blacklist: decline every exception code the full handler does not
+        // actually act on, before touching anything else.
+        //
+        // `vectored_exception_handler` triages exactly four codes -- `EXCEPTION_ACCESS_VIOLATION`
+        // (guest page faults, the FS_BASE-cleared repair, the CoW and exception-table paths),
+        // `EXCEPTION_SINGLE_STEP` (`fork_verify`'s instruction walk), and the two that a guest's
+        // own `syscall`/privileged instruction can raise, `EXCEPTION_ILLEGAL_INSTRUCTION` and
+        // `0xC0000096` (`STATUS_PRIVILEGED_INSTRUCTION`). Everything else fell through to
+        // `.Lswap`, which swaps stacks and calls that handler anyway, purely to have it decide it
+        // has nothing to do.
+        //
+        // That is not merely wasted work, it is actively harmful for two codes in particular:
+        //
+        //   - `EXCEPTION_STACK_OVERFLOW`. Windows delivers it once, on the guard page, and the
+        //     thread has only the remaining guard region to act in. The Rust runtime's own
+        //     handler uses exactly that window to name the overflowing thread and abort cleanly;
+        //     spending it on a stack swap and a large Rust frame instead loses the message, and
+        //     the process dies as a bare `0xC0000005` saying nothing. Observed directly against
+        //     `litebox_shim_linux`'s own `stdio::tests::test_stdio_flags_with_dup`.
+        //   - `0xE06D7363` (`STATUS_MSVC_CPP_EXCEPTION`), which is what a Rust `panic!` raises on
+        //     an MSVC target. Every panic in the process -- including an ordinary assertion
+        //     failure in a unit test -- was entering this trampoline and being carried through a
+        //     stack swap on its way to a handler with no interest in it.
+        //
+        // Declining these is also what makes registering FIRST in the VEH chain safe (see
+        // `AddVectoredExceptionHandler`'s call site): first place in the chain is only correct
+        // for a handler that looks at exactly what is its own.
+        cmp     edx, {EXCEPTION_ACCESS_VIOLATION}
+        je      .Lours
+        cmp     edx, {EXCEPTION_SINGLE_STEP}
+        je      .Lours
+        cmp     edx, {EXCEPTION_ILLEGAL_INSTRUCTION}
+        je      .Lours
+        cmp     edx, {EXCEPTION_PRIV_INSTRUCTION}
+        je      .Lours
+        // Not one of ours. No TLS read, no stack swap, no Rust.
+        mov     eax, {EXCEPTION_CONTINUE_SEARCH}
+        ret
+
+    .Lours:
         // Read this thread's TlsState pointer via the same TEB-slot lookup pattern
         // `syscall_callback` already uses elsewhere in this file. Needed by both the fast path
         // below and the host-stack swap before falling through to the full handler, so done once,
@@ -584,6 +624,9 @@ unsafe extern "system" fn vectored_exception_handler_entry(
         ",
         LSEARCH_COUNT = sym LSEARCH_EXIT_COUNT,
         EXCEPTION_ACCESS_VIOLATION = const Win32_Foundation::EXCEPTION_ACCESS_VIOLATION,
+        EXCEPTION_SINGLE_STEP = const Win32_Foundation::EXCEPTION_SINGLE_STEP,
+        EXCEPTION_ILLEGAL_INSTRUCTION = const Win32_Foundation::EXCEPTION_ILLEGAL_INSTRUCTION,
+        EXCEPTION_PRIV_INSTRUCTION = const 0xC000_0096_u32.cast_signed(),
         EXCEPTION_CONTINUE_EXECUTION = const EXCEPTION_CONTINUE_EXECUTION,
         EXCEPTION_CONTINUE_SEARCH = const EXCEPTION_CONTINUE_SEARCH,
         CONTEXT_RIP = const core::mem::offset_of!(
