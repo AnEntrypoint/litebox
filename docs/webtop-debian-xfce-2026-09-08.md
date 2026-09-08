@@ -72,9 +72,26 @@ why. The actual hole is narrower. A `Hint`-mode request that SUCCEEDS at the add
 `get_unmmaped_area` chose is never claimed (only `Replace` is claimed on that branch), and
 `get_unmmaped_area` chose that address using this process's own `Vmem` alone. The pre-checks that
 should still catch a live neighbour (`has_committed_page`, `find_foreign_claim`) run under
-`ALLOCATE_PAGES_FIXED_ADDR_LOCK`, so the next thing to establish is which of those two -- the
-unclaimed success, or a gap in the checks -- actually lets xfwm4's load land on Xvfb. That needs
-the faulting range captured at the moment of collision, not more reasoning.
+`ALLOCATE_PAGES_FIXED_ADDR_LOCK`.
+
+### The collision, captured
+
+Running the repro under `LITEBOX_DIAG_MM=1` catches it directly. The second fault of the run is a
+read of `cr2=0x11720cd0`, and THREE separate commits in the same run cover that address:
+
+    0x11100000-0x12144000
+    0x1170b000-0x1172c000
+    0x11718000-0x11739000     <-- starts BEFORE the previous range ends
+
+The last two overlap each other: two distinct allocations were handed the same pages. Their
+neighbours in the log march upward in exact `0x21000` steps (`0x117ae000-0x117cf000`,
+`0x117cf000-0x117f0000`, `0x117f0000-0x11811000`, ...), which is the signature of sequential heap
+growth -- so this is two guest processes growing heaps into one another in the single shared host
+address space, and the corruption is what makes Xvfb jump through a NULL pointer.
+
+That is the bug to fix, and it is squarely the address-space-sharing class this runtime is built
+around, not a webtop or XFCE problem. The same run also took the HOST runner down with it
+(`EXIT=139`), so it is not contained to the guest.
 
 ## Networking: the browser path that does work
 
