@@ -143,39 +143,114 @@ pub fn record_unsupported_subcommand(description: &str, errno_name: &str, pid: i
 static SYSCALL_TIMELINE_ENABLED: AtomicBool = AtomicBool::new(false);
 static SYSCALL_TIMELINE_INIT: AtomicBool = AtomicBool::new(false);
 
-/// Call once, early, with a closure performing the platform's `env_flag` lookup for
+/// The process names the timeline is currently aimed at, parsed once from the env var's value.
+///
+/// Empty means the timeline is off; it is never "empty means everything", which is the whole
+/// safety property here (see [`SYSCALL_TIMELINE_DEFAULT_COMMS`]).
+static SYSCALL_TIMELINE_COMMS: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
+
+/// The list `LITEBOX_DIAG_SYSCALL_TIMELINE=1` selects, kept so the historical spelling of this
+/// flag keeps doing exactly what it used to.
+///
+/// These are the XFCE components from the "why does this client go silent after CreateWindow"
+/// investigation (AGENTS.md's "Rendering/scanout blocker" section), confirmed via X11 protocol
+/// decode to create a window, do some property setup, then never issue another X11 request.
+const SYSCALL_TIMELINE_DEFAULT_COMMS: &[&str] = &["xfwm4", "xfdesktop", "xfce4-panel", "xfce4-about"];
+
+/// Call once, early, with a closure performing the platform's `env_value` lookup for
 /// `LITEBOX_DIAG_SYSCALL_TIMELINE`. Idempotent, same lazy-latch pattern as
 /// [`init_strace_summary`], including why the argument is a closure.
-pub fn init_syscall_timeline(enabled: impl FnOnce() -> bool) {
+///
+/// # Why this takes a value rather than a flag
+///
+/// The target list used to be a `const` of four hard-coded XFCE process names, deliberately
+/// fixed "so this stays a targeted diagnostic rather than growing back into the every-process
+/// firehose that OOM'd the host once already". The bound was right; hard-coding it was not. It
+/// made the single most useful instrument in the shim answer questions about exactly one desktop
+/// -- pointing it at a silent `mate-session` meant editing this file and rebuilding, which is a
+/// thing you only discover you need in the middle of the investigation that needs it.
+///
+/// The value form keeps the bound exactly as strong: the list is still an explicit enumeration of
+/// process names, still never a wildcard, and an unset variable still traces nothing. All that
+/// changes is WHO writes the list -- the person running the investigation instead of whoever last
+/// edited this constant.
+///
+/// - unset or empty -> off
+/// - `1` / `true` / `yes` / `on` -> [`SYSCALL_TIMELINE_DEFAULT_COMMS`], the historical behavior
+/// - anything else -> a comma-separated list of `comm` names, e.g. `mate-session,marco,caja`
+pub fn init_syscall_timeline(value: impl FnOnce() -> Option<String>) {
     if SYSCALL_TIMELINE_INIT.load(Ordering::Acquire) {
         return;
     }
-    SYSCALL_TIMELINE_ENABLED.store(enabled(), Ordering::Release);
+    let comms: Vec<String> = match value() {
+        None => Vec::new(),
+        Some(v) if matches!(v.trim(), "1" | "true" | "yes" | "on") => SYSCALL_TIMELINE_DEFAULT_COMMS
+            .iter()
+            .map(|s| String::from(*s))
+            .collect(),
+        Some(v) => v
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+    };
+    SYSCALL_TIMELINE_ENABLED.store(!comms.is_empty(), Ordering::Release);
+    *SYSCALL_TIMELINE_COMMS.lock() = comms;
     SYSCALL_TIMELINE_INIT.store(true, Ordering::Release);
+}
+
+/// Emit one already-formatted timeline line straight to the guest's stderr.
+///
+/// # Why not `litebox_util_log::error!`
+///
+/// Because that is gated on a SECOND, unrelated environment variable. The timeline's lines went
+/// through the `log` macros, which reach the runner's `tracing` subscriber -- and that subscriber
+/// is installed with `.with_env_var("LITEBOX_LOG")`, so with `LITEBOX_LOG` unset the level filter
+/// discards every line before it is written. The result is the worst possible failure mode for an
+/// instrument: `LITEBOX_DIAG_SYSCALL_TIMELINE=mate-session` is accepted, the filter matches, the
+/// emit site runs -- and nothing appears. Silence from a diagnostic reads as "the thing I am
+/// looking for did not happen", which is precisely the wrong conclusion, and it cost a full
+/// webtop boot to find out otherwise.
+///
+/// A diagnostic gated by its own variable must not depend on an unrelated one to produce output.
+/// The rest of this codebase already settled that: `diag_raw_print_proc_sys_open_miss` and
+/// `diag_raw_print_dev_open_miss` both write to stderr through
+/// [`litebox::platform::StdioProvider::write_to`], which is why THEIR output shows up
+/// unconditionally. This is the same path.
+///
+/// Unlike those two, this one is not allocation-free -- the caller has already used `format!` to
+/// build the line, and unlike an open-path miss this only ever runs from ordinary syscall
+/// dispatch, where allocation is fine.
+pub fn emit_timeline_line<Platform: litebox::platform::StdioProvider>(
+    platform: &Platform,
+    line: &str,
+) {
+    let _ = platform.write_to(litebox::platform::StdioOutStream::Stderr, line.as_bytes());
+    let _ = platform.write_to(litebox::platform::StdioOutStream::Stderr, b"
+");
 }
 
 pub fn syscall_timeline_enabled() -> bool {
     SYSCALL_TIMELINE_ENABLED.load(Ordering::Acquire)
 }
 
-/// `comm` prefixes worth per-syscall tracing for the "why does this client go silent after
-/// CreateWindow" investigation (AGENTS.md's "Rendering/scanout blocker" section) -- the XFCE
-/// components confirmed (via the X11 protocol decode) to create a window, do some property
-/// setup, then never issue another X11 request. Kept as a short fixed list, not a general
-/// pattern, so this stays a targeted diagnostic rather than growing back into the
-/// every-process firehose that OOM'd the host once already (see the call site's own comment).
-const SYSCALL_TIMELINE_TARGET_COMMS: &[&[u8]] = &[b"xfwm4", b"xfdesktop", b"xfce4-panel", b"xfce4-about"];
-
 /// Whether `comm` (the raw, NUL-padded `[u8; 16]`-shaped process name, as read from
-/// `Task::comm`) matches one of [`SYSCALL_TIMELINE_TARGET_COMMS`]. A prefix match (real Linux
-/// truncates `comm` to 15 bytes + NUL, and this project's own `comm` field mirrors that), so
-/// e.g. a future longer name is still matched on its first 15 bytes.
+/// `Task::comm`) is one the timeline is aimed at.
+///
+/// A prefix match, because real Linux truncates `comm` to 15 bytes + NUL and this project's own
+/// `comm` field mirrors that -- so a target name longer than 15 bytes is still matched on the
+/// bytes that survive the truncation, rather than silently never matching.
 pub fn is_syscall_timeline_target_comm(comm: &[u8]) -> bool {
+    if !syscall_timeline_enabled() {
+        return false;
+    }
     let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
     let trimmed = &comm[..end];
-    SYSCALL_TIMELINE_TARGET_COMMS
+    SYSCALL_TIMELINE_COMMS
+        .lock()
         .iter()
-        .any(|target| trimmed == *target || target.starts_with(trimmed))
+        .any(|target| trimmed == target.as_bytes() || target.as_bytes().starts_with(trimmed))
 }
 
 /// Public wrapper around [`syscall_name`] for `lib.rs`'s per-syscall timeline trace (the

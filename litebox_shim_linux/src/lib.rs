@@ -1424,36 +1424,50 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // unfiltered every-process version was tried first and OOM'd the host runner process (a
         // 1.25GB single allocation failure, ~21s into a busy full-desktop run, ~26000 log lines
         // already emitted by then) -- logging every syscall of every guest process on a busy
-        // multi-process desktop session is not viable; filtering by comm (rather than pid, which
-        // this `#![no_std]` shim has no host-env-var integer-parsing path to configure without a
-        // new `SystemInfoProvider` trait method -- avoided here specifically because that trait
-        // is in `litebox/src/platform/mod.rs`, mid-edit by a peer session this pass) keeps this
-        // proportional to the specific client processes under investigation.
-        crate::diag::init_syscall_timeline(|| self.global.platform.env_flag("LITEBOX_DIAG_SYSCALL_TIMELINE"));
+        // multi-process desktop session is not viable. Filtering by comm keeps this proportional
+        // to the specific client processes under investigation.
+        //
+        // WHICH comms is now the env var's VALUE, not a `const` in `diag.rs`. That constant was
+        // four hard-coded XFCE names, and this comment used to explain that a configurable filter
+        // was "avoided here specifically because that trait is in `litebox/src/platform/mod.rs`,
+        // mid-edit by a peer session this pass" -- a scheduling accident, recorded honestly, that
+        // then outlived its cause and made the shim's most useful instrument answer questions
+        // about exactly one desktop. `SystemInfoProvider::env_value` now exists and this reads it;
+        // see `diag::init_syscall_timeline` for why the bound is unchanged by that.
+        crate::diag::init_syscall_timeline(|| self.global.platform.env_value("LITEBOX_DIAG_SYSCALL_TIMELINE"));
         let comm_bytes = self.comm.get();
         let is_target = crate::diag::syscall_timeline_enabled()
             && crate::diag::is_syscall_timeline_target_comm(&comm_bytes);
         if is_target {
-            litebox_util_log::error!(
-                pid:% = self.pid,
-                tid:% = self.tid,
-                comm:% = alloc::string::String::from_utf8_lossy(&comm_bytes),
-                syscall:% = crate::diag::syscall_name_pub(syscall_number),
-                syscall_num:% = syscall_number;
-                "diag-syscall-enter"
+            // Straight to stderr, not through `litebox_util_log` -- see
+            // `diag::emit_timeline_line` for why (the log macros are gated on `LITEBOX_LOG`,
+            // so this instrument used to accept its own env var and then print nothing).
+            crate::diag::emit_timeline_line(
+                self.global.platform,
+                &alloc::format!(
+                    "[diag-syscall-enter] pid={} tid={} comm={} syscall={} syscall_num={}",
+                    self.pid,
+                    self.tid,
+                    alloc::string::String::from_utf8_lossy(&comm_bytes),
+                    crate::diag::syscall_name_pub(syscall_number),
+                    syscall_number,
+                ),
             );
         }
 
         let result = self.do_syscall(ctx);
 
         if is_target {
-            litebox_util_log::error!(
-                pid:% = self.pid,
-                tid:% = self.tid,
-                comm:% = alloc::string::String::from_utf8_lossy(&comm_bytes),
-                syscall:% = crate::diag::syscall_name_pub(syscall_number),
-                ok:% = result.is_ok();
-                "diag-syscall-exit"
+            crate::diag::emit_timeline_line(
+                self.global.platform,
+                &alloc::format!(
+                    "[diag-syscall-exit] pid={} tid={} comm={} syscall={} ok={}",
+                    self.pid,
+                    self.tid,
+                    alloc::string::String::from_utf8_lossy(&comm_bytes),
+                    crate::diag::syscall_name_pub(syscall_number),
+                    result.is_ok(),
+                ),
             );
         }
 
@@ -1521,12 +1535,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             } else {
                 debug_str
             };
-            litebox_util_log::error!(
-                pid:% = self.pid,
-                tid:% = self.tid,
-                comm:% = alloc::string::String::from_utf8_lossy(&self.comm.get()),
-                request:% = truncated;
-                "diag-syscall-request-detail"
+            crate::diag::emit_timeline_line(
+                self.global.platform,
+                &alloc::format!(
+                    "[diag-syscall-request-detail] pid={} tid={} comm={} request={}",
+                    self.pid,
+                    self.tid,
+                    alloc::string::String::from_utf8_lossy(&self.comm.get()),
+                    truncated,
+                ),
             );
         }
         if matches!(

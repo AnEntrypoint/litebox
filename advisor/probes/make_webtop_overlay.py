@@ -134,8 +134,30 @@ if [ "$STAGE" -ge 4 ]; then
   # Running the daemon directly makes the address an observable value rather than an implicit
   # side effect: if the bus never comes up, `DBUS_ADDR` is empty and this says so, and if it does,
   # every later failure is unambiguously mate-session's own.
+  # NOT `--fork`. The daemon is backgrounded by the shell instead, so dbus-daemon itself never
+  # forks and its listening socket stays in the process that created it.
+  #
+  # With `--fork`, mate-session hung with a completely diagnostic syscall tail: socket(AF_UNIX),
+  # connect() to the bus path, sendto(1 byte) -- D-Bus's mandatory leading NUL -- sendto(18
+  # bytes) starting the SASL AUTH exchange, then `ppoll(nfds=1, timeout=-1)` that never returns.
+  # It reached the bus and the bus never answered. `--fork` daemonizes by creating the listening
+  # socket, forking, and letting the child serve while the parent prints the address and exits;
+  # litebox's fork carries pipes, regular files and the filesystem to a child but NOT sockets, so
+  # the surviving child holds no listener and nobody ever accepts. (AF_UNIX itself is fine across
+  # processes here -- mate-session's X11 connection to Xvfb is one, and the X census proves it
+  # works.) Backgrounding from the shell puts the socket in the post-exec process, where it stays.
   echo "[stack] starting session dbus-daemon"
-  DBUS_ADDR=$(/usr/bin/dbus-daemon --session --fork --print-address 2>/tmp/dbusd.log)
+  rm -f /tmp/dbus-addr.txt
+  /usr/bin/dbus-daemon --session --print-address > /tmp/dbus-addr.txt 2>/tmp/dbusd.log &
+  # The address is written as soon as the listener is up; poll briefly rather than sleeping a
+  # fixed span, so a fast start is not paid for and a slow one is not truncated.
+  i=0
+  while [ "$i" -lt 30 ]; do
+    [ -s /tmp/dbus-addr.txt ] && break
+    i=$((i + 1))
+    sleep 1
+  done
+  DBUS_ADDR=$(cat /tmp/dbus-addr.txt 2>/dev/null)
   if [ -z "$DBUS_ADDR" ]; then
     echo "[stack] DBUS_FAILED -- dbusd.log follows"; cat /tmp/dbusd.log 2>&1
   else

@@ -9674,6 +9674,29 @@ impl litebox::platform::SystemInfoProvider for WindowsUserland {
         })
     }
 
+    fn env_value(&self, name: &str) -> Option<std::string::String> {
+        // Cached per thread for exactly the reasons `env_flag` above documents at length -- the
+        // cost being avoided is ntdll's process-wide environment critical section, which is a
+        // property of the lookup itself and not of what the lookup returns. A separate cache
+        // rather than a shared one because the two answer different questions ("is it set" vs
+        // "what is it"), and conflating them would make the flag cache's `bool` lossy.
+        thread_local! {
+            static VALUE_CACHE: RefCell<
+                std::vec::Vec<(std::string::String, Option<std::string::String>)>,
+            > = const { RefCell::new(std::vec::Vec::new()) };
+        }
+        VALUE_CACHE.with(|c| {
+            if let Some(v) = c.borrow().iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()) {
+                return v;
+            }
+            let v = std::env::var_os(name)
+                .and_then(|v| v.into_string().ok())
+                .filter(|v| !v.is_empty());
+            c.borrow_mut().push((name.into(), v.clone()));
+            v
+        })
+    }
+
     fn cpu_count(&self) -> usize {
         let count = self.sys_info.read().unwrap().dwNumberOfProcessors;
         usize::try_from(count).unwrap_or(1).max(1)

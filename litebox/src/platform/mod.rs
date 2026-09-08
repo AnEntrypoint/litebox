@@ -1172,6 +1172,23 @@ pub trait SystemInfoProvider {
         false
     }
 
+    /// Returns the given host environment variable's VALUE, or `None` when unset or empty.
+    ///
+    /// [`Self::env_flag`] answers only "is this set", which forces any diagnostic that needs a
+    /// parameter -- a filter, a threshold, a target list -- to be hard-coded in the shim instead.
+    /// That is exactly what happened to the syscall timeline, whose target process list was a
+    /// fixed `["xfwm4", "xfdesktop", "xfce4-panel", "xfce4-about"]` and therefore useless for
+    /// investigating any other desktop; changing the subject of an investigation required editing
+    /// and rebuilding the shim. A value-returning lookup lets the same bounded diagnostic be aimed
+    /// at whatever is actually being investigated, without loosening the bound that keeps it from
+    /// becoming an every-process firehose.
+    ///
+    /// Same default-`None` policy as `env_flag`, so platform implementations that don't override
+    /// it keep their prior behavior (every value-parameterised diagnostic simply stays off).
+    fn env_value(&self, _name: &str) -> Option<alloc::string::String> {
+        None
+    }
+
     /// Returns the number of logical CPUs the host makes available to this process.
     ///
     /// Backs the guest-visible `/proc/cpuinfo` synthesis (see `litebox::fs::procfs::Procfs`):
