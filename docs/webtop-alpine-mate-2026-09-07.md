@@ -771,3 +771,90 @@ the browser", which is now closed.
    (`mate-session-avs-are-in-fork-verify-not-guest`). A lighter WM already present in the image
    (`openbox`, `labwc`) may be worth trying first purely to get window content on `:1`.
 3. Browser verification needs Chrome to be allowed to reach `localhost` on this host.
+
+---
+
+# 2026-09-08 continuation: default-configured MATE desktop, live in the browser
+
+## Result
+
+The stock `linuxserver/webtop:alpine-mate` desktop now comes up with its **own default
+configuration** and streams to a host browser: top panel with `Applications`/`Places`/`System`
+menus and a live clock, desktop icons (Computer, Home, Trash), MATE wallpaper, bottom panel with
+window list and workspace switcher. The Applications menu opens and renders its full category
+tree. Input round-trips (clicks land where sent).
+
+Everything runs inside litebox: Xvfb, dbus-daemon, marco, mate-settings-daemon, caja, mate-panel,
+and selkies with its pixelflux/pcmflux x264 encoders. Only the reverse proxy is host-side, and
+only because guest processes do not share a loopback namespace (pre-existing, documented above).
+
+## Defects found and fixed this pass
+
+Each was found from a live failure, not from reading code.
+
+1. **`ThreadHandle::interrupt` deadlocked the whole guest** (`d89bebd`). It called
+   `std::env::var_os` between its `SuspendThread` and its `ResumeThread`; on Windows that
+   allocates and takes ntdll's process-wide environment critical section, so suspending a thread
+   that happened to hold that lock deadlocked the suspender forever. `cdb -pv` showed one thread
+   at `Suspend: 2` inside `RtlQueryEnvironmentVariable` with six more queued behind it. The shim
+   made it near-certain by calling `env_flag` twice per syscall.
+
+2. **`getsockopt`/`setsockopt` returned `EINVAL` for unknown options** (`694bb93`), where Linux
+   returns `ENOPROTOOPT`. zbus probes `SO_PEERPIDFD`; `EINVAL` turned an optional probe into a
+   fatal transport error, so GdkPixbuf -> glycin -> D-Bus image decoding failed for EVERY image.
+   `mate-panel` aborted outright and `marco` crash-looped on its icon theme.
+
+3. **`O_NOATIME` panicked the host** (`133d3d4`) via an `unimplemented!()` in two filesystems'
+   flag whitelists.
+
+4. **`fork_verify` could write into litebox's own code** (`6860300`) -- a heal target derived
+   from decoded guest operands was only checked for "committed and writable", which litebox's own
+   `MEM_IMAGE` pages satisfy once the widen step flips them.
+
+5. **`allocate_pages` panicked the host on OOM** (`62e3c79`) instead of returning
+   `AllocationError::OutOfMemory`, so one oversized `mmap` killed every process in the guest.
+
+6. **Writable `MAP_SHARED` file mappings were rejected with `ENODEV`** (`d22a916`). dconf's
+   `dconf_shm_flag` asserts on `MAP_FAILED`, so `dconf-service` aborted mid-call and every
+   GSettings write failed.
+
+7. **Read-only `MAP_SHARED` mappings did not share that object** (`5a13f2c`), which defeated the
+   point: dconf's writer maps the flag byte `PROT_WRITE` and its readers map it `PROT_READ`.
+   `mate-panel` appends each panel with a read-modify-write of `toplevel-id-list`, so the second
+   append read a stale list and dropped the first entry:
+
+       before -> toplevel-id-list=['bottom']
+       after  -> toplevel-id-list=['top', 'bottom']
+
+   The missing `top` toplevel is exactly why there was no Applications menu: `menu-bar`, `clock`
+   and `notification-area` all reference `toplevel-id='top'`, and a panel that does not exist
+   cannot host them. The applet IIDs were correct the whole time.
+
+## Not fixed: s6-overlay `/init` cannot run (fixed-address ET_EXEC collision)
+
+Running the image through its own `/init` still fails within the first few syscalls, on both the
+alpine and ubuntu images, reproduced here in about a minute:
+
+    s6-overlay-suexec: fatal: child failed with exit code 139
+
+`preinit` (a static ET_EXEC linked at 0x400000) forks, and the child's `execve` of `s6-mkdir`
+(another ET_EXEC at 0x400000) collides, because every guest process shares ONE host address space
+and the parent's ELF still occupies that range. litebox detects the relocation and fails the load
+after execve's point of no return, which is the honest response but is fatal. This is the
+already-documented `vfork-parent-wakes-during-nested-child-execve` row and needs genuine
+per-process address-space isolation (or exec-into-a-fresh-host-process) to fix; `LITEBOX_PROCESS_FORK=1`
+does not help. Because of it, the DE is started from the image's own `/defaults/startwm.sh`
+components rather than under s6 supervision.
+
+## XFCE: not available on Alpine
+
+`linuxserver/webtop` has no `alpine-xfce` tag; XFCE ships only on the debian/ubuntu/fedora/arch
+bases. `ubuntu-xfce` was pulled and packed via `litebox_packager --oci-image` (119,692 entries,
+13.7 GB, at `C:\dev\litebox-webtop\xfce\webtop_xfce.tar`) and boots far enough to run a shell and
+locate `xfce4-session`/`xfce4-panel`/`xfdesktop`/`xfwm4`, and its `startwm.sh` copies real default
+config from `/defaults/xfce/` (plain XML, no dconf). It then hits a NEW, separate gap: Ubuntu
+ships **rust-coreutils**, and those binaries abort in rustix's auxv handling
+(`rustix/src/backend/linux_raw/param/auxv.rs:269: called Result::unwrap() on an Err value: ()`),
+taking out `sleep`, `tail` and the DE launch. `/bin/sleep 1` on its own succeeds, so the failure
+is situational and not yet root-caused. litebox builds an auxv on the initial stack but provides
+no `/proc/self/auxv`, which is the first thing to check.
