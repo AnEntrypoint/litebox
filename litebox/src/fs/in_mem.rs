@@ -828,8 +828,26 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let Some(from_entry) = from_entry else {
             return Err(PathError::NoSuchFileOrDirectory)?;
         };
-        if let Entry::Dir(_) = from_entry {
-            return Err(RenameError::IsADirectory);
+        // Renaming a DIRECTORY is supported, onto a name that does not yet exist.
+        //
+        // This is how a program installs a tree atomically: build it under a temporary name, then
+        // rename it into place. `s6-rc-init` does exactly that -- it populates
+        // `/run/s6-rc:s6-rc-init:<random>/` and renames it to `/run/s6-rc` -- and refusing left the
+        // live directory absent, so `s6-rc-init` died with `unable to supervise service
+        // directories in /run/s6-rc/servicedirs: Not a directory`, stopping an s6-overlay boot.
+        //
+        // An EXISTING destination is still refused, for both files and directories. Linux allows
+        // directory-onto-empty-directory, which nothing here has needed yet; refusing is the
+        // conservative answer and matches what this function already did.
+        let from_is_dir = matches!(from_entry, Entry::Dir(_));
+        if from_is_dir {
+            // A directory cannot be moved inside itself: the subtree would be unreachable from the
+            // root and its own path keys would become self-referential.
+            let mut inside = String::from(from.as_str());
+            inside.push('/');
+            if to.as_str().starts_with(inside.as_str()) {
+                return Err(RenameError::IsADirectory);
+            }
         }
 
         let (to_parent, to_entry) = root.parent_and_entry(&to, self.current_user)?;
@@ -839,6 +857,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         };
         if let Some(Entry::Dir(_)) = to_entry {
             return Err(RenameError::DestinationIsADirectory);
+        }
+        if from_is_dir && to_entry.is_some() {
+            // Directory onto an existing non-directory is never valid (`ENOTDIR` on Linux).
+            return Err(RenameError::IsADirectory);
         }
 
         let from_name = from.components().unwrap().last().unwrap().to_owned();
@@ -877,6 +899,25 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
 
         let moved = root.entries.remove(&from).unwrap();
+        // `RootDir::entries` is keyed by normalized path, so moving a directory has to re-key every
+        // descendant as well -- the tree itself already moved with the child entry above, but every
+        // path key under the old name would otherwise still resolve to the moved subtree while the
+        // new names resolved to nothing.
+        if from_is_dir {
+            let old_prefix = alloc::format!("{}/", from.as_str());
+            let new_prefix = alloc::format!("{}/", to.as_str());
+            let descendants: Vec<String> = root
+                .entries
+                .keys()
+                .filter(|key| key.starts_with(old_prefix.as_str()))
+                .cloned()
+                .collect();
+            for key in descendants {
+                let entry = root.entries.remove(&key).unwrap();
+                let rekeyed = alloc::format!("{new_prefix}{}", &key[old_prefix.len()..]);
+                root.entries.insert(rekeyed, entry);
+            }
+        }
         root.entries.insert(to, moved);
 
         Ok(())
@@ -1272,47 +1313,93 @@ impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
         }
     }
 
+    /// Resolve `path` to its parent directory and its final entry, FOLLOWING any symlink that
+    /// appears as an intermediate component.
+    ///
+    /// The final component is deliberately never followed -- it is returned as whatever it is, so
+    /// `lstat`, `readlink`, `unlink` and `rename` keep operating on the link itself. Only the
+    /// directories walked through on the way are expanded, which is what `ENOTDIR` was previously
+    /// reported for: `ln -s dir link; cat link/file` failed outright, and so did `s6-rc-init`,
+    /// which publishes its live directory by symlinking `/run/s6-rc` at the temporary tree it just
+    /// built and then opening `/run/s6-rc/servicedirs`.
     fn parent_and_entry(
         &self,
         path: &str,
         current_user: UserInfo,
     ) -> ParentAndEntry<'_, Dir<Platform>, Entry<Platform>> {
-        let mut real_components_seen = false;
-        let mut collected = String::new();
-        let mut parent_dir = None;
-        for p in path.normalized_components()? {
-            if p.is_empty() || p == ".." {
-                // After normalization, these can only be at the start of the path, so can all be
-                // ignored. We do an `assert` here mostly as a sanity check.
-                assert!(!real_components_seen);
-                continue;
-            }
-            // We have seen real components, should no longer see any empty or `/`s.
-            real_components_seen = true;
-            match self
-                .entries
-                .get_key_value(&collected)
-                .ok_or(PathError::MissingComponent)?
-            {
-                (_, Entry::File(_) | Entry::Symlink(_)) => {
-                    return Err(PathError::ComponentNotADirectory);
+        // Linux's own limit, and for the same reason: a symlink cycle has to terminate somewhere.
+        const MAX_SYMLINK_HOPS: usize = 40;
+
+        let mut owned_path;
+        let mut path = path;
+        let mut hops = 0usize;
+
+        'walk: loop {
+            let mut real_components_seen = false;
+            let mut collected = String::new();
+            let mut parent_dir = None;
+            let components: Vec<&str> = path.normalized_components()?.collect();
+            for (index, p) in components.iter().enumerate() {
+                if p.is_empty() || *p == ".." {
+                    // After normalization, these can only be at the start of the path, so can all
+                    // be ignored. We do an `assert` here mostly as a sanity check.
+                    assert!(!real_components_seen);
+                    continue;
                 }
-                (parent_path, Entry::Dir(dir)) => {
-                    if !current_user.can_execute(&dir.read().perms) {
-                        return Err(PathError::NoSearchPerms {
-                            #[cfg(debug_assertions)]
-                            dir: parent_path.clone(),
-                            #[cfg(debug_assertions)]
-                            perms: dir.read().perms.mode,
-                        });
+                // We have seen real components, should no longer see any empty or `/`s.
+                real_components_seen = true;
+                match self
+                    .entries
+                    .get_key_value(&collected)
+                    .ok_or(PathError::MissingComponent)?
+                {
+                    (_, Entry::File(_)) => {
+                        return Err(PathError::ComponentNotADirectory);
                     }
-                    parent_dir = Some((parent_path.as_str(), dir.clone()));
+                    // An intermediate component is a symlink: splice its target in and start over.
+                    // A target starting with `/` is absolute; anything else is relative to the
+                    // directory the link itself lives in, which is `collected` minus its own last
+                    // component.
+                    (_, Entry::Symlink(link)) => {
+                        if hops >= MAX_SYMLINK_HOPS {
+                            return Err(PathError::ComponentNotADirectory);
+                        }
+                        hops += 1;
+                        let target = link.read().target.clone();
+                        let base = if target.starts_with('/') {
+                            String::new()
+                        } else {
+                            let parent = collected.rsplit_once('/').map_or("", |(head, _)| head);
+                            String::from(parent)
+                        };
+                        let mut rebuilt = base;
+                        rebuilt.push('/');
+                        rebuilt.push_str(target.trim_start_matches('/'));
+                        for rest in &components[index..] {
+                            rebuilt.push('/');
+                            rebuilt.push_str(rest);
+                        }
+                        owned_path = rebuilt;
+                        path = &owned_path;
+                        continue 'walk;
+                    }
+                    (parent_path, Entry::Dir(dir)) => {
+                        if !current_user.can_execute(&dir.read().perms) {
+                            return Err(PathError::NoSearchPerms {
+                                #[cfg(debug_assertions)]
+                                dir: parent_path.clone(),
+                                #[cfg(debug_assertions)]
+                                perms: dir.read().perms.mode,
+                            });
+                        }
+                        parent_dir = Some((parent_path.as_str(), dir.clone()));
+                    }
                 }
+                collected += "/";
+                collected += p;
             }
-            collected += "/";
-            collected += p;
+            return Ok((parent_dir, self.entries.get(&collected).cloned()));
         }
-        Ok((parent_dir, self.entries.get(&collected).cloned()))
     }
 }
 

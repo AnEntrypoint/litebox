@@ -1220,11 +1220,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         let old_path = self.resolve_path_at(olddirfd, oldpath)?;
         let new_path = self.resolve_path_at(newdirfd, newpath)?;
-        self.files
+        let result = self
+            .files
             .borrow()
             .fs
-            .rename(old_path, new_path)
-            .map_err(Errno::from)
+            .rename(old_path.clone(), new_path.clone())
+            .map_err(Errno::from);
+        litebox_util_log::debug!(
+            tid:% = self.tid,
+            from:% = old_path.to_string_lossy(),
+            to:% = new_path.to_string_lossy(),
+            err:? = result.as_ref().err();
+            "sys_renameat"
+        );
+        result
     }
 
     /// Handle syscall `linkat`
@@ -1263,11 +1272,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         linkpath: impl path::Arg,
     ) -> Result<(), Errno> {
         let linkpath = self.resolve_path_at(newdirfd, linkpath)?;
-        self.files
+        let target = target.to_c_str()?.into_owned();
+        let result = self
+            .files
             .borrow()
             .fs
-            .symlink(target, linkpath)
-            .map_err(Errno::from)
+            .symlink(&target, linkpath.clone())
+            .map_err(Errno::from);
+        litebox_util_log::debug!(
+            tid:% = self.tid,
+            link:% = linkpath.to_string_lossy(),
+            target:% = target.to_string_lossy(),
+            err:? = result.as_ref().err();
+            "sys_symlinkat"
+        );
+        result
     }
 
     /// Handle syscall `read`
@@ -1919,7 +1938,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         mode: u32,
     ) -> Result<(), Errno> {
         let pathname = self.resolve_path_at(dirfd, pathname)?;
-        self.do_mkdir(pathname, Mode::from_bits_retain(mode))
+        let result = self.do_mkdir(pathname.clone(), Mode::from_bits_retain(mode));
+        litebox_util_log::debug!(
+            tid:% = self.tid, path:% = pathname.to_string_lossy(), err:? = result.as_ref().err();
+            "sys_mkdirat"
+        );
+        result
     }
 
     /// Handle syscall `chmod`/`fchmodat`/`fchmodat2`.
