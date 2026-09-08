@@ -333,6 +333,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShimEntrypoints<Platform, FS> {
     /// Linux exit status once `run_thread` has consumed the entrypoints it was called with -- see
     /// [`LinuxShimProcess::wait_for_encoded_cross_process_exit_status`]'s doc comment for why that
     /// status then needs to become this child's real Windows exit code.
+    /// Create a pipe in this (cross-process fork child) process, place its WRITE end at exactly
+    /// `target_fd`, and return a host-side handle on the READ end for a pump thread.
+    ///
+    /// Runs on this task's own thread by necessity -- `LinuxShimEntrypoints` is deliberately
+    /// `!Send`.
+    pub fn install_pipe_write_end_at_fd(
+        &self,
+        target_fd: i32,
+    ) -> Option<litebox::pipes::DetachedPipeEnd<Platform>> {
+        self.task.install_pipe_write_end_at_fd(target_fd)
+    }
+
     pub fn process(&self) -> LinuxShimProcess<Platform> {
         LinuxShimProcess(self.task.process().clone())
     }
@@ -453,6 +465,39 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
 }
 
 pub struct LinuxShim<Platform: ShimPlatform, FS: ShimFS>(Arc<GlobalState<Platform, FS>>);
+
+impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
+    /// Build a `WaitContext` for host-side pipe I/O.
+    ///
+    /// A pump thread has no `Task` to borrow one from, and `WaitState` is deliberately per-thread
+    /// (`Send` but not `Sync`), so each call makes its own. `WaitState::new` takes the `&'static`
+    /// platform, which is exactly what is available here.
+    fn host_wait_state(&self) -> litebox::event::wait::WaitState<Platform> {
+        litebox::event::wait::WaitState::new(self.0.platform)
+    }
+
+    /// Read from a detached pipe end on the HOST side, for a cross-process fork pump thread.
+    /// Mirrors the existing `pty_master_read`, which is how the runner already bridges a guest
+    /// stream to a real OS handle for stdio.
+    pub fn detached_pipe_read(
+        &self,
+        end: &litebox::pipes::DetachedPipeEnd<Platform>,
+        buf: &mut [u8],
+    ) -> Option<usize> {
+        let wait_state = self.host_wait_state();
+        end.read(&wait_state.context(), buf).ok()
+    }
+
+    /// Write into a detached pipe end on the HOST side. See [`Self::detached_pipe_read`].
+    pub fn detached_pipe_write(
+        &self,
+        end: &litebox::pipes::DetachedPipeEnd<Platform>,
+        buf: &[u8],
+    ) -> Option<usize> {
+        let wait_state = self.host_wait_state();
+        end.write(&wait_state.context(), buf).ok()
+    }
+}
 impl<Platform: ShimPlatform, FS: ShimFS> Clone for LinuxShim<Platform, FS> {
     fn clone(&self) -> Self {
         Self(self.0.clone())

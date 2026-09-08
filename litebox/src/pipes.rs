@@ -124,6 +124,34 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         p.write(cx, buf).map_err(From::from)
     }
 
+    /// Take a handle on the end at `fd` that is independent of the descriptor table.
+    ///
+    /// Every other read/write path here is keyed by a live [`PipeFd`], which is exactly right for
+    /// guest syscalls: pipe lifetime follows descriptors. It cannot serve a HOST-side bridge that
+    /// must outlive the guest's descriptor, though, and the cross-process `fork()` path needs
+    /// precisely that. A shell performing command substitution closes its own copy of the write
+    /// end immediately after forking -- that close is what eventually gives the reader EOF -- so
+    /// by the time the forked child is running there is no descriptor left in the parent to pump
+    /// the child's output through.
+    ///
+    /// This clones the same `Arc` the fd-keyed paths already clone before doing I/O (see
+    /// [`Self::read`]/[`Self::write`]), so it introduces no new sharing rule -- only a second way
+    /// to name an end. Lifetime semantics are unchanged and still correct: dropping the returned
+    /// handle drops its `Arc`, and `WriteEnd`'s own `Drop` shuts the end down and notifies the
+    /// peer with `HUP`. A host pump therefore signals EOF by dropping the handle when its child
+    /// exits, exactly as a guest signals it by closing the last descriptor.
+    pub fn detach_end(
+        &self,
+        fd: &PipeFd<Platform>,
+    ) -> Result<DetachedPipeEnd<Platform>, errors::ClosedError> {
+        let dt = self.litebox.descriptor_table();
+        let end = match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
+            PipeEnd::Receiver(p) => PipeEnd::Receiver(Arc::clone(p)),
+            PipeEnd::Sender(p) => PipeEnd::Sender(Arc::clone(p)),
+        };
+        Ok(DetachedPipeEnd { end })
+    }
+
     /// Whether the provided FD points to a reader or a writer end.
     pub fn half_pipe_type(
         &self,
@@ -173,6 +201,51 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
             PipeEnd::Receiver(p) => Ok(f(p)),
             PipeEnd::Sender(p) => Ok(f(p)),
+        }
+    }
+}
+
+/// One end of a pipe, held independently of any descriptor table entry.
+///
+/// Obtained from [`Pipes::detach_end`]; see that method for why this exists and why its lifetime
+/// semantics match the descriptor path exactly.
+pub struct DetachedPipeEnd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+    end: PipeEnd<Platform>,
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DetachedPipeEnd<Platform> {
+    /// Whether this is the sender half or the receiver half.
+    #[must_use]
+    pub fn half_pipe_type(&self) -> HalfPipeType {
+        match &self.end {
+            PipeEnd::Sender(_) => HalfPipeType::SenderHalf,
+            PipeEnd::Receiver(_) => HalfPipeType::ReceiverHalf,
+        }
+    }
+
+    /// Read from this end. Fails with `NotForReading` on a sender half, matching
+    /// [`Pipes::read`].
+    pub fn read(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        buf: &mut [u8],
+    ) -> Result<usize, errors::ReadError> {
+        match &self.end {
+            PipeEnd::Receiver(p) => p.read(cx, buf).map_err(From::from),
+            PipeEnd::Sender(_) => Err(errors::ReadError::NotForReading),
+        }
+    }
+
+    /// Write into this end. Fails with `NotForWriting` on a receiver half, matching
+    /// [`Pipes::write`].
+    pub fn write(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        buf: &[u8],
+    ) -> Result<usize, errors::WriteError> {
+        match &self.end {
+            PipeEnd::Sender(p) => p.write(cx, buf).map_err(From::from),
+            PipeEnd::Receiver(_) => Err(errors::WriteError::NotForWriting),
         }
     }
 }

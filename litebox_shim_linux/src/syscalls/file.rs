@@ -5607,6 +5607,75 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// The dup() system call creates a copy of the file descriptor oldfd, using the lowest-numbered unused file descriptor for the new descriptor.
     /// The dup2() system call performs the same task as dup(), but instead of using the lowest-numbered unused file descriptor, it uses the file descriptor number specified in newfd.
     /// The dup3() system call is similar to dup2(), but it also takes an additional flags argument that can be used to set the close-on-exec flag for the new file descriptor.
+    /// Create a pipe and place its WRITE end at exactly `target_fd`, returning a
+    /// descriptor-independent handle on the READ end for a host pump thread.
+    ///
+    /// This is how a cross-process `fork()` child reconstructs a pipe fd it could not inherit:
+    /// litebox's pipes are in-memory objects with no OS handle behind them, so the child builds a
+    /// fresh local pipe at the same fd number and a host thread bridges it to the real Windows
+    /// handle the parent passed across.
+    ///
+    /// Goes through the ordinary descriptor paths rather than reaching into the table --
+    /// `create_linux_pipe` for the ends, `insert_raw_fd` to land the writer, then `sys_dup`'s
+    /// exact-fd form to move it, exactly as a guest's own `dup2` would.
+    pub(crate) fn install_pipe_write_end_at_fd(
+        &self,
+        target_fd: i32,
+    ) -> Option<litebox::pipes::DetachedPipeEnd<Platform>> {
+        let ends = self.global.create_linux_pipe(OFlags::empty()).ok()?;
+        let reader_handle = self.global.pipes.detach_end(&ends.reader).ok()?;
+        let temp_fd = {
+            let files = self.files.borrow();
+            let wr = files.insert_raw_fd(ends.writer).ok()?;
+            // The reader half is never inserted: the HOST owns it, via `reader_handle` above.
+            let _ = self.global.pipes.close(&ends.reader);
+            wr
+        };
+        let temp_fd = i32::try_from(temp_fd).ok()?;
+        if temp_fd != target_fd {
+            self.sys_dup(temp_fd, Some(target_fd), None).ok()?;
+            let _ = self.sys_close(temp_fd);
+        }
+        Some(reader_handle)
+    }
+
+    /// If `raw_fd` is a pipe, return a descriptor-independent handle on its end plus which end it
+    /// is; `None` otherwise.
+    ///
+    /// The parent needs this before a cross-process `fork()`: a `SenderHalf` means the child will
+    /// WRITE, so the child is given an OS pipe's write handle and the parent pumps that OS pipe's
+    /// read handle back into this in-memory pipe. The handle must be descriptor-independent
+    /// because the guest typically closes its own copy right after forking.
+    pub(crate) fn detached_pipe_end_for_raw_fd(
+        &self,
+        raw_fd: usize,
+    ) -> Option<(
+        litebox::pipes::DetachedPipeEnd<Platform>,
+        litebox::pipes::HalfPipeType,
+    )> {
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |_| None,
+                |_| None,
+                |pipe_fd| {
+                    let half = self.global.pipes.half_pipe_type(pipe_fd).ok()?;
+                    let end = self.global.pipes.detach_end(pipe_fd).ok()?;
+                    Some((end, half))
+                },
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()
+            .flatten()
+    }
+
     pub fn sys_dup(
         &self,
         oldfd: i32,
