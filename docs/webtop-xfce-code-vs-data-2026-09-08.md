@@ -1,0 +1,141 @@
+# 2026-09-08: the XFCE desktop was black because litebox rewrote data as if it were code
+
+The desktop now assembles. `xfwm4` owns `WM_S0`, 21 windows exist, and `xfce4-session` starts
+`xfwm4`, `xfsettingsd`, `xfdesktop`, `xfce4-panel` and `xfconfd`. None of that happened before this
+pass, and the reason it did not is a single defect with a long tail.
+
+Companion docs: `fork-fs-veh-2026-09-08.md` (cross-process `fork()`, the VEH work),
+`webtop-debian-xfce-2026-09-08.md` (the image and the earlier investigation).
+
+## The defect: a `PROT_EXEC` mapping is not a code segment
+
+The runtime rewriter patched **the whole mapping** whenever `PROT_EXEC` was set. An ELF's `PF_X`
+`PT_LOAD` is not all code. `libLLVM.so.19.1`'s first `PT_LOAD` is `RX` and 118 MB long:
+
+| section | file offset | size |
+|---|---|---|
+| `.dynsym` | `0x260` | 1.2 MB |
+| `.dynstr` | `0x1340f0` | 3.8 MB |
+| `.gnu.hash` | `0x4d2598` | 393 KB |
+| `.gnu.version` | `0x535204` | 105 KB |
+| `.gnu.version_d` / `.gnu.version_r` | `0x54ec90` | 968 B |
+| `.text` | `0xcf6740` | 56 MB |
+| `.rodata` | `0x4574080` | 42 MB |
+
+Linear disassembly does not know where code stops. It decoded the symbol tables as instructions,
+found byte pairs that read as `syscall`, and wrote a 5-byte `JMP` over them.
+
+Measured from inside a guest, mapping that segment `PROT_READ|PROT_EXEC` and comparing against the
+file: **1984 bytes differed**, and the sampled differences were all outside `.text` -- at file
+offsets `0x5dc4` and `0xa0c1c`, both inside `.dynsym`.
+
+## What that did, step by step
+
+1. `ld.so` could not resolve `_ZTSN4llvm11logicalview22LVScopeFunctionInlinedE, version LLVM_19.1`.
+   The file defines it perfectly well: `.dynsym[1296]`, `shndx=14`, `GLOBAL`.
+2. So `libLLVM` failed to load, and with it `libgallium` and `libGLX_mesa` -- confirmed directly:
+   all three `dlopen`s returned that same error, and all three now succeed.
+3. glvnd retried the vendor load on every GLX call. `xfwm4` re-loaded
+   `libgallium` -> `libLLVM` -> `libz3` about three times a second, for ever.
+4. It therefore never created a single X window. The desktop was black, and every earlier
+   explanation of that blackness was a description of this.
+
+`xfwm4`, same image, same workload:
+
+| | large mappings | time inside `mmap` | patching | windows |
+|---|---|---|---|---|
+| before | 3387 | 233.7 s | 225.9 s | 0, ever |
+| after | 5 | -- | -- | `WM_S0 owner=0x600014` |
+
+The ahead-of-time `patch_binary` path never had this bug: it patches `text_sections` only. The fix
+is to give the runtime path the same notion of code, from the same source of truth -- the ELF's own
+section headers, read once per file and cached per `(device, inode)`.
+
+## Two rewriter fixes found on the way
+
+**The decode ran twice and was fully materialized.** `patch_code_segment` decoded the segment to
+collect control-transfer targets, then `hook_syscalls_in_section` decoded the same bytes again,
+with the first `Vec` still alive. An `iced_x86::Instruction` is 40 bytes against roughly 4 bytes of
+x86 per instruction, so each `Vec` is about 10x the size of the code it describes: ~2.6 GB of
+transient allocation for one library, inside a guest `mmap`, in a host process shared by every
+guest. The repeated host OOM kills were that.
+
+Nothing needed it. The hooker asks the decode two questions -- "is this address a control-transfer
+target" and "what are the few instructions either side of this `syscall`" -- and both scans
+provably terminate within 3 instructions, because they stop once the replacement range reaches the
+5 bytes a `JMP rel32` needs. One streaming pass with an 8-instruction ring buffer answers both.
+
+**The scan was redone per mapping.** It is a pure function of the bytes, so it is now kept in
+segment-relative offsets (`SegmentScanTemplate`) and cached per `(device, inode, offset, length)`.
+Rebasing is sound because an `iced_x86::Instruction` derives every address it reports from its own
+`ip` plus decoded displacement bytes, which are identical wherever the segment loads.
+
+Whole-workload effect, 2316 -> 1663 patch calls: **180.9 s -> 6.0 s**, worst single call
+26.4 s -> 2.7 s. Equivalence was not assumed: patching 17 real binaries from the image (libLLVM,
+libc, Xvfb, xfwm4, xfce4-session, dbus-daemon, every mesa DRI driver) gives byte-identical output
+and identical trapped-site lists in all 17 cases.
+
+## `/dev/null` was being destroyed, and that is what broke D-Bus
+
+Three defects in the layered filesystem, compounding:
+
+1. **`O_TRUNC` was applied to non-regular files.** On Linux `do_open()` gates `handle_truncate()`
+   on `S_ISREG`, so `O_TRUNC` on a character device does nothing. Here a shell's `> /dev/null`
+   reached `truncate`, which could not truncate a device and fell through to `migrate_file_up` --
+   which copies a file's BYTES into a newly created upper-layer file. `/dev/null` reads as instant
+   EOF, so what appeared on the writable layer was an empty **regular file** shadowing the
+   character device.
+2. **`migrate_file_up` was type-blind**, so nothing stopped it from changing what an object is.
+3. **Unlinking a lower-layer character device was `unimplemented!()`**, which panics the HOST
+   process and kills every guest in the address space. Reproduced directly with `rm -f /dev/null`.
+
+The chain: once `/dev/null` looked like a regular file, GNU `ld` -- run by selkies at startup, with
+`/dev/null` as its output -- applied libiberty's `unlink_if_ordinary()`, which unlinks only what
+`lstat` calls a regular file or symlink, precisely so it can never delete a device node. Told it was
+ordinary, it deleted it. The tombstone then made every `open("/dev/null")` **without `O_CREAT`**
+return `ENOENT`.
+
+That is why it looked intermittent and was not: shell redirections carry `O_CREAT` and kept
+working, while `dash` opening `/dev/null` for a background job's stdin does not. So
+`dbus-daemon ... &` never started at all, `DBUS_SESSION_BUS_ADDRESS` was empty, and `xfce4-session`
+came up with no session bus and started nothing. The stack reports `DBUS_UP` where it reported
+`DBUS_FAILED`.
+
+## Also corrected
+
+**`--publish` binds every port.** An earlier note in this series claimed only the first was bound.
+It is wrong: `publish.join(",")` and the parser both handle the whole list, and a live run logs
+`published 127.0.0.1:3000` and `published 127.0.0.1:8082`. No fix was needed and none was made.
+
+**A `| sed` pipe kills the desktop.** The launcher ran the session through `sed` for log prefixing.
+`xfwm4` died of `SIGPIPE` (signal 13, confirmed from the syscall timeline), and because `$!` after a
+pipeline is the pid of `sed`, the script's own liveness check reported `DE_ALIVE` for the wrong
+process entirely. Output now goes to a file.
+
+## Still open, located precisely
+
+**The OCI `/init` path cannot boot s6-overlay: static `ET_EXEC` binaries collide.**
+`--oci-image docker.io/linuxserver/webtop:debian-xfce` pulls, rewrites and runs (Debian 13 trixie,
+17 layers, all binaries present), and `/init` reaches `s6-overlay-suexec` -> `preinit` ->
+`s6-mkdir`, where `execve` fails with `LoadError(Map(EEXIST))`. `s6-mkdir` is a static non-PIE
+linked at `0x400000`, and `s6-overlay-suexec` -- still alive -- already occupies that address in
+litebox's single host address space.
+
+Cross-process fork would give the child its own address space and clear this, but it is declined:
+`clone: cross-process fork() skipped for a vfork child`. Both forks here are `vfork`
+(`CloneFlags(16640)`, `CloneFlags(16384)`), and a vfork child shares the parent's address space by
+design, so there is nothing to transfer.
+
+The way through is that **`vfork` shares an address space only until `execve`**. On Linux the child
+gets a fresh one at exec; that is the contract vfork is written against. So the moment to hand a
+guest child a real Windows process is `execve`, not `clone` -- and exec is the easy case, because
+exec discards the image anyway, so nothing has to be duplicated. This is a spawn, not a fork.
+
+**A host access violation at ~100 s** during full desktop startup, amid constant
+`fork_verify: stale CODE pointer` healing. Two shapes seen: `rip=0x0, addr=0x0,
+is_in_guest=false`, and a read of `rcx` pointing into `MEM_RESERVE`/`PAGE_NOACCESS` guest memory
+(`State=0x2000, Protect=0x0`) -- an unchecked host read of guest memory. Same family as the
+corrupted-context resume recorded in `fork-fs-veh-2026-09-08.md`.
+
+**`nginx` returns `HTTP_LOCAL_FAIL`**, so the dashboard is not served yet and the desktop has not
+been seen in a browser. Not yet diagnosed.
