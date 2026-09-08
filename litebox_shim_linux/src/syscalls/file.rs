@@ -3429,12 +3429,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             }
                             f.toggle(diff);
                         };
-                        match self
+                        // Bound to a `let` rather than used directly as the `match` scrutinee,
+                        // and this is load-bearing: a temporary in a scrutinee lives for the
+                        // WHOLE `match`, so the `descriptor_table_mut()` write guard would still
+                        // be held inside the `NoSuchMetadata` arm below -- which takes it again.
+                        // `RawRwLock` is not reentrant, so that is an immediate self-deadlock with
+                        // the descriptor table held forever, and every other thread that touches
+                        // an fd piles up behind it. Observed exactly that: a live XFCE session
+                        // stopped dead at ~49s with 20 of 34 host threads parked in
+                        // `RawMutex::block` and nobody holding the lock in a runnable state.
+                        let existing = self
                             .global
                             .litebox
                             .descriptor_table_mut()
-                            .with_metadata_mut(fd, |crate::StdioStatusFlags(f)| apply(f))
-                        {
+                            .with_metadata_mut(fd, |crate::StdioStatusFlags(f)| apply(f));
+                        match existing {
                             Ok(()) => Ok(()),
                             // No per-description status state on this fd yet. This used to be
                             // reported as success and then DISCARD the write -- so `F_SETFL` was a
@@ -4491,20 +4500,45 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .run_on_raw_fd(
                         desc,
                         |file_fd| {
-                            // Mirrors `FcntlArg::SETFL`'s raw-fd branch: most fds dispatched here
-                            // are plain regular files carrying no `StdioStatusFlags` metadata at
-                            // all (real Linux accepts `ioctl(FIONBIO)` on a regular file as a
-                            // no-op too), so a missing-metadata result is success, not an error.
-                            // For stdio fds this is what makes `do_read`'s non-blocking-stdin
-                            // check observe the flag `FIONBIO` set, not just `fcntl(F_SETFL)`.
-                            match self
+                            // `ioctl(FIONBIO)` is the other way a guest sets `O_NONBLOCK`, and it
+                            // must leave the fd in the same state `fcntl(F_SETFL)` would -- the
+                            // two are interchangeable on real Linux, and `do_read`'s
+                            // non-blocking-stdin check reads whichever one of them ran last.
+                            //
+                            // Previously a missing-metadata result was reported as success and the
+                            // write discarded, which made `FIONBIO` a silent no-op on every fd not
+                            // opened through a `/dev/stdin`-style re-open. Create the state
+                            // instead, seeded from the flags the file was opened with, exactly as
+                            // `F_SETFL`'s raw-fd branch now does.
+                            //
+                            // Bound to a `let`, not used as the `match` scrutinee: a scrutinee
+                            // temporary lives for the whole `match`, and the arm below takes the
+                            // same non-reentrant write lock. See `F_SETFL`'s own comment for the
+                            // deadlock that shape produced.
+                            let existing = self
                                 .global
                                 .litebox
                                 .descriptor_table_mut()
                                 .with_metadata_mut(file_fd, |crate::StdioStatusFlags(flags)| {
                                     flags.set(OFlags::NONBLOCK, val != 0);
-                                }) {
-                                Ok(()) | Err(MetadataError::NoSuchMetadata) => Ok(()),
+                                });
+                            match existing {
+                                Ok(()) => Ok(()),
+                                Err(MetadataError::NoSuchMetadata) => {
+                                    let mut flags = files
+                                        .fs
+                                        .open_flags(file_fd)
+                                        .unwrap_or(OFlags::empty());
+                                    flags.set(OFlags::NONBLOCK, val != 0);
+                                    self.global
+                                        .litebox
+                                        .descriptor_table_mut()
+                                        .set_entry_metadata(
+                                            file_fd,
+                                            crate::StdioStatusFlags(flags),
+                                        );
+                                    Ok(())
+                                }
                                 Err(MetadataError::ClosedFd) => Err(Errno::EBADF),
                             }
                         },
