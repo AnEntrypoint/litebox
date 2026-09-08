@@ -345,6 +345,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShimEntrypoints<Platform, FS> {
         self.task.install_pipe_write_end_at_fd(target_fd)
     }
 
+    /// Create a pipe in this (cross-process fork child) process, place its READ end at exactly
+    /// `target_fd`, and return a host-side handle on the WRITE end for a pump thread. The mirror
+    /// of [`Self::install_pipe_write_end_at_fd`]; same thread requirement.
+    pub fn install_pipe_read_end_at_fd(
+        &self,
+        target_fd: i32,
+    ) -> Option<litebox::pipes::DetachedPipeEnd<Platform>> {
+        self.task.install_pipe_read_end_at_fd(target_fd)
+    }
+
     pub fn process(&self) -> LinuxShimProcess<Platform> {
         LinuxShimProcess(self.task.process().clone())
     }

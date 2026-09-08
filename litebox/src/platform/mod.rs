@@ -908,10 +908,10 @@ pub trait ForkChildVerificationProvider {
     /// `HANDLE`, never exposed to the guest).
     ///
     /// `inherited_pipes` carries the parent-side half of every guest pipe fd the child must come
-    /// up holding (see [`ForkPipeSink`]). The platform is responsible for giving the child a real,
-    /// inheritable OS handle per entry and for pumping that handle back into the matching sink; if
-    /// it cannot, it must return `None` and let the caller fall back rather than spawn a child
-    /// that silently loses the fd.
+    /// up holding (see [`ForkPipeBridge`]). The platform is responsible for giving the child a
+    /// real, inheritable OS handle per entry and for pumping that handle to or from the matching
+    /// parent-side end; if it cannot, it must return `None` and let the caller fall back rather
+    /// than spawn a child that silently loses the fd.
     ///
     /// Takes `&'static self` because those pump threads outlive this call and need the platform to
     /// build their own per-thread wait state -- every caller already holds the platform as
@@ -920,7 +920,7 @@ pub trait ForkChildVerificationProvider {
         &'static self,
         relocations: &crate::mm::AddressRelocations,
         full_gprs: ForkFullGprSnapshot,
-        inherited_pipes: alloc::vec::Vec<(i32, ForkPipeSink)>,
+        inherited_pipes: alloc::vec::Vec<(i32, ForkPipeBridge)>,
     ) -> Option<CrossProcessChildHandle> {
         let _ = relocations;
         let _ = full_gprs;
@@ -929,60 +929,98 @@ pub trait ForkChildVerificationProvider {
     }
 }
 
-/// A host-side writer into one of the PARENT's in-memory pipes, handed across to
+/// A host-side handle on one end of a PARENT's in-memory pipe, handed across to
 /// [`ForkChildVerificationProvider::spawn_cross_process_fork_child`] so the platform can bridge a
-/// cross-process `fork()` child's pipe fd back to it.
+/// cross-process `fork()` child's pipe fd to it.
 ///
 /// litebox's pipes are pure in-memory `ringbuf` objects with no OS handle behind them (see
 /// `crate::pipes`), so nothing about one survives a process boundary. The platform therefore gives
-/// the child a real inheritable OS pipe at the same fd number and runs a pump thread that reads
-/// that OS pipe and calls this sink -- the child's writes reappear in the parent's own pipe, which
-/// is exactly what the guest's other end is blocked reading.
+/// the child a real inheritable OS pipe at the same fd number and runs a pump thread bridging the
+/// two, in whichever direction this end calls for:
 ///
-/// Erased to a boxed closure rather than exposing `pipes::DetachedPipeEnd` in the trait: the sink
-/// is built in `litebox_shim_linux`, where the descriptor table and the pipe registry live, and
-/// the platform needs no knowledge of either -- only "here are some bytes the child wrote".
+/// * [`Self::Sink`] -- the guest fd is a pipe's SENDER, so the child writes. The pump reads the OS
+///   pipe and writes into this end; the child's writes reappear in the parent's own pipe, where
+///   the guest's reader is blocked. This is shell command substitution.
+/// * [`Self::Source`] -- the guest fd is a pipe's RECEIVER, so the child reads. The pump reads
+///   this end and writes into the OS pipe. This is a shell pipeline's second stage.
 ///
-/// **Dropping the sink is how EOF is delivered.** It owns the last non-descriptor reference to the
-/// parent-side write end, so the pump thread dropping it on `ReadFile` returning zero shuts that
-/// end down and `HUP`s the peer -- the same signal a guest gives by closing its last descriptor.
-pub struct ForkPipeSink {
-    write: alloc::boxed::Box<dyn FnMut(&[u8]) -> Option<usize> + Send>,
+/// Erased to boxed closures rather than exposing `pipes::DetachedPipeEnd` in the trait: they are
+/// built in `litebox_shim_linux`, where the descriptor table and pipe registry live, and the
+/// platform needs no knowledge of either -- only bytes, in one direction.
+///
+/// **Dropping the bridge is how EOF is delivered.** Each variant owns the last non-descriptor
+/// reference to its end, so dropping it shuts that end down and notifies the peer -- the same
+/// signal a guest gives by closing its last descriptor.
+pub enum ForkPipeBridge {
+    /// The child writes; bytes flow child -> parent. See the type's own doc comment.
+    Sink(ForkPipeEnd<alloc::boxed::Box<dyn FnMut(&[u8]) -> Option<usize> + Send>>),
+    /// The child reads; bytes flow parent -> child. See the type's own doc comment.
+    Source(ForkPipeEnd<alloc::boxed::Box<dyn FnMut(&mut [u8]) -> Option<usize> + Send>>),
+}
+
+impl ForkPipeBridge {
+    /// How many references to the parent-side pipe end are alive, this bridge included.
+    ///
+    /// `1` means this bridge is the sole owner. For a [`Self::Sink`] that says dropping it will
+    /// actually deliver EOF. For a [`Self::Source`] it says something the platform must wait for:
+    /// the guest parent has closed its own descriptor, so draining the pipe into the child no
+    /// longer steals bytes from a reader still live in this process.
+    #[must_use]
+    pub fn owners(&self) -> usize {
+        match self {
+            Self::Sink(e) => e.owners(),
+            Self::Source(e) => e.owners(),
+        }
+    }
+}
+
+impl core::fmt::Debug for ForkPipeBridge {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Sink(_) => "ForkPipeBridge::Sink(..)",
+            Self::Source(_) => "ForkPipeBridge::Source(..)",
+        })
+    }
+}
+
+/// One direction of a [`ForkPipeBridge`]: the transfer closure, plus the liveness probe both
+/// variants need.
+pub struct ForkPipeEnd<F> {
+    transfer: F,
     owners: alloc::boxed::Box<dyn Fn() -> usize + Send>,
 }
 
-impl ForkPipeSink {
-    /// Wrap a writer. `f` returns the number of bytes accepted, or `None` if the pipe is gone;
-    /// `owners` reports how many references to the underlying pipe end are alive, so the platform
-    /// can tell whether dropping this sink will actually deliver EOF.
+impl<F> ForkPipeEnd<F> {
+    /// Wrap a transfer closure and a probe reporting how many references to the underlying pipe
+    /// end are alive.
     #[must_use]
-    pub fn new(
-        f: impl FnMut(&[u8]) -> Option<usize> + Send + 'static,
-        owners: impl Fn() -> usize + Send + 'static,
-    ) -> Self {
+    pub fn new(transfer: F, owners: impl Fn() -> usize + Send + 'static) -> Self {
         Self {
-            write: alloc::boxed::Box::new(f),
+            transfer,
             owners: alloc::boxed::Box::new(owners),
         }
     }
 
-    /// How many references to the parent-side pipe end are alive, this sink included. `1` means
-    /// dropping this sink shuts the end down and gives the guest's reader EOF.
+    /// See [`ForkPipeBridge::owners`].
     #[must_use]
     pub fn owners(&self) -> usize {
         (self.owners)()
     }
+}
 
+impl ForkPipeEnd<alloc::boxed::Box<dyn FnMut(&[u8]) -> Option<usize> + Send>> {
     /// Write `buf` into the parent-side pipe. Short writes are possible, exactly as for a guest
-    /// `write(2)` on a pipe; the caller loops.
+    /// `write(2)` on a pipe; the caller loops. `None` means the pipe is gone.
     pub fn write(&mut self, buf: &[u8]) -> Option<usize> {
-        (self.write)(buf)
+        (self.transfer)(buf)
     }
 }
 
-impl core::fmt::Debug for ForkPipeSink {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("ForkPipeSink(..)")
+impl ForkPipeEnd<alloc::boxed::Box<dyn FnMut(&mut [u8]) -> Option<usize> + Send>> {
+    /// Read from the parent-side pipe into `buf`, blocking until there is something to read.
+    /// `Some(0)` is EOF; `None` means the pipe is gone.
+    pub fn read(&mut self, buf: &mut [u8]) -> Option<usize> {
+        (self.transfer)(buf)
     }
 }
 

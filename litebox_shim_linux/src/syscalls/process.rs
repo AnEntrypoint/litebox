@@ -2486,62 +2486,93 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         drop(files);
 
-        // A pipe fd the child WRITES can be carried across the process boundary; anything else
-        // still cannot.
+        // A pipe fd, either half, can be carried across the process boundary; anything else still
+        // cannot.
         //
         // litebox's pipes are in-memory `ringbuf` objects with no OS handle behind them, so a
         // cross-process child inherits nothing of one automatically. What it CAN be given is a
         // real Windows pipe at the same fd number, with a host thread on the parent's side
-        // pumping that OS pipe back into the parent's own in-memory pipe -- so the child's writes
-        // reappear exactly where the guest's reader is blocked. That is
-        // `litebox::platform::ForkPipeSink`, built here and consumed by the platform.
+        // bridging that OS pipe to the parent's own in-memory pipe. That is
+        // `litebox::platform::ForkPipeBridge`, built here and driven by the platform.
         //
-        // Only the SENDER half. A receiver half is a shared consumable: on a real fork, parent and
-        // child draw from the SAME byte stream, and no bridge built out of a second OS pipe can
-        // reproduce that -- duplicating the stream would let both read every byte, and splitting it
-        // would deliver each byte to an arbitrary one of them. So a child-side read end stays
-        // ineligible, and the fork falls back to the thread-based path that genuinely shares the
-        // pipe because it shares the address space.
+        // A SENDER half becomes a `Sink`: the child writes, and the pump feeds the parent's pipe,
+        // so the bytes reappear exactly where the guest's reader is blocked. Shell command
+        // substitution. This is what the `beyond_stdio == 0` gate stood in the way of -- `/init`'s
+        // `preinit` does `eval` on a command substitution, and that one sender-half fd was enough
+        // to refuse the whole path.
         //
-        // This is what the `beyond_stdio == 0` gate stood in the way of: `/init`'s `preinit`
-        // performs command substitution (`` eval `s6-overlay-stat /run` ``), whose child writes to
-        // an inherited pipe -- one sender-half fd, and previously enough to refuse the whole path.
-        let mut inherited_pipes: alloc::vec::Vec<(i32, litebox::platform::ForkPipeSink)> =
+        // A RECEIVER half becomes a `Source`: the child reads, and the pump drains the parent's
+        // pipe into it. Shell pipelines. This one carries a real caveat, handled platform-side
+        // rather than here: on a real fork parent and child draw from the SAME byte stream, and no
+        // bridge made of a second OS pipe reproduces that -- draining eagerly would steal bytes
+        // from a reader still live in this process. So the pump waits until this bridge is the
+        // end's sole owner (see `ForkPipeBridge::owners`), which is precisely when the guest
+        // parent has closed its own descriptor. A shell closes its copy immediately after forking,
+        // so a pipeline works; a parent that keeps reading its own copy never releases it, and the
+        // child's inherited fd simply never yields -- wrong only for a genuinely shared reader,
+        // which is unsupportable here in any case, and never wrong by delivering bytes to the
+        // wrong process.
+        let mut inherited_pipes: alloc::vec::Vec<(i32, litebox::platform::ForkPipeBridge)> =
             alloc::vec::Vec::new();
         let mut uncarriable = 0usize;
         for raw_fd in &beyond_stdio_fds {
-            let carried = i32::try_from(*raw_fd).ok().and_then(|fd| {
-                let (end, half) = self.detached_pipe_end_for_raw_fd(*raw_fd)?;
-                (half == litebox::pipes::HalfPipeType::SenderHalf).then_some((fd, end))
-            });
+            let carried = i32::try_from(*raw_fd)
+                .ok()
+                .and_then(|fd| Some((fd, self.detached_pipe_end_for_raw_fd(*raw_fd)?)));
             match carried {
-                Some((fd, end)) => {
-                    // `platform` is `&'static`, so this closure -- which outlives this call on a
-                    // platform-side pump thread -- is `'static` without any further plumbing.
-                    // `WaitState` is per-thread by design and cheap, so the pump builds one per
-                    // write rather than smuggling a non-`Sync` one across threads.
+                Some((fd, (end, half))) => {
+                    // `platform` is `&'static`, so these closures -- which outlive this call on a
+                    // platform-side pump thread -- are `'static` without any further plumbing.
+                    // `WaitState` is per-thread by design and cheap, so a pump builds one per
+                    // transfer rather than smuggling a non-`Sync` one across threads.
                     let platform = self.global.platform;
                     litebox_util_log::debug!(
-                        tid:% = self.tid, fd:% = fd, owners:% = end.strong_count();
-                        "clone: carrying a pipe sender half into the cross-process child"
+                        tid:% = self.tid,
+                        fd:% = fd,
+                        half:? = half,
+                        owners:% = end.strong_count();
+                        "clone: carrying a pipe end into the cross-process child"
                     );
-                    inherited_pipes.push((
-                        fd,
-                        {
-                            let end = alloc::sync::Arc::new(end);
-                            let counted = alloc::sync::Arc::clone(&end);
-                            litebox::platform::ForkPipeSink::new(
-                                move |buf| {
-                                    let wait_state =
-                                        litebox::event::wait::WaitState::new(platform);
-                                    end.write(&wait_state.context(), buf).ok()
-                                },
-                                move || counted.strong_count(),
+                    let end = alloc::sync::Arc::new(end);
+                    let counted = alloc::sync::Arc::clone(&end);
+                    let owners = move || counted.strong_count();
+                    let bridge = match half {
+                        litebox::pipes::HalfPipeType::SenderHalf => {
+                            litebox::platform::ForkPipeBridge::Sink(
+                                litebox::platform::ForkPipeEnd::new(
+                                    alloc::boxed::Box::new(move |buf: &[u8]| {
+                                        let wait_state =
+                                            litebox::event::wait::WaitState::new(platform);
+                                        end.write(&wait_state.context(), buf).ok()
+                                    }),
+                                    owners,
+                                ),
                             )
-                        },
-                    ));
+                        }
+                        litebox::pipes::HalfPipeType::ReceiverHalf => {
+                            litebox::platform::ForkPipeBridge::Source(
+                                litebox::platform::ForkPipeEnd::new(
+                                    alloc::boxed::Box::new(move |buf: &mut [u8]| {
+                                        let wait_state =
+                                            litebox::event::wait::WaitState::new(platform);
+                                        end.read(&wait_state.context(), buf).ok()
+                                    }),
+                                    owners,
+                                ),
+                            )
+                        }
+                    };
+                    inherited_pipes.push((fd, bridge));
                 }
-                None => uncarriable += 1,
+                None => {
+                    uncarriable += 1;
+                    litebox_util_log::debug!(
+                        tid:% = self.tid,
+                        fd:% = raw_fd,
+                        subsystem:% = self.raw_fd_subsystem_name(*raw_fd);
+                        "clone: cross-process fork() cannot carry this fd"
+                    );
+                }
             }
         }
         if uncarriable != 0

@@ -5639,6 +5639,57 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Some(reader_handle)
     }
 
+    /// Create a pipe and place its READ end at exactly `target_fd`, returning a
+    /// descriptor-independent handle on the WRITE end for a host pump thread.
+    ///
+    /// The mirror of [`Self::install_pipe_write_end_at_fd`], for the fd a cross-process `fork()`
+    /// child READS -- a shell pipeline's `cmd2` in `cmd1 | cmd2`. The host pump feeds this pipe
+    /// from the real Windows pipe the parent handed across, so the child's `read(0, ..)` sees the
+    /// same bytes the parent's own copy of the pipe holds.
+    pub(crate) fn install_pipe_read_end_at_fd(
+        &self,
+        target_fd: i32,
+    ) -> Option<litebox::pipes::DetachedPipeEnd<Platform>> {
+        let ends = self.global.create_linux_pipe(OFlags::empty()).ok()?;
+        let writer_handle = self.global.pipes.detach_end(&ends.writer).ok()?;
+        let temp_fd = {
+            let files = self.files.borrow();
+            let rd = files.insert_raw_fd(ends.reader).ok()?;
+            // The writer half is never inserted: the HOST owns it, via `writer_handle` above.
+            let _ = self.global.pipes.close(&ends.writer);
+            rd
+        };
+        let temp_fd = i32::try_from(temp_fd).ok()?;
+        if temp_fd != target_fd {
+            self.sys_dup(temp_fd, Some(target_fd), None).ok()?;
+            let _ = self.sys_close(temp_fd);
+        }
+        Some(writer_handle)
+    }
+
+    /// Name the fd subsystem `raw_fd` belongs to, for diagnostics.
+    ///
+    /// The cross-process `fork()` gate can only carry pipes, and "some fd was in the way" is a
+    /// useless thing to read in a log when the question is which subsystem to teach next.
+    pub(crate) fn raw_fd_subsystem_name(&self, raw_fd: usize) -> &'static str {
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |_| "file",
+                |_| "socket",
+                |_| "pipe",
+                |_| "eventfd",
+                |_| "epoll",
+                |_| "unix-socket",
+                |_| "pty",
+                |_| "signalfd",
+                |_| "timerfd",
+                |_| "netlink",
+            )
+            .unwrap_or("unknown")
+    }
+
     /// If `raw_fd` is a pipe, return a descriptor-independent handle on its end plus which end it
     /// is; `None` otherwise.
     ///

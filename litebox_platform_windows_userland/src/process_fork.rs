@@ -773,9 +773,10 @@ pub fn diag_process_fork_task_resume_enabled() -> bool {
 pub const FORK_CHILD_GPRS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_GPRS";
 
 /// Carries the guest pipe fds a cross-process `fork()` child must come up holding, as
-/// `fd:handle` pairs separated by commas (e.g. `3:1a4,7:1b0`), where `handle` is the hex value of
-/// an inheritable Windows pipe WRITE handle already present in the child by virtue of
-/// `CreateProcessW`'s `bInheritHandles`.
+/// `fd:handle:direction` triples separated by commas (e.g. `3:1a4:w,0:1b0:r`), where `handle` is
+/// the hex value of an inheritable Windows pipe handle already present in the child by virtue of
+/// `CreateProcessW`'s `bInheritHandles`, and `direction` is [`ChildPipeEnd::tag`] -- `w` if the
+/// child writes that fd, `r` if it reads it.
 ///
 /// A handle value passed through the environment looks alarming and is not: handle values are
 /// per-process, and inheritance is what actually makes this one valid in the child -- the number
@@ -894,18 +895,48 @@ pub unsafe fn close_inherited_handle(handle: usize) {
     unsafe { CloseHandle(handle as HANDLE) };
 }
 
-/// Create an anonymous pipe whose WRITE end a `CreateProcessW` child inherits and whose READ end
-/// stays private to this process.
+/// Which end of a bridging OS pipe the cross-process `fork()` child inherits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildPipeEnd {
+    /// The child inherits the WRITE end and writes; the parent keeps the read end.
+    ChildWrites,
+    /// The child inherits the READ end and reads; the parent keeps the write end.
+    ChildReads,
+}
+
+impl ChildPipeEnd {
+    /// The one-character tag this direction travels under in
+    /// [`FORK_CHILD_PIPE_FDS_ENV_VAR`].
+    #[must_use]
+    pub fn tag(self) -> char {
+        match self {
+            Self::ChildWrites => 'w',
+            Self::ChildReads => 'r',
+        }
+    }
+
+    /// Parse [`Self::tag`].
+    #[must_use]
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "w" => Some(Self::ChildWrites),
+            "r" => Some(Self::ChildReads),
+            _ => None,
+        }
+    }
+}
+
+/// Create an anonymous pipe with exactly one end inheritable by a `CreateProcessW` child, the
+/// other staying private to this process.
 ///
-/// Returns `(local_read, child_write)`. Both must be closed by the caller: `child_write` right
-/// after the spawn (the child has its own copy by then, and leaving this one open would keep the
-/// pipe's writer count above zero forever, so the reader would never see EOF), `local_read` when
-/// its pump thread finishes.
+/// Returns `(local, child)`. Both must be closed by the caller: `child` right after the spawn (the
+/// child has its own copy by then, and every extra copy of a pipe end counts as a live
+/// writer/reader, which turns EOF into a hang), `local` when its pump thread finishes.
 ///
-/// `bInheritHandle` on the `SECURITY_ATTRIBUTES` marks BOTH ends inheritable, so the read end is
-/// explicitly un-marked afterwards -- otherwise the child would also hold a reader, and a pipe
-/// with a live reader in the wrong process is a subtle hang rather than a visible error.
-pub fn create_inheritable_child_write_pipe() -> Result<(HANDLE, HANDLE), String> {
+/// `bInheritHandle` on the `SECURITY_ATTRIBUTES` marks BOTH ends inheritable, so the local end is
+/// explicitly un-marked afterwards -- a pipe end live in the wrong process is a subtle hang rather
+/// than a visible error.
+pub fn create_inheritable_child_pipe(which: ChildPipeEnd) -> Result<(HANDLE, HANDLE), String> {
     use windows_sys::Win32::Foundation::SetHandleInformation;
     const HANDLE_FLAG_INHERIT: u32 = 1;
 
@@ -924,18 +955,60 @@ pub fn create_inheritable_child_write_pipe() -> Result<(HANDLE, HANDLE), String>
             unsafe { GetLastError() }
         ));
     }
-    // Safety: `read_handle` was just returned by `CreatePipe`.
-    if unsafe { SetHandleInformation(read_handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+    let (local, child) = match which {
+        ChildPipeEnd::ChildWrites => (read_handle, write_handle),
+        ChildPipeEnd::ChildReads => (write_handle, read_handle),
+    };
+    // Safety: `local` was just returned by `CreatePipe`.
+    if unsafe { SetHandleInformation(local, HANDLE_FLAG_INHERIT, 0) } == 0 {
         let err = unsafe { GetLastError() };
         unsafe {
             CloseHandle(read_handle);
             CloseHandle(write_handle);
         }
         return Err(format!(
-            "SetHandleInformation(read end, INHERIT=0) failed, GetLastError={err}"
+            "SetHandleInformation(parent-side end, INHERIT=0) failed, GetLastError={err}"
         ));
     }
-    Ok((read_handle, write_handle))
+    Ok((local, child))
+}
+
+/// Read up to `buf.len()` bytes from an inherited Windows handle named by its raw value.
+///
+/// `Some(0)` is end-of-file (or `ERROR_BROKEN_PIPE`, which means the same thing for a pipe). The
+/// counterpart of [`write_all_to_inherited_handle`]; see that function for why the handle travels
+/// as a `usize`.
+#[must_use]
+pub fn read_from_inherited_handle(handle: usize, buf: &mut [u8]) -> usize {
+    use windows_sys::Win32::Storage::FileSystem::ReadFile;
+
+    let mut read: u32 = 0;
+    // Safety: `handle` is a live pipe read handle and `buf` outlives the call.
+    let ok = unsafe {
+        ReadFile(
+            handle as HANDLE,
+            buf.as_mut_ptr().cast(),
+            u32::try_from(buf.len()).unwrap_or(u32::MAX),
+            &raw mut read,
+            core::ptr::null_mut(),
+        )
+    };
+    if ok == 0 { 0 } else { read as usize }
+}
+
+/// Whether a process handle refers to a process that has already exited.
+///
+/// Used by the parent-side pump for a pipe end the child READS: that pump has to wait for the
+/// guest parent to close its own copy of the descriptor before it may drain anything, and if the
+/// parent never does, the child exiting is what tells the pump to give up instead of waiting for
+/// ever.
+#[must_use]
+pub fn process_has_exited(process: usize) -> bool {
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    // Safety: `process` is a live process handle owned by the caller.
+    unsafe { WaitForSingleObject(process as HANDLE, 0) == WAIT_OBJECT_0 }
 }
 
 /// Serializes a [`litebox::platform::ForkFullGprSnapshot`] as one comma-separated line of
@@ -1276,7 +1349,7 @@ pub fn spawn_process_fork_child(
     mut read_source_bytes: impl FnMut(Range<usize>) -> Option<Vec<u8>>,
     full_gprs: litebox::platform::ForkFullGprSnapshot,
     relocations_line: String,
-    child_pipe_handles: &[(i32, HANDLE)],
+    child_pipe_handles: &[(i32, HANDLE, ChildPipeEnd)],
 ) -> Result<Option<(u32, HANDLE)>, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe() failed: {e}"))?;
     let mut exe_wide: Vec<u16> = exe
@@ -1316,7 +1389,7 @@ pub fn spawn_process_fork_child(
     if !child_pipe_handles.is_empty() {
         let spec = child_pipe_handles
             .iter()
-            .map(|(fd, h)| format!("{fd}:{:x}", *h as usize))
+            .map(|(fd, h, dir)| format!("{fd}:{:x}:{}", *h as usize, dir.tag()))
             .collect::<Vec<_>>()
             .join(",");
         child_env.push((FORK_CHILD_PIPE_FDS_ENV_VAR, spec));
@@ -1347,7 +1420,7 @@ pub fn spawn_process_fork_child(
     // return zero and the guest's reader never sees EOF, which presents as a hang rather than as
     // an error.
     let close_child_side = || {
-        for (_, h) in child_pipe_handles {
+        for (_, h, _) in child_pipe_handles {
             if !h.is_null() {
                 // Safety: each handle came from `create_inheritable_child_write_pipe` and is
                 // closed exactly once, here.

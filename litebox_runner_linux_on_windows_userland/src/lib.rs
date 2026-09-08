@@ -1436,12 +1436,10 @@ fn diag_process_fork_task_resume_probe(
     // `adopt_forked_process` hands back a fresh, stdio-only fd table -- correct, because litebox's
     // pipes are in-memory `ringbuf` objects with no OS handle behind them and genuinely cannot
     // cross a process boundary. What DID cross is a real Windows pipe per fd, inherited from the
-    // parent via `CreateProcessW`, whose handle values arrived in this child's environment block
-    // (`FORK_CHILD_PIPE_FDS_ENV_VAR`). So for each one: create a local litebox pipe, put its WRITE
-    // end at exactly the fd number the guest expects, and run a host thread that drains the READ
-    // end into the inherited Windows handle. The guest's `write(3, ..)` then lands in the parent's
-    // own pipe, where the parent's reader is blocked -- which is the whole point of the fd being
-    // inherited in the first place.
+    // parent via `CreateProcessW`, whose handle values and directions arrived in this child's
+    // environment block (`FORK_CHILD_PIPE_FDS_ENV_VAR`). So for each one: create a fresh local
+    // litebox pipe, put the end the guest will USE at the fd number it expects, and run a host
+    // thread bridging the other end to the inherited Windows handle.
     //
     // Must happen HERE: before `run_thread_with_fork_verification` consumes `entrypoints`, and on
     // this thread, because `LinuxShimEntrypoints` is deliberately `!Send`.
@@ -1449,41 +1447,79 @@ fn diag_process_fork_task_resume_probe(
         && let Some(spec) = spec.to_str()
     {
         for item in spec.split(',').filter(|s| !s.is_empty()) {
-            let parsed = item.split_once(':').and_then(|(fd, handle)| {
-                Some((fd.parse::<i32>().ok()?, usize::from_str_radix(handle, 16).ok()?))
-            });
-            let Some((fd, handle)) = parsed else {
+            let mut parts = item.split(':');
+            let parsed = (|| {
+                let fd = parts.next()?.parse::<i32>().ok()?;
+                let handle = usize::from_str_radix(parts.next()?, 16).ok()?;
+                let dir = pf::ChildPipeEnd::from_tag(parts.next()?)?;
+                Some((fd, handle, dir))
+            })();
+            let Some((fd, handle, dir)) = parsed else {
                 eprintln!(
-                    "[process_fork_diag] task-resume-probe (child): unparseable inherited-pipe                      entry {item:?}, guest fd will be missing"
+                    "[process_fork_diag] task-resume-probe (child): unparseable inherited-pipe entry {item:?}, guest fd will be missing"
                 );
                 continue;
             };
-            let Some(read_end) = entrypoints.install_pipe_write_end_at_fd(fd) else {
+            // The guest gets the end it will USE; the host pump gets the other one.
+            let host_end = match dir {
+                pf::ChildPipeEnd::ChildWrites => entrypoints.install_pipe_write_end_at_fd(fd),
+                pf::ChildPipeEnd::ChildReads => entrypoints.install_pipe_read_end_at_fd(fd),
+            };
+            let Some(host_end) = host_end else {
                 eprintln!(
-                    "[process_fork_diag] task-resume-probe (child): could not install a pipe at                      guest fd {fd}, it will be missing"
+                    "[process_fork_diag] task-resume-probe (child): could not install a pipe at guest fd {fd}, it will be missing"
                 );
                 continue;
             };
             eprintln!(
-                "[process_fork_diag] task-resume-probe (child): guest fd {fd} rebuilt over                  inherited Windows pipe handle {handle:#x}"
+                "[process_fork_diag] task-resume-probe (child): guest fd {fd} rebuilt over inherited Windows pipe handle {handle:#x} (child {})",
+                match dir {
+                    pf::ChildPipeEnd::ChildWrites => "writes",
+                    pf::ChildPipeEnd::ChildReads => "reads",
+                }
             );
             let pump_shim = shim.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 4096];
-                // Blocks in the guest pipe's own wait machinery until the guest writes, and
-                // returns 0 once the guest has closed every writer -- i.e. exactly when the
-                // parent should see EOF, which closing the inherited handle below delivers.
-                while let Some(n) = pump_shim.detached_pipe_read(&read_end, &mut buf) {
-                    if n == 0 || !pf::write_all_to_inherited_handle(handle, &buf[..n]) {
-                        eprintln!(
-                            "[process_fork_diag] pipe pump (child, fd {fd}): stream ended (n={n}),                              closing the inherited handle to deliver EOF upstream"
-                        );
-                        break;
+                match dir {
+                    // Drain what the guest wrote into the inherited handle, then close it: that
+                    // is what gives the parent's own pump a zero-byte read, and hence the guest on
+                    // the far side its EOF. `detached_pipe_read` blocks in the guest pipe's own
+                    // wait machinery and returns 0 once the guest has closed every writer.
+                    pf::ChildPipeEnd::ChildWrites => {
+                        while let Some(n) = pump_shim.detached_pipe_read(&host_end, &mut buf) {
+                            if n == 0 || !pf::write_all_to_inherited_handle(handle, &buf[..n]) {
+                                eprintln!(
+                                    "[process_fork_diag] pipe pump (child, fd {fd}): stream ended (n={n}), closing the inherited handle to deliver EOF upstream"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    // Fill the guest's pipe from the inherited handle. Dropping `host_end` at the
+                    // end releases the local write end, so the guest's `read` sees EOF once the
+                    // parent's side is done.
+                    pf::ChildPipeEnd::ChildReads => {
+                        loop {
+                            let n = pf::read_from_inherited_handle(handle, &mut buf);
+                            if n == 0 {
+                                eprintln!(
+                                    "[process_fork_diag] pipe pump (child, fd {fd}): upstream closed, releasing the guest pipe's write end so the guest sees EOF"
+                                );
+                                break;
+                            }
+                            let mut off = 0usize;
+                            while off < n {
+                                match pump_shim.detached_pipe_write(&host_end, &buf[off..n]) {
+                                    Some(0) | None => break,
+                                    Some(w) => off += w,
+                                }
+                            }
+                        }
                     }
                 }
+                drop(host_end);
                 // Safety: this thread is the sole owner of `handle`, and closes it exactly once.
-                // This is what gives the parent's pump a zero-byte `ReadFile`, and hence the
-                // guest's reader its EOF.
                 unsafe { pf::close_inherited_handle(handle) };
             });
         }
