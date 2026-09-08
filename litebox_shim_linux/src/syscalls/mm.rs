@@ -2280,29 +2280,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Some(alloc::sync::Arc::clone(cached));
         }
 
-        let mut header = [0u8; 64];
-        if self.read_exact_at(fd, &mut header, 0).is_none() {
-            return None;
-        }
-        // ELF64, little-endian, or this parse does not apply.
-        if header[..4] != *b"\x7fELF" || header[4] != 2 || header[5] != 1 {
-            return None;
-        }
-        let e_shoff = u64::from_le_bytes(header[0x28..0x30].try_into().ok()?);
-        let e_shentsize = u16::from_le_bytes(header[0x3a..0x3c].try_into().ok()?) as usize;
-        let e_shnum = u16::from_le_bytes(header[0x3c..0x3e].try_into().ok()?) as usize;
-        // `e_shnum == 0` with a non-zero `e_shoff` means the real count lives in section 0's
-        // `sh_size` (the >65280-section escape). Rare enough to decline rather than half-support.
-        if e_shoff == 0 || e_shnum == 0 {
-            return None;
-        }
+        let mut header = [0u8; litebox_syscall_rewriter::ELF_HEADER_LEN];
+        self.read_exact_at(fd, &mut header, 0)?;
+        // What an ELF header means is the rewriter's business, and it already has `object`'s own
+        // struct definitions -- decoding `e_shoff`/`e_shentsize`/`e_shnum` by hand here would be a
+        // second, divergent copy of that knowledge expressed as byte offsets.
+        let (e_shoff, e_shentsize, e_shnum) =
+            litebox_syscall_rewriter::section_header_table_location(&header)?;
         let total = e_shentsize.checked_mul(e_shnum)?;
         // A sanity bound, so a corrupt header cannot ask for an unbounded allocation.
         if total > 16 * 1024 * 1024 {
             return None;
         }
         let mut section_headers = alloc::vec![0u8; total];
-        self.read_exact_at(fd, &mut section_headers, e_shoff as usize)?;
+        self.read_exact_at(fd, &mut section_headers, usize::try_from(e_shoff).ok()?)?;
 
         let ranges = alloc::sync::Arc::new(
             litebox_syscall_rewriter::executable_section_file_ranges(

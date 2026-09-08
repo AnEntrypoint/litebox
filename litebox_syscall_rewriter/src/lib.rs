@@ -32,7 +32,8 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use object::read::elf::{ElfFile, ProgramHeader as _};
+use object::Endianness;
+use object::read::elf::{ElfFile, FileHeader as _, ProgramHeader as _};
 use object::read::{Object as _, ObjectSection as _};
 use thiserror::Error;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -476,40 +477,35 @@ pub fn executable_section_file_ranges(
     shentsize: usize,
     shnum: usize,
 ) -> Vec<core::ops::Range<u64>> {
-    // Elf64_Shdr field offsets: sh_type 4 (u32), sh_flags 8 (u64), sh_offset 24 (u64),
-    // sh_size 32 (u64).
-    const SH_TYPE: usize = 4;
-    const SH_FLAGS: usize = 8;
-    const SH_OFFSET: usize = 24;
-    const SH_SIZE: usize = 32;
-    const SHDR_MIN: usize = 40;
-    const SHT_NOBITS: u32 = 8;
-    const SHF_ALLOC: u64 = 0x2;
-    const SHF_EXECINSTR: u64 = 0x4;
-
     let mut ranges = Vec::new();
-    if shentsize < SHDR_MIN {
+    // A section header table whose entries are not the size this ELF class defines is not one this
+    // can walk; refusing beats guessing a stride.
+    if shentsize != core::mem::size_of::<object::elf::SectionHeader64<Endianness>>() {
         return ranges;
     }
-    for i in 0..shnum {
-        let Some(base) = i.checked_mul(shentsize) else {
-            break;
-        };
-        let Some(shdr) = section_headers.get(base..base + shentsize) else {
-            break;
-        };
-        let read_u32 = |o: usize| u32::from_le_bytes(shdr[o..o + 4].try_into().unwrap());
-        let read_u64 = |o: usize| u64::from_le_bytes(shdr[o..o + 8].try_into().unwrap());
+    let Ok((headers, _)) =
+        object::pod::slice_from_bytes::<object::elf::SectionHeader64<Endianness>>(
+            section_headers,
+            shnum,
+        )
+    else {
+        return ranges;
+    };
 
-        if read_u32(SH_TYPE) == SHT_NOBITS {
+    let endian = Endianness::Little;
+    for header in headers {
+        if header.sh_type.get(endian) == object::elf::SHT_NOBITS {
+            // Occupies no file bytes, so there is nothing here to patch.
             continue;
         }
-        let flags = read_u64(SH_FLAGS);
-        if flags & SHF_ALLOC == 0 || flags & SHF_EXECINSTR == 0 {
+        let flags = header.sh_flags.get(endian);
+        if flags & u64::from(object::elf::SHF_ALLOC) == 0
+            || flags & u64::from(object::elf::SHF_EXECINSTR) == 0
+        {
             continue;
         }
-        let offset = read_u64(SH_OFFSET);
-        let size = read_u64(SH_SIZE);
+        let offset = header.sh_offset.get(endian);
+        let size = header.sh_size.get(endian);
         if size == 0 {
             continue;
         }
@@ -521,6 +517,40 @@ pub fn executable_section_file_ranges(
     ranges.sort_by_key(|r| r.start);
     ranges
 }
+
+/// Where an ELF64 little-endian image keeps its section header table: `(offset, entry size, count)`.
+///
+/// `None` when `header` is not an ELF64 little-endian header, or names no section header table.
+/// Callers hand in just the first [`ELF_HEADER_LEN`] bytes -- the table itself lives at the end of
+/// the file, so nothing here requires having read the whole image.
+///
+/// This exists so that a caller reading an ELF a few bytes at a time (the guest `mmap` path reads
+/// the header and the table, never the 130 MB in between) still uses `object`'s own struct
+/// definitions and accessors rather than re-deriving field offsets by hand.
+pub fn section_header_table_location(header: &[u8]) -> Option<(u64, usize, usize)> {
+    let (file_header, _) =
+        object::pod::from_bytes::<object::elf::FileHeader64<Endianness>>(header).ok()?;
+    let ident = &file_header.e_ident;
+    if ident.magic != object::elf::ELFMAG
+        || ident.class != object::elf::ELFCLASS64
+        || ident.data != object::elf::ELFDATA2LSB
+    {
+        return None;
+    }
+    let endian = Endianness::Little;
+    let offset = file_header.e_shoff.get(endian);
+    let entsize = usize::from(file_header.e_shentsize.get(endian));
+    let count = usize::from(file_header.e_shnum.get(endian));
+    // `e_shnum == 0` with a non-zero `e_shoff` means the real count lives in section 0's `sh_size`
+    // (the >65280-section escape hatch). Rare enough to decline rather than half-support.
+    if offset == 0 || count == 0 {
+        return None;
+    }
+    Some((offset, entsize, count))
+}
+
+/// How many bytes of an ELF64 file [`section_header_table_location`] needs.
+pub const ELF_HEADER_LEN: usize = core::mem::size_of::<object::elf::FileHeader64<Endianness>>();
 
 /// (private) Get metadata for executable sections
 fn text_sections(
