@@ -322,3 +322,51 @@ run that is not already failing to map libc.
 of python processes live, the shared address space stops being able to map an ordinary library.
 That is the same single-address-space pressure that the `ET_EXEC` collision comes from, and it is
 the most likely explanation for the intermittent host AV that ends runs at varying points.
+
+## Update 5: only ONE python3 can exist at a time, and that is the thread running through everything
+
+`/lsiopy/bin/python3` and `/usr/bin/python3.13` are **`ET_EXEC`** -- non-PIE, fixed load address.
+Everything else in the desktop is PIE:
+
+| binary | type |
+|---|---|
+| `/lsiopy/bin/python3`, `/usr/bin/python3.13` | **ET_EXEC (fixed address)** |
+| nginx, xfwm4, dash, ls, xfce4-session, Xvfb | ET_DYN (PIE) |
+
+In litebox's single host address space a second `ET_EXEC` instance cannot load, and the failure is
+exactly the one `s6-mkdir` gives:
+
+```
+sys_execve: load_program failed after point of no return, killing process with SIGSEGV
+  tid=4 path=/lsiopy/bin/python3 error=LoadError(Map(Errno(17 = EEXIST: File exists)))
+```
+
+**selkies IS python3.** So selkies and every `python3` probe in a launcher are mutually exclusive:
+whichever starts second dies with SIGSEGV. That single fact explains a long list of this session's
+confusing observations -- `xcensus.py` printing nothing while selkies ran, `grab_root.py` never
+producing pixels, "the guest died" in several runs, and a cross-process loopback test whose client
+"segfaulted" (it was the second python3 failing to load, not a network fault; the earlier
+withdrawal of that loopback claim was right, for a reason that is now precise).
+
+It is also the same defect as the OCI `/init` blocker, and the same single-address-space pressure
+behind `libc.so.6: failed to map segment from shared object` under load. One fix covers all three:
+**give a guest process its own address space at `execve`**, which is the easy direction -- exec
+discards the image anyway, so nothing has to be duplicated.
+
+## Where the stream actually got to
+
+With selkies as the ONLY python3, bound to `0.0.0.0` so the gateway can reach it, published on its
+real port (8081, not the 8082 everything was aimed at):
+
+* `GET /websockets` through `--publish` -> **`HTTP/1.1 101 Switching Protocols`**
+* the browser, connecting once to a fresh stack, **rendered a mouse cursor** -- selkies cursor data
+  arriving over that websocket and drawn by the dashboard
+
+So the full chain does carry data end to end at least once. It then reports
+`WebSocket disconnected` and does not recover, and no video frames arrive. selkies serves a single
+client, and a second connection (including a page reload) gets nothing -- while a plain asyncio
+server in the same image, through the same `--publish` path, answers 5 of 5 sequential requests, so
+litebox's accept path is not what is refusing.
+
+The desktop underneath remains healthy: `WM_S0` owned, 17-21 windows, `DE_ALIVE` past T=300s, and
+the image's own nginx serving its own dashboard to the host at `HTTP 200`.
