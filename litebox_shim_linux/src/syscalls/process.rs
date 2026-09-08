@@ -2480,22 +2480,90 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             );
             return None;
         };
-        let beyond_stdio = {
+        let beyond_stdio_fds: alloc::vec::Vec<usize> = {
             let raw_descriptors = files.raw_descriptor_store.read();
-            raw_descriptors.iter_alive().filter(|&raw| raw >= 3).count()
+            raw_descriptors.iter_alive().filter(|&raw| raw >= 3).collect()
         };
         drop(files);
-        if beyond_stdio != 0
+
+        // A pipe fd the child WRITES can be carried across the process boundary; anything else
+        // still cannot.
+        //
+        // litebox's pipes are in-memory `ringbuf` objects with no OS handle behind them, so a
+        // cross-process child inherits nothing of one automatically. What it CAN be given is a
+        // real Windows pipe at the same fd number, with a host thread on the parent's side
+        // pumping that OS pipe back into the parent's own in-memory pipe -- so the child's writes
+        // reappear exactly where the guest's reader is blocked. That is
+        // `litebox::platform::ForkPipeSink`, built here and consumed by the platform.
+        //
+        // Only the SENDER half. A receiver half is a shared consumable: on a real fork, parent and
+        // child draw from the SAME byte stream, and no bridge built out of a second OS pipe can
+        // reproduce that -- duplicating the stream would let both read every byte, and splitting it
+        // would deliver each byte to an arbitrary one of them. So a child-side read end stays
+        // ineligible, and the fork falls back to the thread-based path that genuinely shares the
+        // pipe because it shares the address space.
+        //
+        // This is what the `beyond_stdio == 0` gate stood in the way of: `/init`'s `preinit`
+        // performs command substitution (`` eval `s6-overlay-stat /run` ``), whose child writes to
+        // an inherited pipe -- one sender-half fd, and previously enough to refuse the whole path.
+        let mut inherited_pipes: alloc::vec::Vec<(i32, litebox::platform::ForkPipeSink)> =
+            alloc::vec::Vec::new();
+        let mut uncarriable = 0usize;
+        for raw_fd in &beyond_stdio_fds {
+            let carried = i32::try_from(*raw_fd).ok().and_then(|fd| {
+                let (end, half) = self.detached_pipe_end_for_raw_fd(*raw_fd)?;
+                (half == litebox::pipes::HalfPipeType::SenderHalf).then_some((fd, end))
+            });
+            match carried {
+                Some((fd, end)) => {
+                    // `platform` is `&'static`, so this closure -- which outlives this call on a
+                    // platform-side pump thread -- is `'static` without any further plumbing.
+                    // `WaitState` is per-thread by design and cheap, so the pump builds one per
+                    // write rather than smuggling a non-`Sync` one across threads.
+                    let platform = self.global.platform;
+                    litebox_util_log::debug!(
+                        tid:% = self.tid, fd:% = fd, owners:% = end.strong_count();
+                        "clone: carrying a pipe sender half into the cross-process child"
+                    );
+                    inherited_pipes.push((
+                        fd,
+                        {
+                            let end = alloc::sync::Arc::new(end);
+                            let counted = alloc::sync::Arc::clone(&end);
+                            litebox::platform::ForkPipeSink::new(
+                                move |buf| {
+                                    let wait_state =
+                                        litebox::event::wait::WaitState::new(platform);
+                                    end.write(&wait_state.context(), buf).ok()
+                                },
+                                move || counted.strong_count(),
+                            )
+                        },
+                    ));
+                }
+                None => uncarriable += 1,
+            }
+        }
+        if uncarriable != 0
             && !self
                 .global
                 .platform
                 .env_flag("LITEBOX_PROCESS_FORK_IGNORE_FDS")
         {
             litebox_util_log::debug!(
-                tid:% = self.tid, beyond_stdio:% = beyond_stdio;
-                "clone: cross-process fork() not eligible -- guest holds fd(s) at or above 3"
+                tid:% = self.tid,
+                uncarriable:% = uncarriable,
+                carried:% = inherited_pipes.len();
+                "clone: cross-process fork() not eligible -- guest holds fd(s) at or above 3 that                  are not a pipe's sender half, and no other fd subsystem here is backed by an                  inheritable Windows HANDLE"
             );
             return None;
+        }
+        if uncarriable != 0 {
+            litebox_util_log::warn!(
+                tid:% = self.tid,
+                uncarriable:% = uncarriable;
+                "clone: cross-process fork() forced by LITEBOX_PROCESS_FORK_IGNORE_FDS -- the                  child WILL LOSE the fds that could not be carried; measurement only"
+            );
         }
 
         let parent_fs_base = self
@@ -2569,8 +2637,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // touches or overlaps. Widening can pull in padding that is not mapped, which is why
         // `read_source_bytes` on the platform side reads a group page at a time and tolerates
         // holes instead of assuming the whole span is readable.
+        //
+        // Only ACCESSIBLE regions contribute a group. A `PROT_NONE` region (no VM_READ/WRITE/EXEC)
+        // has no bytes anyone can legitimately read, so it has nothing to copy -- and litebox
+        // never commits one, which is what lets its address escape the host's own layout
+        // constraints. Observed exactly that: musl's guard pages landed at `0x7ffe0000` and
+        // `0x7ffe3000`, which on every Windows x64 process is `KUSER_SHARED_DATA` -- the parent
+        // never noticed, because it never committed them, but they formed a copy group of their
+        // own and `VirtualAlloc2` in the child refused it with `ERROR_INVALID_ADDRESS` (487),
+        // failing the whole fork. A guard page still reaches the child: the VMA layout travels
+        // separately (`ranges` above) and carries every region, accessible or not, so the child's
+        // adoption still sees it and a guest touching it still faults, exactly as it should.
         const GRANULE: usize = 0x1_0000;
-        let mut sorted = layout.clone();
+        let mut sorted: alloc::vec::Vec<_> = layout
+            .iter()
+            .filter(|(_, f, _)| {
+                let f = litebox::mm::linux::VmFlags::from_bits_truncate(*f);
+                f.intersects(
+                    litebox::mm::linux::VmFlags::VM_READ
+                        | litebox::mm::linux::VmFlags::VM_WRITE
+                        | litebox::mm::linux::VmFlags::VM_EXEC,
+                )
+            })
+            .cloned()
+            .collect();
         sorted.sort_by_key(|(range, _, _)| range.start);
         let mut groups: alloc::vec::Vec<core::ops::Range<usize>> = alloc::vec::Vec::new();
         for (range, _, _) in &sorted {
@@ -2596,6 +2686,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             heap_top:% = heap_top;
             "clone: cross-process fork() copy plan"
         );
+
         let group_relocations: alloc::vec::Vec<(core::ops::Range<usize>, usize)> = groups
             .into_iter()
             .map(|g| {
@@ -2626,7 +2717,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         self.global
             .platform
-            .spawn_cross_process_fork_child(&relocations, full_gprs)
+            .spawn_cross_process_fork_child(&relocations, full_gprs, inherited_pipes)
     }
 
     #[cfg(not(target_arch = "x86_64"))]
@@ -2832,10 +2923,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         } else {
             alloc::sync::Arc::new((**self.fs.borrow()).clone())
         };
-        let files = if flags.contains(CloneFlags::FILES) {
-            self.files.borrow().clone()
-        } else {
-            alloc::sync::Arc::new(self.files.borrow().fork_duplicate(&self.global.litebox))
+        // DEFERRED, not computed here: `fork_duplicate` has a side effect on shared state, and the
+        // cross-process `fork()` path below returns before ever needing the result.
+        //
+        // `Descriptors::duplicate` (which `fork_duplicate` calls per fd) clones the descriptor
+        // table's own `Arc` for each entry, so a duplicate that nothing ever closes pins every one
+        // of the parent's descriptors open forever. On a thread-based fork that is exactly right --
+        // the child's own exit closes its copies -- but a cross-process child has no in-process fd
+        // table to close, so building one here and dropping it on the early return leaked every fd
+        // the parent held. Measured precisely that: with the parent's own `close(3)` reporting
+        // `unique=false`, the write end of a command-substitution pipe never reached refcount zero,
+        // so `WriteEnd::drop` never ran, so the guest's reader never got EOF and `sh` hung after
+        // correctly receiving all 17 bytes the cross-process child wrote.
+        let make_files = || {
+            if flags.contains(CloneFlags::FILES) {
+                self.files.borrow().clone()
+            } else {
+                alloc::sync::Arc::new(self.files.borrow().fork_duplicate(&self.global.litebox))
+            }
         };
 
         let child_tid = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
@@ -3564,10 +3669,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             //
             // Do not enable this to "make things work". Real eligibility needs guest pipes (and
             // the other six fd subsystems) backed by inheritable Windows HANDLEs.
-            let ignore_fds = self
-                .global
-                .platform
-                .env_flag("LITEBOX_PROCESS_FORK_IGNORE_FDS");
+            // NOT honoured here, deliberately, even though this site's own gate used to read it.
+            //
+            // `LITEBOX_PROCESS_FORK_IGNORE_FDS` now means "carry what can be carried and accept
+            // losing the rest", and only the PRE-duplication `try_cross_process_fork` above can
+            // carry anything -- it is the site that builds the `ForkPipeSink`s. This legacy
+            // post-duplication site always passes an empty pipe list, so honouring the flag here
+            // would spawn a child that loses fds the other path would have kept, and it would do
+            // so precisely when the other path had just declined. Measured exactly that: with the
+            // flag set, `sh -c 'V=`echo hi`'` reached this site, spawned a child with no pipe at
+            // all, and the child died on `dup2(3,1): Bad file descriptor` -- the same symptom the
+            // whole pipe-inheritance path exists to remove.
+            let ignore_fds = false;
             if fd_complexity.beyond_stdio != 0 && !ignore_fds {
                 litebox_util_log::warn!(
                     tid:% = self.tid,
@@ -3618,7 +3731,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 && let Some(handle) = self
                     .global
                     .platform
-                    .spawn_cross_process_fork_child(&relocations, full_gprs)
+                    .spawn_cross_process_fork_child(
+                        &relocations,
+                        full_gprs,
+                        alloc::vec::Vec::new(),
+                    )
             {
                 self.process()
                     .register_cross_process_child(child_tid, handle);
@@ -3761,7 +3878,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         credentials: self.credentials.clone(),
                         comm: self.comm.clone(),
                         fs: fs.into(),
-                        files: files.into(),
+                        files: make_files().into(),
                         signals: self.signals.clone_for_new_task(child_shared_pending),
                         attached_pty_id: core::cell::Cell::new(self.attached_pty_id.get()),
                     },

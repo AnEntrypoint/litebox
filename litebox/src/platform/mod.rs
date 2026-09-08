@@ -906,14 +906,83 @@ pub trait ForkChildVerificationProvider {
     /// `cross_process_children` registry key (matching how a thread-based child is keyed), not
     /// whatever this function returns as the process's real OS pid (needed only to interpret the
     /// `HANDLE`, never exposed to the guest).
+    ///
+    /// `inherited_pipes` carries the parent-side half of every guest pipe fd the child must come
+    /// up holding (see [`ForkPipeSink`]). The platform is responsible for giving the child a real,
+    /// inheritable OS handle per entry and for pumping that handle back into the matching sink; if
+    /// it cannot, it must return `None` and let the caller fall back rather than spawn a child
+    /// that silently loses the fd.
+    ///
+    /// Takes `&'static self` because those pump threads outlive this call and need the platform to
+    /// build their own per-thread wait state -- every caller already holds the platform as
+    /// `&'static` (`GlobalState::platform`), so this costs nothing.
     fn spawn_cross_process_fork_child(
-        &self,
+        &'static self,
         relocations: &crate::mm::AddressRelocations,
         full_gprs: ForkFullGprSnapshot,
+        inherited_pipes: alloc::vec::Vec<(i32, ForkPipeSink)>,
     ) -> Option<CrossProcessChildHandle> {
         let _ = relocations;
         let _ = full_gprs;
+        let _ = inherited_pipes;
         None
+    }
+}
+
+/// A host-side writer into one of the PARENT's in-memory pipes, handed across to
+/// [`ForkChildVerificationProvider::spawn_cross_process_fork_child`] so the platform can bridge a
+/// cross-process `fork()` child's pipe fd back to it.
+///
+/// litebox's pipes are pure in-memory `ringbuf` objects with no OS handle behind them (see
+/// `crate::pipes`), so nothing about one survives a process boundary. The platform therefore gives
+/// the child a real inheritable OS pipe at the same fd number and runs a pump thread that reads
+/// that OS pipe and calls this sink -- the child's writes reappear in the parent's own pipe, which
+/// is exactly what the guest's other end is blocked reading.
+///
+/// Erased to a boxed closure rather than exposing `pipes::DetachedPipeEnd` in the trait: the sink
+/// is built in `litebox_shim_linux`, where the descriptor table and the pipe registry live, and
+/// the platform needs no knowledge of either -- only "here are some bytes the child wrote".
+///
+/// **Dropping the sink is how EOF is delivered.** It owns the last non-descriptor reference to the
+/// parent-side write end, so the pump thread dropping it on `ReadFile` returning zero shuts that
+/// end down and `HUP`s the peer -- the same signal a guest gives by closing its last descriptor.
+pub struct ForkPipeSink {
+    write: alloc::boxed::Box<dyn FnMut(&[u8]) -> Option<usize> + Send>,
+    owners: alloc::boxed::Box<dyn Fn() -> usize + Send>,
+}
+
+impl ForkPipeSink {
+    /// Wrap a writer. `f` returns the number of bytes accepted, or `None` if the pipe is gone;
+    /// `owners` reports how many references to the underlying pipe end are alive, so the platform
+    /// can tell whether dropping this sink will actually deliver EOF.
+    #[must_use]
+    pub fn new(
+        f: impl FnMut(&[u8]) -> Option<usize> + Send + 'static,
+        owners: impl Fn() -> usize + Send + 'static,
+    ) -> Self {
+        Self {
+            write: alloc::boxed::Box::new(f),
+            owners: alloc::boxed::Box::new(owners),
+        }
+    }
+
+    /// How many references to the parent-side pipe end are alive, this sink included. `1` means
+    /// dropping this sink shuts the end down and gives the guest's reader EOF.
+    #[must_use]
+    pub fn owners(&self) -> usize {
+        (self.owners)()
+    }
+
+    /// Write `buf` into the parent-side pipe. Short writes are possible, exactly as for a guest
+    /// `write(2)` on a pipe; the caller loops.
+    pub fn write(&mut self, buf: &[u8]) -> Option<usize> {
+        (self.write)(buf)
+    }
+}
+
+impl core::fmt::Debug for ForkPipeSink {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("ForkPipeSink(..)")
     }
 }
 

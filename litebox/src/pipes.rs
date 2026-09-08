@@ -80,7 +80,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     ///
     /// Future operations on the `fd` will start to return `ClosedFd` errors.
     pub fn close(&self, fd: &PipeFd<Platform>) -> Result<(), errors::CloseError> {
-        self.litebox.descriptor_table_mut().remove(fd);
+        let removed = self.litebox.descriptor_table_mut().remove(fd);
+        // `unique` is the invariant that decides whether the guest on the other end gets EOF:
+        // only a unique entry is actually dropped here, and only that drop runs `WriteEnd::drop`.
+        // A `false` on what should be the last close means some other descriptor-table duplicate
+        // is still pinning this end open -- which presents to the guest as a `read()` that blocks
+        // forever, with nothing else to see. Worth a line.
+        litebox_util_log::debug!(unique:% = removed.is_some(); "pipes: closed a pipe end");
         // Shutdowns are taken care of automatically by the drop implementations
         Ok(())
     }
@@ -214,6 +220,20 @@ pub struct DetachedPipeEnd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DetachedPipeEnd<Platform> {
+    /// How many references to this pipe end are alive, this handle included.
+    ///
+    /// Diagnostic only. A host pump uses it to tell "I am the last owner, so dropping me will
+    /// shut the end down and give the peer EOF" from "a descriptor somewhere still holds this
+    /// end open", which are indistinguishable from the outside and produce very different
+    /// behaviour for the guest on the other side.
+    #[must_use]
+    pub fn strong_count(&self) -> usize {
+        match &self.end {
+            PipeEnd::Receiver(p) => Arc::strong_count(p),
+            PipeEnd::Sender(p) => Arc::strong_count(p),
+        }
+    }
+
     /// Whether this is the sender half or the receiver half.
     #[must_use]
     pub fn half_pipe_type(&self) -> HalfPipeType {

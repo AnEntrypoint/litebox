@@ -772,6 +772,110 @@ pub fn diag_process_fork_task_resume_enabled() -> bool {
 /// guest-visible.
 pub const FORK_CHILD_GPRS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_GPRS";
 
+/// Carries the guest pipe fds a cross-process `fork()` child must come up holding, as
+/// `fd:handle` pairs separated by commas (e.g. `3:1a4,7:1b0`), where `handle` is the hex value of
+/// an inheritable Windows pipe WRITE handle already present in the child by virtue of
+/// `CreateProcessW`'s `bInheritHandles`.
+///
+/// A handle value passed through the environment looks alarming and is not: handle values are
+/// per-process, and inheritance is what actually makes this one valid in the child -- the number
+/// only says WHICH of the handles it already owns belongs at which fd. It travels the same way
+/// [`FORK_CHILD_GPRS_ENV_VAR`] does, in the child's own environment block, never by mutating this
+/// process's environment. Never guest-visible.
+pub const FORK_CHILD_PIPE_FDS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_PIPE_FDS";
+
+/// Write `buf` in full to an inherited Windows handle named by its raw value, returning whether
+/// every byte landed.
+///
+/// Exists so the cross-process fork child's pipe pump (in the runner crate, which deliberately
+/// does not depend on `windows-sys`) can drive the inherited handle without reaching for the Win32
+/// API itself. Short writes are ordinary on a pipe, so this loops; `false` means the parent's end
+/// is gone and nothing further is deliverable.
+///
+/// The handle is taken as `usize` because a Windows `HANDLE` is a raw pointer and therefore
+/// `!Send`, while the value itself is process-wide and thread-agnostic.
+#[must_use]
+pub fn write_all_to_inherited_handle(handle: usize, buf: &[u8]) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+
+    let handle = handle as HANDLE;
+    let mut off = 0usize;
+    while off < buf.len() {
+        let mut written: u32 = 0;
+        // Safety: `handle` is a live inherited pipe write handle and `buf` outlives the call.
+        let ok = unsafe {
+            WriteFile(
+                handle,
+                buf[off..].as_ptr().cast(),
+                u32::try_from(buf.len() - off).unwrap_or(u32::MAX),
+                &raw mut written,
+                core::ptr::null_mut(),
+            )
+        };
+        if ok == 0 || written == 0 {
+            return false;
+        }
+        off += written as usize;
+    }
+    true
+}
+
+/// Close an inherited Windows handle named by its raw value. See
+/// [`write_all_to_inherited_handle`] for why the value travels as a `usize`.
+///
+/// For a cross-process fork child's pipe this is what actually delivers EOF: it drops the last
+/// writer, so the parent's pump sees a zero-byte `ReadFile` and releases its own end.
+///
+/// # Safety
+/// The caller must own `handle` and must not close it again.
+pub unsafe fn close_inherited_handle(handle: usize) {
+    unsafe { CloseHandle(handle as HANDLE) };
+}
+
+/// Create an anonymous pipe whose WRITE end a `CreateProcessW` child inherits and whose READ end
+/// stays private to this process.
+///
+/// Returns `(local_read, child_write)`. Both must be closed by the caller: `child_write` right
+/// after the spawn (the child has its own copy by then, and leaving this one open would keep the
+/// pipe's writer count above zero forever, so the reader would never see EOF), `local_read` when
+/// its pump thread finishes.
+///
+/// `bInheritHandle` on the `SECURITY_ATTRIBUTES` marks BOTH ends inheritable, so the read end is
+/// explicitly un-marked afterwards -- otherwise the child would also hold a reader, and a pipe
+/// with a live reader in the wrong process is a subtle hang rather than a visible error.
+pub fn create_inheritable_child_write_pipe() -> Result<(HANDLE, HANDLE), String> {
+    use windows_sys::Win32::Foundation::SetHandleInformation;
+    const HANDLE_FLAG_INHERIT: u32 = 1;
+
+    let mut sa = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(core::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(0),
+        lpSecurityDescriptor: core::ptr::null_mut(),
+        bInheritHandle: 1,
+    };
+    let mut read_handle: HANDLE = core::ptr::null_mut();
+    let mut write_handle: HANDLE = core::ptr::null_mut();
+    // Safety: both out-params are valid local `HANDLE` slots and `sa` outlives the call.
+    let ok = unsafe { CreatePipe(&raw mut read_handle, &raw mut write_handle, &raw mut sa, 0) };
+    if ok == 0 {
+        return Err(format!(
+            "CreatePipe for an inherited fork-child pipe failed, GetLastError={}",
+            unsafe { GetLastError() }
+        ));
+    }
+    // Safety: `read_handle` was just returned by `CreatePipe`.
+    if unsafe { SetHandleInformation(read_handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+        let err = unsafe { GetLastError() };
+        unsafe {
+            CloseHandle(read_handle);
+            CloseHandle(write_handle);
+        }
+        return Err(format!(
+            "SetHandleInformation(read end, INHERIT=0) failed, GetLastError={err}"
+        ));
+    }
+    Ok((read_handle, write_handle))
+}
+
 /// Serializes a [`litebox::platform::ForkFullGprSnapshot`] as one comma-separated line of
 /// hex fields, in a fixed field order matching [`deserialize_full_gprs`] exactly. Mirrors
 /// `AddressRelocations::serialize_for_diagnostic`'s own "both ends are always the same binary"
@@ -1110,6 +1214,7 @@ pub fn spawn_process_fork_child(
     mut read_source_bytes: impl FnMut(Range<usize>) -> Option<Vec<u8>>,
     full_gprs: litebox::platform::ForkFullGprSnapshot,
     relocations_line: String,
+    child_pipe_handles: &[(i32, HANDLE)],
 ) -> Result<Option<(u32, HANDLE)>, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe() failed: {e}"))?;
     let mut exe_wide: Vec<u16> = exe
@@ -1128,7 +1233,7 @@ pub fn spawn_process_fork_child(
     // it sets all three unconditionally rather than exposing them as separately-toggleable knobs.
     // Handed to the child through its OWN environment block -- never by mutating this process's
     // environment. See `build_child_environment_block` for why that distinction is load-bearing.
-    let child_env: Vec<(&str, String)> = vec![
+    let mut child_env: Vec<(&str, String)> = vec![
         (REEXEC_CHILD_ENV_VAR, "1".to_string()),
         ("LITEBOX_DIAG_PROCESS_FORK_GLOBALSTATE", "1".to_string()),
         ("LITEBOX_DIAG_PROCESS_FORK_VMEM_ADOPT", "1".to_string()),
@@ -1136,6 +1241,14 @@ pub fn spawn_process_fork_child(
         (FORK_CHILD_VMA_LAYOUT_ENV_VAR, relocations_line.clone()),
         (FORK_CHILD_GPRS_ENV_VAR, serialize_full_gprs(&full_gprs)),
     ];
+    if !child_pipe_handles.is_empty() {
+        let spec = child_pipe_handles
+            .iter()
+            .map(|(fd, h)| format!("{fd}:{:x}", *h as usize))
+            .collect::<Vec<_>>()
+            .join(",");
+        child_env.push((FORK_CHILD_PIPE_FDS_ENV_VAR, spec));
+    }
     if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
         eprintln!(
             "[diag_alloc_vec] pre-spawn exe_wide len={} cap={} ptr={:p}",
@@ -1154,7 +1267,25 @@ pub fn spawn_process_fork_child(
         );
     }
     // Nothing to undo: this process's own environment was never touched.
+    //
+    // Close this process's copies of the child-side pipe write handles as soon as the spawn is
+    // decided, on BOTH the success and failure paths. The child has its own inherited copies by
+    // now (or does not exist at all), and every copy left open here counts as a live writer on
+    // that pipe -- so keeping one would mean the parent's pump thread never sees `ReadFile`
+    // return zero and the guest's reader never sees EOF, which presents as a hang rather than as
+    // an error.
+    let close_child_side = || {
+        for (_, h) in child_pipe_handles {
+            if !h.is_null() {
+                // Safety: each handle came from `create_inheritable_child_write_pipe` and is
+                // closed exactly once, here.
+                unsafe { CloseHandle(*h) };
+            }
+        }
+    };
+    let spawn_result = spawn_result.inspect_err(|_| close_child_side());
     let (process, thread, pid, _stdout_read, _stdin_write) = spawn_result?;
+    close_child_side();
     if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
         eprintln!(
             "[diag_alloc_vec] spawned child pid={} process={:p} thread={:p}",

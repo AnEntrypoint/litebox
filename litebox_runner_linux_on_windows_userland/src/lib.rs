@@ -1388,6 +1388,64 @@ fn diag_process_fork_task_resume_probe(
     let fs_for_export = fs.clone();
     let entrypoints = shim.adopt_forked_process(fs, task_params, page_manager);
 
+    // Rebuild the guest pipe fds this child could not inherit.
+    //
+    // `adopt_forked_process` hands back a fresh, stdio-only fd table -- correct, because litebox's
+    // pipes are in-memory `ringbuf` objects with no OS handle behind them and genuinely cannot
+    // cross a process boundary. What DID cross is a real Windows pipe per fd, inherited from the
+    // parent via `CreateProcessW`, whose handle values arrived in this child's environment block
+    // (`FORK_CHILD_PIPE_FDS_ENV_VAR`). So for each one: create a local litebox pipe, put its WRITE
+    // end at exactly the fd number the guest expects, and run a host thread that drains the READ
+    // end into the inherited Windows handle. The guest's `write(3, ..)` then lands in the parent's
+    // own pipe, where the parent's reader is blocked -- which is the whole point of the fd being
+    // inherited in the first place.
+    //
+    // Must happen HERE: before `run_thread_with_fork_verification` consumes `entrypoints`, and on
+    // this thread, because `LinuxShimEntrypoints` is deliberately `!Send`.
+    if let Some(spec) = std::env::var_os(pf::FORK_CHILD_PIPE_FDS_ENV_VAR)
+        && let Some(spec) = spec.to_str()
+    {
+        for item in spec.split(',').filter(|s| !s.is_empty()) {
+            let parsed = item.split_once(':').and_then(|(fd, handle)| {
+                Some((fd.parse::<i32>().ok()?, usize::from_str_radix(handle, 16).ok()?))
+            });
+            let Some((fd, handle)) = parsed else {
+                eprintln!(
+                    "[process_fork_diag] task-resume-probe (child): unparseable inherited-pipe                      entry {item:?}, guest fd will be missing"
+                );
+                continue;
+            };
+            let Some(read_end) = entrypoints.install_pipe_write_end_at_fd(fd) else {
+                eprintln!(
+                    "[process_fork_diag] task-resume-probe (child): could not install a pipe at                      guest fd {fd}, it will be missing"
+                );
+                continue;
+            };
+            eprintln!(
+                "[process_fork_diag] task-resume-probe (child): guest fd {fd} rebuilt over                  inherited Windows pipe handle {handle:#x}"
+            );
+            let pump_shim = shim.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                // Blocks in the guest pipe's own wait machinery until the guest writes, and
+                // returns 0 once the guest has closed every writer -- i.e. exactly when the
+                // parent should see EOF, which closing the inherited handle below delivers.
+                while let Some(n) = pump_shim.detached_pipe_read(&read_end, &mut buf) {
+                    if n == 0 || !pf::write_all_to_inherited_handle(handle, &buf[..n]) {
+                        eprintln!(
+                            "[process_fork_diag] pipe pump (child, fd {fd}): stream ended (n={n}),                              closing the inherited handle to deliver EOF upstream"
+                        );
+                        break;
+                    }
+                }
+                // Safety: this thread is the sole owner of `handle`, and closes it exactly once.
+                // This is what gives the parent's pump a zero-byte `ReadFile`, and hence the
+                // guest's reader its EOF.
+                unsafe { pf::close_inherited_handle(handle) };
+            });
+        }
+    }
+
     let mut ctx = litebox_common_linux::PtRegs {
         r15: gprs.r15,
         r14: gprs.r14,

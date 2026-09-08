@@ -9153,9 +9153,10 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
     }
 
     fn spawn_cross_process_fork_child(
-        &self,
+        &'static self,
         relocations: &litebox::mm::AddressRelocations,
         full_gprs: litebox::platform::ForkFullGprSnapshot,
+        inherited_pipes: std::vec::Vec<(i32, litebox::platform::ForkPipeSink)>,
     ) -> Option<litebox::platform::CrossProcessChildHandle> {
         std::env::var_os("LITEBOX_PROCESS_FORK")?;
         let group_relocations = relocations.group_relocations();
@@ -9207,24 +9208,69 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         let relocations_line = relocations
             .identity_for_cross_process()
             .serialize_for_diagnostic();
+        // Give every carried guest pipe fd a REAL Windows pipe the child inherits.
+        //
+        // Built before the spawn because `CreateProcessW` is what actually transfers the handles,
+        // and their values have to be in the child's environment block by then. The parent keeps
+        // only the read ends; `spawn_process_fork_child` closes the child-side write handles as
+        // soon as the spawn is decided (see its own comment on why holding one would turn EOF into
+        // a hang).
+        let mut child_pipe_handles: std::vec::Vec<(i32, windows_sys::Win32::Foundation::HANDLE)> =
+            std::vec::Vec::new();
+        let mut pumps: std::vec::Vec<(usize, litebox::platform::ForkPipeSink)> =
+            std::vec::Vec::new();
+        for (fd, sink) in inherited_pipes {
+            match process_fork::create_inheritable_child_write_pipe() {
+                Ok((local_read, child_write)) => {
+                    child_pipe_handles.push((fd, child_write));
+                    pumps.push((local_read as usize, sink));
+                }
+                Err(e) => {
+                    // Fall back rather than spawn a child that silently loses the fd. Everything
+                    // built so far has to be released by hand -- there is no `Drop` guard on this
+                    // path by design (see `spawn_process_fork_child`'s doc comment).
+                    litebox_util_log::warn!(
+                        err:% = e;
+                        "spawn_cross_process_fork_child: could not create an inheritable pipe for                          a guest fd, caller should fall back to thread-based fork"
+                    );
+                    for (_, h) in &child_pipe_handles {
+                        unsafe { windows_sys::Win32::Foundation::CloseHandle(*h) };
+                    }
+                    for (h, _) in &pumps {
+                        unsafe {
+                            windows_sys::Win32::Foundation::CloseHandle(
+                                *h as windows_sys::Win32::Foundation::HANDLE,
+                            )
+                        };
+                    }
+                    return None;
+                }
+            }
+        }
+
         match process_fork::spawn_process_fork_child(
             group_relocations,
             &vma_layout,
             read_source_bytes,
             full_gprs,
             relocations_line,
+            &child_pipe_handles,
         ) {
             Ok(Some((pid, handle))) => {
                 litebox_util_log::debug!(
                     pid:% = pid;
                     "spawn_cross_process_fork_child: child spawned and resumed successfully"
                 );
+                for (local_read, sink) in pumps {
+                    spawn_fork_child_pipe_pump(local_read, sink);
+                }
                 Some(litebox::platform::CrossProcessChildHandle(handle as usize))
             }
             Ok(None) => {
                 litebox_util_log::warn!(
                     "spawn_cross_process_fork_child: spawn/resume failed, caller should fall back to thread-based fork"
                 );
+                close_unused_pipe_read_ends(pumps);
                 None
             }
             Err(e) => {
@@ -9232,10 +9278,91 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
                     err:% = e;
                     "spawn_cross_process_fork_child: setup error, caller should fall back to thread-based fork"
                 );
+                close_unused_pipe_read_ends(pumps);
                 None
             }
         }
     }
+}
+
+/// Drop the parent-side read ends of pipes built for a cross-process `fork()` child that never
+/// started. Consumes the sinks too, which shuts each parent-side write end down and `HUP`s its
+/// peer -- the correct outcome for a child that will never write anything.
+fn close_unused_pipe_read_ends(
+    pumps: std::vec::Vec<(usize, litebox::platform::ForkPipeSink)>,
+) {
+    for (local_read, _sink) in pumps {
+        // Safety: each handle came from `create_inheritable_child_write_pipe` and, on this path,
+        // was never handed to a pump thread, so this is its only close.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(
+                local_read as windows_sys::Win32::Foundation::HANDLE,
+            )
+        };
+    }
+}
+
+/// Bridge one cross-process `fork()` child's pipe fd back into the parent's own in-memory pipe.
+///
+/// The child writes to a real Windows pipe it inherited; this thread reads that pipe and hands the
+/// bytes to `sink`, which writes them into the parent-side `litebox` pipe the guest's other end is
+/// blocked reading. Without it, the child's `write(3, ..)` would land in an OS pipe nobody drains
+/// and the guest's reader would hang forever.
+///
+/// The thread ends when `ReadFile` reports end-of-file (every writer gone: the child exited or
+/// closed its fd) or any error, at which point dropping `sink` releases the parent-side write end
+/// and `HUP`s the reader -- delivering EOF to the guest exactly as a last `close()` would. It is
+/// detached rather than joined because its lifetime is the CHILD's, not this `fork()` call's; the
+/// parent returns from `fork()` immediately, as it must.
+///
+/// `local_read` is passed as `usize` because a Windows `HANDLE` is a raw pointer and therefore
+/// `!Send`; the value is process-wide and thread-agnostic, so re-forming it here is sound.
+fn spawn_fork_child_pipe_pump(local_read: usize, mut sink: litebox::platform::ForkPipeSink) {
+    std::thread::spawn(move || {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::Storage::FileSystem::ReadFile;
+
+        let handle = local_read as HANDLE;
+        let mut buf = [0u8; 4096];
+        loop {
+            let mut read: u32 = 0;
+            // Safety: `handle` is a live pipe read handle owned solely by this thread, and `buf`
+            // outlives the call.
+            let ok = unsafe {
+                ReadFile(
+                    handle,
+                    buf.as_mut_ptr().cast(),
+                    u32::try_from(buf.len()).unwrap_or(0),
+                    &raw mut read,
+                    core::ptr::null_mut(),
+                )
+            };
+            if ok == 0 || read == 0 {
+                // Zero bytes with success is EOF on a pipe; a failure here is
+                // `ERROR_BROKEN_PIPE` in the overwhelmingly common case, which means the same
+                // thing. Either way there is nothing more to forward.
+                litebox_util_log::debug!(
+                    handle:% = local_read, ok:% = ok, read:% = read, owners:% = sink.owners();
+                    "fork-child pipe pump (parent): end of stream, releasing the guest pipe's                      write end so the guest's reader sees EOF"
+                );
+                break;
+            }
+            // Short writes are ordinary on a pipe, so loop until the chunk is placed. `None`
+            // means the parent-side pipe is gone (the guest closed its reader), which makes
+            // everything still in flight undeliverable -- stop rather than spin.
+            let mut off = 0usize;
+            let end = read as usize;
+            while off < end {
+                match sink.write(&buf[off..end]) {
+                    Some(0) | None => break,
+                    Some(n) => off += n,
+                }
+            }
+        }
+        // Safety: sole owner; closed exactly once, here.
+        unsafe { CloseHandle(handle) };
+        drop(sink);
+    });
 }
 
 impl litebox::platform::SystemInfoProvider for WindowsUserland {
