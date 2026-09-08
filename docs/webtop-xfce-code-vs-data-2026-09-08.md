@@ -139,3 +139,65 @@ corrupted-context resume recorded in `fork-fs-veh-2026-09-08.md`.
 
 **`nginx` returns `HTTP_LOCAL_FAIL`**, so the dashboard is not served yet and the desktop has not
 been seen in a browser. Not yet diagnosed.
+
+## Update: the desktop runs; the last mile is an orphaned accepted socket
+
+Since the above, the desktop assembles reliably and stays up: `xfwm4` owns `WM_S0`, 14 windows,
+`DE_ALIVE` through T=90s, with `xfsettingsd`, `xfdesktop`, `xfce4-panel`, `xfconfd`,
+`dconf-service` and `at-spi2-registryd` all running. `selkies` starts, reports
+`Data WebSocket Server listening on port 8082`, and the host's `--publish` listener binds. The
+dashboard is served and loads in a browser. It never paints, and the reason is now exact.
+
+### `--publish` delivers inbound bytes and loses every reply
+
+A one-shot HTTP server in the guest, with nothing else running, on a `--publish`ed port:
+
+```
+GUEST_ACCEPT ('10.0.0.1', 49152)
+GUEST_RECV   82  b'GET /hello HTTP/1.1'
+GUEST_SENT   76
+```
+
+and the host's `curl` gets `HTTP 000`, zero bytes. The request arrives; the reply never does.
+
+Packet-level, everything the guest ever transmits on that connection is:
+
+```
+src=10.0.0.2 dst=10.0.0.1 sport=8082 dport=49152 flags=SA payload=0
+src=10.0.0.2 dst=10.0.0.1 sport=8082 dport=49152 flags=AF payload=0
+src=10.0.0.2 dst=10.0.0.1 sport=8082 dport=49152 flags=A  payload=0
+```
+
+Handshake, FIN, ACK. **The 76-byte payload is never put on the wire at all**, which is why the
+gateway's own socket sits in `CloseWait` with `recv_q=0` for thousands of poll cycles and then
+closes.
+
+### Why: the accepted socket is orphaned one cycle after `accept()`
+
+The guest's socket writes go into a per-socket TX ring (`proxy.try_write`), and
+`Net::drain_all_socket_channel_buffers` is what moves that ring into the smoltcp socket. Logging
+every socket it visits, per cycle:
+
+```
+h=SocketHandle(0) listening=true  state=Closed      ...   x3807
+h=SocketHandle(1) listening=false state=Established recv_q=82   x1
+```
+
+The accepted socket is visited **exactly once** -- the cycle that delivers the request into its RX
+ring -- and never again. Counting the entries the drain iterates confirms it: `entries=2` for one
+cycle, `entries=1` before and after. The accepted socket's `Network` descriptor-table entry is
+removed almost immediately, while the guest's fd stays perfectly usable at the shim layer.
+
+That is why every observable at the ends looks healthy and the middle is empty: `accept()` returns
+a working fd, `recv()` returns 82 bytes (already in the ring), `sendall()` returns 76 (accepted
+into the ring) -- and nothing ever drains that ring into smoltcp, because the socket the drain
+iterates over is gone. `close()` still reaches the smoltcp socket directly, so the FIN goes out
+while the data does not.
+
+The fd handoff itself looks correct on inspection -- `Net::accept` inserts the handle
+(`descriptor_table_mut().insert`), `initialize_socket` attaches the proxy, and
+`insert_raw_fd` stores the owning `TypedFd` in the raw descriptor store rather than dropping it --
+so what removes the entry is not yet identified. It is not the smoltcp socket being destroyed:
+that socket is still alive later, since it transmits the FIN.
+
+**This is the whole remaining distance to a visible desktop.** Everything upstream of it works.
