@@ -855,6 +855,29 @@ pub fn patch_code_segment(
     trampoline_write_vaddr: u64,
     syscall_entry_addr: u64,
 ) -> Result<(Vec<u8>, Vec<u64>)> {
+    // Fast reject before disassembling anything.
+    //
+    // `decode_section_instructions` disassembles the WHOLE segment, and that cost is proportional
+    // to segment size, not to how much there is to patch. Measured on the webtop: 11.21 s for
+    // mesa's 130 MB `libLLVM` mapping (~11.6 MB/s), paid AGAIN by every process that loads it --
+    // the cache key is per (pid, fd) -- so six XFCE components plus selkies spent over a minute
+    // between them disassembling one library. That is why the desktop never finished assembling.
+    //
+    // The only instruction this function hooks is `Code::Syscall` (see `hook_syscalls_in_section`,
+    // which skips everything else), and on x86-64 `syscall` is encoded as exactly the two bytes
+    // `0F 05` -- no prefix can change those. A segment that does not contain that byte pair
+    // therefore cannot contain a single instruction this function would patch, so scanning for it
+    // is a sound decision procedure rather than a heuristic: the answer is exact, not approximate.
+    //
+    // Returning `(Vec::new(), Vec::new())` is precisely what this function already returns for
+    // `NoSyscallInstructionsFound` below, so the fast path produces an identical result to the
+    // slow one. A false POSITIVE (the pair appearing as data or as part of another instruction's
+    // encoding) simply falls through to the full decode and behaves exactly as before -- the scan
+    // can only skip work that provably does not exist.
+    if !code.windows(2).any(|w| w[0] == 0x0F && w[1] == 0x05) {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
     // Build control-transfer targets for this segment.
     let instructions = decode_section_instructions(Arch::X86_64, code, code_vaddr)?;
     let mut control_transfer_targets = BTreeSet::new();

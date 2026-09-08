@@ -318,5 +318,6 @@ with tarfile.open(OUT, 'w', format=tarfile.GNU_FORMAT) as tar:
     add(tar, 'paint_root.py', read_probe('webtop_paint_root.py'))
     add(tar, 'grab_root.py', read_probe('webtop_grab_root.py'))
     add(tar, 'xcensus.py', read_probe('webtop_xcensus.py'))
+    add(tar, 'makewindow.py', read_probe('webtop_makewindow.py'))
 
 print('wrote', OUT)

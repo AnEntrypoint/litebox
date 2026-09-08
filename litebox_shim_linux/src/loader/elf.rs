@@ -136,7 +136,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox_common_linux::loader::MapMemory
             // so a long-lived guest cannot walk the hint out of `TASK_ADDR_MAX`. This only moves
             // the PREFERRED address: the hint stays advisory, and every existing collision check
             // (`has_committed_page`, `find_foreign_claim`) still applies on top of it.
-            const PID_SALT_STRIDE: usize = 256 * 1024 * 1024;
+            // 4 GiB, not 256 MiB. The first widening (256 KiB -> 256 MiB) stopped Xvfb (~33 MiB
+            // of mappings) colliding, but a big guest process spans far more than that: python3
+            // pulling in mesa maps a single 130 MiB libLLVM on top of its own image, libs and
+            // heap, so consecutive pids at 256 MiB still overlapped and a second python3 crashed
+            // with SIGSEGV while a first was live. A whole 32-bit address space per pid is wider
+            // than any process this runs. The band still wraps at 1024 pids, which spans 4 TiB --
+            // comfortably inside `TASK_ADDR_MAX` (~140 TiB) with room for the OS-picked mappings
+            // that live above it.
+            const PID_SALT_STRIDE: usize = 4 * 1024 * 1024 * 1024;
             let pid_salt = (self.task.pid as usize % 1024).wrapping_mul(PID_SALT_STRIDE);
             super::DEFAULT_LOW_ADDR + pid_salt
         };
