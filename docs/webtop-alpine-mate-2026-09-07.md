@@ -1142,3 +1142,56 @@ will:
 inherit it because none of this shim's fd subsystems is backed by a real Windows HANDLE. That is
 now the single remaining blocker for booting a stock s6-overlay image, it is precisely stated, and
 it is a bounded piece of work rather than an open question.
+
+### The last blocker, scoped: inheriting guest pipe fds across a cross-process fork
+
+`/init` now fails on exactly one thing. With `LITEBOX_PROCESS_FORK_IGNORE_FDS=1` the ET_EXEC
+collision is gone and the boot reaches:
+
+    preinit: line 73: dup2(3,1): Bad file descriptor
+
+`/package/admin/s6-overlay-3.2.1.0/libexec/preinit` is a SHELL SCRIPT, and line 73 is
+
+    eval `s6-overlay-stat /run`
+
+i.e. command substitution: the shell creates a pipe, forks, the child `dup2`s the write end onto
+its stdout and execs, and the parent reads the child's output back. The pipe carries real data, so
+it cannot be dropped -- which is precisely what `LITEBOX_PROCESS_FORK_IGNORE_FDS` warns it does.
+
+**Why this is not a small fix.** litebox's pipes are pure in-memory objects
+(`litebox/src/pipes.rs`: a `ringbuf` `HeapRb` split into `ReadEnd`/`WriteEnd`), with no OS handle
+behind them, so nothing about a pipe survives a process boundary. Confirmed by reading the code
+rather than assumed:
+
+* Direction IS available -- `HalfPipeType::{SenderHalf, ReceiverHalf}` (`pipes.rs:182`), reachable
+  through the pipes arm of `FileDescriptors::run_on_raw_fd`. Enumerating "which of my fds are
+  pipes, and which end" is therefore easy.
+* There is NO host-side read/write API for a guest pipe. The runner's existing stdio forwarders
+  bridge host stdio to the guest via `shim.pty_master_read(pty_id, ..)` -- a PTY-specific call.
+  There is no `pipe_read`/`pipe_write` equivalent.
+* There is NO API to install a descriptor at a chosen guest fd number. Guest fds 0/1/2 are created
+  by `open("/dev/stdin")`/`open("/dev/stdout")` against `litebox::fs::devices::Devices`; nothing
+  places an arbitrary object at fd N.
+* Adding a new fd subsystem is expensive: `run_on_raw_fd` dispatches over the seven existing
+  subsystems by taking one closure EACH (ten arguments today), so an eighth means touching every
+  call site in the shim.
+
+**Implementation plan** (the design that fits the existing architecture -- pump threads bridging
+in-memory pipes to real handles, which is exactly what the stdio forwarders already do):
+
+1. Host-side pipe bridge on `LinuxShim`: `pipe_read(fd, buf)` / `pipe_write(fd, buf)`, mirroring
+   the existing `pty_master_read`/`pty_master_write` pair. No new fd subsystem needed -- these
+   operate on an existing pipe fd.
+2. An fd-installation path for the child. The cheapest honest option is to reuse the existing
+   syscall dispatch rather than add API surface: the child synthesizes `pipe2` + `dup2` + `close`
+   through `LinuxShimEntrypoints::syscall` before resuming the guest, landing a real pipe at the
+   required fd number.
+3. Parent side, in `try_cross_process_fork`: enumerate fds >= 3; for each pipe, `CreatePipe`, mark
+   the child's end inheritable, and spawn a pump thread bridging the OS end to the guest pipe via
+   (1). A `SenderHalf` in the child means child-writes -> parent pumps OS-read -> guest pipe; a
+   `ReceiverHalf` is the mirror image.
+4. Protocol: extend the existing child env block with `fd:handle:direction` triples, alongside
+   `LITEBOX_INTERNAL_FORK_CHILD_GPRS` and `..._VMA_LAYOUT`.
+
+Only the `SenderHalf` direction is needed for command substitution, so (3) can land write-ends
+first and be verified against `/init` before the read-end mirror is added.
