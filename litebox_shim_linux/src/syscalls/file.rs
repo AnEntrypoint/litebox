@@ -778,6 +778,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let slave = self.global.pts_open(id)?;
             return self.insert_raw_pty_fd(slave, flags, path);
         }
+        // A FIFO is a filesystem entry, but opening one has to produce a PIPE. Checked here,
+        // alongside `/dev/ptmx` and `/dev/pts/<id>` above and for the same reason: the underlying
+        // `FileSystem` has no live per-open state to hand back, so these paths never reach
+        // `do_open` at all.
+        if let Ok(status) = self.files.borrow().fs.symlink_metadata(path.as_c_str())
+            && status.file_type == litebox::fs::FileType::Fifo
+        {
+            return self.open_fifo(status.node_info, flags, path);
+        }
         let file = match self.do_open(path.clone(), flags, mode) {
             Ok(file) => file,
             Err(errno) => {
@@ -786,6 +795,96 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         };
         self.insert_raw_file_fd_with_path(file, flags, Some(path))
+    }
+
+    /// Open a FIFO: hand back a descriptor on the pipe that stands behind it.
+    ///
+    /// Every open of the same `(dev, ino)` shares one pipe, created on the first open and kept
+    /// alive by `GlobalState::fifo_registry` afterwards -- the same mechanism `/dev/pts/<id>` uses,
+    /// and for the same reason: a shared namespace any opener can reach by name.
+    ///
+    /// Which END an opener gets follows its access mode, as on real Linux: `O_WRONLY` writes,
+    /// anything else reads. `O_RDWR` on a FIFO is Linux-specific and gets the read end here, the
+    /// half a reader-writer actually blocks on.
+    ///
+    /// **Within one process only.** The registry is shim-wide, which covers every thread of this
+    /// process -- but a cross-process `fork()` child is a genuinely separate OS process with its
+    /// own registry, so a reader there does not see a writer here. The FIFO's existence and type
+    /// do travel between them (they are filesystem state, carried by the writable layer), so a
+    /// child opens a FIFO rather than a plain file and gets pipe semantics; only the bytes stay
+    /// local. Making them meet needs a host transport shared by the whole guest, which does not
+    /// exist yet -- until it does, a reader in one process and a writer in another wait on each
+    /// other for ever, exactly as two processes on a real machine would if their FIFOs were
+    /// somehow different objects.
+    ///
+    /// The open itself never blocks, unlike a real FIFO's rendezvous. The registry holds a
+    /// reference to BOTH ends for the FIFO's lifetime, so the observable difference is confined to
+    /// that -- a reader still blocks in `read()` rather than seeing a spurious EOF, which is the
+    /// property programs actually depend on.
+    fn open_fifo(
+        &self,
+        node_info: litebox::fs::NodeInfo,
+        flags: OFlags,
+        path: CString,
+    ) -> Result<u32, Errno> {
+        let key = (node_info.dev, node_info.ino);
+        let want_write = flags.contains(OFlags::WRONLY);
+        {
+            let registry = self.global.fifo_registry.read();
+            if let Some(fifo) = registry.get(&key) {
+                let end = if want_write { &fifo.writer } else { &fifo.reader };
+                let dup = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .duplicate(end)
+                    .ok_or(Errno::ENXIO)?;
+                drop(registry);
+                return self.insert_raw_fifo_fd(dup, flags, path);
+            }
+        }
+        // First open of this FIFO here: create its pipe, re-checking under the write lock since
+        // another thread may have got there in between.
+        let ends = self.global.create_linux_pipe(OFlags::empty())?;
+        let mut registry = self.global.fifo_registry.write();
+        let fifo = registry.entry(key).or_insert(crate::FifoPipe {
+            reader: ends.reader,
+            writer: ends.writer,
+        });
+        let end = if want_write { &fifo.writer } else { &fifo.reader };
+        let dup = self
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .duplicate(end)
+            .ok_or(Errno::ENXIO)?;
+        drop(registry);
+        self.insert_raw_fifo_fd(dup, flags, path)
+    }
+
+    /// Install a FIFO's pipe end into this process's raw fd table, mirroring
+    /// `insert_raw_file_fd_with_path`'s `O_CLOEXEC`/path bookkeeping.
+    fn insert_raw_fifo_fd(
+        &self,
+        fd: litebox::pipes::PipeFd<Platform>,
+        flags: OFlags,
+        path: CString,
+    ) -> Result<u32, Errno> {
+        if flags.contains(OFlags::CLOEXEC) {
+            let old = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
+            assert!(old.is_none());
+        }
+        let files = self.files.borrow();
+        let raw_fd = files.insert_raw_fd(fd).map_err(|fd| {
+            drop(self.global.litebox.descriptor_table_mut().remove(&fd));
+            Errno::EMFILE
+        })?;
+        files.record_fd_path(raw_fd, path);
+        Ok(u32::try_from(raw_fd).unwrap())
     }
 
     /// Install a freshly allocated/looked-up pty fd (master via `/dev/ptmx`, slave via
@@ -1069,9 +1168,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let files = self.files.borrow();
                 let _ = files.fs.close(&file);
             }
-            // TODO: Named pipe, socket, block and char files are not supported
-            InodeType::NamedPipe
-            | InodeType::Socket
+            InodeType::NamedPipe => {
+                let mode = Mode::from_bits_truncate(mode_and_type & !FILE_TYPE_MASK);
+                let path = self.resolve_path_at(dirfd, pathname)?;
+                self.files
+                    .borrow()
+                    .fs
+                    .make_fifo(path, mode & !self.get_umask())
+                    .map_err(Errno::from)?;
+            }
+            // TODO: socket, block and char files are not supported
+            InodeType::Socket
             | InodeType::BlockDevice
             | InodeType::CharDevice
             | InodeType::Dir => return Err(Errno::EPERM),

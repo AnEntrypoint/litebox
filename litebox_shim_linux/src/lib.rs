@@ -474,6 +474,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             pty_registry: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
             daemon_pty_masters: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
             next_pty_id: core::sync::atomic::AtomicU32::new(0),
+            fifo_registry: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
             next_unix_autobind_id: core::sync::atomic::AtomicU32::new(0),
             next_memfd_id: core::sync::atomic::AtomicU64::new(0),
             drm: syscalls::drm::DrmSubsystem::new(),
@@ -2398,6 +2399,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 }
 
 /// Global shim state, shared across all tasks.
+/// The pipe standing behind one open FIFO: both ends, held for the FIFO's lifetime.
+///
+/// See `GlobalState::fifo_registry` for why both are kept rather than just the one an opener asked
+/// for.
+struct FifoPipe<Platform: ShimPlatform> {
+    reader: litebox::pipes::PipeFd<Platform>,
+    writer: litebox::pipes::PipeFd<Platform>,
+}
+
 struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// The platform instance used throughout the shim.
     platform: &'static Platform,
@@ -2464,6 +2474,27 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     >,
     /// Next id to hand out to a freshly `open("/dev/ptmx")`-allocated pty pair.
     next_pty_id: core::sync::atomic::AtomicU32,
+    /// The live pipe behind each open FIFO, keyed by the FIFO's `(dev, ino)`.
+    ///
+    /// A FIFO is a filesystem entry (see `litebox::fs::FileType::Fifo`) with no data of its own;
+    /// what `open()` on one has to produce is a PIPE. This registry is what makes every open of
+    /// the same path land on the same pipe: the first one creates it, and each open thereafter
+    /// duplicates the end its access mode calls for -- exactly the mechanism `pty_registry` uses
+    /// for `/dev/pts/<id>`, and for the same reason (a shared namespace any process can open by
+    /// name).
+    ///
+    /// Both ends are held here for the FIFO's lifetime, deliberately. A real FIFO's reader blocks
+    /// until a writer appears rather than seeing EOF, and the registry's own writer reference is
+    /// what keeps that true when no guest process currently holds one open.
+    ///
+    /// Shim-wide, so it is shared by every thread of this process -- but NOT across processes. A
+    /// cross-process `fork()` child recognises the FIFO (its type travels with the writable layer)
+    /// and gets a pipe of its own, so data written by one process does not reach a reader in
+    /// another. See `Task::open_fifo`.
+    fifo_registry: litebox::sync::RwLock<
+        Platform,
+        alloc::collections::BTreeMap<(usize, usize), FifoPipe<Platform>>,
+    >,
     /// Next id to hand out for AF_UNIX socket "autobind" (`bind()` called with no address),
     /// formatted the same way real Linux formats its autobind abstract-namespace names: a
     /// leading NUL byte followed by 5 lowercase hex digits (see `unix(7)`). Real Linux starts

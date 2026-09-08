@@ -25,6 +25,7 @@ const BLOCKSIZE: usize = 512;
 #[non_exhaustive]
 pub enum ImportError {
     Mkdir,
+    MakeFifo,
     Symlink,
     Open,
     Write,
@@ -86,6 +87,10 @@ pub fn import_all<FS: FileSystem>(fs: &FS, tar_data: &[u8]) -> Result<(), Import
             tar_no_std::TypeFlag::DIRTYPE => match fs.mkdir(&*path, mode) {
                 Ok(()) | Err(super::errors::MkdirError::AlreadyExists) => {}
                 Err(_) => return Err(ImportError::Mkdir),
+            },
+            tar_no_std::TypeFlag::FIFOTYPE => match fs.make_fifo(&*path, mode) {
+                Ok(()) | Err(super::errors::MkdirError::AlreadyExists) => {}
+                Err(_) => return Err(ImportError::MakeFifo),
             },
             tar_no_std::TypeFlag::SYMTYPE => {
                 let Ok(target) = header.linkname.as_str() else {

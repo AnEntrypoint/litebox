@@ -1804,6 +1804,16 @@ where
                     .append_data(&mut header, tar_path, entry.contents.as_slice())
                     .map_err(|e| anyhow!("failed to add {tar_path} to export tar: {e}"))?;
             }
+            // A FIFO is metadata only, like a directory -- but it must still be archived, or a
+            // cross-process fork child would receive it as a plain empty file.
+            litebox::fs::FileType::Fifo => {
+                header.set_entry_type(tar::EntryType::Fifo);
+                header.set_size(0);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, tar_path, std::io::empty())
+                    .map_err(|e| anyhow!("failed to add {tar_path} to export tar: {e}"))?;
+            }
             litebox::fs::FileType::Symlink => {
                 let Some(target) = &entry.symlink_target else {
                     continue;
@@ -1861,6 +1871,16 @@ fn import_writable_layer(
                 // this directory (e.g. `/tmp`, `/etc`).
                 let _ = fs.mkdir(&*path, mode);
             }
+            // A FIFO must come back as a FIFO. Restoring it as an ordinary file -- which the
+            // catch-all arm below would do -- means the process reading this layer opens a plain
+            // file where the guest expects a pipe, so a read returns instant EOF instead of
+            // blocking for a writer. `AlreadyExists` is fine: these archives are round-tripped
+            // between a parent and its cross-process `fork()` children, so a child's export
+            // restates everything it adopted.
+            tar::EntryType::Fifo => match fs.make_fifo(&*path, mode) {
+                Ok(()) | Err(litebox::fs::errors::MkdirError::AlreadyExists) => {}
+                Err(e) => return Err(anyhow!("failed to recreate fifo {path}: {e:?}")),
+            },
             tar::EntryType::Symlink => {
                 let target = entry
                     .link_name()
@@ -1868,8 +1888,18 @@ fn import_writable_layer(
                     .ok_or_else(|| anyhow!("symlink entry {path} has no target"))?
                     .to_string_lossy()
                     .into_owned();
-                fs.symlink(&*target, &*path)
-                    .map_err(|e| anyhow!("failed to recreate symlink {path}: {e:?}"))?;
+                match fs.symlink(&*target, &*path) {
+                    Ok(()) => {}
+                    // Replace an existing link, for the same round-tripping reason as above --
+                    // and matching `litebox::fs::import`, whose own abort-on-repeat cost a
+                    // child's entire writable layer before it was fixed.
+                    Err(litebox::fs::errors::SymlinkError::AlreadyExists) => {
+                        let _ = fs.unlink(&*path);
+                        fs.symlink(&*target, &*path)
+                            .map_err(|e| anyhow!("failed to recreate symlink {path}: {e:?}"))?;
+                    }
+                    Err(e) => return Err(anyhow!("failed to recreate symlink {path}: {e:?}")),
+                }
             }
             _ => {
                 let mut contents = Vec::new();

@@ -261,6 +261,7 @@ impl From<litebox::fs::FileType> for InodeType {
             litebox::fs::FileType::Directory => InodeType::Dir,
             litebox::fs::FileType::CharacterDevice => InodeType::CharDevice,
             litebox::fs::FileType::Symlink => InodeType::SymLink,
+            litebox::fs::FileType::Fifo => InodeType::NamedPipe,
             // `FileType` is `#[non_exhaustive]`; unlike `DirentType` (which has a legitimate
             // `DT_UNKNOWN` fallback matching real Linux `getdents` behavior, see the `From` impl
             // above), `st_mode`'s file-type bits have no safe "unknown" value -- every `stat()`
@@ -300,6 +301,7 @@ impl From<litebox::fs::FileType> for DirentType {
             litebox::fs::FileType::Directory => DirentType::Directory,
             litebox::fs::FileType::CharacterDevice => DirentType::CharDevice,
             litebox::fs::FileType::Symlink => DirentType::SymLink,
+            litebox::fs::FileType::Fifo => DirentType::NamedPipe,
             // `FileType` is `#[non_exhaustive]`; match Linux's own `getdents`-family behavior of
             // reporting `DT_UNKNOWN` for any type it can't otherwise classify rather than
             // panicking on a still-unmatched (but not-actually-invalid) directory entry. Real

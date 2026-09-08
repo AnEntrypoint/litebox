@@ -336,6 +336,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     },
                     data: Vec::new().into(),
                     unique_id: self.fresh_id(),
+                    is_fifo: false,
                 })));
                 let old = root.entries.insert(path, entry.clone());
                 assert!(old.is_none());
@@ -788,7 +789,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         // Just a sanity check
         assert!(matches!(
             removed,
-            Some(FileType::RegularFile | FileType::Symlink)
+            Some(FileType::RegularFile | FileType::Symlink | FileType::Fifo)
         ));
         let removed = root.entries.remove(&path).unwrap();
         // Just a sanity check
@@ -966,6 +967,43 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         );
         assert!(old.is_none());
         let old = root.entries.insert(newpath, Entry::File(file));
+        assert!(old.is_none());
+        Ok(())
+    }
+
+    fn make_fifo(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), MkdirError> {
+        let path = self.absolute_path(path)?;
+        let mut root = self.root.write();
+        let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
+        if entry.is_some() {
+            return Err(MkdirError::AlreadyExists);
+        }
+        let Some((_, parent)) = parent else {
+            // Only `/` has no parent, and `/` always exists, so the `AlreadyExists` above would
+            // already have fired. Same reasoning as `symlink` below.
+            unreachable!()
+        };
+        let mut parent = parent.write();
+        if !self.current_user.can_write(&parent.perms) {
+            return Err(MkdirError::NoWritePerms);
+        }
+        let old = parent.children.insert(
+            path.components().unwrap().last().unwrap().into(),
+            FileType::Fifo,
+        );
+        assert!(old.is_none());
+        let entry = Entry::File(Arc::new(sync::RwLock::new(FileX {
+            perms: Permissions {
+                mode,
+                userinfo: self.current_user,
+                atime: super::Timestamp::default(),
+                mtime: super::Timestamp::default(),
+            },
+            data: Vec::new().into(),
+            unique_id: self.fresh_id(),
+            is_fifo: true,
+        })));
+        let old = root.entries.insert(path, entry);
         assert!(old.is_none());
         Ok(())
     }
@@ -1181,7 +1219,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             Entry::File(file) => {
                 let file = file.read();
                 (
-                    super::FileType::RegularFile,
+                    if file.is_fifo {
+                        super::FileType::Fifo
+                    } else {
+                        super::FileType::RegularFile
+                    },
                     file.perms.clone(),
                     file.data.len(),
                     file.unique_id,
@@ -1233,7 +1275,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             Descriptor::File { file, .. } => {
                 let file = file.read();
                 (
-                    super::FileType::RegularFile,
+                    if file.is_fifo {
+                        super::FileType::Fifo
+                    } else {
+                        super::FileType::RegularFile
+                    },
                     file.perms.clone(),
                     file.data.len(),
                     file.unique_id,
@@ -1362,7 +1408,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
                     // component.
                     (_, Entry::Symlink(link)) => {
                         if hops >= MAX_SYMLINK_HOPS {
-                            return Err(PathError::ComponentNotADirectory);
+                            return Err(PathError::TooManySymlinkHops);
                         }
                         hops += 1;
                         let target = link.read().target.clone();
@@ -1443,6 +1489,13 @@ pub(crate) struct FileX {
     perms: Permissions,
     data: alloc::borrow::Cow<'static, [u8]>,
     unique_id: usize,
+    /// This entry is a named pipe (FIFO), not a regular file.
+    ///
+    /// A FIFO is stored as an ordinary `Entry::File` carrying no data, because everything a
+    /// directory entry has to do -- exist, be walked past, be `stat`ed, be unlinked -- is
+    /// identical. Only its reported [`FileType`] differs, and what a guest gets when it OPENS one
+    /// is a pipe, which the shim arranges; see `FileSystem::make_fifo`.
+    is_fifo: bool,
 }
 
 type Symlink<Platform> = Arc<sync::RwLock<Platform, SymlinkX>>;

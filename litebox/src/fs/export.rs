@@ -81,6 +81,23 @@ fn walk<FS: FileSystem>(
                 });
                 walk(fs, &child_path, out)?;
             }
+            // A FIFO carries no data of its own, so exporting it is exactly a directory-style
+            // metadata-only entry. It has to travel, though: these archives are how a writable
+            // layer reaches a cross-process `fork()` child, and a FIFO that arrived as a plain
+            // empty file there would be opened as one -- reads returning instant EOF instead of
+            // blocking for a writer.
+            FileType::Fifo => {
+                let status = fs
+                    .file_status(&*child_path)
+                    .map_err(|_| ExportError::FileStatus)?;
+                out.push(ExportedEntry {
+                    path: child_path.clone(),
+                    file_type: FileType::Fifo,
+                    mode: status.mode,
+                    contents: Vec::new(),
+                    symlink_target: None,
+                });
+            }
             FileType::RegularFile => {
                 let status = fs
                     .file_status(&*child_path)

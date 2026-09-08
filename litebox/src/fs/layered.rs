@@ -163,7 +163,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         },
                     }
                 }
-                Ok(FileType::RegularFile | FileType::CharacterDevice | FileType::Symlink)
+                Ok(FileType::RegularFile | FileType::CharacterDevice | FileType::Symlink | FileType::Fifo)
                 | Err(
                     FileStatusError::PathError(PathError::MissingComponent)
                     | FileStatusError::ClosedFd,
@@ -1508,7 +1508,7 @@ impl<
                         FileStatusError::PathError(p) => UnlinkError::PathError(p),
                         FileStatusError::ClosedFd => unreachable!(),
                     })? {
-                        FileType::RegularFile | FileType::Symlink => {
+                        FileType::RegularFile | FileType::Symlink | FileType::Fifo => {
                             // fallthrough
                         }
                         FileType::Directory => {
@@ -1636,6 +1636,31 @@ impl<
                     self.upper.link(oldpath, newpath)
                 } else {
                     Err(LinkError::PathError(PathError::MissingComponent))
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn make_fifo(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), MkdirError> {
+        let path = self.absolute_path(path)?;
+        // Anything already at `path`, in EITHER layer, is `EEXIST` -- same rule as `symlink`
+        // below, and for the same reason: creating a new entry only ever targets the upper layer,
+        // so an existing lower-layer entry would otherwise be silently shadowed.
+        if self.file_status(path.as_str()).is_ok() {
+            return Err(MkdirError::AlreadyExists);
+        }
+        match self.upper.make_fifo(path.as_str(), mode) {
+            Ok(()) => Ok(()),
+            // `path`'s parent may so far exist only in the read-only lower layer; migrate the
+            // ancestor chain up and retry, exactly as `symlink` and `mkdir` already do.
+            Err(MkdirError::PathError(PathError::MissingComponent)) => {
+                let dirname = path.rsplit_once('/').unwrap().0;
+                if let Ok(FileType::Directory) = self.ensure_lower_contains(dirname) {
+                    self.mkdir_migrating_ancestor_dirs(&path)?;
+                    self.upper.make_fifo(path.as_str(), mode)
+                } else {
+                    Err(MkdirError::PathError(PathError::MissingComponent))
                 }
             }
             Err(e) => Err(e),

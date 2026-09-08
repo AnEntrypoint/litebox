@@ -209,6 +209,21 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     fn symlink(&self, target: impl path::Arg, linkpath: impl path::Arg)
     -> Result<(), SymlinkError>;
 
+    /// Create a named pipe (FIFO) at `path`.
+    ///
+    /// The entry is an ordinary directory entry whose [`FileType`] is [`FileType::Fifo`]; it holds
+    /// no data of its own. What a guest gets when it OPENS one is a pipe, which is the shim's
+    /// business, not the filesystem's -- this method only records that the path names a FIFO, so
+    /// that `stat` reports `S_IFIFO` and `open` knows to hand back a pipe.
+    ///
+    /// Errors mirror [`FileSystem::mkdir`]'s exactly, which is the closest existing shape: both
+    /// create a non-file entry in a parent directory. Defaults to
+    /// [`MkdirError::ReadOnlyFileSystem`], which is the right answer for every read-only backend.
+    fn make_fifo(&self, path: impl path::Arg, mode: Mode) -> Result<(), MkdirError> {
+        let _ = (path, mode);
+        Err(MkdirError::ReadOnlyFileSystem)
+    }
+
     /// Read the target of the symbolic link at `path`.
     ///
     /// Returns [`ReadLinkError::NotASymlink`] if `path` does not name a symbolic link.
@@ -311,6 +326,8 @@ pub enum FileType {
     Directory,
     CharacterDevice,
     Symlink,
+    /// A named pipe (FIFO), created by [`FileSystem::make_fifo`].
+    Fifo,
 }
 
 bitflags! {
