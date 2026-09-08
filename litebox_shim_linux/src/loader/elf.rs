@@ -120,7 +120,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox_common_linux::loader::MapMemory
                 clippy::cast_sign_loss,
                 reason = "pid is always non-negative in practice"
             )]
-            let pid_salt = (self.task.pid as usize).wrapping_mul(PAGE_SIZE * 64);
+            // The stride must exceed a whole process image, or it spreads nothing.
+            //
+            // This was `PAGE_SIZE * 64` -- 256 KiB per pid. A real guest image plus its heap is
+            // TENS OF MEGABYTES (Xvfb's own claims here span 0x10040000-0x12144000, ~33 MiB), so
+            // consecutive pids' "spread" bases landed deep inside one another and the salt bought
+            // nothing. Measured directly: with two concurrently-live processes, pid 4 (Xvfb) and
+            // pid 9 (xfwm4) received IDENTICAL claims for both the ELF load base
+            // (0x10040000-0x10063000) and the heap (0x11063000-0x11084000). Loading the second
+            // process wrote over the first's live memory, and Xvfb then jumped through a NULL
+            // function pointer (rip=0x0) and aborted -- which is what kept the XFCE desktop from
+            // ever rendering.
+            //
+            // 256 MiB per pid is wider than any image this runs, and the band wraps at 1024 pids
+            // so a long-lived guest cannot walk the hint out of `TASK_ADDR_MAX`. This only moves
+            // the PREFERRED address: the hint stays advisory, and every existing collision check
+            // (`has_committed_page`, `find_foreign_claim`) still applies on top of it.
+            const PID_SALT_STRIDE: usize = 256 * 1024 * 1024;
+            let pid_salt = (self.task.pid as usize % 1024).wrapping_mul(PID_SALT_STRIDE);
             super::DEFAULT_LOW_ADDR + pid_salt
         };
         let mapping_ptr = self
