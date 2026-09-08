@@ -1984,6 +1984,12 @@ unsafe extern "system" fn vectored_exception_handler(
                         // its own -- arm the watchdog first as a backstop, same as the sibling
                         // unconditional-terminate path below.
                         FAULT_TERMINATE_ARMED_TICK.fetch_add(1, Ordering::SeqCst);
+            // Capture a real minidump now that the watchdog is standing by. Deliberately AFTER the
+            // arm, never before: `MiniDumpWriteDump` walks every thread in the process and can
+            // block, so if it never returns the watchdog still terminates -- the dump attempt
+            // cannot turn a crash into a hang. See `write_crash_minidump` for why this uses the
+            // native API rather than a crate, and what it deliberately does not capture.
+            write_crash_minidump(exception_info);
                         unsafe {
                             windows_sys::Win32::System::Threading::TerminateProcess(
                                 windows_sys::Win32::System::Threading::GetCurrentProcess(),
@@ -9012,6 +9018,185 @@ fn diag_alloc_enabled() -> bool {
     enabled
 }
 
+/// Is a `LITEBOX_*` environment variable set, read without allocating?
+///
+/// `std::env::var_os` allocates an `OsString`, which is not safe on a fault path (and, from inside
+/// the allocator itself, recurses -- see `diag_alloc_enabled`'s own doc comment for the hang that
+/// caused). This reads the raw Win32 API instead. Uncached, because the one caller runs at most
+/// once per process.
+///
+/// `name` must be NUL-terminated.
+fn raw_env_is_set(name: &[u8]) -> bool {
+    let mut buf = [0u8; 4];
+    // A return of 0 means "not found"; any other value means the variable exists, whatever its
+    // value -- matching how every other `LITEBOX_*` diagnostic gate in this file treats presence.
+    0 != unsafe {
+        windows_sys::Win32::System::Environment::GetEnvironmentVariableA(
+            name.as_ptr(),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+        )
+    }
+}
+
+/// Set once the process has written (or failed to write) its crash dump, so a fault cascade cannot
+/// try again from a second thread while the first attempt is still running.
+static CRASH_DUMP_ATTEMPTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Write a Windows minidump for an unrecoverable fault, via the OS's own `MiniDumpWriteDump`.
+///
+/// # Why this exists
+///
+/// Everything this crate previously left behind for a fatal host-side fault was the allocation-free
+/// `[diag-unrecov-av-*]` ring dump: a faulting `rip`, a handful of stack words, and the module
+/// RVAs. Those are only meaningful against the exact build that emitted them, so a log outliving
+/// one rebuild becomes unsymbolizable -- and symbolizing it against a newer binary yields
+/// confident, wrong names (see `advisor/probes/symbolize_litebox_crash.py`, which exists because
+/// this was done by hand, and which had to grow a warning about exactly that). A minidump carries
+/// its own module list with build identities, every thread's stack, and the memory those stacks
+/// reference, so it stays analysable for as long as the matching `.pdb` exists.
+///
+/// AGENTS.md's `RtlpUnwindPrologue` section lists integrating Mozilla's `minidump-writer` crate as
+/// a next step for exactly this. No crate is needed: `MiniDumpWriteDump` is the native API that
+/// crate wraps, `windows-sys` already declares it, and this crate already enables both features it
+/// needs (`Win32_System_Diagnostics_Debug`, `Win32_System_Kernel`). Linking it costs a load-time
+/// dependency on `dbghelp.dll`, which is deliberate: the alternative is a lazy `LoadLibrary` from
+/// inside a fault handler, which can deadlock against the loader lock the faulting thread may
+/// already hold.
+///
+/// # What it deliberately does NOT capture
+///
+/// Not `MiniDumpWithFullMemory`. A litebox process maps the guest's entire address space -- many
+/// gigabytes for a desktop -- and a full-memory dump of that is both unusable and liable to fill
+/// the disk at the worst possible moment. `MiniDumpWithThreadInfo |
+/// MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithUnloadedModules` captures every thread's
+/// stack plus the memory those stacks point at, which is what reconstructs a call chain and shows
+/// what a faulting pointer referenced, at a few MB.
+///
+/// # Ordering and failure
+///
+/// Called AFTER the fault-terminate watchdog is armed, on purpose. `MiniDumpWriteDump` walks every
+/// thread in the process and can block; if it never returns, the watchdog still kills the process,
+/// so the dump attempt can never turn a crash into a hang. Every step is best-effort and silent on
+/// failure beyond one diagnostic line -- the process is dying either way, and the ring dump above
+/// has already been emitted.
+fn write_crash_minidump(exception_info: *mut EXCEPTION_POINTERS) {
+    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CREATE_ALWAYS, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, GetTempPathW,
+    };
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        MINIDUMP_EXCEPTION_INFORMATION, MiniDumpWithIndirectlyReferencedMemory,
+        MiniDumpWithThreadInfo, MiniDumpWithUnloadedModules, MiniDumpWriteDump,
+    };
+
+    if CRASH_DUMP_ATTEMPTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if raw_env_is_set(b"LITEBOX_NO_CRASH_DUMP\0") {
+        return;
+    }
+
+    let pid = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessId() };
+
+    // Path built into a fixed stack buffer: `<temp>\litebox-crash-<pid>.dmp`. No allocation, for
+    // the same reason the ring dump allocates nothing -- the heap is not trustworthy here, and on
+    // a stack-exhaustion fault neither is a large frame.
+    let mut path = [0u16; 320];
+    let temp_len = unsafe {
+        GetTempPathW(
+            path.len() as u32 - 64,
+            path.as_mut_ptr(),
+        )
+    } as usize;
+    // `GetTempPathW` returns 0 on failure; fall back to the current directory, which is always a
+    // legal relative path, rather than giving up on the dump entirely.
+    let mut pos = if temp_len == 0 || temp_len >= path.len() - 64 {
+        0
+    } else {
+        temp_len
+    };
+    for ch in "litebox-crash-".encode_utf16() {
+        path[pos] = ch;
+        pos += 1;
+    }
+    // Decimal pid, written most-significant digit first without `format!`.
+    let mut digits = [0u16; 10];
+    let mut n = pid;
+    let mut d = 0usize;
+    if n == 0 {
+        digits[0] = u16::from(b'0');
+        d = 1;
+    }
+    while n > 0 {
+        digits[d] = u16::from(b'0') + u16::try_from(n % 10).unwrap_or(0);
+        n /= 10;
+        d += 1;
+    }
+    while d > 0 {
+        d -= 1;
+        path[pos] = digits[d];
+        pos += 1;
+    }
+    for ch in ".dmp".encode_utf16() {
+        path[pos] = ch;
+        pos += 1;
+    }
+    path[pos] = 0;
+
+    let file = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ,
+            core::ptr::null(),
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            core::ptr::null_mut(),
+        )
+    };
+    if file.is_null() || file == INVALID_HANDLE_VALUE {
+        diag_raw_print(
+            b"[diag-crash-dump] CreateFileW failed, no dump written for pid=",
+            pid as usize,
+            b" err=0x",
+            unsafe { GetLastError() } as usize,
+        );
+        return;
+    }
+
+    let mut info = MINIDUMP_EXCEPTION_INFORMATION {
+        ThreadId: unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() },
+        ExceptionPointers: exception_info,
+        // The exception pointers are in THIS process's address space, not a client's.
+        ClientPointers: 0,
+    };
+    let ok = unsafe {
+        MiniDumpWriteDump(
+            GetCurrentProcess(),
+            pid,
+            file,
+            MiniDumpWithThreadInfo
+                | MiniDumpWithIndirectlyReferencedMemory
+                | MiniDumpWithUnloadedModules,
+            &raw const info,
+            core::ptr::null(),
+            core::ptr::null(),
+        )
+    };
+    let _ = &mut info;
+    unsafe { CloseHandle(file) };
+    // The pid is the filename, so printing it is enough to locate the dump -- and it avoids
+    // pushing a UTF-16 path through the byte-oriented raw printer on a dying process.
+    diag_raw_print(
+        b"[diag-crash-dump] wrote %TEMP%/litebox-crash-<pid>.dmp pid=",
+        pid as usize,
+        b" ok=0x",
+        usize::from(ok != 0),
+    );
+}
+
 /// Format `n` as decimal into `buf`, returning the written prefix. No heap allocation.
 fn fmt_usize_hex(mut n: usize, buf: &mut [u8; 20]) -> &[u8] {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -10127,6 +10312,44 @@ mod tests {
     use litebox::platform::RawMutex;
     use litebox::platform::page_mgmt::FixedAddressBehavior;
     use litebox::platform::page_mgmt::MemoryRegionPermissions;
+
+    /// `write_crash_minidump` must actually produce a readable dump, not merely compile.
+    ///
+    /// Exercised with a null `EXCEPTION_POINTERS`, which is the one part of a real fatal fault that
+    /// cannot be staged from a test: `MiniDumpWriteDump` treats a dump with no exception record as
+    /// valid (it just has no faulting-thread annotation), so everything else this function does --
+    /// building the path without allocating, creating the file, and getting the OS to walk every
+    /// thread -- is exercised for real against the real API.
+    ///
+    /// Worth having as a test rather than trusting the fatal path: that path runs once, on a dying
+    /// process, where a silent failure would leave exactly the no-evidence situation this function
+    /// exists to end. A wrong `CreateFileW` flag or a mis-built path would be invisible there.
+    #[test]
+    fn crash_minidump_writes_a_real_dump_file() {
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("litebox-crash-{pid}.dmp"));
+        // A stale dump from an earlier run of this test would make the assertion below vacuous.
+        let _ = std::fs::remove_file(&path);
+
+        super::write_crash_minidump(core::ptr::null_mut());
+
+        let meta = std::fs::metadata(&path)
+            .unwrap_or_else(|e| panic!("no dump at {}: {e}", path.display()));
+        // A minidump of a live multi-threaded process is never tiny; a few hundred bytes would mean
+        // the header was written and the thread walk failed.
+        assert!(
+            meta.len() > 4096,
+            "dump at {} is only {} bytes, which means MiniDumpWriteDump did not really run",
+            path.display(),
+            meta.len()
+        );
+        // `MDMP` is the minidump signature, and checking it is what distinguishes a real dump from
+        // any file of the right size.
+        let head = std::fs::read(&path).expect("dump is readable");
+        assert_eq!(&head[..4], b"MDMP", "file is not a minidump");
+
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn test_raw_mutex() {
