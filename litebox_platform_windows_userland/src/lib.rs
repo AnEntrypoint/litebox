@@ -5252,7 +5252,28 @@ fn unclaim_range(range: core::ops::Range<usize>) {
         return;
     }
     let owner = current_claim_owner();
-    for slot in CLAIMED_RANGES.lock().unwrap().iter_mut() {
+    // NEVER block to release a claim.
+    //
+    // This runs from `Vmem::remove_mapping`, i.e. underneath the caller's own memory-manager
+    // lock, on every guest unmap. Taking `CLAIMED_RANGES` blocking there froze the entire guest:
+    // with this call enabled the whole runtime went silent ~99 s into an XFCE session (every
+    // thread, not just the unmapping one) while the identical run with it disabled ran past
+    // 250 s. The registry is a HEURISTIC that exists to spot cross-process collisions -- failing
+    // to record a release only weakens that heuristic, and the consumer already re-validates a
+    // claim against Windows before acting on it (`range_holds_real_memory`), so a missed release
+    // is self-correcting. Deadlocking the guest is not. Bounded spin, then give up.
+    let mut guard = None;
+    for _ in 0..256 {
+        if let Ok(g) = CLAIMED_RANGES.try_lock() {
+            guard = Some(g);
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    let Some(mut claims) = guard else {
+        return;
+    };
+    for slot in claims.iter_mut() {
         let Some((claimed, o, _tid, _seq)) = slot else {
             continue;
         };
