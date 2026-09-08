@@ -1123,15 +1123,50 @@ impl<
         offset: isize,
         whence: SeekWhence,
     ) -> Result<usize, SeekError> {
-        let entry = self
+        let (entry, this_position) = self
             .litebox
             .descriptor_table()
-            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry))
+            .with_entry(fd, |descriptor| {
+                (
+                    Arc::clone(&descriptor.entry.entry),
+                    descriptor.entry.position.load(SeqCst),
+                )
+            })
             .ok_or(SeekError::ClosedFd)?;
         // Perform the seek, and update the position info
         let position = match entry.as_ref() {
             EntryX::Upper { fd } => self.upper.seek(fd, offset, whence)?,
-            EntryX::Lower { fd } => self.lower.seek(fd, offset, whence)?,
+            // A `Lower` entry's underlying fd is CACHED AND SHARED across every `open()` of the
+            // same path, so the lower backend's own cursor is not this descriptor's -- exactly the
+            // reasoning `read` above already spells out, and which applies verbatim here.
+            // Delegating a `SEEK_CUR` unchanged resolves it against that shared cursor and then
+            // stores the answer back as this descriptor's authoritative position, so a relative
+            // seek both returns the wrong number and corrupts the caller's own place in the file.
+            //
+            // `ftell()` is a `SEEK_CUR` of zero, which makes this reachable from almost any guest
+            // reading a file out of the read-only rootfs. Observed as an infinite loop in
+            // s6-overlay's `preinit`: its shell's own script fd sat on the tar layer, one
+            // `SEEK_CUR` rewound it to the shared cursor's 0, and the script re-ran from the top
+            // for ever.
+            //
+            // Resolve `SEEK_CUR` against this descriptor's tracked position and delegate it as an
+            // absolute seek. `SEEK_SET` and `SEEK_END` do not consult the shared cursor at all
+            // (the backend answers them from the argument and the file size), so they pass
+            // through unchanged.
+            EntryX::Lower { fd } => match whence {
+                SeekWhence::RelativeToCurrentOffset => {
+                    let absolute = this_position
+                        .checked_add_signed(offset)
+                        .ok_or(SeekError::InvalidOffset)?;
+                    let absolute =
+                        isize::try_from(absolute).map_err(|_| SeekError::InvalidOffset)?;
+                    self.lower
+                        .seek(fd, absolute, SeekWhence::RelativeToBeginning)?
+                }
+                SeekWhence::RelativeToBeginning | SeekWhence::RelativeToEnd => {
+                    self.lower.seek(fd, offset, whence)?
+                }
+            },
             EntryX::Tombstone => unreachable!(),
         };
         if let Some(e) = self.litebox.descriptor_table().get_entry(fd) {

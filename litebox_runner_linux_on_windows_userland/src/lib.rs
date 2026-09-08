@@ -472,6 +472,26 @@ fn acquire_boot_lock() -> Result<BootLock> {
     }
 }
 
+/// Install the `LITEBOX_LOG` tracing subscriber.
+///
+/// Idempotent (`try_init`), and public because a cross-process `fork()` child never reaches
+/// [`run`] -- it takes `main`'s diagnostic-resume-child branch instead. Without calling this there
+/// too, a child produces no log output at all, which is exactly backwards: the child is where the
+/// interesting half of a cross-process fork happens, and "no lines from the child" reads as
+/// "nothing happened" rather than "logging was never switched on".
+pub fn init_logging() {
+    let _ = tracing_subscriber::fmt()
+        .with_writer(|| FlushingStderr)
+        .with_timer(tracing_subscriber::fmt::time::uptime())
+        .with_level(true)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_env_var("LITEBOX_LOG")
+                .from_env_lossy(),
+        )
+        .try_init();
+}
+
 pub fn run(cli_args: CliArgs) -> Result<()> {
     // `litebox` is `#![no_std]` and cannot read an environment variable itself, so the runner
     // forwards this one on its behalf, here -- before any guest mapping is placed. It disables the
@@ -524,16 +544,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     litebox_platform_windows_userland::install_memcpy_watch_from_env();
 
-    tracing_subscriber::fmt()
-        .with_writer(|| FlushingStderr)
-        .with_timer(tracing_subscriber::fmt::time::uptime())
-        .with_level(true)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::builder()
-                .with_env_var("LITEBOX_LOG")
-                .from_env_lossy(),
-        )
-        .init();
+    init_logging();
 
     // Two mutually-exclusive rootfs sources (enforced by clap's `conflicts_with` on both args):
     // a pre-built `--initial-files` tar (host-mmapped, unchanged from before), or a live

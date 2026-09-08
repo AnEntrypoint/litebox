@@ -831,12 +831,36 @@ fn remove_descendants_of(live: &mut alloc::collections::BTreeMap<String, RawLive
         live.clear();
         return;
     }
-    let prefix = {
+    // Range query, not a scan. `live` is a `BTreeMap<String, _>`, so it is ordered by byte
+    // sequence, and every key nested under `parent` is exactly the half-open range
+    // `["parent/", "parent0")` -- `/` is 0x2f and `0` is 0x30, so bumping the separator by one
+    // gives the first key that can no longer share the prefix.
+    //
+    // This is called before EVERY insert (a later layer's file may replace what was a directory
+    // earlier, so the subtree has to go), and the old `retain` walked the whole map each time.
+    // That is O(entries^2) over the merged image, and it dominated startup completely: a 2.5 GB
+    // webtop rootfs took 14 s to index, against ~1 s to read the same bytes from disk. With the
+    // range query the common case -- nothing nested under this path at all -- is one lookup.
+    let start = {
         let mut p = String::from(parent);
         p.push('/');
         p
     };
-    live.retain(|p, _| !p.starts_with(prefix.as_str()));
+    let end = {
+        let mut p = String::from(parent);
+        p.push('0');
+        p
+    };
+    let doomed: Vec<String> = live
+        .range::<str, _>((
+            core::ops::Bound::Included(start.as_str()),
+            core::ops::Bound::Excluded(end.as_str()),
+        ))
+        .map(|(path, _)| path.clone())
+        .collect();
+    for path in doomed {
+        live.remove(&path);
+    }
 }
 
 /// Extract the `path` record's value from a PAX extended header payload (POSIX.1-2001 `pax`

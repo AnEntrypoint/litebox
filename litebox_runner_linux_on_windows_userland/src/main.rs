@@ -64,6 +64,9 @@ fn main() -> anyhow::Result<()> {
         // `resume_and_observe`/`inject_and_observe` stop reading this child's stdout pipe the
         // moment they see that marker, so any diagnostic output emitted AFTER it would never
         // reach the parent. See `diag_process_fork_globalstate_probe`'s own doc comment.
+        // Before the probe, so a cross-process fork child's own `LITEBOX_LOG` output actually
+        // appears -- `run()` (which normally installs this) is never reached on this branch.
+        litebox_runner_linux_on_windows_userland::init_logging();
         litebox_runner_linux_on_windows_userland::diag_process_fork_globalstate_probe();
         litebox_platform_windows_userland::process_fork::run_diagnostic_resume_child();
         return Ok(());
