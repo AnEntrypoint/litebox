@@ -201,3 +201,45 @@ so what removes the entry is not yet identified. It is not the smoltcp socket be
 that socket is still alive later, since it transmits the FIN.
 
 **This is the whole remaining distance to a visible desktop.** Everything upstream of it works.
+
+## Update 2: `--publish` fixed, and two of my own measurements corrected
+
+**`close(2)` was discarding queued data.** `CloseBehavior::Graceful` -- which is what an ordinary
+close with `SO_LINGER` unset maps to -- closed the socket immediately without checking
+`has_pending_tx()`, so `write(fd, response); close(fd);` lost the response whenever the periodic
+drain had not run in between. Only `GracefulIfNoPendingData` checked. Linux does the opposite: the
+kernel flushes queued data and sends FIN afterwards.
+
+That is what "the guest never transmits the payload" above actually was. Host round-trips through a
+`--publish`ed port now return HTTP 200 with the body, 5/5 and 3/3 on clean builds with logging off,
+where every attempt before returned HTTP 000.
+
+Two things recorded above were wrong, and the corrections matter more than the claims:
+
+* **The accepted socket is not orphaned.** The "visited exactly once / `entries=2` for one cycle"
+  reading came from a run whose own instrumentation logged thousands of lines a second and changed
+  the timing it was measuring. With the close fix in and the probes out, accepted sockets stay in
+  the table and long-lived connections work.
+* **`nginx` was never failing.** `HTTP_LOCAL_FAIL` came from the launcher's own check running
+  `wget`, which this image does not ship (`/bin/sh: wget: not found`). Asked with `python3`
+  instead, in-guest nginx answers `200` with the 762-byte dashboard, and one guest process fetching
+  another over loopback works.
+
+Also confirmed wrong: an earlier reading here of "101 Switching Protocols on every path" from
+selkies was a leftover test server of mine still holding port 8082, not selkies.
+
+## Still open
+
+**selkies does not answer the WebSocket handshake.** Its log says
+`Data WebSocket Server listening on port 8082`, the host reaches it through `--publish`, and the
+connection is accepted -- but no handshake response is ever sent, so the dashboard loads and sits
+on `WebSocket disconnected. Attempting to reconnect...`. A plain HTTP server put on the same port
+in the same image answers fine through the same path, so this is selkies-side, not transport.
+
+**An intermittent host access violation** still ends runs at varying points, now in a different
+shape from the one fixed in `8aa05af`: `rip == fault address == 0x7ff003444000`, an instruction
+fetch in the host-allocator region rather than a context caught on the way into the guest. The
+`switch_to_guest` fix converts one corruption path into a guest SIGSEGV; this is another.
+
+The desktop itself is in good shape -- `WM_S0` owned, 14-21 windows, `DE_ALIVE` past T=255s where
+it used to die at ~100s -- and has still never been seen rendered in a browser.
