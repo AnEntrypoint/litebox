@@ -5065,6 +5065,114 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 woken
             }
+            // Priority-inheritance locking, implemented on the ordinary futex machinery.
+            //
+            // litebox has no thread priorities to inherit, so the "PI" part of a PI mutex has
+            // nothing to do here -- what remains is an ordinary mutex whose owner is recorded in
+            // the futex word, and that part is implemented faithfully. The word protocol is the
+            // kernel's own: the low 30 bits hold the owner's TID, `FUTEX_WAITERS` (bit 31) marks
+            // that someone is blocked on it, and zero means unlocked.
+            //
+            // These used to return `EOPNOTSUPP`, chosen from measurements against musl, where the
+            // errno reaches `pthread_mutexattr_setprotocol` and a caller can degrade. On glibc it
+            // is not negotiable: any unexpected return from a futex operation reaches
+            // `futex_fatal_error()`, which prints `The futex facility returned an unexpected error
+            // code` and aborts. On the debian webtop that abort killed selkies one log line after a
+            // browser client's cursor had already been delivered, taking the video stream with it.
+            //
+            // Known limit, stated rather than hidden: the read-modify-write below is a relaxed
+            // atomic load followed by a store, not a compare-exchange, because no
+            // compare-exchange over guest memory exists at this layer yet. It is therefore not
+            // atomic against a CONCURRENT userspace CAS on the same word. glibc only reaches these
+            // operations on the contended slow path (the uncontended cases are settled in
+            // userspace), so the window is small -- but it is real, and closing it needs an atomic
+            // compare-exchange on `RawMutPointer<u32>`.
+            FutexArgs::LockPi {
+                addr,
+                flags,
+                timeout,
+            } => {
+                warn_shared_futex!(flags);
+                // `FUTEX_LOCK_PI`'s timeout is ABSOLUTE, like every futex op except plain WAIT.
+                let deadline = if let Some(timeout) = timeout.read::<Platform>()? {
+                    let clock_id =
+                        if flags.contains(litebox_common_linux::FutexFlags::CLOCK_REALTIME) {
+                            litebox_common_linux::ClockId::RealTime
+                        } else {
+                            litebox_common_linux::ClockId::Monotonic
+                        };
+                    self.duration_since_epoch_to_deadline(clock_id, timeout)?
+                } else {
+                    None
+                };
+                let me = self.tid as u32 & FUTEX_TID_MASK;
+                loop {
+                    let current = addr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                    if current & FUTEX_TID_MASK == 0 {
+                        // Free: claim it, preserving any waiters bit already set.
+                        addr.write_at_offset::<Platform>(0, me | (current & FUTEX_WAITERS))
+                            .ok_or(Errno::EFAULT)?;
+                        break 0;
+                    }
+                    if current & FUTEX_TID_MASK == me {
+                        // Already ours. A non-recursive mutex should not get here; Linux answers
+                        // `EDEADLK` rather than deadlocking the caller against itself.
+                        return Err(Errno::EDEADLK);
+                    }
+                    // Held by someone else: publish that we are waiting, then block until the
+                    // owner's `UNLOCK_PI` changes the word.
+                    let contended = current | FUTEX_WAITERS;
+                    addr.write_at_offset::<Platform>(0, contended)
+                        .ok_or(Errno::EFAULT)?;
+                    // A value mismatch means the word already moved on between our store and the
+                    // wait; re-read and retry rather than reporting a spurious failure.
+                    match self.global.futex_manager.wait(
+                        &self.wait_cx().with_deadline(deadline),
+                        addr.to_platform_ptr::<Platform>(),
+                        contended,
+                        None,
+                    ) {
+                        Ok(()) => {}
+                        Err(litebox::sync::futex::FutexError::ImmediatelyWokenBecauseValueMismatch) => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+            FutexArgs::TrylockPi { addr, flags } => {
+                warn_shared_futex!(flags);
+                let me = self.tid as u32 & FUTEX_TID_MASK;
+                let current = addr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                if current & FUTEX_TID_MASK != 0 {
+                    // Held. Linux reports a failed acquisition here as `EAGAIN`.
+                    return Err(Errno::EAGAIN);
+                }
+                addr.write_at_offset::<Platform>(0, me | (current & FUTEX_WAITERS))
+                    .ok_or(Errno::EFAULT)?;
+                0
+            }
+            FutexArgs::UnlockPi { addr, flags } => {
+                warn_shared_futex!(flags);
+                let me = self.tid as u32 & FUTEX_TID_MASK;
+                let current = addr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                if current & FUTEX_TID_MASK != me {
+                    // Releasing a lock this thread does not hold is the caller's bug, and Linux
+                    // says so rather than corrupting the word.
+                    return Err(Errno::EPERM);
+                }
+                // Drop ownership AND the waiters bit together: a waiter woken below re-reads the
+                // word and must see it free, and whichever waiter wins will set the bit again if
+                // it finds the lock taken.
+                addr.write_at_offset::<Platform>(0, 0).ok_or(Errno::EFAULT)?;
+                if current & FUTEX_WAITERS != 0 {
+                    let one = core::num::NonZeroU32::new(1).unwrap();
+                    let _ = self.global.futex_manager.wake(
+                        addr.to_platform_ptr::<Platform>(),
+                        one,
+                        None,
+                    );
+                }
+                0
+            }
             _ => unimplemented!("Unsupported futex operation"),
         };
         Ok(res)

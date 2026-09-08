@@ -3032,6 +3032,12 @@ pub enum FutexOperation {
     Wake = 1,
     Requeue = 3,
     CmpRequeue = 4,
+    /// `FUTEX_LOCK_PI`: block until the futex word can be claimed as an owned lock.
+    LockPi = 6,
+    /// `FUTEX_UNLOCK_PI`: release a lock claimed by [`Self::LockPi`] and wake a waiter.
+    UnlockPi = 7,
+    /// `FUTEX_TRYLOCK_PI`: attempt [`Self::LockPi`] without blocking.
+    TrylockPi = 8,
     WaitBitset = 9,
 }
 
@@ -3086,6 +3092,23 @@ pub enum FutexArgs {
     /// `FUTEX_CMP_REQUEUE`: identical to `Requeue`, but first atomically checks that the word at
     /// `addr` still equals `expected_value`, failing with `EAGAIN` otherwise (closes the race
     /// where the value changed between userspace's check and this syscall).
+    /// `FUTEX_LOCK_PI`: acquire the lock whose owner is recorded in the futex word, blocking
+    /// until it is free. See the shim's implementation for the word protocol.
+    LockPi {
+        addr: UserPtrMut<u32>,
+        flags: FutexFlags,
+        timeout: TimeParam,
+    },
+    /// `FUTEX_UNLOCK_PI`: release the lock and wake one waiter.
+    UnlockPi {
+        addr: UserPtrMut<u32>,
+        flags: FutexFlags,
+    },
+    /// `FUTEX_TRYLOCK_PI`: acquire the lock if it is free, without blocking.
+    TrylockPi {
+        addr: UserPtrMut<u32>,
+        flags: FutexFlags,
+    },
     CmpRequeue {
         addr: UserPtrMut<u32>,
         flags: FutexFlags,
@@ -3998,6 +4021,14 @@ pub enum SyscallRequest {
     SchedSetParam {
         pid: Option<i32>,
         param: UserPtr<i32>,
+    },
+    /// `sched_get_priority_max`: highest priority value valid for `policy`.
+    SchedGetPriorityMax {
+        policy: i32,
+    },
+    /// `sched_get_priority_min`: lowest priority value valid for `policy`.
+    SchedGetPriorityMin {
+        policy: i32,
     },
     SchedGetScheduler {
         pid: Option<i32>,
@@ -4918,6 +4949,12 @@ impl SyscallRequest {
                     pid: if pid == 0 { None } else { Some(pid) },
                 }
             }
+            Sysno::sched_get_priority_max => SyscallRequest::SchedGetPriorityMax {
+                policy: ctx.sys_req_arg::<i32>(0),
+            },
+            Sysno::sched_get_priority_min => SyscallRequest::SchedGetPriorityMin {
+                policy: ctx.sys_req_arg::<i32>(0),
+            },
             Sysno::sched_setscheduler => {
                 let pid = ctx.sys_req_arg(0);
                 SyscallRequest::SchedSetScheduler {
@@ -5030,10 +5067,25 @@ impl SyscallRequest {
         // both musl and PulseAudio already know how to degrade on. (`ENOSYS`, "syscall not
         // implemented", would be the right answer for a missing syscall; `futex` is implemented,
         // just not these six operations.)
-        const FUTEX_PI_OPS: [i32; 6] = [
-            6,  // FUTEX_LOCK_PI
-            7,  // FUTEX_UNLOCK_PI
-            8,  // FUTEX_TRYLOCK_PI
+        //
+        // `FUTEX_LOCK_PI`/`UNLOCK_PI`/`TRYLOCK_PI` are no longer in this list: they are IMPLEMENTED
+        // now (see `FutexOperation::LockPi` and the shim's `sys_futex`), because returning an error
+        // for them is not survivable on glibc.
+        //
+        // The reasoning above was measured against MUSL, where the errno propagates out through
+        // `pthread_mutexattr_setprotocol` and a caller can degrade. This webtop image is DEBIAN --
+        // glibc -- and glibc does not treat a failed PI operation as a negotiable answer: its futex
+        // wrappers call `futex_fatal_error()` for any unexpected return, which prints
+        // `The futex facility returned an unexpected error code` and aborts the process outright.
+        //
+        // Measured: with `EOPNOTSUPP` here, a browser connecting to the webtop made selkies reach
+        // `Attempting to establish PulseAudio connection...`, take `futex(op = 7)`
+        // (`FUTEX_UNLOCK_PI`), and die on that abort -- taking the whole video stream with it, one
+        // log line after the client's cursor had already been delivered.
+        //
+        // The three REQUEUE_PI operations stay unsupported: they have no plain-futex equivalent to
+        // map onto, and nothing here has been observed to use them.
+        const FUTEX_PI_OPS: [i32; 3] = [
             11, // FUTEX_WAIT_REQUEUE_PI
             12, // FUTEX_CMP_REQUEUE_PI
             13, // FUTEX_LOCK_PI2
@@ -5073,6 +5125,13 @@ impl SyscallRequest {
                 flags,
                 count: val,
             },
+            FutexOperation::LockPi => FutexArgs::LockPi {
+                addr,
+                flags,
+                timeout: time_param(ctx.sys_req_ptr(3)),
+            },
+            FutexOperation::UnlockPi => FutexArgs::UnlockPi { addr, flags },
+            FutexOperation::TrylockPi => FutexArgs::TrylockPi { addr, flags },
             // Note: for FUTEX_REQUEUE/FUTEX_CMP_REQUEUE, the 4th syscall argument (normally a
             // `struct timespec *timeout` for FUTEX_WAIT) is instead a plain integer -- the
             // requeue count -- per futex(2)'s documented reuse of that argument slot. It must NOT

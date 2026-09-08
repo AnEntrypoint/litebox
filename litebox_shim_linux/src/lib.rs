@@ -1038,6 +1038,34 @@ fn default_fs<Platform: ShimPlatform>(
     )
 }
 
+/// The `(min, max)` priority values Linux reports for a scheduling `policy`.
+///
+/// These are the real kernel's numbers, not placeholders: the real-time policies span 1..=99 and
+/// every non-real-time policy is fixed at 0..=0. glibc reads both at startup and stores them, then
+/// ASSERTS against them whenever a thread's priority changes -- so getting them wrong is not a
+/// cosmetic inaccuracy.
+///
+/// Neither syscall was implemented, which left glibc with whatever the unsupported-syscall path
+/// returned and produced, on a plain `PTHREAD_PRIO_INHERIT` mutex:
+///
+/// ```text
+/// Fatal glibc error: tpp.c:83 (__pthread_tpp_change_priority): assertion failed:
+///   new_prio == -1 || (new_prio >= fifo_min_prio && new_prio <= fifo_max_prio)
+/// ```
+///
+/// Reporting the range faithfully costs nothing and does not claim litebox honours priorities: a
+/// guest may ask what the valid range IS and still find that scheduling behaves uniformly, exactly
+/// as it does on a machine where every thread happens to run at the same priority.
+fn sched_priority_range(policy: i32) -> Result<(i32, i32), Errno> {
+    match policy {
+        // SCHED_FIFO, SCHED_RR
+        1 | 2 => Ok((1, 99)),
+        // SCHED_OTHER, SCHED_BATCH, SCHED_IDLE, SCHED_DEADLINE
+        0 | 3 | 5 | 6 => Ok((0, 0)),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
 // Special override so that `GETFL` can return stdio-specific flags
 #[derive(Clone)]
 pub(crate) struct StdioStatusFlags(litebox::fs::OFlags);
@@ -2355,6 +2383,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             SyscallRequest::SchedGetScheduler { pid } => {
                 Ok(self.sys_sched_getscheduler(pid).reinterpret_as_unsigned() as usize)
+            }
+            SyscallRequest::SchedGetPriorityMax { policy } => {
+                Ok(sched_priority_range(policy)?.1 as usize)
+            }
+            SyscallRequest::SchedGetPriorityMin { policy } => {
+                Ok(sched_priority_range(policy)?.0 as usize)
             }
             SyscallRequest::SchedSetScheduler { pid, policy, param } => {
                 let sched_priority = param.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
