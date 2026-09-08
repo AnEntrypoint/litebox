@@ -64,9 +64,17 @@ Every binary involved is PIE, so litebox chooses their load addresses; this is t
 PLACEMENT problem in a single shared host address space, matching the pre-existing note in
 `allocate_pages` about `labwc`/`xfwm4`/`xfdesktop` SIGSEGV-ing under concurrent multi-process
 `mmap(NULL)`/`munmap()` load. `Vmem` placement only avoids a one-time startup snapshot plus its
-OWN mappings, and only `Replace`-mode (MAP_FIXED) allocations are ever entered in
-`CLAIMED_RANGES` -- so an ordinary `mmap(NULL)` in one guest process is invisible to every other
-guest process's placement search.
+OWN mappings, so it has no view of another live guest process's address space.
+
+A first guess -- that `CLAIMED_RANGES` never records ordinary `mmap(NULL)` -- is WRONG and worth
+recording as such: the OS-picks-the-address path claims unconditionally, with a comment saying
+why. The actual hole is narrower. A `Hint`-mode request that SUCCEEDS at the address
+`get_unmmaped_area` chose is never claimed (only `Replace` is claimed on that branch), and
+`get_unmmaped_area` chose that address using this process's own `Vmem` alone. The pre-checks that
+should still catch a live neighbour (`has_committed_page`, `find_foreign_claim`) run under
+`ALLOCATE_PAGES_FIXED_ADDR_LOCK`, so the next thing to establish is which of those two -- the
+unclaimed success, or a gap in the checks -- actually lets xfwm4's load land on Xvfb. That needs
+the faulting range captured at the moment of collision, not more reasoning.
 
 ## Networking: the browser path that does work
 
