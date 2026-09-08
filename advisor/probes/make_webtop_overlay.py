@@ -1,9 +1,15 @@
 import io
 import os
+import sys
 import tarfile
 import time
 
-OUT = r'C:\dev\litebox-main\.wfgy\webtop_overlay.tar'
+# Output path and dashboard root are arguments: the ubuntu-xfce image lays the selkies
+# dashboard out at its own path, and forking this builder to change one string would fork
+# every other fix in it too.
+#   usage: make_webtop_overlay.py [<out.tar>] [<dashboard-dir>]
+OUT = sys.argv[1] if len(sys.argv) > 1 else r'C:\dev\litebox-main\.wfgy\webtop_overlay.tar'
+DASHBOARD = sys.argv[2] if len(sys.argv) > 2 else '/usr/share/selkies/selkies-dashboard/'
 
 # A complete replacement nginx.conf rather than a drop-in under http.d, because the two
 # directives that matter most here -- `daemon off` and `master_process off` -- are main-context
@@ -45,7 +51,7 @@ http {
     # to /usr/share/selkies/web during s6 init; pointing the alias at the real directory instead
     # skips a multi-thousand-file copy that would buy nothing.
     location / {
-      alias /usr/share/selkies/selkies-dashboard/;
+      alias __DASHBOARD__;
       index index.html index.htm;
       try_files $uri $uri/ =404;
     }
@@ -81,6 +87,21 @@ export PATH=/lsiopy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:
 
 STAGE="${STACK_STAGE:-4}"
 HOLD="${HOLD_SECS:-900}"
+
+# Which desktop to start, as a RUNTIME parameter rather than a baked-in command.
+#
+# This launcher was written for `mate-session` and hard-coded it. The Xvfb/nginx/selkies stack
+# underneath is desktop-environment-agnostic -- it streams whatever X surface exists -- so the
+# hard-coded session was the only thing tying this overlay to one desktop, and bringing up XFCE
+# would otherwise have meant a second near-identical copy to maintain in parallel. One overlay,
+# selected with `--env DESKTOP_CMD=...`, keeps every fix (the non-forking dbus-daemon above all)
+# shared between desktops instead of fixed once per copy.
+#
+# For XFCE that means `xfce4-session`, NOT `startxfce4`: startxfce4 is a wrapper whose main job
+# is to start a session bus with dbus-launch and then exec xfce4-session. This script already
+# owns that bus deliberately (see the dbus block below), so the wrapper would start a SECOND bus
+# and hand the session a different address than the one exported here.
+DESKTOP_CMD="${DESKTOP_CMD:-/usr/bin/mate-session --debug}"
 
 mkdir -p /config/.XDG /config/Desktop /var/log/nginx /run/nginx \
   /var/lib/nginx/tmp /var/lib/nginx/logs /var/lib/nginx/body \
@@ -165,7 +186,7 @@ if [ "$STAGE" -ge 4 ]; then
     export DBUS_SESSION_BUS_ADDRESS="$DBUS_ADDR"
   fi
 
-  echo "[stack] starting mate-session"
+  echo "[stack] starting desktop: $DESKTOP_CMD"
   cd /config
   # `--debug` and an unbuffered stderr, because the previous invocation's silence was itself the
   # problem: mate-session logs nothing on a successful start, so an empty log was equally
@@ -177,13 +198,13 @@ if [ "$STAGE" -ge 4 ]; then
   # never reached the file) and no way to choose between them. The `[stack]` echoes around it
   # demonstrably reach the console, so routing mate-session the same way removes the file as a
   # variable: anything it writes now lands where output is already proven to arrive.
-  /usr/bin/mate-session --debug 2>&1 | sed "s/^/[mate] /" &
-  MATE_PID=$!
+  $DESKTOP_CMD 2>&1 | sed "s/^/[de] /" &
+  DE_PID=$!
   sleep 40
-  if kill -0 "$MATE_PID" 2>/dev/null; then
-    echo "[stack] MATE_ALIVE pid=$MATE_PID"
+  if kill -0 "$DE_PID" 2>/dev/null; then
+    echo "[stack] DE_ALIVE pid=$DE_PID"
   else
-    echo "[stack] MATE_EXITED pid=$MATE_PID"
+    echo "[stack] DE_EXITED pid=$DE_PID"
   fi
 fi
 
@@ -251,7 +272,7 @@ with tarfile.open(OUT, 'w', format=tarfile.GNU_FORMAT) as tar:
               'run', 'run/nginx',
               'etc', 'etc/nginx']:
         add(tar, d, None, isdir=True)
-    add(tar, 'etc/nginx/nginx.conf', NGINX_CONF)
+    add(tar, 'etc/nginx/nginx.conf', NGINX_CONF.replace('__DASHBOARD__', DASHBOARD))
     add(tar, 'start-webtop.sh', LAUNCH, mode=0o755)
     # `/patch` goes on the guest's PYTHONPATH, so CPython's own `site` module imports
     # `sitecustomize` before any application code runs -- the only hook that reaches selkies
