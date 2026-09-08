@@ -24,6 +24,7 @@ pub mod layered;
 pub mod nine_p;
 pub mod procfs;
 pub mod resolver;
+pub mod static_files;
 pub mod tar_ro;
 
 #[cfg(test)]

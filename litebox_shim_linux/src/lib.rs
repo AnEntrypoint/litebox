@@ -997,8 +997,91 @@ fn default_fs<Platform: ShimPlatform>(
             .mount("/sys/dev/char", |allocator| {
                 litebox::fs::devices::SysDevChar::new(litebox, allocator)
             })
-            .mount("/proc/sys/kernel", |allocator| {
-                litebox::fs::devices::ProcSysKernel::new(litebox, allocator)
+            // Every `/proc/sys` file whose value is fixed for the life of a guest, in one
+            // table-driven backend (see `litebox::fs::static_files`). This replaces a dedicated
+            // ~270-line `Backend` implementation that served `overflowuid`/`overflowgid` and
+            // nothing else -- adding the three files below to it would have meant either
+            // extending that one-off or writing more of them, and a live XFCE session was
+            // observed asking for eleven distinct constant `/proc`+`/sys` paths and getting
+            // `ENOENT` for every one.
+            .mount("/proc/sys", |allocator| {
+                litebox::fs::static_files::StaticFiles::new(
+                    litebox,
+                    allocator,
+                    alloc::vec![
+                        // The traditional fixed "nobody" ids, `65534` on every Linux kernel --
+                        // what a user namespace maps anything outside its own uid/gid range to.
+                        // `bwrap` (bubblewrap, behind `glycin`'s per-format sandboxed image
+                        // decoders, which is what `gdk-pixbuf` uses in place of its old
+                        // in-process loader modules) reads both while setting up its sandbox,
+                        // right after `prctl(PR_SET_NO_NEW_PRIVS, 1)`. Without them it fails
+                        // outright ("bwrap: Can't read /proc/sys/kernel/overflowuid"), which
+                        // breaks sandboxed decode entirely and surfaces as a `Gtk:ERROR`
+                        // assertion abort in any GTK app that has to decode a PNG -- confirmed
+                        // live as what was crashing `xfce4-panel` on its own bundled
+                        // `image-missing.png` fallback icon.
+                        litebox::fs::static_files::file("kernel/overflowuid", b"65534
+"),
+                        litebox::fs::static_files::file("kernel/overflowgid", b"65534
+"),
+                        // The highest capability number this "kernel" knows. `40` is
+                        // `CAP_CHECKPOINT_RESTORE`, the last one defined as of Linux 5.9 and
+                        // still the last in 6.x. libcap reads this to size its own capability
+                        // bitmaps and to bound `cap_get_bound` loops.
+                        litebox::fs::static_files::file("kernel/cap_last_cap", b"40
+"),
+                        // Not a FIPS build. OpenSSL and GnuTLS both read this at init; absent, at
+                        // least one of them logs a startup complaint on every process.
+                        litebox::fs::static_files::file("crypto/fips_enabled", b"0
+"),
+                        // Heuristic overcommit (the Linux default). Read by allocators deciding
+                        // whether a large speculative reservation will be honoured -- which, on
+                        // this platform, it is, since `allocate_pages` reserves without
+                        // committing until touched.
+                        litebox::fs::static_files::file("vm/overcommit_memory", b"0
+"),
+                    ],
+                )
+            })
+            // Sandboxing-capability probes. `N` is what a kernel built without AppArmor reports,
+            // and it is the truth here: litebox has no LSM. Absent, these read as `ENOENT`, which
+            // some probes treat as "unknown" and retry rather than as a settled "no".
+            .mount("/sys/module/apparmor/parameters", |allocator| {
+                litebox::fs::static_files::StaticFiles::new(
+                    litebox,
+                    allocator,
+                    alloc::vec![
+                        litebox::fs::static_files::file("enabled", b"N
+"),
+                        litebox::fs::static_files::file("available", b"N
+"),
+                    ],
+                )
+            })
+            // CPU topology. Fixed for the life of the guest but not at compile time, which is why
+            // `StaticFiles` owns its table rather than borrowing a `&'static` one. GLib and
+            // libstdc++ both prefer these over `sysconf` when present, and a wrong or missing
+            // answer here sizes every thread pool in the session.
+            .mount("/sys/devices/system/cpu", |allocator| {
+                let range = if cpu_count > 1 {
+                    alloc::format!("0-{}
+", cpu_count - 1)
+                } else {
+                    alloc::string::String::from("0
+")
+                };
+                litebox::fs::static_files::StaticFiles::new(
+                    litebox,
+                    allocator,
+                    alloc::vec![
+                        litebox::fs::static_files::file("online", range.as_bytes()),
+                        litebox::fs::static_files::file("possible", range.as_bytes()),
+                        // `1024` is the scheduler's "full capacity" reference value, what every
+                        // core on a uniform (non-big.LITTLE) machine reports.
+                        litebox::fs::static_files::file("cpu0/cpu_capacity", b"1024
+"),
+                    ],
+                )
             })
             .mount("/proc", |allocator| {
                 litebox::fs::procfs::Procfs::new(

@@ -8,8 +8,8 @@
 //! introspection to be individually CORRECT, only a format-accurate synthesis. This is
 //! deliberately NOT a general-purpose `/proc` filesystem (see `Procfs`/`ProcSelf`'s own doc
 //! comments for the exact, fixed set each one covers) -- mirrors the same "minimal, exact files a
-//! real client needs" pattern already used by [`super::devices::ProcSysKernel`] for
-//! `/proc/sys/kernel/{overflowuid,overflowgid}`.
+//! real client needs" pattern already used by [`super::static_files`] for
+//! the constant `/proc/sys` and `/sys` files.
 //!
 //! `/proc/self/auxv` is load-bearing rather than informational: rustix falls back to reading
 //! it when it cannot obtain the auxiliary vector from the initial stack, and it `unwrap()`s
@@ -167,6 +167,68 @@ fn format_mounts() -> Vec<u8> {
     b"rootfs / rootfs rw 0 0\n".to_vec()
 }
 
+/// Real `/proc/filesystems` format: one filesystem type per line, `nodev	` prefixed for types
+/// that need no backing block device, a bare tab otherwise.
+///
+/// A live XFCE session read this 18 times in one boot and got `ENOENT` every time. The readers are
+/// `mount`/`libmount`, GIO's volume monitor, and anything deciding whether a `tmpfs` or `proc`
+/// mount is even possible before attempting it -- a missing file reads as "this kernel supports
+/// nothing", which is a different and worse answer than an honest short list.
+///
+/// The list is exactly what litebox actually serves: the synthesized `proc`/`sysfs` trees, the
+/// `devtmpfs`/`tmpfs` shape `/dev` and `/dev/shm` present, and `rootfs` for the tar-backed root
+/// [`format_mounts`] already reports. Claiming `ext4`/`overlay`/`fuse` here would be a lie a
+/// caller could act on.
+fn format_filesystems() -> Vec<u8> {
+    b"nodev	rootfs
+nodev	proc
+nodev	sysfs
+nodev	devtmpfs
+nodev	tmpfs
+nodev	devpts
+"
+        .to_vec()
+}
+
+/// Real `/proc/stat` format: a `cpu` aggregate line, one `cpuN` line per logical CPU, then the
+/// `intr`/`ctxt`/`btime`/`processes`/`procs_running`/`procs_blocked` counters.
+///
+/// Every counter is zero, and that is honest rather than lazy: litebox does not schedule guest
+/// threads itself (Windows does), so it has no jiffy accounting to report and inventing plausible
+/// numbers would make a monitoring client draw graphs of fiction. What the readers overwhelmingly
+/// want from this file is the CPU COUNT -- `nproc`, GLib's `g_get_num_processors` fallback, and
+/// several thread-pool sizers count `cpuN` lines -- and that number is real.
+///
+/// Named `format_stat_global` to keep it distinct from [`format_stat`], which renders the very
+/// differently-shaped per-process `/proc/[pid]/stat`.
+fn format_stat_global(cpu_count: usize) -> Vec<u8> {
+    let mut out = String::from("cpu  0 0 0 0 0 0 0 0 0 0
+");
+    for cpu in 0..cpu_count {
+        out.push_str(&format!("cpu{cpu} 0 0 0 0 0 0 0 0 0 0
+"));
+    }
+    out.push_str("intr 0
+ctxt 0
+btime 0
+processes 0
+procs_running 1
+procs_blocked 0
+");
+    out.into_bytes()
+}
+
+/// Real `/proc/cmdline` content: the kernel's own boot command line, one line.
+///
+/// There is no bootloader here and no kernel command line to report, so the honest content is the
+/// bare minimum a real kernel always carries. Readers (systemd-ish tooling, container-detection
+/// heuristics, `dracut`-style probes) parse it for `key=value` options and treat a missing file as
+/// a broken `/proc` mount rather than as an empty command line.
+fn format_kernel_cmdline() -> Vec<u8> {
+    b"BOOT_IMAGE=/litebox root=/dev/root rw
+".to_vec()
+}
+
 /// Real `/proc/[pid]/mountinfo` format (see `man 5 proc`): 10+ space-separated fields per line,
 /// with a literal ` - ` separator before the last three (fstype, source, super options). A
 /// single root entry, minimal-but-format-correct (see [`format_mounts`]'s doc comment for why
@@ -281,6 +343,12 @@ enum ProcfsEntry {
     MemInfo,
     Mounts,
     Uptime,
+    /// `filesystems` -- which filesystem types this "kernel" can mount.
+    Filesystems,
+    /// `stat` -- kernel/CPU activity counters.
+    Stat,
+    /// `cmdline` -- the kernel's own boot command line.
+    Cmdline,
 }
 
 impl ProcfsEntry {
@@ -289,6 +357,9 @@ impl ProcfsEntry {
         ("meminfo", ProcfsEntry::MemInfo),
         ("mounts", ProcfsEntry::Mounts),
         ("uptime", ProcfsEntry::Uptime),
+        ("filesystems", ProcfsEntry::Filesystems),
+        ("stat", ProcfsEntry::Stat),
+        ("cmdline", ProcfsEntry::Cmdline),
     ];
 
     fn from_name(name: &str) -> Option<Self> {
@@ -297,7 +368,7 @@ impl ProcfsEntry {
 }
 
 /// Node info for each entry -- distinct, stable, fake inode numbers (mirrors
-/// [`super::devices::ProcSysKernel`]'s own fixed constants for its two files).
+/// [`super::static_files`]'s own allocator-assigned inodes).
 const PROCFS_CPUINFO_NODE_INFO: NodeInfo = NodeInfo {
     dev: 6,
     ino: 1,
@@ -316,6 +387,21 @@ const PROCFS_MOUNTS_NODE_INFO: NodeInfo = NodeInfo {
 const PROCFS_UPTIME_NODE_INFO: NodeInfo = NodeInfo {
     dev: 6,
     ino: 4,
+    rdev: None,
+};
+const PROCFS_FILESYSTEMS_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 6,
+    ino: 5,
+    rdev: None,
+};
+const PROCFS_STAT_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 6,
+    ino: 6,
+    rdev: None,
+};
+const PROCFS_CMDLINE_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 6,
+    ino: 7,
     rdev: None,
 };
 
@@ -403,6 +489,9 @@ where
             ProcfsEntry::MemInfo => format_meminfo(self.mem_total_kb, self.mem_avail_kb),
             ProcfsEntry::Mounts => format_mounts(),
             ProcfsEntry::Uptime => format_uptime(self.boot_uptime_secs),
+            ProcfsEntry::Filesystems => format_filesystems(),
+            ProcfsEntry::Stat => format_stat_global(self.cpu_count),
+            ProcfsEntry::Cmdline => format_kernel_cmdline(),
         };
         Ok(Permissioned {
             item: FileHandle::from_typed::<Self>(ProcfsFileHandle { entry, content }),
@@ -462,6 +551,9 @@ where
                 ProcfsEntry::MemInfo => PROCFS_MEMINFO_NODE_INFO,
                 ProcfsEntry::Mounts => PROCFS_MOUNTS_NODE_INFO,
                 ProcfsEntry::Uptime => PROCFS_UPTIME_NODE_INFO,
+                ProcfsEntry::Filesystems => PROCFS_FILESYSTEMS_NODE_INFO,
+                ProcfsEntry::Stat => PROCFS_STAT_NODE_INFO,
+                ProcfsEntry::Cmdline => PROCFS_CMDLINE_NODE_INFO,
             },
             blksize: 0x1000,
             atime: Timestamp::default(),
