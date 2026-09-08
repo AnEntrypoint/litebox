@@ -243,3 +243,41 @@ fetch in the host-allocator region rather than a context caught on the way into 
 
 The desktop itself is in good shape -- `WM_S0` owned, 14-21 windows, `DE_ALIVE` past T=255s where
 it used to die at ~100s -- and has still never been seen rendered in a browser.
+
+## Update 3: the image's own web UI now reaches the browser
+
+`--publish` carrying a real HTTP response (the `close(2)` flush fix above) plus `AF_INET6` existing
+means the guest's own nginx serves the webtop dashboard to the host:
+
+```
+UI HTTP 200 bytes=762      # host -> --publish -> in-guest nginx
+```
+
+**`AF_INET6` was the reason nginx would not start.** Stock configs `listen [::]:80`, and
+`socket(AF_INET6)` returning `EAFNOSUPPORT` made nginx log `[emerg]` and exit. v6 sockets now use
+the v4 machinery (Linux's `bindv6only=0` behaviour), v4-meaningful v6 addresses map (`::`, `::1`,
+`::ffff:a.b.c.d`), and a v6 `bind()` succeeds while listening on nothing -- because no IPv6 packet
+can arrive here, and mapping it onto the v4 wildcard instead made `0.0.0.0:80` and `[::]:80`
+collide with `EADDRINUSE`, which killed nginx just as dead.
+
+Where the image's own service scripts are needed, they are read and followed rather than guessed:
+`svc-selkies/run` is `selkies --addr="localhost" --mode="websockets"`, `svc-nginx/run` is
+`nginx -g 'daemon off;'`. The 3000-port site config is generated at runtime by `init-nginx`, which
+is part of `/init` -- still blocked by the `ET_EXEC` collision -- so that one config file is
+supplied directly, the way a container bind-mount would.
+
+## Still open
+
+**selkies never opens its data WebSocket.** With `--addr=localhost` it stops after its gamepad
+interposers (`EVDEV interposer server listening on /tmp/selkies_event1003.sock`) and prints no
+error; nginx's proxy to it therefore answers `502 Bad Gateway`. The desktop itself is fine
+underneath -- `WM_S0` owned, 17-21 windows -- so the last missing piece is the pixel stream.
+
+**A script run from a `--resume-from` path hangs the shell.** `sh /stack.sh` produces no output at
+all, not even under `sh -x`; `cp /stack.sh /tmp/s.sh && sh /tmp/s.sh` runs the identical 2601 bytes
+correctly (`XVFB_UP`, `SELKIES_LAUNCHED`, `DBUS_UP`). `sh -n` accepts the file and `wc -c` agrees on
+both paths, so this is the layered filesystem stalling a read of an imported file that is being
+executed as a script, not a damaged file.
+
+**The intermittent host access violation** remains, and now ends some runs during Xvfb startup
+rather than at ~100s.
