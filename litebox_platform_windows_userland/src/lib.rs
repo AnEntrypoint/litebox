@@ -5172,6 +5172,111 @@ fn claim_range(range: core::ops::Range<usize>) {
     }
 }
 
+/// Drops the calling guest process's claim over `range`, because that host memory has just been
+/// genuinely released back to Windows.
+///
+/// # Why this must exist
+///
+/// [`CLAIMED_RANGES`] previously only ever GREW for a given owner: [`claim_range`] coalesces each
+/// new claim with the same owner's overlapping-or-adjacent entries into one merged bound, and the
+/// only removal path was [`release_all_claims_for_current_thread`], which runs when an entire OS
+/// THREAD exits. Nothing dropped a claim when the memory under it was unmapped. A long-lived
+/// process that maps and unmaps repeatedly therefore accumulated one ever-widening claim covering
+/// address space it no longer owned -- and Windows, which does know the memory was freed, is free
+/// to hand that same address to a DIFFERENT guest process.
+///
+/// The consequence was fatal and looked nothing like its cause. `ld.so` maps a shared library in
+/// two steps: `mmap(NULL, whole_span, PROT_READ)` to reserve it, then `mmap(base + off, len,
+/// MAP_FIXED)` for each segment INSIDE that reservation. Step one succeeded; step two arrived as
+/// a `Replace`-mode fixed request, hit a stale foreign claim over its own freshly-reserved range,
+/// and was relocated to an OS-chosen address (`base_addr = null`). `do_mmap`'s post-check then
+/// correctly refused a `MAP_FIXED` that did not land where it was asked, returning `EEXIST`, and
+/// glibc reported `libc.so.6: failed to map segment from shared object`. Every process started
+/// after a heavy mapper (selkies, a Python process) intermittently failed to start at all; that
+/// is what kept `dbus-daemon` -- and therefore the whole XFCE session -- from ever coming up.
+///
+/// Removing rather than splitting on a punch-out is deliberate. The two error directions are not
+/// symmetric: a MISSING claim only weakens a collision heuristic, while a claim that outlives its
+/// memory actively breaks correct programs. When a freed range falls strictly inside a claim,
+/// this keeps only the part below it rather than consuming a second slot to represent the hole.
+/// Whether Windows itself reports ANY reserved or committed memory inside `range`.
+///
+/// The claim registry is bookkeeping; Windows is the ground truth for whether memory exists. A
+/// claim covering a range Windows says is entirely `MEM_FREE` is provably stale -- the memory it
+/// described has already been released -- and honouring it corrupts nothing but does break the
+/// caller, so the registry must lose that argument.
+fn range_holds_real_memory(range: &core::ops::Range<usize>) -> bool {
+    let mut address = range.start;
+    while address < range.end {
+        let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+        let ok = unsafe {
+            Win32_Memory::VirtualQuery(
+                address as *const c_void,
+                &raw mut mbi,
+                core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+            ) != 0
+        };
+        if !ok {
+            // Cannot tell -- assume it is real, i.e. keep the conservative old behaviour.
+            return true;
+        }
+        if mbi.State == Win32_Memory::MEM_RESERVE || mbi.State == Win32_Memory::MEM_COMMIT {
+            return true;
+        }
+        let next = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+        if next <= address {
+            return true;
+        }
+        address = next;
+    }
+    false
+}
+
+/// Drops EVERY owner's claim over `range`, used when Windows has proven the range holds no real
+/// memory (see [`range_holds_real_memory`]). Unlike [`unclaim_range`] this deliberately ignores
+/// ownership: a stale entry belongs to whichever process last held the address, never to the one
+/// discovering it.
+fn purge_stale_claims(range: &core::ops::Range<usize>) {
+    for slot in CLAIMED_RANGES.lock().unwrap().iter_mut() {
+        if let Some((claimed, ..)) = slot
+            && claimed.start < range.end
+            && claimed.end > range.start
+        {
+            *slot = None;
+        }
+    }
+}
+
+fn unclaim_range(range: core::ops::Range<usize>) {
+    if range.is_empty() {
+        return;
+    }
+    let owner = current_claim_owner();
+    for slot in CLAIMED_RANGES.lock().unwrap().iter_mut() {
+        let Some((claimed, o, _tid, _seq)) = slot else {
+            continue;
+        };
+        // Only this guest process's own claims: another owner's entry overlapping memory this
+        // process is freeing would mean the bookkeeping was already wrong, and silently dropping
+        // a live process's claim is exactly the failure this registry exists to prevent.
+        if *o != owner || claimed.end <= range.start || claimed.start >= range.end {
+            continue;
+        }
+        if range.start <= claimed.start && range.end >= claimed.end {
+            *slot = None;
+            continue;
+        }
+        if range.start <= claimed.start {
+            claimed.start = range.end;
+        } else {
+            claimed.end = range.start;
+        }
+        if claimed.start >= claimed.end {
+            *slot = None;
+        }
+    }
+}
+
 /// Re-claims every one of `parent_owner`'s ranges under the CALLING thread's own
 /// [`current_claim_owner`] (the new `fork()` child, whose `CURRENT_GUEST_PID` must already be
 /// set before calling this). See the call site in [`WindowsUserland::spawn_thread`] for the
@@ -6714,13 +6819,27 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     collision.is_some()
                 }
             {
-                // See `CLAIMED_RANGES`'s doc comment: a claimed range here that this thread
-                // does not itself own is another still-live guest process's real memory (most
-                // commonly two `ET_EXEC` binaries sharing the same link-time base address while
-                // both alive via nested `vfork()`), never a stale leftover safe to clobber.
-                // Relocate to a fresh address instead of decommitting/recommitting/committing
-                // over it.
-                base_addr = core::ptr::null_mut();
+                // A foreign claim used to be trusted outright here, on the reasoning that it
+                // "is another still-live guest process's real memory ... never a stale leftover
+                // safe to clobber". That is not true, and assuming it was is what made ld.so fail.
+                //
+                // Claims outlive their memory whenever a range is released by a path that does not
+                // reach the release hook, so the registry can assert ownership over address space
+                // Windows has already handed back. Ask Windows before believing it: if the range
+                // holds no reserved or committed memory at all, the claim describes something that
+                // no longer exists, and relocating away from it turns a perfectly good MAP_FIXED
+                // into an `EEXIST` (`do_mmap` rightly refuses a fixed mapping that moved), which
+                // surfaces as `libc.so.6: failed to map segment from shared object` and kills every
+                // process that tries to start.
+                //
+                // A genuinely live collision -- two `ET_EXEC` binaries sharing a link-time base
+                // while both alive via nested `vfork()`, the case the original comment describes --
+                // still has real memory behind it and still relocates exactly as before.
+                if range_holds_real_memory(&suggested_range) {
+                    base_addr = core::ptr::null_mut();
+                } else {
+                    purge_stale_claims(&suggested_range);
+                }
             } else {
                 let diag_requested_start = suggested_range.start;
                 process_memory_range_by_regions(
@@ -7287,11 +7406,21 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         Ok(UserMutPtr::from_ptr(ptr.cast::<u8>()))
     }
 
+    fn release_mapping_claim(&self, range: core::ops::Range<usize>) {
+        // See `unclaim_range` for why a claim outliving its memory is fatal rather than untidy.
+        unclaim_range(range);
+    }
+
     unsafe fn deallocate_pages(
         &self,
         range: core::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
         debug_assert_alignment!(range, ALIGN);
+        // NOTE: the claim release does NOT live here. `deallocate_pages` is not reached for every
+        // guest unmap (a subrange overlapping a shared view deliberately skips it, since a view
+        // can only be unmapped whole), so releasing here left exactly those ranges claimed
+        // forever. It now hangs off `release_mapping_claim`, which `Vmem::remove_mapping` calls
+        // unconditionally.
         // Hold `ALLOCATE_PAGES_FIXED_ADDR_LOCK` across this entire query-then-decommit walk, for
         // the same reason `allocate_pages`'s fixed-address path holds it (see that call site's own
         // doc comment): `process_memory_range_by_regions`'s `VirtualQuery`-then-act loop has no

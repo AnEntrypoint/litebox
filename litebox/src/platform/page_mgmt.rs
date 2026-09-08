@@ -72,6 +72,20 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// # Safety
     ///
     /// The caller must ensure that these pages are not in active use.
+    /// Notification that the guest's mapping over `range` has been removed, whether or not that
+    /// removal also required a real platform-level deallocation.
+    ///
+    /// Distinct from `deallocate_pages` on purpose. A platform may keep bookkeeping keyed by guest
+    /// address (the Windows backend keeps a claim registry used to detect one guest process's fixed
+    /// mapping colliding with another's), and that bookkeeping must be dropped whenever the guest
+    /// stops owning the address -- including on the paths that deliberately do NOT deallocate, such
+    /// as removing a subrange that overlaps a shared view, where the view must stay mapped as a
+    /// whole. Hanging the release off `deallocate_pages` alone left exactly those ranges claimed
+    /// forever.
+    ///
+    /// Default implementation does nothing, so platforms with no such bookkeeping are unaffected.
+    fn release_mapping_claim(&self, _range: core::ops::Range<usize>) {}
+
     unsafe fn deallocate_pages(&self, range: Range<usize>) -> Result<(), DeallocationError>;
 
     /// Remap pages from `old_range` to `new_range`.

@@ -1008,6 +1008,13 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     .map_err(VmemUnmapError::UnmapError)?;
             }
         }
+        // Unconditional, and deliberately NOT hung off `deallocate_pages` above: this is the one
+        // point every guest unmap converges on, including the shared-overlap branch that skips
+        // the platform deallocation entirely because a shared view can only be unmapped whole.
+        // Any platform bookkeeping keyed by guest address has to be dropped on ALL of those
+        // paths -- see `release_mapping_claim`. Placed before `self.vmas.remove` only so the
+        // range is still owned here; the order is otherwise immaterial.
+        self.platform.release_mapping_claim(range.clone());
         self.vmas.remove(range);
         Ok(())
     }

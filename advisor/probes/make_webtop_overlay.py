@@ -155,8 +155,15 @@ if [ "$STAGE" -ge 4 ]; then
   # Running the daemon directly makes the address an observable value rather than an implicit
   # side effect: if the bus never comes up, `DBUS_ADDR` is empty and this says so, and if it does,
   # every later failure is unambiguously mate-session's own.
-  # NOT `--fork`. The daemon is backgrounded by the shell instead, so dbus-daemon itself never
-  # forks and its listening socket stays in the process that created it.
+  # `--nofork`, stated explicitly rather than merely omitting `--fork`. The daemon is
+  # backgrounded by the shell instead, so dbus-daemon itself never forks and its listening
+  # socket stays in the process that created it.
+  #
+  # Omitting `--fork` is NOT sufficient: whether dbus-daemon daemonizes is decided by its
+  # configuration, and on debian-xfce it forks by default -- which silently reproduced the
+  # exact bug this whole block exists to avoid (no address printed, no log file created at
+  # all, and a session that then came up with no bus). Only `--nofork` makes the requirement
+  # a property of the command rather than of whichever image's session.conf is in play.
   #
   # With `--fork`, mate-session hung with a completely diagnostic syscall tail: socket(AF_UNIX),
   # connect() to the bus path, sendto(1 byte) -- D-Bus's mandatory leading NUL -- sendto(18
@@ -169,21 +176,50 @@ if [ "$STAGE" -ge 4 ]; then
   # works.) Backgrounding from the shell puts the socket in the post-exec process, where it stays.
   echo "[stack] starting session dbus-daemon"
   rm -f /tmp/dbus-addr.txt
-  /usr/bin/dbus-daemon --session --print-address > /tmp/dbus-addr.txt 2>/tmp/dbusd.log &
+  # Explicit stdin from a regular file, because `cmd &` in a non-interactive shell makes
+  # dash open /dev/null for the child's stdin -- and when that open fails the job never
+  # starts at all. That is exactly what happened here: `cannot open /dev/null: No such
+  # file` appeared on this line, no redirect target was ever created, and the script
+  # reported DBUS_FAILED for a daemon that had never been launched. Every other /dev/null
+  # use in the same run succeeded, so the open failure is transient, not a missing device.
+  : > /tmp/emptyin
+  /usr/bin/dbus-daemon --session --nofork --print-address < /tmp/emptyin > /tmp/dbus-addr.txt 2>/tmp/dbusd.log &
   # The address is written as soon as the listener is up; poll briefly rather than sleeping a
   # fixed span, so a fast start is not paid for and a slow one is not truncated.
   i=0
-  while [ "$i" -lt 30 ]; do
+  while [ "$i" -lt 20 ]; do
     [ -s /tmp/dbus-addr.txt ] && break
     i=$((i + 1))
     sleep 1
   done
-  DBUS_ADDR=$(cat /tmp/dbus-addr.txt 2>/dev/null)
+  # Read with the shell builtin, not `$(cat ... 2>/dev/null)`.
+  #
+  # That substitution reported DBUS_FAILED for a bus that had actually started: it needs a
+  # subprocess AND `/dev/null`, and a single transient `cannot open /dev/null: No such file`
+  # (seen once, right at this line, while every other /dev/null use in the run succeeded)
+  # emptied the variable. `read` needs neither, so the check now reflects whether dbus
+  # published an address rather than whether an unrelated open happened to succeed.
+  DBUS_ADDR=""
+  [ -s /tmp/dbus-addr.txt ] && read -r DBUS_ADDR < /tmp/dbus-addr.txt
   if [ -z "$DBUS_ADDR" ]; then
     echo "[stack] DBUS_FAILED -- dbusd.log follows"; cat /tmp/dbusd.log 2>&1
   else
     echo "[stack] DBUS_UP addr=$DBUS_ADDR"
     export DBUS_SESSION_BUS_ADDRESS="$DBUS_ADDR"
+  fi
+
+  # Seed the desktop's own default configuration, exactly as the image's `/defaults/startwm.sh`
+  # does before it launches the session. Skipping it is not harmless: xfce4-session reads its
+  # per-channel xfconf XML from here, and with the directory absent it comes up with no panel
+  # layout, no window-manager settings and no desktop configuration at all -- a failure that
+  # looks like "XFCE started but nothing appeared" rather than like a missing config.
+  #
+  # Guarded on the source existing so this stays a no-op for desktops that ship no such
+  # defaults (MATE, here), keeping one launcher correct for both.
+  if [ -d /defaults/xfce ] && [ ! -d "$HOME/.config/xfce4/xfconf/xfce-perchannel-xml" ]; then
+    mkdir -p "$HOME/.config/xfce4/xfconf/xfce-perchannel-xml"
+    cp /defaults/xfce/* "$HOME/.config/xfce4/xfconf/xfce-perchannel-xml/" 2>/dev/null
+    echo "[stack] seeded xfconf defaults"
   fi
 
   echo "[stack] starting desktop: $DESKTOP_CMD"
@@ -198,7 +234,7 @@ if [ "$STAGE" -ge 4 ]; then
   # never reached the file) and no way to choose between them. The `[stack]` echoes around it
   # demonstrably reach the console, so routing mate-session the same way removes the file as a
   # variable: anything it writes now lands where output is already proven to arrive.
-  $DESKTOP_CMD 2>&1 | sed "s/^/[de] /" &
+  $DESKTOP_CMD < /tmp/emptyin 2>&1 | sed "s/^/[de] /" &
   DE_PID=$!
   sleep 40
   if kill -0 "$DE_PID" 2>/dev/null; then
