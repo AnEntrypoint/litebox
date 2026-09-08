@@ -3186,6 +3186,10 @@ pub enum PrctlArg {
     GetNoNewPrivs,
     /// `PR_SET_PDEATHSIG`: request a signal when the parent dies. Accepted, not delivered.
     SetPDeathSig(i32),
+    /// `PR_SET_DUMPABLE`: whether this process may be core-dumped and ptrace-attached.
+    SetDumpable(usize),
+    /// `PR_GET_DUMPABLE`: read back what [`PrctlArg::SetDumpable`] last set.
+    GetDumpable,
 }
 
 #[repr(i32)]
@@ -3383,6 +3387,27 @@ pub enum SyscallRequest {
     },
     Close {
         fd: i32,
+    },
+    /// `close_range(first, last, flags)` -- close (or mark close-on-exec) every open descriptor in
+    /// an inclusive range. See `sys_close_range` for why implementing it matters beyond saving the
+    /// caller some syscalls.
+    CloseRange {
+        first: u32,
+        last: u32,
+        flags: u32,
+    },
+    /// `getresuid` -- real, effective and saved user ids, all three of which are the one identity
+    /// this shim models. See the dispatch site.
+    Getresuid {
+        ruid: UserPtrMut<u32>,
+        euid: UserPtrMut<u32>,
+        suid: UserPtrMut<u32>,
+    },
+    /// `getresgid` -- the group-id counterpart of [`SyscallRequest::Getresuid`].
+    Getresgid {
+        rgid: UserPtrMut<u32>,
+        egid: UserPtrMut<u32>,
+        sgid: UserPtrMut<u32>,
     },
     /// `posix_fadvise` -- an access-pattern hint. Accepted and ignored; see the dispatch site.
     Fadvise64,
@@ -4166,6 +4191,11 @@ impl SyscallRequest {
             Sysno::read => sys_req!(Read { fd, buf:*, count }),
             Sysno::write => sys_req!(Write { fd, buf:*, count }),
             Sysno::close => sys_req!(Close { fd }),
+            Sysno::close_range => SyscallRequest::CloseRange {
+                first: ctx.sys_req_arg::<u32>(0),
+                last: ctx.sys_req_arg::<u32>(1),
+                flags: ctx.sys_req_arg::<u32>(2),
+            },
             Sysno::lseek => sys_req!(Lseek { fd, offset, whence }),
             #[cfg(target_arch = "x86_64")]
             Sysno::stat => sys_req!(Stat { pathname:*, buf:* }),
@@ -4573,6 +4603,22 @@ impl SyscallRequest {
             Sysno::getpgrp => SyscallRequest::Getpgid { pid: 0 },
             Sysno::setpgid => sys_req!(Setpgid { pid, pgid }),
             Sysno::setsid => SyscallRequest::Setsid,
+            // `getresuid`/`getresgid` report the real, effective and saved ids together. Every one
+            // of the three is the same single identity this shim models (see `Getuid` below), so
+            // the answer is that identity written three times -- which is exactly what real Linux
+            // reports for a process that has never changed ids. `ENOSYS` here is not neutral:
+            // these are read during startup by gnupg's and polkit's privilege checks, and a
+            // caller that cannot determine its own ids generally refuses to continue.
+            Sysno::getresuid => SyscallRequest::Getresuid {
+                ruid: ctx.sys_req_ptr(0),
+                euid: ctx.sys_req_ptr(1),
+                suid: ctx.sys_req_ptr(2),
+            },
+            Sysno::getresgid => SyscallRequest::Getresgid {
+                rgid: ctx.sys_req_ptr(0),
+                egid: ctx.sys_req_ptr(1),
+                sgid: ctx.sys_req_ptr(2),
+            },
             Sysno::getuid => SyscallRequest::Getuid,
             Sysno::getgid => SyscallRequest::Getgid,
             Sysno::geteuid => SyscallRequest::Geteuid,
@@ -4643,6 +4689,17 @@ impl SyscallRequest {
                         },
                         PrctlOption::GetNoNewPrivs => SyscallRequest::Prctl {
                             args: PrctlArg::GetNoNewPrivs,
+                        },
+                        // `PR_SET_DUMPABLE`/`PR_GET_DUMPABLE` control whether a process may be
+                        // core-dumped and ptrace-attached. Both are read and written by ordinary
+                        // startup code (glibc clears it after a setuid exec; gnupg, systemd and
+                        // several session helpers set it deliberately), and a hard failure there
+                        // is a refusal where real Linux always succeeds.
+                        PrctlOption::SetDumpable => SyscallRequest::Prctl {
+                            args: PrctlArg::SetDumpable(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::GetDumpable => SyscallRequest::Prctl {
+                            args: PrctlArg::GetDumpable,
                         },
                         // `PR_SET_PDEATHSIG` asks for a signal when the PARENT dies. GLib's
                         // `g_spawn_*` sets it in the child between fork and exec, and treats a

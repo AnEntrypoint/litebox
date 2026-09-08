@@ -680,7 +680,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                     egid,
                 }
                 .into(),
-                comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
+                comm: [0; litebox_common_linux::TASK_COMM_LEN].into(),
+                dumpable: Cell::new(1),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(bootstrap_shared_pending),
@@ -843,6 +844,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 }
                 .into(),
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(),
+                dumpable: Cell::new(1),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(shared_pending),
@@ -1670,6 +1672,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 | SyscallRequest::ExitGroup { .. }
                 | SyscallRequest::Openat { .. }
                 | SyscallRequest::Close { .. }
+                | SyscallRequest::CloseRange { .. }
                 | SyscallRequest::Mkdirat { .. }
                 | SyscallRequest::Renameat { .. }
                 | SyscallRequest::Symlinkat { .. }
@@ -1755,6 +1758,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 None => Err(Errno::EFAULT),
             },
             SyscallRequest::Close { fd } => syscall!(sys_close(fd)),
+            SyscallRequest::CloseRange { first, last, flags } => {
+                syscall!(sys_close_range(first, last, flags))
+            }
             SyscallRequest::Fsync { fd } => syscall!(sys_fsync(fd)),
             SyscallRequest::Fdatasync { fd } => syscall!(sys_fdatasync(fd)),
             SyscallRequest::Lseek { fd, offset, whence } => {
@@ -2409,6 +2415,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(0)
             }
             SyscallRequest::Setsid => Ok(self.sys_setsid()?.reinterpret_as_unsigned() as usize),
+            SyscallRequest::Getresuid { ruid, euid, suid } => {
+                syscall!(sys_getresuid(ruid, euid, suid))
+            }
+            SyscallRequest::Getresgid { rgid, egid, sgid } => {
+                syscall!(sys_getresgid(rgid, egid, sgid))
+            }
             SyscallRequest::Getuid => Ok(self.sys_getuid() as usize),
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
@@ -2716,6 +2728,16 @@ struct Task<Platform: ShimPlatform, FS: ShimFS> {
     credentials: Arc<syscalls::process::Credentials>,
     /// Command name (usually the executable name, excluding the path)
     comm: Cell<[u8; litebox_common_linux::TASK_COMM_LEN]>,
+    /// `PR_SET_DUMPABLE`/`PR_GET_DUMPABLE` state, per process.
+    ///
+    /// Tracked rather than refused because the pair is read-write and callers check what they set:
+    /// glibc clears it after a privileged exec, gnupg and several session helpers set it
+    /// deliberately, and a `prctl` that fails where real Linux always succeeds is a refusal they
+    /// have no reason to expect. It changes nothing observable here -- litebox has no core dumps
+    /// and no `ptrace` -- so honouring it means storing it faithfully and reading it back.
+    ///
+    /// `1` is Linux's own default (`SUID_DUMP_USER`).
+    dumpable: Cell<u32>,
     /// Filesystem state. `RefCell` to support `unshare` in the future.
     fs: RefCell<Arc<syscalls::file::FsState<Platform>>>,
     /// File descriptors. `RefCell` to support `unshare` in the future.
@@ -2775,6 +2797,7 @@ mod test_utils {
                     egid: 0,
                 }),
                 comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
+                dumpable: Cell::new(1),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(shared_pending),
@@ -2800,6 +2823,7 @@ mod test_utils {
                 tid,
                 credentials: self.credentials.clone(),
                 comm: self.comm.clone(),
+                dumpable: self.dumpable.clone(),
                 fs: self.fs.clone(),
                 files: self.files.clone(),
                 // Always a same-process thread clone -- see `self.thread.new_thread(tid)` above.
@@ -2844,6 +2868,7 @@ mod test_utils {
                 tid: pid,
                 credentials: self.credentials.clone(),
                 comm: self.comm.clone(),
+                dumpable: self.dumpable.clone(),
                 fs: self.fs.clone(),
                 files: self.files.clone(),
                 signals: self.signals.clone_for_new_task(Some(shared_pending)),

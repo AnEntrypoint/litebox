@@ -1072,6 +1072,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // tracks per-thread no_new_privs state (see SetNoNewPrivs above), and sandboxing
             // tools only use this to confirm the bit stuck, so reporting 1 unconditionally is
             // consistent with SetNoNewPrivs always succeeding.
+            PrctlArg::SetDumpable(value) => {
+                // Linux accepts only `SUID_DUMP_DISABLE` (0) and `SUID_DUMP_USER` (1) from
+                // userspace; `SUID_DUMP_ROOT` (2) is kernel-internal and `EINVAL` here.
+                let Ok(value) = u32::try_from(value) else {
+                    return Err(Errno::EINVAL);
+                };
+                if value > 1 {
+                    return Err(Errno::EINVAL);
+                }
+                self.dumpable.set(value);
+                Ok(0)
+            }
+            PrctlArg::GetDumpable => Ok(self.dumpable.get() as usize),
             PrctlArg::GetNoNewPrivs => Ok(1),
             // Accepted so `g_spawn`'s child does not abort the whole spawn; the signal itself is
             // never delivered (a guest child cannot outlive the runner, so nothing is orphaned).
@@ -3976,6 +3989,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         ppid,
                         credentials: self.credentials.clone(),
                         comm: self.comm.clone(),
+                        // A child inherits `PR_SET_DUMPABLE`, as on real Linux.
+                        dumpable: self.dumpable.clone(),
                         fs: fs.into(),
                         files: make_files().into(),
                         signals: self.signals.clone_for_new_task(child_shared_pending),
@@ -4727,6 +4742,49 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `getuid`.
     pub(crate) fn sys_getuid(&self) -> u32 {
         self.credentials.uid
+    }
+
+    /// Handle syscall `getresuid`.
+    ///
+    /// Real Linux reports the real, effective and saved user ids. This shim models one real and one
+    /// effective id (`Credentials`) and no saved id, so the saved id is reported as the effective
+    /// one -- which is what a real kernel reports for any process that has not performed a
+    /// set-user-ID transition away from it, and is the honest answer here rather than inventing a
+    /// third value.
+    pub(crate) fn sys_getresuid(
+        &self,
+        ruid: UserPtrMut<u32>,
+        euid: UserPtrMut<u32>,
+        suid: UserPtrMut<u32>,
+    ) -> Result<usize, Errno> {
+        let effective = self.credentials.euid;
+        for (ptr, value) in [
+            (ruid, self.credentials.uid),
+            (euid, effective),
+            (suid, effective),
+        ] {
+            ptr.write_at_offset::<Platform>(0, value).ok_or(Errno::EFAULT)?;
+        }
+        Ok(0)
+    }
+
+    /// Handle syscall `getresgid`. See [`Self::sys_getresuid`] for why the saved id mirrors the
+    /// effective one.
+    pub(crate) fn sys_getresgid(
+        &self,
+        rgid: UserPtrMut<u32>,
+        egid: UserPtrMut<u32>,
+        sgid: UserPtrMut<u32>,
+    ) -> Result<usize, Errno> {
+        let effective = self.credentials.egid;
+        for (ptr, value) in [
+            (rgid, self.credentials.gid),
+            (egid, effective),
+            (sgid, effective),
+        ] {
+            ptr.write_at_offset::<Platform>(0, value).ok_or(Errno::EFAULT)?;
+        }
+        Ok(0)
     }
 
     /// Handle syscall `geteuid`.
@@ -5861,6 +5919,72 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
 #[cfg(test)]
 mod tests {
+    /// `getresuid`/`getresgid` report three ids, and a caller that reads them is usually deciding
+    /// whether it is privileged -- so reporting `ENOSYS` makes it refuse to continue rather than
+    /// degrade. These were unimplemented and observed being called by a real session.
+    #[test]
+    fn getresuid_and_getresgid_report_the_process_identity() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        let uid = task.sys_getuid();
+        let euid = task.sys_geteuid();
+        let gid = task.sys_getgid();
+        let egid = task.sys_getegid();
+
+        let mut r = 0u32;
+        let mut e = 0u32;
+        let mut sv = 0u32;
+        task.sys_getresuid(
+            UserPtrMut::from_ptr(&raw mut r),
+            UserPtrMut::from_ptr(&raw mut e),
+            UserPtrMut::from_ptr(&raw mut sv),
+        )
+        .unwrap();
+        let slots = [r, e, sv];
+        assert_eq!(slots[0], uid, "real uid");
+        assert_eq!(slots[1], euid, "effective uid");
+        // No saved id is modelled, so it mirrors the effective one -- what a real kernel reports
+        // for a process that never performed a set-user-ID transition.
+        assert_eq!(slots[2], euid, "saved uid");
+
+        let mut r = 0u32;
+        let mut e = 0u32;
+        let mut sv = 0u32;
+        task.sys_getresgid(
+            UserPtrMut::from_ptr(&raw mut r),
+            UserPtrMut::from_ptr(&raw mut e),
+            UserPtrMut::from_ptr(&raw mut sv),
+        )
+        .unwrap();
+        let slots = [r, e, sv];
+        assert_eq!(slots[0], gid, "real gid");
+        assert_eq!(slots[1], egid, "effective gid");
+        assert_eq!(slots[2], egid, "saved gid");
+    }
+
+    /// `PR_SET_DUMPABLE` must round-trip through `PR_GET_DUMPABLE`: callers set it and check it.
+    #[test]
+    fn prctl_dumpable_round_trips_and_rejects_out_of_range() {
+        use litebox_common_linux::PrctlArg;
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Linux's own default for a process that has not changed it.
+        assert_eq!(task.sys_prctl(PrctlArg::GetDumpable).unwrap(), 1);
+
+        task.sys_prctl(PrctlArg::SetDumpable(0)).unwrap();
+        assert_eq!(task.sys_prctl(PrctlArg::GetDumpable).unwrap(), 0);
+        task.sys_prctl(PrctlArg::SetDumpable(1)).unwrap();
+        assert_eq!(task.sys_prctl(PrctlArg::GetDumpable).unwrap(), 1);
+
+        // `SUID_DUMP_ROOT` (2) is kernel-internal; userspace may not set it.
+        assert_eq!(
+            task.sys_prctl(PrctlArg::SetDumpable(2)).unwrap_err(),
+            Errno::EINVAL
+        );
+        // ...and the value it already had must survive the rejected call.
+        assert_eq!(task.sys_prctl(PrctlArg::GetDumpable).unwrap(), 1);
+    }
+
     use crate::{UserPtr, UserPtrMut};
     use litebox_common_linux::errno::Errno;
 

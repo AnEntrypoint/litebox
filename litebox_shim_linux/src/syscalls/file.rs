@@ -2345,6 +2345,106 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     /// Handle syscall `close`
+    /// Handle syscall `close_range`
+    ///
+    /// Closes every open descriptor in `first..=last`, or -- with `CLOSE_RANGE_CLOEXEC` -- marks
+    /// them close-on-exec instead of closing them.
+    ///
+    /// # Why this is worth implementing rather than refusing
+    ///
+    /// It is not a convenience. `close_range` is how modern libc closes inherited descriptors
+    /// before `exec`, and when it is missing CPython (and glibc, and Go) fall back to listing
+    /// `/proc/self/fd` -- which this shim also does not serve as a directory -- and from there to
+    /// brute-forcing every integer up to `RLIMIT_NOFILE`. A live XFCE session was observed asking
+    /// for `/proc/self/fd` 282 times in one boot for exactly this reason, once per process spawn.
+    ///
+    /// Returning `ENOSYS` is also the wrong kind of answer for a caller that cannot proceed
+    /// without closing its descriptors: it is the difference between "this is slow" and "this
+    /// child inherits fds it must not have".
+    ///
+    /// A descriptor in the range that is not open is not an error, per Linux.
+    pub(crate) fn sys_close_range(&self, first: u32, last: u32, flags: u32) -> Result<(), Errno> {
+        /// `CLOSE_RANGE_UNSHARE` -- unshare the descriptor table from any `CLONE_FILES` sharer
+        /// before acting.
+        const CLOSE_RANGE_UNSHARE: u32 = 1 << 1;
+        /// `CLOSE_RANGE_CLOEXEC` -- set close-on-exec rather than closing.
+        const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
+
+        if first > last {
+            return Err(Errno::EINVAL);
+        }
+        if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        // `CLOSE_RANGE_UNSHARE` only has meaning for a descriptor table shared via `CLONE_FILES`.
+        // Accepted and ignored rather than refused: the request is "do not let my sharer see
+        // this", and for a caller that has no sharer that is already true. Refusing would break
+        // the common `CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC` pairing that libcs use by
+        // default, over a flag that asks for nothing here.
+        let _ = CLOSE_RANGE_UNSHARE;
+
+        // Snapshot the alive fds first. Closing walks the same store this iterates, and the range
+        // is an inclusive `u32` range that can legitimately be `0..=u32::MAX` (the idiom for
+        // "close everything above my stdio"), so iterating the RANGE rather than the open
+        // descriptors would mean four billion lookups per spawn.
+        let targets: alloc::vec::Vec<usize> = {
+            let files = self.files.borrow();
+            let store = files.raw_descriptor_store.read();
+            store
+                .iter_alive()
+                .filter(|raw| {
+                    u32::try_from(*raw).is_ok_and(|raw| raw >= first && raw <= last)
+                })
+                .collect()
+        };
+
+        for raw_fd in targets {
+            let Ok(fd) = i32::try_from(raw_fd) else {
+                continue;
+            };
+            if flags & CLOSE_RANGE_CLOEXEC != 0 {
+                // Same descriptor-table flag `ioctl(FIOCLEX)` and `fcntl(F_SETFD)` set, applied the
+                // same way for every fd type.
+                let files = self.files.borrow();
+                let _ = files.run_on_raw_fd(
+                    raw_fd,
+                    |fd| self.set_cloexec_on(fd),
+                    |fd| self.set_cloexec_on(fd),
+                    |fd| self.set_cloexec_on(fd),
+                    |fd| self.set_cloexec_on(fd),
+                    |fd| self.set_cloexec_on(fd),
+                    |fd| self.set_cloexec_on(fd),
+                    |fd| self.set_cloexec_on(fd),
+                    |fd| self.set_cloexec_on(fd),
+                    |fd| self.set_cloexec_on(fd),
+                    |fd| self.set_cloexec_on(fd),
+                );
+            } else {
+                // A close that fails (e.g. the fd was closed concurrently) is not a failure of
+                // `close_range` -- Linux reports success as long as the range is valid.
+                let _ = self.sys_close(fd);
+            }
+        }
+        Ok(())
+    }
+
+    /// Set `FD_CLOEXEC` on one descriptor, whatever subsystem it belongs to.
+    ///
+    /// Close-on-exec is a property of the descriptor table entry, not of the file behind it, so
+    /// this is identical for every fd type -- which is why it is written once here instead of ten
+    /// times at each `run_on_raw_fd` arm that needs it.
+    fn set_cloexec_on<S: litebox::fd::FdEnabledSubsystem>(
+        &self,
+        fd: &litebox::fd::TypedFd<S>,
+    ) {
+        let _old = self
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+    }
+
     pub(crate) fn sys_close(&self, fd: i32) -> Result<(), Errno> {
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
@@ -7417,6 +7517,89 @@ mod tests {
         assert_eq!(
             flags & litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC.bits(),
             litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC.bits()
+        );
+    }
+
+    #[test]
+    fn close_range_closes_everything_in_range_and_spares_everything_outside() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let (a, b) = task.sys_pipe2(OFlags::empty()).unwrap();
+        let (c, d) = task.sys_pipe2(OFlags::empty()).unwrap();
+        let (a, b, c, d) = (
+            i32::try_from(a).unwrap(),
+            i32::try_from(b).unwrap(),
+            i32::try_from(c).unwrap(),
+            i32::try_from(d).unwrap(),
+        );
+        // The four pipe ends are consecutive above stdio; close the middle two only, so the test
+        // distinguishes "closed the range" from "closed everything".
+        let (low, high) = (b.min(c), b.max(c));
+
+        task.sys_close_range(
+            u32::try_from(low).unwrap(),
+            u32::try_from(high).unwrap(),
+            0,
+        )
+        .expect("close_range over open fds must succeed");
+
+        for fd in [low, high] {
+            assert_eq!(
+                task.sys_fcntl(fd, FcntlArg::GETFD).unwrap_err(),
+                Errno::EBADF,
+                "fd {fd} was in the range and must be closed"
+            );
+        }
+        for fd in [a, d] {
+            if fd < low || fd > high {
+                task.sys_fcntl(fd, FcntlArg::GETFD)
+                    .unwrap_or_else(|e| panic!("fd {fd} was outside the range: {e:?}"));
+            }
+        }
+
+        // Re-closing an already-closed range is success, not `EBADF`: a descriptor in the range
+        // that is not open is explicitly not an error on Linux, and the whole point of the
+        // `0..=u32::MAX` idiom is that almost nothing in the range is open.
+        task.sys_close_range(
+            u32::try_from(low).unwrap(),
+            u32::try_from(high).unwrap(),
+            0,
+        )
+        .expect("a range with nothing open in it must still succeed");
+    }
+
+    #[test]
+    fn close_range_cloexec_marks_instead_of_closing() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let (reader, writer) = task.sys_pipe2(OFlags::empty()).unwrap();
+        let (reader, writer) = (
+            i32::try_from(reader).unwrap(),
+            i32::try_from(writer).unwrap(),
+        );
+        // `CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC`, which is the pairing libcs actually pass --
+        // `UNSHARE` must be accepted rather than rejected as an unknown flag.
+        task.sys_close_range(
+            u32::try_from(reader.min(writer)).unwrap(),
+            u32::try_from(reader.max(writer)).unwrap(),
+            (1 << 1) | (1 << 2),
+        )
+        .expect("CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC must be accepted");
+
+        let cloexec = litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC.bits();
+        for fd in [reader, writer] {
+            let flags = task
+                .sys_fcntl(fd, FcntlArg::GETFD)
+                .unwrap_or_else(|e| panic!("fd {fd} must still be OPEN, not closed: {e:?}"));
+            assert_eq!(flags & cloexec, cloexec, "fd {fd} must be close-on-exec");
+        }
+    }
+
+    #[test]
+    fn close_range_rejects_an_inverted_range_and_unknown_flags() {
+        let task = crate::syscalls::tests::init_platform(None);
+        assert_eq!(task.sys_close_range(9, 3, 0).unwrap_err(), Errno::EINVAL);
+        assert_eq!(
+            task.sys_close_range(3, 9, 1 << 7).unwrap_err(),
+            Errno::EINVAL
         );
     }
 
