@@ -1195,3 +1195,40 @@ in-memory pipes to real handles, which is exactly what the stdio forwarders alre
 
 Only the `SenderHalf` direction is needed for command substitution, so (3) can land write-ends
 first and be verified against `/init` before the read-end mirror is added.
+
+#### Attempted, and the constraints the attempt found
+
+The plan above was implemented far enough to hit the encapsulation boundaries, then reverted. Three
+constraints it discovered, none of which are visible from the design sketch and all of which change
+the shape of the work:
+
+1. **`PipeFd` is move-only on purpose.** It is not `Copy` and not `Clone` -- `syscalls/pipe.rs`
+   states it "does not release the pipe on `Drop`; ends must either be inserted or closed", so the
+   type enforces single ownership. A pump thread therefore cannot simply hold a copy taken out of
+   the fd table (`error[E0507]: cannot move out of *pipe_fd which is behind a shared reference`).
+
+2. **The pipe ends' `Arc`s are private.** `PipeEnd { Receiver(Arc<ReadEnd>), Sender(Arc<WriteEnd>) }`
+   is a private enum in `litebox/src/pipes.rs`, and the only accessor that reaches inside it,
+   `with_iopollable`, yields `&dyn IOPollable` -- pollable, not writable. Every read/write path
+   (`Pipes::read`/`Pipes::write`) is keyed by a live `PipeFd`.
+
+3. **Which is fatal for the case that matters**, because a shell doing command substitution CLOSES
+   its own copy of the write end immediately after forking -- that is what lets the reader see EOF.
+   So by the time the child is running, no descriptor for that write end exists in the parent at
+   all, and a descriptor-keyed pump has nothing to write through. Keeping the parent's fd open
+   instead is not a fix: the reader would then never see EOF and the shell would hang forever.
+
+So the plan needs a fifth piece, in the core crate rather than the shim: a detached pipe-end handle
+-- something like `Pipes::detach_end(&PipeFd) -> DetachedPipeEnd` holding the `Arc<WriteEnd>` /
+`Arc<ReadEnd>` with `read`/`write`/`close` on it -- so a host pump can outlive the descriptor and
+can drop the end explicitly to signal EOF when the child exits. That is a deliberate widening of a
+core API's contract (pipe lifetime currently follows descriptors, exclusively), which is a design
+decision about `litebox::pipes` and not a mechanical addition to the fork path.
+
+Everything else in the plan survives intact and was confirmed to exist:
+`WaitState::new(&'static Platform)` is public so a pump thread can build its own `WaitContext`;
+`GlobalState::{read,write}_linux_pipe` are the pumping primitives; `create_linux_pipe` +
+`insert_raw_fd` + `sys_dup`'s exact-fd form place a fresh pipe at a chosen fd in the child;
+`half_pipe_type` classifies direction; and `LinuxShim` is `Arc`-backed and `Clone` so pump threads
+can hold it, while `LinuxShimEntrypoints` is deliberately `!Send` so the child-side install must
+run on the child's own guest thread.
