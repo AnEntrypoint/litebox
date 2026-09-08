@@ -2468,11 +2468,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // a cross-process child cannot carry anything past the 0/1/2 stdio slots `CreateProcessW`
         // hands it automatically. `LITEBOX_PROCESS_FORK_IGNORE_FDS=1` overrides this for
         // measurement only, accepting that the child loses those fds.
+        litebox_util_log::debug!(tid:% = self.tid; "clone: try_cross_process_fork entry");
+        // `try_borrow`, not `borrow`: a panic here would unwind, and unwinding in this process
+        // has been observed to crash inside `ntdll!RtlpUnwindPrologue` WITHOUT the panic message
+        // ever reaching stderr -- so a borrow conflict would present as an unexplained fault with
+        // no diagnostic at all. Falling back to the thread-based fork is always safe.
+        let Ok(files) = self.files.try_borrow() else {
+            litebox_util_log::debug!(
+                tid:% = self.tid;
+                "clone: cross-process fork() skipped -- fd table already borrowed"
+            );
+            return None;
+        };
         let beyond_stdio = {
-            let files = self.files.borrow();
             let raw_descriptors = files.raw_descriptor_store.read();
             raw_descriptors.iter_alive().filter(|&raw| raw >= 3).count()
         };
+        drop(files);
         if beyond_stdio != 0
             && !self
                 .global
@@ -2573,6 +2585,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 _ => groups.push(start..end),
             }
         }
+        let total_bytes: usize = groups.iter().map(core::ops::Range::len).sum();
+        litebox_util_log::debug!(
+            tid:% = self.tid,
+            regions:% = layout.len(),
+            groups:% = groups.len(),
+            total_bytes:% = total_bytes,
+            first:% = groups.first().map_or(0, |g| g.start),
+            last_end:% = groups.last().map_or(0, |g| g.end),
+            heap_top:% = heap_top;
+            "clone: cross-process fork() copy plan"
+        );
         let group_relocations: alloc::vec::Vec<(core::ops::Range<usize>, usize)> = groups
             .into_iter()
             .map(|g| {

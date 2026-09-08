@@ -1036,3 +1036,36 @@ default path re-verified clean (3/3 `A B C`, 0 AVs) after each.
 never appears and the parent does not reach `echo C`. The failure has moved (it now happens before
 `do_clone` logs anything) and remains non-deterministic across identical runs. `/init` does not
 boot. The path is opt-in and off by default, so none of this reaches ordinary use.
+
+### Why the cross-process copy cannot work as written: it races litebox's own demand-commit
+
+Traced to the exact operation, by instrumenting `copy_one_group` page by page on the ten-second
+repro against a deliberately tiny rootfs (`docker.io/library/alpine:latest`, 8.8 MB, so the copy
+plan is 84 MB rather than 1.5 GB and the walk is quick):
+
+    [process_fork] spawn_process_fork_child: CreateProcessW returned ok=true
+    [process_fork] copying group 0x10040000..0x10110000
+    [process_fork_trace] reserve done ptr=0x10040000
+    ... 397 successful page read/write traces ...
+    [process_fork_trace] page 0x10106000 read q=48 State=0x2000 Protect=0x0 Type=0x20000
+                                              Size=0xa000        <- MEM_RESERVE, not MEM_COMMIT
+
+`0x10106000` is the address that had appeared in every unexplained crash all session. It is
+RESERVED but NOT COMMITTED, because litebox commits guest memory ON DEMAND -- that is what all the
+`[diag-commit] VirtualAlloc2(MEM_COMMIT) over reserved range` lines in any debug log are.
+
+That is the real defect, and it is structural rather than a missing null check. `fork()` must
+snapshot the parent's address space ATOMICALLY. The cross-process path instead walks that address
+space page by page from the forking thread while **the parent's other guest threads keep running
+and keep demand-committing pages underneath it**. The copy is racing the VEH that materialises
+those pages. It explains everything that made this so hard to pin down: the faulting address was
+always `0x10106000`, but the crash site, the AV count, and the exit code differed on every
+otherwise-identical run -- the hallmark of a race, not of a wrong constant.
+
+So the remaining work is not another bug fix in the copy loop. Either the guest must be frozen for
+the duration of the snapshot (litebox already has the machinery -- `ThreadHandle::interrupt` and
+`ctxwatch_arm_other_threads` suspend every other guest thread, with the hard-won constraint that
+NOTHING inside that window may allocate or take a lock the suspended threads could hold, see
+`diag_interrupt_enabled`), or the child must fault its own pages in from the parent on demand
+rather than being handed an eager copy. Both are real designs; neither is a small change, and
+picking one should be a deliberate decision rather than the next thing tried.
