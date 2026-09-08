@@ -2441,6 +2441,179 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         clippy::similar_names,
         reason = "pid/ppid is standard Unix terminology"
     )]
+    /// Try to satisfy this `fork()` with a child in a genuinely separate Windows process, which
+    /// therefore gets its own address space. Returns the child's handle on success, `None` to
+    /// fall through to the ordinary thread-based fork.
+    ///
+    /// Called BEFORE `pm.duplicate()`, and that ordering is the whole point. A cross-process
+    /// child runs at SOURCE coordinates in its own address space, so it has no use whatsoever for
+    /// an in-process duplicate -- and building one anyway was actively harmful. The duplicate was
+    /// created, moved into a child `ThreadState`, and then dropped when this path returned early;
+    /// that teardown corrupted the parent badly enough to produce 67 unrecoverable AVs and a
+    /// SIGSEGV on `sh -c 'echo A; (echo B); echo C'`, while simply leaking it instead took that to
+    /// zero. Deciding here removes the duplicate rather than trying to tear it down more
+    /// carefully, and saves a full eager address-space copy per fork on top.
+    ///
+    /// Everything this needs is available before duplication and none of it comes from one:
+    /// the register snapshot is the parent's own `ctx`, the FS base is the parent's own, and the
+    /// child's layout is the parent's own `tracked_regions()` -- which is exactly the shape
+    /// `PageManager::new_adopting_existing_memory` consumes on the child side. The relocation map
+    /// is the identity, because source and destination coordinates are the same here.
+    #[cfg(target_arch = "x86_64")]
+    fn try_cross_process_fork(
+        &self,
+        ctx: &litebox_common_linux::PtRegs,
+    ) -> Option<litebox::platform::CrossProcessChildHandle> {
+        // None of this shim's seven fd subsystems is backed by an inheritable Windows HANDLE, so
+        // a cross-process child cannot carry anything past the 0/1/2 stdio slots `CreateProcessW`
+        // hands it automatically. `LITEBOX_PROCESS_FORK_IGNORE_FDS=1` overrides this for
+        // measurement only, accepting that the child loses those fds.
+        let beyond_stdio = {
+            let files = self.files.borrow();
+            let raw_descriptors = files.raw_descriptor_store.read();
+            raw_descriptors.iter_alive().filter(|&raw| raw >= 3).count()
+        };
+        if beyond_stdio != 0
+            && !self
+                .global
+                .platform
+                .env_flag("LITEBOX_PROCESS_FORK_IGNORE_FDS")
+        {
+            litebox_util_log::debug!(
+                tid:% = self.tid, beyond_stdio:% = beyond_stdio;
+                "clone: cross-process fork() not eligible -- guest holds fd(s) at or above 3"
+            );
+            return None;
+        }
+
+        let parent_fs_base = self
+            .global
+            .platform
+            .get_arch_specific_register(&ArchSpecificRegister::FsBase)
+            .ok()?;
+        if !litebox_common_linux::arch::is_valid_user_fs_base(parent_fs_base)
+            || parent_fs_base >= Platform::TASK_ADDR_MAX
+        {
+            return None;
+        }
+
+        let mut source_ctx = ctx.clone();
+        if !source_ctx.sanitize_for_user_return() {
+            return None;
+        }
+        let full_gprs = litebox::platform::ForkFullGprSnapshot {
+            r15: source_ctx.r15,
+            r14: source_ctx.r14,
+            r13: source_ctx.r13,
+            r12: source_ctx.r12,
+            rbp: source_ctx.rbp,
+            rbx: source_ctx.rbx,
+            r11: source_ctx.r11,
+            r10: source_ctx.r10,
+            r9: source_ctx.r9,
+            r8: source_ctx.r8,
+            // fork()'s child-side return value, NOT `source_ctx.rax` -- at this point `ctx.rax`
+            // still holds `syscall_callback`'s pre-dispatch `-ENOSYS` placeholder, and a
+            // cross-process child never goes through `init_thread_context` to have it fixed up.
+            rax: 0,
+            rcx: source_ctx.rcx,
+            rdx: source_ctx.rdx,
+            rsi: source_ctx.rsi,
+            rdi: source_ctx.rdi,
+            orig_rax: source_ctx.orig_rax,
+            rip: source_ctx.rip,
+            cs: source_ctx.cs,
+            eflags: source_ctx.eflags,
+            rsp: source_ctx.rsp,
+            ss: source_ctx.ss,
+            fs_base: parent_fs_base,
+        };
+
+        // The identity relocation map over the parent's own live layout. `dest_base` is each
+        // range's own start: the child reserves at the parent's bases, so `translate()` is the
+        // identity and `fork_verify` in the child sees no spurious "stale pre-fork pointer".
+        let pm = self.process().pm();
+        let layout = pm.tracked_regions();
+        if layout.is_empty() {
+            return None;
+        }
+        // `.1` is the program break -- the same pair the child's own adoption compares against.
+        let heap_top = pm.tracked_region_summary().1;
+        let ranges: alloc::vec::Vec<(core::ops::Range<usize>, usize)> = layout
+            .iter()
+            .map(|(range, _, _)| (range.clone(), range.start))
+            .collect();
+
+        // The COPY groups are a different thing from the per-region layout above, and must be
+        // 64 KiB aligned. `copy_one_group` reserves each group in the child with
+        // `MEM_ADDRESS_REQUIREMENTS` pinning it to that exact base, and Windows rejects a
+        // reservation whose base is not allocation-granularity aligned with
+        // `ERROR_INVALID_PARAMETER` -- observed exactly that, `group copy FAILED
+        // group=0x10046000..0x100df000 GetLastError=87`, because `tracked_regions()` reports
+        // PAGE-aligned VMA bounds while `PageManager::duplicate`'s own reservation groups (which
+        // this path replaces) were always granule-aligned by construction.
+        //
+        // So: sort, widen each region out to its enclosing granule, and merge anything that then
+        // touches or overlaps. Widening can pull in padding that is not mapped, which is why
+        // `read_source_bytes` on the platform side reads a group page at a time and tolerates
+        // holes instead of assuming the whole span is readable.
+        const GRANULE: usize = 0x1_0000;
+        let mut sorted = layout.clone();
+        sorted.sort_by_key(|(range, _, _)| range.start);
+        let mut groups: alloc::vec::Vec<core::ops::Range<usize>> = alloc::vec::Vec::new();
+        for (range, _, _) in &sorted {
+            let start = range.start & !(GRANULE - 1);
+            let end = range.end.next_multiple_of(GRANULE);
+            match groups.last_mut() {
+                Some(last) if start <= last.end => {
+                    if end > last.end {
+                        last.end = end;
+                    }
+                }
+                _ => groups.push(start..end),
+            }
+        }
+        let group_relocations: alloc::vec::Vec<(core::ops::Range<usize>, usize)> = groups
+            .into_iter()
+            .map(|g| {
+                let base = g.start;
+                (g, base)
+            })
+            .collect();
+        let flags: alloc::vec::Vec<u32> = layout.iter().map(|(_, f, _)| *f).collect();
+        let is_file_backed: alloc::vec::Vec<bool> =
+            layout.iter().map(|(_, _, fb)| *fb).collect();
+        let executable: alloc::vec::Vec<bool> = layout
+            .iter()
+            .map(|(_, f, _)| f & litebox::mm::linux::VmFlags::VM_EXEC.bits() != 0)
+            .collect();
+        // `private_data` drives a `fork_verify` heuristic about which ranges may hold allocator
+        // metadata. Reporting none is the conservative answer: it never claims a range IS
+        // private data, it only forgoes the extra scrutiny that flag would request.
+        let private_data = alloc::vec![false; layout.len()];
+        let relocations = litebox::mm::AddressRelocations::from_raw_parts_for_diagnostic(
+            ranges,
+            executable,
+            private_data,
+            is_file_backed,
+            heap_top,
+            group_relocations,
+            flags,
+        );
+
+        self.global
+            .platform
+            .spawn_cross_process_fork_child(&relocations, full_gprs)
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn try_cross_process_fork(
+        &self,
+        _ctx: &litebox_common_linux::PtRegs,
+    ) -> Option<litebox::platform::CrossProcessChildHandle> {
+        None
+    }
+
     fn do_clone(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -2682,6 +2855,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // no-op below (an empty `AddressRelocations`, `translate()` returns `None`
             // everywhere): no addresses moved, because nothing was duplicated.
             let vforked = flags.contains(CloneFlags::VFORK);
+
+            // Cross-process fork(), decided BEFORE any duplication -- see
+            // `try_cross_process_fork`'s doc comment for why the ordering is the whole point.
+            //
+            // Never for a vfork: a `CLONE_VFORK` child deliberately SHARES the parent's
+            // `PageManager` for the window until its own `execve`/`_exit`, which is both correct
+            // Linux semantics and already litebox's own answer to the fixed-address collision the
+            // cross-process path exists to solve. It has nothing to hand a separate address space.
+            if !vforked
+                && let Some(handle) = self.try_cross_process_fork(ctx)
+            {
+                self.process().register_cross_process_child(child_tid, handle);
+                litebox_util_log::debug!(
+                    parent_tid:% = self.tid, child_tid:% = child_tid;
+                    "clone: spawned cross-process fork() child (no in-process duplicate made)"
+                );
+                return Ok(usize::try_from(child_tid).unwrap());
+            }
+
             let (dest_pm, relocations) = if vforked {
                 (
                     self.process().pm(),

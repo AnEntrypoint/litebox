@@ -9016,13 +9016,43 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         // Read each group's real, live bytes out of THIS (the parent) process -- same primitive
         // `Vmem::duplicate` itself uses (`RawConstPointer::to_owned_slice`), just invoked here
         // for a diagnostic side channel rather than the real duplication path.
+        // Read a copy group PAGE AT A TIME, tolerating pages that are not mapped.
+        //
+        // A copy group is a 64 KiB-granule-aligned span covering one or more guest regions (see
+        // the group construction in `do_clone`'s `try_cross_process_fork`), so by construction it
+        // can include padding that no guest mapping covers -- and it can also span a guard gap or
+        // a range the guest `munmap`ed between two regions it does cover. The previous
+        // whole-range `to_owned_slice(range.len())` assumed every byte was readable and faulted in
+        // the PARENT, mid-fork, before the child was ever resumed.
+        //
+        // Unreadable pages contribute zeroes, which is the correct content for them: the guest
+        // cannot have observed anything there either, and the child re-establishes each region's
+        // real bounds and permissions from the VMA layout, which travels separately.
         let read_source_bytes = |range: core::ops::Range<usize>| {
             use litebox::platform::RawConstPointer as _;
-            let ptr =
-                <Self as litebox::platform::RawPointerProvider>::RawConstPointer::<u8>::from_usize(
-                    range.start,
-                );
-            ptr.to_owned_slice(range.len()).map(<[u8]>::into_vec)
+            const PAGE: usize = litebox::mm::linux::PAGE_SIZE;
+            let len = range.len();
+            let mut out = std::vec::Vec::new();
+            out.resize(len, 0u8);
+            let mut any_readable = false;
+            let mut off = 0usize;
+            while off < len {
+                let addr = range.start.wrapping_add(off);
+                // Stop each read at the next page boundary so an unaligned start still lines up
+                // with the pages `is_readable` is answering about.
+                let chunk = (PAGE - (addr % PAGE)).min(len - off);
+                if fork_verify::is_readable(addr) {
+                    let ptr = <Self as litebox::platform::RawPointerProvider>::RawConstPointer::<
+                        u8,
+                    >::from_usize(addr);
+                    if let Some(bytes) = ptr.to_owned_slice(chunk) {
+                        out[off..off + chunk].copy_from_slice(&bytes);
+                        any_readable = true;
+                    }
+                }
+                off += chunk;
+            }
+            any_readable.then_some(out)
         };
         let want_registers = process_fork::diag_process_fork_registers_enabled();
         let inject_gprs = if want_registers {

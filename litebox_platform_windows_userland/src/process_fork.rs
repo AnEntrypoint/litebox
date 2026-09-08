@@ -55,7 +55,8 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CreateProcessW, GetExitCodeProcess, INFINITE, PROCESS_INFORMATION,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, GetExitCodeProcess, INFINITE,
+    PROCESS_INFORMATION,
     ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
 
@@ -1008,7 +1009,7 @@ pub fn diagnostic_spawn_and_copy(
     // whether or not `LITEBOX_DIAG_PROCESS_FORK_FDS` is also set (the two are otherwise unrelated
     // gates -- see each one's own doc comment).
     let want_stdin_pipe = want_fds || want_relocations;
-    let spawn_result = spawn_suspended(&mut exe_wide, want_resume, want_stdin_pipe);
+    let spawn_result = spawn_suspended(&mut exe_wide, want_resume, want_stdin_pipe, false, &[]);
     unsafe {
         std::env::remove_var(REEXEC_CHILD_ENV_VAR);
         std::env::remove_var(REAL_RESUME_CHILD_ENV_VAR);
@@ -1125,14 +1126,16 @@ pub fn spawn_process_fork_child(
     // probe`, wired in the runner crate's `main()`) by setting the SAME three gate env vars those
     // passes introduced as opt-in flags -- this production path always wants that exact chain, so
     // it sets all three unconditionally rather than exposing them as separately-toggleable knobs.
-    unsafe {
-        std::env::set_var(REEXEC_CHILD_ENV_VAR, "1");
-        std::env::set_var("LITEBOX_DIAG_PROCESS_FORK_GLOBALSTATE", "1");
-        std::env::set_var("LITEBOX_DIAG_PROCESS_FORK_VMEM_ADOPT", "1");
-        std::env::set_var("LITEBOX_DIAG_PROCESS_FORK_TASK_RESUME", "1");
-        std::env::set_var(FORK_CHILD_VMA_LAYOUT_ENV_VAR, &relocations_line);
-        std::env::set_var(FORK_CHILD_GPRS_ENV_VAR, serialize_full_gprs(&full_gprs));
-    }
+    // Handed to the child through its OWN environment block -- never by mutating this process's
+    // environment. See `build_child_environment_block` for why that distinction is load-bearing.
+    let child_env: Vec<(&str, String)> = vec![
+        (REEXEC_CHILD_ENV_VAR, "1".to_string()),
+        ("LITEBOX_DIAG_PROCESS_FORK_GLOBALSTATE", "1".to_string()),
+        ("LITEBOX_DIAG_PROCESS_FORK_VMEM_ADOPT", "1".to_string()),
+        ("LITEBOX_DIAG_PROCESS_FORK_TASK_RESUME", "1".to_string()),
+        (FORK_CHILD_VMA_LAYOUT_ENV_VAR, relocations_line.clone()),
+        (FORK_CHILD_GPRS_ENV_VAR, serialize_full_gprs(&full_gprs)),
+    ];
     if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
         eprintln!(
             "[diag_alloc_vec] pre-spawn exe_wide len={} cap={} ptr={:p}",
@@ -1141,7 +1144,7 @@ pub fn spawn_process_fork_child(
             exe_wide.as_ptr()
         );
     }
-    let spawn_result = spawn_suspended(&mut exe_wide, false, false);
+    let spawn_result = spawn_suspended(&mut exe_wide, false, false, true, &child_env);
     if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
         eprintln!(
             "[diag_alloc_vec] post-spawn exe_wide len={} cap={} ptr={:p}",
@@ -1150,14 +1153,7 @@ pub fn spawn_process_fork_child(
             exe_wide.as_ptr()
         );
     }
-    unsafe {
-        std::env::remove_var(REEXEC_CHILD_ENV_VAR);
-        std::env::remove_var("LITEBOX_DIAG_PROCESS_FORK_GLOBALSTATE");
-        std::env::remove_var("LITEBOX_DIAG_PROCESS_FORK_VMEM_ADOPT");
-        std::env::remove_var("LITEBOX_DIAG_PROCESS_FORK_TASK_RESUME");
-        std::env::remove_var(FORK_CHILD_VMA_LAYOUT_ENV_VAR);
-        std::env::remove_var(FORK_CHILD_GPRS_ENV_VAR);
-    }
+    // Nothing to undo: this process's own environment was never touched.
     let (process, thread, pid, _stdout_read, _stdin_write) = spawn_result?;
     if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
         eprintln!(
@@ -2788,11 +2784,61 @@ impl EncodeWideExt for std::ffi::OsStr {
 /// `(process, thread, pid, stdout_read_end, stdin_write_end)`.
 type SpawnSuspendedResult = (HANDLE, HANDLE, u32, Option<HANDLE>, Option<HANDLE>);
 
+/// Builds a `CREATE_UNICODE_ENVIRONMENT` block: this process's current environment plus `extra`,
+/// as UTF-16 `NAME=VALUE\0` records terminated by an extra `\0`.
+///
+/// This exists so a child can be handed extra variables WITHOUT the parent calling
+/// `std::env::set_var`. The previous approach set six variables, spawned, and removed them again,
+/// relying on `lpEnvironment: null` inheritance. Mutating the environment is undefined behaviour
+/// in a multi-threaded process (which is why `set_var` is `unsafe` in current Rust), and litebox
+/// is emphatically multi-threaded: ~20 host threads, several of which read environment variables.
+/// Windows implements those reads and writes against one process-wide structure guarded by
+/// ntdll's environment critical section, so the write storm raced every concurrent reader.
+///
+/// This is the write-side twin of a bug already fixed on the read side: `ThreadHandle::interrupt`
+/// used to call `std::env::var_os` between its `SuspendThread` and `ResumeThread`, and could
+/// deadlock against a thread suspended while holding that same lock. Reading the environment
+/// (`vars_os` below) is safe and is all this needs.
+fn build_child_environment_block(extra: &[(&str, String)]) -> Vec<u16> {
+    let mut block: Vec<u16> = Vec::new();
+    let mut push_entry = |name: &std::ffi::OsStr, value: &std::ffi::OsStr| {
+        // Skip anything we are about to override, so the child never sees a stale duplicate --
+        // Windows resolves duplicates by first occurrence, so a leftover would win.
+        let name_lossy = name.to_string_lossy();
+        if extra.iter().any(|(k, _)| k.eq_ignore_ascii_case(&name_lossy)) {
+            return;
+        }
+        block.extend(name.encode_wide_for_windows());
+        block.push(u16::from(b'='));
+        block.extend(value.encode_wide_for_windows());
+        block.push(0);
+    };
+    for (name, value) in std::env::vars_os() {
+        push_entry(&name, &value);
+    }
+    for (name, value) in extra {
+        block.extend(std::ffi::OsStr::new(name).encode_wide_for_windows());
+        block.push(u16::from(b'='));
+        block.extend(std::ffi::OsStr::new(value.as_str()).encode_wide_for_windows());
+        block.push(0);
+    }
+    // An empty environment still needs its own terminating NUL before the block terminator.
+    if block.is_empty() {
+        block.push(0);
+    }
+    block.push(0);
+    block
+}
+
 fn spawn_suspended(
     exe_wide: &mut [u16],
     want_stdout_pipe: bool,
     want_stdin_pipe: bool,
+    inherit_stdio: bool,
+    extra_env: &[(&str, String)],
 ) -> Result<SpawnSuspendedResult, String> {
+    // Built up-front so the pointer handed to `CreateProcessW` stays valid for the whole call.
+    let mut env_block = build_child_environment_block(extra_env);
     let mut startup_info: STARTUPINFOW = unsafe { core::mem::zeroed() };
     startup_info.cb =
         u32::try_from(core::mem::size_of::<STARTUPINFOW>()).expect("STARTUPINFOW fits in u32");
@@ -2932,6 +2978,42 @@ fn spawn_suspended(
         }
     }
 
+    // A real cross-process `fork()` child must write to the SAME stdout/stderr as its parent -- it
+    // is running the guest's own forked code, and that code's output is the whole point. With
+    // `bInheritHandles = FALSE` and no `STARTF_USESTDHANDLES`, `CreateProcessW` gives the child
+    // neither, so everything it prints (the guest's own writes AND the child-side
+    // `[process_fork_diag]` lines) is discarded. That is why a forked `(echo B)` under
+    // `LITEBOX_PROCESS_FORK=1` produced no `B`, and why the child looked like it had never started
+    // when in fact nothing it said could reach us.
+    //
+    // Only for the non-pipe case: the diagnostic callers deliberately hand the child pipe ends
+    // instead and must keep doing so.
+    if inherit_stdio && !want_stdout_pipe && !want_stdin_pipe {
+        use windows_sys::Win32::Foundation::SetHandleInformation;
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+        const HANDLE_FLAG_INHERIT: u32 = 1;
+        let stdin_h = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        let stdout_h = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+        let stderr_h = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+        // These are the parent's own long-lived std handles; marking them inheritable changes a
+        // property of the handle rather than creating a duplicate, so nothing here needs closing
+        // afterwards -- and the post-spawn cleanup below only ever closes pipe ends it created.
+        for h in [stdin_h, stdout_h, stderr_h] {
+            if !h.is_null() && h as isize != -1 {
+                unsafe {
+                    SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+                }
+            }
+        }
+        startup_info.dwFlags |= STARTF_USESTDHANDLES;
+        startup_info.hStdInput = stdin_h;
+        startup_info.hStdOutput = stdout_h;
+        startup_info.hStdError = stderr_h;
+        inherit_handles = 1;
+    }
+
     let ok = unsafe {
         CreateProcessW(
             core::ptr::null(),
@@ -2939,8 +3021,8 @@ fn spawn_suspended(
             core::ptr::null(),
             core::ptr::null(),
             inherit_handles,
-            CREATE_SUSPENDED,
-            core::ptr::null(),
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+            env_block.as_mut_ptr().cast(),
             core::ptr::null(),
             &raw const startup_info,
             &raw mut process_info,

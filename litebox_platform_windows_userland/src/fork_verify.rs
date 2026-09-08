@@ -1817,7 +1817,7 @@ fn read_code_bytes(rip: usize, buf: &mut [u8]) -> usize {
 }
 
 /// Whether `addr` is in a committed, readable region of the host address space.
-fn is_readable(addr: usize) -> bool {
+pub(crate) fn is_readable(addr: usize) -> bool {
     readable_and_writable(addr).0
 }
 

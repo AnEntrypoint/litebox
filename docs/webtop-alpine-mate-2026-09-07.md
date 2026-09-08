@@ -989,3 +989,50 @@ taken -- decide eligibility BEFORE `pm.duplicate()` and derive the child's ident
 from the parent's own `tracked_regions()`, since a cross-process child runs at SOURCE coordinates
 and has no use for a duplicate. That removes the teardown entirely rather than making it less
 destructive, and removes a wasted full address-space copy per fork.
+
+### Five more defects in the cross-process fork path
+
+All found with the ten-second repro, all confined to the `LITEBOX_PROCESS_FORK=1` opt-in path,
+default path re-verified clean (3/3 `A B C`, 0 AVs) after each.
+
+1. **The in-process duplicate was built and then thrown away.** `do_clone` always ran
+   `pm.duplicate()` and moved the result into a child `ThreadState`, which the cross-process branch
+   then dropped on early return. A cross-process child runs at SOURCE coordinates in its own
+   address space and has no use for a duplicate at all. The decision now happens BEFORE
+   duplication (`try_cross_process_fork`), which removes the destructive teardown outright rather
+   than trying to make it less destructive -- and saves a full eager address-space copy per fork.
+   Everything the path needs is available pre-duplication: the register snapshot is the parent's
+   own `ctx`, the FS base is the parent's own, the layout is the parent's own `tracked_regions()`,
+   and the relocation map is the identity.
+
+2. **`std::env::set_var` storm around the spawn.** Six `set_var` calls before `CreateProcessW` and
+   six `remove_var` after, to pass data to the child via `lpEnvironment: null` inheritance.
+   Mutating the environment is undefined behaviour in a multi-threaded process, and litebox runs
+   ~20 host threads several of which read environment variables through the same ntdll critical
+   section. This is the WRITE-side twin of the read-side deadlock already fixed in
+   `ThreadHandle::interrupt`. The child now gets an explicit `CREATE_UNICODE_ENVIRONMENT` block
+   built from `vars_os()` plus the extras; the parent's own environment is never touched.
+
+3. **The child inherited no stdio at all.** `spawn_suspended` was called with
+   `bInheritHandles = FALSE` and no `STARTF_USESTDHANDLES`, so the child had no stdout, stderr or
+   stdin. Everything it printed -- the guest's own `echo B` AND every child-side
+   `[process_fork_diag]` line -- went nowhere. That is why the child appeared never to start.
+
+4. **Copy groups were not allocation-granularity aligned.** `copy_one_group` pins each group in
+   the child with `MEM_ADDRESS_REQUIREMENTS`, and Windows rejects a reservation whose base is not
+   64 KiB aligned:
+
+       group copy FAILED group=0x10046000..0x100df000 GetLastError=87   (ERROR_INVALID_PARAMETER)
+
+   `PageManager::duplicate`'s own reservation groups were granule-aligned by construction;
+   `tracked_regions()` reports page-aligned VMA bounds. Groups are now widened to their enclosing
+   granule and merged.
+
+5. **The source read assumed a group was fully mapped.** A granule-aligned group can span padding,
+   a guard gap, or a range the guest `munmap`ed. `read_source_bytes` now reads page at a time and
+   zero-fills holes instead of faulting in the parent mid-fork.
+
+**Still not working.** `LITEBOX_PROCESS_FORK=1` does not complete a fork: the guest's `(echo B)`
+never appears and the parent does not reach `echo C`. The failure has moved (it now happens before
+`do_clone` logs anything) and remains non-deterministic across identical runs. `/init` does not
+boot. The path is opt-in and off by default, so none of this reaches ordinary use.
