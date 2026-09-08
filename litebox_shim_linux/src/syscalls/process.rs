@@ -3331,7 +3331,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // mechanism it never exercised). Anyone setting `LITEBOX_PROCESS_FORK=1` and reading
             // the log can now see, per fork() call, whether the path was taken or why not.
             // See `advisor/ADVISORY-002-d-zero-fork.md` sections 1 and 1.5.
-            if fd_complexity.beyond_stdio != 0 {
+            // `LITEBOX_PROCESS_FORK_IGNORE_FDS=1`: take the cross-process path even though the
+            // guest holds fds at or above 3, ACCEPTING THAT THE CHILD LOSES THEM. This is a
+            // measurement tool, not a correctness feature, and it is off unless asked for.
+            //
+            // It exists because the `beyond_stdio == 0` gate is what stands between this project
+            // and running any s6-overlay container image. `/init`'s very first steps are
+            // `s6-overlay-suexec` creating a synchronisation PIPE, vfork+exec'ing `preinit`, and
+            // `preinit` forking `s6-mkdir`; the inherited pipe fd alone makes `beyond_stdio == 1`,
+            // so the cross-process path is refused and the thread-based fork runs instead -- which
+            // then dies, because `s6-mkdir` is a static ET_EXEC linked at 0x400000 and that range
+            // is already claimed by a still-live GuestPid(1) in litebox's single host address
+            // space. Whether giving the child its own real address space actually clears that
+            // collision is the question this flag answers, WITHOUT pretending the fd problem is
+            // solved: a child that loses its pipe is wrong in general, but `s6-mkdir` never reads
+            // or writes that pipe, so the experiment is meaningful for exactly this shape.
+            //
+            // Do not enable this to "make things work". Real eligibility needs guest pipes (and
+            // the other six fd subsystems) backed by inheritable Windows HANDLEs.
+            let ignore_fds = self
+                .global
+                .platform
+                .env_flag("LITEBOX_PROCESS_FORK_IGNORE_FDS");
+            if fd_complexity.beyond_stdio != 0 && !ignore_fds {
                 litebox_util_log::warn!(
                     tid:% = self.tid,
                     beyond_stdio:% = fd_complexity.beyond_stdio,
@@ -3341,8 +3363,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                      HANDLE; falling back to the thread-based relocating fork (which is known \
                      incompatible with glibc safe-linking -- see ADVISORY-001 section 3N)"
                 );
+            } else if fd_complexity.beyond_stdio != 0 {
+                litebox_util_log::warn!(
+                    tid:% = self.tid,
+                    beyond_stdio:% = fd_complexity.beyond_stdio,
+                    total_alive:% = fd_complexity.total_alive;
+                    "clone: cross-process fork() forced by LITEBOX_PROCESS_FORK_IGNORE_FDS -- the \
+                     child WILL LOSE these fds; measurement only"
+                );
             }
-            if fd_complexity.beyond_stdio == 0
+            if (fd_complexity.beyond_stdio == 0 || ignore_fds)
                 && let Some(mut full_gprs) = cross_process_gprs
                 && {
                     full_gprs.fs_base = cross_process_fs_base;

@@ -858,3 +858,54 @@ ships **rust-coreutils**, and those binaries abort in rustix's auxv handling
 taking out `sleep`, `tail` and the DE launch. `/bin/sleep 1` on its own succeeds, so the failure
 is situational and not yet root-caused. litebox builds an auxv on the initial stack but provides
 no `/proc/self/auxv`, which is the first thing to check.
+
+## Forking work: the s6 collision, measured rather than argued
+
+New this pass, on top of the `debian-i3` session's writeup. The failure reproduces on the LOCAL
+alpine image in about a minute (`-- /init`), so it no longer needs an 8GB Debian pull to study:
+
+    s6-overlay-suexec: fatal: child failed with exit code 139
+
+**1. The colliding owner is the grandparent, not the parent.** The untruncated foreign-claim line
+says `self_owner=GuestPid(3) foreign_owner=Some(GuestPid(1)) foreign_range=Some((4194304, 4255744))`.
+GuestPid(1) is `s6-overlay-suexec` itself, still live and still holding 0x400000, while its
+grandchild `s6-mkdir` tries to load there. The chain is pid 1 --vfork--> pid 2 (`preinit`,
+`CLONE_VM|CLONE_VFORK`) --fork--> pid 3 (`s6-mkdir`, flags 0). All three are static ET_EXEC linked
+at 0x400000, and litebox has one host address space for all of them.
+
+**2. What actually blocks the cross-process path is a PIPE.** `LITEBOX_PROCESS_FORK=1` alone
+changes nothing, and the reason is now logged explicitly rather than inferred:
+
+    clone: cross-process (D==0) fork() NOT eligible -- guest holds fd(s) at or above 3
+
+`s6-overlay-suexec` creates its synchronisation pipe (`sys_pipe2: created rd_fd=4 wr_fd=3`)
+immediately before forking, so `beyond_stdio` is nonzero at both clones and the gate refuses.
+None of the shim's seven fd subsystems are backed by an inheritable Windows HANDLE.
+
+**3. Forcing the gate proves the address space is the right lever -- and that the mechanism is
+not ready.** `LITEBOX_PROCESS_FORK_IGNORE_FDS=1` (added this pass; measurement only, off by
+default, documented as accepting that the child loses its fds) takes the cross-process path:
+
+    clone: cross-process fork() forced by LITEBOX_PROCESS_FORK_IGNORE_FDS
+    clone: spawned cross-process fork() child parent_tid=1 child_tid=2
+
+and the 0x400000 collision DISAPPEARS -- no `AddressInUse`, no "load_program failed after point
+of no return", no SIGSEGV. So giving the child its own real address space is the correct fix.
+
+It then hangs instead, and the child's own diagnostics say why:
+
+    vmem-adopt-probe (child): adopting 0 pre-populated region(s), brk=0x0
+    vmem-adopt-probe (child): adopted=0 ... tracked=0, expected=0, brk=0x0
+    task-resume-probe (child): ... calling run_thread with rip=0x40c83d rsp=0x7fefffeee128
+
+The child adopts ZERO regions and is then resumed at an address inside the parent's ELF that does
+not exist in it. Cross-process fork currently spawns a real Windows process, verifies its VMA
+layout round-trips, and resumes it -- but never transfers the parent's memory. It is diagnostic
+scaffolding, not a working fork.
+
+**So the remaining work is now specific**, rather than "needs address-space isolation": (a) make
+`spawn_cross_process_fork_child` actually transfer the parent's regions instead of adopting an
+empty layout, and (b) back guest pipes (and the other fd subsystems) with inheritable Windows
+HANDLEs so the eligibility gate can pass honestly. Neither was attempted here; forcing a third
+unverified fix at this depth is what this project's own discipline warns against, and the
+measurement flag is deliberately not a workaround.
