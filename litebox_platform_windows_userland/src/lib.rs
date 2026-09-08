@@ -2938,8 +2938,25 @@ impl WindowsUserland {
 
         // Windows sets FS_BASE to 0 regularly upon scheduling; we register an exception handler
         // to set FS_BASE back to a "stored" value whenever we notice that it has become 0.
+        //
+        // Registered FIRST in the process's VEH chain (`1`), not last (`0`).
+        //
+        // The `0` here dated to the initial commit and was never a decision -- confirmed by
+        // `git log -S`, which finds no change to this line since. It is the wrong value. This
+        // handler owns this process's guest-execution fault semantics outright: FS_BASE repair,
+        // the guest-address-stack swap, `fork_verify`'s single-step walk, and delivery of a real
+        // guest `SIGSEGV`. Nothing else loaded into the process has any business seeing a guest
+        // fault first, and anything that does can `EXCEPTION_CONTINUE_EXECUTION` straight out from
+        // under this handler -- silently, with no trace -- which is exactly the possibility
+        // AGENTS.md's `RtlpUnwindPrologue` section asks to rule out before spending further
+        // investigation passes on faults that never reach here.
+        //
+        // Safe in the other direction too: this handler is already a good citizen for exceptions
+        // it does not own, falling through to `EXCEPTION_CONTINUE_SEARCH` on every path it does
+        // not deliberately handle (the naked entry point does so without entering Rust at all),
+        // so going first cannot swallow a host-side exception that belongs to someone else.
         unsafe {
-            let _ = AddVectoredExceptionHandler(0, Some(vectored_exception_handler_entry));
+            let _ = AddVectoredExceptionHandler(1, Some(vectored_exception_handler_entry));
         }
 
         // Register a console control handler to receive Ctrl+C / Ctrl+Break
@@ -4999,6 +5016,24 @@ static CLAIMED_RANGES: Mutex<[ClaimSlot; MAX_CLAIMS]> = Mutex::new([const { None
 /// oldest entry when the registry is full and a new claim needs a slot (see `claim_range`).
 static NEXT_CLAIM_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// High-water mark of [`CLAIMED_RANGES`] occupancy, and the last value already reported.
+///
+/// Exhausting the registry is not a tidiness problem: eviction drops a claim that may still
+/// describe LIVE memory, which is the exact cross-process collision this registry exists to
+/// prevent (see [`MAX_CLAIMS`], whose own doc comment records two separate live sessions killed
+/// this way). The tuning history there was driven by after-the-fact reasoning about repro logs
+/// because nothing ever reported how full the registry actually got. These do, at zero added
+/// cost: [`claim_range`] already walks the whole array for coalescing, so the count folds into a
+/// scan that was happening anyway rather than adding one.
+static CLAIM_HIGH_WATER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Last high-water value actually logged, so a rising mark reports in coarse steps instead of on
+/// every single claim -- this is `allocate_pages`'s hot path and the `MAX_CLAIMS` doc comment
+/// records log volume alone regressing a live weston session.
+static CLAIM_HIGH_WATER_REPORTED: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+/// Granularity of the high-water report above.
+const CLAIM_HIGH_WATER_STEP: usize = 128;
+
 /// Returns the (range, owner) of any claimed range overlapping `range` whose owner is NOT
 /// `exclude_owner`, if one exists.
 ///
@@ -5152,6 +5187,10 @@ fn claim_range(range: core::ops::Range<usize>) {
     // one thread from consuming a fresh slot per call, and now ALSO coalesces a sibling
     // pthread's own overlapping claim into the same guest process's own bound.
     let mut merged = range;
+    // Occupancy is counted in this same pass rather than by a second scan: see
+    // `CLAIM_HIGH_WATER`. Counted AFTER the coalescing clear below, so it reflects what the
+    // registry actually holds going into the insert.
+    let mut occupied = 0usize;
     for slot in claims.iter_mut() {
         if let Some((claimed, o, _tid, _seq)) = slot
             && *o == owner
@@ -5161,6 +5200,21 @@ fn claim_range(range: core::ops::Range<usize>) {
             merged.start = merged.start.min(claimed.start);
             merged.end = merged.end.max(claimed.end);
             *slot = None;
+        }
+        if slot.is_some() {
+            occupied += 1;
+        }
+    }
+    // `+ 1` for the entry about to be inserted (or, when full, to replace an evicted one).
+    let occupancy = occupied + 1;
+    if CLAIM_HIGH_WATER.fetch_max(occupancy, core::sync::atomic::Ordering::Relaxed) < occupancy {
+        let reported = CLAIM_HIGH_WATER_REPORTED.load(core::sync::atomic::Ordering::Relaxed);
+        if occupancy >= reported.saturating_add(CLAIM_HIGH_WATER_STEP) {
+            CLAIM_HIGH_WATER_REPORTED.store(occupancy, core::sync::atomic::Ordering::Relaxed);
+            litebox_util_log::warn!(
+                occupancy:% = occupancy, max:% = MAX_CLAIMS;
+                "claim_range: CLAIMED_RANGES high-water mark rose"
+            );
         }
     }
     let seq = NEXT_CLAIM_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -5178,9 +5232,16 @@ fn claim_range(range: core::ops::Range<usize>) {
             .min_by_key(|(_, seq)| *seq)
             .map(|(i, _)| i);
         if let Some(idx) = oldest_idx {
-            litebox_util_log::debug!(
-                start:% = merged.start, end:% = merged.end, owner:? = owner;
-                "allocate_pages: DIAG claim_range evicting oldest entry (registry full)"
+            // `warn!`, not `debug!`. This drops a claim that may still describe LIVE memory of
+            // a still-running guest process, re-opening the silent cross-process corruption this
+            // registry exists to close -- `MAX_CLAIMS`'s doc comment records two separate live
+            // desktop sessions killed exactly this way. It was previously invisible at the
+            // default log level, so the only evidence it had happened was the hang it caused
+            // seconds later.
+            litebox_util_log::warn!(
+                start:% = merged.start, end:% = merged.end, owner:? = owner,
+                max:% = MAX_CLAIMS;
+                "claim_range: registry full, evicting oldest entry (a live claim may be lost)"
             );
             claims[idx] = Some((merged, owner, tid, seq));
         }
@@ -7324,9 +7385,27 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     },
                 )
                 .unwrap();
-                if fixed_address_behavior == FixedAddressBehavior::Replace {
-                    claim_range(base_addr as usize..(base_addr as usize + size));
-                }
+                // Claimed for EVERY behavior, not just `Replace`.
+                //
+                // `claim_range`'s own doc comment already states that `Hint`-mode allocations
+                // reach it -- but they only ever did via the OS-picks-the-address fallback at the
+                // bottom of this function, which a hint reaches ONLY when it collides and gets
+                // relocated. A hint that SUCCEEDS at the address it asked for landed here, where
+                // the claim was gated on `Replace`, and was never recorded at all.
+                //
+                // That is not a rare corner: `Vmem::create_mapping` runs every ordinary guest
+                // `mmap(NULL, ...)` through `get_unmmaped_area` FIRST, which always returns a
+                // concrete non-zero address, and only then calls `insert_mapping` with `Hint`. So
+                // `suggested_range.start != 0` holds for essentially every guest mmap, and the
+                // uncollided majority of them were invisible to `find_foreign_claim` -- exactly
+                // the memory a different thread's later `Replace`-mode fixed allocation (its own
+                // `brk()` growth, or an `ET_EXEC` segment at a baked-in base) decommits and
+                // recommits straight over, with no page fault and no guest-visible signal. It is
+                // the same defect `claim_range`'s weston repro describes, left open for every
+                // allocation that did not happen to be relocated first.
+                //
+                // `NoReplace` is claimed for the same reason: it commits real host memory too.
+                claim_range(base_addr as usize..(base_addr as usize + size));
                 // DIAG (AGENTS.md pass 223): allocation-free raw print of the actual returned
                 // base_addr vs. the originally-requested suggested_range.start, specifically for
                 // Replace-mode fixed calls -- to finally observe directly whether this success

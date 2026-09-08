@@ -33,7 +33,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use object::Endianness;
-use object::read::elf::{ElfFile, FileHeader as _, ProgramHeader as _};
+use object::read::elf::{ElfFile, ProgramHeader as _};
 use object::read::{Object as _, ObjectSection as _};
 use thiserror::Error;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
