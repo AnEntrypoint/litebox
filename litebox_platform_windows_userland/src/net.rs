@@ -625,7 +625,24 @@ impl GatewayState {
             // also gates the guest<->real pump loops above) tracks this so it fires exactly once;
             // the flow is only fully removed -- finally dropping `real` -- once BOTH sides have
             // nothing left pending, so a partially-flushed response is never truncated.
-            if !socket.is_open() && !flow.real_shutdown_sent {
+            //
+            // Gated on the guest->real direction being fully drained, for the same reason the
+            // close above is gated on the real->guest one. `Shutdown::Write` ends our ability to
+            // send ANYTHING further to the host peer, so doing it while bytes the guest already
+            // wrote are still sitting in smoltcp's receive buffer (`socket.can_recv()`) or in
+            // `pending_to_real` throws the response away.
+            //
+            // That is the ordinary shape of a `--publish`ed request, not a corner case: a server
+            // writes its reply and closes immediately, so the guest's socket goes non-open in the
+            // very same pump cycle that its response becomes readable. Measured with a one-shot
+            // HTTP server in the guest -- it logged `GUEST_GOT_REQUEST /hello` and wrote a
+            // 200, while the host's `curl` got no response at all, and a browser reached selkies
+            // and then reported `WebSocket disconnected` on every attempt.
+            if !socket.is_open()
+                && !flow.real_shutdown_sent
+                && flow.pending_to_real.is_empty()
+                && !socket.can_recv()
+            {
                 let _ = real.shutdown(std::net::Shutdown::Write);
                 flow.real_shutdown_sent = true;
             }

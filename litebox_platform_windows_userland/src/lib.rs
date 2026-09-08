@@ -3950,6 +3950,24 @@ fn diag_resume_history() -> String {
 /// Do not call this at a point where the stack needs to be unwound to run
 /// destructors.
 ///
+/// Whether `ctx` could plausibly be resumed as GUEST state.
+///
+/// `rip` and `rsp` must both land inside the guest's own address range. A value outside it did not
+/// come from guest execution: observed live as `rip=0x7ff8b1b221f4`, a Windows system-DLL address,
+/// sitting in a context about to be resumed as if it were guest code.
+///
+/// This is a necessary condition, not a sufficient one -- it cannot tell a corrupted in-range
+/// address from a good one. It exists to catch the case that is structurally unrecoverable:
+/// resuming onto an out-of-range `rip`/`rsp` faults with no usable exception frame (once `rsp`
+/// itself is bad, the CPU cannot even push one), which the exception-table recovery cannot help
+/// with.
+fn guest_context_is_plausible(ctx: &litebox_common_linux::PtRegs) -> bool {
+    use litebox::platform::PageManagementProvider;
+    let task_min = <WindowsUserland as PageManagementProvider<0x1000>>::TASK_ADDR_MIN;
+    let task_max = <WindowsUserland as PageManagementProvider<0x1000>>::TASK_ADDR_MAX;
+    (task_min..task_max).contains(&ctx.rip) && (task_min..task_max).contains(&ctx.rsp)
+}
+
 unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     #[unsafe(naked)]
     extern "C" fn switch_to_guest_sysret(ctx: &litebox_common_linux::PtRegs) -> ! {
@@ -4116,21 +4134,18 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     // follow-up), but a diagnostic panic that unambiguously names the corrupted register and its
     // value is a strict improvement over the current silent, unrecoverable, hard-to-diagnose
     // cascade.
-    {
-        use litebox::platform::PageManagementProvider;
-        let task_min = <WindowsUserland as PageManagementProvider<0x1000>>::TASK_ADDR_MIN;
-        let task_max = <WindowsUserland as PageManagementProvider<0x1000>>::TASK_ADDR_MAX;
-        let rip_ok = (task_min..task_max).contains(&ctx.rip);
-        let rsp_ok = (task_min..task_max).contains(&ctx.rsp);
-        assert!(
-            rip_ok && rsp_ok,
-            "switch_to_guest: refusing to resume with an implausible guest address \
-             (rip={:#x} rip_ok={rip_ok} rsp={:#x} rsp_ok={rsp_ok}, valid range {task_min:#x}..{task_max:#x}) -- \
-             this would otherwise jump/switch onto a corrupted value with no further checks",
-            ctx.rip,
-            ctx.rsp,
-        );
-    }
+    // Unreachable in the normal case: the resume path's caller has already turned an implausible
+    // context into a guest SIGSEGV (see `guest_context_is_plausible`). This stays as a last-ditch
+    // assertion because `switch_to_guest` is also reached from paths that do not go through that
+    // caller, and jumping onto a corrupted `rip`/`rsp` is unrecoverable by construction.
+    assert!(
+        guest_context_is_plausible(ctx),
+        "switch_to_guest: refusing to resume with an implausible guest address \
+         (rip={:#x} rsp={:#x}) -- this would otherwise jump/switch onto a corrupted value with \
+         no further checks",
+        ctx.rip,
+        ctx.rsp,
+    );
 
     // Restore fsbase for the guest.
     WindowsUserland::restore_thread_fs_base();
@@ -9314,6 +9329,47 @@ impl ThreadContext<'_> {
                     // `ThreadHandle::interrupt` already uses for cross-thread context
                     // manipulation.
                     ctxwatch_arm_other_threads(self.ctx);
+                }
+                // A corrupted context kills THIS GUEST PROCESS, not the host.
+                //
+                // This used to reach `switch_to_guest`'s assertion and panic the whole runner --
+                // and with every guest process sharing one host process, that took down the entire
+                // desktop because one component's context went bad. The assertion's own comment
+                // already said what should happen instead: "a real Linux kernel would deliver
+                // SIGSEGV to a userspace program that corrupts its own signal frame this way
+                // rather than crash the kernel itself; this project does not yet synthesize that
+                // signal at this choke point (a follow-up)". This is that follow-up.
+                //
+                // Synthesizing a page fault at `rip` and handing it to the shim reuses the path
+                // that already exists for a genuine guest fault, so the outcome is exactly what
+                // Linux gives: a handler runs if the guest installed one, and otherwise the task
+                // dies with SIGSEGV and its parent reaps it. Observed live as
+                // `rip=0x7ff8b1b221f4` -- a Windows DLL address -- in a context about to be
+                // resumed as guest code.
+                //
+                // The `kernel_mode: false` and `error_code: 0x14` (user-mode instruction fetch of
+                // a non-present page) describe what actually went wrong: control was about to be
+                // transferred to an address the guest cannot execute.
+                if !guest_context_is_plausible(self.ctx) {
+                    litebox_util_log::error!(
+                        rip:% = self.ctx.rip, rsp:% = self.ctx.rsp;
+                        "implausible guest context on resume -- delivering SIGSEGV to the guest \
+                         task instead of terminating the host"
+                    );
+                    let info = litebox::shim::ExceptionInfo {
+                        exception: litebox::shim::Exception::PAGE_FAULT,
+                        error_code: 0x14,
+                        cr2: self.ctx.rip,
+                        kernel_mode: false,
+                    };
+                    match self.shim.exception(self.ctx, &info) {
+                        // The shim ran a guest signal handler and gave us a fresh context. Resume
+                        // only if THAT one is sane; otherwise let the task end rather than loop.
+                        ContinueOperation::Resume if guest_context_is_plausible(self.ctx) => {
+                            unsafe { switch_to_guest(self.ctx) }
+                        }
+                        _ => return,
+                    }
                 }
                 unsafe { switch_to_guest(self.ctx) }
             }
