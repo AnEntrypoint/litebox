@@ -2820,12 +2820,20 @@ mod tests {
         task.sys_close(fd).unwrap();
     }
 
-    /// A fresh `memfd_create` fd (before any `ftruncate`) has no real shared-memory object
-    /// registered yet -- `mmap` on it must fall through to the ordinary file-backed path (which
-    /// correctly rejects `MAP_SHARED|PROT_WRITE` on a zero-length file), not panic or silently
-    /// succeed against stale/wrong state.
+    /// A fresh `memfd_create` fd (before any `ftruncate`) has no shared-memory object registered
+    /// yet. `mmap(MAP_SHARED|PROT_WRITE)` on it must still produce a usable mapping rather than
+    /// panicking or reading stale state -- which is also what real Linux does: a zero-length memfd
+    /// can be mapped, and it is only an ACCESS past the end of the object that raises `SIGBUS`.
+    ///
+    /// This test previously asserted `ENODEV`, which was correct for the implementation that
+    /// existed when it was written: `mmap(MAP_SHARED|PROT_WRITE)` on anything file-backed was
+    /// refused outright. `try_shared_file_mmap` (see its doc comment -- `dconf`, and therefore
+    /// every GSettings write in a MATE/GNOME/XFCE session, cannot survive that `ENODEV`)
+    /// deliberately replaced that answer with a real shared object, and this expectation was never
+    /// updated. It was not noticed because the whole test binary was crashing at test 9 of 181
+    /// before reaching here -- see the VEH exception-code whitelist for that.
     #[test]
-    fn test_memfd_create_mmap_before_ftruncate_does_not_panic() {
+    fn test_memfd_create_mmap_before_ftruncate_is_usable() {
         let task = init_platform(None);
 
         let fd = task
@@ -2833,7 +2841,7 @@ mod tests {
             .unwrap();
         let fd = i32::try_from(fd).unwrap();
 
-        let err = task
+        let addr = task
             .sys_mmap(
                 0,
                 0x1000,
@@ -2842,9 +2850,16 @@ mod tests {
                 fd,
                 0,
             )
-            .unwrap_err();
-        assert_eq!(err, Errno::ENODEV);
+            .expect("mmap of a fresh memfd must produce a mapping, not ENODEV");
 
+        // Zero-filled to start with, like any fresh anonymous memory, and actually writable --
+        // "did not panic" alone would also be satisfied by a mapping that faults on first touch.
+        assert_eq!(addr.read_at_offset::<Platform>(0).unwrap(), 0_u8);
+        addr.write_slice_at_offset::<Platform>(0, &[0x5a; 0x10])
+            .unwrap();
+        assert_eq!(addr.read_at_offset::<Platform>(0).unwrap(), 0x5a_u8);
+
+        task.sys_munmap(addr, PAGE_SIZE).unwrap();
         task.sys_close(fd).unwrap();
     }
 
@@ -3012,21 +3027,36 @@ mod tests {
             content.as_slice(),
         );
 
-        // mprotect to add write permission should fail
-        let err = task
-            .sys_mprotect(addr, len, ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
-            .unwrap_err();
-        assert_eq!(err, Errno::EACCES);
+        // `mprotect` adding write permission SUCCEEDS here, and that is correct: the fd above was
+        // opened `O_RDWR`, and real Linux only answers `EACCES` when the file was opened without
+        // write permission. This asserted `EACCES` for as long as `MAP_SHARED` mapped the file
+        // read-only at the host level, which is no longer how it works (see
+        // `try_shared_file_mmap`); the expectation outlived the implementation it described.
+        task.sys_mprotect(addr, len, ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+            .expect("mprotect may add write to a MAP_SHARED mapping of an O_RDWR fd");
+        // And the promotion is real, not merely accepted.
+        addr.write_slice_at_offset::<Platform>(0, b"W").unwrap();
+        assert_eq!(addr.read_at_offset::<Platform>(0).unwrap(), b'W');
 
         task.sys_munmap(addr, len).unwrap();
         task.sys_close(fd).unwrap();
     }
 
+    /// `mmap(MAP_SHARED|PROT_WRITE)` on a file-backed fd gives every mapper of that file the SAME
+    /// memory -- the guarantee `try_shared_file_mmap` exists to provide, and the one `dconf` builds
+    /// its staleness flag out of (a writer maps the byte `PROT_WRITE`, readers map it `PROT_READ`
+    /// and poll it; see that function's doc comment for why refusing this made `mate-panel` come up
+    /// with no panels at all).
+    ///
+    /// Two separate histories meet in this test. It was originally written because the combination
+    /// used to `todo!()` and crash the whole runner on an idiom as ordinary as Python's
+    /// `mmap.mmap(fd, length, mmap.MAP_SHARED, mmap.PROT_WRITE)`; the fix then was to refuse it
+    /// with `ENODEV`, which is what this asserted. `try_shared_file_mmap` later replaced that
+    /// refusal with real shared memory and left the assertion behind. Neither the staleness nor the
+    /// failure was visible, because the test binary was crashing before this test ran -- see the
+    /// VEH exception-code whitelist.
     #[test]
-    fn test_map_shared_writable_file_returns_enodev_instead_of_panicking() {
-        // Regression test: `mmap(MAP_SHARED | PROT_WRITE)` on a file-backed fd used to
-        // unconditionally panic (`todo!()`), crashing the whole runner on an ordinary idiom like
-        // Python's `mmap.mmap(fd, length, mmap.MAP_SHARED, mmap.PROT_WRITE)`.
+    fn test_map_shared_writable_file_is_shared_between_mappers() {
         let task = init_platform(None);
         let fd = task
             .sys_open(
@@ -3036,18 +3066,50 @@ mod tests {
             )
             .unwrap();
         let fd = i32::try_from(fd).unwrap();
+        assert_eq!(task.sys_write(fd, b"seed", None).unwrap(), 4);
 
-        let err = task
+        let writer = task
             .sys_mmap(
                 0,
-                0x1000,
+                PAGE_SIZE,
                 ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
                 MapFlags::MAP_SHARED,
                 fd,
                 0,
             )
-            .unwrap_err();
-        assert_eq!(err, Errno::ENODEV);
+            .expect("MAP_SHARED|PROT_WRITE on a file must map, not fail with ENODEV");
+
+        // Seeded from the file's current bytes by the first mapper.
+        assert_eq!(writer.read_at_offset::<Platform>(0).unwrap(), b's');
+
+        // A SECOND, independent read-only mapping of the same file must be the same memory, not a
+        // private snapshot -- this is the whole point, and an identically-seeded private copy would
+        // pass a content check while failing this one.
+        let reader = task
+            .sys_mmap(
+                0,
+                PAGE_SIZE,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_SHARED,
+                fd,
+                0,
+            )
+            .expect("a second MAP_SHARED mapping of the same file must succeed");
+        writer
+            .write_slice_at_offset::<Platform>(0, b"MADE")
+            .unwrap();
+        assert_eq!(reader.read_at_offset::<Platform>(0).unwrap(), b'M');
+
+        // The documented limitation, asserted rather than left to drift: writes through the
+        // mapping do NOT reach the file's byte storage, so a `read()` still sees the pre-`mmap`
+        // contents. If that ever changes, this is the test that should be updated to say so.
+        let mut via_read = [0u8; 4];
+        assert_eq!(task.sys_read(fd, &mut via_read, Some(0)).unwrap(), 4);
+        assert_eq!(&via_read, b"seed");
+
+        task.sys_munmap(reader, PAGE_SIZE).unwrap();
+        task.sys_munmap(writer, PAGE_SIZE).unwrap();
+        task.sys_close(fd).unwrap();
     }
 
     /// Contrast case for [`test_map_shared_writable_file_returns_enodev_instead_of_panicking`]

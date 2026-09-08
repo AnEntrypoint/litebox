@@ -2463,6 +2463,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
 /// Linux's `IOV_MAX` / `UIO_MAXIOV`: the kernel rejects iovec counts above this
 /// with `EINVAL` for `readv`/`writev`/`preadv`/`pwritev`.
+/// The `O_*` bits `fcntl(F_SETFL)` is permitted to change on an already-open fd.
+///
+/// Real Linux ignores every other bit in the `F_SETFL` argument: the access mode
+/// (`O_RDONLY`/`O_WRONLY`/`O_RDWR`) and the creation flags (`O_CREAT`, `O_EXCL`, `O_TRUNC`,
+/// `O_CLOEXEC`) are fixed at `open` time and cannot be changed afterwards.
+///
+/// Shared by `F_GETFL` and `F_SETFL` deliberately, rather than written out in each: the two have
+/// to agree on exactly which bits live in the mutable per-description state and which come from
+/// the filesystem record of the original `open`, and they did not. See `F_GETFL`'s raw-fd branch.
+const SETFL_MUTABLE_FLAGS: OFlags = OFlags::APPEND
+    .union(OFlags::NONBLOCK)
+    .union(OFlags::NDELAY)
+    .union(OFlags::DIRECT)
+    .union(OFlags::NOATIME);
+
 const IOV_MAX: usize = 1024;
 const SSIZE_MAX: usize = isize::MAX as usize;
 
@@ -3309,7 +3324,36 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         // see `layered::FileSystem::open_flags`'s doc comment for the real bug
                         // this fixes (confirmed live: `xkbcomp`'s `fdopen(fd, "w")` failing on an
                         // `O_WRONLY`-opened fd because `F_GETFL` lied and reported `O_RDONLY`).
-                        |fd| Ok(files.fs.open_flags(fd).unwrap_or(OFlags::empty())),
+                        |fd| {
+                            // Two sources, and BOTH are needed. The filesystem knows the flags the
+                            // fd was opened with -- crucially its access mode, which is what the
+                            // comment above is about. The per-description `StdioStatusFlags`
+                            // metadata knows what `F_SETFL` has changed SINCE then.
+                            //
+                            // Reading only the first was a real, silent bug: `F_SETFL` writes that
+                            // metadata and nothing else, so every flag a guest set after open --
+                            // `O_NONBLOCK` above all -- vanished from the very next `F_GETFL`. The
+                            // universal idiom is `flags = F_GETFL; F_SETFL(flags | O_NONBLOCK)`,
+                            // and a library that then re-checks `F_GETFL & O_NONBLOCK` to decide
+                            // whether to use non-blocking reads concluded the fd was still
+                            // blocking. `stdio::tests::test_stdio_flags_with_dup` asserts exactly
+                            // this round-trip and had been failing it invisibly -- the test binary
+                            // was crashing before the failure could be reported.
+                            let open_flags = files.fs.open_flags(fd).unwrap_or(OFlags::empty());
+                            let set = self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .with_metadata(fd, |crate::StdioStatusFlags(f)| {
+                                    *f & SETFL_MUTABLE_FLAGS
+                                });
+                            Ok(match set {
+                                Ok(set) => (open_flags & SETFL_MUTABLE_FLAGS.complement()) | set,
+                                // No per-description state yet means nothing has called `F_SETFL`
+                                // on this fd, so the open-time flags ARE the current flags.
+                                Err(_) => open_flags,
+                            })
+                        },
                         |fd| getfl_from_metadata!(fd, crate::syscalls::net::SocketOFlags),
                         |fd| self.global.linux_pipe_status_flags(fd),
                         |fd| getfl_from_handle!(fd),
@@ -3323,11 +3367,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .bits())
             }
             FcntlArg::SETFL(flags) => {
-                let setfl_mask = OFlags::APPEND
-                    | OFlags::NONBLOCK
-                    | OFlags::NDELAY
-                    | OFlags::DIRECT
-                    | OFlags::NOATIME;
+                let setfl_mask = SETFL_MUTABLE_FLAGS;
                 let flags = flags & setfl_mask;
                 macro_rules! toggle_flags {
                     ($fd:ident) => {{
@@ -3382,20 +3422,43 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         // Linux, `fcntl(F_SETFL, ...)` on a regular file is accepted but has no
                         // effect on read/write blocking behavior, so treat a missing-metadata fd
                         // here as a successful no-op rather than an error.
+                        let apply = |f: &mut OFlags| {
+                            let diff = (*f & setfl_mask) ^ flags;
+                            if diff.intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME) {
+                                log_unsupported!("unsupported flags");
+                            }
+                            f.toggle(diff);
+                        };
                         match self
                             .global
                             .litebox
                             .descriptor_table_mut()
-                            .with_metadata_mut(fd, |crate::StdioStatusFlags(f)| {
-                                let diff = (*f & setfl_mask) ^ flags;
-                                if diff
-                                    .intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME)
-                                {
-                                    log_unsupported!("unsupported flags");
-                                }
-                                f.toggle(diff);
-                            }) {
-                            Ok(()) | Err(MetadataError::NoSuchMetadata) => Ok(()),
+                            .with_metadata_mut(fd, |crate::StdioStatusFlags(f)| apply(f))
+                        {
+                            Ok(()) => Ok(()),
+                            // No per-description status state on this fd yet. This used to be
+                            // reported as success and then DISCARD the write -- so `F_SETFL` was a
+                            // silent no-op on every fd that had not been opened through a
+                            // `/dev/stdin`-style re-open, which is what attaches this metadata (see
+                            // `insert_raw_file_fd_with_path`). Real Linux accepts `F_SETFL` on any
+                            // fd and a later `F_GETFL` reflects it, so create the state instead,
+                            // seeded from the flags the file was actually opened with so the bits
+                            // `F_SETFL` does not govern stay truthful.
+                            Err(MetadataError::NoSuchMetadata) => {
+                                let mut f = files.fs.open_flags(fd).unwrap_or(OFlags::empty());
+                                apply(&mut f);
+                                // `set_entry_metadata`, not `set_fd_metadata`: status flags belong
+                                // to the open file DESCRIPTION, so every fd duplicated from this
+                                // one must see the change -- which is what
+                                // `stdio::tests::test_stdio_flags_with_dup` asserts when it reads
+                                // the flag back through the original fd after setting it on the
+                                // duplicate.
+                                self.global
+                                    .litebox
+                                    .descriptor_table_mut()
+                                    .set_entry_metadata(fd, crate::StdioStatusFlags(f));
+                                Ok(())
+                            }
                             Err(MetadataError::ClosedFd) => Err(Errno::EBADF),
                         }
                     },
