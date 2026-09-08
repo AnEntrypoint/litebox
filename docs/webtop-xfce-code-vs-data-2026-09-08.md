@@ -370,3 +370,60 @@ litebox's accept path is not what is refusing.
 
 The desktop underneath remains healthy: `WM_S0` owned, 17-21 windows, `DE_ALIVE` past T=300s, and
 the image's own nginx serving its own dashboard to the host at `HTTP 200`.
+
+## The XFCE desktop renders in a browser
+
+It works. Chrome on the host shows the guest's XFCE desktop -- xfdesktop's `Home` and
+`File System` icons, the cursor, live pixels off the guest's X server -- streamed by selkies as
+H264 and carried out through `--publish`. Reproduced on a fresh stack, twice.
+
+The last two blockers were both glibc refusing to accept an answer litebox was giving it.
+
+**PI futexes.** `FUTEX_LOCK_PI`/`UNLOCK_PI`/`TRYLOCK_PI` returned `EOPNOTSUPP`, a value chosen from
+measurements against MUSL, where the errno reaches `pthread_mutexattr_setprotocol` and a caller can
+degrade. This image is Debian. glibc calls `futex_fatal_error()` for any unexpected futex return --
+`The futex facility returned an unexpected error code` -- and aborts. Measured: a browser connecting
+drove selkies to `Attempting to establish PulseAudio connection...`, then `futex(op = 7)`, then that
+abort, ONE LINE after the client's cursor had already been delivered. That is why every earlier
+attempt showed a cursor at best.
+
+They are implemented now, on the ordinary futex machinery: litebox has no priorities to inherit, so
+what remains of a PI mutex is an ordinary mutex whose owner lives in the futex word, and that
+protocol (owner TID in the low 30 bits, `FUTEX_WAITERS` in bit 31) is implemented faithfully.
+
+**The scheduler priority range.** `sched_get_priority_min`/`max` were not implemented at all. glibc
+reads both at startup and asserts against them on every priority change, so fixing the futexes
+simply moved the abort:
+
+```text
+Fatal glibc error: tpp.c:83 (__pthread_tpp_change_priority): assertion failed:
+  new_prio == -1 || (new_prio >= fifo_min_prio && new_prio <= fifo_max_prio)
+```
+
+They now report the kernel's real numbers: 1..=99 for `SCHED_FIFO`/`RR`, 0..=0 otherwise.
+
+With both in, selkies survives the audio failure it *should* survive -- no PulseAudio daemon is
+running, so `pa_context_connect()` fails and is handled rather than fatal -- and goes on to
+`SUCCESS: Capture started for 'primary'`,
+`Res: 1280x674 | FPS: 30.0 | Encoder: CPU | Mode: H264`.
+
+### What the working configuration is
+
+* the desktop from the OCI-derived rootfs, `xfce4-session` starting xfwm4, xfsettingsd, xfdesktop,
+  xfce4-panel, xfconfd
+* the image's own selkies invocation, with `--addr=0.0.0.0` rather than `localhost` so the gateway
+  can reach it, on its real port **8081**
+* **selkies must be the only python3.** `/lsiopy/bin/python3` is `ET_EXEC`, so a second instance
+  dies with `execve` `EEXIST` -- any `python3` probe in a launcher and selkies are mutually
+  exclusive
+* the dashboard served over `--publish`, with `/websockets` tunnelled to 8081
+
+### Still open
+
+* selkies serves **one client**: a page reload does not reclaim the slot, and a fresh stack is
+  needed for the next connection.
+* `xfce4-panel` is running but no panel is visible in the stream yet.
+* The `ET_EXEC` single-address-space limit is unchanged, and remains the fundamental item: it is
+  what blocks `/init` (s6-overlay), what allows only one python3, and what is behind
+  `failed to map segment` under load. `execve` giving a guest process its own address space fixes
+  all three.
