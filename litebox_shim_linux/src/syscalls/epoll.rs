@@ -745,7 +745,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> ReadySet<Platform, FS> {
                 continue;
             };
 
-            litebox_util_log::error!(
+            litebox_util_log::debug!(
                 entry_id:% = alloc::sync::Arc::as_ptr(&entry) as usize,
                 data:% = entry.data(),
                 events_bits:% = event.as_ref().map(|e| e.events).unwrap_or(0),

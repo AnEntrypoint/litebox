@@ -1204,7 +1204,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // range needs to be compared against to catch a cross-process reclaim hitting
         // this VMA.
         if let Ok(ptr) = &result {
-            litebox_util_log::error!(
+            litebox_util_log::debug!(
                 addr:% = ptr.as_usize(), len:% = aligned_len;
                 "diag-drm-fb-addr"
             );

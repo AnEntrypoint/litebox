@@ -669,7 +669,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         // exceed it, which is fine -- those aren't the requests this trace needs to see in full).
         if crate::syscalls::drm::drm_trace_enabled() {
             let n = core::cmp::min(msg.data.len(), 4096);
-            litebox_util_log::error!(
+            litebox_util_log::debug!(
                 sock_id:% = sock_id,
                 len:% = len,
                 prefix_hex:? = &msg.data[..n];
@@ -677,7 +677,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             );
         }
         let result = self.connected_send_channel.try_write_one(msg);
-        litebox_util_log::error!(
+        litebox_util_log::debug!(
             sock_id:% = sock_id,
             len:% = len,
             ok:% = result.is_ok();
@@ -741,14 +741,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             // still valid for the duration of this function call; `total_read` (and so `n <=
             // total_read`) bytes starting there were just written by the loop above.
             let prefix = unsafe { core::slice::from_raw_parts(buf_start, n) };
-            litebox_util_log::error!(
+            litebox_util_log::debug!(
                 sock_id:% = self as *const _ as usize,
                 total_read:% = total_read,
                 prefix_hex:? = prefix;
                 "diag-unix-stream-read-bytes"
             );
         }
-        litebox_util_log::error!(
+        litebox_util_log::debug!(
             sock_id:% = self as *const _ as usize,
             total_read:% = total_read;
             "diag-unix-stream-read: try_recvfrom drained recv_channel"

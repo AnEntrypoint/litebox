@@ -1930,7 +1930,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     pub(crate) fn sys_exit(&self, status: i32) {
         // Always-on process-timeline diagnostic (advisor-db spec item 3).
-        litebox_util_log::error!(
+        litebox_util_log::debug!(
             pid:% = self.pid, comm:? = self.comm.get(), status:% = status;
             "DIAG_TIMELINE exit"
         );
@@ -1943,7 +1943,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     pub(crate) fn sys_exit_group(&self, status: i32) {
         // Always-on process-timeline diagnostic (advisor-db spec item 3).
-        litebox_util_log::error!(
+        litebox_util_log::debug!(
             pid:% = self.pid, comm:? = self.comm.get(), status:% = status;
             "DIAG_TIMELINE exit_group"
         );
@@ -2189,7 +2189,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         options: i32,
         _rusage: Option<UserPtrMut<u8>>,
     ) -> Result<usize, Errno> {
-        litebox_util_log::warn!(tid:% = self.tid, pid:% = pid, options:% = options; "drm-diag: sys_wait4 entry");
+        litebox_util_log::debug!(tid:% = self.tid, pid:% = pid, options:% = options; "drm-diag: sys_wait4 entry");
         const WNOHANG: i32 = 0x1;
         let no_hang = options & WNOHANG != 0;
         let process = self.process();
@@ -2344,12 +2344,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         // Confirmed live: this exact race reproduced 100% of the time with a
                         // minimal `sh -c "sleep 3 & wait"` repro, hanging the shell's `wait`
                         // builtin forever even though the backgrounded child exited cleanly.
-                        litebox_util_log::warn!(tid:% = self.tid; "drm-diag: sys_wait4 interrupted, re-polling");
+                        litebox_util_log::debug!(tid:% = self.tid; "drm-diag: sys_wait4 interrupted, re-polling");
                         if !poll_once() {
-                            litebox_util_log::warn!(tid:% = self.tid; "drm-diag: sys_wait4 re-poll found nothing, returning EINTR");
+                            litebox_util_log::debug!(tid:% = self.tid; "drm-diag: sys_wait4 re-poll found nothing, returning EINTR");
                             return Err(Errno::EINTR);
                         }
-                        litebox_util_log::warn!(tid:% = self.tid; "drm-diag: sys_wait4 re-poll found exited child");
+                        litebox_util_log::debug!(tid:% = self.tid; "drm-diag: sys_wait4 re-poll found exited child");
                     }
                     Err(litebox::event::wait::WaitError::TimedOut) => unreachable!(
                         "wait_until with no deadline never returns WaitError::TimedOut"
@@ -4034,7 +4034,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // execve" a direct count comparison instead of an inference. `error` level for the same
         // reason as its siblings: always visible regardless of the configured log filter.
         if is_process_clone {
-            litebox_util_log::error!(
+            litebox_util_log::debug!(
                 pid:% = self.pid,
                 comm:? = self.comm.get(),
                 child_tid:% = child_tid;
@@ -5445,7 +5445,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // filter. Deliberately logged here (path resolved, before the point-of-no-return teardown
         // below) rather than after `load_program` succeeds, so a process that dies mid-exec still
         // leaves a timeline entry showing what it was trying to become.
-        litebox_util_log::error!(
+        litebox_util_log::debug!(
             pid:% = self.pid, ppid:% = self.ppid, comm:? = self.comm.get(), argv0:% = path;
             "DIAG_TIMELINE execve"
         );

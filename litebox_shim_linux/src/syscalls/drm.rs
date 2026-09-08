@@ -612,7 +612,7 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     /// fail the guest's own ioctl" contract.
     fn notify_flip_callback(&self, platform: &Platform, fb_id: u32) {
         let callback_count = self.flip_callbacks.lock().len();
-        litebox_util_log::warn!(callback_count:? = callback_count; "drm-diag: notify_flip_callback called");
+        litebox_util_log::debug!(callback_count:? = callback_count; "drm-diag: notify_flip_callback called");
         if callback_count == 0 {
             return;
         }
@@ -645,7 +645,7 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
                 // Log the address this fb is mapped at, so a range destroyed by
                 // allocate_pages (see diag-reclaim) can be matched against it.
                 if drm_trace_enabled() {
-                    litebox_util_log::error!(
+                    litebox_util_log::debug!(
                         fb_id:% = fb_id, addr:% = addr, size:% = size;
                         "diag-drm-fb-addr"
                     );
@@ -668,8 +668,8 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
                     for (i, b) in bytes.iter().enumerate().step_by(4096) {
                         sum = sum.wrapping_mul(31).wrapping_add((*b as u64) ^ (i as u64));
                     }
-                    litebox_util_log::error!(fb_id:% = fb_id, digest:% = sum; "diag-drm-digest");
-                    litebox_util_log::error!(
+                    litebox_util_log::debug!(fb_id:% = fb_id, digest:% = sum; "diag-drm-digest");
+                    litebox_util_log::debug!(
                         fb_id:% = fb_id,
                         bytes_len:% = n,
                         nonzero_bytes:% = nz,
@@ -687,7 +687,7 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
                     // cheap enough to run on every flip while `LITEBOX_DRM_TRACE=1` is set.
                     let sample_len = bytes.len().min(4096);
                     let non_zero_in_sample = bytes[..sample_len].iter().filter(|b| **b != 0).count();
-                    litebox_util_log::error!(
+                    litebox_util_log::debug!(
                         fb_id:% = fb_id, handle:? = handle, addr:% = addr, size:% = size,
                         sample_len:% = sample_len, non_zero_in_sample:% = non_zero_in_sample;
                         "diag-drm-flip-source-bytes"
@@ -1409,7 +1409,7 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         // "does Xorg actually issue DIRTYFB at all" -- the question that decides whether this
         // path matters. A diagnostic that is invisible at the level investigations actually run
         // at has repeatedly cost real time in this codebase.
-        litebox_util_log::error!(
+        litebox_util_log::debug!(
             fb_id:% = req.fb_id, num_clips:% = req.num_clips;
             "DIAG_DIRTYFB"
         );
@@ -1429,7 +1429,7 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         boot_time: &<Platform as litebox::platform::TimeProvider>::Instant,
         ptr: UserPtr<DrmModeCrtcPageFlip>,
     ) -> Result<u32, Errno> {
-        litebox_util_log::warn!("drm-diag: page_flip called");
+        litebox_util_log::debug!("drm-diag: page_flip called");
         let req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         if req.crtc_id != VIRTUAL_CRTC_ID {
             return Err(Errno::ENOENT);
@@ -1444,7 +1444,7 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         // drawn into (a surface-ownership problem) -- and only the fb id distinguishes
         // them.
         if drm_trace_enabled() {
-            litebox_util_log::error!(
+            litebox_util_log::debug!(
                 fb_id:% = req.fb_id, crtc_id:% = req.crtc_id;
                 "diag-drm-flip"
             );

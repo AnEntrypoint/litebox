@@ -54,6 +54,25 @@ narrative appended to the bottom.
   break unrelated features entirely (a `clone()` namespace-flag EINVAL once silently broke ALL
   PNG/JPEG decoding via glycin's own bwrap-sandboxing fallback logic). Report what's actually
   true, never a fake success or an overly-broad failure.
+- **A panic in litebox on Windows used to become a host crash, and that hid things for a long
+  time.** `vectored_exception_handler_entry` entered the full handler for every exception code
+  except nothing -- including `0xE06D7363`, which is what a Rust `panic!` raises on an MSVC target.
+  Every panic in the process was therefore carried through a stack swap into a handler with no
+  interest in it, and the cascade overflowed the stack: the process died as a bare `0xC0000005`
+  with no panic message, no test name, and no indication a panic had even happened. Fixed by
+  whitelisting the four codes the handler actually triages (`EXCEPTION_ACCESS_VIOLATION`,
+  `EXCEPTION_SINGLE_STEP`, `EXCEPTION_ILLEGAL_INSTRUCTION`, `0xC0000096`). The same handler now
+  also registers FIRST in the VEH chain rather than last -- answering the open question in the
+  `RtlpUnwindPrologue` section below, which `git log -S` settles: the `0` was never a decision, it
+  is unchanged from the initial commit. **If you see an unexplained `0xC0000005` with no further
+  detail, consider that something panicked** before assuming a memory bug.
+- **Use `advisor/probes/symbolize_litebox_crash.py` on any host-side crash dump, and snapshot the
+  `.exe` + `.pdb` next to the log when you start a run you might need to debug.** The ring dump's
+  `rva=` values are only meaningful against the exact build that emitted them; symbolizing against
+  a rebuilt binary gives confident, plausible, completely wrong names (verified -- a fault inside
+  litebox's own fault path resolved to `flt2dec::grisu::possibly_round`). Also note the ring prints
+  `rva` for GUEST rips too, where it wraps into nonsense; only `is_in_guest=false` entries carry a
+  real module address.
 - **Always build general debug/observability tooling proactively while investigating**, not just
   enough to explain the current bug -- e.g. separating guest stdout from litebox's own log
   stream, capturing a component's own stderr instead of letting it get redirected to an unread
@@ -338,12 +357,15 @@ depth-0 (`is_in_guest=true`) via the already-existing allocation-free `RECENT_FA
 (`lib.rs:587`) or `diag_raw_regdump`, against the exact `mate-session --version` x3 repro --
 **do NOT run this under `LITEBOX_VEH_TRACE=1`**, the archive already records ~12 consecutive
 traced runs where the crash never reproduced, meaning tracing's own overhead dodges the race this
-bug depends on. Also worth a one-line experiment first: `AddVectoredExceptionHandler(0, ...)` at
-`lib.rs:2418` registers LAST in the process's VEH chain (`0` means last, `1` means first) --
-confirm whether that's deliberate; if another VEH in the process (CRT, a loaded DLL, a nested
-litebox fork child) registers with `1`, it sees the exception first and can
-`EXCEPTION_CONTINUE_EXECUTION` out from under this trace, silently hiding exactly the fault being
-hunted.
+bug depends on. **The `AddVectoredExceptionHandler` question in this section is ANSWERED (2026-09-09) and the
+code is changed.** It registered LAST (`0`); `git log -S` shows that was never a decision, just
+what the initial commit wrote. It now registers FIRST (`1`), which is correct -- this handler owns
+this process's guest-execution fault semantics outright -- and it is safe to do so only because the
+trampoline now declines every exception code the full handler does not triage (see the standing
+lesson above). So the specific hazard this paragraph raised, another VEH seeing the fault first and
+continuing out from under the trace, is closed. Note while re-running this repro that the change
+also means litebox no longer sees Rust panics at all, which is what used to turn them into bare
+`0xC0000005`s -- a symptom easily mistaken for this bug.
 
 **Two older next-step options, lower priority now that the above is known**: (a) generic tracing
 of "the true original fault" via new diagnostics (largely superseded by the depth-0-capture step
@@ -403,7 +425,13 @@ on-screen client first.
   investigation (`decode_frame.py`, `run_xfce_xwm.sh` and variants, `drm_flip_probe.c`, etc.) --
   useful, keep using them, but don't assume every script there is still the current recommended
   path (e.g. the OCI-pull Python scripts are retired, see "Container images" above).
-- Pre-existing, unrelated test-suite gaps as of this writing (not blocking, not this project's
-  fault to fix unless picked up deliberately): `cargo test -p litebox --lib` has 26 failing tests
-  out of 150 (missing `diod` binary for 9P tests, plus two separate pre-existing logic bugs
-  unrelated to anything in this file). `cargo test -p litebox_shim_linux --lib` is clean, 181/181.
+- **Test-suite status (2026-09-09, measured).** `cargo test -p litebox_shim_linux --lib` is
+  181/181. It had been *reported* as 181/181 for a long time without that ever being true: the
+  test binary died at test 9 of 181 with `STATUS_ACCESS_VIOLATION`, so most of the suite never ran
+  and its result was whatever someone last wrote down. Three real defects came out of fixing that,
+  see "A panic used to become a host crash" below. `cargo test -p litebox --lib` has 26 failures
+  out of 150 -- unchanged, and genuinely pre-existing (9 need a `diod` binary for the 9P tests;
+  the rest are separate logic bugs unrelated to anything in this file). **Never record a test
+  count you did not just watch run to completion**: a suite that aborts partway through reports
+  nothing about the tests after the abort, and "it was clean last time" is how this one stayed
+  wrong.

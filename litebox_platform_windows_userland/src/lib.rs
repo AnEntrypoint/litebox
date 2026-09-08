@@ -6760,7 +6760,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             } else {
                 let commit_addr = if r.start == 0 { ptr } else { r.start as *mut c_void };
                 if diag_mm_enabled() {
-                    litebox_util_log::error!(
+                    litebox_util_log::debug!(
                         start:% = commit_addr as usize, end:% = commit_addr as usize + r.len(),
                         len:% = r.len(), pid:% = std::process::id(),
                         tid:? = std::thread::current().id();
@@ -6830,7 +6830,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     // Only report acquisitions that actually cost something, so the
                     // common fast path does not flood the log and skew the run.
                     if held.as_millis() >= 50 || self.2.as_millis() >= 50 {
-                        litebox_util_log::error!(
+                        litebox_util_log::debug!(
                             held_ms:% = held.as_millis(),
                             waited_ms:% = self.2.as_millis(),
                             len:% = self.1;
@@ -7179,7 +7179,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                     // EXACTLY zero after a fork. Log the range so it can be
                                     // matched against the framebuffer's own mapping.
                                     if diag_mm_enabled() {
-                                        litebox_util_log::error!(
+                                        litebox_util_log::debug!(
                                             start:% = r.start,
                                             end:% = r.end,
                                             len:% = r.len(),
@@ -7364,7 +7364,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                                     "diag-reclaim: failed to commit orphaned CoW-view flank as anonymous memory -- next touch will SIGSEGV"
                                                 );
                                             } else if diag_mm_enabled() {
-                                                litebox_util_log::error!(
+                                                litebox_util_log::debug!(
                                                     start:% = flank.start, end:% = flank.end,
                                                     len:% = flank.len();
                                                     "diag-reclaim: committed orphaned CoW-view flank as anonymous zero-fill memory"
@@ -7396,7 +7396,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                     }
                                 } else {
                                     if diag_mm_enabled() {
-                                        litebox_util_log::error!(
+                                        litebox_util_log::debug!(
                                             start:% = r.start, end:% = r.end, len:% = r.len(),
                                             pid:% = std::process::id(),
                                             tid:? = std::thread::current().id();
@@ -7638,7 +7638,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     return Ok(true);
                 }
                 if diag_mm_enabled() {
-                    litebox_util_log::error!(
+                    litebox_util_log::debug!(
                         start:% = r.start, end:% = r.end, len:% = r.len(),
                         pid:% = std::process::id(), tid:? = std::thread::current().id();
                         "diag-decommit: VirtualFree(MEM_DECOMMIT)"
@@ -7686,7 +7686,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     VirtualProtect(r.start as *mut c_void, r.len(), flags, &raw mut old_protect)
                 } != 0;
                 if diag_mm_enabled() {
-                    litebox_util_log::error!(
+                    litebox_util_log::debug!(
                         tid:? = std::thread::current().id(),
                         start:% = r.start,
                         end:% = r.end,
@@ -7951,7 +7951,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             Some((view.Value as usize, view_padding))
         };
         if diag_mm_enabled() {
-            litebox_util_log::error!(
+            litebox_util_log::debug!(
                 addr:% = content_ptr as usize, len:% = source_data.len(), file_offset:% = file_offset,
                 view_padding:% = view_padding;
                 "diag-cow: try_allocate_cow_pages OK"
@@ -7990,7 +7990,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             return Err(SharedMemoryError::OutOfMemory);
         }
         if diag_mm_enabled() {
-            litebox_util_log::error!(
+            litebox_util_log::debug!(
                 handle:% = handle as usize, size:% = size, pid:% = std::process::id();
                 "diag-shm: create_shared_memory"
             );
@@ -8120,7 +8120,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             } else {
                 usize::MAX // not sampled
             };
-            litebox_util_log::error!(
+            litebox_util_log::debug!(
                 handle:% = handle as usize,
                 pid:% = std::process::id(),
                 addr:% = view.Value as usize,
@@ -8156,7 +8156,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                         .collect();
                     let distinct: std::collections::BTreeSet<usize> =
                         readings.iter().map(|(_, n)| *n).collect();
-                    litebox_util_log::error!(
+                    litebox_util_log::debug!(
                         handle:% = handle as usize,
                         views:? = readings,
                         agree:? = distinct.len() == 1;
@@ -8204,7 +8204,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if diag_mm_enabled() {
-            litebox_util_log::error!(
+            litebox_util_log::debug!(
                 start:% = range.start, end:% = range.end, len:% = range.len(),
                 pid:% = std::process::id(), tid:? = std::thread::current().id();
                 "diag-decommit: UnmapViewOfFileEx"
@@ -8267,7 +8267,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         // failures as fatal (see e.g. `VirtualFree` callers that only assert in truly
         // unexpected cases).
         if diag_mm_enabled() {
-            litebox_util_log::error!(
+            litebox_util_log::debug!(
                 handle:% = handle, pid:% = std::process::id();
                 "diag-shm: close_shared_memory"
             );
@@ -9391,12 +9391,12 @@ unsafe extern "C-unwind" fn exception_handler(
 
 unsafe extern "C-unwind" fn interrupt_handler(thread_ctx: &mut ThreadContext<'_>) {
     thread_ctx.tls.is_in_guest.set(false);
-    litebox_util_log::warn!(
+    litebox_util_log::debug!(
         tid:? = std::thread::current().id();
         "drm-diag: interrupt_handler entry"
     );
     thread_ctx.call_shim(|shim, ctx, interrupt| {
-        litebox_util_log::warn!(
+        litebox_util_log::debug!(
             tid:? = std::thread::current().id(), interrupt:% = interrupt;
             "drm-diag: interrupt_handler call_shim closure"
         );

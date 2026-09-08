@@ -269,7 +269,7 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
             let mut probe = [0u8; 16];
             let size = (&file).size().ok();
             let read_ok = (&file).read_at(0, &mut probe).is_ok();
-            litebox_util_log::warn!(
+            litebox_util_log::debug!(
                 fd:% = file.fd,
                 size:? = size,
                 read_ok:% = read_ok,
@@ -324,7 +324,7 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
         // p_memsz` despite the loader's own guard, etc.) right before the crash, that confirms the
         // hypothesis directly.
         for ph in self.parsed.pt_loads_diag() {
-            litebox_util_log::warn!(
+            litebox_util_log::debug!(
                 p_vaddr:% = alloc::format!("{:#x}", ph.p_vaddr),
                 p_filesz:% = alloc::format!("{:#x}", ph.p_filesz),
                 p_memsz:% = alloc::format!("{:#x}", ph.p_memsz),
@@ -358,7 +358,7 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfLoader<'a, Platform, FS> {
         // DIAG (this investigation pass): warn-level (unlike sys_open's own debug-level path
         // logging) so this survives in captures that use LITEBOX_LOG=warn to actually reach a
         // slow-to-trigger crash without debug-level's much higher verbosity timing it out first.
-        litebox_util_log::warn!(path:% = path; "DIAG elf_load: ElfLoader::new main path");
+        litebox_util_log::debug!(path:% = path; "DIAG elf_load: ElfLoader::new main path");
         // AGENTS.md pass 260: log the load base for every ELF this loader handles so a future
         // guest-exception capture's `rip` can be matched against these ranges by hand to
         // identify which file (and, via the path + `nm`/`objdump` on that exact file, which
@@ -374,7 +374,7 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfLoader<'a, Platform, FS> {
         // Parse the interpreter ELF file, if any.
         let interp = if let Some(interp_name) = main.parsed.interp(&mut &main.file)? {
             // e.g., /lib64/ld-linux-x86-64.so.2
-            litebox_util_log::warn!(
+            litebox_util_log::debug!(
                 interp_name:? = interp_name;
                 "DIAG elf_load: ElfLoader::new interp path"
             );

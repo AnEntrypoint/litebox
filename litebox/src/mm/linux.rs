@@ -1962,12 +1962,20 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     ) -> Result<Platform::RawMutPointer<u8>, VmemMoveError> {
         assert!(new_size.as_usize() >= old_range.len());
 
-        // Check if the given range is covered by exactly one mapping
-        let (cur_range, vma) = self
-            .vmas
-            .get_key_value(&old_range.start)
-            .expect("VMEM: range not found");
-        assert!(cur_range.contains(&(old_range.end - 1)));
+        // Check if the given range is covered by exactly one mapping.
+        //
+        // Copied out of `self.vmas` rather than held as a borrow: the non-shared placement loop
+        // below now inserts and removes placeholder entries while searching (see its own comment),
+        // and a live immutable borrow of the map would forbid that. Both values are small and
+        // `Copy`.
+        let vma = {
+            let (cur_range, vma) = self
+                .vmas
+                .get_key_value(&old_range.start)
+                .expect("VMEM: range not found");
+            assert!(cur_range.contains(&(old_range.end - 1)));
+            *vma
+        };
 
         // A file-backed mapping with a real shared-memory handle (a `wl_shm`/memfd `MAP_SHARED`
         // pool, e.g. `libwayland-cursor`'s own pool-growth pattern) must fall through to the
@@ -2001,7 +2009,6 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // private memory -- no byte-copy is needed since the content lives in the shared object,
         // not in either view.
         if let Some(_shared_handle) = vma.shared_handle {
-            let vma: VmArea<Platform, ALIGN> = *vma;
             // `insert_mapping` rejects `start < Platform::TASK_ADDR_MIN` unconditionally, even
             // under `FixedAddressBehavior::Hint` -- unlike `allocate_pages`, it has no "0 means
             // let the platform pick freely" convention of its own, so a literal 0 hint here
@@ -2080,15 +2087,44 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         const MAX_PLACEMENT_RETRIES: u32 = 8;
         let mut next_hint = suggested_new_address;
         let mut attempt = 0u32;
-        loop {
-            let new_addr = self
-                .get_unmmaped_area(
-                    next_hint,
-                    new_size,
-                    false,
-                    vma.flags.contains(VmFlags::VM_GROWSDOWN),
-                )
-                .ok_or(VmemMoveError::OutOfMemory)?;
+        // Candidates the platform has already rejected, parked in `self.vmas` as placeholder VMAs
+        // so the next `get_unmmaped_area` cannot hand back the same address again.
+        //
+        // Dropping the hint was NOT enough, and the retry loop did not work: `get_unmmaped_area`
+        // searches `self.vmas` top-down and is deterministic, so with `self.vmas` unchanged every
+        // one of the eight attempts computed the IDENTICAL address, asked the platform about it
+        // again, and was refused again. The loop was eight copies of one attempt. Its own comment
+        // describes the intended behaviour ("retry with a fresh OS/tracker-picked address", "a
+        // genuine, persistent AlreadyAllocated ... still terminates"), which is what this makes
+        // true.
+        //
+        // Reproduced deterministically: `litebox_shim_linux`'s `syscalls::mm::tests::test_mremap`
+        // failing with `EFAULT` in roughly one multi-threaded run in four, and never once in 12
+        // single-threaded runs -- a collision with a sibling test thread's genuinely live memory,
+        // which is exactly the case this loop exists to place around.
+        //
+        // `VmFlags::empty()` is the established placeholder shape in this module: `Vmem::new` uses
+        // it for the platform's own `reserved_pages`, and `insert_mapping` already distinguishes an
+        // empty-flags entry from a real guest mapping. Every one is removed again before this
+        // function returns, on every path, so nothing leaks into the caller's address space.
+        let mut rejected: alloc::vec::Vec<core::ops::Range<usize>> = alloc::vec::Vec::new();
+        let placeholder = VmArea::<Platform, ALIGN> {
+            flags: VmFlags::empty(),
+            is_file_backed: false,
+            shared_handle: None,
+            view_base: 0,
+            view_len: 0,
+            reserved_extra: 0,
+        };
+        let result = loop {
+            let Some(new_addr) = self.get_unmmaped_area(
+                next_hint,
+                new_size,
+                false,
+                vma.flags.contains(VmFlags::VM_GROWSDOWN),
+            ) else {
+                break Err(VmemMoveError::OutOfMemory);
+            };
             let new_range =
                 PageRange::<ALIGN>::new(new_addr, new_addr + new_size.as_usize()).unwrap();
             match unsafe {
@@ -2098,19 +2134,30 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 Ok(new_addr) => {
                     let new_start = new_addr.as_usize();
                     let new_end = new_start + new_size.as_usize();
-                    self.vmas.insert(new_start..new_end, *vma);
+                    // The placeholders must come out BEFORE the real mapping goes in: one of them
+                    // can be adjacent to (or, if the platform relocated the mapping itself,
+                    // overlapping) the range being inserted, and a `RangeMap` insert over a
+                    // placeholder would otherwise be resolved against an entry that is about to
+                    // stop existing.
+                    for range in &rejected {
+                        self.vmas.remove(range.clone());
+                    }
+                    rejected.clear();
+                    self.vmas.insert(new_start..new_end, vma);
                     self.vmas.remove(old_range.into());
                     return Ok(new_addr);
                 }
                 Err(RemapError::AlreadyAllocated) if attempt < MAX_PLACEMENT_RETRIES => {
                     litebox_util_log::debug!(
                         attempt:% = attempt, new_addr:% = new_addr, vmas_count:% = self.vmas.iter().count();
-                        "move_mappings: DIAG AlreadyAllocated, retrying with fresh placement"
+                        "move_mappings: DIAG AlreadyAllocated, parking candidate and retrying"
                     );
                     attempt += 1;
-                    // Drop the hint on retry: a repeated collision at the same suggested address
-                    // would just fail identically again, so fall through to the OS/tracker's own
-                    // free-gap search for the next attempt.
+                    // Park the refused candidate so the next search has to look elsewhere, and
+                    // drop the hint so the search is free to.
+                    let parked = new_addr..(new_addr + new_size.as_usize());
+                    self.vmas.insert(parked.clone(), placeholder);
+                    rejected.push(parked);
                     next_hint = None;
                 }
                 Err(e) => {
@@ -2119,10 +2166,17 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                         err:? = &e;
                         "move_mappings: DIAG non-retriable RemapError, giving up"
                     );
-                    return Err(VmemMoveError::RemapError(e));
+                    break Err(VmemMoveError::RemapError(e));
                 }
             }
+        };
+        // Failure path: the placeholders are bookkeeping for this search only, and leaving them
+        // behind would permanently forbid those addresses to every later allocation in this
+        // address space.
+        for range in &rejected {
+            self.vmas.remove(range.clone());
         }
+        result
     }
 
     /// Change the permissions ([`VmFlags::VM_ACCESS_FLAGS`]) of a range in the virtual address space.

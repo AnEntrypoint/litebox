@@ -1009,7 +1009,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             // Always-on process-timeline diagnostic (advisor-db spec item 3):
                             // same event, in the DIAG_TIMELINE-prefixed shape the other
                             // exit/execve timeline lines use, for a uniform post-hoc `grep`.
-                            litebox_util_log::error!(
+                            litebox_util_log::debug!(
                                 pid:% = self.pid, comm:? = self.comm.get(), signal:? = signal;
                                 "DIAG_TIMELINE exit_signal"
                             );

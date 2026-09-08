@@ -5164,7 +5164,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // (page flips arrive at vblank rate) and has previously throttled the
         // emulator badly enough to change what is being measured.
         if crate::syscalls::drm::drm_trace_enabled() {
-            litebox_util_log::error!(pid:% = self.pid, ioctl:? = arg; "diag-drm-ioctl");
+            litebox_util_log::debug!(pid:% = self.pid, ioctl:? = arg; "diag-drm-ioctl");
         }
         match arg {
             IoctlArg::DrmModeGetResources(ptr) => self.global.drm.get_resources(*ptr),

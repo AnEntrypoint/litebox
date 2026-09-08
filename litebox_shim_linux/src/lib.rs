@@ -153,7 +153,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
     type ExecutionContext = litebox_common_linux::PtRegs;
 
     fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        litebox_util_log::warn!("drm-diag: init() entry");
+        litebox_util_log::debug!("drm-diag: init() entry");
         self.enter_shim(true, ctx, Task::handle_init_request)
     }
 
@@ -166,7 +166,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
         ctx: &mut Self::ExecutionContext,
         info: &litebox::shim::ExceptionInfo,
     ) -> ContinueOperation {
-        litebox_util_log::warn!(
+        litebox_util_log::debug!(
             exception:? = info.exception, kernel_mode:% = info.kernel_mode;
             "drm-diag: exception() entry"
         );
@@ -225,7 +225,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
         // faulting instruction address to investigate instead of just "Signal(11)".
         #[cfg(target_arch = "x86_64")]
         {
-            litebox_util_log::error!(
+            litebox_util_log::debug!(
                 exception:? = info.exception, kernel_mode:% = info.kernel_mode,
                 rip:% = format_args!("{:#x}", ctx.rip), rsp:% = format_args!("{:#x}", ctx.rsp),
                 cr2:% = format_args!("{:#x}", info.cr2), error_code:% = format_args!("{:#x}", info.error_code);
@@ -252,7 +252,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
                 .filter(|(r, _)| r.start < probe_range.end && r.end > probe_range.start)
                 .collect();
             for (r, flags) in &overlapping {
-                litebox_util_log::error!(
+                litebox_util_log::debug!(
                     range_start:% = format_args!("{:#x}", r.start),
                     range_end:% = format_args!("{:#x}", r.end),
                     flags:? = flags;
@@ -261,7 +261,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
             }
             let cr2_mapped = overlapping.iter().any(|(r, _)| r.contains(&info.cr2));
             if overlapping.is_empty() {
-                litebox_util_log::error!(
+                litebox_util_log::debug!(
                     cr2:% = format_args!("{:#x}", info.cr2);
                     "diag-guest-exception: NO mapping overlaps cr2 (genuinely unmapped)"
                 );
@@ -284,7 +284,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
                 let dump = unsafe {
                     core::slice::from_raw_parts(info.cr2 as *const u8, 64)
                 };
-                litebox_util_log::error!(
+                litebox_util_log::debug!(
                     cr2:% = format_args!("{:#x}", info.cr2),
                     bytes:% = format_args!("{:02x?}", dump);
                     "diag-guest-exception: cr2 byte dump"
@@ -301,7 +301,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
                 let dump = unsafe {
                     core::slice::from_raw_parts(ctx.rip as *const u8, 64)
                 };
-                litebox_util_log::error!(
+                litebox_util_log::debug!(
                     rip:% = format_args!("{:#x}", ctx.rip),
                     bytes:% = format_args!("{:02x?}", dump);
                     "diag-guest-exception: rip byte dump"
@@ -309,7 +309,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
             }
         }
         #[cfg(target_arch = "aarch64")]
-        litebox_util_log::error!(
+        litebox_util_log::debug!(
             exception:? = info.exception, kernel_mode:% = info.kernel_mode,
             pc:% = format_args!("{:#x}", ctx.pc), sp:% = format_args!("{:#x}", ctx.sp),
             fault_address:% = format_args!("{:#x}", info.fault_address);
