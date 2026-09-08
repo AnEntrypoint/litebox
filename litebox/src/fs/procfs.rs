@@ -146,6 +146,26 @@ fn format_mountinfo() -> Vec<u8> {
     b"1 0 0:1 / / rw - rootfs rootfs rw\n".to_vec()
 }
 
+/// Real `/proc/[pid]/cgroup` content, unified-hierarchy (cgroup v2) form.
+///
+/// The format is `hierarchy-ID:controller-list:cgroup-path` per line. On a v2-only system --
+/// which is what every current container runtime presents, and what this shim most closely
+/// resembles, having no cgroup controllers of its own -- there is exactly one line, the hierarchy
+/// ID is `0`, and the controller list is empty: `0::/`.
+///
+/// This existing as a real file rather than `ENOENT` matters because it is not an optional
+/// nicety for the consumers that read it. glib's `g_get_user_runtime_dir`, systemd's
+/// `sd_pid_get_unit`, and libcontainer-aware code all probe it, and several of them treat a
+/// missing file (`ENOENT`) differently from a v2 answer -- a MISSING file reads as "cgroups are
+/// not mounted at all, this is a pre-2008 kernel", which is a state no modern userspace is
+/// prepared for, whereas `0::/` reads as "cgroup v2, this process is in the root group", which is
+/// both true here and the case every one of them handles. The webtop stack read this thousands of
+/// times in a single boot.
+fn format_cgroup() -> Vec<u8> {
+    Vec::from(&b"0::/
+"[..])
+}
+
 /// Real `/proc/uptime` format: two space-separated floating point seconds values (system uptime,
 /// idle time summed across all CPUs), `\n`-terminated. This shim does not track guest idle time,
 /// so idle is conservatively reported equal to uptime -- what actually matters to every known
@@ -517,6 +537,7 @@ enum ProcSelfEntry {
     Status,
     Environ,
     MountInfo,
+    Cgroup,
 }
 
 impl ProcSelfEntry {
@@ -527,6 +548,7 @@ impl ProcSelfEntry {
         ("status", ProcSelfEntry::Status),
         ("environ", ProcSelfEntry::Environ),
         ("mountinfo", ProcSelfEntry::MountInfo),
+        ("cgroup", ProcSelfEntry::Cgroup),
     ];
 
     fn from_name(name: &str) -> Option<Self> {
@@ -562,6 +584,11 @@ const PROC_SELF_ENVIRON_NODE_INFO: NodeInfo = NodeInfo {
 const PROC_SELF_MOUNTINFO_NODE_INFO: NodeInfo = NodeInfo {
     dev: 7,
     ino: 6,
+    rdev: None,
+};
+const PROC_SELF_CGROUP_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 7,
+    ino: 7,
     rdev: None,
 };
 
@@ -660,6 +687,7 @@ where
             ProcSelfEntry::Status => format_status(&snapshot),
             ProcSelfEntry::Environ => snapshot.environ.clone(),
             ProcSelfEntry::MountInfo => format_mountinfo(),
+            ProcSelfEntry::Cgroup => format_cgroup(),
         };
         Ok(Permissioned {
             item: FileHandle::from_typed::<Self>(ProcSelfFileHandle { entry, content }),
@@ -687,9 +715,16 @@ where
         let _handle = handle.into_typed::<Self>();
         Ok(ProcSelfEntry::ALL
             .iter()
-            .map(|(n, _)| DirEntry {
+            .map(|(n, e)| DirEntry {
                 name: String::from(*n),
-                file_type: FileType::RegularFile,
+                // `exe` is a symlink and `read_link_at` above already treats it as one; reporting
+                // `RegularFile` here contradicted that, and a caller that trusts `d_type` from
+                // `getdents64` rather than re-`lstat`ing (which is the whole point of `d_type`)
+                // would never follow it.
+                file_type: match e {
+                    ProcSelfEntry::Exe => FileType::Symlink,
+                    _ => FileType::RegularFile,
+                },
                 ino_info: None,
             })
             .collect())
@@ -737,6 +772,7 @@ where
                 ProcSelfEntry::Status => PROC_SELF_STATUS_NODE_INFO,
                 ProcSelfEntry::Environ => PROC_SELF_ENVIRON_NODE_INFO,
                 ProcSelfEntry::MountInfo => PROC_SELF_MOUNTINFO_NODE_INFO,
+                ProcSelfEntry::Cgroup => PROC_SELF_CGROUP_NODE_INFO,
             },
             blksize: 0x1000,
             atime: Timestamp::default(),

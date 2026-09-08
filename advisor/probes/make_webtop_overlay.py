@@ -122,16 +122,71 @@ if [ "$STAGE" -ge 3 ]; then
 fi
 
 if [ "$STAGE" -ge 4 ]; then
+  # An explicit `dbus-daemon`, not `dbus-launch`.
+  #
+  # `dbus-launch --exit-with-session mate-session` is one opaque step that does three separable
+  # things: fork a bus daemon, discover its address, and exec the session. When stage 4 produced a
+  # completely empty `/tmp/mate.log` and a black root window, that single log could not say WHICH
+  # of the three failed -- and dbus-launch is the fragile one here, since it double-forks and then
+  # reads the daemon's pid back over a pipe (the `EOF in dbus-launch reading PID from bus daemon`
+  # already seen on the cross-process fork path is exactly that read failing).
+  #
+  # Running the daemon directly makes the address an observable value rather than an implicit
+  # side effect: if the bus never comes up, `DBUS_ADDR` is empty and this says so, and if it does,
+  # every later failure is unambiguously mate-session's own.
+  echo "[stack] starting session dbus-daemon"
+  DBUS_ADDR=$(/usr/bin/dbus-daemon --session --fork --print-address 2>/tmp/dbusd.log)
+  if [ -z "$DBUS_ADDR" ]; then
+    echo "[stack] DBUS_FAILED -- dbusd.log follows"; cat /tmp/dbusd.log 2>&1
+  else
+    echo "[stack] DBUS_UP addr=$DBUS_ADDR"
+    export DBUS_SESSION_BUS_ADDRESS="$DBUS_ADDR"
+  fi
+
   echo "[stack] starting mate-session"
   cd /config
-  /usr/bin/dbus-launch --exit-with-session /usr/bin/mate-session > /tmp/mate.log 2>&1 &
-  sleep 30
-  echo "[stack] --- mate.log ---"; tail -15 /tmp/mate.log 2>&1
-  echo "[stack] --- xlsclients ---"; xlsclients 2>&1 | head -12
+  # `--debug` and an unbuffered stderr, because the previous invocation's silence was itself the
+  # problem: mate-session logs nothing on a successful start, so an empty log was equally
+  # consistent with "never ran" and "running fine". With --debug it always says something.
+  # Straight to this script's own stdout through a prefixing pipe, NOT `> /tmp/mate.log`.
+  #
+  # With the redirect, `--debug` still produced a zero-byte log while `kill -0` said the process
+  # was alive -- which leaves two incompatible readings (mate-session is silent, or its output
+  # never reached the file) and no way to choose between them. The `[stack]` echoes around it
+  # demonstrably reach the console, so routing mate-session the same way removes the file as a
+  # variable: anything it writes now lands where output is already proven to arrive.
+  /usr/bin/mate-session --debug 2>&1 | sed "s/^/[mate] /" &
+  MATE_PID=$!
+  sleep 40
+  if kill -0 "$MATE_PID" 2>/dev/null; then
+    echo "[stack] MATE_ALIVE pid=$MATE_PID"
+  else
+    echo "[stack] MATE_EXITED pid=$MATE_PID"
+  fi
+fi
+
+if [ "$STAGE" -ge 5 ]; then
+  # Ask the X server what is actually there, rather than inferring it from a browser screenshot.
+  # A black stream is equally consistent with "no client connected" and "clients connected but
+  # nothing mapped"; only the server can tell those apart. See `webtop_xcensus.py`.
+  echo "[stack] --- X census ---"; python3 /xcensus.py 2>&1 | head -60
+  echo "[stack] --- root grab ---"; python3 /grab_root.py 2>&1 | tail -32
 fi
 
 echo "[stack] STACK_READY stage=$STAGE"
-sleep "$HOLD"
+
+if [ "$STAGE" -ge 5 ]; then
+  # Re-census on a slow cadence while holding. A desktop that assembles late looks identical to
+  # one that never assembles if the only census is taken at a single instant.
+  ELAPSED=0
+  while [ "$ELAPSED" -lt "$HOLD" ]; do
+    sleep 60
+    ELAPSED=$((ELAPSED + 60))
+    echo "[stack] --- X census t=${ELAPSED}s ---"; python3 /xcensus.py 2>&1 | head -40
+  done
+else
+  sleep "$HOLD"
+fi
 """
 
 
@@ -183,5 +238,6 @@ with tarfile.open(OUT, 'w', format=tarfile.GNU_FORMAT) as tar:
     add(tar, 'patch/sitecustomize.py', read_probe('webtop_sitecustomize.py'))
     add(tar, 'paint_root.py', read_probe('webtop_paint_root.py'))
     add(tar, 'grab_root.py', read_probe('webtop_grab_root.py'))
+    add(tar, 'xcensus.py', read_probe('webtop_xcensus.py'))
 
 print('wrote', OUT)
