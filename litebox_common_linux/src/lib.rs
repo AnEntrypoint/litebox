@@ -3409,6 +3409,13 @@ pub enum SyscallRequest {
         egid: UserPtrMut<u32>,
         sgid: UserPtrMut<u32>,
     },
+    /// `sched_setaffinity` -- restrict a thread to a CPU set. See the dispatch site and
+    /// `sys_sched_setaffinity`.
+    SchedSetAffinity {
+        pid: Option<i32>,
+        len: usize,
+        mask: UserPtr<u8>,
+    },
     /// `posix_fadvise` -- an access-pattern hint. Accepted and ignored; see the dispatch site.
     Fadvise64,
     Fsync {
@@ -4980,6 +4987,18 @@ impl SyscallRequest {
             Sysno::sched_getaffinity => {
                 let pid = ctx.sys_req_arg(0);
                 SyscallRequest::SchedGetAffinity {
+                    pid: if pid == 0 { None } else { Some(pid) },
+                    len: ctx.sys_req_arg(1),
+                    mask: ctx.sys_req_ptr(2),
+                }
+            }
+            // `sched_setaffinity` is the write side of `sched_getaffinity`, which IS implemented --
+            // so the read-narrow-write sequence every affinity-aware caller performs used to fail
+            // at the last step with `ENOSYS` after the first two succeeded. A real XFCE session
+            // was observed doing it 16 times in one boot.
+            Sysno::sched_setaffinity => {
+                let pid = ctx.sys_req_arg(0);
+                SyscallRequest::SchedSetAffinity {
                     pid: if pid == 0 { None } else { Some(pid) },
                     len: ctx.sys_req_arg(1),
                     mask: ctx.sys_req_ptr(2),

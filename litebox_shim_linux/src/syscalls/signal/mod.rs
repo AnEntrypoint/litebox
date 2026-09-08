@@ -127,16 +127,18 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         }
     }
 
-    /// Resets signal state for an `execve` call.
-    pub(crate) fn reset_for_exec(&self) {
-        // execve() replaces the entire address space with a fresh ELF image -- any previously
-        // allocated trampoline address is no longer valid (or even mapped); `write_signal_frame`
-        // lazily re-allocates a fresh one on next use.
-        self.sigreturn_trampoline.set(0);
+    /// Resets every installed signal handler to its default, leaving an explicitly IGNORED signal
+    /// ignored.
+    ///
+    /// That asymmetry is the kernel's, not a simplification: `flush_signal_handlers(t, 0)` skips
+    /// `SIG_IGN`, so a signal the caller deliberately ignored stays ignored across both operations
+    /// that use this. Shared by `execve` and by `CLONE_CLEAR_SIGHAND`, which have identical
+    /// handler semantics -- they differ only in what ELSE they reset, so only the handler loop
+    /// belongs here.
+    pub(crate) fn reset_handlers_to_default(&self) {
         let mut handlers = self.handlers.borrow_mut();
         // Ensure that the signal handlers are no longer shared.
         let handlers = Arc::make_mut(&mut handlers);
-        // Reset the handlers to defaults.
         for handler in &mut handlers.inner.get_mut().handlers {
             handler.action = SigAction {
                 sigaction: if handler.action.sigaction == SIG_IGN {
@@ -150,6 +152,15 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
                 __pad: 0,
             };
         }
+    }
+
+    /// Resets signal state for an `execve` call.
+    pub(crate) fn reset_for_exec(&self) {
+        // execve() replaces the entire address space with a fresh ELF image -- any previously
+        // allocated trampoline address is no longer valid (or even mapped); `write_signal_frame`
+        // lazily re-allocates a fresh one on next use.
+        self.sigreturn_trampoline.set(0);
+        self.reset_handlers_to_default();
         self.clear_sigaltstack();
     }
 }

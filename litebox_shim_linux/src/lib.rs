@@ -1072,18 +1072,24 @@ fn default_fs<Platform: ShimPlatform>(
                     alloc::string::String::from("0
 ")
                 };
-                litebox::fs::static_files::StaticFiles::new(
-                    litebox,
-                    allocator,
-                    alloc::vec![
-                        litebox::fs::static_files::file("online", range.as_bytes()),
-                        litebox::fs::static_files::file("possible", range.as_bytes()),
-                        // `1024` is the scheduler's "full capacity" reference value, what every
-                        // core on a uniform (non-big.LITTLE) machine reports.
-                        litebox::fs::static_files::file("cpu0/cpu_capacity", b"1024
-"),
-                    ],
-                )
+                let mut entries = alloc::vec![
+                    litebox::fs::static_files::file("online", range.as_bytes()),
+                    litebox::fs::static_files::file("possible", range.as_bytes()),
+                ];
+                // One `cpuN/cpu_capacity` per CPU, not just `cpu0`. Declaring only `cpu0` was a
+                // real gap, not a simplification: a live session was observed reading
+                // `cpu1/cpu_capacity` and getting `ENOENT`, because a reader that finds the file
+                // for one CPU reasonably expects it for all of them. `1024` is the scheduler's
+                // "full capacity" reference value, what every core on a uniform
+                // (non-big.LITTLE) machine reports.
+                for cpu in 0..cpu_count {
+                    entries.push(litebox::fs::static_files::file(
+                        &alloc::format!("cpu{cpu}/cpu_capacity"),
+                        b"1024
+",
+                    ));
+                }
+                litebox::fs::static_files::StaticFiles::new(litebox, allocator, entries)
             })
             .mount("/proc", |allocator| {
                 litebox::fs::procfs::Procfs::new(
@@ -2444,6 +2450,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::CapGet { header, data } => syscall!(sys_capget(header, data)),
             SyscallRequest::GetDirent64 { fd, dirp, count } => {
                 self.sys_getdirent64(fd, dirp, count)
+            }
+            SyscallRequest::SchedSetAffinity { pid, len, mask } => {
+                syscall!(sys_sched_setaffinity(pid, len, mask))
             }
             SyscallRequest::SchedGetAffinity { pid, len, mask } => {
                 const BITS_PER_BYTE: usize = 8;

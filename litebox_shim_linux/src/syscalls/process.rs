@@ -2888,7 +2888,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             | CloneFlags::CHILD_SETTID
             | CloneFlags::VFORK
             // Ignored since we don't support sysv semaphores anyway.
-            | CloneFlags::SYSVSEM;
+            | CloneFlags::SYSVSEM
+            // `CLONE_CLEAR_SIGHAND` resets the child's signal handlers to their defaults. This is
+            // what glibc's `posix_spawn` passes, so refusing it sends every `posix_spawn` caller
+            // down a `fork`+`exec` fallback at best -- and a real XFCE session was observed being
+            // refused it. Honoured below, not merely accepted: the child's handlers really are
+            // reset, with the same preserve-`SIG_IGN` rule the kernel applies.
+            | CloneFlags::CLEAR_SIGHAND;
 
         // Namespace-creation flags get EPERM, not EINVAL. The distinction is load-bearing:
         // sandboxing tools probe for namespace support and degrade gracefully when REFUSED,
@@ -2917,6 +2923,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 flags & NAMESPACE_FLAGS
             );
             return Err(Errno::EPERM);
+        }
+        // Linux rejects this pair outright: one asks to SHARE the handler table, the other to
+        // reset it, and there is no coherent meaning for both.
+        if flags.contains(CloneFlags::CLEAR_SIGHAND | CloneFlags::SIGHAND) {
+            return Err(Errno::EINVAL);
         }
         if flags.intersects(!supported_clone_flags) {
             log_unsupported!(
@@ -3993,7 +4004,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         dumpable: self.dumpable.clone(),
                         fs: fs.into(),
                         files: make_files().into(),
-                        signals: self.signals.clone_for_new_task(child_shared_pending),
+                        signals: {
+                            let signals = self.signals.clone_for_new_task(child_shared_pending);
+                            // `CLONE_CLEAR_SIGHAND`: the child starts with default dispositions.
+                            // Applied to the CHILD's freshly-cloned state, never the caller's.
+                            if flags.contains(CloneFlags::CLEAR_SIGHAND) {
+                                signals.reset_handlers_to_default();
+                            }
+                            signals
+                        },
                         attached_pty_id: core::cell::Cell::new(self.attached_pty_id.get()),
                     },
                 }),
@@ -4924,6 +4943,52 @@ impl CpuSet {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    /// Handle syscall `sched_setaffinity`.
+    ///
+    /// Validated and accepted. litebox does not place guest threads on CPUs itself -- Windows
+    /// schedules the real OS threads that back them -- so the requested mask cannot be honoured as
+    /// a restriction, and saying so by returning `ENOSYS` is the wrong answer for two reasons.
+    ///
+    /// First, it is inconsistent: [`Self::sys_sched_getaffinity`] is implemented and reports every
+    /// CPU as available, so the read-narrow-write sequence every affinity-aware caller performs
+    /// (GLib's thread-pool sizing, OpenMP runtimes, ffmpeg, numactl-style launchers) succeeded
+    /// twice and then failed. Second, a caller that asks to run on a SUBSET of the CPUs it was
+    /// already allowed to run on is not asking for a capability -- it is expressing a preference,
+    /// and ignoring a preference is a valid implementation where refusing the call is not.
+    ///
+    /// The validation is real rather than decorative, and matches Linux: an empty mask, or one
+    /// naming no CPU this system has, is `EINVAL`. That is what distinguishes "ignored your
+    /// preference" from "accepted a request that can never be satisfied".
+    pub(crate) fn sys_sched_setaffinity(
+        &self,
+        _pid: Option<i32>,
+        len: usize,
+        mask: UserPtr<u8>,
+    ) -> Result<usize, Errno> {
+        // Linux requires the supplied buffer to be at least as large as `sizeof(long)` and
+        // rejects a zero length outright.
+        if len == 0 {
+            return Err(Errno::EINVAL);
+        }
+        // Only the bytes that can name a CPU this system has are examined; anything beyond is
+        // padding the caller is free to leave as it likes.
+        let readable = len.min(NR_CPUS.div_ceil(8));
+        let mut any_valid_cpu = false;
+        for byte_index in 0..readable {
+            let byte = mask
+                .read_at_offset::<Platform>(isize::try_from(byte_index).map_err(|_| Errno::EINVAL)?)
+                .ok_or(Errno::EFAULT)?;
+            if byte != 0 {
+                any_valid_cpu = true;
+            }
+        }
+        if !any_valid_cpu {
+            // An affinity mask naming no usable CPU can never be satisfied, and Linux says so.
+            return Err(Errno::EINVAL);
+        }
+        Ok(0)
+    }
+
     /// Handle syscall `sched_getaffinity`.
     ///
     /// Note this is a dummy implementation that always returns the same CPU set
@@ -5919,6 +5984,43 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
 #[cfg(test)]
 mod tests {
+    /// `sched_setaffinity` must accept a narrowing of the mask `sched_getaffinity` just reported.
+    ///
+    /// The two were inconsistent: the read side was implemented and reported every CPU available,
+    /// the write side returned `ENOSYS`, so the read-narrow-write sequence every affinity-aware
+    /// caller performs succeeded twice and then failed.
+    #[test]
+    fn sched_setaffinity_accepts_a_narrowed_mask_and_rejects_an_impossible_one() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Whatever the read side reports must be settable -- that round-trip is the contract.
+        let available = task.sys_sched_getaffinity(None);
+        assert!(
+            available.bits.any(),
+            "the read side must report at least one usable CPU"
+        );
+
+        // Narrow to CPU 0 only, which is what a caller pinning itself does.
+        let mask = [1u8, 0, 0, 0, 0, 0, 0, 0];
+        task.sys_sched_setaffinity(None, mask.len(), UserPtr::from_ptr(mask.as_ptr()))
+            .expect("pinning to CPU 0 must be accepted");
+
+        // An empty mask names no CPU and can never be satisfied; Linux says `EINVAL`, and that is
+        // what distinguishes "your preference was ignored" from "your request was impossible".
+        let empty = [0u8; 8];
+        assert_eq!(
+            task.sys_sched_setaffinity(None, empty.len(), UserPtr::from_ptr(empty.as_ptr()))
+                .unwrap_err(),
+            Errno::EINVAL
+        );
+        // A zero-length buffer is rejected outright, as on Linux.
+        assert_eq!(
+            task.sys_sched_setaffinity(None, 0, UserPtr::from_ptr(mask.as_ptr()))
+                .unwrap_err(),
+            Errno::EINVAL
+        );
+    }
+
     /// `getresuid`/`getresgid` report three ids, and a caller that reads them is usually deciding
     /// whether it is privileged -- so reporting `ENOSYS` makes it refuse to continue rather than
     /// degrade. These were unimplemented and observed being called by a real session.
