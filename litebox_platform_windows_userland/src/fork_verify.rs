@@ -1817,8 +1817,17 @@ fn read_code_bytes(rip: usize, buf: &mut [u8]) -> usize {
 }
 
 /// Whether `addr` is in a committed, readable region of the host address space.
+///
+/// Single-byte question: callers that go on to read more than one byte must use
+/// [`is_readable_range`] instead, or they reintroduce the straddling-access fault
+/// [`readable_and_writable`] documents.
 pub(crate) fn is_readable(addr: usize) -> bool {
-    readable_and_writable(addr).0
+    readable_and_writable(addr, 1).0
+}
+
+/// Whether every byte of `addr..addr + len` is in one committed, readable region.
+pub(crate) fn is_readable_range(addr: usize, len: usize) -> bool {
+    readable_and_writable(addr, len).0
 }
 
 /// A single `VirtualQuery` call answering both "is `addr` in a committed, readable region" and
@@ -1832,7 +1841,7 @@ pub(crate) fn is_readable(addr: usize) -> bool {
 /// single-step-triggered healing path, potentially thousands of times per verified `fork()`
 /// child, so halving the syscall count here is a real, input-size-independent win on every call,
 /// largest exactly where it matters most (a large guest process forking).
-fn readable_and_writable(addr: usize) -> (bool, bool) {
+fn readable_and_writable(addr: usize, len: usize) -> (bool, bool) {
     use windows_sys::Win32::System::Memory as Win32_Memory;
     const NO_ACCESS: u32 = Win32_Memory::PAGE_NOACCESS | Win32_Memory::PAGE_GUARD;
     const WRITABLE: u32 = Win32_Memory::PAGE_READWRITE
@@ -1849,6 +1858,30 @@ fn readable_and_writable(addr: usize) -> (bool, bool) {
         ) != 0
     };
     if !ok || mbi.State != Win32_Memory::MEM_COMMIT {
+        return (false, false);
+    }
+    // The region must cover the WHOLE access, not just its first byte.
+    //
+    // `VirtualQuery` describes the region containing `addr`; a caller then reading `len` bytes
+    // from there straddles into the NEXT region whenever `addr` sits within `len` of this one's
+    // end -- and the next region is routinely uncommitted (a guard gap, or simply the end of a
+    // mapping). The check said "readable" and the access faulted, inside a vectored exception
+    // handler, with no exception-table entry: fatal.
+    //
+    // This was long assumed impossible, on the grounds that callers "only ever pass addresses
+    // inside a tracked destination range, always mapped with room for a full `usize`". That holds
+    // for a return-address slot. It does NOT hold for `read_usize_fault_tolerant`'s other callers,
+    // which pass an address DECODED FROM A GUEST INSTRUCTION'S MEMORY OPERAND -- an arbitrary
+    // guest address with no relationship to any mapping boundary. `mate-session` died reproducibly
+    // on exactly that load (`on_single_step+0x3da6`, confirmed by the fault moving when the load
+    // was changed).
+    //
+    // Deliberately conservative: an access spanning two ADJACENT committed regions is reported
+    // unreadable rather than walked region by region. Declining to heal a slot is always safe;
+    // faulting inside the handler is not, and a straddling heal target is vanishingly rare next to
+    // the boundary case this exists to reject.
+    let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+    if addr.saturating_add(len) > region_end {
         return (false, false);
     }
     // A `MEM_IMAGE` region is a loaded module -- litebox's own executable or a DLL. Guest
@@ -1941,13 +1974,14 @@ fn explicit_memory_operand_address(instruction: &Instruction, context: &CONTEXT)
 /// Reads a `usize` from `addr` via a fault-tolerant access, returning `None` if `addr` is not in a
 /// committed, readable region.
 fn read_usize_fault_tolerant(addr: usize) -> Option<usize> {
-    if !is_readable(addr) {
+    if !is_readable_range(addr, core::mem::size_of::<usize>()) {
         return None;
     }
-    // SAFETY: `is_readable` confirmed `addr` is in a committed, readable region of at least one
-    // page; callers of this function only ever pass addresses inside a tracked destination range,
-    // which -- by construction of `Vmem::duplicate` -- are always mapped with room for a full
-    // `usize` (never split mid-word across mapping boundaries with different protection).
+    // SAFETY: the check above confirmed all `size_of::<usize>()` bytes at `addr` lie inside one
+    // committed, readable region -- the whole access, not merely its first byte. Several of this
+    // function's callers pass an address decoded from a guest instruction's memory operand, which
+    // has no relationship to any mapping boundary, so the range form is required rather than
+    // merely tidier; see `readable_and_writable`.
     Some(unsafe { core::ptr::read_unaligned(addr as *const usize) })
 }
 
@@ -2013,7 +2047,7 @@ fn write_usize_fault_tolerant(addr: usize, value: usize) {
 
     // See `readable_and_writable`'s doc comment for why this is one query instead of separate
     // `is_writable`/`is_readable` calls.
-    let (readable, writable) = readable_and_writable(addr);
+    let (readable, writable) = readable_and_writable(addr, core::mem::size_of::<usize>());
 
     if writable {
         // SAFETY: the query above confirmed `addr` is in a committed, writable region; see
