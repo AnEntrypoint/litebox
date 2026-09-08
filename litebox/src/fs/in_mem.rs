@@ -453,7 +453,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         debug_assert!(start <= end);
         let retlen = end - start;
         buf[..retlen].copy_from_slice(&file.data[start..end]);
-        *position = end;
+        // Advance by what was actually read, rather than assigning `end`. Now that a position
+        // beyond the end of the file is reachable (see `seek`), `end` clamps to the file length,
+        // so assigning it would silently REWIND the descriptor on a zero-byte read past EOF.
+        // Real Linux leaves the offset alone there.
+        *position += retlen;
         Ok(retlen)
     }
 
@@ -546,12 +550,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let new_posn = base
             .checked_add_signed(offset)
             .ok_or(SeekError::InvalidOffset)?;
-        if new_posn > file_len {
-            Err(SeekError::InvalidOffset)
-        } else {
-            *position = new_posn;
-            Ok(new_posn)
-        }
+        // Past the end of the file is legal on a regular file, and useful: seek out, write, and
+        // the gap becomes a hole. `write` above already implements exactly that (it zero-pads up
+        // to `write_position` when the position is beyond the current length), so refusing the
+        // seek only made the capability unreachable.
+        //
+        // skalibs' `cdbmake_start` opens a fresh file and seeks to 2048 to reserve the cdb header
+        // before writing records, so `s6-rc-compile` died with `unable to cdbmake_start on
+        // /run/s6/db/resolve.cdb: Invalid argument` -- which stops an s6-overlay boot outright.
+        let _ = file_len;
+        *position = new_posn;
+        Ok(new_posn)
     }
 
     fn truncate(

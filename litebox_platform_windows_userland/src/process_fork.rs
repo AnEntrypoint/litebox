@@ -1421,12 +1421,22 @@ pub fn spawn_process_fork_child(
     // contents have to reflect the parent as of this `fork()`, not as of whenever the child gets
     // around to reading it.
     let parent_layer = export_parent_writable_layer_for_child();
-    if let Some(path) = &parent_layer {
-        child_env.push((
-            FORK_CHILD_PARENT_LAYER_ENV_VAR,
-            path.to_string_lossy().into_owned(),
-        ));
-    }
+    // Pushed UNCONDITIONALLY, empty when there is nothing to hand over.
+    //
+    // `build_child_environment_block` copies this process's own environment and skips whatever is
+    // being overridden -- so an entry that is merely omitted here is inherited instead. A
+    // cross-process child is itself a fork parent for its own children, and it already carries
+    // this variable from its own spawn, so omitting it let a grandchild inherit its GRANDparent's
+    // path: an archive that had already been consumed and deleted. Observed exactly that, five
+    // children in a row reporting `could not adopt the parent's writable layer from
+    // ...forkparent-8760-8.tar: failed to open`, every one of them naming the same stale file.
+    child_env.push((
+        FORK_CHILD_PARENT_LAYER_ENV_VAR,
+        parent_layer
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    ));
     if !inherited_files.is_empty() {
         let spec = inherited_files
             .iter()

@@ -2581,9 +2581,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 )
             }
             FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
-            FsPath::FdRelative { .. } => {
-                log_unsupported!("fd-relative faccessat is not supported yet");
-                Err(Errno::EINVAL)
+            // Resolve exactly as `resolve_path_at` does for every other `*at` syscall -- the
+            // `dirfd`'s recorded path joined with the relative one. There was nothing special
+            // about `faccessat` here; it simply predated that helper.
+            //
+            // Returning `EINVAL` instead was not a harmless stub: `s6-rc-compile` checks each
+            // service definition with `faccessat(dirfd, "flag-essential", ...)`, and reported the
+            // errno verbatim as `unable to read /etc/s6-overlay/s6-rc.d/<svc>/flag-essential:
+            // Invalid argument`, which stops an s6-overlay container's boot outright.
+            FsPath::FdRelative { fd, path } => {
+                let dir_path = self.resolve_dirfd_path(fd)?;
+                let full = Self::join_dir_relative_path(&dir_path, &path)?;
+                self.do_access(full, mode, caller)
             }
         }
     }

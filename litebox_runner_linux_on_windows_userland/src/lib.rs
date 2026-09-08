@@ -1239,7 +1239,12 @@ pub fn diag_process_fork_globalstate_probe() {
     // being restored are root-owned, matching `--resume-from`'s own import above.
     if let Some(parent_layer) = std::env::var_os(
         litebox_platform_windows_userland::process_fork::FORK_CHILD_PARENT_LAYER_ENV_VAR,
-    ) {
+    )
+        // Empty means "this fork had nothing to hand over", which the spawner writes explicitly
+        // rather than omitting -- see `FORK_CHILD_PARENT_LAYER_ENV_VAR`'s push site for why
+        // omitting it would instead resurrect a grandparent's stale path.
+        && !parent_layer.is_empty()
+    {
         let parent_layer = PathBuf::from(&parent_layer);
         in_mem.with_root_privileges(|fs| match import_writable_layer(fs, &parent_layer) {
             Ok(()) => eprintln!(
@@ -1257,6 +1262,19 @@ pub fn diag_process_fork_globalstate_probe() {
 
     let fs = shim_builder.default_fs(in_mem, tar_data.into());
     let fs = std::sync::Arc::new(fs);
+
+    // This child is itself a fork parent for any child IT goes on to spawn, and it never reaches
+    // `run()` -- so without registering here, its own children would be handed nothing and would
+    // start from the base rootfs, losing everything this process and its ancestors had written.
+    // Same registration `run()` performs, over this child's own filesystem.
+    {
+        let fs_for_fork = fs.clone();
+        litebox_platform_windows_userland::process_fork::register_parent_writable_layer_exporter(
+            Box::new(move |path| {
+                export_writable_layer(&fs_for_fork, path).map_err(|e| format!("{e}"))
+            }),
+        );
+    }
 
     // `LinuxShimBuilder::build()` is the exact call pass 135 identified as the sole construction
     // site of `GlobalState`, exercised here a SECOND time within this same host OS process

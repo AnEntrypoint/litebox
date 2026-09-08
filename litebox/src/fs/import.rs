@@ -91,8 +91,24 @@ pub fn import_all<FS: FileSystem>(fs: &FS, tar_data: &[u8]) -> Result<(), Import
                 let Ok(target) = header.linkname.as_str() else {
                     continue;
                 };
-                fs.symlink(target, &*path)
-                    .map_err(|_| ImportError::Symlink)?;
+                match fs.symlink(target, &*path) {
+                    Ok(()) => {}
+                    // Already present: replace it, so an archive that updates a symlink's target
+                    // still takes effect, and one that merely repeats an existing link is a
+                    // no-op. `mkdir` above already tolerates the same situation, and it arises
+                    // for exactly the same reason -- these archives are round-tripped between a
+                    // parent and its cross-process `fork()` children, so a child's export
+                    // necessarily re-states everything it adopted from the parent to begin with.
+                    // Without this, one repeated symlink aborted the whole import and the child's
+                    // real writes were silently lost (`wait4: failed to import cross-process
+                    // child's exported writable layer error=Symlink`).
+                    Err(super::errors::SymlinkError::AlreadyExists) => {
+                        let _ = fs.unlink(&*path);
+                        fs.symlink(target, &*path)
+                            .map_err(|_| ImportError::Symlink)?;
+                    }
+                    Err(_) => return Err(ImportError::Symlink),
+                }
             }
             tar_no_std::TypeFlag::REGTYPE | tar_no_std::TypeFlag::AREGTYPE => {
                 let payload_blocks = header.payload_block_count().unwrap_or(0);
