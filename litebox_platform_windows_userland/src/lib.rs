@@ -9030,29 +9030,11 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         // real bounds and permissions from the VMA layout, which travels separately.
         let read_source_bytes = |range: core::ops::Range<usize>| {
             use litebox::platform::RawConstPointer as _;
-            const PAGE: usize = litebox::mm::linux::PAGE_SIZE;
-            let len = range.len();
-            let mut out = std::vec::Vec::new();
-            out.resize(len, 0u8);
-            let mut any_readable = false;
-            let mut off = 0usize;
-            while off < len {
-                let addr = range.start.wrapping_add(off);
-                // Stop each read at the next page boundary so an unaligned start still lines up
-                // with the pages `is_readable` is answering about.
-                let chunk = (PAGE - (addr % PAGE)).min(len - off);
-                if fork_verify::is_readable(addr) {
-                    let ptr = <Self as litebox::platform::RawPointerProvider>::RawConstPointer::<
-                        u8,
-                    >::from_usize(addr);
-                    if let Some(bytes) = ptr.to_owned_slice(chunk) {
-                        out[off..off + chunk].copy_from_slice(&bytes);
-                        any_readable = true;
-                    }
-                }
-                off += chunk;
-            }
-            any_readable.then_some(out)
+            let ptr =
+                <Self as litebox::platform::RawPointerProvider>::RawConstPointer::<u8>::from_usize(
+                    range.start,
+                );
+            ptr.to_owned_slice(range.len()).map(<[u8]>::into_vec)
         };
         let want_registers = process_fork::diag_process_fork_registers_enabled();
         let inject_gprs = if want_registers {
@@ -9178,13 +9160,41 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         std::env::var_os("LITEBOX_PROCESS_FORK")?;
         let group_relocations = relocations.group_relocations();
         let vma_layout = relocations.vma_layout();
+        // Read PAGE AT A TIME and refuse to touch a page that is not committed.
+        //
+        // `copy_one_group` already calls this once per page and treats `None` as "leave the
+        // child's zero-fill alone", but the read itself used to assume the page was mapped. A
+        // copy group is widened out to 64 KiB allocation granularity, and litebox commits guest
+        // memory on demand, so a group legitimately contains `MEM_RESERVE`-but-not-committed
+        // pages -- reading one faults in the PARENT, mid-fork. Measured: the copy walks ~199
+        // pages of the first group and then hits `0x10106000`, which `VirtualQuery` reports as
+        // `State=MEM_RESERVE Protect=0x0`, and the run dies there every time.
+        //
+        // `fork_verify::is_readable` is the same committed-and-readable test used elsewhere, so
+        // an uncommitted page is skipped rather than faulted on.
         let read_source_bytes = |range: core::ops::Range<usize>| {
             use litebox::platform::RawConstPointer as _;
-            let ptr =
-                <Self as litebox::platform::RawPointerProvider>::RawConstPointer::<u8>::from_usize(
-                    range.start,
-                );
-            ptr.to_owned_slice(range.len()).map(<[u8]>::into_vec)
+            const PAGE: usize = litebox::mm::linux::PAGE_SIZE;
+            let len = range.len();
+            let mut out = std::vec::Vec::new();
+            out.resize(len, 0u8);
+            let mut any_readable = false;
+            let mut off = 0usize;
+            while off < len {
+                let addr = range.start.wrapping_add(off);
+                let chunk = (PAGE - (addr % PAGE)).min(len - off);
+                if fork_verify::is_readable(addr) {
+                    let ptr = <Self as litebox::platform::RawPointerProvider>::RawConstPointer::<
+                        u8,
+                    >::from_usize(addr);
+                    if let Some(bytes) = ptr.to_owned_slice(chunk) {
+                        out[off..off + chunk].copy_from_slice(&bytes);
+                        any_readable = true;
+                    }
+                }
+                off += chunk;
+            }
+            any_readable.then_some(out)
         };
         // PASS 150: the child's own `fork_verify` reads this line back and calls `translate()` on
         // it to repair stale pointers it observes mid-execution -- but the cross-process child's

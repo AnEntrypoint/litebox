@@ -1095,3 +1095,50 @@ What remains true and load-bearing from that section: the ten-second repro, the 
 practical, and the fact that every crash converges on the same address. What is NOT established is
 why. Anyone picking this up should start from the nested-dispatch failure, not from the reserved
 page, and should not trust the retracted race explanation.
+
+### RESOLVED: cross-process fork works
+
+`LITEBOX_PROCESS_FORK=1` now completes a real fork. On the ten-second repro,
+`sh -c 'echo A; (echo B); echo C'`, 4/4 runs print `A B C` with exit 0 and ZERO unrecoverable
+AVs, and the child's own diagnostics confirm it is doing the real thing rather than falling back:
+
+    vmem-adopt-probe (child): adopted=18 (VM_SHARED=0), tracked=18, expected=18,
+                              brk=0x11108000 (expected 0x11108000)
+    vmem-adopt-probe (child): VMA layout adoption VERIFIED -- every region's boundaries,
+                              flags and file-backing round-trip exactly
+    task-resume-probe (child): built Task, set fs_base, ... run_thread returned
+
+The `B` comes from a genuinely separate Windows process. The default (thread-based) fork path is
+unchanged.
+
+**The last defect was mine, in the patch two sections above.** `litebox_platform_windows_userland`
+contains TWO closures named `read_source_bytes` with byte-identical bodies -- one in
+`diagnostic_process_fork_probe`, one in the production `spawn_cross_process_fork_child`. The
+page-tolerance fix was applied with a single-occurrence string replace, so it landed on the
+DIAGNOSTIC one and the production path kept the original whole-range
+`ptr.to_owned_slice(range.len())`. That read faults on a `MEM_RESERVE`-but-not-committed page, and
+a copy group -- widened to 64 KiB allocation granularity, over an address space litebox commits on
+demand -- always contains some. Hence the copy dying at `0x10106000` every single time while the
+crash site, AV count and exit code moved around: the fault was deterministic, its consequences
+were not.
+
+Two lessons worth keeping. First, an anchored single-occurrence replace is unsafe in a file with
+duplicated helper closures -- verify WHICH function the edit landed in. Second, the bisection that
+found it (`if true { return None; }` at the top of the read) appeared to prove "the copy is not at
+fault" because it was editing the same wrong copy; the bisection and the fix were consistent with
+each other and both wrong.
+
+### `/init`: the ET_EXEC collision is gone; fd inheritance is the only thing left
+
+With a working cross-process fork, `s6-overlay-suexec: fatal: child failed with exit code 139` --
+the SIGSEGV from `s6-mkdir` colliding with GuestPid(1) at 0x400000, and the wall this whole line of
+work existed to break -- **no longer happens**. Booting `/init` with
+`LITEBOX_PROCESS_FORK_IGNORE_FDS=1` now gets past it and fails on exactly what that flag warns it
+will:
+
+    preinit: line 73: dup2(3,1): Bad file descriptor
+
+`s6-overlay-suexec` creates a synchronisation pipe before forking, and a cross-process child cannot
+inherit it because none of this shim's fd subsystems is backed by a real Windows HANDLE. That is
+now the single remaining blocker for booting a stock s6-overlay image, it is precisely stated, and
+it is a bounded piece of work rather than an open question.
