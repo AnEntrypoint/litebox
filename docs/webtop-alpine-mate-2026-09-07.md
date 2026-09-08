@@ -943,3 +943,49 @@ a source range, so the child is never resumed and the run dies. The next step is
 fault-tolerant per page rather than assuming every byte of a group is mapped -- `fork_verify`'s own
 `read_usize_fault_tolerant` is the existing pattern for that -- and only then to revisit fd
 inheritance, which remains the other half of honest eligibility.
+
+### Root cause found: the abandoned duplicate's teardown, not the transfer
+
+The cross-process fork path was never functional -- not "incomplete for s6", broken for ANY fork.
+Minimal repro, ten seconds, no s6 and no webtop needed:
+
+    litebox_runner ... --initial-files webtop_mate.tar -- \
+      /bin/sh -c 'echo PARENT_START; (echo IN_CHILD); echo PARENT_END'
+
+    LITEBOX_PROCESS_FORK unset -> PARENT_START / IN_CHILD / PARENT_END, 0 AVs, exit 0
+    LITEBOX_PROCESS_FORK=1     -> PARENT_START only, 67 AVs, SIGSEGV (exit 139)
+
+The real fault was masked. What `[diag-unrecov-av]` reported first was a crash inside
+`ntdll!RtlpUnwindPrologue+0x11a` (`mov rcx,[r8]` with `r8=0xa`), reached from
+`ntdll!RtlpxVirtualUnwind` with `std::io::Write::write_all<Stderr>` on the stack -- i.e. the
+DIAGNOSTIC path dying while trying to report. Resolved via the PDB with `cdb`'s `ln`. With
+`RUST_BACKTRACE=1` the underlying fault appears instead:
+
+    rip=0x7ff000c09000 addr=0x7ff000c09000       <- instruction fetch
+    pagestate: State=MEM_COMMIT Protect=PAGE_READWRITE Type=MEM_PRIVATE
+
+an instruction fetch on a guest page that is committed and readable/writable but NOT executable.
+Guest code had lost its execute permission.
+
+**The cause is the in-process duplicate being torn down, not the cross-process transfer.**
+`do_clone` always builds `dest_pm` via `pm.duplicate()` and moves it into a child `ThreadState`;
+the cross-process branch then returns early and drops that `ThreadState`, freeing the duplicated
+address space. Proven by simply leaking it instead:
+
+    mem::forget(thread)  ->  67 AVs and SIGSEGV become ZERO AVs, no SIGSEGV
+
+Leaking is not a fix (it strands a whole duplicated address space per fork), but it isolates the
+teardown as the culprit. The mechanism is an identity mismatch: `duplicate()` runs wrapped in
+`with_fork_duplicate_claim_owner(child_tid, ..)`, so every range it reserves is registered to the
+CHILD, while the early return drops it on the PARENT's thread where `current_claim_owner()` is the
+parent -- and `claim_range`'s same-owner coalescing then merges and releases ranges that are
+really the parent's own live memory. Dropping it under the child's owner instead takes the repro
+from 67 AVs + SIGSEGV to 1 AV and exit 0.
+
+**Still not finished.** One AV remains (a guest page around `0x10106000`), the child produces no
+output and the parent does not continue, so `LITEBOX_PROCESS_FORK=1` remains non-functional. The
+structurally correct fix is to not build the duplicate at all when the cross-process path will be
+taken -- decide eligibility BEFORE `pm.duplicate()` and derive the child's identity relocations
+from the parent's own `tracked_regions()`, since a cross-process child runs at SOURCE coordinates
+and has no use for a duplicate. That removes the teardown entirely rather than making it less
+destructive, and removes a wasted full address-space copy per fork.

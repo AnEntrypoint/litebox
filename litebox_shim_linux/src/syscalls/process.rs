@@ -3412,6 +3412,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     child_tid:% = child_tid;
                     "clone: spawned cross-process fork() child"
                 );
+                // Tear the now-unused in-process duplicate down under the SAME claim owner it
+                // was built under. `with_fork_duplicate_claim_owner(child_tid, ..)` wrapped the
+                // `duplicate()` call, so every range it reserved is registered to the CHILD; but
+                // this early return runs on the parent's thread, where `current_claim_owner()` is
+                // the PARENT -- so an unwrapped drop frees the child's ranges while claiming to be
+                // the parent, and `claim_range`'s same-owner coalescing then merges and releases
+                // ranges that are really the parent's own live memory.
+                //
+                // Measured: dropping it unwrapped corrupts the parent badly enough to produce 67
+                // unrecoverable AVs and a SIGSEGV on `sh -c 'echo A; (echo B); echo C'`; simply
+                // leaking it instead (`mem::forget`) took that to ZERO, which is what identified
+                // the teardown -- not the transfer -- as the culprit. Leaking is not a fix (it
+                // strands the whole duplicated address space on every fork), so the drop is kept
+                // and given the right identity instead.
+                self.global
+                    .platform
+                    .with_fork_duplicate_claim_owner(child_tid, || drop(thread));
                 return Ok(usize::try_from(child_tid).unwrap());
             }
 
