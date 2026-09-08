@@ -2246,21 +2246,10 @@ mod codewatch {
         }
     }
 
-    /// Cached per thread, for the same reason [`crate::veh_trace_enabled`] is: this is reached
-    /// from the vectored exception handler on exception-handling paths where an environment
-    /// lookup allocates and takes ntdll's process-wide environment critical section.
+    /// Resolved once at startup; see [`crate::VehGates`] for why this must not read the
+    /// environment at the use site.
     pub(super) fn enabled() -> bool {
-        thread_local! {
-            static ENABLED: core::cell::Cell<Option<bool>> = const { core::cell::Cell::new(None) };
-        }
-        ENABLED.with(|c| match c.get() {
-            Some(v) => v,
-            None => {
-                let v = std::env::var_os("LITEBOX_CODEWATCH").is_some();
-                c.set(Some(v));
-                v
-            }
-        })
+        crate::veh_gates().codewatch
     }
 
     /// Whether `addr` falls inside any currently watched region.
@@ -2522,7 +2511,7 @@ fn arm_codewatch(relocations: &litebox::mm::AddressRelocations) {
         // meaningful if a write provably *does* trap. `LITEBOX_CODEWATCH=selftest` proves it by
         // writing one byte back to itself per armed range and checking the trap fires; it is a
         // separate mode because it deliberately perturbs the pages under investigation.
-        if armed && std::env::var_os("LITEBOX_CODEWATCH").is_some_and(|v| v == "selftest") {
+        if armed && crate::veh_gates().codewatch_selftest {
             let probe = start + 0x100;
             // SAFETY: `probe` is inside a committed, just-armed executable destination range, and
             // the value written is the one just read back, so guest state is left unchanged.
@@ -2549,27 +2538,13 @@ fn arm_codewatch(relocations: &litebox::mm::AddressRelocations) {
 /// since it is not CPU debug state at all, so this reuses `arm_codewatch`'s machinery instead of
 /// building that cross-thread plumbing. Same env var also gates `ctxwatch`'s Dr1 mechanism, which
 /// harmlessly still tries and fails to arm (logged, non-fatal) alongside this.
-/// Cached per thread; see [`codewatch::enabled`].
+/// Resolved once at startup; see [`crate::VehGates`].
 fn watchaddr_data_enabled() -> bool {
-    thread_local! {
-        static ENABLED: core::cell::Cell<Option<bool>> = const { core::cell::Cell::new(None) };
-    }
-    ENABLED.with(|c| match c.get() {
-        Some(v) => v,
-        None => {
-            let v = std::env::var_os("LITEBOX_DIAG_WATCHADDR").is_some();
-            c.set(Some(v));
-            v
-        }
-    })
+    crate::veh_gates().watchaddr.is_some()
 }
 
 fn arm_watchaddr_data() {
-    let Some(addr) = std::env::var("LITEBOX_DIAG_WATCHADDR")
-        .ok()
-        .and_then(|s| usize::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-        .filter(|&a| a != 0)
-    else {
+    let Some(addr) = crate::veh_gates().watchaddr else {
         return;
     };
     let page = addr & !0xfff;
@@ -2668,7 +2643,7 @@ pub(crate) fn begin(relocations: alloc::sync::Arc<litebox::mm::AddressRelocation
     if let Some(tls) = crate::get_tls_ptr() {
         // SAFETY: `get_tls_ptr` returns this thread's live `TlsState`.
         let tls = unsafe { &*tls };
-        if std::env::var_os("LITEBOX_FORKVERIFY_OFF").is_none() {
+        if !crate::veh_gates().forkverify_off {
             tls.fork_verify_step_count.set(0);
             // Stamp this thread with its OWN current generation before arming the map, so
             // `current_map_is_valid` can later detect a leftover map that survived this same

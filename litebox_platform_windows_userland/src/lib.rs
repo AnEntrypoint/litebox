@@ -221,31 +221,104 @@ impl WindowsUserland {
     }
 }
 
-/// Diagnostic tracing gated by `LITEBOX_VEH_TRACE=1`, added to root-cause the intermittent
-/// hang/crash in the `apk add nodejs` repro. Temporary; remove once root-caused.
+/// Every diagnostic gate consulted by code reachable from the vectored exception handler,
+/// resolved ONCE before any guest thread exists.
 ///
-/// **Cached per thread, and that is load-bearing rather than an optimisation.** This used to
-/// re-read the environment on every call, justified by "only called on already-rare
-/// exception-handling paths". That premise was wrong: `fork_verify::on_single_step` calls it on
-/// EVERY single-step trap, and verification single-steps the guest instruction by instruction --
-/// thousands of calls per fork, every one of them inside a vectored exception handler.
+/// # Why this is a correctness requirement, not a cache
 ///
-/// `std::env::var_os` on Windows allocates (`std::sys::pal::windows::to_u16s`) and takes ntdll's
-/// process-wide environment critical section. Doing that from inside a VEH, on a thread whose
-/// `rsp` is still guest-address memory and with the guest mid-step, is the same hazard that made
-/// `ThreadHandle::interrupt` deadlock the whole guest earlier -- except here it faults instead:
-/// `mate-session` died reproducibly with an access violation inside `on_single_step` itself
-/// (`is_in_guest=false is_verifying=true`, `to_u16s` on the stack, `rax=0xc0000100` =
-/// `STATUS_VARIABLE_NOT_FOUND`), then a second fault at `rip=0x40` as the handler re-entered.
+/// On Windows `std::env::var_os` is not a cheap read: it allocates
+/// (`std::sys::pal::windows::to_u16s` grows a `Vec`, then an `OsString`) and it enters ntdll's
+/// process-wide environment critical section via `RtlQueryEnvironmentVariable`. Neither is safe
+/// from inside a vectored exception handler, which runs on a thread whose `rsp` is still
+/// guest-address memory, at an arbitrary instruction boundary, possibly while another thread holds
+/// the environment or heap lock.
 ///
-/// Cached in the existing per-thread `DIAG` state rather than behind a new `static`, so the
-/// bare-static count `dev_tests/src/ratchet.rs` tracks does not grow -- which is what the original
-/// comment was protecting, and is preserved.
+/// [`ThreadHandle::interrupt`] already learned this the hard way -- see `diag_interrupt_enabled`'s
+/// history, a full MATE session frozen with one thread parked in `RtlQueryEnvironmentVariable`
+/// and six queued behind it -- but the fix there was applied to that one call site. It was not
+/// the only one. `fork_verify::on_single_step` consulted `LITEBOX_VEH_TRACE` and
+/// `LITEBOX_DIAG_ALLOC_VEC` on EVERY single-step trap, and verification single-steps the guest
+/// instruction by instruction; `mate-session` died reproducibly with an access violation inside
+/// `on_single_step` itself, `to_u16s` on the stack and `rax=0xc0000100`
+/// (`STATUS_VARIABLE_NOT_FOUND`) -- the environment lookup, faulting.
+///
+/// Per-call-site caching would leave the same hole, just rarer: a lazily-initialised cache still
+/// performs its one real lookup wherever it is first reached, which for a single-step gate is
+/// inside the handler. So every gate is read here instead, from
+/// [`WindowsUserland::new`], before any guest code runs -- after which the handler only ever reads
+/// already-initialised memory.
+///
+/// One `static` holding every gate, rather than one per gate: `dev_tests/src/ratchet.rs`'s
+/// `ratchet_globals` tracks this crate's bare-static count and is trying to reduce it. This
+/// replaces `diag_interrupt_enabled`'s own `OnceLock` and two per-thread caches, so the count goes
+/// down.
+#[derive(Debug)]
+pub(crate) struct VehGates {
+    /// `LITEBOX_VEH_TRACE`
+    pub(crate) veh_trace: bool,
+    /// `LITEBOX_DIAG_WAIT4GATE`
+    pub(crate) rip0: bool,
+    /// `LITEBOX_DIAG_FATALDUMP`
+    pub(crate) fataldump: bool,
+    /// `LITEBOX_DIAG_FAULT_VQ`
+    pub(crate) fault_vq: bool,
+    /// `LITEBOX_DIAG_FAULT_MODULE`
+    pub(crate) fault_module: bool,
+    /// `LITEBOX_DIAG_ALLOC_VEC`
+    pub(crate) alloc_vec: bool,
+    /// `LITEBOX_DIAG_AVFULL`
+    pub(crate) avfull: bool,
+    /// `LITEBOX_DIAG_ALLOW_WER`
+    pub(crate) allow_wer: bool,
+    /// `LITEBOX_DIAG_INTERRUPT`
+    pub(crate) interrupt: bool,
+    /// `LITEBOX_CODEWATCH`
+    pub(crate) codewatch: bool,
+    /// `LITEBOX_CODEWATCH=selftest`
+    pub(crate) codewatch_selftest: bool,
+    /// `LITEBOX_DIAG_WATCHADDR`, already parsed -- so even the parse never runs in the handler.
+    pub(crate) watchaddr: Option<usize>,
+    /// `LITEBOX_FORKVERIFY_OFF`
+    pub(crate) forkverify_off: bool,
+}
+
+impl VehGates {
+    fn read_environment() -> Self {
+        let codewatch = std::env::var_os("LITEBOX_CODEWATCH");
+        Self {
+            veh_trace: std::env::var_os("LITEBOX_VEH_TRACE").is_some(),
+            rip0: std::env::var_os("LITEBOX_DIAG_WAIT4GATE").is_some(),
+            fataldump: std::env::var_os("LITEBOX_DIAG_FATALDUMP").is_some(),
+            fault_vq: std::env::var_os("LITEBOX_DIAG_FAULT_VQ").is_some(),
+            fault_module: std::env::var_os("LITEBOX_DIAG_FAULT_MODULE").is_some(),
+            alloc_vec: std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some(),
+            avfull: std::env::var_os("LITEBOX_DIAG_AVFULL").is_some(),
+            allow_wer: std::env::var_os("LITEBOX_DIAG_ALLOW_WER").is_some(),
+            interrupt: std::env::var_os("LITEBOX_DIAG_INTERRUPT").is_some(),
+            codewatch_selftest: codewatch.as_deref().is_some_and(|v| v == "selftest"),
+            codewatch: codewatch.is_some(),
+            watchaddr: std::env::var("LITEBOX_DIAG_WATCHADDR")
+                .ok()
+                .and_then(|s| usize::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                .filter(|&a| a != 0),
+            forkverify_off: std::env::var_os("LITEBOX_FORKVERIFY_OFF").is_some(),
+        }
+    }
+}
+
+static VEH_GATES: OnceLock<VehGates> = OnceLock::new();
+
+/// The process-wide [`VehGates`], initialising them on first use.
+///
+/// [`WindowsUserland::new`] calls this before any guest thread exists, so every later call --
+/// including every one from inside the exception handler -- is a plain read of initialised memory.
+pub(crate) fn veh_gates() -> &'static VehGates {
+    VEH_GATES.get_or_init(VehGates::read_environment)
+}
+
+/// Whether `LITEBOX_VEH_TRACE` tracing is enabled. See [`VehGates`].
 pub(crate) fn veh_trace_enabled() -> bool {
-    DIAG.with_borrow_mut(|d| {
-        *d.veh_trace_enabled
-            .get_or_insert_with(|| std::env::var_os("LITEBOX_VEH_TRACE").is_some())
-    })
+    veh_gates().veh_trace
 }
 
 /// Whether the targeted `rip == 0` crash diagnostics (`LITEBOX_DIAG_WAIT4GATE=1`) are enabled.
@@ -253,13 +326,9 @@ pub(crate) fn veh_trace_enabled() -> bool {
 /// Deliberately a separate, much narrower gate than [`veh_trace_enabled`]: full `LITEBOX_VEH_TRACE`
 /// emits a per-instruction trace that perturbs timing enough to hide the crash being investigated,
 /// whereas this gate only enables a handful of one-off prints around fork-child verification and
-/// the fault itself. Cached per thread so the resume path pays only a thread-local read rather
-/// than an environment lookup when unset.
+/// the fault itself.
 pub(crate) fn diag_rip0_enabled() -> bool {
-    DIAG.with_borrow_mut(|d| {
-        *d.enabled
-            .get_or_insert_with(|| std::env::var_os("LITEBOX_DIAG_WAIT4GATE").is_some())
-    })
+    veh_gates().rip0
 }
 
 /// Whether the fatal-fault-only dump (`LITEBOX_DIAG_FATALDUMP=1`) is enabled.
@@ -269,13 +338,12 @@ pub(crate) fn diag_rip0_enabled() -> bool {
 /// verifying fork child (thousands of prints per fork, each an expensive `eprintln!` to a
 /// piped terminal) -- perturbing timing enough in practice to hide the very crash under
 /// investigation (see FINDINGS.txt pass 39 item 3). This gate covers only the rare block
-/// below that dumps rip bytes/regs on an actual fatal fault (rip==0 privileged-instruction
+/// that dumps rip bytes/regs on an actual fatal fault (rip==0 privileged-instruction
 /// class, or a near-null access violation), so it is cheap enough to leave on for an entire
-/// local repro run without masking the bug. Deliberately re-reads the environment on every
-/// call for the same "rare path, avoid growing the bare-static count" reason documented on
-/// `veh_trace_enabled`.
+/// local repro run without masking the bug.
 pub(crate) fn diag_fataldump_enabled() -> bool {
-    veh_trace_enabled() || std::env::var_os("LITEBOX_DIAG_FATALDUMP").is_some()
+    let gates = veh_gates();
+    gates.veh_trace || gates.fataldump
 }
 
 /// Minimal-footprint entry point registered with `AddVectoredExceptionHandler`, in place of
@@ -656,7 +724,7 @@ unsafe extern "system" fn vectored_exception_handler(
     // gate in this function (all of which run later and could themselves be skipped for reasons
     // unrelated to whether VEH fired at all).
     static VEH_ENTRY_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-    if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
+    if veh_gates().alloc_vec {
         let n = VEH_ENTRY_COUNT.fetch_add(1, Ordering::Relaxed);
         if n < 10 {
             let code = unsafe { (*(*exception_info).ExceptionRecord).ExceptionCode };
@@ -784,7 +852,7 @@ unsafe extern "system" fn vectored_exception_handler(
         let is_access_violation =
             raw_exception_code == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION;
         if this_is_in_guest
-            && std::env::var_os("LITEBOX_DIAG_FAULT_VQ").is_some()
+            && veh_gates().fault_vq
             && (rip == raw_cr2 || is_ud_fault || is_access_violation)
         {
             // Widened (peer investigation, this pass): the musl dtv-clear shape this
@@ -832,7 +900,7 @@ unsafe extern "system" fn vectored_exception_handler(
             );
         }
 
-        if this_is_in_guest && std::env::var_os("LITEBOX_DIAG_FAULT_MODULE").is_some() {
+        if this_is_in_guest && veh_gates().fault_module {
             let mut module: windows_sys::Win32::Foundation::HMODULE = core::ptr::null_mut();
             let resolved = unsafe {
                 windows_sys::Win32::System::LibraryLoader::GetModuleHandleExW(
@@ -952,7 +1020,7 @@ unsafe extern "system" fn vectored_exception_handler(
         let rec = unsafe { &*(*exception_info).ExceptionRecord };
         diag_raw_print(b"[diag_null_host_sp] tid_hash=0x", std::process::id() as usize, b" code=0x", rec.ExceptionCode as usize);
     }
-    if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
+    if veh_gates().alloc_vec {
         let depth = tls.veh_depth.get();
         if depth > 1 {
             let rec = unsafe { &*(*exception_info).ExceptionRecord };
@@ -1284,7 +1352,7 @@ unsafe extern "system" fn vectored_exception_handler(
         // into (a prior captured run's `r9` matched file offset 0xa4ac0 in the extracted guest
         // libc.so). Read-only probe of two candidate `struct malloc_context.active[]` base
         // hypotheses -- purely diagnostic, writes nothing.
-        if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
+        if veh_gates().alloc_vec {
             #[allow(clippy::cast_possible_truncation)]
             let r9 = context.R9 as usize;
             #[allow(clippy::cast_possible_truncation)]
@@ -1532,7 +1600,7 @@ unsafe extern "system" fn vectored_exception_handler(
         // via `apk add --no-cache nodejs` against a freshly packaged `alpine-rootfs.tar`) rather
         // than being folded into this fix.
         if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
-            && std::env::var_os("LITEBOX_DIAG_AVFULL").is_some()
+            && veh_gates().avfull
         {
             // `has_fs_override` reads the instruction bytes AT `rip` -- when `rip` itself is a
             // corrupted, unmapped address (the `rip=0x100000001`-class crash this diagnostic was
@@ -1835,7 +1903,7 @@ unsafe extern "system" fn vectored_exception_handler(
                     // reach Windows so WER can capture full register/stack state. Never set
                     // this outside a debugging session -- it reintroduces the unbounded
                     // disk-exhaustion hazard this circuit breaker exists to prevent.
-                    if std::env::var_os("LITEBOX_DIAG_ALLOW_WER").is_none() {
+                    if !veh_gates().allow_wer {
                         diag_raw_print(
                             b"[diag-unrecov-av-giveup] rip=0x",
                             context_snapshot.Rip as usize,
@@ -2506,7 +2574,7 @@ unsafe extern "system" fn vectored_exception_handler(
     if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_SINGLE_STEP {
         match fork_verify::on_single_step(tls, context) {
             fork_verify::StepOutcome::Continue => {
-                if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
+                if veh_gates().alloc_vec {
                     #[allow(clippy::cast_possible_truncation)]
                     let tf_armed = usize::from(context.EFlags & fork_verify::EFLAGS_TF as u32 != 0);
                     diag_raw_print(
@@ -2534,7 +2602,7 @@ unsafe extern "system" fn vectored_exception_handler(
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
             fork_verify::StepOutcome::StalePointer { address, is_write } => {
-                if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
+                if veh_gates().alloc_vec {
                     diag_raw_print(
                         b"[diag_stale_ptr] is_write=0x",
                         usize::from(is_write),
@@ -2774,6 +2842,11 @@ impl WindowsUserland {
     ///
     /// Panics if the TLS slot cannot be created.
     pub fn new() -> &'static Self {
+        // Resolve every exception-handler-reachable diagnostic gate now, while this is still
+        // ordinary startup code. See [`VehGates`] for why doing it later -- lazily, from inside
+        // the handler -- is not merely slower but unsafe.
+        let _ = veh_gates();
+
         let mut sys_info = Win32_SysInfo::SYSTEM_INFO::default();
         Self::get_system_information(&mut sys_info);
 
@@ -3740,12 +3813,6 @@ type DiagResume = (usize, usize, usize, usize, usize);
 /// here is required for correctness, and no field is read except by the diagnostic prints in
 /// [`vectored_exception_handler`].
 struct DiagState {
-    /// Cache of whether the diagnostics are enabled, `None` until first queried. Caching this
-    /// per thread keeps the guest-resume path off the environment-lookup path when unset.
-    enabled: Option<bool>,
-    /// Same, for `LITEBOX_VEH_TRACE`. See [`veh_trace_enabled`] for why caching this one is a
-    /// correctness requirement rather than a speed-up.
-    veh_trace_enabled: Option<bool>,
     /// Which resume path (`"sysret"`/`"ntcontinue"`) this thread last took, so a crash handler
     /// can report which one was in effect for the resume immediately preceding a fault.
     last_resume_path: &'static str,
@@ -3762,8 +3829,6 @@ struct DiagState {
 impl DiagState {
     const fn new() -> Self {
         Self {
-            enabled: None,
-            veh_trace_enabled: None,
             last_resume_path: "none",
             history: (0, [(0, 0, 0, 0, 0); DIAG_RESUME_HISTORY_LEN]),
             pending_watch_addr: None,
@@ -5177,8 +5242,7 @@ fn release_claim_range_for_current_thread(range: core::ops::Range<usize>) {
 /// `ThreadHandle::interrupt`. The freeze landed at a different guest pid on each run, which is
 /// what a lock race looks like and what resource exhaustion does not.
 fn diag_interrupt_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("LITEBOX_DIAG_INTERRUPT").is_some())
+    veh_gates().interrupt
 }
 
 fn rip_in_global_allocator(rip: usize) -> bool {
