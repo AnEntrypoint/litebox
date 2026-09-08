@@ -146,6 +146,22 @@ fn format_mountinfo() -> Vec<u8> {
     b"1 0 0:1 / / rw - rootfs rootfs rw\n".to_vec()
 }
 
+/// Real `/proc/[pid]/oom_score_adj` content: the OOM-killer score adjustment, one decimal integer
+/// on a line, in the range -1000..=1000.
+///
+/// `0` is the kernel's own default for a process that has not been adjusted, and it is the honest
+/// answer here: litebox has no OOM killer, so nothing is ever adjusted away from the default.
+///
+/// This matters because the readers treat absence and neutrality differently. GLib's
+/// `g_spawn`/`gio` launch paths, systemd's `oom_score_adjust`, and several session managers read
+/// this file to save-and-restore the value around spawning a child; a missing file makes that a
+/// visible failure to report, whereas `0` is simply "nothing to restore". The webtop desktop hit
+/// it on essentially every process launch.
+fn format_oom_score_adj() -> Vec<u8> {
+    Vec::from(&b"0
+"[..])
+}
+
 /// Real `/proc/[pid]/cgroup` content, unified-hierarchy (cgroup v2) form.
 ///
 /// The format is `hierarchy-ID:controller-list:cgroup-path` per line. On a v2-only system --
@@ -538,6 +554,7 @@ enum ProcSelfEntry {
     Environ,
     MountInfo,
     Cgroup,
+    OomScoreAdj,
 }
 
 impl ProcSelfEntry {
@@ -549,6 +566,7 @@ impl ProcSelfEntry {
         ("environ", ProcSelfEntry::Environ),
         ("mountinfo", ProcSelfEntry::MountInfo),
         ("cgroup", ProcSelfEntry::Cgroup),
+        ("oom_score_adj", ProcSelfEntry::OomScoreAdj),
     ];
 
     fn from_name(name: &str) -> Option<Self> {
@@ -589,6 +607,11 @@ const PROC_SELF_MOUNTINFO_NODE_INFO: NodeInfo = NodeInfo {
 const PROC_SELF_CGROUP_NODE_INFO: NodeInfo = NodeInfo {
     dev: 7,
     ino: 7,
+    rdev: None,
+};
+const PROC_SELF_OOM_SCORE_ADJ_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 7,
+    ino: 8,
     rdev: None,
 };
 
@@ -688,6 +711,7 @@ where
             ProcSelfEntry::Environ => snapshot.environ.clone(),
             ProcSelfEntry::MountInfo => format_mountinfo(),
             ProcSelfEntry::Cgroup => format_cgroup(),
+            ProcSelfEntry::OomScoreAdj => format_oom_score_adj(),
         };
         Ok(Permissioned {
             item: FileHandle::from_typed::<Self>(ProcSelfFileHandle { entry, content }),
@@ -773,6 +797,7 @@ where
                 ProcSelfEntry::Environ => PROC_SELF_ENVIRON_NODE_INFO,
                 ProcSelfEntry::MountInfo => PROC_SELF_MOUNTINFO_NODE_INFO,
                 ProcSelfEntry::Cgroup => PROC_SELF_CGROUP_NODE_INFO,
+                ProcSelfEntry::OomScoreAdj => PROC_SELF_OOM_SCORE_ADJ_NODE_INFO,
             },
             blksize: 0x1000,
             atime: Timestamp::default(),
