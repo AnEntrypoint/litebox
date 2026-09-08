@@ -355,6 +355,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShimEntrypoints<Platform, FS> {
         self.task.install_pipe_read_end_at_fd(target_fd)
     }
 
+    /// Reopen an inherited regular file at exactly `target_fd`, positioned at `offset`. See
+    /// `Task::install_file_at_fd`. Same thread requirement as the pipe installers.
+    pub fn install_file_at_fd(
+        &self,
+        target_fd: i32,
+        path: &str,
+        flags: u32,
+        offset: u64,
+    ) -> Option<()> {
+        self.task.install_file_at_fd(target_fd, path, flags, offset)
+    }
+
     pub fn process(&self) -> LinuxShimProcess<Platform> {
         LinuxShimProcess(self.task.process().clone())
     }

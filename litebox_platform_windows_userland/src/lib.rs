@@ -9157,6 +9157,7 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         relocations: &litebox::mm::AddressRelocations,
         full_gprs: litebox::platform::ForkFullGprSnapshot,
         inherited_pipes: std::vec::Vec<(i32, litebox::platform::ForkPipeBridge)>,
+        inherited_files: std::vec::Vec<litebox::platform::ForkInheritedFile>,
     ) -> Option<litebox::platform::CrossProcessChildHandle> {
         std::env::var_os("LITEBOX_PROCESS_FORK")?;
         let group_relocations = relocations.group_relocations();
@@ -9269,6 +9270,7 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
             full_gprs,
             relocations_line,
             &child_pipe_handles,
+            &inherited_files,
         ) {
             Ok(Some((pid, handle))) => {
                 litebox_util_log::debug!(

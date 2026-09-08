@@ -921,12 +921,40 @@ pub trait ForkChildVerificationProvider {
         relocations: &crate::mm::AddressRelocations,
         full_gprs: ForkFullGprSnapshot,
         inherited_pipes: alloc::vec::Vec<(i32, ForkPipeBridge)>,
+        inherited_files: alloc::vec::Vec<ForkInheritedFile>,
     ) -> Option<CrossProcessChildHandle> {
         let _ = relocations;
         let _ = full_gprs;
         let _ = inherited_pipes;
+        let _ = inherited_files;
         None
     }
+}
+
+/// A regular file a cross-process `fork()` child must come up holding at a particular fd.
+///
+/// Unlike a pipe, a file needs no bridge at all: the child's filesystem is the parent's (see
+/// `FORK_CHILD_PARENT_LAYER_ENV_VAR` in the Windows platform crate), so it can simply reopen the
+/// same path and seek to the same place. That is enough for by far the commonest case -- a shell
+/// that saved its own script fd out of the way before forking, which is what `/init`'s `preinit`
+/// does and what kept every one of its forks off the cross-process path.
+///
+/// **The offset is copied, not shared.** A real `fork()` leaves parent and child pointing at ONE
+/// open file description, so a read in either advances the other's offset; a reopen gives them
+/// independent ones. That difference is invisible to a child that closes the fd, `execve`s, or
+/// reads a file the parent has finished with -- and visible to one that interleaves reads with its
+/// parent on the same descriptor, which this cannot support and does not pretend to.
+#[derive(Debug, Clone)]
+pub struct ForkInheritedFile {
+    /// The guest fd number the child must find this file at.
+    pub fd: i32,
+    /// Absolute path to reopen.
+    pub path: alloc::string::String,
+    /// The parent's open flags, as an `OFlags` bit pattern. Creation flags are the caller's to
+    /// strip; reopening must never create or truncate.
+    pub flags: u32,
+    /// The parent's current file offset, to seek to after reopening.
+    pub offset: u64,
 }
 
 /// A host-side handle on one end of a PARENT's in-memory pipe, handed across to

@@ -3374,6 +3374,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         DupFdError::TooManyFiles => Errno::EMFILE,
                         DupFdError::TargetFdExceedsLimit => Errno::EINVAL,
                     })?;
+                // Carry the source fd's recorded path over, exactly as `sys_dup` does. Without
+                // this, an fd duplicated through `fcntl(F_DUPFD)` -- rather than `dup`/`dup2` --
+                // loses the one thing `record_fd_path` exists to provide, and that is precisely
+                // the shape a shell produces: `savefd()` moves its own script fd up out of the way
+                // with `F_DUPFD`, and the result then cannot serve as a `dirfd` for the
+                // `openat`-family syscalls, nor be reopened by a cross-process `fork()` child.
+                // Observed as `/init`'s `preinit` presenting `fd=10 subsystem=file` with no path,
+                // which kept every one of its forks off the cross-process path.
+                {
+                    let files = self.files.borrow();
+                    if let Some(path) = files.lookup_fd_path(desc) {
+                        files.record_fd_path(new_file, path);
+                    }
+                }
                 Ok(new_file.try_into().unwrap())
             }
             _ => unimplemented!(),
@@ -5665,6 +5679,84 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let _ = self.sys_close(temp_fd);
         }
         Some(writer_handle)
+    }
+
+    /// Describe a regular-file fd well enough for a cross-process `fork()` child to reproduce it,
+    /// or `None` if it is not a file or cannot be reproduced.
+    ///
+    /// "Reproduce" means reopen the same path and seek to the same offset -- see
+    /// [`litebox::platform::ForkInheritedFile`] for what that does and does not preserve. Requires
+    /// a path (an fd opened through a path this shim never recorded, or one whose file has since
+    /// been unlinked, cannot be reopened) and a seekable offset, so a directory fd or an anonymous
+    /// file simply stays uncarriable and the fork falls back.
+    pub(crate) fn carriable_file_for_raw_fd(
+        &self,
+        raw_fd: usize,
+    ) -> Option<(alloc::string::String, u32, u64)> {
+        let files = self.files.borrow();
+        let path = files.lookup_fd_path(raw_fd)?;
+        let path = path.to_str().ok()?;
+        // The path must still resolve: an unlinked file is perfectly usable through the parent's
+        // open fd and completely unreachable by name, which is exactly the case a reopen cannot
+        // serve.
+        files.fs.symlink_metadata(path).ok()?;
+        let path = alloc::string::String::from(path);
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |fd| {
+                    let flags = files.fs.open_flags(fd)?;
+                    let offset = files
+                        .fs
+                        .seek(fd, 0, litebox::fs::SeekWhence::RelativeToCurrentOffset)
+                        .ok()?;
+                    Some((path, flags.bits(), offset as u64))
+                },
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()
+            .flatten()
+    }
+
+    /// Reopen `path` at exactly `target_fd`, positioned at `offset`.
+    ///
+    /// How a cross-process `fork()` child restores an inherited regular-file fd. Creation flags
+    /// are stripped: the parent had this file open, so it exists, and honouring `O_CREAT`/`O_TRUNC`
+    /// here would let restoring a descriptor destroy the very data it is restoring access to.
+    pub(crate) fn install_file_at_fd(
+        &self,
+        target_fd: i32,
+        path: &str,
+        flags: u32,
+        offset: u64,
+    ) -> Option<()> {
+        const AT_FDCWD: i32 = -100;
+        let flags = OFlags::from_bits_truncate(flags)
+            & !(OFlags::CREAT | OFlags::EXCL | OFlags::TRUNC);
+        let raw = self.sys_openat(AT_FDCWD, path, flags, Mode::empty()).ok()?;
+        let raw = i32::try_from(raw).ok()?;
+        if raw != target_fd {
+            self.sys_dup(raw, Some(target_fd), None).ok()?;
+            let _ = self.sys_close(raw);
+        }
+        if offset != 0 {
+            let offset = isize::try_from(offset).ok()?;
+            self.sys_lseek(
+                target_fd,
+                offset,
+                litebox::fs::SeekWhence::RelativeToBeginning,
+            )
+            .ok()?;
+        }
+        Some(())
     }
 
     /// Name the fd subsystem `raw_fd` belongs to, for diagnostics.

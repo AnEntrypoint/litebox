@@ -1431,6 +1431,41 @@ fn diag_process_fork_task_resume_probe(
     let fs_for_export = fs.clone();
     let entrypoints = shim.adopt_forked_process(fs, task_params, page_manager);
 
+    // Reopen the regular-file fds the parent held.
+    //
+    // No bridge needed, unlike a pipe: this child's filesystem IS the parent's (its writable layer
+    // arrived with the spawn), so the same path at the same offset is the same file. Enough for
+    // the case that matters -- a shell that saved its own script fd out of the way before forking.
+    // See `litebox::platform::ForkInheritedFile` for what a reopen preserves and what it does not.
+    if let Some(spec) = std::env::var_os(pf::FORK_CHILD_FILE_FDS_ENV_VAR)
+        && let Some(spec) = spec.to_str()
+    {
+        for item in spec.split(',').filter(|s| !s.is_empty()) {
+            let mut parts = item.split(':');
+            let parsed = (|| {
+                let fd = i32::from_str_radix(parts.next()?, 16).ok()?;
+                let offset = u64::from_str_radix(parts.next()?, 16).ok()?;
+                let flags = u32::from_str_radix(parts.next()?, 16).ok()?;
+                let path = String::from_utf8(pf::hex_decode(parts.next()?)?).ok()?;
+                Some((fd, offset, flags, path))
+            })();
+            let Some((fd, offset, flags, path)) = parsed else {
+                eprintln!(
+                    "[process_fork_diag] task-resume-probe (child): unparseable inherited-file entry {item:?}, guest fd will be missing"
+                );
+                continue;
+            };
+            match entrypoints.install_file_at_fd(fd, &path, flags, offset) {
+                Some(()) => eprintln!(
+                    "[process_fork_diag] task-resume-probe (child): guest fd {fd} reopened on {path} at offset {offset}"
+                ),
+                None => eprintln!(
+                    "[process_fork_diag] task-resume-probe (child): could not reopen {path} at guest fd {fd}, it will be missing"
+                ),
+            }
+        }
+    }
+
     // Rebuild the guest pipe fds this child could not inherit.
     //
     // `adopt_forked_process` hands back a fresh, stdio-only fd table -- correct, because litebox's

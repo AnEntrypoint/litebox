@@ -800,6 +800,46 @@ pub const FORK_CHILD_PIPE_FDS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_PIPE_
 /// The child deletes the file once it has imported it. Never guest-visible.
 pub const FORK_CHILD_PARENT_LAYER_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_PARENT_LAYER";
 
+/// Carries the regular-file fds a cross-process `fork()` child must come up holding, as
+/// `fd:offset:flags:path` entries separated by commas, all four fields hex (the path is the hex of
+/// its UTF-8 bytes).
+///
+/// The path is hex-encoded rather than quoted because a filesystem path may contain any byte at
+/// all, `:` and `,` included, and an escaping scheme that has to be got right in two places is a
+/// bug waiting to happen for no benefit -- these entries are written and read by the same binary
+/// and never seen by anything else.
+///
+/// Unlike a pipe there is no handle to inherit: the child's filesystem is already the parent's
+/// (see [`FORK_CHILD_PARENT_LAYER_ENV_VAR`]), so it reopens the path and seeks. See
+/// `litebox::platform::ForkInheritedFile` for what that preserves. Never guest-visible.
+pub const FORK_CHILD_FILE_FDS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_FILE_FDS";
+
+/// Encode `bytes` as lowercase hex, for [`FORK_CHILD_FILE_FDS_ENV_VAR`].
+#[must_use]
+pub fn hex_encode(bytes: &[u8]) -> String {
+    use core::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Decode what [`hex_encode`] produced. `None` on anything malformed.
+#[must_use]
+pub fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(text.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let s = core::str::from_utf8(pair).ok()?;
+        out.push(u8::from_str_radix(s, 16).ok()?);
+    }
+    Some(out)
+}
+
 /// Serializes the parent's current writable layer to `path`, or explains why it could not.
 type ParentWritableLayerExporter =
     Box<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync + 'static>;
@@ -1350,6 +1390,7 @@ pub fn spawn_process_fork_child(
     full_gprs: litebox::platform::ForkFullGprSnapshot,
     relocations_line: String,
     child_pipe_handles: &[(i32, HANDLE, ChildPipeEnd)],
+    inherited_files: &[litebox::platform::ForkInheritedFile],
 ) -> Result<Option<(u32, HANDLE)>, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe() failed: {e}"))?;
     let mut exe_wide: Vec<u16> = exe
@@ -1385,6 +1426,22 @@ pub fn spawn_process_fork_child(
             FORK_CHILD_PARENT_LAYER_ENV_VAR,
             path.to_string_lossy().into_owned(),
         ));
+    }
+    if !inherited_files.is_empty() {
+        let spec = inherited_files
+            .iter()
+            .map(|f| {
+                format!(
+                    "{:x}:{:x}:{:x}:{}",
+                    f.fd,
+                    f.offset,
+                    f.flags,
+                    hex_encode(f.path.as_bytes())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        child_env.push((FORK_CHILD_FILE_FDS_ENV_VAR, spec));
     }
     if !child_pipe_handles.is_empty() {
         let spec = child_pipe_handles

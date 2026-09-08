@@ -2514,6 +2514,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // wrong process.
         let mut inherited_pipes: alloc::vec::Vec<(i32, litebox::platform::ForkPipeBridge)> =
             alloc::vec::Vec::new();
+        let mut inherited_files: alloc::vec::Vec<litebox::platform::ForkInheritedFile> =
+            alloc::vec::Vec::new();
         let mut uncarriable = 0usize;
         for raw_fd in &beyond_stdio_fds {
             let carried = i32::try_from(*raw_fd)
@@ -2564,15 +2566,37 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     };
                     inherited_pipes.push((fd, bridge));
                 }
-                None => {
-                    uncarriable += 1;
-                    litebox_util_log::debug!(
-                        tid:% = self.tid,
-                        fd:% = raw_fd,
-                        subsystem:% = self.raw_fd_subsystem_name(*raw_fd);
-                        "clone: cross-process fork() cannot carry this fd"
-                    );
-                }
+                // Not a pipe. A regular file needs no bridge at all -- the child's filesystem is
+                // this one (the parent's writable layer travels with the spawn), so it can reopen
+                // the same path at the same offset. That is what `/init`'s `preinit` needs: a
+                // shell saves its own script fd out of the way before forking, and that single
+                // `fd=10 subsystem=file` was enough to refuse every one of its forks.
+                None => match i32::try_from(*raw_fd)
+                    .ok()
+                    .zip(self.carriable_file_for_raw_fd(*raw_fd))
+                {
+                    Some((fd, (path, flags, offset))) => {
+                        litebox_util_log::debug!(
+                            tid:% = self.tid, fd:% = fd, path:% = path, offset:% = offset;
+                            "clone: carrying a regular file into the cross-process child"
+                        );
+                        inherited_files.push(litebox::platform::ForkInheritedFile {
+                            fd,
+                            path,
+                            flags,
+                            offset,
+                        });
+                    }
+                    None => {
+                        uncarriable += 1;
+                        litebox_util_log::debug!(
+                            tid:% = self.tid,
+                            fd:% = raw_fd,
+                            subsystem:% = self.raw_fd_subsystem_name(*raw_fd);
+                            "clone: cross-process fork() cannot carry this fd"
+                        );
+                    }
+                },
             }
         }
         if uncarriable != 0
@@ -2584,8 +2608,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             litebox_util_log::debug!(
                 tid:% = self.tid,
                 uncarriable:% = uncarriable,
-                carried:% = inherited_pipes.len();
-                "clone: cross-process fork() not eligible -- guest holds fd(s) at or above 3 that                  are not a pipe's sender half, and no other fd subsystem here is backed by an                  inheritable Windows HANDLE"
+                carried_pipes:% = inherited_pipes.len(),
+                carried_files:% = inherited_files.len();
+                "clone: cross-process fork() not eligible -- guest holds fd(s) at or above 3 that are neither a pipe (bridged over a real Windows pipe) nor a reopenable regular file; see the per-fd `cannot carry this fd` lines just above for which subsystem to teach next"
             );
             return None;
         }
@@ -2748,7 +2773,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         self.global
             .platform
-            .spawn_cross_process_fork_child(&relocations, full_gprs, inherited_pipes)
+            .spawn_cross_process_fork_child(
+                &relocations,
+                full_gprs,
+                inherited_pipes,
+                inherited_files,
+            )
     }
 
     #[cfg(not(target_arch = "x86_64"))]
@@ -3765,6 +3795,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .spawn_cross_process_fork_child(
                         &relocations,
                         full_gprs,
+                        alloc::vec::Vec::new(),
                         alloc::vec::Vec::new(),
                     )
             {
