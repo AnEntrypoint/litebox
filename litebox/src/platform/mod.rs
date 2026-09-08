@@ -481,6 +481,26 @@ where
     #[must_use]
     fn write_at_offset(self, count: isize, value: T) -> Option<()>;
 
+    /// Atomically compare-and-exchange the value at signed offset from this pointer.
+    ///
+    /// On success returns `Some(Ok(current))`; on failure `Some(Err(actual))`, carrying the value
+    /// that was actually there. `None` means the access itself could not be performed -- an invalid
+    /// pointer, a misaligned one, or a `T` this cannot be done atomically for.
+    ///
+    /// # Why this exists
+    ///
+    /// [`read_at_offset`](RawConstPointer::read_at_offset) and [`Self::write_at_offset`] are each
+    /// individually atomic for small aligned types, but a load followed by a store is NOT: another
+    /// party can change the word in between. That is exactly the shape of every lock protocol a
+    /// guest runs against a shared word, and the kernel side of `FUTEX_LOCK_PI`/`UNLOCK_PI` cannot
+    /// be implemented correctly without it -- guest userspace does its own compare-exchange on the
+    /// very same word, so a read-then-write here would race it.
+    ///
+    /// Only sizes the target can do atomically are supported (4 bytes, and 8 on 64-bit); anything
+    /// else returns `None` rather than silently degrading to a non-atomic sequence.
+    #[must_use]
+    fn compare_exchange_at_offset(self, count: isize, current: T, new: T) -> Option<Result<T, T>>;
+
     /// Write a slice of values at the given offset.
     ///
     /// Returns `None` if the provided pointer is invalid, or if the specified offset is known (in

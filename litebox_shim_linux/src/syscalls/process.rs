@@ -1120,6 +1120,23 @@ const FUTEX_WAITERS: u32 = 0x8000_0000;
 /// `FUTEX_TID_MASK`.
 const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
 
+/// Atomically compare-exchange a guest futex word.
+///
+/// `Ok(Ok(previous))` on success, `Ok(Err(actual))` when the word did not hold `current`, and
+/// `Err(EFAULT)` when the address itself is not usable. Separating "the exchange lost" from "the
+/// memory is bad" is what lets the PI paths retry on the former and fail on the latter.
+fn futex_compare_exchange<Platform: ShimPlatform>(
+    addr: UserPtrMut<u32>,
+    current: u32,
+    new: u32,
+) -> Result<Result<u32, u32>, Errno> {
+    use litebox::platform::RawMutPointer as _;
+    addr.to_platform_ptr::<Platform>()
+        .compare_exchange_at_offset(0, current, new)
+        .ok_or(Errno::EFAULT)
+}
+
+
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Process a single robust-futex-list entry belonging to a dying thread: if the futex word
     /// still records this thread as the owner, mark it as dead (setting [`FUTEX_OWNER_DIED`] and
@@ -5080,13 +5097,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // code` and aborts. On the debian webtop that abort killed selkies one log line after a
             // browser client's cursor had already been delivered, taking the video stream with it.
             //
-            // Known limit, stated rather than hidden: the read-modify-write below is a relaxed
-            // atomic load followed by a store, not a compare-exchange, because no
-            // compare-exchange over guest memory exists at this layer yet. It is therefore not
-            // atomic against a CONCURRENT userspace CAS on the same word. glibc only reaches these
-            // operations on the contended slow path (the uncontended cases are settled in
-            // userspace), so the window is small -- but it is real, and closing it needs an atomic
-            // compare-exchange on `RawMutPointer<u32>`.
+            // Every word update below is a real `compare_exchange_at_offset`, not a load followed
+            // by a store. That matters: guest userspace runs its own compare-exchange against this
+            // same word for the uncontended fast path, so a read-then-write here would race it and
+            // could lose an ownership handoff.
             FutexArgs::LockPi {
                 addr,
                 flags,
@@ -5109,10 +5123,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 loop {
                     let current = addr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
                     if current & FUTEX_TID_MASK == 0 {
-                        // Free: claim it, preserving any waiters bit already set.
-                        addr.write_at_offset::<Platform>(0, me | (current & FUTEX_WAITERS))
-                            .ok_or(Errno::EFAULT)?;
-                        break 0;
+                        // Free: claim it, preserving any waiters bit already set. If someone beat
+                        // us to it the exchange fails and we simply look again.
+                        match futex_compare_exchange::<Platform>(
+                            addr,
+                            current,
+                            me | (current & FUTEX_WAITERS),
+                        )? {
+                            Ok(_) => break 0,
+                            Err(_) => continue,
+                        }
                     }
                     if current & FUTEX_TID_MASK == me {
                         // Already ours. A non-recursive mutex should not get here; Linux answers
@@ -5120,10 +5140,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         return Err(Errno::EDEADLK);
                     }
                     // Held by someone else: publish that we are waiting, then block until the
-                    // owner's `UNLOCK_PI` changes the word.
+                    // owner's `UNLOCK_PI` changes the word. A failed exchange means the word moved
+                    // (very likely the owner releasing it), so re-read rather than blocking on a
+                    // value that is already stale.
                     let contended = current | FUTEX_WAITERS;
-                    addr.write_at_offset::<Platform>(0, contended)
-                        .ok_or(Errno::EFAULT)?;
+                    if futex_compare_exchange::<Platform>(addr, current, contended)?.is_err() {
+                        continue;
+                    }
                     // A value mismatch means the word already moved on between our store and the
                     // wait; re-read and retry rather than reporting a spurious failure.
                     match self.global.futex_manager.wait(
@@ -5146,9 +5169,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // Held. Linux reports a failed acquisition here as `EAGAIN`.
                     return Err(Errno::EAGAIN);
                 }
-                addr.write_at_offset::<Platform>(0, me | (current & FUTEX_WAITERS))
-                    .ok_or(Errno::EFAULT)?;
-                0
+                // A lost exchange means someone else took it between the read and here, which for
+                // a TRY is the same answer as finding it held.
+                match futex_compare_exchange::<Platform>(
+                    addr,
+                    current,
+                    me | (current & FUTEX_WAITERS),
+                )? {
+                    Ok(_) => 0,
+                    Err(_) => return Err(Errno::EAGAIN),
+                }
             }
             FutexArgs::UnlockPi { addr, flags } => {
                 warn_shared_futex!(flags);
@@ -5161,8 +5191,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
                 // Drop ownership AND the waiters bit together: a waiter woken below re-reads the
                 // word and must see it free, and whichever waiter wins will set the bit again if
-                // it finds the lock taken.
-                addr.write_at_offset::<Platform>(0, 0).ok_or(Errno::EFAULT)?;
+                // it finds the lock taken. Exchanged against the value we just read, so a waiter
+                // setting `FUTEX_WAITERS` concurrently cannot have its bit erased -- the exchange
+                // fails instead, and we retry against what is actually there.
+                let mut current = current;
+                loop {
+                    match futex_compare_exchange::<Platform>(addr, current, 0)? {
+                        Ok(_) => break,
+                        Err(actual) => {
+                            if actual & FUTEX_TID_MASK != me {
+                                return Err(Errno::EPERM);
+                            }
+                            current = actual;
+                        }
+                    }
+                }
                 if current & FUTEX_WAITERS != 0 {
                     let one = core::num::NonZeroU32::new(1).unwrap();
                     let _ = self.global.futex_manager.wake(

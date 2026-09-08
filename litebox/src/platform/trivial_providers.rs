@@ -185,6 +185,38 @@ impl<T: FromBytes + IntoBytes> RawMutPointer<T> for TransparentMutPtr<T> {
         }
         Some(())
     }
+    fn compare_exchange_at_offset(self, count: isize, current: T, new: T) -> Option<Result<T, T>> {
+        if size_of::<T>() != 4 {
+            return None;
+        }
+        let ptr = self.as_ptr();
+        if ptr.is_null() || !ptr.is_aligned() {
+            return None;
+        }
+        let p = ptr.wrapping_offset(count);
+        if !(p as usize).is_multiple_of(align_of::<u32>()) {
+            return None;
+        }
+        // SAFETY: non-null, aligned, and `T` is a 4-byte `FromBytes + IntoBytes` type, so it
+        // shares a representation with `u32`.
+        unsafe {
+            let cur: u32 = core::mem::transmute_copy(&current);
+            let nxt: u32 = core::mem::transmute_copy(&new);
+            let atomic = &*p.cast::<core::sync::atomic::AtomicU32>();
+            Some(
+                match atomic.compare_exchange(
+                    cur,
+                    nxt,
+                    core::sync::atomic::Ordering::SeqCst,
+                    core::sync::atomic::Ordering::SeqCst,
+                ) {
+                    Ok(v) => Ok(core::mem::transmute_copy::<u32, T>(&v)),
+                    Err(v) => Err(core::mem::transmute_copy::<u32, T>(&v)),
+                },
+            )
+        }
+    }
+
     fn mutate_subslice_with<R>(
         self,
         range: impl core::ops::RangeBounds<isize>,

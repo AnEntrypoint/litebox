@@ -397,6 +397,43 @@ impl<V: ValidateAccess, T: FromBytes + IntoBytes> RawMutPointer<T> for UserMutPt
         .ok()
     }
 
+    fn compare_exchange_at_offset(self, count: isize, current: T, new: T) -> Option<Result<T, T>> {
+        // Only 4-byte words, which is what every futex protocol uses. Refusing other sizes keeps
+        // the "atomic" in this method's name true rather than quietly degrading.
+        if size_of::<T>() != 4 {
+            return None;
+        }
+        let dst = self.as_ptr().wrapping_add(usize::try_from(count).ok()?);
+        let dst = V::validate(dst)?;
+        if !(dst as usize).is_multiple_of(align_of::<u32>()) {
+            return None;
+        }
+        // SAFETY: `T` is 4 bytes and `FromBytes + IntoBytes`, so it shares a representation with
+        // `u32`; `V::validate` has confirmed the address is accessible to the guest and the
+        // alignment check above makes the atomic well-defined. The access runs inside
+        // `with_user_memory_access` like every other access here.
+        //
+        // This is a genuine `AtomicU32::compare_exchange` rather than the exception-table
+        // fallible helpers because there is no fallible compare-exchange: a fault here would not
+        // be recoverable through the table. `V::validate` is what stands in for that, and it is
+        // the same guarantee the surrounding writes rely on.
+        V::with_user_memory_access(|| unsafe {
+            let cur: u32 = core::mem::transmute_copy(&current);
+            let nxt: u32 = core::mem::transmute_copy(&new);
+            let atomic = &*dst.cast::<core::sync::atomic::AtomicU32>();
+            match atomic.compare_exchange(
+                cur,
+                nxt,
+                core::sync::atomic::Ordering::SeqCst,
+                core::sync::atomic::Ordering::SeqCst,
+            ) {
+                Ok(v) => Ok(core::mem::transmute_copy::<u32, T>(&v)),
+                Err(v) => Err(core::mem::transmute_copy::<u32, T>(&v)),
+            }
+        })
+        .into()
+    }
+
     fn mutate_subslice_with<R>(
         self,
         _range: impl core::ops::RangeBounds<isize>,

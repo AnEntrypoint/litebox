@@ -645,9 +645,32 @@ impl<
             // with a hint flag took the whole thing down. Reached live by `mate-session`'s
             // startup: `not implemented: OFlags(LARGEFILE | NOATIME)`.
             | OFlags::NOATIME
+            // I/O-behaviour hints, accepted and ignored: they say HOW to do the I/O, not WHAT
+            // to open, and none of them changes what `open` returns or what the caller may then
+            // do here. `DSYNC`/`SYNC` are durability barriers and nothing here is backed by a
+            // device that can lose writes; `DIRECT` bypasses a page cache that does not exist;
+            // `ASYNC` asks for `SIGIO`, which the fd layer above owns; `CLOEXEC` is a
+            // descriptor-table property applied by the shim, never by a backend.
+            | OFlags::DSYNC
+            | OFlags::SYNC
+            | OFlags::DIRECT
+            | OFlags::ASYNC
+            | OFlags::CLOEXEC
             | OFlags::PATH;
+        // An unlisted flag is REPORTED, never fatal.
+        //
+        // This was `unimplemented!("{flags:?}")`, which panics the HOST process -- so any guest
+        // that opened a file with a flag this backend had not been taught took down the runner and
+        // every other guest running inside it. Not hypothetical: it killed a live XFCE session with
+        // `not implemented: OFlags(NOATIME)`, and the comment a few lines above records the SAME
+        // defect being found once before, in a sibling backend, without the others being changed.
+        // Teaching each whitelist one more flag does not fix that; not panicking does.
+        //
+        // `EINVAL` is what Linux reports for a flag combination it will not honour, and it leaves
+        // the decision with the caller instead of ending everyone's process.
         if flags.intersects(currently_supported_oflags.complement()) {
-            unimplemented!("{flags:?}")
+            litebox_util_log::warn!(flags:? = flags; "open: unsupported open flag(s)");
+            return Err(OpenError::PathError(PathError::InvalidPathname));
         }
         let path = self.absolute_path(path)?;
         if flags.contains(OFlags::CREAT) {

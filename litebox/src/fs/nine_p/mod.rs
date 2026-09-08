@@ -631,8 +631,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             | OFlags::DSYNC
             | OFlags::DIRECT
             | OFlags::NOATIME;
+        // An unlisted flag is REPORTED, never fatal.
+        //
+        // This was `unimplemented!("{flags:?}")`, which panics the HOST process -- so any guest
+        // that opened a file with a flag this backend had not been taught took down the runner and
+        // every other guest running inside it. Not hypothetical: it killed a live XFCE session with
+        // `not implemented: OFlags(NOATIME)`, and the comment a few lines above records the SAME
+        // defect being found once before, in a sibling backend, without the others being changed.
+        // Teaching each whitelist one more flag does not fix that; not panicking does.
+        //
+        // `EINVAL` is what Linux reports for a flag combination it will not honour, and it leaves
+        // the decision with the caller instead of ending everyone's process.
         if flags.intersects(currently_supported_oflags.complement()) {
-            unimplemented!("{flags:?}")
+            litebox_util_log::warn!(flags:? = flags; "open: unsupported open flag(s)");
+            return Err(OpenError::PathError(PathError::InvalidPathname));
         }
 
         let path = self.absolute_path(path)?;
