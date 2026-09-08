@@ -3372,7 +3372,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                      child WILL LOSE these fds; measurement only"
                 );
             }
-            if (fd_complexity.beyond_stdio == 0 || ignore_fds)
+            // NEVER for a vfork. A `CLONE_VFORK` child deliberately SHARES the parent's
+            // `PageManager` and is handed a deliberately EMPTY `AddressRelocations` (see the
+            // `let vforked = ...` branch earlier in this function) -- nothing was duplicated,
+            // because nothing is supposed to be. Handing that empty map to the cross-process
+            // path spawns a real Windows process and then tells it to adopt zero regions, so the
+            // child comes up with no address space at all and is resumed at an `rip` belonging to
+            // a parent it does not share memory with. Observed exactly that: the child logged
+            // `adopting 0 pre-populated region(s), brk=0x0` and then hung.
+            //
+            // vfork already has its own, correct answer to the fixed-address collision this path
+            // exists to solve -- it shares one address space, and `ElfLoader::load`'s
+            // vfork-detach step gives the child a brand-new `PageManager` at `execve` time. The
+            // cross-process path is for REAL forks, where a genuine duplicate exists to transfer.
+            let vfork_child = flags.contains(CloneFlags::VFORK);
+            if vfork_child {
+                litebox_util_log::debug!(
+                    tid:% = self.tid;
+                    "clone: cross-process fork() skipped for a vfork child (shares the parent's \
+                     address space by design; nothing was duplicated to transfer)"
+                );
+            }
+            if !vfork_child
+                && (fd_complexity.beyond_stdio == 0 || ignore_fds)
                 && let Some(mut full_gprs) = cross_process_gprs
                 && {
                     full_gprs.fs_base = cross_process_fs_base;

@@ -909,3 +909,37 @@ empty layout, and (b) back guest pipes (and the other fd subsystems) with inheri
 HANDLEs so the eligibility gate can pass honestly. Neither was attempted here; forcing a third
 unverified fix at this depth is what this project's own discipline warns against, and the
 measurement flag is deliberately not a workaround.
+
+### Update: vfork must never take the cross-process path, and what is left after that
+
+Two corrections to the section above, both measured.
+
+**The empty VMA layout was not a missing feature -- it was the cross-process path being applied to
+a vfork.** `do_clone` already handles `CLONE_VFORK` correctly and deliberately: the child SHARES
+the parent's `Arc<PageManager>` and is handed an intentionally EMPTY `AddressRelocations`, because
+nothing was duplicated and nothing is supposed to be (`ElfLoader::load`'s vfork-detach step then
+gives the child a brand-new `PageManager` at `execve` time). Feeding that empty map to
+`spawn_cross_process_fork_child` spawns a real Windows process and tells it to adopt zero regions,
+so the child comes up with no address space and is resumed at an `rip` belonging to a parent it
+does not share memory with -- exactly the `adopting 0 pre-populated region(s), brk=0x0` hang.
+The cross-process path is for REAL forks, and now refuses vfork children explicitly.
+
+**With that fixed, the collision this whole line of work targets is gone.** On the s6 chain the
+vfork (pid 1 -> pid 2) correctly stays on the sharing path, the real fork (pid 2 -> pid 3) goes
+cross-process, and the count of `sys_execve: load_program failed after point of no return` drops
+to ZERO -- `s6-mkdir` no longer collides with GuestPid(1) at 0x400000. That confirms the diagnosis
+end to end: a real per-process address space is both necessary and sufficient for this collision
+class.
+
+**What still fails is the transfer itself.** The parent now AVs while copying its own memory into
+the child:
+
+    [process_fork_diag] fork(): probing 0 reservation group(s)   <- the vfork, correctly empty
+    [process_fork_diag] fork(): probing 2 reservation group(s)   <- the real fork
+    [diag-unrecov-av-terminate] rip=0x7ff7cfb6af48 addr=0xaab000
+
+`read_source_bytes` (`ptr.to_owned_slice(range.len())` over each relocation group) faults reading
+a source range, so the child is never resumed and the run dies. The next step is to make that read
+fault-tolerant per page rather than assuming every byte of a group is mapped -- `fork_verify`'s own
+`read_usize_fault_tolerant` is the existing pattern for that -- and only then to revisit fd
+inheritance, which remains the other half of honest eligibility.
