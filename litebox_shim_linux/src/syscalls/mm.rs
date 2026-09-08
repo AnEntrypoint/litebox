@@ -890,11 +890,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         )
     }
 
-    /// If `fd` is an ordinary file and the guest asked for a WRITABLE `MAP_SHARED` mapping, back
-    /// it with a real shared-memory object -- keyed by the file's `(dev, ino)`, so every process
-    /// mapping the same file binds to the SAME object and sees the others' writes -- and return
-    /// `Some(result)`. Returns `None` when this does not apply, leaving read-only shared mappings
-    /// and every other case on their existing, cheaper paths.
+    /// If `fd` is an ordinary file and the guest asked for a `MAP_SHARED` mapping, back it with a
+    /// real shared-memory object -- keyed by the file's `(dev, ino)`, so every process mapping the
+    /// same file binds to the SAME object and sees the others' writes -- and return `Some(result)`.
+    /// Returns `None` for anonymous or `MAP_PRIVATE` mappings, which keep their existing paths.
+    ///
+    /// Read-only mappers must go through here too, not just writable ones. `MAP_SHARED` means
+    /// "these mappers see each other's writes", and that is precisely a property that cannot be
+    /// delivered by giving the reader its own snapshot of the file's bytes while the writer gets
+    /// a shared object -- they would simply be different memory. dconf is built out of exactly
+    /// that asymmetry: the writer (`dconf_shm_flag`) maps the flag byte `PROT_WRITE`, while every
+    /// reader (`dconf_shm_open`) maps the same byte `PROT_READ`, and the reader polls it to learn
+    /// that its cached copy of the database is stale.
     ///
     /// This exists because rejecting the combination outright with `ENODEV` (as the check just
     /// below this call site used to do for every file) is not a survivable answer for the callers
@@ -922,28 +929,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// layer already widens write-only to read/write, since Windows has no write-only page
     /// protection.
     ///
-    /// KNOWN LIMITATION, stated rather than papered over: writes through the mapping are visible
-    /// to every other MAPPER of the same file, but are not propagated back into the file's own
-    /// byte storage, so a later `read()` of that file still returns the pre-`mmap` contents.
-    /// Closing that gap needs a write-back path this shim has nowhere to hang -- the mapping
-    /// outlives the descriptor (POSIX requires that, and the dconf sequence above closes the fd
-    /// immediately after mapping), and there is no fd-to-path or open-by-inode route to reacquire
-    /// the file at `munmap`/`msync` time. Mapper-to-mapper coherence is the property this shape
-    /// of IPC-flag file actually depends on, and it is the property implemented here; a caller
-    /// wanting durable file bytes still has `write()`.
+    /// KNOWN LIMITATIONS, stated rather than papered over. Both are consequences of the shared
+    /// object being a separate allocation from the file's own byte storage:
+    ///
+    /// 1. Writes through the mapping are visible to every other MAPPER of the file, but are not
+    ///    propagated back into its byte storage, so a later `read()` still returns the pre-`mmap`
+    ///    contents. Closing that needs a write-back path this shim has nowhere to hang: the
+    ///    mapping outlives the descriptor (POSIX requires that, and the dconf sequence above
+    ///    closes the fd immediately after mapping), and there is no fd-to-path or open-by-inode
+    ///    route to reacquire the file at `munmap`/`msync` time.
+    /// 2. The object is seeded from the file once, by the first mapper. A file rewritten IN PLACE
+    ///    with `write()` afterwards will not show its new bytes to mappers. Rewriting by
+    ///    `rename()` over the top -- what dconf-service itself does with the database, and the
+    ///    normal atomic-replace idiom -- is unaffected, because the replacement is a different
+    ///    inode and therefore a different key, hence a fresh object seeded from the new contents.
     fn try_shared_file_mmap(
         &self,
         addr: usize,
         len: usize,
-        prot: &ProtFlags,
         flags: &MapFlags,
         fd: i32,
         offset: usize,
     ) -> Option<Result<UserPtrMut<u8>, MappingError>> {
-        if flags.contains(MapFlags::MAP_ANONYMOUS)
-            || !flags.contains(MapFlags::MAP_SHARED)
-            || !prot.contains(ProtFlags::PROT_WRITE)
-        {
+        if flags.contains(MapFlags::MAP_ANONYMOUS) || !flags.contains(MapFlags::MAP_SHARED) {
             return None;
         }
         // Only whole-file mappings from offset 0 share an object here. A non-zero offset would
@@ -1238,8 +1246,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // rejection was fatal rather than degrading for the callers that hit it. Read-only
         // shared mappings deliberately fall past this and keep their existing path.
         if !flags.contains(MapFlags::MAP_ANONYMOUS)
-            && let Some(result) =
-                self.try_shared_file_mmap(addr, len, &prot, &flags, fd, offset)
+            && let Some(result) = self.try_shared_file_mmap(addr, len, &flags, fd, offset)
         {
             return result.map_err(Errno::from);
         }
