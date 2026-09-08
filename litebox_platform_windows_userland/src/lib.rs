@@ -1842,10 +1842,36 @@ unsafe extern "system" fn vectored_exception_handler(
             // build, confirmed via a real crash this exact process previously logged with
             // exception code `0xc0000409`/`STATUS_STACK_BUFFER_OVERRUN` at a fixed offset,
             // suggests a fast-fail-class kernel exception is the more likely mechanism than an
-            // ordinary AV). The watchdog's own CPU-delta safety check (see
-            // `fault_terminate_watchdog_thread_body`) guards against a false-positive kill of a
-            // process that is merely slow rather than truly wedged.
-            FAULT_TERMINATE_ARMED_TICK.fetch_add(1, Ordering::SeqCst);
+            // ordinary AV).
+            //
+            // The watchdog is NO LONGER ARMED HERE, and the comment above is kept because its
+            // evidence is still the record of why it once was.
+            //
+            // Arming on this path was a process-wide death sentence for an ordinary, successful
+            // recovery. `FAULT_TERMINATE_ARMED_TICK` is a monotonic counter that nothing ever
+            // resets, and `fault_terminate_watchdog_thread_body` treats any non-zero value as
+            // "armed" -- it only clears its tick count when the counter reads exactly 0. So the
+            // FIRST exception-table recovery in a process's life armed the watchdog permanently,
+            // and three seconds later it killed the process, whether or not anything was actually
+            // wrong. Every other arming site is on a terminate path, where a monotonic
+            // never-reset counter is exactly right because the process is already ending; this one
+            // was on a path whose whole purpose is to carry on.
+            //
+            // The safety-check sentence above is also no longer true: that CPU-delta check was
+            // removed as live-confirmed unreliable (see `fault_terminate_watchdog_thread_body`),
+            // leaving nothing between a recovery and a kill but a 3-second grace period.
+            //
+            // Measured: `mate-session` logged `[diag-recover-fsbase]` three times -- three
+            // successful recoveries -- and then `[diag-fault-watchdog-terminate]`. With the
+            // watchdog disabled the identical run completes cleanly, exit 0, zero unrecoverable
+            // AVs, `xdotool` reporting a live `mate-session` window. It was never wedged.
+            //
+            // The hang this arming was added to catch is very likely the same corruption fixed by
+            // `VEH_FRAME_STRIDE`'s sizing (see that constant): a nested handler frame overlapping
+            // a live outer one produced exactly the "resumes at `recover` and is never heard from
+            // again" signature. If a genuine recovery-resume hang ever returns, it must be caught
+            // by something that can tell a wedged process from a working one -- which a counter
+            // that only ever counts up cannot.
             context.Rip = recover as u64;
             return EXCEPTION_CONTINUE_EXECUTION;
         } else {
