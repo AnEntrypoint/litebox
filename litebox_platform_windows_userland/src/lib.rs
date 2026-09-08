@@ -2430,21 +2430,13 @@ unsafe extern "system" fn vectored_exception_handler(
     // `is_in_source` membership hit (never a coincidental numeric overlap), and never touches
     // any other register or memory -- the narrowest fix this specific gap admits, matching the
     // same bounded, deterministic shape every safe fix in `fork_verify.rs` itself already uses.
-    // Bounded-spin `try_lock`, never an unconditional block: see `FORK_VERIFY_HEAL_LOCK`'s own doc
-    // comment for why. Held across BOTH the AV-path healers below and the `on_single_step` call
-    // further down (they are sequential alternatives for the same fault, never nested) so no two
-    // threads' healing sequences for two different faults ever interleave.
-    let _fork_verify_heal_guard = {
-        let mut guard = None;
-        for _ in 0..1000 {
-            if let Ok(g) = FORK_VERIFY_HEAL_LOCK.try_lock() {
-                guard = Some(g);
-                break;
-            }
-            core::hint::spin_loop();
-        }
-        guard
-    };
+    // Re-entrant blocking acquisition -- see `lock_fork_verify_heal_reentrant` for why the
+    // previous bounded-spin `try_lock` was wrong: its give-up path healed UNSERIALIZED, which is
+    // exactly the hazard this lock exists to prevent, in exactly the contended case where it
+    // matters. Held across BOTH the AV-path healers below and the `on_single_step` call further
+    // down (they are sequential alternatives for the same fault, never nested) so no two threads'
+    // healing sequences for two different faults ever interleave.
+    let _fork_verify_heal_guard = lock_fork_verify_heal_reentrant();
 
     if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
         && fork_verify::is_verifying(tls)
@@ -8421,6 +8413,62 @@ static ADV_SHM_VIEWS: Mutex<std::collections::BTreeMap<usize, Vec<(usize, usize)
 /// dispatch.
 pub(crate) static FORK_VERIFY_HEAL_LOCK: Mutex<()> = Mutex::new(());
 
+thread_local! {
+    /// How many times THIS thread currently holds [`FORK_VERIFY_HEAL_LOCK`], so a nested fault on
+    /// the same thread can recognise its own ownership instead of deadlocking against itself.
+    static FORK_VERIFY_HEAL_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// A held (or re-entrantly observed) [`FORK_VERIFY_HEAL_LOCK`].
+pub(crate) struct ForkVerifyHealGuard {
+    /// `None` when this thread already held the lock further up its own stack.
+    _outer: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+impl Drop for ForkVerifyHealGuard {
+    fn drop(&mut self) {
+        FORK_VERIFY_HEAL_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Acquire [`FORK_VERIFY_HEAL_LOCK`], blocking for OTHER threads and re-entering freely on this
+/// one.
+///
+/// # Why this replaced a bounded-spin `try_lock`
+///
+/// The previous acquisition spun `try_lock` a thousand times and, on failure, fell through to
+/// "the pre-existing, unserialized behavior (strictly no worse than before this fix)". But
+/// unserialized healing is precisely the hazard this lock exists to prevent -- its own doc comment
+/// records two threads confirmed mid-healing at the same moment, and says "two healers
+/// independently walking the SAME instruction's operands/registers/decode state at once is not
+/// sound just because each individual memory access is atomic". A give-up path that then does the
+/// unsound thing turns the contended case -- the only case the lock matters in -- into the broken
+/// one. `mate-session` runs dozens of threads and contends this constantly.
+///
+/// Blocking was avoided for a real reason: a nested fault on the SAME thread would deadlock
+/// against itself (see `TlsState::veh_depth`). That is a re-entrancy problem, not a reason to
+/// abandon mutual exclusion, and re-entrancy is what this fixes -- a per-thread depth count lets
+/// this thread recognise a lock it already owns and proceed, while a DIFFERENT thread still waits
+/// its turn. Waiting is bounded in practice: healing is, by the same doc comment, "a small,
+/// bounded, non-blocking sequence of local checks and at most one word write".
+pub(crate) fn lock_fork_verify_heal_reentrant() -> ForkVerifyHealGuard {
+    let already_held = FORK_VERIFY_HEAL_DEPTH.with(|d| {
+        let previous = d.get();
+        d.set(previous.saturating_add(1));
+        previous > 0
+    });
+    let outer = if already_held {
+        None
+    } else {
+        Some(
+            FORK_VERIFY_HEAL_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    };
+    ForkVerifyHealGuard { _outer: outer }
+}
+
 /// Serializes `allocate_pages`'s fixed-address (`suggested_range.start != 0`) check-then-act
 /// sequence -- see that call site's own comment for the real TOCTOU race this closes: without a
 /// lock spanning the ENTIRE query-then-allocate span, two concurrently-running guest processes'
@@ -9072,30 +9120,13 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
     }
 
     fn lock_fork_verify_heal(&self) -> impl Sized {
-        // Bounded-spin `try_lock`, never an unconditional block -- see `FORK_VERIFY_HEAL_LOCK`'s
-        // own doc comment for why: this can run on the PARENT's thread inside `do_clone`, which
-        // must never risk deadlocking against a healing pass that itself needs to make forward
-        // progress (e.g. a nested fork's own proactive fixup, or this same thread's own re-entry
-        // via a nested fault). A failed acquisition after the bounded spin falls through to the
-        // pre-existing, unserialized behavior (strictly no worse than before this guard existed)
-        // rather than risking an indefinite block.
-        let mut guard = None;
-        let mut spins = 0u32;
-        for _ in 0..1000 {
-            if let Ok(g) = FORK_VERIFY_HEAL_LOCK.try_lock() {
-                guard = Some(g);
-                break;
-            }
-            spins += 1;
-            core::hint::spin_loop();
-        }
-        if std::env::var_os("LITEBOX_DIAG_HEALLOCK").is_some() {
-            eprintln!(
-                "[diag-heallock] tid={:?} spins={spins} acquired={}",
-                std::thread::current().id(),
-                guard.is_some(),
-            );
-        }
+        // Re-entrant blocking acquisition, same as the exception handler's -- see
+        // `lock_fork_verify_heal_reentrant`. The old bounded spin was justified by this running on
+        // the PARENT's thread inside `do_clone`, which "must never risk deadlocking against a
+        // healing pass"; the deadlock it feared is same-thread re-entry, which the depth count now
+        // handles directly, so waiting for a DIFFERENT thread's bounded healing pass is simply
+        // correct rather than dangerous.
+        let guard = lock_fork_verify_heal_reentrant();
         guard
     }
 
