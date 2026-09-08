@@ -620,44 +620,155 @@ where
     }
 }
 
+/// Every live guest process's [`ProcSelfInfo`], keyed by pid.
+///
+/// # Why this is a table and not one cell
+///
+/// It was one cell. A [`Backend`] is shim-wide -- built once, shared by every guest process -- and
+/// the trait carries no identity of the caller, so `/proc/self` was served from a single
+/// `ProcSelfInfo` that whichever process `execve`'d most recently overwrote. Every other process
+/// then read that one's `exe`, `cmdline`, `environ`, `stat`, `status`, `auxv` and `maps` as its
+/// own.
+///
+/// For `exe` and `cmdline` that is wrong but inert. The other two are not inert:
+///
+/// - `/proc/self/auxv` is read by rustix when it cannot get the auxiliary vector from the initial
+///   stack, and the result is `unwrap()`ed. Handing it another binary's `AT_PHDR`/`AT_ENTRY`/
+///   `AT_BASE` is handing it a description of an address space the caller does not have.
+/// - `/proc/self/maps` is parsed by Rust's std to locate the main thread's stack guard before it
+///   installs the handler that reports stack overflow. Another process's map means another
+///   process's stack bounds.
+///
+/// Both are read during early process startup, which is exactly when a busy session has several
+/// processes starting at once -- so the window is not narrow, and what lands in it varies run to
+/// run. A desktop whose startup outcome differs between identical runs is the symptom this shape
+/// produces.
+///
+/// [`Backend`]: super::backend::Backend
+#[derive(Default)]
+pub struct ProcSelfTable {
+    by_pid: alloc::collections::BTreeMap<i32, ProcSelfInfo>,
+    /// The last pid written, used only when the platform cannot name the calling process (see
+    /// [`ProcSelfTable::resolve`]).
+    most_recent: Option<i32>,
+}
+
+impl ProcSelfTable {
+    /// Replaces `pid`'s entry wholesale, as `execve` does.
+    pub fn set(&mut self, pid: i32, info: ProcSelfInfo) {
+        self.by_pid.insert(pid, info);
+        self.most_recent = Some(pid);
+    }
+
+    /// Mutates `pid`'s existing entry, for the fields `execve` can only fill in after `load`.
+    ///
+    /// Does nothing if there is no entry -- a caller completing a snapshot it just wrote always
+    /// has one, and inventing a default here would manufacture a process that never existed.
+    pub fn with_mut(&mut self, pid: i32, f: impl FnOnce(&mut ProcSelfInfo)) {
+        if let Some(info) = self.by_pid.get_mut(&pid) {
+            f(info);
+        }
+    }
+
+    /// Gives `child` its own copy of `parent`'s entry, on a process `clone()`.
+    ///
+    /// A `fork()`ed child that has not `execve`'d yet genuinely IS running its parent's binary with
+    /// its parent's argv and environment, so real Linux's `/proc/<child>/exe` and `cmdline` are the
+    /// parent's -- only the `pid` field differs. Without this the child has no entry at all and
+    /// falls back to whichever process wrote last (see [`Self::resolve`]), which for a desktop --
+    /// where every shell script in the startup path forks constantly and most of those children
+    /// never `execve` -- is usually some unrelated process.
+    ///
+    /// `maps` is deliberately NOT carried over: it is a closure over the PARENT's page manager, and
+    /// the child's address space is its own from the moment it starts. A child that `execve`s gets a
+    /// renderer for its own page manager there; one that does not would rather report nothing than
+    /// report its parent's address space as its own.
+    pub fn inherit(&mut self, parent: i32, child: i32) {
+        let Some(mut info) = self.by_pid.get(&parent).cloned() else {
+            return;
+        };
+        info.pid = child;
+        info.maps = None;
+        self.by_pid.insert(child, info);
+    }
+
+    /// Drops `pid`'s entry, on process exit.
+    ///
+    /// Not optional housekeeping: each entry holds that process's whole `cmdline`, `environ` and
+    /// `auxv`, plus an `Arc` closure keeping its page-manager mapping table alive. A session that
+    /// starts thousands of short-lived processes would otherwise hold every one of them forever.
+    pub fn remove(&mut self, pid: i32) {
+        self.by_pid.remove(&pid);
+        if self.most_recent == Some(pid) {
+            self.most_recent = None;
+        }
+    }
+
+    /// The entry `/proc/self` should serve to a caller whose pid is `caller`.
+    ///
+    /// Falls back to the most recently written entry when `caller` is `None` (a platform that does
+    /// not track per-thread guest pids) or names a pid with no entry. That fallback IS the old
+    /// single-cell behaviour, deliberately: it is what a platform without
+    /// [`ThreadProvider::current_guest_pid`] could do anyway, so keeping it means this change can
+    /// only improve an answer, never remove one.
+    ///
+    /// [`ThreadProvider::current_guest_pid`]: crate::platform::ThreadProvider::current_guest_pid
+    fn resolve(&self, caller: Option<i32>) -> Option<&ProcSelfInfo> {
+        caller
+            .and_then(|pid| self.by_pid.get(&pid))
+            .or_else(|| self.most_recent.and_then(|pid| self.by_pid.get(&pid)))
+    }
+}
+
 /// A [`Backend`] serving `/proc/self/*` files whose content depends on the CURRENT guest process:
 /// `exe` (a symlink, via [`Backend::read_link_at`]), `cmdline`, `stat`, `status`, `environ`,
 /// `mountinfo`. Mounted at `/proc/self`.
 ///
-/// Backed by a shared [`ProcSelfInfo`] cell (`Arc<RwLock<...>>`), updated by the shim's `execve`
-/// handling via [`ProcSelf::handle`] + [`ProcSelfInfo`]'s own fields -- this backend has no
-/// per-task concept of its own (a [`Backend`] is shim-wide, not per-process), so it always
-/// reflects whichever process most recently `execve`'d, matching this shim's current
-/// single-live-process-tree usage.
+/// Backed by a shared [`ProcSelfTable`] (`Arc<RwLock<...>>`) the shim's `execve` handling writes
+/// one entry per guest process into, and resolved per CALLER via
+/// [`ThreadProvider::current_guest_pid`] -- see [`ProcSelfTable`]'s own doc comment for what this
+/// replaced (one global cell holding whichever process `execve`'d last) and why `auxv` and `maps`
+/// made that actively dangerous rather than merely inaccurate.
+///
+/// [`ThreadProvider::current_guest_pid`]: crate::platform::ThreadProvider::current_guest_pid
 pub struct ProcSelf<Platform>
 where
-    Platform: RawSyncPrimitivesProvider + 'static,
+    Platform: RawSyncPrimitivesProvider + crate::platform::ThreadProvider + 'static,
 {
-    _litebox: LiteBox<Platform>,
+    litebox: LiteBox<Platform>,
     root_inode: NodeInfo,
     _alloc: InodeAllocator,
-    info: alloc::sync::Arc<RwLock<Platform, ProcSelfInfo>>,
+    info: alloc::sync::Arc<RwLock<Platform, ProcSelfTable>>,
 }
 
 impl<Platform> ProcSelf<Platform>
 where
-    Platform: RawSyncPrimitivesProvider + 'static,
+    Platform: RawSyncPrimitivesProvider + crate::platform::ThreadProvider + 'static,
 {
-    /// Construct a new `ProcSelf` backend sharing the given `info` cell -- the caller keeps its
+    /// Construct a new `ProcSelf` backend sharing the given `info` table -- the caller keeps its
     /// own clone of the same `Arc` to update it on `execve` (see this module's doc comment).
     #[must_use]
     pub fn new(
         litebox: &LiteBox<Platform>,
         allocator: InodeAllocator,
-        info: alloc::sync::Arc<RwLock<Platform, ProcSelfInfo>>,
+        info: alloc::sync::Arc<RwLock<Platform, ProcSelfTable>>,
     ) -> Self {
         let root_inode = allocator.next();
         Self {
-            _litebox: litebox.clone(),
+            litebox: litebox.clone(),
             root_inode,
             _alloc: allocator,
             info,
         }
+    }
+
+    /// The [`ProcSelfInfo`] this backend should answer with for the CALLING guest process.
+    ///
+    /// Cloned rather than borrowed because the lock cannot be held across the rendering below, and
+    /// because `/proc/self/maps` is a closure the caller invokes after the lock is released.
+    fn current(&self) -> Option<ProcSelfInfo> {
+        let caller = crate::platform::ThreadProvider::current_guest_pid(self.litebox.x.platform);
+        self.info.read().resolve(caller).cloned()
     }
 }
 
@@ -759,13 +870,13 @@ pub struct ProcSelfFileHandle {
 }
 
 impl<Platform> super::backend::private::Sealed for ProcSelf<Platform> where
-    Platform: RawSyncPrimitivesProvider + 'static
+    Platform: RawSyncPrimitivesProvider + crate::platform::ThreadProvider + 'static
 {
 }
 
 impl<Platform> BackendHandles for ProcSelf<Platform>
 where
-    Platform: RawSyncPrimitivesProvider + 'static,
+    Platform: RawSyncPrimitivesProvider + crate::platform::ThreadProvider + 'static,
 {
     type WalkingDirHandle<'a> = ProcSelfDirHandle;
     type FileHandle = ProcSelfFileHandle;
@@ -774,7 +885,7 @@ where
 
 impl<Platform> Backend for ProcSelf<Platform>
 where
-    Platform: RawSyncPrimitivesProvider + 'static,
+    Platform: RawSyncPrimitivesProvider + crate::platform::ThreadProvider + 'static,
 {
     fn root(&self) -> WalkingDirHandle<'_> {
         WalkingDirHandle::from_typed::<Self>(ProcSelfDirHandle)
@@ -831,7 +942,11 @@ where
         if flags.contains(OFlags::DIRECTORY) {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
-        let snapshot = self.info.read().clone();
+        // `unwrap_or_default` rather than an error: a process that has not yet `execve`'d has no
+        // snapshot, and an empty one renders every file as empty -- the same thing the single
+        // global cell produced before any process had run, and a better answer than refusing the
+        // read outright to a caller the table simply does not know yet.
+        let snapshot = self.current().unwrap_or_default();
         let content = match entry {
             // A direct `open("/proc/self/exe")` (rather than `readlink`) on real Linux opens the
             // symlink's TARGET (the executable itself) -- but this shim has no real inode for the
@@ -866,7 +981,7 @@ where
     ) -> Result<Option<String>, OpenError> {
         let _dir = dir.into_typed::<Self>();
         match ProcSelfEntry::from_name(name) {
-            Some(ProcSelfEntry::Exe) => Ok(Some(self.info.read().exe_path.clone())),
+            Some(ProcSelfEntry::Exe) => Ok(self.current().map(|info| info.exe_path)),
             Some(_) => Ok(None),
             None => Err(OpenError::PathError(PathError::NoSuchFileOrDirectory)),
         }

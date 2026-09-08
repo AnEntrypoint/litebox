@@ -4450,6 +4450,14 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
         NEXT_SPAWNED_THREAD_GUEST_PID.set(Some(pid));
     }
 
+    fn current_guest_pid(&self) -> Option<i32> {
+        // Already maintained per real OS thread for `CLAIMED_RANGES`' ownership checks, and
+        // propagated onto every thread this platform spawns (see `CURRENT_GUEST_PID` and
+        // `set_next_spawned_thread_guest_pid`), so every thread of one guest process -- its
+        // pthreads included -- answers with that process's own pid.
+        CURRENT_GUEST_PID.get()
+    }
+
     fn with_fork_duplicate_claim_owner<R>(&self, child_pid: i32, f: impl FnOnce() -> R) -> R {
         // Save/restore THIS (the parent's) thread's own `CURRENT_GUEST_PID` around `f` --
         // `duplicate()`'s eager address-space copy runs synchronously on the parent's thread, so

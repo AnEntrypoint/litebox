@@ -396,7 +396,7 @@ pub struct LinuxShimBuilder<Platform: ShimPlatform> {
     /// Shared with `GlobalState::proc_self_info` once `build()` runs -- created here (rather than
     /// in `build()`) because `default_fs` (which mounts the `/proc/self` backend sharing this
     /// same cell) always runs before `build()`. See `GlobalState::proc_self_info`'s doc comment.
-    proc_self_info: Arc<litebox::sync::RwLock<Platform, litebox::fs::procfs::ProcSelfInfo>>,
+    proc_self_info: Arc<litebox::sync::RwLock<Platform, litebox::fs::procfs::ProcSelfTable>>,
 }
 
 impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
@@ -406,7 +406,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             platform,
             litebox: LiteBox::new(platform),
             proc_self_info: Arc::new(litebox::sync::RwLock::new(
-                litebox::fs::procfs::ProcSelfInfo::default(),
+                litebox::fs::procfs::ProcSelfTable::default(),
             )),
         }
     }
@@ -955,7 +955,7 @@ fn default_fs<Platform: ShimPlatform>(
     platform: &'static Platform,
     in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
     tar_layers: Vec<Cow<'static, [u8]>>,
-    proc_self_info: Arc<litebox::sync::RwLock<Platform, litebox::fs::procfs::ProcSelfInfo>>,
+    proc_self_info: Arc<litebox::sync::RwLock<Platform, litebox::fs::procfs::ProcSelfTable>>,
 ) -> LinuxFS<Platform> {
     // Real host logical-CPU count -- see `litebox::platform::SystemInfoProvider::cpu_count`'s doc
     // comment for why GLib's thread-pool sizing needs this to be accurate, not just present.
@@ -2698,7 +2698,7 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// `Task::load_program`). Shared (not owned solely by the mounted backend) so
     /// `Task::load_program` -- which has no reference to the mounted `Backend` trait object, only
     /// to `GlobalState` -- can update it.
-    proc_self_info: Arc<litebox::sync::RwLock<Platform, litebox::fs::procfs::ProcSelfInfo>>,
+    proc_self_info: Arc<litebox::sync::RwLock<Platform, litebox::fs::procfs::ProcSelfTable>>,
 }
 
 struct Task<Platform: ShimPlatform, FS: ShimFS> {

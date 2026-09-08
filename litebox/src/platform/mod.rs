@@ -133,6 +133,31 @@ pub trait ThreadProvider: RawPointerProvider {
         let _ = pid;
     }
 
+    /// The guest-space process id (`Task::pid`) that the CALLING host thread currently belongs to,
+    /// or `None` if this platform does not track it.
+    ///
+    /// The read side of [`set_next_spawned_thread_guest_pid`](Self::set_next_spawned_thread_guest_pid):
+    /// a platform that already propagates a guest-pid onto each real OS thread it spawns (because
+    /// every guest process here is an OS thread sharing one host process) can answer this for free,
+    /// and every thread of one guest process answers with that process's pid -- a pthread is not a
+    /// different process and must not look like one.
+    ///
+    /// # Why anything needs this
+    ///
+    /// `/proc/self` is per-process BY DEFINITION, but a [`Backend`] is shim-wide: the filesystem is
+    /// built once and shared by every guest process, and nothing in the `Backend` trait carries the
+    /// identity of the caller (`UserInfo` is credentials, not identity). Without this, the only
+    /// implementable behaviour is a single global cell -- which is what `/proc/self` WAS, reporting
+    /// whichever process most recently `execve`'d to every process that read it. For `exe` and
+    /// `cmdline` that is merely wrong; for `auxv` (rustix reads it and unwraps the result) and
+    /// `maps` (Rust's std parses it to find the main thread's stack guard before installing its
+    /// stack-overflow handler) it hands a process another process's address-space facts.
+    ///
+    /// [`Backend`]: crate::fs::backend::Backend
+    fn current_guest_pid(&self) -> Option<i32> {
+        None
+    }
+
     /// Temporarily attributes any host-memory-ownership bookkeeping this platform performs
     /// (see [`set_next_spawned_thread_guest_pid`](Self::set_next_spawned_thread_guest_pid)'s
     /// doc comment for why such bookkeeping exists at all -- `litebox_platform_windows_userland`'s

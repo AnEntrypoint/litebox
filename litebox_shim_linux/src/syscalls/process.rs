@@ -1785,6 +1785,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // happen before `notify_detached` below -- see this function's comment above.
             self.close_all_fds_on_process_exit();
             litebox_util_log::debug!(tid:% = self.tid; "DIAG prepare_for_exit: close_all_fds done");
+            // Drop this process's `/proc/self` snapshot along with its fds. Not optional
+            // housekeeping: the entry holds the whole `cmdline`, `environ` and `auxv`, plus an
+            // `Arc` closure that keeps this process's page-manager mapping table alive for as long
+            // as the entry lives. A session that starts thousands of short-lived processes -- any
+            // desktop, via every shell script in its startup path -- would otherwise accumulate
+            // every one of them for the life of the runner. See
+            // `litebox::fs::procfs::ProcSelfTable::remove`.
+            self.global.proc_self_info.write().remove(self.pid);
             let orphans = self.process().take_children();
             litebox_util_log::debug!(tid:% = self.tid, n_orphans:% = orphans.len(); "DIAG prepare_for_exit: take_children done");
             if !orphans.is_empty() {
@@ -3943,6 +3951,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // running -- never a false "still the parent's own memory" merge in either direction.
         self.global.platform.set_next_spawned_thread_guest_pid(pid);
 
+        // Give a forked child its own `/proc/self` entry, copied from this process's. A thread
+        // clone needs nothing: it shares `self.pid` and therefore already resolves to the same
+        // entry. See `litebox::fs::procfs::ProcSelfTable::inherit` for why a child that has not
+        // `execve`d yet must report its parent's `exe`/`cmdline` rather than fall back to whichever
+        // unrelated process happened to write the table last.
+        if is_process_clone {
+            self.global
+                .proc_self_info
+                .write()
+                .inherit(self.pid, pid);
+        }
+
         let r = unsafe {
             self.global.platform.spawn_thread(
                 ctx,
@@ -5594,18 +5614,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 environ.extend_from_slice(var.as_bytes_with_nul());
             }
             let comm = alloc::string::String::from_utf8_lossy(loader.comm()).into_owned();
-            *self.global.proc_self_info.write() = litebox::fs::procfs::ProcSelfInfo {
-                exe_path: alloc::string::String::from(loader.path()),
-                cmdline,
-                environ,
-                pid: self.pid,
-                comm,
-                // Both filled in below: the complete auxiliary vector does not exist until `load`
-                // has placed the image and written the stack, and the maps renderer is installed
-                // against this process's page manager once it exists.
-                auxv: alloc::vec::Vec::new(),
-                maps: None,
-            };
+            // Keyed by THIS process's pid, not written over a single global cell. See
+            // `litebox::fs::procfs::ProcSelfTable`'s doc comment: the cell meant every other
+            // live process read this one's `exe`/`cmdline`/`auxv`/`maps` as its own.
+            self.global.proc_self_info.write().set(
+                self.pid,
+                litebox::fs::procfs::ProcSelfInfo {
+                    exe_path: alloc::string::String::from(loader.path()),
+                    cmdline,
+                    environ,
+                    pid: self.pid,
+                    comm,
+                    // Both filled in below: the complete auxiliary vector does not exist until
+                    // `load` has placed the image and written the stack, and the maps renderer is
+                    // installed against this process's page manager once it exists.
+                    auxv: alloc::vec::Vec::new(),
+                    maps: None,
+                },
+            );
         }
 
         // A live `/proc/self/maps` renderer over THIS process's page manager. Installed here
@@ -5614,8 +5640,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // table alive and always reports the CURRENT layout rather than a snapshot.
         {
             let pm = self.process().pm();
-            self.global.proc_self_info.write().maps =
-                Some(alloc::sync::Arc::new(move || render_proc_maps(&pm)));
+            self.global
+                .proc_self_info
+                .write()
+                .with_mut(self.pid, |info| {
+                    info.maps = Some(alloc::sync::Arc::new(move || render_proc_maps(&pm)));
+                });
         }
 
         let load_info = loader.load(argv, envp, self.init_auxv())?;
@@ -5623,7 +5653,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // vector does not exist until the image has been placed (`AT_PHDR`/`AT_ENTRY`/`AT_BASE`)
         // and the stack written (`AT_RANDOM`), and deliberately not reconstructed here -- these
         // are the very bytes `load` wrote to the initial stack.
-        self.global.proc_self_info.write().auxv = load_info.auxv.clone();
+        self.global
+            .proc_self_info
+            .write()
+            .with_mut(self.pid, |info| info.auxv = load_info.auxv.clone());
 
         self.set_task_comm(loader.comm());
 
