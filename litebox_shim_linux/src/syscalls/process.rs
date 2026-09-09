@@ -3875,14 +3875,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // whole pipe-inheritance path exists to remove.
             let ignore_fds = false;
             if fd_complexity.beyond_stdio != 0 && !ignore_fds {
-                litebox_util_log::warn!(
+                // `debug!`, and no longer claiming the fd subsystems carry nothing.
+                //
+                // This is the SUPERSEDED post-duplication site. Reaching it means the
+                // pre-duplication `try_cross_process_fork` has already run, already decided, and
+                // already logged its own reason -- and unlike this site it genuinely carries pipes
+                // (bridged over real OS pipes), regular files (reopened at path+offset) and
+                // eventfds (recreated from their counter), and drops close-on-exec fds rather than
+                // refusing over them. This site's `beyond_stdio == 0` rule is strictly cruder than
+                // the decision already made, so it can only ever repeat it.
+                //
+                // The old text asserted that NONE of the fd subsystems are backed by a real
+                // Windows HANDLE and that any fd above 2 therefore refuses the fork. Both halves
+                // are now false, and it was emitted at `warn` -- 67 times in one desktop boot,
+                // against 3 forks that actually took the path. That is exactly the failure this
+                // site's own comment records: a misleading line here produced the 94th-pass claim
+                // that `LITEBOX_PROCESS_FORK=1` "reproduced the crash IDENTICALLY", from a run
+                // that never entered the cross-process path at all.
+                litebox_util_log::debug!(
                     tid:% = self.tid,
                     beyond_stdio:% = fd_complexity.beyond_stdio,
                     total_alive:% = fd_complexity.total_alive;
-                    "clone: cross-process (D==0) fork() NOT eligible -- guest holds fd(s) at or \
-                     above 3 and none of this shim's fd subsystems are backed by a real Windows \
-                     HANDLE; falling back to the thread-based relocating fork (which is known \
-                     incompatible with glibc safe-linking -- see ADVISORY-001 section 3N)"
+                    "clone: superseded post-duplication cross-process site declining; the real \
+                     decision was made by try_cross_process_fork above, which logged its own reason"
                 );
             } else if fd_complexity.beyond_stdio != 0 {
                 litebox_util_log::warn!(
