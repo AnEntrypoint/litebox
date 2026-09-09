@@ -228,7 +228,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
             litebox_util_log::debug!(
                 exception:? = info.exception, kernel_mode:% = info.kernel_mode,
                 rip:% = format_args!("{:#x}", ctx.rip), rsp:% = format_args!("{:#x}", ctx.rsp),
-                cr2:% = format_args!("{:#x}", info.cr2), error_code:% = format_args!("{:#x}", info.error_code);
+                cr2:% = format_args!("{:#x}", info.cr2), error_code:% = format_args!("{:#x}", info.error_code),
+                // 2026-09-09 Track-B Xvfb-crash investigation: added to test the "corrupted
+                // pointer, not a missing mapping" hypothesis (docs/track-b-fork-fix-progress.md,
+                // "closing synthesis" entry) against the decoded faulting instruction
+                // (`mov rax, [rdx + rax*8]`) -- rdx is the table base, rax the index; if rdx
+                // itself doesn't point anywhere a real relocation/GOT table for one of Xvfb's
+                // loaded libraries could plausibly live, that's direct evidence for corruption
+                // over a genuinely-missing-mapping explanation.
+                rax:% = format_args!("{:#x}", ctx.rax), rdx:% = format_args!("{:#x}", ctx.rdx),
+                rcx:% = format_args!("{:#x}", ctx.rcx), rsi:% = format_args!("{:#x}", ctx.rsi),
+                rdi:% = format_args!("{:#x}", ctx.rdi);
                 "diag-guest-exception: pre-signal snapshot"
             );
             // AGENTS.md pass 257 follow-up: distinguish "genuine weston bug jumping to a real
@@ -259,7 +269,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
                     "diag-guest-exception: mapping overlapping cr2"
                 );
             }
-            let cr2_mapped = overlapping.iter().any(|(r, _)| r.contains(&info.cr2));
             if overlapping.is_empty() {
                 litebox_util_log::debug!(
                     cr2:% = format_args!("{:#x}", info.cr2);
@@ -269,27 +278,35 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
             // Live byte-dump diagnostic (see docs/webtop-debian-selkies-2026-09-06.md,
             // "the Xvfb pid-1 SIGSEGV is NOT RELRO" section) -- a prior session's attempt at this
             // via `RawConstPointer::to_owned_slice`/`memcpy_fallible`'s fault-catching path hung
-            // the whole runner. Root cause of the hang was never confirmed to be lock reentrancy
-            // (the mappings-lock hypothesis is now ruled out above: no lock is held here), so the
-            // remaining suspect is `memcpy_fallible`'s own exception-table-based fault recovery
-            // not being safe to invoke reentrantly from a thread already inside VEH's guest-fault
-            // dispatch. We sidestep that path entirely: `cr2_mapped`/the mapping walk above just
-            // independently confirmed real guest memory backs this address (same for `rip`, whose
-            // fault-free execution up to this point already proves it's mapped and executable), so
-            // an ordinary raw pointer read needs no fault-catching machinery at all. Bounded to a
-            // fixed 64-byte window and gated on the mapping check so an address that turns out NOT
-            // to be backed (the aarch64 path, or a future cr2 that's genuinely unmapped) never
-            // reaches the raw dereference.
-            if cr2_mapped {
-                let dump = unsafe {
-                    core::slice::from_raw_parts(info.cr2 as *const u8, 64)
-                };
-                litebox_util_log::debug!(
-                    cr2:% = format_args!("{:#x}", info.cr2),
-                    bytes:% = format_args!("{:02x?}", dump);
-                    "diag-guest-exception: cr2 byte dump"
-                );
-            }
+            // the whole runner, so this used a raw, unchecked `core::slice::from_raw_parts`
+            // dereference instead, on the reasoning that `cr2_mapped` (the mapping walk just
+            // above) already "independently confirmed real guest memory backs this address".
+            //
+            // That reasoning is exactly backwards, and is now CONFIRMED live (2026-09-09,
+            // `docs/track-b-fork-fix-progress.md`'s "symbolized the crash" entries): `cr2_mapped`
+            // reflects litebox's OWN VMA tracking, which can genuinely diverge from real Windows
+            // memory (a real page-fault with `error_code=0x4`/Present-bit-clear was captured at a
+            // `cr2` this exact tracking believed was mapped -- the underlying bug this whole
+            // investigation is chasing). This diagnostic's own raw dereference then faults AGAIN
+            // on exactly that same, genuinely-unbacked address -- but this time as a SECOND,
+            // host-mode (`is_in_guest=false`) access violation with no exception-table entry,
+            // which is unrecoverable and kills the whole runner. Confirmed via
+            // `advisor/probes/symbolize_litebox_crash.py`: the crash resolves to
+            // `<i8 as core::fmt::LowerHex>::fmt`, reached via this dump's own `{:02x?}` format.
+            //
+            // Net effect: a debug-only diagnostic was turning an ORDINARY, gracefully-delivered
+            // guest `SIGSEGV` (which the guest's own userspace handler is perfectly able to catch
+            // and report, confirmed live without this diagnostic enabled) into an unrecoverable
+            // HOST crash, specifically in the exact scenario -- a tracked-but-not-really-backed
+            // page -- this diagnostic exists to help debug. Removed rather than re-attempting the
+            // fault-tolerant path that hung before (that reentrancy question is still open, see
+            // the doc entry above); this diagnostic is not load-bearing for guest correctness,
+            // only for a developer's follow-up capture, so it must never be able to crash the
+            // host trying to help debug a crash. `rip_mapped`'s own dump just below is NOT
+            // touched by this fix: unlike `cr2` (the address that just faulted), `rip`'s
+            // fault-free execution up to this exact instruction is a real, live guarantee that
+            // page is genuinely mapped and executable, not an assumption resting on
+            // possibly-stale tracking.
             let rip_mapped = self
                 .process()
                 .0

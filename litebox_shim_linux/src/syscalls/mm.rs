@@ -2179,17 +2179,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 if tramp_pages_needed > state.trampoline_mapped_len {
                     let extra_start = state.trampoline_addr + state.trampoline_mapped_len;
                     let extra_len = tramp_pages_needed - state.trampoline_mapped_len;
-                    if self
-                        .do_mmap_anonymous(
-                            Some(extra_start),
-                            extra_len,
-                            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                            MapFlags::MAP_ANONYMOUS
-                                | MapFlags::MAP_PRIVATE
-                                | MapFlags::MAP_FIXED_NOREPLACE,
-                        )
-                        .is_err()
-                    {
+                    litebox_util_log::debug!(
+                        extra_start:% = format_args!("{extra_start:#x}"),
+                        extra_end:% = format_args!("{:#x}", extra_start + extra_len),
+                        extra_len:% = extra_len,
+                        trampoline_addr:% = format_args!("{:#x}", state.trampoline_addr),
+                        trampoline_mapped_len:% = state.trampoline_mapped_len;
+                        "diag-tramp-extend: about to extend trampoline region"
+                    );
+                    let extend_result = self.do_mmap_anonymous(
+                        Some(extra_start),
+                        extra_len,
+                        ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                        MapFlags::MAP_ANONYMOUS
+                            | MapFlags::MAP_PRIVATE
+                            | MapFlags::MAP_FIXED_NOREPLACE,
+                    );
+                    litebox_util_log::debug!(
+                        ok:% = extend_result.is_ok(),
+                        result_addr:% = extend_result.as_ref().map(|p| p.as_usize()).unwrap_or(0);
+                        "diag-tramp-extend: do_mmap_anonymous result"
+                    );
+                    if extend_result.is_err() {
                         litebox_util_log::warn!("failed to expand trampoline region");
                         self.apply_trap_fallback(mapped_addr, len, true);
                         restore_trampoline_rx(self, state);

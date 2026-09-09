@@ -1,5 +1,1177 @@
 # Track B fork-without-exec fix: running progress log
 
+## 2026-09-09 (same night, a correction against my own last theory): checked `execve`'s memory
+## teardown against real source rather than assumption -- it DOES call a genuine platform-level
+## deallocation for ordinary (non-shared) mappings, which is the common case here. This weakens
+## (does not fully rule out, but weakens) the "stale, corrupted memory survives `execve`'s
+## teardown and gets reused later" framing the entry below leans on.
+
+### What was checked
+
+`release_memory` (called at the very top of `sys_execve`'s teardown, per the entry below) walks
+every releasable mapping and calls `remove_mapping` (`litebox/src/mm/linux.rs` ~line 900) on
+each. For the NON-shared case -- ordinary private mappings, which is what essentially everything
+in this crash's own address space is (Xvfb's dependency libraries' file-backed and BSS
+mappings, none of them `MAP_SHARED`) -- the code path is:
+```rust
+if shared_overlaps.is_empty() {
+    self.platform
+        .deallocate_pages(range.clone())
+        .map_err(VmemUnmapError::UnmapError)?;
+}
+```
+This is a REAL platform-level deallocation call (on Windows, ultimately a real `VirtualFree`),
+not merely an update to litebox's own `Vmem` bookkeeping. So `execve`'s teardown genuinely does
+release the shell's pre-exec memory back to the OS for the ordinary case -- by the time Xvfb's
+own post-exec code starts allocating, the address space it's handed back by Windows should be
+freshly, genuinely clean, not a "litebox forgot but Windows still holds it" leak the way the
+already-fixed `VM_OWN_FORK_PADDING` bug (two entries below) was.
+
+### What this means for the disassembly finding below
+
+Doesn't invalidate the disassembly work (the actual faulting instruction, its bitmap-test shape,
+and the `link_map`-field-holds-an-unbacked-pointer observation are all still directly, empirically
+true) -- it removes ONE candidate explanation for HOW that pointer became bad (stale pre-exec
+content surviving teardown). What remains open, roughly in order of how directly testable each
+still is:
+- The corruption happens genuinely AFTER `execve` succeeds, during Xvfb's own (real, `D==0`-free-
+  of-the-shell's-own-history) runtime -- i.e. NOT inherited from the shell's fork at all, but a
+  separate bug specific to something Xvfb's own dependency-loading triggers (still consistent
+  with, but not proof of, a `malloc`-result corruption of the general `ADVISORY-001` 3N shape,
+  just with the "inherited from an earlier forked ancestor" framing removed).
+- The teardown's REAL-vs-TRACKED correctness has some OTHER, more specific gap than
+  `VM_OWN_FORK_PADDING` already covers (worth re-examining the `shared_overlaps` branch above,
+  and the `platform.release_mapping_claim`/`self.vmas.remove` calls at the very end of
+  `remove_mapping`, for a subtler bookkeeping-vs-reality mismatch than a blanket "not released at
+  all" gap).
+- An ordinary, execve-history-independent litebox bug in the mmap/malloc emulation path itself,
+  coincidentally more likely to be OBSERVED in a process with fork ancestry for a reason
+  unrelated to memory content (e.g. an ID/counter/allocator-state field that differs for a
+  forked-then-exec'd process vs. a genuinely fresh one, independent of any actual memory
+  corruption).
+
+None of these is confirmed; recorded so a future session inherits the CORRECT constraint (real
+deallocation happens) rather than the disproven one this session briefly held.
+
+### What remains open, added by this entry
+
+- Re-examine the disassembly finding's own "corrupted by the fork" framing in light of this
+  correction -- it is now an open question again, not a settled conclusion, whether the `link_map`
+  field's bad value originates from the shell's pre-exec fork at all, or from something in Xvfb's
+  own post-exec execution.
+- Everything below (the disassembly evidence itself, the real diagnostic-crash fix, every other
+  ruled-out hypothesis, and every other entry's own open items) remains exactly as documented --
+  this is a correction to ONE causal claim, not a retraction of the observational evidence.
+
+---
+
+## 2026-09-09 (same night, DISASSEMBLED THE ACTUAL CRASH SITE): extracted the real
+## `ld-linux-x86-64.so.2` from the cached OCI layer, computed its exact load base for THIS
+## specific Xvfb process from an already-existing diagnostic, and disassembled the faulting
+## instruction's surrounding code. It is a bitmap-membership test against a field of what is
+## structurally a `struct link_map*` -- matching glibc's internal TLS/DTV generation-bookkeeping
+## shape, not an arbitrary or random access. This is the deepest and most concrete finding of
+## the whole investigation: a `link_map`'s own TLS-bookkeeping field holds a pointer to memory
+## that was never actually backed.
+
+### How: chained three already-existing diagnostics together (no new instrumentation needed)
+
+1. `diag-elf-load: aux vector base/entry values` (`litebox_shim_linux/src/loader/elf.rs`,
+   already built) gives `interp_base` -- for THIS Xvfb process specifically (captured
+   `main_base=0x310000000`, matching the already-known `/usr/bin/Xvfb` exec-mmap address):
+   `interp_base=0x47c0000`.
+2. The captured fault `rip=0x47ca2e1` (from the GPR-extended `diag-guest-exception` snapshot,
+   entry immediately below) minus `interp_base` gives the file offset inside
+   `ld-linux-x86-64.so.2` itself: `0x47ca2e1 - 0x47c0000 = 0xa2e1`.
+3. Extracted the real binary from this session's own OCI layer cache (`.litebox-cache/`;
+   `linuxserver/webtop:debian-xfce`'s `/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2`, 230636
+   bytes, matching the size already logged by an existing `DIAG elf_load: FileAndParsed::new`
+   diagnostic -- confirmed the RIGHT file variant among four candidates the image ships,
+   stripped, static-pie, glibc build) and disassembled around that offset
+   (`llvm-objdump -d --start-address=0xa200 --stop-address=0xa350`, `llvm-objdump` already
+   present via scoop, no new tool install needed).
+
+### The disassembly at the crash site
+
+```
+    a2bc: 48 8b 93 38 03 00 00     movq   0x338(%rbx), %rdx      ; rdx = *(rbx + 0x338)
+    a2cf: 44 89 e0                 movl   %r12d, %eax             ; eax = r12  (a small index)
+    a2d2: 8b 8b 34 03 00 00        movl   0x334(%rbx), %ecx        ; ecx = *(rbx + 0x334)
+    a2d8: c1 e8 06                 shrl   $0x6, %eax                ; eax = r12 >> 6
+    a2db: 23 83 30 03 00 00        andl   0x330(%rbx), %eax        ; eax &= *(rbx + 0x330)
+    a2e1: 48 8b 04 c2               movq   (%rdx,%rax,8), %rax     ; <-- FAULTS HERE
+    a2e5: 44 89 e2                 movl   %r12d, %edx
+    a2e8: d3 ea                    shrl   %cl, %edx
+    a2ea: 89 d1                    movl   %edx, %ecx
+    a2ec: 48 89 c2                 movq   %rax, %rdx
+    a2ef: 48 d3 ea                 shrq   %cl, %rdx
+    a2f2: 44 89 e1                 movl   %r12d, %ecx
+    a2f5: 48 d3 e8                 shrq   %cl, %rax
+    a2f8: 48 21 c2                 andq   %rax, %rdx
+    a2fb: 83 e2 01                 andl   $0x1, %edx               ; extract ONE bit
+    a2fe: 0f 85 3c 02 00 00        jne    0xa540                    ; branch on it
+```
+
+This is a textbook **bitmap membership test**: `word_index = (idx >> 6) & bound`, load the
+64-bit word at `table[word_index]`, then extract bit `idx & 63` from it. `idx` (`r12`) was set
+from the function's `%esi` argument at entry (`movl %esi, %r12d`, earlier in the same function).
+`%rbx` is used throughout as a struct pointer with fields read at offsets `0x32c`, `0x330`,
+`0x334`, `0x338`, `0x356`, `0x68`, `0x70` -- a field layout and access pattern (a small-index
+bitmap test gating a conditional branch, on a per-loaded-object structure) that is structurally
+consistent with glibc's internal TLS/DTV (`dynamic thread vector`) generation-counter or
+module-registration bookkeeping on a `struct link_map*` -- not a random or generically corrupted
+walk. `llvm-objdump`'s own (unreliable on a stripped binary -- nearest-exported-symbol heuristic,
+not a real attribution) label calls this `_dl_rtld_di_serinfo+0x411`; that specific name is very
+likely wrong (that function is for `dlinfo(RTLD_DI_SERINFO)`, an unrelated, rarely-called path),
+but the instruction PATTERN itself is real and directly observed, independent of the label.
+
+### What this means: `rdx` (`0x338(%rbx)`) is a `link_map`'s OWN bookkeeping pointer, and it
+### points at unbacked memory
+
+The table base (`rdx`, `= *(rbx+0x338)`) is not a raw corrupted register value floating free --
+it is a FIELD READ OUT OF a `link_map`-shaped structure, meaning something earlier legitimately
+wrote `0x7feffdff02a8`-ish into that structure's `0x338` offset, presumably as "the address of
+this module's TLS bitmap/slotinfo array" at TLS-registration time (classically a `calloc`/`malloc`
+result in real glibc). If that write itself carried a corrupted VALUE (the safe-linked/tcache
+corruption class `ADVISORY-001` section 3N already documents at length, now via a `malloc`
+result rather than a `free`d chunk's `next` pointer) -- rather than the array's real backing
+memory having been dropped/never-created -- this closes the loop back to the exact same
+architectural bug this whole Track B document exists to fix, cleanly: a value that should be a
+freshly-`malloc`'d pointer, corrupted by the thread-based fork's relocation window, later
+dereferenced by completely unrelated code (`ld-linux`'s TLS bookkeeping, not glibc's allocator
+itself) that has no way to know anything is wrong until it faults.
+
+### What remains open, added by this entry
+
+- **Confirm the TLS-bookkeeping identification against real glibc source** (this build's own
+  glibc version/patch level, `elf/dl-tls.c`'s `_dl_next_tls_modid`/`_dl_update_slotinfo`/
+  `allocate_dtv`-family functions specifically -- the field-offset/bitmap shape matches closely
+  but this entry does not claim a byte-exact source match, only a strong structural one from
+  disassembly alone).
+- **If confirmed**: the actual bug is not in `ld-linux`'s TLS code at all -- it is that SOME
+  earlier `malloc`/`calloc` call (during this same process's dependency-loading phase, almost
+  certainly still within the fork-corruption-vulnerable window this whole investigation
+  documents) returned or stored a corrupted pointer into the `link_map`'s own bookkeeping field.
+  Finding exactly WHICH allocation and WHY needs either a live debugger single-stepping TLS
+  registration, or comparing this exact byte-for-byte-deterministic run's full allocation
+  sequence against a real (non-litebox) Linux run of the identical glibc build -- the most
+  concrete, well-scoped starting point this whole document has produced for closing this out.
+- Everything below (the real, verified diagnostic-crash fix; every ruled-out hypothesis;
+  the corrected log-reading methodology; the working toolchain/symbolizer/objdump paths; and
+  every other entry's own open items) remains exactly as documented.
+
+---
+
+## 2026-09-09 (same night, GPR capture -- the "corrupted single pointer" theory is ALSO now
+## disfavored by direct evidence): extended `diag-guest-exception`'s snapshot to full relevant
+## GPR state (`rax`/`rdx`/`rcx`/`rsi`/`rdi`), rebuilt, re-ran. `rdx` (the table base) AND `rsi`
+## both resolve into the SAME 28 KB region, at plausible-looking, non-garbage offsets -- not what
+## a single wild/corrupted pointer looks like. This points back toward "a real segment that
+## should be backed, isn't" over "a corrupted pointer landing somewhere plausible-looking" -- the
+## entry two below this one may have over-corrected in the corruption direction; both
+## possibilities are live until a source-level (glibc `ld-linux`/TLS internals) or live-debugger
+## pass actually identifies what this table structurally IS.
+
+### The captured data
+
+```
+diag-guest-exception: pre-signal snapshot rip=0x47ca2e1 cr2=0x7feffdff02d8 error_code=0x4
+  rax=0x6 rdx=0x7feffdff02a8 rcx=0xb rsi=0x7feffdff0a90 rdi=0xc5
+diag-guest-exception: pre-signal snapshot rip=0x47ca2e1 cr2=0x7feffdff02a8 error_code=0x4
+  rax=0x0 rdx=0x7feffdff02a8 rcx=0xb rsi=0x7feffdff0a90 rdi=0xc5
+```
+
+Both captures confirm the decoded instruction exactly: `cr2 = rdx + rax*8` in both cases
+(`0x7feffdff02a8 + 0x6*8 = 0x7feffdff02d8`; `0x7feffdff02a8 + 0*8 = 0x7feffdff02a8`). More
+informative than the instruction confirmation itself: **`rdx` and `rsi` are BOTH addresses
+inside the same `0x7feffdff0000`-`0x7feffdff7000` region** (`rsi=0x7feffdff0a90` is `0x7e8`/2024
+bytes past the region's start; `rdx=0x7feffdff02a8` is `0x2a8`/680 bytes past it) -- two
+DIFFERENT registers, presumably set up by two DIFFERENT earlier steps of whatever `ld-linux`
+routine this is, both landing in the same span. `rdi=0xc5` (197 decimal) and `rcx=0xb` (11) are
+small, count/index-shaped values, not addresses.
+
+### Why this cuts against (though does not fully rule out) the "single corrupted pointer" framing
+### from the entry two below
+
+A single relocation/tcache-style pointer corruption (the `ADVISORY-001` 3N class this whole doc
+otherwise documents) typically corrupts ONE value, which then gets dereferenced once, faulting
+once, at essentially one address, chosen only by whatever the corruption's XOR/pointer-mangling
+arithmetic happened to produce. Here, TWO independently-loaded registers land in the SAME 28 KB
+window, at DIFFERENT, small, plausible-looking offsets from its start (`0x2a8`, `0x7e8`) -- the
+shape of "two different fields of one coherent structure", not "two unrelated corrupted values
+that happen to collide by chance" (the address space is 2^48-ish; a coincidental collision this
+tight, twice, is not the more likely explanation). The more parsimonious reading: `ld-linux` is
+processing something (TLS setup is one concrete, testable guess -- the small `rdi`/`rcx` values
+and multi-field-struct shape are consistent with DTV/TLS-block bookkeeping, though NOT confirmed)
+that legitimately, correctly computes these addresses as part of ONE coherent data structure --
+and that structure's backing memory was simply never created, for reasons still unknown.
+
+### Net effect: two live hypotheses, not yet distinguished, both concrete enough to test
+
+1. **A genuinely missing mapping** (something SHOULD have `mmap`'d/`brk`'d this region and
+   didn't, or did so through a syscall path not yet traced -- `diag-exec-mmap`/`DIAG sys_mmap`
+   cover `mmap` calls; a `brk()`-based allocation, or a TLS-specific allocation path, would not
+   yet be captured by either).
+2. **A corrupted value that happens to derive two internally-consistent-looking addresses** from
+   one corrupted base (e.g. if the CORRUPTED value is itself a POINTER TO A STRUCT whose own
+   fields are then read to produce `rdx`/`rsi` -- both would inherit the same wrong base, still
+   explaining the tight clustering, without requiring the memory to be genuinely unbacked by
+   design).
+
+Distinguishing these two needs either: identifying exactly what glibc/`ld-linux` routine is at
+`rip=0x47ca2e1` (source-level knowledge of `ld-linux-x86-64.so.2`'s relocation/TLS internals, or
+disassembling/diffing against a real Linux run of the same glibc build), or a live debugger
+walking the actual call stack at the fault to see what's being computed and why.
+
+### What remains open, added by this entry
+
+- **Identify the actual glibc routine at this RIP** -- disassemble `/lib64/ld-linux-x86-64.so.2`
+  from the image (`objdump -d` against the cached OCI layer, or a debugger with symbols) at file
+  offset corresponding to `rip - <ld-linux's own load base>` and read the surrounding code to
+  determine what data structure `rdx`/`rsi` are meant to be fields of. This is now the single
+  most direct way to settle the corrupted-value-vs-missing-mapping question, more so than another
+  build-test cycle on the litebox side.
+- If it's TLS-related: check whether Xvfb's dependency count (how many libraries need static TLS
+  blocks) was accounted for correctly at whatever point glibc sizes/allocates its static TLS
+  area -- a classic real-world bug shape for exactly this kind of "coherent-looking but unbacked
+  multi-field region" symptom, independent of anything fork/exec-specific.
+- Everything below (the real, verified diagnostic fix; the ruled-out BSS-mmap, trampoline-
+  extension, GLX/environment/PID-collision hypotheses; the corrected log-reading methodology; the
+  working toolchain/symbolizer paths; and every other entry's own open items) remains exactly as
+  documented.
+
+---
+
+## 2026-09-09 (same night, closing synthesis): the "leading theory" from the entry immediately
+## below (a BSS/zero-fill anonymous mmap landing in the crash region) is RULED OUT by direct
+## log correlation -- and what remains points at something more fundamental: the crash region is
+## very likely a CORRUPTED POINTER VALUE (not a genuinely-expected-but-missing mapping), which
+## would make this Xvfb crash the SAME underlying architectural bug class as everything else this
+## whole Track B document is about (`ADVISORY-001` section 3N), just manifesting through the
+## guest's own `ld-linux` relocation processing instead of glibc's malloc tcache.
+
+### The BSS-mmap theory, checked directly against `diag-exec-mmap`'s sibling `DIAG sys_mmap:
+### entry` log (also already built, also already capturing everything needed) -- ruled out
+
+Every anonymous (BSS-zero-fill-shaped) `mmap` between Xvfb's own `execve` and the crash was
+checked by address. The three closest in TIME to the 8.2156s crash (8.166s/8.203s/8.212s) are
+all in the `0x7fefbXXXXXXX`-`0x7fefb5bXXXXXXX` range -- **over a gigabyte away** from the crash's
+`0x7feffdff0000`-`0x7feffdff7000` region, not merely non-adjacent. No `mmap` call of ANY kind
+appears in the ~3ms window between the last logged mapping (8.212170200s) and the crash
+(8.215357800s per `diag-guest-exception`'s own timestamp). **This rules out "a BSS/zero-fill
+mapping for this exact region was requested and something went wrong creating it"** -- nothing
+ever asked to map anything there, at least not through any `sys_mmap` call this diagnostic
+would have caught.
+
+### What that leaves: the crash region is very likely not a real address at all, but a
+### CORRUPTED VALUE that happens to look like one
+
+If nothing ever mapped `0x7feffdff0000`, but `ld-linux`'s own code (`mov rax, [rdx + rax*8]`, the
+decoded faulting instruction from the entry below) is computing addresses that land inside it
+repeatedly, the far more likely explanation is that the TABLE BASE (`rdx`) itself holds a
+corrupted value -- not a genuinely-missing mapping, but a POINTER gone wrong, being dereferenced
+as if it were a valid GOT/relocation-table address. This is structurally identical to
+`ADVISORY-001` section 3N's whole documented failure class: the thread-based relocating fork
+corrupts a pointer somewhere in the guest's memory (that section's own examples are glibc's
+safe-linked tcache `next` pointers), and the crash happens later, whenever something finally
+dereferences the corrupted value -- which can be ANY pointer-shaped data the fork's relocation
+window touched, not only glibc's allocator internals. This investigation has spent most of
+tonight treating Xvfb's crash as possibly a SEPARATE, novel bug (Mesa/EGL-specific, or
+mmap-tracking-specific) -- the evidence now assembled points more toward "the same well-documented
+architectural bug, a new manifestation" than toward a new, independently-fixable defect. Not
+100% proven (would need `rdx`'s actual value and a comparison against what it SHOULD have held,
+which needs either a live debugger or extending `diag-guest-exception` to dump full GPR state --
+noted as the concrete next step below), but the weight of tonight's evidence leans this way.
+
+### What this means for tonight's overall conclusion
+
+This does not change Track B's status or recommendation at all -- if anything, it is one more
+independent data point supporting the same conclusion every other entry in this document already
+reaches: the fix is architectural (`ADVISORY-002`'s shared-kernel-state plan), not a local patch
+to any one crash site. The value of tonight's work is the REAL fix delivered (below -- the
+diagnostic-crashes-the-host bug, genuinely fixed and verified) plus a much more precise
+characterization of how this specific, oft-cited "Xvfb crash" actually manifests -- useful,
+concrete groundwork for whoever eventually does the live-debugger session this needs, not a
+resolution of the underlying architectural question.
+
+### What remains open, added by this entry
+
+- **Capture `rdx`'s actual value at the fault** (needs `diag-guest-exception`'s snapshot extended
+  to full GPR state, or a live debugger) and compare it against what a NON-corrupted run would
+  hold at the same code point -- this is the single most direct way to convert "very likely a
+  corrupted pointer" into a confirmed finding.
+- If confirmed as pointer corruption: this crash site (guest `ld-linux` relocation processing) is
+  now a second, independently-observed manifestation of `ADVISORY-001` section 3N's failure class,
+  alongside the original glibc-tcache one -- worth citing as further evidence for that advisory's
+  own case for Track B, if a future session revisits the priority/urgency of that work.
+- Everything below (the real fix, the ruled-out BSS-mmap and trampoline-extension hypotheses, the
+  corrected log-reading methodology, the working toolchain/symbolizer paths, and every other
+  entry's own open items) remains exactly as documented.
+
+---
+
+## 2026-09-09 (same night, A REAL FIX, VERIFIED LIVE): found and fixed the diagnostic-crashes-
+## the-host bug identified two entries below -- confirmed fixed via a build-test-observe cycle
+## against the deterministic isolated repro. The Xvfb crash itself is NOT fixed (root cause
+## still open), but this removes a real, confirmed, separate bug that was converting an ordinary,
+## gracefully-catchable guest `SIGSEGV` into an unrecoverable HOST crash -- and, as a side effect,
+## unlocked the FIRST-EVER decoded faulting instruction for the underlying bug, worth a lot to
+## whoever continues this.
+
+### The fix
+
+`litebox_shim_linux/src/lib.rs`'s `diag-guest-exception: cr2 byte dump` diagnostic (added by an
+earlier session specifically to help debug this Xvfb crash) did a raw, unchecked
+`core::slice::from_raw_parts(info.cr2 as *const u8, 64)` dereference, gated on `cr2_mapped` --
+litebox's OWN VMA-tracking belief that the address is backed. The entry two below this one
+proved that belief can be wrong (a real `error_code=0x4` page-not-present fault at an address
+litebox's own tracking calls mapped). So this diagnostic re-dereferenced the SAME already-invalid
+address a second time, unchecked -- and crashed the HOST (confirmed via
+`advisor/probes/symbolize_litebox_crash.py`: resolves to `<i8 as core::fmt::LowerHex>::fmt`,
+reached through this dump's own `{:02x?}` byte-slice formatting). Removed the `cr2` byte-dump
+block entirely (kept the `rip` byte-dump -- different, still-valid safety argument: `rip`'s own
+fault-free execution up to that exact instruction is a live guarantee that page is genuinely
+backed, unlike `cr2`, the address that just faulted).
+
+### Verified live, build-test-observe (toolchain: `~/.rustup/toolchains/stable-x86_64-pc-windows-
+### msvc/bin`, not on `PATH` by default; `cargo build --release -p
+### litebox_runner_linux_on_windows_userland` ~46s)
+
+Before the fix, `LITEBOX_LOG=litebox_shim_linux=debug` against the isolated `xvfb_sh_repro.sh`
+reliably produced `[diag-unrecov-av] ... is_in_guest=false ... no exception-table entry found`
+-- an unrecoverable host crash. After the fix, the IDENTICAL repro, IDENTICAL log scope, produces:
+
+```
+fatal signal: terminating task signal=Signal(11) pid=3 tid=3 comm=[88,118,102,98,...]   <- "Xvfb"
+```
+
+An ORDINARY guest-mode `SIGSEGV` delivery to Xvfb itself -- no host crash, no
+`diag-unrecov-av`, no `is_in_guest=false`. This is a REAL, CONFIRMED fix: the diagnostic no
+longer has the power to crash the host. (Xvfb still ultimately fails -- `XVFB_SOCK_FAILED` --
+because the underlying cause of ITS crash is unrelated and still open; see below.)
+
+### A real, new, decoded clue about the underlying bug -- unlocked BY this fix (the diagnostics
+### could not be trusted or safely re-run before this)
+
+With the fix in place, `diag-guest-exception`'s `rip` byte dump (still present, now safe to
+trust) gives the actual faulting INSTRUCTION for the first time this whole investigation:
+`rip=0x47ca2e1`, bytes `48 8b 04 c2 ...`. Decoded: `REX.W + 8B /r`, ModRM `04` (mod=00, reg=RAX,
+rm=SIB-follows), SIB `c2` (scale=8, index=RAX, base=RDX) -- **`mov rax, [rdx + rax*8]`**, a
+classic 8-byte-table INDEX LOAD (GOT/PLT/relocation-table access shape). The SAME instruction
+faults repeatedly in immediate succession (captured twice, 13us apart, at `cr2=0x7feffdff02d8`
+then `cr2=0x7feffdff02a8` -- 0x30/48 bytes apart, i.e. RAX incrementing by 6 between the two
+faults, consistent with iterating consecutive 8-byte table slots). **`ld-linux` is looping over
+some table whose base (`rdx`) resolves into the SAME untracked-but-tracked-as-mapped 28 KB
+region every iteration, and every single entry it tries to load faults.**
+
+Cross-checked against `diag-exec-mmap`'s own log for this exact run: no mapping anywhere in the
+whole capture has a `start` address inside `0x7feffdff0000`-`0x7feffdff7000` (checked every entry
+up to and past the crash). The nearest is `libc.so.6` at `0x7feffde18000`, ending
+`0x7feffdf7b000` -- a `0x75000` (479 KB) gap short of the crash region, not adjacent. Combined
+with `diag-exec-mmap` only firing for mappings that are `PROT_EXEC` AT MMAP TIME (an ELF loader's
+own BSS/zero-fill anonymous mapping for a segment's `memsz > filesz` tail is typically
+`PROT_READ|PROT_WRITE`, no `PROT_EXEC`, and would never appear in this log at all) -- **the
+leading working theory now is that this 28 KB region is a BSS/zero-fill anonymous mapping for one
+of Xvfb's Mesa/EGL dependency libraries** (`libEGL.so.1`/`swrast_dri.so`, per the earlier-captured
+guest backtrace), created through a DIFFERENT code path than `do_mmap_file`'s `is_exec`-gated
+logging entirely -- worth extending `diag-exec-mmap`-style logging to the BSS/zero-fill anonymous
+mmap path specifically (wherever the ELF loader calls `do_mmap_anonymous` for a segment's
+memsz-minus-filesz tail) as the concrete next instrumentation step, now that it's SAFE to keep
+adding and testing diagnostics without risking a host crash masking the result.
+
+### What remains open, added by this entry
+
+- **Instrument the BSS/zero-fill anonymous-mapping path** (not `do_mmap_file`, which is already
+  covered by `diag-exec-mmap`) the same way -- log path/segment/address for every ELF loader
+  zero-fill mmap, then correlate against `0x7feffdff0000`-`0x7feffdff7000` directly. This is now
+  the single most concrete, actionable next step -- likely resolves this in one more build-test
+  cycle.
+- Decode/identify `rdx`'s actual value at the fault (not directly logged this run -- only `rcx`/
+  fault-address-adjacent registers were captured by the OLD host-crash diagnostic; the GUEST-mode
+  `diag-guest-exception` path doesn't currently dump full GPR state, only `rip`/`rsp`/`cr2`/
+  `error_code` -- worth adding `rax`/`rdx` to that snapshot specifically, now that it's safe to
+  extend this diagnostic without the crash-masking risk).
+- Consider whether to keep, restore-with-a-real-fix (SEH-wrapped, not `memcpy_fallible`'s
+  reentrancy-suspect path), or permanently retire the `cr2` byte-dump -- it is currently just
+  removed, not replaced; a future session may want the byte content back once a genuinely safe
+  way to capture it exists.
+- Everything below (the ruled-out hypotheses, the corrected log-reading methodology, the working
+  toolchain/symbolizer paths, and every other entry's own open items) remains exactly as
+  documented -- this entry is a real fix and new data layered on top, not a retraction.
+
+---
+
+## 2026-09-09 (same night, narrower-scope re-test + a log-structure correction): confirmed the
+## trampoline-extension hypothesis is wrong (empirically, twice now); discovered an ALREADY-BUILT
+## diagnostic (`diag-exec-mmap`) that logs every executable file-backed mapping, and used it to
+## catch this repro's own wait-loop forking `/usr/bin/sleep` NINE TIMES (dash's `sleep` is not a
+## builtin in this image after all -- a small, useful correction to two entries below); and
+## corrected a mis-reading of the log structure: the "(EE) Segmentation fault" text near the end
+## of every capture is Xvfb's OWN log FILE being `cat`'d by the repro script, not a live crash at
+## that timestamp -- and THIS run shows ZERO `fatal signal` lines from litebox itself, meaning
+## Xvfb's crash was fully caught by Xvfb's OWN userspace SIGSEGV handler this time, with no
+## unrecoverable host-level fault needed to explain it.
+
+### Re-ran with the narrower `litebox_shim_linux::syscalls::mm=debug` scope (avoiding the
+### logging-artifact crash the entry above found) -- back to the real, original bug
+
+`diag-tramp-extend` still never fires. The trampoline-extension `do_mmap_anonymous` call is
+directly, empirically ruled out as the crash site for the second time (once via the broader-scope
+run that hit the unrelated logging bug, once here cleanly) -- not a hypothesis any more, a tested
+negative result.
+
+### `diag-exec-mmap` (`mm.rs` ~line 455, "AGENTS.md pass 260", already built) -- exactly the
+### crash-address-correlation tool needed, and it surfaced something unexpected
+
+This pre-existing diagnostic logs `path`/`start`/`len`/`offset` for every `PROT_EXEC`-flagged
+file-backed mapping. Enabling it (same `mm=debug` scope) shows Xvfb's own dependency chain
+loading cleanly up through `libmd.so.0` at ~6.92s -- then, immediately, `/usr/bin/sleep` and
+`/lib64/ld-linux-x86-64.so.2` and `/lib/x86_64-linux-gnu/libc.so.6` being mapped AGAIN AND AGAIN,
+once per second, for nine consecutive iterations (7.47s through 15.59s), followed by
+`/usr/bin/cat` (the repro script's own `cat /tmp/xvfb.log` line). **This means the isolated
+repro's `sleep 1` inside its polling loop forks a real external `/usr/bin/sleep` binary each
+iteration** -- correcting an assumption two entries below this one made (`sleep` was assumed to
+be a dash builtin; it is not, in this image). No `swrast_dri.so`/`libEGL.so.1` entry appears
+anywhere in this list -- inconclusive on its own (a dynamic loader commonly maps a segment
+`PROT_READ`-only first and `mprotect`s in `PROT_EXEC` later, which this diagnostic's
+`is_exec`-at-mmap-time gate would miss entirely), but worth noting rather than over-reading.
+
+### The log-structure correction: no `fatal signal` line exists in this capture at all
+
+A shell-level (not Xvfb-internal) `Segmentation fault` line appears at ~6.92s, right as the
+polling loop begins -- consistent with Xvfb itself (the backgrounded `&` job) crashing right after
+finishing its own dependency loading, exactly as every other capture this investigation has shown.
+But **grepping this entire log for `fatal signal` (litebox's own host-side "I delivered/translated
+an unrecoverable fault" log line, present in EVERY prior capture this whole investigation
+documents) returns nothing.** The `(EE) Segmentation fault at address .../Caught signal 11`
+lines near the end of the capture are the CONTENTS of `/tmp/xvfb.log`, printed by the repro
+script's own `cat /tmp/xvfb.log` line after its polling loop gives up -- i.e. Xvfb's own log FILE
+from whenever it actually crashed, not a live event captured at that later timestamp. This session
+had been reading that placement as "the crash, captured live" in every earlier entry; it is
+actually "Xvfb's postmortem of itself, read back later." The underlying timing conclusion (Xvfb
+crashes right after its own dependencies finish loading, before creating its listening socket)
+is unchanged and still well-supported by the shell-level message's own timing -- this is a
+correction to how the LOG output should be read, not a retraction of the timing finding itself.
+
+**Why no `fatal signal` this run specifically**: this session's earlier captures (two entries
+below) DID show a `fatal signal: terminating task ... comm=Xvfb` line -- meaning in THOSE runs,
+litebox's own outer fault-translation layer saw and logged the fault before Xvfb's userspace
+handler got to report it. This run shows neither -- either the same fault is being delivered as a
+clean, ordinary guest SIGSEGV Xvfb's own handler catches without litebox needing its own
+unrecoverable-fault path at all (the more likely reading, and arguably the CORRECT behavior for a
+real, in-bounds-but-actually-unbacked memory access -- real Linux delivers SIGSEGV the same way),
+or logging-scope differences between runs affected which log lines got captured. Not fully
+resolved; noted for whoever continues this to watch for on the next capture.
+
+### What remains open, added by this entry
+
+- The `diag-exec-mmap` tool is genuinely useful and already exists -- lean on it for the next
+  investigative session rather than adding new ad hoc instrumentation from scratch.
+- Confirm definitively whether `swrast_dri.so`/`libEGL.so.1` ever get a `PROT_EXEC` mapping via
+  the normal `do_mmap_file` path at all, or whether they're loaded through a `PROT_READ`-then-
+  `mprotect` sequence this diagnostic's current placement misses -- if the latter, the
+  diagnostic itself is worth extending to also log `is_exec` transitions via `mprotect`, not
+  only at initial `mmap` time.
+- Reconcile why this run produced no `fatal signal` line where earlier runs did -- check whether
+  this is deterministic per-run-configuration or genuinely variable.
+- Everything below (the ruled-out trampoline/`VM_OWN_FORK_PADDING`/PID-collision/GLX/environment
+  hypotheses, the original `cr2`/`error_code=0x4` diagnostics, and every other entry's own open
+  items) remains exactly as documented.
+
+---
+
+## 2026-09-09 (same night, symbolized the crash -- and it's a DIFFERENT bug than expected): the
+## RVA from the entry below resolves to Rust's OWN standard-library hex-formatter, reached via a
+## `Debug`-formatted byte slice -- this is a LOGGING bug (something building an unchecked `&[u8]`
+## over guest memory for a trace/debug log statement), most likely triggered by this session's
+## own overly-broad `LITEBOX_LOG=litebox_shim_linux=debug` scope, and probably NOT the original
+## Xvfb/EGL crash this whole investigation set out to find. Narrower-scoped re-test queued next.
+
+### How: this repo already has a crash symbolizer (`advisor/probes/symbolize_litebox_crash.py`)
+
+Found and ran it against the exact log from the entry below (same, unrebuilt-since binary --
+the script's own doc comment stresses this match matters). Needed a real Python (the `python3`
+on `PATH` is the Windows Store stub; `/c/Python312/python.exe` works) and `llvm-symbolizer`
+(already installed via scoop, `~/scoop/apps/llvm/current/bin`, not on `PATH` by default either).
+
+### The symbolized result
+
+```
+[diag-unrecov-av-terminate] rip=0x7ff7fa6ab5da addr=0x7feffdff02d8
+        0xb3b5da     <i8 as core::fmt::LowerHex>::fmt  .../library/core/src/fmt/num.rs:33:0
+```
+
+And the surrounding ring-buffer stack (also symbolized) shows `core::fmt::Formatter::new`,
+`<alloc::string::String as core::fmt::Write>::write_str`, `core::fmt::builders::debug_list_new`,
+and -- the key one -- **`<&[u8] as core::fmt::Debug>::fmt`**. This is Rust's standard `Debug`
+impl for a byte slice, which iterates every byte and hex-formats it (via exactly the
+`i8::LowerHex::fmt` the crash itself is inside). **The fault is happening while some log
+statement's `Debug`-formats a byte slice that references this exact guest address
+(`0x7feffdff02d8`) -- and that byte slice's underlying memory isn't actually valid.**
+
+### Why this is very likely a DIFFERENT bug from the one this investigation was chasing --
+### and points at THIS session's own diagnostic scope rather than the underlying Xvfb crash
+
+The entry below this one enabled `LITEBOX_LOG=litebox_shim_linux=debug` -- deliberately broad
+(the WHOLE crate), to catch the trampoline-extension diagnostic added the same session wherever
+it fired. That scope also turns on every OTHER `debug!`/`trace!` call site in the crate,
+including (found earlier this same investigation, `syscalls/process.rs`'s `copy_vector`) at
+least one that already logs `bytes:? = cs.as_bytes()` -- a byte slice, Debug-formatted, exactly
+matching this crash's own call stack shape. A narrower run earlier the same night
+(`LITEBOX_LOG=litebox_shim_linux::syscalls::mm=debug,litebox_shim_linux::syscalls::signal=debug`)
+did NOT produce this host-mode crash at all -- it showed the ORIGINAL guest-mode `(EE) Caught
+signal 11` Xvfb-internal crash instead (see the entry two below this one). That is strong
+circumstantial evidence this specific host-mode crash is an ARTIFACT of turning on broader
+logging, not the bug this whole investigation is about -- some log call site, somewhere in the
+broader `litebox_shim_linux` scope, builds an unchecked `&[u8]` directly over guest memory
+(rather than going through the safe, exception-table-covered `to_owned_slice`/`memcpy_fallible`
+convention already used elsewhere) for a `bytes:?`-style debug print, and THAT unchecked read is
+what's crashing -- a real, separate, worth-fixing bug in its own right (a debug log statement
+should never be ABLE to crash the host), but not confirmed to be the same mechanism as the
+original Xvfb crash.
+
+### What remains open, added by this entry
+
+- **Re-run the isolated `xvfb_sh_repro.sh` test with the NARROWER log scope**
+  (`litebox_shim_linux::syscalls::mm=debug` only, omitting the crate-wide scope that pulled in
+  the unrelated logging call site) to get back to observing the ORIGINAL crash with the new
+  `diag-tramp-extend` instrumentation intact -- this is the direct next step, not yet done this
+  session (host memory was too low, ~1GB free, when this was found; queued for when it recovers).
+- **Find and fix the logging bug independently**: some `debug!`/`trace!` call site in
+  `litebox_shim_linux` builds an unchecked `&[u8]` over guest memory for a `bytes:?` print.
+  `syscalls/process.rs`'s `copy_vector` (`bytes:? = cs.as_bytes()`) is the one confirmed call
+  site of this SHAPE found so far in this investigation, but `cs` there is a host-owned
+  `CString` (copied out via `to_cstring`, not a raw guest slice) -- so it is likely NOT the
+  actual culprit; the real one is still unidentified.  A debug log statement that can crash the
+  host on certain inputs is a real defect independent of anything else in this doc.
+- Everything below (the trampoline-extension ruling-out, the original `cr2`/`error_code=0x4`
+  diagnostics, and everything both other entries already list as open) remains exactly as
+  documented -- this entry adds a caveat to how to interpret the MOST RECENT capture, not a
+  retraction of the earlier, narrower-logged findings.
+
+---
+
+## 2026-09-09 (same night, build-and-test dive): added a targeted diagnostic, rebuilt, and
+## re-ran against the live repro -- ruled OUT the trampoline-extension hypothesis directly
+## (empirically, not by inspection), and found the crash is HOST-mode (`is_in_guest=false`),
+## not inside the one memory-access primitive (`memcpy_fallible`) that's supposed to survive
+## exactly this kind of fault. Trampoline-extend diagnostic kept in the tree, debug-gated,
+## zero cost when disabled -- useful for whoever continues this.
+
+### What was done: a real build-test-observe cycle, not more guessing
+
+Added two `debug!` log lines bracketing the trampoline-region-extension `do_mmap_anonymous` call
+(`litebox_shim_linux/src/syscalls/mm.rs`, the exact code the entry below this one flagged as the
+leading suspect for the leaked-but-tracked-as-valid 28 KB mapping) -- one right before, printing
+the computed `extra_start`/`extra_len`, one right after, printing whether the call succeeded.
+Compiled clean (`cargo check -p litebox_shim_linux`, `cargo build --release -p
+litebox_runner_linux_on_windows_userland`, ~1 minute, toolchain at
+`~/.rustup/toolchains/stable-x86_64-pc-windows-msvc/bin` -- not on `PATH` in this shell by
+default, worth remembering for the next session). Re-ran the identical isolated `xvfb_sh_repro.sh`
+repro against the new binary with `LITEBOX_LOG=litebox_shim_linux=debug`.
+
+### Result: the new diagnostic never fired -- the trampoline-extension hypothesis is directly
+### RULED OUT, not just deprioritized
+
+Neither `diag-tramp-extend` log line appears anywhere in the captured output. The crash happens
+BEFORE this code is ever reached. This rules out the leading hypothesis from the entry below
+(the 28 KB `VM_MAYEXEC` region being the trampoline's own extension mapping going stale) as
+directly, concretely wrong -- whatever crashes, it is not this specific `do_mmap_anonymous` call
+or anything after it in that function.
+
+### A second, more informative crash signature appeared this run: HOST-mode, not guest-mode
+
+This run's crash was NOT captured as the earlier `(EE) Caught signal 11` Xvfb-internal handler
+output at all -- instead, litebox's own `[diag-unrecov-av]`/`[diag-unrecov-av-terminate]`
+diagnostics (this codebase's HOST-side unrecovered-access-violation path, see the CET/
+`0xc0000409` investigation entry elsewhere in this doc for its full mechanism) fired:
+
+```
+[diag-unrecov-av] tid=ThreadId(9) rip=0x7ff7fa6ab5da rva=0xb3b5da addr=0x7feffdff02d8
+  rsp=0x50cf3fdf40 rax=0x6b000020 rbx=0x50cf3fe048 rcx=0x7feffdff02d8 rdx=0x50cf3fe0c0
+  rsi=0x50cf3fe050 rdi=0x50cf3fe0c0 rbp=0x50cf3fdf80
+  is_in_guest=false is_verifying=false -- no exception-table entry found
+[diag-unrecov-av-terminate] rip=0x7ff7fa6ab5da addr=0x7feffdff02d8
+```
+
+`addr=0x7feffdff02d8` is byte-identical to the `cr2` captured in the entry below (same underlying
+fault, different capture point). **`is_in_guest=false`**: this is litebox's own HOST Rust code
+faulting while touching this guest address -- not guest code (Xvfb/`swrast_dri.so`/`ld-linux`)
+running directly. And **"no exception-table entry found"**: litebox's `memcpy_fallible`
+(`litebox/src/mm/exception_table.rs`) is specifically designed to survive exactly this shape of
+fault (an invalid guest-memory access from host code) via a registered `[2:, 3:)` exception-table
+range around its `rep movsq`/`rep movsb` (x86_64) inline asm, returning `Err(Fault)` instead of
+crashing. This fault was NOT caught by that mechanism.
+
+**Directly checked and this is NOT inside `memcpy_fallible` itself**: that function's x86_64 body
+uses `rdi`=dst, `rsi`=src, `rcx`=qword-count (a small number, `size / 8`) per its own inline-asm
+operand bindings. The captured registers don't match that shape at all -- `rcx` HOLDS the fault
+address itself (`0x7feffdff02d8`, matching `addr`), not a byte count, and `rsi`/`rdi` both hold
+unrelated small stack-ish addresses (`0x50cf3fe0c0`/`0x50cf3fe050`). This is some OTHER, single,
+plain (non-`rep`-prefixed) memory access instruction -- likely a single `mov` touching `[rcx]` --
+somewhere in host code that runs before the trampoline-extension code (since the `diag-tramp-extend`
+markers never printed), most likely `to_owned_slice`'s call site (`mm.rs` ~line 2050,
+`mapped_addr.to_owned_slice::<Platform>(len)`, reading the just-mapped `swrast_dri.so` code bytes
+into `code_buf` for scanning) or something even earlier in `init_elf_patch_state`/
+`executable_file_ranges`. Not pinned to an exact line without symbol resolution at the crash RIP
+(`rva=0xb3b5da` into the runner binary) -- the concrete next step for whoever has that tooling.
+
+### What this changes about the picture
+
+The bug is not really about "trampoline state going stale across a fork" (that hypothesis is now
+ruled out) -- it is host code performing a plain memory access to guest memory that LOOKS valid
+per litebox's own VMA tracking but faults for real, in a code path that is NOT wrapped in
+`memcpy_fallible`'s fault-tolerant convention the way this pattern is supposed to be handled
+elsewhere in this codebase. Two framings, not yet distinguished: (a) `to_owned_slice`'s OWN call
+into `memcpy_fallible` really is the site, and the "no exception-table entry found" message
+reflects some OTHER, unrelated fault that happened to be captured at the exact same host RIP by
+coincidence (unlikely, given how specific and reproducible this is, but not impossible); or (b)
+a DIFFERENT plain memory access nearby (not going through `to_owned_slice`/`memcpy_fallible` at
+all) is the real site, and needs its own fault-tolerant wrapper added, the same way
+`memcpy_fallible` already exists for exactly this class of "host code touching guest memory that
+might not really be there" hazard.
+
+### What remains open, added by this entry
+
+- **Resolve the exact host RIP** (`rva=0xb3b5da` into `litebox_runner_linux_on_windows_userland.exe`,
+  release build from this session) to a source line -- either via a debugger with symbols loaded,
+  or `addr2line`/`llvm-symbolizer` against the release binary's PDB if this workspace produces
+  one. This single step would likely settle (a) vs (b) above immediately.
+- If it IS `to_owned_slice`/`memcpy_fallible`: investigate why THIS call's fault wasn't caught --
+  possible causes worth checking first: whether `ex_table_entry!`'s registration mechanism
+  requires some linker-section setup that could be affected by inlining/codegen differences
+  specific to this call site, or whether `V::with_user_memory_access` (the wrapper closure around
+  the `memcpy_fallible` call in `to_owned_slice`) does something that interferes with the
+  exception table's lookup for a fault occurring inside its closure.
+- If it is NOT `to_owned_slice`: find the actual unwrapped memory access near `mm.rs` ~line
+  2040-2070 (before the trampoline-extension code) and give it the same `memcpy_fallible`-style
+  fault tolerance.
+- The `diag-tramp-extend` diagnostic added this session stays in the tree (debug-gated, zero cost
+  disabled) -- delete it once the real site is found, or keep it if it turns out to still be
+  useful for confirming the trampoline path is healthy once the real bug is fixed.
+- Everything this doc's other entries already list as open remains open, unchanged.
+
+---
+
+## 2026-09-09 (same night, deepest dive yet): got the REAL fault diagnostics for the Xvfb
+## post-exec crash -- `error_code=0x4` (page NOT PRESENT) at an address litebox's OWN vmem
+## tracking believes IS mapped. This is litebox's memory bookkeeping genuinely diverging from
+## real Windows memory, not a mystery corrupted pointer. Found a closely-related, already-
+## documented, NOT-YET-FIXED bug in the same code path (fork/`ElfPatchKey` interaction) but did
+## NOT verify it is the SAME bug -- flagging both precisely for whoever debugs this next.
+
+### How: this codebase already has purpose-built fault diagnostics for exactly this shape of bug
+
+`litebox_shim_linux/src/lib.rs` (~line 220, comment dated "AGENTS.md pass 257") already logs, on
+every guest-mode `#PF`, BEFORE translating it into a signal: the real `rip`/`rsp`, the real fault
+address (`cr2`), the raw page-fault `error_code`, AND -- critically -- every guest VMA mapping
+litebox's OWN tracking believes overlaps that fault address. Its own comment states the exact
+purpose: "distinguish a genuine bug jumping to a real but corrupted pointer value from a litebox
+emulation gap leaving `cr2` unmapped when it should be mapped." Enabling it
+(`LITEBOX_LOG=litebox_shim_linux=debug`) against the isolated `xvfb_sh_repro.sh` crash gives:
+
+```
+diag-guest-exception: pre-signal snapshot
+  exception=Exception(14) kernel_mode=false rip=0x47ca2e1 rsp=0x4ffdb80 cr2=0x7feffdff02d8 error_code=0x4
+diag-guest-exception: mapping overlapping cr2
+  range_start=0x7feffdff0000 range_end=0x7feffdff7000 flags=VmFlags(VM_READ | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC)
+```
+
+`rip=0x47ca2e1` is inside `/lib64/ld-linux-x86-64.so.2` (matches the earlier-captured Xvfb
+backtrace's ld-linux frames almost exactly). **`error_code=0x4` is the x86 page-fault error code
+with the Present bit (bit 0) CLEAR** -- a real Linux `#PF` with this exact bit pattern means "read
+access, user mode, page not present" (not a permissions violation on an existing page). And the
+overlapping-mapping dump shows litebox's OWN vmem tracking DOES believe a 28 KB
+(`0x7feffdff0000`-`0x7feffdff7000`) region -- readable, writable, and markable-executable
+(`VM_MAYEXEC`) -- covers this exact address. **This is precisely the emulation-gap shape the
+diagnostic's own comment was written to catch**: litebox's bookkeeping says "mapped", real
+Windows says "not present". Not a wild/corrupted pointer dereferencing genuinely unmapped space --
+a real address that SHOULD be backed by memory per litebox's own accounting, and isn't.
+
+### A closely-related, already-documented, NOT-YET-FIXED bug lives in the exact same subsystem --
+### flagged here precisely, NOT confirmed to be the same root cause
+
+While reading `litebox_shim_linux/src/syscalls/mm.rs` (the runtime syscall-patcher/trampoline
+machinery -- see the entry below this one for the `docs/webtop-xfce-code-vs-data-2026-09-08.md`
+background on what this subsystem does) looking for a plausible source of a 28 KB
+`VM_MAYEXEC`-flagged mapping going stale, found `init_elf_patch_state`'s own comment
+(`mm.rs` ~line 1580):
+
+> NOTE (not yet fixed): `ElfPatchKey` is `(pid, fd)` and nothing re-keys a parent's entries onto
+> the child's pid at `fork()`. So a forked child ... computing a fresh `trampoline_addr` while
+> the copied code still jumps to the parent's. Worth revisiting.
+
+This is a REAL, acknowledged, unfixed bug in the trampoline/patch-state tracking that `ElfPatchState`
+(`trampoline_addr`/`trampoline_cursor`/`trampoline_mapped_len`, `mm.rs` ~line 321) belongs to --
+the exact same struct whose mmap-extension logic (`mm.rs` ~line 2179, `do_mmap_anonymous(...,
+MAP_FIXED_NOREPLACE)` growing the trampoline region on demand, invoked when a newly-`dlopen`'d
+library needs its own syscall patches -- exactly `swrast_dri.so`'s situation) is the most direct
+candidate for producing a stale-but-tracked-as-valid mapping. **This entry does NOT claim to have
+confirmed this is the SAME bug causing the Xvfb crash** -- the documented bug's own description is
+about a fork WITHOUT exec (the child's memory still literally holding the parent's copied,
+already-patched code), and Xvfb's crash happens well AFTER a successful `execve()` wipes the
+address space, so the mechanism is not a direct match by the letter of that comment. But it is the
+same subsystem, the same kind of state (trampoline-region bookkeeping keyed in a way that does not
+obviously survive process-identity changes cleanly), and the closest lead this investigation found
+by reading source rather than only black-box testing -- worth a future session's direct attention,
+confirmed or ruled out with a debugger rather than assumed either way.
+
+### Why this was not pursued into an actual source fix tonight
+
+Modifying `mm.rs`'s trampoline-extension/patch-state code without being able to verify the fix
+against a live debugger (to confirm both that this IS the actual mechanism, and that a fix does
+not introduce a new bug in this delicate, security-relevant syscall-patching path) is exactly the
+kind of unverified change this project's own established practice avoids -- every fix recorded
+elsewhere in this doc and in `advisor/`'s docs was confirmed against a live, captured repro before
+being called done. Recorded here instead as the most concrete, source-level lead available,
+precise enough (`error_code=0x4`, `cr2=0x7feffdff02d8`, the specific overlapping-mapping dump, and
+the exact file/line of the related documented gap) for a future session to pick up and verify
+directly rather than needing to re-derive any of this.
+
+### PID reuse directly ruled out as the mechanism connecting the two findings above (verified
+### from source, not guessed)
+
+The natural hypothesis linking the two findings above: does `ElfPatchKey = (pid, fd)` ever
+collide across two DIFFERENT guest processes within the same boot, causing a stale
+`ElfPatchState` (with a `trampoline_addr` from a since-dead process, whose trampoline region may
+no longer be backed by real memory) to be looked up and reused for Xvfb's own `swrast_dri.so`
+patching? Checked directly: `next_thread_id` (`litebox_shim_linux/src/lib.rs` ~line 2609,
+`AtomicI32`, initialized to 2) is a strictly monotonically increasing counter for the whole boot
+-- confirmed via source, not observation -- so no two guest processes in one boot EVER share a
+pid, and `elf_patch_cache` (same file, ~line 2613) has no eviction/removal code anywhere (checked
+every reference to it in `mm.rs`/`lib.rs`/`process.rs`; it only ever grows). **This rules out a
+stale-cache-entry-reuse-via-pid-collision mechanism directly and cleanly** -- Xvfb's own
+`(pid, fd)` key for `swrast_dri.so` cannot possibly collide with any earlier process's entry.
+Combined with the fork-without-exec-specific wording of the documented `ElfPatchKey` comment
+itself (Xvfb's crash happens well after a successful `execve`, not during a still-un-exec'd
+fork child), **this session now considers the documented `ElfPatchKey` gap UNLIKELY to be the
+direct cause of the Xvfb crash, though it remains a real, separate, unfixed bug in its own right**
+-- the connection between the two findings above is NOT confirmed, and a future session should
+not assume it without further evidence.
+
+### `VM_OWN_FORK_PADDING` (a directly analogous, ALREADY-FIXED bug class) checked and ruled out
+### as an explanation too -- `sys_execve`'s teardown is more comprehensive than it first looked
+
+`sys_execve`'s `release_memory` call (`process.rs` ~line 5972) already correctly handles the
+historical version of this exact bug shape: `Vmem::duplicate`'s own coherent-relocation-group
+padding (`VM_OWN_FORK_PADDING`, `litebox/src/mm/linux.rs` ~line 103) is real, committed host
+memory from a THREAD-BASED fork's address-space copy that has no individual guest mapping of its
+own -- previously indistinguishable from legitimate foreign-host placeholder memory
+(`VmFlags::empty()`), and confirmed (per that flag's own doc comment) as the root cause of a
+PRIOR, now-fixed `fork()+execve()` mallocng crash with an almost identical symptom shape (leaked
+real memory, invisible to `execve`'s cleanup, corrupting a LATER unrelated allocation's
+neighbor-check). Checked whether this same gap could still apply to the (unrelated,
+non-fork-machinery) trampoline mapping specifically: it does not -- `release_memory`'s predicate
+(`!vm.is_empty() || contains(VM_OWN_FORK_PADDING)`) releases EVERY non-empty-flagged mapping
+unconditionally, and an ordinary guest `mmap` (which is what the trampoline/patcher's regions
+are, `ProtFlags::PROT_READ | PROT_WRITE` via `do_mmap_anonymous`, never `VmFlags::empty()`) is
+therefore always torn down at `execve`, regardless of `VM_OWN_FORK_PADDING`. **The parent shell's
+own pre-exec trampoline region is correctly released before Xvfb's image ever loads** -- this is
+not a case of an old, stale trampoline surviving into the new image's address space.
+
+This means the mystery is specifically about Xvfb's OWN, freshly-created (post-teardown,
+post-reload) trampoline-extension mapping for `swrast_dri.so` -- not a leftover from before the
+exec. Three concrete mechanisms this session verified are NOT the cause (PID collision, GLX/
+environment/GL-driver configuration, and now the general `VM_OWN_FORK_PADDING` gap) narrow this
+to something Windows-side and specific to `VirtualAlloc`/`MEM_FIXED`/`MAP_FIXED_NOREPLACE`
+behaving differently for THIS particular process's history (having gone through `fork()`'s
+address-space-copy machinery earlier in its life, even though `execve` is supposed to reset
+everything) versus a process that was `CreateProcess`'d fresh and never forked at all -- which is
+squarely a question about actual Windows API return values and real page-table state at the
+moment of the crash, not something further source-reading (without also being able to inspect
+live memory/API-call results) can resolve further. This is now a well-bounded, well-evidenced
+question for a live debugger session, not an open-ended one.
+
+### What remains open, added by this entry
+
+- **Attach a live debugger at the Xvfb crash** (deterministic, same address every run,
+  `LITEBOX_LOG=litebox_shim_linux=debug` gives the exact `cr2`/`error_code` to break on) and
+  determine which `do_mmap_anonymous`/`VirtualAlloc` call for Xvfb's OWN (post-exec, not
+  fork-leftover) trampoline-extension mapping returns success without the memory actually being
+  backed -- three plausible alternative causes (PID collision, environment/GLX, and the general
+  `VM_OWN_FORK_PADDING` leaked-memory gap) are now directly ruled out by source verification, not
+  assumption, narrowing this to Windows-level `VirtualAlloc` behavior specific to a process with
+  fork history.
+- The documented `ElfPatchKey`/fork-without-exec gap (`mm.rs` ~line 1584) remains real and
+  unfixed in its own right, independent of whether it explains THIS crash -- worth fixing on its
+  own merits for the many fork-without-exec cases this whole doc otherwise documents.
+- Everything this doc's other entries already list as open remains open, unchanged.
+
+---
+
+## 2026-09-09 (later, same overall night): MAJOR finding -- switching the boot script's shell
+## from `/bin/bash` to `/bin/sh` (dash) fixes the fork-without-exec crash for dbus-daemon
+## ENTIRELY, gets the boot further than any run this whole doc has recorded, and isolates
+## Xvfb's remaining crash to something specific to the fork+exec transition, NOT Xvfb's GLX/
+## iglx configuration (ruled out directly)
+
+### The decisive test: bash vs. dash, same command, same image, same everything else
+
+An isolated, minimal repro (`dbus_isolated_repro.sh`, `beyond_stdio==0`-equivalent, no prior
+forks, dbus-daemon as the ONLY backgrounded job) run under `/bin/bash`: crashes on the FIRST
+EVER `&` fork, `comm=bash` (not yet `dbus-daemon`), 100% reproducible. The IDENTICAL script run
+under `/bin/sh` (this image's `/bin/sh`, standard Debian, almost certainly dash): **`DBUS_UP` --
+clean, no crash, every time.** This is the single most decisive result this whole doc has
+produced: **it is not fork-without-exec in general that is unsafe -- it is specifically bash's
+OWN job-control-heavy implementation of `&` backgrounding** (new process group via `setpgid`,
+terminal-control transfer attempts, `SIGCHLD`/`SIGTTOU` handling -- all absent from dash's much
+simpler backgrounding code), doing enough additional malloc/free activity in the fork child
+between `fork()` and reaching `execve()` to hit the safe-linked tcache corruption
+(`ADVISORY-001` 3N) that a lighter shell's simpler fork path apparently avoids or at least
+survives more often.
+
+**Practical effect on the real boot**: re-ran the FULL `webtop_stack.sh` (unmodified content,
+only the invocation's top-level shell changed from `/bin/bash` to `/bin/sh` -- confirmed the
+script itself has NO bash-only syntax anywhere: no `[[`, no arrays, no `local`, no `$RANDOM`, no
+process substitution, checked directly via grep) via `/bin/sh /config/webtop_stack.sh`. Result,
+furthest this doc has ever recorded a real boot reaching:
+```
+[s] NGINX_CONFIGURED / NGINX_STARTED / NGINX_SELFTEST http_code=200 (after 0s)   <- instant, clean
+[s] XVFB_FAILED                                                                  <- Xvfb still crashes (see below)
+[s] DBUS_UP                                                                      <- NEW: dbus-daemon backgrounds cleanly
+[s] DE_LAUNCHED (image startwm.sh)
+[s] DE_VIA_STARTWM=no / DE_FALLBACK_LAUNCHED / DE_FAILED                         <- downstream of no X server, not a new crash
+[de2] xfce4-session: Cannot open display: .
+[s] SELKIES_LAUNCHED_LAST supervisor_pid=107
+[fatal signal SIGSEGV pid=107 comm=sh]                                          <- selkies's own supervisor subshell, likely
+                                                                                     also downstream of no working X display
+```
+nginx now comes up instantly (`http_code=200 after 0s`, vs. bash's typical multi-second struggle
+with supervisor retries) and dbus-daemon backgrounds with zero crash -- both genuine, real
+improvements from this one change. `webtop_stack.sh` was updated to use `/bin/sh` going forward
+(the OCI image's own `/bin/sh` -- not a source change, this repository has no control over which
+shell binary the image provides, only which one this script's own invocation and any internal
+`#!/bin/sh`-style re-invocation uses).
+
+### Xvfb's remaining crash: NOT fixed by the shell change, but PRECISELY re-localized to a
+### specific, different, more tractable-sounding bug -- and GLX/iglx are directly ruled out
+
+Xvfb still crashes under `/bin/sh`, but the crash signature changed in a hugely informative way.
+Isolated, minimal repro (`xvfb_sh_repro.sh`, Xvfb as the ONLY backgrounded job, no prior forks):
+
+```
+fatal signal: ... pid=3 comm=[88,118,102,98,...]   <- "Xvfb", NOT "sh"/"bash"
+```
+
+`comm` is already `Xvfb` -- this crash happens AFTER `execve()` into the real Xvfb binary
+succeeded, a fundamentally different failure class from every other crash this whole doc
+documents (all of which show `comm=sh`/`bash`, i.e. crashing BEFORE reaching `execve` at all,
+`ADVISORY-002`'s Mode A). Xvfb's OWN internal SIGSEGV handler catches it and prints a real
+backtrace:
+
+```
+(EE) Backtrace:
+(EE) ... /lib/x86_64-linux-gnu/libEGL.so.1 [...]  (repeated, several frames)
+(EE) ... /usr/lib/x86_64-linux-gnu/dri/swrast_dri.so [...]
+(EE) ... /usr/bin/Xvfb [...]  (several frames)
+(EE) Segmentation fault at address 0x7ff178e30428
+(EE) Caught signal 11 (Segmentation fault). Server aborting
+```
+
+The crash is inside Mesa's classic software-rasterizer DRI driver (`swrast_dri.so`), reached via
+`libEGL.so.1` -- i.e. Xvfb's own EGL/GLX-capability probing at startup, not anything a connecting
+client triggered (this repro never runs an X client at all).
+
+**Directly tested and ruled out as the cause, both with byte-identical results (same crash
+address `0x7ff178e30428`, same ~5.3-5.9s timing, every time)**:
+- Removing `+iglx` (indirect GLX) from Xvfb's flags -- no change.
+- Removing `+extension "GLX"` (the WHOLE GLX extension, not just indirect) from Xvfb's flags --
+  no change.
+
+So this is not gated by whether GLX is advertised to clients at all -- Xvfb's EGL/swrast probe at
+startup appears unconditional, independent of both indirect-GLX and GLX-extension flags. The
+`GALLIUM_DRIVER=softpipe`/`LIBGL_ALWAYS_SOFTWARE=1` overrides (added earlier tonight for an
+UNRELATED whole-guest-death cc1/JIT collision) also do not prevent this specific crash --
+`swrast_dri.so` is Mesa's classic (non-Gallium) software rasterizer and does not read
+`GALLIUM_DRIVER` at all, which is itself informative for a future session narrowing this down.
+
+**The most informative comparison**: earlier the SAME night, a run invoking Xvfb DIRECTLY as the
+runner's OWN top-level pid-1 program (no shell, no fork at all -- see the entry below,
+"one more test the same session") ran the SAME extension flag set (including `+iglx`,
+`+extension GLX`) for 35+ seconds with ZERO crash. The only variable that changed between that
+clean run and this crashing one is the fork+exec transition itself -- strongly suggesting this
+is NOT really a GLX/EGL/Mesa configuration bug at all, but a subtler state difference the
+fork+exec boundary leaves behind that a genuinely fresh top-level process launch does not have
+(e.g. something in glibc's own post-`execve` re-initialization, TLS/FS_BASE setup, or `ld.so`'s
+lazy-binding state, that litebox's emulation layer handles correctly for a top-level launch but
+not identically for a forked-then-exec'd one) -- surfaced specifically when Xvfb's startup path
+happens to `dlopen()`/initialize EGL, rather than being inherent to EGL/swrast themselves. Not
+yet root-caused to a specific instruction or register value; the natural next step is a live
+debugger attach at the crash address (`0x7ff178e30428`, deterministic and 100% reproducible)
+comparing the exact machine state to the same point reached via a genuinely fresh top-level
+launch, to find what's actually different.
+
+### Net effect on Step 0 / Track A / Track B
+
+Does not change Step 0's REFUTED verdict or Track B's status at all (this entry's findings are
+about thread-based fork specifically, not `LITEBOX_PROCESS_FORK=1`/cross-process fork). It DOES
+give Track A (§6, "the demo, on existing code, no architectural change") a concrete, real,
+partially-working step forward for the first time in this doc: `/bin/sh` genuinely fixes
+dbus-daemon's (and by extension, likely other simple daemons') fork-without-exec crash outright,
+with zero architectural change -- keep this. Xvfb remains the one holdout, now precisely
+localized to a specific, deterministic, byte-address-reproducible crash inside its own
+EGL/swrast startup probe, reachable only via the fork+exec path and not via a top-level launch --
+a genuinely different, and on the surface more tractable-sounding, question than the general
+tcache-safe-linking corruption this doc's other entries chase. A live-debugger session is the
+clear next step for this specific crash, separate from (though possibly related to, per the
+speculation above) Track B's broader shared-kernel-state work.
+
+### One more variable ruled out, same session: NOT an environment difference either
+
+The clean top-level-launch comparison above used a minimal environment (`--forward-env` from
+the Windows host plus only `DISPLAY`) -- worth independently checking whether ITS cleanliness
+was actually just because Mesa's driver-probing code path was never reached at all (e.g.
+`LIBGL_DRIVERS_PATH`-equivalent unset, so `swrast_dri.so` is never even looked for) rather than
+the fork+exec transition being the true variable. Re-ran the SAME top-level, no-fork Xvfb launch
+with the environment matched EXACTLY to the script (`HOME=/config`, the full Linux `PATH`,
+`LIBGL_ALWAYS_SOFTWARE=1`, `GALLIUM_DRIVER=softpipe`, all via `--env`): still zero crash after
+60+ seconds. This rules out environment differences as the cause too. Combined with the GLX/
+`+iglx` ruling-out above, **every plausible confound except the fork+exec transition itself has
+now been directly tested and eliminated** -- GL driver choice, GLX/indirect-GLX advertisement,
+and environment variables all produce identical (clean) top-level-launch behavior and identical
+(crashing, byte-address-deterministic) forked-then-exec'd behavior regardless of their setting.
+
+### What remains open, added by this entry
+
+- **Root-cause the Xvfb EGL/swrast crash at `0x7ff178e30428`** via live debugger attach,
+  comparing exact register/memory state against the clean top-level-launch case at the same
+  code point (Mesa's `swrast_dri.so` init, called from `libEGL.so.1`). GLX/iglx, `GALLIUM_DRIVER`,
+  and environment variables are all directly ruled out as the trigger (see above) -- the fork+exec
+  transition itself is the only remaining candidate variable, isolated as cleanly as black-box
+  testing (varying flags/env and observing crash-or-not) can achieve. The most promising working
+  theory (unverified, needs a debugger to confirm): something about post-`execve` process state
+  specific to the fork+exec path (vs. a genuinely fresh `CreateProcess`-launched top-level
+  process) that only a `dlopen()`/dynamic-loader-heavy startup path like EGL's driver probing
+  exposes -- plausibly a DEFERRED manifestation of the same tcache safe-linking corruption class
+  this whole doc otherwise documents as an immediate (pre-`execve`) crash, just triggered late by
+  `swrast_dri.so`'s own fresh relocation/TLS-allocating `dlopen()` instead of by an early
+  malloc/free burst.
+- Try the same `/bin/sh` swap for selkies's own supervisor loop and see whether ITS crash (SIGSEGV,
+  `comm=sh`, pid 107, downstream of Xvfb never coming up in this session's runs) also clears once
+  Xvfb itself is fixed -- not yet separately isolated, since every run so far still has Xvfb
+  failing first.
+- Once Xvfb's crash is fixed, re-run the full `webtop_stack.sh` under `/bin/sh` end-to-end and
+  check for a genuine `DE_UP`/`SELKIES_LAUNCHED_LAST` clean boot -- this entry's evidence
+  suggests this may now be realistic without needing Track B at all, if Xvfb's specific crash
+  turns out to be independently fixable.
+
+---
+
+## 2026-09-09 (real-webtop-boot session): a NEW data point -- `LITEBOX_PROCESS_FORK=1` got
+## further than any documented run, against the REAL webtop boot (not the isolated tcache
+## repro) -- no Mode A/B/C crash observed -- but then hit the ALREADY-DOCUMENTED socket-
+## unreachability wall plus severe per-fork overhead. Step 0's own verdict is unchanged
+## (this session did not re-run the isolated repro); this is additional evidence alongside it,
+## not a replacement for it.
+
+### Context for this entry
+
+This session's own goal was NOT Track B research -- it was making the actual webtop desktop
+boot reliably (PTY/terminal fix landed and verified live this session, commit `564af3f`;
+nginx-reliability and Xvfb-crash investigation followed). Mid-session, `LITEBOX_PROCESS_FORK=1`
+was tried live, once, as a targeted experiment against the real `linuxserver/webtop:debian-xfce`
+boot script (not the minimal `tcache_fork_repro.sh`/`bash -c` repro this doc's other entries
+use) -- worth recording here since it is new evidence bearing directly on Step 0's open
+question, even though it was not run as a controlled Step-0-style repro.
+
+### What happened
+
+`LITEBOX_PROCESS_FORK=1` set for the whole guest (host env var), booting the full webtop stack
+script (nginx, then Xvfb, then dbus, then xfce4-session). Observed in the log, for the FIRST
+TIME in this doc's history:
+
+```
+[process_fork_diag] globalstate-probe (child): adopted the parent's writable layer from ...
+[process_fork_diag] globalstate-probe (child): GlobalState constructed successfully, no crash/hang/error
+[process_fork_diag] vmem-adopt-probe (child): adopting 124 pre-populated region(s), brk=0x111169000
+[process_fork_diag] vmem-adopt-probe (child): adopted=124 (of which VM_SHARED=1), tracked=124, expected=124, brk=0x111169000 (expected 0x111169000)
+[process_fork_diag] vmem-adopt-probe (child): VMA layout adoption VERIFIED -- every region's boundaries, flags and file-backing round-trip exactly, no allocation performed
+[process_fork_diag] task-resume-probe (child): guest fd 255 reopened on /config/webtop_stack.sh at offset 8007
+[process_fork_diag] task-resume-probe (child, winpid=19060): built Task, set fs_base=0x7feffffb0740, calling run_thread with rip=... rsp=... -- entering real guest execution
+```
+
+No Mode A (`addr=0x10188000` pre-`do_clone` crash), no Mode B (double-fault after FS_BASE
+recovery), no Mode C (silent freeze) -- the child was constructed, adopted its VMA layout
+(VERIFIED, not just attempted), and reached real guest execution. This is qualitatively
+further than any run this doc's other entries document reaching. Not a controlled Step-0 repro
+(no isolated single-fork minimal test was run this session to confirm this specific outcome in
+a repeatable, instrumented way) -- offered here as a live, real-workload data point, not a
+verdict change.
+
+Two real, load-bearing follow-on problems, both already independently understood before this
+session (not new discoveries, but now confirmed to actually manifest in a real boot, not just
+predicted):
+
+1. **Severe per-fork overhead.** The webtop boot script forks dozens of times per second during
+   nginx's supervisor retry loop (`mkdir`, `cp`, `sed`, `ln`, every shell builtin-adjacent
+   command) -- under `LITEBOX_PROCESS_FORK=1` set globally, EVERY one of these becomes a full
+   `spawn_cross_process_fork_child` (real `CreateProcess`, writable-layer tar export/import,
+   VMA-adoption verification). Six `litebox_runner_linux_on_windows_userland.exe` processes were
+   observed simultaneously alive at one point (`Get-Process`), one with 284s of accumulated CPU
+   time, with the boot log producing no new output for 5+ minutes -- a practical livelock for
+   any shell-script-driven boot, not a crash. This confirms `ADVISORY-002`'s own step-4
+   recommendation ("relax the `beyond_stdio` gate ... incrementally," not a global flip) is not
+   just cleaner but necessary for usability, independent of correctness.
+2. **Socket unreachability (already documented, now reconfirmed live in a real boot rather than
+   only predicted).** `process.rs`'s `THREAD_BASED_FORK_ONLY` exemption comment already recorded
+   the mechanism from an earlier session's measurement: a cross-process Xvfb's listening
+   `/tmp/.X11-unix/X1` socket lives in `GlobalState.unix_addr_table`, which is fresh and private
+   per real Windows process -- confirmed again this session by reading `unix.rs`/`lib.rs`
+   directly (`GlobalState` at `litebox_shim_linux/src/lib.rs:2594`, `unix_addr_table` field at
+   `:2611`, constructed fresh in `GlobalState::new` at `:483`). A cross-process Xvfb binds into
+   its OWN empty table; no thread-based sibling (nginx, dbus clients, XFCE) can ever reach it.
+   **This means Track B's shared-kernel-state fix (this doc's whole subject) is not just "the
+   general architectural fix" -- it is the ONLY fix that makes Xvfb specifically work under
+   cross-process fork**, since a fixed-base shared section holding `GlobalState` (per
+   `ADVISORY-002` step 3) would give a cross-process Xvfb child the SAME `unix_addr_table` the
+   parent and every thread-based sibling already share, resolving both problems (item 1's
+   overhead AND this item's reachability) at once, by construction, rather than needing a
+   separate RPC/socket-bridging layer.
+
+### A design direction this session explored and rejected: an RPC-based "Shared Filesystem
+### Protocol" (do not pursue; the shared-kernel-state plan in this doc already supersedes it)
+
+Before finding this doc, this session read an earlier design artifact (published mid-session,
+"A Shared Filesystem for Diverged Guest Processes") proposing a 9P/NFS-style RPC filesystem
+server for cross-process children, reusing `litebox_session_daemon`'s named-pipe framing. On
+inspection this does NOT solve the Xvfb problem (`FileSystem` and `unix_addr_table` are
+unrelated subsystems -- sharing file content never touches socket-address resolution), and even
+extended to cover AF_UNIX bridging, it would need a SEPARATE duplex socket-bridge protocol plus
+cross-process `SCM_RIGHTS` fd-passing (since `UnixConnectedStream`'s `Message` type carries
+donated fds, per `syscalls/unix.rs`) -- a materially larger and slower-at-runtime undertaking
+(every filesystem op and every socket byte becomes an IPC round trip) than the shared-memory
+approach this doc already has a concrete, ordered plan for. **Do not build the RPC filesystem
+server; the fixed-base shared-section plan in `ADVISORY-002` section 3 (and this doc's own
+running effort) is the right target and already supersedes it** -- noted here so a future
+session does not rediscover and re-reject the same RPC design from scratch.
+
+### A second finding this session: the thread-based-fork crash killing Xvfb is deterministic
+### AND independent of Xvfb's own GL driver -- it happens before Xvfb's own code runs at all
+
+Separately from the `LITEBOX_PROCESS_FORK=1` finding above, this session ran SIX consecutive
+default (thread-based fork) boots of the full webtop stack in a row, late in the session.
+**All six failed at the identical point**: the shell's `xset q` readiness-polling loop
+(`webtop_stack.sh`'s own `svc-de: wait for X` section) crashes with `SIGSEGV comm=bash`,
+byte-for-byte the SAME pid (180, or 181/182/183 for the immediately-following `xrdb`/`chmod`/
+`dbus-daemon` forks) across every run -- not merely similar, but the exact same pid number every
+time, consistent with `ADVISORY-002` §1.5/Mode-A's own observation that this guest has no ASLR,
+so a fixed fork-count history deterministically reproduces the same corrupted address every run
+of an unchanged script.
+
+To test whether this was sensitive to Xvfb's own GL driver (softpipe vs. llvmpipe -- an earlier
+session added `GALLIUM_DRIVER=softpipe`/`LIBGL_ALWAYS_SOFTWARE=1` to fix a DIFFERENT, unrelated
+whole-guest-death mode caused by Mesa's llvmpipe JIT shelling out to `cc1`), this session
+temporarily removed both exports and re-ran: **identical crash, identical pid (180)**. This
+rules out the GL driver as a factor for THIS specific crash and is useful negative evidence:
+the corruption is being triggered by the shell's OWN repeated `fork()`s in the polling loop (or
+possibly the earlier `Xvfb &` fork itself), not by anything inside Xvfb's rendering
+initialization -- consistent with `ADVISORY-002`'s Mode A characterization (crash before the
+target program's own code, i.e. before `execve` even completes) rather than anything downstream
+of Xvfb successfully starting. The softpipe/`LIBGL_ALWAYS_SOFTWARE` exports were restored
+afterward (still independently justified for the `cc1` collision they were added to fix; this
+test only showed they are irrelevant to the `xset`-loop crash specifically).
+
+**Practical implication for a future session attempting Track A style demos** (per
+`ADVISORY-002` §6, "the demo, on existing code, no architectural change"): this script's own
+`xset q` polling loop is itself a fork-WITHOUT-exec (a plain external-command invocation from a
+live, un-exec'd shell), so it is exactly the class Track A's own scope note already excludes
+("clients-as-sibling-runner-instances... avoiding fork-without-exec entirely" -- see §1.5/§6).
+A literal demo attempt would need to replace this script's shell-level readiness polling with
+something that does not fork from the long-lived script shell at all (e.g. a busy-wait using
+only shell builtins, or restructuring so the READINESS CHECK itself is the sole external command
+run, executed via `exec` rather than a forked subshell) -- not yet attempted, and worth trying
+before assuming Track A is unreachable for this specific script.
+
+### Follow-up in the SAME session: pinpointed the crash to Xvfb's OWN fork specifically,
+### byte-perfect Mode-A evidence, from a real production workload rather than the isolated repro
+
+Applied the fix the previous entry's finding suggested: rewrote `webtop_stack.sh`'s `xset q`
+readiness-polling loop to use a builtin-only socket-file existence check (`[ -S
+/tmp/.X11-unix/X1 ]` -- `[`/`test`/`sleep` are bash builtins, confirmed via `type sleep`, so this
+forks NOTHING while waiting), leaving only ONE external-command fork (a single final `xset q`)
+instead of up to 60. Re-ran: **still crashes, but now with much sharper localization**:
+
+```
+[warn] fork_verify: stale CODE pointer detected via raw access violation ...
+[error] fatal signal: ... signal=Signal(11) pid=59 tid=59 comm=[98,97,115,104,...]   <- "bash"
+webtop_stack.sh: line 210:    59 Segmentation fault      /usr/bin/Xvfb "$DISPLAY" ... &
+```
+
+`comm` is still `bash` (not yet `Xvfb`) at the moment of the fault -- this is Xvfb's OWN
+backgrounding fork (`/usr/bin/Xvfb ... &`) crashing BEFORE its `execve()` into the Xvfb binary
+ever completes. This is byte-perfect confirmation of `ADVISORY-002` §1.5's Mode-A
+characterization ("every crash in this investigation has been in a forked child that did NOT
+exec"), now reproduced from the REAL webtop boot script rather than only the isolated
+`tcache_fork_repro.sh`. With the polling-loop forks eliminated, the wait loop's 60s timeout
+correctly elapses (no socket ever appears, since Xvfb's fork already died), then the ONE
+remaining `xset q` fork (pid 120) ALSO crashes -- inheriting whatever the Xvfb fork's crash left
+corrupted in the parent shell's heap, consistent with `fork_verify.rs`'s own documented "silent
+parent corruption" model (the crashing child's own death does not undo damage its access already
+did to shared/parent-visible state before the fault).
+
+**This rules out two hypotheses this session had been testing**: it is not the GL driver
+(`GALLIUM_DRIVER=softpipe` vs. llvmpipe -- both crash identically) and it is not the REPEATED
+nature of the `xset` polling loop (removing 59 of 60 forks from that loop did not change the
+outcome) -- the corrupting event is Xvfb's OWN single backgrounding fork, full stop. The
+builtin-only wait-loop rewrite is kept in `webtop_stack.sh` regardless (strictly fewer wasted
+forks, faster failure detection, no downside), but it is a script-level cleanup, not a fix for
+this crash.
+
+**What this does and does not change about the plan**: does not change Step 0's open status or
+Track B's recommended path at all -- if anything, it strengthens the case for it, since the
+crash is now confirmed to reproduce identically from a real, unmodified production workload
+(not just a synthetic minimal repro), at the exact fork this whole investigation's `ADVISORY-002`
+already targeted. Worth flagging for a future session per `ADVISORY-002` §6's Track A: since
+Xvfb's OWN backgrounding (`&`) is a fork-without-exec by construction (the shell forks, and the
+CHILD -- not a fresh top-level process -- then execs Xvfb), Track A's own scope note ("avoiding
+fork-without-exec entirely," "run Xvfb ... as pid 1 directly, no shell, no `&`") is not yet
+actually being followed by this script. A literal Track-A-shaped experiment -- invoke
+`litebox_runner` directly with Xvfb as the top-level program and no backgrounding shell at all
+(matching §1.5's own confirmed-clean `-- /usr/bin/Xorg :0 ...` repro exactly) -- has not been
+tried against this specific webtop image/script combination and remains open. Note it does not
+by itself solve the "other processes need to reach Xvfb's socket" problem this doc's other entry
+already covers (a bare bounded Xvfb-as-pid-1 process has no sibling nginx/dbus/xfce4-session
+sharing its `GlobalState` either) -- it would only prove Xvfb ITSELF can run crash-free in this
+image, isolating that from the separate cross-process-sharing question.
+
+### One more test the same session: Xvfb itself is NOT broken in this image -- confirmed clean
+### as a direct pid-1 process, exactly matching `ADVISORY-002` §1.5's own Xorg result
+
+Direct test: invoked `litebox_runner` with Xvfb as the TOP-LEVEL program directly (no shell, no
+`&`, no fork at all) -- `-- /usr/bin/Xvfb :1 -screen 0 1280x800x24 ... +iglx +render -nolisten
+tcp -ac -noreset`, `linuxserver/webtop:debian-xfce`'s own real Xvfb binary, same flags the
+script uses. Observed 35+ seconds stable, zero `fatal signal` lines, only ordinary
+unsupported-syscall warnings (`prctl(GetSecureBits)`, `prctl(CapAmbient)`) -- process alive,
+resident (~1GB, consistent with the full image loaded), never crashed. This is the SAME clean
+result `ADVISORY-002` §1.5 already documented for Xorg under this exact pattern, now confirmed
+for Xvfb specifically and against `linuxserver/webtop:debian-xfce`'s own real binary (not a
+synthetic repro).
+
+**This precisely isolates the bug**: Xvfb itself has nothing wrong with it in this image. The
+crash reproduced everywhere else in this doc is specifically the SHELL's `fork()` of `Xvfb ...
+&` -- the fork()-then-(crash-before-)execve() window inside `webtop_stack.sh`'s own backgrounding
+of it -- not anything Xvfb's own code does once it actually starts running. This sharpens
+`ADVISORY-002` §6's Track A recommendation from a general principle into a concretely-verified
+fact for this exact workload: **running Xvfb as its own pid-1 process, with no intervening
+shell fork, is a real, available, already-working path** -- the open problem is purely
+downstream of that (every other service currently reachable only via `unix_addr_table`,
+per-`GlobalState`, needing either Track B's shared-kernel-state fix, or a from-scratch
+cross-process-sibling-runner bridging design that does not currently exist and would itself be
+a large undertaking, likely comparable in scope to Track B rather than smaller than it).
+
+### What remains open (unchanged by this session, plus one new item)
+
+Everything this doc's most recent entry (immediately below) already lists remains open and
+unchanged -- Mode A/B/C are not root-caused, Step 0 is not CONFIRMED via a controlled repro.
+New item from this session: **when Step 0 is eventually confirmed and Track B proceeds past
+step 3 (fixed-base shared `GlobalState`), verify AF_UNIX listening-socket reachability
+specifically** (a cross-process Xvfb's `unix_addr_table` entry visible to and connectable from
+a thread-based sibling) as an explicit acceptance test for that step -- this session's finding
+above is the concrete motivating case and should not be assumed to fall out for free without
+checking.
+
+---
+
 ## 2026-09-07 (Defender-exclusion follow-up session): Step 0 FINAL VERDICT -- **REFUTED, still**.
 ## The Defender real-time-protection exclusion for `target/` (applied and confirmed active this
 ## session) does NOT fix the freeze, and does NOT unblock a clean run at all: 8/8
