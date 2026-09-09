@@ -484,7 +484,26 @@ impl<Platform: ShimPlatform, FS: crate::ShimFS> crate::GlobalState<Platform, FS>
         (master, id)
     }
 
-    /// Handle `open("/dev/pts/<id>")`: produce a fresh, independent fd that duplicates the
+/// Is `id` a currently-allocated pty, i.e. does `/dev/pts/<id>` exist right now?
+    ///
+    /// Exists so `stat`/`access` on a pty slave path can be answered from the SAME registry that
+    /// `pts_open` consults, rather than approximated. glibc's `ptsname_r` issues `TIOCGPTN`, builds
+    /// `/dev/pts/<n>` and stats it before opening -- so a wrong answer here is the difference
+    /// between a working `openpty()` and `xfce4-terminal`'s "error creating pty".
+    ///
+    /// The filesystem layer cannot answer this: `/dev/pts` is per-open shim state, not a static
+    /// device table (see `litebox::fs::devices::Device::Ptmx`'s doc comment for the same split on
+    /// the multiplexer side).
+    pub(crate) fn pty_exists(&self, id: u32) -> bool {
+        self.pty_registry.read().contains_key(&id)
+    }
+
+    /// Every currently-allocated pty id, for listing `/dev/pts`.
+    pub(crate) fn live_pty_ids(&self) -> alloc::vec::Vec<u32> {
+        self.pty_registry.read().keys().copied().collect()
+    }
+
+        /// Handle `open("/dev/pts/<id>")`: produce a fresh, independent fd that duplicates the
     /// registered slave entry (the same mechanism `dup()`/`fork()` use), so every open of the
     /// same pty id shares one underlying entry. Fails with `ENXIO` if no such pty exists, or
     /// `EIO` if the master hasn't unlocked it yet (`TIOCSPTLCK`/`unlockpt`), matching real Linux

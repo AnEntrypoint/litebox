@@ -3061,12 +3061,42 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Get the file status of `pathname`.
     ///
     /// The `pathname` must be absolute.
+    /// `FileStatus` for `/dev/pts` and `/dev/pts/<id>`, or `None` if `path` is neither.
+    ///
+    /// These are answered here rather than by the filesystem for the same reason `do_open_resolved`
+    /// intercepts them: a pty pair is live per-open state held in `GlobalState::pty_registry`, which
+    /// the stateless `litebox::fs::devices` table cannot represent. Answering from that registry
+    /// means `stat` agrees exactly with what `open` would do -- a slave that exists stats, one that
+    /// does not gets `ENOENT`, with no approximation either way.
+    ///
+    /// Why it matters: glibc's `openpty` calls `ptsname_r`, which issues `TIOCGPTN`, builds
+    /// `/dev/pts/<n>` and then STATS it before opening it. With nothing answering that stat, the
+    /// stat failed, `openpty` failed, and `xfce4-terminal` reported "error creating pty" -- on a
+    /// shim whose pty subsystem works. `/dev/ptmx` itself is a static node and lives in the device
+    /// table proper; only the dynamic half is here.
+    fn devpts_stat(&self, path: &str) -> Option<litebox::fs::FileStatus> {
+        // The devpts mount point itself. `grantpt` and several shells probe for it to decide
+        // whether ptys are available at all.
+        if path == "/dev/pts" {
+            return Some(litebox::fs::devices::devpts_dir_status());
+        }
+        let id: u32 = path.strip_prefix("/dev/pts/")?.parse().ok()?;
+        // Existence comes from the same registry `pts_open` consults, so `stat` and `open` can
+        // never disagree about a given slave.
+        self.global
+            .pty_exists(id)
+            .then(|| litebox::fs::devices::devpts_slave_status(id))
+    }
+
     fn do_stat<T: From<litebox::fs::FileStatus>>(
         &self,
         pathname: impl path::Arg,
         follow_symlink: bool,
     ) -> Result<T, Errno> {
         let normalized_path = pathname.normalized()?;
+        if let Some(status) = self.devpts_stat(normalized_path.as_str()) {
+            return Ok(T::from(status));
+        }
         let status = if follow_symlink {
             let path = self.resolve_final_symlinks(normalized_path)?;
             self.files.borrow().fs.file_status(path)?

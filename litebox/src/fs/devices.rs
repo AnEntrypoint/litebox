@@ -131,6 +131,77 @@ const TTY_NODE_INFO: NodeInfo = NodeInfo {
     rdev: core::num::NonZeroUsize::new(0x500),
 };
 
+/// What `stat` reports for the `/dev/pts` devpts mount point.
+///
+/// Lives here, with the rest of the device-node shapes, even though nothing in this crate mounts
+/// `/dev/pts`: WHICH pty slaves exist is live shim state (`GlobalState::pty_registry`), but what a
+/// devpts node LOOKS LIKE is filesystem knowledge, and `FileStatus` is `#[non_exhaustive]` so only
+/// this crate can build one. The shim decides existence and calls these for the shape.
+///
+/// See [`Device::Ptmx`] for why the multiplexer itself is an ordinary table entry while the slaves
+/// cannot be.
+#[must_use]
+pub fn devpts_dir_status() -> FileStatus {
+    FileStatus {
+        file_type: FileType::Directory,
+        mode: Mode::RWXU
+            .union(Mode::RGRP)
+            .union(Mode::XGRP)
+            .union(Mode::ROTH)
+            .union(Mode::XOTH),
+        size: super::DEFAULT_DIRECTORY_SIZE,
+        owner: UserInfo::ROOT,
+        node_info: NodeInfo {
+            dev: 5,
+            ino: 1,
+            rdev: None,
+        },
+        blksize: super::DEFAULT_DIRECTORY_SIZE,
+        atime: Timestamp::default(),
+        mtime: Timestamp::default(),
+    }
+}
+
+/// What `stat` reports for the pty slave `/dev/pts/<id>`.
+///
+/// The caller must already have established that this pty is allocated -- see
+/// [`devpts_dir_status`].
+#[must_use]
+pub fn devpts_slave_status(id: u32) -> FileStatus {
+    FileStatus {
+        file_type: FileType::CharacterDevice,
+        // `rw-rw-rw-`. A slave is opened by whoever holds its id, and this crate models no tty
+        // group ownership to restrict it with.
+        mode: Mode::RUSR
+            .union(Mode::WUSR)
+            .union(Mode::RGRP)
+            .union(Mode::WGRP)
+            .union(Mode::ROTH)
+            .union(Mode::WOTH),
+        size: 0,
+        owner: UserInfo::ROOT,
+        node_info: NodeInfo {
+            dev: 5,
+            // Distinct per slave, so two ptys never look like the same file to a caller that
+            // compares `(dev, ino)`.
+            ino: 0x1000 + id as usize,
+            // Real Linux devpts slaves are character devices 136:<id>.
+            rdev: core::num::NonZeroUsize::new(0x8800 + id as usize),
+        },
+        blksize: 0x1000,
+        atime: Timestamp::default(),
+        mtime: Timestamp::default(),
+    }
+}
+
+/// `/dev/ptmx`, the pty multiplexer. Real Linux character device 5:2.
+const PTMX_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 28,
+    // major=5, minor=2
+    rdev: core::num::NonZeroUsize::new(0x502),
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Device {
     Stdin,
@@ -150,6 +221,19 @@ enum Device {
     Random,
     /// `/dev/full` -- reads behave like [`Device::Zero`]; every write fails with `ENOSPC`.
     Full,
+    /// `/dev/ptmx` -- the pty multiplexer.
+    ///
+    /// Present here for `stat`/`access`/`readdir` ONLY. An `open` of this path never reaches this
+    /// backend: the shim intercepts it ahead of the filesystem and hands back a live pty master
+    /// from its own registry, because a pty pair is per-open state a stateless `Device` cannot
+    /// hold (see `Task::do_open_resolved`).
+    ///
+    /// That interception alone was not enough, and the gap was not cosmetic. glibc's `openpty`
+    /// calls `ptsname_r`, which issues `TIOCGPTN`, builds `/dev/pts/<n>` and then STATS it before
+    /// opening it -- and `grantpt`/`ls`/shell probes stat `/dev/ptmx` itself. With no node here,
+    /// every one of those failed with `ENOENT`, so `openpty` failed and `xfce4-terminal` reported
+    /// "error creating pty" on a shim that implements ptys perfectly well.
+    Ptmx,
     /// `/dev/console` -- opens and stats successfully; real byte-stream I/O is not
     /// implemented (mirrors [`Device::Tty0`]/[`Device::Tty1`]'s identical "fail loud, not
     /// silently wrong" rationale for a device-node shape this backend doesn't implement the
@@ -185,6 +269,7 @@ impl Device {
         ("full", Device::Full),
         ("console", Device::Console),
         ("tty", Device::Tty),
+        ("ptmx", Device::Ptmx),
     ];
 
     fn from_name(name: &str) -> Option<Self> {
@@ -277,6 +362,22 @@ impl Device {
                 owner: UserInfo::ROOT,
                 node_info: CONSOLE_NODE_INFO,
                 blksize: STDIO_BLOCK_SIZE,
+                atime: Timestamp::default(),
+                mtime: Timestamp::default(),
+            },
+            // `rw-rw-rw-`, matching real Linux: any user may open the multiplexer.
+            Device::Ptmx => FileStatus {
+                file_type: FileType::CharacterDevice,
+                mode: Mode::RUSR
+                    .union(Mode::WUSR)
+                    .union(Mode::RGRP)
+                    .union(Mode::WGRP)
+                    .union(Mode::ROTH)
+                    .union(Mode::WOTH),
+                size: 0,
+                owner: UserInfo::ROOT,
+                node_info: PTMX_NODE_INFO,
+                blksize: 0x1000,
                 atime: Timestamp::default(),
                 mtime: Timestamp::default(),
             },
@@ -554,7 +655,7 @@ where
             // "fail loud, not silently wrong" rationale for a device-node shape this backend
             // does not implement the full byte-stream protocol for. `Console`/`Tty` share this
             // same rationale (see their own `Device` variant doc comments).
-            Device::Tty0 | Device::Tty1 | Device::Console | Device::Tty => {
+            Device::Tty0 | Device::Tty1 | Device::Console | Device::Tty | Device::Ptmx => {
                 Err(ReadError::NotForReading)
             }
         }
@@ -591,7 +692,7 @@ where
                 return Err(WriteError::Io);
             }
             // See `Device::Tty0 | Device::Tty1`'s identical rationale in `read` above.
-            Device::Tty0 | Device::Tty1 | Device::Console | Device::Tty => {
+            Device::Tty0 | Device::Tty1 | Device::Console | Device::Tty | Device::Ptmx => {
                 return Err(WriteError::NotForWriting);
             }
         };
@@ -621,7 +722,8 @@ where
             | Device::Tty0
             | Device::Tty1
             | Device::Console
-            | Device::Tty => SeekBehavior::NonSeekable,
+            | Device::Tty
+            | Device::Ptmx => SeekBehavior::NonSeekable,
             Device::Null | Device::URandom | Device::Zero | Device::Random | Device::Full => {
                 SeekBehavior::ZeroPosition
             }
