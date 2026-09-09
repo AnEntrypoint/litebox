@@ -6093,6 +6093,77 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .flatten()
     }
 
+    /// An eventfd's carryable state, if `raw_fd` names one.
+    ///
+    /// Counterpart to [`Self::carriable_file_for_raw_fd`] for the cheapest subsystem that was
+    /// keeping forks off the cross-process path: an eventfd has no OS object and no path, only a
+    /// counter and two behaviour bits. See `litebox::platform::ForkInheritedEventfd`.
+    pub(crate) fn carriable_eventfd_for_raw_fd(&self, raw_fd: usize) -> Option<(u64, u32)> {
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |_| None,
+                |_| None,
+                |_| None,
+                |fd: &litebox::fd::TypedFd<super::eventfd::EventfdSubsystem<Platform>>| {
+                    let handle = self.global.litebox.descriptor_table().entry_handle(fd)?;
+                    Some(
+                        handle.with_entry(|e: &super::eventfd::EventFile<Platform>| {
+                            let (count, flags) = e.fork_state();
+                            (count, flags.bits())
+                        }),
+                    )
+                },
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()
+            .flatten()
+    }
+
+    /// Recreate an eventfd at exactly `target_fd` with `count` and `flags`.
+    ///
+    /// How a cross-process `fork()` child restores an inherited eventfd, mirroring
+    /// [`Self::install_file_at_fd`].
+    pub(crate) fn install_eventfd_at_fd(
+        &self,
+        target_fd: i32,
+        count: u64,
+        flags: u32,
+    ) -> Option<()> {
+        let flags = litebox_common_linux::EfdFlags::from_bits_truncate(flags);
+        let eventfd = super::eventfd::EventFile::<Platform>::new(count, flags);
+        let typed = self
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<super::eventfd::EventfdSubsystem<Platform>>(eventfd);
+        let files = self.files.borrow();
+        let raw = files
+            .insert_raw_fd(typed)
+            .map_err(|typed| {
+                self.global
+                    .litebox
+                    .descriptor_table_mut()
+                    .remove(&typed)
+                    .unwrap();
+            })
+            .ok()?;
+        // `insert_raw_fd` picks the lowest free number; the child needs this exact one.
+        let raw_i32 = i32::try_from(raw).ok()?;
+        if raw_i32 == target_fd {
+            return Some(());
+        }
+        let moved = self.sys_dup(raw_i32, Some(target_fd), None).is_ok();
+        let _ = self.sys_close(raw_i32);
+        moved.then_some(())
+    }
+
     /// Reopen `path` at exactly `target_fd`, positioned at `offset`.
     ///
     /// How a cross-process `fork()` child restores an inherited regular-file fd. Creation flags

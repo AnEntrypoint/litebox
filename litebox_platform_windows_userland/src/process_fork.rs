@@ -814,6 +814,13 @@ pub const FORK_CHILD_PARENT_LAYER_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_P
 /// `litebox::platform::ForkInheritedFile` for what that preserves. Never guest-visible.
 pub const FORK_CHILD_FILE_FDS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_FILE_FDS";
 
+/// Eventfds the child must recreate, as `fd:count:flags` hex triples joined by `,`.
+///
+/// Same channel and shape as [`FORK_CHILD_FILE_FDS_ENV_VAR`], because an eventfd needs even less
+/// than a file does: no reopen, no bridge, just the counter and its two behaviour bits. See
+/// `litebox::platform::ForkInheritedEventfd`.
+pub const FORK_CHILD_EVENTFDS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_EVENTFDS";
+
 /// Encode `bytes` as lowercase hex, for [`FORK_CHILD_FILE_FDS_ENV_VAR`].
 #[must_use]
 pub fn hex_encode(bytes: &[u8]) -> String {

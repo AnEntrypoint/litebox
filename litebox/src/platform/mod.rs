@@ -967,11 +967,13 @@ pub trait ForkChildVerificationProvider {
         full_gprs: ForkFullGprSnapshot,
         inherited_pipes: alloc::vec::Vec<(i32, ForkPipeBridge)>,
         inherited_files: alloc::vec::Vec<ForkInheritedFile>,
+        inherited_eventfds: alloc::vec::Vec<ForkInheritedEventfd>,
     ) -> Option<CrossProcessChildHandle> {
         let _ = relocations;
         let _ = full_gprs;
         let _ = inherited_pipes;
         let _ = inherited_files;
+        let _ = inherited_eventfds;
         None
     }
 }
@@ -1000,6 +1002,30 @@ pub struct ForkInheritedFile {
     pub flags: u32,
     /// The parent's current file offset, to seek to after reopening.
     pub offset: u64,
+}
+
+/// An eventfd a cross-process `fork()` child must recreate at the same fd number.
+///
+/// An eventfd has no OS object behind it -- it is a 64-bit counter and two behaviour bits -- so
+/// unlike a pipe it needs no bridge and unlike a file it needs no reopen. The child simply builds
+/// one with the same state.
+///
+/// **The counter is copied, not shared**, exactly as [`ForkInheritedFile`]'s offset is. A real
+/// `fork()` leaves both processes on ONE open file description, so a read in either drains the
+/// other's counter; recreating gives them independent ones. Invisible to a child that `execve`s,
+/// closes it, or uses it only to wake its own event loop -- which is what GLib does with the
+/// eventfds a desktop process holds, and why carrying them this way is worth far more than
+/// refusing the fork. Visible, and unsupported, only to a parent and child that deliberately
+/// signal each other through the inherited counter.
+#[derive(Debug, Clone, Copy)]
+pub struct ForkInheritedEventfd {
+    /// The guest fd number the child must find this eventfd at.
+    pub fd: i32,
+    /// The parent's counter value at fork time.
+    pub count: u64,
+    /// `EFD_*` bits: `SEMAPHORE` and `NONBLOCK`. `CLOEXEC` is a descriptor-table property the
+    /// child's own fd table carries, not part of the object.
+    pub flags: u32,
 }
 
 /// A host-side handle on one end of a PARENT's in-memory pipe, handed across to

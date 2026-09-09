@@ -2554,7 +2554,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             alloc::vec::Vec::new();
         let mut inherited_files: alloc::vec::Vec<litebox::platform::ForkInheritedFile> =
             alloc::vec::Vec::new();
+        let mut inherited_eventfds: alloc::vec::Vec<litebox::platform::ForkInheritedEventfd> =
+            alloc::vec::Vec::new();
         let mut uncarriable = 0usize;
+        // WHICH subsystems blocked, deduplicated -- reported once per refused fork at `warn` so the
+        // answer to "what do I teach next" is visible without turning on a debug firehose. The
+        // per-fd `debug!` below still gives the individual fds when that is what's wanted.
+        let mut uncarriable_kinds: alloc::vec::Vec<&'static str> = alloc::vec::Vec::new();
         for raw_fd in &beyond_stdio_fds {
             let carried = i32::try_from(*raw_fd)
                 .ok()
@@ -2625,12 +2631,37 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             offset,
                         });
                     }
+                    // An eventfd carries as pure state: a counter and two bits, no path, no
+                    // handle. GLib arms one per main-loop wakeup, so a desktop process always
+                    // holds several and any one of them used to force the whole fork onto the
+                    // thread-based relocating fallback.
+                    None if i32::try_from(*raw_fd).is_ok()
+                        && self.carriable_eventfd_for_raw_fd(*raw_fd).is_some() =>
+                    {
+                        let fd = i32::try_from(*raw_fd).expect("checked just above");
+                        let (count, flags) = self
+                            .carriable_eventfd_for_raw_fd(*raw_fd)
+                            .expect("checked just above");
+                        litebox_util_log::debug!(
+                            tid:% = self.tid, fd:% = fd, count:% = count, flags:% = flags;
+                            "clone: carrying an eventfd into the cross-process child"
+                        );
+                        inherited_eventfds.push(litebox::platform::ForkInheritedEventfd {
+                            fd,
+                            count,
+                            flags,
+                        });
+                    }
                     None => {
                         uncarriable += 1;
+                        let subsystem = self.raw_fd_subsystem_name(*raw_fd);
+                        if !uncarriable_kinds.iter().any(|k| *k == subsystem) {
+                            uncarriable_kinds.push(subsystem);
+                        }
                         litebox_util_log::debug!(
                             tid:% = self.tid,
                             fd:% = raw_fd,
-                            subsystem:% = self.raw_fd_subsystem_name(*raw_fd);
+                            subsystem:% = subsystem;
                             "clone: cross-process fork() cannot carry this fd"
                         );
                     }
@@ -2643,12 +2674,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .platform
                 .env_flag("LITEBOX_PROCESS_FORK_IGNORE_FDS")
         {
-            litebox_util_log::debug!(
+            litebox_util_log::warn!(
                 tid:% = self.tid,
                 uncarriable:% = uncarriable,
+                kinds:? = uncarriable_kinds,
                 carried_pipes:% = inherited_pipes.len(),
-                carried_files:% = inherited_files.len();
-                "clone: cross-process fork() not eligible -- guest holds fd(s) at or above 3 that are neither a pipe (bridged over a real Windows pipe) nor a reopenable regular file; see the per-fd `cannot carry this fd` lines just above for which subsystem to teach next"
+                carried_files:% = inherited_files.len(),
+                carried_eventfds:% = inherited_eventfds.len();
+                "clone: cross-process fork() not eligible -- these fd subsystems cannot cross the process boundary yet; each one taught is one more fork that gets a real address space instead of the thread-based relocating fallback"
             );
             return None;
         }
@@ -2816,6 +2849,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 full_gprs,
                 inherited_pipes,
                 inherited_files,
+            inherited_eventfds,
             )
     }
 
@@ -3844,6 +3878,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .spawn_cross_process_fork_child(
                         &relocations,
                         full_gprs,
+                        alloc::vec::Vec::new(),
                         alloc::vec::Vec::new(),
                         alloc::vec::Vec::new(),
                     )

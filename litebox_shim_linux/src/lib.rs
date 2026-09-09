@@ -367,6 +367,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShimEntrypoints<Platform, FS> {
         self.task.install_file_at_fd(target_fd, path, flags, offset)
     }
 
+    /// Recreate an inherited eventfd at exactly `target_fd`. See `Task::install_eventfd_at_fd`.
+    /// Same thread requirement as the pipe and file installers.
+    pub fn install_eventfd_at_fd(&self, target_fd: i32, count: u64, flags: u32) -> Option<()> {
+        self.task.install_eventfd_at_fd(target_fd, count, flags)
+    }
+
     pub fn process(&self) -> LinuxShimProcess<Platform> {
         LinuxShimProcess(self.task.process().clone())
     }

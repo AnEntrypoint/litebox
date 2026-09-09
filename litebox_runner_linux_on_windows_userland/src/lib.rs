@@ -1492,6 +1492,38 @@ fn diag_process_fork_task_resume_probe(
     // arrived with the spawn), so the same path at the same offset is the same file. Enough for
     // the case that matters -- a shell that saved its own script fd out of the way before forking.
     // See `litebox::platform::ForkInheritedFile` for what a reopen preserves and what it does not.
+    // Recreate the eventfds the parent held. Cheaper than a file: no reopen and no bridge, since
+    // an eventfd is a counter and two behaviour bits. See `litebox::platform::ForkInheritedEventfd`
+    // for what a recreate preserves (everything a wakeup fd needs) and what it does not (a counter
+    // genuinely SHARED with the parent).
+    if let Some(spec) = std::env::var_os(pf::FORK_CHILD_EVENTFDS_ENV_VAR)
+        && let Some(spec) = spec.to_str()
+    {
+        for item in spec.split(',').filter(|s| !s.is_empty()) {
+            let mut parts = item.split(':');
+            let parsed = (|| {
+                let fd = i32::from_str_radix(parts.next()?, 16).ok()?;
+                let count = u64::from_str_radix(parts.next()?, 16).ok()?;
+                let flags = u32::from_str_radix(parts.next()?, 16).ok()?;
+                Some((fd, count, flags))
+            })();
+            let Some((fd, count, flags)) = parsed else {
+                eprintln!(
+                    "[process_fork_diag] task-resume-probe (child): unparseable inherited-eventfd entry {item:?}, guest fd will be missing"
+                );
+                continue;
+            };
+            match entrypoints.install_eventfd_at_fd(fd, count, flags) {
+                Some(()) => eprintln!(
+                    "[process_fork_diag] task-resume-probe (child): guest fd {fd} recreated as an eventfd (count={count}, flags={flags:#x})"
+                ),
+                None => eprintln!(
+                    "[process_fork_diag] task-resume-probe (child): could not recreate eventfd at guest fd {fd}, it will be missing"
+                ),
+            }
+        }
+    }
+
     if let Some(spec) = std::env::var_os(pf::FORK_CHILD_FILE_FDS_ENV_VAR)
         && let Some(spec) = spec.to_str()
     {

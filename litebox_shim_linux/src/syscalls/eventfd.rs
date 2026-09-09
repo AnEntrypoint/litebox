@@ -36,6 +36,26 @@ pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider + TimeProvider> 
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
+    /// This eventfd's entire guest-visible state: the counter, and the flags that shape how it
+    /// behaves.
+    ///
+    /// Exists so a cross-process `fork()` can carry an eventfd to its child. An eventfd is a
+    /// 64-bit counter plus two behaviour bits -- there is no OS object behind it and nothing else
+    /// to reproduce -- which makes it the cheapest of the subsystems that were blocking that path
+    /// (see `Task::try_cross_process_fork`'s uncarriable-kinds report). GLib arms one per main-loop
+    /// wakeup, so a desktop process holds several at all times, and any one of them was enough to
+    /// force the whole fork onto the thread-based relocating fallback.
+    pub(crate) fn fork_state(&self) -> (u64, EfdFlags) {
+        let mut flags = EfdFlags::empty();
+        flags.set(
+            EfdFlags::NONBLOCK,
+            OFlags::from_bits_truncate(self.status.load(core::sync::atomic::Ordering::Relaxed))
+                .contains(OFlags::NONBLOCK),
+        );
+        flags.set(EfdFlags::SEMAPHORE, self.semaphore);
+        (*self.counter.lock(), flags)
+    }
+
     pub(crate) fn new(count: u64, flags: EfdFlags) -> Self {
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(EfdFlags::NONBLOCK));
