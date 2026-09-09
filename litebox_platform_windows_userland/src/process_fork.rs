@@ -821,6 +821,21 @@ pub const FORK_CHILD_FILE_FDS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_FILE_
 /// `litebox::platform::ForkInheritedEventfd`.
 pub const FORK_CHILD_EVENTFDS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_EVENTFDS";
 
+/// The `--oci-image` reference this run booted from, so a cross-process child can rebuild the same
+/// rootfs.
+///
+/// [`FORK_CHILD_TAR_PATH_ENV_VAR`] carries the `--initial-files` path, and a child re-execs with
+/// NO command line of its own -- it reconstructs everything from its environment. So on the
+/// `--oci-image` path a child arrived with no rootfs source at all and could not `execve` anything;
+/// every cross-process fork of an OCI-booted guest failed, which is why enabling
+/// `LITEBOX_PROCESS_FORK` broke a webtop boot outright (`XVFB_FAILED`, `DBUS_FAILED`).
+///
+/// The reference, not a materialised rootfs: the child re-derives its layers through the same
+/// `pull_layers_in_memory` call the parent used, which is a read of the digest-keyed on-disk layer
+/// cache the parent has already warmed. No image is modified, nothing extra is written, and the two
+/// processes agree by construction because they run the same code over the same digests.
+pub const FORK_CHILD_OCI_IMAGE_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_OCI_IMAGE";
+
 /// Encode `bytes` as lowercase hex, for [`FORK_CHILD_FILE_FDS_ENV_VAR`].
 #[must_use]
 pub fn hex_encode(bytes: &[u8]) -> String {
@@ -1423,6 +1438,19 @@ pub fn spawn_process_fork_child(
         ("LITEBOX_DIAG_PROCESS_FORK_TASK_RESUME", "1".to_string()),
         (FORK_CHILD_VMA_LAYOUT_ENV_VAR, relocations_line.clone()),
         (FORK_CHILD_GPRS_ENV_VAR, serialize_full_gprs(&full_gprs)),
+        // A fork child must never publish host ports.
+        //
+        // `LITEBOX_PUBLISH` would otherwise be inherited (the block below copies this process's
+        // environment), and every cross-process child then raced to bind the same
+        // `127.0.0.1:<port>` the parent already holds -- observed as a burst of
+        // `failed to bind 127.0.0.1:3000: Only one usage of each socket address ...` on every
+        // fork. Losing that race is the harmless outcome; WINNING it would be worse, because the
+        // child would then be answering connections meant for the guest's real listener.
+        //
+        // Publishing is a property of the top-level run, exactly as it is of a `docker run`, not of
+        // every process the guest happens to fork. Overridden to empty rather than merely omitted,
+        // because omission means inherit here.
+        ("LITEBOX_PUBLISH", String::new()),
     ];
     // Exported BEFORE the spawn: the path has to be in the child's environment block, and the
     // contents have to reflect the parent as of this `fork()`, not as of whenever the child gets

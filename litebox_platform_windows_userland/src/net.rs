@@ -935,7 +935,10 @@ impl NatGateway {
     /// bind (address already in use is the usual cause) would otherwise present as "the guest's
     /// server is broken", sending the next person to debug entirely the wrong layer.
     fn spawn_published_listeners() -> Option<std::sync::mpsc::Receiver<InboundConnection>> {
-        let spec = std::env::var("LITEBOX_PUBLISH").ok()?;
+        // Same empty-means-unset rule as `init_published_ports`; see its comment.
+        let spec = std::env::var("LITEBOX_PUBLISH")
+            .ok()
+            .filter(|v| !v.trim().is_empty())?;
         let (tx, rx) = std::sync::mpsc::channel();
         let mut bound_any = false;
         for entry in spec.split(',').map(str::trim).filter(|e| !e.is_empty()) {
@@ -990,7 +993,12 @@ fn gateway(slot: &OnceLock<NatGateway>) -> &NatGateway {
 /// Call once during platform construction. No-op when `LITEBOX_PUBLISH` is unset, preserving the
 /// laziness for everyone not publishing a port.
 pub(crate) fn init_published_ports(slot: &OnceLock<NatGateway>) {
-    if std::env::var_os("LITEBOX_PUBLISH").is_some() {
+    // An EMPTY value counts as unset. A cross-process fork child is handed
+    // `LITEBOX_PUBLISH=""` precisely to cancel the parent's inherited value (see
+    // `process_fork`'s `child_env`), and Windows environment blocks have no way to express
+    // "remove this name" -- so empty is how the cancellation arrives, and treating it as set
+    // would start a gateway for a spec with nothing in it.
+    if std::env::var("LITEBOX_PUBLISH").is_ok_and(|v| !v.trim().is_empty()) {
         let _ = gateway(slot);
     }
 }

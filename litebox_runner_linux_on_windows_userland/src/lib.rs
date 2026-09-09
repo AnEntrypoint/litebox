@@ -595,6 +595,17 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         // all-layers-at-once memory spike this function was changed to avoid).
         let pulled = litebox_packager::oci::pull_layers_in_memory(image_ref, true)
             .map_err(|e| anyhow!("failed to pull OCI image {image_ref}: {e}"))?;
+        // Carry the REFERENCE across a cross-process `fork()`, the way the `--initial-files` path
+        // carries its tar path. A child re-execs with no command line of its own, so without this
+        // it arrives with no rootfs source at all and cannot `execve` anything. See
+        // `FORK_CHILD_OCI_IMAGE_ENV_VAR` for why the reference is the right thing to hand over
+        // rather than a materialised rootfs.
+        unsafe {
+            std::env::set_var(
+                litebox_platform_windows_userland::process_fork::FORK_CHILD_OCI_IMAGE_ENV_VAR,
+                image_ref,
+            );
+        }
         RootfsSource::OciLayers {
             layers: pulled.layers,
         }
@@ -1214,28 +1225,63 @@ pub fn diag_process_fork_globalstate_probe() {
     if !litebox_platform_windows_userland::process_fork::diag_process_fork_globalstate_enabled() {
         return;
     }
-    let Some(tar_path) = std::env::var_os(
+    // The child's read-only rootfs, from whichever source this run booted with. It re-execs with
+    // no command line of its own, so both arrive by environment: a `--initial-files` tar as a path
+    // to mmap, an `--oci-image` as the REFERENCE to re-derive from the digest-keyed layer cache the
+    // parent has already warmed.
+    //
+    // Only the tar case existed. On the `--oci-image` path a child therefore arrived with no
+    // rootfs at all and could not `execve` anything -- which is why enabling `LITEBOX_PROCESS_FORK`
+    // on an OCI-booted webtop broke it outright (`XVFB_FAILED`, `DBUS_FAILED`) while the same build
+    // without it reached a running desktop. See `FORK_CHILD_OCI_IMAGE_ENV_VAR`.
+    let oci_ref = std::env::var(
+        litebox_platform_windows_userland::process_fork::FORK_CHILD_OCI_IMAGE_ENV_VAR,
+    )
+    .ok()
+    .filter(|v| !v.is_empty());
+    let tar_path = std::env::var_os(
         litebox_platform_windows_userland::process_fork::FORK_CHILD_TAR_PATH_ENV_VAR,
-    ) else {
+    )
+    .filter(|v| !v.is_empty());
+
+    let tar_layers: Vec<std::borrow::Cow<'static, [u8]>> = if let Some(image_ref) = &oci_ref {
         eprintln!(
-            "[process_fork_diag] globalstate-probe (child): no tar path arrived via {}, skipping",
+            "[process_fork_diag] globalstate-probe (child): rebuilding rootfs from OCI image {image_ref}"
+        );
+        // The same call the parent made. Layers are read from the on-disk digest+rewriter-version
+        // cache rather than the network, so this is a local read of bytes the parent has already
+        // produced -- the two processes agree by construction because they run the same code over
+        // the same digests, with no separate artifact to keep in sync.
+        match litebox_packager::oci::pull_layers_in_memory(image_ref, true) {
+            Ok(pulled) => pulled.layers,
+            Err(e) => {
+                eprintln!(
+                    "[process_fork_diag] globalstate-probe (child): failed to rebuild rootfs from {image_ref}: {e}"
+                );
+                return;
+            }
+        }
+    } else if let Some(tar_path) = &tar_path {
+        eprintln!(
+            "[process_fork_diag] globalstate-probe (child): attempting standalone GlobalState construction"
+        );
+        match mmapped_file(tar_path) {
+            Ok(f) => vec![f.data.into()],
+            Err(e) => {
+                eprintln!(
+                    "[process_fork_diag] globalstate-probe (child): failed to mmap tar at {}: {e}",
+                    PathBuf::from(tar_path).display()
+                );
+                return;
+            }
+        }
+    } else {
+        eprintln!(
+            "[process_fork_diag] globalstate-probe (child): no rootfs source arrived via {} or {}, skipping",
+            litebox_platform_windows_userland::process_fork::FORK_CHILD_OCI_IMAGE_ENV_VAR,
             litebox_platform_windows_userland::process_fork::FORK_CHILD_TAR_PATH_ENV_VAR
         );
         return;
-    };
-    eprintln!(
-        "[process_fork_diag] globalstate-probe (child): attempting standalone GlobalState construction"
-    );
-
-    let tar_data = match mmapped_file(&tar_path) {
-        Ok(f) => f.data,
-        Err(e) => {
-            eprintln!(
-                "[process_fork_diag] globalstate-probe (child): failed to mmap tar at {}: {e}",
-                PathBuf::from(&tar_path).display()
-            );
-            return;
-        }
     };
 
     let platform = Platform::new();
@@ -1286,7 +1332,9 @@ pub fn diag_process_fork_globalstate_probe() {
         let _ = std::fs::remove_file(&parent_layer);
     }
 
-    let fs = shim_builder.default_fs(in_mem, tar_data.into());
+    // `default_fs` is `default_fs_multi_layer` with a one-element list, so a tar and an OCI layer
+    // stack converge here exactly as they do in `run()`.
+    let fs = shim_builder.default_fs_multi_layer(in_mem, tar_layers);
     let fs = std::sync::Arc::new(fs);
 
     // This child is itself a fork parent for any child IT goes on to spawn, and it never reaches
