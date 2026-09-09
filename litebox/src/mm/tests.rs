@@ -180,10 +180,28 @@ fn test_vmm_mapping() {
         }
         .is_ok()
     );
-    // Grow and merge, [(0x1_0000, 0x1_c000)]
+    // Grown, and deliberately NOT merged:
+    // [(0x1_0000, 0x1_2000), (0x1_2000, 0x1_4000), (0x1_4000, 0x1_c000)]
+    //
+    // This expected one coalesced entry, which is what `rangemap` does for touching ranges whose
+    // values compare equal. `VmArea`'s `PartialEq` deliberately makes two PRIVATE areas never
+    // equal, so they never coalesce -- see that impl's own comment for the live failure that
+    // forced it: a tracked VMA's extent was observed growing from 0.93 MB to 5.44 MB with no
+    // corresponding guest operation, and a later `mprotect`/`munmap` walk that should have touched
+    // one fragment applied across the whole merged span, reaching into memory the guest never
+    // asked about. A private `VmArea` carries no field identifying which real allocation it is, so
+    // keeping every one as its own entry is the only safe option.
+    //
+    // The expectation here simply outlived that fix -- and the test already contradicted itself:
+    // the assertion a few dozen lines below, after `protect_mapping`, expects exactly these three
+    // separate entries.
     assert_eq!(
         collect_mappings(&vmm),
-        vec![start_addr..start_addr + 12 * PAGE_SIZE]
+        vec![
+            start_addr..start_addr + 2 * PAGE_SIZE,
+            start_addr + 2 * PAGE_SIZE..start_addr + 4 * PAGE_SIZE,
+            start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE
+        ]
     );
 
     assert!(matches!(
@@ -244,6 +262,14 @@ fn test_vmm_mapping() {
     );
 
     // create new mapping with no suggested address
+    //
+    // Placed one `MAPPING_GUARD_GAP` below the top of the usable range, not flush against it.
+    // `get_unmmaped_area`'s top-down fast path subtracts that gap deliberately so an
+    // independently-placed mapping can never end up adjacent to whatever sits above it -- see
+    // `MAPPING_GUARD_GAP`'s own doc comment for the glibc `sysmalloc` chunk-header overrun
+    // (`+0x8`/`+0x18` past the end) that it converts from silent corruption of a neighbour into a
+    // clean fault on an unmapped hole. This expectation predates that gap.
+    let top = DummyVmemBackend::TASK_ADDR_MAX - Vmem::<DummyVmemBackend, PAGE_SIZE>::MAPPING_GUARD_GAP;
     assert_eq!(
         unsafe {
             vmm.create_mapping(
@@ -255,7 +281,7 @@ fn test_vmm_mapping() {
         }
         .unwrap()
         .as_usize(),
-        DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE,
+        top - PAGE_SIZE,
     );
     assert_eq!(
         collect_mappings(&vmm),
@@ -263,7 +289,7 @@ fn test_vmm_mapping() {
             start_addr..start_addr + 2 * PAGE_SIZE,
             start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
             start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
-            DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
+            top - PAGE_SIZE..top,
         ]
     );
 
@@ -288,7 +314,7 @@ fn test_vmm_mapping() {
             start_addr + PAGE_SIZE..start_addr + 2 * PAGE_SIZE,
             start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
             start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
-            DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
+            top - PAGE_SIZE..top,
         ]
     );
 
@@ -310,7 +336,7 @@ fn test_vmm_mapping() {
             start_addr + 4 * PAGE_SIZE..start_addr + 6 * PAGE_SIZE,
             start_addr + 8 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
             start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
-            DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
+            top - PAGE_SIZE..top,
         ]
     );
 }

@@ -425,13 +425,22 @@ on-screen client first.
   investigation (`decode_frame.py`, `run_xfce_xwm.sh` and variants, `drm_flip_probe.c`, etc.) --
   useful, keep using them, but don't assume every script there is still the current recommended
   path (e.g. the OCI-pull Python scripts are retired, see "Container images" above).
-- **Test-suite status (2026-09-09, measured).** `cargo test -p litebox_shim_linux --lib` is
-  181/181. It had been *reported* as 181/181 for a long time without that ever being true: the
-  test binary died at test 9 of 181 with `STATUS_ACCESS_VIOLATION`, so most of the suite never ran
-  and its result was whatever someone last wrote down. Three real defects came out of fixing that,
-  see "A panic used to become a host crash" below. `cargo test -p litebox --lib` has 26 failures
-  out of 150 -- unchanged, and genuinely pre-existing (9 need a `diod` binary for the 9P tests;
-  the rest are separate logic bugs unrelated to anything in this file). **Never record a test
-  count you did not just watch run to completion**: a suite that aborts partway through reports
-  nothing about the tests after the abort, and "it was clean last time" is how this one stayed
-  wrong.
+- **Test-suite status (2026-09-09, measured): everything is green.** `cargo test -p litebox --lib`
+  150/150, `-p litebox_shim_linux --lib` 187/187, `-p litebox_platform_windows_userland`,
+  `-p litebox_common_linux` and `-p litebox_syscall_rewriter` all clean. Getting there fixed real
+  defects, and the way they had been hidden is the lesson:
+  - `litebox_shim_linux` was *reported* as 181/181 for a long time without that ever being true:
+    the binary died at test 9 of 181 with `STATUS_ACCESS_VIOLATION`, so most of the suite never ran
+    and its result was whatever someone last wrote down. See "A panic used to become a host crash"
+    below for the cause; three real defects were underneath.
+  - `litebox --lib` was written off here as "26 failures, 9 need `diod`, the rest are separate
+    logic bugs". The real split was 24 `diod` tests and exactly 2 logic failures -- and those two
+    were genuine: `lstat` could not walk an intermediate symlink (so `lstat("/lib/anything")` failed
+    with `ENOTDIR` on any usrmerge layout, which is every modern distro), and `test_vmm_mapping`
+    held two expectations that had outlived the fixes that invalidated them.
+  - The 24 `diod` tests now SKIP with a loud notice instead of failing, because `diod` is a
+    Linux-only server that cannot be installed on this host. A suite that is permanently red for an
+    environmental reason stops being read, which is precisely how those two logic failures sat
+    unexamined behind them.
+  **Never record a test count you did not just watch run to completion**, and **never leave a suite
+  red for an environmental reason** -- both are how this one stayed wrong.

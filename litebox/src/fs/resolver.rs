@@ -141,6 +141,21 @@ impl Default for Context {
 /// Maximum number of intermediate-symlink hops a single walk will follow before giving up with
 /// `PathError::TooManySymlinkHops` (`ELOOP`). Matches
 /// [`super::in_mem::FileSystem`]'s own `MAX_SYMLINK_HOPS` for its (upper/writable) layer.
+/// Whether a path walk must resolve a symlink sitting in its FINAL position.
+///
+/// The distinction is the difference between two different questions. `open`/`lstat` ask about the
+/// leaf itself, and must decide for themselves whether to follow it (`O_NOFOLLOW`, and `lstat`'s
+/// whole purpose). A walk to a containing DIRECTORY has no such choice: every component of it,
+/// including its own last, has to be a directory for the walk to mean anything -- and that last
+/// component is an intermediate component of the path the caller actually named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FollowFinal {
+    /// Resolve a final-position symlink and keep walking (a walk to a directory).
+    Yes,
+    /// Stop at the final component and let the caller decide (a walk to a leaf).
+    No,
+}
+
 const MAX_SYMLINK_HOPS: u32 = 8;
 
 /// Absolute normalized path, must only be created from [`Context::resolve`].
@@ -214,6 +229,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             components,
             #[cfg(debug_assertions)]
             absolute_components,
+            // Walking TO a directory: every component must resolve to one, the last included. A
+            // symlink in the final position here is still an INTERMEDIATE component of the path
+            // the caller actually asked about -- `parent_dir_and_name` hands this function only the
+            // parent components, so the leaf of this walk is never the leaf of the real path.
+            //
+            // Leaving it unfollowed made `lstat("lib/libfoo.so.1")` fail with `ENOTDIR` on any
+            // usrmerge layout (`/lib -> usr/lib`), which is every modern distro including the
+            // `debian-xfce` image this project targets.
+            FollowFinal::Yes,
         )?;
 
         match outcome.stop_reason {
@@ -246,6 +270,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             components,
             #[cfg(debug_assertions)]
             absolute_components,
+            // The caller resolves the leaf itself -- `open()` must decide whether to follow it
+            // based on `O_NOFOLLOW`, and `lstat` must not follow it at all.
+            FollowFinal::No,
         )
     }
 
@@ -277,6 +304,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         _from: WalkingDirHandle<'a>,
         components: &[&str],
         #[cfg(debug_assertions)] absolute_components: &[&str],
+        follow_final_component: FollowFinal,
     ) -> Result<(WalkOutcome<WalkingDirHandle<'a>>, usize), WalkError> {
         // Owned, mutable working copy of the remaining path, so a symlink target can be spliced
         // in.
@@ -298,7 +326,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             let walked = outcome.components.len();
             let is_final_component_stop = outcome.stop_reason
                 == WalkStopReason::StoppedAtNonDirectory
-                && walked + 1 == current.len();
+                && walked + 1 == current.len()
+                // When the caller needs EVERY component resolved (`FollowFinal::Yes`), a stop at
+                // the final one is not a destination -- it falls through to the symlink hop below,
+                // exactly like a stop at an intermediate component.
+                && follow_final_component == FollowFinal::No;
             if outcome.stop_reason == WalkStopReason::CompleteDirectory || is_final_component_stop {
                 // Either fully walked, or stopped exactly at the requested final component (which
                 // is allowed to be a non-directory, e.g. a file or a symlink the caller will
@@ -317,6 +349,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 // `current.len()` against `original_len` could both underflow (a previous bug here)
                 // and, even saturating, return a value that does not correspond to a valid index
                 // into the caller's original array.
+                // With `FollowFinal::Yes` a success is always a complete walk (the final-stop
+                // short-circuit above cannot fire), so every originally requested component was
+                // consumed -- which is what `walk_to_directory`'s own assertion checks.
                 let consumed = if is_final_component_stop {
                     original_len - 1
                 } else {
