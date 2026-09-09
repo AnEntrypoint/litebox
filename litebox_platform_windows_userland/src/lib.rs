@@ -10045,6 +10045,199 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
             }
         }
     }
+
+    /// See the trait method's own doc comment for the full "real `execve()` guarantees a fresh
+    /// address space; this process literally cannot provide one itself" rationale.
+    ///
+    /// Reuses the EXISTING rootfs-continuity mechanism wholesale rather than inventing a second
+    /// one: `run()` already sets [`process_fork::FORK_CHILD_OCI_IMAGE_ENV_VAR`]/
+    /// [`process_fork::FORK_CHILD_TAR_PATH_ENV_VAR`] on THIS process's own environment
+    /// unconditionally (for the cross-process-fork child's benefit) -- `std::process::Command`
+    /// inherits this process's environment by default, so the spawned child sees them with no
+    /// new plumbing, and just needs telling, via an ORDINARY `--oci-image`/`--initial-files` CLI
+    /// flag (clap does not bind flags to env vars on its own here), to use them the normal way
+    /// any fresh `litebox_runner_linux_on_windows_userland` invocation would.
+    ///
+    /// Writable-layer continuity reuses the EXISTING cross-process-FORK mechanism wholesale, not
+    /// a second one: [`process_fork::export_parent_writable_layer_for_child`] snapshots whatever
+    /// this process has written so far to a tar, the same call the fork path already makes, and
+    /// the child imports it the normal, public way any fresh run would (`--resume-from`) --
+    /// without this, every collision child would start from the image's base rootfs, blind to
+    /// every directory/file an EARLIER, in-process step of this same boot had already created.
+    /// Confirmed live as a real (not hypothetical) gap: a later `s6-mkdir` collision child
+    /// reported `/run/s6/basedir: No such file or directory` because an EARLIER, successful,
+    /// in-process step's own `/run/s6` never reached it.
+    ///
+    /// **Disclosed limitation, v1.** Only stdio (fds 0/1/2, inherited the same way any ordinary
+    /// child process's are) crosses this boundary -- no non-stdio fd carrying (pipes/eventfds/
+    /// files, same machinery `spawn_cross_process_fork_child` already has) yet. Exactly
+    /// [`LITEBOX_PROCESS_FORK_IGNORE_FDS`]'s own precedent: a narrower, disclosed trade-off is
+    /// strictly better than the unconditional `SIGSEGV` this replaces, and widening it is real,
+    /// separate follow-on work, not silently claimed here.
+    fn spawn_exec_collision_child(
+        &self,
+        path: &str,
+        argv: &[alloc::ffi::CString],
+        envp: &[alloc::ffi::CString],
+    ) -> Option<litebox::platform::ExecCollisionChildResult> {
+        let exe = std::env::current_exe().ok()?;
+        let mut cmd = std::process::Command::new(exe);
+
+        if let Ok(image_ref) = std::env::var(process_fork::FORK_CHILD_OCI_IMAGE_ENV_VAR)
+            && !image_ref.is_empty()
+        {
+            cmd.arg("--oci-image").arg(image_ref);
+        } else if let Ok(tar_path) = std::env::var(process_fork::FORK_CHILD_TAR_PATH_ENV_VAR)
+            && !tar_path.is_empty()
+        {
+            cmd.arg("--initial-files").arg(tar_path);
+        } else {
+            litebox_util_log::warn!(
+                oci_image_env_var:% = process_fork::FORK_CHILD_OCI_IMAGE_ENV_VAR,
+                tar_path_env_var:% = process_fork::FORK_CHILD_TAR_PATH_ENV_VAR;
+                "spawn_exec_collision_child: neither env var is set on this process's own \
+                 environment -- this process did not boot from an OCI image or a tar, so there is \
+                 no rootfs to hand the child"
+            );
+            return None;
+        }
+
+        // Writable-layer continuity -- see this method's own doc comment for why this is not
+        // optional in practice. Best-effort, same as the fork path's identical call: a failure
+        // (nothing registered, or the export itself failing) means the child sees only the base
+        // rootfs, strictly worse than a correct hand-off but never worse than the unconditional
+        // `SIGSEGV` this whole method replaces.
+        if let Some(snapshot) = process_fork::export_parent_writable_layer_for_child() {
+            cmd.arg("--resume-from").arg(snapshot);
+        }
+
+        // The other half of writable-layer continuity (see this method's own doc comment): the
+        // child exports whatever IT writes, to a SEPARATE path from the `--resume-from` one above
+        // (the same archive cannot be both read at startup and overwritten at exit), which this
+        // call reads back after the child exits and hands to the caller to import into the
+        // CONTINUING guest process -- there is no later `wait4` to carry it at here, unlike the
+        // cross-process FORK case this mirrors.
+        //
+        // MUST be added before any positional argument below: `program_and_arguments` is a
+        // `trailing_var_arg` positional (clap), which greedily swallows every token after the
+        // first one, flags included -- an `--export-writable-layer` placed after `path`/`argv`
+        // would silently become part of the GUEST's own argv instead of being parsed as a flag
+        // at all. Confirmed live: exactly that, no error, `cli_args.export_writable_layer` stayed
+        // `None`, and nothing was ever written.
+        // A per-call sequence number, not just this process's own pid: several guest THREADS of
+        // this SAME process can each hit their own collision and call this concurrently, and a
+        // pid-only name would let two of them share one file, each truncating/overwriting the
+        // other's write mid-flight. Same pattern as `export_parent_writable_layer_for_child`'s
+        // own `SEQ` for the identical reason.
+        static EXEC_COLLISION_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let export_path = std::env::temp_dir().join(format!(
+            "litebox-execwrite-{}-{}.tar",
+            std::process::id(),
+            EXEC_COLLISION_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        ));
+        cmd.arg("--export-writable-layer").arg(&export_path);
+
+        // `--env KEY=VALUE`, once per entry -- the NEW program's own guest-visible environment
+        // (`execve`'s own `envp` argument), entirely separate from this HOST process's
+        // environment (which the child inherits unconditionally via `Command`'s own default,
+        // unrelated to this loop).
+        for entry in envp {
+            let Ok(entry) = entry.to_str() else {
+                litebox_util_log::warn!(
+                    "spawn_exec_collision_child: a guest envp entry was not valid UTF-8, dropping it"
+                );
+                continue;
+            };
+            cmd.arg("--env").arg(entry);
+        }
+
+        // The new program's own path, then every argv entry EXCEPT argv[0] -- `program_and_
+        // arguments`'s own doc comment: the path is given separately, and litebox supplies its
+        // own argv[0] from it, so the guest's original argv[0] (conventionally a program name,
+        // not necessarily `path` itself) is not re-passed here.
+        cmd.arg(path);
+        for arg in argv.iter().skip(1) {
+            let Ok(arg) = arg.to_str() else {
+                litebox_util_log::warn!(
+                    "spawn_exec_collision_child: a guest argv entry was not valid UTF-8, dropping it"
+                );
+                continue;
+            };
+            cmd.arg(arg);
+        }
+
+        // This process already bound any published host ports; the child must not also try --
+        // same reasoning, same override, as `process_fork`'s own `child_env` for a cross-process
+        // FORK child (see its doc comment on `("LITEBOX_PUBLISH", String::new())`).
+        cmd.env("LITEBOX_PUBLISH", "");
+        // See this env var's own doc comment: lets the child's `run()` skip the host-wide boot
+        // lock, which exists for a different case (two independent, accidental concurrent boots)
+        // than this one (one deliberate, synchronous continuation of the SAME boot).
+        cmd.env(process_fork::EXEC_COLLISION_CHILD_ENV_VAR, "1");
+
+        litebox_util_log::warn!(
+            path:% = path;
+            "spawn_exec_collision_child: this process's own address space cannot load this \
+             image (a fixed-address collision with a still-live guest process) -- spawning a \
+             fresh process instead of killing the guest, matching real Linux's own execve() \
+             guarantee of a fresh address space"
+        );
+
+        // Blocking: see the trait method's own doc comment for why there is nothing else for
+        // this thread to do but wait.
+        match cmd.status() {
+            Ok(status) => {
+                // `ExitStatus::code()` is `None` only for a signal-terminated child on Unix --
+                // never on Windows, where every process exit carries a plain numeric code (a
+                // process killed the way `TerminateProcess`/an unhandled exception would still
+                // reports SOME `u32` code, just not through this enum's signal-shaped variant at
+                // all, since Windows has no such variant). `unwrap_or(-1)` is therefore dead code
+                // on this platform, kept only because the method returns a plain `Option<i32>`
+                // signature shared with every other platform that might implement it.
+                let raw_status = status.code().unwrap_or(-1);
+                // Best-effort, same as the export call itself: a child that crashed or never
+                // reached its own exit path leaves nothing here, which is no worse than the
+                // pre-existing "nothing carries over" behaviour, not a new failure mode.
+                let exported_writable_layer = match std::fs::read(&export_path) {
+                    Ok(bytes) => {
+                        litebox_util_log::warn!(
+                            path:% = path, bytes:% = bytes.len();
+                            "spawn_exec_collision_child: read back the child's exported writable layer"
+                        );
+                        Some(bytes)
+                    }
+                    Err(e) => {
+                        litebox_util_log::warn!(
+                            path:% = path, export_path:? = export_path, error:% = e;
+                            "spawn_exec_collision_child: no exported writable layer to read back \
+                             (the child may not have reached its own exit path)"
+                        );
+                        None
+                    }
+                };
+                // Publish the child's export as the boot tree's new canonical "latest" snapshot
+                // (see `CONTAINER_FS_SNAPSHOT_ENV_VAR`'s own doc comment) rather than discarding
+                // it -- a `rename`, so this also takes care of removing `export_path` itself.
+                // Only when the read above actually found something: `export_path` not existing
+                // at all (the child never reached its own exit path) is the common, already-
+                // logged case, not something to also report as a publish failure.
+                if exported_writable_layer.is_some() {
+                    let _ = process_fork::publish_as_container_fs_snapshot(export_path);
+                }
+                Some(litebox::platform::ExecCollisionChildResult {
+                    raw_status,
+                    exported_writable_layer,
+                })
+            }
+            Err(e) => {
+                litebox_util_log::warn!(
+                    error:% = e;
+                    "spawn_exec_collision_child: failed to spawn the replacement process"
+                );
+                None
+            }
+        }
+    }
 }
 
 /// Release the parent-side ends of pipes built for a cross-process `fork()` child that never

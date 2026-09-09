@@ -73,6 +73,11 @@ pub(crate) struct PtyPair<Platform: ShimPlatform> {
     /// Starts locked, matching real Linux devpts: opening the slave before the master issues
     /// `TIOCSPTLCK(0)` (`unlockpt`) fails with `EIO`.
     locked: AtomicBool,
+    /// `TIOCPKT` state: accepted and stored (`TIOCGPTPEER`'s doc comment on `IoctlArg::TIOCPKT`
+    /// explains why accepting it at all matters), but not acted on -- no consumer in this
+    /// codebase's terminal-emulation path reads via packet mode's control-byte-prefixed
+    /// protocol, so there is nothing to change about `read()`'s behavior here.
+    packet_mode: AtomicBool,
 }
 
 impl<Platform: ShimPlatform> PtyPair<Platform> {
@@ -106,6 +111,10 @@ impl<Platform: ShimPlatform> PtyPair<Platform> {
 
     pub(crate) fn set_locked(&self, locked: bool) {
         self.locked.store(locked, Ordering::Release);
+    }
+
+    pub(crate) fn set_packet_mode(&self, enabled: bool) {
+        self.packet_mode.store(enabled, Ordering::Relaxed);
     }
 }
 
@@ -438,6 +447,7 @@ pub(crate) fn new_pty_pair<Platform: ShimPlatform>(
         winsize: Mutex::new(Winsize::default()),
         fg_pgid: AtomicI32::new(0),
         locked: AtomicBool::new(true),
+        packet_mode: AtomicBool::new(false),
     });
     let master_pollee = Arc::new(Pollee::new());
     let slave_pollee = Arc::new(Pollee::new());
@@ -481,6 +491,9 @@ impl<Platform: ShimPlatform, FS: crate::ShimFS> crate::GlobalState<Platform, FS>
         let id = self.next_pty_id.fetch_add(1, Ordering::Relaxed);
         let (master, slave) = new_pty_pair(&self.litebox, id);
         self.pty_registry.write().insert(id, slave);
+        // Mirror into `pts_registry` too -- see that field's doc comment -- so `/dev/pts` lists
+        // this id the moment it exists, matching real devpts.
+        self.pts_registry.write().insert(id);
         (master, id)
     }
 
@@ -534,6 +547,7 @@ impl<Platform: ShimPlatform, FS: crate::ShimFS> crate::GlobalState<Platform, FS>
         if let Some(slave) = self.pty_registry.write().remove(&id) {
             drop(self.litebox.descriptor_table_mut().remove(&slave));
         }
+        self.pts_registry.write().remove(&id);
     }
 
     /// Wakes a thread blocked reading `pair`'s master, matching real Linux's behavior of
@@ -622,6 +636,8 @@ impl<Platform: ShimPlatform, FS: crate::ShimFS> Task<Platform, FS> {
         // (and this shim's own `ptmx_open` path) delivers that hangup unconditionally at process
         // death, not only when the process explicitly closed its slave fds first.
         global.pty_registry.write().insert(id, slave);
+        // Mirror into `pts_registry` too -- see `ptmx_open`'s identical comment.
+        global.pts_registry.write().insert(id);
 
         // The registry above holds the canonical slave entry now (mirroring `ptmx_open`'s own
         // comment: "never installed into any process's own fd table directly"). Get an

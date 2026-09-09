@@ -519,6 +519,31 @@ pub fn init_logging() {
 }
 
 pub fn run(cli_args: CliArgs) -> Result<()> {
+    // One fixed, well-known tar path for this whole boot tree's shared filesystem continuity --
+    // see `process_fork::CONTAINER_FS_SNAPSHOT_ENV_VAR`'s own doc comment for the full "approximates
+    // a real container's one shared mount namespace" reasoning. Set ONLY if not already inherited:
+    // the FIRST process in the tree establishes it (a real file, genuinely unique to this boot --
+    // named from this process's own pid, which cannot collide with a concurrent, unrelated boot's
+    // own first process), and `Command`'s default env inheritance carries the SAME value to every
+    // fork/exec-collision descendant automatically, so every one of them resolves to the identical
+    // path without it ever being re-derived or passed explicitly.
+    if std::env::var_os(
+        litebox_platform_windows_userland::process_fork::CONTAINER_FS_SNAPSHOT_ENV_VAR,
+    )
+    .is_none()
+    {
+        let path = std::env::temp_dir().join(format!(
+            "litebox-container-fs-{}.tar",
+            std::process::id()
+        ));
+        unsafe {
+            std::env::set_var(
+                litebox_platform_windows_userland::process_fork::CONTAINER_FS_SNAPSHOT_ENV_VAR,
+                &path,
+            );
+        }
+    }
+
     // `litebox` is `#![no_std]` and cannot read an environment variable itself, so the runner
     // forwards this one on its behalf, here -- before any guest mapping is placed. It disables the
     // inter-mapping guard gap (see `litebox::mm::linux::MAPPING_GUARD_GAP`) so the gap can be A/B'd
@@ -548,7 +573,22 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // lockfile's own open OS handle, which Windows closes on every exit path this
     // process actually takes -- including `std::process::exit`/`ExitProcess` and a
     // hard kill, neither of which runs any destructor. See `acquire_boot_lock`.
-    let _boot_lock = acquire_boot_lock()?;
+    //
+    // EXCEPT for one deliberate, narrow case: a child spawned by `ForkChildVerificationProvider::
+    // spawn_exec_collision_child` (see `process_fork::EXEC_COLLISION_CHILD_ENV_VAR`'s own doc
+    // comment) is one synchronous continuation of the SAME boot, not a second, independent one --
+    // the parent thread is blocked waiting for it, contending for nothing. Taking the lock there
+    // would make every such child hit the still-live parent's own lock and exit immediately with
+    // this very lock's "another boot is already in progress" error, confirmed live.
+    let _boot_lock = if std::env::var_os(
+        litebox_platform_windows_userland::process_fork::EXEC_COLLISION_CHILD_ENV_VAR,
+    )
+    .is_some()
+    {
+        None
+    } else {
+        Some(acquire_boot_lock()?)
+    };
 
     // The shim is `no_std` and cannot read the environment itself, so translate
     // `LITEBOX_DRM_TRACE=1` here. This logs every DRM ioctl at its single dispatch
@@ -712,8 +752,23 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         initialize_root_in_mem_layer(&mut in_mem);
         if let Some(resume_from) = &cli_args.resume_from {
             in_mem.with_root_privileges(|fs| {
-                import_writable_layer(fs, resume_from)
-                    .unwrap_or_else(|e| panic!("failed to import --resume-from archive: {e}"));
+                // Best-effort, not a hard requirement: `--resume-from` is no longer only a
+                // human operator's own, presumed-good archive -- `spawn_exec_collision_child`/
+                // the cross-process fork path now also pass it internally, pointing at the boot
+                // tree's shared "latest" filesystem snapshot (see `CONTAINER_FS_SNAPSHOT_ENV_VAR`'s
+                // own doc comment), which can legitimately not exist yet (the very first spawn in
+                // a fresh boot) or be caught mid-`rename` by a concurrent sibling publishing its
+                // own update. A missing or malformed archive there is exactly as recoverable as
+                // never having had one -- the process already starts from a correct, empty upper
+                // layer otherwise -- so this degrades to that rather than taking the whole process
+                // down over a best-effort continuity mechanism's own race.
+                if let Err(e) = import_writable_layer(fs, resume_from) {
+                    eprintln!(
+                        "warning: failed to import --resume-from archive {}: {e} -- starting from \
+                         the base rootfs instead",
+                        resume_from.display()
+                    );
+                }
             });
         }
 
@@ -1842,16 +1897,40 @@ fn diag_process_fork_task_resume_probe(
     // env var missing, or a write failure), the child still exits with its real, correctly
     // encoded status below -- a lost filesystem export degrades to today's pre-pass-157 behavior
     // rather than blocking this process's own exit.
-    if let Some(tar_path) = std::env::var_os(pf::FORK_CHILD_TAR_PATH_ENV_VAR) {
-        let export_path = pf::cross_process_writable_export_path(
-            std::path::Path::new(&tar_path),
-            std::process::id(),
-        );
+    // `FORK_CHILD_TAR_PATH_ENV_VAR` is unset for an `--oci-image` boot (no single on-disk tar file
+    // exists to name this export after -- see that env var's own doc comment); `cross_process_
+    // writable_export_path` only needs SOME path to derive a filename stem from, so a fixed
+    // placeholder stands in for it there. Without this arm, every OCI-booted cross-process fork
+    // child silently skipped this export entirely -- not a narrower, disclosed trade-off, a real
+    // gap this pass closes, found while auditing this exact mechanism for `spawn_exec_collision_
+    // child`'s own writable-layer continuity.
+    let tar_path_for_naming = std::env::var_os(pf::FORK_CHILD_TAR_PATH_ENV_VAR)
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os(pf::FORK_CHILD_OCI_IMAGE_ENV_VAR)
+                .map(|_| std::path::PathBuf::from("oci-image"))
+        });
+    if let Some(tar_path) = tar_path_for_naming {
+        let export_path = pf::cross_process_writable_export_path(&tar_path, std::process::id());
         match export_writable_layer(&fs_for_export, &export_path) {
-            Ok(()) => eprintln!(
-                "[process_fork_diag] task-resume-probe (child): exported writable layer to {}",
-                export_path.display()
-            ),
+            Ok(()) => {
+                eprintln!(
+                    "[process_fork_diag] task-resume-probe (child): exported writable layer to {}",
+                    export_path.display()
+                );
+                // Also publish as the boot tree's shared "latest" snapshot -- see
+                // `CONTAINER_FS_SNAPSHOT_ENV_VAR`'s own doc comment -- so a LATER sibling
+                // (fork or exec-collision, anywhere in the tree) sees this child's writes even
+                // if the parent's own `wait4` has not yet reaped it. A COPY, not the usual
+                // `publish_as_container_fs_snapshot` rename: `export_path` itself must survive
+                // intact for the PARENT's own later `wait4`-time read (`cross_process_writable_
+                // export_path` recomputes this exact deterministic path from this child's pid).
+                if let Ok(shared) = std::env::var(
+                    litebox_platform_windows_userland::process_fork::CONTAINER_FS_SNAPSHOT_ENV_VAR,
+                ) {
+                    let _ = std::fs::copy(&export_path, shared);
+                }
+            }
             Err(e) => eprintln!(
                 "[process_fork_diag] task-resume-probe (child): failed to export writable layer to {}: {e}",
                 export_path.display()

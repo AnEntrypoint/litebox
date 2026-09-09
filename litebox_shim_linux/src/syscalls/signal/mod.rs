@@ -487,7 +487,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// genuine guest breakpoint (see aarch64's `LinuxShimEntrypoints::exception`).
     #[cfg(target_arch = "aarch64")]
     pub(crate) fn sigreturn_trampoline_addr(&self) -> usize {
-        self.signals.sigreturn_trampoline.get()
+        self.signals.borrow().sigreturn_trampoline.get()
     }
 
     /// Returns the guest-visible address of a litebox-synthesized `rt_sigreturn` trampoline
@@ -517,7 +517,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // `brk #0xdead` -- see this function's doc comment. Encoded by hand (verified via
         // `as`/`objdump`) rather than depending on an assembler at build time for 4 fixed bytes.
         const TRAMPOLINE_CODE: [u8; 4] = [0xa0, 0xd5, 0x3b, 0xd4];
-        let existing = self.signals.sigreturn_trampoline.get();
+        let existing = self.signals.borrow().sigreturn_trampoline.get();
         if existing != 0 {
             return existing;
         }
@@ -558,15 +558,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if !write_ok {
             return 0;
         }
-        self.signals.sigreturn_trampoline.set(addr);
+        self.signals.borrow().sigreturn_trampoline.set(addr);
         addr
     }
 
     pub(crate) fn with_temporary_signal_mask<R>(&self, mask: SigSet, f: impl FnOnce() -> R) -> R {
-        let old = self.signals.blocked.get();
-        self.signals.set_signal_mask(mask);
+        let old = self.signals.borrow().blocked.get();
+        self.signals.borrow().set_signal_mask(mask);
         let result = f();
-        self.signals.set_signal_mask(old);
+        self.signals.borrow().set_signal_mask(old);
         result
     }
 
@@ -587,14 +587,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
 
         if let Some(oldset_ptr) = oldset_ptr {
-            let oldset = self.signals.blocked.get();
+            let oldset = self.signals.borrow().blocked.get();
             oldset_ptr
                 .write_at_offset::<Platform>(0, oldset)
                 .ok_or(Errno::EFAULT)?;
         }
 
         if let Some(set) = set {
-            let mut blocked = self.signals.blocked.get();
+            let mut blocked = self.signals.borrow().blocked.get();
             match how {
                 SigmaskHow::SIG_BLOCK => {
                     blocked = blocked | set;
@@ -606,7 +606,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     blocked = set;
                 }
             }
-            self.signals.set_signal_mask(blocked);
+            self.signals.borrow().set_signal_mask(blocked);
         }
 
         Ok(0)
@@ -643,8 +643,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         let mask = mask_ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
 
-        let old_mask = self.signals.blocked.get();
-        self.signals.set_signal_mask(mask);
+        let old_mask = self.signals.borrow().blocked.get();
+        self.signals.borrow().set_signal_mask(mask);
         let result = self.wait_cx().sleep();
         // Dispatch/consume the signal that woke this thread WHILE the caller-supplied (usually
         // more permissive) mask from `sigsuspend`'s own argument is still installed -- real Linux
@@ -659,7 +659,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // `has_pending_signals()` still saw the stale, never-cleared entry once its RESTORED
         // block state briefly matched what `check_for_interrupt` samples on next entry).
         self.process_signals(ctx);
-        self.signals.set_signal_mask(old_mask);
+        self.signals.borrow().set_signal_mask(old_mask);
         match result {
             litebox::event::wait::WaitError::Interrupted => Err(Errno::EINTR),
             litebox::event::wait::WaitError::TimedOut => {
@@ -674,7 +674,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         old_ss_ptr: Option<UserPtrMut<SigAltStack>>,
         ctx: &PtRegs,
     ) -> Result<usize, Errno> {
-        let mut old_ss = self.signals.altstack.get();
+        let mut old_ss = self.signals.borrow().altstack.get();
         let is_on_stack = is_on_stack(&old_ss, arch::sp(ctx));
         if let Some(old_ss_ptr) = old_ss_ptr {
             if is_on_stack {
@@ -689,7 +689,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 return Err(Errno::EPERM);
             }
             let ss = ss_ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-            self.signals.set_sigaltstack(ss)?;
+            self.signals.borrow().set_sigaltstack(ss)?;
         }
         Ok(0)
     }
@@ -703,9 +703,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
 
         // Restore the alternate signal stack, ignoring errors.
-        self.signals.set_sigaltstack(uctx.stack).ok();
+        self.signals.borrow().set_sigaltstack(uctx.stack).ok();
 
-        self.signals.set_signal_mask(uctx.sigmask);
+        self.signals.borrow().set_signal_mask(uctx.sigmask);
 
         // Restore xmm0-xmm15 from the fpstate block this same handler's `write_signal_frame`
         // wrote, if any (non-null fpstate = this delivery genuinely captured FP state; null =
@@ -748,7 +748,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             None
         };
 
-        let handlers = self.signals.handlers.borrow();
+        let signals = self.signals.borrow();
+        let handlers = signals.handlers.borrow();
         let old_act = {
             let mut inner = handlers.inner.lock();
             let handler = &mut inner[signal];
@@ -805,7 +806,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // sibling thread for internal cross-thread synchronization handshakes, e.g. dlopen's
         // TLS-update quiesce signal -- sent fire-and-forget, with the return value never checked
         // by the caller). This used to be rejected outright with `ESRCH` here (there was no way
-        // to reach one specific sibling thread's own `self.signals.pending` from outside that
+        // to reach one specific sibling thread's own `self.signals.borrow().pending` from outside that
         // thread's own `Task`), which glibc's internal call sites don't handle -- the signal was
         // silently and permanently dropped, wedging both the sender (waiting on the receiver's
         // acknowledgment) and the receiver (which never got a chance to run its handler) forever.
@@ -827,7 +828,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // notification, so it is also the only thread that will actually be waiting to consume a
         // signal at all.
         if let Some(target_tid) = tid
-            && target_tid != self.tid
+            && target_tid != self.tid.get()
         {
             // Push the signal into `shared_pending` BEFORE checking whether the target thread is
             // still live: a thread that exits between this check and the push could otherwise
@@ -840,7 +841,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             if let Some(signal) = signal
                 && !self.is_signal_ignored(signal)
             {
-                self.signals
+                self.signals.borrow()
                     .shared_pending
                     .lock()
                     .push(&self.process().limits, signal, siginfo_kill(signal));
@@ -880,7 +881,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let self_pgid = self.sys_getpgid(0)?;
         let targets_self = match pid {
             None | Some(0 | -1) => true,
-            Some(p) if p == self.pid => true,
+            Some(p) if p == self.pid.get() => true,
             Some(p) => p.checked_neg().is_some_and(|group| group == self_pgid),
         };
         let mut delivered = targets_self;
@@ -945,21 +946,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Returns whether there are any pending signals that can be delivered.
     pub(crate) fn has_pending_signals(&self) -> bool {
-        let blocked = self.signals.blocked.get();
-        let thread_pending = self.signals.pending.borrow().pending & !blocked;
+        let blocked = self.signals.borrow().blocked.get();
+        let thread_pending = self.signals.borrow().pending.borrow().pending & !blocked;
         if !thread_pending.is_empty() {
             return true;
         }
-        let shared_pending = self.signals.shared_pending.lock().pending & !blocked;
+        let shared_pending = self.signals.borrow().shared_pending.lock().pending & !blocked;
         !shared_pending.is_empty()
     }
 
     /// Returns the set of all pending (deliverable) signals.
     #[cfg(test)]
     pub(crate) fn pending_signal_set(&self) -> SigSet {
-        let blocked = self.signals.blocked.get();
-        let thread = self.signals.pending.borrow().pending & !blocked;
-        let shared = self.signals.shared_pending.lock().pending & !blocked;
+        let blocked = self.signals.borrow().blocked.get();
+        let thread = self.signals.borrow().pending.borrow().pending & !blocked;
+        let shared = self.signals.borrow().shared_pending.lock().pending & !blocked;
         thread | shared
     }
 
@@ -970,36 +971,38 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // the `drm-diag` prefix is leftover from a DRM investigation. It runs 32 times per
             // exec, emitting 128 warn-level lines per exec on a completely normal run.
         litebox_util_log::debug!(
-            tid:% = self.tid, rip:% = ctx.rip, orig_rax:% = ctx.orig_rax;
+            tid:% = self.tid.get(), rip:% = ctx.rip, orig_rax:% = ctx.orig_rax;
             "drm-diag: process_signals entry with ctx"
         );
         let mut iter_count: u32 = 0;
         loop {
             iter_count += 1;
-            litebox_util_log::debug!(tid:% = self.tid, iter_count:% = iter_count; "drm-diag: process_signals loop iteration");
-            let blocked = self.signals.blocked.get();
+            litebox_util_log::debug!(tid:% = self.tid.get(), iter_count:% = iter_count; "drm-diag: process_signals loop iteration");
+            let blocked = self.signals.borrow().blocked.get();
             let (signal, siginfo) = {
-                let mut pending = self.signals.pending.borrow_mut();
+                let signals = self.signals.borrow();
+                let mut pending = signals.pending.borrow_mut();
                 if let Some(signal) = pending.next(blocked) {
                     (signal, pending.remove(signal))
                 } else {
                     // Then try shared pending.
-                    let mut shared = self.signals.shared_pending.lock();
+                    let signals = self.signals.borrow();
+                    let mut shared = signals.shared_pending.lock();
                     if let Some(signal) = shared.next(blocked) {
                         (signal, shared.remove(signal))
                     } else {
-                        litebox_util_log::debug!(tid:% = self.tid, iter_count:% = iter_count; "drm-diag: process_signals breaking (nothing pending)");
+                        litebox_util_log::debug!(tid:% = self.tid.get(), iter_count:% = iter_count; "drm-diag: process_signals breaking (nothing pending)");
                         break;
                     }
                 }
             };
-            litebox_util_log::debug!(tid:% = self.tid, signal:? = signal; "drm-diag: process_signals dispatching signal");
+            litebox_util_log::debug!(tid:% = self.tid.get(), signal:? = signal; "drm-diag: process_signals dispatching signal");
             if self.is_exiting() {
                 // Don't deliver any more signals if exiting.
                 return;
             }
 
-            let action = self.signals.handlers.borrow().inner.lock()[signal].action;
+            let action = self.signals.borrow().handlers.borrow().inner.lock()[signal].action;
             #[expect(clippy::match_same_arms)]
             match action.sigaction {
                 SIG_DFL => {
@@ -1012,8 +1015,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             // supported.
                             litebox_util_log::error!(
                                 signal:? = signal,
-                                pid:% = self.pid,
-                                tid:% = self.tid,
+                                pid:% = self.pid.get(),
+                                tid:% = self.tid.get(),
                                 comm:? = self.comm.get();
                                 "fatal signal: terminating task"
                             );
@@ -1021,7 +1024,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             // same event, in the DIAG_TIMELINE-prefixed shape the other
                             // exit/execve timeline lines use, for a uniform post-hoc `grep`.
                             litebox_util_log::debug!(
-                                pid:% = self.pid, comm:? = self.comm.get(), signal:? = signal;
+                                pid:% = self.pid.get(), comm:? = self.comm.get(), signal:? = signal;
                                 "DIAG_TIMELINE exit_signal"
                             );
                             // `sys_exit`/`sys_exit_group` both tear down fork-child single-step
@@ -1055,7 +1058,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     let sigreturn_trampoline = self.ensure_sigreturn_trampoline();
                     #[cfg(not(target_arch = "aarch64"))]
                     let sigreturn_trampoline = 0;
-                    if let Err(DeliverFault) = self.signals.deliver_signal(
+                    if let Err(DeliverFault) = self.signals.borrow().deliver_signal(
                         self.global.platform,
                         signal,
                         &siginfo,
@@ -1071,7 +1074,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
             }
         }
-        litebox_util_log::debug!(tid:% = self.tid; "drm-diag: process_signals returning normally");
+        litebox_util_log::debug!(tid:% = self.tid.get(); "drm-diag: process_signals returning normally");
     }
 
 
@@ -1082,7 +1085,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     #[cfg(feature = "alarm_fallback")]
     #[inline]
     pub(crate) fn check_alarm_deadline(&self) {
-        let mut alarm = self.process().alarm_timer.lock();
+        let process = self.process();
+        let mut alarm = process.alarm_timer.lock();
         if alarm.handle.is_some() {
             // If the platform supports timers, we rely on those to trigger SIGALRM, so we don't need
             // to check the deadline here.
@@ -1108,7 +1112,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     pub(crate) fn queue_signals(&self, signal: litebox_common_linux::signal::Signal) {
         if signal == litebox_common_linux::signal::Signal::SIGALRM {
-            let mut alarm = self.process().alarm_timer.lock();
+            let process = self.process();
+            let mut alarm = process.alarm_timer.lock();
             // Periodic `setitimer(ITIMER_REAL, ...)` (nonzero `it_interval`): re-arm the real
             // platform timer for another `interval` instead of leaving it disarmed, so the next
             // `SIGALRM` actually arrives -- see `Alarm::interval`'s doc comment. A one-shot
@@ -1137,10 +1142,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         // Blocked signals are never ignored, since the signal handler may
         // change by the time it is unblocked.
-        if self.signals.blocked.get().contains(signal) {
+        if self.signals.borrow().blocked.get().contains(signal) {
             return false;
         }
-        let handlers = self.signals.handlers.borrow();
+        let signals = self.signals.borrow();
+        let handlers = signals.handlers.borrow();
         let inner = handlers.inner.lock();
         match inner[signal].action.sigaction {
             SIG_IGN => true,
@@ -1154,7 +1160,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if self.is_signal_ignored(signal) {
             return;
         }
-        self.signals
+        self.signals.borrow()
             .pending
             .borrow_mut()
             .push(&self.process().limits, signal, siginfo);
@@ -1165,7 +1171,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if self.is_signal_ignored(signal) {
             return;
         }
-        self.signals
+        self.signals.borrow()
             .shared_pending
             .lock()
             .push(&self.process().limits, signal, siginfo);
@@ -1194,22 +1200,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Signal::SIGKILL | Signal::SIGSEGV | Signal::SIGFPE | Signal::SIGTRAP | Signal::SIGILL
         ));
 
-        self.signals
+        self.signals.borrow()
             .pending
             .borrow_mut()
             .push(&self.process().limits, signal, siginfo);
 
         // Update the handler if necessary to ensure the signal is handled.
-        let handlers = self.signals.handlers.borrow();
+        let signals = self.signals.borrow();
+        let handlers = signals.handlers.borrow();
         let mut inner = handlers.inner.lock();
         let handler = &mut inner[signal];
         if force_exit
-            || self.signals.blocked.get().contains(signal)
+            || self.signals.borrow().blocked.get().contains(signal)
             || handler.action.sigaction == SIG_IGN
         {
-            let mut blocked = self.signals.blocked.get();
+            let mut blocked = self.signals.borrow().blocked.get();
             blocked.remove(signal);
-            self.signals.set_signal_mask(blocked);
+            self.signals.borrow().set_signal_mask(blocked);
             handler.action = SigAction {
                 sigaction: SIG_DFL,
                 restorer: 0,
@@ -1270,7 +1277,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             };
             (signal, fault_address)
         };
-        self.signals.last_exception.set(*info);
+        self.signals.borrow().last_exception.set(*info);
         self.force_signal_with_info(signal, false, siginfo_exception(signal, fault_address));
     }
 }

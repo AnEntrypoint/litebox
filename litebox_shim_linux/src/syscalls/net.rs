@@ -1060,7 +1060,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<u32, Errno> {
         let result = self.do_sys_socket(domain, type_and_flags, protocol);
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             domain:% = domain,
             type_and_flags:% = type_and_flags,
             protocol:% = protocol,
@@ -1224,7 +1224,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // when a child inherits one of the two fds and then fails on it (glycin's decoder
         // receives its D-Bus socket this way via --dbus-fd).
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             ty:? = ty,
             sock1:% = sock1,
             sock2:% = sock2;
@@ -1656,7 +1656,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     matches!(AddressFamily::try_from(u32::from(f)), Ok(AddressFamily::INET6))
                 })
             {
-                litebox_util_log::debug!(tid:% = self.tid, fd:% = sockfd;
+                litebox_util_log::debug!(tid:% = self.tid.get(), fd:% = sockfd;
                     "bind(AF_INET6): accepted as a listener nothing can reach");
                 return Ok(());
             }
@@ -1721,7 +1721,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let result = self.do_sendto(fd, &buf, flags, sockaddr);
         let preview_len = buf.len().min(64);
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             fd:% = fd,
             len:% = buf.len(),
             preview:? = core::str::from_utf8(&buf[..preview_len]).unwrap_or("<binary>"),
@@ -1790,7 +1790,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             });
         let result = self.do_sendmsg(fd, &msg, flags);
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             fd:% = fd,
             preview:? = preview,
             result:? = result;
@@ -2065,7 +2065,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(size) => size,
             Err(e) => {
                 litebox_util_log::debug!(
-                    tid:% = self.tid,
+                    tid:% = self.tid.get(),
                     fd:% = fd,
                     len:% = len,
                     result:? = Err::<usize, _>(e);
@@ -2077,7 +2077,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let capped_size = size.min(recv_buf.len());
         let preview_len = capped_size.min(64);
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             fd:% = fd,
             len:% = len,
             preview:? = core::str::from_utf8(&recv_buf[..preview_len]).unwrap_or("<binary>"),
@@ -2220,7 +2220,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
 
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             fd:% = sockfd,
             flags:? = flags;
             "DIAG sys_recvmsg: entry"
@@ -2237,7 +2237,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         let result = self.do_recvmsg(sockfd, msg_ptr, flags);
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             fd:% = sockfd,
             result:? = result;
             "DIAG sys_recvmsg: returning"
@@ -2584,7 +2584,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         let new_len = self.do_getsockopt(sockfd, optname, optval, len);
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             sockfd:% = sockfd,
             optname:? = optname,
             result:? = new_len;

@@ -1665,22 +1665,25 @@ impl<
             }
             Err(e) => return Err(e),
         }
-        // If `to` shadows a lower-layer entry, place a tombstone over it -- otherwise a stale
-        // cached `EntryX::Lower` entry (from a previous open of `to` before this rename) would
-        // keep being returned by `open`, exactly as `unlink` guards against below.
-        if self.ensure_lower_contains(&to).is_ok() {
-            self.root
-                .write()
-                .entries
-                .insert(to, Arc::new(EntryX::Tombstone));
-        } else {
-            // No lower-layer shadowing, but there might still be a stale cached entry (e.g. an
-            // `EntryX::Upper` from a previous open of a *different* upper-layer file at the same
-            // path that was later unlinked and recreated) -- clear it so the next `open` re-reads
-            // fresh, mirroring the invalidation `unlink` performs by simply not caching anything
-            // for a path with no lower-layer shadow.
-            self.root.write().entries.remove(&to);
-        }
+        // Invalidate whatever `open` may have cached for `to` -- a stale `EntryX::Lower` (from a
+        // previous open of `to` before this rename, when it still fell through to the lower
+        // layer) or a stale `EntryX::Upper` (from a previous open of a *different* upper-layer
+        // file at this same path that was later unlinked and recreated) would otherwise keep
+        // being returned by `open` instead of the file `self.upper.rename` just placed here.
+        //
+        // This must NOT insert a tombstone, even when `to` shadows a lower-layer entry: a
+        // tombstone means "deleted", and `open`'s own cache lookup (above in this same impl)
+        // returns `NoSuchFileOrDirectory` for one WITHOUT EVER CHECKING `self.upper` -- exactly
+        // backwards for a rename destination, which is not deleted, it is REPLACED, and the
+        // replacement is sitting in `self.upper` right now. Confirmed live: `sed -i` (write a
+        // temp file, `rename()` it over the original -- textbook in-place-edit idiom) succeeded
+        // once, then every later open of that same path failed `ENOENT`, because this exact
+        // tombstone insertion shadowed `self.upper`'s own freshly-renamed-in file. Plain removal
+        // (same as the lower-shadow case needs) forces the next `open` to re-resolve fresh, which
+        // correctly finds `self.upper`'s file first -- `self.upper` already and always takes
+        // precedence over a lower-layer shadow, so there is nothing further to invalidate once
+        // the stale cache entry itself is gone.
+        self.root.write().entries.remove(&to);
         Ok(())
     }
 

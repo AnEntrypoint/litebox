@@ -145,7 +145,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox_common_linux::loader::MapMemory
             // comfortably inside `TASK_ADDR_MAX` (~140 TiB) with room for the OS-picked mappings
             // that live above it.
             const PID_SALT_STRIDE: usize = 4 * 1024 * 1024 * 1024;
-            let pid_salt = (self.task.pid as usize % 1024).wrapping_mul(PID_SALT_STRIDE);
+            let pid_salt = (self.task.pid.get() as usize % 1024).wrapping_mul(PID_SALT_STRIDE);
             super::DEFAULT_LOW_ADDR + pid_salt
         };
         let mapping_ptr = self

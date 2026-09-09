@@ -8,7 +8,7 @@ use alloc::boxed::Box;
 use alloc::collections::btree_map::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use core::mem::offset_of;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -797,21 +797,22 @@ impl<Platform: ShimPlatform> Process<Platform> {
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Updates the process exit status for a thread exit.
     fn exit_thread(&self, code: i8) {
-        litebox_util_log::debug!(tid:% = self.tid, code:% = code; "sys_exit: exit_thread entry");
-        let mut inner = self.thread.process.inner.lock();
+        litebox_util_log::debug!(tid:% = self.tid.get(), code:% = code; "sys_exit: exit_thread entry");
+        let thread = self.thread.borrow();
+        let mut inner = thread.process.inner.lock();
         if self.is_exiting() {
-            litebox_util_log::debug!(tid:% = self.tid; "sys_exit: already exiting, no-op");
+            litebox_util_log::debug!(tid:% = self.tid.get(); "sys_exit: already exiting, no-op");
             return;
         }
         inner.exit_status = ExitStatus::Exit(code);
-        self.thread.remote.is_exiting.store(true, Ordering::Relaxed);
-        litebox_util_log::debug!(tid:% = self.tid; "sys_exit: is_exiting set, thread will unwind to prepare_for_exit");
+        self.thread.borrow().remote.is_exiting.store(true, Ordering::Relaxed);
+        litebox_util_log::debug!(tid:% = self.tid.get(); "sys_exit: is_exiting set, thread will unwind to prepare_for_exit");
     }
 
     /// Updates the process exit status for a group exit and signals all threads
     /// to exit.
     pub(crate) fn exit_group(&self, status: ExitStatus) {
-        litebox_util_log::debug!(tid:% = self.tid, status:? = status; "sys_exit_group: entry");
+        litebox_util_log::debug!(tid:% = self.tid.get(), status:? = status; "sys_exit_group: entry");
         // Mark every thread as exiting, and collect their remotes, while holding `inner` --
         // but do NOT call `interrupt()` (below) while still holding it.
         //
@@ -833,7 +834,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // entirely, matching how a real kernel's `do_group_exit` never needs to hold a
         // process-wide lock while signaling sibling threads.
         let remotes: alloc::vec::Vec<_> = {
-            let mut inner = self.thread.process.inner.lock();
+            let thread = self.thread.borrow();
+            let mut inner = thread.process.inner.lock();
             if self.is_exiting() {
                 return;
             }
@@ -846,7 +848,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             inner.is_killing_other_threads = true;
             // Every thread (including the caller) must be marked exiting so no other syscall
             // path treats this process as still alive, but `remotes` (below) must EXCLUDE the
-            // caller -- mirroring `kill_other_threads`'s own `tid != self.tid` filter. Calling
+            // caller -- mirroring `kill_other_threads`'s own `tid != self.tid.get()` filter. Calling
             // `ThreadHandle::interrupt` (an OS-level `SuspendThread`-based primitive) ON THE
             // CALLING THREAD ITSELF is unsafe: a thread cannot cleanly suspend itself this way,
             // and doing so was confirmed live to crash the whole process with an uncaught
@@ -861,19 +863,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             inner
                 .threads
                 .iter()
-                .filter(|&(&tid, _)| tid != self.tid)
+                .filter(|&(&tid, _)| tid != self.tid.get())
                 .map(|(_, thread)| thread.clone())
                 .collect()
         };
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             n_remotes:% = remotes.len();
             "sys_exit_group: interrupting sibling threads"
         );
         for thread in remotes {
             thread.interrupt();
         }
-        litebox_util_log::debug!(tid:% = self.tid; "sys_exit_group: done interrupting siblings");
+        litebox_util_log::debug!(tid:% = self.tid.get(); "sys_exit_group: done interrupting siblings");
         // Wait for every interrupted sibling to actually finish exiting (their own
         // `sys_exit`/`Task::drop` unwind all the way through `Task::prepare_for_exit`) before
         // returning -- mirroring `kill_other_threads`'s own identical wait loop below, which
@@ -892,6 +894,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         loop {
             let n = self
                 .thread
+                .borrow()
                 .process
                 .nr_threads
                 .underlying_atomic()
@@ -899,7 +902,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             if n <= 1 {
                 break;
             }
-            let _ = self.thread.process.nr_threads.block(n);
+            let _ = self.thread.borrow().process.nr_threads.block(n);
         }
     }
 
@@ -912,14 +915,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // holding `inner`: collect the other threads' remotes first, mark
         // `is_killing_other_threads` and release the lock, then interrupt them afterward.
         let remotes: alloc::vec::Vec<_> = {
-            let mut inner = self.thread.process.inner.lock();
+            let thread = self.thread.borrow();
+            let mut inner = thread.process.inner.lock();
             if self.is_exiting() {
                 return false;
             }
             let remotes = inner
                 .threads
                 .iter()
-                .filter(|&(&tid, _)| tid != self.tid)
+                .filter(|&(&tid, _)| tid != self.tid.get())
                 .map(|(_, thread)| thread.clone())
                 .collect::<alloc::vec::Vec<_>>();
             for thread in &remotes {
@@ -930,7 +934,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             remotes
         };
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             n_remotes:% = remotes.len();
             "kill_other_threads: interrupting siblings"
         );
@@ -941,25 +945,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         loop {
             let n = self
                 .thread
+                .borrow()
                 .process
                 .nr_threads
                 .underlying_atomic()
                 .load(Ordering::Acquire);
-            litebox_util_log::debug!(tid:% = self.tid, n:% = n; "kill_other_threads: nr_threads check");
+            litebox_util_log::debug!(tid:% = self.tid.get(), n:% = n; "kill_other_threads: nr_threads check");
             if n == 1 {
                 break;
             }
-            let _ = self.thread.process.nr_threads.block(n);
+            let _ = self.thread.borrow().process.nr_threads.block(n);
         }
-        self.thread.process.inner.lock().is_killing_other_threads = false;
-        litebox_util_log::debug!(tid:% = self.tid; "kill_other_threads: done");
+        self.thread.borrow().process.inner.lock().is_killing_other_threads = false;
+        litebox_util_log::debug!(tid:% = self.tid.get(); "kill_other_threads: done");
         true
     }
 
     /// Returns true if the task is exiting and should not continue running
     /// guest code.
     pub fn is_exiting(&self) -> bool {
-        self.thread.remote.is_exiting.load(Ordering::Relaxed)
+        self.thread.borrow().remote.is_exiting.load(Ordering::Relaxed)
     }
 }
 
@@ -1008,8 +1013,15 @@ pub(crate) struct Credentials {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
-    pub(crate) fn process(&self) -> &Arc<Process<Platform>> {
-        &self.thread.process
+    /// Returns this task's [`Process`], by value (a cheap `Arc` clone) rather than by
+    /// reference: the backing `thread: RefCell<ThreadState<Platform>>` (see its own doc comment
+    /// on why it must be a `RefCell`) can only ever hand out a `Ref` whose lifetime is tied to
+    /// this call, never one a caller could hold past it -- so a clone is the only shape that
+    /// still lets every existing caller treat this exactly like the `&Arc` it used to be (every
+    /// `Arc<T>` method and `Deref` to `&T` works identically on an owned `Arc` as on a borrowed
+    /// one).
+    pub(crate) fn process(&self) -> Arc<Process<Platform>> {
+        self.thread.borrow().process.clone()
     }
 
     /// Set the current task's command name.
@@ -1186,7 +1198,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             reason = "tid is always non-negative; only ever compared against another tid read \
                       back from a futex word, never used arithmetically"
         )]
-        if (word & FUTEX_TID_MASK) != self.tid as u32 {
+        if (word & FUTEX_TID_MASK) != self.tid.get() as u32 {
             return Ok(());
         }
 
@@ -1763,7 +1775,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// pending the remainder, per this investigation's standing discipline of not overclaiming
     /// resolution.
     pub(crate) fn prepare_for_exit(&mut self) {
-        litebox_util_log::debug!(tid:% = self.tid; "prepare_for_exit: entry (Task dropping)");
+        litebox_util_log::debug!(tid:% = self.tid.get(); "prepare_for_exit: entry (Task dropping)");
         // Snapshot + detach BEFORE `detach_from_process_deferred()` below: that call's own
         // `detach_thread` unconditionally calls `signal_vfork_done()` when it observes the last
         // thread exiting, clearing the `vfork_done` flag `detach_pm_for_vfork_execve` itself
@@ -1783,8 +1795,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // shim-only observable-timing divergence from real Linux on this exact path: a pipeline
         // parent's `wait4()` could return while a just-exited child's pipe fd was still open from
         // a peer's point of view.
-        let (notify, process_exited) = self.thread.detach_from_process_deferred();
-        litebox_util_log::debug!(tid:% = self.tid, process_exited:% = process_exited; "prepare_for_exit: detach_from_process done");
+        let (notify, process_exited) = self.thread.borrow().detach_from_process_deferred();
+        litebox_util_log::debug!(tid:% = self.tid.get(), process_exited:% = process_exited; "prepare_for_exit: detach_from_process done");
         if process_exited {
             // Real Linux implicitly closes every fd a process holds when its last thread exits,
             // releasing each open file description's reference so peers (e.g. a pipe's reader,
@@ -1797,7 +1809,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // closure and child reparenting are independent cleanup steps. It MUST, however,
             // happen before `notify_detached` below -- see this function's comment above.
             self.close_all_fds_on_process_exit();
-            litebox_util_log::debug!(tid:% = self.tid; "DIAG prepare_for_exit: close_all_fds done");
+            litebox_util_log::debug!(tid:% = self.tid.get(); "DIAG prepare_for_exit: close_all_fds done");
             // Drop this process's `/proc/self` snapshot along with its fds. Not optional
             // housekeeping: the entry holds the whole `cmdline`, `environ` and `auxv`, plus an
             // `Arc` closure that keeps this process's page-manager mapping table alive for as long
@@ -1805,16 +1817,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // desktop, via every shell script in its startup path -- would otherwise accumulate
             // every one of them for the life of the runner. See
             // `litebox::fs::procfs::ProcSelfTable::remove`.
-            self.global.proc_self_info.write().remove(self.pid);
+            self.global.proc_self_info.write().remove(self.pid.get());
             let orphans = self.process().take_children();
-            litebox_util_log::debug!(tid:% = self.tid, n_orphans:% = orphans.len(); "DIAG prepare_for_exit: take_children done");
+            litebox_util_log::debug!(tid:% = self.tid.get(), n_orphans:% = orphans.len(); "DIAG prepare_for_exit: take_children done");
             if !orphans.is_empty() {
                 let target = self
                     .process()
                     .live_parent()
                     .or_else(|| self.global.bootstrap_process.get().cloned());
                 if let Some(target) = target
-                    && !Arc::ptr_eq(&target, self.process())
+                    && !Arc::ptr_eq(&target, &self.process())
                 {
                     target.adopt_children(orphans);
                 }
@@ -1849,7 +1861,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let exit_signal_diag = self.process().exit_signal;
             let live_parent_diag = self.process().live_parent().is_some();
             litebox_util_log::debug!(
-                tid:% = self.tid,
+                tid:% = self.tid.get(),
                 exit_signal:? = exit_signal_diag,
                 has_live_parent:% = live_parent_diag;
                 "DIAG prepare_for_exit: parent-notify gate check"
@@ -1860,10 +1872,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .process()
                     .live_parent()
                     .or_else(|| self.global.bootstrap_process.get().cloned())
-                && !Arc::ptr_eq(&parent, self.process())
+                && !Arc::ptr_eq(&parent, &self.process())
             {
                 litebox_util_log::debug!(
-                    tid:% = self.tid;
+                    tid:% = self.tid.get();
                     "DIAG prepare_for_exit: calling parent.interrupt_all_threads()"
                 );
                 parent.shared_pending.lock().push(
@@ -1877,10 +1889,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if notify {
             self.process().notify_detached();
         }
-        litebox_util_log::debug!(tid:% = self.tid; "DIAG prepare_for_exit: notify_detached done");
+        litebox_util_log::debug!(tid:% = self.tid.get(); "DIAG prepare_for_exit: notify_detached done");
 
-        if let Some(clear_child_tid) = self.thread.clear_child_tid.take() {
-            litebox_util_log::debug!(tid:% = self.tid; "DIAG prepare_for_exit: clear_child_tid futex wake start");
+        if let Some(clear_child_tid) = self.thread.borrow().clear_child_tid.take() {
+            litebox_util_log::debug!(tid:% = self.tid.get(); "DIAG prepare_for_exit: clear_child_tid futex wake start");
             // Clear the child TID if requested
             // TODO: if we are the last thread, we don't need to clear it
             let _ = clear_child_tid.write_at_offset::<Platform>(0, 0);
@@ -1891,13 +1903,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 flags: litebox_common_linux::FutexFlags::PRIVATE,
                 count: 1,
             });
-            litebox_util_log::debug!(tid:% = self.tid; "DIAG prepare_for_exit: clear_child_tid futex wake done");
+            litebox_util_log::debug!(tid:% = self.tid.get(); "DIAG prepare_for_exit: clear_child_tid futex wake done");
         }
-        litebox_util_log::debug!(tid:% = self.tid; "DIAG prepare_for_exit: about to check robust_list");
-        if let Some(robust_list) = self.thread.robust_list.take() {
-            litebox_util_log::debug!(tid:% = self.tid; "DIAG prepare_for_exit: wake_robust_list start");
+        litebox_util_log::debug!(tid:% = self.tid.get(); "DIAG prepare_for_exit: about to check robust_list");
+        if let Some(robust_list) = self.thread.borrow().robust_list.take() {
+            litebox_util_log::debug!(tid:% = self.tid.get(); "DIAG prepare_for_exit: wake_robust_list start");
             let _ = self.wake_robust_list(robust_list);
-            litebox_util_log::debug!(tid:% = self.tid; "DIAG prepare_for_exit: wake_robust_list done");
+            litebox_util_log::debug!(tid:% = self.tid.get(); "DIAG prepare_for_exit: wake_robust_list done");
         }
         if process_exited {
             // Real Linux's own `do_exit()` -> `exit_mm()` releases the whole address space once
@@ -1935,16 +1947,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let release =
                 |_r: Range<usize>, vm: VmFlags| !vm.is_empty() || vm.contains(VmFlags::VM_OWN_FORK_PADDING);
             if let Err(err) = unsafe { self.process().pm().release_memory(release) } {
-                litebox_util_log::warn!(tid:% = self.tid, err:? = err; "prepare_for_exit: release_memory failed");
+                litebox_util_log::warn!(tid:% = self.tid.get(), err:? = err; "prepare_for_exit: release_memory failed");
             }
         }
-        litebox_util_log::debug!(tid:% = self.tid; "DIAG prepare_for_exit: exiting fn");
+        litebox_util_log::debug!(tid:% = self.tid.get(); "DIAG prepare_for_exit: exiting fn");
     }
 
     pub(crate) fn sys_exit(&self, status: i32) {
         // Always-on process-timeline diagnostic (advisor-db spec item 3).
         litebox_util_log::debug!(
-            pid:% = self.pid, comm:? = self.comm.get(), status:% = status;
+            pid:% = self.pid.get(), comm:? = self.comm.get(), status:% = status;
             "DIAG_TIMELINE exit"
         );
         self.print_diag_reports_if_bootstrap_process();
@@ -1957,7 +1969,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn sys_exit_group(&self, status: i32) {
         // Always-on process-timeline diagnostic (advisor-db spec item 3).
         litebox_util_log::debug!(
-            pid:% = self.pid, comm:? = self.comm.get(), status:% = status;
+            pid:% = self.pid.get(), comm:? = self.comm.get(), status:% = status;
             "DIAG_TIMELINE exit_group"
         );
         self.print_diag_reports_if_bootstrap_process();
@@ -1987,7 +1999,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .global
             .bootstrap_process
             .get()
-            .is_some_and(|bp| Arc::ptr_eq(bp, self.process()));
+            .is_some_and(|bp| Arc::ptr_eq(bp, &self.process()));
         if !is_bootstrap {
             return;
         }
@@ -2202,7 +2214,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         options: i32,
         _rusage: Option<UserPtrMut<u8>>,
     ) -> Result<usize, Errno> {
-        litebox_util_log::debug!(tid:% = self.tid, pid:% = pid, options:% = options; "drm-diag: sys_wait4 entry");
+        litebox_util_log::debug!(tid:% = self.tid.get(), pid:% = pid, options:% = options; "drm-diag: sys_wait4 entry");
         const WNOHANG: i32 = 0x1;
         let no_hang = options & WNOHANG != 0;
         let process = self.process();
@@ -2357,12 +2369,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         // Confirmed live: this exact race reproduced 100% of the time with a
                         // minimal `sh -c "sleep 3 & wait"` repro, hanging the shell's `wait`
                         // builtin forever even though the backgrounded child exited cleanly.
-                        litebox_util_log::debug!(tid:% = self.tid; "drm-diag: sys_wait4 interrupted, re-polling");
+                        litebox_util_log::debug!(tid:% = self.tid.get(); "drm-diag: sys_wait4 interrupted, re-polling");
                         if !poll_once() {
-                            litebox_util_log::debug!(tid:% = self.tid; "drm-diag: sys_wait4 re-poll found nothing, returning EINTR");
+                            litebox_util_log::debug!(tid:% = self.tid.get(); "drm-diag: sys_wait4 re-poll found nothing, returning EINTR");
                             return Err(Errno::EINTR);
                         }
-                        litebox_util_log::debug!(tid:% = self.tid; "drm-diag: sys_wait4 re-poll found exited child");
+                        litebox_util_log::debug!(tid:% = self.tid.get(); "drm-diag: sys_wait4 re-poll found exited child");
                     }
                     Err(litebox::event::wait::WaitError::TimedOut) => unreachable!(
                         "wait_until with no deadline never returns WaitError::TimedOut"
@@ -2501,19 +2513,66 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn try_cross_process_fork(
         &self,
         ctx: &litebox_common_linux::PtRegs,
+        child_tid: i32,
+        exit_signal: u64,
     ) -> Option<litebox::platform::CrossProcessChildHandle> {
+        // A platform with a REAL `fork()` needs none of what follows below in this function: no
+        // fd-eligibility scan, no CLOEXEC accounting, no pipe/file/eventfd bridging -- a real
+        // `fork()` inherits every open fd natively (CLOEXEC ones included; the kernel only
+        // honours that flag at a later `execve`, not at `fork()` itself), for free. See
+        // `ForkChildVerificationProvider::native_fork`'s doc comment: everything below this
+        // branch exists solely to reconstruct, by hand and imperfectly, what a real `fork()`
+        // syscall already does completely.
+        if self.global.platform.has_native_fork() {
+            return self.try_native_cross_process_fork(ctx, child_tid, exit_signal);
+        }
+
+        // Xvfb and dbus-daemon are excluded here, by name, from a cross-process child no matter
+        // how eligible their fds otherwise look. Both hold a unix-domain LISTENING socket
+        // (X11's `/tmp/.X11-unix/X<n>`, the session bus) that every OTHER guest process spawned
+        // for the REST OF THE SESSION connects to -- not a one-shot artifact a filesystem
+        // snapshot can carry, but live, ongoing, multi-client connectivity. A cross-process
+        // child gets its OWN writable-layer snapshot at fork time (see
+        // `spawn_cross_process_fork_child`'s `--resume-from`/`--export-writable-layer` handoff);
+        // that is exactly right for a plain fork+exec utility (`mkdir`, `cp`, `which`, and
+        // crucially `xfce4-session`'s own GUI children `xfdesktop`/`xfce4-panel`, none of which
+        // need anything from the rest of the guest beyond files already on disk by the time they
+        // start) and exactly wrong for a server the whole session keeps dialing back into.
+        // Measured live: with `LITEBOX_PROCESS_FORK=1` unconditionally, Xvfb's own fork was
+        // accepted as eligible and the child spawned, but `xset q` never came up (`XVFB_FAILED`)
+        // -- consistent with exactly this: a live X11 listener that no longer has any client
+        // able to reach it once cross-process migrated. Everything else in this boot -- the
+        // actual source of the thread-based relocating fork's glibc tcache/fastbin safe-linking
+        // corruption crashing `mkdir`/`cp`/`which`/`xfdesktop`/`xfce4-panel` (see
+        // `advisor/ADVISORY-001-fundamentals.md` section 3N) -- has no such requirement and
+        // belongs on the cross-process path, which is real-`fork()`-correct by construction.
+        const THREAD_BASED_FORK_ONLY: &[&[u8]] = &[b"Xvfb", b"dbus-daemon"];
+        let comm = self.comm.get();
+        if THREAD_BASED_FORK_ONLY
+            .iter()
+            .any(|name| comm.starts_with(name) && comm.get(name.len()).is_none_or(|b| *b == 0))
+        {
+            litebox_util_log::debug!(
+                tid:% = self.tid.get(),
+                comm:? = alloc::string::String::from_utf8_lossy(&comm);
+                "clone: cross-process fork() excluded by name -- this process's listening socket \
+                 needs live, ongoing connectivity a fork-time filesystem snapshot cannot provide"
+            );
+            return None;
+        }
+
         // None of this shim's seven fd subsystems is backed by an inheritable Windows HANDLE, so
         // a cross-process child cannot carry anything past the 0/1/2 stdio slots `CreateProcessW`
         // hands it automatically. `LITEBOX_PROCESS_FORK_IGNORE_FDS=1` overrides this for
         // measurement only, accepting that the child loses those fds.
-        litebox_util_log::debug!(tid:% = self.tid; "clone: try_cross_process_fork entry");
+        litebox_util_log::debug!(tid:% = self.tid.get(); "clone: try_cross_process_fork entry");
         // `try_borrow`, not `borrow`: a panic here would unwind, and unwinding in this process
         // has been observed to crash inside `ntdll!RtlpUnwindPrologue` WITHOUT the panic message
         // ever reaching stderr -- so a borrow conflict would present as an unexplained fault with
         // no diagnostic at all. Falling back to the thread-based fork is always safe.
         let Ok(files) = self.files.try_borrow() else {
             litebox_util_log::debug!(
-                tid:% = self.tid;
+                tid:% = self.tid.get();
                 "clone: cross-process fork() skipped -- fd table already borrowed"
             );
             return None;
@@ -2578,7 +2637,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // transfer rather than smuggling a non-`Sync` one across threads.
                     let platform = self.global.platform;
                     litebox_util_log::debug!(
-                        tid:% = self.tid,
+                        tid:% = self.tid.get(),
                         fd:% = fd,
                         half:? = half,
                         owners:% = end.strong_count();
@@ -2626,7 +2685,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 {
                     Some((fd, (path, flags, offset))) => {
                         litebox_util_log::debug!(
-                            tid:% = self.tid, fd:% = fd, path:% = path, offset:% = offset;
+                            tid:% = self.tid.get(), fd:% = fd, path:% = path, offset:% = offset;
                             "clone: carrying a regular file into the cross-process child"
                         );
                         inherited_files.push(litebox::platform::ForkInheritedFile {
@@ -2648,7 +2707,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             .carriable_eventfd_for_raw_fd(*raw_fd)
                             .expect("checked just above");
                         litebox_util_log::debug!(
-                            tid:% = self.tid, fd:% = fd, count:% = count, flags:% = flags;
+                            tid:% = self.tid.get(), fd:% = fd, count:% = count, flags:% = flags;
                             "clone: carrying an eventfd into the cross-process child"
                         );
                         inherited_eventfds.push(litebox::platform::ForkInheritedEventfd {
@@ -2682,7 +2741,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     None if self.raw_fd_is_cloexec(*raw_fd) => {
                         dropped_cloexec += 1;
                         litebox_util_log::debug!(
-                            tid:% = self.tid,
+                            tid:% = self.tid.get(),
                             fd:% = raw_fd,
                             subsystem:% = self.raw_fd_subsystem_name(*raw_fd);
                             "clone: dropping a close-on-exec fd rather than refusing the fork; the child would lose it at exec anyway"
@@ -2698,7 +2757,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             uncarriable_kinds.push(subsystem);
                         }
                         litebox_util_log::debug!(
-                            tid:% = self.tid,
+                            tid:% = self.tid.get(),
                             fd:% = raw_fd,
                             subsystem:% = subsystem;
                             "clone: cross-process fork() cannot carry this fd"
@@ -2714,7 +2773,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .env_flag("LITEBOX_PROCESS_FORK_IGNORE_FDS")
         {
             litebox_util_log::warn!(
-                tid:% = self.tid,
+                tid:% = self.tid.get(),
                 uncarriable:% = uncarriable,
                 uncarriable_cloexec:% = uncarriable_cloexec,
                 kinds:? = uncarriable_kinds,
@@ -2728,14 +2787,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         if uncarriable != 0 {
             litebox_util_log::warn!(
-                tid:% = self.tid,
+                tid:% = self.tid.get(),
                 uncarriable:% = uncarriable;
                 "clone: cross-process fork() forced by LITEBOX_PROCESS_FORK_IGNORE_FDS -- the                  child WILL LOSE the fds that could not be carried; measurement only"
             );
         }
 
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             dropped_cloexec:% = dropped_cloexec,
             carried_pipes:% = inherited_pipes.len(),
             carried_files:% = inherited_files.len(),
@@ -2853,7 +2912,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         let total_bytes: usize = groups.iter().map(core::ops::Range::len).sum();
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             regions:% = layout.len(),
             groups:% = groups.len(),
             total_bytes:% = total_bytes,
@@ -2905,9 +2964,171 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     #[cfg(not(target_arch = "x86_64"))]
     fn try_cross_process_fork(
         &self,
-        _ctx: &litebox_common_linux::PtRegs,
+        ctx: &litebox_common_linux::PtRegs,
+        child_tid: i32,
+        exit_signal: u64,
     ) -> Option<litebox::platform::CrossProcessChildHandle> {
+        // The Windows-shaped reconstruction path above (GPR injection, VMA relocation) is only
+        // wired up for x86_64 -- but native `fork()` needs none of that machinery at all (see
+        // `try_native_cross_process_fork`'s doc comment), so it is exactly as available here as
+        // it is on x86_64: a real `fork()` doesn't care what architecture the guest is.
+        if self.global.platform.has_native_fork() {
+            return self.try_native_cross_process_fork(ctx, child_tid, exit_signal);
+        }
         None
+    }
+
+    /// The native-`fork()` counterpart of the Windows-shaped `try_cross_process_fork` above --
+    /// taken instead of it whenever
+    /// [`litebox::platform::ForkChildVerificationProvider::has_native_fork`] is `true`. Shared by
+    /// both the x86_64 and non-x86_64 `try_cross_process_fork` variants, since a real `fork()` is
+    /// architecture-agnostic: the child continues executing THIS EXACT call stack, on THIS EXACT
+    /// thread, with every register already correct, regardless of the guest's own architecture.
+    ///
+    /// `ctx` is accepted for signature symmetry with the Windows-shaped path and is deliberately
+    /// unused: there is no register snapshot to inject. `child_tid` and `exit_signal` are the
+    /// SAME values `do_clone`'s thread-based path uses to build the child's `Process` (allocated,
+    /// respectively validated, earlier in `do_clone` -- threaded through rather than
+    /// recomputed, since `next_thread_id` must be incremented exactly once per `clone()` either
+    /// way).
+    fn try_native_cross_process_fork(
+        &self,
+        _ctx: &litebox_common_linux::PtRegs,
+        child_tid: i32,
+        exit_signal: u64,
+    ) -> Option<litebox::platform::CrossProcessChildHandle> {
+        litebox_util_log::debug!(tid:% = self.tid.get(); "clone: try_native_cross_process_fork entry");
+        // SAFETY: no `RefCell`/lock guard local to this function is held across the call. Every
+        // SHIM-WIDE lock that could otherwise be caught mid-hold by a sibling host thread at the
+        // instant `fork()` runs is quiesced by `with_shimwide_locks_held` itself -- see its own
+        // doc comment for what that covers and, explicitly, what it does not.
+        let result = self
+            .global
+            .with_shimwide_locks_held(|| unsafe { self.global.platform.native_fork() });
+        match result {
+            None => {
+                litebox_util_log::debug!(
+                    tid:% = self.tid.get();
+                    "clone: native fork() failed (EAGAIN/ENOMEM) -- falling back to the thread-based relocating fork"
+                );
+                None
+            }
+            Some(0) => {
+                // Returning in the CHILD's own copy of this exact call stack. `0` is a reserved
+                // sentinel (see `CrossProcessChildHandle`'s doc comment on `native_fork`) so
+                // `do_clone` can tell the two returns of this one `fork()` apart and report the
+                // guest-visible `fork()` return value real Linux gives a child: `0`, never this
+                // process's own pid.
+                //
+                // This exact `Task` -- at this exact address, on this exact (now single-threaded,
+                // genuinely separate) host process's one surviving thread -- IS the child from
+                // here on. Nothing about it (pid, `Process`, pending signals, `/proc/self`) is
+                // correct for that identity yet; `reinit_as_native_fork_child` makes it so, in
+                // place, before anything else runs on this thread again.
+                self.reinit_as_native_fork_child(child_tid, exit_signal);
+                litebox_util_log::debug!(
+                    tid:% = self.tid.get();
+                    "clone: native fork() succeeded -- this thread is now the child, resuming in place"
+                );
+                Some(litebox::platform::CrossProcessChildHandle(0))
+            }
+            Some(child_pid) => {
+                litebox_util_log::debug!(
+                    tid:% = self.tid.get(), child_pid:% = child_pid;
+                    "clone: native fork() succeeded -- spawned real child pid"
+                );
+                // A real pid from a real `fork()` is always > 0 here (the `Some(0)` arm above
+                // already took the only case that isn't), so this always fits.
+                Some(litebox::platform::CrossProcessChildHandle(
+                    usize::try_from(child_pid)
+                        .expect("a real fork() child pid is always positive"),
+                ))
+            }
+        }
+    }
+
+    /// Re-identifies THIS EXACT `Task` -- in place, at its fixed address, continuing the one
+    /// host thread a real `fork()` just duplicated -- as the child a guest `fork()` syscall
+    /// promised: its own `pid`/`tid` (`new_pid`, real Linux's `pid == tid` for a freshly forked
+    /// single-threaded process), its own fresh `Process` (empty children, parent pointing at
+    /// the process that forked it, its own adopted [`litebox::mm::PageManager`]), and its own
+    /// cleared pending-signal state -- everything [`syscalls::process::ThreadState::new_process`]
+    /// already builds correctly for the thread-based fork path's BRAND NEW `Task`, reused here
+    /// verbatim rather than re-derived, just installed into the SAME `Task` instead of a new one.
+    ///
+    /// Deliberately does NOT touch `credentials`, `comm`, `dumpable`, `fs`, `files`, or
+    /// `wait_state`: a real `fork()` already gives this process's own copy of that memory
+    /// correct, independently-mutable content for every one of them (real Linux `fork()`
+    /// inherits credentials and `PR_SET_DUMPABLE` unchanged, and gives an independent COPY of
+    /// the fd table/cwd that diverges from the parent's from this point on -- exactly what the
+    /// kernel's copy-on-write already produced in this process's own memory, with nothing further
+    /// for this function to do), and `wait_state` describes this HOST THREAD's own park/wake
+    /// primitives, untouched by which guest process it now belongs to.
+    fn reinit_as_native_fork_child(&self, new_pid: i32, exit_signal: u64) {
+        let old_pid = self.pid.get();
+        let old_process = self.process();
+
+        // The old (pre-`fork()`, now COW-identical in this process's own memory) `PageManager`'s
+        // bookkeeping describes memory this process ALREADY has, at these exact addresses --
+        // nothing to copy, only bookkeeping to build. See `PageManager::new_adopting_existing_
+        // memory`'s doc comment (the same primitive the Windows cross-process path's diagnostic
+        // probe chain proved, pass 137) for why this is a correct, allocation-free adoption
+        // rather than a `Vmem::duplicate`-style eager copy.
+        //
+        // Measured against the obvious public prior art for "reconstruct a process's VMA
+        // layout from an existing one" -- CRIU. CRIU's restore path parses `/proc/$pid/smaps`
+        // and re-`mmap`s every VMA from scratch via injected PIE restorer code, because ITS
+        // memory genuinely isn't there yet (a checkpoint dumped to image files, possibly
+        // restored later, on a different machine). That machinery solves a strictly HARDER
+        // problem than this one: here, the kernel's own `fork()` COW has already put every byte
+        // of this memory in this exact process, at these exact addresses, before this line ever
+        // runs. Reaching for CRIU-style re-`mmap`-everything here would be the wrong tool for
+        // this job, not a more complete one -- it would redundantly recreate mappings the kernel
+        // already gave this process for free, and could not even run from the forked child's
+        // own PERSPECTIVE (parasite/PIE injection is an OUTSIDE-looking-in tool, not something
+        // the process being reconstructed does to itself). `new_adopting_existing_memory` is
+        // sized to what this case actually needs.
+        let old_pm = old_process.pm();
+        let regions = old_pm.tracked_regions();
+        let (_, brk) = old_pm.tracked_region_summary();
+        let (new_pm, _adopted, _shared) = litebox::mm::PageManager::new_adopting_existing_memory(
+            &self.global.litebox,
+            regions.into_iter(),
+            brk,
+        );
+
+        let shared_pending = Arc::new(Mutex::new(super::signal::PendingSignals::new()));
+        let new_signals = self
+            .signals
+            .borrow()
+            .clone_for_new_task(Some(shared_pending.clone()));
+        let new_thread = ThreadState::new_process(
+            new_pid,
+            Arc::new(new_pm),
+            false,
+            Some(Arc::downgrade(&old_process)),
+            shared_pending,
+            // Same encoding `do_clone`'s thread-based path uses: `0` is real Linux's own "no
+            // signal on exit", already validated (`exit_signal <= MAX_SIGNAL_NUMBER`) by the
+            // time `do_clone` reaches either path.
+            (exit_signal != 0).then_some(i32::try_from(exit_signal).unwrap_or(0)),
+        );
+        self.thread.replace(new_thread);
+        self.signals.replace(new_signals);
+
+        // Give this child its own `/proc/self` entry, copied from the parent's, exactly as
+        // `do_clone`'s thread-based path does for ITS new `Task` -- BEFORE overwriting `pid`
+        // below, since `inherit` is keyed by the OLD pid.
+        self.global.proc_self_info.write().inherit(old_pid, new_pid);
+
+        self.ppid.set(old_pid);
+        self.pid.set(new_pid);
+        self.tid.set(new_pid);
+        // A forked child starts attached to no pty of its own -- see this field's own doc
+        // comment ("`None` for every ordinary (non-`--pty-mode`) process"); the PARENT's
+        // session-daemon attachment, if any, is host-side bookkeeping about THAT process, not
+        // something a freshly forked child inherits.
+        self.attached_pty_id.set(None);
     }
 
     fn do_clone(
@@ -3077,7 +3298,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 || addr >= Platform::TASK_ADDR_MAX
             {
                 litebox_util_log::warn!(
-                    tid:% = self.tid, addr:% = addr;
+                    tid:% = self.tid.get(), addr:% = addr;
                     "clone(SETTLS): rejected out-of-range TLS base"
                 );
                 return Err(Errno::EPERM);
@@ -3185,11 +3406,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // Linux semantics and already litebox's own answer to the fixed-address collision the
             // cross-process path exists to solve. It has nothing to hand a separate address space.
             if !vforked
-                && let Some(handle) = self.try_cross_process_fork(ctx)
+                && let Some(handle) = self.try_cross_process_fork(ctx, child_tid, exit_signal)
             {
+                // `handle.0 == 0` is the reserved sentinel `try_native_cross_process_fork`
+                // documents: this very call is returning in the CHILD's own copy of this exact
+                // stack (a real `fork()`'s dual return), already fully re-identified by
+                // `reinit_as_native_fork_child`. The guest's `fork()` return value must be `0`,
+                // never `child_tid` -- and there is nothing to register, since this call is not
+                // the parent and has no child to wait for.
+                if handle.0 == 0 {
+                    litebox_util_log::debug!(
+                        tid:% = self.tid.get();
+                        "clone: native fork() child resuming -- reporting guest fork() return value 0"
+                    );
+                    return Ok(0);
+                }
                 self.process().register_cross_process_child(child_tid, handle);
                 litebox_util_log::debug!(
-                    parent_tid:% = self.tid, child_tid:% = child_tid;
+                    parent_tid:% = self.tid.get(), child_tid:% = child_tid;
                     "clone: spawned cross-process fork() child (no in-process duplicate made)"
                 );
                 return Ok(usize::try_from(child_tid).unwrap());
@@ -3215,7 +3449,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // returned" debug log in `mm.rs`) landed BEFORE this point (the sweep should have
                 // seen it) or AFTER it (the sweep genuinely could not have seen it).
                 litebox_util_log::debug!(
-                    tid:% = self.tid;
+                    tid:% = self.tid.get();
                     "do_clone: about to duplicate address space for fork()"
                 );
                 // NOTE (concurrent-fork SIGSEGV/SIGILL investigation): wrapping this call in
@@ -3326,7 +3560,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 child_tid,
                 dest_pm,
                 vforked,
-                Some(Arc::downgrade(self.process())),
+                Some(Arc::downgrade(&self.process())),
                 child_shared_pending.clone(),
                 // `0` is real Linux's own encoding for "no signal on exit" -- only a genuine
                 // nonzero signal number (validated above, `exit_signal <= MAX_SIGNAL_NUMBER`, which
@@ -3806,7 +4040,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 || cross_process_fs_base >= Platform::TASK_ADDR_MAX
             {
                 litebox_util_log::warn!(
-                    tid:% = self.tid, fs_base:% = cross_process_fs_base;
+                    tid:% = self.tid.get(), fs_base:% = cross_process_fs_base;
                     "do_clone: cross-process fork rejected out-of-range live FS base, \
                      falling back to thread-based fork"
                 );
@@ -3893,7 +4127,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // that `LITEBOX_PROCESS_FORK=1` "reproduced the crash IDENTICALLY", from a run
                 // that never entered the cross-process path at all.
                 litebox_util_log::debug!(
-                    tid:% = self.tid,
+                    tid:% = self.tid.get(),
                     beyond_stdio:% = fd_complexity.beyond_stdio,
                     total_alive:% = fd_complexity.total_alive;
                     "clone: superseded post-duplication cross-process site declining; the real \
@@ -3901,7 +4135,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
             } else if fd_complexity.beyond_stdio != 0 {
                 litebox_util_log::warn!(
-                    tid:% = self.tid,
+                    tid:% = self.tid.get(),
                     beyond_stdio:% = fd_complexity.beyond_stdio,
                     total_alive:% = fd_complexity.total_alive;
                     "clone: cross-process fork() forced by LITEBOX_PROCESS_FORK_IGNORE_FDS -- the \
@@ -3924,7 +4158,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let vfork_child = flags.contains(CloneFlags::VFORK);
             if vfork_child {
                 litebox_util_log::debug!(
-                    tid:% = self.tid;
+                    tid:% = self.tid.get();
                     "clone: cross-process fork() skipped for a vfork child (shares the parent's \
                      address space by design; nothing was duplicated to transfer)"
                 );
@@ -3950,7 +4184,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 self.process()
                     .register_cross_process_child(child_tid, handle);
                 litebox_util_log::debug!(
-                    parent_tid:% = self.tid,
+                    parent_tid:% = self.tid.get(),
                     child_tid:% = child_tid;
                     "clone: spawned cross-process fork() child"
                 );
@@ -4029,11 +4263,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     set_child_tid,
                 ),
                 child_tid,
-                self.pid,
+                self.pid.get(),
                 Some(child_shared_pending),
             )
         } else {
-            let thread = self.thread.new_thread(child_tid).ok_or(Errno::EBUSY)?;
+            let thread = self.thread.borrow().new_thread(child_tid).ok_or(Errno::EBUSY)?;
             (
                 thread,
                 ThreadInitState::NewThread {
@@ -4041,8 +4275,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     tls,
                     set_child_tid,
                 },
-                self.pid,
-                self.ppid,
+                self.pid.get(),
+                self.ppid.get(),
                 None,
             )
         };
@@ -4053,7 +4287,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // clone that appears here with no corresponding start means the failure is in spawn.
         litebox_util_log::debug!(
             child_tid:% = child_tid,
-            parent_pid:% = self.pid;
+            parent_pid:% = self.pid.get();
             "clone: request registered"
         );
         thread.init_state.set(init_state);
@@ -4069,13 +4303,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // host-memory ownership per real OS thread (see `ThreadProvider::
         // set_next_spawned_thread_guest_pid`'s doc comment) can correctly recognize a same-
         // process thread clone's new OS thread as belonging to the SAME guest process as this
-        // one (an ordinary pthread, `pid == self.pid`), and a `fork()`'s new OS thread as its
+        // one (an ordinary pthread, `pid == self.pid.get()`), and a `fork()`'s new OS thread as its
         // own, distinct guest process (`pid` freshly allocated above) from the moment it starts
         // running -- never a false "still the parent's own memory" merge in either direction.
         self.global.platform.set_next_spawned_thread_guest_pid(pid);
 
         // Give a forked child its own `/proc/self` entry, copied from this process's. A thread
-        // clone needs nothing: it shares `self.pid` and therefore already resolves to the same
+        // clone needs nothing: it shares `self.pid.get()` and therefore already resolves to the same
         // entry. See `litebox::fs::procfs::ProcSelfTable::inherit` for why a child that has not
         // `execve`d yet must report its parent's `exe`/`cmdline` rather than fall back to whichever
         // unrelated process happened to write the table last.
@@ -4083,7 +4317,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.global
                 .proc_self_info
                 .write()
-                .inherit(self.pid, pid);
+                .inherit(self.pid.get(), pid);
         }
 
         let r = unsafe {
@@ -4093,25 +4327,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     task: Task {
                         global: self.global.clone(),
                         wait_state: crate::wait::WaitState::new(self.global.platform),
-                        thread,
-                        pid,
-                        tid: child_tid,
-                        ppid,
+                        thread: RefCell::new(thread),
+                        pid: Cell::new(pid),
+                        tid: Cell::new(child_tid),
+                        ppid: Cell::new(ppid),
                         credentials: self.credentials.clone(),
                         comm: self.comm.clone(),
                         // A child inherits `PR_SET_DUMPABLE`, as on real Linux.
                         dumpable: self.dumpable.clone(),
                         fs: fs.into(),
                         files: make_files().into(),
-                        signals: {
-                            let signals = self.signals.clone_for_new_task(child_shared_pending);
+                        signals: RefCell::new({
+                            let signals = self.signals.borrow().clone_for_new_task(child_shared_pending);
                             // `CLONE_CLEAR_SIGHAND`: the child starts with default dispositions.
                             // Applied to the CHILD's freshly-cloned state, never the caller's.
                             if flags.contains(CloneFlags::CLEAR_SIGHAND) {
                                 signals.reset_handlers_to_default();
                             }
                             signals
-                        },
+                        }),
                         attached_pty_id: core::cell::Cell::new(self.attached_pty_id.get()),
                     },
                 }),
@@ -4125,7 +4359,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::ENOMEM);
         }
         litebox_util_log::debug!(
-            parent_tid:% = self.tid,
+            parent_tid:% = self.tid.get(),
             child_tid:% = child_tid,
             flags:? = flags,
             is_process_clone:% = is_process_clone;
@@ -4168,7 +4402,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // reason as its siblings: always visible regardless of the configured log filter.
         if is_process_clone {
             litebox_util_log::debug!(
-                pid:% = self.pid,
+                pid:% = self.pid.get(),
                 comm:? = self.comm.get(),
                 child_tid:% = child_tid;
                 "DIAG_TIMELINE clone"
@@ -4188,13 +4422,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Handle syscall `set_tid_address`.
     pub(crate) fn sys_set_tid_address(&self, tidptr: UserPtrMut<i32>) -> i32 {
-        self.thread.clear_child_tid.set(Some(tidptr));
-        self.tid
+        self.thread.borrow().clear_child_tid.set(Some(tidptr));
+        self.tid.get()
     }
 
     /// Handle syscall `gettid`.
     pub(crate) fn sys_gettid(&self) -> i32 {
-        self.tid
+        self.tid.get()
     }
 }
 
@@ -4319,7 +4553,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         resource: litebox_common_linux::RlimitResource,
         new_limit: Option<litebox_common_linux::Rlimit>,
     ) -> Result<litebox_common_linux::Rlimit, Errno> {
-        let old_rlimit = self.thread.process.limits.get_rlimit(resource);
+        let old_rlimit = self.thread.borrow().process.limits.get_rlimit(resource);
         if let Some(new_limit) = new_limit {
             if new_limit.rlim_cur > new_limit.rlim_max {
                 return Err(Errno::EINVAL);
@@ -4342,7 +4576,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // without making ordinary `ulimit -c 0`/`ulimit -s ...` calls
             // panic the whole runner.
             let new_max_fd = new_limit.rlim_cur.saturating_sub(1);
-            self.thread.process.limits.set_rlimit(resource, new_limit);
+            self.thread.borrow().process.limits.set_rlimit(resource, new_limit);
             if let litebox_common_linux::RlimitResource::NOFILE = resource {
                 self.files.borrow().set_max_fd(new_max_fd);
             }
@@ -4358,12 +4592,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         new_rlim: Option<UserPtr<litebox_common_linux::Rlimit64>>,
         old_rlim: Option<UserPtrMut<litebox_common_linux::Rlimit64>>,
     ) -> Result<(), Errno> {
-        // `pid == 0` means "the calling process" per prlimit(2); `pid == self.pid` is exactly
+        // `pid == 0` means "the calling process" per prlimit(2); `pid == self.pid.get()` is exactly
         // equivalent (e.g. the util-linux `prlimit` CLI, unlike getrlimit()/setrlimit() callers,
         // defaults to passing its own real pid rather than 0). Both target self, which this shim
         // can always answer. A genuine *other* pid can't be reached: there's no shim-wide
         // process registry to look one up (see the same limitation `kill()`/`tkill()` document).
-        if pid != 0 && pid != self.pid {
+        if pid != 0 && pid != self.pid.get() {
             log_unsupported!("prlimit64 for a remote pid");
             return Err(Errno::ESRCH);
         }
@@ -4409,7 +4643,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `set_robust_list`.
     pub(crate) fn sys_set_robust_list(&self, head: usize) {
         let head = UserPtr::from_usize(head);
-        self.thread.robust_list.set(Some(head));
+        self.thread.borrow().robust_list.set(Some(head));
     }
 
     /// Handle syscall `get_robust_list`.
@@ -4423,6 +4657,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         let head = self
             .thread
+            .borrow()
             .robust_list
             .get()
             .map_or(0, |ptr| ptr.as_usize());
@@ -4677,7 +4912,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         delay: Duration,
         interval: Option<Duration>,
     ) -> Result<(Duration, Option<Duration>), Errno> {
-        let mut alarm = self.process().alarm_timer.lock();
+        let process = self.process();
+        let mut alarm = process.alarm_timer.lock();
         let now = self.global.platform.now();
         let prev = (alarm.remaining(now), alarm.interval);
         let new_deadline = if delay.is_zero() {
@@ -4753,7 +4989,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<(), Errno> {
         let (value, interval) = match which {
             IntervalTimer::Real => {
-                let alarm = self.process().alarm_timer.lock();
+                let process = self.process();
+                let alarm = process.alarm_timer.lock();
                 let now = self.global.platform.now();
                 (alarm.remaining(now), alarm.interval.unwrap_or(Duration::ZERO))
             }
@@ -4777,11 +5014,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Handle syscall `getpid`.
     pub(crate) fn sys_getpid(&self) -> i32 {
-        self.pid
+        self.pid.get()
     }
 
     pub(crate) fn sys_getppid(&self) -> i32 {
-        self.ppid
+        self.ppid.get()
     }
 
     /// Handle syscall `getpgid`.
@@ -4791,7 +5028,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// via `children`, the same reachability `do_kill`'s remote-child case relies on) --
     /// matching real Linux's `ESRCH` for any other pid, since there is nowhere to look one up.
     pub(crate) fn sys_getpgid(&self, pid: i32) -> Result<i32, Errno> {
-        if pid == 0 || pid == self.pid {
+        if pid == 0 || pid == self.pid.get() {
             Ok(self.process().pgid.load(Ordering::Relaxed))
         } else if pid > 0 {
             self.process()
@@ -4816,8 +5053,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if requested_group < 0 {
             return Err(Errno::EINVAL);
         }
-        let (target_process, target_own_pid) = if pid == 0 || pid == self.pid {
-            (self.process().clone(), self.pid)
+        let (target_process, target_own_pid) = if pid == 0 || pid == self.pid.get() {
+            (self.process().clone(), self.pid.get())
         } else if pid > 0 {
             let child = self.process().find_child(pid).ok_or(Errno::ESRCH)?;
             (child, pid)
@@ -4853,8 +5090,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         reason = "keeps the real syscall's fallible signature (matching sys_setpgid/sys_getpgid) rather than baking in that this build never rejects it, since that's a simplification of the real ABI, not a guarantee"
     )]
     pub(crate) fn sys_setsid(&self) -> Result<i32, Errno> {
-        self.process().pgid.store(self.pid, Ordering::Relaxed);
-        Ok(self.pid)
+        self.process().pgid.store(self.pid.get(), Ordering::Relaxed);
+        Ok(self.pid.get())
     }
 
     /// Handle syscall `getuid`.
@@ -4925,7 +5162,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// (not the real uid/gid) of the connecting/listening process, plus its pid.
     pub(crate) fn peer_cred(&self) -> litebox_common_linux::Ucred {
         litebox_common_linux::Ucred {
-            pid: self.pid as u32,
+            pid: self.pid.get() as u32,
             uid: self.credentials.euid,
             gid: self.credentials.egid,
         }
@@ -5110,21 +5347,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// last recorded via `sched_setparam`/`sched_setscheduler` for this thread (`0` under the
     /// default `SCHED_OTHER` policy, matching real Linux).
     pub(crate) fn sys_sched_getparam(&self, _pid: Option<i32>) -> i32 {
-        self.thread.sched_policy_priority.get().1
+        self.thread.borrow().sched_policy_priority.get().1
     }
 
     /// Handle syscall `sched_setparam`. Accept-and-remember: records `sched_priority` without
     /// implementing real scheduling semantics.
     pub(crate) fn sys_sched_setparam(&self, _pid: Option<i32>, sched_priority: i32) {
-        let (policy, _) = self.thread.sched_policy_priority.get();
-        self.thread
+        let (policy, _) = self.thread.borrow().sched_policy_priority.get();
+        self.thread.borrow()
             .sched_policy_priority
             .set((policy, sched_priority));
     }
 
     /// Handle syscall `sched_getscheduler`. See [`Self::sys_sched_getparam`].
     pub(crate) fn sys_sched_getscheduler(&self, _pid: Option<i32>) -> i32 {
-        self.thread.sched_policy_priority.get().0
+        self.thread.borrow().sched_policy_priority.get().0
     }
 
     /// Handle syscall `sched_setscheduler`. Accept-and-remember: records the policy and priority
@@ -5135,7 +5372,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         policy: i32,
         sched_priority: i32,
     ) {
-        self.thread
+        self.thread.borrow()
             .sched_policy_priority
             .set((policy, sched_priority));
     }
@@ -5182,7 +5419,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     None,
                 )? as usize;
                 litebox_util_log::debug!(
-                    tid:% = self.tid,
+                    tid:% = self.tid.get(),
                     host_tid:% = self.global.platform.host_debug_tid(),
                     addr:% = addr.as_usize(),
                     current_value:? = current_value,
@@ -5206,7 +5443,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // "what any wake anywhere ever saw", without needing a live memory-poll thread.
                 let current_value = addr.read_at_offset::<Platform>(0);
                 litebox_util_log::debug!(
-                    tid:% = self.tid,
+                    tid:% = self.tid.get(),
                     addr:% = addr.as_usize(),
                     val:% = val,
                     current_value:? = current_value,
@@ -5222,7 +5459,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // exited is a lost handoff.
                 if val & 0x8000_0000 != 0 {
                     litebox_util_log::debug!(
-                        tid:% = self.tid,
+                        tid:% = self.tid.get(),
                         addr:% = addr.as_usize(),
                         owner_tid:% = val & 0x3fff_ffff,
                         raw_val:% = val;
@@ -5236,7 +5473,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     None,
                 );
                 litebox_util_log::debug!(
-                    tid:% = self.tid,
+                    tid:% = self.tid.get(),
                     addr:% = addr.as_usize(),
                     res:? = res;
                     "futex: WAIT return"
@@ -5287,7 +5524,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     None,
                 )? as usize;
                 litebox_util_log::trace!(
-                    tid:% = self.tid,
+                    tid:% = self.tid.get(),
                     addr:% = addr.as_usize(),
                     addr2:% = addr2.as_usize(),
                     wake_count:% = wake_count,
@@ -5314,7 +5551,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     Some(expected_value),
                 )? as usize;
                 litebox_util_log::trace!(
-                    tid:% = self.tid,
+                    tid:% = self.tid.get(),
                     addr:% = addr.as_usize(),
                     addr2:% = addr2.as_usize(),
                     wake_count:% = wake_count,
@@ -5361,7 +5598,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 } else {
                     None
                 };
-                let me = self.tid as u32 & FUTEX_TID_MASK;
+                let me = self.tid.get() as u32 & FUTEX_TID_MASK;
                 loop {
                     let current = addr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
                     if current & FUTEX_TID_MASK == 0 {
@@ -5405,7 +5642,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             FutexArgs::TrylockPi { addr, flags } => {
                 warn_shared_futex!(flags);
-                let me = self.tid as u32 & FUTEX_TID_MASK;
+                let me = self.tid.get() as u32 & FUTEX_TID_MASK;
                 let current = addr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
                 if current & FUTEX_TID_MASK != 0 {
                     // Held. Linux reports a failed acquisition here as `EAGAIN`.
@@ -5424,7 +5661,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             FutexArgs::UnlockPi { addr, flags } => {
                 warn_shared_futex!(flags);
-                let me = self.tid as u32 & FUTEX_TID_MASK;
+                let me = self.tid.get() as u32 & FUTEX_TID_MASK;
                 let current = addr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
                 if current & FUTEX_TID_MASK != me {
                     // Releasing a lock this thread does not hold is the caller's bug, and Linux
@@ -5658,7 +5895,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let path = path_cstr.to_str().map_err(|_| Errno::ENOENT)?;
 
         litebox_util_log::debug!(
-            tid:% = self.tid, host_tid:% = self.global.platform.host_debug_tid(), path:% = path;
+            tid:% = self.tid.get(), host_tid:% = self.global.platform.host_debug_tid(), path:% = path;
             "sys_execve: entry"
         );
 
@@ -5668,12 +5905,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // below) rather than after `load_program` succeeds, so a process that dies mid-exec still
         // leaves a timeline entry showing what it was trying to become.
         litebox_util_log::debug!(
-            pid:% = self.pid, ppid:% = self.ppid, comm:? = self.comm.get(), argv0:% = path;
+            pid:% = self.pid.get(), ppid:% = self.ppid.get(), comm:? = self.comm.get(), argv0:% = path;
             "DIAG_TIMELINE execve"
         );
         crate::diag::record_process(
-            self.pid,
-            self.ppid,
+            self.pid.get(),
+            self.ppid.get(),
             &alloc::string::String::from_utf8_lossy(path.as_bytes()),
         );
 
@@ -5717,12 +5954,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.close_on_exec();
 
         // unmmap all memory mappings and reset brk
-        if let Some(robust_list) = self.thread.robust_list.take() {
+        if let Some(robust_list) = self.thread.borrow().robust_list.take() {
             let _ = self.wake_robust_list(robust_list);
         }
-        self.thread.clear_child_tid.set(None);
+        self.thread.borrow().clear_child_tid.set(None);
 
-        self.signals.reset_for_exec();
+        self.signals.borrow().reset_for_exec();
 
         // Don't release reserved/foreign-host-placeholder mappings (bare `VmFlags::empty()`,
         // from `Vmem::new_excluding`) -- but DO release this process's own leaked fork-group
@@ -5741,7 +5978,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // guest process with `SIGSEGV` via `exit_group` instead of panicking the whole host
             // runner thread over what is fundamentally a guest-side resource/bookkeeping failure.
             litebox_util_log::warn!(
-                tid:% = self.tid, error:? = e;
+                tid:% = self.tid.get(), error:? = e;
                 "sys_execve: failed to release old memory mappings after point of no return, killing process with SIGSEGV"
             );
             self.exit_group(ExitStatus::Signal(
@@ -5762,7 +5999,55 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .set_arch_specific_register(&ArchSpecificRegister::TpidrEl0, 0)
             .expect("failed to clear guest TLS on execve");
 
+        // Cloned BEFORE the call (cheap -- small `Vec<CString>`s), solely for the collision
+        // hand-off below: `load_program` takes both by value, and they are needed again, intact,
+        // only on the rare failure path that follows.
+        let argv_for_collision_retry = argv_vec.clone();
+        let envp_for_collision_retry = envp_vec.clone();
+
         if let Err(e) = self.load_program(loader, argv_vec, envp_vec) {
+            // `EEXIST` at this specific point is, in practice, exactly one thing: a fixed-address
+            // (`ET_EXEC`) ELF whose linked load address collides with a still-live guest
+            // process's own memory, unsolvable within this one shared host address space (see
+            // `ForkChildVerificationProvider::spawn_exec_collision_child`'s doc comment for the
+            // full reasoning). Real Linux's own `execve()` guarantees a fresh address space every
+            // time; give the platform one chance to actually honour that guarantee -- on a real
+            // `fork()` host this situation cannot occur at all, and the default (`None`) makes
+            // this branch a no-op there.
+            if matches!(
+                e,
+                crate::loader::elf::ElfLoaderError::LoadError(
+                    litebox_common_linux::loader::ElfLoadError::Map(Errno::EEXIST)
+                )
+            ) && let Some(result) = self.global.platform.spawn_exec_collision_child(
+                    &path,
+                    &argv_for_collision_retry,
+                    &envp_for_collision_retry,
+                )
+            {
+                litebox_util_log::warn!(
+                    tid:% = self.tid.get(), path:% = path, raw_status:% = result.raw_status;
+                    "sys_execve: load_program hit a fixed-address collision, but a fresh process \
+                     loaded the image instead -- adopting its exit status"
+                );
+                // The other half of writable-layer continuity -- see `ExecCollisionChildResult`'s
+                // own doc comment. This IS the continuing guest process (unlike a cross-process
+                // FORK child, there is no separate identity to `wait4` later), so the import
+                // happens right here, before `exit_group`, exactly where a real `execve()`'s own
+                // filesystem effects would already be visible.
+                if let Some(tar_bytes) = &result.exported_writable_layer {
+                    let fs = self.files.borrow().fs.clone();
+                    if let Err(e) = litebox::fs::import::import_all(&*fs, tar_bytes) {
+                        litebox_util_log::warn!(
+                            tid:% = self.tid.get(), error:? = e;
+                            "sys_execve: failed to import the collision child's exported writable layer"
+                        );
+                    }
+                }
+                self.exit_group(ExitStatus::Exit(result.raw_status.clamp(0, 255) as u8 as i8));
+                self.process().signal_vfork_done();
+                return Ok(0);
+            }
             // The old program image is already torn down (memory released, other threads killed,
             // TLS cleared above) -- there is no program left to return an errno to, matching real
             // Linux's own `execve`: once the kernel has committed to replacing the address space,
@@ -5773,7 +6058,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // than panicking the host runner thread (the prior `.expect()` here) -- a guest-side
             // resource failure must stay a guest-side event, never take down the whole runner.
             litebox_util_log::warn!(
-                tid:% = self.tid, path:% = path, error:? = e;
+                tid:% = self.tid.get(), path:% = path, error:? = e;
                 "sys_execve: load_program failed after point of no return, killing process with SIGSEGV"
             );
             self.exit_group(ExitStatus::Signal(
@@ -5840,12 +6125,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // `litebox::fs::procfs::ProcSelfTable`'s doc comment: the cell meant every other
             // live process read this one's `exe`/`cmdline`/`auxv`/`maps` as its own.
             self.global.proc_self_info.write().set(
-                self.pid,
+                self.pid.get(),
                 litebox::fs::procfs::ProcSelfInfo {
                     exe_path: alloc::string::String::from(loader.path()),
                     cmdline,
                     environ,
-                    pid: self.pid,
+                    pid: self.pid.get(),
                     comm,
                     // Both filled in below: the complete auxiliary vector does not exist until
                     // `load` has placed the image and written the stack, and the maps renderer is
@@ -5865,7 +6150,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.global
                 .proc_self_info
                 .write()
-                .with_mut(self.pid, |info| {
+                .with_mut(self.pid.get(), |info| {
                     info.maps = Some(alloc::sync::Arc::new(move || render_proc_maps(&pm)));
                 });
         }
@@ -5878,11 +6163,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.global
             .proc_self_info
             .write()
-            .with_mut(self.pid, |info| info.auxv = load_info.auxv.clone());
+            .with_mut(self.pid.get(), |info| info.auxv = load_info.auxv.clone());
 
         self.set_task_comm(loader.comm());
 
-        self.thread
+        self.thread.borrow()
             .init_state
             .set(ThreadInitState::NewProcess(load_info));
         Ok(())
@@ -5891,7 +6176,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn handle_init_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
         self.init_thread_context(ctx);
         // Attach the thread handle so that the thread can be interrupted.
-        self.thread
+        self.thread.borrow()
             .remote
             .handle
             .set(Box::new(self.wait_state.thread_handle()))
@@ -5901,7 +6186,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Initialize the thread context for a new process or thread, and perform any
     /// other initial setup required.
     fn init_thread_context(&self, ctx: &mut litebox_common_linux::PtRegs) {
-        match self.thread.init_state.take() {
+        match self.thread.borrow().init_state.take() {
             ThreadInitState::None => {}
             ThreadInitState::NewProcess(load_info) => {
                 #[cfg(target_arch = "x86_64")]
@@ -5989,7 +6274,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
                 if let Some(child_tid_ptr) = set_child_tid {
                     // Set the child TID if requested.
-                    let _ = child_tid_ptr.write_at_offset::<Platform>(0, self.tid);
+                    let _ = child_tid_ptr.write_at_offset::<Platform>(0, self.tid.get());
                 }
 
                 // Diagnostic logging (pthread_create/clone stall investigation, sub-session 36),
@@ -6015,7 +6300,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             .is_some()
                     });
                     litebox_util_log::debug!(
-                        tid:% = self.tid,
+                        tid:% = self.tid.get(),
                         host_tid:% = self.global.platform.host_debug_tid(),
                         rip:% = alloc::format!("{:#x}", ctx.rip),
                         rsp:% = alloc::format!("{:#x}", ctx.rsp),
@@ -6061,10 +6346,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     match child_ctid {
                         Some(addr) => {
                             let slot = UserPtrMut::<i32>::from_usize(addr);
-                            let _ = slot.write_at_offset::<Platform>(0, self.tid);
+                            let _ = slot.write_at_offset::<Platform>(0, self.tid.get());
                         }
                         None => litebox_util_log::debug!(
-                            ctid:% = ctid.as_usize(), child_tid:% = self.tid;
+                            ctid:% = ctid.as_usize(), child_tid:% = self.tid.get();
                             "fork: CLONE_CHILD_SETTID slot did not relocate, child keeps the parent's cached thread id"
                         ),
                     }

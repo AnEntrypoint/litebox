@@ -1834,6 +1834,8 @@ pub const TIOCGPGRP: u32 = 0x540F;
 pub const TIOCSPGRP: u32 = 0x5410;
 pub const TIOCGPTN: u32 = 0x8004_5430;
 pub const TIOCSPTLCK: u32 = 0x4004_5431;
+pub const TIOCGPTPEER: u32 = 0x5441;
+pub const TIOCPKT: u32 = 0x5420;
 
 /// Commands for use with `ioctl`.
 #[non_exhaustive]
@@ -1870,6 +1872,33 @@ pub enum IoctlArg {
     /// always calls this right after `setsid()`; without it, every one of those fails to open a
     /// session on this pty.
     TIOCSCTTY(i32),
+    /// Atomically open the pty peer of a `/dev/ptmx` master (`ioctl(master_fd, TIOCGPTPEER,
+    /// flags)`), returning a fresh fd on the slave rather than writing through a pointer. The
+    /// third argument is the `open()` flags for that new fd (a plain scalar, like `TIOCSCTTY`
+    /// above), not a pointer.
+    ///
+    /// This is not a rare corner case: since Linux 4.13 (and unconditionally in glibc's
+    /// `openpty()` for a long time now), this ioctl is the FIRST and ONLY thing glibc issues to
+    /// get the slave -- it does not fall back to `ptsname()`+`open("/dev/pts/<n>")` if this
+    /// fails. A shim that only implements the older `TIOCGPTN`/`ptsname`-style path silently
+    /// breaks every real `openpty()`/`forkpty()` caller (Python's `os.openpty()`, `libvte`
+    /// underneath every GTK terminal, `tmux`, `script`) while `TIOCGPTN` itself looks perfectly
+    /// fine in isolation -- which is exactly what made `xfce4-terminal`'s "error creating pty"
+    /// survive the `/dev/ptmx`/`/dev/pts` stat fix untouched: that fix made the OLDER path work,
+    /// but real glibc was never taking it.
+    TIOCGPTPEER(i32),
+    /// Enable/disable packet mode on a pty master (`ioctl(master_fd, TIOCPKT, &nonzero_or_zero)`).
+    /// `libvte` (every GTK terminal, including `xfce4-terminal`) issues this immediately after
+    /// opening `/dev/ptmx`, before `TIOCGPTN`/`TIOCGPTPEER` -- to explicitly reset packet mode to
+    /// a known state, not because it uses packet mode's read-side control-byte prefixing (no
+    /// consumer in this codebase's actual terminal-emulation path does). Left unimplemented, this
+    /// ioctl fell into the generic "unsupported" bucket, and `libvte` treats that failure as
+    /// fatal and aborts the ENTIRE pty setup right there -- before ever reaching `TIOCGPTN` or
+    /// `TIOCGPTPEER` -- surfacing as `xfce4-terminal`'s "Failed to open PTY: Invalid argument"
+    /// with nothing to suggest a missing ioctl is the cause. This is why `openpty()` (glibc,
+    /// Python's `os.openpty()`) could work perfectly while every GTK terminal still failed:
+    /// `openpty()` never calls `TIOCPKT` at all.
+    TIOCPKT(UserPtr<i32>),
     /// Get the terminal's foreground process group ID (`tcgetpgrp`).
     TIOCGPGRP(UserPtrMut<i32>),
     /// Set the terminal's foreground process group ID (`tcsetpgrp`). A shell's job-control
@@ -4314,6 +4343,8 @@ impl SyscallRequest {
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),
                         TIOCSPTLCK => IoctlArg::TIOCSPTLCK(ctx.sys_req_ptr(2)),
                         TIOCSCTTY => IoctlArg::TIOCSCTTY(ctx.sys_req_arg(2)),
+                        TIOCGPTPEER => IoctlArg::TIOCGPTPEER(ctx.sys_req_arg(2)),
+                        TIOCPKT => IoctlArg::TIOCPKT(ctx.sys_req_ptr(2)),
                         TIOCGPGRP => IoctlArg::TIOCGPGRP(ctx.sys_req_ptr(2)),
                         TIOCSPGRP => IoctlArg::TIOCSPGRP(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),

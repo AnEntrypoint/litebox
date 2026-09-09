@@ -1127,6 +1127,253 @@ impl InputDevice {
     }
 }
 
+/// The set of currently-allocated pty ids, shared (`Arc<RwLock<...>>`) between
+/// [`PtsDevices`] and `litebox_shim_linux`'s `GlobalState::ptmx_open`/`ptmx_closed` (the same
+/// split [`devpts_dir_status`]/[`devpts_slave_status`] already document: WHICH ptys exist is live
+/// shim state, what a devpts node looks like is filesystem knowledge). Kept deliberately separate
+/// from the shim's own `pty_registry` map (which cannot appear in this crate -- its values are
+/// `litebox_shim_linux`-specific typed fds) rather than trying to share one map across the crate
+/// boundary; `GlobalState::ptmx_open`/`ptmx_closed`/`attach_pty_stdio` update both at the same
+/// three call sites, so the two never have a chance to drift.
+pub type PtsRegistry = alloc::collections::BTreeSet<u32>;
+
+/// A [`super::backend::Backend`] exposing `/dev/pts/<id>` for every currently-live pty, and --
+/// the reason this backend exists at all -- making `/dev/pts` itself `open()`-able and
+/// `getdents64`-listable as a directory. Mounted as its own nested backend at `/dev/pts`,
+/// mirroring [`DriDevices`] at `/dev/dri` (see that type's own doc comment for why a nested mount
+/// is needed instead of adding directly to the flat, single-level [`Devices`] namespace).
+///
+/// Before this existed, `/dev/pts/<id>` and `/dev/ptmx` both worked (intercepted directly by the
+/// shim, see `litebox_shim_linux::syscalls::file::do_open_resolved`) and `stat("/dev/pts")`
+/// worked (`devpts_dir_status`, also answered by the shim) -- but `open("/dev/pts", O_DIRECTORY)`
+/// itself fell through to this module's flat [`Devices`] backend, whose `walk_directories`
+/// rejects any component that isn't a registered top-level device name, i.e. always `ENOENT` for
+/// `"pts"`. That single missing case was enough to break every real `openpty()`/`forkpty()`
+/// caller: glibc's `ttyname_r` (issued right after allocating the peer via `TIOCGPTPEER`, see
+/// that ioctl's own doc comment in `litebox_common_linux`) cross-checks its `/proc/self/fd`
+/// readlink answer by opening `/dev/pts` and scanning it for a matching entry, and reports the
+/// whole call as failed -- `FileNotFoundError`, opaque and disconnected from the real cause -- the
+/// moment that `opendir` returns `ENOENT`, even though the master, the slave, and the peer fd
+/// were all already allocated and working correctly by that point.
+pub struct PtsDevices<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    registry: alloc::sync::Arc<crate::sync::RwLock<Platform, PtsRegistry>>,
+}
+
+impl<Platform> PtsDevices<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    /// Construct a new `PtsDevices` backend sharing the given `registry` -- the caller (the shim)
+    /// keeps its own clone of the same `Arc` to update it as ptys are allocated/freed (see this
+    /// type's own doc comment).
+    #[must_use]
+    pub fn new(
+        _litebox: &LiteBox<Platform>,
+        _allocator: InodeAllocator,
+        registry: alloc::sync::Arc<crate::sync::RwLock<Platform, PtsRegistry>>,
+    ) -> Self {
+        Self { registry }
+    }
+}
+
+/// Owned file handle; identifies which pty slave (by id) backs this fd.
+///
+/// In practice never actually used for real I/O: every guest-visible `open("/dev/pts/<id>")`
+/// is intercepted directly by the shim (see this type's own doc comment) before it would ever
+/// reach this backend's `open_file_at`. This exists so a caller that reaches this backend anyway
+/// (stat/access on a path the shim's own string-prefix check somehow doesn't catch) gets a
+/// correctly-shaped answer rather than a panic.
+#[derive(Debug, Clone, Copy)]
+pub struct PtsDeviceFileHandle {
+    id: u32,
+}
+
+/// Directory handle, reused for both walking and owned dir handles (no borrows needed).
+#[derive(Debug, Clone, Copy)]
+pub struct PtsDeviceDirHandle;
+
+impl<Platform> super::backend::private::Sealed for PtsDevices<Platform> where
+    Platform: RawSyncPrimitivesProvider + 'static
+{
+}
+
+impl<Platform> BackendHandles for PtsDevices<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    type WalkingDirHandle<'a> = PtsDeviceDirHandle;
+    type FileHandle = PtsDeviceFileHandle;
+    type DirHandle = PtsDeviceDirHandle;
+}
+
+impl<Platform> Backend for PtsDevices<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    fn root(&self) -> WalkingDirHandle<'_> {
+        WalkingDirHandle::from_typed::<Self>(PtsDeviceDirHandle)
+    }
+
+    fn walk_directories<'a>(
+        &'a self,
+        from: WalkingDirHandle<'a>,
+        components: &[&str],
+    ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError> {
+        let from = from.into_typed::<Self>();
+        if let Some(&component) = components.first() {
+            let exists = component
+                .parse::<u32>()
+                .is_ok_and(|id| self.registry.read().contains(&id));
+            if exists {
+                return Ok(WalkOutcome {
+                    components: vec![],
+                    last: WalkingDirHandle::from_typed::<Self>(from),
+                    stop_reason: WalkStopReason::StoppedAtNonDirectory,
+                });
+            }
+            return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
+        }
+        Ok(WalkOutcome {
+            components: vec![],
+            last: WalkingDirHandle::from_typed::<Self>(from),
+            stop_reason: WalkStopReason::CompleteDirectory,
+        })
+    }
+
+    fn owned_dir_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        _flags: OFlags,
+    ) -> Result<DirHandle, OpenError> {
+        Ok(DirHandle::from_typed::<Self>(dir.into_typed::<Self>()))
+    }
+
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<WalkingDirHandle<'a>> {
+        Some(WalkingDirHandle::from_typed::<Self>(
+            *dir.get_typed::<Self>(),
+        ))
+    }
+
+    fn open_file_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        name: &str,
+        flags: OFlags,
+    ) -> Result<Permissioned<FileHandle>, OpenError> {
+        let _dir = dir.into_typed::<Self>();
+        let id = name
+            .parse::<u32>()
+            .ok()
+            .filter(|id| self.registry.read().contains(id))
+            .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+
+        if flags.contains(OFlags::DIRECTORY) {
+            return Err(OpenError::PathError(PathError::ComponentNotADirectory));
+        }
+
+        Ok(Permissioned {
+            item: FileHandle::from_typed::<Self>(PtsDeviceFileHandle { id }),
+            permissions: PermissionCheck::ByBackend,
+        })
+    }
+
+    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
+        let _handle = handle.into_typed::<Self>();
+        Ok(self
+            .registry
+            .read()
+            .iter()
+            .map(|id| DirEntry {
+                name: format!("{id}"),
+                file_type: FileType::CharacterDevice,
+                ino_info: Some(devpts_slave_status(*id).node_info),
+            })
+            .collect())
+    }
+
+    fn read(&self, _h: &FileHandle, _buf: &mut [u8], _offset: usize) -> Result<usize, ReadError> {
+        // See `PtsDeviceFileHandle`'s doc comment: real pty I/O never reaches this backend.
+        Err(ReadError::NotForReading)
+    }
+
+    fn write(&self, _h: &FileHandle, _buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
+        Err(WriteError::NotForWriting)
+    }
+
+    fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {
+        Err(TruncateError::IsTerminalDevice)
+    }
+
+    fn chmod(&self, _h: &FileHandle, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
+    fn seek_behavior(&self, _h: &FileHandle) -> SeekBehavior {
+        SeekBehavior::NonSeekable
+    }
+
+    fn file_status(&self, h: &FileHandle) -> Result<FileStatus, FileStatusError> {
+        Ok(devpts_slave_status(h.get_typed::<Self>().id))
+    }
+
+    fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
+        let _h = h.get_typed::<Self>();
+        // The SAME shape the shim's own `stat("/dev/pts")` intercept answers with (see
+        // `devpts_dir_status`'s doc comment) -- not a separately-allocated `root_inode`, so a
+        // caller comparing the two `stat`s (exactly what `ttyname_r`'s cross-check does) never
+        // sees them disagree.
+        Ok(devpts_dir_status())
+    }
+
+    fn create_file_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _mode: Mode,
+    ) -> Result<FileHandle, OpenError> {
+        Err(OpenError::ReadOnlyFileSystem)
+    }
+
+    fn mkdir_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<DirHandle, MkdirError> {
+        Err(MkdirError::ReadOnlyFileSystem)
+    }
+
+    fn unlink_at(&self, _dir: DirHandle, _name: &str) -> Result<(), UnlinkError> {
+        Err(UnlinkError::ReadOnlyFileSystem)
+    }
+
+    fn rmdir_at(&self, _dir: DirHandle, _name: &str) -> Result<(), RmdirError> {
+        Err(RmdirError::ReadOnlyFileSystem)
+    }
+
+    fn chmod_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
+    fn chown_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _user: Option<u16>,
+        _group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        Err(ChownError::ReadOnlyFileSystem)
+    }
+
+    fn set_times_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _atime: Option<Timestamp>,
+        _mtime: Option<Timestamp>,
+    ) -> Result<(), SetTimesError> {
+        Err(SetTimesError::ReadOnlyFileSystem)
+    }
+}
+
 /// A [`super::backend::Backend`] exposing `/dev/input/event0` -- the evdev node a guest
 /// keyboard/mouse-driven GUI toolkit reads raw `struct input_event` records from.
 /// Mounted as its own nested backend at `/dev/input`, mirroring [`DriDevices`] at

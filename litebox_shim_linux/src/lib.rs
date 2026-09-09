@@ -403,6 +403,10 @@ pub struct LinuxShimBuilder<Platform: ShimPlatform> {
     /// in `build()`) because `default_fs` (which mounts the `/proc/self` backend sharing this
     /// same cell) always runs before `build()`. See `GlobalState::proc_self_info`'s doc comment.
     proc_self_info: Arc<litebox::sync::RwLock<Platform, litebox::fs::procfs::ProcSelfTable>>,
+    /// Shared with `GlobalState::pts_registry` once `build()` runs, for the exact same reason as
+    /// `proc_self_info` above: `default_fs` mounts the `/dev/pts` backend sharing this cell, and
+    /// that always runs before `build()`. See `litebox::fs::devices::PtsRegistry`'s doc comment.
+    pts_registry: Arc<litebox::sync::RwLock<Platform, litebox::fs::devices::PtsRegistry>>,
 }
 
 impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
@@ -413,6 +417,9 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             litebox: LiteBox::new(platform),
             proc_self_info: Arc::new(litebox::sync::RwLock::new(
                 litebox::fs::procfs::ProcSelfTable::default(),
+            )),
+            pts_registry: Arc::new(litebox::sync::RwLock::new(
+                litebox::fs::devices::PtsRegistry::new(),
             )),
         }
     }
@@ -434,6 +441,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             in_mem_fs,
             vec![tar_data],
             self.proc_self_info.clone(),
+            self.pts_registry.clone(),
         )
     }
 
@@ -455,6 +463,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             in_mem_fs,
             tar_layers,
             self.proc_self_info.clone(),
+            self.pts_registry.clone(),
         )
     }
 
@@ -490,6 +499,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             memfds: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
             shared_files: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
             proc_self_info: self.proc_self_info,
+            pts_registry: self.pts_registry,
         });
         LinuxShim(global)
     }
@@ -667,18 +677,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.0.clone(),
-                thread: syscalls::process::ThreadState::new_process(
+                thread: RefCell::new(syscalls::process::ThreadState::new_process(
                     pid,
                     Arc::new(PageManager::new(&self.0.litebox)),
                     false,
                     None,
                     bootstrap_shared_pending.clone(),
                     None,
-                ),
+                )),
                 wait_state: wait::WaitState::new(self.0.platform),
-                pid,
-                ppid,
-                tid: pid,
+                pid: Cell::new(pid),
+                ppid: Cell::new(ppid),
+                tid: Cell::new(pid),
                 credentials: syscalls::process::Credentials {
                     uid,
                     euid,
@@ -690,7 +700,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 dumpable: Cell::new(1),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
-                signals: syscalls::signal::SignalState::new_process(bootstrap_shared_pending),
+                signals: RefCell::new(syscalls::signal::SignalState::new_process(
+                    bootstrap_shared_pending,
+                )),
                 attached_pty_id: Cell::new(None),
             },
         };
@@ -830,18 +842,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.0.clone(),
-                thread: syscalls::process::ThreadState::new_process(
+                thread: RefCell::new(syscalls::process::ThreadState::new_process(
                     pid,
                     Arc::new(pm),
                     false,
                     None,
                     shared_pending.clone(),
                     None,
-                ),
+                )),
                 wait_state: wait::WaitState::new(self.0.platform),
-                pid,
-                ppid,
-                tid: pid,
+                pid: Cell::new(pid),
+                ppid: Cell::new(ppid),
+                tid: Cell::new(pid),
                 credentials: syscalls::process::Credentials {
                     uid,
                     euid,
@@ -853,7 +865,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 dumpable: Cell::new(1),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
-                signals: syscalls::signal::SignalState::new_process(shared_pending),
+                signals: RefCell::new(syscalls::signal::SignalState::new_process(shared_pending)),
                 attached_pty_id: Cell::new(None),
             },
         }
@@ -964,6 +976,7 @@ fn default_fs<Platform: ShimPlatform>(
     in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
     tar_layers: Vec<Cow<'static, [u8]>>,
     proc_self_info: Arc<litebox::sync::RwLock<Platform, litebox::fs::procfs::ProcSelfTable>>,
+    pts_registry: Arc<litebox::sync::RwLock<Platform, litebox::fs::devices::PtsRegistry>>,
 ) -> LinuxFS<Platform> {
     // Real host logical-CPU count -- see `litebox::platform::SystemInfoProvider::cpu_count`'s doc
     // comment for why GLib's thread-pool sizing needs this to be accurate, not just present.
@@ -992,6 +1005,13 @@ fn default_fs<Platform: ShimPlatform>(
             })
             .mount("/dev/input", |allocator| {
                 litebox::fs::devices::InputDevices::new(litebox, allocator)
+            })
+            // See `litebox::fs::devices::PtsDevices`'s doc comment: without this, `/dev/pts/<id>`
+            // and `stat("/dev/pts")` both work (the shim intercepts those directly), but
+            // `open("/dev/pts", O_DIRECTORY)` does not -- which is what glibc's real `openpty()`
+            // needs (via `ttyname_r`'s directory-scan cross-check) to succeed at all.
+            .mount("/dev/pts", |allocator| {
+                litebox::fs::devices::PtsDevices::new(litebox, allocator, pts_registry.clone())
             })
             .mount("/sys/class/drm", |allocator| {
                 litebox::fs::devices::SysClassDrm::new(litebox, allocator)
@@ -1573,8 +1593,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 self.global.platform,
                 &alloc::format!(
                     "[diag-syscall-enter] pid={} tid={} comm={} syscall={} syscall_num={}",
-                    self.pid,
-                    self.tid,
+                    self.pid.get(),
+                    self.tid.get(),
                     alloc::string::String::from_utf8_lossy(&comm_bytes),
                     crate::diag::syscall_name_pub(syscall_number),
                     syscall_number,
@@ -1589,8 +1609,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 self.global.platform,
                 &alloc::format!(
                     "[diag-syscall-exit] pid={} tid={} comm={} syscall={} ok={}",
-                    self.pid,
-                    self.tid,
+                    self.pid.get(),
+                    self.tid.get(),
                     alloc::string::String::from_utf8_lossy(&comm_bytes),
                     crate::diag::syscall_name_pub(syscall_number),
                     result.is_ok(),
@@ -1641,7 +1661,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 if crate::diag::strace_summary_enabled() {
                     crate::diag::record_unresolved_syscall(
                         syscall_number,
-                        self.pid,
+                        self.pid.get(),
                         &alloc::string::String::from_utf8_lossy(&self.comm.get()),
                     );
                 }
@@ -1666,8 +1686,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 self.global.platform,
                 &alloc::format!(
                     "[diag-syscall-request-detail] pid={} tid={} comm={} request={}",
-                    self.pid,
-                    self.tid,
+                    self.pid.get(),
+                    self.tid.get(),
                     alloc::string::String::from_utf8_lossy(&self.comm.get()),
                     truncated,
                 ),
@@ -2551,7 +2571,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     crate::diag::record_unsupported_subcommand(
                         &alloc::format!("{request:?}"),
                         "ENOSYS",
-                        self.pid,
+                        self.pid.get(),
                         &alloc::string::String::from_utf8_lossy(&self.comm.get()),
                     );
                 }
@@ -2726,18 +2746,100 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// `Task::load_program` -- which has no reference to the mounted `Backend` trait object, only
     /// to `GlobalState` -- can update it.
     proc_self_info: Arc<litebox::sync::RwLock<Platform, litebox::fs::procfs::ProcSelfTable>>,
+    /// The mirror `litebox::fs::devices::PtsDevices` reads to answer `open("/dev/pts",
+    /// O_DIRECTORY)` and its `getdents64` listing. `syscalls::pty::GlobalState::ptmx_open`/
+    /// `ptmx_closed`/`attach_pty_stdio` update this alongside `pty_registry` at each of their
+    /// three call sites -- see `PtsRegistry`'s own doc comment for why this can't just BE
+    /// `pty_registry` shared directly.
+    pts_registry: Arc<litebox::sync::RwLock<Platform, litebox::fs::devices::PtsRegistry>>,
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
+    /// Runs `f` with every shim-WIDE lock held, for the one caller that genuinely needs it:
+    /// [`syscalls::process::Task::try_cross_process_fork`]'s native-`fork()` path (see
+    /// [`litebox::platform::ForkChildVerificationProvider::native_fork`]'s doc comment).
+    ///
+    /// This is the shim-level half of the same discipline glibc's own `__libc_fork` uses
+    /// internally before calling the kernel's `fork()`: a REAL `fork()` duplicates the calling
+    /// thread only, so a lock some OTHER host thread happened to be holding at that instant is
+    /// held forever in the child -- the thread that would have released it does not exist there.
+    /// Acquiring every such lock first (which, for a `spin`-backed `RawMutex`, simply waits for
+    /// whichever thread currently holds it to finish its critical section and release) guarantees
+    /// none of them can be caught mid-hold at the instant `fork()` actually runs; `f` (the
+    /// `fork()` call itself) then executes with the whole set quiesced, and every guard is
+    /// dropped -- an ordinary, syscall-free unlock -- when this function returns, in BOTH the
+    /// parent and, since `fork()` duplicates this stack frame verbatim, the child.
+    ///
+    /// **Scope, stated rather than left implicit.** This covers every lock that is genuinely
+    /// SHIM-WIDE -- reachable from more than one guest process under this architecture's single
+    /// shared address space, which is the one hazard a real `fork()` on genuine, independent-
+    /// address-space Linux would never have (unrelated processes there share no locks at all).
+    /// It deliberately does NOT reach into `litebox` (per-process `PageManager`/descriptor-table
+    /// locks live under each `Arc<Process>`, not here), `futex_manager`, or `pipes`. A lock held
+    /// by a SIBLING thread of the SAME forking guest process at fork time is the ordinary,
+    /// general "`fork()` in a multithreaded program" hazard POSIX itself documents -- no worse
+    /// than a real multithreaded guest program forking on real Linux already has to be written to
+    /// tolerate, and not specific to litebox. Extending coverage into those structures is real,
+    /// separate follow-on work, not silently claimed here.
+    ///
+    /// **Why this, and not the standard `pthread_atfork(prepare, parent, child)` registration**
+    /// the glibc comparison above might suggest reaching for instead. `pthread_atfork` exists to
+    /// decouple "who calls `fork()`" from "who needs to prepare" -- essential when `fork()` may
+    /// be invoked by code you do not control (a library calling it on your behalf, or several
+    /// independent call sites). Neither applies here: `native_fork` has exactly one caller in the
+    /// entire codebase (`try_native_cross_process_fork`, always reaching it through this very
+    /// function), so there is nothing to decouple. Registering real handlers instead would add a
+    /// DOCUMENTED hazard for no offsetting benefit: POSIX's own `pthread_atfork` guidance warns
+    /// that handlers "should not call library functions... This includes avoiding the use of any
+    /// interfaces which may directly or indirectly attempt to allocate memory" specifically
+    /// because other already-registered handlers (glibc's own malloc-arena ones, or a linked
+    /// library's) can deadlock against a handler that allocates -- and acquiring any of this
+    /// crate's own locks is not provably allocation-free. A plain closure sidesteps that whole
+    /// hazard class: it participates in no global registration, runs only around this one call,
+    /// and never interleaves with any other library's own atfork handlers' acquisition order.
+    /// Real `fork()`'s OWN internal glibc/libc atfork handlers (malloc's included) still run
+    /// normally, inside the `libc::fork()` call this wraps -- nothing here replaces those, only
+    /// adds to them, narrowly, for the one thing this crate owns that they don't: its own
+    /// shim-wide locks.
+    fn with_shimwide_locks_held<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _net = self.net.lock();
+        let _unix_addr_table = self.unix_addr_table.write();
+        let _elf_patch_cache = self.elf_patch_cache.lock();
+        let _segment_scan_cache = self.segment_scan_cache.lock();
+        let _exec_ranges_cache = self.exec_ranges_cache.lock();
+        let _sysv_shm = self.sysv_shm.lock();
+        let _flock_registry = self.flock_registry.lock();
+        let _pty_registry = self.pty_registry.write();
+        let _daemon_pty_masters = self.daemon_pty_masters.write();
+        let _memfds = self.memfds.lock();
+        let _shared_files = self.shared_files.lock();
+        let _proc_self_info = self.proc_self_info.write();
+        f()
+    }
 }
 
 struct Task<Platform: ShimPlatform, FS: ShimFS> {
     global: Arc<GlobalState<Platform, FS>>,
+    /// Unlike [`Self::pid`]/[`Self::thread`]/[`Self::signals`], this does NOT need to become
+    /// replaceable for a native fork() child: it describes THIS HOST THREAD's own park/wake
+    /// primitives, which a real `fork()` leaves completely unaffected -- only which GUEST
+    /// PROCESS the thread belongs to changes, never its own interruptibility. The existing
+    /// value stays exactly as correct for the child as it was for the parent.
     wait_state: wait::WaitState<Platform>,
-    thread: syscalls::process::ThreadState<Platform>,
-    /// Process ID
-    pid: i32,
-    /// Parent Process ID
-    ppid: i32,
-    /// Thread ID
-    tid: i32,
+    /// `RefCell` for the same reason as [`Self::pid`]: a native fork() child needs its own
+    /// [`syscalls::process::Process`] (fresh children list, parent pointing at the process that
+    /// forked it, its own adopted [`litebox::mm::PageManager`]) in place of the one it continues
+    /// to hold immediately after `fork()` returns, which is still this SAME process's own.
+    thread: RefCell<syscalls::process::ThreadState<Platform>>,
+    /// Process ID. `Cell`, not a plain `i32`: a native `fork()` continues this exact host
+    /// thread, at this exact `Task`'s fixed address, as the CHILD -- there is no other storage
+    /// to construct a fresh identity into. See
+    /// [`Task::reinit_as_native_fork_child`].
+    pid: Cell<i32>,
+    /// Parent Process ID. `Cell` for the same reason as [`Self::pid`].
+    ppid: Cell<i32>,
+    /// Thread ID. `Cell` for the same reason as [`Self::pid`].
+    tid: Cell<i32>,
     /// Task credentials. These are set per task but are Arc'd to save space
     /// since most tasks never change their credentials.
     credentials: Arc<syscalls::process::Credentials>,
@@ -2757,8 +2859,12 @@ struct Task<Platform: ShimPlatform, FS: ShimFS> {
     fs: RefCell<Arc<syscalls::file::FsState<Platform>>>,
     /// File descriptors. `RefCell` to support `unshare` in the future.
     files: RefCell<Arc<syscalls::file::FilesState<Platform, FS>>>,
-    /// Signal state
-    signals: syscalls::signal::SignalState<Platform>,
+    /// Signal state. `RefCell` for the same reason as [`Self::pid`]: a native fork() child's
+    /// pending signals must be cleared and its `shared_pending` repointed at the fresh child
+    /// `Process`'s own queue (see [`syscalls::signal::SignalState::clone_for_new_task`], already
+    /// used -- at ordinary Task-construction time, never in place -- by the thread-based fork
+    /// path this one can't use).
+    signals: RefCell<syscalls::signal::SignalState<Platform>>,
     /// Set by [`LinuxShim::load_program_attach_pty`]'s internal call to `Self::attach_pty_stdio`
     /// once this task's stdio has been attached to a fresh pty's slave -- the pty id a host-side
     /// caller (with no `Task` in scope) should pass to
@@ -2794,17 +2900,17 @@ mod test_utils {
             ));
             Task {
                 wait_state: wait::WaitState::new(self.platform),
-                thread: syscalls::process::ThreadState::new_process(
+                thread: RefCell::new(syscalls::process::ThreadState::new_process(
                     pid,
                     Arc::new(PageManager::new(&self.litebox)),
                     false,
                     None,
                     shared_pending.clone(),
                     None,
-                ),
-                pid,
-                ppid: 0,
-                tid: pid,
+                )),
+                pid: Cell::new(pid),
+                ppid: Cell::new(0),
+                tid: Cell::new(pid),
                 credentials: Arc::new(syscalls::process::Credentials {
                     uid: 0,
                     euid: 0,
@@ -2815,7 +2921,7 @@ mod test_utils {
                 dumpable: Cell::new(1),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
-                signals: syscalls::signal::SignalState::new_process(shared_pending),
+                signals: RefCell::new(syscalls::signal::SignalState::new_process(shared_pending)),
                 attached_pty_id: Cell::new(None),
                 global: self,
             }
@@ -2832,17 +2938,17 @@ mod test_utils {
             let task = Task {
                 wait_state: wait::WaitState::new(self.global.platform),
                 global: self.global.clone(),
-                thread: self.thread.new_thread(tid)?,
-                pid: self.pid,
-                ppid: self.ppid,
-                tid,
+                thread: RefCell::new(self.thread.borrow().new_thread(tid)?),
+                pid: Cell::new(self.pid.get()),
+                ppid: Cell::new(self.ppid.get()),
+                tid: Cell::new(tid),
                 credentials: self.credentials.clone(),
                 comm: self.comm.clone(),
                 dumpable: self.dumpable.clone(),
                 fs: self.fs.clone(),
                 files: self.files.clone(),
-                // Always a same-process thread clone -- see `self.thread.new_thread(tid)` above.
-                signals: self.signals.clone_for_new_task(None),
+                // Always a same-process thread clone -- see `self.thread.borrow().new_thread(tid)` above.
+                signals: RefCell::new(self.signals.borrow().clone_for_new_task(None)),
                 attached_pty_id: Cell::new(self.attached_pty_id.get()),
             };
             Some(task)
@@ -2877,20 +2983,21 @@ mod test_utils {
             let child = Task {
                 wait_state: wait::WaitState::new(self.global.platform),
                 global: self.global.clone(),
-                thread,
-                pid,
-                ppid: self.pid,
-                tid: pid,
+                thread: RefCell::new(thread),
+                pid: Cell::new(pid),
+                ppid: Cell::new(self.pid.get()),
+                tid: Cell::new(pid),
                 credentials: self.credentials.clone(),
                 comm: self.comm.clone(),
                 dumpable: self.dumpable.clone(),
                 fs: self.fs.clone(),
                 files: self.files.clone(),
-                signals: self.signals.clone_for_new_task(Some(shared_pending)),
+                signals: RefCell::new(
+                    self.signals.borrow().clone_for_new_task(Some(shared_pending)),
+                ),
                 attached_pty_id: Cell::new(self.attached_pty_id.get()),
             };
-            self.process()
-                .add_child_for_test(pid, child.process().clone());
+            self.process().add_child_for_test(pid, child.process());
             child
         }
 
@@ -2923,7 +3030,7 @@ mod test_utils {
         /// always goes through, which `spawn_clone_for_test` deliberately bypasses (it does not
         /// run any guest code).
         pub(crate) fn set_thread_handle_for_test(&self) {
-            self.thread
+            self.thread.borrow()
                 .remote_handle_cell()
                 .set(alloc::boxed::Box::new(self.wait_state.thread_handle()))
                 .ok();

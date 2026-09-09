@@ -2938,7 +2938,48 @@ impl ThreadContext<'_> {
     }
 }
 
-impl litebox::platform::ForkChildVerificationProvider for LinuxUserland {}
+impl litebox::platform::ForkChildVerificationProvider for LinuxUserland {
+    // "Think rust, not windows": this trait's default `spawn_cross_process_fork_child` contract
+    // (a relocation map to translate, a register snapshot to inject, pipes/files/eventfds to
+    // individually bridge or reopen) exists entirely to compensate for a host with no `fork()`
+    // syscall. A real Linux host has one -- see `has_native_fork`/`native_fork`'s own doc
+    // comments on `ForkChildVerificationProvider` for the full reasoning -- so none of that
+    // machinery is implemented here at all; `litebox_shim_linux`'s `try_native_cross_process_fork`
+    // takes an entirely different, much smaller path when this returns `true`.
+    fn has_native_fork(&self) -> bool {
+        true
+    }
+
+    /// Calls the host's real `fork()` directly via `libc`, matching every other raw syscall this
+    /// platform already issues the same way (`libc::pthread_kill` above, the raw `futex` calls
+    /// in `RawMutex`) rather than taking on a dependency for this one call.
+    ///
+    /// Checked against the obvious public alternative before settling on this: `nix::unistd::
+    /// fork`'s ENTIRE body is
+    /// ```ignore
+    /// let res = unsafe { libc::fork() };
+    /// Errno::result(res).map(|res| match res { 0 => Child, res => Parent { child: Pid(res) } })
+    /// ```
+    /// -- a typed wrapper over exactly this call and nothing else (no `pthread_atfork`
+    /// involvement, no additional safety machinery; its own docs place every multithreaded-fork
+    /// safety obligation on the caller, same as here). `rustix` does not expose `fork()` at all.
+    /// There is no more-complete public implementation of the bare syscall to defer to; the real
+    /// prior art that matters is in how the CALLER (`with_shimwide_locks_held`, below) behaves
+    /// around this call, not in this call itself.
+    ///
+    /// # Safety
+    /// See the trait method's own doc comment for the caller's half of this contract (no
+    /// Rust-level borrow held across the call that the child's continued execution would need to
+    /// independently re-derive -- `litebox_shim_linux::GlobalState::with_shimwide_locks_held`, the
+    /// call's only caller, is precisely what satisfies it). `fork()` itself takes no arguments to
+    /// misuse and has no further precondition beyond that one, already the caller's to satisfy.
+    unsafe fn native_fork(&self) -> Option<i32> {
+        // SAFETY: `fork()` has no arguments and no precondition of its own beyond the caller's
+        // lock-quiescing contract (see above) -- nothing here can misuse it further.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 { None } else { Some(pid) }
+    }
+}
 
 impl litebox::platform::SystemInfoProvider for LinuxUserland {
     fn get_syscall_entry_point(&self) -> usize {

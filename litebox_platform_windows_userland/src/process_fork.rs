@@ -821,6 +821,108 @@ pub const FORK_CHILD_FILE_FDS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_FILE_
 /// `litebox::platform::ForkInheritedEventfd`.
 pub const FORK_CHILD_EVENTFDS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_EVENTFDS";
 
+/// Set (to any non-empty value) on a child spawned by
+/// [`litebox::platform::ForkChildVerificationProvider::spawn_exec_collision_child`], read by the
+/// runner's own `run()` to skip `acquire_boot_lock()` for this one, specific case.
+///
+/// The boot lock's own purpose is real and unrelated to this: it exists to make two
+/// INDEPENDENT, accidental concurrent boots of this host's own litebox instances structurally
+/// impossible, because they would silently starve each other for host memory/CPU. A collision
+/// child is not that -- it is one deliberate, synchronous continuation of the SAME logical boot,
+/// and the spawning thread is BLOCKED waiting for it (`Command::status()`), contending for
+/// nothing while the child runs. Without this, the child's own `run()` would hit the SAME
+/// host-wide lock the still-live parent already holds and exit immediately with the lock's own
+/// "another boot is already in progress" error -- confirmed live: exactly this, `raw_status=1`,
+/// before `s6-mkdir` ever ran.
+pub const EXEC_COLLISION_CHILD_ENV_VAR: &str = "LITEBOX_INTERNAL_EXEC_COLLISION_CHILD";
+
+/// One fixed, well-known tar path, shared by EVERY real OS process this boot ever spawns
+/// (the top-level process sets it once; `Command`'s default env inheritance carries it to
+/// every descendant automatically, fork or exec-collision alike) -- the container's ONE
+/// filesystem, approximated.
+///
+/// **Why this exists, stated precisely.** A real Linux container's processes all share ONE
+/// mount namespace: any process's write is immediately visible to every other, no matter how
+/// the process tree branches. Litebox's cross-process fork and exec-collision hand-offs instead
+/// give each new real OS process a POINT-IN-TIME snapshot (`--resume-from` at spawn,
+/// `--export-writable-layer` at exit) -- correct for a short-lived, run-to-completion child with
+/// no live siblings (`s6-mkdir`, a command-substitution subshell), but wrong the moment two
+/// branches diverge and BOTH stay alive: each keeps writing to its own frozen fork of the
+/// filesystem, invisible to the other, forever. Confirmed live as a real defect, not a
+/// hypothetical one: `s6-svscan`'s long-lived supervision children never saw a servicedir `pid 1`
+/// created well after they were spawned, and kept failing "No such file or directory" on every
+/// retry, each retry re-importing the SAME stale snapshot rather than `pid 1`'s current state.
+///
+/// **The fix, and its honest limit.** Route EVERY hand-off's export and import through this ONE
+/// path instead of a fresh per-call file, and -- critically -- export the SPAWNING process's own
+/// current state to it immediately before every spawn, not only at a child's own exit. This
+/// makes every `--resume-from` as fresh as the most recent spawn or exit ANYWHERE in the tree,
+/// which is exactly right for the sequential, one-event-at-a-time shape almost all of a container
+/// boot actually has. It is NOT a general solution to live, concurrent, continuous filesystem
+/// sharing across real OS processes: two branches that are BOTH independently writing at
+/// overlapping instants can still race (last exporter wins), and nothing propagates to an
+/// already-running long-lived process between ITS OWN spawns -- only a true shared-memory or
+/// IPC-backed filesystem (a real, separate, much larger undertaking) closes that gap completely.
+/// This is the right-sized fix for what the boot actually does, not a claim of full POSIX shared-
+/// filesystem semantics.
+pub const CONTAINER_FS_SNAPSHOT_ENV_VAR: &str = "LITEBOX_INTERNAL_CONTAINER_FS_SNAPSHOT";
+
+/// Publishes a freshly-written export as this boot tree's new canonical "latest" filesystem
+/// snapshot (see [`CONTAINER_FS_SNAPSHOT_ENV_VAR`]'s own doc comment), and returns the path a
+/// caller should actually hand to whatever reads it back -- the shared path on success, or
+/// `written_to` itself unchanged if there is no shared path to publish to (the env var was never
+/// set -- should not happen in practice, since `run()` always sets it, but a caller with no
+/// shared destination is no worse off than before this mechanism existed).
+///
+/// `rename`, not copy: atomic on the same volume (both paths are under `std::env::temp_dir()`),
+/// so a concurrent reader of the shared path never observes a half-written file -- at worst,
+/// under genuinely concurrent exports, the LAST rename to land wins, this mechanism's disclosed,
+/// bounded limitation, not silent corruption.
+pub(crate) fn publish_as_container_fs_snapshot(written_to: std::path::PathBuf) -> std::path::PathBuf {
+    let Some(shared) = std::env::var_os(CONTAINER_FS_SNAPSHOT_ENV_VAR) else {
+        return written_to;
+    };
+    let shared = std::path::PathBuf::from(shared);
+
+    // Non-regression guard, not a real merge (seeing this module's own doc comment's honest
+    // limit on CONTAINER_FS_SNAPSHOT_ENV_VAR: this is not live, concurrent, continuous sharing).
+    // Confirmed live as a REAL, active harm without this: several independent, short-lived,
+    // rapidly-retrying processes (s6-supervise instances, one per supervised service, each
+    // re-executing and re-colliding every few seconds) each import the shared snapshot at their
+    // own spawn and export it back unchanged at their own exit -- but an import that lost the
+    // race this module's own doc comment discloses (the shared file briefly missing mid-publish)
+    // falls back to the BASE rootfs's empty upper layer, and THAT process then re-publishes ITS
+    // OWN much-smaller view, clobbering a larger, more-complete snapshot a sibling had already
+    // published. Observed: published sizes oscillating 55808 -> 7680 -> 55808 bytes across
+    // consecutive retries, a real regression, not a rare theoretical one. A byte-size comparison
+    // is a crude proxy for "more complete" -- genuinely wrong in principle (a smaller archive can
+    // legitimately be the newer, correct one, e.g. after a real `rm -rf`) -- but it is cheap,
+    // directionally right for the failure this module actually observes (an EMPTY fallback, not
+    // a deliberate deletion, losing to a populated one), and never makes a currently-missing
+    // shared file worse; a real fix needs actual merge semantics, named as separate, larger
+    // follow-on work, not approximated further here.
+    if let Ok(existing) = std::fs::metadata(&shared)
+        && let Ok(new) = std::fs::metadata(&written_to)
+        && existing.len() > new.len()
+    {
+        let _ = std::fs::remove_file(&written_to);
+        return shared;
+    }
+
+    match std::fs::rename(&written_to, &shared) {
+        Ok(()) => shared,
+        Err(e) => {
+            eprintln!(
+                "[process_fork] could not publish {} as the container's shared filesystem \
+                 snapshot {} ({e}); handing over the unpublished export instead",
+                written_to.display(),
+                shared.display()
+            );
+            written_to
+        }
+    }
+}
+
 /// The `--oci-image` reference this run booted from, so a cross-process child can rebuild the same
 /// rootfs.
 ///
@@ -885,20 +987,24 @@ pub fn register_parent_writable_layer_exporter(exporter: ParentWritableLayerExpo
 /// Best-effort, and deliberately so: a failure here means the child sees only the base rootfs,
 /// which is exactly the behaviour before this existed -- strictly worse than a correct fork, but
 /// never worse than failing the fork outright.
-fn export_parent_writable_layer_for_child() -> Option<std::path::PathBuf> {
+pub(crate) fn export_parent_writable_layer_for_child() -> Option<std::path::PathBuf> {
     use core::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
     let exporter = PARENT_WRITABLE_LAYER_EXPORTER.get()?;
     // Named by this process's pid plus a sequence number: several forks can be in flight from
-    // different guest threads, and a fixed name would let one overwrite another's archive.
+    // different guest threads, and a fixed name would let one overwrite another's archive mid-
+    // write (the write itself, not the canonical "latest" pointer below, which tolerates it).
     let path = std::env::temp_dir().join(format!(
         "litebox-forkparent-{}-{}.tar",
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     match exporter(&path) {
-        Ok(()) => Some(path),
+        // Publish this export as the boot tree's new canonical "latest" snapshot -- see
+        // `CONTAINER_FS_SNAPSHOT_ENV_VAR`'s own doc comment -- and hand the child THAT path, not
+        // the now-possibly-renamed-away unique one.
+        Ok(()) => Some(publish_as_container_fs_snapshot(path)),
         Err(e) => {
             eprintln!(
                 "[process_fork] could not export the parent's writable layer for the fork child                  ({e}); it will start from the base rootfs only"

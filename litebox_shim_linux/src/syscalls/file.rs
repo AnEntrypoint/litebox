@@ -729,12 +729,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub fn sys_open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
         let path = self.resolve_path(path)?;
         litebox_util_log::debug!(
-            tid:% = self.tid, path:% = path.to_string_lossy(), flags:? = flags;
+            tid:% = self.tid.get(), path:% = path.to_string_lossy(), flags:? = flags;
             "DIAG sys_open: resolved path"
         );
         let result = self.do_open_resolved(path, flags, mode);
         litebox_util_log::debug!(
-            tid:% = self.tid, result:? = result;
+            tid:% = self.tid.get(), result:? = result;
             "DIAG sys_open: result"
         );
         result
@@ -755,7 +755,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // log line's numeric `fd` back to the real file it refers to, blocking correlation of a
         // crashing memory region against which shared library/ELF actually backs it.
         litebox_util_log::debug!(
-            tid:% = self.tid, path:% = path.to_string_lossy(), fd:? = result.as_ref().ok(), flags:? = flags;
+            tid:% = self.tid.get(), path:% = path.to_string_lossy(), fd:? = result.as_ref().ok(), flags:? = flags;
             "sys_openat"
         );
         result
@@ -916,7 +916,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `ftruncate`
     pub(crate) fn sys_ftruncate(&self, fd: i32, length: usize) -> Result<(), Errno> {
         litebox_util_log::debug!(
-            tid:% = self.tid, fd:% = fd, length:% = length;
+            tid:% = self.tid.get(), fd:% = fd, length:% = length;
             "sys_ftruncate: entry"
         );
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
@@ -1224,7 +1224,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             result
         };
         litebox_util_log::debug!(
-            tid:% = self.tid, path:% = path.to_string_lossy(), ok:? = result.is_ok(), err:? = result.as_ref().err();
+            tid:% = self.tid.get(), path:% = path.to_string_lossy(), ok:? = result.is_ok(), err:? = result.as_ref().err();
             "sys_unlinkat"
         );
         result
@@ -1334,7 +1334,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .rename(old_path.clone(), new_path.clone())
             .map_err(Errno::from);
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             from:% = old_path.to_string_lossy(),
             to:% = new_path.to_string_lossy(),
             err:? = result.as_ref().err();
@@ -1387,7 +1387,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .symlink(&target, linkpath.clone())
             .map_err(Errno::from);
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             link:% = linkpath.to_string_lossy(),
             target:% = target.to_string_lossy(),
             err:? = result.as_ref().err();
@@ -1406,7 +1406,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         let result = self.do_read(raw_fd, buf, offset);
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             fd:% = fd,
             len:% = buf.len(),
             offset:? = offset,
@@ -1630,7 +1630,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // and keep stdout and files short so a chatty program does not flood the log.
         let preview_len = buf.len().min(if fd == 2 { 4096 } else { 64 });
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             fd:% = fd,
             len:% = buf.len(),
             offset:? = offset,
@@ -2047,7 +2047,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let pathname = self.resolve_path_at(dirfd, pathname)?;
         let result = self.do_mkdir(pathname.clone(), Mode::from_bits_retain(mode));
         litebox_util_log::debug!(
-            tid:% = self.tid, path:% = pathname.to_string_lossy(), err:? = result.as_ref().err();
+            tid:% = self.tid.get(), path:% = pathname.to_string_lossy(), err:? = result.as_ref().err();
             "sys_mkdirat"
         );
         result
@@ -2089,7 +2089,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// function previously had no `debug!` logging of its own to reveal it.
     pub(crate) fn sys_fchmod(&self, fd: u32, mode: u32) -> Result<(), Errno> {
         litebox_util_log::debug!(
-            tid:% = self.tid, fd:% = fd, mode:% = mode;
+            tid:% = self.tid.get(), fd:% = fd, mode:% = mode;
             "sys_fchmod: entry"
         );
         let Ok(raw_fd) = usize::try_from(fd) else {
@@ -2455,7 +2455,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // failure (a child getting EPIPE on a socket it was handed), so make it visible.
         let result = self.do_close(raw_fd);
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             fd:% = fd,
             result:? = result;
             "sys_close"
@@ -2899,7 +2899,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         buf: &mut [u8],
     ) -> Result<usize, Errno> {
         let pathname = self.resolve_path_at(dirfd, pathname)?;
-        litebox_util_log::debug!(tid:% = self.tid, path:? = pathname; "sys_readlinkat: entry");
+        litebox_util_log::debug!(tid:% = self.tid.get(), path:? = pathname; "sys_readlinkat: entry");
         let result = (|| {
             let path = self.do_readlink(pathname.to_str().map_err(|_| Errno::EINVAL)?)?;
             let bytes = path.as_bytes();
@@ -2909,10 +2909,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         })();
         match &result {
             Ok((len, target)) => {
-                litebox_util_log::debug!(tid:% = self.tid, len:% = len, target:? = target; "sys_readlinkat: returning");
+                litebox_util_log::debug!(tid:% = self.tid.get(), len:% = len, target:? = target; "sys_readlinkat: returning");
             }
             Err(e) => {
-                litebox_util_log::debug!(tid:% = self.tid, errno:? = e; "sys_readlinkat: error");
+                litebox_util_log::debug!(tid:% = self.tid.get(), errno:? = e; "sys_readlinkat: error");
             }
         }
         result.map(|(len, _)| len)
@@ -3151,14 +3151,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `stat`
     pub fn sys_stat(&self, pathname: impl path::Arg) -> Result<FileStat, Errno> {
         let pathname = self.resolve_path(pathname)?;
-        litebox_util_log::debug!(tid:% = self.tid, path:? = pathname; "sys_stat: entry");
+        litebox_util_log::debug!(tid:% = self.tid.get(), path:? = pathname; "sys_stat: entry");
         let result: Result<FileStat, Errno> = self.do_stat(pathname, true);
         match &result {
             Ok(st) => {
                 let (mode, rdev) = (st.st_mode, st.st_rdev);
-                litebox_util_log::debug!(tid:% = self.tid, mode:% = mode, rdev:% = rdev; "sys_stat: returning");
+                litebox_util_log::debug!(tid:% = self.tid.get(), mode:% = mode, rdev:% = rdev; "sys_stat: returning");
             }
-            Err(e) => litebox_util_log::debug!(tid:% = self.tid, errno:? = e; "sys_stat: error"),
+            Err(e) => litebox_util_log::debug!(tid:% = self.tid.get(), errno:? = e; "sys_stat: error"),
         }
         result
     }
@@ -3175,7 +3175,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Handle syscall `fstat`
     pub fn sys_fstat(&self, fd: i32) -> Result<FileStat, Errno> {
-        litebox_util_log::debug!(tid:% = self.tid, fd:% = fd; "sys_fstat: entry");
+        litebox_util_log::debug!(tid:% = self.tid.get(), fd:% = fd; "sys_fstat: entry");
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
@@ -3183,9 +3183,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         match &result {
             Ok(st) => {
                 let (mode, rdev) = (st.st_mode, st.st_rdev);
-                litebox_util_log::debug!(tid:% = self.tid, mode:% = mode, rdev:% = rdev; "sys_fstat: returning");
+                litebox_util_log::debug!(tid:% = self.tid.get(), mode:% = mode, rdev:% = rdev; "sys_fstat: returning");
             }
-            Err(e) => litebox_util_log::debug!(tid:% = self.tid, errno:? = e; "sys_fstat: error"),
+            Err(e) => litebox_util_log::debug!(tid:% = self.tid.get(), errno:? = e; "sys_fstat: error"),
         }
         result
     }
@@ -3234,17 +3234,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         litebox_util_log::debug!(
-            tid:% = self.tid, dirfd:% = dirfd, flags:? = flags; "sys_newfstatat: entry"
+            tid:% = self.tid.get(), dirfd:% = dirfd, flags:? = flags; "sys_newfstatat: entry"
         );
         let result: Result<FileStat, Errno> = self.do_fstatat(dirfd, pathname, flags);
         match &result {
             Ok(st) => {
                 let (mode, rdev) = (st.st_mode, st.st_rdev);
                 litebox_util_log::debug!(
-                    tid:% = self.tid, mode:% = mode, rdev:% = rdev; "sys_newfstatat: returning"
+                    tid:% = self.tid.get(), mode:% = mode, rdev:% = rdev; "sys_newfstatat: returning"
                 );
             }
-            Err(e) => litebox_util_log::debug!(tid:% = self.tid, errno:? = e; "sys_newfstatat: error"),
+            Err(e) => litebox_util_log::debug!(tid:% = self.tid.get(), errno:? = e; "sys_newfstatat: error"),
         }
         result
     }
@@ -3386,7 +3386,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let arg_dbg = alloc::format!("{arg:?}");
         let result = self.do_fcntl(fd, arg);
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             fd:% = fd,
             arg:% = arg_dbg,
             result:? = result;
@@ -3960,7 +3960,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Errno::EMFILE
         })?;
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             rd_fd:% = rd_raw_fd,
             wr_fd:% = wr_raw_fd;
             "sys_pipe2: created"
@@ -4072,7 +4072,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Errno::EMFILE
         })?;
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             fd:% = raw_fd,
             initval:% = initval;
             "sys_eventfd2: created"
@@ -4111,7 +4111,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Errno::EMFILE
         })?;
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             fd:% = raw_fd;
             "sys_timerfd_create: created"
         );
@@ -4134,7 +4134,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let interval = core::time::Duration::try_from(new.it_interval)?;
         let value = core::time::Duration::try_from(new.it_value)?;
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             fd:% = fd,
             flags:? = flags,
             interval:? = interval,
@@ -4379,14 +4379,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
-            // Both are pty-specific: meaningless (and `ENOTTY` on real Linux) for a plain stdio
-            // fd, unlike `pty_ioctl`'s handling of the same commands on an actual pty.
-            IoctlArg::TIOCGPTN(_) | IoctlArg::TIOCSPTLCK(_) => Err(Errno::ENOTTY),
+            // All four are ptmx-master-specific: meaningless (and `ENOTTY` on real Linux) for a
+            // plain stdio fd, unlike `pty_ioctl`'s handling of the same commands on an actual pty.
+            IoctlArg::TIOCGPTN(_)
+            | IoctlArg::TIOCSPTLCK(_)
+            | IoctlArg::TIOCGPTPEER(_)
+            | IoctlArg::TIOCPKT(_) => Err(Errno::ENOTTY),
             IoctlArg::TIOCGPGRP(pgrp_ptr) => {
                 let dt = self.global.litebox.descriptor_table();
                 let pgid = dt
                     .with_metadata(fd, |p: &crate::ForegroundPgid| p.0)
-                    .unwrap_or(self.pid);
+                    .unwrap_or(self.pid.get());
                 pgrp_ptr
                     .write_at_offset::<Platform>(0, pgid)
                     .ok_or(Errno::EFAULT)?;
@@ -4424,10 +4427,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     /// Handle a `TCGETS`/`TCSETS*`/`TIOCGWINSZ`/`TIOCSWINSZ`/`TIOCGPTN`/`TIOCSPTLCK`/
-    /// `TIOCGPGRP`/`TIOCSPGRP` ioctl on a pty fd (master or slave).
+    /// `TIOCGPTPEER`/`TIOCGPGRP`/`TIOCSPGRP` ioctl on a pty fd (master or slave).
     ///
-    /// `TIOCGPTN`/`TIOCSPTLCK` are master-only (matching real Linux, which returns `ENOTTY` for
-    /// them on the slave); every other command works on both sides, reading/writing the state
+    /// `TIOCGPTN`/`TIOCSPTLCK`/`TIOCGPTPEER` are master-only (matching real Linux, which returns
+    /// `ENOTTY` for them on the slave); every other command works on both sides, reading/writing the state
     /// shared on the pty's [`super::pty::PtyPair`] so master and slave observe the same tty
     /// state, exactly as real Linux's master/slave pair do.
     fn pty_ioctl(&self, end: &super::pty::PtyEnd<Platform>, arg: &IoctlArg) -> Result<u32, Errno> {
@@ -4474,9 +4477,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 pair.set_locked(val != 0);
                 Ok(0)
             }
+            // Atomically open the peer (slave) and return its fd directly as this ioctl's
+            // result -- the fast path real glibc's `openpty()` actually takes (see the variant's
+            // doc comment in `litebox_common_linux`). Reuses `GlobalState::pts_open`, the exact
+            // function `open("/dev/pts/<id>")` itself calls, so the two paths agree on
+            // everything: the `EIO`-while-locked check, the shared underlying entry, all of it.
+            IoctlArg::TIOCGPTPEER(flags) => {
+                if !end.is_master() {
+                    return Err(Errno::ENOTTY);
+                }
+                let flags = OFlags::from_bits_truncate(*flags as u32);
+                let slave = self.global.pts_open(pair.id)?;
+                let path = alloc::ffi::CString::new(alloc::format!("/dev/pts/{}", pair.id))
+                    .map_err(|_| Errno::EINVAL)?;
+                self.insert_raw_pty_fd(slave, flags, path)
+            }
+            IoctlArg::TIOCPKT(ptr) => {
+                if !end.is_master() {
+                    return Err(Errno::ENOTTY);
+                }
+                let val = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                pair.set_packet_mode(val != 0);
+                Ok(0)
+            }
             IoctlArg::TIOCGPGRP(pgrp_ptr) => {
                 let pgid = match pair.get_fg_pgid() {
-                    0 => self.pid,
+                    0 => self.pid.get(),
                     pgid => pgid,
                 };
                 pgrp_ptr
@@ -4568,7 +4594,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
                 let major = status.node_info.rdev.map_or(0, |v| v.get() >> 8);
                 litebox_util_log::debug!(
-                    tid:% = self.tid,
+                    tid:% = self.tid.get(),
                     rdev:? = status.node_info.rdev.map(|v| (v.get() >> 8, v.get() & 0xff)),
                     file_type:? = status.file_type;
                     "classify_device_fd: character device"
@@ -4587,7 +4613,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let is_input =
                     major == 13 && status.file_type == litebox::fs::FileType::CharacterDevice;
                 litebox_util_log::debug!(
-                    tid:% = self.tid,
+                    tid:% = self.tid.get(),
                     rdev:? = status.node_info.rdev.map(|v| (v.get() >> 8, v.get() & 0xff)),
                     file_type:? = status.file_type,
                     is_input:% = is_input;
@@ -4620,7 +4646,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EBADF);
         };
 
-        litebox_util_log::debug!(tid:% = self.tid, fd:% = fd, arg:? = arg; "sys_ioctl: entry");
+        litebox_util_log::debug!(tid:% = self.tid.get(), fd:% = fd, arg:? = arg; "sys_ioctl: entry");
         let files = self.files.borrow();
         match arg {
             IoctlArg::FIONBIO(arg) => {
@@ -4880,6 +4906,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             | IoctlArg::TIOCGPTN(..)
             | IoctlArg::TIOCSPTLCK(..)
             | IoctlArg::TIOCSCTTY(..)
+            | IoctlArg::TIOCGPTPEER(..)
+            | IoctlArg::TIOCPKT(..)
             | IoctlArg::TIOCGPGRP(..)
             | IoctlArg::TIOCSPGRP(..) => files.run_on_raw_fd(
                 desc,
@@ -5328,7 +5356,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // (page flips arrive at vblank rate) and has previously throttled the
         // emulator badly enough to change what is being measured.
         if crate::syscalls::drm::drm_trace_enabled() {
-            litebox_util_log::debug!(pid:% = self.pid, ioctl:? = arg; "diag-drm-ioctl");
+            litebox_util_log::debug!(pid:% = self.pid.get(), ioctl:? = arg; "diag-drm-ioctl");
         }
         match arg {
             IoctlArg::DrmModeGetResources(ptr) => self.global.drm.get_resources(*ptr),
@@ -5527,7 +5555,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Some(event.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?)
         };
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             epfd:% = epfd,
             op:? = op,
             fd:% = fd;
@@ -5595,7 +5623,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         };
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             epfd:% = epfd,
             maxevents:% = maxevents,
             timeout:? = timeout;
@@ -5607,7 +5635,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     &self.global,
                     &self.wait_cx().with_timeout(timeout),
                     maxevents,
-                    self.tid,
+                    self.tid.get(),
                     epfd,
                 ) {
                     Ok(epoll_events) => {
@@ -5629,7 +5657,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             do_wait()
         };
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             epfd:% = epfd,
             result:? = result;
             "sys_epoll_pwait: returning"
@@ -5674,7 +5702,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // calls -- see AGENTS.md sub-session 39). Kept landed: cheap (one line per ppoll call),
         // and directly shows which fds/events a GLib/GTK main loop is watching and what came back.
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             fds:? = diag_fds,
             timeout:? = timeout;
             "sys_ppoll: entry"
@@ -5693,7 +5721,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             do_wait()
         };
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             wait_result:? = wait_result;
             "sys_ppoll: wait returned"
         );
@@ -5728,7 +5756,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         }
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             ready_count:% = ready_count;
             "sys_ppoll: returning"
         );

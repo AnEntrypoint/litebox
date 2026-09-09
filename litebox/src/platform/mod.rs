@@ -976,6 +976,132 @@ pub trait ForkChildVerificationProvider {
         let _ = inherited_eventfds;
         None
     }
+
+    /// Whether this platform has a REAL `fork()` -- a single syscall that gives a cross-process
+    /// child its own address space as a copy-on-write duplicate of the caller's, with every open
+    /// fd (`FD_CLOEXEC` ones included; the kernel only honours that flag at a later `execve`, not
+    /// at `fork()` itself) and the calling thread's entire register/TLS state inherited for free.
+    ///
+    /// [`Self::spawn_cross_process_fork_child`]'s five-parameter shape -- relocations to
+    /// translate, a register snapshot to inject, pipes/files/eventfds to individually bridge or
+    /// reopen -- exists ENTIRELY to compensate for a host that has no such syscall (Windows:
+    /// `CreateProcess` starts a disjoint process with an empty address space and none of the
+    /// parent's handles, so every one of those must be reconstructed by hand). A host that
+    /// answers `true` here skips all of it: see [`Self::native_fork`].
+    ///
+    /// Default `false` -- unconditionally safe for any platform, since [`Self::native_fork`]'s
+    /// default already matches (returns `None`, meaning "no such syscall").
+    ///
+    /// The "reverse wine" answer for this specific capability: Wine implements Windows syscalls
+    /// on Linux primitives, keeping a userspace server (`wineserver`) only for the semantics
+    /// Linux genuinely lacks. litebox runs the opposite direction -- Linux syscalls on whatever
+    /// host it's given -- so its own reverse-wine discipline is the same shape, mirrored: use the
+    /// HOST's real primitive directly wherever the host's own semantics already match what the
+    /// guest syscall needs, and reserve a userspace (shim-level) reimplementation for exactly the
+    /// gap where the host lacks it. `fork()` is the clean case of that gap NOT existing: a real
+    /// POSIX host already has the exact primitive `clone()`/`fork()` asks for, so `true` here
+    /// means "don't reimplement it" -- [`Self::spawn_cross_process_fork_child`]'s whole apparatus
+    /// is the userspace reimplementation this trait keeps around specifically for hosts (Windows)
+    /// where the gap is real, the same role `wineserver` plays for Wine's own genuine gaps.
+    fn has_native_fork(&self) -> bool {
+        false
+    }
+
+    /// Calls the host's real `fork()`. Only ever called when [`Self::has_native_fork`] is `true`.
+    ///
+    /// Returns `Some(0)` if this call is returning in the CHILD's own copy of the calling
+    /// thread's stack (the callee must treat the in-progress guest syscall as returning `0`, the
+    /// `fork()` ABI's child-side contract, and must NOT register anything into
+    /// `Process::cross_process_children` -- there is nothing to wait for from inside the child
+    /// itself), `Some(child_pid)` if this call is returning in the PARENT (the callee registers a
+    /// [`CrossProcessChildHandle`] keyed by this pid and reports it as the guest's `fork()`
+    /// return value), or `None` if the underlying `fork()` call itself failed (e.g. `EAGAIN`,
+    /// `ENOMEM`) -- the caller falls back to the thread-based relocating fork exactly as it would
+    /// for [`Self::spawn_cross_process_fork_child`] returning `None`.
+    ///
+    /// A real `fork()` duplicates every host thread's worth of memory but only the CALLING
+    /// thread itself -- every sibling host thread (other guest threads of this same guest
+    /// process, and, under this architecture's single-shared-address-space model, every thread
+    /// belonging to every OTHER guest process) simply does not exist in the child, exactly
+    /// matching real Linux's own `fork()` semantics for a multithreaded process. If one of those
+    /// now-vanished threads held a lock reachable from the child's own continued execution, that
+    /// lock is locked forever in the child -- POSIX's well-known, general "fork() in a
+    /// multithreaded program" hazard, not a litebox-specific defect. The caller is responsible
+    /// for quiescing the locks it knows to be at risk (see
+    /// `litebox_shim_linux::GlobalState::with_shimwide_locks_held`) immediately around this call,
+    /// the same way glibc's own `__libc_fork` quiesces malloc's arena locks before calling the
+    /// kernel -- this method itself does no quiescing of its own, since it has no visibility into
+    /// the shim-level locks above it.
+    ///
+    /// # Safety
+    /// Must be called with no Rust-level borrow (e.g. a `RefCell`/lock guard) live across the
+    /// call that the child's continued execution would need to independently re-derive -- a
+    /// borrow's runtime state is duplicated exactly as-is into the child, so a guard that looks
+    /// "held" to the child but whose releasing code never runs there (because the thread that
+    /// would have run it doesn't exist in the child) is as unsound as the same pattern would be
+    /// around a raw `libc::fork()` call directly.
+    unsafe fn native_fork(&self) -> Option<i32> {
+        None
+    }
+
+    /// On a host with no real `fork()`, litebox maps every guest process into ONE shared host
+    /// address space (see [`Self::has_native_fork`]'s doc comment). A fixed-address (`ET_EXEC`)
+    /// ELF image occasionally needs the EXACT SAME address a still-live ancestor or sibling
+    /// guest process already occupies -- impossible to satisfy within that one shared space, and
+    /// on a host with genuinely independent per-process address spaces (a real `fork()`, or any
+    /// two ordinary Windows processes) this situation cannot occur at all.
+    ///
+    /// Called once `sys_execve` has found no way to load the new image into THIS process's own
+    /// address space (an unrecoverable collision after every ordinary relocation attempt has
+    /// already failed) -- i.e. real Linux's own `execve()` guarantee (a genuinely FRESH address
+    /// space, every time, `vfork`-originated or not) cannot be honoured by staying in this
+    /// process. The platform's only remaining way to still honour it is the one thing a host
+    /// without `fork()` is actually good at: starting a genuinely separate process. Unlike
+    /// [`Self::spawn_cross_process_fork_child`], there is no existing execution state to carry
+    /// across -- the old program's memory is already torn down by the time this is called -- just
+    /// the new program's own `path`/`argv`/`envp`, exactly what a real `execve()` itself needs.
+    ///
+    /// Synchronous and blocking: by the time this is called there is nothing else for the calling
+    /// thread to do except wait for the new process and adopt its exit status, exactly as if this
+    /// process's own `execve()` had succeeded and that program had then run to completion -- so
+    /// this does the whole thing (spawn, wait, return the raw exit status) rather than handing
+    /// back a handle for some other call to wait on later.
+    ///
+    /// Returns `None` if this platform has no way to do this (the correct default on every
+    /// platform with a real `fork()` -- the collision this exists for cannot occur there) or if
+    /// the spawn itself failed; the caller's existing fallback (kill the guest with `SIGSEGV`,
+    /// matching real Linux's own behaviour for an unrecoverable post-point-of-no-return `execve`
+    /// failure) still applies either way.
+    ///
+    /// The result's `exported_writable_layer`, when present, is a tar archive of every file the
+    /// child created or modified -- the SAME shape [`Self::take_cross_process_writable_layer_
+    /// export`] hands a cross-process FORK's parent at `wait4` time, for the identical reason:
+    /// the child is a genuinely separate process with its own independently-COW'd filesystem
+    /// state, so whatever it wrote (e.g. the very directories this new program needs to find
+    /// already in place) is invisible to this one unless explicitly carried back. Unlike the
+    /// fork case, there is no later `wait4` to carry it at -- this IS the continuing guest
+    /// process, so the caller imports it immediately, inline, rather than deferring to a
+    /// registry keyed by a handle nothing else needs.
+    fn spawn_exec_collision_child(
+        &self,
+        path: &str,
+        argv: &[alloc::ffi::CString],
+        envp: &[alloc::ffi::CString],
+    ) -> Option<ExecCollisionChildResult> {
+        let _ = (path, argv, envp);
+        None
+    }
+}
+
+/// The outcome of [`ForkChildVerificationProvider::spawn_exec_collision_child`] -- see its own
+/// doc comment for the full reasoning behind each field.
+#[derive(Debug)]
+pub struct ExecCollisionChildResult {
+    /// The replacement process's raw exit status, to be adopted as this guest process's own.
+    pub raw_status: i32,
+    /// A tar archive of the replacement process's writable-layer changes, if any, to be imported
+    /// into this (continuing) guest process's own filesystem before it exits.
+    pub exported_writable_layer: Option<alloc::vec::Vec<u8>>,
 }
 
 /// A regular file a cross-process `fork()` child must come up holding at a particular fd.

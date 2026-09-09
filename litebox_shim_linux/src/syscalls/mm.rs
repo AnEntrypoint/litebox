@@ -542,7 +542,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // this print exists to check whether reaching this far (i.e. `get_static_backing_data`
         // succeeding) at all correlates with the still-open EEXIST regression.
         litebox_util_log::debug!(
-            tid:% = self.tid, offset:% = offset, static_len:% = static_data.len();
+            tid:% = self.tid.get(), offset:% = offset, static_len:% = static_data.len();
             "DIAG try_cow_mmap_file: static_data resolved, about to attempt CoW"
         );
 
@@ -1223,7 +1223,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         offset: usize,
     ) -> Result<UserPtrMut<u8>, Errno> {
         litebox_util_log::debug!(
-            tid:% = self.tid, addr:% = addr, len:% = len, prot:? = prot, flags:? = flags,
+            tid:% = self.tid.get(), addr:% = addr, len:% = len, prot:? = prot, flags:? = flags,
             fd:% = fd, offset:% = offset;
             "DIAG sys_mmap: entry"
         );
@@ -1335,7 +1335,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // while investigating the mallocng `.meta=0` use-after-free (a group pointer's crashing
         // address had zero matches anywhere in an otherwise-complete debug trace).
         litebox_util_log::debug!(
-            tid:% = self.tid, host_tid:% = self.global.platform.host_debug_tid(),
+            tid:% = self.tid.get(), host_tid:% = self.global.platform.host_debug_tid(),
             addr:% = addr.as_usize(), len:% = len, ok:% = result.is_ok();
             "sys_munmap"
         );
@@ -1361,7 +1361,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         for ((pid, _), state) in cache.iter_mut() {
             // The unmapped range is an address in *this* process's address space; entries owned by
             // other processes describe unrelated address spaces (see [`ElfPatchKey`]).
-            if *pid != self.pid {
+            if *pid != self.pid.get() {
                 continue;
             }
             state.file_mappings.retain(|&(vaddr, seg_len)| {
@@ -1384,7 +1384,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         prot: ProtFlags,
     ) -> Result<(), Errno> {
         litebox_util_log::debug!(
-            tid:% = self.tid, addr:% = addr.as_usize(), len:% = len, prot:? = prot;
+            tid:% = self.tid.get(), addr:% = addr.as_usize(), len:% = len, prot:? = prot;
             "sys_mprotect: entry"
         );
         // Intercept transitions to PROT_EXEC: patch unpatched file mappings.
@@ -1396,7 +1396,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         let result = self.sys_mprotect_raw(addr, len, prot);
         litebox_util_log::debug!(
-            tid:% = self.tid, ok:% = result.is_ok();
+            tid:% = self.tid.get(), ok:% = result.is_ok();
             "sys_mprotect: returned"
         );
         result
@@ -1442,7 +1442,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // failure path (mirroring `sys_brk`'s pattern just below); a successful mremap is
             // already visible via the ordinary `mmap`/`mprotect` traces around it.
             litebox_util_log::debug!(
-                tid:% = self.tid, old_addr:% = old_addr.as_usize(), old_size:% = old_size,
+                tid:% = self.tid.get(), old_addr:% = old_addr.as_usize(), old_size:% = old_size,
                 new_size:% = new_size, flags:% = flags_for_log, new_addr:% = new_addr, err:? = e;
                 "sys_mremap: failed"
             );
@@ -1496,7 +1496,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             for (&(pid, fd), state) in cache.iter() {
                 // Only this process's own entries describe this address space; another process's
                 // absolute `file_mappings` addresses are meaningless here (see [`ElfPatchKey`]).
-                if pid != self.pid || state.pre_patched {
+                if pid != self.pid.get() || state.pre_patched {
                     continue;
                 }
                 for &(seg_start, seg_len) in &state.file_mappings {
@@ -2337,7 +2337,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// The [`ElfPatchCache`] key for `fd` in *this* task's process. See [`ElfPatchKey`].
     fn elf_patch_key(&self, fd: i32) -> ElfPatchKey {
-        (self.pid, fd)
+        (self.pid.get(), fd)
     }
 
     /// Finalize the ELF patching state for `fd`.
