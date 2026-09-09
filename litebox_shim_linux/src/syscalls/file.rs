@@ -6201,6 +6201,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ///
     /// The cross-process `fork()` gate can only carry pipes, and "some fd was in the way" is a
     /// useless thing to read in a log when the question is which subsystem to teach next.
+    /// Is `raw_fd` marked close-on-exec?
+    ///
+    /// Reported alongside the subsystem when a cross-process `fork()` refuses an fd, because the
+    /// two facts together decide what carrying it would even mean: a `CLOEXEC` fd is one the guest
+    /// has already declared its exec'd children must NOT have, so for the fork+exec pair that is
+    /// almost every fork, carrying it faithfully and then closing it at exec are the same outcome.
+    pub(crate) fn raw_fd_is_cloexec(&self, raw_fd: usize) -> bool {
+        let files = self.files.borrow();
+        crate::syscalls::file::get_file_descriptor_flags(raw_fd, &self.global, &files)
+            .map(|f| f.contains(FileDescriptorFlags::FD_CLOEXEC))
+            .unwrap_or(false)
+    }
+
     pub(crate) fn raw_fd_subsystem_name(&self, raw_fd: usize) -> &'static str {
         let files = self.files.borrow();
         files
