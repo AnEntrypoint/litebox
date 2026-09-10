@@ -307,10 +307,6 @@ pub struct PulledLayers {
     /// whole lifetime). Only on the rare failure to write/mmap the cache file does a layer fall
     /// back to `Cow::Owned` (heap-resident) as a correctness-preserving degradation.
     pub layers: Vec<Cow<'static, [u8]>>,
-    /// Parsed image execution config (ENTRYPOINT, CMD, ENV, WORKDIR).
-    pub config: ImageConfig,
-    /// Raw OCI image config JSON blob.
-    pub config_json: Vec<u8>,
 }
 
 /// On-disk cache of rewritten OCI layers, keyed by `(layer_digest, rewriter_version)`.
@@ -734,7 +730,7 @@ pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<P
         }
     }
 
-    let (config, layers) = rt.block_on(async {
+    let layers = rt.block_on(async {
         let client_config = ClientConfig {
             protocol: ClientProtocol::Https,
             platform_resolver: Some(Box::new(|entries| {
@@ -762,16 +758,15 @@ pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<P
             .await
             .with_context(|| format!("failed to pull manifest for {reference}"))?;
 
-        let mut config_bytes: Vec<u8> = Vec::new();
-        client
-            .pull_blob(&reference, &manifest.config, &mut config_bytes)
-            .await
-            .with_context(|| format!("failed to pull image config for {reference}"))?;
-        let config = oci_client::client::Config::new(
-            config_bytes,
-            manifest.config.media_type.clone(),
-            manifest.annotations.clone(),
-        );
+        // No image-config blob pull here, unlike `pull_and_extract`: `PulledLayers` has no
+        // `config`/`config_json` field and neither runtime caller
+        // (`litebox_runner_linux_on_windows_userland`) ever reads one -- the program to run is
+        // always given explicitly on this runner's own command line, never derived from the
+        // image's ENTRYPOINT/CMD. Fetching and parsing it was pure wasted work: one whole extra
+        // network round-trip (blob GET + the manifest GET above, with no HTTP keep-alive across
+        // them since every cross-process fork child re-execs with a brand-new `Client`) on every
+        // single `--oci-image` boot AND every cross-process fork of one, for a value nothing
+        // downstream ever looked at.
 
         if verbose {
             eprintln!("  Pulled manifest ({} layer(s))", manifest.layers.len());
@@ -1044,31 +1039,10 @@ pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<P
             layers.push(mapped);
         }
 
-        Ok::<_, anyhow::Error>((config, layers))
+        Ok::<_, anyhow::Error>(layers)
     })?;
 
-    let config_json = config.data.to_vec();
-    let parsed_config = match ConfigFile::try_from(config) {
-        Ok(cf) => {
-            let exec_config = cf.config.as_ref();
-            ImageConfig {
-                entrypoint: exec_config.and_then(|c| c.entrypoint.clone()),
-                cmd: exec_config.and_then(|c| c.cmd.clone()),
-                env: exec_config.and_then(|c| c.env.clone()),
-                working_dir: exec_config.and_then(|c| c.working_dir.clone()),
-            }
-        }
-        Err(e) => {
-            eprintln!("warning: failed to parse image config: {e}");
-            ImageConfig::default()
-        }
-    };
-
-    Ok(PulledLayers {
-        layers,
-        config: parsed_config,
-        config_json,
-    })
+    Ok(PulledLayers { layers })
 }
 
 /// Rewrite every executable ELF entry inside one decompressed OCI layer tar's bytes, eagerly,
