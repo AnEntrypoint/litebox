@@ -361,7 +361,10 @@ on-screen client first.
   (Supersedes any older "26 failing, 9 need `diod`" note dated before 2026-09-09.) Full history:
   memory test-suite-status-history-2026-09-09-miscounting-root-causes (mem-14fccd59cddec385-2382).
 - `docs/webtop-debian-selkies-2026-09-06.md` (Track A) and `docs/webtop-alpine-mate-2026-09-07.md`
-  -- the full, dated investigation logs behind "Webtop browser-verified video pipeline" above.
+  -- the full, dated investigation logs behind "Webtop browser-verified video pipeline" above. The
+  latter's 2026-09-10 addendum has the full ordered `s6-rc.d` dep chain and confirms selkies is
+  pure Python (no Node.js anywhere in this image) -- a PRD row referring to a "selkies node.js
+  WebRTC server" is describing the wrong image/stack; treat selkies as Python+pixelflux/pcmflux.
 - `docs/track-b-fork-fix-progress.md` and `advisor/ADVISORY-002-d-zero-fork.md` -- the full log
   and design case behind "Track B: `D == 0` cross-process fork" above, including the 2026-09-10
   `CLAIMED_RANGES` cross-process-collision root-cause fix for Xvfb's deterministic crash.

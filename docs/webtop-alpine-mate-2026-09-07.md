@@ -1232,3 +1232,33 @@ Everything else in the plan survives intact and was confirmed to exist:
 `half_pipe_type` classifies direction; and `LinuxShim` is `Arc`-backed and `Clone` so pump threads
 can hold it, while `LinuxShimEntrypoints` is deliberately `!Send` so the child-side install must
 run on the child's own guest thread.
+
+# 2026-09-10: exact s6-rc.d dependency order and tar-pair equivalence, read directly from both rootfs tars
+
+Read both `.wfgy/webtop_seatd.tar` and `.wfgy/webtop_seatd_realigned.tar` via Python `tarfile` (no
+extraction) to settle two open questions left by "The image's real launch recipe" above.
+
+**The two tars are file-set-identical (54,273 entries each).** `_realigned` only adds 2,384
+`litebox/.align/<offset>` padding entries and converts 4,913 duplicate-content regular files into
+symlinks (content dedup) -- neither is more complete; use whichever is convenient.
+
+**Full ordered `s6-rc.d` dependency chain** (reference for what a manual bypass-s6 launch script
+must still replicate by hand): `init-migrations -> init-adduser -> init-device-perms/init-envfile
+-> init-os-end -> init-selkies -> init-nginx -> init-selkies-config -> init-video ->
+init-selkies-end -> init-config -> init-crontab-config -> init-config-end -> init-mods ->
+init-mods-package-install -> init-mods-end -> init-custom-files -> init-services -> {svc-xorg,
+svc-nginx, svc-pulseaudio, svc-cron, svc-docker, svc-watchdog}`; `svc-xsettingsd`, `svc-selkies`
+and `svc-de` additionally depend on `svc-xorg`+`svc-nginx`. **Pixel-bearing subset is exactly four
+services**: `svc-xorg` (Xvfb), `svc-de` (`/defaults/startwm.sh` -> MATE), `svc-nginx`,
+`svc-selkies` -- everything else (cron, docker, watchdog, xsettingsd [self-disables once
+`xfce4-session` exists], mods, crontab, device-perms, adduser, migrations) contributes zero pixels
+and can stay skipped in a bypass launch. **There is no `svc-dbus` anywhere in this alpine tree** --
+the only D-Bus is the `dbus-launch --exit-with-session /usr/bin/mate-session` already named above.
+
+**Ports, for completeness** (3000/8082 already confirmed live above): HTTPS on **3001**
+(`CUSTOM_HTTPS_PORT`, same `init-nginx` sed as 3000); selkies `control_port` defaults to **8083**;
+`/devmode`->5173 and `/pelorus`->5100 exist only under `DEV_MODE`/`PELORUS`, which must stay unset.
+One more `svc-selkies` env not previously recorded here: `XCURSOR_THEME=Breeze_Light`.
+
+No new blockers found -- this only fills in the bypass-launch reference map. Full raw finding:
+gm mutable `webtop-alpine-mate-s6-bypass-launch-recipe` (filed here, resolved).
