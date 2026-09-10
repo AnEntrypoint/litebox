@@ -885,6 +885,52 @@ pub trait ForkChildVerificationProvider {
         )
     }
 
+    /// Arranges for `on_exit` to run (on some platform-chosen thread, NOT necessarily the calling
+    /// one) once the real OS process identified by `handle` terminates -- the async counterpart to
+    /// [`Self::wait_for_cross_process_exit`]'s blocking wait.
+    ///
+    /// Exists because a `LITEBOX_PROCESS_FORK=1` child's exit has no path into this process's own
+    /// in-guest signal-delivery machinery otherwise. `Process::prepare_for_exit`
+    /// (`litebox_shim_linux`) notifies a live parent of an ordinary (same-process, thread-based)
+    /// child's exit by pushing `SIGCHLD` into the parent's `shared_pending` and calling
+    /// `interrupt_all_threads()` -- which wakes any thread blocked in `wait_cx().sleep()`
+    /// (`sys_pause`, `sys_rt_sigsuspend`, the `pid == -1` poll loop in `sys_wait4`/`sys_waitid`).
+    /// A cross-process child is a genuinely separate OS process reconstructing its OWN `Process`
+    /// from scratch (`new_adopting_existing_memory`), so it has no `Arc` back to the real parent's
+    /// `Process` to push into or interrupt -- confirmed live: `prepare_for_exit`'s own
+    /// `has_live_parent` gate check is unconditionally `false` for such a child, so that whole
+    /// notify step is skipped every time.
+    ///
+    /// Without this, a parent that blocks the race-free way -- mask `SIGCHLD`, then
+    /// `sigsuspend`/`pause` to atomically wait for it (the standard idiom; busybox ash's plain
+    /// `wait` builtin uses exactly this once it has more than one backgrounded job) -- hangs
+    /// forever the moment it has ANY cross-process-fork child, even after that child has already
+    /// exited: nothing will ever wake the sleeper, because no real `SIGCHLD`-equivalent is ever
+    /// delivered. An active poller (a plain `wait4(-1, ..., 0)` retry loop with no intervening
+    /// sleep) would eventually notice via `Self::wait_for_cross_process_exit`/
+    /// `Self::try_wait_for_cross_process_exit` on its own, but a signal-driven waiter never will.
+    ///
+    /// The caller (`litebox_shim_linux::syscalls::process::do_clone`, right after
+    /// `register_cross_process_child`) supplies `on_exit` to push the CHILD's own `exit_signal`
+    /// into the PARENT's `shared_pending` and call the parent's `interrupt_all_threads()` --
+    /// exactly mirroring `prepare_for_exit`'s existing same-process notify step, just reached via
+    /// a different trigger. This call returns immediately; `on_exit` runs later, asynchronously,
+    /// whenever the watched process actually exits. The default implementation is unreachable for
+    /// the same reason its siblings above are: nothing ever calls this without having first
+    /// successfully registered a real [`CrossProcessChildHandle`], which requires cross-process
+    /// fork support to exist in the first place.
+    fn spawn_cross_process_exit_notifier(
+        &'static self,
+        handle: CrossProcessChildHandle,
+        on_exit: alloc::boxed::Box<dyn FnOnce() + Send>,
+    ) {
+        let _ = handle;
+        drop(on_exit);
+        unreachable!(
+            "spawn_cross_process_exit_notifier called on a platform with no cross-process fork support"
+        )
+    }
+
     /// Pass 157: after `sys_wait4` has observed cross-process child `handle`'s real exit (via
     /// [`Self::wait_for_cross_process_exit`]/[`Self::try_wait_for_cross_process_exit`]) but
     /// BEFORE reaping it from the registry, returns the raw bytes of a tar archive containing

@@ -3131,6 +3131,38 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.attached_pty_id.set(None);
     }
 
+    /// Bridges a `LITEBOX_PROCESS_FORK=1` cross-process child's real OS-level exit into this
+    /// (parent) process's own in-guest signal-delivery machinery, exactly mirroring what
+    /// `Process::prepare_for_exit` already does for an ordinary thread-based child -- push
+    /// `signal` into `shared_pending` and call `interrupt_all_threads()` so any thread blocked in
+    /// `wait_cx().sleep()` (`sys_pause`, `sys_rt_sigsuspend`, `sys_wait4`/`sys_waitid`'s
+    /// `pid == -1` poll loop) wakes up and re-checks. Without this, a parent that blocks the
+    /// race-free way (mask `SIGCHLD`, `sigsuspend` to atomically wait for it -- busybox ash's
+    /// plain `wait` builtin does exactly this once it has more than one backgrounded job) hangs
+    /// forever the moment it has any cross-process-fork child: see
+    /// `ForkChildVerificationProvider::spawn_cross_process_exit_notifier`'s doc comment for the
+    /// full live-reproduced evidence. A no-op when `signal` is `None` (the raw `clone()`/`clone3`
+    /// caller explicitly passed `exit_signal == 0`, real Linux's own "no signal on exit" encoding)
+    /// -- nothing to deliver, so no notifier thread to spawn either.
+    fn arm_cross_process_exit_notifier(
+        &self,
+        handle: litebox::platform::CrossProcessChildHandle,
+        signal: Option<litebox_common_linux::signal::Signal>,
+    ) {
+        let Some(signal) = signal else { return };
+        let process = self.process();
+        self.global.platform.spawn_cross_process_exit_notifier(
+            handle,
+            alloc::boxed::Box::new(move || {
+                process
+                    .shared_pending
+                    .lock()
+                    .push(&process.limits, signal, super::signal::siginfo_kill(signal));
+                process.interrupt_all_threads();
+            }),
+        );
+    }
+
     fn do_clone(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -3269,11 +3301,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EINVAL);
         }
 
-        // TODO: `exit_signal` is validated but not yet delivered to the parent on child exit
-        // (no SIGCHLD support yet -- see sys_wait4/waitpid, also not yet implemented).
         if exit_signal > MAX_SIGNAL_NUMBER {
             return Err(Errno::EINVAL);
         }
+        // For a THREAD-based child, delivering `exit_signal` to a live parent is
+        // `Process::prepare_for_exit`'s job (it has a direct `Arc` to the parent to push into and
+        // interrupt). A `LITEBOX_PROCESS_FORK=1` CROSS-PROCESS child has no such `Arc` -- it is a
+        // separate OS process reconstructing its own `Process` from scratch -- so `register_cross_
+        // process_child`'s two call sites below each also arm a
+        // `ForkChildVerificationProvider::spawn_cross_process_exit_notifier` themselves, computed
+        // once here since both need the identical conversion.
+        let cross_process_exit_signal = (exit_signal != 0)
+            .then(|| i32::try_from(exit_signal).unwrap_or(0))
+            .and_then(|raw| litebox_common_linux::signal::Signal::try_from(raw).ok());
 
         let tls = if flags.contains(CloneFlags::SETTLS) {
             let addr = tls.trunc();
@@ -3422,6 +3462,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     return Ok(0);
                 }
                 self.process().register_cross_process_child(child_tid, handle);
+                self.arm_cross_process_exit_notifier(handle, cross_process_exit_signal);
                 litebox_util_log::debug!(
                     parent_tid:% = self.tid.get(), child_tid:% = child_tid;
                     "clone: spawned cross-process fork() child (no in-process duplicate made)"
@@ -4183,6 +4224,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             {
                 self.process()
                     .register_cross_process_child(child_tid, handle);
+                self.arm_cross_process_exit_notifier(handle, cross_process_exit_signal);
                 litebox_util_log::debug!(
                     parent_tid:% = self.tid.get(),
                     child_tid:% = child_tid;

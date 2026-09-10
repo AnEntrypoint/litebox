@@ -9634,6 +9634,24 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         }
     }
 
+    fn spawn_cross_process_exit_notifier(
+        &'static self,
+        handle: litebox::platform::CrossProcessChildHandle,
+        on_exit: alloc::boxed::Box<dyn FnOnce() + Send>,
+    ) {
+        // This thread's only job is the blocking wait -- `wait_for_cross_process_exit` already
+        // does it, same `HANDLE`-safety contract as every other cross-process-wait call above
+        // (the registry entry outlives this thread; `sys_wait4`'s `reap_cross_process_child`
+        // only ever runs after a wait on this same handle has already returned). Deliberately NOT
+        // using `self.global.platform`-style access to anything guest-side here: this thread
+        // exists specifically to reach into the GUEST's own notify machinery through `on_exit`,
+        // never to touch guest memory or state directly itself.
+        std::thread::spawn(move || {
+            self.wait_for_cross_process_exit(handle);
+            on_exit();
+        });
+    }
+
     fn diagnostic_cross_process_wait4_probe(
         &self,
         register: &mut dyn FnMut(i32, litebox::platform::CrossProcessChildHandle),
