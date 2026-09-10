@@ -31,23 +31,46 @@
 //!
 //! **The consequence for this module's own API is the inverse of `litebox_platform_windows_
 //! userland::presentation::Presenter`: [`Presenter::run`] must be called from the actual process
-//! main thread (the same thread `fn main()` starts on), and whatever this platform's own
-//! `run_thread` (guest execution) is must move to a background thread instead** -- the opposite of
-//! how `litebox_runner_linux_on_windows_userland`/`litebox_runner_linux_userland` are structured
-//! today. A future macOS runner (see this module's own "What this pass does NOT do" section below)
-//! would need a shape like:
+//! main thread (the same thread `fn main()` starts on), and guest execution must move to a
+//! background thread instead** -- the opposite of how `litebox_runner_linux_on_windows_userland`/
+//! `litebox_runner_linux_userland` are structured today. The two crate-level entry points that
+//! shape exists for, [`crate::run_thread`] and [`crate::spawn_guest_thread`], carry the full
+//! rationale; a future macOS runner (see this module's own "What this pass does NOT do" section
+//! below) wires them together like this:
 //!
 //! ```ignore
 //! // Illustrative only -- no macOS runner crate exists yet to actually call this.
-//! let presenter = Presenter::new();
+//! // The presenter is built FIRST, on the real main thread, so its frame sender can simply be
+//! // moved INTO the guest thread. Windows/Linux have to pass theirs the other way -- back out of
+//! // the presenter thread over an `mpsc` channel -- because `winit::EventLoop` is `!Send` there
+//! // as well, which is the one place this platform's inversion is the simpler arrangement.
+//! let mut presenter = Presenter::new()?;
 //! let sender = presenter.sender();
-//! std::thread::spawn(move || {
-//!     // Guest execution moves here, off the main thread -- the inverse of the Windows/Linux
-//!     // userland runners, where run_thread stays on main and the presenter gets the background
-//!     // thread.
-//!     unsafe { litebox_platform_macos_userland::guest::run_thread(shim, ctx) };
+//! let input_shim = shim.clone();
+//! presenter.set_input_consumer(move |signal| match signal {
+//!     InputSignal::Key(code, value) => input_shim.push_input_key(code, value),
+//!     InputSignal::Rel(code, value) => input_shim.push_input_rel(code, value),
 //! });
-//! presenter.run().expect("run presenter event loop"); // blocks the real main thread
+//! shim.add_drm_flip_callback(move |bytes, width, height, pitch, _pixel_format| {
+//!     sender.send(Frame { width, height, pitch, bytes: bytes.to_vec() });
+//! });
+//! // Guest execution moves off the main thread -- the inverse of the Windows/Linux userland
+//! // runners, where `run_thread` stays on main and the presenter gets the background thread.
+//! // `spawn_guest_thread` rather than a bare `std::thread::spawn`: the initial guest thread no
+//! // longer inherits the main thread's stack, and `load_program` must run on the same thread as
+//! // `run_thread` (its `LinuxShimEntrypoints` is `!Send`).
+//! let guest = litebox_platform_macos_userland::spawn_guest_thread(move || {
+//!     let program = shim.load_program(fs, init_task, &prog_path, argv, envp)?;
+//!     unsafe {
+//!         litebox_platform_macos_userland::run_thread(
+//!             program.entrypoints,
+//!             &mut litebox_common_linux::PtRegs::default(),
+//!         );
+//!     }
+//!     Ok(program.process.wait())
+//! })?;
+//! presenter.run()?; // blocks the real main thread until the window closes
+//! let exit_code = guest.join().expect("initial guest thread panicked")?;
 //! ```
 //!
 //! # What this pass does NOT do (honest scope limit, distinct from the Linux userland port)
@@ -61,13 +84,13 @@
 //!    (or similarly named) crate exists in this workspace that constructs a `LinuxShimBuilder`,
 //!    loads a guest program, and calls a `run_thread`. This module cannot be wired to a real `--gui`
 //!    CLI flag the way the Linux userland port was, because there is nothing to add that flag to.
-//! 2. **Guest entry itself is not implemented on this platform.** `litebox_platform_macos_
-//!    userland::guest::run_thread` (see that module's own doc comment and `docs/macos.md`'s
-//!    "Remaining work" section) is a documented stub that logs an error and returns without
-//!    executing any guest code -- the aarch64 context-switch/trampoline/TPIDR_EL0-anchor work is
-//!    real, separate, unstarted work, unrelated to GUI presentation. So even with a runner crate,
-//!    there is currently no guest execution on this platform for a page-flip to ever originate
-//!    from.
+//! 2. **Guest entry is now REACHABLE but still not IMPLEMENTED.** [`crate::run_thread`] and
+//!    [`crate::spawn_guest_thread`] exist and are callable in exactly the shape above -- that part
+//!    of the gap is closed -- but what they ultimately reach is a documented stub that logs an
+//!    error and returns without executing any guest code. The aarch64 context-switch/trampoline/
+//!    `TPIDR_EL0`-anchor work behind it (see `docs/macos.md`'s "Remaining work" section) is real,
+//!    separate, unstarted work, unrelated to GUI presentation. So even with a runner crate, there
+//!    is currently no guest execution on this platform for a page-flip to ever originate from.
 //! 3. **No real macOS host is available in this environment to run-verify against**, and no
 //!    `codesign`/JIT-entitlement tooling either (`docs/macos.md`'s W^X section) -- both would be
 //!    required even once (1) and (2) are done.

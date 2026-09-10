@@ -1271,6 +1271,7 @@ impl litebox::platform::ThreadProvider for MacOsUserland {
         let mut ctx = ctx.clone();
         std::thread::Builder::new()
             .name("litebox-guest".into())
+            .stack_size(GUEST_THREAD_STACK_SIZE)
             .spawn(move || {
                 // Let the shim set up its per-thread state before the new thread
                 // reaches guest code.
@@ -1292,6 +1293,86 @@ impl litebox::platform::ThreadProvider for MacOsUserland {
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
         ThreadHandle::run_with_handle(f)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Guest entry
+// ---------------------------------------------------------------------------
+
+/// Stack size for every host thread that can execute guest code.
+///
+/// Guest code runs directly on the real host thread's own stack -- there is no separate emulated
+/// guest-stack region -- so the host-side frames LiteBox itself incurs while emulating a syscall
+/// share this same native stack, on top of whatever the guest's own `sp` addresses. That is why
+/// this matches `litebox_platform_windows_userland`'s own `GUEST_THREAD_STACK_SIZE` rather than
+/// being sized against the guest's `sp` region alone (which
+/// `litebox_shim_linux::loader::DEFAULT_STACK_SIZE` sizes separately).
+///
+/// This platform needs it in one place the others do not: its initial (`execve`-time) guest
+/// thread is a *spawned* thread, not the process main thread, because of the inversion the
+/// [`presentation`] module documents. A spawned Rust thread's default stack is 2 MiB, where
+/// Darwin gives the main thread 8 MiB, so taking the default here would SHRINK the initial guest
+/// thread's budget relative to the other userland runners. Windows hit exactly that as a real,
+/// live `STATUS_STACK_OVERFLOW` when its own initial guest thread moved off the main thread (see
+/// `litebox_runner_linux_on_windows_userland`'s `INITIAL_GUEST_THREAD_STACK_SIZE`);
+/// [`spawn_guest_thread`] applies this size so the macOS inversion cannot reintroduce it.
+pub const GUEST_THREAD_STACK_SIZE: usize = 32 * 1024 * 1024;
+
+/// Runs a guest thread with `shim` and the given initial context, returning once that guest
+/// thread terminates.
+///
+/// This is the crate-level guest entry point a runner calls for a guest program's INITIAL
+/// (`execve`-time) thread -- the counterpart of `litebox_platform_linux_userland::run_thread` and
+/// `litebox_platform_windows_userland::run_thread`. Later `clone()`-created guest threads never
+/// come through here; this platform's [`litebox::platform::ThreadProvider::spawn_thread`]
+/// implementation spawns those itself.
+///
+/// Whenever a [`presentation::Presenter`] is in use, the calling thread must NOT be the process
+/// main thread -- the presenter owns that one on this platform. Use [`spawn_guest_thread`].
+///
+/// Guest execution itself (the host<->guest context switch this ultimately performs) is still
+/// unimplemented on this platform: the call reports the gap and unwinds cleanly rather than
+/// executing a half-formed switch. See `docs/macos.md`'s "Remaining work".
+///
+/// # Safety
+///
+/// `ctx` must be a valid guest context.
+pub unsafe fn run_thread<T>(shim: T, ctx: &mut litebox_common_linux::PtRegs)
+where
+    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+{
+    ThreadHandle::run_with_handle(|| guest::run_thread(&shim, ctx));
+}
+
+/// Spawn a correctly-sized host thread for guest execution and run `f` on it.
+///
+/// # Why a macOS runner must use this for its initial guest thread
+///
+/// `litebox_runner_linux_userland` runs the initial guest thread on the thread that called its
+/// own `run`, and gives `presentation::Presenter` a dedicated background thread. This platform
+/// cannot: Cocoa pins both [`presentation::Presenter::new`] and [`presentation::Presenter::run`]
+/// to the real process main thread with no escape hatch at all (see the [`presentation`] module's
+/// doc comment for why that is Apple platform behavior rather than a `winit` limitation), so the
+/// presenter takes the main thread and guest execution is what moves to a spawned thread.
+///
+/// `f` must perform the whole guest-owning sequence on the spawned thread, not just
+/// [`run_thread`]: `litebox_shim_linux`'s `LinuxShimEntrypoints` is deliberately `!Send` (a task
+/// must not move once it is bound to a platform thread), so `load_program` has to run on the same
+/// thread that goes on to call [`run_thread`] with its result -- the same constraint
+/// `litebox_runner_linux_on_windows_userland` already documents at its own spawn site.
+///
+/// # Errors
+///
+/// Returns the `std::thread` spawn error if the host refuses to create the thread.
+pub fn spawn_guest_thread<F, R>(f: F) -> Result<std::thread::JoinHandle<R>, std::io::Error>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    std::thread::Builder::new()
+        .name("litebox-guest-initial".into())
+        .stack_size(GUEST_THREAD_STACK_SIZE)
+        .spawn(f)
 }
 
 // ---------------------------------------------------------------------------

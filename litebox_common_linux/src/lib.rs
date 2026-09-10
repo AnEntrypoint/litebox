@@ -4638,6 +4638,13 @@ impl SyscallRequest {
             // spelling of the same call. Without it, `dash`'s job-control setup compares
             // `tcgetpgrp(fd)` against a failed `getpgrp()`, decides it is a background process,
             // and sends itself SIGTTIN.
+            //
+            // x86_64-only, like the `time`/`readlink` arms above: the generic (aarch64, riscv64,
+            // ...) Linux syscall table has no `getpgrp` number at all -- libc there implements the
+            // function as a userspace `getpgid(0)`, so no guest on those architectures can issue
+            // it, and naming the nonexistent `Sysno` variant is a hard compile error rather than
+            // dead code.
+            #[cfg(target_arch = "x86_64")]
             Sysno::getpgrp => SyscallRequest::Getpgid { pid: 0 },
             Sysno::setpgid => sys_req!(Setpgid { pid, pgid }),
             Sysno::setsid => SyscallRequest::Setsid,
