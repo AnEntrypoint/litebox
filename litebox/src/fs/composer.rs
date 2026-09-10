@@ -638,13 +638,10 @@ impl Backend for Composer {
                 handle,
             } => {
                 let child_path = append_components(path, &[name]);
-                // A read-only lookup, unlike the mutating operations `checked_child_path` guards
-                // (create/unlink/mkdir/...): a name that is itself a nested mount point (e.g.
-                // `read_link_at("/dev", "dri")` when `/dev/dri` is its own mount) is a real,
-                // existing child directory, just never a symlink -- reject only the case where
-                // it's an ancestor of a *deeper* mount (no backend entry could resolve there),
-                // and let an exact mount point fall through to the "not a symlink" answer instead
-                // of being misreported as ENOENT.
+                // A read-only lookup must NOT use `checked_child_path`, which also rejects an
+                // exact mount point: `read_link_at("/dev", "dri")` with `/dev/dri` mounted names a
+                // real directory and must answer "not a symlink", never ENOENT. See gm mutable
+                // `composer-readlinkat-exact-mount-not-enoent`.
                 if self.mount_relation(&child_path) == MountRelation::AncestorOfMount {
                     return Ok(None);
                 }

@@ -35,25 +35,15 @@ pub enum LayeringSemantics {
     LowerLayerReadOnly,
     /// Lower layer's files are writable.
     ///
-    /// No new files can be made at the lower layer, but any existing files in the lower layer can
-    /// still be written to. If an upper level file exists with the same name as a lower layer file,
-    /// then it is shadowed, and only the upper layer file would be visible.
+    /// No new files can be made at the lower layer, but existing ones can still be written to. An
+    /// upper layer file of the same name shadows the lower layer file entirely.
     LowerLayerWritableFiles,
 }
 
 /// A backing implementation of [`FileSystem`](super::FileSystem) that layers a file system on top
-/// of another.
-///
-/// This particular implementation itself doesn't carry or store any of the files, but delegates to
-/// each of the layers. Specifically, this implementation will look for and work with files in
-/// the upper layer, unless they don't exist, in which case the lower layer is looked at.
-///
-/// The current design of layering supports treating the lower layer as read-only, or as a
-/// transparent write-through. In read-only lower layer, if a file is opened in writable mode that
-/// doesn't exist in the upper layer, but _does_ exist in the lower layer, this will have
-/// copy-on-write semantics.
-///
-/// Future versions of the layering might support other configurable options for the layering.
+/// of another: it stores no files itself, resolving every operation in the upper layer first and
+/// falling back to the lower layer. A writable open of a file present only in a read-only lower
+/// layer has copy-on-write semantics.
 pub struct FileSystem<
     Platform: sync::RawSyncPrimitivesProvider,
     Upper: super::FileSystem + 'static,
@@ -69,13 +59,8 @@ pub struct FileSystem<
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
     node_info_lookup: sync::RwLock<Platform, HashMap<NodeInfo, usize>>,
-    // Serializes `migrate_file_up` end-to-end: that function reads `self.root` under a lock,
-    // releases it, then later re-derives state (`Arc::strong_count`) it assumes is still valid
-    // when it swaps the descriptor-table entry over to the upper layer. Two threads racing to
-    // migrate the SAME path concurrently (e.g. two guest threads independently opening the same
-    // shared library or executable for the first time) can interleave in that gap and violate
-    // the swap's own `Arc::ptr_eq` invariant. Migrations are rare (first-open-for-write per file
-    // only), so serializing the whole function is a correctness fix with no meaningful cost.
+    // Serializes `migrate_file_up` end-to-end; never narrow it to the swap, which reopens the
+    // `Arc::ptr_eq` race -- gm mutable `layered-migrate-lock-serializes-whole-migration`.
     migrate_lock: sync::Mutex<Platform, ()>,
 }
 
@@ -117,12 +102,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         self.lower.file_status(path).map(|stat| stat.file_type)
     }
 
-    /// (private-only) Create all parent/ancestor directories for a `path`, making sure that each of
-    /// these exist in the lower layer. It does _not_ set up `path` itself on the upper layer
-    /// though; this is left to the callee to handle.
-    ///
-    /// NOTE: This is _not_ equivalent to running `mkdir -p {path}` or `mkdir {path}` or anything
-    /// like that.
+    /// (private-only) Create all parent/ancestor directories for `path`, making sure each exists in
+    /// the lower layer. It does NOT set up `path` itself on the upper layer -- that is the caller's
+    /// job -- and is NOT equivalent to `mkdir -p {path}` or `mkdir {path}`.
     fn mkdir_migrating_ancestor_dirs(&self, path: &str) -> Result<(), MkdirError> {
         let path = self.absolute_path(path)?;
         for dir in path.increasing_ancestors().map_err(PathError::from)? {
@@ -190,38 +172,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         unreachable!()
     }
 
-    /// (private-only) Migrate a file from lower to upper layer
+    /// (private-only) Migrate a file from lower to upper layer, erroring with the relevant
+    /// `PathError` if the lower layer does not have it. Files only, never directories.
     ///
-    /// It performs a check to make sure that the lower level has the file, and if the lower-level
-    /// does not, then it will error out with the relevant `PathError` that can be propagated as
-    /// necessary.
-    ///
-    /// Note: this focuses only on files.
-    ///
-    /// If `copy_data` is `true`, it copies over the lower data to the upper one, otherwise, it
-    /// makes the upper file empty (similar to a truncate). Generally speaking, you want to use
-    /// `true` for `copy_data`.
+    /// `copy_data` copies the lower bytes up; `false` leaves the upper file empty, as if truncated.
+    /// Generally you want `true`.
     fn migrate_file_up(&self, path: &str, copy_data: bool) -> Result<(), MigrationError> {
-        // Serialize the entire migration end-to-end (see `migrate_lock`'s own doc comment): two
-        // threads racing to migrate the SAME path concurrently can otherwise interleave between
-        // this function's own `self.root` read and its later `Arc`-based swap, violating that
-        // swap's `Arc::ptr_eq` invariant. Held for the whole call, not just the swap, since the
-        // race exists across the full open-lower/open-upper/copy/swap sequence, not just its tail.
+        // Held for the whole call, not just the swap -- gm mutable
+        // `layered-migrate-lock-serializes-whole-migration`.
         let _migrate_guard = self.migrate_lock.lock();
 
-        // Only a REGULAR file has byte contents whose copy is the same object.
-        //
-        // This function's whole method -- open the lower file, read it, write those bytes into a
-        // newly created upper-layer file -- silently changes WHAT AN OBJECT IS when the lower entry
-        // is a character device, FIFO or socket. `/dev/null` reads as immediate EOF, so migrating it
-        // produced an empty REGULAR file shadowing the character device, and everything downstream
-        // that asks `lstat` what kind of thing it is was then lied to. See the `O_TRUNC` guard in
-        // `open` for the full chain that took the XFCE desktop down.
-        //
-        // Refusing here is not merely defensive: no caller can want this. `write` and `truncate`
-        // both reach this function only as a fallback for "the lower layer would not take the
-        // change", and for a device the honest answer to that is the device's own error, never a
-        // fabricated regular file.
+        // Only a REGULAR file (or symlink) has byte contents whose copy is the same object:
+        // migrating a character device fabricates an empty regular file shadowing it, which is how
+        // `/dev/null` was destroyed -- gm mutable `layered-migrate-refuses-non-regular`.
         match self.ensure_lower_contains(path) {
             Ok(FileType::RegularFile | FileType::Symlink) => {}
             Ok(_) => return Err(MigrationError::NotAFile),
@@ -230,15 +193,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             Err(FileStatusError::ClosedFd) => unreachable!(),
         }
 
-        // This function's mechanics (open-for-read on `self.lower`, open/write on `self.upper`)
-        // are agnostic to `self.layering_semantics` -- both `write`'s and `truncate`'s
-        // `LowerLayerWritableFiles` branches now call this directly as a fallback when their own
-        // attempt to delegate straight to `self.lower` fails because the lower fs's own upper
-        // can't hold `path` (see `MigrationError::UpperCannotHoldPath`). There is deliberately no
-        // per-semantics guard here anymore -- every caller decides for itself, based on its own
-        // control flow, whether reaching this function is the correct thing to do for its layer.
-
-        // We first open the file up at the lower level for reading
+        // Deliberately agnostic to `self.layering_semantics`: every caller decides for itself
+        // whether reaching this function is right for its layer -- gm mutable
+        // `layered-migrate-refuses-non-regular`.
         let lower_fd = match self.lower.open(path, OFlags::RDONLY, Mode::empty()) {
             Ok(fd) => fd,
             Err(e) => match e {
@@ -251,36 +208,26 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 OpenError::PathError(path_error) => return Err(path_error)?,
             },
         };
-        // We begin to read the lower file before opening the upper file, just in case the lower
-        // file is not really a file (in which case, we don't want to tell the upper layer anything,
-        // but error out sooner.
-        //
-        // Other than that, this is a simple loop that just copies over in chunks by a simple
-        // read-write loop.
+        // Read the lower file BEFORE opening the upper one, so a lower entry that is not really a
+        // file errors out before the upper layer has been told anything.
         let mut upper_fd = None;
         let mut temp_buf = [0u8; 4096];
         loop {
             match self.lower.read(&lower_fd, &mut temp_buf, None) {
                 Ok(size) => {
                     if upper_fd.is_none() {
-                        // We are here the first time around, and did not error out, yay! We can
-                        // actually open up the file.
-                        //
-                        // First, we make sure we've set up the ancestor directories.
                         match self.mkdir_migrating_ancestor_dirs(path) {
                             Ok(()) => {}
                             Err(MkdirError::ReadOnlyFileSystem) => {
-                                // This upper layer physically cannot hold `path` (e.g. `dev_stdio`,
-                                // which only backs `/dev`, being asked to migrate a non-`/dev`
-                                // path). This is a structural mismatch, not a transient failure --
-                                // let the caller fall back to a different upper layer capable of
-                                // holding it, rather than treating it as unreachable/fatal.
+                                // This upper layer structurally cannot hold `path`; let the caller
+                                // fall back to another upper layer rather than treating it as
+                                // fatal -- gm mutable
+                                // `layered-parent-copyup-and-upper-cannot-hold`.
                                 let _ = self.lower.close(&lower_fd);
                                 return Err(MigrationError::UpperCannotHoldPath);
                             }
                             Err(e) => unimplemented!("{e} when setting up ancestor dirs"),
                         }
-                        // Now we can actually open the file.
                         upper_fd = Some(
                             self.upper
                                 .open(
@@ -297,25 +244,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                             "writing to upper layer must succeed, or layered file migration is in serious trouble",
                         );
                     } else {
-                        // EOF
                         break;
                     }
                 }
                 Err(e) => match e {
-                    // `NotForReading` is real and reachable here, not merely theoretical: `path`
-                    // opened successfully `RDONLY` above (a directory opens fine RDONLY on every
-                    // backend in this codebase), but a directory cannot actually be streamed via
-                    // `read()` -- confirmed live via a real weston/litebox repro where a
-                    // Lower-classified fd's `path` resolved to a directory, not a regular file,
-                    // and hit exactly this arm instead of `NotAFile` (whichever earlier stage
-                    // classified this path as needing migration did not itself verify it names a
-                    // regular file). Treat it the same as `NotAFile` -- both mean "this isn't a
-                    // stream of file bytes to migrate", the same real-world condition by two
-                    // different backends' error taxonomies, not two different bugs.
+                    // `NotForReading` is real and reachable, not theoretical: a directory opens
+                    // fine `RDONLY` but cannot be streamed via `read()`. Treat it exactly as
+                    // `NotAFile` -- gm mutable `layered-read-notforreading-directory-weston`.
                     ReadError::NotAFile | ReadError::NotForReading => {
-                        // We can only have this happen the first time around
                         assert!(upper_fd.is_none());
-                        // In which case we quit early
                         return Err(MigrationError::NotAFile);
                     }
                     ReadError::ClosedFd => unreachable!(),
@@ -323,8 +260,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 },
             }
         }
-        // After migrating the data, we also use these FDs to migrate the node-info over, so that
-        // any caller that tries to get the inode before/after the migration sees the same inode.
+        // Migrate the node-info over too, so a caller that stats the path either side of the
+        // migration sees one unchanging inode.
         let found = self
             .node_info_lookup
             .read()
@@ -338,23 +275,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     .node_info,
                 layered_id,
             );
-            // `migrate_file_up` holds no lock spanning its own full body (the `root_guard` lock
-            // below is only taken after this point), so two threads can genuinely race to
-            // migrate paths concurrently -- each opens its own `upper_fd` via `OFlags::CREAT`
-            // (which, without `EXCL`, happily reopens a file a racing thread already created),
-            // and each then reaches this insert. Confirmed live TWICE on real weston/XFCE-under-
-            // litebox repros: once as the same `layered_id` re-inserted for the same key (a
-            // genuinely benign double-migration of the SAME path), and once as this key already
-            // mapped to a DIFFERENT `layered_id` (plausible if the upper filesystem backend
-            // recycles a freed node-info/inode number quickly under concurrent creates, so two
-            // logically distinct migrated paths land on the same upper node-info id in short
-            // succession). Either way the underlying migration of `path`'s own data/metadata onto
-            // `upper_fd` above already completed correctly -- `node_info_lookup` is a lookup
-            // cache keyed by node-info, not the source of truth for file content/identity -- so
-            // losing a stale/superseded cache entry to whichever insert won the race is a correct
-            // outcome, not corruption. Panicking the whole host process here (as the original
-            // `assert!(old.is_none())` did) turns a benign cache race into total guest-session
-            // loss; log and move on instead.
+            // Two threads can genuinely race to migrate the same path and both reach this insert;
+            // `node_info_lookup` is a cache, not the source of truth for identity, so never panic
+            // here -- gm mutable `layered-node-info-insert-race`.
             if let Some(old_id) = old {
                 if old_id != layered_id {
                     litebox_util_log::warn!(
@@ -365,46 +288,30 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 }
             }
         }
-        // Now that we've migrated the data (and node-info) over, we can close out both of the file
-        // descriptors.
         self.upper.close(&upper_fd.unwrap()).unwrap();
         self.lower.close(&lower_fd).unwrap();
 
-        // Now we need to migrate all the descriptor entries over.
+        // Perf: a full scan over all open descriptors.
         //
-        // Perf: this does a full scan over all open descriptors: if a process has a HUGE number of
-        // open descriptors, this could be slow.
-        //
-        // This lock is held across the ENTIRE migration loop below (collection through the final
-        // `Arc::strong_count` check and swap), not just released after collecting `to_migrate`.
-        // `open()`'s `EntryX::Lower` fast path (which `Arc::clone`s this same path's entry into a
-        // brand-new descriptor-table slot, bumping its strong count) takes `self.root.read()` --
-        // holding the write lock here for the full duration genuinely excludes that racing path,
-        // closing the window where a concurrent `open()` could invalidate the strong-count
-        // invariant the swap below assumes still holds after `to_migrate` was collected.
+        // This write lock is held across the ENTIRE migration loop below, never released after
+        // collecting `to_migrate`: that is what excludes `open()`'s `EntryX::Lower` fast path from
+        // invalidating the strong-count invariant the swap assumes -- gm mutable
+        // `layered-migrate-concurrency-root-lock`.
         let mut root_guard = self.root.write();
         let RootDir {
             entries: root_entries,
         } = &mut *root_guard;
-        // First we figure out which entries need to be moved up. These entries are arc-cloned into
-        // a `Vec` so that we can release the lock the file descriptor table when setting things up
-        // within the upper layer.
         let to_migrate: alloc::vec::Vec<(InternalFd, usize, OFlags, Entry<Upper, Lower>)> = self
             .litebox
             .descriptor_table()
             .iter::<Self>()
             .filter_map(|(internal_fd, e)| {
                 if e.entry.path != path {
-                    // Skip any that do not match the path
                     return None;
                 }
                 match &*e.entry.entry {
-                    EntryX::Upper { fd: _ } => {
-                        // Need to do nothing, jump to next
-                        None
-                    }
+                    EntryX::Upper { fd: _ } => None,
                     EntryX::Lower { fd: _ } => {
-                        // We need to change this up to an upper-level entry.
                         Some((
                             internal_fd,
                             e.entry.position.load(SeqCst),
@@ -416,11 +323,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 }
             })
             .collect();
-        // Now we can actually perform the migration, since we've unlocked the lock on the
-        // file-descriptor table, which allows us to actually access things within the upper/lower
-        // levels without trouble.
         for (internal_fd, position, flags, entry) in to_migrate {
-            // First, we set up the upper entry we'll be swapping/placing in.
             let upper_fd = self.upper.open(path, flags, Mode::empty()).unwrap();
             if position > 0 {
                 self.upper
@@ -432,24 +335,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     .unwrap();
             }
             let upper_entry = Arc::new(EntryX::Upper { fd: upper_fd });
-            // Then we check up on replacing entries
             match Arc::strong_count(&entry) {
                 0..=2 => {
-                    // Normally unreachable: while `to_migrate` was being collected, this count
-                    // was guaranteed to be >=3 (our own local `entry` clone here, `root_entries`'s
-                    // own reference, and the descriptor-table slot's own reference). But
-                    // `to_migrate`'s collection only holds the descriptor table's OWN lock (not
-                    // `self.root`'s, which THIS loop holds for its whole duration) -- a concurrent
-                    // `close()` on this exact `internal_fd`, racing between that collection and
-                    // this check, can drop the descriptor-table-side reference in the meantime,
-                    // observably reducing the count below 3 by the time we get here. `entry` and
-                    // `root_entries`'s own reference are still safely intact either way (the write
-                    // lock this loop holds on `self.root` for its whole duration guarantees
-                    // `root_entries` itself is untouched); there's simply nothing left in the
-                    // descriptor table for THIS `internal_fd` to migrate anymore -- skip it, the
-                    // close already tore down whatever it referenced. `upper_entry` was never
-                    // installed anywhere else in this branch, so it's still the sole owner of
-                    // `upper_fd`; unwrap it back out to close it rather than leaking the fd.
+                    // Reachable, not unreachable: a concurrent `close()` on this exact
+                    // `internal_fd` drops the descriptor-table-side reference after `to_migrate`
+                    // was collected, leaving nothing here to migrate. `upper_entry` was never
+                    // installed anywhere, so unwrap it back out to close `upper_fd` rather than
+                    // leaking it -- gm mutable `layered-migrate-concurrency-root-lock`.
                     let EntryX::Upper { fd: upper_fd } = Arc::into_inner(upper_entry).unwrap()
                     else {
                         unreachable!()
@@ -458,21 +350,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     continue;
                 }
                 3 => {
-                    // Perfect amount to trigger a `close` on the lower level, and remove
-                    // the underlying root entry, since further syncing is no longer
-                    // necessary.
-                    //
-                    // `internal_fd` was captured while iterating the descriptor table under its
-                    // own, separate lock (dropped before this loop runs) -- a concurrent `close`
-                    // (possibly racing with a `dup` reusing the freed slot for an unrelated file)
-                    // on this exact slot between that iteration and now would otherwise make
-                    // `with_entry_mut_via_internal_fd` silently swap out a DIFFERENT entry that
-                    // now happens to live at the same index, violating the `Arc::ptr_eq` invariant
-                    // below without any actual correctness problem for `path`'s own migration --
-                    // that slot no longer holds anything referencing `path` at all. Compare-and-
-                    // skip instead of blindly swapping: `with_entry_mut_via_internal_fd` only
-                    // performs the replace if the closure's own check (comparing against `entry`
-                    // first) confirms this is still genuinely the same `Arc` we collected earlier.
+                    // Compare-and-skip rather than blindly swapping: a concurrent `close`/`dup`
+                    // may have reused this `internal_fd`'s slot for an unrelated file since
+                    // `to_migrate` was collected -- gm mutable
+                    // `layered-migrate-concurrency-root-lock`.
                     let old_entry = self.litebox.descriptor_table().with_entry_mut_via_internal_fd::<Self, _, _>(
                         internal_fd,
                         |slot| {
@@ -484,9 +365,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         },
                     );
                     let Some(Some(old_entry)) = old_entry else {
-                        // The slot was closed and/or reused for an unrelated file by a concurrent
-                        // `close`/`open` between collection and this replace -- nothing of `path`'s
-                        // migration remains to do for this `internal_fd`; move on to the next one.
                         continue;
                     };
                     assert!(Arc::ptr_eq(&old_entry, &entry));
@@ -503,12 +381,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     }
                 }
                 _ => {
-                    // Other FDs are open with the same file too. We'll handle the open one
-                    // here locally, and a future FD will take care of the relevant closing.
-                    //
-                    // Same compare-and-skip rationale as the `3 =>` arm above: `internal_fd` may
-                    // have been closed and its slot reused by a concurrent `close`/`open` since
-                    // `to_migrate` was collected.
+                    // Other fds still share this file, so a future fd does the closing. Same
+                    // compare-and-skip for the same slot-reuse race -- gm mutable
+                    // `layered-migrate-concurrency-root-lock`.
                     let old_entry = self.litebox.descriptor_table().with_entry_mut_via_internal_fd::<Self, _, _>(
                         internal_fd,
                         |slot| {
@@ -527,25 +402,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             }
         }
 
-        // A caller that triggers migration via `write()`'s fallback (the common, unshared-fd
-        // case) explicitly `drop(entry)`s its own clone before calling this function, so the
-        // `to_migrate` loop's own strong-count arithmetic above (which assumes the caller's
-        // clone is still alive, see the `0..=2` arm's comment) systematically undercounts by
-        // one in exactly that case: the writer's own fd is the ONLY entry in `to_migrate`, its
-        // observed count is 2 (this function's local `entry` + `root_entries`'s own reference),
-        // never 3 -- so it always takes the `0..=2` "nothing to migrate" branch and leaves the
-        // stale `EntryX::Lower` entry sitting in `root_entries` untouched. `open()`'s own
-        // fast-path cache check (`self.root.read().entries.get(&path)`) then keeps returning
-        // that stale Lower entry to every FUTURE `open()` of this exact path forever, even
-        // though the file was just migrated to the upper layer and the correct content lives
-        // there now -- a cross-process, write-then-read visibility bug: a second process's
-        // fresh `open()` of a just-migrated path can still observe pre-migration (lower-layer)
-        // content indefinitely. Since `path` is unconditionally migrated to `EntryX::Upper` by
-        // the time we reach here (every branch of the loop above either already skipped a
-        // non-Lower entry or replaced/closed a Lower one), any `Lower` entry still cached in
-        // `root_entries` for `path` is now stale by construction -- remove it unconditionally
-        // so the next `open()` re-resolves fresh (and correctly reaches the upper layer) rather
-        // than serving a cache built before this migration happened.
+        // `path` is unconditionally `EntryX::Upper` by now, so any `Lower` entry still cached here
+        // is stale by construction; leaving it made a just-migrated path keep serving
+        // pre-migration lower-layer content to every future `open()`, across processes -- gm
+        // mutable `layered-stale-lower-cache-after-migration`.
         if let Some(existing) = root_entries.get(path) {
             if matches!(**existing, EntryX::Lower { .. }) {
                 root_entries.remove(path);
@@ -555,23 +415,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         Ok(())
     }
 
-    /// (private-only) Make `path` exist in the UPPER layer, so that a metadata-only change
-    /// (`chmod`/`chown`/`set_times`) applied to the upper layer is what the guest observes
-    /// afterwards.
+    /// (private-only) Make `path` exist in the UPPER layer, so a metadata-only change
+    /// (`chmod`/`chown`/`set_times`) applied there is what the guest observes afterwards.
     ///
-    /// [`Self::migrate_file_up`] alone cannot serve those three callers, because it migrates BYTE
-    /// CONTENTS: a lower-layer entry that is a directory (or a character device/FIFO) comes back
-    /// as [`MigrationError::NotAFile`], which all three turned into `unimplemented!()` -- a HOST
-    /// panic for an ordinary `touch`/`chmod`/`chown` on a path that exists only in the read-only
-    /// lower layer and happens not to be a regular file. `touch /usr/share` under `--oci-image
-    /// docker.io/library/debian:stable-slim` reached exactly that panic live, at `set_times`'
-    /// `NotAFile` arm.
-    ///
-    /// A directory has no contents to copy, so recreate it in the upper layer carrying the lower's
-    /// own mode -- the same copy-up [`Self::mkdir_migrating_ancestor_dirs`] already performs for a
-    /// path's ancestors, and what makes a metadata change on a lower-only directory actually work
-    /// rather than merely stop crashing. For the kinds that genuinely cannot be carried up,
-    /// report [`MetadataMigrationError::ReadOnly`], an honest `EROFS` the guest can act on.
+    /// A lower-only directory is recreated in the upper layer carrying the lower's own mode;
+    /// anything that genuinely cannot be carried up reports [`MetadataMigrationError::ReadOnly`],
+    /// an honest `EROFS`. See gm mutable `layered-metadata-copyup-touch-panic`.
     fn migrate_entry_up_for_metadata(&self, path: &str) -> Result<(), MetadataMigrationError> {
         let lower_type = match self.ensure_lower_contains(path) {
             Ok(file_type) => file_type,
@@ -606,12 +455,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     return Err(MetadataMigrationError::ReadOnly);
                 }
             }
-            // Carry the node-info over, for the same reason `migrate_file_up` does it for a
-            // regular file: a caller that stats the path either side of the copy-up must see
-            // one unchanging inode, not a directory that silently becomes a different object
-            // the first time its timestamps or mode are touched. `node_info_lookup` is a
-            // lookup cache rather than the source of truth for identity, so whichever insert
-            // wins a concurrent copy-up of the same path is a correct outcome.
+            // Carry the node-info over so a caller that stats the path either side of the copy-up
+            // sees one unchanging inode -- gm mutable `layered-node-info-insert-race`.
             let layered_id = self
                 .node_info_lookup
                 .read()
@@ -636,10 +481,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         }
     }
 
-    // Gives the absolute path for `path`, resolving any `.` or `..`s, and making sure to account
-    // for any relative paths from current working directory.
-    //
-    // Note: does NOT account for symlinks.
+    // Gives the absolute path for `path`, resolving `.`/`..` and any relative path against the
+    // current working directory. Does NOT account for symlinks.
     fn absolute_path(&self, path: impl crate::path::Arg) -> Result<String, PathError> {
         assert!(self.current_working_dir.ends_with('/'));
         let path = path.as_rust_str()?;
@@ -668,10 +511,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
 }
 
 /// Why [`FileSystem::migrate_entry_up_for_metadata`] could not make a path exist in the upper
-/// layer.
-///
-/// Narrowed deliberately to the four shapes [`ChmodError`], [`ChownError`] and [`SetTimesError`]
-/// all share, so each caller converts it with no per-caller reasoning of its own.
+/// layer: the four shapes [`ChmodError`], [`ChownError`] and [`SetTimesError`] all share, so each
+/// caller converts it with no per-caller reasoning of its own.
 enum MetadataMigrationError {
     Io,
     Path(PathError),
@@ -723,11 +564,9 @@ pub enum MigrationError {
     Io,
     #[error(transparent)]
     PathError(#[from] PathError),
-    /// The upper layer cannot hold this path at all (e.g. a namespace like `/dev` that only
-    /// backs a narrow subtree of the full path space) -- distinct from `Io`, since this is a
-    /// structural, always-reproducible mismatch rather than a transient failure. Callers that
-    /// have another upper layer capable of holding the path (e.g. an outer layered fs whose own
-    /// upper is a general-purpose in-memory fs) should fall back to migrating there instead.
+    /// The upper layer cannot hold this path at all (e.g. a namespace like `/dev` that only backs
+    /// a narrow subtree) -- a structural, always-reproducible mismatch, distinct from `Io`.
+    /// Callers with another upper layer capable of holding the path should migrate there instead.
     #[error("upper layer cannot hold this path")]
     UpperCannotHoldPath,
 }
@@ -761,39 +600,20 @@ impl<
             | OFlags::LARGEFILE
             | OFlags::NOFOLLOW
             | OFlags::APPEND
-            // `O_NOATIME` asks the kernel not to update the file's access time on read. It is a
-            // pure performance hint with no effect on what `open` returns or what the caller can
-            // then do, and this filesystem does not maintain a meaningful atime to suppress in
-            // the first place -- so honouring it is exactly the same as ignoring it.
-            //
-            // It was previously absent, and because the check below turns any unlisted flag into
-            // an `unimplemented!()` that panics the HOST process, a guest simply opening a file
-            // with a hint flag took the whole thing down. Reached live by `mate-session`'s
-            // startup: `not implemented: OFlags(LARGEFILE | NOATIME)`.
+            // Hints that say HOW to do the I/O, not WHAT to open: none changes what `open` returns
+            // or what the caller may then do, so each is accepted and ignored -- gm mutable
+            // `layered-open-unlisted-oflag-einval-not-panic`.
             | OFlags::NOATIME
-            // I/O-behaviour hints, accepted and ignored: they say HOW to do the I/O, not WHAT
-            // to open, and none of them changes what `open` returns or what the caller may then
-            // do here. `DSYNC`/`SYNC` are durability barriers and nothing here is backed by a
-            // device that can lose writes; `DIRECT` bypasses a page cache that does not exist;
-            // `ASYNC` asks for `SIGIO`, which the fd layer above owns; `CLOEXEC` is a
-            // descriptor-table property applied by the shim, never by a backend.
             | OFlags::DSYNC
             | OFlags::SYNC
             | OFlags::DIRECT
             | OFlags::ASYNC
             | OFlags::CLOEXEC
             | OFlags::PATH;
-        // An unlisted flag is REPORTED, never fatal.
-        //
-        // This was `unimplemented!("{flags:?}")`, which panics the HOST process -- so any guest
-        // that opened a file with a flag this backend had not been taught took down the runner and
-        // every other guest running inside it. Not hypothetical: it killed a live XFCE session with
-        // `not implemented: OFlags(NOATIME)`, and the comment a few lines above records the SAME
-        // defect being found once before, in a sibling backend, without the others being changed.
-        // Teaching each whitelist one more flag does not fix that; not panicking does.
-        //
-        // `EINVAL` is what Linux reports for a flag combination it will not honour, and it leaves
-        // the decision with the caller instead of ending everyone's process.
+        // An unlisted flag is REPORTED, never fatal: this was `unimplemented!()`, which panics the
+        // HOST and killed a live XFCE session with `not implemented: OFlags(NOATIME)`. `EINVAL`
+        // leaves the decision with the caller -- gm mutable
+        // `layered-open-unlisted-oflag-einval-not-panic`.
         if flags.intersects(currently_supported_oflags.complement()) {
             litebox_util_log::warn!(flags:? = flags; "open: unsupported open flag(s)");
             return Err(OpenError::PathError(PathError::InvalidPathname));
@@ -814,16 +634,10 @@ impl<
             }
         }
         let mut tombstone_removal = false;
-        // If we already have an entry saying it is a tombstone, then we need to quit out early;
-        // otherwise, we'll check the levels.
         if let Some(entry) = self.root.read().entries.get(&path) {
             match entry.as_ref() {
                 EntryX::Tombstone => {
-                    // The file has been cleared out; it used to exist on the lower level, but we
-                    // explicitly have placed a tombstone in its place.
                     if flags.contains(OFlags::CREAT) {
-                        // Fallthrough, since we will create it at the upper level now. We should
-                        // remove the tombstone though.
                         tombstone_removal = true;
                     } else {
                         Err(PathError::NoSuchFileOrDirectory)?;
@@ -831,10 +645,9 @@ impl<
                 }
                 EntryX::Upper { .. } => unreachable!(),
                 EntryX::Lower { .. } => {
-                    // As an optimization, since a lower-level file entry is always opened with the
-                    // same flags, and since it indicates that there is no such file at the upper
-                    // level, we can just return that directly (with the "real" flags being wrapped
-                    // up in the layered descriptor).
+                    // A cached lower entry is always opened with the same flags, and its presence
+                    // means there is no such file at the upper level, so it can be returned
+                    // directly with the caller's "real" flags wrapped in the layered descriptor.
                     return Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
                         path,
                         flags,
@@ -850,9 +663,8 @@ impl<
                     unreachable!()
                 };
             } else {
-                // Another thread which also was attempting to create the same file (on top of a
-                // tombstoned file) won on the race to lock `self.root`, and thus it has already
-                // removed it for us. We don't need to remove it, and can proceed as normal.
+                // A racing thread creating the same file over the same tombstone already removed
+                // it; proceed as normal.
             }
         }
         // Otherwise, we first check the upper level, creating an entry if needed
@@ -892,19 +704,10 @@ impl<
                 OpenError::PathError(PathError::MissingComponent)
                     if flags.contains(OFlags::CREAT) =>
                 {
-                    // We must check if the lower layer contains all the directories; if it does, we
-                    // can create the same directories and then re-trigger the open.
-                    //
-                    // A top-level path (e.g. `/.memfd:17`) splits into an EMPTY `dirname` here
-                    // (`rsplit_once('/')` on `/.memfd:17` yields `("", ".memfd:17")`), which is not
-                    // itself a valid path `ensure_lower_contains`/`file_status` accepts -- it must be
-                    // normalized to root `/` first, exactly like every other path this method
-                    // receives already goes through `self.absolute_path()`. Without this, a brand-new
-                    // top-level file whose Upper root directory doesn't exist yet silently falls
-                    // through to the Lower-layer open path below instead of creating the directory and
-                    // retrying on Upper -- the new file is then classified as `EntryX::Lower`, and any
-                    // later `truncate`/`fallocate`/write on it hits `migrate_file_up`'s read-side
-                    // `unreachable!()` (`ReadError::NotForReading`) instead of writing normally.
+                    // A top-level path such as `/.memfd:17` splits into an EMPTY `dirname`, which
+                    // no path-taking call accepts; it must be normalized to root `/` or the new
+                    // file is misclassified as `EntryX::Lower` -- gm mutable
+                    // `layered-open-creat-empty-dirname-root`.
                     let dirname = match path.rsplit_once('/').unwrap().0 {
                         "" => "/",
                         d => d,
@@ -923,23 +726,10 @@ impl<
                 }
             },
         }
-        // Before falling back to a raw re-query of the lower level under the ORIGINAL path: if
-        // the upper layer has a symlink at this exact path (its own `open()` attempt above failed
-        // trying to reach the symlink's TARGET, not because the symlink itself is missing), the
-        // correct fallback is to resolve that symlink and retry the open against the FULL layered
-        // view (`self`, not `self.lower` directly) under the resolved target path -- not to ask
-        // the lower layer whether it has a file with the SYMLINK's OWN name, which it structurally
-        // cannot: the symlink itself only exists on the upper layer.
-        //
-        // Confirmed live as a real bug this way: a `--resume-from` upper layer containing only a
-        // symlink (e.g. `to_base_etc -> /etc/passwd`) over a base/lower layer containing the real
-        // target correctly resolves `read_link`/`ls -la` (those already compose upper-then-lower,
-        // see this file's own `read_link` a few hundred lines up) but `open()` on the SAME path
-        // returned `ENOENT`, because the pre-existing fallback below re-queried `self.lower.open`
-        // for the symlink's literal name (`to_base_etc`) instead of its resolved target
-        // (`/etc/passwd`). `open(2)`'s `O_NOFOLLOW` semantics apply here exactly as they do to any
-        // other symlink-following decision in this codebase: skip this resolve-and-retry when the
-        // caller explicitly asked NOT to follow symlinks.
+        // An upper-layer symlink must be resolved and retried against the FULL layered view, never
+        // re-queried on the lower layer under the symlink's own name, which only exists on the
+        // upper layer. `O_NOFOLLOW` skips the retry entirely -- gm mutable
+        // `layered-open-upper-symlink-resolve-retry`.
         if !flags.contains(OFlags::NOFOLLOW)
             && let Ok(target) = self.upper.read_link(path.as_str())
         {
@@ -974,19 +764,10 @@ impl<
                 assert!(!flags.contains(OFlags::TRUNC));
             }
         }
-        // Any errors from lower level now _must_ propagate up, so we can just invoke
-        // the lower level and set up the relevant descriptor upon success.
-        //
-        // `self.lower.open` runs without holding `self.root`'s write lock (it can be slow, e.g. a
-        // real syscall/IO), so two threads opening the same not-yet-cached path concurrently can
-        // both reach here with their own freshly opened lower-level fd. Whichever thread's
-        // `entries.insert` below runs second must NOT blindly overwrite/duplicate the winner's
-        // entry (that previously asserted `old.is_none()`, which is not actually guaranteed under
-        // concurrency, and left a second live `Lower` fd untracked by `root.entries` -- exactly the
-        // divergence that corrupted later `close()`'s `Arc::ptr_eq` bookkeeping). Instead, the loser
-        // discards its own redundant fd and reuses the entry the winner already installed, matching
-        // the existing cache-hit fast path a few lines above for a path that was already resolved
-        // by an earlier, separate open.
+        // `self.lower.open` runs without `self.root`'s write lock, so two threads opening the same
+        // not-yet-cached path both arrive here with their own fd; the loser must discard its own
+        // and reuse the winner's entry, never overwrite it -- gm mutable
+        // `layered-open-lower-race-loser-closes-fd`.
         let our_entry = Arc::new(EntryX::Lower {
             fd: self.lower.open(path.as_str(), flags, mode)?,
         });
@@ -994,8 +775,8 @@ impl<
             let mut root = self.root.write();
             if let Some(existing) = root.entries.get(&path) {
                 let existing = Arc::clone(existing);
-                // Safe to drop `root`'s lock before closing: `our_entry` was never published,
-                // so no other thread can observe or hold a reference to its fd.
+                // Safe to drop `root`'s lock before closing: `our_entry` was never published, so no
+                // other thread can observe or hold a reference to its fd.
                 drop(root);
                 let EntryX::Lower { fd } = Arc::into_inner(our_entry)
                     .expect("our_entry was never shared, so this must be its sole owner")
@@ -1009,33 +790,13 @@ impl<
                 our_entry
             }
         };
-        // `O_TRUNC` applies to REGULAR FILES ONLY -- exactly as on Linux, where `do_open()` gates
-        // its `handle_truncate()` call on `S_ISREG(...)`, so opening a character device, FIFO or
-        // socket with `O_TRUNC` succeeds and truncates nothing.
+        // `O_TRUNC` applies to REGULAR FILES ONLY, as Linux's `do_open()` gates `handle_truncate()`
+        // on `S_ISREG`; truncating a device here is what destroyed `/dev/null` for GNU `ld` -- gm
+        // mutable `layered-otrunc-regular-only-devnull-chain`.
         //
-        // This was unconditional, and truncating a NON-regular lower-layer file is what silently
-        // destroyed `/dev/null`. The chain, observed end to end on the webtop:
-        //
-        //   1. A shell redirect `> /dev/null` opens it `O_WRONLY|O_CREAT|O_TRUNC`. The open lands
-        //      on the lower layer (the `/dev` device mount), so this block then ran `truncate`.
-        //   2. `truncate` cannot truncate a device, so it fell through to `migrate_file_up`, which
-        //      copies the lower file's BYTES into a newly created upper-layer file. `/dev/null`
-        //      reads as immediate EOF, so what appeared on the writable layer was a REGULAR,
-        //      EMPTY FILE shadowing the character device.
-        //   3. `lstat("/dev/null")` from then on reported a regular file rather than a device.
-        //   4. GNU `ld` -- run by selkies at startup, with `/dev/null` as its output file -- calls
-        //      libiberty's `unlink_if_ordinary()`, which unlinks its target ONLY if `lstat` says
-        //      regular file or symlink, precisely so it can never delete a device node. Told it was
-        //      an ordinary file, it deleted it.
-        //   5. `unlink` left a tombstone, after which EVERY `open("/dev/null")` WITHOUT `O_CREAT`
-        //      returned `ENOENT`. `dash` opens `/dev/null` for a background job's stdin, so
-        //      `dbus-daemon ... &` never started, `DBUS_SESSION_BUS_ADDRESS` was empty, and
-        //      `xfce4-session` came up with no session bus and started no components at all.
-        //
-        // Every step after the first is a faithful consequence of the one before it; the only
-        // actual defect is truncating something that is not a regular file. `migrate_file_up` now
-        // refuses non-regular files as well (see its own guard), so the invariant is enforced at
-        // both ends rather than resting on this check alone.
+        // `migrate_file_up` INDEPENDENTLY refuses non-regular entries, so the invariant holds at
+        // both ends and does not rest on this check alone -- gm mutable
+        // `layered-migrate-refuses-non-regular`.
         let truncate_applies = original_flags.contains(OFlags::TRUNC)
             && matches!(
                 self.ensure_lower_contains(&path),
@@ -1048,16 +809,8 @@ impl<
             position: 0.into(),
         });
         if truncate_applies {
-            // The only scenario where we need to manually trigger truncation is when a file does
-            // not exist at the upper level but exists at the lower level; in that case, our
-            // `truncate` functionality (at the layered FS itself) should correctly migrate things
-            // over and handle them.
             match self.truncate(&fd, 0, true) {
-                Ok(()) | Err(TruncateError::IsTerminalDevice) => {
-                    // The terminal device is the one case we need to (due to Linux compatibility)
-                    // explicitly ignore the truncation ability, and instead silently continue as if
-                    // no error was thrown during truncation.
-                }
+                Ok(()) | Err(TruncateError::IsTerminalDevice) => {}
                 Err(e) => {
                     self.close(&fd).unwrap();
                     return Err(e.into());
@@ -1069,7 +822,6 @@ impl<
 
     fn close(&self, fd: &FileFd<Platform, Upper, Lower>) -> Result<(), CloseError> {
         let Some(removed_entry) = self.litebox.descriptor_table_mut().remove(fd) else {
-            // Was duplicated, don't need to do anything.
             return Ok(());
         };
         let Descriptor {
@@ -1078,27 +830,17 @@ impl<
             flags: _,
             position: _,
         } = removed_entry.entry;
-        // We can first sanity check that we don't have a tombstone: none of the other operations
-        // should ever cause the entry _at_ an fd to become a tombstone, even if the entry at the
-        // path becomes a tombstone due to a file removal.
         match entry.as_ref() {
             EntryX::Upper { .. } | EntryX::Lower { .. } => {}
             EntryX::Tombstone => unreachable!(),
         }
-        // Crucially, we need to grab an exclusive lock to the root, so that the counts cannot
-        // change while we are reasoning about them.
+        // The exclusive root lock is what keeps the `Arc` counts below from changing while they are
+        // being reasoned about.
         let RootDir {
             entries: root_entries,
         } = &mut *self.root.write();
-        // Our approach to this changes depending on whether this is an upper level FD or a
-        // lower FD.
         match *entry {
-            EntryX::Tombstone => {
-                // A tombstone should never have even become an FD (if a file was opened, and then
-                // was subsequently deleted, then the FD itself would not yet be a tombstone, but
-                // would be pointing to the original value).
-                unreachable!()
-            }
+            EntryX::Tombstone => unreachable!(),
             EntryX::Upper { .. } => {
                 // Upper-level FDs do not have any entry in the root, nor do they share anything via
                 // `Arc`s. Thus, we can deal with them individually.
@@ -1110,27 +852,20 @@ impl<
                 self.upper.close(&fd)
             }
             EntryX::Lower { .. } => {
-                // Lower level FDs almost always have a corresponding entry in the root. Thus, we
-                // might need to possibly clean things up from the root.
-                //
-                // First, we can attempt a fast-path clean-up by quickly check if there are other
-                // FDs referring to the same file
                 if Arc::strong_count(&entry) > 2 {
-                    // There are _definitely_ other FDs pointing at this file, leave it alone
+                    // Other fds definitely still point at this file; leave it alone.
                     return Ok(());
                 }
-                // Otherwise, either we have ourselves and the root pointing at it OR the root has
-                // been tombstoned out after the FDs have been opened at it.
+                // Either only this fd and the root point at it, or the root was tombstoned out after
+                // the fds were opened.
                 match **root_entries.get(&path).unwrap() {
                     EntryX::Upper { .. } => unreachable!(),
                     EntryX::Lower { .. } => {
                         // We are going to have to deal with it at the entry too, fallthrough
                     }
                     EntryX::Tombstone => {
-                        // A tombstone here means that the root doesn't contain the entry. There may
-                        // possibly be other FDs opened for the same file before it was tombstoned
-                        // out, so we'll close it out if we are the sole remaining holder;
-                        // otherwise, it will be someone else's job to do so.
+                        // Other fds may have been opened before the tombstone, so close the
+                        // underlying fd only when this is the sole remaining holder.
                         match Arc::into_inner(entry) {
                             Some(EntryX::Upper { .. } | EntryX::Tombstone) => unreachable!(),
                             Some(EntryX::Lower { fd }) => {
@@ -1168,10 +903,8 @@ impl<
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, ReadError> {
-        // Since a write to a lower-level file upgrades the underlying entry out completely to an
-        // upper-level file, we don't actually need to worry about a desync; a write to lower-level
-        // file will successfully be seen as just being an upper level file. Thus, it is sufficient
-        // just to delegate this operation based whether the entry points to upper or lower layers.
+        // A write to a lower-level file upgrades its entry wholesale to an upper-level one, so there
+        // is no desync to guard against here -- plain delegation on the entry's layer suffices.
         let (entry, this_position) = self
             .litebox
             .descriptor_table()
@@ -1188,22 +921,15 @@ impl<
             })
             .ok_or(ReadError::ClosedFd)
             .flatten()?;
-        // A `Lower` entry's underlying fd is cached in `root.entries` and shared across every
-        // `open()` of the same path (see `open`'s cache-hit fast path and its race-loser fallback
-        // above) -- unlike an `Upper` fd, which is always a fresh, unshared fd per `open()` call.
-        // An implicit `offset: None` read is documented to use "the current file offset" (see this
-        // trait method's own doc comment), which for a shared `Lower` fd is NOT this specific
-        // layered `Descriptor`'s own position: two independent opens of the same lower-layer file
-        // would otherwise silently read from (and advance) one shared position, each stealing bytes
-        // the other expected to see from its own start-at-0. Resolve `None` to this descriptor's
-        // own tracked `position` explicitly before delegating, so every open of a `Lower` file keeps
-        // an independent read cursor, matching real POSIX per-open-fd offset semantics.
+        // A `Lower` fd is cached and SHARED across every `open()` of the same path, so `None` must
+        // resolve to this descriptor's own tracked position, not the backend's shared cursor, or
+        // two opens steal each other's bytes -- gm mutable
+        // `layered-lower-fd-shared-cursor-read-and-seek`.
         let resolved_offset = match entry.as_ref() {
             EntryX::Upper { .. } => offset,
             EntryX::Lower { .. } => Some(offset.unwrap_or(this_position)),
             EntryX::Tombstone => unreachable!(),
         };
-        // Perform the actual operation
         let num_bytes = match entry.as_ref() {
             EntryX::Upper { fd } => self.upper.read(fd, buf, resolved_offset)?,
             EntryX::Lower { fd } => self.lower.read(fd, buf, resolved_offset)?,
@@ -1227,9 +953,8 @@ impl<
         buf: &[u8],
         offset: Option<usize>,
     ) -> Result<usize, WriteError> {
-        // Writing needs to be careful of how it is performing the write. Any upper-level file can
-        // instantly be written to; but a lower-level file must become a upper-level file, before
-        // actually being written to.
+        // An upper-level file is written directly; a lower-level file must first become an
+        // upper-level file.
         let (entry, path) = self
             .litebox
             .descriptor_table()
@@ -1265,11 +990,9 @@ impl<
                         // fallthrough
                     }
                     LayeringSemantics::LowerLayerWritableFiles => {
-                        // Allow direct write to lower layer, unless the lower layer itself can't
-                        // hold this path in its own upper (e.g. the lower is a `dev_stdio`-over-
-                        // `tar_ro` fs and this path isn't under `/dev`) -- in which case fall
-                        // through below to migrate the file into *this* fs's own upper instead,
-                        // same as the `LowerLayerReadOnly` case.
+                        // Direct write to the lower layer, unless the lower layer cannot hold this
+                        // path in its own upper, in which case fall through and migrate into *this*
+                        // fs's upper -- gm mutable `layered-parent-copyup-and-upper-cannot-hold`.
                         match self.lower.write(lower_fd, buf, offset) {
                             Ok(num_bytes) => {
                                 if let Some(e) = self.litebox.descriptor_table().get_entry(fd) {
@@ -1287,7 +1010,6 @@ impl<
             }
             EntryX::Tombstone => unreachable!(),
         }
-        // Change it to an upper-level file, also altering the file descriptor.
         drop(entry);
         match self.migrate_file_up(&path, true) {
             Ok(()) => {}
@@ -1295,15 +1017,11 @@ impl<
             Err(MigrationError::NotAFile) => return Err(WriteError::NotAFile),
             Err(MigrationError::Io) => return Err(WriteError::Io),
             Err(MigrationError::PathError(_e)) => unreachable!(),
-            // This fs's own upper layer cannot hold `path` (see `UpperCannotHoldPath`'s doc
-            // comment) -- e.g. this is the inner `dev_stdio`-over-`tar_ro` fs and `path` isn't
-            // under `/dev`. Surface it as `NotForWriting`: not semantically precise, but the
-            // closest existing `WriteError` variant, and an outer fs composing this one as its
-            // `lower` (see the `EntryX::Lower` branch in the outer `write` above) specifically
-            // matches on this to fall back to migrating through its *own* upper instead.
+            // `NotForWriting` is imprecise but is exactly the signal an outer fs composing this one
+            // as its `lower` matches on to migrate through its own upper instead -- gm mutable
+            // `layered-parent-copyup-and-upper-cannot-hold`.
             Err(MigrationError::UpperCannotHoldPath) => return Err(WriteError::NotForWriting),
         }
-        // As a sanity check, in debug mode, confirm that it is now an upper file
         debug_assert!(matches!(
             *self
                 .litebox
@@ -1314,8 +1032,6 @@ impl<
                 .entry,
             EntryX::Upper { .. }
         ));
-        // Since it has been migrated, we can just re-trigger, causing it to apply to the
-        // upper layer
         self.write(fd, buf, offset)
     }
 
@@ -1335,26 +1051,12 @@ impl<
                 )
             })
             .ok_or(SeekError::ClosedFd)?;
-        // Perform the seek, and update the position info
         let position = match entry.as_ref() {
             EntryX::Upper { fd } => self.upper.seek(fd, offset, whence)?,
-            // A `Lower` entry's underlying fd is CACHED AND SHARED across every `open()` of the
-            // same path, so the lower backend's own cursor is not this descriptor's -- exactly the
-            // reasoning `read` above already spells out, and which applies verbatim here.
-            // Delegating a `SEEK_CUR` unchanged resolves it against that shared cursor and then
-            // stores the answer back as this descriptor's authoritative position, so a relative
-            // seek both returns the wrong number and corrupts the caller's own place in the file.
-            //
-            // `ftell()` is a `SEEK_CUR` of zero, which makes this reachable from almost any guest
-            // reading a file out of the read-only rootfs. Observed as an infinite loop in
-            // s6-overlay's `preinit`: its shell's own script fd sat on the tar layer, one
-            // `SEEK_CUR` rewound it to the shared cursor's 0, and the script re-ran from the top
-            // for ever.
-            //
-            // Resolve `SEEK_CUR` against this descriptor's tracked position and delegate it as an
-            // absolute seek. `SEEK_SET` and `SEEK_END` do not consult the shared cursor at all
-            // (the backend answers them from the argument and the file size), so they pass
-            // through unchanged.
+            // A `Lower` fd is cached and SHARED, so `SEEK_CUR` must be resolved against this
+            // descriptor's own position and delegated as an absolute seek -- delegating it
+            // unchanged looped s6-overlay's `preinit` for ever. `SEEK_SET`/`SEEK_END` never consult
+            // the shared cursor -- gm mutable `layered-lower-fd-shared-cursor-read-and-seek`.
             EntryX::Lower { fd } => match whence {
                 SeekWhence::RelativeToCurrentOffset => {
                     let absolute = this_position
@@ -1398,9 +1100,9 @@ impl<
                     LayeringSemantics::LowerLayerWritableFiles => {
                         match self.lower.truncate(fd, length, reset_offset) {
                             Err(TruncateError::NotForWriting) => {
-                                // The lower fs's own upper can't hold this path -- fall back to
-                                // migrating into *this* fs's own upper, same pattern as `write`'s
-                                // `LowerLayerWritableFiles` branch above.
+                                // The lower fs's own upper cannot hold this path; migrate into
+                                // *this* fs's upper instead -- gm mutable
+                                // `layered-parent-copyup-and-upper-cannot-hold`.
                                 drop(entry);
                                 let path = self
                                     .litebox
@@ -1426,10 +1128,8 @@ impl<
                                 }
                                 Err(TruncateError::PathOnlyFd) => Err(TruncateError::PathOnlyFd),
                                 Err(TruncateError::NotForWriting) => {
-                                    // We must actually migrate this file up, and keep it truncated.
-                                    //
-                                    // We must first drop the cloned entry to make sure that the ref
-                                    // counting works out correctly during migration.
+                                    // The cloned entry must be dropped first, so the refcounting
+                                    // `migrate_file_up` reasons about works out.
                                     drop(entry);
                                     let path = self
                                         .litebox
@@ -1440,12 +1140,9 @@ impl<
                                         .ok_or(TruncateError::ClosedFd)?;
                                     match self.migrate_file_up(&path, false) {
                                         Ok(()) => Ok(()),
-                                        // This fs's own upper can't hold `path` (see
-                                        // `UpperCannotHoldPath`'s doc comment). Surface as
-                                        // `NotForWriting`, the same signal an outer fs composing
-                                        // this one as its `lower` already matches on to fall back
-                                        // to migrating through its own upper instead (see the
-                                        // outer `truncate`'s `LowerLayerWritableFiles` branch).
+                                        // `NotForWriting` is the signal an outer fs composing this
+                                        // one as its `lower` matches on -- gm mutable
+                                        // `layered-parent-copyup-and-upper-cannot-hold`.
                                         Err(MigrationError::UpperCannotHoldPath) => {
                                             Err(TruncateError::NotForWriting)
                                         }
@@ -1469,10 +1166,9 @@ impl<
     }
 
     fn chmod_fd(&self, fd: &FileFd<Platform, Upper, Lower>, mode: Mode) -> Result<(), ChmodError> {
-        // Mirrors `truncate` above (see [`super::FileSystem::chmod_fd`]'s doc comment on why
-        // this must operate on the already-open handle rather than re-resolving `fd` to a path
-        // -- the whole point is to keep working after the caller has `unlink`ed the path this fd
-        // was opened at).
+        // Must operate on the already-open handle, never re-resolve `fd` to a path: the point is to
+        // keep working after the caller has `unlink`ed it -- gm mutable
+        // `layered-chmod-fd-lower-hard-error`.
         let entry = self
             .litebox
             .descriptor_table()
@@ -1481,19 +1177,11 @@ impl<
         match entry.as_ref() {
             EntryX::Upper { fd } => self.upper.chmod_fd(fd, mode),
             EntryX::Lower { fd } => {
-                // A file opened purely from the lower (read-only-relative-to-this-layer, per
-                // `LayeringSemantics::LowerLayerReadOnly`) layer was never write-opened through
-                // *this* fs (an `O_CREAT`/write-opened path always migrates up at `open` time,
-                // matching `write`'s/`truncate`'s own upper-vs-lower split above) -- so a still-
-                // open fd resolving to `EntryX::Lower` here can only be a read-only fd, for which
-                // real `fchmod` is still valid on Linux (permission bits are independent of the
-                // fd's own read/write mode) but this bounded implementation has no upper-
-                // migration path for an *already-open, no-longer-path-addressable* fd (unlike
-                // `chmod`'s own path-based migrate-then-retry, which works because it re-resolves
-                // the path before the migrated file's fd would need to change). No real call site
-                // in this codebase (wlroots' shm-file dance, the only real `fchmod` caller,
-                // always operates on a freshly created-in-upper file) exercises this, so this
-                // stays a hard error rather than growing unverified migration logic.
+                // A still-open fd resolving to `Lower` can only be read-only, and there is no
+                // upper-migration path for an already-open, no-longer-path-addressable fd; no real
+                // caller (wlroots' shm dance) exercises it, so this stays a hard error rather than
+                // growing unverified migration logic -- gm mutable
+                // `layered-chmod-fd-lower-hard-error`.
                 let _ = fd;
                 Err(ChmodError::Io)
             }
@@ -1502,30 +1190,10 @@ impl<
     }
 
     fn open_flags(&self, fd: &FileFd<Platform, Upper, Lower>) -> Option<OFlags> {
-        // `Descriptor::flags` (set correctly at `open()`, and already relied on internally by
-        // `write()`'s `OFlags::WRONLY`/`RDWR` check above) is the real, per-fd open-time access
-        // mode -- exactly what `fcntl(F_GETFL)` needs, and (before this override existed) the only
-        // caller (`litebox_shim_linux`'s `sys_fcntl`) had no way to reach it: this field is
-        // private to this module, wrapped in the fd-subsystem machinery's own `DescriptorEntry`
-        // (see `crate::fd::enable_fds_for_subsystem!`'s generated wrapper), which exposes no
-        // `get_status`/`set_status` pair the way every OTHER fd-enabled subsystem in this codebase
-        // does (eventfd, epoll, unix, pty, signalfd, timerfd all provide one via
-        // `common_functions_for_file_status!` -- a regular file never got the same treatment).
-        // Lacking any accessor, `sys_fcntl`'s `GETFL` fell back to looking up `StdioStatusFlags`
-        // *metadata* for the fd instead -- metadata that is only ever attached to a re-opened
-        // `/dev/stdin`/`/dev/stdout`/`/dev/stderr` fd (see `insert_raw_file_fd_with_path`'s
-        // `stdio_stream_for_path` check), never to an ordinary file. For every other regular file,
-        // that lookup silently missed and defaulted to `OFlags::empty()` -- reporting `O_RDONLY`
-        // (0) regardless of whether the fd was actually opened `O_WRONLY`/`O_RDWR`. Confirmed live
-        // as the real root cause of Xorg's "Cannot open ... to write keyboard description":
-        // `xkbcomp` opens `/var/lib/xkb/server-0.xkm` with `O_WRONLY|O_CREAT|O_EXCL` (succeeds),
-        // then glibc's `fdopen(fd, "w")` calls `fcntl(F_GETFL)` to confirm the fd's access mode is
-        // compatible with `"w"` -- got back 0 (`O_RDONLY`) here, so `fdopen` refused and returned
-        // `NULL`, which is exactly what `xkbcomp`'s own C code reports as "Cannot open <path> to
-        // write" (a wrapper around a failed `fdopen`, not a failed `open`) before exiting --
-        // confirmed via a live instrumented probe showing the raw `open()` syscall succeeding and
-        // creating the (0-byte) file, immediately followed by `fcntl(F_GETFL)` returning `Ok(0)`,
-        // with no `write()`/`close()` ever reaching this fs in between.
+        // `Descriptor::flags` is the real per-fd open-time access mode and the only correct source
+        // for `fcntl(F_GETFL)`; never fall back to `StdioStatusFlags` metadata, which exists only on
+        // re-opened `/dev/std*` fds and made `xkbcomp`'s `fdopen(fd, "w")` fail on every ordinary
+        // file -- gm mutable `layered-open-flags-xkbcomp-fdopen`.
         self.litebox
             .descriptor_table()
             .with_entry(fd, |descriptor| descriptor.entry.flags & OFlags::STATUS_FLAGS_MASK)
@@ -1683,16 +1351,9 @@ impl<
                         FileType::Directory => {
                             return Err(UnlinkError::IsADirectory);
                         }
-                        // A device node is unlinkable, exactly like the regular file above: on
-                        // Linux `rm /dev/null` succeeds for a caller with write permission on
-                        // `/dev`, and the tombstone below reproduces that -- the entry disappears
-                        // from the composed view while the synthetic `/dev` mount, which has no
-                        // notion of removal, is left untouched.
-                        //
-                        // This was `unimplemented!()`, which panics the HOST process. Every guest
-                        // in the address space died together, from one guest running `rm -f
-                        // /dev/null` -- reproduced directly, and reachable from ordinary software:
-                        // GNU `ld` unlinks its output file before writing it.
+                        // A device node is unlinkable exactly like a regular file: `rm /dev/null`
+                        // succeeds on Linux, and the tombstone reproduces that without touching the
+                        // synthetic `/dev` mount -- gm mutable `layered-unlink-chardev-tombstone`.
                         FileType::CharacterDevice => {
                             // fallthrough
                         }
@@ -1716,28 +1377,16 @@ impl<
     ) -> Result<(), RenameError> {
         let from = self.absolute_path(from)?;
         let to = self.absolute_path(to)?;
-        // Scoped to the common case this method exists to support (a package manager-style
-        // atomic replace of a file it just wrote into the writable upper layer, e.g. `apk`
-        // installing a downloaded package, or atomically replacing its own on-disk database):
-        // `from` must already live purely in the upper (writable) layer -- renaming a source that
-        // only exists in the read-only lower layer would require migrating it up first, which is
-        // real Linux `EXDEV`-fallback territory (`RenameError::CrossDevice`), same as `rename`'s
-        // other implementations in this codebase.
-        //
-        // `to`, however, is allowed to shadow an existing lower-layer entry (this is exactly the
-        // `apk`-installed-database-file case: the database already shipped as part of the base
-        // image, so it exists in the lower/tar layer, and `apk` atomically replaces it by
-        // rename-over, same pattern as `unlink` already supports via a tombstone below).
+        // `from` must already live purely in the upper layer; a lower-only source is real Linux
+        // `EXDEV` territory. `to` IS allowed to shadow a lower-layer entry (the `apk`
+        // replace-its-own-database case) -- gm mutable
+        // `layered-rename-link-exdev-and-invalidation`.
         if self.ensure_lower_contains(&from).is_ok() {
             return Err(RenameError::CrossDevice);
         }
-        // `to`'s parent directory may only exist in the read-only lower layer so far (e.g. a
-        // package extractor's typical write-to-temp-then-atomic-`rename()`-into-place idiom,
-        // renaming into a directory that came from the read-only initial rootfs and has not yet
-        // been touched on the upper layer) -- mirror `open`'s `O_CREAT` handling and `symlink`'s
-        // equivalent fallback above: on a missing-component error, check whether the lower layer
-        // has the parent directory, migrate the ancestor chain up to the upper layer if so, and
-        // retry.
+        // `to`'s parent directory may so far exist only in the read-only lower layer: on a
+        // missing-component error, migrate the ancestor chain up and retry -- gm mutable
+        // `layered-parent-copyup-and-upper-cannot-hold`.
         match self.upper.rename(&from, &to) {
             Ok(()) => {}
             Err(RenameError::PathError(PathError::MissingComponent)) => {
@@ -1758,24 +1407,10 @@ impl<
             }
             Err(e) => return Err(e),
         }
-        // Invalidate whatever `open` may have cached for `to` -- a stale `EntryX::Lower` (from a
-        // previous open of `to` before this rename, when it still fell through to the lower
-        // layer) or a stale `EntryX::Upper` (from a previous open of a *different* upper-layer
-        // file at this same path that was later unlinked and recreated) would otherwise keep
-        // being returned by `open` instead of the file `self.upper.rename` just placed here.
-        //
-        // This must NOT insert a tombstone, even when `to` shadows a lower-layer entry: a
-        // tombstone means "deleted", and `open`'s own cache lookup (above in this same impl)
-        // returns `NoSuchFileOrDirectory` for one WITHOUT EVER CHECKING `self.upper` -- exactly
-        // backwards for a rename destination, which is not deleted, it is REPLACED, and the
-        // replacement is sitting in `self.upper` right now. Confirmed live: `sed -i` (write a
-        // temp file, `rename()` it over the original -- textbook in-place-edit idiom) succeeded
-        // once, then every later open of that same path failed `ENOENT`, because this exact
-        // tombstone insertion shadowed `self.upper`'s own freshly-renamed-in file. Plain removal
-        // (same as the lower-shadow case needs) forces the next `open` to re-resolve fresh, which
-        // correctly finds `self.upper`'s file first -- `self.upper` already and always takes
-        // precedence over a lower-layer shadow, so there is nothing further to invalidate once
-        // the stale cache entry itself is gone.
+        // Invalidate `open`'s cache for `to` by PLAIN REMOVAL, never a tombstone: a tombstone means
+        // "deleted" and makes `open` answer `ENOENT` without ever checking `self.upper`, which is
+        // how `sed -i` broke every later open of the file it had just written -- gm mutable
+        // `layered-rename-link-exdev-and-invalidation`.
         self.root.write().entries.remove(&to);
         Ok(())
     }
@@ -1787,23 +1422,21 @@ impl<
     ) -> Result<(), LinkError> {
         let oldpath = self.absolute_path(oldpath)?;
         let newpath = self.absolute_path(newpath)?;
-        // Scoped to the common case this exists to support (Xorg-style atomic lock-file
-        // acquisition: link a temp file the caller just wrote into the writable upper layer to
-        // its final name) -- same rationale, and the exact same restriction, as `rename` above:
-        // `oldpath` must already live purely in the upper layer, or this is real Linux `EXDEV`
-        // territory.
+        // `oldpath` must already live purely in the upper layer (Xorg-style lock-file acquisition
+        // links a temp file it just wrote); a lower-only source is real Linux `EXDEV` -- gm mutable
+        // `layered-rename-link-exdev-and-invalidation`.
         if self.ensure_lower_contains(&oldpath).is_ok() {
             return Err(LinkError::CrossDevice);
         }
-        // Fail if anything already exists at `newpath`, in either layer -- matches Linux
-        // `link(2)`'s `EEXIST`, and mirrors `symlink`'s identical check just below.
+        // Anything already at `newpath` in EITHER layer is `link(2)`'s `EEXIST`, since creation only
+        // ever targets the upper layer -- gm mutable
+        // `layered-parent-copyup-and-upper-cannot-hold`.
         if self.file_status(newpath.as_str()).is_ok() {
             return Err(LinkError::AlreadyExists);
         }
-        // `newpath`'s parent directory may only exist in the read-only lower layer so far --
-        // mirror `symlink`'s own identical fallback: on a missing-component error, check whether
-        // the lower layer has the parent directory, migrate the ancestor chain up to the upper
-        // layer if so, and retry.
+        // `newpath`'s parent may so far exist only in the read-only lower layer: migrate the
+        // ancestor chain up and retry -- gm mutable
+        // `layered-parent-copyup-and-upper-cannot-hold`.
         match self.upper.link(&oldpath, newpath.as_str()) {
             Ok(()) => Ok(()),
             Err(LinkError::PathError(PathError::MissingComponent)) => {
@@ -1828,16 +1461,16 @@ impl<
 
     fn make_fifo(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), MkdirError> {
         let path = self.absolute_path(path)?;
-        // Anything already at `path`, in EITHER layer, is `EEXIST` -- same rule as `symlink`
-        // below, and for the same reason: creating a new entry only ever targets the upper layer,
-        // so an existing lower-layer entry would otherwise be silently shadowed.
+        // Anything already at `path` in EITHER layer is `EEXIST`, since creation only ever targets
+        // the upper layer -- gm mutable `layered-parent-copyup-and-upper-cannot-hold`.
         if self.file_status(path.as_str()).is_ok() {
             return Err(MkdirError::AlreadyExists);
         }
         match self.upper.make_fifo(path.as_str(), mode) {
             Ok(()) => Ok(()),
             // `path`'s parent may so far exist only in the read-only lower layer; migrate the
-            // ancestor chain up and retry, exactly as `symlink` and `mkdir` already do.
+            // ancestor chain up and retry -- gm mutable
+            // `layered-parent-copyup-and-upper-cannot-hold`.
             Err(MkdirError::PathError(PathError::MissingComponent)) => {
                 let dirname = path.rsplit_once('/').unwrap().0;
                 if let Ok(FileType::Directory) = self.ensure_lower_contains(dirname) {
@@ -1857,19 +1490,15 @@ impl<
         linkpath: impl crate::path::Arg,
     ) -> Result<(), SymlinkError> {
         let linkpath = self.absolute_path(linkpath)?;
-        // Fail if anything already exists at `linkpath`, in either layer -- matches Linux
-        // `symlink(2)`'s `EEXIST`, and mirrors `open`'s `O_CREAT | O_EXCL` handling above.
+        // Anything already at `linkpath` in EITHER layer is `symlink(2)`'s `EEXIST`, since creation
+        // only ever targets the upper layer -- gm mutable
+        // `layered-parent-copyup-and-upper-cannot-hold`.
         if self.file_status(linkpath.as_str()).is_ok() {
             return Err(SymlinkError::AlreadyExists);
         }
-        // Symlink creation only ever targets the writable upper layer -- there is no
-        // "copy-on-write" concept for creating a brand new path, unlike writing to an existing
-        // lower-layer file. However, `linkpath`'s *parent* directory may only exist in the
-        // read-only lower layer so far (e.g. a package extractor creating a brand new symlink
-        // inside a directory that came from the read-only initial rootfs and has not yet been
-        // touched on the upper layer) -- mirror `open`'s `O_CREAT` handling and `mkdir`'s
-        // fallback: on a missing-component error, check whether the lower layer has the parent
-        // directory, migrate the ancestor chain up to the upper layer if so, and retry.
+        // There is no copy-on-write concept for creating a brand new path, but `linkpath`'s parent
+        // may so far exist only in the read-only lower layer: migrate the ancestor chain up and
+        // retry -- gm mutable `layered-parent-copyup-and-upper-cannot-hold`.
         match self.upper.symlink(&target, linkpath.as_str()) {
             Ok(()) => Ok(()),
             Err(SymlinkError::PathError(PathError::MissingComponent)) => {
@@ -2113,9 +1742,8 @@ impl<
     }
 
     fn file_status(&self, path: impl crate::path::Arg) -> Result<FileStatus, FileStatusError> {
-        // Note: we grab the info from the relevant level and then immediately spit back the same,
-        // essentially to ask the compiler to remind us we need to update this when we support
-        // inodes and such.
+        // The fields are destructured and immediately re-assembled so the compiler forces an update
+        // here when inode support lands.
         let path = self.absolute_path(path)?;
         if let Some(entry) = self.root.read().entries.get(&path) {
             let FileStatus {
@@ -2210,12 +1838,10 @@ impl<
     }
 
     fn symlink_metadata(&self, path: impl crate::path::Arg) -> Result<FileStatus, FileStatusError> {
-        // Mirrors `file_status` above exactly, except the "not an already-open fd" fallback
-        // calls `symlink_metadata` (not `file_status`) on each layer, so a final-component
-        // symlink's own metadata is preserved instead of being transparently followed. An
-        // already-open fd can never be a symlink itself (`open()` always resolves through any
-        // final-component symlink to reach the fd it hands back), so that branch is unaffected
-        // and stays on `fd_file_status` like `file_status` does.
+        // The not-an-already-open-fd fallback must call `symlink_metadata`, not `file_status`, on
+        // each layer, so a final-component symlink's own metadata survives. An already-open fd can
+        // never itself be a symlink, so that branch stays on `fd_file_status` -- gm mutable
+        // `layered-doc-trims`.
         let path = self.absolute_path(path)?;
         if let Some(entry) = self.root.read().entries.get(&path) {
             let FileStatus {
@@ -2328,8 +1954,6 @@ impl<
             EntryX::Lower { fd } => self.lower.fd_file_status(fd)?,
             EntryX::Tombstone => unreachable!(),
         };
-        // Note: we grab the info and then immediately spit back the same, essentially to ask the
-        // compiler to remind us we need to update this when we support inodes and such.
         Ok(FileStatus {
             file_type,
             mode,
@@ -2366,10 +1990,8 @@ struct Descriptor<Upper: super::FileSystem + 'static, Lower: super::FileSystem +
 }
 
 struct RootDir<Upper: super::FileSystem + 'static, Lower: super::FileSystem + 'static> {
-    // keys are normalized paths; directories do not have the final `/` (thus the root would be at
-    // the empty-string key "")
-    //
-    // Invariant: this only stores lower+tombstone entries, no upper entries will show up here.
+    // Keys are normalized paths, directories without the final `/` (so the root is the empty-string
+    // key). Invariant: only `Lower` and `Tombstone` entries are ever stored here, never `Upper`.
     entries: HashMap<String, Entry<Upper, Lower>>,
 }
 
@@ -2384,12 +2006,11 @@ impl<Upper: super::FileSystem, Lower: super::FileSystem> RootDir<Upper, Lower> {
 type Entry<Upper, Lower> = Arc<EntryX<Upper, Lower>>;
 
 enum EntryX<Upper: super::FileSystem + 'static, Lower: super::FileSystem + 'static> {
-    // This file should be considered a purely upper-level file, independent of whether lower level file exists or not.
+    // Purely an upper-level file, whether or not a lower-level file exists.
     Upper { fd: TypedFd<Upper> },
-    // This file is a lower-level file and does NOT exist in the upper level file.
+    // A lower-level file that does NOT exist in the upper level.
     Lower { fd: TypedFd<Lower> },
-    // This file exists in the lower level, but as far as the layered architecture is concerned,
-    // this is marked as deleted. RIP (x_x)
+    // Exists in the lower level, but is marked deleted as far as the layering is concerned.
     Tombstone,
 }
 

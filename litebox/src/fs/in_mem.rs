@@ -68,20 +68,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
         }
     }
 
-    /// Permanently change the fixed uid/gid used for all subsequent permission checks against
-    /// this file system (i.e. the "current user" of the single, fixed set of credentials the
-    /// whole sandboxed guest runs as -- see the `setuid` syscall handler's doc comment).
-    ///
-    /// [`FileSystem::new`] defaults this to an unprivileged uid/gid, but some guest rootfs
-    /// layouts (e.g. an OCI/container image such as Alpine, whose `/`, `/etc`, `/lib`, etc. are
-    /// root-owned at mode `0755` since a real container's initial process runs as root absent an
-    /// explicit `USER` directive) require the guest to actually run as root in order to write
-    /// into those directories, matching what a real container would allow.
-    ///
-    /// This is distinct from [`FileSystem::with_root_privileges`], which only grants root
-    /// privileges for the duration of a closure (intended for one-off internal setup); this
-    /// method changes the persistent identity used for every future operation until changed
-    /// again.
+    /// Permanently change the fixed uid/gid used for every subsequent permission check against
+    /// this file system -- the single set of credentials the whole sandboxed guest runs as.
+    /// Unlike [`FileSystem::with_root_privileges`] the change outlives any closure; an OCI rootfs
+    /// root-owned at `0755` needs root here to be writable: gm mut-1789043702913.
     pub fn set_default_user(&mut self, user: u16, group: u16) {
         self.current_user = UserInfo { user, group };
     }
@@ -102,15 +92,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
         }
     }
 
-    /// Initialize a primarily read-heavy file with static data.
-    ///
-    /// While this function could technically work with write-heavy files, it has performance
-    /// benefits _particularly_ for files that are read-only, compared to doing open+write
-    /// operations.
-    ///
-    /// The file is initialized with clone-on-write semantics for the data, meaning that the first
-    /// time a write occurs on the file, it suffers the penalty of the entire data being cloned into
-    /// memory, which is why this is intended primarily for read-only files (such as executables).
+    /// Initialize an empty file with `data`, borrowed rather than copied.
+    /// Held clone-on-write: reads and `mmap` (via `get_static_backing_data`) borrow it directly;
+    /// the first write clones the whole buffer -- hence read-heavy files, not write-heavy ones.
+    /// See gm mutable mut-1789043709443.
     ///
     /// # Panics
     ///
@@ -174,8 +159,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
 impl<Platform: sync::RawSyncPrimitivesProvider> super::private::Sealed for FileSystem<Platform> {}
 
 /// Maximum number of final-component symlink hops [`FileSystem::resolve_final_symlinks`] will
-/// transparently follow before giving up with `ELOOP`-equivalent behavior. This is intentionally
-/// a small, fixed bound rather than full POSIX loop-safe resolution -- see that method's docs.
+/// transparently follow before giving up with `ELOOP`-equivalent behavior. Intentionally a small,
+/// fixed bound, distinct from the 40-hop bound `RootDir::parent_and_entry` applies to intermediate
+/// components.
 const MAX_SYMLINK_HOPS: u32 = 8;
 
 impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
@@ -198,18 +184,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     /// Given an already-normalized absolute `path`, transparently follow the *final path
     /// component* if it names a symlink, repeatedly, up to [`MAX_SYMLINK_HOPS`] times.
     ///
-    /// This deliberately does NOT resolve symlinks appearing in intermediate/parent path
-    /// components (e.g. `/a/b/c` where `a` or `b` is itself a symlink) -- that would require full
-    /// POSIX-style multi-component loop-safe resolution, which is out of scope here. This is
-    /// sufficient for the scenario this exists to support: `open()`-time resolution of a
-    /// shared-library symlink (e.g. `libfoo.so -> libfoo.so.1.2.3`), where the symlink is always
-    /// the final component of the path being opened.
+    /// Intermediate components are handled by `RootDir::parent_and_entry`, which this calls and
+    /// which follows them itself under its own 40-hop bound.
     ///
     /// A relative symlink target is resolved relative to the directory containing the symlink
     /// itself (matching Linux semantics). Returns `Ok(resolved_path)` where `resolved_path` is
     /// either `path` unchanged (not a symlink) or the final target path after following all hops.
     /// Returns [`PathError::TooManySymlinkHops`] (`ELOOP`) if more than [`MAX_SYMLINK_HOPS`] hops
-    /// would be required.
+    /// would be required. See gm mutable mut-1789043729871.
     fn resolve_final_symlinks(&self, path: String) -> Result<String, PathError> {
         let mut current = path;
         for _ in 0..MAX_SYMLINK_HOPS {
@@ -275,48 +257,29 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             | OFlags::LARGEFILE
             | OFlags::NOFOLLOW
             | OFlags::APPEND
-            // `O_NOATIME` is a pure hint ("do not update the access time on read") with no
-            // bearing on what `open` returns or what the caller may then do, and this filesystem
-            // keeps no meaningful atime to suppress -- honouring it and ignoring it are the same
-            // thing. `nine_p` already accepted it; this whitelist and `layered`'s did not, and
-            // because an unlisted flag becomes an `unimplemented!()` that panics the HOST, a
-            // guest merely opening a file with a hint flag brought the whole process down.
-            // Reached live by `mate-session` startup: `not implemented: OFlags(LARGEFILE |
-            // NOATIME)`.
+            // Accepted and ignored: hints that say HOW to do the I/O, never WHAT to open, so none
+            // of them changes what `open` returns or what the caller may then do. `NOATIME` (no
+            // atime is kept here to suppress), `DSYNC`/`SYNC` (nothing here can lose a write),
+            // `DIRECT` (no page cache exists), `ASYNC` (`SIGIO` belongs to the fd layer above),
+            // `CLOEXEC` (a descriptor-table property the shim applies). gm mut-1789044616577.
             | OFlags::NOATIME
-            // I/O-behaviour hints, accepted and ignored: they say HOW to do the I/O, not WHAT
-            // to open, and none of them changes what `open` returns or what the caller may then
-            // do here. `DSYNC`/`SYNC` are durability barriers and nothing here is backed by a
-            // device that can lose writes; `DIRECT` bypasses a page cache that does not exist;
-            // `ASYNC` asks for `SIGIO`, which the fd layer above owns; `CLOEXEC` is a
-            // descriptor-table property applied by the shim, never by a backend.
             | OFlags::DSYNC
             | OFlags::SYNC
             | OFlags::DIRECT
             | OFlags::ASYNC
             | OFlags::CLOEXEC
             | OFlags::PATH;
-        // An unlisted flag is REPORTED, never fatal.
-        //
-        // This was `unimplemented!("{flags:?}")`, which panics the HOST process -- so any guest
-        // that opened a file with a flag this backend had not been taught took down the runner and
-        // every other guest running inside it. Not hypothetical: it killed a live XFCE session with
-        // `not implemented: OFlags(NOATIME)`, and the comment a few lines above records the SAME
-        // defect being found once before, in a sibling backend, without the others being changed.
-        // Teaching each whitelist one more flag does not fix that; not panicking does.
-        //
-        // `EINVAL` is what Linux reports for a flag combination it will not honour, and it leaves
-        // the decision with the caller instead of ending everyone's process.
+        // An unlisted flag is reported, never fatal: this was `unimplemented!("{flags:?}")`, which
+        // panicked the HOST and with it every other guest in the runner. `EINVAL` is what Linux
+        // reports for a flag combination it will not honour. See gm mutable mut-1789044062368.
         if flags.intersects(currently_supported_oflags.complement()) {
             litebox_util_log::warn!(flags:? = flags; "open: unsupported open flag(s)");
             return Err(OpenError::PathError(PathError::InvalidPathname));
         }
         let path_only = flags.contains(OFlags::PATH);
         let path = self.absolute_path(path)?;
-        // Transparently follow a final-component symlink (e.g. dynamic-linker resolution of a
-        // shared-library symlink), unless the caller explicitly asked not to (`O_NOFOLLOW`) or is
-        // creating the file (in which case there is nothing to follow yet, and `O_CREAT` should
-        // create/replace exactly the named path, not some other path a stale symlink points at).
+        // `O_CREAT` must create/replace exactly the named path, never what a stale symlink points
+        // at, and `O_NOFOLLOW` asks for the link itself. See gm mutable mut-1789044063125.
         let path = if flags.contains(OFlags::NOFOLLOW) || flags.contains(OFlags::CREAT) {
             path
         } else {
@@ -374,12 +337,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             (entry, false)
         };
         let access_mode = flags & (OFlags::WRONLY | OFlags::RDWR);
-        // `O_PATH` opens the fd purely for path resolution -- it must never grant read/write
-        // access, regardless of what `access_mode` numerically computes to (`O_PATH` alone
-        // leaves `access_mode` at its zero/`O_RDONLY` value, which would otherwise look
-        // identical to a real read-only open). Also skip the permission check below: a real
-        // `O_PATH` open succeeds even without read/write permission on the target, matching real
-        // Linux (only the path needs to resolve).
+        // `O_PATH` must grant neither read nor write however `access_mode` computes (alone it
+        // leaves `access_mode` at `O_RDONLY`, indistinguishable from a real read-only open), and
+        // skips the permission check: a real `O_PATH` open needs only the path to resolve.
+        // See gm mutable mut-1789044063125.
         let read_allowed = if path_only {
             false
         } else if access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR {
@@ -477,10 +438,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         debug_assert!(start <= end);
         let retlen = end - start;
         buf[..retlen].copy_from_slice(&file.data[start..end]);
-        // Advance by what was actually read, rather than assigning `end`. Now that a position
-        // beyond the end of the file is reachable (see `seek`), `end` clamps to the file length,
-        // so assigning it would silently REWIND the descriptor on a zero-byte read past EOF.
-        // Real Linux leaves the offset alone there.
+        // Advance by what was read, never assign `end`: `end` clamps to the file length, so on a
+        // zero-byte read past EOF (reachable, see `seek`) assigning it would silently rewind the
+        // descriptor, where real Linux leaves the offset alone. See gm mutable mut-1789044076728.
         *position += retlen;
         Ok(retlen)
     }
@@ -574,14 +534,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let new_posn = base
             .checked_add_signed(offset)
             .ok_or(SeekError::InvalidOffset)?;
-        // Past the end of the file is legal on a regular file, and useful: seek out, write, and
-        // the gap becomes a hole. `write` above already implements exactly that (it zero-pads up
-        // to `write_position` when the position is beyond the current length), so refusing the
-        // seek only made the capability unreachable.
-        //
-        // skalibs' `cdbmake_start` opens a fresh file and seeks to 2048 to reserve the cdb header
-        // before writing records, so `s6-rc-compile` died with `unable to cdbmake_start on
-        // /run/s6/db/resolve.cdb: Invalid argument` -- which stops an s6-overlay boot outright.
+        // Seeking past EOF is legal and useful -- `write` above zero-pads up to the position, so
+        // the gap becomes a hole; refusing it made that unreachable and broke skalibs'
+        // `cdbmake_start`, hence `s6-rc-compile` and an s6-overlay boot. gm mut-1789044084650.
         let _ = file_len;
         *position = new_posn;
         Ok(new_posn)
@@ -607,10 +562,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         else {
             return Err(TruncateError::IsDirectory);
         };
-        // Both flags false only happens for an `O_PATH` fd (a real read-only-but-not-`O_PATH`
-        // open always leaves `read_allowed` true) -- distinguish it from the ordinary
-        // opened-without-write-access case so the caller gets the real Linux `EBADF`, not
-        // `NotForWriting`'s `EACCES`.
+        // Both flags false means an `O_PATH` fd (a real read-only open always leaves
+        // `read_allowed` true), which owes the caller Linux's `EBADF`, not `NotForWriting`'s
+        // `EACCES`. See gm mutable mut-1789044076728.
         if !*read_allowed && !*write_allowed {
             return Err(TruncateError::PathOnlyFd);
         }
@@ -659,12 +613,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 Ok(())
             }
             Entry::Symlink(symlink) => {
-                // Linux's `chmod` follows symlinks and applies to the target; since this bounded
-                // implementation doesn't recurse `chmod` through `resolve_final_symlinks`, and a
-                // symlink's own permission bits are never actually consulted (see
-                // `resolve_final_symlinks`/`read_link`, which only check ownership for chmod
-                // itself, not searchability), we permissively apply the mode directly to the
-                // symlink's own (otherwise-unused) permission bits rather than erroring.
+                // Linux's `chmod` applies to a symlink's target; this implementation does not
+                // recurse, and a symlink's own mode bits are never consulted, so writing them is
+                // harmless where erroring would not be. See gm mutable mut-1789044090865.
                 let perms = &mut symlink.write().perms;
                 if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
                     return Err(ChmodError::NotTheOwner);
@@ -676,15 +627,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     }
 
     fn chmod_fd(&self, fd: &FileFd<Platform>, mode: super::Mode) -> Result<(), ChmodError> {
-        // Unlike `chmod` above (and unlike this same method's own path-based twin), this
-        // operates directly on the `Arc<RwLock<FileX|DirX>>` already held by the open
-        // descriptor -- never re-walking `root.entries`/`parent.children` by name. This is
-        // deliberate: a caller may `unlink` a file and then `fchmod` the still-open fd (see
-        // `FileSystem::chmod_fd`'s doc comment on the `Self` trait for the exact real-world
-        // sequence, wlroots' `allocate_shm_file_pair`, that depends on this), and by the time
-        // `fchmod` runs the directory entry naming the file is already gone -- a path-based
-        // re-resolution would always fail with `NoSuchFileOrDirectory` here, which is exactly
-        // the bug this method exists to avoid.
+        // Operates on the `Arc` the open descriptor already holds, never re-walking by name: a
+        // caller may `unlink` the file and then `fchmod` the still-open fd (wlroots'
+        // `allocate_shm_file_pair`), by which time a path lookup could only fail.
+        // See gm mutable mut-1789044105548.
         let descriptor_table = self.litebox.descriptor_table();
         let entry = &descriptor_table
             .get_entry_mut(fd)
@@ -852,17 +798,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let Some(from_entry) = from_entry else {
             return Err(PathError::NoSuchFileOrDirectory)?;
         };
-        // Renaming a DIRECTORY is supported, onto a name that does not yet exist.
-        //
-        // This is how a program installs a tree atomically: build it under a temporary name, then
-        // rename it into place. `s6-rc-init` does exactly that -- it populates
-        // `/run/s6-rc:s6-rc-init:<random>/` and renames it to `/run/s6-rc` -- and refusing left the
-        // live directory absent, so `s6-rc-init` died with `unable to supervise service
-        // directories in /run/s6-rc/servicedirs: Not a directory`, stopping an s6-overlay boot.
-        //
-        // An EXISTING destination is still refused, for both files and directories. Linux allows
-        // directory-onto-empty-directory, which nothing here has needed yet; refusing is the
-        // conservative answer and matches what this function already did.
+        // Renaming a DIRECTORY onto a name that does not yet exist is supported: it is how a
+        // program installs a tree atomically, and refusing it broke `s6-rc-init`'s publish of
+        // `/run/s6-rc`, stopping an s6-overlay boot. An existing destination is refused whenever
+        // either side is a directory; file-onto-file replaces, as Linux does. gm mut-1789044625250.
         let from_is_dir = matches!(from_entry, Entry::Dir(_));
         if from_is_dir {
             // A directory cannot be moved inside itself: the subtree would be unreachable from the
@@ -923,10 +862,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
 
         let moved = root.entries.remove(&from).unwrap();
-        // `RootDir::entries` is keyed by normalized path, so moving a directory has to re-key every
-        // descendant as well -- the tree itself already moved with the child entry above, but every
-        // path key under the old name would otherwise still resolve to the moved subtree while the
-        // new names resolved to nothing.
+        // `RootDir::entries` is keyed by normalized path, so a moved directory must re-key every
+        // descendant too, or old keys still resolve to the moved subtree. gm mut-1789044267194.
         if from_is_dir {
             let old_prefix = alloc::format!("{}/", from.as_str());
             let new_prefix = alloc::format!("{}/", to.as_str());
@@ -965,11 +902,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let Entry::File(file) = old_entry else {
             return Err(LinkError::IsADirectory);
         };
-        // `parent_and_entry` already hands back an owned `Entry` (cloning only the `Arc`, not the
-        // underlying `FileX` -- `Entry: Clone` clones each variant's `Arc` field). Both paths then
-        // genuinely share the same data/`unique_id` (`stat`'s `ino`), exactly like a real hard
-        // link: a write through one path is visible through the other, and the content only
-        // actually goes away once every linking path has been unlinked.
+        // `parent_and_entry` hands back an owned `Entry` cloning only the `Arc`, so both paths
+        // share one `FileX` and `unique_id` (`stat`'s `ino`) -- a real hard link, and unlinking
+        // one name leaves the other's content alive. See gm mutable mut-1789044267194.
 
         let (new_parent, new_entry) = root.parent_and_entry(&newpath, self.current_user)?;
         if new_entry.is_some() {
@@ -1386,11 +1321,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
     /// appears as an intermediate component.
     ///
     /// The final component is deliberately never followed -- it is returned as whatever it is, so
-    /// `lstat`, `readlink`, `unlink` and `rename` keep operating on the link itself. Only the
-    /// directories walked through on the way are expanded, which is what `ENOTDIR` was previously
-    /// reported for: `ln -s dir link; cat link/file` failed outright, and so did `s6-rc-init`,
-    /// which publishes its live directory by symlinking `/run/s6-rc` at the temporary tree it just
-    /// built and then opening `/run/s6-rc/servicedirs`.
+    /// `lstat`, `readlink`, `unlink` and `rename` keep operating on the link itself. Expanding the
+    /// intermediate ones is what stopped `ln -s dir link; cat link/file` and `s6-rc-init`'s
+    /// symlinked `/run/s6-rc` from failing with `ENOTDIR`. See gm mutable mut-1789044284240.
     fn parent_and_entry(
         &self,
         path: &str,

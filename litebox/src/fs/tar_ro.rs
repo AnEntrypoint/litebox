@@ -63,14 +63,9 @@ impl TarRo {
     }
 
     /// Construct a tar backend from multiple OCI-style layer tars, applied bottom-to-top
-    /// (`layers[0]` is the base layer, `layers[last]` the topmost). OCI whiteout files
-    /// (`.wh.<name>`, deleting a single sibling entry) and opaque whiteouts
-    /// (`.wh..wh..opq`, clearing every pre-existing entry under its own parent directory) in a
-    /// later layer are applied against everything indexed from earlier layers, exactly as the
-    /// OCI image spec's layer application order requires -- this is what lets a runtime image
-    /// load skip ever materializing a merged rootfs onto a real host directory (see
-    /// `litebox_packager/src/oci.rs`'s `extract_tar`, whose whiteout handling this ports into
-    /// this `no_std` index builder so the runtime can do the same merge purely in memory).
+    /// (`layers[0]` is the base layer, `layers[last]` the topmost). A later layer's whiteouts --
+    /// `.wh.<name>` (delete one sibling entry) and `.wh..wh..opq` (clear every pre-existing entry
+    /// under its own parent) -- are applied against everything earlier layers indexed.
     #[must_use]
     pub fn from_layers(
         layers: Vec<alloc::borrow::Cow<'static, [u8]>>,
@@ -172,11 +167,8 @@ impl super::backend::Backend for TarRo {
             .get(name)
             .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
         let IndexedChild::File(file_idx) = *child else {
-            // Either a directory (attempted to `open()` it as a file, without `O_DIRECTORY`) or a
-            // symlink (the resolver is responsible for following final-component symlinks before
-            // calling here; reaching this with `O_NOFOLLOW` on a symlink should surface as ELOOP
-            // rather than this generic error, but no caller currently does that against this
-            // backend).
+            // A symlink reaching here means `O_NOFOLLOW`, where Linux returns ELOOP rather than
+            // this generic error -- see gm mutable fs-tarro-nofollow-eloop-gap.
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         };
         if flags.contains(OFlags::DIRECTORY) {
@@ -245,17 +237,10 @@ impl super::backend::Backend for TarRo {
         Err(WriteError::NotForWriting)
     }
 
-    /// Exposes a file's bytes as a `'static` slice for `try_allocate_cow_pages`, when this
-    /// backend's own `tar_data` is itself `'static`-borrowed (i.e. the tar was host-mmapped and
-    /// passed in without a syscall-rewrite pass copying it into an owned buffer -- see
-    /// `litebox_runner_linux_userland`/`litebox_runner_linux_on_windows_userland`'s `mmapped_file`
-    /// helpers). Previously this always returned the trait default (`None`): every rootfs-tar-
-    /// backed exec (e.g. `/bin/busybox` through any of its many symlinks) skipped the CoW-mmap
-    /// fast path entirely and fell through to `do_mmap_file_memcpy`'s page-by-page `sys_read` loop,
-    /// regardless of platform CoW support -- a real, measured ~27ms/exec cost on Windows before a
-    /// platform CoW implementation even existed to receive this data. `Cow::Owned` (the in-mem
-    /// upper layer, or a rewritten/copied tar) correctly returns `None`: those bytes are not
-    /// `'static`-stable, so a caller cannot legally re-slice `&'static [u8]` out of them.
+    /// Exposes a file's bytes as a `'static` slice for `try_allocate_cow_pages`. Only a
+    /// `Cow::Borrowed` layer (a host-mmapped tar handed in uncopied) can yield one; `Cow::Owned`
+    /// must keep returning `None`, and returning `None` for both costs every tar-backed exec the
+    /// CoW-mmap fast path -- see gm mutable fs-tarro-static-backing-cow.
     fn get_static_backing_data(&self, h: &FileHandle) -> Option<&'static [u8]> {
         let idx = h.get_typed::<Self>().idx;
         let file = &self.tar_index.files[idx];
@@ -460,16 +445,10 @@ enum RawEntry {
     /// `.wh..wh..opq`: clear every entry earlier layers contributed under this entry's own
     /// parent directory (but not the directory itself), per the OCI opaque-whiteout spec.
     OpaqueWhiteout { parent: String },
-    /// A POSIX hard link (`tar_no_std::TypeFlag::LINK`): `path` should alias whatever entry
-    /// currently exists at `link_target` once every layer has been folded. Real base images rely
-    /// on this -- e.g. busybox's official image ships `bin/busybox` itself as a hard link to
-    /// `bin/[` (the actual regular-file payload), with every other applet (`bin/ls`, `bin/mv`,
-    /// ...) as a *symlink* to `bin/busybox`; skipping hardlinks entirely (as this parser
-    /// previously did, since no earlier caller's images needed one) left `bin/busybox` itself
-    /// unindexed, which is fatal since it's the actual program every applet symlink chains to.
-    /// Resolved as a deferred alias after every layer's real files/symlinks/whiteouts are folded,
-    /// so a hard link to a path added by a later layer (unusual, but not disallowed by the tar
-    /// format) still resolves correctly.
+    /// A POSIX hard link (`tar_no_std::TypeFlag::LINK`): `path` aliases whatever `link_target`
+    /// resolves to once every layer is folded. Must be indexed (busybox's official image ships
+    /// `bin/busybox` itself as a hard link) and must stay deferred -- see gm mutable
+    /// fs-tarro-hardlink-busybox.
     HardLink {
         path: String,
         link_target: String,
@@ -489,20 +468,10 @@ impl TarIndex {
         raw_entries: &mut Vec<RawEntry>,
         inode_allocator: &InodeAllocator,
     ) {
-        // `tar_no_std::TarArchiveRef::entries()` silently *skips* every non-regular-file entry
-        // (directories, symlinks, hardlinks, ...) -- see that crate's `ArchiveEntryIterator::next`,
-        // which loops past any header whose `TypeFlag::is_regular_file()` is false. That means a
-        // symlink shipped in the base rootfs tar (e.g. Alpine's usrmerge `usr/lib -> lib` or
-        // `lib -> usr/lib` compat symlinks) is invisible to this filesystem entirely: not indexed
-        // as a file, not as a directory, not as anything -- any path walk through it fails with
-        // `NoSuchFileOrDirectory`, which is exactly the failure `apk` hits extracting a package
-        // whose payload is written through such a symlinked directory.
-        //
-        // To index symlinks too, we walk the raw 512-byte header blocks ourselves (mirroring what
-        // `tar_no_std`'s internal `ArchiveHeaderIterator` does, since that type isn't constructible
-        // outside the crate) using the fully-`pub` `PosixHeader`/`TypeFlag` types this crate
-        // exposes. `BLOCKSIZE` itself is `512` per the POSIX tar spec (`tar_no_std`'s own private
-        // constant of the same value); it is not expected to ever change.
+        // `tar_no_std::TarArchiveRef::entries()` skips every non-regular-file entry, so symlinks
+        // must be indexed by walking the raw header blocks here -- see gm mutable
+        // fs-tarro-raw-header-walk-apk (`apk` through Alpine's usrmerge symlinks).
+        // `BLOCKSIZE` is `512` per the POSIX tar spec and is not expected to change.
         const BLOCKSIZE: usize = 512;
 
         // A PAX extended header (`XHDTYPE`, typeflag `'x'`) precedes the one entry it applies to
@@ -562,14 +531,9 @@ impl TarIndex {
                 let Ok(filename) = header.name.as_str() else {
                     continue;
                 };
-                // POSIX ustar splits a path too long for the 100-byte `name` field across it and
-                // the separate 155-byte `prefix` field (joined as `prefix/name`) rather than
-                // truncating -- GNU tar (and every other modern implementation) does this whenever
-                // `name` alone can't hold the path, which is routine for anything a few directories
-                // deep (e.g. `usr/include/c++/<ver>/ext/pb_ds/detail/...`, `usr/lib/node_modules/
-                // npm/node_modules/...`). Ignoring `prefix` silently drops every such entry's real
-                // directory component, leaving only the basename -- indistinguishable from a
-                // legitimate root-level file, which is exactly the corruption this join prevents.
+                // POSIX ustar splits an over-100-byte path across `name` and the 155-byte `prefix`
+                // field; ignoring `prefix` silently corrupts the path to its basename -- see gm
+                // mutable fs-tarro-ustar-prefix-join.
                 match header.prefix.as_str() {
                     Ok(prefix) if !prefix.is_empty() => {
                         let mut joined = String::from(normalize_tar_filename(prefix));
@@ -584,11 +548,9 @@ impl TarIndex {
                 continue;
             }
 
-            // OCI whiteout files are named `.wh.<name>` (delete sibling `<name>`) or the special
-            // `.wh..wh..opq` (opaque whiteout: clear this entry's own parent directory). Detected
-            // by basename exactly as `litebox_packager/src/oci.rs::extract_tar` does, since a
-            // whiteout marker is itself shipped as a zero-length regular-file tar entry, not a
-            // distinct tar type flag.
+            // A whiteout marker ships as a zero-length regular-file entry, not a distinct tar type
+            // flag, so `.wh.<name>` / `.wh..wh..opq` must be detected by basename -- see gm
+            // mutable fs-tarro-whiteout-basename.
             {
                 let (parent, basename) = path
                     .rsplit_once('/')
@@ -631,11 +593,8 @@ impl TarIndex {
                     files.push(IndexedFile {
                         layer_idx,
                         data_range: content_start..content_end,
-                        // A malformed octal mode field (e.g. from a tar repacked by a tool that
-                        // doesn't preserve Unix permission bits faithfully) must never panic the
-                        // whole process -- fall back to a permissive rwxrwxrwx default rather
-                        // than aborting, matching `owner_from_posix_header`'s own fallback for an
-                        // unparseable uid/gid just above.
+                        // An unparseable octal mode degrades to rwxrwxrwx, never panics -- see gm
+                        // mutable fs-tarro-malformed-tar-field-tolerance.
                         mode: header
                             .mode
                             .to_flags()
@@ -708,12 +667,8 @@ impl TarIndex {
         // whiteout can never remove something a *later* layer goes on to (re-)create.
         let mut live: alloc::collections::BTreeMap<String, RawLiveEntry> =
             alloc::collections::BTreeMap::new();
-        // Hard links are resolved in a second pass below, once every layer's real files,
-        // symlinks, and whiteouts have been folded -- a hard link's target is, in every real
-        // image observed, either an earlier entry in the very same layer or something an earlier
-        // layer already contributed, so deferring resolution to "whatever `live` holds once
-        // folding finishes" is at least as correct as resolving inline and additionally handles
-        // the (unusual but tar-legal) case of a link target introduced later in the same layer.
+        // Hard links resolve against `live` only once every layer is folded -- see gm mutable
+        // fs-tarro-hardlink-busybox.
         let mut deferred_hardlinks: Vec<(String, String)> = Vec::new();
 
         for raw_entry in raw_entries {
@@ -742,10 +697,8 @@ impl TarIndex {
             if let Some(&resolved) = live.get(link_target.as_str()) {
                 live.insert(path, resolved);
             }
-            // A hard link whose target never resolves (missing from every layer, e.g. a
-            // malformed or truncated image) is silently dropped, matching this backend's
-            // existing tolerance for other malformed tar fields elsewhere in this file (a
-            // best-effort read-only filesystem view, not a validating extractor).
+            // An unresolvable hard-link target is dropped, not an error -- see gm mutable
+            // fs-tarro-hardlink-busybox.
         }
 
         let mut dirs = alloc::vec![IndexedDir {
@@ -831,16 +784,9 @@ fn remove_descendants_of(live: &mut alloc::collections::BTreeMap<String, RawLive
         live.clear();
         return;
     }
-    // Range query, not a scan. `live` is a `BTreeMap<String, _>`, so it is ordered by byte
-    // sequence, and every key nested under `parent` is exactly the half-open range
-    // `["parent/", "parent0")` -- `/` is 0x2f and `0` is 0x30, so bumping the separator by one
-    // gives the first key that can no longer share the prefix.
-    //
-    // This is called before EVERY insert (a later layer's file may replace what was a directory
-    // earlier, so the subtree has to go), and the old `retain` walked the whole map each time.
-    // That is O(entries^2) over the merged image, and it dominated startup completely: a 2.5 GB
-    // webtop rootfs took 14 s to index, against ~1 s to read the same bytes from disk. With the
-    // range query the common case -- nothing nested under this path at all -- is one lookup.
+    // Must stay a range query: the `retain` scan it replaced was O(entries^2) and cost 14 s to
+    // index a 2.5 GB rootfs. The `["parent/", "parent0")` bound relies on `BTreeMap` byte
+    // ordering. See gm mutable fs-tarro-subtree-range-query-perf.
     let start = {
         let mut p = String::from(parent);
         p.push('/');
@@ -896,7 +842,7 @@ fn normalize_tar_filename(filename: &str) -> &str {
 
 /// Ensure every ancestor directory of `path` exists in `dirs`, returning the immediate parent's
 /// index and the final path component's name. Shared by both file and symlink tar entries when
-/// building the index in [`TarIndex::new`].
+/// building the index in [`TarIndex::from_layers`].
 fn ensure_ancestors(
     dirs: &mut Vec<IndexedDir>,
     dirs_by_path: &mut HashMap<String, usize>,
@@ -962,10 +908,8 @@ fn mode_of_modeflags(perms: tar_no_std::ModeFlags) -> Mode {
 }
 
 fn owner_from_posix_header(posix_header: &tar_no_std::PosixHeader) -> UserInfo {
-    // A malformed or out-of-range octal uid/gid field (e.g. a tar repacked by a tool that writes
-    // a large host-derived numeric id rather than a genuine small Unix uid) must never panic the
-    // whole process -- fall back to uid/gid 0 (root), matching how a well-behaved tar reader
-    // degrades on an unparseable owner field instead of aborting.
+    // An unparseable or out-of-range octal uid/gid degrades to 0 (root), never panics -- see gm
+    // mutable fs-tarro-malformed-tar-field-tolerance.
     UserInfo {
         user: posix_header.uid.as_number().unwrap_or(0),
         group: posix_header.gid.as_number().unwrap_or(0),

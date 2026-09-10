@@ -81,11 +81,9 @@ fn walk<FS: FileSystem>(
                 });
                 walk(fs, &child_path, out)?;
             }
-            // A FIFO carries no data of its own, so exporting it is exactly a directory-style
-            // metadata-only entry. It has to travel, though: these archives are how a writable
-            // layer reaches a cross-process `fork()` child, and a FIFO that arrived as a plain
-            // empty file there would be opened as one -- reads returning instant EOF instead of
-            // blocking for a writer.
+            // A FIFO carries no data but must still travel: arriving as a plain empty file in a
+            // cross-process `fork()` child, it would be opened as one -- reads returning instant
+            // EOF instead of blocking for a writer. See gm mutable fs-export-fifo-roundtrip.
             FileType::Fifo => {
                 let status = fs
                     .file_status(&*child_path)

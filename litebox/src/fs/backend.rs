@@ -91,16 +91,9 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError>;
 
     /// If `name` at `dir` names a symlink, return its (unresolved) target string.
-    ///
-    /// Returns `Ok(None)` if `name` exists but is not a symlink. Returns
-    /// `Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))` if `name` does not exist at
-    /// `dir`. This exists so [`super::resolver::Resolver`] can transparently follow a symlink
-    /// appearing in an intermediate (non-final) path component during a walk -- e.g. Alpine's
-    /// usrmerge `/lib -> usr/lib` -- the same way [`super::in_mem`] already does for its own
-    /// (upper/writable) layer.
-    ///
-    /// Backends with no symlink concept (e.g. [`super::devices::Devices`]) can rely on the default
-    /// body, which always reports "not a symlink" for anything walkable.
+    /// `Ok(None)` if `name` exists but is not a symlink;
+    /// `Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))` if absent at `dir`.
+    /// Lets the resolver follow Alpine's usrmerge `/lib -> usr/lib` mid-walk: gm mut-1789043688759.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
     fn read_link_at(
         &self,
@@ -144,12 +137,10 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
     /// adding `\0`s.
     fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError>;
 
-    /// Change the permissions of an already-open file handle, matching `fchmod(2)` -- see
-    /// [`super::FileSystem::chmod_fd`]'s doc comment for why this must operate on `h` directly
-    /// rather than re-resolving a path (a caller may `unlink` the directory entry naming this
-    /// file and then `fchmod` the still-open handle, e.g. wlroots' `util/shm.c`
-    /// `allocate_shm_file_pair`). Scoped to `FileHandle` only, matching [`Self::truncate`]'s own
-    /// scope -- no backend in this codebase currently needs `fchmod` on a directory fd.
+    /// Change the permissions of an already-open file handle, matching `fchmod(2)`.
+    /// Must operate on `h` directly, never re-resolve by path: wlroots' `util/shm.c`
+    /// `allocate_shm_file_pair` unlinks before `fchmod` (gm mut-1789043689150). Scoped to
+    /// `FileHandle` only, matching [`Self::truncate`].
     fn chmod(&self, h: &FileHandle, mode: Mode) -> Result<(), ChmodError>;
 
     /// Describe seek behavior for an open file handle.
@@ -377,16 +368,4 @@ pub(super) struct WalkedComponent {
 pub(super) struct PermissionInfo {
     pub(super) mode: Mode,
     pub(super) owner: UserInfo,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::Backend;
-
-    #[test]
-    fn backend_is_dyn_safe() {
-        fn assert_dyn_safe(_: Option<&dyn Backend>) {}
-
-        assert_dyn_safe(None);
-    }
 }

@@ -1,33 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Synthesized `/proc` entries [`super::backend::Backend`]s.
-//!
-//! A stock XFCE/GLib/dbus desktop session (and many ordinary CLI tools) read a small, fixed set
-//! of `/proc` paths for introspection or sizing purposes -- none of them need real process
-//! introspection to be individually CORRECT, only a format-accurate synthesis. This is
-//! deliberately NOT a general-purpose `/proc` filesystem (see `Procfs`/`ProcSelf`'s own doc
-//! comments for the exact, fixed set each one covers) -- mirrors the same "minimal, exact files a
-//! real client needs" pattern already used by [`super::static_files`] for
-//! the constant `/proc/sys` and `/sys` files.
-//!
-//! `/proc/self/auxv` is load-bearing rather than informational: rustix falls back to reading
-//! it when it cannot obtain the auxiliary vector from the initial stack, and it `unwrap()`s
-//! the result. Every Rust-coreutils (uutils) binary therefore ABORTS outright without this
-//! file -- on `linuxserver/webtop:ubuntu-xfce`, whose /bin/mkdir, /bin/cp and /bin/rm are
-//! uutils, that meant every shell script in the boot path failing at its first command.
-//!
-//! `/proc/self/maps` is load-bearing for the same image and the same reason: Rust's std
-//! locates the main thread's stack guard by parsing it when installing the SIGSEGV handler
-//! that reports stack overflow. With the file absent it proceeds on a guess, and the first
-//! thing the guest does after `rt_sigaction(SIGSEGV)` is take a real SIGSEGV.
-//!
-//! Two backends, mounted separately (like `/dev` + `/dev/dri` in [`super::devices`]):
-//! - [`Procfs`], mounted at `/proc`: static/host-derived flat files (`cpuinfo`, `meminfo`,
-//!   `mounts`, `uptime`) that need no per-process state.
-//! - [`ProcSelf`], mounted at `/proc/self`: files whose content depends on the CURRENT guest
-//!   process (`exe`, `cmdline`, `stat`, `status`, `environ`, `mountinfo`) -- backed by a shared
-//!   [`ProcSelfInfo`] cell the shim updates on every `execve` (see `ProcSelf::update`).
+//! Synthesized `/proc`: format-accurate renderings of the fixed sets `ProcfsEntry::ALL`
+//! ([`Procfs`], mounted `/proc`) and `ProcSelfEntry::ALL` ([`ProcSelf`], mounted `/proc/self`);
+//! not a general procfs -- gm mutable `mut-1789043963534`. `auxv`/`maps` are load-bearing, not
+//! informational: rustix `unwrap()`s auxv, std parses maps -- gm mutable `mut-1789043907427`.
 
 use alloc::format;
 use alloc::string::String;
@@ -48,7 +25,8 @@ use super::errors::{
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, Timestamp, UserInfo};
 
-/// Per-process data backing `/proc/self/*`, updated on every `execve` (see [`ProcSelf::update`]).
+/// Per-process data backing `/proc/self/*`, refreshed on every `execve` by whoever owns the shared
+/// [`ProcSelfTable`] this backend reads through (see [`ProcSelf::new`]).
 ///
 /// Deliberately minimal: only the fields the synthesized files below actually surface.
 #[derive(Clone, Default)]
@@ -67,31 +45,19 @@ pub struct ProcSelfInfo {
     /// `comm` field and `status`'s `Name:` field.
     pub comm: String,
     /// The process's auxiliary vector in `/proc/[pid]/auxv` form: `(a_type, a_val)` `usize` pairs
-    /// in native byte order, terminated by an `AT_NULL` pair.
-    ///
-    /// Supplied by the loader from the very bytes it wrote to the initial stack, rather than
-    /// rebuilt here, so the file and the stack cannot disagree -- see the shim's
-    /// `UserStack::push_aux`.
+    /// in native byte order, terminated by an `AT_NULL` pair. Supplied by the loader from the bytes
+    /// it wrote to the initial stack, so the two cannot disagree; load-bearing for rustix -- see gm
+    /// mutable `mut-1789043907427`.
     pub auxv: Vec<u8>,
     /// Renders `/proc/[pid]/maps` for the CURRENT process, or `None` before any process has been
-    /// loaded.
-    ///
-    /// A callback rather than a snapshot, because unlike every other field here the address space
-    /// changes constantly -- every `mmap`, `munmap`, `mprotect`, `dlopen` and heap growth alters
-    /// it. A value captured at `execve` would be stale by the time anything read it, and the
-    /// readers that matter are asking precisely because they need the CURRENT layout.
-    ///
-    /// It is a closure because this crate cannot name the shim's per-process memory manager; the
-    /// shim installs one that holds an `Arc` to it (see `load_program`).
+    /// loaded. A callback, not a snapshot: the address space changes on every `mmap`/`mprotect`/
+    /// `dlopen`, and a closure is the only shape that can name the shim's per-process memory
+    /// manager from this crate. Load-bearing for Rust std -- gm mutable `mut-1789043907427`.
     pub maps: Option<alloc::sync::Arc<dyn Fn() -> Vec<u8> + Send + Sync>>,
 }
 
-/// Real `/proc/[pid]/stat` (see `man 5 proc`) has 52 whitespace-separated fields as of Linux
-/// 5.x; tools that parse it (e.g. `libgtop`, some process-introspection dbus services) generally
-/// only rely on the field COUNT and the position of `pid`/`comm`/`state`, tolerating conservative
-/// placeholder values for the rest. `comm` is always parenthesized (fields after it are found by
-/// splitting on the LAST `)`, since `comm` itself may contain spaces/parens) -- this synthesis
-/// follows that exactly.
+/// Real `/proc/[pid]/stat`: 52 whitespace-separated fields, `comm` parenthesized so readers split
+/// on the LAST `)`. `libgtop` parses it positionally -- see gm mutable `mut-1789043806784`.
 fn format_stat(info: &ProcSelfInfo) -> Vec<u8> {
     // field 3 is state; 'R' (running) is always accurate enough for a process that is alive to
     // read its own /proc/self/stat.
@@ -109,10 +75,8 @@ fn format_stat(info: &ProcSelfInfo) -> Vec<u8> {
     s.into_bytes()
 }
 
-/// Real `/proc/[pid]/status` (see `man 5 proc`) is a human-readable `Key:\tvalue` listing.
-/// Only the widely-parsed fields are given accurate values; the rest of a real kernel's listing
-/// is omitted rather than guessed, since (unlike `stat`) there is no fixed field count a parser
-/// depends on here -- every consumer reads this format by key, not by position.
+/// Real `/proc/[pid]/status`: a `Key:\tvalue` listing read by key, never by position, so unknown
+/// keys are omitted rather than guessed -- see gm mutable `mut-1789043822948`.
 fn format_status(info: &ProcSelfInfo) -> Vec<u8> {
     format!(
         "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t1\n",
@@ -121,11 +85,9 @@ fn format_status(info: &ProcSelfInfo) -> Vec<u8> {
     .into_bytes()
 }
 
-/// Real `/proc/cpuinfo` content: one stanza per logical CPU, each ending in a blank line, `\n`
-/// terminated `key\t: value` pairs. GLib's `g_get_num_processors()` (and several GUI toolkits'
-/// thread-pool sizing) counts `processor\t:` lines, so the STANZA COUNT here must match the real
-/// host core count exactly; the other fields are reasonable generic values (unlike the count,
-/// nothing real depends on their exact content).
+/// Real `/proc/cpuinfo`: one blank-line-terminated `key\t: value` stanza per logical CPU, and the
+/// stanza count must match the real host core count -- GLib's `g_get_num_processors()` counts
+/// `processor\t:` lines. See gm mutable `mut-1789043826779`.
 fn format_cpuinfo(cpu_count: usize) -> Vec<u8> {
     let mut s = String::new();
     for i in 0..cpu_count.max(1) {
@@ -136,18 +98,9 @@ fn format_cpuinfo(cpu_count: usize) -> Vec<u8> {
     s.into_bytes()
 }
 
-/// Real `/proc/meminfo` key-value format (see `man 5 proc`), values in kB, `\n`-terminated.
-///
-/// Both figures come from the platform's real host query (see
-/// `crate::platform::SystemInfoProvider::memory_info_kb`), NOT from a formula over an invented
-/// total. The previous implementation derived `MemFree`/`MemAvailable` as a fixed 3/4 of
-/// `mem_total_kb` and described that as "a safe over-estimate... real Linux tools treat it as a
-/// hint, not a hard guarantee". That reasoning is wrong in the one direction that matters:
-/// over-estimating *free* memory is an instruction to the guest to allocate memory the host does
-/// not have. Measured live -- a 4 GiB total yielded exactly 3 GiB `MemFree`, and Xorg on
-/// `linuxserver/webtop:debian-xfce` allocated to precisely that figure (3104-3128 MiB across
-/// three runs), peaking near 8.9 GiB during its final growth step and repeatedly tripping the
-/// host's low-memory watchdog, which kills with no error and no exit status.
+/// Real `/proc/meminfo`: `Key:\tvalue` in kB. `MemFree`/`MemAvailable` must come from the
+/// platform's real host query, never a fraction of an invented total -- over-stating free memory
+/// drove Xorg into the host's low-memory watchdog. See gm mutable `mut-1789043836796`.
 fn format_meminfo(mem_total_kb: u64, mem_avail_kb: u64) -> Vec<u8> {
     // Never advertise more available than total, whatever the platform reported.
     let free = mem_avail_kb.min(mem_total_kb);
@@ -157,28 +110,16 @@ fn format_meminfo(mem_total_kb: u64, mem_avail_kb: u64) -> Vec<u8> {
     .into_bytes()
 }
 
-/// Real `/proc/mounts` format: `device mountpoint fstype options dump pass`, one line per mount,
-/// space-separated. A single entry describing the guest's own root filesystem as it appears to
-/// the guest (matches this shim's own rootfs presentation -- read-only tar-backed lower layer
-/// composed with a writable in-mem upper layer) -- real completeness (every synthetic `/dev`,
-/// `/proc`, `/sys` mount) is deliberately out of scope; the one real client this exists for
-/// (gvfs/gio volume monitoring) only needs a well-formed root entry to avoid aborting/spinning.
+/// Real `/proc/mounts`: `device mountpoint fstype options dump pass` per line. A single root entry;
+/// real completeness is deliberately out of scope -- gvfs/gio volume monitoring only needs a
+/// well-formed root entry. See gm mutable `mut-1789044455985`.
 fn format_mounts() -> Vec<u8> {
     b"rootfs / rootfs rw 0 0\n".to_vec()
 }
 
-/// Real `/proc/filesystems` format: one filesystem type per line, `nodev	` prefixed for types
-/// that need no backing block device, a bare tab otherwise.
-///
-/// A live XFCE session read this 18 times in one boot and got `ENOENT` every time. The readers are
-/// `mount`/`libmount`, GIO's volume monitor, and anything deciding whether a `tmpfs` or `proc`
-/// mount is even possible before attempting it -- a missing file reads as "this kernel supports
-/// nothing", which is a different and worse answer than an honest short list.
-///
-/// The list is exactly what litebox actually serves: the synthesized `proc`/`sysfs` trees, the
-/// `devtmpfs`/`tmpfs` shape `/dev` and `/dev/shm` present, and `rootfs` for the tar-backed root
-/// [`format_mounts`] already reports. Claiming `ext4`/`overlay`/`fuse` here would be a lie a
-/// caller could act on.
+/// Real `/proc/filesystems`: one type per line, `nodev	` prefixed when no block device is needed.
+/// Must list only what litebox actually serves -- a missing file reads to `mount`/`libmount` and
+/// GIO's volume monitor as "this kernel supports nothing". See gm mutable `mut-1789043857688`.
 fn format_filesystems() -> Vec<u8> {
     b"nodev	rootfs
 nodev	proc
@@ -190,17 +131,10 @@ nodev	devpts
         .to_vec()
 }
 
-/// Real `/proc/stat` format: a `cpu` aggregate line, one `cpuN` line per logical CPU, then the
-/// `intr`/`ctxt`/`btime`/`processes`/`procs_running`/`procs_blocked` counters.
-///
-/// Every counter is zero, and that is honest rather than lazy: litebox does not schedule guest
-/// threads itself (Windows does), so it has no jiffy accounting to report and inventing plausible
-/// numbers would make a monitoring client draw graphs of fiction. What the readers overwhelmingly
-/// want from this file is the CPU COUNT -- `nproc`, GLib's `g_get_num_processors` fallback, and
-/// several thread-pool sizers count `cpuN` lines -- and that number is real.
-///
-/// Named `format_stat_global` to keep it distinct from [`format_stat`], which renders the very
-/// differently-shaped per-process `/proc/[pid]/stat`.
+/// Real `/proc/stat`: a `cpu` aggregate line, one `cpuN` line per logical CPU, then the
+/// `intr`/`ctxt`/`btime`/`processes`/`procs_running`/`procs_blocked` counters. Counters are
+/// honestly zero (litebox does not schedule guest threads); the `cpuN` count is the real payload
+/// `nproc` and GLib read. See gm mutable `mut-1789043865374`.
 fn format_stat_global(cpu_count: usize) -> Vec<u8> {
     let mut out = String::from("cpu  0 0 0 0 0 0 0 0 0 0
 ");
@@ -218,73 +152,49 @@ procs_blocked 0
     out.into_bytes()
 }
 
-/// Real `/proc/cmdline` content: the kernel's own boot command line, one line.
-///
-/// There is no bootloader here and no kernel command line to report, so the honest content is the
-/// bare minimum a real kernel always carries. Readers (systemd-ish tooling, container-detection
-/// heuristics, `dracut`-style probes) parse it for `key=value` options and treat a missing file as
-/// a broken `/proc` mount rather than as an empty command line.
+/// Real `/proc/cmdline`: the kernel boot command line, one line. Must exist -- systemd-ish tooling,
+/// container-detection heuristics and `dracut`-style probes read a missing file as a broken `/proc`
+/// mount rather than an empty command line. See gm mutable `mut-1789043872060`.
 fn format_kernel_cmdline() -> Vec<u8> {
     b"BOOT_IMAGE=/litebox root=/dev/root rw
 ".to_vec()
 }
 
-/// Real `/proc/[pid]/mountinfo` format (see `man 5 proc`): 10+ space-separated fields per line,
-/// with a literal ` - ` separator before the last three (fstype, source, super options). A
-/// single root entry, minimal-but-format-correct (see [`format_mounts`]'s doc comment for why
-/// completeness is out of scope here).
+/// Real `/proc/[pid]/mountinfo`: 10+ space-separated fields per line with a literal ` - ` before
+/// the last three (fstype, source, super options). A single root entry; completeness is out of
+/// scope -- see gm mutable `mut-1789044455985`.
 fn format_mountinfo() -> Vec<u8> {
     b"1 0 0:1 / / rw - rootfs rootfs rw\n".to_vec()
 }
 
-/// Real `/proc/[pid]/oom_score_adj` content: the OOM-killer score adjustment, one decimal integer
-/// on a line, in the range -1000..=1000.
-///
-/// `0` is the kernel's own default for a process that has not been adjusted, and it is the honest
-/// answer here: litebox has no OOM killer, so nothing is ever adjusted away from the default.
-///
-/// This matters because the readers treat absence and neutrality differently. GLib's
-/// `g_spawn`/`gio` launch paths, systemd's `oom_score_adjust`, and several session managers read
-/// this file to save-and-restore the value around spawning a child; a missing file makes that a
-/// visible failure to report, whereas `0` is simply "nothing to restore". The webtop desktop hit
-/// it on essentially every process launch.
+/// Real `/proc/[pid]/oom_score_adj`: one decimal integer in -1000..=1000. `0` (the kernel default)
+/// must be served rather than `ENOENT` -- GLib's `g_spawn`/`gio` and systemd's `oom_score_adjust`
+/// save-and-restore it around every spawn, and absence is a failure to report where `0` is simply
+/// "nothing to restore". See gm mutable `mut-1789043876626`.
 fn format_oom_score_adj() -> Vec<u8> {
     Vec::from(&b"0
 "[..])
 }
 
-/// Real `/proc/[pid]/cgroup` content, unified-hierarchy (cgroup v2) form.
-///
-/// The format is `hierarchy-ID:controller-list:cgroup-path` per line. On a v2-only system --
-/// which is what every current container runtime presents, and what this shim most closely
-/// resembles, having no cgroup controllers of its own -- there is exactly one line, the hierarchy
-/// ID is `0`, and the controller list is empty: `0::/`.
-///
-/// This existing as a real file rather than `ENOENT` matters because it is not an optional
-/// nicety for the consumers that read it. glib's `g_get_user_runtime_dir`, systemd's
-/// `sd_pid_get_unit`, and libcontainer-aware code all probe it, and several of them treat a
-/// missing file (`ENOENT`) differently from a v2 answer -- a MISSING file reads as "cgroups are
-/// not mounted at all, this is a pre-2008 kernel", which is a state no modern userspace is
-/// prepared for, whereas `0::/` reads as "cgroup v2, this process is in the root group", which is
-/// both true here and the case every one of them handles. The webtop stack read this thousands of
-/// times in a single boot.
+/// Real `/proc/[pid]/cgroup`, unified (v2) form: `hierarchy-ID:controller-list:cgroup-path` per
+/// line, so a v2-only system with no controllers of its own is exactly `0::/`. Must exist rather
+/// than `ENOENT` -- glib's `g_get_user_runtime_dir` and systemd's `sd_pid_get_unit` read a missing
+/// file as "cgroups not mounted at all". See gm mutable `mut-1789043885409`.
 fn format_cgroup() -> Vec<u8> {
     Vec::from(&b"0::/
 "[..])
 }
 
-/// Real `/proc/uptime` format: two space-separated floating point seconds values (system uptime,
-/// idle time summed across all CPUs), `\n`-terminated. This shim does not track guest idle time,
-/// so idle is conservatively reported equal to uptime -- what actually matters to every known
-/// consumer is that this file parses as two valid floats, not their precise values.
+/// Real `/proc/uptime`: two space-separated float seconds (uptime, summed idle), `\n`-terminated.
+/// Idle is reported equal to uptime -- no guest idle accounting exists, and consumers only need two
+/// parseable floats. See gm mutable `mut-1789044456945`.
 fn format_uptime(uptime_secs: u64) -> Vec<u8> {
     format!("{uptime_secs}.00 {uptime_secs}.00\n").into_bytes()
 }
 
-/// A [`Backend`] serving the static/host-derived `/proc` flat files that need no per-process
-/// state: `cpuinfo`, `meminfo`, `mounts`, `uptime`. Mounted at `/proc`.
-///
-/// Deliberately NOT a general procfs -- see this module's own doc comment.
+/// A [`Backend`] serving the static/host-derived `/proc` flat files that need no per-process state
+/// -- the exact set is `ProcfsEntry::ALL`. Mounted at `/proc`; deliberately not a general procfs
+/// (gm mutable `mut-1789043963534`).
 pub struct Procfs<Platform>
 where
     Platform: RawSyncPrimitivesProvider + 'static,
@@ -304,12 +214,8 @@ where
 {
     /// Construct a new `Procfs` backend.
     ///
-    /// `cpu_count` should be the real host logical-CPU count (see
-    /// `crate::platform::SystemInfoProvider::cpu_count`) -- this is the one field a real GLib
-    /// consumer's thread-pool sizing depends on being accurate. `mem_total_kb` is the host's (or
-    /// a reasonable approximation of the guest's) total memory in kB. `boot_uptime_secs` is a
-    /// fixed uptime value reported for the lifetime of this backend (this shim does not track a
-    /// live wall-clock uptime source usable from `no_std` code).
+    /// `cpu_count` must be the real host logical-CPU count (GLib thread-pool sizing depends on it);
+    /// `boot_uptime_secs` is fixed for this backend's lifetime. See gm mutable `mut-1789043963534`.
     #[must_use]
     pub fn new(
         litebox: &LiteBox<Platform>,
@@ -622,29 +528,8 @@ where
 
 /// Every live guest process's [`ProcSelfInfo`], keyed by pid.
 ///
-/// # Why this is a table and not one cell
-///
-/// It was one cell. A [`Backend`] is shim-wide -- built once, shared by every guest process -- and
-/// the trait carries no identity of the caller, so `/proc/self` was served from a single
-/// `ProcSelfInfo` that whichever process `execve`'d most recently overwrote. Every other process
-/// then read that one's `exe`, `cmdline`, `environ`, `stat`, `status`, `auxv` and `maps` as its
-/// own.
-///
-/// For `exe` and `cmdline` that is wrong but inert. The other two are not inert:
-///
-/// - `/proc/self/auxv` is read by rustix when it cannot get the auxiliary vector from the initial
-///   stack, and the result is `unwrap()`ed. Handing it another binary's `AT_PHDR`/`AT_ENTRY`/
-///   `AT_BASE` is handing it a description of an address space the caller does not have.
-/// - `/proc/self/maps` is parsed by Rust's std to locate the main thread's stack guard before it
-///   installs the handler that reports stack overflow. Another process's map means another
-///   process's stack bounds.
-///
-/// Both are read during early process startup, which is exactly when a busy session has several
-/// processes starting at once -- so the window is not narrow, and what lands in it varies run to
-/// run. A desktop whose startup outcome differs between identical runs is the symptom this shape
-/// produces.
-///
-/// [`Backend`]: super::backend::Backend
+/// Per-pid rather than one shared cell: a shim-wide [`Backend`] carries no caller identity, so one
+/// cell served every process the last `execve`'s `auxv`/`maps` -- gm mutable `mut-1789043924408`.
 #[derive(Default)]
 pub struct ProcSelfTable {
     by_pid: alloc::collections::BTreeMap<i32, ProcSelfInfo>,
@@ -672,17 +557,8 @@ impl ProcSelfTable {
 
     /// Gives `child` its own copy of `parent`'s entry, on a process `clone()`.
     ///
-    /// A `fork()`ed child that has not `execve`'d yet genuinely IS running its parent's binary with
-    /// its parent's argv and environment, so real Linux's `/proc/<child>/exe` and `cmdline` are the
-    /// parent's -- only the `pid` field differs. Without this the child has no entry at all and
-    /// falls back to whichever process wrote last (see [`Self::resolve`]), which for a desktop --
-    /// where every shell script in the startup path forks constantly and most of those children
-    /// never `execve` -- is usually some unrelated process.
-    ///
-    /// `maps` is deliberately NOT carried over: it is a closure over the PARENT's page manager, and
-    /// the child's address space is its own from the moment it starts. A child that `execve`s gets a
-    /// renderer for its own page manager there; one that does not would rather report nothing than
-    /// report its parent's address space as its own.
+    /// A child not yet `execve`'d runs its parent's binary and argv, so only `pid` differs; `maps`
+    /// is NOT inherited, closing over the parent's page manager. gm mutable `mut-1789043924408`.
     pub fn inherit(&mut self, parent: i32, child: i32) {
         let Some(mut info) = self.by_pid.get(&parent).cloned() else {
             return;
@@ -694,9 +570,8 @@ impl ProcSelfTable {
 
     /// Drops `pid`'s entry, on process exit.
     ///
-    /// Not optional housekeeping: each entry holds that process's whole `cmdline`, `environ` and
-    /// `auxv`, plus an `Arc` closure keeping its page-manager mapping table alive. A session that
-    /// starts thousands of short-lived processes would otherwise hold every one of them forever.
+    /// Not optional: each entry holds that process's whole `cmdline`, `environ` and `auxv` plus an
+    /// `Arc` closure pinning its page-manager mapping table. gm mutable `mut-1789043924408`.
     pub fn remove(&mut self, pid: i32) {
         self.by_pid.remove(&pid);
         if self.most_recent == Some(pid) {
@@ -706,13 +581,9 @@ impl ProcSelfTable {
 
     /// The entry `/proc/self` should serve to a caller whose pid is `caller`.
     ///
-    /// Falls back to the most recently written entry when `caller` is `None` (a platform that does
-    /// not track per-thread guest pids) or names a pid with no entry. That fallback IS the old
-    /// single-cell behaviour, deliberately: it is what a platform without
-    /// [`ThreadProvider::current_guest_pid`] could do anyway, so keeping it means this change can
-    /// only improve an answer, never remove one.
-    ///
-    /// [`ThreadProvider::current_guest_pid`]: crate::platform::ThreadProvider::current_guest_pid
+    /// Falls back to the most recently written entry when `caller` is `None` or names a pid with no
+    /// entry -- that fallback is the old single-cell behaviour, kept deliberately so this can only
+    /// improve an answer, never remove one. See gm mutable `mut-1789043924408`.
     fn resolve(&self, caller: Option<i32>) -> Option<&ProcSelfInfo> {
         caller
             .and_then(|pid| self.by_pid.get(&pid))
@@ -720,17 +591,10 @@ impl ProcSelfTable {
     }
 }
 
-/// A [`Backend`] serving `/proc/self/*` files whose content depends on the CURRENT guest process:
-/// `exe` (a symlink, via [`Backend::read_link_at`]), `cmdline`, `stat`, `status`, `environ`,
-/// `mountinfo`. Mounted at `/proc/self`.
-///
-/// Backed by a shared [`ProcSelfTable`] (`Arc<RwLock<...>>`) the shim's `execve` handling writes
-/// one entry per guest process into, and resolved per CALLER via
-/// [`ThreadProvider::current_guest_pid`] -- see [`ProcSelfTable`]'s own doc comment for what this
-/// replaced (one global cell holding whichever process `execve`'d last) and why `auxv` and `maps`
-/// made that actively dangerous rather than merely inaccurate.
-///
-/// [`ThreadProvider::current_guest_pid`]: crate::platform::ThreadProvider::current_guest_pid
+/// A [`Backend`] serving the `/proc/self/*` files whose content depends on the CURRENT guest
+/// process -- the exact set is `ProcSelfEntry::ALL`, and `exe` is a symlink (see
+/// [`Backend::read_link_at`]). Mounted at `/proc/self`; resolved per CALLER from a shared
+/// [`ProcSelfTable`] via `ThreadProvider::current_guest_pid`. gm mutable `mut-1789043924408`.
 pub struct ProcSelf<Platform>
 where
     Platform: RawSyncPrimitivesProvider + crate::platform::ThreadProvider + 'static,
@@ -746,7 +610,7 @@ where
     Platform: RawSyncPrimitivesProvider + crate::platform::ThreadProvider + 'static,
 {
     /// Construct a new `ProcSelf` backend sharing the given `info` table -- the caller keeps its
-    /// own clone of the same `Arc` to update it on `execve` (see this module's doc comment).
+    /// own clone of the same `Arc` to update it on `execve`.
     #[must_use]
     pub fn new(
         litebox: &LiteBox<Platform>,
@@ -764,8 +628,8 @@ where
 
     /// The [`ProcSelfInfo`] this backend should answer with for the CALLING guest process.
     ///
-    /// Cloned rather than borrowed because the lock cannot be held across the rendering below, and
-    /// because `/proc/self/maps` is a closure the caller invokes after the lock is released.
+    /// Cloned, not borrowed: the lock must not be held across rendering, and `/proc/self/maps` is a
+    /// closure the caller invokes after release. See gm mutable `mut-1789043934584`.
     fn current(&self) -> Option<ProcSelfInfo> {
         let caller = crate::platform::ThreadProvider::current_guest_pid(self.litebox.x.platform);
         self.info.read().resolve(caller).cloned()
@@ -942,18 +806,13 @@ where
         if flags.contains(OFlags::DIRECTORY) {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
-        // `unwrap_or_default` rather than an error: a process that has not yet `execve`'d has no
-        // snapshot, and an empty one renders every file as empty -- the same thing the single
-        // global cell produced before any process had run, and a better answer than refusing the
-        // read outright to a caller the table simply does not know yet.
+        // A caller the table does not know yet (nothing `execve`'d) gets an empty snapshot, not an
+        // error -- see gm mutable `mut-1789043934584`.
         let snapshot = self.current().unwrap_or_default();
         let content = match entry {
-            // A direct `open("/proc/self/exe")` (rather than `readlink`) on real Linux opens the
-            // symlink's TARGET (the executable itself) -- but this shim has no real inode for the
-            // running binary to hand back a matching fd for, and no known guest workload in scope
-            // for this task opens `exe` directly rather than reading it via `readlink`, so this
-            // reports the path text itself rather than attempting to open the target. `readlink`
-            // (via `read_link_at` below) is the well-formed path real consumers use.
+            // Deliberate deviation: a direct `open` reports the path TEXT, not the symlink target
+            // real Linux would open -- `readlink` is the path real consumers use. See gm mutable
+            // `mut-1789043942984`.
             ProcSelfEntry::Exe => snapshot.exe_path.clone().into_bytes(),
             ProcSelfEntry::Cmdline => snapshot.cmdline.clone(),
             ProcSelfEntry::Stat => format_stat(&snapshot),
@@ -971,9 +830,8 @@ where
         })
     }
 
-    /// `exe` is the one real symlink in this backend -- see this module's own doc comment for
-    /// why `/proc/self/exe` matters enough to get real symlink semantics (`readlink` returning
-    /// the resolved guest binary path) rather than a plain-file stand-in.
+    /// `exe` is the one real symlink in this backend: `readlink` returns the resolved guest binary
+    /// path, and every other entry answers "not a symlink". gm mutable `mut-1789043963534`.
     fn read_link_at(
         &self,
         dir: WalkingDirHandle<'_>,
@@ -993,10 +851,8 @@ where
             .iter()
             .map(|(n, e)| DirEntry {
                 name: String::from(*n),
-                // `exe` is a symlink and `read_link_at` above already treats it as one; reporting
-                // `RegularFile` here contradicted that, and a caller that trusts `d_type` from
-                // `getdents64` rather than re-`lstat`ing (which is the whole point of `d_type`)
-                // would never follow it.
+                // `exe`'s `d_type` must say `Symlink`: a caller trusting `getdents64`'s `d_type`
+                // instead of re-`lstat`ing would never follow it. gm mutable `mut-1789043942984`.
                 file_type: match e {
                     ProcSelfEntry::Exe => FileType::Symlink,
                     _ => FileType::RegularFile,

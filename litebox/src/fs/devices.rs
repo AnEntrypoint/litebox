@@ -64,9 +64,9 @@ const URANDOM_NODE_INFO: NodeInfo = NodeInfo {
     // major=1, minor=9
     rdev: core::num::NonZeroUsize::new(0x109),
 };
-/// Node info for `/dev/tty0` (major=4, minor=0 -- the real Linux "current VT" console device;
-/// see `Documentation/admin-guide/devices.txt`). `seatd`'s `seat_update_vt` opens exactly this
-/// path and calls `VT_GETSTATE` on it to learn which numbered VT (`/dev/tty<N>`) is active.
+/// Node info for `/dev/tty0` (major=4, minor=0 -- the real Linux "current VT" console device).
+/// `seatd`'s `seat_update_vt` opens exactly this path and `VT_GETSTATE`s it to learn the active
+/// VT. See gm mutable mut-1789043589437.
 const TTY0_NODE_INFO: NodeInfo = NodeInfo {
     dev: 5,
     ino: 21,
@@ -74,19 +74,17 @@ const TTY0_NODE_INFO: NodeInfo = NodeInfo {
     rdev: core::num::NonZeroUsize::new(0x0400),
 };
 /// Node info for `/dev/tty1` (major=4, minor=1 -- the first real numbered VT). This virtual
-/// device always reports VT 1 as active (see [`super::super::syscalls::vt`]'s doc comment, or
-/// this module's own [`Device::Tty0`]/[`Device::Tty1`] pairing), so `/dev/tty1` is the one
-/// `seatd`'s `vt_open`/`vt_close` subsequently open once `VT_GETSTATE` on `/dev/tty0` names it.
+/// device always reports VT 1 as active, so `/dev/tty1` is the node `seatd`'s `vt_open`/`vt_close`
+/// open once `VT_GETSTATE` on `/dev/tty0` names it. See gm mutable mut-1789043589437.
 const TTY1_NODE_INFO: NodeInfo = NodeInfo {
     dev: 5,
     ino: 22,
     // major=4, minor=1
     rdev: core::num::NonZeroUsize::new(0x0401),
 };
-/// Node info for `/dev/zero` (major=1 "memory devices", minor=5 -- real Linux
-/// `Documentation/admin-guide/devices.txt` convention). Reads deliver an endless stream of
-/// NUL bytes; writes are discarded. Used by GTK/GLib/Xorg allocation paths (mmap'ing
-/// `/dev/zero` as an anonymous-memory substitute) and by many programs' zero-fill idioms.
+/// Node info for `/dev/zero` (major=1, minor=5 -- real Linux convention). Reads deliver endless
+/// NUL bytes, writes are discarded; GTK/GLib/Xorg mmap it as an anonymous-memory substitute.
+/// See gm mutable mut-1789043610245.
 const ZERO_NODE_INFO: NodeInfo = NodeInfo {
     dev: 5,
     ino: 23,
@@ -94,9 +92,8 @@ const ZERO_NODE_INFO: NodeInfo = NodeInfo {
     rdev: core::num::NonZeroUsize::new(0x105),
 };
 /// Node info for `/dev/random` (major=1, minor=8 -- real Linux convention). libgcrypt/GnuTLS
-/// (used by dbus, at-spi, gvfs) opens this directly; this backend treats it identically to
-/// `/dev/urandom` (see [`Device::URandom`]) since litebox has no real entropy-starvation
-/// model to distinguish blocking-until-seeded from always-ready.
+/// (dbus, at-spi, gvfs) open this directly; treated identically to [`Device::URandom`], litebox
+/// having no entropy-starvation model. See gm mutable mut-1789043610245.
 const RANDOM_NODE_INFO: NodeInfo = NodeInfo {
     dev: 5,
     ino: 24,
@@ -104,26 +101,26 @@ const RANDOM_NODE_INFO: NodeInfo = NodeInfo {
     rdev: core::num::NonZeroUsize::new(0x108),
 };
 /// Node info for `/dev/full` (major=1, minor=7 -- real Linux convention). Reads behave like
-/// `/dev/zero`; every write fails with `ENOSPC`, matching real Linux semantics some programs'
-/// error-handling paths depend on.
+/// `/dev/zero`; every write must fail, which some programs' error-handling paths depend on.
+/// See gm mutable mut-1789043610245.
 const FULL_NODE_INFO: NodeInfo = NodeInfo {
     dev: 5,
     ino: 25,
     // major=1, minor=7
     rdev: core::num::NonZeroUsize::new(0x107),
 };
-/// Node info for `/dev/console` (major=5 "TTY devices", minor=1 -- real Linux convention;
-/// matches the major:minor already observed in the real webtop image's own tar device-node
-/// entry for this path). Session/init-shaped guest code opens this directly.
+/// Node info for `/dev/console` (major=5, minor=1 -- matching the major:minor observed in the
+/// real webtop image's own tar device-node entry for this path). Session/init-shaped guest code
+/// opens it directly. See gm mutable mut-1789043589437.
 const CONSOLE_NODE_INFO: NodeInfo = NodeInfo {
     dev: 5,
     ino: 26,
     // major=5, minor=1
     rdev: core::num::NonZeroUsize::new(0x501),
 };
-/// Node info for `/dev/tty` (major=5, minor=0 -- real Linux convention). This is the
-/// controlling-terminal alias, distinct from the numbered VT devices (`tty0`/`tty1`); see
-/// [`Device::Tty`]'s doc comment for what this backend actually implements for it.
+/// Node info for `/dev/tty` (major=5, minor=0 -- real Linux convention). The
+/// controlling-terminal alias, distinct from the numbered VT devices (`tty0`/`tty1`).
+/// See gm mutable mut-1789043589437.
 const TTY_NODE_INFO: NodeInfo = NodeInfo {
     dev: 5,
     ino: 27,
@@ -133,13 +130,8 @@ const TTY_NODE_INFO: NodeInfo = NodeInfo {
 
 /// What `stat` reports for the `/dev/pts` devpts mount point.
 ///
-/// Lives here, with the rest of the device-node shapes, even though nothing in this crate mounts
-/// `/dev/pts`: WHICH pty slaves exist is live shim state (`GlobalState::pty_registry`), but what a
-/// devpts node LOOKS LIKE is filesystem knowledge, and `FileStatus` is `#[non_exhaustive]` so only
-/// this crate can build one. The shim decides existence and calls these for the shape.
-///
-/// See [`Device::Ptmx`] for why the multiplexer itself is an ordinary table entry while the slaves
-/// cannot be.
+/// Lives here although nothing in this crate mounts `/dev/pts`: `FileStatus` is
+/// `#[non_exhaustive]`, so only this crate can build one. The shim decides which ptys exist.
 #[must_use]
 pub fn devpts_dir_status() -> FileStatus {
     FileStatus {
@@ -216,42 +208,24 @@ enum Device {
     Tty1,
     /// `/dev/zero` -- endless NUL-byte stream on read, discards writes.
     Zero,
-    /// `/dev/random` -- treated identically to [`Device::URandom`] (see [`RANDOM_NODE_INFO`]
-    /// doc comment: this backend has no entropy-starvation model to distinguish the two).
+    /// `/dev/random` -- treated identically to [`Device::URandom`]; this backend has no
+    /// entropy-starvation model to distinguish the two. See gm mutable mut-1789043610245.
     Random,
     /// `/dev/full` -- reads behave like [`Device::Zero`]; every write fails with `ENOSPC`.
     Full,
-    /// `/dev/ptmx` -- the pty multiplexer.
-    ///
-    /// Present here for `stat`/`access`/`readdir` ONLY. An `open` of this path never reaches this
-    /// backend: the shim intercepts it ahead of the filesystem and hands back a live pty master
-    /// from its own registry, because a pty pair is per-open state a stateless `Device` cannot
-    /// hold (see `Task::do_open_resolved`).
-    ///
-    /// That interception alone was not enough, and the gap was not cosmetic. glibc's `openpty`
-    /// calls `ptsname_r`, which issues `TIOCGPTN`, builds `/dev/pts/<n>` and then STATS it before
-    /// opening it -- and `grantpt`/`ls`/shell probes stat `/dev/ptmx` itself. With no node here,
-    /// every one of those failed with `ENOENT`, so `openpty` failed and `xfce4-terminal` reported
-    /// "error creating pty" on a shim that implements ptys perfectly well.
+    /// `/dev/ptmx` -- the pty multiplexer. `open` never reaches this backend: the shim's
+    /// `do_open_resolved` intercepts it and returns a live master from its own registry.
+    /// Must stay in `Device::ALL` regardless, or `stat`/`access`/`readdir` return `ENOENT`, glibc's
+    /// `openpty`/`grantpt` fail, and `xfce4-terminal` reports "error creating pty".
+    /// See gm mutable mut-1789043570653.
     Ptmx,
-    /// `/dev/console` -- opens and stats successfully; real byte-stream I/O is not
-    /// implemented (mirrors [`Device::Tty0`]/[`Device::Tty1`]'s identical "fail loud, not
-    /// silently wrong" rationale for a device-node shape this backend doesn't implement the
-    /// full protocol for).
+    /// `/dev/console` -- opens and stats successfully; byte-stream I/O is rejected rather than
+    /// faked. See gm mutable mut-1789043589437.
     Console,
-    /// `/dev/tty` -- the controlling-terminal alias. Real Linux resolves this dynamically to
-    /// whichever tty is the *calling process's* current controlling terminal (session/ctty
-    /// state that lives in `litebox_shim_linux`'s process/session subsystem, not in this
-    /// backend, which is a stateless, per-process-agnostic filesystem shim). A fully faithful
-    /// implementation would need this backend to consult that shim-layer session state per
-    /// open, which the current `Backend`/`open_file_at` signature (no caller-identity
-    /// parameter) does not plumb through. As a deliberate, disclosed simplification, this
-    /// registers `/dev/tty` as a fixed node with the same open/stat/directory-listing shape
-    /// real Linux always has, and the same read/write behavior as [`Device::Tty0`]/
-    /// [`Device::Tty1`] (reject, not silently wrong) -- sufficient for `isatty`/`ctermid`/
-    /// stat-based probing (the common case: existence + character-device-ness), but NOT a
-    /// real per-session ctty redirect. Making this fully correct is out of scope for this
-    /// pass; see this device's own file/module doc comment for why.
+    /// `/dev/tty` -- the controlling-terminal alias, deliberately a FIXED node and NOT a real
+    /// per-session ctty redirect: `open_file_at` carries no caller identity, so this backend
+    /// cannot reach the shim's session state. Serves `isatty`/`ctermid`/stat probing only.
+    /// See gm mutable mut-1789043589437.
     Tty,
 }
 
@@ -310,9 +284,8 @@ impl Device {
             },
             Device::Tty0 | Device::Tty1 => FileStatus {
                 file_type: FileType::CharacterDevice,
-                // Real VT device nodes are `crw--w----`, group `tty` -- litebox's guest
-                // identity always runs as root (see `DriDevice::file_status`'s identical
-                // rationale), so group-writable is sufficient for every guest process.
+                // Real VT nodes are `crw--w----` group `tty`; litebox's guest identity is
+                // always root, so group-writable suffices. See gm mutable mut-1789043627523.
                 mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
                 size: 0,
                 owner: UserInfo::ROOT,
@@ -403,13 +376,11 @@ impl Device {
     }
 }
 
-/// LOUD, allocation-free diagnostic for an `open("/dev/<name>")` on a path this backend does
-/// not register as a device (see the call site in `open_file_at`). Writes directly to stderr
-/// via [`crate::platform::StdioProvider::write_to`] using a fixed stack buffer -- no `format!`,
-/// no heap allocation -- so this is safe to call even from constrained/early-in-startup
-/// contexts, matching this codebase's established raw-diagnostic convention (see
-/// `litebox_platform_windows_userland::diag_raw_print` and
-/// `common_providers::userspace_pointers::diag_near_null_write`).
+/// LOUD diagnostic for an `open("/dev/<name>")` this backend does not register: without it the
+/// guest sees only a generic `ENOENT` and names no missing device.
+/// Must stay `format!`-free -- a fixed stack buffer straight to
+/// [`crate::platform::StdioProvider::write_to`] -- so it is safe where the heap may not be.
+/// See gm mutable mut-1789043615583.
 fn diag_raw_print_dev_open_miss<Platform: crate::platform::StdioProvider>(
     platform: &Platform,
     name: &str,
@@ -556,15 +527,6 @@ where
         let device = match Device::from_name(name) {
             Some(device) => device,
             None => {
-                // LOUD, allocation-free diagnostic: a guest tried to open a `/dev/<name>`
-                // path this backend does not register as a device. Without this, the guest
-                // simply sees a generic ENOENT indistinguishable from any other missing-file
-                // failure, and a desktop session failing to start surfaces no clue which
-                // device was missing. Allocation-free (stack buffer + `StdioProvider::write_to`
-                // directly, no `format!`), matching this codebase's established convention for
-                // a diagnostic that must survive being reached from a path where heap
-                // allocation may not be trustworthy (see `litebox_platform_windows_userland`'s
-                // `diag_raw_print` / `userspace_pointers.rs`'s `diag_near_null_write`).
                 diag_raw_print_dev_open_miss(self.litebox.x.platform, name);
                 return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
             }
@@ -573,22 +535,10 @@ where
         if flags.contains(OFlags::DIRECTORY) {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
-        // `O_NONBLOCK` is accepted here without changing this backend's own `read`/`write`
-        // (mirroring the `O_TRUNC` handling below, which is likewise accepted but not literally
-        // honored by this backend). `Stdout`/`Stderr`/`Null`/`URandom` never block in the first
-        // place, so there is nothing to honor for them. `Stdin` is the one device that can
-        // genuinely block (`StdioProvider::read_from_stdin`) -- callers that need `O_NONBLOCK`
-        // to actually take effect on a stdin read (e.g. `open("/dev/stdin", O_NONBLOCK)`, the
-        // real-world case is libuv/Node putting a reopened stdin fd into non-blocking mode) get
-        // it from the shim layer instead: `litebox_shim_linux::syscalls::file::do_read` consults
-        // `StdioStatusFlags` metadata and the platform's `stdin_ready` probe to return `EAGAIN`
-        // rather than blocking, for any fd tagged `StdioStream::Stdin` -- see
-        // `insert_raw_file_fd_with_path`, which tags a freshly-(re)opened `/dev/stdin` with both
-        // `StdioStream` and `StdioStatusFlags` metadata derived from these same `flags`. This
-        // backend has no such per-fd status-flag storage of its own (`DeviceFileHandle` is a
-        // stateless `Copy` type), so previously this `unimplemented!()`'d unconditionally instead
-        // of ever reaching that shim-layer handling -- crashing the whole process on any
-        // `open("/dev/stdin"|"/dev/stdout"|"/dev/stderr"|"/dev/urandom", O_NONBLOCK)`.
+        // `O_NONBLOCK` must be accepted and ignored here, never rejected: libuv/Node reopens
+        // `/dev/stdin` non-blocking, and `EAGAIN` is delivered by the shim's `do_read` from
+        // `StdioStatusFlags` metadata, not by this stateless backend.
+        // See gm mutable mut-1789043596575.
 
         if flags.contains(OFlags::TRUNC) {
             // Note: matching Linux behavior, this does not actually perform any truncation, and
@@ -637,8 +587,8 @@ where
                 Ok(0)
             }
             Device::URandom | Device::Random => {
-                // /dev/random is treated identically to /dev/urandom -- see `RANDOM_NODE_INFO`
-                // doc comment for why.
+                // `/dev/random` is treated identically to `/dev/urandom`: no entropy-starvation
+                // model. See gm mutable mut-1789043610245.
                 self.litebox.x.platform.fill_bytes_crng(buf);
                 Ok(buf.len())
             }
@@ -647,14 +597,9 @@ where
                 buf.fill(0);
                 Ok(buf.len())
             }
-            // Real Linux VT devices support read()/write() (raw keyboard/console I/O); no
-            // caller on this codebase's actual VT usage path (`seatd`'s open + VT_GETSTATE/
-            // VT_SETMODE/KDSETMODE/KDSKBMODE ioctls, see `litebox_shim_linux`'s VT subsystem)
-            // ever reads or writes these nodes, so this deliberately rejects rather than
-            // silently returning zero bytes -- matching `DriDevices::read`'s identical
-            // "fail loud, not silently wrong" rationale for a device-node shape this backend
-            // does not implement the full byte-stream protocol for. `Console`/`Tty` share this
-            // same rationale (see their own `Device` variant doc comments).
+            // Reject, never return 0 bytes: `seatd` only ever ioctls these nodes, so a silent
+            // empty read would hide a real caller this backend cannot serve.
+            // See gm mutable mut-1789043589437.
             Device::Tty0 | Device::Tty1 | Device::Console | Device::Tty | Device::Ptmx => {
                 Err(ReadError::NotForReading)
             }
@@ -668,14 +613,9 @@ where
             Device::Stdout => crate::platform::StdioOutStream::Stdout,
             Device::Stderr => crate::platform::StdioOutStream::Stderr,
             Device::Null | Device::URandom | Device::Random => {
-                // /dev/null discards data: report as if written fully
-                //
-                // Writing to /dev/random or /dev/urandom will update the entropy
-                // pool with the data written, but this will not result in a higher
-                // entropy count. This means that it will impact the contents read
-                // from both files, but it will not make reads from /dev/random
-                // faster. For simplicity, we just discard the data written to
-                // /dev/urandom here.
+                // Discarded, not stirred in: a real `/dev/[u]random` write perturbs the entropy
+                // pool (without raising the entropy count), which litebox does not model.
+                // See gm mutable mut-1789043610245.
                 return Ok(buf.len());
             }
             Device::Zero => {
@@ -683,15 +623,12 @@ where
                 return Ok(buf.len());
             }
             Device::Full => {
-                // Real /dev/full: every write fails with ENOSPC. This backend's `WriteError`
-                // has no dedicated no-space variant (adding one would widen every `Backend`
-                // implementor's error surface for a single device), so this deliberately
-                // reuses `WriteError::Io` as the closest existing mapping -- disclosed here
-                // rather than silently reported as success, which would hide the exact
-                // behavior real programs' error-handling paths depend on.
+                // Real `/dev/full` gives `ENOSPC`; `WriteError` has no no-space variant, so `Io`
+                // is the deliberate stand-in -- never `Ok`, which callers' error paths test for.
+                // See gm mutable mut-1789043610245.
                 return Err(WriteError::Io);
             }
-            // See `Device::Tty0 | Device::Tty1`'s identical rationale in `read` above.
+            // Reject, never silently succeed -- see gm mutable mut-1789043589437.
             Device::Tty0 | Device::Tty1 | Device::Console | Device::Tty | Device::Ptmx => {
                 return Err(WriteError::NotForWriting);
             }
@@ -810,11 +747,9 @@ const DRI_RENDERD128_NODE_INFO: NodeInfo = NodeInfo {
     rdev: core::num::NonZeroUsize::new(0xE280),
 };
 
-/// A DRM device node -- `card0` (the control/modeset node) or `renderD128` (the
-/// render-only node). Real DRM devices always ship at least the control node; a render
-/// node is only meaningful once real GPU-accelerated rendering (as opposed to the
-/// dumb-buffer path) is implemented, but is included now since userspace libraries
-/// (`libdrm`) commonly probe for it and quietly skip it if absent.
+/// A DRM device node -- `card0` (the control/modeset node) or `renderD128` (the render-only
+/// node). `renderD128` is exposed even though only the dumb-buffer path is implemented, because
+/// `libdrm` commonly probes for a render node and quietly skips it if absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriDevice {
     Card0,
@@ -836,11 +771,8 @@ impl DriDevice {
         };
         FileStatus {
             file_type: FileType::CharacterDevice,
-            // Real DRM nodes are `crw-rw----`, group `video` -- litebox's own guest
-            // identity always runs as root (see `initialize_root_in_mem_layer`'s doc
-            // comment elsewhere in this codebase), so group-readable is sufficient for
-            // every guest process to open this node without needing a real group-membership
-            // model.
+            // Real DRM nodes are `crw-rw----` group `video`; litebox's guest identity is
+            // always root, so group-readable suffices. See gm mutable mut-1789043627523.
             mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP,
             size: 0,
             owner: UserInfo::ROOT,
@@ -852,19 +784,10 @@ impl DriDevice {
     }
 }
 
-/// A [`super::backend::Backend`] exposing `/dev/dri/{card0,renderD128}` -- the DRM
-/// device nodes a "dumb buffer" software display client opens to enumerate a virtual
-/// display, allocate a pixel buffer, and page-flip it. Mounted as its own nested backend
-/// at `/dev/dri` (see the composer's nested-mount support), separate from [`Devices`]
-/// at `/dev`, since [`Devices`]' own `walk_directories` is a flat, single-level
-/// namespace with no subdirectory support.
-///
-/// This backend only handles the filesystem-visible SHAPE of the device nodes (open,
-/// stat, permissions, directory listing) -- the actual DRM ioctl protocol (buffer
-/// allocation, mode-setting, page-flip) is handled by `litebox_shim_linux`'s
-/// `DrmSubsystem`, reached once a guest has successfully `open()`ed one of these nodes,
-/// mirroring how `Devices`' own stdio entries are thin filesystem shells around state
-/// that actually lives in the shim layer.
+/// A [`super::backend::Backend`] exposing `/dev/dri/{card0,renderD128}` -- the device-node SHAPE
+/// only (open/stat/permissions/listing); the DRM ioctl protocol lives in `litebox_shim_linux`'s
+/// `DrmSubsystem`. Must be a nested mount at `/dev/dri`: [`Devices`]' own `walk_directories` is a
+/// flat single-level namespace with no subdirectory support.
 pub struct DriDevices<Platform>
 where
     Platform: RawSyncPrimitivesProvider + 'static,
@@ -992,13 +915,9 @@ where
     }
 
     fn read(&self, _h: &FileHandle, _buf: &mut [u8], _offset: usize) -> Result<usize, ReadError> {
-        // Real Linux DRM device nodes DO support read() -- it delivers queued
-        // DRM_EVENT_FLIP_COMPLETE/DRM_EVENT_VBLANK events (struct drm_event), not raw pixel
-        // bytes. That event-delivery path isn't implemented yet (page-flip completion is a
-        // stub in this pass -- see DrmSubsystem's own doc comment), so reads are rejected
-        // outright for now rather than silently returning zero bytes as if no event were
-        // ever pending, which would be a worse lie: a real client polling for flip
-        // completion would spin forever instead of failing loudly.
+        // Real DRM `read()` delivers queued `drm_event` records, not pixel bytes, and that path
+        // is still a stub: reject rather than return 0, or a client polling for flip completion
+        // spins forever. See gm mutable mut-1789043637459.
         Err(ReadError::NotForReading)
     }
 
@@ -1092,11 +1011,9 @@ const INPUT_EVENT0_NODE_INFO: NodeInfo = NodeInfo {
     rdev: core::num::NonZeroUsize::new(0x0D40),
 };
 
-/// An evdev input device node -- only `event0` (one virtual keyboard+mouse device) is
-/// exposed in this pass; a real system typically has one event node per physical input
-/// device, but a single combined node is a real, valid evdev shape (e.g. a USB
-/// keyboard-with-trackpad reports both `EV_KEY` and `EV_REL` on one node) and is
-/// sufficient for a single virtual display with one virtual input source.
+/// An evdev input device node. Only `event0` is exposed: one combined keyboard+mouse node is a
+/// real, valid evdev shape (a USB keyboard-with-trackpad reports both `EV_KEY` and `EV_REL` on one
+/// node) and is sufficient for one virtual display with one virtual input source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputDevice {
     Event0,
@@ -1113,9 +1030,8 @@ impl InputDevice {
         let InputDevice::Event0 = self;
         FileStatus {
             file_type: FileType::CharacterDevice,
-            // Real evdev nodes are `crw-r-----`, group `input` -- same rationale as
-            // `DriDevice::file_status`: litebox's guest identity is always root, so
-            // group-readable is enough for every guest process to open this node.
+            // Real evdev nodes are `crw-r-----` group `input`; litebox's guest identity is
+            // always root, so group-readable suffices. See gm mutable mut-1789043627523.
             mode: Mode::RUSR | Mode::WUSR | Mode::RGRP,
             size: 0,
             owner: UserInfo::ROOT,
@@ -1127,34 +1043,16 @@ impl InputDevice {
     }
 }
 
-/// The set of currently-allocated pty ids, shared (`Arc<RwLock<...>>`) between
-/// [`PtsDevices`] and `litebox_shim_linux`'s `GlobalState::ptmx_open`/`ptmx_closed` (the same
-/// split [`devpts_dir_status`]/[`devpts_slave_status`] already document: WHICH ptys exist is live
-/// shim state, what a devpts node looks like is filesystem knowledge). Kept deliberately separate
-/// from the shim's own `pty_registry` map (which cannot appear in this crate -- its values are
-/// `litebox_shim_linux`-specific typed fds) rather than trying to share one map across the crate
-/// boundary; `GlobalState::ptmx_open`/`ptmx_closed`/`attach_pty_stdio` update both at the same
-/// three call sites, so the two never have a chance to drift.
+/// The set of currently-allocated pty ids, shared with `litebox_shim_linux`'s `GlobalState`.
+/// A deliberate mirror of the shim's own `pty_registry`, whose typed-fd values cannot cross the
+/// crate boundary; `ptmx_open`/`ptmx_closed`/`attach_pty_stdio` are the only sites that mutate
+/// either, so the two cannot drift.
 pub type PtsRegistry = alloc::collections::BTreeSet<u32>;
 
-/// A [`super::backend::Backend`] exposing `/dev/pts/<id>` for every currently-live pty, and --
-/// the reason this backend exists at all -- making `/dev/pts` itself `open()`-able and
-/// `getdents64`-listable as a directory. Mounted as its own nested backend at `/dev/pts`,
-/// mirroring [`DriDevices`] at `/dev/dri` (see that type's own doc comment for why a nested mount
-/// is needed instead of adding directly to the flat, single-level [`Devices`] namespace).
-///
-/// Before this existed, `/dev/pts/<id>` and `/dev/ptmx` both worked (intercepted directly by the
-/// shim, see `litebox_shim_linux::syscalls::file::do_open_resolved`) and `stat("/dev/pts")`
-/// worked (`devpts_dir_status`, also answered by the shim) -- but `open("/dev/pts", O_DIRECTORY)`
-/// itself fell through to this module's flat [`Devices`] backend, whose `walk_directories`
-/// rejects any component that isn't a registered top-level device name, i.e. always `ENOENT` for
-/// `"pts"`. That single missing case was enough to break every real `openpty()`/`forkpty()`
-/// caller: glibc's `ttyname_r` (issued right after allocating the peer via `TIOCGPTPEER`, see
-/// that ioctl's own doc comment in `litebox_common_linux`) cross-checks its `/proc/self/fd`
-/// readlink answer by opening `/dev/pts` and scanning it for a matching entry, and reports the
-/// whole call as failed -- `FileNotFoundError`, opaque and disconnected from the real cause -- the
-/// moment that `opendir` returns `ENOENT`, even though the master, the slave, and the peer fd
-/// were all already allocated and working correctly by that point.
+/// A [`super::backend::Backend`] exposing `/dev/pts/<id>` for every live pty. It exists so that
+/// `/dev/pts` ITSELF is `open(O_DIRECTORY)`-able and listable: glibc's `ttyname_r` opens and scans
+/// that directory to cross-check its `/proc/self/fd` readlink, and fails every `openpty()` without
+/// it. Nested mount at `/dev/pts`, under the same constraint as [`DriDevices`].
 pub struct PtsDevices<Platform>
 where
     Platform: RawSyncPrimitivesProvider + 'static,
@@ -1166,9 +1064,8 @@ impl<Platform> PtsDevices<Platform>
 where
     Platform: RawSyncPrimitivesProvider + 'static,
 {
-    /// Construct a new `PtsDevices` backend sharing the given `registry` -- the caller (the shim)
-    /// keeps its own clone of the same `Arc` to update it as ptys are allocated/freed (see this
-    /// type's own doc comment).
+    /// Construct a new `PtsDevices` backend sharing the given `registry` -- the shim keeps its own
+    /// clone of the same `Arc` and updates it as ptys are allocated and freed.
     #[must_use]
     pub fn new(
         _litebox: &LiteBox<Platform>,
@@ -1179,13 +1076,9 @@ where
     }
 }
 
-/// Owned file handle; identifies which pty slave (by id) backs this fd.
-///
-/// In practice never actually used for real I/O: every guest-visible `open("/dev/pts/<id>")`
-/// is intercepted directly by the shim (see this type's own doc comment) before it would ever
-/// reach this backend's `open_file_at`. This exists so a caller that reaches this backend anyway
-/// (stat/access on a path the shim's own string-prefix check somehow doesn't catch) gets a
-/// correctly-shaped answer rather than a panic.
+/// Owned file handle; identifies which pty slave (by id) backs this fd. Never carries real I/O --
+/// the shim intercepts every `open("/dev/pts/<id>")` first; this is the correctly-shaped fallback
+/// for a stat/access that interception misses, so such a caller gets an answer and not a panic.
 #[derive(Debug, Clone, Copy)]
 pub struct PtsDeviceFileHandle {
     id: u32,
@@ -1295,7 +1188,7 @@ where
     }
 
     fn read(&self, _h: &FileHandle, _buf: &mut [u8], _offset: usize) -> Result<usize, ReadError> {
-        // See `PtsDeviceFileHandle`'s doc comment: real pty I/O never reaches this backend.
+        // Real pty I/O never reaches this backend -- see gm mutable mut-1789043570653.
         Err(ReadError::NotForReading)
     }
 
@@ -1321,10 +1214,8 @@ where
 
     fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
         let _h = h.get_typed::<Self>();
-        // The SAME shape the shim's own `stat("/dev/pts")` intercept answers with (see
-        // `devpts_dir_status`'s doc comment) -- not a separately-allocated `root_inode`, so a
-        // caller comparing the two `stat`s (exactly what `ttyname_r`'s cross-check does) never
-        // sees them disagree.
+        // Must be the SAME shape the shim's own `stat("/dev/pts")` answers with, not a separate
+        // `root_inode`: glibc's `ttyname_r` compares the two. See gm mutable mut-1789043570653.
         Ok(devpts_dir_status())
     }
 
@@ -1374,17 +1265,10 @@ where
     }
 }
 
-/// A [`super::backend::Backend`] exposing `/dev/input/event0` -- the evdev node a guest
-/// keyboard/mouse-driven GUI toolkit reads raw `struct input_event` records from.
-/// Mounted as its own nested backend at `/dev/input`, mirroring [`DriDevices`] at
-/// `/dev/dri` (see that type's own doc comment for why a nested mount is needed instead
-/// of adding directly to the flat, single-level [`Devices`] namespace).
-///
-/// This backend only handles the filesystem-visible SHAPE of the device node (open,
-/// stat, permissions, directory listing) -- the actual evdev protocol (capability-query
-/// ioctls, and the real `input_event` byte stream) is handled by `litebox_shim_linux`'s
-/// `EvdevSubsystem`, reached once a guest has successfully `open()`ed this node,
-/// mirroring how [`DriDevices`] hands off to `litebox_shim_linux`'s `DrmSubsystem`.
+/// A [`super::backend::Backend`] exposing `/dev/input/event0` -- the device-node SHAPE only
+/// (open/stat/permissions/listing); the evdev capability ioctls and `input_event` byte stream live
+/// in `litebox_shim_linux`'s `EvdevSubsystem`. Nested mount at `/dev/input`, under the same
+/// constraint as [`DriDevices`].
 pub struct InputDevices<Platform>
 where
     Platform: RawSyncPrimitivesProvider + 'static,
@@ -1514,13 +1398,9 @@ where
     }
 
     fn read(&self, _h: &FileHandle, _buf: &mut [u8], _offset: usize) -> Result<usize, ReadError> {
-        // Real evdev reads deliver queued `struct input_event` records, handled by
-        // `litebox_shim_linux`'s `EvdevSubsystem` (reached once the guest has opened this
-        // node) rather than this filesystem-shape-only backend -- see this type's own doc
-        // comment. Rejecting outright here (rather than silently returning zero bytes) is
-        // deliberate: `EvdevSubsystem` intercepts `read()` on this fd before this method is
-        // ever reached in practice (mirroring `DriDevices::read`'s identical rationale), so
-        // reaching this specific code path means something bypassed that interception.
+        // `EvdevSubsystem` intercepts `read()` on this fd before this method is ever reached, so
+        // reaching it means something bypassed that interception: reject rather than return 0.
+        // See gm mutable mut-1789043637459.
         Err(ReadError::NotForReading)
     }
 
@@ -1605,14 +1485,9 @@ where
 }
 
 
-/// A leaf file inside `/sys/class/drm/{card0,renderD128}/` -- the minimal set a real
-/// `libudev`/`libdrm` device-enumeration walk actually reads:
-/// `udev_enumerate_scan_devices()` opens `uevent` (to populate `udev_device` properties)
-/// and reads the `dev`/`subsystem` attributes via `sysattr` lookups that fall back to
-/// reading these same files directly when no udev database is present (as is always the
-/// case here, since litebox has no `udevd`/`/run/udev` database at all). This matches the
-/// real, stable shape every Linux kernel has shipped under `/sys/class/drm/cardN/` since
-/// DRM's sysfs class was added -- not a guess.
+/// A leaf file inside `/sys/class/drm/{card0,renderD128}/` -- exactly the set a real
+/// `libudev`/`libdrm` enumeration walk falls back to reading when no `udevd` database exists,
+/// which in litebox is always.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SysDrmFile {
     /// `MAJOR=`/`MINOR=`/`DEVNAME=`/`SUBSYSTEM=` key=value lines, the same content the
@@ -1624,18 +1499,10 @@ pub enum SysDrmFile {
     /// Symlink to the (synthetic) `drm` subsystem directory -- `libudev` reads this
     /// link's target basename to populate `udev_device_get_subsystem()`.
     Subsystem,
-    /// `<name>/device/uevent` -- distinct from [`SysDrmFile::Uevent`] (which lives at
-    /// `<name>/uevent`, one level up): real libdrm's `drmGetDevice2()` (via
-    /// `drm_platform_device_alloc`/`drm_device_get_bustype`) reads the *device's own*
-    /// uevent file (not the DRM node's) to parse `DRIVER=`/`OF_*` key=value lines that
-    /// identify which kernel driver bound to the physical device -- confirmed live, a
-    /// failed `openat` on this exact path (`fd=None`) immediately precedes
-    /// `types/wlr_drm.c:217]"drmGetDevice2 failed"` once the shallower `device`/
-    /// `device/drm`/`device/subsystem` paths above it already resolve. Only reachable via
-    /// [`SysDrmDirHandle::DeviceOf`] (never listed in [`SysDrmFile::ALL`], which is scoped
-    /// to the real `<name>/` directory's own leaf files) -- kept as a `SysDrmFile` variant
-    /// purely to reuse the existing `SysDrmFileHandle { device, file }` read/status
-    /// plumbing rather than inventing a parallel handle shape for one file.
+    /// `<name>/device/uevent` -- the *device's own* uevent file, one level below
+    /// [`SysDrmFile::Uevent`]; libdrm's `drmGetDevice2()` fails without it. Deliberately absent
+    /// from [`SysDrmFile::ALL`], which covers only the real `<name>/` directory, and therefore
+    /// reachable solely via [`SysDrmDirHandle::DeviceOf`].
     DeviceUevent,
 }
 
@@ -1666,8 +1533,7 @@ const SYS_DRM_RENDERD128_DIR_NODE_INFO: NodeInfo = NodeInfo {
     rdev: None,
 };
 
-/// Node info for the synthetic `/sys/class/drm/card0/device` directory (see
-/// [`SysDrmDirHandle::DeviceOf`] doc comment for why this exists).
+/// Node info for the synthetic `/sys/class/drm/card0/device` directory.
 const SYS_DRM_CARD0_DEVICE_DIR_NODE_INFO: NodeInfo = NodeInfo {
     dev: 5,
     ino: 28,
@@ -1679,8 +1545,7 @@ const SYS_DRM_RENDERD128_DEVICE_DIR_NODE_INFO: NodeInfo = NodeInfo {
     ino: 29,
     rdev: None,
 };
-/// Node info for the synthetic `/sys/class/drm/card0/device/drm` directory (see
-/// [`SysDrmDirHandle::DeviceDrmOf`] doc comment for why this exists).
+/// Node info for the synthetic `/sys/class/drm/card0/device/drm` directory.
 const SYS_DRM_CARD0_DEVICE_DRM_DIR_NODE_INFO: NodeInfo = NodeInfo {
     dev: 5,
     ino: 30,
@@ -1728,31 +1593,10 @@ impl DriDevice {
     }
 }
 
-/// A [`super::backend::Backend`] exposing the minimal `/sys/class/drm/{card0,renderD128}/`
-/// subtree a real `libudev`-based DRM client (e.g. `weston`'s `drm-backend.so`) needs to
-/// enumerate litebox's one emulated DRM device. This is deliberately NOT a general
-/// procfs/sysfs emulation -- only the exact files real `udev_enumerate_scan_devices()` +
-/// `udev_device_new_from_syspath()` calls read (`uevent`, `dev`, `subsystem`) are served,
-/// for exactly the two DRM nodes [`DriDevices`] already exposes at `/dev/dri`. Mounted at
-/// `/sys/class/drm`; the composer's virtual-directory auto-synthesis (see
-/// `super::composer::ComposerBuilder::build`) creates the `/sys` and `/sys/class` ancestor
-/// directories automatically, so this backend only needs to handle its own two-level
-/// subtree (`card0`/`renderD128`, each containing `uevent`/`dev`/`subsystem`).
-///
-/// Also serves a third, synthetic level beneath each device: `<name>/device/drm/<name>`.
-/// On real hardware, `/sys/class/drm/cardN/device` is a symlink to the card's parent PCI
-/// device directory, which itself has its own `drm/` subdirectory listing every DRM node
-/// sharing that PCI device (`cardN`, `renderDxxx`) -- i.e. the path loops back around to a
-/// sibling of where it started, via the device's real bus topology. `libdrm`'s
-/// `drmGetDeviceNameFromFd2()` (called by wlroots' DRM backend, used by `labwc` -- distinct
-/// from weston's own DRM backend, which never walks this deep) `stat`s exactly this
-/// `device/drm` sub-path while resolving a DRM fd back to its sysfs device name, and fails
-/// hard (`ENOENT` -> "Failed to create DRM backend") if it is missing. litebox's virtual
-/// DRM device has no real PCI parent to model, so `<name>/device` and `<name>/device/drm`
-/// are synthesized as self-referencing directories: `<name>/device/drm/card0` and
-/// `<name>/device/drm/renderD128` both resolve straight back to the real, pre-existing
-/// `/sys/class/drm/card0` and `/sys/class/drm/renderD128` directories this whole tree
-/// originates from (see [`SysDrmDirHandle::DeviceOf`]/[`SysDrmDirHandle::DeviceDrmOf`]).
+/// A [`super::backend::Backend`] serving the minimal `/sys/class/drm/{card0,renderD128}/` subtree
+/// a `libudev` DRM client enumerates (`uevent`/`dev`/`subsystem`), plus a synthetic
+/// `<name>/device/drm/<name>` looping back to `/sys/class/drm/<name>`: libdrm's
+/// `drmGetDeviceNameFromFd2()` (wlroots/labwc) `stat`s it or fails "Failed to create DRM backend".
 pub struct SysClassDrm<Platform>
 where
     Platform: RawSyncPrimitivesProvider + 'static,
@@ -1778,12 +1622,9 @@ where
     }
 }
 
-/// Directory handle: the backend's mount root (`/sys/class/drm` itself), inside one
-/// specific device's subdirectory (`/sys/class/drm/<name>`), inside that device's
-/// synthetic `device` subdirectory (`/sys/class/drm/<name>/device`), or inside that
-/// synthetic subdirectory's own `drm` subdirectory (`/sys/class/drm/<name>/device/drm`) --
-/// see the doc comment on [`SysClassDrm`] for why the latter two exist and what real
-/// sysfs shape they emulate.
+/// Directory handle: the backend's mount root (`/sys/class/drm` itself), one specific device's
+/// subdirectory (`/sys/class/drm/<name>`), that device's synthetic `device` subdirectory, or that
+/// subdirectory's own `drm` subdirectory.
 #[derive(Debug, Clone, Copy)]
 pub enum SysDrmDirHandle {
     Root,
@@ -1842,12 +1683,9 @@ where
                 let Some(device) = DriDevice::from_name(component) else {
                     return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
                 };
-                // Walked one real directory level (`card0`/`renderD128`) -- the resolver
-                // uses `components.len()` both to check per-level permissions and, via
-                // `walk_path_following_symlinks`, to know how many of the caller's path
-                // components were consumed as directories, so this MUST be populated
-                // (unlike the flat `DriDevices`/`Devices` backends, which never walk past
-                // their mount root and so correctly leave this empty).
+                // MUST be populated: the resolver reads `components.len()` both for per-level
+                // permissions and to know how many path components were consumed as directories.
+                // See gm mutable mut-1789043705517.
                 let walked = vec![WalkedComponent {
                     permissions: PermissionCheck::ByBackend,
                 }];
@@ -1860,10 +1698,9 @@ where
                         stop_reason: WalkStopReason::CompleteDirectory,
                     });
                 }
-                // Second component: must name one of this device's leaf files (stop here,
-                // a leaf file is never a directory, leaving the resolver/caller to resolve
-                // the final component itself, matching `TarRo`'s own convention), OR name
-                // the synthetic `device` subdirectory, in which case walking continues.
+                // Second component: a leaf file stops the walk -- the caller resolves the final
+                // component itself, as `TarRo` does -- while `device` continues it.
+                // See gm mutable mut-1789043705517.
                 if components.len() == 2 && SysDrmFile::from_name(components[1]).is_some() {
                     return Ok(WalkOutcome {
                         components: walked,
@@ -1878,15 +1715,9 @@ where
                         WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::DeviceOf(device)),
                         &components[2..],
                     )?;
-                    // Prepend BOTH components this arm itself consumed -- the
-                    // `card0`/`renderD128` component (`walked`, already built above) AND
-                    // the `device` component itself (the delegated call above only knows
-                    // about components past `device`, so it never counts `device` in its
-                    // own returned `components`). The composer's own walk-length invariant
-                    // requires the returned `components` count to match the total path
-                    // components consumed when `stop_reason` is `CompleteDirectory`
-                    // (`composer.rs` asserts `walked_len == prefix_len`), so undercounting
-                    // here would trip that assertion one level up.
+                    // Prepend BOTH components consumed here: `card0`/`renderD128` AND `device`
+                    // itself, which the delegated call never counts. Undercounting trips the
+                    // composer's own walk-length assertion. See gm mutable mut-1789043705517.
                     let mut components_out = walked;
                     components_out.push(WalkedComponent {
                         permissions: PermissionCheck::ByBackend,
@@ -1928,8 +1759,7 @@ where
                         WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::DeviceOf(device)),
                         &components[1..],
                     )?;
-                    // Count the `device` component itself -- see the identical comment in
-                    // the `Root` arm's `"device"` branch above for why this is required.
+                    // Count the `device` component itself -- see gm mutable mut-1789043705517.
                     let mut components_out = vec![WalkedComponent {
                         permissions: PermissionCheck::ByBackend,
                     }];
@@ -1943,9 +1773,9 @@ where
                 Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
             }
             SysDrmDirHandle::DeviceOf(device) => {
-                // Inside the synthetic `<name>/device` directory: only `drm` exists here
-                // (see `SysClassDrm`'s doc comment for why), and walking into it continues
-                // one more synthetic level.
+                // Inside the synthetic `<name>/device` directory: only `drm` exists here, and
+                // walking into it continues one more synthetic level.
+                // See gm mutable mut-1789043688678.
                 let Some(&component) = components.first() else {
                     return Ok(WalkOutcome {
                         components: vec![],
@@ -1975,7 +1805,7 @@ where
                         &components[1..],
                     )?;
                     // Prepend the `drm` component this arm consumed -- same walk-length
-                    // invariant as the `Root`/`"device"` case above.
+                    // invariant; see gm mutable mut-1789043705517.
                     let mut components_out = walked;
                     components_out.append(&mut outcome.components);
                     return Ok(WalkOutcome {
@@ -1984,15 +1814,8 @@ where
                         stop_reason: outcome.stop_reason,
                     });
                 }
-                // `<name>/device/subsystem` -- same rationale as `Device(_)`'s own
-                // `subsystem` leaf (see `read_link_at`'s doc comment): real wlroots
-                // (`types/wlr_drm.c`'s `drmGetDevice2()`, via libdrm's
-                // `drm_device_get_subsystem_type`) reads this symlink to classify the
-                // *device's* bus (not the DRM node's own class, which is what the
-                // shallower `<name>/subsystem` link resolves) -- confirmed live, a
-                // `readlinkat` on this exact path immediately precedes
-                // `types/wlr_drm.c:217]"drmGetDevice2 failed"` when unhandled. This is a
-                // leaf (non-directory) stop, not a further walkable directory.
+                // Leaf stops, not walkable directories: libdrm's `drmGetDevice2()` fails if
+                // either is unhandled. See gm mutable mut-1789043688678.
                 if component == "subsystem" || component == "uevent" {
                     return Ok(WalkOutcome {
                         components: vec![],
@@ -2005,11 +1828,9 @@ where
                 Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
             }
             SysDrmDirHandle::DeviceDrmOf(device) => {
-                // Inside the synthetic `<name>/device/drm` directory: entries here are
-                // `card0`/`renderD128`, each resolving straight back to the real, existing
-                // `/sys/class/drm/<name>` directory (this is the self-referencing loop the
-                // real PCI-topology-based sysfs shape produces on real hardware -- see
-                // `SysClassDrm`'s doc comment).
+                // Inside the synthetic `<name>/device/drm` directory: `card0`/`renderD128` each
+                // resolve back to the real `/sys/class/drm/<name>` -- the self-referencing loop
+                // real PCI topology produces. See gm mutable mut-1789043688678.
                 let Some(&component) = components.first() else {
                     return Ok(WalkOutcome {
                         components: vec![],
@@ -2034,11 +1855,9 @@ where
                         stop_reason: WalkStopReason::CompleteDirectory,
                     });
                 }
-                // Beyond this point (e.g. `.../drm/card0/uevent`), delegate straight into
-                // the real `Device(target)` walk logic -- looping back is exactly the
-                // point, so no separate handling is needed past here. Same walk-length
-                // invariant as above: prepend the `card0`/`renderD128` component this arm
-                // consumed to whatever the delegated call reports.
+                // Beyond here (e.g. `.../drm/card0/uevent`) delegate into the real
+                // `Device(target)` walk -- looping back is the point -- prepending the component
+                // this arm consumed. See gm mutable mut-1789043705517.
                 let mut outcome = self.walk_directories(
                     WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(target)),
                     &components[1..],
@@ -2075,11 +1894,9 @@ where
         flags: OFlags,
     ) -> Result<Permissioned<FileHandle>, OpenError> {
         let dir = dir.into_typed::<Self>();
-        // `device/drm` is a synthetic directory with no leaf files of its own (only
-        // further directory entries, handled by `walk_directories`/`list_dir_at`), so
-        // opening a plain file inside it is always ENOENT. `device` itself has exactly
-        // one real leaf file (`uevent`, see [`SysDrmFile::DeviceUevent`]'s doc comment) --
-        // `subsystem` is a symlink, opened via `read_link_at` instead, never through here.
+        // `device/drm` has no leaf files of its own, so a plain-file open inside it is always
+        // `ENOENT`; `device` has exactly one (`uevent`), its `subsystem` being a symlink served
+        // by `read_link_at`. See gm mutable mut-1789043688678.
         let (device, file) = match dir {
             SysDrmDirHandle::Device(device) => {
                 let file = SysDrmFile::from_name(name)
@@ -2164,30 +1981,19 @@ where
                 let Some(SysDrmFile::Subsystem) = SysDrmFile::from_name(name) else {
                     return Ok(None);
                 };
-                // Real sysfs `subsystem` links are relative, e.g. `../../../../class/drm`,
-                // resolving back up to the `drm` class directory -- `libudev` only reads the
-                // link target's basename (`drm`) to populate `udev_device_get_subsystem()`, so
-                // the exact number of `../` hops does not matter as long as the final basename
-                // is right (litebox's `/sys/class/drm` mount is itself a virtual directory with
-                // no real sibling classes, so this link is illustrative rather than
-                // independently walkable -- matching real udev's own basename-only usage).
+                // Only the basename is load-bearing: `libudev` reads it for
+                // `udev_device_get_subsystem()` and never walks the `../` hops.
+                // See gm mutable mut-1789043689557.
                 Ok(Some(String::from("../../../class/drm")))
             }
             SysDrmDirHandle::DeviceOf(_) => {
                 if name != "subsystem" {
                     return Ok(None);
                 }
-                // `<name>/device/subsystem` -- real sysfs points this at the device's real
-                // bus subsystem directory (`../../../bus/pci` for a real PCI GPU). litebox's
-                // virtual DRM device has no real bus parent to model (see `SysClassDrm`'s
-                // doc comment on the synthetic `device` subtree), so this resolves to
-                // `platform` -- the real kernel's own choice for a DRM device with no
-                // discoverable discrete bus (e.g. `simpledrm`/`vkms`), and the value
-                // `drmGetDevice2()` (via libdrm's `drm_device_get_subsystem_type`) most
-                // readily recognizes as "not a proper PCI/USB/platform device to introspect
-                // further" without treating the lookup itself as an error -- confirmed live,
-                // this is the only remaining unresolved path in wlroots' render-node open
-                // sequence for `226:128` once `device`/`device/drm` themselves resolve.
+                // Must be `platform`, never `pci`: it is what the kernel itself reports for a
+                // bus-less DRM device (`simpledrm`/`vkms`) and the one value libdrm's
+                // `drm_device_get_subsystem_type()` accepts without erroring.
+                // See gm mutable mut-1789043688678.
                 Ok(Some(String::from("../../../bus/platform")))
             }
             SysDrmDirHandle::Root | SysDrmDirHandle::DeviceDrmOf(_) => Ok(None),
@@ -2203,12 +2009,9 @@ where
             }
             SysDrmFile::Dev => format!("{major}:{minor}\n"),
             SysDrmFile::Subsystem => return Err(ReadError::NotForReading),
-            // `<name>/device/uevent` -- real platform-bus devices with no removable-media/
-            // module-alias properties worth reporting typically carry just `DRIVER=`
-            // (`drm_device_get_bustype()` only needs the file to exist and be readable; it
-            // does not require any specific key to be present to classify the device as
-            // platform-bus rather than PCI/USB, since bus classification already happened
-            // via the `subsystem` symlink read immediately before this).
+            // `drm_device_get_bustype()` only needs this file to exist and be readable -- no
+            // specific key -- bus classification having already happened via the `subsystem`
+            // symlink read just before. See gm mutable mut-1789043688678.
             SysDrmFile::DeviceUevent => String::from("DRIVER=litebox\n"),
         };
         let bytes = content.as_bytes();
@@ -2347,39 +2150,16 @@ const UDEV_DB_EVENT0_NODE_INFO: NodeInfo = NodeInfo {
     rdev: None,
 };
 
-/// Real eudev per-device-database `E:` property lines this backend serves for
-/// `/run/udev/data/c13:64` -- each parsed by `udev_device_read_db()`
-/// (`src/libudev/libudev-device.c`) into a real udev property via
-/// `udev_device_add_property_from_string()`. libinput's `evdev_configure_device()`
-/// (`src/evdev.c`) reads these SPECIFIC property names (`ID_INPUT`/`ID_INPUT_MOUSE`/
-/// `ID_INPUT_KEYBOARD`, matched against `evdev_udev_tag_matches[]`) to decide whether a
-/// device is tagged as supported input at all -- a device with NO `ID_INPUT` property
-/// hits `evdev_configure_device`'s very first check (`(udev_tags &
-/// EVDEV_UDEV_TAG_INPUT) == 0`) and is rejected with "not tagged as supported input
-/// device", logged by the caller as "not using input device". This is NOT read from any
-/// ioctl or sysfs attribute -- real udev normally derives these properties at boot via
-/// `hwdb`/`udev` rules matching the device's real evdev capabilities, which litebox has no
-/// equivalent of; serving them directly here is the correct, faithful substitute for
-/// litebox's one static, known-shape virtual device (a keyboard+mouse-capable device,
-/// matching [`EvdevSubsystem`]'s real `push_key`/`push_rel` capability range).
+/// The exact `E:` property lines `/run/udev/data/c13:64` must carry. libinput's
+/// `evdev_configure_device()` rejects any device without `ID_INPUT` ("not tagged as supported
+/// input device"); real udev derives these from `hwdb` rules at boot, which litebox has none of.
+/// See gm mutable mut-1789043722510.
 const UDEV_DB_EVENT0_CONTENT: &[u8] = b"E:ID_INPUT=1\nE:ID_INPUT_MOUSE=1\nE:ID_INPUT_KEYBOARD=1\n";
 
-/// A [`super::backend::Backend`] exposing `/run/udev/data/c13:64` -- real eudev's
-/// per-device database file (`udev_device_read_db()`, `src/libudev/libudev-device.c`):
-/// merely being ABLE TO OPEN this file (any content, even empty) is what real eudev
-/// treats as "this device has a database entry" -> `udev_device->is_initialized = true`.
-/// `libinput_udev_create_context()`'s own device-enumeration walk
-/// (`udev_input_add_devices()`, `src/udev-seat.c`) explicitly skips any device where
-/// `udev_device_get_is_initialized()` is false ("skip unconfigured input device") --
-/// litebox has no real `udevd` ever running to create this file, so without it, the one
-/// virtual input device [`SysClassInput`]/[`InputDevices`] otherwise correctly exposes is
-/// silently rejected by libinput's own enumeration filter. Beyond mere openability, the
-/// file's CONTENT also matters -- see [`UDEV_DB_EVENT0_CONTENT`]'s own doc comment. This is
-/// deliberately NOT a general `/run/udev/data` emulation -- exactly one, fixed file is
-/// served, matching litebox's one static virtual input device; a real system's device
-/// database has one entry per real device and is written by `udevd` at boot, which
-/// litebox has no equivalent of (correctly -- see [`EvdevSubsystem`]'s doc comment on why
-/// litebox's device set is intentionally static per-run).
+/// A [`super::backend::Backend`] serving exactly one file, `/run/udev/data/c13:64` -- eudev's
+/// per-device database entry. Its mere openability sets `udev_device->is_initialized`, without
+/// which `libinput_udev_create_context()` silently skips the one virtual input device
+/// [`InputDevices`] exposes; its contents matter too, see [`UDEV_DB_EVENT0_CONTENT`].
 pub struct UdevDb<Platform>
 where
     Platform: RawSyncPrimitivesProvider + 'static,
@@ -2501,9 +2281,8 @@ where
     }
 
     fn read(&self, _h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
-        // See `UDEV_DB_EVENT0_CONTENT`'s own doc comment: these `E:` property lines are
-        // what makes libinput's `evdev_configure_device()` tag this device as supported
-        // input at all, not just "openable".
+        // These `E:` lines are what make libinput's `evdev_configure_device()` tag this device
+        // as supported input at all, not merely "openable". See gm mutable mut-1789043722510.
         let content = UDEV_DB_EVENT0_CONTENT;
         if offset >= content.len() {
             return Ok(0);
@@ -2602,12 +2381,9 @@ where
     }
 }
 
-/// A leaf file inside `/sys/class/input/event0/` -- the minimal set a real
-/// `libudev`-based input client (`libinput_udev_create_context()`'s
-/// `udev_enumerate_scan_devices()` walk) needs: `uevent` (populates `udev_device`
-/// properties without a running `udevd`) and `subsystem` (a symlink whose basename
-/// `udev_device_get_subsystem()` reads). Mirrors [`SysDrmFile`]'s exact shape, scoped to
-/// litebox's one virtual input device (`/dev/input/event0`, see [`InputDevice::Event0`]).
+/// A leaf file inside `/sys/class/input/event0/` -- the same minimal set as [`SysDrmFile`], which
+/// is what a real `libudev` input client's `udev_enumerate_scan_devices()` walk reads, scoped to
+/// litebox's one virtual input device ([`InputDevice::Event0`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SysInputFile {
     /// `MAJOR=`/`MINOR=`/`DEVNAME=`/`SUBSYSTEM=` key=value lines.
@@ -2639,16 +2415,10 @@ const SYS_INPUT_EVENT0_DIR_NODE_INFO: NodeInfo = NodeInfo {
     rdev: None,
 };
 
-/// A [`super::backend::Backend`] exposing the minimal `/sys/class/input/event0/` subtree
-/// a real `libudev`-based input client needs to enumerate litebox's one emulated evdev
-/// device. Deliberately NOT a general procfs/sysfs emulation -- only the exact files real
-/// `udev_enumerate_scan_devices()` + `udev_device_new_from_syspath()` calls read
-/// (`uevent`, `dev`, `subsystem`) are served, for the one node [`InputDevices`] already
-/// exposes at `/dev/input/event0`. Mounted at `/sys/class/input`; the composer's virtual-
-/// directory auto-synthesis creates the `/sys` and `/sys/class` ancestor directories
-/// automatically, so this backend only needs to handle its own one-level subtree
-/// (`event0`, containing `uevent`/`dev`/`subsystem`). Only one device exists, so unlike
-/// [`SysClassDrm`] this backend has no device-selector enum to match on.
+/// A [`super::backend::Backend`] serving the minimal `/sys/class/input/event0/` subtree a
+/// `libudev` input client enumerates for the one node [`InputDevices`] exposes --
+/// `uevent`/`dev`/`subsystem`, never general sysfs. One device only, so unlike [`SysClassDrm`]
+/// there is no device-selector enum.
 pub struct SysClassInput<Platform>
 where
     Platform: RawSyncPrimitivesProvider + 'static,
@@ -2975,28 +2745,15 @@ where
 enum SysDevCharEntry {
     /// `13:64` -- the virtual input device, target `../../class/input/event0`.
     Input,
-    /// `226:0` -- the virtual DRM primary node, target `../../class/drm/card0`. Needed by
-    /// `wlroots`' DRM backend (`drmGetDeviceNameFromFd2()`, used by labwc/sway): unlike
-    /// weston's DRM backend, which opens `/dev/dri/card0` by its already-known path and
-    /// never re-derives it via this reverse lookup, wlroots calls `fstat()` on the fd then
-    /// resolves this symlink to canonicalize the device name -- without it,
-    /// `drmGetDeviceNameFromFd2()` fails with ENOENT and wlroots aborts backend creation
-    /// before ever reaching DRM_IOCTL_MODE_GETRESOURCES, confirmed live (weston's DRM
-    /// backend works fine against the same virtual card with this entry absent; labwc's does
-    /// not).
+    /// `226:0` -- the virtual DRM primary node, target `../../class/drm/card0`. Required by
+    /// wlroots' `drmGetDeviceNameFromFd2()` (labwc/sway), which weston never calls -- so a
+    /// weston-only check passes with this entry missing while labwc aborts backend creation.
+    /// See gm mutable mut-1789043688678.
     Drm,
-    /// `226:128` -- the virtual DRM render node, target `../../class/drm/renderD128`. Same
-    /// rationale as [`SysDevCharEntry::Drm`], but reached from a *different* wlroots code
-    /// path: after the primary node's DRM backend is up, wlroots' `wlr_drm_backend` (via
-    /// `types/wlr_drm.c`'s `drmGetDevice2()`) opens the render node to build a GBM/EGL
-    /// renderer for client buffer allocation, and that call needs `226:128`'s own reverse
-    /// lookup for the identical reason `226:0`'s was needed for the primary node -- confirmed
-    /// live, `sys_stat` on `/sys/dev/char/226:128/device/drm` returning `ENOENT` immediately
-    /// precedes `types/wlr_drm.c:217]"drmGetDevice2 failed"` in a real repro capture, with the
-    /// shallower `/sys/dev/char/226:128` symlink itself already resolvable once this entry
-    /// exists (the deeper `device/drm` subtree it resolves into was already served for both
-    /// `card0` and `renderD128` by [`SysClassDrm`] -- only this reverse-lookup entry was
-    /// missing).
+    /// `226:128` -- the virtual DRM render node, target `../../class/drm/renderD128`. The same
+    /// reverse lookup as [`SysDevCharEntry::Drm`], needed by a later wlroots path: the GBM/EGL
+    /// render-node open, which reports `drmGetDevice2 failed` without it.
+    /// See gm mutable mut-1789043688678.
     DrmRender,
 }
 
@@ -3041,20 +2798,10 @@ const SYS_DEV_CHAR_DRM_RENDER_NODE_INFO: NodeInfo = NodeInfo {
     rdev: None,
 };
 
-/// A [`super::backend::Backend`] exposing `/sys/dev/char/<major>:<minor>` -- the standard
-/// sysfs reverse-lookup symlink from a character device's `(major, minor)` pair back to
-/// its `/sys/class/*` directory. Real `libudev`'s `udev_device_new_from_devnum()` (used by
-/// `seatd`'s own `seat_open_device()` to canonicalize/re-validate a device path via
-/// `realpath()` + a `stat()`-then-devnum-lookup) reads exactly this symlink; without it,
-/// seatd's device-open sequence silently fails and immediately closes the just-opened fd
-/// (confirmed live: `sys_stat` on `/sys/dev/char/13:64` returns `ENOENT` immediately before
-/// seatd's own `"Closing device"` log line, with zero error in between). Deliberately NOT a
-/// general sysfs `dev/char` emulation -- only the two entries litebox's static virtual
-/// device set needs (see [`SysClassInput`]/[`SysClassDrm`]): weston's DRM backend opens
-/// `/dev/dri/card0` by its already-known path and never re-derives it via this reverse
-/// lookup, but wlroots' DRM backend (labwc/sway) calls `drmGetDeviceNameFromFd2()`, which
-/// does depend on this lookup succeeding -- confirmed live, `226:0` was originally omitted
-/// on the (wrong, weston-only) assumption that no DRM consumer needed it.
+/// A [`super::backend::Backend`] serving `/sys/dev/char/<major>:<minor>` -- the sysfs reverse
+/// lookup from a char device's `(major, minor)` back to its `/sys/class/*` directory. `libudev`'s
+/// `udev_device_new_from_devnum()` reads it; without it seatd silently closes the fd it just
+/// opened, and wlroots' `drmGetDeviceNameFromFd2()` fails.
 pub struct SysDevChar<Platform>
 where
     Platform: RawSyncPrimitivesProvider + 'static,

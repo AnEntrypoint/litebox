@@ -2,38 +2,9 @@
 // Licensed under the MIT license.
 
 //! A table-driven [`Backend`] for read-only files whose content is fixed for a guest's lifetime.
-//!
-//! # Why this exists
-//!
-//! A guest desktop reads a long tail of `/proc` and `/sys` files whose real content is a fixed
-//! string on any machine litebox will ever emulate -- `/proc/sys/crypto/fips_enabled` is `0`,
-//! `/sys/module/apparmor/parameters/enabled` is `N`, `/proc/sys/kernel/cap_last_cap` is a kernel
-//! version constant. Each one previously needed either its own ~270-line [`Backend`]
-//! implementation (see the `ProcSysKernel` this replaces, which served exactly two files that
-//! way) or nothing at all, and "nothing at all" is what the guest got: a live XFCE session was
-//! observed asking for eleven distinct such paths and receiving `ENOENT` for every one.
-//!
-//! Writing an eleventh copy of that boilerplate is the wrong answer to "the guest wants one more
-//! constant". This is the mechanism instead: a `(path, bytes)` table, one `Backend`
-//! implementation over it, mounted wherever a subtree of constants is wanted. Adding a file is a
-//! table row.
-//!
-//! Paths in the table may contain `/`; the intermediate directories are derived from the table
-//! itself at construction, so `cpu0/cpu_capacity` creates a listable `cpu0` with no extra
-//! declaration.
-//!
-//! The table is owned rather than `&'static`, so a value that is constant for the life of a guest
-//! but not known at compile time belongs here too -- `/sys/devices/system/cpu/online` is
-//! `0-{cpu_count-1}`, fixed once the host CPU count is read and never changing afterwards. The
-//! alternative was leaking a `String` per boot to satisfy a `'static` bound, which buys nothing:
-//! these files are a few bytes each and are read, not mapped.
-//!
-//! # What this is not
-//!
-//! Not a substitute for a synthesized file whose content depends on live state. `/proc/stat`,
-//! `/proc/meminfo` and `/proc/self/*` are NOT constants and do not belong here -- they live in
-//! [`super::procfs`], which can see the state they report. The test for belonging here is whether
-//! the bytes can change while the guest is running.
+//! Adding one is a `(path, bytes)` row; a `/` in a path derives its intermediate directories at
+//! construction, and the owned (not `&'static`) table also admits values fixed once per boot, while
+//! live-changing content belongs in [`super::procfs`]. See gm mutable mut-1789043521509.
 
 use alloc::string::String;
 use alloc::vec;
@@ -236,11 +207,8 @@ where
                 permissions: PermissionCheck::ByBackend,
             });
         }
-        // A directory reached through `open_file_at` is a real entry, just not a file. Reporting
-        // `NoSuchFileOrDirectory` for something that demonstrably exists would misinform a caller
-        // deciding whether to create it. `ComponentNotADirectory` is what `tar_ro` answers in the
-        // same situation -- see its own `open_file_at` for why this generic error is the closest
-        // available fit, there being no `IsADirectory` variant on `PathError`.
+        // `ComponentNotADirectory`, never `NoSuchFileOrDirectory`: the entry demonstrably exists,
+        // and `PathError` has no `IsADirectory`. See gm mutable mut-1789043718495.
         if self.child_dir(dir.0, name).is_some() {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }

@@ -1203,14 +1203,10 @@ impl<'a> TaggedFcall<'a> {
 
 /// Trait for encoding/decoding types in little-endian wire format.
 ///
-/// The 9P protocol uses little-endian byte order for all integer fields. The actual byte
-/// conversion is delegated to `zerocopy::byteorder`'s `little_endian::{U16, U32, U64}` wrapper
-/// types (already a workspace dependency) rather than hand-rolled `to_le_bytes`/`from_le_bytes`
-/// calls -- this keeps the existing streaming, variable-length-aware trait/decoder architecture
-/// (`FcallDecoder`'s own byte-slice cursor, needed for the protocol's real length-prefixed
-/// strings/vectors, which a fixed-layout `#[derive(FromBytes)]` struct alone can't express) while
-/// still routing every primitive's actual endian conversion through a crate whose correctness is
-/// independently tested, instead of this file's own hand-rolled version of the same thing.
+/// Primitive conversion must route through `zerocopy::byteorder`'s `little_endian` wrappers, never
+/// hand-rolled `to_le_bytes`/`from_le_bytes`. `FcallDecoder`'s streaming byte-slice cursor must
+/// stay: 9P's length-prefixed strings/vectors need it, and a fixed-layout `#[derive(FromBytes)]`
+/// struct cannot express them. See gm mutable fs-ninep-lewire-zerocopy-not-handrolled.
 trait LeWire: Sized + Copy {
     const SIZE: usize;
     fn write_le<W: transport::Write>(self, w: &mut W) -> Result<(), transport::WriteError>;

@@ -1,18 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Apply the contents of a raw tar archive (in memory, e.g. produced by
-//! [`super::export::export_all`] and serialized to a tar archive by a `std`-capable caller) into
-//! any [`FileSystem`] implementation, via that trait's own `mkdir`/`open`/`write`/`symlink`
-//! calls.
-//!
-//! Walks the archive's raw 512-byte POSIX header blocks directly (the same technique
-//! `super::tar_ro::TarIndex::new` uses, for the same reason: `tar_no_std::TarArchiveRef::
-//! entries()` silently skips every non-regular-file entry, so a symlink in the archive would
-//! otherwise be invisible), so this stays `no_std`/`alloc`-only like the rest of this crate --
-//! unlike [`super::export`]'s sibling doc comment, this module both reads its input format
-//! (tar) and applies it, since (unlike serializing an export, which needs a stream writer)
-//! parsing an in-memory byte slice needs no I/O capability at all.
+//! Apply a raw in-memory tar archive (e.g. [`super::export::export_all`]'s entries, serialized to
+//! tar by a `std`-capable caller) into any [`FileSystem`], via that trait's own
+//! `mkdir`/`open`/`write`/`symlink` calls. Walks the raw 512-byte POSIX header blocks directly
+//! (`tar_no_std`'s own iterator skips non-regular entries), staying `no_std`/`alloc`-only.
 
 use alloc::format;
 use alloc::string::String;
@@ -32,14 +24,10 @@ pub enum ImportError {
     Close,
 }
 
-/// Parses `tar_data` as a POSIX tar archive and applies every regular-file, directory, and
-/// symlink entry into `fs`, creating ancestor directories as needed.
-///
-/// `AlreadyExists` from `mkdir` is treated as success (the target filesystem's own default
-/// layout may have already created a directory this archive also mentions, e.g. `/tmp`, `/etc`)
-/// -- every other error is propagated. Character devices, hardlinks, and FIFOs are skipped
-/// (mirroring [`super::tar_ro`]'s own read-only-layer handling); this module supports exactly
-/// the entry types [`super::export::export_all`] ever produces.
+/// Parses `tar_data` as a POSIX tar archive and applies every regular-file, directory, FIFO and
+/// symlink entry into `fs`, creating ancestor directories as needed. `AlreadyExists` from `mkdir`
+/// is treated as success (the target filesystem may already provide `/tmp`, `/etc`); every other
+/// error is propagated. Character devices and hardlinks are skipped.
 ///
 /// # Panics
 ///
@@ -98,15 +86,9 @@ pub fn import_all<FS: FileSystem>(fs: &FS, tar_data: &[u8]) -> Result<(), Import
                 };
                 match fs.symlink(target, &*path) {
                     Ok(()) => {}
-                    // Already present: replace it, so an archive that updates a symlink's target
-                    // still takes effect, and one that merely repeats an existing link is a
-                    // no-op. `mkdir` above already tolerates the same situation, and it arises
-                    // for exactly the same reason -- these archives are round-tripped between a
-                    // parent and its cross-process `fork()` children, so a child's export
-                    // necessarily re-states everything it adopted from the parent to begin with.
-                    // Without this, one repeated symlink aborted the whole import and the child's
-                    // real writes were silently lost (`wait4: failed to import cross-process
-                    // child's exported writable layer error=Symlink`).
+                    // Already present: replace it -- cross-process `fork()` children re-export
+                    // everything adopted from the parent, and erroring here silently lost the
+                    // child's real writes. See gm mutable fs-import-symlink-replace-fork.
                     Err(super::errors::SymlinkError::AlreadyExists) => {
                         let _ = fs.unlink(&*path);
                         fs.symlink(target, &*path)
@@ -142,7 +124,7 @@ pub fn import_all<FS: FileSystem>(fs: &FS, tar_data: &[u8]) -> Result<(), Import
                 fs.close(&fd).map_err(|_| ImportError::Close)?;
             }
             _ => {
-                // Character devices, hardlinks, FIFOs: not produced by `export_all`, skipped.
+                // Character devices and hardlinks: not produced by `export_all`, skipped.
                 let payload_blocks = header.payload_block_count().unwrap_or(0);
                 block_index += payload_blocks;
             }

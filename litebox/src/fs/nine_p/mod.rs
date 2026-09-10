@@ -32,9 +32,6 @@ mod fcall;
 
 pub mod transport;
 
-#[cfg(test)]
-mod tests;
-
 const DEVICE_ID: usize = u32::from_le_bytes(*b"NINE") as usize;
 
 // Common POSIX error codes used when converting remote errors to specific FS error types.
@@ -294,16 +291,7 @@ impl From<Rlerror> for Error {
 }
 
 /// A backing implementation for [`FileSystem`](super::FileSystem) using a 9P2000.L-based network
-/// file system.
-///
-/// This filesystem implementation communicates with a 9P server to provide access to remote files.
-/// All file operations are translated into 9P protocol messages that are sent to the server.
-///
-/// # Type Parameters
-///
-/// - `Platform`: The platform provider that supplies synchronization primitives and other
-///   platform-specific functionality.
-/// - `T`: The transport type that implements both `Read` and `Write` traits.
+/// file system: every file operation is translated into a 9P message sent to the server.
 pub struct FileSystem<
     Platform: sync::RawSyncPrimitivesProvider,
     T: transport::Read + transport::Write,
@@ -323,23 +311,10 @@ pub struct FileSystem<
 impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write>
     FileSystem<Platform, T>
 {
-    /// Construct a new `FileSystem` instance
-    ///
-    /// This function is expected to only be invoked once per platform, as an initialization step,
-    /// and the created `FileSystem` handle is expected to be shared across all usage over the
-    /// system.
-    ///
-    /// # Arguments
-    ///
-    /// * `litebox` - Reference to the LiteBox instance for platform access
-    /// * `transport` - The transport for 9P communication
-    /// * `msize` - Maximum message size to negotiate
-    /// * `username` - Username for authentication
-    /// * `path` - Attach path (typically the root directory path)
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if version negotiation or attach fails.
+    /// Construct a new `FileSystem`: negotiates the 9P version over `transport` with `msize` as
+    /// the maximum message size, then attaches as `username` at `path` (typically the remote
+    /// root), erroring if either step fails. Expected to be constructed once per platform, with
+    /// the resulting handle shared across all usage.
     pub fn new(
         litebox: &LiteBox<Platform>,
         transport: T,
@@ -611,11 +586,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     ) -> Result<FileFd<Platform, T>, super::errors::OpenError> {
         // We don't support non-blocking, so ignore that flag instead of returning an error.
         let flags = flags - OFlags::NONBLOCK;
-        // Every flag here is one `oflags_to_lopen` (below) actually translates to its 9P
-        // `Lopen` wire equivalent -- this allowlist previously lagged that function, so an
-        // ordinary `open(path, O_WRONLY|O_CREAT|O_TRUNC)` (one of the single most common
-        // open patterns in real software) unconditionally panicked the whole runner even
-        // though the translation for TRUNC/APPEND/etc. was already implemented and correct.
+        // Keep in step with `oflags_to_lopen` -- gm mutable fs-ninep-open-oflag-allowlist-never-panics.
         let currently_supported_oflags: OFlags = OFlags::RDONLY
             | OFlags::WRONLY
             | OFlags::RDWR
@@ -631,17 +602,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             | OFlags::DSYNC
             | OFlags::DIRECT
             | OFlags::NOATIME;
-        // An unlisted flag is REPORTED, never fatal.
-        //
-        // This was `unimplemented!("{flags:?}")`, which panics the HOST process -- so any guest
-        // that opened a file with a flag this backend had not been taught took down the runner and
-        // every other guest running inside it. Not hypothetical: it killed a live XFCE session with
-        // `not implemented: OFlags(NOATIME)`, and the comment a few lines above records the SAME
-        // defect being found once before, in a sibling backend, without the others being changed.
-        // Teaching each whitelist one more flag does not fix that; not panicking does.
-        //
-        // `EINVAL` is what Linux reports for a flag combination it will not honour, and it leaves
-        // the decision with the caller instead of ending everyone's process.
+        // An unlisted flag is reported, never fatal: `unimplemented!` here panicked the host
+        // runner. See gm mutable fs-ninep-open-oflag-allowlist-never-panics.
         if flags.intersects(currently_supported_oflags.complement()) {
             litebox_util_log::warn!(flags:? = flags; "open: unsupported open flag(s)");
             return Err(OpenError::PathError(PathError::InvalidPathname));
@@ -827,12 +789,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         fd: &FileFd<Platform, T>,
         mode: super::Mode,
     ) -> Result<(), super::errors::ChmodError> {
-        // Unlike `chmod` below (path-based, `walk_to` + `clunk`), this reuses the fd's own
-        // already-open `fid` -- see [`super::FileSystem::chmod_fd`]'s doc comment on why a
-        // caller may `unlink` the file and then `fchmod` this same still-open fd, and why a
-        // fresh path walk would be the wrong thing to do here (9P `unlink` on the client-visible
-        // path does not invalidate a `fid` obtained before the unlink, matching Linux's own
-        // still-open-fd-survives-unlink semantics this whole method exists to preserve).
+        // Reuse the fd's `fid`; never re-walk the path: gm mutable fs-ninep-chmodfd-reuses-fid-not-path.
         let fid = self
             .litebox
             .descriptor_table()

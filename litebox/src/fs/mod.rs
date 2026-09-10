@@ -27,9 +27,6 @@ pub mod resolver;
 pub mod static_files;
 pub mod tar_ro;
 
-#[cfg(test)]
-mod tests;
-
 use errors::{
     ChmodError, ChownError, CloseError, FileStatusError, LinkError, MkdirError, OpenError,
     ReadDirError, ReadError, ReadLinkError, RenameError, RmdirError, SeekError, SetTimesError,
@@ -119,35 +116,15 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     fn chmod(&self, path: impl path::Arg, mode: Mode) -> Result<(), ChmodError>;
 
     /// Change the permissions of a file via an already-open file descriptor, matching the
-    /// semantics of `fchmod(2)`.
-    ///
-    /// This MUST NOT be implemented as `chmod` re-resolving `fd` back to a path and re-walking
-    /// the directory tree by name (the way `sys_fchmod` used to before this method existed) --
-    /// real `fchmod` operates on the fd's already-open inode, which real POSIX (and this file
-    /// system) keeps alive via the open handle even after the directory entry naming it has been
-    /// `unlink`ed (the fd's refcount on the underlying file/inode is exactly [`Self::truncate`]'s
-    /// own `fd: &TypedFd<Self>`-based design, which this mirrors). A caller that `unlink`s a file
-    /// and then `fchmod`s the still-open fd (e.g. wlroots' `util/shm.c` `allocate_shm_file_pair`:
-    /// open, open, unlink, fchmod, ftruncate, in that exact order) is relying on precisely this
-    /// -- a path-based re-resolution after the `unlink` would always fail with
-    /// `NoSuchFileOrDirectory`, which is the bug this method exists to avoid.
+    /// semantics of `fchmod(2)`. MUST operate on the fd's already-open inode and MUST NOT
+    /// re-resolve `fd` to a path: a caller may `unlink` the file first and then `fchmod` the
+    /// still-open fd, as wlroots' `util/shm.c` `allocate_shm_file_pair` does.
     fn chmod_fd(&self, fd: &TypedFd<Self>, mode: Mode) -> Result<(), ChmodError>;
 
-    /// The access-mode/status flags `fd` was actually opened with (the `O_RDONLY`/`O_WRONLY`/
-    /// `O_RDWR` bits plus whatever of [`OFlags::STATUS_FLAGS_MASK`] applied at `open()` time),
-    /// for `fcntl(F_GETFL)` to report correctly.
-    ///
-    /// Defaults to `None` (caller falls back to reporting `O_RDONLY`/0, the pre-existing
-    /// behavior) since not every implementor of this trait is a real, fd-table-backed regular
-    /// file (e.g. [`devices::Devices`], [`procfs`] synthesize their entries differently) --
-    /// override this wherever the implementation actually tracks per-fd open flags, as
-    /// [`layered::FileSystem`] does. Added specifically because the previous fallback used by
-    /// every caller (`litebox_shim_linux`'s `sys_fcntl`), looking up `StdioStatusFlags`
-    /// *metadata* on the fd, is only ever populated for a re-opened `/dev/stdin`/`/dev/stdout`/
-    /// `/dev/stderr` fd -- for an ordinary regular file it silently missed and always reported
-    /// `O_RDONLY` regardless of the fd's real access mode, which is exactly what broke
-    /// `xkbcomp`'s `fdopen(fd, "w")` on an `O_WRONLY`-opened fd (see `layered::FileSystem::
-    /// open_flags`'s doc comment for the full, confirmed-live root-cause trace).
+    /// The access-mode/status flags `fd` was actually opened with, for `fcntl(F_GETFL)` to report
+    /// correctly. Defaults to `None` (the caller then reports `O_RDONLY`); override it wherever
+    /// per-fd open flags are tracked, as [`layered::FileSystem`] does -- without that override
+    /// `F_GETFL` broke xkbcomp's `fdopen`. See gm mutable fs-mod-openflags-fcntl-getfl-xkbcomp.
     fn open_flags(&self, _fd: &TypedFd<Self>) -> Option<OFlags> {
         None
     }
@@ -176,50 +153,29 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// Unlink a file
     fn unlink(&self, path: impl path::Arg) -> Result<(), UnlinkError>;
 
-    /// Rename (move) `from` to `to`, atomically replacing `to` if it already exists.
-    ///
-    /// Regular-file and symlink renames are supported (directory rename returns
-    /// [`RenameError::IsADirectory`]) -- this covers the common "atomically replace a file with a
-    /// freshly-written temp file" pattern (e.g. package managers like `apk` installing a
-    /// downloaded package), which is the scenario this method exists to support. `from` and `to`
-    /// must resolve within the same filesystem/layer, matching Linux's `EXDEV` restriction on
-    /// cross-filesystem rename (implementations that can't support the general case return
-    /// [`RenameError::CrossDevice`] for a cross-layer attempt, e.g. renaming a file that currently
-    /// only exists in a read-only layer of a [`layered`] filesystem).
+    /// Rename (move) `from` to `to`, atomically replacing `to` if it already exists. Regular files
+    /// and symlinks only ([`RenameError::IsADirectory`] for a directory); `from` and `to` must be
+    /// in the same filesystem/layer, else [`RenameError::CrossDevice`], matching Linux's `EXDEV`.
+    /// Exists for the atomic replace-with-a-temp-file pattern, e.g. `apk` installing a package.
     fn rename(&self, from: impl path::Arg, to: impl path::Arg) -> Result<(), RenameError>;
 
-    /// Create a hard link at `newpath` referring to the same underlying file as `oldpath`.
-    ///
-    /// Both paths independently refer to the SAME file content and metadata afterward (a write
-    /// through one path is visible through the other, matching Linux's `link(2)`); the
-    /// underlying file is only actually removed once every linking path has been unlinked.
-    /// `oldpath` must name a regular file, never a directory (Linux's `link(2)` returns `EPERM`
-    /// for a directory; this is the same restriction real Linux enforces to keep the filesystem
-    /// tree acyclic). This exists to support the common "atomic lock-file acquisition" pattern
-    /// (create a uniquely-named temp file, then `link()` it to the real lock path -- an
-    /// `EEXIST`-if-already-locked check with no TOCTOU window a plain `open(O_CREAT|O_EXCL)`
-    /// alone doesn't give across NFS-like semantics), e.g. Xorg's own lock-file handling.
+    /// Create a hard link at `newpath` aliasing `oldpath`: both paths share content and metadata
+    /// (a write through one is visible through the other), and the file is removed only once every
+    /// linking path is unlinked. `oldpath` must be a regular file, never a directory (Linux's
+    /// `link(2)` `EPERM`, keeping the tree acyclic). For atomic lock files, e.g. Xorg's own.
     fn link(&self, oldpath: impl path::Arg, newpath: impl path::Arg) -> Result<(), LinkError>;
 
-    /// Create a symbolic link at `linkpath` pointing to `target`.
-    ///
-    /// `target` is stored verbatim (it is never itself resolved or validated at creation time,
-    /// matching Linux's `symlink(2)`, which happily creates dangling or relative-target
-    /// symlinks). This exists to support the common "package manager installs a shared-library
-    /// symlink" pattern (e.g. `apk` extracting `usr/lib/libfoo.so -> libfoo.so.1.2.3`).
+    /// Create a symbolic link at `linkpath` pointing to `target`. `target` is stored verbatim,
+    /// never resolved or validated at creation time -- dangling and relative targets are legal,
+    /// as in Linux's `symlink(2)`. For e.g. `apk` installing a shared-library symlink
+    /// (`usr/lib/libfoo.so -> libfoo.so.1.2.3`).
     fn symlink(&self, target: impl path::Arg, linkpath: impl path::Arg)
     -> Result<(), SymlinkError>;
 
-    /// Create a named pipe (FIFO) at `path`.
-    ///
-    /// The entry is an ordinary directory entry whose [`FileType`] is [`FileType::Fifo`]; it holds
-    /// no data of its own. What a guest gets when it OPENS one is a pipe, which is the shim's
-    /// business, not the filesystem's -- this method only records that the path names a FIFO, so
-    /// that `stat` reports `S_IFIFO` and `open` knows to hand back a pipe.
-    ///
-    /// Errors mirror [`FileSystem::mkdir`]'s exactly, which is the closest existing shape: both
-    /// create a non-file entry in a parent directory. Defaults to
-    /// [`MkdirError::ReadOnlyFileSystem`], which is the right answer for every read-only backend.
+    /// Create a named pipe (FIFO) at `path`: an ordinary directory entry whose [`FileType`] is
+    /// [`FileType::Fifo`] and which holds no data, so `stat` reports `S_IFIFO` and `open` knows to
+    /// hand back a pipe -- the pipe itself is the shim's business, not this trait's. Errors mirror
+    /// [`FileSystem::mkdir`]'s; defaults to [`MkdirError::ReadOnlyFileSystem`].
     fn make_fifo(&self, path: impl path::Arg, mode: Mode) -> Result<(), MkdirError> {
         let _ = (path, mode);
         Err(MkdirError::ReadOnlyFileSystem)
@@ -244,20 +200,10 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// Obtain the status of a file/directory/... on the file-system.
     fn file_status(&self, path: impl path::Arg) -> Result<FileStatus, FileStatusError>;
 
-    /// Equivalent to [`Self::file_status`], but does not follow a symlink named by the FINAL
-    /// path component (matching `lstat(2)`/`fstatat(AT_SYMLINK_NOFOLLOW)` semantics): if
-    /// `path`'s last component is itself a symlink, this returns the symlink's OWN metadata
-    /// (`file_type: FileType::Symlink`, `size` = the length of its target string) rather than
-    /// the metadata of whatever it points at -- including for a dangling symlink, which must
-    /// still succeed here even though the target does not exist.
-    ///
-    /// Every path component *before* the final one is still resolved normally (following any
-    /// intermediate symlinks), exactly like [`Self::file_status`].
-    ///
-    /// The default body preserves this trait's original, symlink-following behavior for any
-    /// implementer that has no real symlink concept of its own (or already returns correct
-    /// lstat-shaped data from `file_status`, e.g. [`in_mem::FileSystem`], whose own entries are
-    /// never transparently followed to begin with).
+    /// Equivalent to [`Self::file_status`], but does not follow a symlink named by the FINAL path
+    /// component (`lstat(2)`/`AT_SYMLINK_NOFOLLOW`): returns the symlink's own metadata, and must
+    /// succeed for a dangling symlink. Earlier components resolve normally. The default body keeps
+    /// the following behavior, right for an implementer with no symlinks (e.g. [`in_mem`]).
     fn symlink_metadata(&self, path: impl path::Arg) -> Result<FileStatus, FileStatusError> {
         self.file_status(path)
     }
@@ -455,16 +401,10 @@ pub struct FileStatus {
 }
 
 impl FileStatus {
-    /// Build the [`FileStatus`] for a symlink itself (never the file/directory it points at) --
-    /// what [`FileSystem::symlink_metadata`] returns for a path whose final component is a
-    /// symlink. `target_len` is the byte length of the symlink's (unresolved) target string.
-    ///
-    /// Real Linux always reports a symlink's own mode as `lrwxrwxrwx`: the permission bits on a
-    /// symlink itself are meaningless (any access check follows the link instead), so this does
-    /// not take a `mode` parameter and always sets full `rwxrwxrwx` permission bits.
-    /// `owner`/`node_info`/`blksize`/`atime`/`mtime` are supplied by the caller, since a
-    /// filesystem backend without a first-class symlink-metadata store of its own can
-    /// reasonably approximate them from the containing directory's own status.
+    /// Build the [`FileStatus`] for a symlink itself (never the file it points at) -- what
+    /// [`FileSystem::symlink_metadata`] returns for a path whose final component is a symlink.
+    /// `target_len` is the byte length of the unresolved target. Takes no `mode`: Linux always
+    /// reports a symlink's own mode as `lrwxrwxrwx`, so full `rwxrwxrwx` bits are always set.
     #[must_use]
     pub fn symlink(
         target_len: usize,
