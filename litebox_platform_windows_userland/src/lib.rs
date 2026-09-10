@@ -2257,64 +2257,13 @@ unsafe extern "system" fn vectored_exception_handler(
                 use std::io::Write;
                 let _ = std::io::stderr().flush();
             }
-            // AGENTS.md pass 246: a WER minidump captured for the FIRST TIME in this whole
-            // investigation proved that `EXCEPTION_CONTINUE_SEARCH` here is not merely
-            // unproductive for an `is_in_guest` fault -- it is actively harmful.
-            // `switch_to_guest`'s own trampoline (`switch_to_guest_sysret`) enters guest code via
-            // a bare `jmp`, never a `call`, deliberately adopting the guest's own `rsp` with no
-            // host stack frame set up at all -- so there is no legitimate call chain for Windows'
-            // SEH machinery to walk back through once it takes over. The captured dump showed
-            // `ntdll!RtlVirtualUnwind2` itself faulting while attempting exactly this: reading a
-            // stale `UWOP_ALLOC_SMALL`-accumulated stack-offset value out of its own internal
-            // unwind-context struct and dereferencing it as a pointer, because no real
-            // `RUNTIME_FUNCTION`/`UNWIND_INFO` entry describes this jump-based guest frame.
-            // `EXCEPTION_CONTINUE_SEARCH` was previously reached unconditionally on the very
-            // FIRST unrecovered AV (before the sibling repeat-count circuit breaker above ever
-            // has a chance to intervene, since that only fires from the 65th identical repeat
-            // onward) -- meaning this exact ntdll corruption was hit on every single genuine
-            // first-chance unrecovered guest fault, not just a rare repeated-fault edge case.
-            // Terminate cleanly instead for this specific case: a guest-mode fault with no
-            // recognized exception-table entry is not something Windows' own unwind path can
-            // ever safely process, so handing it onward can only make things worse.
-            //
-            // Track-B investigation (fork-without-exec hang, this session): the ORIGINAL fix
-            // above only covers `is_in_guest == true`, on the reasoning that `switch_to_guest`'s
-            // bare-`jmp` frame is the only one with no legitimate unwind chain. Live evidence
-            // this session (five consecutive deterministic `LITEBOX_PROCESS_FORK=1` repros,
-            // reproduced with NO debugger ever attached to rule out an attach artifact, and
-          // reproduced identically with Windows Error Reporting fully disabled -- both
-            // `HKCU\...\Windows Error Reporting\Disabled` and `DontShowUI` set -- to rule out a
-            // WER-specific hang) proved the identical failure mode also happens for
-            // `is_in_guest == false` (host-mode) faults: this exact `[diag-unrecov-av]` branch
-            // fires with `is_in_guest=false` (confirmed in every capture), falls through
-            // unmodified to `EXCEPTION_CONTINUE_SEARCH` below, and the target thread is
-            // subsequently observed via `Get-Process`/`cdb -pv` (non-invasively, so as not to
-            // itself perturb the state) parked forever at `WaitReason=Suspended,
-            // ThreadState=Wait`, CPU pinned at 0 (a real kernel suspend, not a spin loop --
-            // confirmed by sampling `Process.CPU` twice, three seconds apart, with zero delta),
-            // inside `ntdll.dll` with no other thread in the process ever alive to have called
-            // `SuspendThread` a second time (exhaustively confirmed: `ThreadHandle::interrupt`
-            // and `ctxwatch_arm_other_threads`, this file's only two other `SuspendThread` call
-            // sites, were both instrumented this session behind `LITEBOX_DIAG_INTERRUPT=1` and
-            // NEVER fired during any hang -- ruling out every litebox-owned suspend/resume
-            // pairing as the mechanism). This matches the Windows Application event log's own
-            // record of PRIOR sessions' `LITEBOX_PROCESS_FORK=1` runs on this exact host crashing
-          // with exception code `0xc0000409` (`STATUS_STACK_BUFFER_OVERRUN`, Windows' fast-fail
-            // code) at a fixed `ntdll.dll` offset -- i.e. the same "Windows' own unwind/exception
-            // path cannot safely continue past this fault" hazard the guest-mode fix above
-            // already root-caused, just reachable from host-mode fault sites too (this crate's
-            // own host-mode call chains -- the VEH trampoline's per-depth scratch-stack frames,
-            // `memcpy_fallible`/`write_u32_fallible`-class fallible accessors, the `recover`
-            // fixup's own compiler-generated epilogue resumed via a raw `context.Rip` write with
-            // no corresponding `call`, and the deep, hand-written-assembly `switch_to_guest*`
-            // family generally -- are exactly as unwind-info-hostile as the guest-mode jump this
-            // investigation already fixed). Extend the same clean, deterministic termination to
-            // every unrecovered AV, not just guest-mode ones: an unrecovered fault Windows itself
-            // cannot safely unwind past is equally unsafe to hand onward via
-            // `EXCEPTION_CONTINUE_SEARCH` regardless of which side of the guest/host boundary it
-            // occurred on, and a clean `TerminateProcess` (recoverable by the caller: a fork
-            // parent can retry, a top-level guest run reports a real failure) is strictly better
-            // than an indefinite, silent, zero-CPU hang with no further diagnostic ever possible.
+            // `EXCEPTION_CONTINUE_SEARCH` is actively harmful here, for BOTH guest-mode and
+            // host-mode unrecovered faults: `switch_to_guest`'s bare-`jmp` trampoline (and this
+            // crate's other unwind-info-hostile hand-written-assembly call chains) leave no
+            // legitimate frame for Windows' SEH unwinder to walk, so handing the fault onward
+            // corrupts `ntdll` state rather than recovering. Terminate instead.
+            // See docs/veh-exception-handler-design.md ("Unrecovered access violations now
+            // terminate instead of EXCEPTION_CONTINUE_SEARCH") for the full evidence trail.
             diag_raw_print(
                 b"[diag-unrecov-av-terminate] rip=0x",
                 context_snapshot.Rip as usize,
@@ -2328,27 +2277,14 @@ unsafe extern "system" fn vectored_exception_handler(
             // (rather than a bare `1`) so a future diagnostic can distinguish which of possibly
             // several arm events the watchdog eventually acted on.
             FAULT_TERMINATE_ARMED_TICK.fetch_add(1, Ordering::SeqCst);
-            // Live evidence THIS session: a self-`TerminateProcess(GetCurrentProcess(), ...)`
-            // call made from exactly this position (inside the VEH, on the very thread that is
-            // mid-exception-dispatch for the fault being handled) does not reliably terminate
-            // the process on this host/Windows build -- confirmed directly: the diagnostic print
-            // immediately above this call DID appear in the captured log (so this code path was
-            // genuinely reached and ran), yet the process was independently observed via
-            // `Get-Process` 30+ seconds later still alive, its sole thread still parked at
-            // `WaitReason=Suspended`/`HasExited=False`. An EXTERNAL `Stop-Process -Force` (a
-            // `TerminateProcess` call from a DIFFERENT process) against the same PID succeeded
-            // immediately with no error. This is consistent with a documented Windows caveat: a
-            // thread already inside kernel-mode exception/debug-port delivery for its OWN fault
-            // cannot always complete a self-`TerminateProcess` of that same process, because the
-            // call itself can block behind the very kernel-mode exception protocol this code is
-            // trying to escape. `RaiseFailFastException` is Windows' purpose-built "abandon
-            // immediately, no unwind, no SEH second-chance dispatch" primitive (the same
-            // mechanism `__fastfail`/heap-corruption detection uses) -- unlike
-            // `EXCEPTION_CONTINUE_SEARCH` (this function's old default returned to the SAME
-            // exception dispatcher already failing to make progress) or `TerminateProcess`
-            // (blocked behind that same dispatcher per the evidence above), a fail-fast exception
-            // is delivered through an entirely separate, always-fatal kernel path that does not
-            // wait on the ordinary exception port protocol.
+            // A self-`TerminateProcess` from inside the VEH was confirmed NOT to reliably
+            // terminate the process on this host (the thread can be stuck behind the same
+            // kernel-mode exception protocol it's trying to escape). `RaiseFailFastException`
+            // uses a separate, always-fatal kernel path instead. See
+            // docs/veh-exception-handler-design.md ("Why RaiseFailFastException, not a
+            // self-TerminateProcess") for the live evidence.
+            // SAFETY: passes real records for an exception already being handled by this VEH;
+            // never returns.
             unsafe {
                 windows_sys::Win32::System::Diagnostics::Debug::RaiseFailFastException(
                     exception_record as *const EXCEPTION_RECORD,
@@ -2361,70 +2297,20 @@ unsafe extern "system" fn vectored_exception_handler(
         }
     }
 
-    // Windows clears this thread's FS_BASE MSR back to 0 on its own initiative, apparently as
-    // part of ordinary scheduling (observed to recur many times per second under load, e.g.
-    // during `apk add nodejs`'s guest dynamic-linking/TLS-heavy startup). A guest `mov %fs:...`
-    // hit while FS_BASE is 0 reads/writes through linear address `0 + offset` instead of the
-    // real TLS block, which is (almost always) unmapped and therefore an ordinary `#PF` here,
-    // reported as `EXCEPTION_ACCESS_VIOLATION` -- indistinguishable, without this check, from a
-    // genuine guest segfault.
-    //
-    // Detect and repair this *before* any other exception-code-specific handling (in particular
-    // before the `EXCEPTION_SINGLE_STEP` triage below, which hands off to
-    // `fork_verify::on_single_step` -- that function has no notion of FS_BASE at all, and running
-    // its source/destination-range and instruction-decode logic against a thread whose FS_BASE is
-    // transiently wrong would either misclassify the trap or simply waste the step; simplest and
-    // safest is to make sure FS_BASE is never wrong by the time exception-code-specific logic
-    // runs, for every exception code, not just the ones this repro happens to hit).
-    //
-    // Repair happens in place, without ever leaving guest mode: just `wrfsbase` the stored value
-    // back and retry the exact same faulting instruction via `EXCEPTION_CONTINUE_EXECUTION`. This
-    // used to instead route through `interrupt_callback` (`set_context_to_interrupt_callback`),
-    // which is far more expensive -- it leaves guest mode, saves the full guest context, and takes
-    // a `NtContinue` round-trip through host Rust code before `switch_to_guest` gets back around
-    // to restoring FS_BASE and re-entering the guest. Under the same scheduler pressure that
-    // causes FS_BASE to be cleared in the first place, that round-trip reliably took long enough
-    // for FS_BASE to be cleared *again* before the guest completed even one more instruction,
-    // producing an unbounded livelock: thousands of these access violations in a row, forward
-    // progress permanently stalled, observed in practice as the reported indefinite hang (see the
-    // `LITEBOX_VEH_TRACE=1` diagnostic traces this fix was root-caused from -- runs that hung
-    // showed exactly this pattern: repeated `EXCEPTION_ACCESS_VIOLATION` with `rdfsbase() == 0` at
-    // a different `rip` each time, `is_verifying == false`, never reaching a third occurrence of
-    // the same instruction because the guest one instruction at a time). Fixing FS_BASE directly
-    // in the handler removes every one of those host round-trip's kernel transitions from the
-    // recovery path, so recovery is a single MSR write plus a `CONTINUE_EXECUTION` return -- no
-    // syscalls, no context save, no scheduling-visible event of its own to compound the problem.
-    //
-    // This does forgo the old comment's stated rationale for going through `interrupt_callback`
-    // ("avoid missing a real interrupt that arrives while resuming the guest"): a pending
-    // interrupt is not inspected here before resuming. This is safe: interrupt/signal delivery to
-    // a running guest is already only ever "eventually", never guaranteed at a specific
-    // instruction boundary (the same is true on real hardware), and `ThreadHandle::interrupt`
-    // does not depend on this path at all -- it suspends the target thread directly and rewrites
-    // its context itself, which still works correctly regardless of whether this handler happens
-    // to run in between. A real interrupt is caught at the next point that already checks for one
-    // (the next syscall, or the next time this same thread is suspended-and-inspected by
-    // `ThreadHandle::interrupt`), exactly as it would be if this exact access violation had not
-    // happened to occur at all.
+    // Windows clears this thread's FS_BASE MSR back to 0 on its own initiative as part of
+    // ordinary scheduling; an in-guest `mov %fs:...` then faults indistinguishably from a real
+    // guest segfault. Detect and repair in place (no guest-mode exit) before any other
+    // exception-code-specific handling. See docs/veh-exception-handler-design.md
+    // ("FS_BASE-reset repair") for why this must happen here rather than via
+    // `interrupt_callback`, and for the two guards below.
     if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
         && unsafe { litebox_common_linux::rdfsbase() } == 0
-        // See the matching guard in the `!is_in_guest` branch above: `Rip == 0` means this is not
-        // a genuine FS_BASE-reset fault at a real instruction, and blindly repairing-and-resuming
-        // would just re-fault at address 0 forever. Fall through to the normal exception path
-        // below (single-step triage / `exception_callback`) instead of looping silently.
-        //
-        // TORN-READ FIX (track-b sweep): `context_snapshot.Rip`, not a live re-read of
-        // `context.Rip` -- mirrors the identical fix just above in the `!is_in_guest` (host-mode)
-        // branch. This is a real control-flow gate for the guest-mode FS_BASE repair, not a
-        // diagnostic.
+        // `Rip == 0` => not a real instruction; don't loop re-faulting at address 0. Uses the
+        // snapshot, not a live re-read, to avoid a torn read (mirrors the !is_in_guest branch).
         && context_snapshot.Rip != 0
-        // Same guard as the host-mode repair above -- see
-        // `faulting_instruction_has_fs_override`'s doc comment. Without this, a real guest fault
-        // (e.g. a null-pointer dereference with no FS-segment prefix) coinciding with
-        // `rdfsbase() == 0` gets misdiagnosed as FS_BASE-reset and retried forever; confirmed live
-        // via a `process.title = <string>` repro under Node.js, where a plain `mov rdx,
-        // [rdx+0x788]` (no FS override) with `rdx` already null was being "repaired" and retried
-        // unboundedly on a background guest thread.
+        // Without this, a guest fault with no FS-segment prefix coinciding with
+        // `rdfsbase() == 0` gets misdiagnosed as FS_BASE-reset and retried forever (confirmed
+        // live, Node.js `process.title = <string>`). See the doc section above.
         && faulting_instruction_has_fs_override(context_snapshot.Rip.trunc())
     {
         let saved = WindowsUserland::get_thread_fs_base();
@@ -2456,28 +2342,11 @@ unsafe extern "system" fn vectored_exception_handler(
     // the parent's address space, in which case we fall through to the normal exception path with
     // a synthesized access violation so the child dies exactly as it would on real hardware.
     //
-    // FS_BASE-reset repair applies here too, and matters *far* more here than on the plain
-    // (non-single-stepped) guest-execution path above: single-stepping means every guest
-    // instruction is its own kernel round-trip through this handler, which is exactly the kind of
-    // scheduling-visible event the FS_BASE-reset behavior above is already keyed off of ("observed
-    // to recur many times per second under load") -- so a `fork()` child under verification hits
-    // the reset on very nearly every single instruction (confirmed via `LITEBOX_VEH_TRACE=1`:
-    // >99% of `on_single_step` calls during a real `apk add nodejs` run observed `rdfsbase() ==
-    // 0`), not merely "many times per second". Before this fix, this path had no FS_BASE repair of
-    // its own: `on_single_step` only *logged* the corruption and proceeded with its rip/instruction
-    // classification regardless (which is safe -- it never reads `%fs:`-relative memory itself,
-    // only CPU registers and instruction bytes at `rip`), then re-armed `TF` and resumed the
-    // *original* guest instruction with FS_BASE still zero. If that instruction touched `%fs:`, it
-    // then took a *second* trap -- `EXCEPTION_ACCESS_VIOLATION` this time -- which the repair above
-    // fixes and retries via `CONTINUE_EXECUTION`, but with `TF` still armed the whole time, so the
-    // very next instruction immediately single-steps again, and if FS_BASE has already been reset
-    // yet again by then (observed to be the common case), the two traps alternate in an extremely
-    // tight loop -- thousands of round trips to make a handful of instructions of real forward
-    // progress, exactly the "quadratic-ish" slowdown reported as an apparent hang. Repairing FS_BASE
-    // in place here, before `on_single_step` runs, means the guest instruction that resumes after
-    // this step always sees correct FS_BASE the first time, so it never needs that second
-    // access-violation-and-retry round trip at all: one MSR rewrite replaces two full VEH
-    // dispatches.
+    // FS_BASE-reset repair applies here too, and matters far more: single-stepping makes every
+    // guest instruction its own kernel round-trip through this handler, so a fork() child under
+    // verification hits the reset on very nearly every instruction (>99% measured). Repairing
+    // before `on_single_step` runs avoids a second access-violation-and-retry round trip per
+    // step. See docs/veh-exception-handler-design.md ("Single-step path needs the same repair").
     if unsafe { litebox_common_linux::rdfsbase() } == 0 {
         let saved = WindowsUserland::get_thread_fs_base();
         if saved != 0 {
@@ -2485,32 +2354,15 @@ unsafe extern "system" fn vectored_exception_handler(
         }
     }
 
-    // A stale, untranslated source-range `rip` (the exact class of value case (1) in
-    // `fork_verify::on_single_step` already exists to heal -- see that function's own doc
-    // comment) does not always announce itself as `EXCEPTION_SINGLE_STEP`: whether Windows
-    // delivers a clean `#DB` trap (the page the stale address names is still resident, so the
-    // CPU can fetch and execute it under `TF` before this handler ever sees it) or a raw
-    // `EXCEPTION_ACCESS_VIOLATION` (the page is not resident at all) is incidental paging state
-    // at that instant, not something the single-step-only dispatch below distinguishes.
-    // Confirmed live (litebox-xfce-1, dbus-daemon fork-child investigation,
-    // `LITEBOX_DIAG_FATALDUMP=1`/`LITEBOX_VEH_TRACE=1`): a thread single-stepping cleanly under
-    // verification set `rip` to a source-range value via an ordinary instruction, and the VERY
-    // NEXT event on that thread was a raw `EXCEPTION_ACCESS_VIOLATION` with the fault address
-    // equal to that same `rip` -- an execute fault reaching this handler entirely outside the
-    // `EXCEPTION_SINGLE_STEP` branch below, so `fork_verify::on_single_step`'s case (1) never
-    // ran at all. This mirrors case (1) exactly (translate via the same relocation map already
-    // proven correct for every other register at `fork()` time, resume at the translated
-    // address) rather than reimplementing it: only fires for a genuinely `is_verifying` thread,
-    // only on an EXECUTE-shaped guest-mode AV whose fault address is a real, exact
-    // `is_in_source` membership hit (never a coincidental numeric overlap), and never touches
-    // any other register or memory -- the narrowest fix this specific gap admits, matching the
-    // same bounded, deterministic shape every safe fix in `fork_verify.rs` itself already uses.
-    // Re-entrant blocking acquisition -- see `lock_fork_verify_heal_reentrant` for why the
-    // previous bounded-spin `try_lock` was wrong: its give-up path healed UNSERIALIZED, which is
-    // exactly the hazard this lock exists to prevent, in exactly the contended case where it
-    // matters. Held across BOTH the AV-path healers below and the `on_single_step` call further
-    // down (they are sequential alternatives for the same fault, never nested) so no two threads'
-    // healing sequences for two different faults ever interleave.
+    // A stale, untranslated source-range `rip` (fork_verify::on_single_step's case (1)) can
+    // arrive as a raw EXECUTE access violation instead of EXCEPTION_SINGLE_STEP, depending on
+    // incidental paging state -- confirmed live (litebox-xfce-1, dbus-daemon fork child). This
+    // mirrors case (1)'s translate-and-resume fix; see docs/veh-exception-handler-design.md
+    // ("A stale source-range rip can arrive as a raw AV").
+    // The following lock must be a re-entrant BLOCKING acquisition, not a bounded-spin try_lock
+    // (an earlier version's give-up path healed unserialized) -- held across both the AV-path
+    // healers below and the on_single_step call further down so two threads' healing sequences
+    // never interleave. See docs/veh-exception-handler-design.md ("The re-entrant heal lock").
     let _fork_verify_heal_guard = lock_fork_verify_heal_reentrant();
 
     if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
