@@ -150,14 +150,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     FileStatusError::PathError(PathError::MissingComponent)
                     | FileStatusError::ClosedFd,
                 ) => unreachable!(),
-                Err(FileStatusError::PathError(PathError::ComponentNotADirectory)) => {
-                    unimplemented!()
-                }
                 Err(FileStatusError::PathError(PathError::InvalidPathname)) => {
                     unreachable!("we just confirmed valid path")
                 }
                 Err(FileStatusError::PathError(
-                    e @ (PathError::NoSearchPerms { .. } | PathError::TooManySymlinkHops),
+                    e @ (PathError::ComponentNotADirectory
+                    | PathError::NoSearchPerms { .. }
+                    | PathError::TooManySymlinkHops),
                 )) => {
                     Err(e)?;
                 }
@@ -1013,7 +1012,9 @@ impl<
         drop(entry);
         match self.migrate_file_up(&path, true) {
             Ok(()) => {}
-            Err(MigrationError::NoReadPerms) => unimplemented!(),
+            // Not `NotForWriting`: that is this function's "migrate through an outer fs's upper
+            // instead" signal, and an outer fs retrying would fail reading the same lower copy.
+            Err(MigrationError::NoReadPerms) => return Err(WriteError::Io),
             Err(MigrationError::NotAFile) => return Err(WriteError::NotAFile),
             Err(MigrationError::Io) => return Err(WriteError::Io),
             Err(MigrationError::PathError(_e)) => unreachable!(),
