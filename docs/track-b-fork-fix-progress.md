@@ -1,5 +1,53 @@
 # Track B fork-without-exec fix: running progress log
 
+## 2026-09-10 (later still): full webtop boot under the manifest-skip fix -- a real 3.4-3.9x
+## per-fork speedup confirmed, but the full stack still stalls for a DIFFERENT, not-yet-isolated
+## reason; writable-layer growth ruled out cleanly as that reason
+
+### Re-ran the full webtop stack (not just the isolated bash repro) with the fix active
+
+With `LITEBOX_PROCESS_FORK=1` and the manifest-skip fix from the entry below both active, booted
+the real `webtop_stack.sh` (nginx + dbus + `startwm.sh` + selkies) against the full
+`linuxserver/webtop:debian-xfce` image. Confirmed the fix IS taking effect for this run too (every
+fork child's log shows `Using pre-resolved layer digests (17 layer(s), no manifest fetch)`, and
+individual forks completed cleanly -- `run_thread returned`, writable layer exported, clean exit,
+no `fatal signal`). But the run still stalled badly: after 15 real minutes, only ~13,000 log lines
+and not even the FIRST `[s]` stage marker (`NGINX_CONFIGURED`, which needs only ~7 sequential
+forks -- `mkdir`, `cp`, four `sed -i`, `ln -sf` -- to complete its own setup). Killed the run.
+
+### Hypothesis tested and RULED OUT: a growing writable layer is not the cause
+
+Plausible theory: unlike the isolated `echo hi` repro (which never touches the filesystem), the
+real stack's early setup actively writes files (nginx config, directories), and each subsequent
+fork must export/import a WRITABLE layer that grows with everything written so far -- maybe THAT
+cost compounds badly. Tested directly: a new isolated repro (`.wfgy/writetest_seed.tar`) forks 8
+times, each fork writing a real 20MB file before the next fork starts. Result, using the new
+`LITEBOX_DIAG_FORK_TIMING=1` writable-layer-size marker added this session: the writable layer
+import cost DOES grow with size, but only modestly and predictably -- `69ms` at `9KB` up to `235ms`
+at `167MB` (roughly 1.4ms per additional MB) -- and all 8 forks, each writing 20MB, completed
+cleanly in well under the 60s timeout. **This rules out writable-layer growth as the explanation**
+for the full stack's 15-minute stall on just its first ~7 forks, which never even reach 1MB of
+writable content between them.
+
+### What's left open
+
+The full webtop stack's specific slowness past the manifest-skip fix is confirmed REAL (measured,
+not the earlier "fork_verify pathological loop" guess, and now also not writable-layer growth) but
+its exact cause is NOT YET ISOLATED. Candidates not yet tested individually: (a) the base rootfs
+TarRo merge (`default_fs_multi_layer`, measured at 400-570ms per fork in the isolated write-test
+above) scaling worse against the FULL webtop image's real file count than either isolated repro
+exercises (both repros use the same 17 cached layers, so this seems unlikely to differ, but was not
+directly re-measured against the full stack specifically); (b) something specific to one of the
+early setup commands themselves (e.g. `openssl req -x509` RSA key generation inside the nginx
+supervisor's first iteration, or a `cp`/`sed` touching something unexpectedly large) rather than
+the fork mechanism itself; (c) an accumulation of MANY MORE forks than either isolated repro
+exercises (the real script's nginx supervisor alone can retry up to 30 times) combined with
+per-fork costs each individually reasonable. (b) and (c) were not measured this session. The
+`LITEBOX_DIAG_FORK_TIMING=1` instrumentation added this session (gated, zero-cost when unset,
+left in place) is the direct tool for isolating whichever of these it turns out to be -- point it
+at the real stack script next, not another isolated repro, since isolated repros have so far
+each failed to reproduce this specific slowdown.
+
 ## 2026-09-10 (later still): a real, verified fix for part of the per-fork overhead -- plus a
 ## near-mistake in measuring it, caught before being written down wrong
 
