@@ -275,38 +275,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
                     "diag-guest-exception: NO mapping overlaps cr2 (genuinely unmapped)"
                 );
             }
-            // Live byte-dump diagnostic (see docs/webtop-debian-selkies-2026-09-06.md,
-            // "the Xvfb pid-1 SIGSEGV is NOT RELRO" section) -- a prior session's attempt at this
-            // via `RawConstPointer::to_owned_slice`/`memcpy_fallible`'s fault-catching path hung
-            // the whole runner, so this used a raw, unchecked `core::slice::from_raw_parts`
-            // dereference instead, on the reasoning that `cr2_mapped` (the mapping walk just
-            // above) already "independently confirmed real guest memory backs this address".
-            //
-            // That reasoning is exactly backwards, and is now CONFIRMED live (2026-09-09,
-            // `docs/track-b-fork-fix-progress.md`'s "symbolized the crash" entries): `cr2_mapped`
-            // reflects litebox's OWN VMA tracking, which can genuinely diverge from real Windows
-            // memory (a real page-fault with `error_code=0x4`/Present-bit-clear was captured at a
-            // `cr2` this exact tracking believed was mapped -- the underlying bug this whole
-            // investigation is chasing). This diagnostic's own raw dereference then faults AGAIN
-            // on exactly that same, genuinely-unbacked address -- but this time as a SECOND,
-            // host-mode (`is_in_guest=false`) access violation with no exception-table entry,
-            // which is unrecoverable and kills the whole runner. Confirmed via
-            // `advisor/probes/symbolize_litebox_crash.py`: the crash resolves to
-            // `<i8 as core::fmt::LowerHex>::fmt`, reached via this dump's own `{:02x?}` format.
-            //
-            // Net effect: a debug-only diagnostic was turning an ORDINARY, gracefully-delivered
-            // guest `SIGSEGV` (which the guest's own userspace handler is perfectly able to catch
-            // and report, confirmed live without this diagnostic enabled) into an unrecoverable
-            // HOST crash, specifically in the exact scenario -- a tracked-but-not-really-backed
-            // page -- this diagnostic exists to help debug. Removed rather than re-attempting the
-            // fault-tolerant path that hung before (that reentrancy question is still open, see
-            // the doc entry above); this diagnostic is not load-bearing for guest correctness,
-            // only for a developer's follow-up capture, so it must never be able to crash the
-            // host trying to help debug a crash. `rip_mapped`'s own dump just below is NOT
-            // touched by this fix: unlike `cr2` (the address that just faulted), `rip`'s
-            // fault-free execution up to this exact instruction is a real, live guarantee that
-            // page is genuinely mapped and executable, not an assumption resting on
-            // possibly-stale tracking.
+            // Deliberately no raw byte-dump diagnostic of `*cr2` here: `cr2_mapped` (the mapping
+            // walk above) reflects litebox's own VMA tracking, which can diverge from real
+            // Windows memory, so a raw dereference "confirmed safe" by it can itself take a
+            // second, unrecoverable host-mode fault -- this previously turned an ordinary,
+            // gracefully-delivered guest SIGSEGV into a host crash. Do not re-add one without
+            // resolving that gap; see docs/track-b-fork-fix-progress.md's 2026-09-09 "symbolized
+            // the crash" entries for the full trace. (`rip_mapped`'s dump below is NOT subject to
+            // this: `rip`'s fault-free execution up to this instruction is a live guarantee it's
+            // genuinely mapped, not an assumption resting on possibly-stale tracking.)
             let rip_mapped = self
                 .process()
                 .0
