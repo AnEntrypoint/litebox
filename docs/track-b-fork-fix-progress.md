@@ -52,18 +52,47 @@ with zero change to the thread-based path.
   print, same as before the fix, but this time the script keeps going instead of hanging) and
   into its `curl` self-test retry loop (waits for nginx to actually start serving on :3000).
 
-### New, distinct stall found immediately after (NOT yet investigated)
+### New, distinct stall found immediately after -- narrowed, NOT YET root-caused
 
 The self-test loop (`code=$(curl -s -o /dev/null -m 3 -w "%{http_code}" http://127.0.0.1:3000/
-...)`, up to 20 retries, 1s apart) got through at least one `curl` invocation (logged child exit
-status `0xc0de0007` -- `7` is curl's own "failed to connect" exit code, plausible this early
-since nginx itself may not be listening yet) and then stalled again: zero log growth for 60+s,
-same blocked-not-spinning CPU signature (near-zero but nonzero growth) as every hang this session.
-This is a DIFFERENT pattern from the one just fixed -- a command-substitution wait is a simple
-direct wait, not the `sigsuspend`-based idiom -- so it is not obviously the same bug, and might
-instead be in curl's own networking path (litebox's virtual network stack) rather than fork/wait
-at all. Not yet isolated into its own minimal repro or debug-traced; left for a follow-up session
-rather than guessed at further in this one.
+...)`, up to 20 retries, 1s apart) stalls: zero log growth for 100+s at `LITEBOX_LOG=warn`, same
+blocked-not-spinning CPU signature as every hang this session.
+
+Two follow-up checks so far narrow it, but do not close it:
+
+1. **An isolated repro of JUST this curl-retry-loop pattern (no nginx, nothing else running
+   concurrently) does NOT hang** -- 5 iterations complete cleanly, each `RC=7` (curl's own
+   "failed to connect", correct since nothing is listening). So the bug is not in curl's
+   networking path / litebox's virtual network stack in general, and not in command-substitution
+   waits in general.
+2. **A combined repro (the real nginx supervisor loop + the curl self-test loop, running
+   concurrently, no Xvfb/dbus/anything else) also does NOT hang** -- completes in ~55s (slower,
+   consistent with real concurrent-fork overhead, not a hang).
+3. **A full `LITEBOX_LOG=litebox_shim_linux=debug` capture of the REAL script DOES still stall**
+   at the same point, but the 949K-line capture shows the stall is more subtle than "nothing is
+   happening": nginx's own cross-process child (confirmed via its `execve path=/usr/sbin/nginx`
+   trace) is still actively loading its shared libraries via the known-slow 4KB-`memcpy`-per-read
+   fallback path (`windows-cow-mmap-unimplemented-forces-4kb-memcpy-per-exec`, already profiled
+   elsewhere in this project -- nginx links far more shared libraries than the `busybox`/`sh`
+   binaries that profile was taken against) when the capture stops growing, and the one `curl`
+   invocation visible in the capture (`tid=34440`) exits CLEANLY via a complete `exit_group`/
+   `prepare_for_exit` sequence -- it is not stuck itself. No second `curl` invocation, and no
+   `sys_wait4`/`sys_waitid` call consuming that exit, is visible anywhere after it in the capture.
+
+That last point is the open lead: either (a) the parent script's own wait for THIS specific
+command-substitution child has a gap the sigsuspend-based fix (commit `060ccc3`) doesn't cover --
+plausible since a command substitution's wait is usually a direct, simple `waitpid`, a different
+code path from the `sigsuspend`/`pause` idiom that bug was about -- or (b) nginx itself is
+genuinely still mid-startup (legitimately slow, not hung) and the apparent 100+s stall at
+`LITEBOX_LOG=warn` would resolve given more real wall-clock time, which was not tested past ~110s.
+Not yet distinguished; the 949K-line debug capture this session produced is too large and
+too cross-process-clock-confusing (each fork child's own clock restarts near zero, interleaving
+non-monotonically with its siblings' and the parent's timestamps in the same file) to push further
+productively in the same pass that found it -- a follow-up needs either a MUCH narrower, purpose-
+built repro (a fake `nginx` that forks a plain `sleep 5 &` placeholder, so the next `wait4` for a
+command-substitution child is reached in well under a second instead of minutes into a real
+startup) or a longer, patient wall-clock observation of the real script with no debug tracing at
+all, to settle (a) vs (b) before writing any more code against this.
 
 ## 2026-09-10 (latest): VirtualQuery-per-page caching fix (~40-60x per-fork speedup, committed
 ## `ce5648f`) -- then a NEW, real hang surfaced past `NGINX_CONFIGURED` that this fix exposed
