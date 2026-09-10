@@ -3569,6 +3569,15 @@ fn spawn_suspended(
         inherit_handles = 1;
     }
 
+    // `CREATE_NO_WINDOW`: every caller of this function redirects the child's stdio itself
+    // (`want_stdout_pipe`/`want_stdin_pipe`'s pipes, or `inherit_stdio`'s inherited handles) --
+    // there is never a case where this child needs its OWN visible console. Without this flag,
+    // Windows allocates a fresh console window for each spawn regardless of stdio redirection
+    // (redirecting the streams and suppressing the window are independent knobs), which is
+    // exactly what made every `LITEBOX_PROCESS_FORK=1` child (nginx, curl, mkdir, sed, ... --
+    // every one of this session's dozens of test runs) flash a new terminal window on screen.
+    // Mirrors the fault-watchdog spawn's own `CREATE_NO_WINDOW` use elsewhere in this file.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let ok = unsafe {
         CreateProcessW(
             core::ptr::null(),
@@ -3576,7 +3585,7 @@ fn spawn_suspended(
             core::ptr::null(),
             core::ptr::null(),
             inherit_handles,
-            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
             env_block.as_mut_ptr().cast(),
             core::ptr::null(),
             &raw const startup_info,
