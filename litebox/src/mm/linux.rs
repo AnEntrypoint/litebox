@@ -1411,51 +1411,14 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .map(|(r, vma)| (r.clone(), *vma))
             .collect();
 
-        // Non-shared regions must be relocated in COHERENT GROUPS, not independently: real guest
-        // code (any dynamically-linked or PIE binary, which is the overwhelming majority) uses
-        // RIP-relative addressing across ELF segments -- e.g. a `call *offset(%rip)` in `.text`
-        // reading a function pointer out of `.got`, which are always mapped as SEPARATE regions
-        // (one per `PT_LOAD` segment / `mmap` call) but at a FIXED relative distance from each
-        // other, guaranteed by the original single coherent virtual address layout the linker
-        // computed. Relocating each region independently (as this function used to do, in the
-        // same style still used below for `PROT_NONE` guard pages and `VM_SHARED` regions, where
-        // no such cross-region relationship exists) would let two regions of the SAME loaded
-        // object land at DIFFERENT relative offsets in the child, silently corrupting every
-        // RIP-relative reference that crosses a region boundary -- observed as a NULL-pointer
-        // crash jumping through a GOT-style table whose entries read back wrong after `fork()`.
-        //
-        // The fix: partition regions into contiguity-based groups (adjacent-or-near regions,
-        // i.e. the segments of one loaded ELF image, separated by no more than
-        // `MAX_INTRA_GROUP_GAP`) rather than one single span covering the WHOLE address space --
-        // a single global span would also force the guest's stack (placed far from the ELF's own
-        // low-address segments, with no RIP-relative relationship to them at all) into the same
-        // reservation, requiring an absurdly large, likely-unsatisfiable allocation. Each group is
-        // reserved as ONE contiguous span at a single freshly-chosen base address, then every
-        // region within it is placed at `group_new_base + (region.start - group_min_start)` --
-        // preserving every pairwise relative offset within the group exactly, the same guarantee
-        // real Linux `fork()` gets for free by giving the child the SAME virtual addresses as the
-        // parent (see this function's "Known deviation" doc section on why that specific
-        // guarantee isn't available here). Regions in DIFFERENT groups (e.g. the stack vs. the
-        // main ELF image) have no such relationship and may land anywhere independently.
-        // 16 * ALIGN (64KiB) was too small for a real heap allocator's own layout: musl mallocng
-        // grows its heap via many separate `mmap()` calls over a process's lifetime (each malloc
-        // "group" plus its own lazily-allocated `meta_area`, from `alloc_meta()` in
-        // malloc/mallocng/meta.c), and consecutive calls are NOT guaranteed to land within 64KiB
-        // of each other once the heap has grown -- multi-MiB gaps between a group and its own
-        // meta_area are common in practice. When a gap split them into two independently-placed
-        // groups, any pointer arithmetic between them (e.g. mallocng's `get_meta()` computing a
-        // meta_area location relative to its group) computed a WRONG address in the child --
-        // landing on unrelated, legitimately-zeroed memory that read back exactly like mallocng's
-        // own real group-retirement poison pattern (`g->mem->meta = 0` in `free_group()`),
-        // matching this project's oldest, previously-unsolved cross-session mallocng NULL-deref
-        // crash. 16 MiB comfortably covers realistic single-process heap growth while still
-        // leaving the guest stack (placed far from the heap, with no RIP-relative relationship to
-        // it) in its own separate group.
-        // 16 MiB (the original constant, sized for musl's mallocng group/meta_area spacing
-        // reasoned about above) was too small for a glibc guest (Debian): per-thread arenas each
-        // reserve 64 MiB of address space, so inter-arena gaps routinely exceed 16 MiB by design,
-        // splitting them into separately-placed groups and breaking exactly the cross-region
-        // pointer arithmetic this grouping exists to preserve. Raised to 64 MiB to cover that.
+        // Non-shared regions must be relocated in COHERENT GROUPS (adjacent-or-near regions kept
+        // at the same relative offsets), not independently -- otherwise RIP-relative references
+        // that cross a region boundary (e.g. `.text` -> `.got`) silently corrupt in the child.
+        // `max_intra_group_gap` is a gap-distance heuristic, currently sized for glibc's 64MiB
+        // per-thread arenas (musl mallocng needed only 16MiB; this is a known allocator-specific
+        // fragility, not a permanent fix). See docs/fork-region-grouping-design.md for the full
+        // bug history, both allocators' measured gap sizes, and the provenance-based replacement
+        // this heuristic is meant to be superseded by.
         let max_intra_group_gap: usize = 64 * 1024 * 1024;
         // Each entry's `end` is the region's RESERVED extent, not its VMA extent: a mapping
         // created with `CreatePagesFlags::ENSURE_SPACE_AFTER` holds `reserved_extra` further
