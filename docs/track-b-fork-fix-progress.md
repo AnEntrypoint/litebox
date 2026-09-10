@@ -1,5 +1,94 @@
 # Track B fork-without-exec fix: running progress log
 
+## 2026-09-10 (later still, after the correction below): a GENUINE cross-process fork run of the
+## isolated bash repro is correctness-sound (zero corruption) but costs ~3.5-5s of pure overhead
+## PER FORK -- a tractable performance/caching problem, not a memory-safety one, and a more
+## promising path to a working desktop than fixing the thread-based path's corruption
+
+### What this is, and why it's different from the entry below
+
+The correction below established that the prior session's "cross-process fork also corrupts"
+claim was wrong because the repro never actually took the cross-process path (`LITEBOX_PROCESS_FORK`
+was unset). This entry re-runs the SAME isolated repro with `LITEBOX_PROCESS_FORK=1` actually set,
+confirmed genuinely taken this time via the same verification the correction used: 28
+`[process_fork_diag] task-resume-probe` lines present, one real `winpid=` per fork.
+
+### Result: zero corruption, command substitution actually works
+
+```
+iter=0 got=hi
+iter=1 got=hi
+iter=2 got=hi
+iter=3 got=hi
+iter=4 got=            <- this one's OWN fork hadn't finished when the outer timeout killed the run
+```
+**Zero `fatal signal` lines** across 4 complete fork cycles (vs. 10/10 crashing under the
+thread-based default in every prior repro this whole investigation has run). `x=$(echo hi)`
+correctly captured `hi` into `x` four times in a row -- cross-process fork, when it actually
+executes, does not exhibit the ADVISORY-001 3N tcache corruption at all. This is consistent with
+that theory's own mechanism: a cross-process child's memory is placed at the EXACT source address
+(no relocation), so there is no stale-pointer-surviving-relocation hazard for it to hit in the
+first place.
+
+### The real cost: ~3.5-5 seconds of overhead PER FORK, even with a fully warm cache
+
+Fork spawn timestamps across the run: `6.664s, 10.157s, 14.987s, 20.435s, 25.987s, 30.228s` --
+roughly 3.5-5.5 seconds between consecutive forks, for a guest program that does almost nothing
+(`echo hi`). Breaking down what happens in that window (all from real log timestamps, one complete
+cycle, `litebox_platform_windows_userland`+`litebox_shim_linux` debug log):
+1. Parent-side spawn is FAST: `try_cross_process_fork entry` to `spawn_cross_process_fork_child:
+   child spawned and resumed successfully` is only ~85ms (group-relocation computation + the
+   real `VirtualAllocEx`/`WriteProcessMemory` page copy for this small process). Not the
+   bottleneck.
+2. The child then: re-derives its OCI rootfs via `pull_layers_in_memory` (all 17 layers report
+   `[cache] HIT` -- no network fetch, no re-rewriting, per `FORK_CHILD_OCI_IMAGE_ENV_VAR`'s own
+   documented design), adopts the parent's exported writable-layer tar, constructs a fresh
+   `GlobalState`, adopts 134 VMA regions, reopens 1 file + 2 pipes, runs the guest to completion,
+   exports its own writable layer, and exits. ALL OF THIS happens inside the ~3.5-5s gap.
+
+This was NOT the originally-designed use case being measured inefficiently -- `FORK_CHILD_OCI_
+IMAGE_ENV_VAR`'s own doc comment explicitly reasons that re-deriving from the warmed on-disk cache
+is cheap ("No image is modified, nothing extra is written"). That reasoning covers NETWORK and
+DISK-WRITE cost correctly, but not the cost actually dominating here: reading and merging ~17
+cached layers (whiteout-aware, multi-GB of the real `debian-xfce` image) back into an in-memory
+`TarRo`, PLUS a full fresh-process cold start of `WindowsUserland::new()` (VEH registration,
+console-resize-watcher thread, NAT gateway `net_worker` spawn, etc. -- see the extensive
+`diag_process_fork_task_resume_probe` comments on why a second `Platform::new()` is dangerous, let
+alone necessary) -- all of it repeated, from scratch, on EVERY SINGLE FORK, even though the result
+is byte-for-byte identical every time within one run.
+
+### Why this matters strategically
+
+A real XFCE boot forks dozens to low hundreds of times (every shell command, every `xprop`/`xset`/
+`dbus-daemon` invocation, every nginx/selkies respawn). At 3.5-5s of pure, avoidable overhead per
+fork, cross-process fork is CORRECT but currently impractical for that workload by roughly two to
+three orders of magnitude of wall-clock time -- which is almost certainly the true explanation for
+this investigation's own earlier-today "15 real minutes produced 7 guest-seconds of progress"
+full-webtop-stack observation under `LITEBOX_PROCESS_FORK=1` (previously attributed to a
+`fork_verify` pathological healing loop; that attribution was never independently confirmed and
+should be re-examined in light of this much simpler, already-measured explanation: dozens of
+forks x ~4s of genuinely-necessary-feeling-but-actually-redundant per-fork rootfs/process
+reconstruction adds up to real minutes on its own, no pathological loop required).
+
+This reframes the path to a working desktop in a materially more optimistic way than this
+document's own prior entries: the blocker may not be the thread-based path's fundamental,
+research-grade memory-safety problem (safe-linked pointers surviving relocation) at all -- it may
+be a conventional, well-scoped CACHING/reuse engineering problem on the cross-process path, which
+is already correctness-sound. Making cross-process fork fast enough to use as the default (by
+caching/reusing the already-merged in-memory rootfs across forks within one run, and/or skipping
+whichever part of `WindowsUserland::new()`'s re-init a forked child genuinely does not need)
+would sidestep ADVISORY-001 3N entirely rather than needing to solve it.
+
+### Why this was not pursued to a fix this session
+
+This is a genuine, multi-part engineering task in its own right -- sharing or caching a multi-GB
+in-memory filesystem structure safely across process boundaries, and auditing exactly which parts
+of a fresh process's `WindowsUserland::new()` a forked child can safely skip -- not a small patch,
+and exactly the kind of work that deserves unhurried, dedicated design rather than a rushed
+same-session attempt bolted onto a correctness fix that had nothing to do with it. Recorded here,
+with real measurements, as the most promising concrete lead this whole investigation has
+produced for actually reaching a working desktop, for whoever picks up ADVISORY-002 next.
+
 ## 2026-09-10 (later still, CORRECTION): the "cross-process fork also corrupts" entry directly
 ## below is WRONG -- the repro never actually took the cross-process path. Retracted here with the
 ## mechanism of the misreading, so the wrong conclusion is not mistaken for settled in the future.

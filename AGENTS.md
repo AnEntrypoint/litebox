@@ -169,28 +169,47 @@ fork site that still risks the `fork_verify` host-side AV (the real architectura
 alpine-mate repro, so the confirmed desktop content is a painted root window, not a full desktop
 session.
 
-## Track B: `D == 0` cross-process fork (architectural fix, inconclusive -- do not fund further without new evidence)
+## Track B: `D == 0` cross-process fork (CORRECTNESS confirmed, blocked on a PERFORMANCE problem, not a memory-safety one)
 
 A genuine `D == 0` (child lands at the SAME addresses as the parent, no relocation, no
-`fork_verify` healing needed at all) cross-process fork already exists in-tree and already works
+`fork_verify` healing needed at all) cross-process fork already exists in-tree
 (`LITEBOX_PROCESS_FORK=1`, `spawn_cross_process_fork_child`) -- see `advisor/ADVISORY-002-d-zero-
 fork.md` for the full feasibility case. It is hard-gated off for every real workload by one check
 (`fd_complexity.beyond_stdio == 0` in `litebox_shim_linux/src/syscalls/process.rs`): any guest
 holding an fd at or above 3 -- i.e. every XFCE component, every X client, every D-Bus participant
--- falls back to the existing thread-based relocating fork and its `fork_verify` healing.
+-- falls back to the existing thread-based relocating fork and its `fork_verify` healing, the
+path that still carries ADVISORY-001 section 3N's tcache-corruption risk.
 
-**Current verdict, per `docs/track-b-fork-fix-progress.md`'s own running log (the designated
-before-funding-anything-else gate for the whole rewrite): do not proceed with the larger Track B
-investment yet.** The gating experiment (Step 0: a `beyond_stdio == 0` glibc fork-without-exec
-repro under `LITEBOX_PROCESS_FORK=1`) remains INCONCLUSIVE across multiple sessions. The
-observed freeze/hang blocking that experiment was root-caused this session to Windows Defender's
-real-time-protection scan-gating delaying the child process's very first scheduled tick after
-`CreateProcess` -- not a litebox memory-safety bug (`PageManager::duplicate`, `copy_one_group`,
-and `memcpy_fallible` were all re-audited specifically hunting for a PEB/loader-list write and
-none was found). The direct next step -- adding a Defender exclusion for the build output
-directory and re-running the repro -- needs administrator rights no session so far has had.
-Whoever picks this up next should read that doc's own "What remains open" section before doing
-anything else; do not re-derive this from scratch.
+**Current verdict, 2026-09-10 (supersedes the "inconclusive, Defender scan-gating" verdict this
+section used to carry): cross-process fork IS correctness-sound.** A minimal, fully isolated
+repro (`bash -c` doing `x=$(echo hi)` in a loop) run with `LITEBOX_PROCESS_FORK=1` genuinely set,
+confirmed actually taking the cross-process path via the `[process_fork_diag] task-resume-probe`
+log trail: **zero corruption across every completed fork**, `$(...)` correctly captured `hi`
+every time -- a stark contrast to the thread-based default's 100% `malloc(): unaligned tcache
+chunk detected` crash rate on the identical repro. This directly confirms the mechanism
+ADVISORY-002 predicts: no relocation, no stale-pointer hazard for `fork_verify` to (mis)heal.
+
+**The real, now-measured blocker is performance, not correctness:** each fork costs roughly
+3.5-5 SECONDS of overhead, even with every OCI layer at `[cache] HIT` (no network, no
+re-rewriting) -- spent re-deriving the full in-memory rootfs (`pull_layers_in_memory` re-reading
+and re-merging ~17 cached layers of a multi-GB image) and cold-starting a fresh
+`WindowsUserland::new()` (VEH registration, console-watcher thread, NAT gateway `net_worker`) on
+every single fork, from scratch, even though the result is byte-identical every time within one
+run. A real XFCE boot forks dozens to low hundreds of times; at this cost that is minutes to
+hours of avoidable overhead -- almost certainly the real explanation for this investigation's own
+earlier "15 real minutes, 7 guest-seconds of progress" full-webtop-stack observation under
+`LITEBOX_PROCESS_FORK=1`, previously (and, in light of this, likely wrongly) attributed to a
+Defender scan-gate or a pathological `fork_verify` healing loop.
+
+**This reframes the whole Track B effort more optimistically than the old verdict did:** the path
+to a working desktop may not require solving the thread-based path's research-grade memory-safety
+problem at all -- it may instead need a conventional, well-scoped caching/reuse engineering pass
+(share or cache the already-merged in-memory rootfs across forks within one run; audit which parts
+of a forked child's `WindowsUserland::new()` re-init are genuinely unnecessary) to make
+cross-process fork fast enough to use as the default. That caching/reuse work is itself
+substantial and was deliberately NOT attempted in the same session that found it -- see
+`docs/track-b-fork-fix-progress.md`'s matching 2026-09-10 entry for the full measurements and
+exact log evidence before starting it.
 
 ## Container images
 
