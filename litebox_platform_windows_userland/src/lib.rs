@@ -6994,106 +6994,26 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                         FixedAddressBehavior::Replace,
                                         "raced with another memory allocator"
                                     );
-                                    // `r` here is a single `VirtualQuery`/`MEMORY_BASIC_INFORMATION`
-                                    // region, i.e. a maximal run of pages sharing the same state
-                                    // and protection. Windows merges adjacent same-attribute
-                                    // regions from *distinct* `VirtualAlloc2` reservations into
-                                    // one reported region, so `r` can straddle an allocation-object
-                                    // boundary even though it looked like one region to us. A
-                                    // single `VirtualFree(MEM_DECOMMIT)` call cannot span more than
-                                    // one allocation object -- Windows rejects it wholesale with
-                                    // ERROR_INVALID_PARAMETER (87) rather than decommitting the
-                                    // part(s) it could -- confirmed live via a weston `dlopen()` of
-                                    // `xwayland.so`, whose fixed-address PT_LOAD placement landed
-                                    // exactly on such a merged-region boundary and crashed the host
-                                    // process. Recover by bisecting: on failure, split the range in
-                                    // half and decommit each half (recursively, in case a half still
-                                    // straddles another boundary) instead of asserting success on
-                                    // the whole range in one shot.
-                                    //
-                                    // A distinct, non-bisectable failure mode: `r` can be a
-                                    // `MEM_MAPPED` (or `MEM_IMAGE`) region -- a real
-                                    // `MapViewOfFile3`-backed view, e.g. litebox's own
-                                    // `map_shared_memory` (guest `MAP_SHARED`/`wl_shm` buffers) --
-                                    // rather than an ordinary `VirtualAlloc2`-committed `MEM_PRIVATE`
-                                    // region. `VirtualFree(MEM_DECOMMIT)` is documented by Microsoft
-                                    // to be invalid on a mapped view regardless of size (it fails
-                                    // with `ERROR_INVALID_PARAMETER` or, observed live,
-                                    // `ERROR_INVALID_HANDLE` (6)) -- bisecting it down to a single
-                                    // page still can't succeed, since the operation itself is
-                                    // categorically wrong for this region type, not merely
-                                    // mis-sized. Confirmed live: a real Weston `mremap()` (pixman
-                                    // shadow-framebuffer growth) placed a `Replace`-mode fixed
-                                    // allocation exactly on a `MEM_MAPPED` region and hit this same
-                                    // decommit path, panicking the host. The correct operation for a
-                                    // mapped view is `UnmapViewOfFileEx`, which drops the whole view
-                                    // (mapped views cannot be partially unmapped -- unlike
-                                    // `VirtualFree`, there is no sub-range form), after which the
-                                    // freed range is `MEM_FREE` again for `VirtualAlloc2` to commit
-                                    // fresh `MEM_PRIVATE` pages into, matching what a real Linux
-                                    // `mmap(MAP_FIXED)` replacing a `shmat`/file mapping does.
+                                    // Windows can reject a `VirtualFree(MEM_DECOMMIT)` spanning
+                                    // `r` with ERROR_INVALID_PARAMETER if `r` straddles a
+                                    // merged-region boundary between two distinct allocations, or
+                                    // if `r` is actually a mapped view (needs `UnmapViewOfFileEx`
+                                    // instead, see below). See docs/cow-mmap-fixed-address-design.md
+                                    // ("Reclaiming an already-committed range") for the full
+                                    // reasoning and live repros behind both cases.
                                     do_query_on_region(&mut view_mbi, r.start as *mut c_void);
                                     let mbi_type = view_mbi.Type;
                                     was_mapped_view = mbi_type == Win32_Memory::MEM_MAPPED
                                         || mbi_type == Win32_Memory::MEM_IMAGE;
-                                    // The real view this `VirtualQuery` reports can be WIDER than
-                                    // `r` (the caller's own requested sub-range, already clamped by
-                                    // `process_memory_range_by_regions` above): `ld.so` commonly
-                                    // creates ONE whole-library `MapViewOfFile3` CoW view spanning
-                                    // several future PT_LOAD segments, then issues a `MAP_FIXED`
-                                    // sub-mmap for just one segment (e.g. the RW data segment)
-                                    // landing INSIDE that wider view. `UnmapViewOfFileEx` below has
-                                    // no partial/sub-range form -- it destroys the WHOLE view, not
-                                    // just `r` -- so the flanking remainder on either side of `r`
-                                    // (still part of the original view, per litebox's own `Vmem`
-                                    // bookkeeping, which is never told the view died) would
-                                    // otherwise be left permanently `MEM_FREE`/unbacked, causing a
-                                    // SIGSEGV the first time anything touches it (confirmed live:
-                                    // Xvfb's `ld.so` loading `libepoxy.so.0` under
-                                    // `linuxserver/webtop:debian-i3`, see
-                                    // docs/webtop-debian-selkies-2026-09-06.md's
-                                    // "UnmapViewOfFileEx silently destroys the WHOLE CoW view"
-                                    // section for the full root-cause trace).
-                                    //
-                                    // This fix cannot reconstruct the flanks as equivalent CoW
-                                    // mappings (same source file/offset) from here: this function
-                                    // has no `Vmem` access (see `try_allocate_cow_pages`'s own doc
-                                    // comment on why it takes a caller-verified-safe padding
-                                    // parameter rather than querying `Vmem` itself -- the same
-                                    // design boundary applies here), and `Vmem`'s `VmArea` does not
-                                    // track per-mapping file/offset at all (only `is_file_backed:
-                                    // bool` -- confirmed by reading `litebox/src/mm/linux.rs`), so
-                                    // there is no way to ask "what file/offset backed the flank"
-                                    // once the view is gone. What IS achievable, and what this does:
-                                    // never leave the flanks unbacked. They are re-committed below as
-                                    // ordinary anonymous zero-fill pages (matching what `MEM_FREE`
-                                    // would otherwise silently become on next touch, except now
-                                    // safely backed instead of faulting) -- this loses the flanks'
-                                    // original CoW file content (a real, documented limitation, not
-                                    // silently papered over) but converts a SIGSEGV into a
-                                    // zero-filled read, which is always memory-safe and is the
-                                    // correct outcome whenever the guest's later access to a flank
-                                    // is a write to a *_data_ segment BSS-tail-shaped page anyway
-                                    // (the overwhelmingly common real-world shape of this pattern,
-                                    // per PT_LOAD segment layout: RO/text flank content the guest
-                                    // never actually re-reads post-relocation is the risk case this
-                                    // does not fully cover, and is exactly the deeper, file-content-
-                                    // preserving fix the docs above describe as needing new
-                                    // guest-address -> file/offset tracking infrastructure that does
-                                    // not exist anywhere in this codebase today).
-                                    // `view_mbi.BaseAddress`/`RegionSize` describe only the
-                                    // maximal run of pages sharing one state+protection, which for
-                                    // a multi-segment view is just ONE of its segments -- not the
-                                    // view. Using them here under-reported the view's extent, so
-                                    // the flanks missed whatever lay outside that one run and those
-                                    // bytes had nothing even attempting to restore them.
-                                    //
-                                    // `AllocationBase` IS the view's own base, and because the view
-                                    // came from `MapViewOfFile3` it is allocation-granularity
-                                    // aligned -- exactly what `MEM_RESERVE` requires and what a
-                                    // page-aligned flank boundary can never be relied on to be.
-                                    // Walk `VirtualQuery` forward from it while `AllocationBase`
-                                    // keeps matching to recover the view's true end.
+                                    // A mapped view's `UnmapViewOfFileEx` (below) destroys the
+                                    // WHOLE view, which can be wider than `r` (e.g. ld.so's one
+                                    // whole-library CoW view vs. one PT_LOAD's MAP_FIXED sub-mmap).
+                                    // The code below recovers the view's true extent and
+                                    // re-commits the flanking remainder as zero-fill so a later
+                                    // guest access faults safely instead of SIGSEGV-ing on freed
+                                    // memory; see the doc section above for why this can't instead
+                                    // restore the flanks' original CoW content, and its resulting
+                                    // known limitation.
                                     let view_base = view_mbi.AllocationBase as usize;
                                     let mut view_limit = view_base;
                                     if was_mapped_view && view_base != 0 {

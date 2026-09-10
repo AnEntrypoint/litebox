@@ -355,3 +355,77 @@ correct, honest call — the memcpy fallback path is correct today, just not opt
   `Unaligned` fallback as the permanent behavior) is a legitimate, honest outcome — not a
   failure to find a fix, but a correct call that the fix isn't worth its risk for an unproven
   gain.
+
+## Reclaiming an already-committed range: bisecting decommit, and flank restoration for mapped views
+
+This section documents the reasoning behind `allocate_pages`'s `MEM_RESERVE | MEM_COMMIT`
+reclaim branch in `litebox_platform_windows_userland/src/lib.rs` (the code that runs when a
+guest `MAP_FIXED` mmap lands on memory Windows already considers reserved/committed). The
+inline comments there now just point here; this is the full reasoning.
+
+**Bisecting decommit.** A `VirtualQuery` region `r` is only a maximal run of pages sharing one
+state+protection — Windows merges adjacent same-attribute regions from *distinct*
+`VirtualAlloc2` reservations into one reported region, so `r` can straddle an allocation-object
+boundary even though it looked like one region to the caller. A single `VirtualFree
+(MEM_DECOMMIT)` cannot span more than one allocation object — Windows rejects it wholesale with
+`ERROR_INVALID_PARAMETER` (87) rather than decommitting the part(s) it could. Confirmed live via
+a weston `dlopen()` of `xwayland.so`, whose fixed-address `PT_LOAD` placement landed exactly on
+such a merged-region boundary and crashed the host. Fix: on that specific failure, bisect the
+range in half and decommit each half recursively (handling a half that itself straddles another
+boundary) instead of asserting success on the whole range in one shot.
+
+**Mapped views need `UnmapViewOfFileEx`, not `VirtualFree`.** `r` can also be a `MEM_MAPPED`/
+`MEM_IMAGE` region — a real `MapViewOfFile3`-backed view (e.g. litebox's own
+`map_shared_memory` for guest `MAP_SHARED`/`wl_shm` buffers) rather than an ordinary
+`VirtualAlloc2`-committed `MEM_PRIVATE` region. `VirtualFree(MEM_DECOMMIT)` is documented by
+Microsoft to be invalid on a mapped view regardless of size (fails with
+`ERROR_INVALID_PARAMETER`, or, observed live, `ERROR_INVALID_HANDLE`); bisecting it down to a
+single page still can't succeed since the operation is categorically wrong for this region
+type, not merely mis-sized. Confirmed live: a real Weston `mremap()` (pixman shadow-framebuffer
+growth) placed a `Replace`-mode fixed allocation exactly on a `MEM_MAPPED` region and hit this
+same decommit path, panicking the host. The correct operation for a mapped view is
+`UnmapViewOfFileEx`, which drops the *whole* view (mapped views have no partial-unmap form),
+after which the freed range is `MEM_FREE` again for `VirtualAlloc2` to commit fresh
+`MEM_PRIVATE` pages into — matching what a real Linux `mmap(MAP_FIXED)` replacing a
+`shmat`/file mapping does.
+
+**Why the flanks need restoring at all.** The view `VirtualQuery` reports for `r` can be WIDER
+than `r` itself: `ld.so` commonly creates ONE whole-library `MapViewOfFile3` CoW view spanning
+several future `PT_LOAD` segments, then issues a `MAP_FIXED` sub-mmap for just one segment
+(e.g. the RW data segment) landing INSIDE that wider view. `UnmapViewOfFileEx` has no
+sub-range form — it destroys the WHOLE view, not just `r` — so the flanking remainder on
+either side of `r` (still part of the original view per litebox's own `Vmem` bookkeeping, which
+is never told the view died) would otherwise be left permanently `MEM_FREE`/unbacked, faulting
+the first time anything touches it. Confirmed live: Xvfb's `ld.so` loading `libepoxy.so.0`
+under `linuxserver/webtop:debian-i3` (see `docs/webtop-debian-selkies-2026-09-06.md`'s
+"UnmapViewOfFileEx silently destroys the WHOLE CoW view" section for the full root-cause
+trace).
+
+**What the fix does, and its known limitation.** The code cannot reconstruct the flanks as
+equivalent CoW mappings (same source file/offset) from here: this function has no `Vmem`
+access (see `try_allocate_cow_pages`'s own doc comment on why it takes a caller-verified-safe
+padding parameter rather than querying `Vmem` itself — the same design boundary applies here),
+and `Vmem`'s `VmArea` does not track per-mapping file/offset at all (only `is_file_backed:
+bool`, confirmed by reading `litebox/src/mm/linux.rs`), so there is no way to ask "what
+file/offset backed the flank" once the view is gone. So instead it guarantees the weaker,
+still-correct property: never leave a flank unbacked. Flanks are re-committed as ordinary
+anonymous zero-fill pages (matching what `MEM_FREE` would otherwise silently become on next
+touch, except now safely backed instead of faulting). This loses the flanks' original CoW file
+content — a real, documented limitation, not silently papered over — but converts a SIGSEGV
+into a zero-filled read, which is always memory-safe. This is the correct outcome whenever the
+guest's later access to a flank is a write to a `.data`-segment BSS-tail-shaped page anyway (the
+overwhelmingly common real-world shape here). The risk case this does not cover is a flank
+holding RO/text content the guest genuinely re-reads post-relocation; fully closing that would
+need new guest-address -> file/offset tracking infrastructure that does not exist anywhere in
+this codebase today.
+
+**Recovering the view's true extent.** `view_mbi.BaseAddress`/`RegionSize` describe only the
+maximal run of pages sharing one state+protection, which for a multi-segment view is just ONE
+of its segments, not the whole view — using them directly under-reports the view's extent and
+misses flank bytes outside that one run. `AllocationBase` IS the view's own base, and because
+the view came from `MapViewOfFile3` it is allocation-granularity aligned (exactly what
+`MEM_RESERVE` requires, unlike a page-aligned flank boundary). The fix walks `VirtualQuery`
+forward from `AllocationBase` while `AllocationBase` keeps matching, to recover the view's true
+end; it only trusts the walk if the resulting span actually contains the caller's range,
+otherwise it falls back to the old per-range (`BaseAddress`/`RegionSize`) behavior rather than
+acting on bounds that cannot be justified.
