@@ -1,5 +1,101 @@
 # Track B fork-without-exec fix: running progress log
 
+## 2026-09-10 (later still): minimal isolated repro shows the SAME tcache corruption under
+## CROSS-PROCESS fork, not just the thread-based default -- evidence the shared root cause is
+## region-grouping/copy-range computation, not (only) ADVISORY-001 3N's pointer-mangling-survives-
+## relocation theory
+
+### Repro
+
+Simplest possible trigger: a 10-line, 10-iteration loop doing `x=$(echo hi)` (`bash`'s own command
+substitution -- fork, then exec `echo` almost immediately, no deliberate fork-without-exec).
+Isolated from the rest of the webtop stack entirely (`.wfgy/bashfork_repro.sh`, a bare
+`/bin/bash` invocation with no other services running). Result: **10/10 iterations crash** --
+`malloc(): unaligned tcache chunk detected` (the exact, literal signature this document's own
+2026-09-07 `tcache_fork_repro.sh` baseline already established for the thread-based default
+path), alternating `SIGABRT`/`SIGSEGV`, every single time. The PARENT bash survives each crash
+(only the forked child dies) and the loop completes to `DONE` -- consistent with every other
+observation of this bug class: silent, narrowly-scoped child death, never visible as a guest-wide
+failure unless something downstream (`dbus-daemon`, `nginx`) depends on that one fork succeeding.
+
+### The new, specific finding: this is NOT gated behind `LITEBOX_PROCESS_FORK=1`
+
+Ran with `LITEBOX_LOG=litebox_shim_linux=debug` and no other env override -- i.e. whatever this
+guest's default fork eligibility decision is, not a forced cross-process test. The log shows,
+unambiguously, for every one of the 10 crashing forks:
+```
+clone: try_cross_process_fork entry
+clone: carrying a pipe end into the cross-process child ...
+clone: carrying a regular file into the cross-process child ...
+clone: cross-process fork() is eligible -- the child gets a real address space ... beyond_stdio=3
+clone: cross-process fork() copy plan ... regions=122 groups=6 total_bytes=12713984
+do_clone: about to duplicate address space for fork() tid=1
+clone: superseded post-duplication cross-process site declining; the real decision was already
+  made by try_cross_process_fork above  <- confirms: this is a SECOND, now-dead/no-op diagnostic
+  site; the cross-process path really was taken, not merely considered and abandoned
+clone: spawned new task parent_tid=1 child_tid=2
+```
+...followed within ~70ms by `malloc(): unaligned tcache chunk detected` and the fatal signal.
+**This guest's ordinary, default, un-flagged fork path for this shape of fork ALREADY goes through
+the cross-process mechanism** (`beyond_stdio=3` -- bash's open fds here -- did not block
+eligibility; only a live LISTENING SOCKET, as seen for Xvfb's own `clone: ... excluded by name`
+line elsewhere in this doc, blocks it). This directly refutes treating
+`LITEBOX_PROCESS_FORK=1` as a meaningfully different, not-yet-tried code path for this failure
+shape -- it is, empirically, already the path a plain `bash -c 'x=$(cmd)'` takes by default on
+this build, and it still corrupts.
+
+### Why this matters for where the real bug lives
+
+ADVISORY-001 section 3N's theory (glibc's safe-linked tcache/fastbin `next` pointers, mangled
+against their OWN storage address, surviving a RELOCATING fork that changes that storage address)
+does not, on its own, explain corruption under a fork mechanism that does NOT relocate addresses
+at all -- a cross-process child is reserved and `WriteProcessMemory`'d at the group's EXACT
+SOURCE address (`copy_one_group`, `litebox_platform_windows_userland/src/process_fork.rs` ~3577;
+`MEM_ADDRESS_REQUIREMENTS` makes same-address placement a hard, checked requirement, not a hope).
+A safe-linked pointer's mangle key is `(storage_address >> 12) XOR plaintext_target`; if storage
+address is IDENTICAL in parent and child, the mangled bytes copied byte-for-byte are trivially
+still self-consistent, with no translation needed and nothing left to get wrong by THAT
+mechanism specifically.
+
+Read `copy_one_group` in full this session looking for a copy-correctness bug instead (the
+candidate a same-address cross-process mechanism actually leaves room for): the `VirtualAlloc2`
+reservation is address-hard-required and checked against silent rounding; the page-by-page
+`read_source_bytes`/`WriteProcessMemory` loop checks both the read length and the write length
+against the expected page size and fails the whole group rather than silently proceeding on a
+mismatch. No structural bug found by inspection in this specific function -- it looks exactly as
+carefully defensive as its own `pass 109`/`pass 110`/`pass 141` comments claim.
+
+**What was NOT yet checked, and is the most promising concrete next lead**: the GROUPING itself,
+upstream of `copy_one_group` -- i.e. whether `regions=122 groups=6` is computing the right 6
+groups. `docs/fork-region-grouping-design.md` (already cross-linked from `AGENTS.md` as of this
+session) documents, in its own words, that the CURRENTLY SHIPPED grouping is a "gap heuristic" --
+an approximation -- and that the permanent, provenance-based fix is "not yet implemented; the
+shipped state is still a diagnostic probe". A heuristic that misjudges where one VMA's real,
+committed content ends and an adjacent gap begins would produce EXACTLY this symptom class: a
+page that is genuinely live, committed heap content in the parent, but which the heuristic
+(incorrectly) treats as uncommitted padding outside any group, copies as nothing, and leaves as
+the child's `VirtualAlloc2`-default zero-fill -- a tcache `next` pointer or fastbin link that
+reads back as zero (or as whatever partial/adjacent real data happens to survive next to it) is a
+very natural way to produce "unaligned tcache chunk detected" without needing any relocation,
+timing race, or WriteProcessMemory bug at all. This was not directly confirmed this session (would
+need per-group boundary logging cross-referenced against the guest's own `Vmem` VMA table at the
+moment of the fork, not yet instrumented) -- recorded here as the most concrete, specific,
+actionable next step for whoever picks this up, sharper than "the architectural class is still
+open" was before today.
+
+### Why this was not pursued to a fix this session
+
+Confirming and fixing a grouping-boundary bug needs: (a) new instrumentation correlating each
+`GroupRelocation`'s computed bounds against the guest's own authoritative `Vmem` VMA list at fork
+time (not currently logged together anywhere), (b) a guest process with an actually inspectable,
+simple heap layout to test against (glibc's own tcache/fastbin internals, not just "crashes or
+doesn't"), and (c) confirming a fix doesn't regress the ALREADY-working cases
+`fork-region-grouping-design.md`'s gap heuristic was written to handle. That is real, multi-step
+investigative work in an area already flagged by this project's own design doc as incomplete-by-
+design -- exactly the shape of work ADVISORY-002 scopes as belonging to a dedicated, multi-day
+pass, not a same-session follow-on to an unrelated same-day fix. Recorded here, sharply scoped,
+rather than attempted partially and left in an unverified state in code this delicate.
+
 ## 2026-09-10 (later same day): isolated Xvfb confirmed genuinely working; full webtop stack
 ## still blocked, but on the ALREADY-KNOWN ADVISORY-001 3N class, not a new bug -- and a tempting
 ## quick fix (`LITEBOX_PROCESS_FORK=1`) makes it WORSE, confirmed live
