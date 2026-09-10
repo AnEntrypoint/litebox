@@ -689,7 +689,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// the neighbour, in the same glibc function, differing only in what happened to be next door:
     ///
     /// - `libc+0xa0b98` (`mov %r9,0x8(%rcx)`), forked Xorg: neighbour was a library's R+X text, so
-    ///   the write hit a non-writable, non-present page -- `error_code=0x6`, SIGSEGV.
+    ///   the write hit a present-but-non-writable page -- `error_code=0x7`, SIGSEGV.
     /// - `libc+0xa0966` (`mov %rax,0x8(%rsi)`), Xorg as pid 1: neighbour was ordinary R+W data, so
     ///   the write succeeded, corrupted it, and glibc's own consistency check aborted -- SIGABRT.
     ///
@@ -2466,8 +2466,9 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // megabytes apart when the same binary runs as pid 1 and never trips this). glibc's
         // `sysmalloc` then extended its top chunk straight across into an adjacent library's R+X
         // text segment and faulted writing the chunk header (`mov %r9,0x8(%rcx)`), surfacing as a
-        // user-mode WRITE to a NOT-PRESENT page (`error_code=0x6`) inside a `VM_READ | VM_EXEC`
-        // mapping -- deterministic to the byte across runs, since the packing is deterministic.
+        // user-mode WRITE to a PRESENT, non-writable page (`error_code=0x7`) inside a
+        // `VM_READ | VM_EXEC` mapping -- deterministic to the byte across runs, since the packing
+        // is deterministic.
         //
         // So rather than give up on the upper region, walk DOWN from `high_limit` past the
         // mappings that occupy it, taking the first gap that fits. This is the same top-down

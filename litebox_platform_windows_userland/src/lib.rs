@@ -858,10 +858,9 @@ unsafe extern "system" fn vectored_exception_handler(
         // a corrupted jump target -- and that Windows genuinely reports the page as not-present,
         // not a permissions mismatch. This diagnostic answers "what does Windows' own VAD tree say
         // about this exact address right now" directly, without needing a live debugger.
-        // Gated on `rip == cr2` (this investigation's own documented crash signature -- see
-        // AGENTS.md's "Exception(N)/error_code decoding" note: `rip==cr2` with a nonzero
-        // `error_code` whose low bit is set means a genuine instruction-FETCH fault on a
-        // not-present page): `fork_verify`'s own expected/recoverable single-step and AV-path
+        // Gated on `rip == cr2` (this investigation's own documented crash signature: an
+        // instruction fetch faulting on its own address, i.e. the page backing `rip` itself is
+        // not present): `fork_verify`'s own expected/recoverable single-step and AV-path
         // healing faults (the overwhelming majority of in-guest faults on this platform) do NOT
         // have `rip==cr2` -- they fault on a DIFFERENT address than the one currently executing.
         // Without this filter, this fired 268,000+ times in one 30-concurrent-fork oracle run
@@ -9349,7 +9348,34 @@ unsafe extern "C-unwind" fn exception_handler(
                 // This is probably a #GP, not a #PF.
                 (Exception::GENERAL_PROTECTION_FAULT, 0, 0)
             } else {
-                let error_code = 4 | if read_write_flag == 0 { 0 } else { 1 << 1 }; // PF error code: bit 1 = write
+                // Windows' `ExceptionInformation[0]` is read(0)/write(1)/DEP-execute(8) --
+                // the same convention already documented in this repo at
+                // `process_fork.rs:2067` and `fork_verify.rs:2296` -- never a present/absent
+                // bit, so bit0 (the real x86 P-bit) cannot be read off it and was previously
+                // hardcoded to 0 (always "not present"), making every reported not-present
+                // fault indistinguishable from a present-page protection violation. Recover
+                // the real P-bit the same way `vectored_exception_handler`'s
+                // `LITEBOX_DIAG_FAULT_VQ` diagnostic already does: ask Windows' own VAD tree
+                // via `VirtualQuery` whether the faulting address is currently committed.
+                let present = {
+                    let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+                    let queried = unsafe {
+                        Win32_Memory::VirtualQuery(
+                            faulting_address as *const c_void,
+                            &mut mbi,
+                            core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+                        )
+                    };
+                    queried != 0 && mbi.State == Win32_Memory::MEM_COMMIT
+                };
+                // `read_write_flag == 8` is Windows' DEP/execute-prevention code, not a write
+                // -- the previous `!= 0` test folded it into the write bit, fabricating a
+                // write fault out of an instruction fetch. Emit the real instruction-fetch
+                // bit (bit 4) instead, and set the write bit (bit 1) only for an actual write.
+                let error_code: u32 = u32::from(present) // bit 0: present
+                    | (1 << 2) // bit 2: user mode (this platform never delivers kernel-mode guest faults)
+                    | if read_write_flag == 1 { 1 << 1 } else { 0 } // bit 1: write
+                    | if read_write_flag == 8 { 1 << 4 } else { 0 }; // bit 4: instruction fetch (DEP)
                 (Exception::PAGE_FAULT, error_code, faulting_address)
             }
         }
