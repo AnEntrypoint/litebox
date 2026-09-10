@@ -1,5 +1,86 @@
 # Track B fork-without-exec fix: running progress log
 
+## 2026-09-10 (later same day): isolated Xvfb confirmed genuinely working; full webtop stack
+## still blocked, but on the ALREADY-KNOWN ADVISORY-001 3N class, not a new bug -- and a tempting
+## quick fix (`LITEBOX_PROCESS_FORK=1`) makes it WORSE, confirmed live
+
+### Xvfb itself: confirmed genuinely functional post-fix, not just crash-free
+
+After the `CLAIMED_RANGES` fix below, the isolated `xvfb_sh_repro.sh` no longer crashes, but the
+repro script's own `[ -S /tmp/.X11-unix/X1 ]` poll still reported `XVFB_SOCK_FAILED` even after a
+40s window. Traced this to a SEPARATE, pre-existing, non-fatal gap, not a new problem: AF_UNIX
+`bind()` to a filesystem path (`litebox_shim_linux/src/syscalls/unix.rs` ~line 118, already
+commented `// TODO: extend fs to support creating sock file (i.e., with type InodeType::Socket)`)
+creates the path via an ordinary `fs.open(..., OFlags::CREAT)`, i.e. a REGULAR file, never an
+`InodeType::Socket`. Confirmed directly: `stat /tmp/.X11-unix/X1` reports "regular empty file".
+`[ -S ... ]` tests the inode's type bit and will therefore NEVER succeed for this or any other
+path-bound Unix socket in this runtime, regardless of whether the socket is actually bound,
+listening, and accepting connections. This also affects `webtop_stack.sh`'s own `svc-de` wait
+loop (same `[ -S "$XSOCK" ]` check) -- harmless there specifically because it falls through to a
+real `xset q` check after the wait anyway, but worth knowing before trusting any `-S` test against
+a litebox-hosted Unix socket again.
+
+Proved the REAL thing that matters instead: ran the isolated repro with a real X client.
+`xdpyinfo` against `DISPLAY=:1` returned a full, correct protocol response (`name of display: :1`,
+`X.Org version: 21.1.16`, pixmap formats, 23 extensions, etc.) -- Xvfb is genuinely listening and
+correctly serving X11 protocol requests end to end. The fix below is not merely "crash-free", it
+restores real, working functionality.
+
+### Full `webtop_stack.sh` run: blocked, but by the ALREADY-DOCUMENTED fork-corruption class
+
+Ran the full stack (`linuxserver/webtop:debian-xfce`, nginx + dbus-daemon + `startwm.sh`
+(xfce4-session) + selkies, via the existing gitignored `.wfgy/webtop_stack.sh`) with the fix in
+place and port 3000 published (`-p 3000:3000`). nginx never served (`NGINX_SELFTEST_FAILED`),
+`dbus-daemon` never came up (`DBUS_FAILED`), and `startwm.sh` never produced a window manager
+(`DE_VIA_STARTWM=no`). The log shows why, unambiguously: a near-continuous stream of
+```
+fatal signal: terminating task signal=Signal(11) pid=N tid=N comm=bash
+```
+-- every `bash` fork this script's own `$(cmd)` command substitutions and `(...)  &` subshells
+produce (the nginx respawn-supervisor loop, the `curl` self-test loop, `dbus-daemon`'s own launch)
+crashed with SIGSEGV at effectively a 100% rate, roughly one every 1.3-1.5s for as long as the run
+was observed. This is the SAME corruption class this whole document already tracks under Track B
+(`ADVISORY-001-fundamentals.md` section 3N: the default thread-based relocating fork is
+structurally incompatible with glibc's safe-linked tcache/fastbin freelists) -- not a new finding,
+just the first time this session watched it take down the ENTIRE rest of the desktop stack rather
+than one isolated repro. The Xvfb crash fixed earlier today was a genuinely separate bug
+(a cross-process memory-collision defect in `CLAIMED_RANGES`); this is the architectural one
+ADVISORY-002 already exists to eventually replace.
+
+### Tempting quick fix tried and REJECTED: `LITEBOX_PROCESS_FORK=1` hangs, does not help
+
+Reasoned that cross-process fork might sidestep the bash-fork corruption above without needing
+ADVISORY-002's full rewrite, since the existing `clone: cross-process fork() excluded by name`
+log line shows Xvfb specifically (by name) is excluded from the cross-process path while ordinary
+utility forks are not -- so plain `bash`/`curl`/`dbus-daemon` forks might ride the cross-process
+path cleanly. Tested directly: re-ran the identical full stack with `LITEBOX_PROCESS_FORK=1` set
+as a real host environment variable. Result: severe, effectively infinite hang -- 15 real minutes
+produced only 7.23 GUEST-CLOCK SECONDS of progress, stuck emitting an unbroken stream of
+`fork_verify: stale CODE pointer detected, translating and resuming` lines whose `translated_rip`
+crept forward by single-digit byte offsets one log line at a time (`...054736`, `...054740`,
+`...054741`, `...054744`, ...) -- `fork_verify`'s healing loop pathologically walking some region
+byte-by-byte under the cross-process path, not merely slow. Killed the run; this is not a viable
+workaround as currently implemented. Consistent with, not a refutation of, this document's own
+earlier 2026-09-07 entry finding `LITEBOX_PROCESS_FORK=1` "inconclusive... blocked on a clean
+high-memory run" -- this session's result is a different, additional failure mode on the same
+generally-not-yet-reliable path, found the moment it was tried against a real, busy workload
+instead of an isolated `vfork` repro.
+
+### Honest status for "full desktop observed in a browser"
+
+Not reached this session, and not reachable by a quick fix: the remaining blocker is the
+thread-based relocating fork's glibc-tcache corruption (ADVISORY-001 section 3N), hitting ordinary
+shell-script forks hard enough that `dbus-daemon`/`nginx`/`xfce4-session` cannot reliably start at
+all in a realistic multi-process boot sequence. This is the exact gap ADVISORY-002's cross-process
+fork redesign (presenter-process split, fixed-base shared kernel-state section, relaxed
+`beyond_stdio` gate, `RtlCloneUserProcess`) exists to close -- already scoped in that document as a
+genuine multi-day architectural project, and now with one more piece of live evidence
+(`LITEBOX_PROCESS_FORK=1` hanging under `fork_verify` on a real workload) for whoever picks it up
+next. Today's fix (below) closes a real, separate, now-confirmed-fixed bug and leaves Xvfb
+itself -- proven via an actual X11 client round-trip -- in a genuinely working state; it does not
+and cannot by itself unblock the rest of the desktop stack, which was never blocked by the same
+bug to begin with.
+
 ## 2026-09-10: Xvfb/libselinux.so.1 deterministic crash -- ROOT-CAUSED AND FIXED (not Track B
 ## specific: a general `CLAIMED_RANGES` bug affecting every guest process, fork-related or not)
 
