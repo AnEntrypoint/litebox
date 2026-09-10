@@ -1419,6 +1419,7 @@ pub fn diag_process_fork_globalstate_probe() {
         && !parent_layer.is_empty()
     {
         let parent_layer = PathBuf::from(&parent_layer);
+        let writable_layer_size = std::fs::metadata(&parent_layer).map(|m| m.len()).ok();
         in_mem.with_root_privileges(|fs| match import_writable_layer(fs, &parent_layer) {
             Ok(()) => eprintln!(
                 "[process_fork_diag] globalstate-probe (child): adopted the parent's writable layer from {}",
@@ -1429,6 +1430,10 @@ pub fn diag_process_fork_globalstate_probe() {
                 parent_layer.display()
             ),
         });
+        diag_elapsed!(format!(
+            "writable layer imported (size={} bytes)",
+            writable_layer_size.unwrap_or(0)
+        ));
         // Single-use, and this child is its only reader.
         let _ = std::fs::remove_file(&parent_layer);
     }
