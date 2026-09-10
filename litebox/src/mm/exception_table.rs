@@ -72,17 +72,19 @@ macro_rules! ex_table_entry {
 pub struct Fault;
 
 // TEMPORARY diagnostic (litebox investigation: XFCE/weston mallocng heap-corruption
-// bug hunt) -- logs any `memcpy_fallible` write whose destination range overlaps a
-// configurable watch window, to determine whether the corrupting write to a specific
-// guest heap address ever goes through this crate's own fallible-write path (as
-// opposed to a raw guest-code memory store that never calls into litebox at all).
+// bug hunt) -- logs any fallible write (`memcpy_fallible` or a `write_fn!`-generated
+// scalar write) whose destination range overlaps a configurable watch window, to
+// determine whether the corrupting write to a specific guest heap address ever goes
+// through this crate's own fallible-write path (as opposed to a raw guest-code
+// memory store that never calls into litebox at all).
 // Remove once the investigation concludes.
 static WATCH_RANGE_START: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 static WATCH_RANGE_END: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static WATCH_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-/// Configures the address range `[start, end)` that [`memcpy_fallible`] watches for
+/// Configures the address range `[start, end)` that [`memcpy_fallible`] and the
+/// `write_fn!`-generated scalar writes (`write_u8_fallible`, etc.) watch for
 /// overlapping writes, and the raw callback invoked when a write overlaps it. `hook`
 /// receives `(dst, size)` of the overlapping write. Pass `start == end` to disable.
 ///
@@ -365,6 +367,7 @@ macro_rules! write_fn {
         /// `dest` must be valid for writes or a pointer that's guaranteed to be
         /// in non-Rust memory.
         pub unsafe fn $name(dest: *mut $ty, value: $ty) -> Result<(), Fault> {
+            check_memcpy_watch(dest.cast(), core::mem::size_of::<$ty>());
             let value: usize = (u64::from(value)).trunc();
             #[cfg(target_arch = "x86_64")]
             unsafe {
@@ -401,6 +404,7 @@ macro_rules! write_fn {
         /// `dest` must be valid for writes or a pointer that's guaranteed to be
         /// in non-Rust memory.
         pub unsafe fn $name(dest: *mut $ty, value: $ty) -> Result<(), Fault> {
+            check_memcpy_watch(dest.cast(), core::mem::size_of::<$ty>());
             unsafe {
                 core::arch::asm! {
                     "2:",
