@@ -441,13 +441,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let is_exec = prot.contains(ProtFlags::PROT_EXEC);
 
         // Perform the normal mmap first (CoW or memcpy fallback).
-        let result = if let Some(cow_result) = cow_mmap_enabled()
+        let cow_attempt = cow_mmap_enabled()
             .then(|| self.try_cow_mmap_file(suggested_addr, len, &prot, &flags, fd, offset))
-            .flatten()
-        {
+            .flatten();
+        litebox_util_log::debug!(
+            fd:% = fd, len:% = len, offset:% = offset,
+            cow_took_path:% = cow_attempt.is_some();
+            "DIAG do_mmap_file: path chosen"
+        );
+        let result = if let Some(cow_result) = cow_attempt {
             cow_result?
         } else {
-            self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, fd, offset)?
+            let memcpy_result = self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, fd, offset);
+            litebox_util_log::debug!(
+                fd:% = fd, len:% = len, offset:% = offset,
+                memcpy_ok:% = memcpy_result.is_ok(),
+                memcpy_addr:% = memcpy_result.as_ref().map(|p| p.as_usize()).unwrap_or(0);
+                "DIAG do_mmap_file: memcpy fallback result"
+            );
+            memcpy_result?
         };
 
         // AGENTS.md pass 260: log path<->address for every executable file-backed mapping, so a
@@ -759,6 +771,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 copied += size;
                 file_offset += size;
             }
+            litebox_util_log::debug!(
+                fd:% = fd, requested_len:% = len, copied:% = copied, offset:% = offset;
+                "DIAG do_mmap_file_memcpy: copy loop finished"
+            );
             Ok(copied)
         };
         let fixed_addr = flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE);
@@ -1214,6 +1230,33 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Handle syscall `mmap`
     pub(crate) fn sys_mmap(
+        &self,
+        addr: usize,
+        len: usize,
+        prot: ProtFlags,
+        flags: MapFlags,
+        fd: i32,
+        offset: usize,
+    ) -> Result<UserPtrMut<u8>, Errno> {
+        // 2026-09-10 Track-B Xvfb-crash investigation (docs/track-b-fork-fix-progress.md):
+        // "DIAG sys_mmap: entry" below only logs the REQUESTED parameters, never the actual
+        // returned address for an `addr == 0` (let-the-platform-choose) call -- which is every
+        // anonymous mmap a dynamic linker makes for a library's BSS/TLS-bookkeeping tail. This
+        // wrapper logs the result too, closing that gap: lets a future capture directly answer
+        // "did any mmap call's RETURNED range overlap the crash region" instead of only "was
+        // that exact size ever requested".
+        let result = self.sys_mmap_inner(addr, len, prot, flags, fd, offset);
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(), addr:% = addr, len:% = len,
+            ok:% = result.is_ok(),
+            returned_start:% = result.as_ref().map(|p| p.as_usize()).unwrap_or(0),
+            returned_end:% = result.as_ref().map(|p| p.as_usize() + len).unwrap_or(0);
+            "DIAG sys_mmap: result"
+        );
+        result
+    }
+
+    fn sys_mmap_inner(
         &self,
         addr: usize,
         len: usize,

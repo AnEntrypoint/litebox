@@ -1,5 +1,110 @@
 # Track B fork-without-exec fix: running progress log
 
+## 2026-09-10: Xvfb/libselinux.so.1 deterministic crash -- ROOT-CAUSED AND FIXED (not Track B
+## specific: a general `CLAIMED_RANGES` bug affecting every guest process, fork-related or not)
+
+### Summary
+
+The crash this whole investigation has chased (Xvfb reliably faulting a few seconds into boot,
+`error_code=0x4` "genuinely not-present" reads inside `libselinux.so.1`'s first PT_LOAD segment,
+at a memory address that was itself successfully populated seconds earlier) is fixed, with the
+mechanism traced end-to-end against live `LITEBOX_DIAG_MM=1` + `litebox_shim_linux`/
+`litebox_platform_windows_userland` debug logs from the exact deterministic repro
+(`.wfgy/xvfb_sh_repro.sh`, gitignored local repro script; seeded via `--resume-from`), not
+inferred from symptoms alone.
+
+### Root cause
+
+`litebox_platform_windows_userland`'s `CLAIMED_RANGES` registry exists to detect when two
+different guest "processes" (every guest process is a real OS thread sharing ONE real Windows
+process address space -- see that static's own doc comment) are about to collide on the same
+real host address. Two of its own mechanisms combine to create a silent blind spot:
+
+1. `claim_range` coalesces a guest process's own claims into one slot whenever they overlap OR
+   merely TOUCH (adjacent, inclusive bound) -- deliberate, documented, and fine for its stated
+   purpose (avoiding a fresh slot per ordinary sequential heap/mmap growth).
+2. `WindowsUserland::deallocate_pages` called a second, now-removed function,
+   `release_claim_range_for_current_thread`, on every `munmap`, IN ADDITION to the already-
+   correct, already-unconditional `release_mapping_claim`/`unclaim_range` release that
+   `Vmem::remove_mapping` performs for every guest unmap. That second call's own doc comment
+   admitted the flaw outright: "a fixed-array slot that only PARTIALLY overlaps `range` is
+   dropped WHOLE rather than split/shrunk". A `deallocate_pages` comment written right above its
+   own call site even already said "the claim release does NOT live here" -- directly
+   contradicted two lines later by the call still being present.
+
+Combined: `elf_load` places a library's PT_LOAD segments touching each other, plus a small
+trampoline-extension padding region immediately after the image -- all of which coalesce into
+ONE `CLAIMED_RANGES` slot under the loading guest process's owner. When that small padding
+region is later freed (routine, expected), the buggy release call found a PARTIAL overlap with
+the merged slot and dropped the WHOLE thing -- silently erasing collision-detection coverage for
+the entire rest of the library's real, still-live image (confirmed live: `libselinux.so.1`'s
+full 212992-byte first-segment allocation, owned by the guest process that became Xvfb).
+
+With that claim gone, a SECOND, completely unrelated guest process (in the isolated repro: one
+iteration of the polling loop's own `/bin/sleep`, loading its own fresh `libc.so.6`) later
+requested an address that happened to overlap the now-unprotected region. Its own
+`find_foreign_claim` check correctly found nothing (there was nothing left to find), so its
+`Replace`-mode fixed allocation proceeded, silently decommitting and recommitting straight over
+Xvfb's still-live `libselinux.so.1` memory with no error, no page fault, and no guest-visible
+signal at the time. Xvfb's own later read of that memory (confirmed live: offsets `0x2a8`/`0x2d8`
+within the segment, ~2.6 seconds after the original successful populate) then faulted as
+genuinely not-present -- the crash this investigation has been chasing.
+
+Every other candidate ruled out in this investigation's own earlier entries (file-size/tail-gap
+shortfall, an explicit munmap/mprotect on the exact faulting region, a later overlapping mmap,
+`vfork`-based relocation corruption, the CoW-view flank-destroy path, the platform's raw
+`VirtualAlloc2` mechanics) really was innocent; the actual mechanism was one layer further down,
+in the cross-process collision DEFENSE itself silently failing closed.
+
+### Fix applied
+
+`litebox_platform_windows_userland/src/lib.rs`: removed the `release_claim_range_for_current_thread`
+call from `deallocate_pages` (and deleted the now-dead function). `release_mapping_claim` /
+`unclaim_range` -- which already runs unconditionally from `Vmem::remove_mapping` for every guest
+unmap, and already correctly SHRINKS a claim from whichever edge a freed sub-range touches instead
+of dropping it whole -- was always the intended, sole release path; the removed call was pure
+redundancy with a strictly worse failure mode bolted on, directly contradicting the very comment
+sitting above its own call site.
+
+### Verification
+
+Rebuilt (`cargo build --release --bin litebox_runner_linux_on_windows_userland`), re-ran the exact
+isolated repro three times under `LITEBOX_DIAG_MM=1` + debug logging and once more under default
+(`warn`) logging:
+
+- **Before the fix**: 100% reproducible `diag-guest-exception` crash (`error_code=0x4`, the exact
+  `cr2` offsets `0x2a8`/`0x2d8` this investigation has tracked throughout), every run.
+- **After the fix**: zero occurrences of `diag-guest-exception` across 4 separate runs (2 with
+  debug logging, 2 quiet). Instead, the EXPECTED, already-documented, SAFE failure mode for a
+  genuine cross-process address collision now fires correctly: `allocate_pages`'s Replace-mode
+  foreign-claim check now correctly reports `found=true foreign_owner=Some(GuestPid(3))` for the
+  same collision that previously went undetected, relocates away from it, the relocated
+  `MAP_FIXED` call correctly fails with `EEXIST` per `do_mmap`'s own post-check, and the COLLIDING
+  process (the unrelated `sleep` helper, not Xvfb) fails loudly and in isolation
+  (`error while loading shared libraries: libc.so.6: failed to map segment from shared object`)
+  instead of silently corrupting a different, live guest process's memory. This is exactly the
+  documented, intended behavior for this registry, now actually reachable.
+
+### What remains open
+
+Xvfb itself still does not create its `/tmp/.X11-unix/X1` socket within a 40-second poll window
+in the isolated repro (confirmed: `/tmp/xvfb.log` is EMPTY even after 40s -- Xvfb has not even
+reached its own startup log banner -- while its own `sh`/`xkbcomp` child processes are alive and
+not crashed). This is a DIFFERENT, separate problem from the crash fixed above (no fault, no
+exception, just apparent early hang before Xvfb's own logging starts) -- possibly related to the
+same class of resource/scheduling issue this doc's other entries already describe (Defender
+scan-gating, host memory pressure, the general cost of this runtime's thread-based guest-process
+model under load), possibly something specific to `xkbcomp`/keyboard-map synchronous setup. Not
+yet root-caused. This is the next thing to investigate for the full "Xvfb boots to a usable X
+display" goal; it is NOT the crash this entry fixes, and the two should not be conflated.
+
+The underlying architectural class this bug's first half belongs to (every guest process sharing
+one real Windows address space, defended only by a best-effort heuristic registry rather than
+real OS-level isolation) is exactly what `advisor/ADVISORY-002-d-zero-fork.md`'s cross-process
+fork redesign would eliminate structurally rather than patch around -- this fix closes one real,
+now-understood hole in the heuristic, not the underlying architectural exposure itself.
+
+
 ## 2026-09-09 (same night, a correction against my own last theory): checked `execve`'s memory
 ## teardown against real source rather than assumption -- it DOES call a genuine platform-level
 ## deallocation for ordinary (non-shared) mappings, which is the common case here. This weakens

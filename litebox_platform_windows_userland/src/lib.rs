@@ -5477,29 +5477,6 @@ fn release_all_claims_for_current_thread() {
     }
 }
 
-/// Removes `range` from the calling thread's own claims (called on `deallocate_pages`/`munmap`).
-/// Unlike a growable map, a fixed-array slot that only PARTIALLY overlaps `range` is dropped
-/// whole rather than split/shrunk (splitting would need a second slot, which may not be
-/// available) -- a rare, always-safe-to-be-conservative-about approximation: the untouched
-/// remainder of that slot's original range simply stops being defended by this registry until
-/// this thread's own next `Replace` allocation re-claims it, which is no worse than this
-/// registry not existing at all for that sliver.
-fn release_claim_range_for_current_thread(range: core::ops::Range<usize>) {
-    if range.is_empty() {
-        return;
-    }
-    let owner = current_claim_owner();
-    for slot in CLAIMED_RANGES.lock().unwrap().iter_mut() {
-        if let Some((claimed, o, _tid, _seq)) = slot
-            && *o == owner
-            && claimed.start < range.end
-            && claimed.end > range.start
-        {
-            *slot = None;
-        }
-    }
-}
-
 /// Best-effort check: is `rip` inside (or very near) `SLAB_ALLOC`'s `GlobalAlloc::alloc`/
 /// `dealloc` implementation? Used by [`ThreadHandle::interrupt`] to avoid suspending a thread
 /// while it holds the global allocator's internal spinlock mid-mutation -- see that call site's
@@ -7656,11 +7633,30 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             },
         )
         .expect("deallocate_pages failed");
-        // Release this thread's own claim (see `CLAIMED_RANGES`'s doc comment), if any -- an
-        // explicit `munmap` genuinely relinquishes the range, unlike `execve` (which leaves an
-        // old claim standing until superseded by the new image's own `Replace` allocations, or
-        // this thread itself exits).
-        release_claim_range_for_current_thread(range);
+        // Claim release does NOT happen here -- see the NOTE a few lines up: it is
+        // `release_mapping_claim`'s job, which `Vmem::remove_mapping` already calls
+        // unconditionally for every guest unmap via `unclaim_range`.
+        //
+        // This used to ALSO call `release_claim_range_for_current_thread` here, a second,
+        // redundant release directly contradicting the NOTE above. That function matched
+        // `CLAIMED_RANGES`' doc-commented coalescing behaviour (`claim_range` merges a guest
+        // process's own touching/overlapping claims into one slot) with a release that, on any
+        // PARTIAL overlap, dropped the ENTIRE merged slot rather than shrinking it -- unlike
+        // `unclaim_range`, which correctly shrinks from whichever edge the freed sub-range
+        // touches. Root-caused live: `elf_load`'s per-segment trampoline-extension padding
+        // (a few KiB, freed right after use) routinely coalesces into the SAME `CLAIMED_RANGES`
+        // slot as the real library image next to it (they are placed touching, and `claim_range`
+        // treats "touching" as coalesce-eligible) -- freeing just the padding then deleted the
+        // WHOLE slot, silently erasing collision-detection coverage for the entire
+        // still-live library image beside it. A second, unrelated guest process that later
+        // happened to request an overlapping address (confirmed live: a short-lived `sleep`
+        // helper's own libc.so.6 load) then passed `find_foreign_claim` with no record left to
+        // find, silently decommitted-and-recommitted straight over the first process's real,
+        // already-populated library memory, and that process's own later read of it (~2.6s on
+        // the observed Xvfb/libselinux.so.1 repro) faulted as genuinely not-present. Removing
+        // this call (rather than fixing it to shrink like `unclaim_range`) is correct, not just
+        // simpler: `release_mapping_claim` already runs unconditionally and already does this
+        // right, so this call was always pure redundancy with a worse failure mode bolted on.
         Ok(())
     }
 
