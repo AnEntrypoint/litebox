@@ -610,10 +610,18 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     /// (and a silently-swallowed lookup failure) when no callback is installed or the mapping
     /// fails, matching `page_flip`'s own established "a host-side presentation miss must never
     /// fail the guest's own ioctl" contract.
+    ///
+    /// `callback_count == 0` alone never skips this: `--gui`/`LITEBOX_DUMP_FRAMES` (what actually
+    /// populates `flip_callbacks`) and `LITEBOX_DRM_TRACE` (what the digest/scanout-byte logging
+    /// below is gated on, via `drm_trace_enabled()`) are two independent diagnostics with no
+    /// reason to depend on each other -- a trace-only run with neither presenter nor frame-dump
+    /// registered a single callback would otherwise see every `diag-drm-*` line below silently
+    /// vanish, indistinguishable from "no presents happened" (see this fn's own fix history for
+    /// the LYING INSTRUMENTS writeup this corrects).
     fn notify_flip_callback(&self, platform: &Platform, fb_id: u32) {
         let callback_count = self.flip_callbacks.lock().len();
         litebox_util_log::debug!(callback_count:? = callback_count; "drm-diag: notify_flip_callback called");
-        if callback_count == 0 {
+        if callback_count == 0 && !drm_trace_enabled() {
             return;
         }
         let Some((handle, size, width, height, pitch, pixel_format)) = ({
