@@ -94,6 +94,63 @@ command-substitution child is reached in well under a second instead of minutes 
 startup) or a longer, patient wall-clock observation of the real script with no debug tracing at
 all, to settle (a) vs (b) before writing any more code against this.
 
+## 2026-09-10 (final of this session): (a) confirmed -- root-caused and fixed (commit `6e86a40`)
+
+A patient, non-debug observation confirmed the stall above was a genuine hang (180s, zero log
+growth), settling (a) vs (b) from the previous entry in favour of (a). Built the exact minimal
+repro the previous entry called for: the real `webtop_stack.sh`, truncated to its first 148 lines
+(everything through the nginx self-test, nothing after) via `head -n 148`, run as its own seed tar
+-- no synthetic approximation, the ACTUAL script. It reproduces the identical stall (same line
+count at the same point) in under a minute, versus minutes-to-never for the full script.
+
+Scoped debug tracing (`LITEBOX_LOG=error,litebox_shim_linux::syscalls::process=debug`) against
+this clean ~840-line capture (vs the earlier 949K-line one) showed it precisely: 15 plain
+`mkdir`/`cp`/`sed`/`ln` commands in the nginx-config-setup block each forked via the THREAD-based
+path (`children`, not `cross_process_children`) before the script ever backgrounds the
+cross-process-eligible nginx supervisor and `curl` self-test. `sys_wait4`'s `pid == -1` handling
+had a real gap: the cross-process registry was only consulted when `children` was ALREADY empty
+at call time (the narrow "pass 156" fix, landed before this session). With those 15 thread-based
+entries sitting in `children`, that gate never opened, so the parent's final blocking
+`sys_wait4(pid=-1, options=0)` fell into the purely thread-based polling loop -- which the trace
+showed calling `try_wait_for_exit()` on `children` only, never on `cross_process_children`, even
+though curl's cross-process child had ALREADY exited cleanly (`exit_group`, full `prepare_for_exit`
+sequence, visible in the very same capture) and was sitting right there, unreaped, the whole time.
+
+**Fix:** removed the narrow pass-156 special case; the general `poll_once` closure (shared by the
+`WNOHANG` and blocking paths, and re-invoked on every wake from `wait_until`) now checks
+`cross_process_children` FIRST on every single invocation, handling a match with the same
+reap/decode/return logic the old special case used, before ever touching `children`. This is
+strictly more general than the old fix: it also catches a cross-process child that exits AFTER
+the blocking wait begins, not only one already exited before the call started.
+
+**Verified:** the 148-line truncated repro now completes (`WEBTOP_TRUNC_DONE`, exit 0) across
+repeated runs. Existing correctness repros (`bashfork_repro.sh`, `cross_process_fork_wait_hang_
+probe.sh`) still pass, zero corruption. The FULL, untruncated `webtop_stack.sh` now correctly
+falls through its nginx self-test loop instead of hanging there (`NGINX_SELFTEST_FAILED ...
+supervisor still retrying in background` -- the expected outcome, since nginx's own SSL-cert
+startup failure is a separate, still-open issue, not this one) and continued running for 95K+ more
+warn-level log lines before this session had to stop it for host memory pressure (8 accumulated
+`litebox_runner` processes from this session's many repro runs drove free memory to under 1GB;
+always kill every `litebox_runner` process between runs on this host, never run two at once --
+see AGENTS.md's own standing lesson on exactly this).
+
+**Session summary, three real fixes landed on the cross-process (`LITEBOX_PROCESS_FORK=1`) fork
+mechanism, each independently verified live:**
+1. `ce5648f` -- VirtualQuery-per-page caching, ~40-60x per-fork speedup.
+2. `060ccc3` -- SIGCHLD delivery to the parent on a cross-process child's exit (fixes
+   `sigsuspend`/`pause`-based waits, e.g. a shell's plain `wait` builtin with >1 backgrounded job).
+3. `6e86a40` -- `sys_wait4(pid=-1)` now sees cross-process children even when thread-based ones
+   are ALSO registered (fixes command-substitution/targeted waits racing against earlier
+   synchronous forks).
+
+**Not yet fixed, left for a follow-up session:** nginx's own SSL-cert-generation failure on its
+real first startup attempt inside `webtop_stack.sh` (the ORIGINAL symptom that started this whole
+investigation) -- genuinely not yet root-caused; the cert.pem-missing error is real and still
+reproduces. The project's own `webtop_stack.sh` comments separately document that
+`LITEBOX_PROCESS_FORK=1` is "documented unreliable"/known to break Xvfb/dbus specifically, a
+caveat pre-dating and independent of this session's fixes -- worth re-testing given how much of
+the underlying cross-process fork/wait machinery just changed, but not re-tested this session.
+
 ## 2026-09-10 (latest): VirtualQuery-per-page caching fix (~40-60x per-fork speedup, committed
 ## `ce5648f`) -- then a NEW, real hang surfaced past `NGINX_CONFIGURED` that this fix exposed
 

@@ -184,11 +184,30 @@ platform/mod.rs`), Windows-implemented via a spawned thread blocking on the exis
 `wait_for_cross_process_exit`, wired into both real `do_clone` cross-process-fork sites
 (`litebox_shim_linux/src/syscalls/process.rs`) to push the child's `exit_signal` into the
 parent's `shared_pending` and call `interrupt_all_threads()` on exit -- exactly mirroring
-`prepare_for_exit`'s existing same-process notify step. Verified: the probe now passes, 5/5 fresh
-hang-repro runs complete, 3/3 existing correctness-repro runs still pass with zero corruption, and
-the real `webtop_stack.sh` boot now gets well past the original stall -- through nginx's SSL-cert
-supervisor loop entirely, into its `curl` self-test retry loop, where a NEW, distinct stall was
-found (not yet investigated; see `docs/track-b-fork-fix-progress.md`'s matching entry).
+`prepare_for_exit`'s existing same-process notify step.
+
+**A THIRD real bug, immediately downstream of fixing the second, also root-caused and fixed
+(commit `6e86a40`): `sys_wait4(pid=-1)` only consulted `cross_process_children` when `children`
+(thread-based) was ALREADY empty at call time** -- backwards for the common shape where a shell
+forks several plain commands (`mkdir`/`cp`/`sed`, thread-based) before backgrounding a LATER
+cross-process fork, leaving `children` non-empty and the cross-process registry never checked by
+the blocking wait loop. `poll_once` (shared by the `WNOHANG` and blocking paths) now checks
+`cross_process_children` first on every invocation, not just once up front.
+
+**Net result, verified live:** the minimal repro (`advisor/probes/cross_process_fork_wait_hang_
+probe.sh`) and a 148-line truncation of the real `webtop_stack.sh` (everything through its nginx
+self-test) both complete cleanly and deterministically; existing correctness repros
+(`bashfork_repro.sh`) still show zero corruption; the FULL `webtop_stack.sh` now correctly falls
+through its nginx self-test instead of hanging there. **Not yet fixed:** nginx's own SSL-cert
+generation failure on its real first startup attempt (the ORIGINAL symptom this whole
+investigation started from) -- still reproduces, not yet root-caused. `webtop_stack.sh`'s own
+comments separately note `LITEBOX_PROCESS_FORK=1` as "documented unreliable"/breaking Xvfb/dbus,
+a pre-existing caveat not re-tested against these three fixes. Host note: each `litebox_runner`
+process under this OCI image holds 650MB-1GB+ resident; this host has limited free RAM (seen as
+low as ~800MB) -- always kill every `litebox_runner` process between test runs, never run two
+concurrently (see "Never run two full-stack litebox verifications concurrently" above). Full
+narrative, exact measurements, and rejected alternatives for all three fixes:
+`docs/track-b-fork-fix-progress.md`.
 
 ## Container images
 
