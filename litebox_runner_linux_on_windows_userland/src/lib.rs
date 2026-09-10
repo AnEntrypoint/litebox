@@ -1470,7 +1470,7 @@ pub fn diag_process_fork_globalstate_probe() {
     );
     diag_elapsed!("GlobalState built, handing off to vmem-adopt-probe");
 
-    diag_process_fork_vmem_adopt_probe(platform, &shim, fs);
+    diag_process_fork_vmem_adopt_probe(platform, &shim, fs, t0);
 }
 
 /// Pass 137's `Vmem`/`PageManager`-adoption probe, gated behind
@@ -1494,11 +1494,20 @@ fn diag_process_fork_vmem_adopt_probe(
     platform: &'static Platform,
     shim: &litebox_shim_linux::LinuxShim<Platform, litebox_shim_linux::DefaultFS<Platform>>,
     fs: std::sync::Arc<litebox_shim_linux::DefaultFS<Platform>>,
+    t0: std::time::Instant,
 ) {
     use litebox_platform_windows_userland::process_fork as pf;
 
     if !pf::diag_process_fork_vmem_adopt_enabled() {
         return;
+    }
+    let diag_timing = std::env::var_os("LITEBOX_DIAG_FORK_TIMING").is_some();
+    macro_rules! diag_elapsed {
+        ($label:expr) => {
+            if diag_timing {
+                eprintln!("[diag-fork-timing] {} at {:?}", $label, t0.elapsed());
+            }
+        };
     }
     let litebox = shim.litebox();
     let Some(line) = std::env::var_os(pf::FORK_CHILD_VMA_LAYOUT_ENV_VAR) else {
@@ -1542,6 +1551,7 @@ fn diag_process_fork_vmem_adopt_probe(
     >::new_adopting_existing_memory(
         litebox, expected.iter().cloned(), heap_top
     );
+    diag_elapsed!("PageManager::new_adopting_existing_memory returned");
 
     let (tracked_count, tracked_brk) = page_manager.tracked_region_summary();
     let tracked = page_manager.tracked_regions();
@@ -1577,7 +1587,8 @@ fn diag_process_fork_vmem_adopt_probe(
         );
     }
 
-    diag_process_fork_task_resume_probe(platform, shim, fs, page_manager, relocations);
+    diag_elapsed!("vmem-adopt-probe verification done, handing off to task-resume-probe");
+    diag_process_fork_task_resume_probe(platform, shim, fs, page_manager, relocations, t0);
 }
 
 /// Pass 139's in-process `Task`-resume probe, gated behind
@@ -1600,12 +1611,22 @@ fn diag_process_fork_task_resume_probe(
     fs: std::sync::Arc<litebox_shim_linux::DefaultFS<Platform>>,
     page_manager: litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
     relocations: litebox::mm::AddressRelocations,
+    t0: std::time::Instant,
 ) {
     use litebox_platform_windows_userland::process_fork as pf;
 
     if !pf::diag_process_fork_task_resume_enabled() {
         return;
     }
+    let diag_timing = std::env::var_os("LITEBOX_DIAG_FORK_TIMING").is_some();
+    macro_rules! diag_elapsed {
+        ($label:expr) => {
+            if diag_timing {
+                eprintln!("[diag-fork-timing] {} at {:?}", $label, t0.elapsed());
+            }
+        };
+    }
+    diag_elapsed!("task-resume-probe entered");
     let Some(line) = std::env::var_os(pf::FORK_CHILD_GPRS_ENV_VAR) else {
         eprintln!(
             "[process_fork_diag] task-resume-probe (child): no register snapshot arrived via {}, skipping",
@@ -1903,6 +1924,7 @@ fn diag_process_fork_task_resume_probe(
         ctx.rip,
         ctx.rsp
     );
+    diag_elapsed!("fd/pipe rebuild + net_worker spawn done, about to call run_thread_with_fork_verification");
     // Arm the SAME post-fork stale-pointer verification the real, working thread-based fork path
     // arms via `Task::init`'s `ThreadInitState::ForkedChild` branch (`begin_fork_child_
     // verification`, litebox_shim_linux/src/syscalls/process.rs) -- this cross-process child never
@@ -1928,6 +1950,7 @@ fn diag_process_fork_task_resume_probe(
     eprintln!(
         "[process_fork_diag] task-resume-probe (child): run_thread returned (guest thread terminated)"
     );
+    diag_elapsed!("run_thread_with_fork_verification returned (guest execution complete)");
 
     // Pass 142: this child process only ever exists as a `LITEBOX_PROCESS_FORK=1` cross-process
     // fork() child (or this same probe's pre-existing diagnostic use, which never previously
@@ -1991,6 +2014,7 @@ fn diag_process_fork_task_resume_probe(
         }
     }
 
+    diag_elapsed!("writable layer exported, about to call std::process::exit");
     eprintln!(
         "[process_fork_diag] task-resume-probe (child): exiting with encoded status {encoded:#x}"
     );

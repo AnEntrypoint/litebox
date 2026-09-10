@@ -1,5 +1,125 @@
 # Track B fork-without-exec fix: running progress log
 
+## 2026-09-10 (latest): VirtualQuery-per-page caching fix (~40-60x per-fork speedup, committed
+## `ce5648f`) -- then a NEW, real hang surfaced past `NGINX_CONFIGURED` that this fix exposed
+
+### The fix
+
+`spawn_cross_process_fork_child`'s parent-side `read_source_bytes` closure
+(`litebox_platform_windows_userland/src/lib.rs`) called `fork_verify::is_readable` -- one
+`VirtualQuery` syscall -- per 4KB page being copied. `VirtualQuery`'s cost scales with the
+process's total committed memory (a VAD-tree walk), so a large, heavily-committed guest paid
+that full walk on EVERY page: measured live at 23-25s for one 173MB/~42,000-page group alone.
+
+Tried and rejected first: batching the WRITE side (`WriteProcessMemory`) in `copy_one_group`
+(`process_fork.rs`) into larger chunks, on the theory that per-call `WriteProcessMemory`
+overhead was the cost. Measured live: 46.06s for the same group -- ~2x WORSE. Reverted cleanly.
+
+Real fix: added `fork_verify::readable_region(addr) -> Option<Range<usize>>`, returning the
+FULL bounds `VirtualQuery` already reports, not just a yes/no for one address. `read_source_
+bytes` now caches the last region and reuses it for every subsequent address it contains -- a
+real guest mapping is typically megabytes, so this pays one `VirtualQuery` per mapping instead
+of one per page.
+
+Measured live: the same 173MB group went from 23.5-25.4s to 400-650ms (**~40-60x**). Re-verified
+correctness: 10/10 clean runs of the isolated `bashfork_repro.sh`, zero corruption. Committed as
+`ce5648f`.
+
+### What this unlocked, and the new problem it exposed
+
+Under `LITEBOX_PROCESS_FORK=1`, the real `webtop_stack.sh` boot reached `NGINX_CONFIGURED` /
+`NGINX_STARTED` in under a minute for the first time ever (previously: never past ~7 setup
+forks in 15+ minutes). Real, qualitative progress toward the full stack boot.
+
+nginx's first actual startup attempt then failed:
+```
+[emerg] 8376#8376: cannot load certificate "/config/ssl/cert.pem": BIO_new_file() failed
+(SSL: ... No such file or directory ...)
+```
+even though `webtop_stack.sh`'s nginx supervisor loop runs `openssl req -x509 ...` synchronously,
+gated on `[ ! -f /config/ssl/cert.pem ]`, in the SAME iteration before starting nginx. `openssl`'s
+own stdout/stderr is redirected to `/tmp/ssl_gen.log` *inside the guest* -- never `cat`ed anywhere
+-- so the host-captured log shows nothing about whether `openssl` ran or why it might have failed;
+only nginx's own complaint (itself only visible because the script `cat`s `/tmp/ng.log` after
+each attempt) is visible host-side.
+
+Investigating that led to a separate, real discovery: the dominant content of this test's log
+(84,319 of ~90,400 total lines, in 26 bursts of ~3000-4096 lines each) is `fork_verify`'s
+"stale CODE pointer detected, translating and resuming" warning, firing with `translated_rip ==
+rip` in literally every single occurrence (verified via direct extraction, 0 of 84,319 had a real
+translation). This is NOT a new bug by itself -- it is `AddressRelocations::is_identity()`'s
+already-documented, already-bounded (`MAX_IDENTITY_VERIFICATION_STEPS = 4096`,
+`fork_verify.rs`) expected behavior for every cross-process/identity fork child: source ==
+destination by construction for this fork mechanism, so case (1) of `on_single_step` fires on
+essentially every instruction until the bound is hit, and the "heal" (translating+patching a
+return-address slot) is a pure no-op in this case (writes the same value back) -- wasteful
+(~4096 single-step trap round-trips, tens of ms, per fork child that runs long enough pre-
+`execve` to hit the bound) but not corrupting. One burst per external command the shell forks
+(`mkdir`, `cp`, `sed` x4, `ln`, `openssl`, `nginx`, ...) lines up with 26 observed bursts in one
+supervisor-loop iteration.
+
+**The real, NEW problem: after the 26th (last) burst ends cleanly at the step bound, the fork
+child that burst belongs to (confirmed via the log's own `winpid=18284` marker, entered guest
+execution reading `/config/webtop_stack.sh` at fd-reopen offset 8007) never produces another
+log line, and never finishes.** Confirmed genuinely hung, not just slow:
+- Log line count: static at 90,398 for 75+ seconds of polling (6 x 10s checks, zero growth).
+- `Get-Process -Id 18284` CPU time: +2.5s total across all 4 threads over ~20s wall (some
+  activity, nowhere near a hot spin loop).
+- Per-thread (`$p.Threads`) snapshot: all 4 threads in `Wait` state at every sample; the busiest
+  thread's `TotalProcessorTime` crept +0.047s over a 5s window (consistent with periodic
+  housekeeping/timer wakeups, not productive forward progress); a second thread was completely
+  flat.
+
+This is consistent with a genuine deadlock (a blocking wait on a handle/pipe/lock that will
+never be signaled) rather than the identity-path single-step spam itself (which already ended
+cleanly, clearing `TF`, before the hang window began) or normal slowness. Not yet root-caused.
+Next step: reproduce in isolation (a minimal script that forks + execs `openssl` and/or `nginx`
+under `LITEBOX_PROCESS_FORK=1`, on the theory that a specific binary/syscall combination in this
+next phase of the script -- not the shell's own fork/exec glue the existing repros already cover
+-- is what's deadlocking), rather than continuing to dig through the real stack's own log, which
+offers no further signal once the hang has already started.
+
+### Follow-up, same session: isolated in < 4 seconds, and it is NOT openssl/nginx-specific
+
+A single cross-process fork running `openssl req -x509 ...` in isolation (`--oci-image
+docker.io/linuxserver/webtop:debian-xfce`, a script that just mkdirs + runs openssl + checks the
+result) completes cleanly every time -- `MARK_OPENSSL_RC=0`, `MARK_CERT_EXISTS`. openssl itself is
+not broken under `LITEBOX_PROCESS_FORK=1`.
+
+The real trigger: **two backgrounded cross-process forks from the SAME parent thread, followed by
+`wait`.** New probe, `advisor/probes/cross_process_fork_wait_hang_probe.sh` (saved permanently,
+reproduces in under 4 seconds, no XFCE/Xvfb/dbus needed) -- two trivial `(...)& (...)& wait`
+subshells. Both subshells run to completion and print their own `*_DONE` marker (confirmed via
+log); `wait` itself never returns and `CONC_DONE` never prints. This is exactly
+`webtop_stack.sh`'s own shape: many `(...)&` supervisor loops started before any synchronization
+point.
+
+`LITEBOX_LOG=litebox_shim_linux::syscalls::process=debug` pinpoints it precisely: the parent
+thread's (guest tid=1) LAST syscall, ever, is a single non-blocking `sys_wait4(pid=-1,
+options=WNOHANG)` issued immediately after the SECOND `clone: try_cross_process_fork` call,
+correctly returning `Ok(0)` (neither child has exited yet). No further syscall from tid=1 is ever
+logged again -- not even minutes later, and not even after both children log their own clean
+`exit_group status=0`. This rules out `wait_for_cross_process_exit` (never reached: that requires
+a SECOND `sys_wait4`, which never happens) and rules out a missing-case bug in `sys_wait4`/
+`sys_waitid`'s `cross_process_children` handling (also never reached). The parent's own GUEST CODE
+stops issuing syscalls entirely, right after two cross-process forks back-to-back from one thread.
+Windows-level process/thread inspection (`Get-Process`/`$p.Threads`) confirms the surviving
+process is not hot-spinning: near-zero but nonzero CPU growth, the signature of a blocked wait, not
+a tight loop -- same signature as the original full-stack hang.
+
+**This is very likely the same still-open concurrent-cross-process-fork corruption class
+`advisor/ADVISORY-001-fundamentals.md` sections 3H-3N+ have been chasing for many sessions**
+(MAXCONCURRENT>=2 correlating with corruption; "trampoline-rw-window-race"; glibc tcache/
+safe-linking corruption under the thread-based path) -- just newly reachable, and far more cheaply
+reproducible (4 seconds, no GUI stack at all), because the VirtualQuery fix made forks fast enough
+for a real script to actually get two of them running back-to-back before hitting a wait point.
+Root-causing the EXACT corrupted register/stack slot (the advisory's own multi-section methodology:
+`LITEBOX_VEH_TRACE=1`/`LITEBOX_DIAG_FATALDUMP=1`, symbolizing the stuck rip, comparing against
+`AddressRelocations`) is a distinct, substantial investigation in its own right and was correctly
+left to a dedicated follow-up rather than rushed here -- but it now has a much cheaper door in than
+any prior repro in that advisory.
+
+
 ## 2026-09-10 (later still): pointed the timing diagnostic at the REAL stack script as planned --
 ## narrows the remaining unexplained cost to AFTER `GlobalState built`, not before
 

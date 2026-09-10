@@ -178,7 +178,7 @@ fork site that still risks the `fork_verify` host-side AV (the real architectura
 alpine-mate repro, so the confirmed desktop content is a painted root window, not a full desktop
 session.
 
-## Track B: `D == 0` cross-process fork (CORRECTNESS confirmed, blocked on a PERFORMANCE problem, not a memory-safety one)
+## Track B: `D == 0` cross-process fork (fast now; a real, newly-reachable concurrency hang replaces the old perf blocker)
 
 A genuine `D == 0` (child lands at the SAME addresses as the parent, no relocation, no
 `fork_verify` healing needed at all) cross-process fork already exists in-tree
@@ -210,15 +210,34 @@ earlier "15 real minutes, 7 guest-seconds of progress" full-webtop-stack observa
 `LITEBOX_PROCESS_FORK=1`, previously (and, in light of this, likely wrongly) attributed to a
 Defender scan-gate or a pathological `fork_verify` healing loop.
 
-**This reframes the whole Track B effort more optimistically than the old verdict did:** the path
-to a working desktop may not require solving the thread-based path's research-grade memory-safety
-problem at all -- it may instead need a conventional, well-scoped caching/reuse engineering pass
-(share or cache the already-merged in-memory rootfs across forks within one run; audit which parts
-of a forked child's `WindowsUserland::new()` re-init are genuinely unnecessary) to make
-cross-process fork fast enough to use as the default. That caching/reuse work is itself
-substantial and was deliberately NOT attempted in the same session that found it -- see
-`docs/track-b-fork-fix-progress.md`'s matching 2026-09-10 entry for the full measurements and
-exact log evidence before starting it.
+**2026-09-10, later: the performance blocker above is FIXED (commit `ce5648f`).** The per-fork
+cost was never `WindowsUserland::new()`/rootfs re-merge overhead as first suspected -- it was
+`fork_verify::is_readable` calling `VirtualQuery` once PER 4KB PAGE on the parent side while
+copying the child's memory (`VirtualQuery`'s cost scales with total committed memory, a VAD-tree
+walk). Caching the queried region's bounds across consecutive pages (`fork_verify::
+readable_region`) cut a 173MB group's copy time from 23.5-25.4s to 400-650ms (**~40-60x**). The
+real `webtop_stack.sh` boot under `LITEBOX_PROCESS_FORK=1` now reaches `NGINX_CONFIGURED`/
+`NGINX_STARTED` in under a minute, versus never getting there in 15+ minutes before. Full
+measurement/rejected-alternative narrative: `docs/track-b-fork-fix-progress.md`.
+
+**This performance fix immediately exposed a real, previously-unreachable correctness bug: two
+backgrounded cross-process forks from the SAME parent thread, followed by `wait`, hangs the
+parent forever.** Isolated into a 4-second, no-GUI repro: `advisor/probes/cross_process_fork_
+wait_hang_probe.sh`. Both forked children run to completion and print their own `*_DONE` marker;
+`wait` never returns. `LITEBOX_LOG=litebox_shim_linux::syscalls::process=debug` shows the
+parent's (guest tid=1) LAST syscall ever is a single non-blocking `sys_wait4(pid=-1,
+options=WNOHANG)` right after the second `clone: try_cross_process_fork` -- it returns `Ok(0)`
+correctly, and then the parent's OWN GUEST CODE never issues another syscall, confirmed via
+Windows-level thread inspection to be blocked (near-zero but nonzero CPU), not hot-spinning. This
+rules out `wait_for_cross_process_exit` and the `sys_wait4`/`sys_waitid` `cross_process_children`
+registries entirely (neither is ever reached a second time). **This is very likely the same
+still-open concurrent-cross-process-fork corruption class ADVISORY-001 sections 3H-3N+ have
+chased for many sessions** (MAXCONCURRENT>=2 correlating with corruption, "trampoline-rw-window-
+race", glibc tcache/safe-linking corruption under the thread-based path) -- now reachable, and far
+cheaper to reproduce, only because forks are finally fast enough for a real script to get two of
+them running before hitting a wait point. Root-causing the exact corrupted state is a dedicated
+follow-up (the advisory's own `LITEBOX_VEH_TRACE=1`/`LITEBOX_DIAG_FATALDUMP=1` methodology against
+this new, much cheaper probe), deliberately not rushed in the same session that found it.
 
 ## Container images
 
