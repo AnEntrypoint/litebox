@@ -3681,6 +3681,12 @@ fn copy_one_group(
         let Some(bytes) = read_source_bytes(page_range.clone()) else {
             // Unreadable page: leave it as the child's already-zero-filled MEM_COMMIT content
             // (real guest padding pages are unmapped too, so this matches production behavior).
+            if std::env::var_os("LITEBOX_DIAG_FORK_SKIPPED_PAGE").is_some() {
+                eprintln!(
+                    "[diag-fork-skip] page treated as unreadable/padding, left zero-filled in child: addr={:#x}..{:#x} group={:#x}..{:#x}",
+                    page_range.start, page_range.end, source_group.start, source_group.end
+                );
+            }
             cursor = page_end;
             continue;
         };

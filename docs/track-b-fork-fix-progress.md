@@ -1,9 +1,63 @@
 # Track B fork-without-exec fix: running progress log
 
-## 2026-09-10 (later still): minimal isolated repro shows the SAME tcache corruption under
-## CROSS-PROCESS fork, not just the thread-based default -- evidence the shared root cause is
-## region-grouping/copy-range computation, not (only) ADVISORY-001 3N's pointer-mangling-survives-
-## relocation theory
+## 2026-09-10 (later still, CORRECTION): the "cross-process fork also corrupts" entry directly
+## below is WRONG -- the repro never actually took the cross-process path. Retracted here with the
+## mechanism of the misreading, so the wrong conclusion is not mistaken for settled in the future.
+
+### What was actually wrong
+
+The entry below concluded, from live logs, that a minimal `bash -c 'x=$(echo hi)'` repro's fork
+went through `try_cross_process_fork`'s real, non-relocating `spawn_cross_process_fork_child` by
+default and STILL corrupted -- taken as evidence against ADVISORY-001 3N's relocation-specific
+theory. That reading is false. Root cause of the error: `litebox_shim_linux`'s
+`try_cross_process_fork` logs `"clone: cross-process fork() is eligible"` and
+`"clone: cross-process fork() copy plan"` based on fd-complexity/address-layout checks it runs
+ITSELF, BEFORE ever calling into the platform -- `WindowsUserland::spawn_cross_process_fork_child`
+(`litebox_platform_windows_userland/src/lib.rs` ~9896) has its own, separate, unconditional gate
+as its literal first line, `std::env::var_os("LITEBOX_PROCESS_FORK")?`, and returns `None`
+immediately when that's unset, which it was for every run in the entry below. Verified directly
+with a temporary diagnostic print placed at that exact line (removed again after use, never
+committed): `LITEBOX_PROCESS_FORK=None`, confirmed on every single fork in the repro, and -- with
+`litebox_shim_linux`+`litebox_platform_windows_userland` both at debug level -- zero
+`[process_fork_diag] task-resume-probe` lines anywhere in the log, which is the sole resume path
+a REAL cross-process child goes through. The repro's fork fell back to the ordinary thread-based
+path every single time, exactly as the project's documented default has always done; the shim's
+own "eligible"/"copy plan" log lines are real but describe a plan that was never executed, not a
+decision that was acted on.
+
+This also resolves what looked like a contradiction in the entry below: `fork_verify`'s
+`rip=140668706084432 -> translated_rip=2614240958032` "translation" is not a bug injecting a wrong
+destination into an address space that should have been untouched -- it is `fork_verify` correctly
+doing its designed job, translating a genuinely stale pointer left over from a genuinely
+relocating thread-based fork, to its genuinely new, correct destination. There was no contradiction
+to resolve in the first place once the premise (cross-process path taken) is corrected.
+
+### What remains true and useful from the entry below
+
+The isolated repro itself (`bash -c` in a tight loop doing `x=$(echo hi)`, no other services) is a
+clean, fast, fully-isolated reproduction of the ALREADY-DOCUMENTED thread-based-fork tcache
+corruption (ADVISORY-001 3N) -- 10/10 crash rate, `malloc(): unaligned tcache chunk detected`,
+matching this document's own 2026-09-07 `tcache_fork_repro.sh` baseline exactly. Worth keeping as a
+faster, simpler alternative to that repro for a future session that picks up ADVISORY-002 proper.
+The `LITEBOX_DIAG_FORK_SKIPPED_PAGE` diagnostic added to `copy_one_group`
+(`litebox_platform_windows_userland/src/process_fork.rs`) is harmless and real (logs any page that
+function's cross-process copy treats as unreadable padding), but says nothing about THIS repro's
+failure mode, since `copy_one_group` never ran for it -- it remains available, zero-cost when
+unset, for whoever next investigates an ACTUAL cross-process fork.
+
+The region-grouping-heuristic hypothesis (`docs/fork-region-grouping-design.md`'s "gap heuristic")
+is NEITHER confirmed NOR refuted by anything in this document -- the "zero pages skipped" evidence
+that seemed to refute it was collected from a code path (`copy_one_group`) that this corrected
+understanding now shows never executed. It remains exactly as untested as it was before any of
+today's cross-process investigation, and is still a reasonable candidate for a genuine
+cross-process repro (one actually run with `LITEBOX_PROCESS_FORK=1`, verified via the same
+`[process_fork_diag] task-resume-probe` log check this correction used) to check first.
+
+## 2026-09-10 (later still): [RETRACTED BY THE CORRECTION ABOVE -- kept for the historical record
+## of how the misreading happened, not as a standing conclusion] minimal isolated repro shows the
+## SAME tcache corruption under CROSS-PROCESS fork, not just the thread-based default -- evidence
+## the shared root cause is region-grouping/copy-range computation, not (only) ADVISORY-001 3N's
+## pointer-mangling-survives-relocation theory
 
 ### Repro
 
