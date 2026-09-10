@@ -2270,45 +2270,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Ok(usize::try_from(pid).unwrap());
         }
 
-        // Pass 156: `wait4(-1, ...)` ("any child") previously consulted only `children`
-        // (thread-based), never `cross_process_children` -- documented above as a known gap. A
-        // shell's `A && B`/pipeline wait loop (busybox ash included) calls exactly this pattern
-        // after `fork()`ing a cross-process child (`LITEBOX_PROCESS_FORK=1`'s `beyond_stdio == 0`
-        // shape, e.g. `apk` spawned by `/bin/sh -c "apk add ... && ..."`) -- with `children` empty
-        // and this registry never consulted, the wait fell straight through to `ECHILD` below,
-        // silently short-circuiting the shell's own wait loop and never running the rest of the
-        // `&&`/pipeline chain (live-observed: `apk add --no-cache jq` completes for real under
-        // `LITEBOX_PROCESS_FORK=1`, but the following `echo hello | jq -R .` never executes).
-        // Only taken when `children` has nothing (checked first, just below) so an existing
-        // thread-based-only caller's `pid == -1` behavior is completely unaffected.
-        if pid == -1 && process.children.lock().is_empty() {
-            let first_cross_pid = process
-                .cross_process_children
-                .lock()
-                .first()
-                .map(|(p, _)| *p);
-            if let Some(cross_pid) = first_cross_pid {
-                let handle = process
-                    .find_cross_process_child(cross_pid)
-                    .expect("pid just read from cross_process_children must still be registered");
-                let raw_exit = if no_hang {
-                    let Some(raw_exit) =
-                        self.global.platform.try_wait_for_cross_process_exit(handle)
-                    else {
-                        return Ok(0);
-                    };
-                    raw_exit
-                } else {
-                    self.global.platform.wait_for_cross_process_exit(handle)
-                };
-                self.import_cross_process_writable_layer(handle);
-                process.reap_cross_process_child(cross_pid);
-                let encoded = decode_cross_process_wait_status(raw_exit);
-                if let Some(wstatus) = wstatus {
-                    let _ = wstatus.write_at_offset::<Platform>(0, encoded);
-                }
-                return Ok(usize::try_from(cross_pid).unwrap());
-            }
+        // `wait4(-1, ...)` ("any child") must poll BOTH registries uniformly. An earlier, narrower
+        // fix (pass 156) consulted `cross_process_children` only when `children` was ALREADY
+        // empty at call time -- backwards for the common real shape: an unrelated thread-based
+        // child left registered (e.g. a shell's own earlier foreground `mkdir`/`cp`/`sed` fork
+        // that has not been individually reaped by the time it backgrounds a LATER cross-process
+        // fork) made `children.is_empty()` false, so execution fell straight into the
+        // thread-only blocking-wait loop below, which never looked at `cross_process_children`
+        // at all. Confirmed live: this hung a shell's `wait4(-1)` forever waiting for a
+        // cross-process `curl` child that had ALREADY exited cleanly (`webtop_stack.sh`'s own
+        // nginx-config-setup block forks several plain `mkdir`/`sed`/`ln` commands via the
+        // thread-based path before ever backgrounding the cross-process-eligible nginx
+        // supervisor and `curl` self-test loop).
+        //
+        // Unlike the WNOHANG-only narrow fix, `poll_once` below checks `cross_process_children`
+        // on EVERY invocation -- including every time the blocking `wait_until` wakes and
+        // re-polls -- so a cross-process child that exits AFTER this call starts blocking is
+        // caught too, not just one that was already exited before the call began.
+        enum AnyChildExit {
+            Thread(i32, ExitStatus),
+            CrossProcess(i32, u32),
         }
 
         // Unlike the blocking path, a `WNOHANG` poll must NOT remove the child from our children
@@ -2330,15 +2311,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // of an unrelated signal, which `ready()` below simply reports not-ready-yet and loops
         // again).
         let (child_pid, exit_status) = if pid == -1 {
-            if process.children.lock().is_empty() {
+            if process.children.lock().is_empty() && process.cross_process_children.lock().is_empty()
+            {
                 return Err(Errno::ECHILD);
             }
-            let mut found = None;
+            let mut found: Option<AnyChildExit> = None;
             let mut poll_once = || {
+                // Cross-process children first: `try_wait_for_cross_process_exit` is a cheap,
+                // side-effect-free poll (the real reap happens below, once, after the loop), so
+                // calling it speculatively on every `poll_once` invocation -- including ones that
+                // find nothing -- costs nothing a real exit wasn't already going to pay for.
+                {
+                    let cross = process.cross_process_children.lock();
+                    for (p, h) in cross.iter() {
+                        if let Some(raw_exit) =
+                            self.global.platform.try_wait_for_cross_process_exit(*h)
+                        {
+                            found = Some(AnyChildExit::CrossProcess(*p, raw_exit));
+                            return true;
+                        }
+                    }
+                }
                 let children = process.children.lock();
                 for (p, c) in children.iter() {
                     if let Some(status) = c.try_wait_for_exit() {
-                        found = Some((*p, status));
+                        found = Some(AnyChildExit::Thread(*p, status));
                         return true;
                     }
                 }
@@ -2381,7 +2378,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     ),
                 };
             }
-            found.expect("poll_once only returns true after `found` is set")
+            match found.expect("poll_once only returns true after `found` is set") {
+                AnyChildExit::CrossProcess(cross_pid, raw_exit) => {
+                    let handle = process.find_cross_process_child(cross_pid).expect(
+                        "pid just read from cross_process_children must still be registered",
+                    );
+                    self.import_cross_process_writable_layer(handle);
+                    process.reap_cross_process_child(cross_pid);
+                    let encoded = decode_cross_process_wait_status(raw_exit);
+                    if let Some(wstatus) = wstatus {
+                        let _ = wstatus.write_at_offset::<Platform>(0, encoded);
+                    }
+                    return Ok(usize::try_from(cross_pid).unwrap());
+                }
+                AnyChildExit::Thread(p, status) => (p, status),
+            }
         } else {
             let (child_pid, child_process) = {
                 let children = process.children.lock();
