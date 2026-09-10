@@ -1,5 +1,51 @@
 # Track B fork-without-exec fix: running progress log
 
+## 2026-09-10 (later still): pointed the timing diagnostic at the REAL stack script as planned --
+## narrows the remaining unexplained cost to AFTER `GlobalState built`, not before
+
+### What this entry adds
+
+The entry below ends with "point `LITEBOX_DIAG_FORK_TIMING` at the real stack script next, not
+another isolated repro." Done. Booted the real `webtop_stack.sh` again with
+`LITEBOX_PROCESS_FORK=1` + `LITEBOX_DIAG_FORK_TIMING=1` + `LITEBOX_LOG=warn`, and watched both the
+timing markers AND real wall-clock time (file mtime/size, not just line count -- this session's
+own log-reading tool showed a real buffering lag against a file an active background process is
+still writing, so file mtime/size is the reliable wall-clock signal here, not a `wc -l` snapshot
+that can read stale).
+
+**Every individual fork's OWN internal timing, up through `GlobalState built`, stayed fast and
+consistent with both isolated repros** -- `rootfs layers ready` ~60-100ms, `Platform::new()`
+near-instant, `default_fs_multi_layer` (the base rootfs TarRo merge) ~390-660ms, writable layer
+import proportional to its (here, still small) size. All consistent with the entries below; no
+regression, no surprise.
+
+**But real wall-clock time between forks was still far larger than those internal numbers
+explain** -- confirmed via file mtime/size going genuinely idle (not a stale read) for well over a
+minute at a stretch while only 4 of the ~7 forks `NGINX_CONFIGURED` needs had completed, with one
+specific fork's own process (confirmed via `tasklist`, not log-inferred) visibly still resident and
+still GROWING in memory (tens of MB, climbing) long after its own `GlobalState built` line had
+already printed. That rules out the base-rootfs-merge and writable-layer-import steps as the
+cause of THIS specific remaining gap -- both already completed and logged before the stall -- and
+narrows it to whatever happens next: `diag_process_fork_vmem_adopt_probe`'s region-by-region
+`PageManager` reconstruction/verification, `diag_process_fork_task_resume_probe`'s fd/pipe
+rebuild and `run_thread_with_fork_verification` dispatch, or the forked guest's OWN execution of
+whatever real command this particular fork is (one of `mkdir -p` with many path arguments, `cp`,
+or a `sed -i` against `/defaults/default.conf`, at this point in the script -- not yet narrowed to
+which).
+
+### Why this session stops here rather than adding a third round of instrumentation
+
+Neither isolated repro (`bashfork_repro.sh`, `writetest_repro.sh`) reproduces this specific gap --
+both stay fast end-to-end under the identical `LITEBOX_PROCESS_FORK=1` + digest-skip-fix
+configuration. That means the next diagnostic step needs markers INSIDE
+`diag_process_fork_vmem_adopt_probe`/`diag_process_fork_task_resume_probe` themselves (not just
+around the already-instrumented `globalstate_probe`), run against the real stack script
+specifically -- a third round of instrumentation, not a conclusion reachable by more reasoning
+over data already collected. Stopping here, with the search space correctly narrowed (confirmed
+NOT the manifest fetch, confirmed NOT writable-layer growth, confirmed NOT the base rootfs merge,
+narrowed TO post-`GlobalState`/VMA-adopt/guest-execution) rather than extending the instrumentation
+a third time in the same sitting.
+
 ## 2026-09-10 (later still): full webtop boot under the manifest-skip fix -- a real 3.4-3.9x
 ## per-fork speedup confirmed, but the full stack still stalls for a DIFFERENT, not-yet-isolated
 ## reason; writable-layer growth ruled out cleanly as that reason
