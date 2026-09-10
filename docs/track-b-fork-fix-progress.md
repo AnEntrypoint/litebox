@@ -1,5 +1,57 @@
 # Track B fork-without-exec fix: running progress log
 
+## 2026-09-10 (later still): a real, verified fix for part of the per-fork overhead -- plus a
+## near-mistake in measuring it, caught before being written down wrong
+
+### The fix: stop fetching an OCI image-config blob nobody reads
+
+`pull_layers_in_memory` (the runtime `--oci-image` boot AND fork-child-rebuild path) fetched and
+parsed the full image-config blob -- `client.pull_blob(&reference, &manifest.config, ...)` plus
+`ConfigFile::try_from` -- on every single call, including once per cross-process fork child (a
+fresh process, fresh `Client`, zero connection reuse). Checked both runtime callers
+(`litebox_runner_linux_on_windows_userland`'s top-level boot and its fork-child rebuild): neither
+ever reads `PulledLayers::config`/`config_json` -- only `.layers`. Removed the blob pull, the
+parsing, and the now-dead fields (commit `1199ab6`). `litebox-packager`'s separate ahead-of-time
+`pull_and_extract` CLI path, which genuinely needs ENTRYPOINT/CMD/ENV for `config_and_run.sh`, has
+its own independent fetch and is untouched.
+
+Verified: `litebox_packager --lib` tests pass, the runner builds clean, and a live timing repro
+shows a real, if modest, improvement: per-fork wall-clock time across 6 cross-process forks of the
+isolated `bash -c 'x=$(echo hi)'` repro averaged ~4.1s after the fix vs. ~4.7s before (one fewer
+network round-trip per fork, no HTTP keep-alive across the fresh process each fork spawns, so the
+saving is a full manifest-blob-GET's worth of TLS+request+response latency every time). Does not
+fully resolve the documented per-fork overhead -- see below.
+
+### A near-mistake, caught before it was written down: don't compare two processes' own clocks
+
+While measuring this, a `[process_fork_diag]` child log line showed fork_verify activity at
+`5.404797s` against the PARENT's own `try_cross_process_fork entry` at `5.372645s` -- numerically
+close enough to read, at a glance, as "the child was running guest code only 32ms after the fork
+attempt, so rootfs rebuild isn't the bottleneck after all." That reading is wrong and was caught
+before being committed anywhere: every cross-process fork child is a FRESH re-exec of the whole
+runner binary, with its own `init_logging()` call resetting elapsed-time-since-process-start to
+near zero at ITS OWN process creation -- a moment that has no fixed relationship to the PARENT's
+own elapsed-time clock, which started when the whole run began. The two `5.4s`-ish values were
+coincidentally close, not causally related; subtracting across them produces a meaningless number.
+The only valid way to measure a fork cycle's real duration is consecutive timestamps from ONE
+process's own log (parent-side `try_cross_process_fork entry` to the parent's own next post-fork
+activity, or separately, a child's own first timestamp to its own last) -- which is exactly the
+method the entry below already used, and which this note reconfirms rather than overturns: the
+real ~4-5s-per-fork cost, measured correctly, on a single consistent clock, stands.
+
+### What's left: the per-fork cost is very likely dominated by the in-memory rootfs re-merge, not network
+
+With the now-single remaining network call (the manifest GET, still needed to discover which
+layer digests to check in cache) and the config-blob fetch gone, ~4.1s of per-fork cost remains.
+The next concrete target, not yet attempted: `TarRo::from_layers` re-indexing all 17 (mostly
+multi-hundred-MB, one ~2.5GB) cached layers from scratch on every single fork, plus a fresh
+`WindowsUserland::new()` cold start (VEH registration, NAT gateway `net_worker` spawn, console
+watcher) -- both CPU/IO-bound, not network-bound, and both genuinely redundant across forks within
+one run since the result is byte-identical every time. Caching/reusing either of these across
+forks is a substantially larger, riskier change (needs either cross-process shared state or a
+pre-merged on-disk snapshot, versus this entry's pure subtraction of dead work) and was
+deliberately not attempted in the same pass as this smaller, fully-verified fix.
+
 ## 2026-09-10 (later still, after the correction below): a GENUINE cross-process fork run of the
 ## isolated bash repro is correctness-sound (zero corruption) but costs ~3.5-5s of pure overhead
 ## PER FORK -- a tractable performance/caching problem, not a memory-safety one, and a more
