@@ -629,21 +629,31 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     let rootfs_source = if let Some(image_ref) = &cli_args.oci_image {
         eprintln!("Pulling OCI image (runtime, in-memory): {image_ref}");
-        // `pull_layers_in_memory` pulls, decompresses, AND rewrites each layer's ELFs one layer
-        // at a time internally -- never holding more than one layer's raw+rewritten bytes at
-        // once. Rewriting again here would be redundant (and re-introduce the same
-        // all-layers-at-once memory spike this function was changed to avoid).
-        let pulled = litebox_packager::oci::pull_layers_in_memory(image_ref, true)
-            .map_err(|e| anyhow!("failed to pull OCI image {image_ref}: {e}"))?;
+        // `pull_layers_in_memory_with_resolved_digests` pulls, decompresses, AND rewrites each
+        // layer's ELFs one layer at a time internally -- never holding more than one layer's
+        // raw+rewritten bytes at once. Rewriting again here would be redundant (and
+        // re-introduce the same all-layers-at-once memory spike this function was changed to
+        // avoid).
+        let (pulled, resolved_layers_json) =
+            litebox_packager::oci::pull_layers_in_memory_with_resolved_digests(image_ref, true)
+                .map_err(|e| anyhow!("failed to pull OCI image {image_ref}: {e}"))?;
         // Carry the REFERENCE across a cross-process `fork()`, the way the `--initial-files` path
         // carries its tar path. A child re-execs with no command line of its own, so without this
         // it arrives with no rootfs source at all and cannot `execve` anything. See
         // `FORK_CHILD_OCI_IMAGE_ENV_VAR` for why the reference is the right thing to hand over
         // rather than a materialised rootfs.
+        //
+        // Also carry the ALREADY-RESOLVED layer digest list, so every fork child can skip its
+        // own manifest fetch entirely -- see `FORK_CHILD_OCI_LAYER_DIGESTS_ENV_VAR`'s doc comment
+        // for the measured cost (2.2-3.1s per fork) this removes.
         unsafe {
             std::env::set_var(
                 litebox_platform_windows_userland::process_fork::FORK_CHILD_OCI_IMAGE_ENV_VAR,
                 image_ref,
+            );
+            std::env::set_var(
+                litebox_platform_windows_userland::process_fork::FORK_CHILD_OCI_LAYER_DIGESTS_ENV_VAR,
+                &resolved_layers_json,
             );
         }
         RootfsSource::OciLayers {
@@ -1280,6 +1290,21 @@ pub fn diag_process_fork_globalstate_probe() {
     if !litebox_platform_windows_userland::process_fork::diag_process_fork_globalstate_enabled() {
         return;
     }
+    // Investigative timing only (LITEBOX_DIAG_FORK_TIMING=1): breaks down where a cross-process
+    // fork child's startup time actually goes, to tell the rootfs-re-merge cost apart from
+    // Platform::new()'s cold-start cost -- see docs/track-b-fork-fix-progress.md's per-fork
+    // overhead entries. `t0` is this function's own entry, the earliest point a child-specific
+    // clock can start (process creation itself, and the re-exec/CreateProcessW machinery before
+    // this, are not covered).
+    let diag_timing = std::env::var_os("LITEBOX_DIAG_FORK_TIMING").is_some();
+    let t0 = std::time::Instant::now();
+    macro_rules! diag_elapsed {
+        ($label:expr) => {
+            if diag_timing {
+                eprintln!("[diag-fork-timing] {} at {:?}", $label, t0.elapsed());
+            }
+        };
+    }
     // The child's read-only rootfs, from whichever source this run booted with. It re-execs with
     // no command line of its own, so both arrive by environment: a `--initial-files` tar as a path
     // to mmap, an `--oci-image` as the REFERENCE to re-derive from the digest-keyed layer cache the
@@ -1299,16 +1324,36 @@ pub fn diag_process_fork_globalstate_probe() {
     )
     .filter(|v| !v.is_empty());
 
+    let layer_digests_json = std::env::var(
+        litebox_platform_windows_userland::process_fork::FORK_CHILD_OCI_LAYER_DIGESTS_ENV_VAR,
+    )
+    .ok()
+    .filter(|v| !v.is_empty());
+
     let tar_layers: Vec<std::borrow::Cow<'static, [u8]>> = if let Some(image_ref) = &oci_ref {
         eprintln!(
             "[process_fork_diag] globalstate-probe (child): rebuilding rootfs from OCI image {image_ref}"
         );
-        // The same call the parent made. Layers are read from the on-disk digest+rewriter-version
-        // cache rather than the network, so this is a local read of bytes the parent has already
-        // produced -- the two processes agree by construction because they run the same code over
-        // the same digests, with no separate artifact to keep in sync.
-        match litebox_packager::oci::pull_layers_in_memory(image_ref, true) {
-            Ok(pulled) => pulled.layers,
+        // Layers are read from the on-disk digest+rewriter-version cache rather than the
+        // network, so this is a local read of bytes the parent has already produced -- the two
+        // processes agree by construction because they run the same code over the same digests,
+        // with no separate artifact to keep in sync. When the parent's already-resolved digest
+        // list arrived too (the normal case -- see `FORK_CHILD_OCI_LAYER_DIGESTS_ENV_VAR`), skip
+        // this child's own manifest fetch entirely; it would just re-discover the identical
+        // digests the parent already resolved, at the cost of a real, unconditional multi-second
+        // network round-trip (measured, see that constant's own doc comment). Falls back to the
+        // ordinary manifest-fetching path if the digest list didn't arrive for some reason
+        // (e.g. an older parent build), rather than failing this fork outright.
+        let pull_result = if let Some(digests_json) = &layer_digests_json {
+            litebox_packager::oci::pull_layers_with_known_digests(image_ref, digests_json, true)
+        } else {
+            litebox_packager::oci::pull_layers_in_memory(image_ref, true)
+        };
+        match pull_result {
+            Ok(pulled) => {
+                diag_elapsed!("rootfs layers ready (pull_layers_in_memory returned)");
+                pulled.layers
+            }
             Err(e) => {
                 eprintln!(
                     "[process_fork_diag] globalstate-probe (child): failed to rebuild rootfs from {image_ref}: {e}"
@@ -1340,6 +1385,7 @@ pub fn diag_process_fork_globalstate_probe() {
     };
 
     let platform = Platform::new();
+    diag_elapsed!("Platform::new() returned");
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
     let litebox = shim_builder.litebox();
 
@@ -1390,6 +1436,7 @@ pub fn diag_process_fork_globalstate_probe() {
     // `default_fs` is `default_fs_multi_layer` with a one-element list, so a tar and an OCI layer
     // stack converge here exactly as they do in `run()`.
     let fs = shim_builder.default_fs_multi_layer(in_mem, tar_layers);
+    diag_elapsed!("default_fs_multi_layer returned (rootfs indexed/merged)");
     let fs = std::sync::Arc::new(fs);
 
     // This child is itself a fork parent for any child IT goes on to spawn, and it never reaches
@@ -1416,6 +1463,7 @@ pub fn diag_process_fork_globalstate_probe() {
     eprintln!(
         "[process_fork_diag] globalstate-probe (child): GlobalState constructed successfully, no crash/hang/error"
     );
+    diag_elapsed!("GlobalState built, handing off to vmem-adopt-probe");
 
     diag_process_fork_vmem_adopt_probe(platform, &shim, fs);
 }

@@ -21,6 +21,7 @@ flate2 = "1.1"
 memmap2 = "0.9.8"
 oci-client = { version = "0.16", default-features = false, features = ["native-tls"] }
 oci-spec = { version = "0.9", features = ["image"] }
+serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["rt"] }
 walkdir = "2.0"

@@ -932,11 +932,34 @@ pub(crate) fn publish_as_container_fs_snapshot(written_to: std::path::PathBuf) -
 /// every cross-process fork of an OCI-booted guest failed, which is why enabling
 /// `LITEBOX_PROCESS_FORK` broke a webtop boot outright (`XVFB_FAILED`, `DBUS_FAILED`).
 ///
-/// The reference, not a materialised rootfs: the child re-derives its layers through the same
-/// `pull_layers_in_memory` call the parent used, which is a read of the digest-keyed on-disk layer
-/// cache the parent has already warmed. No image is modified, nothing extra is written, and the two
-/// processes agree by construction because they run the same code over the same digests.
+/// The reference, not a materialised rootfs: the child re-derives its layers from the
+/// digest-keyed on-disk layer cache the parent has already warmed. No image is modified, nothing
+/// extra is written, and the two processes agree by construction because they run the same code
+/// over the same digests -- see [`FORK_CHILD_OCI_LAYER_DIGESTS_ENV_VAR`] for why the child skips
+/// re-DISCOVERING those digests via its own manifest fetch, using this reference only as a
+/// fallback identifier (error messages, and the rare case a referenced layer is missing from the
+/// cache and must be pulled fresh).
 pub const FORK_CHILD_OCI_IMAGE_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_OCI_IMAGE";
+
+/// The parent's already-resolved OCI manifest layer list (media type + digest + size, JSON via
+/// `litebox_packager::oci::pull_layers_in_memory_with_resolved_digests`'s return value), so a
+/// cross-process fork child can skip its own manifest fetch entirely
+/// (`litebox_packager::oci::pull_layers_with_known_digests`).
+///
+/// # Why this exists
+///
+/// Measured live (`LITEBOX_DIAG_FORK_TIMING=1`, see `docs/track-b-fork-fix-progress.md`'s
+/// matching entry): `pull_image_manifest` -- a real, unconditional HTTPS round-trip to the
+/// registry, with NO connection reuse across forks since each one is a fresh process with its own
+/// fresh `Client` -- took 2.2-3.1 SECONDS per call against a real public registry from this
+/// project's own dev host, while the entire per-layer cache-check loop that follows it (all 17
+/// layers already `[cache] HIT`) took 3-15 MILLISECONDS. The manifest fetch was, by a factor of
+/// roughly 200-700x, the dominant cost of every single cross-process fork of an `--oci-image`
+/// boot -- for a value (WHICH layer digests exist) the parent had already resolved, correctly,
+/// moments earlier in the exact same run. Handing it over removes that cost from every fork after
+/// the first resolution, exactly as [`FORK_CHILD_OCI_IMAGE_ENV_VAR`] already removes the need to
+/// re-specify which image to boot.
+pub const FORK_CHILD_OCI_LAYER_DIGESTS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_OCI_DIGESTS";
 
 /// Encode `bytes` as lowercase hex, for [`FORK_CHILD_FILE_FDS_ENV_VAR`].
 #[must_use]

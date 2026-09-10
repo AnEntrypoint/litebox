@@ -2146,6 +2146,7 @@ dependencies = [
  "oci-client",
  "oci-spec",
  "rayon",
+ "serde_json",
  "tar",
  "tempfile",
  "tokio",

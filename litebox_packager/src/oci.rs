@@ -703,6 +703,52 @@ pub mod cache {
 /// both the raw and rewritten copies of every layer simultaneously -- fusing pull+decompress+
 /// rewrite into one per-layer step, as done here, is the fix).
 pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<PulledLayers> {
+    pull_layers_in_memory_impl(image_ref, None, verbose).map(|(pulled, _)| pulled)
+}
+
+/// Like [`pull_layers_in_memory`], but ALSO returns the resolved manifest layer list
+/// (media type + digest + size), JSON-serialized, so a caller that is about to become a
+/// cross-process fork PARENT can hand it to every child it spawns via
+/// [`pull_layers_with_known_digests`] -- skipping that child's own, otherwise-unconditional
+/// manifest fetch. See that function's own doc comment for why this matters and how much it
+/// saves.
+#[must_use = "the returned layer-digest JSON is the whole point of calling this over `pull_layers_in_memory`"]
+pub fn pull_layers_in_memory_with_resolved_digests(
+    image_ref: &str,
+    verbose: bool,
+) -> anyhow::Result<(PulledLayers, String)> {
+    pull_layers_in_memory_impl(image_ref, None, verbose)
+}
+
+/// Like [`pull_layers_in_memory`], but skips the manifest fetch entirely -- a real, unconditional
+/// network round-trip (2-3s against a real public registry from this project's own dev host,
+/// measured via `LITEBOX_DIAG_FORK_TIMING=1`; see `docs/track-b-fork-fix-progress.md`'s matching
+/// entry) that a cross-process fork child otherwise pays on EVERY SINGLE FORK for a manifest
+/// whose content is byte-identical to the one the parent already resolved moments earlier within
+/// the same run. `layers_json` is the JSON list `pull_layers_in_memory_with_resolved_digests`
+/// returned from that earlier, real fetch.
+///
+/// Falls back to a genuine network pull (same as the manifest-driven path) for any INDIVIDUAL
+/// layer that isn't found in the on-disk cache -- this only skips discovering WHICH digests to
+/// look for, never the ability to actually fetch one if the cache came up empty. The parent and
+/// every fork child share one on-disk cache and run within the same process lifetime, so a cache
+/// miss here is expected to be as rare as it already is on the manifest-driven path, not a new
+/// failure mode this path introduces.
+pub fn pull_layers_with_known_digests(
+    image_ref: &str,
+    layers_json: &str,
+    verbose: bool,
+) -> anyhow::Result<PulledLayers> {
+    let known_layers: Vec<oci_client::manifest::OciDescriptor> = serde_json::from_str(layers_json)
+        .context("failed to parse pre-resolved OCI layer digest list")?;
+    pull_layers_in_memory_impl(image_ref, Some(known_layers), verbose).map(|(pulled, _)| pulled)
+}
+
+fn pull_layers_in_memory_impl(
+    image_ref: &str,
+    known_layers: Option<Vec<oci_client::manifest::OciDescriptor>>,
+    verbose: bool,
+) -> anyhow::Result<(PulledLayers, String)> {
     let reference: Reference = image_ref
         .parse()
         .with_context(|| format!("invalid OCI image reference: {image_ref}"))?;
@@ -730,7 +776,7 @@ pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<P
         }
     }
 
-    let layers = rt.block_on(async {
+    let (layers, resolved_layers_json) = rt.block_on(async {
         let client_config = ClientConfig {
             protocol: ClientProtocol::Https,
             platform_resolver: Some(Box::new(|entries| {
@@ -749,38 +795,65 @@ pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<P
         let client = Client::new(client_config);
         let auth = RegistryAuth::Anonymous;
 
-        if verbose {
-            eprintln!("  Fetching manifest...");
-        }
+        // Investigative timing only (LITEBOX_DIAG_FORK_TIMING=1): isolates the manifest fetch's
+        // own cost from the per-layer cache-check loop below -- see
+        // docs/track-b-fork-fix-progress.md's per-fork overhead entries.
+        let diag_timing = std::env::var_os("LITEBOX_DIAG_FORK_TIMING").is_some();
 
-        let (manifest, _digest) = client
-            .pull_image_manifest(&reference, &auth)
-            .await
-            .with_context(|| format!("failed to pull manifest for {reference}"))?;
+        let resolved_layers: Vec<oci_client::manifest::OciDescriptor> = if let Some(known) =
+            known_layers
+        {
+            if verbose {
+                eprintln!(
+                    "  Using pre-resolved layer digests ({} layer(s), no manifest fetch)",
+                    known.len()
+                );
+            }
+            known
+        } else {
+            if verbose {
+                eprintln!("  Fetching manifest...");
+            }
+            let manifest_t0 = std::time::Instant::now();
+            let (manifest, _digest) = client
+                .pull_image_manifest(&reference, &auth)
+                .await
+                .with_context(|| format!("failed to pull manifest for {reference}"))?;
+            if diag_timing {
+                eprintln!(
+                    "[diag-fork-timing] pull_image_manifest returned at {:?}",
+                    manifest_t0.elapsed()
+                );
+            }
 
-        // No image-config blob pull here, unlike `pull_and_extract`: `PulledLayers` has no
-        // `config`/`config_json` field and neither runtime caller
-        // (`litebox_runner_linux_on_windows_userland`) ever reads one -- the program to run is
-        // always given explicitly on this runner's own command line, never derived from the
-        // image's ENTRYPOINT/CMD. Fetching and parsing it was pure wasted work: one whole extra
-        // network round-trip (blob GET + the manifest GET above, with no HTTP keep-alive across
-        // them since every cross-process fork child re-execs with a brand-new `Client`) on every
-        // single `--oci-image` boot AND every cross-process fork of one, for a value nothing
-        // downstream ever looked at.
+            // No image-config blob pull here, unlike `pull_and_extract`: `PulledLayers` has no
+            // `config`/`config_json` field and neither runtime caller
+            // (`litebox_runner_linux_on_windows_userland`) ever reads one -- the program to run
+            // is always given explicitly on this runner's own command line, never derived from
+            // the image's ENTRYPOINT/CMD. Fetching and parsing it was pure wasted work: one
+            // whole extra network round-trip (blob GET + the manifest GET above, with no HTTP
+            // keep-alive across them since every cross-process fork child re-execs with a
+            // brand-new `Client`) on every single `--oci-image` boot AND every cross-process fork
+            // of one, for a value nothing downstream ever looked at.
 
-        if verbose {
-            eprintln!("  Pulled manifest ({} layer(s))", manifest.layers.len());
-        }
+            if verbose {
+                eprintln!("  Pulled manifest ({} layer(s))", manifest.layers.len());
+            }
+            manifest.layers
+        };
+        let resolved_layers_json = serde_json::to_string(&resolved_layers)
+            .context("failed to serialize resolved OCI layer digest list")?;
 
         let accepted_media_types = [
             oci_client::manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE,
             oci_client::manifest::IMAGE_LAYER_MEDIA_TYPE,
             oci_client::manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE,
         ];
-        let num_layers = manifest.layers.len();
+        let num_layers = resolved_layers.len();
         let mut layers: Vec<Cow<'static, [u8]>> = Vec::with_capacity(num_layers);
         let rewriter_version = litebox_syscall_rewriter::REWRITER_CACHE_VERSION;
-        for (i, layer_desc) in manifest.layers.iter().enumerate() {
+        let layer_loop_t0 = std::time::Instant::now();
+        for (i, layer_desc) in resolved_layers.iter().enumerate() {
             if !accepted_media_types.contains(&layer_desc.media_type.as_str()) {
                 anyhow::bail!("unsupported layer media type: {}", layer_desc.media_type);
             }
@@ -1039,10 +1112,17 @@ pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<P
             layers.push(mapped);
         }
 
-        Ok::<_, anyhow::Error>(layers)
+        if diag_timing {
+            eprintln!(
+                "[diag-fork-timing] all {num_layers} layer(s) ready (cache-check loop done) at {:?}",
+                layer_loop_t0.elapsed()
+            );
+        }
+
+        Ok::<_, anyhow::Error>((layers, resolved_layers_json))
     })?;
 
-    Ok(PulledLayers { layers })
+    Ok((PulledLayers { layers }, resolved_layers_json))
 }
 
 /// Rewrite every executable ELF entry inside one decompressed OCI layer tar's bytes, eagerly,
