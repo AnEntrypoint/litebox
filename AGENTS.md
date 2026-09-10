@@ -1,4 +1,4 @@
-# litebox — current state (2026-09-05)
+# litebox — current state (2026-09-07)
 
 This file is the authoritative, CURRENT-STATE picture of what works, what's broken, and what to
 do next — consolidated, not historical. It does not narrate how each conclusion was reached; it
@@ -116,6 +116,81 @@ narrative appended to the bottom.
   like `../litebox-webtop/`. Root-level scratch files (`probe_*.tar`, `*.bmp`, `*.log`) are
   gitignored; if `git add -A`/`git add .` sweeps one in by accident, untrack it rather than leave
   it committed.
+
+## Webtop browser-verified video pipeline (WORKING, as of 2026-09-07)
+
+**A real guest desktop stack (selkies, inside a `linuxserver/webtop` image) now streams live,
+changing video frames into a real browser on the host.** Confirmed by three consecutive
+browser screenshots of the selkies dashboard, each a different color (cyan/green/magenta)
+matching a root-window painter cycling color once per second inside the guest -- a live stream,
+not one stale frame. The whole pipeline (Xvfb, the X client, selkies with its pixelflux x264
+encoder, MIT-SHM capture) runs inside litebox; only the reverse proxy is host-side, since guest
+processes don't share a loopback namespace and litebox's own `--publish` is already a host-side
+NAT. Full narrative, reproduction recipe, and the load-bearing gotchas (`+extension RANDR` and
+MIT-SHM on the `Xvfb` argv, matching the websocket port selkies actually reports, ~2GB free host
+memory) are in `docs/webtop-debian-selkies-2026-09-06.md` (Track A: the webtop/XFCE demo-path
+log; see also the alpine-mate-specific `docs/webtop-alpine-mate-2026-09-07.md`).
+
+Getting here required fixing seven real, independent litebox defects, all landed:
+1. `insert_mapping` rejected any `FixedAddressBehavior::Hint` suggestion ending past
+   `TASK_ADDR_MAX` outright instead of sliding it down, failing `fork()` with `ENOMEM` whenever
+   a parent's topmost region group sat near the top of the address space -- despite a `Hint`
+   being free to land anywhere. This was being misattributed to the well-known, separate
+   fork-without-exec architectural hazard (see "Track B" below); it is not the same bug.
+2. `BootLock` released its lock in a `Drop` impl, but `std::process::exit`/`ExitProcess` runs no
+   destructors, so every clean run leaked its lockfile and the next boot waited out a 5-minute
+   staleness window. Now tied to a held OS file handle (`FILE_SHARE_READ`), so the OS itself
+   enforces exclusivity and releases it on every exit path, including a hard kill.
+3. The Windows CoW `mmap` fast path (`try_allocate_cow_pages`) silently corrupted shared
+   libraries when a guest `MAP_FIXED`-remapped a sub-range of a view, because the flanking
+   remainder died with the whole view and was rebuilt as zero-fill anonymous memory instead of
+   equivalent CoW. Now opt-in only (`LITEBOX_COW_MMAP`, default off), with the flank-restoration
+   path itself also fixed for anyone who opts back in -- see "Windows CoW-mmap performance"
+   below and `docs/cow-mmap-fixed-address-design.md`.
+4. `futex`'s priority-inheritance ops (`FUTEX_LOCK_PI` etc.) returned EINVAL for an unknown op,
+   which PulseAudio's `pa_mutex_new` treats as a hard abort (it only tolerates 0 or ENOTSUP) --
+   aborting PulseAudio, and with it selkies, the instant a browser client connected. Now ENOTSUP.
+5. `sys_waitid` was entirely unimplemented, hanging every `asyncio` subprocess reaper
+   (`os.waitid(P_PID, pid, WEXITED | WNOWAIT)`) -- this is what left selkies' display
+   reconfiguration permanently unfinished.
+6. `resize_mapping`'s in-place-expand path `unreachable!()`-panicked (killing the whole guest)
+   on an ordinary out-of-space `AboveMaxAddress`/`BelowMinAddress`, instead of reporting ENOMEM
+   like real Linux.
+7. System V shared memory (`shmget`/`shmat`/`shmdt`/`shmctl`) was entirely unimplemented --
+   this was the actual, final blocker: selkies' pixelflux capture uses X11 MIT-SHM to move
+   framebuffer bytes, and without it capture failed immediately with `shmget failed` and the
+   browser never left "Waiting for stream...". litebox runs every guest process in one real host
+   address space, so a segment is just an anonymous mapping and every attachment gets the
+   identical pointer -- genuine sharing, not an approximation.
+
+**Not yet done**: audio, clipboard, and gamepad remain disabled in this recipe because each is a
+fork site that still risks the `fork_verify` host-side AV (the real architectural gap -- see
+"Track B" and the `RtlpUnwindPrologue` section below). MATE itself is not running in the verified
+alpine-mate repro, so the confirmed desktop content is a painted root window, not a full desktop
+session.
+
+## Track B: `D == 0` cross-process fork (architectural fix, inconclusive -- do not fund further without new evidence)
+
+A genuine `D == 0` (child lands at the SAME addresses as the parent, no relocation, no
+`fork_verify` healing needed at all) cross-process fork already exists in-tree and already works
+(`LITEBOX_PROCESS_FORK=1`, `spawn_cross_process_fork_child`) -- see `advisor/ADVISORY-002-d-zero-
+fork.md` for the full feasibility case. It is hard-gated off for every real workload by one check
+(`fd_complexity.beyond_stdio == 0` in `litebox_shim_linux/src/syscalls/process.rs`): any guest
+holding an fd at or above 3 -- i.e. every XFCE component, every X client, every D-Bus participant
+-- falls back to the existing thread-based relocating fork and its `fork_verify` healing.
+
+**Current verdict, per `docs/track-b-fork-fix-progress.md`'s own running log (the designated
+before-funding-anything-else gate for the whole rewrite): do not proceed with the larger Track B
+investment yet.** The gating experiment (Step 0: a `beyond_stdio == 0` glibc fork-without-exec
+repro under `LITEBOX_PROCESS_FORK=1`) remains INCONCLUSIVE across multiple sessions. The
+observed freeze/hang blocking that experiment was root-caused this session to Windows Defender's
+real-time-protection scan-gating delaying the child process's very first scheduled tick after
+`CreateProcess` -- not a litebox memory-safety bug (`PageManager::duplicate`, `copy_one_group`,
+and `memcpy_fallible` were all re-audited specifically hunting for a PEB/loader-list write and
+none was found). The direct next step -- adding a Defender exclusion for the build output
+directory and re-running the repro -- needs administrator rights no session so far has had.
+Whoever picks this up next should read that doc's own "What remains open" section before doing
+anything else; do not re-derive this from scratch.
 
 ## Container images
 
@@ -398,6 +473,18 @@ is a closed, well-evidenced negative result -- do not re-attempt without a genui
 approach** (e.g. per-segment ELF relayout, which was considered and rejected as too risky for
 `ET_EXEC` binaries with linker-fixed addresses).
 
+**Separately, a real correctness bug was since found and fixed in this same path (2026-09-07):**
+a mapped view can only be destroyed whole on Windows (no partial unmap), so when the guest
+`MAP_FIXED`-remaps a sub-range of a view (exactly what `ld.so` does: one whole-library view, then
+a fixed sub-mmap per `PT_LOAD`), the flanking remainder on either side died with it and was
+rebuilt as zero-fill anonymous memory -- for a shared library, silently corrupting it (measured:
+a real `pixelflux`/`pcmflux` import failure and SIGSEGV against a realigned webtop image). The
+path is now opt-in only, behind `LITEBOX_COW_MMAP` (default off, costing nothing given the "zero
+practical effect" finding above), and the flank-restoration logic itself is fixed for anyone who
+opts back in (recover the view's true extent from `AllocationBase`, not `BaseAddress`, and round
+its end UP to allocation granularity before reserving). See
+`docs/cow-mmap-fixed-address-design.md` for the fuller design writeup of this area.
+
 ## Input latency (fixed, shipped)
 
 Three real bugs found and fixed in the Windows presentation/input path, all verified live:
@@ -443,4 +530,25 @@ on-screen client first.
     environmental reason stops being read, which is precisely how those two logic failures sat
     unexamined behind them.
   **Never record a test count you did not just watch run to completion**, and **never leave a suite
-  red for an environmental reason** -- both are how this one stayed wrong.
+  red for an environmental reason** -- both are how this one stayed wrong. (Supersedes any older
+  "26 failing, 9 need `diod`" note you may see elsewhere dated before 2026-09-09 -- that count is
+  now stale; the two real logic bugs it bundled in are fixed.)
+- `docs/webtop-debian-selkies-2026-09-06.md` (Track A) and `docs/webtop-alpine-mate-2026-09-07.md`
+  -- the full, dated investigation logs behind "Webtop browser-verified video pipeline" above.
+- `docs/track-b-fork-fix-progress.md` and `advisor/ADVISORY-002-d-zero-fork.md` -- the full log
+  and design case behind "Track B: `D == 0` cross-process fork" above, including the 2026-09-10
+  `CLAIMED_RANGES` cross-process-collision root-cause fix for Xvfb's deterministic crash.
+- `docs/presenter-process-design.md` -- design spec (not yet implemented) for moving the
+  window/wgpu/winit presentation loop out of the same process as guest syscall emulation, per
+  `advisor/ADVISORY-001-fundamentals.md` Appendix D.
+- `docs/session-daemon-design.md` -- design for agent-driven multi-session TTY control; its
+  foundational slice (`litebox_termemu`, a pure bytes -> rendered-screen VT100 emulator) is
+  already implemented, the daemon/IPC layer on top of it is not yet built.
+- `docs/fork-region-grouping-design.md` -- permanent-fix design (not yet implemented; the
+  shipped state is still a diagnostic probe) for provenance-based region grouping in
+  `Vmem::duplicate`, replacing the current gap-heuristic grouping.
+- `docs/drm-dumb-buffer-ioctl-reference.md` -- verbatim kernel UAPI struct reference for the
+  dumb-buffer DRM/KMS ioctls `litebox_shim_linux/src/syscalls/drm.rs` implements against; consult
+  it rather than re-deriving struct layouts from scratch when touching that file.
+- `docs/diag-timeline-field-semantics.md` -- read before building any new hypothesis on
+  `DIAG_TIMELINE`'s `comm` field; two separate investigations already mis-traced it once.
