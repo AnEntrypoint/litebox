@@ -220,24 +220,34 @@ real `webtop_stack.sh` boot under `LITEBOX_PROCESS_FORK=1` now reaches `NGINX_CO
 `NGINX_STARTED` in under a minute, versus never getting there in 15+ minutes before. Full
 measurement/rejected-alternative narrative: `docs/track-b-fork-fix-progress.md`.
 
-**This performance fix immediately exposed a real, previously-unreachable correctness bug: two
-backgrounded cross-process forks from the SAME parent thread, followed by `wait`, hangs the
-parent forever.** Isolated into a 4-second, no-GUI repro: `advisor/probes/cross_process_fork_
-wait_hang_probe.sh`. Both forked children run to completion and print their own `*_DONE` marker;
-`wait` never returns. `LITEBOX_LOG=litebox_shim_linux::syscalls::process=debug` shows the
-parent's (guest tid=1) LAST syscall ever is a single non-blocking `sys_wait4(pid=-1,
-options=WNOHANG)` right after the second `clone: try_cross_process_fork` -- it returns `Ok(0)`
-correctly, and then the parent's OWN GUEST CODE never issues another syscall, confirmed via
-Windows-level thread inspection to be blocked (near-zero but nonzero CPU), not hot-spinning. This
-rules out `wait_for_cross_process_exit` and the `sys_wait4`/`sys_waitid` `cross_process_children`
-registries entirely (neither is ever reached a second time). **This is very likely the same
-still-open concurrent-cross-process-fork corruption class ADVISORY-001 sections 3H-3N+ have
-chased for many sessions** (MAXCONCURRENT>=2 correlating with corruption, "trampoline-rw-window-
-race", glibc tcache/safe-linking corruption under the thread-based path) -- now reachable, and far
-cheaper to reproduce, only because forks are finally fast enough for a real script to get two of
-them running before hitting a wait point. Root-causing the exact corrupted state is a dedicated
-follow-up (the advisory's own `LITEBOX_VEH_TRACE=1`/`LITEBOX_DIAG_FATALDUMP=1` methodology against
-this new, much cheaper probe), deliberately not rushed in the same session that found it.
+**This performance fix immediately exposed a real, previously-unreachable correctness bug, now
+ROOT-CAUSED AND FIXED (commit `060ccc3`): two backgrounded cross-process forks from the SAME
+parent thread, followed by `wait`, hung the parent forever.** Root cause was NOT the
+concurrent-corruption class this section used to guess at -- it was a missing `SIGCHLD` bridge.
+A `LITEBOX_PROCESS_FORK=1` child is a genuinely separate Windows process reconstructing its own
+`Process` from scratch, with no `Arc` back to the real parent -- confirmed via `Process::
+prepare_for_exit`'s own `has_live_parent` gate reading unconditionally `false` for such a child,
+silently skipping the SAME same-process `SIGCHLD`-delivery step a thread-based child's exit
+already uses. A parent blocked the race-free way (mask `SIGCHLD`, `sigsuspend`/`pause` to
+atomically wait for it -- busybox ash's plain `wait` builtin does exactly this with more than one
+backgrounded job) therefore hung forever the moment it had any cross-process-fork child, even
+after that child had already exited: nothing was ever going to wake it. Pinpointed via debug
+syscall tracing against `advisor/probes/cross_process_fork_wait_hang_probe.sh`: the parent's last
+syscall ever was a non-blocking `sys_wait4(WNOHANG)` (correctly returns `Ok(0)`) immediately
+followed by `rt_sigprocmask`, then silence -- the standard mask-then-sigsuspend idiom's second
+half never got traced because `sys_pause`/`sys_rt_sigsuspend` have no entry log, not because
+nothing happened.
+
+Fix: new `ForkChildVerificationProvider::spawn_cross_process_exit_notifier` (`litebox/src/
+platform/mod.rs`), Windows-implemented via a spawned thread blocking on the existing
+`wait_for_cross_process_exit`, wired into both real `do_clone` cross-process-fork sites
+(`litebox_shim_linux/src/syscalls/process.rs`) to push the child's `exit_signal` into the
+parent's `shared_pending` and call `interrupt_all_threads()` on exit -- exactly mirroring
+`prepare_for_exit`'s existing same-process notify step. Verified: the probe now passes, 5/5 fresh
+hang-repro runs complete, 3/3 existing correctness-repro runs still pass with zero corruption, and
+the real `webtop_stack.sh` boot now gets well past the original stall -- through nginx's SSL-cert
+supervisor loop entirely, into its `curl` self-test retry loop, where a NEW, distinct stall was
+found (not yet investigated; see `docs/track-b-fork-fix-progress.md`'s matching entry).
 
 ## Container images
 

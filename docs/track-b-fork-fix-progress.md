@@ -1,5 +1,70 @@
 # Track B fork-without-exec fix: running progress log
 
+## 2026-09-10 (latest of all): root-caused AND FIXED the concurrent-fork wait() hang -- it was
+## missing SIGCHLD delivery, not the deep ADVISORY-001 corruption class the previous entry guessed
+
+### The real root cause (not corruption)
+
+The previous entry's hypothesis -- "very likely the same still-open concurrent-cross-process-
+fork corruption class as ADVISORY-001 3H-3N+" -- was a reasonable guess but WRONG. Debug-level
+tracing (`LITEBOX_LOG=litebox_shim_linux=debug` against `advisor/probes/cross_process_fork_
+wait_hang_probe.sh`) pinned the parent's exact last two syscalls before going silent: a
+non-blocking `sys_wait4(pid=-1, WNOHANG)` (correctly returns `Ok(0)`, neither child has exited
+yet), immediately followed by `rt_sigprocmask` (orig_rax=14). That pairing is the standard
+race-free "mask SIGCHLD, then block to atomically wait for it" shell idiom -- the very next call
+is `sigsuspend`/`pause`, which busybox ash's plain `wait` builtin uses once it has more than one
+backgrounded job.
+
+Reading `sys_pause`/`sys_rt_sigsuspend` (`litebox_shim_linux`): both block via the SAME
+`wait_cx().sleep()` primitive that ordinary same-process `SIGCHLD` delivery wakes
+(`Process::interrupt_all_threads()`, called from `Process::prepare_for_exit`'s parent-notify
+step). But `prepare_for_exit`'s own debug line (`parent-notify gate check ... has_live_parent=
+false`) proved that gate is UNCONDITIONALLY false for a `LITEBOX_PROCESS_FORK=1` child: it is a
+genuinely separate Windows process that reconstructed its own `Process` from scratch
+(`new_adopting_existing_memory`), with no `Arc` back to the real parent to push a signal into or
+interrupt. So a parent blocked in `sigsuspend`/`pause` waiting for `SIGCHLD` hangs FOREVER the
+moment it has any cross-process-fork child, even after that child has already exited -- nothing
+was ever going to wake it. An active poller (plain `wait4(-1, ..., 0)` retry with no sleep)
+would still work via `wait_for_cross_process_exit`/`try_wait_for_cross_process_exit`; only the
+signal-driven wait was broken.
+
+### The fix (commit `060ccc3`)
+
+Added `ForkChildVerificationProvider::spawn_cross_process_exit_notifier` (`litebox/src/platform/
+mod.rs`): arranges for a callback to run once a cross-process child's real OS process exits.
+Windows implementation (`litebox_platform_windows_userland`) spawns a thread that blocks on the
+already-existing `wait_for_cross_process_exit` then invokes the callback. Wired into both real
+`do_clone` cross-process-fork call sites (`litebox_shim_linux/src/syscalls/process.rs`) via a new
+`arm_cross_process_exit_notifier` helper: the callback pushes the child's own `exit_signal` into
+the parent's `shared_pending` and calls `interrupt_all_threads()` -- exactly mirroring
+`prepare_for_exit`'s existing same-process notify step, just reached via a different trigger,
+with zero change to the thread-based path.
+
+### Verification
+
+- The committed probe (`cross_process_fork_wait_hang_probe.sh`) now prints `CONC_DONE`.
+- 5/5 fresh runs of the isolated 2-subshell repro completed cleanly (previously: 0/N, deterministic
+  hang).
+- 3/3 re-runs of the existing correctness repro (`bashfork_repro.sh`) still pass, zero corruption
+  -- this fix only adds a notify path, touches no existing memory-copy/relocation logic.
+- The real `webtop_stack.sh` boot, re-run with the fix, now gets well past the original stall
+  point: through nginx's SSL-cert supervisor loop ENTIRELY (`NGINX_CONFIGURED`/`NGINX_STARTED`
+  print, same as before the fix, but this time the script keeps going instead of hanging) and
+  into its `curl` self-test retry loop (waits for nginx to actually start serving on :3000).
+
+### New, distinct stall found immediately after (NOT yet investigated)
+
+The self-test loop (`code=$(curl -s -o /dev/null -m 3 -w "%{http_code}" http://127.0.0.1:3000/
+...)`, up to 20 retries, 1s apart) got through at least one `curl` invocation (logged child exit
+status `0xc0de0007` -- `7` is curl's own "failed to connect" exit code, plausible this early
+since nginx itself may not be listening yet) and then stalled again: zero log growth for 60+s,
+same blocked-not-spinning CPU signature (near-zero but nonzero growth) as every hang this session.
+This is a DIFFERENT pattern from the one just fixed -- a command-substitution wait is a simple
+direct wait, not the `sigsuspend`-based idiom -- so it is not obviously the same bug, and might
+instead be in curl's own networking path (litebox's virtual network stack) rather than fork/wait
+at all. Not yet isolated into its own minimal repro or debug-traced; left for a follow-up session
+rather than guessed at further in this one.
+
 ## 2026-09-10 (latest): VirtualQuery-per-page caching fix (~40-60x per-fork speedup, committed
 ## `ce5648f`) -- then a NEW, real hang surfaced past `NGINX_CONFIGURED` that this fix exposed
 
