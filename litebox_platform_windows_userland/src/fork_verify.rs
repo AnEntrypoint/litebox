@@ -1897,6 +1897,43 @@ fn readable_and_writable(addr: usize, len: usize) -> (bool, bool) {
     )
 }
 
+/// Like [`is_readable`], but additionally returns the FULL extent of the committed-and-readable
+/// region `addr` falls in, so a caller walking many addresses can skip re-querying for every
+/// subsequent one that falls in the SAME region it already has the bounds of.
+///
+/// # Why this exists
+///
+/// `VirtualQuery`'s cost scales with the process's total committed memory (see
+/// `readable_and_writable`'s own doc comment) -- a real cost this function's only caller,
+/// `spawn_cross_process_fork_child`'s page-by-page memory copy, was paying ONCE PER 4KiB PAGE of
+/// every cross-process fork, even though a real guest mapping is typically many megabytes of ONE
+/// contiguous committed region. Measured live (`LITEBOX_DIAG_FORK_TIMING=1`): a single 173MB
+/// region (one guest process's shared-library reservation group, ~42,000 pages) took 23-25 REAL
+/// SECONDS to copy, reproducibly, on every single fork of that guest -- batching the destination
+/// `WriteProcessMemory` calls instead (tried first) measured WORSE, not better, confirming the
+/// `VirtualQuery`-per-page cost on this, the READ side, was the actual bottleneck all along. A
+/// single query per region instead of per page turns ~42,000 kernel round-trips into one.
+#[must_use]
+pub(crate) fn readable_region(addr: usize) -> Option<core::ops::Range<usize>> {
+    use windows_sys::Win32::System::Memory as Win32_Memory;
+    const NO_ACCESS: u32 = Win32_Memory::PAGE_NOACCESS | Win32_Memory::PAGE_GUARD;
+
+    let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+    let ok = unsafe {
+        Win32_Memory::VirtualQuery(
+            addr as *const core::ffi::c_void,
+            &raw mut mbi,
+            core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+        ) != 0
+    };
+    if !ok || mbi.State != Win32_Memory::MEM_COMMIT || mbi.Protect & NO_ACCESS != 0 {
+        return None;
+    }
+    let start = mbi.BaseAddress as usize;
+    let end = start.saturating_add(mbi.RegionSize);
+    (start..end).contains(&addr).then_some(start..end)
+}
+
 /// If `instruction` writes to memory, computes the effective address it writes to from its
 /// operands plus the live register values in `context`.
 ///

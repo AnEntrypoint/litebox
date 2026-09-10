@@ -1023,11 +1023,31 @@ pub(crate) fn export_parent_writable_layer_for_child() -> Option<std::path::Path
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    match exporter(&path) {
+    let diag_timing = std::env::var_os("LITEBOX_DIAG_FORK_TIMING").is_some();
+    let export_t0 = std::time::Instant::now();
+    let export_result = exporter(&path);
+    if diag_timing {
+        eprintln!(
+            "[diag-fork-timing] (parent) export_parent_writable_layer_for_child: exporter() returned ok={} at {:?}",
+            export_result.is_ok(),
+            export_t0.elapsed()
+        );
+    }
+    match export_result {
         // Publish this export as the boot tree's new canonical "latest" snapshot -- see
         // `CONTAINER_FS_SNAPSHOT_ENV_VAR`'s own doc comment -- and hand the child THAT path, not
         // the now-possibly-renamed-away unique one.
-        Ok(()) => Some(publish_as_container_fs_snapshot(path)),
+        Ok(()) => {
+            let publish_t0 = std::time::Instant::now();
+            let published = publish_as_container_fs_snapshot(path);
+            if diag_timing {
+                eprintln!(
+                    "[diag-fork-timing] (parent) publish_as_container_fs_snapshot returned at {:?}",
+                    publish_t0.elapsed()
+                );
+            }
+            Some(published)
+        }
         Err(e) => {
             eprintln!(
                 "[process_fork] could not export the parent's writable layer for the fork child                  ({e}); it will start from the base rootfs only"
@@ -1695,6 +1715,8 @@ pub fn spawn_process_fork_child(
         }};
     }
 
+    let diag_copy_timing = std::env::var_os("LITEBOX_DIAG_FORK_TIMING").is_some();
+    let copy_all_t0 = std::time::Instant::now();
     for (source_group, dest_base) in group_relocations {
         let process = core::hint::black_box(process);
         if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
@@ -1706,7 +1728,14 @@ pub fn spawn_process_fork_child(
                 process, process_addr, stack_addr, source_group.start, source_group.end
             );
         }
+        let group_t0 = std::time::Instant::now();
         let result = copy_one_group(process, source_group, *dest_base, &mut read_source_bytes);
+        if diag_copy_timing {
+            eprintln!(
+                "[diag-fork-timing] (parent) copy_one_group group={:#x}..{:#x} len={:#x} succeeded={} took {:?}",
+                source_group.start, source_group.end, source_group.len(), result.succeeded, group_t0.elapsed()
+            );
+        }
         if !result.succeeded {
             fail_teardown!(
                 "[process_fork] spawn_process_fork_child: group copy FAILED group={:#x}..{:#x} GetLastError={}",
@@ -1715,6 +1744,13 @@ pub fn spawn_process_fork_child(
                 result.last_error
             );
         }
+    }
+    if diag_copy_timing {
+        eprintln!(
+            "[diag-fork-timing] (parent) ALL group copies done, {} group(s), took {:?} total",
+            group_relocations.len(),
+            copy_all_t0.elapsed()
+        );
     }
 
     // PASS 144: `copy_one_group` above commits every reservation-group span as blanket
@@ -3697,6 +3733,18 @@ fn copy_one_group(
     // ever reached the resume/injection step). The full per-address log is reconstructible from
     // (start_addr, run_length) at analysis time by grep'ing the printed range.
     let mut zero_runs: Vec<(usize, usize)> = Vec::new();
+
+    // Batching consecutive pages into one larger `WriteProcessMemory` call was tried here and
+    // MEASURED LIVE to make things WORSE, not better (see `docs/track-b-fork-fix-progress.md`'s
+    // matching entry): ~24s became ~46s for the same real 173MB group. The per-page cost this
+    // function pays is not dominated by `WriteProcessMemory`'s own call overhead -- it is
+    // dominated by `read_source_bytes`'s own per-page `VirtualQuery` call (see
+    // `fork_verify::is_readable`'s doc comment: cost scales with the process's total committed
+    // memory), which batching the WRITE side does nothing to reduce while adding a real extra
+    // buffer-copy cost on top. The actual fix belongs on the READ side, not here -- see
+    // `read_source_bytes`'s own construction site in this crate's `lib.rs`
+    // (`spawn_cross_process_fork_child`) for where that is addressed instead. Left as simple,
+    // unbatched per-page writes here deliberately, now that batching is a confirmed non-fix.
     let mut cursor = source_group.start;
     while cursor < source_group.end {
         let page_end = (cursor + PAGE_SIZE).min(source_group.end);

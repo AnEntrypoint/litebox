@@ -9686,8 +9686,16 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         // pages of the first group and then hits `0x10106000`, which `VirtualQuery` reports as
         // `State=MEM_RESERVE Protect=0x0`, and the run dies there every time.
         //
-        // `fork_verify::is_readable` is the same committed-and-readable test used elsewhere, so
-        // an uncommitted page is skipped rather than faulted on.
+        // `fork_verify::readable_region` is the same committed-and-readable `VirtualQuery` test
+        // `is_readable` uses elsewhere, so an uncommitted page is skipped rather than faulted on
+        // -- but it ALSO returns the queried region's full bounds, cached here across calls
+        // (`cached_region`) so consecutive pages within the SAME real guest mapping (the common
+        // case -- a mapping is typically megabytes, not one page) pay for one `VirtualQuery` per
+        // region instead of one per page. Measured live: this was the actual dominant cost of
+        // copying a large guest process's memory across a cross-process fork (23-25s for one
+        // 173MB region, ~42,000 pages) -- see `readable_region`'s own doc comment for the full
+        // finding and why batching the WRITE side instead (tried first) did not help.
+        let mut cached_region: Option<core::ops::Range<usize>> = None;
         let read_source_bytes = |range: core::ops::Range<usize>| {
             use litebox::platform::RawConstPointer as _;
             const PAGE: usize = litebox::mm::linux::PAGE_SIZE;
@@ -9699,7 +9707,11 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
             while off < len {
                 let addr = range.start.wrapping_add(off);
                 let chunk = (PAGE - (addr % PAGE)).min(len - off);
-                if fork_verify::is_readable(addr) {
+                let in_cached_region = cached_region.as_ref().is_some_and(|r| r.contains(&addr));
+                if !in_cached_region {
+                    cached_region = fork_verify::readable_region(addr);
+                }
+                if cached_region.is_some() {
                     let ptr = <Self as litebox::platform::RawPointerProvider>::RawConstPointer::<
                         u8,
                     >::from_usize(addr);
