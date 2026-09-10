@@ -784,19 +784,40 @@ unsafe extern "system" fn vectored_exception_handler(
     // is otherwise unrecoverable. `std::cell::Cell`-based thread_local, no heap allocation, no
     // locking -- safe to read/write even from deep inside exception handling.
     std::thread_local! {
-        static RECENT_FAULTS: RefCell<[(i32, u64, u64, bool); 4]> =
-            const { RefCell::new([(0, 0, 0, false); 4]) };
+        // `Option<bool>` (not `bool`): see the `is_in_guest_state` comment below -- `None` means
+        // "could not determine" and must stay distinguishable from a confirmed `Some(false)`.
+        static RECENT_FAULTS: RefCell<[(i32, u64, u64, Option<bool>); 4]> =
+            const { RefCell::new([(0, 0, 0, None); 4]) };
         // Ring of (faulting_rip, recover_fixup_addr) pairs for every exception-table recovery
         // this thread has taken -- see the `context.Rip = recover` call site's own doc comment.
         static RECOVERY_LOG: RefCell<[(u64, u64); 4]> = const { RefCell::new([(0, 0); 4]) };
     }
     {
         let code = unsafe { (*(*exception_info).ExceptionRecord).ExceptionCode };
-        let rip = unsafe { (*(*exception_info).ContextRecord).Rip };
-        let rsp = unsafe { (*(*exception_info).ContextRecord).Rsp };
-        let this_is_in_guest = get_tls_ptr()
-            .map(|p| unsafe { (*p).is_in_guest.get() })
-            .unwrap_or(false);
+        // ATOMICITY FIX: `rip` and `rsp` used to come from two SEPARATE dereferences of the live,
+        // OS-owned `CONTEXT` (`(*(*exception_info).ContextRecord).Rip` then `.Rsp`). This function
+        // runs before the `context_snapshot` copy a few hundred lines below is taken, and nothing
+        // stops `ThreadHandle::interrupt`'s `SuspendThread`/`SetThreadContext` or
+        // `ctxwatch_arm_other_threads`' debug-register rewrites on another thread from mutating
+        // that same CONTEXT between the two reads -- exactly the torn-read class already fixed
+        // for the later diagnostics by commit 9b124ed, which predates this early ring capture and
+        // never covered it. Take one struct copy up front (same justification as
+        // `context_snapshot`: `CONTEXT` is `Copy`, a fixed-size stack copy, no allocation, no
+        // call that can itself fault) and read both fields from that single snapshot.
+        let ctx_snapshot = unsafe { *(*exception_info).ContextRecord };
+        let rip = ctx_snapshot.Rip;
+        let rsp = ctx_snapshot.Rsp;
+        // TRI-STATE FIX: `get_tls_ptr()` returning `None` means this thread has no TLS slot at
+        // all, i.e. "could not determine whether this is a guest thread" -- not "confirmed not a
+        // guest thread". Collapsing that via `.unwrap_or(false)` made the two cases print
+        // identically (`is_in_guest=false`) everywhere this value is logged, so a reader could
+        // never tell "genuinely a host thread" apart from "thread identification failed here".
+        // Keep the tri-state for the ring/log; `this_is_in_guest` below stays the existing
+        // conservative bool (unknown treated as not-guest) for this function's own gating logic,
+        // which is unaffected by this fix.
+        let is_in_guest_state: Option<bool> =
+            get_tls_ptr().map(|p| unsafe { (*p).is_in_guest.get() });
+        let this_is_in_guest = is_in_guest_state.unwrap_or(false);
         // A nested/re-entrant fault (this handler invoked again while an outer invocation still
         // holds this same borrow -- e.g. a genuine secondary fault occurring while already inside
         // this diagnostic block) must never panic here: `RefCell::borrow_mut`'s "already borrowed"
@@ -808,7 +829,7 @@ unsafe extern "system" fn vectored_exception_handler(
         RECENT_FAULTS.with(|cell| {
             if let Ok(mut ring) = cell.try_borrow_mut() {
                 ring.rotate_left(1);
-                ring[3] = (code, rip, rsp, this_is_in_guest);
+                ring[3] = (code, rip, rsp, is_in_guest_state);
             }
         });
         // Confirmed live (this investigation): a fault dispatched all the way down to the guest
@@ -885,8 +906,15 @@ unsafe extern "system" fn vectored_exception_handler(
         if is_ud_fault {
             let tid0 = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
             diag_raw_print(b"[diag-ud-entry] tid=0x", tid0 as usize, b" rip=0x", rip as usize);
+            // Encode the tri-state as 0/1/2 (not `this_is_in_guest as usize`'s collapsed 0/1):
+            // 2 means "no TLS slot -- could not determine", never conflated with a confirmed 0.
             diag_raw_print(
-                b"[diag-ud-entry]   this_is_in_guest=0x", this_is_in_guest as usize,
+                b"[diag-ud-entry]   is_in_guest_state=0x",
+                match is_in_guest_state {
+                    Some(false) => 0usize,
+                    Some(true) => 1usize,
+                    None => 2usize,
+                },
                 b" raw_code=0x", raw_exception_code as usize as usize,
             );
         }
@@ -2204,8 +2232,18 @@ unsafe extern "system" fn vectored_exception_handler(
                 RECENT_FAULTS.with(|cell| {
                     if let Ok(ring) = cell.try_borrow() {
                         for (i, (code, rip, fault_rsp, in_guest)) in ring.iter().enumerate() {
+                            // `in_guest` is `Option<bool>`: `None` means this ring entry's thread
+                            // had no TLS slot at capture time, i.e. thread identification could
+                            // not be done -- print it as its own distinct state, never silently
+                            // folded into "false", so a reader can tell "confirmed host thread"
+                            // apart from "could not determine".
+                            let in_guest_str = match in_guest {
+                                Some(true) => "true",
+                                Some(false) => "false",
+                                None => "unknown(no-tls)",
+                            };
                             eprintln!(
-                                "[diag-unrecov-av-ring] [{i}] code={code:#x} rip={rip:#x} rva={:#x} rsp={fault_rsp:#x} is_in_guest={in_guest}",
+                                "[diag-unrecov-av-ring] [{i}] code={code:#x} rip={rip:#x} rva={:#x} rsp={fault_rsp:#x} is_in_guest={in_guest_str}",
                                 (*rip as usize).wrapping_sub(module_base),
                             );
                             // Dump this ring entry's own top-of-stack too, so the caller of a
