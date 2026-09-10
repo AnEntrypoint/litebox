@@ -555,6 +555,87 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         Ok(())
     }
 
+    /// (private-only) Make `path` exist in the UPPER layer, so that a metadata-only change
+    /// (`chmod`/`chown`/`set_times`) applied to the upper layer is what the guest observes
+    /// afterwards.
+    ///
+    /// [`Self::migrate_file_up`] alone cannot serve those three callers, because it migrates BYTE
+    /// CONTENTS: a lower-layer entry that is a directory (or a character device/FIFO) comes back
+    /// as [`MigrationError::NotAFile`], which all three turned into `unimplemented!()` -- a HOST
+    /// panic for an ordinary `touch`/`chmod`/`chown` on a path that exists only in the read-only
+    /// lower layer and happens not to be a regular file. `touch /usr/share` under `--oci-image
+    /// docker.io/library/debian:stable-slim` reached exactly that panic live, at `set_times`'
+    /// `NotAFile` arm.
+    ///
+    /// A directory has no contents to copy, so recreate it in the upper layer carrying the lower's
+    /// own mode -- the same copy-up [`Self::mkdir_migrating_ancestor_dirs`] already performs for a
+    /// path's ancestors, and what makes a metadata change on a lower-only directory actually work
+    /// rather than merely stop crashing. For the kinds that genuinely cannot be carried up,
+    /// report [`MetadataMigrationError::ReadOnly`], an honest `EROFS` the guest can act on.
+    fn migrate_entry_up_for_metadata(&self, path: &str) -> Result<(), MetadataMigrationError> {
+        let lower_type = match self.ensure_lower_contains(path) {
+            Ok(file_type) => file_type,
+            Err(FileStatusError::Io | FileStatusError::ClosedFd) => {
+                return Err(MetadataMigrationError::Io);
+            }
+            Err(FileStatusError::PathError(e)) => return Err(MetadataMigrationError::Path(e)),
+        };
+        if let FileType::Directory = lower_type {
+            let lower_status = match self.lower.file_status(path) {
+                Ok(status) => status,
+                Err(FileStatusError::Io | FileStatusError::ClosedFd) => {
+                    return Err(MetadataMigrationError::Io);
+                }
+                Err(FileStatusError::PathError(e)) => return Err(MetadataMigrationError::Path(e)),
+            };
+            match self.mkdir_migrating_ancestor_dirs(path) {
+                Ok(()) | Err(MkdirError::AlreadyExists) => {}
+                Err(MkdirError::Io) => return Err(MetadataMigrationError::Io),
+                Err(MkdirError::PathError(e)) => return Err(MetadataMigrationError::Path(e)),
+                Err(MkdirError::NoWritePerms) => return Err(MetadataMigrationError::NotPermitted),
+                Err(MkdirError::ReadOnlyFileSystem) => {
+                    return Err(MetadataMigrationError::ReadOnly);
+                }
+            }
+            match self.upper.mkdir(path, lower_status.mode) {
+                Ok(()) | Err(MkdirError::AlreadyExists) => {}
+                Err(MkdirError::Io) => return Err(MetadataMigrationError::Io),
+                Err(MkdirError::PathError(e)) => return Err(MetadataMigrationError::Path(e)),
+                Err(MkdirError::NoWritePerms) => return Err(MetadataMigrationError::NotPermitted),
+                Err(MkdirError::ReadOnlyFileSystem) => {
+                    return Err(MetadataMigrationError::ReadOnly);
+                }
+            }
+            // Carry the node-info over, for the same reason `migrate_file_up` does it for a
+            // regular file: a caller that stats the path either side of the copy-up must see
+            // one unchanging inode, not a directory that silently becomes a different object
+            // the first time its timestamps or mode are touched. `node_info_lookup` is a
+            // lookup cache rather than the source of truth for identity, so whichever insert
+            // wins a concurrent copy-up of the same path is a correct outcome.
+            let layered_id = self
+                .node_info_lookup
+                .read()
+                .get(&lower_status.node_info)
+                .copied();
+            if let (Some(layered_id), Ok(upper_status)) = (layered_id, self.upper.file_status(path))
+            {
+                self.node_info_lookup
+                    .write()
+                    .insert(upper_status.node_info, layered_id);
+            }
+            return Ok(());
+        }
+        match self.migrate_file_up(path, true) {
+            Ok(()) => Ok(()),
+            Err(MigrationError::Io) => Err(MetadataMigrationError::Io),
+            Err(MigrationError::PathError(e)) => Err(MetadataMigrationError::Path(e)),
+            Err(MigrationError::NoReadPerms) => Err(MetadataMigrationError::NotPermitted),
+            Err(MigrationError::NotAFile | MigrationError::UpperCannotHoldPath) => {
+                Err(MetadataMigrationError::ReadOnly)
+            }
+        }
+    }
+
     // Gives the absolute path for `path`, resolving any `.` or `..`s, and making sure to account
     // for any relative paths from current working directory.
     //
@@ -582,6 +663,51 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             dev: DEVICE_ID,
             ino,
             rdev,
+        }
+    }
+}
+
+/// Why [`FileSystem::migrate_entry_up_for_metadata`] could not make a path exist in the upper
+/// layer.
+///
+/// Narrowed deliberately to the four shapes [`ChmodError`], [`ChownError`] and [`SetTimesError`]
+/// all share, so each caller converts it with no per-caller reasoning of its own.
+enum MetadataMigrationError {
+    Io,
+    Path(PathError),
+    NotPermitted,
+    ReadOnly,
+}
+
+impl From<MetadataMigrationError> for ChmodError {
+    fn from(error: MetadataMigrationError) -> Self {
+        match error {
+            MetadataMigrationError::Io => Self::Io,
+            MetadataMigrationError::Path(e) => Self::PathError(e),
+            MetadataMigrationError::NotPermitted => Self::NotTheOwner,
+            MetadataMigrationError::ReadOnly => Self::ReadOnlyFileSystem,
+        }
+    }
+}
+
+impl From<MetadataMigrationError> for ChownError {
+    fn from(error: MetadataMigrationError) -> Self {
+        match error {
+            MetadataMigrationError::Io => Self::Io,
+            MetadataMigrationError::Path(e) => Self::PathError(e),
+            MetadataMigrationError::NotPermitted => Self::NotTheOwner,
+            MetadataMigrationError::ReadOnly => Self::ReadOnlyFileSystem,
+        }
+    }
+}
+
+impl From<MetadataMigrationError> for SetTimesError {
+    fn from(error: MetadataMigrationError) -> Self {
+        match error {
+            MetadataMigrationError::Io => Self::Io,
+            MetadataMigrationError::Path(e) => Self::PathError(e),
+            MetadataMigrationError::NotPermitted => Self::NotPermitted,
+            MetadataMigrationError::ReadOnly => Self::ReadOnlyFileSystem,
         }
     }
 }
@@ -1407,46 +1533,35 @@ impl<
 
     fn chmod(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), ChmodError> {
         let path = self.absolute_path(path)?;
-        match self.upper.chmod(path.as_str(), mode) {
-            Ok(()) => return Ok(()),
-            Err(e) => match e {
-                ChmodError::NotTheOwner
-                | ChmodError::Io
-                | ChmodError::ReadOnlyFileSystem
-                | ChmodError::PathError(
-                    PathError::ComponentNotADirectory
-                    | PathError::InvalidPathname
-                    | PathError::NoSearchPerms { .. }
-                    | PathError::TooManySymlinkHops,
-                ) => {
-                    return Err(e);
-                }
-                ChmodError::PathError(
-                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
-                ) => {
-                    // fallthrough
-                }
-            },
+        let mut migrated_up = false;
+        loop {
+            match self.upper.chmod(path.as_str(), mode) {
+                Ok(()) => return Ok(()),
+                Err(e) => match e {
+                    ChmodError::NotTheOwner
+                    | ChmodError::Io
+                    | ChmodError::ReadOnlyFileSystem
+                    | ChmodError::PathError(
+                        PathError::ComponentNotADirectory
+                        | PathError::InvalidPathname
+                        | PathError::NoSearchPerms { .. }
+                        | PathError::TooManySymlinkHops,
+                    ) => {
+                        return Err(e);
+                    }
+                    ChmodError::PathError(
+                        PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                    ) => {
+                        if migrated_up {
+                            return Err(e);
+                        }
+                    }
+                },
+            }
+            self.migrate_entry_up_for_metadata(&path)
+                .map_err(ChmodError::from)?;
+            migrated_up = true;
         }
-        match self.ensure_lower_contains(&path) {
-            Ok(_) => {}
-            Err(FileStatusError::Io) => return Err(ChmodError::Io),
-            Err(FileStatusError::PathError(e)) => return Err(ChmodError::PathError(e)),
-            Err(FileStatusError::ClosedFd) => unreachable!(),
-        }
-        match self.migrate_file_up(&path, true) {
-            Ok(()) => {}
-            Err(MigrationError::NoReadPerms) => unimplemented!(),
-            Err(MigrationError::NotAFile) => unimplemented!(),
-            Err(MigrationError::Io) => return Err(ChmodError::Io),
-            Err(MigrationError::PathError(_e)) => unreachable!(),
-            Err(MigrationError::UpperCannotHoldPath) => unreachable!(
-                "this fs's own upper should always be able to hold a path already confirmed to exist in its lower"
-            ),
-        }
-        // Since it has been migrated, we can just re-trigger, causing it to apply to the
-        // upper layer
-        self.chmod(path, mode)
     }
 
     fn chown(
@@ -1456,46 +1571,35 @@ impl<
         group: Option<u16>,
     ) -> Result<(), ChownError> {
         let path = self.absolute_path(path)?;
-        match self.upper.chown(path.as_str(), user, group) {
-            Ok(()) => return Ok(()),
-            Err(e) => match e {
-                ChownError::NotTheOwner
-                | ChownError::Io
-                | ChownError::ReadOnlyFileSystem
-                | ChownError::PathError(
-                    PathError::ComponentNotADirectory
-                    | PathError::InvalidPathname
-                    | PathError::NoSearchPerms { .. }
-                    | PathError::TooManySymlinkHops,
-                ) => {
-                    return Err(e);
-                }
-                ChownError::PathError(
-                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
-                ) => {
-                    // fallthrough
-                }
-            },
+        let mut migrated_up = false;
+        loop {
+            match self.upper.chown(path.as_str(), user, group) {
+                Ok(()) => return Ok(()),
+                Err(e) => match e {
+                    ChownError::NotTheOwner
+                    | ChownError::Io
+                    | ChownError::ReadOnlyFileSystem
+                    | ChownError::PathError(
+                        PathError::ComponentNotADirectory
+                        | PathError::InvalidPathname
+                        | PathError::NoSearchPerms { .. }
+                        | PathError::TooManySymlinkHops,
+                    ) => {
+                        return Err(e);
+                    }
+                    ChownError::PathError(
+                        PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                    ) => {
+                        if migrated_up {
+                            return Err(e);
+                        }
+                    }
+                },
+            }
+            self.migrate_entry_up_for_metadata(&path)
+                .map_err(ChownError::from)?;
+            migrated_up = true;
         }
-        match self.ensure_lower_contains(&path) {
-            Ok(_) => {}
-            Err(FileStatusError::Io) => return Err(ChownError::Io),
-            Err(FileStatusError::PathError(e)) => return Err(ChownError::PathError(e)),
-            Err(FileStatusError::ClosedFd) => unreachable!(),
-        }
-        match self.migrate_file_up(&path, true) {
-            Ok(()) => {}
-            Err(MigrationError::NoReadPerms) => unimplemented!(),
-            Err(MigrationError::NotAFile) => unimplemented!(),
-            Err(MigrationError::Io) => return Err(ChownError::Io),
-            Err(MigrationError::PathError(_e)) => unreachable!(),
-            Err(MigrationError::UpperCannotHoldPath) => unreachable!(
-                "this fs's own upper should always be able to hold a path already confirmed to exist in its lower"
-            ),
-        }
-        // Since it has been migrated, we can just re-trigger, causing it to apply to the
-        // upper layer
-        self.chown(path, user, group)
     }
 
     fn set_times(
@@ -1505,46 +1609,35 @@ impl<
         mtime: Option<super::Timestamp>,
     ) -> Result<(), SetTimesError> {
         let path = self.absolute_path(path)?;
-        match self.upper.set_times(path.as_str(), atime, mtime) {
-            Ok(()) => return Ok(()),
-            Err(e) => match e {
-                SetTimesError::NotPermitted
-                | SetTimesError::Io
-                | SetTimesError::ReadOnlyFileSystem
-                | SetTimesError::PathError(
-                    PathError::ComponentNotADirectory
-                    | PathError::InvalidPathname
-                    | PathError::NoSearchPerms { .. }
-                    | PathError::TooManySymlinkHops,
-                ) => {
-                    return Err(e);
-                }
-                SetTimesError::PathError(
-                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
-                ) => {
-                    // fallthrough
-                }
-            },
+        let mut migrated_up = false;
+        loop {
+            match self.upper.set_times(path.as_str(), atime, mtime) {
+                Ok(()) => return Ok(()),
+                Err(e) => match e {
+                    SetTimesError::NotPermitted
+                    | SetTimesError::Io
+                    | SetTimesError::ReadOnlyFileSystem
+                    | SetTimesError::PathError(
+                        PathError::ComponentNotADirectory
+                        | PathError::InvalidPathname
+                        | PathError::NoSearchPerms { .. }
+                        | PathError::TooManySymlinkHops,
+                    ) => {
+                        return Err(e);
+                    }
+                    SetTimesError::PathError(
+                        PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                    ) => {
+                        if migrated_up {
+                            return Err(e);
+                        }
+                    }
+                },
+            }
+            self.migrate_entry_up_for_metadata(&path)
+                .map_err(SetTimesError::from)?;
+            migrated_up = true;
         }
-        match self.ensure_lower_contains(&path) {
-            Ok(_) => {}
-            Err(FileStatusError::Io) => return Err(SetTimesError::Io),
-            Err(FileStatusError::PathError(e)) => return Err(SetTimesError::PathError(e)),
-            Err(FileStatusError::ClosedFd) => unreachable!(),
-        }
-        match self.migrate_file_up(&path, true) {
-            Ok(()) => {}
-            Err(MigrationError::NoReadPerms) => unimplemented!(),
-            Err(MigrationError::NotAFile) => unimplemented!(),
-            Err(MigrationError::Io) => return Err(SetTimesError::Io),
-            Err(MigrationError::PathError(_e)) => unreachable!(),
-            Err(MigrationError::UpperCannotHoldPath) => unreachable!(
-                "this fs's own upper should always be able to hold a path already confirmed to exist in its lower"
-            ),
-        }
-        // Since it has been migrated, we can just re-trigger, causing it to apply to the
-        // upper layer
-        self.set_times(path, atime, mtime)
     }
 
     fn unlink(&self, path: impl crate::path::Arg) -> Result<(), UnlinkError> {
