@@ -176,7 +176,10 @@ fn push_to_drm_dumb_buffer(drm: &DrmDevice, pixels: &[u8], width: u32, height: u
         dest[..n].copy_from_slice(&pixels[..n]);
     }
 
-    let Ok(fb) = drm.add_framebuffer(&dumb, 32, 32) else {
+    // (depth=24, bpp=32): real XRGB8888 color depth is 24 bits (the top byte is padding, not
+    // alpha) even though each pixel occupies 32 bits -- litebox's own `add_fb` handler enforces
+    // exactly this real-kernel distinction and rejects `depth=32` as unsupported.
+    let Ok(fb) = drm.add_framebuffer(&dumb, 24, 32) else {
         println!("ADDFB_FAILED");
         return false;
     };
@@ -287,6 +290,12 @@ fn main() {
                 // reference compositor's identical use of this exact API.
                 unsafe {
                     display.get_mut().dispatch_clients(data).ok();
+                    // Without this, the compositor's own queued replies never reach the client --
+                    // `dispatch_clients` only processes requests already read off the wire, it
+                    // never writes responses back out on its own. See `combined.rs`'s own doc
+                    // comment for the live investigation that found this (a real client's second
+                    // round-trip silently stalls otherwise).
+                    display.get_mut().flush_clients().ok();
                 }
                 Ok(PostAction::Continue)
             },

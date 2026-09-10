@@ -24,6 +24,10 @@ name = "wayland-combined"
 path = "src/combined.rs"
 
 [[bin]]
+name = "wayland-combined-drm"
+path = "src/combined_drm.rs"
+
+[[bin]]
 name = "wayland-desktop"
 path = "src/desktop.rs"
 

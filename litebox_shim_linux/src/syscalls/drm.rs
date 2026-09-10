@@ -52,7 +52,7 @@ use litebox_common_linux::{
     DrmModeGetBlob,
     DrmModeGetConnector, DrmModeGetEncoder, DrmModeGetPlane, DrmModeGetPlaneRes, DrmModeGetProperty,
     DrmModeMapDumb,
-    DrmModeModeinfo, DrmModeObjGetProperties, DrmModePropertyEnum, DrmModeSetPlane,
+    DrmModeModeinfo, DrmModeObjGetProperties, DrmModeObjSetProperty, DrmModePropertyEnum, DrmModeSetPlane,
     DrmSetClientCap, DrmVersion, VIRTUAL_CONNECTOR_DPMS_PROP_ID, VIRTUAL_CONNECTOR_DPMS_VALUE,
     VIRTUAL_CONNECTOR_EDID_BLOB_ID, VIRTUAL_CONNECTOR_EDID_PROP_ID, VIRTUAL_PLANE_TYPE_PROP_ID,
     VIRTUAL_PLANE_TYPE_VALUE, errno::Errno,
@@ -1047,6 +1047,31 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     ) -> Result<u32, Errno> {
         let req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         if req.connector_id != VIRTUAL_CONNECTOR_ID {
+            return Err(Errno::ENOENT);
+        }
+        if req.prop_id != VIRTUAL_CONNECTOR_DPMS_PROP_ID {
+            return Err(Errno::ENOENT);
+        }
+        Ok(0)
+    }
+
+    /// `DRM_IOCTL_MODE_OBJ_SETPROPERTY` -- the generic, object-type-carrying property-set ioctl.
+    /// See [`DRM_IOCTL_MODE_OBJ_SETPROPERTY`]'s own doc comment: this is the ioctl `drm-rs`'s
+    /// `Device::set_property` (used by `smithay`'s `backend_drm`, confirmed live via
+    /// `docs/wayland-drm-backend-probe/`) actually sends, distinct from the legacy
+    /// connector-only [`Self::connector_set_property`] above. Same accept-as-a-no-op semantics
+    /// as that sibling function (no real DPMS hardware state exists for this single-
+    /// address-space shim to change), narrowed to exactly the one real (object, property) pair
+    /// this device advertises as settable today: the virtual connector's `DPMS` property. Any
+    /// other object/property combination gets a real `ENOENT`, matching every other
+    /// unknown-ID path in this file.
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn obj_set_property(
+        &self,
+        ptr: UserPtr<DrmModeObjSetProperty>,
+    ) -> Result<u32, Errno> {
+        let req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        if req.obj_type != DRM_MODE_OBJECT_CONNECTOR || req.obj_id != VIRTUAL_CONNECTOR_ID {
             return Err(Errno::ENOENT);
         }
         if req.prop_id != VIRTUAL_CONNECTOR_DPMS_PROP_ID {

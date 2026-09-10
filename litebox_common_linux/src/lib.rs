@@ -1056,6 +1056,26 @@ pub const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u32 = 0xC020_64B9;
 /// [`DrmSubsystem::connector_set_property`]'s own doc comment for why accepting this is a safe,
 /// honest no-op in a single-address-space shim with no real hardware DPMS state to change.
 pub const DRM_IOCTL_MODE_CONNECTOR_SETPROPERTY: u32 = 0xC010_64AB;
+/// `DRM_IOCTL_MODE_OBJ_SETPROPERTY = DRM_IOWR(0xba, struct drm_mode_obj_set_property)`,
+/// `size=24` (a `u64` then three `u32`s, rounded up to the next 8-byte-aligned multiple because
+/// of the leading `u64` -- `size_of::<DrmModeObjSetProperty>()` independently re-verified the
+/// same way as the other `DRM_IOCTL_MODE_*` constants here, and the exact reason this struct
+/// carries an explicit trailing `_pad` field rather than 20 bytes of implicit padding) -- the
+/// *generic*,
+/// object-type-carrying sibling of [`DRM_IOCTL_MODE_CONNECTOR_SETPROPERTY`] above. Real clients
+/// do not always use the legacy connector-only setter: `drm-rs`'s own `Device::set_property`
+/// (used by `smithay`'s `backend_drm`, confirmed live via `docs/wayland-drm-backend-probe/`'s
+/// `DrmDevice::new(fd, true)` -> `LegacyDrmDevice::reset_state` -> `set_connector_state` call
+/// chain) calls `drm_ffi::mode::set_property`, which unconditionally issues THIS ioctl (nr
+/// `0xba`) with the object's type tagged alongside its id -- never the legacy `0xab` one, even
+/// when the target object is a connector. With this ioctl entirely unhandled, the real call fell
+/// through to the dispatch's `EINVAL` default arm with the exact same "Invalid argument" symptom
+/// `DRM_IOCTL_MODE_CONNECTOR_SETPROPERTY`'s own doc comment describes for the legacy ioctl --
+/// but this time from a caller that never sends the legacy ioctl at all, so implementing only
+/// the legacy one left this path completely uncovered. `DrmDevice::new` failed outright before
+/// any further DRM work (dumb buffers, page-flip) could be attempted, regardless of the legacy
+/// ioctl's own correctness.
+pub const DRM_IOCTL_MODE_OBJ_SETPROPERTY: u32 = 0xC018_64BA;
 /// `DRM_IOCTL_MODE_GETPROPBLOB = DRM_IOWR(0xac, struct drm_mode_get_blob)`, `size=16` (two
 /// `u32`s then a `u64`, same independent-re-verification discipline as the constant above). Real
 /// clients reach this after `OBJ_GETPROPERTIES` returns a blob-typed property (this device's
@@ -1581,6 +1601,23 @@ pub struct DrmModeConnectorSetProperty {
     pub connector_id: u32,
 }
 
+/// `struct drm_mode_obj_set_property` (`DRM_IOCTL_MODE_OBJ_SETPROPERTY`). See
+/// [`DRM_IOCTL_MODE_OBJ_SETPROPERTY`]'s own doc comment for the real client (`drm-rs`'s generic
+/// `Device::set_property`, used by `smithay`'s `backend_drm`) this exists to satisfy -- field
+/// order matches the real kernel struct exactly (`value`, then `prop_id`/`obj_id`/`obj_type`).
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmModeObjSetProperty {
+    pub value: u64,
+    pub prop_id: u32,
+    pub obj_id: u32,
+    pub obj_type: u32,
+    /// Compiler-inserted trailing padding (20 bytes of real fields, rounded up to the next
+    /// 8-byte-aligned multiple because of the leading `u64`) -- see [`DrmModeFbCmd2`]'s `_pad`
+    /// field doc comment for why this is made explicit rather than left implicit.
+    _pad: u32,
+}
+
 /// `struct drm_mode_get_blob` (`DRM_IOCTL_MODE_GETPROPBLOB`), same two-call size-probe pattern
 /// as every other variable-length query this device implements: a caller passes `length` set to
 /// its buffer size (0 to just probe the true length), and gets the true length written back to
@@ -1966,6 +2003,9 @@ pub enum IoctlArg {
     DrmModeGetProperty(UserPtrMut<DrmModeGetProperty>),
     /// `DRM_IOCTL_MODE_CONNECTOR_SETPROPERTY` -- legacy per-connector property set (DPMS).
     DrmModeConnectorSetProperty(UserPtr<DrmModeConnectorSetProperty>),
+    /// `DRM_IOCTL_MODE_OBJ_SETPROPERTY` -- generic, object-type-carrying property set (any KMS
+    /// object, not just a connector via the legacy ioctl above).
+    DrmModeObjSetProperty(UserPtr<DrmModeObjSetProperty>),
     /// `DRM_IOCTL_MODE_GETPROPBLOB` -- resolve a blob property's raw bytes (two-call size-probe
     /// pattern for `data`, same shape as [`DrmModeObjGetProperties`]'s own arrays).
     DrmModeGetPropBlob(UserPtrMut<DrmModeGetBlob>),
@@ -4393,6 +4433,9 @@ impl SyscallRequest {
                         }
                         DRM_IOCTL_MODE_CONNECTOR_SETPROPERTY => {
                             IoctlArg::DrmModeConnectorSetProperty(ctx.sys_req_ptr(2))
+                        }
+                        DRM_IOCTL_MODE_OBJ_SETPROPERTY => {
+                            IoctlArg::DrmModeObjSetProperty(ctx.sys_req_ptr(2))
                         }
                         DRM_IOCTL_MODE_GETPROPBLOB => {
                             IoctlArg::DrmModeGetPropBlob(ctx.sys_req_ptr(2))

@@ -4980,6 +4980,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             | IoctlArg::DrmModeObjGetProperties(..)
             | IoctlArg::DrmModeGetProperty(..)
             | IoctlArg::DrmModeConnectorSetProperty(..)
+            | IoctlArg::DrmModeObjSetProperty(..)
             | IoctlArg::DrmModeGetPropBlob(..)
             | IoctlArg::DrmPrimeHandleToFd(..)
             | IoctlArg::DrmPrimeFdToHandle(..)
@@ -5396,6 +5397,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             IoctlArg::DrmModeConnectorSetProperty(ptr) => {
                 self.global.drm.connector_set_property(*ptr)
             }
+            IoctlArg::DrmModeObjSetProperty(ptr) => self.global.drm.obj_set_property(*ptr),
             IoctlArg::DrmModeGetPropBlob(ptr) => self.global.drm.get_prop_blob(*ptr),
             IoctlArg::DrmPrimeHandleToFd(ptr) => self.drm_prime_handle_to_fd(*ptr),
             IoctlArg::DrmPrimeFdToHandle(ptr) => self.drm_prime_fd_to_handle(*ptr),
