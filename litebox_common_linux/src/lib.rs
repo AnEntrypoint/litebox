@@ -5146,52 +5146,10 @@ impl SyscallRequest {
         let op_and_flags: i32 = ctx.sys_req_arg(1);
         let op = op_and_flags & FutexFlags::FUTEX_CMD_MASK.bits();
         let flags = op_and_flags & !FutexFlags::FUTEX_CMD_MASK.bits();
-        // Priority-inheritance futexes are genuinely unimplemented here, and the errno chosen to
-        // say so is part of the API contract rather than incidental -- the same lesson AGENTS.md
-        // records from a `clone()` namespace-flag `EINVAL` that silently broke ALL image decoding
-        // through glycin's sandbox fallback.
-        //
-        // musl's `pthread_mutexattr_setprotocol(a, PTHREAD_PRIO_INHERIT)` probes for support by
-        // issuing `futex(FUTEX_LOCK_PI)` and, in this image's musl, reports the probe's errno
-        // straight back to its caller. Measured in-guest with ctypes, which is what pinned this
-        // down -- the value the guest sees tracks this syscall's errno exactly:
-        //
-        //     futex PI errno        setprotocol(PRIO_INHERIT) returns
-        //     EINVAL  (22)   ->     22      (original behaviour)
-        //     ENOSYS  (38)   ->     38
-        //     ENOTSUP (95)   ->     95      <-- what callers actually handle
-        //
-        //     (for reference, PRIO_PROTECT already returns 95 from musl itself, and PRIO_NONE 0)
-        //
-        // PulseAudio's `pa_mutex_new` asserts `r == 0 || r == ENOTSUP` on exactly that call and
-        // aborts the process otherwise: `Assertion 'r == 0 || r == 95' failed at
-        // ../src/pulsecore/mutex-posix.c:57`. That abort killed selkies -- and with it the
-        // webtop's whole video path -- the instant a browser client connected.
-        //
-        // `EINVAL` claims the request was malformed, which is false and is what broke PulseAudio.
-        // `ENOTSUP`/`EOPNOTSUPP` says this OPERATION is not supported -- the accurate statement
-        // for an unimplemented futex op on an otherwise-implemented syscall, and the one value
-        // both musl and PulseAudio already know how to degrade on. (`ENOSYS`, "syscall not
-        // implemented", would be the right answer for a missing syscall; `futex` is implemented,
-        // just not these six operations.)
-        //
-        // `FUTEX_LOCK_PI`/`UNLOCK_PI`/`TRYLOCK_PI` are no longer in this list: they are IMPLEMENTED
-        // now (see `FutexOperation::LockPi` and the shim's `sys_futex`), because returning an error
-        // for them is not survivable on glibc.
-        //
-        // The reasoning above was measured against MUSL, where the errno propagates out through
-        // `pthread_mutexattr_setprotocol` and a caller can degrade. This webtop image is DEBIAN --
-        // glibc -- and glibc does not treat a failed PI operation as a negotiable answer: its futex
-        // wrappers call `futex_fatal_error()` for any unexpected return, which prints
-        // `The futex facility returned an unexpected error code` and aborts the process outright.
-        //
-        // Measured: with `EOPNOTSUPP` here, a browser connecting to the webtop made selkies reach
-        // `Attempting to establish PulseAudio connection...`, take `futex(op = 7)`
-        // (`FUTEX_UNLOCK_PI`), and die on that abort -- taking the whole video stream with it, one
-        // log line after the client's cursor had already been delivered.
-        //
-        // The three REQUEUE_PI operations stay unsupported: they have no plain-futex equivalent to
-        // map onto, and nothing here has been observed to use them.
+        // The remaining priority-inheritance futex ops return EOPNOTSUPP, not EINVAL/ENOSYS --
+        // that errno choice is load-bearing (glibc's futex wrappers abort on an unexpected
+        // error), not incidental. See AGENTS.md's "Webtop browser-verified video pipeline" item 4
+        // for the full reasoning and measurements.
         const FUTEX_PI_OPS: [i32; 3] = [
             11, // FUTEX_WAIT_REQUEUE_PI
             12, // FUTEX_CMP_REQUEUE_PI

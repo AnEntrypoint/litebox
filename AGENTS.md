@@ -149,7 +149,16 @@ Getting here required fixing seven real, independent litebox defects, all landed
    below and `docs/cow-mmap-fixed-address-design.md`.
 4. `futex`'s priority-inheritance ops (`FUTEX_LOCK_PI` etc.) returned EINVAL for an unknown op,
    which PulseAudio's `pa_mutex_new` treats as a hard abort (it only tolerates 0 or ENOTSUP) --
-   aborting PulseAudio, and with it selkies, the instant a browser client connected. Now ENOTSUP.
+   aborting PulseAudio, and with it selkies, the instant a browser client connected. `LockPi`/
+   `UnlockPi`/`TryLockPi` are now genuinely implemented (`FutexOperation::LockPi` et al.); the
+   three `REQUEUE_PI` variants (no plain-futex equivalent, nothing observed to use them) still
+   return `EOPNOTSUPP`, not `EINVAL`/`ENOSYS`: musl's `pthread_mutexattr_setprotocol` probe relays
+   this syscall's errno straight back to its caller (measured via ctypes: probe errno 22/38/95 ->
+   `setprotocol` return 22/38/95), and PulseAudio's own glibc build asserts `r == 0 || r == 95`
+   on the equivalent call, aborting with `Assertion 'r == 0 || r == 95' failed` on anything else.
+   `ENOSYS` ("syscall not implemented") would be wrong too -- `futex` itself is implemented, just
+   not these three ops; `EOPNOTSUPP` correctly says "this operation" is unsupported. See
+   `parse_futex`'s `FUTEX_PI_OPS` handling in `litebox_common_linux/src/lib.rs` for the code.
 5. `sys_waitid` was entirely unimplemented, hanging every `asyncio` subprocess reaper
    (`os.waitid(P_PID, pid, WEXITED | WNOWAIT)`) -- this is what left selkies' display
    reconfiguration permanently unfinished.
