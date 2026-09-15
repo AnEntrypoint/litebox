@@ -4,9 +4,10 @@ This documents the reasoning behind several non-obvious decisions in
 `litebox_platform_windows_userland/src/lib.rs`'s vectored exception handler (the function that
 receives every `AddVectoredExceptionHandler`-routed fault, both guest-mode and host-mode). The
 inline comments at each site now just point here; this is the full reasoning, current as of
-2026-09-09/10. See also `AGENTS.md`'s "The `RtlpUnwindPrologue` crash" section for the still-
-unresolved crash this same handler is implicated in, and `fork_verify.rs`'s own doc comments for
-the stale-pointer-healing machinery referenced below.
+2026-09-09/10. The `RtlpUnwindPrologue` crash this handler was long implicated in is closed — it was
+`VEH_FRAME_STRIDE` being 168 bytes short of the two frames it must cover, fixed by `0473cc3` and
+bisected live 2026-09-15; see `AGENTS.md`'s "Closed" section. `fork_verify.rs`'s own doc comments
+cover the stale-pointer-healing machinery referenced below.
 
 ## Unrecovered access violations now terminate instead of `EXCEPTION_CONTINUE_SEARCH`
 

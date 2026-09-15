@@ -1,9 +1,26 @@
 # fork_verify AV: minimal repro (3 execs of one large ELF)
 
-Deterministic host-side access violation in litebox's `fork_verify` single-step
-healing path. NOT a guest bug and NOT specific to mate-session.
+**RESOLVED 2026-09-15 — this repro is now a regression guard, not an open bug.**
+The fault was never inside `fork_verify`'s healing logic. `fork_verify`'s AV-heal
+storm is what nests litebox's vectored exception handler to `veh_depth=2`, and
+`VEH_FRAME_STRIDE` (the per-nesting-level host-stack slice) was 168 bytes smaller
+than the two frames it must cover, so the inner handler wrote through the outer
+handler's live frame and its `EXCEPTION_RECORD`. Fixed by `0473cc3`; bisected with
+this exact repro: `66bd640` 10/10 fatal, `b0fe210` (`0473cc3`'s parent) 10/10 fatal,
+`0473cc3` 0/10, `5683a4e` 0/57. Everything below the "Signature" heading is the
+original 2026-09-04 observation, preserved because every measurement in it holds --
+only its conclusion ("root cause genuinely open") is superseded. Full account:
+`AGENTS.md`, "Closed" section.
 
-## Repro (~40s, no compositor, no boot)
+Run it as written to re-check the fix. Expected today: rc=1 (mate-session's own
+exit status, it cannot open a display), zero `[diag-unrecov-av]` lines, and
+238-714 `fork_verify:` heal lines proving the machinery ran. Do NOT run it under
+`LITEBOX_VEH_TRACE=1` or `LITEBOX_DIAG_FATALDUMP=1`: both trace every single-step
+trap and perturb the timing this bug depended on (`FATALDUMP` produced 11.8 MB of
+`[veh] RAWREGS` for one run). The `[diag-unrecov-av]` block is ungated and needs
+neither.
+
+## Repro (~2s today, ~40s when first written; no compositor, no boot)
 
     runner --initial-files .wfgy/webtop_seatd.tar --resume-from three.tar -- /bin/sh /p.sh
 
@@ -118,3 +135,14 @@ dlopens, what it touches during startup) than a property of the ELF on disk.
 That is a different investigation shape from the archive's static/unwind-metadata
 angle, and it is the honest open question -- not a mechanism anyone has yet
 established.
+
+## Answer to that question (2026-09-15)
+
+Runtime, as suspected, and specifically: `mate-session` reaches display init and
+forks `dbus-daemon`, which is what produces the 238-714 `fork_verify` stale-pointer
+heals per run that nest the VEH to `veh_depth=2`. `seatd`, `caja`, `mate-panel`,
+`find` and the rest of the clean column never fork, so they never nest the handler
+and never met the undersized `VEH_FRAME_STRIDE`. The three-exec threshold is the
+same thing: the first two execs' heal storms do not happen to nest deeply enough
+often enough. That is also why the file-property bisection above refuted every
+static hypothesis -- the required property was never on disk.

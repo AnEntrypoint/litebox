@@ -290,21 +290,9 @@ FIRST in the chain (`5870ab0`). Per-depth frames are sized from disassembly rath
 (`5cacf7f`, `0473cc3`), and `dc108fb` stopped the watchdog killing a successfully-recovered run.
 Constants: archive. Narrative: `docs/veh-exception-handler-design.md`.
 
-**The `RtlpUnwindPrologue` crash — the one genuinely open host crash.** A host-side (not guest) access
-violation inside litebox's own `fork_verify` single-step healing, reached from `ntdll!RtlpUnwindPrologue`.
-Repro: `mate-session --help` against `webtop_seatd.tar`, no compositor, ~30s (PRD row
-`mate-session-avs-are-in-fork-verify-not-guest`; the older `--version` x3 / ~90s form also works,
-slower). Surviving evidence: 66 of 66 AV events report `is_verifying=true`, and independently of any
-register field the faulting stack decodes as UTF-16 `LITEBOX_DIAG_FAT…LT_VEC` — litebox's own
-`GetEnvironmentVariableW` strings, which guest musl would never have on its stack. **Every
-register-level claim older than `c0c1472` is void, in both directions**: neither the "`is_in_guest=true`,
-`addr=usize::MAX`" first-fault claim nor the 154-event "`is_in_guest=false`, `addr=0x2` on every event"
-claim raised to refute it has standing, because that ring tore `rip`/`rsp` and collapsed unknown-TLS into
-`false`. There is no surviving depth-0 evidence either way. Next step: re-capture the now-fixed
-`RECENT_FAULTS` ring or `diag_raw_regdump`, and **not** under `LITEBOX_VEH_TRACE=1` — tracing's overhead
-dodges the race (~12 traced runs never reproduced it). Do not theorize a fix before that capture; the
-standard here is a genuinely root-caused fix, not one that stops the symptom. History: memory
-`mem-5ad34546c566b8d6-7306`, `advisor/probes/fork_verify_third_exec_repro.md`.
+**There is no open host crash.** The `RtlpUnwindPrologue` crash this section called "the one genuinely
+open" one was closed by `0473cc3` on 2026-09-08; the claim survived to 2026-09-10 only because `8fc102a`
+recompiled this file from pre-`0473cc3` archive text without re-running the repro. See "Closed" below.
 
 **Cross-process synchronization on Windows is a hard platform constraint** (measured, memory
 `mem-b709a7d784b98110-1430`): every native address/TID-based wait is process-local — `WaitOnAddress`,
@@ -314,6 +302,18 @@ live-verified (`litebox_platform_windows_userland/src/xproc_sync.rs`, `b2166c4`)
 `RawMutex` is open (PRD row `wire-xproc-sync-crossprocessmutex-into-litebox-platform-rawmutex`).
 
 ## Closed — do not re-attempt without a genuinely new approach
+
+**The `RtlpUnwindPrologue` crash: it was `VEH_FRAME_STRIDE`, and `0473cc3` closed it.** Never inside
+`fork_verify` — its AV-heal storm (238-714 heals/run) is merely what nests the VEH to `veh_depth=2`,
+where a 4096-byte per-level slice was 168 bytes short of the two frames it must cover, so the inner
+handler wrote through the outer's live frame and `EXCEPTION_RECORD`. `RtlpUnwindPrologue` was the
+secondary (`EXCEPTION_CONTINUE_SEARCH` into a frameless guest stack; gone, unrecovered AVs fail fast),
+and the UTF-16 `LITEBOX_DIAG_FAT…LT_VEC` was a nested handler's own `env::var_os` buffers, removed by
+`8ef49b5`+`fdf5dd9`. Bisected live 2026-09-15 on `mate-session --version` x3 against
+`webtop_seatd.tar`: `66bd640` and `b0fe210` 10/10 fatal, `0473cc3` 0/10, `5683a4e` 0/57. Mechanism,
+signature, the five-day cause of the stale claim, and the diagnostic pitfall: memory
+`mem-c62454fedb1baef8-2714`; superseded framing: archive. Still unguarded, not a live defect: nothing
+detects a too-small stride (PRD row `veh-frame-stride-has-no-overflow-guard`).
 
 **Windows CoW-mmap performance.** Zero practical effect on real tar-packed execs: `MapViewOfFile3` needs
 64KiB file-offset alignment and real ELF `PT_LOAD` segments are only page-aligned with no exploitable
@@ -376,7 +376,8 @@ real host window (memory `mem-3c4a9980a884604b-1031`). Not an open X11-vs-Waylan
   `cross_process_fork_wait_hang_probe.sh`, `drm_flip_probe.c`, `clone_probe.c`, `run_xfce_xwm.sh`) plus
   three notes worth reading directly: `MEASUREMENT-PITFALLS.md`, `DISK-HYGIENE.md`,
   `fork_verify_third_exec_repro.md`. The OCI-pull Python scripts there are retired.
-- `.gm/memories/`: `mem-5ad34546c566b8d6-7306` (RtlpUnwindPrologue), `mem-7cb09e839ca086f2-4223`
+- `.gm/memories/`: `mem-c62454fedb1baef8-2714` (RtlpUnwindPrologue, resolved — supersedes the
+  "unresolved" `mem-5ad34546c566b8d6-7306`), `mem-7cb09e839ca086f2-4223`
   (XFCE/MATE weston, rendering, decoding), `mem-6c4697ac568ea7be-4487` (packager OOM),
   `mem-136ae2ce29bc28a4-3133` (image tags, OCI in-memory loading), `mem-b709a7d784b98110-1430`
   (cross-process sync), `mem-f17269d5777055d3-3326` (2026-09-07 defects), `mem-3e13872ce1ffe95e-2814`

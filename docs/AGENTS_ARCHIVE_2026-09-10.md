@@ -516,3 +516,39 @@ to the `x86_64` crate).
 **Use `litebox_packager --oci-image <ref> --output <tar>` rather than any ad-hoc pull script.** The
 Python tooling that used to do this — `pull_oci_image.py`, `batch_rewrite_layer.py`,
 `fetch_container.py` — is retired (`cfae690`, `9076087`). Do not recreate it.
+
+## Superseded 2026-09-15: AGENTS.md's "The `RtlpUnwindPrologue` crash — the one genuinely open host crash"
+
+Drained from AGENTS.md when the bisection in that file's "Closed" section showed the crash had already
+been fixed by `0473cc3` (2026-09-08). Kept verbatim because its evidence is real and was correctly
+observed — only its "still open" conclusion and its "next step" were wrong, and both were wrong for one
+reason: `8fc102a` recompiled AGENTS.md on 2026-09-10 from pre-`0473cc3` archive text without re-running
+the repro. Each surviving observation below maps onto the actual mechanism (`VEH_FRAME_STRIDE` at 4096
+being 168 bytes short of the two frames it must cover, so a `veh_depth=2` nested handler wrote through
+the outer handler's live frame and its `EXCEPTION_RECORD`):
+
+- "66 of 66 AV events report `is_verifying=true`" — correct, and not because the fault was *inside*
+  `fork_verify`'s healing code. `fork_verify`'s AV-heal storm is simply what nests the VEH deep enough
+  for the undersized stride to matter, so every occurrence is on a verifying thread by construction.
+- "the faulting stack decodes as UTF-16 `LITEBOX_DIAG_FAT…LT_VEC` — litebox's own
+  `GetEnvironmentVariableW` strings" — correct, and the single most load-bearing clue: those are
+  `LITEBOX_DIAG_FATALDUMP`/`LITEBOX_DIAG_ALLOC_VEC`, the `std::env::var_os` name buffers a *nested*
+  handler invocation built on the frame it was overwriting. `8ef49b5` and `fdf5dd9` moved every gate to
+  a startup `OnceLock<VehGates>`, so those strings can never be on that stack again.
+- "reached from `ntdll!RtlpUnwindPrologue`" — a secondary, never the fault itself. The corrupted
+  dispatch returned `EXCEPTION_CONTINUE_SEARCH`, and Windows' unwinder then walked
+  `switch_to_guest_sysret`'s frameless guest stack. Unreachable since unrecovered AVs
+  `RaiseFailFastException` instead of continuing the search.
+- "Every register-level claim older than `c0c1472` is void, in both directions" — still true, and still
+  the right caution. The 2026-09-15 bisection deliberately rests on `[diag-unrecov-av]` occurrence
+  counts and process exit codes, not on any register field from that ring.
+- "Next step: re-capture the now-fixed `RECENT_FAULTS` ring … not under `LITEBOX_VEH_TRACE=1`" — the
+  method was right and was followed; `LITEBOX_DIAG_FATALDUMP=1` turns out to be just as unusable, since
+  it prints `[veh] RAWREGS` for every single-step trap (11.8 MB of log for one 3-exec run). The ungated
+  `[diag-unrecov-av]` block is enough on its own and perturbs nothing.
+- PRD row `mate-session-avs-are-in-fork-verify-not-guest`, cited as the repro's home, never existed in
+  `.gm/prd.yml` — only references to it do, in `.gm/mutables.yml` and
+  `docs/webtop-alpine-mate-2026-09-07.md`.
+- "`mate-session --help` … ~30s" was also wrong: `--help` alone returns 0 in under two seconds and forks
+  nothing (9 lines of stderr, zero `fork_verify` activity). `--version` is the fork-heavy one, because
+  it reaches display init and spawns `dbus-daemon`.
