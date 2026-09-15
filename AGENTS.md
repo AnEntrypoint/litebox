@@ -582,6 +582,85 @@ dashboard source (`advisor/probes/dashboard/src/selkies-core.js`, `.../index.htm
   is untested, not confirmed and not refuted.** Next agent: get a working coordinate-click path (connect the
   claude-in-chrome extension first), open/close a real window, and time-correlate against `sk.log`'s
   `_run_command`/`_run_detached_command`/xrandr/xfconf-query call sites while it happens.
+- **`litebox-fork-verify-thread-scheduling-starvation`, eighth candidate, 2026-09-15: NOT confirmed and NOT
+  cleanly refuted — no disconnect occurred at all in this session's live window, so there was nothing to
+  correlate a fork-heal burst against either way. User's explicit direction for this investigation: host-level
+  causes (AV exclusions, host tuning, "free up more RAM") are out of scope — any real fix must live in
+  litebox's own code and hold on a general Windows host with no special config; a future session must not
+  re-suggest a host-config workaround for this symptom.** Hypothesis: litebox's own thread-based fork()
+  healing (NOT selkies' code, NOT the network/`--publish` layer, both already ruled out above) might starve
+  selkies' event-loop thread via unfair host-thread scheduling whenever ANY other guest process forks.
+  Confirmed this demo uses the THREAD-based fork path (`.wfgy/webtop_stack.sh` never sets
+  `LITEBOX_PROCESS_FORK`; its own comments say so directly, `:123`).
+  - **No priority or affinity manipulation exists anywhere in `litebox_platform_windows_userland`** — grepped
+    the whole crate for `SetThreadPriority`/`SetPriorityClass`/`SetThreadAffinityMask`/`SetProcessAffinityMask`:
+    zero hits. Every guest process/thread is an ordinary `std::thread::Builder`-spawned OS thread scheduled by
+    Windows' own preemptive scheduler, same as any two unrelated threads — no litebox-specific cooperative or
+    non-preemptive multiplexing found.
+  - **The only process-wide lock reachable from fork_verify healing is `VIRTUAL_PROTECT_LOCK`**
+    (`lib.rs:8562`), taken by `fork_verify.rs`'s `write_usize_fault_tolerant` (`:2081`) for the brief
+    query-flip-`VirtualProtect`-write-restore span of ONE heal, and by ordinary guest `mprotect()`
+    (`update_permissions`, `lib.rs:7499`) and fixed-address `munmap`/`mmap` (`lib.rs:8031`,
+    `ALLOCATE_PAGES_FIXED_ADDR_LOCK` is a const alias for the same mutex, `:8672`). Real but narrow — a
+    microsecond-scale critical section per heal, not a stop-the-world mechanism — and not observed to fire
+    during this session's clean 5-minute window (see below).
+  - **`ThreadHandle::interrupt` (`lib.rs:5556`) and `ctxwatch` (`ctxwatch.rs`) suspend only ONE explicitly
+    targeted thread each, never system-wide**, and `ctxwatch` is diagnostic-only (`LITEBOX_CTXWATCH=1`) — no
+    global thread-suspension mechanism exists in the fork_verify hot path.
+  - **A real, litebox-only cost DOES exist, independently confirmed live, though not tied to the symptom this
+    session**: `MAX_THREAD_VERIFICATION_STEPS = 16384` (`fork_verify.rs:243`, ~4x the identity path's 4096)
+    bounds the thread-path's single-step healing. `on_single_step`'s case (1) (`fork_verify.rs:1048-1060`)
+    translates a stale `rip` and resumes on every single-step trap but — unlike the AV-path's sibling cases
+    (3)/(4), which patch the stale slot in memory so a future read is already healed (`lib.rs:2465` region
+    even has an explicit `AV_RIP_LIVELOCK_THRESHOLD=8` breaker for exactly this reason) — case (1) has NO
+    livelock protection and never patches the underlying code/pointer, so a guest loop that keeps re-entering
+    the same unhealed source-range address pays a fresh ~600us single-step trap on EVERY iteration. Live
+    capture during this session's boot (`LITEBOX_LOG=warn,litebox_platform_windows_userland::fork_verify=warn`,
+    `.wfgy/sched_starve_run1.log`): one thread hit the identical `rip`/`translated_rip` pair 357 consecutive
+    times across 199.330s-199.546s (216ms, ~605us/heal) — real, measured, and consistent with the doc
+    comment's predicted mechanism. At the 16384-step cap this is ~9.8s of single-thread CPU-bound trap
+    handling for ONE fork, a cost with NO counterpart under real Linux `fork()` (identical child addresses,
+    no relocation) — a genuine "pro rata" violation regardless of whether it explains THIS symptom. **Not
+    fixed, only documented** — no live reproduction ties it to the keepalive-timeout pattern (see next
+    point), so applying a fix here would be a correct-shaped change against an unconfirmed mechanism, same
+    standard the seven prior candidates were held to. If a future session wants to close it: give case (1) the
+    same slot-patching treatment cases (3)/(4) already have, so a repeated loop through the same stale address
+    heals once instead of every iteration.
+  - **Live correlation attempt, inconclusive by absence of the symptom, not by contrary evidence.** Killed the
+    existing idle, post-crash, non-instrumented stack (PID 18292 — default `LITEBOX_LOG` pins `fork_verify` to
+    `error`, so its own log had zero heal visibility) and relaunched the IDENTICAL
+    `.wfgy/webtop_stack.sh`/`--resume-from .wfgy/webtop_stack_seed.tar` invocation with
+    `LITEBOX_LOG=warn,litebox_platform_windows_userland::fork_verify=warn` so heals would be visible
+    (`.wfgy/sched_starve_run1.log`/`.out.log`). All 4574 fork_verify warn lines fired during BOOT only
+    (Xvfb/dbus/xfce4-session forking); the count stayed at exactly 4574 — ZERO new heals — for the entire
+    post-boot window. Connected one real Chrome tab (chrome-devtools MCP,
+    `http://localhost:3000/`) and observed **5+ minutes of continuous, error-free streaming for the first time
+    across eight investigations** (18:54:12→18:59:30 guest clock, screenshots both ends, desktop rendering
+    throughout, zero console disconnect/reload messages, zero `keepalive ping timeout` in `sk.log` the whole
+    window) — with zero new fork_verify activity throughout. Because no keepalive timeout fired at all, there
+    was no disconnect event to correlate a fork-heal burst against, in either direction: this run neither
+    confirms nor refutes fork_verify as the historical trigger, it only confirms the healing mechanism itself
+    is real, boot-scoped, and absent during a clean run. (Synthetic input via `chrome-devtools` `evaluate_script`
+    dispatching `PointerEvent`/`MouseEvent` on the canvas again did not register with the guest's real
+    input-forwarding path — same finding as the immediately preceding session; the cursor icon on-screen
+    changed but no window opened. Coordinate-click verification of responsiveness during live streaming is
+    still an open tooling gap, not attempted further this session.)
+  - **Host has 16 logical processors (8 cores)**, free memory 2.1-8GB across this session's measurements. With
+    this many cores relative to a webtop guest's thread count (roughly 15-20 real OS threads for
+    Xvfb/dbus/nginx/xfce4-session+children/selkies), a single core pinned by fork-heal single-stepping is
+    unlikely by itself to starve one SPECIFIC other thread on THIS host via Windows' own preemptive scheduler
+    — this weakens confidence that "too few cores forces real unfairness" is a mechanism that holds on an
+    arbitrary general host, though it does not rule the mechanism out on a host with genuinely few cores (a
+    2-4 core VM/laptop), which the user's "must work on general host OSes" framing means should still be
+    kept in view rather than dismissed.
+  - **The real root cause of the periodic `keepalive ping timeout` pattern remains unidentified after eight
+    investigations.** What a follow-up session needs that this one didn't get: a run that actually reproduces
+    the disconnect WHILE `fork_verify=warn` logging is active, so a real fork-heal burst (or its absence) can
+    be read directly against the exact moment of the next timeout — this session's stack happened to stay
+    disconnect-free for its whole observation window, which is itself notable (nothing about a fresh restart
+    guarantees failure) but left no failure to instrument. Do not re-attempt the thread-priority/global-lock/
+    thread-suspension angles this session already checked and found clean (see above) without new evidence.
+
 Do not re-reach for the GLIBC_TUNABLES fix for either of these symptoms — it is already ruled out by direct
 evidence (zero fatal-signal lines anywhere near any of the observed kills/stalls/dual-connects), and do not
 re-open a frontend/nginx-config investigation for "dual-connect" — both are now byte/log-verified clean.
