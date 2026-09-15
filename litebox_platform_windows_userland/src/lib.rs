@@ -3362,6 +3362,21 @@ struct TlsState {
     /// `translate_stale_source_rip` itself keeps reporting success. Confirmed live: 266,408
     /// identical `(rip, translated_rip)` AV events in 8.4s during a real XFCE `--gui` launch.
     fork_verify_av_rip_repeat: Cell<Option<(usize, usize, u32)>>,
+    /// The single-step-path counterpart to [`Self::fork_verify_av_rip_repeat`]: tracks
+    /// `(rip, translated_rip)` and a repeat count for [`fork_verify::on_single_step`]'s own case
+    /// (1) (the stale-CODE-pointer-in-`rip` heal reached via `EXCEPTION_SINGLE_STEP`, not the raw
+    /// `EXCEPTION_ACCESS_VIOLATION` `translate_stale_source_rip` guards). Case (1) always
+    /// translates `rip`/`rbp`/`rdi` and patches `[rsp-8]` when it is the just-popped `ret` target,
+    /// but a guest loop whose stale value is re-supplied from a slot `[rsp-8]` does not reach (a
+    /// GOT/PLT-style slot, or a register-indirect load chain) keeps re-arriving at the identical
+    /// `(rip, translated_rip)` pair every iteration -- confirmed live: 357 consecutive identical
+    /// heals of one pair in 216ms during one boot. Once this counter reaches the same
+    /// `AV_RIP_LIVELOCK_THRESHOLD` used by the AV-path breaker, case (1) additionally falls
+    /// through to the same deeper healers (`translate_stale_source_indirect_call_target`,
+    /// `translate_stale_source_register_indirect_call_target`) that close this exact gap on the
+    /// AV path, so the underlying slot is patched in place and the loop's later iterations no
+    /// longer re-trap at all -- healed once, not on every pass.
+    fork_verify_step_rip_repeat: Cell<Option<(usize, usize, u32)>>,
     /// The provenance chain [`fork_verify::on_single_step`] is tracking for the most recent
     /// explicit-memory-operand read on this thread, or `None` if no register currently carries a
     /// value traceable back to a specific memory slot this way.
@@ -3569,6 +3584,7 @@ impl TlsState {
             fork_verify: RefCell::new(None),
             fork_verify_step_count: Cell::new(0),
             fork_verify_av_rip_repeat: Cell::new(None),
+            fork_verify_step_rip_repeat: Cell::new(None),
             fork_verify_last_load: Cell::new(None),
             codewatch: fork_verify::CodewatchState::new(),
             ctxwatch: ctxwatch::State::new(),

@@ -1053,6 +1053,49 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
             );
         }
         if let Some(translated_rip) = relocations.translate(rip) {
+            // Livelock breaker, the single-step-path counterpart to `vectored_exception_handler`'s
+            // `AV_RIP_LIVELOCK_THRESHOLD` (see `TlsState::fork_verify_step_rip_repeat`'s own doc
+            // comment): translating `rip`/`rbp`/`rdi` and patching `[rsp-8]` below always resolves
+            // THIS trap, but does nothing for a persistent slot outside those fixed locations (a
+            // GOT/PLT-style memory operand, or a register-indirect load chain) that keeps
+            // re-supplying the identical stale value on every loop iteration -- confirmed live: 357
+            // consecutive identical `(rip, translated_rip)` heals in 216ms during one boot. Once the
+            // same pair has repeated past the threshold, additionally run the deeper healers that
+            // already close this exact gap on the AV path (`translate_stale_source_indirect_call_
+            // target` / `translate_stale_source_register_indirect_call_target`, case (3)/(4)'s own
+            // logic) so the slot actually feeding this loop is patched in place -- healed once, not
+            // on every pass -- while the translate-and-resume below still always runs to resolve
+            // this specific trap regardless of whether the deeper healers found anything to patch.
+            const STEP_RIP_LIVELOCK_THRESHOLD: u32 = 8;
+            let prior_repeat = tls.fork_verify_step_rip_repeat.get();
+            let repeat_count = match prior_repeat {
+                Some((prev_rip, prev_translated, count))
+                    if prev_rip == rip && prev_translated == translated_rip =>
+                {
+                    count + 1
+                }
+                _ => 1,
+            };
+            tls.fork_verify_step_rip_repeat
+                .set(Some((rip, translated_rip, repeat_count)));
+            if repeat_count >= STEP_RIP_LIVELOCK_THRESHOLD {
+                let mem_operand_healed =
+                    translate_stale_source_memory_operand_registers(tls, rip, context);
+                let indirect_healed =
+                    translate_stale_source_indirect_call_target(tls, rip, context);
+                let register_indirect_healed =
+                    translate_stale_source_register_indirect_call_target(tls, rip, context);
+                if mem_operand_healed || indirect_healed || register_indirect_healed {
+                    litebox_util_log::warn!(
+                        host_tid:? = std::thread::current().id(), rip:? = rip,
+                        translated_rip:? = translated_rip, repeat:? = repeat_count,
+                        mem_operand_healed:? = mem_operand_healed,
+                        indirect_healed:? = indirect_healed,
+                        register_indirect_healed:? = register_indirect_healed;
+                        "fork_verify: on_single_step case=1 livelock detected (same rip repeated), deeper slot healed in place"
+                    );
+                }
+            }
             litebox_util_log::warn!(
                 host_tid:? = std::thread::current().id(), rip:? = rip, translated_rip:? = translated_rip;
                 "fork_verify: stale CODE pointer detected, translating and resuming"
@@ -2716,6 +2759,7 @@ pub(crate) fn begin(relocations: alloc::sync::Arc<litebox::mm::AddressRelocation
         let tls = unsafe { &*tls };
         if !crate::veh_gates().forkverify_off {
             tls.fork_verify_step_count.set(0);
+            tls.fork_verify_step_rip_repeat.set(None);
             // Stamp this thread with its OWN current generation before arming the map, so
             // `current_map_is_valid` can later detect a leftover map that survived this same
             // thread's own `end()`-triggered generation bump (execve, or a leaked skip-clear on
