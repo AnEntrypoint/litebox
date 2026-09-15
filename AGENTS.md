@@ -362,6 +362,78 @@ this project's own standing discipline against forcing an unverified fix. The on
 (nginx dir-recreate race) is in `.wfgy/webtop_stack.sh` only and measurably improves boot reliability for
 whoever runs this repro next, but does not itself touch litebox.
 
+**2026-09-16: the t≈175s `spawn_exec_collision_child` + selkies-never-binds mechanism, root-caused and
+fixed — the trigger was NOT `gst_app_resize`/xfconf-query as guessed above; it is selkies' own interpreter
+re-exec, and the real defect was an unbounded blocking wait with no fallback.** Live-reproduced
+(`.wfgy/boot_repro2.*`, `.wfgy/fix_verify_run1.log`) with `LITEBOX_LOG=warn,…fork_verify=warn`, correlating
+`path=` on every `spawn_exec_collision_child` line against the guest's own `[sk]`-tagged stdout:
+
+- The collision is `path=/lsiopy/bin/python3` — selkies' shebang (`/lsiopy/bin/selkies` → `#!/lsiopy/bin/
+  python3`) re-execs an `ET_EXEC` python3 at selkies' own launch, ~70-180s into boot, once nginx/Xvfb/dbus/
+  xfce4-session's cumulative fork/exec history has filled enough of litebox's ONE shared host address
+  space to collide with python3's fixed link address. The EARLIER, already-documented `cc1`/Mesa-llvmpipe
+  collision (`~t=76s`, harmless, resolves in ~5s) is a separate, unrelated event that just happens to
+  precede it by design (`.wfgy/webtop_stack.sh` starts nginx/Xvfb before selkies specifically to dodge that
+  one) — do not conflate the two `spawn_exec_collision_child` events in a boot's log.
+- `spawn_exec_collision_child` (`litebox/src/platform/mod.rs:1131`, impl `litebox_platform_windows_userland/
+  src/lib.rs:9972`, called from `sys_execve` at `litebox_shim_linux/src/syscalls/process.rs:6075` on
+  `Map(EEXIST)` after the point of no return) correctly avoids crashing the guest by spawning a fresh,
+  genuinely separate `litebox_runner` process to run the colliding program and adopting its exit status —
+  but it did so via a **plain blocking `cmd.status()` with no timeout**. That nested child is a completely
+  isolated OS process with no shared AF_UNIX namespace with the ORIGINAL guest's already-running Xvfb/
+  D-Bus (the same gap `docs/fork-fs-veh-2026-09-08.md:128-144` already documents for cross-process FORK
+  children, now confirmed to also apply here) — selkies inside it cannot actually reach the desktop it's
+  supposed to serve. Observed live consequences, both real, both reproduced: (a) the nested attempt can
+  exit quickly with a real but degraded-environment failure (its own gcc/collect2 sub-step, itself another
+  nested collision, returning `raw_status=1`); or (b) — the actual mechanism behind this row's original
+  "selkies never binds, 404s forever" symptom — the nested child can sit at 0% CPU forever (most likely
+  blocked on a `connect()`-then-`ppoll(timeout=-1)` against an unreachable socket path, the exact
+  `dbus-daemon --fork` hang class this project already knows), and since the calling guest thread blocks on
+  it UNCONDITIONALLY, this wedges the ENTIRE guest boot — the top-level shell's own supervisor loop never
+  sees `selkies` exit, so it never respawns, and the whole `.wfgy/webtop_stack.sh` `HOLD` loop just ticks
+  forever over a dead boot. Live-witnessed: 7+ minutes at 0.06s total CPU, `Get-Process` confirmed, until
+  manually killed.
+- **Fixed** (`litebox_platform_windows_userland/src/lib.rs`, `spawn_exec_collision_child`): replaced the
+  blocking `cmd.status()` with `cmd.spawn()` + a poll loop using the SAME "genuinely wedged, not just slow"
+  CPU-progress check `process_fork::run_external_fault_watchdog_child` already uses and this project already
+  trusts for the identical judgment call (measured on the CHILD's handle from a genuinely different
+  process, never the self-measurement that function's own doc comment already found unreliable) — a 20s
+  no-CPU-progress stall grace, and a 120s absolute cap regardless of progress. Timing out kills the child
+  and returns `None`, which is exactly the existing, already-correct spawn-failure fallback (kill this ONE
+  guest process with `SIGSEGV`; its own supervisor loop already respawns it) — changes nothing for the
+  overwhelmingly common case where the child actually exits.
+- **Live-verified the fix actually fires and recovers**, not just compiles: re-ran the identical repro on
+  the patched binary (`.wfgy/boot_repro3.*`). The SAME `/lsiopy/bin/python3` collision occurred (t=161.7s
+  this run — this class is inherently non-deterministic run to run, expected), its nested child again made
+  some CPU progress but never exited; at t=281.9s (exactly 120.1s later) the absolute cap fired —
+  `spawn_exec_collision_child: replacement process exceeded the absolute time cap … killing it` — the
+  original guest thread then took the pre-existing `killing process with SIGSEGV tid=211 path=/lsiopy/
+  bin/python3` fallback, and the boot's own supervisor loop printed `SELKIES_SUPERVISOR: attempt=… exited
+  rc=… -- respawning` and kept going instead of hanging. `Get-Process` after the fix's cap fired showed only
+  the one main runner process alive (no orphaned/zombie nested child), confirming `child.kill()`+`child.
+  wait()` clean up correctly.
+- **What this fix does NOT close**: the underlying single-shared-address-space collision itself (Track B,
+  already extensively documented, multi-session-scale infra work) is unchanged — selkies' python3 re-exec
+  can still collide, and when it does, the nested recovery attempt still cannot reach Xvfb/D-Bus, so it
+  still very likely fails or times out (now bounded at ≤120s instead of forever). A separate, pre-existing,
+  already-documented bug (ADVISORY-001 §3N glibc tcache/fastbin corruption, `[sk] Segmentation fault`
+  `rc=139`) also still fires independently on some selkies (re)launches, unrelated to this fix. **The fix's
+  scope is precisely**: convert an unbounded, unrecoverable, whole-boot hang into a bounded failure the
+  existing supervisor-respawn loop already knows how to recover from — a real, live-confirmed reliability
+  improvement, not a claim that the collision itself no longer happens.
+- Boot-reliability numbers, repeated live boots, `.wfgy/webtop_stack.sh --resume-from .wfgy/
+  webtop_stack_seed.tar`: pre-fix, one live run hit the unbounded hang directly (0/1 that run, needed a
+  manual kill after 7+ minutes with zero progress) — consistent with this row's own prior-session 3/5
+  "clean boot but selkies never binds" characterization, since an unbounded hang and a `404`-forever boot
+  are the same underlying defect, just differing in whether the specific run's nested child fully wedges or
+  merely fails slowly. Post-fix, two live runs both avoided the hang: one recovered via the bounded fallback
+  and kept cycling through the supervisor loop (never reached a fully clean `Data WebSocket Server
+  listening` state in the observation window, blocked by the separate, pre-existing tcache-corruption
+  respawn loop above); commit `HEAD` has the fix. This is a real, measured improvement (a boot that used to
+  need a manual process kill now self-recovers), not yet a claim of 100% clean-boot reliability — the
+  tcache/fastbin corruption class remains this project's next blocker for a fully clean boot, tracked
+  separately (ADVISORY-001 §3N).
+
 ## Host-side crash machinery
 
 **A fatal host fault dumps before it dies, ungated** — the stack walk, `RECENT_FAULTS` ring

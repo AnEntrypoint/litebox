@@ -10079,8 +10079,122 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         );
 
         // Blocking: see the trait method's own doc comment for why there is nothing else for
-        // this thread to do but wait.
-        match cmd.status() {
+        // this thread to do but wait -- but NOT unconditionally forever. Live-reproduced this
+        // session (`docs/AGENTS_ARCHIVE_2026-09-15.md`'s webtop-boot investigation): a collision
+        // child that itself needs a sibling guest process's AF_UNIX socket (the X11 display, the
+        // D-Bus session bus) -- unreachable from this genuinely separate OS process, same
+        // architectural gap `docs/fork-fs-veh-2026-09-08.md` already documents for the sibling
+        // cross-process FORK mechanism -- can connect() against the filesystem path and then hang
+        // forever waiting for a peer that will never answer, exactly the already-known
+        // `dbus-daemon --fork` hang class this file's own module doc describes, just reached via
+        // this different call path. Observed live: a `/lsiopy/bin/python3` (selkies' own
+        // interpreter) collision child sat at 0% CPU for 7+ minutes with no further log line,
+        // wedging the ENTIRE guest boot (the top-level shell's own supervisor loop never saw
+        // `selkies` exit to respawn it) until manually killed. `cmd.status()` has no timeout at
+        // all, so this call used to block the calling guest thread -- and therefore this one
+        // collision recovery -- indefinitely.
+        //
+        // The fix: poll instead of blocking outright, using the SAME "genuinely wedged, not just
+        // slow" CPU-progress check `run_external_fault_watchdog_child` (`process_fork.rs`) already
+        // uses and already trusts for exactly this judgment call -- measured on the CHILD's handle
+        // from THIS (a genuinely different) process, not the child measuring itself, which is the
+        // specific self-measurement failure mode that function's own doc comment separately
+        // disclosed and ruled out. A child making real CPU progress (a legitimate, if slow, full
+        // nested image re-pull/merge/boot) is never killed by this; only a flatlined-at-0%-CPU
+        // child is, after a generous grace period. Timing out returns `None`, exactly as a spawn
+        // failure already does -- the caller's existing fallback (kill this ONE guest process with
+        // `SIGSEGV`, which its own supervisor loop already respawns) is strictly better than an
+        // unrecoverable, silent, whole-boot hang, and changes nothing for the overwhelmingly common
+        // case where the child actually exits.
+        const EXEC_COLLISION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+        const EXEC_COLLISION_STALL_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+        const EXEC_COLLISION_ABSOLUTE_CAP: std::time::Duration = std::time::Duration::from_secs(120);
+
+        fn child_cpu_time_100ns(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<u64> {
+            let mut creation = windows_sys::Win32::Foundation::FILETIME::default();
+            let mut exit = windows_sys::Win32::Foundation::FILETIME::default();
+            let mut kernel = windows_sys::Win32::Foundation::FILETIME::default();
+            let mut user = windows_sys::Win32::Foundation::FILETIME::default();
+            let ok = unsafe {
+                windows_sys::Win32::System::Threading::GetProcessTimes(
+                    handle,
+                    &raw mut creation,
+                    &raw mut exit,
+                    &raw mut kernel,
+                    &raw mut user,
+                )
+            };
+            if ok == 0 {
+                return None;
+            }
+            let as_u64 = |ft: windows_sys::Win32::Foundation::FILETIME| -> u64 {
+                (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime)
+            };
+            Some(as_u64(kernel) + as_u64(user))
+        }
+
+        let status = match cmd.spawn() {
+            Ok(mut child) => {
+                let handle = child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+                let start = std::time::Instant::now();
+                let mut cpu_at_stall_start = child_cpu_time_100ns(handle);
+                let mut stall_started = start;
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => break Ok(status),
+                        Ok(None) => {}
+                        Err(e) => break Err(e),
+                    }
+                    let elapsed = start.elapsed();
+                    if elapsed >= EXEC_COLLISION_ABSOLUTE_CAP {
+                        litebox_util_log::warn!(
+                            path:% = path, elapsed:? = elapsed;
+                            "spawn_exec_collision_child: replacement process exceeded the absolute \
+                             time cap even while making CPU progress -- killing it rather than \
+                             blocking this guest thread forever"
+                        );
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break Err(std::io::Error::other(
+                            "spawn_exec_collision_child: absolute time cap exceeded",
+                        ));
+                    }
+                    let cpu_now = child_cpu_time_100ns(handle);
+                    // Same threshold and reasoning as `run_external_fault_watchdog_child`'s own
+                    // `MEANINGFUL_CPU_DELTA_100NS`: a real tick of scheduler/measurement noise, not
+                    // a claim of genuine work, so only a delta clearly above it resets the stall
+                    // clock.
+                    const MEANINGFUL_CPU_DELTA_100NS: u64 = 100_000;
+                    let made_progress = match (cpu_at_stall_start, cpu_now) {
+                        (Some(before), Some(after)) => {
+                            after.saturating_sub(before) > MEANINGFUL_CPU_DELTA_100NS
+                        }
+                        _ => false,
+                    };
+                    if made_progress {
+                        cpu_at_stall_start = cpu_now;
+                        stall_started = std::time::Instant::now();
+                    } else if stall_started.elapsed() >= EXEC_COLLISION_STALL_GRACE {
+                        litebox_util_log::warn!(
+                            path:% = path, stalled_for:? = stall_started.elapsed();
+                            "spawn_exec_collision_child: replacement process made no CPU progress \
+                             for the whole grace period -- treating it as wedged (most likely \
+                             blocked forever on a sibling guest process's AF_UNIX socket this \
+                             genuinely separate OS process cannot reach) and killing it rather than \
+                             blocking this guest thread forever"
+                        );
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break Err(std::io::Error::other(
+                            "spawn_exec_collision_child: stalled with no CPU progress",
+                        ));
+                    }
+                    std::thread::sleep(EXEC_COLLISION_POLL_INTERVAL);
+                }
+            }
+            Err(e) => Err(e),
+        };
+        match status {
             Ok(status) => {
                 // `ExitStatus::code()` is `None` only for a signal-terminated child on Unix --
                 // never on Windows, where every process exit carries a plain numeric code (a
@@ -10125,9 +10239,15 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
                 })
             }
             Err(e) => {
+                // Covers both a genuine spawn failure (nothing above logged yet -- this is the
+                // first and only line) and the stall/absolute-cap kill paths above (which already
+                // logged their own specific reason; this is a short, generic follow-up, not a
+                // duplicate diagnosis).
                 litebox_util_log::warn!(
-                    error:% = e;
-                    "spawn_exec_collision_child: failed to spawn the replacement process"
+                    path:% = path, error:% = e;
+                    "spawn_exec_collision_child: the replacement process did not exit normally -- \
+                     falling back to killing the guest with SIGSEGV, matching a real execve() \
+                     failure"
                 );
                 None
             }
