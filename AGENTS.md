@@ -259,6 +259,23 @@ limitation, not a litebox gap; every older gdk-pixbuf/GTK per-format decode find
 `694bb93` broke decode for **every** format, so re-measure before trusting any; and the two network
 fixes this path needs (`537c088`, `2197d18`).
 
+**The XFCE desktop renders on the THREAD-based fork path too, and one flag is why** (2026-09-15,
+`docker.io/linuxserver/webtop:debian-xfce`, `.wfgy/webtop_stack.sh` over `--publish 3000:3000`). Without
+it this boot dies 3/3 at a fixed point ~7s in — `comm=sh`, pre-execve, in the fork child taken right
+after the nginx self-test — and `XVFB_FAILED`/`DE_FAILED` follow because the X server never comes up.
+The register capture identifies that fault as ADVISORY-001 section 3N instruction-for-instruction
+(`__libc_malloc+0x76`'s `xor (%rax),%rsi`: fault address `== %rax`, `%rsi == %rax >> 12`, safe-linking's
+own `pos>>12` term), and the `fork_verify: stale CODE pointer ... translating and resuming` warning that
+precedes it is a red herring — the identical instruction re-faults on the identical address at the
+translated `rip`, so the translation is byte-correct. The flag:
+`--env GLIBC_TUNABLES=glibc.malloc.tcache_count=0:glibc.malloc.mxfast=0`. It turns off glibc's only two
+safe-linked freelists; what remains links chunks with plain `fd`/`bk` pointers that relocation healing
+already handles. Section 3N predicted `tcache_count=0` alone would merely move the fault to the
+fastbins; `mxfast=0` is the half that closes it. Workaround, glibc-only, not a fix — `LITEBOX_PROCESS_FORK=1`
+still removes the class properly but cannot run a desktop until the AF_UNIX gap below closes. Selkies
+additionally needs `--clipboard-enabled=false` (its clipboard monitor fork+execs `xclip` on a timer,
+which is a fresh draw against the same corruption every tick; it took the stream down at rc=139).
+
 **Open here.** Selkies serves one client and a page reload does not reclaim the slot, so a fresh stack
 is needed per view. An intermittent host AV ends some runs at varying points (latest shape `rip == fault
 address == 0x7ff003444000`, an instruction fetch in the host-allocator region) — that, not the desktop

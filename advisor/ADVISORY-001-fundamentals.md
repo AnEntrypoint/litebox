@@ -1773,3 +1773,38 @@ goes to 0/30 while everything else is unchanged, the attribution is closed exper
 as analytically. Note this is a DIAGNOSTIC, not a fix -- glibc's fastbins are safe-linked by the
 same macro and the same corruption exists there; a tcache-free run is expected to move the fault,
 not remove the class.
+
+### Both halves of that confirmation have now been run (2026-09-15, `linuxserver/webtop:debian-xfce`)
+
+**The attribution is closed experimentally.** The register capture, from a boot that dies 3/3 at a
+fixed point (~7s in, `comm=sh`, pre-execve, in the fork child taken immediately after the nginx
+self-test), re-derives `a2c06`'s operands from live state rather than from the disassembly:
+
+```
+[veh] RAWREGS code=c0000005 addr=111022d00 rip=7feffd391c06 rax=111022d00 rsi=111022 ...
+```
+
+`addr == %rax` because `a2c06`'s operand is `(%rax)`; `%rsi == %rax >> 12` because `a2c02` is
+`shr $0xc,%rsi`; `rip & 0xffff == 0x2c06` as `:1233`/`:1621` predict. No prior capture in the tree
+records both operand identities at once. `fork_verify` translating that `rip` to `0x58c62c06` is a
+red herring, and provably so: the identical instruction at the translated `rip` re-faults on the
+identical `addr`, which makes the translation byte-correct and the freelist word the only defect.
+That warning is now logged with its own `fault_addr` (`litebox_platform_windows_userland/src/lib.rs`)
+precisely so this misreading cannot recur -- it has cost two investigations already.
+
+**And the fault class can be removed wholesale, not merely moved.** The prediction above is right
+that `tcache_count=0` alone only shifts the fault into the fastbins -- but glibc exposes a tunable
+for those too, and turning BOTH off leaves only bins that link chunks with ordinary, unmangled
+`fd`/`bk` pointers, which do land in a relocation source range and which the existing healing
+already handles:
+
+```
+--env GLIBC_TUNABLES=glibc.malloc.tcache_count=0:glibc.malloc.mxfast=0
+```
+
+With that one flag added and nothing else changed, the same boot that died 3/3 at 7s reached
+`XVFB_UP`, `DBUS_UP`, `DE_UP via startwm.sh` and a live selkies stream, and the XFCE desktop
+rendered and responded to input in host Chrome over `--publish 3000:3000`. This is a WORKAROUND, not
+a fix: it applies only to glibc guests, it is a real allocator slowdown, and it does nothing for the
+`PTR_MANGLE` half of the class this section already names. `1.2` staging step (b) remains the
+recommended next step; what changed is that a glibc desktop stack is no longer blocked on it.

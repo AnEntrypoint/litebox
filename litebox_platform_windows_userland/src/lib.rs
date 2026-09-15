@@ -2443,8 +2443,25 @@ unsafe extern "system" fn vectored_exception_handler(
                     std::thread::current().id(),
                 );
             }
+            // `fault_addr` is `ExceptionInformation[1]`, the address the access violation actually
+            // faulted on. It is logged because without it this line reads as a confession: it is a
+            // `warn!` naming a wild-looking address pair (a source-range `rip` in the 0x7fef_xxxx_xxxx
+            // parent band translating to a child-band address orders of magnitude away), it is
+            // frequently the last line before a fatal SIGSEGV, and it therefore looks exactly like a
+            // mis-heal that jumped the guest into garbage. Twice now that reading has been wrong and
+            // has cost a whole investigation: when `fault_addr != rip` the violation is a DATA access,
+            // this healer's translation of `rip` is not what faulted and not what is about to fault
+            // again, and the real cause is whatever register formed `fault_addr`. The live case that
+            // forced this in was `advisor/ADVISORY-001-fundamentals.md` section 3N: `fault_addr` was
+            // equal to `%rax`, the revealed-but-garbage safe-linked tcache `next` pointer, and the
+            // identical instruction re-faulted on the identical `fault_addr` at `translated_rip`,
+            // proving the translation byte-correct and this line innocent. One extra field settles
+            // that at a glance instead of requiring a `LITEBOX_DIAG_FATALDUMP=1` register capture.
             litebox_util_log::warn!(
-                rip:? = rip, translated_rip:? = translated_rip, repeat:? = next_count;
+                rip:? = rip,
+                translated_rip:? = translated_rip,
+                fault_addr:? = exception_record.ExceptionInformation[1],
+                repeat:? = next_count;
                 "fork_verify: stale CODE pointer detected via raw access violation (no #DB delivered), translating and resuming"
             );
             #[allow(clippy::cast_possible_truncation)]
