@@ -620,12 +620,22 @@ dashboard source (`advisor/probes/dashboard/src/selkies-core.js`, `.../index.htm
     times across 199.330s-199.546s (216ms, ~605us/heal) — real, measured, and consistent with the doc
     comment's predicted mechanism. At the 16384-step cap this is ~9.8s of single-thread CPU-bound trap
     handling for ONE fork, a cost with NO counterpart under real Linux `fork()` (identical child addresses,
-    no relocation) — a genuine "pro rata" violation regardless of whether it explains THIS symptom. **Not
-    fixed, only documented** — no live reproduction ties it to the keepalive-timeout pattern (see next
-    point), so applying a fix here would be a correct-shaped change against an unconfirmed mechanism, same
-    standard the seven prior candidates were held to. If a future session wants to close it: give case (1) the
-    same slot-patching treatment cases (3)/(4) already have, so a repeated loop through the same stale address
-    heals once instead of every iteration.
+    no relocation) — a genuine "pro rata" violation regardless of whether it explains THIS symptom.
+    **FIXED (2026-09-15, `b6ddf43`, tenth investigation)**: case (1) now tracks `(rip, translated_rip)`
+    repeats per-thread (`TlsState::fork_verify_step_rip_repeat`, mirroring `fork_verify_av_rip_repeat`)
+    and, once the same pair recurs `STEP_RIP_LIVELOCK_THRESHOLD=8` times, additionally invokes the same
+    deeper healers the AV path already uses (`translate_stale_source_indirect_call_target`,
+    `translate_stale_source_register_indirect_call_target`) to patch the underlying GOT/PLT-slot or
+    register-indirect-load-chain slot in place, exactly mirroring the already-proven AV-path pattern one
+    section up. The existing translate-and-resume for the CURRENT trap still always runs afterward (case
+    (1), unlike the AV path, must resolve the trap that is actually in front of it either way — there is
+    no "skip the shallow heal" option here). **Honest limitation, not a regression**: this closes the same
+    CLASS of gap the AV-path fix closes, not every possible repeat pattern — live-observed this session,
+    one thread hit 46 consecutive identical heals of one pair with the livelock counter correctly crossing
+    the threshold but none of the three deeper healers finding a patchable slot for that specific case (the
+    escalation ran, found nothing, and case (1) simply kept resuming as before — no worse than pre-fix
+    behavior, just not fully closed for every shape). Stress-test result for this fix: see the new
+    "tenth investigation" entry below.
   - **Live correlation attempt, inconclusive by absence of the symptom, not by contrary evidence.** Killed the
     existing idle, post-crash, non-instrumented stack (PID 18292 — default `LITEBOX_LOG` pins `fork_verify` to
     `error`, so its own log had zero heal visibility) and relaunched the IDENTICAL
@@ -653,13 +663,70 @@ dashboard source (`advisor/probes/dashboard/src/selkies-core.js`, `.../index.htm
     arbitrary general host, though it does not rule the mechanism out on a host with genuinely few cores (a
     2-4 core VM/laptop), which the user's "must work on general host OSes" framing means should still be
     kept in view rather than dismissed.
-  - **The real root cause of the periodic `keepalive ping timeout` pattern remains unidentified after eight
-    investigations.** What a follow-up session needs that this one didn't get: a run that actually reproduces
-    the disconnect WHILE `fork_verify=warn` logging is active, so a real fork-heal burst (or its absence) can
-    be read directly against the exact moment of the next timeout — this session's stack happened to stay
-    disconnect-free for its whole observation window, which is itself notable (nothing about a fresh restart
-    guarantees failure) but left no failure to instrument. Do not re-attempt the thread-priority/global-lock/
-    thread-suspension angles this session already checked and found clean (see above) without new evidence.
+  - **The real root cause of the periodic `keepalive ping timeout` pattern remains unidentified after nine
+    investigations** (tenth below adds a fix + deliberate-load stress test, still without a live disconnect
+    to correlate against). What a follow-up session needs that none so far got: a run that actually
+    reproduces the disconnect WHILE `fork_verify=warn` logging is active, so a real fork-heal burst (or its
+    absence) can be read directly against the exact moment of the next timeout. Do not re-attempt the
+    thread-priority/global-lock/thread-suspension angles already checked and found clean (see above) without
+    new evidence.
+  - **Tenth investigation (2026-09-15): fixed the case-(1) livelock (`b6ddf43`, see above) and deliberately
+    stress-tested it — still no disconnect reproduced, so still not confirmed as THE cause, but the real
+    defect is fixed either way.** Built both crates, booted the real webtop stack
+    (`--resume-from .wfgy/webtop_stack_seed.tar`, `--publish 3000:3000`,
+    `LITEBOX_LOG=warn,litebox_platform_windows_userland::fork_verify=warn`,
+    `GLIBC_TUNABLES=glibc.malloc.tcache_count=0:glibc.malloc.mxfast=0` — confirmed `.wfgy/webtop_stack.sh`
+    still exports this itself) with a concurrent guest-side shell loop (`/bin/sh -c` wrapper around the
+    stack script) forking+execing `/bin/true` every 0.3s for the ENTIRE session, so fork_verify's heal path
+    stayed under continuous deliberate load rather than relying on incidental boot-time activity or hoping a
+    real UI action would fork something. Connected a real Chrome tab (chrome-devtools MCP) and observed
+    **11+ minutes of continuous, disconnect-free streaming** (console log stayed at one `[websockets]
+    Connection opened!` for the entire window — zero reconnect/close events, zero `keepalive ping timeout`)
+    while fork_verify logged continuous heal activity throughout (124k+ warn lines by the end, growing
+    steadily past the boot window, not boot-only as in the ninth investigation's run) and the new livelock
+    counter visibly engaged (repeat counts crossing the threshold live, not just in theory). **This is honest,
+    useful evidence the fixed defect was not (by itself, alone) THE cause of the disconnect symptom** — a
+    real fork-heal storm ran continuously under real streaming for over 11 minutes with the fix applied and
+    nothing disconnected — but it does not prove the fix would have made no difference had it not been
+    applied (no back-to-back unfixed-vs-fixed A/B on the identical run was done this session, since only one
+    `litebox_runner` may run at a time on this host). The real root cause remains open.
+  - **Process-launch harness note (PowerShell)**: `Start-Process -RedirectStandardOutput/-RedirectStandardError`
+    silently produced EMPTY output files for this runner when launched with a longer `/bin/sh -c '<script>'`
+    argument via `-ArgumentList` (confirmed repeatable, not a one-off) — the process would start, pull the
+    cached OCI layers, then appear to exit with nothing further logged, looking exactly like a crash. Native
+    invocation (`& $exe ... > out.log 2> err.log`, or a `.ps1` file launched via
+    `Start-Process powershell.exe -ArgumentList "-File",<script>` for a detached background run) reliably
+    captured all output for the identical command. Root cause not fully isolated (plain `/bin/echo` and the
+    unwrapped `/bin/sh /config/webtop_stack.sh` form both worked fine via `Start-Process`), but a future
+    session hitting an empty-output "silent failure" from `Start-Process` with a `-c`-wrapped shell script
+    should suspect the launch mechanism before the guest.
+  - **Real, user-reported complaint (separate from the disconnect symptom): opening apps in the streamed
+    desktop is slow, and Terminal Emulator specifically was reported to never appear after a full minute's
+    wait.** Investigated this session under the SAME live, fork-stress-loaded, fixed-binary stack above.
+    `MAX_THREAD_VERIFICATION_STEPS` exhaustion itself is not a hang/crash mechanism by code inspection
+    (`fork_verify.rs` ~980-1006): once the per-thread step bound is hit, single-stepping is disarmed (`TF`
+    cleared) and the thread resumes at full guest speed — `is_verifying` stays true so the AV-path healing
+    (now also livelock-protected, see above) stays armed for anything single-stepping would have caught
+    later — so exhausting the bound degrades to "less verification coverage," not a stall. Direct evidence:
+    double-clicking the `Home` and `Desktop` desktop icons (native `SendInput`-level clicks, precisely
+    coordinate-mapped and verified pixel-exact against the live screenshot — see `.wfgy/click_helper.ps1`)
+    opened a real Thunar file-manager window, fully rendered, within a few seconds each time, WHILE the
+    fork-stress loop was continuously running — real fork+exec of a genuine dynamically-linked GTK app was
+    not slow or hung. **Terminal Emulator specifically could not be opened this session** — not because it
+    hung, but because every dropdown/popup-menu interaction (the XFCE panel's own "Applications" menu, and
+    separately Thunar's own "File" menu bar) systematically failed to open despite the same native
+    coordinate-precise clicks working reliably for every non-popup target tried (desktop icons, window
+    buttons, a dialog's Close button) — a distinct, separate input-forwarding gap from fork_verify, not
+    yet root-caused (candidates: X11 pointer-grab semantics for `GtkMenu` popups not surviving whatever
+    layer forwards clicks through selkies, vs. a real timing/coordinate issue specific to menu widgets).
+    This is the SAME "coordinate-click verification... open tooling gap" the eighth investigation flagged as
+    unresolved — now partially closed (regular clicks/double-clicks DO work reliably via native `SendInput`
+    at precisely-mapped coordinates) but the popup-menu sub-case remains open. **Net finding: app-launch
+    latency itself is NOT evidence of a litebox-caused slowdown for the one real GUI app actually measured
+    (Thunar, sub-few-seconds); the specific Terminal Emulator complaint remains unvalidated one way or the
+    other** — a future session with working popup-menu input (or a guest-side `xdotool`/direct `exec` path
+    into the already-running desktop) should open Terminal Emulator directly and time it before assuming the
+    case-(1) fix above resolves it.
 
 Do not re-reach for the GLIBC_TUNABLES fix for either of these symptoms — it is already ruled out by direct
 evidence (zero fatal-signal lines anywhere near any of the observed kills/stalls/dual-connects), and do not
