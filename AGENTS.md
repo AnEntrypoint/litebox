@@ -401,6 +401,44 @@ dashboard source (`advisor/probes/dashboard/src/selkies-core.js`, `.../index.htm
   already-built instrument at `litebox_shim_linux/src/diag.rs:86` / `lib.rs:1550-1620`, not previously used
   for this row — correlated against `sk.log` timestamps). **Do not re-attempt a fix aimed at the open-miss
   or diag-print path** — closed by the measurement above, not just unconfirmed.
+  **`ack-stall-kill-rootcause-not-proc-syscall-cost`, RESOLVED 2026-09-15: the "psutil enumerates every
+  process" premise itself was wrong — real numbers, not just the hypothesis, checked this time.** Pulled the
+  exact deployed selkies source (`docker-baseimage-selkies`'s Dockerfile pins
+  `selkies-project/selkies@348bc4f61da66198573e7e57db9a266aca1991d5`, a pre-refactor single-file
+  `src/selkies/selkies.py`, NOT the current `main` branch's `resource_stats.py`/`ResourceMonitor`, which
+  already wraps this same sampling in `asyncio.to_thread` — this bug is upstream-fixed in a later,
+  not-yet-adopted version). At the pinned commit, `_collect_system_stats_ws` (`selkies.py:3273-3291`, one
+  instance per connected data-websocket, `interval_seconds=1`) calls exactly two psutil functions directly
+  on the coroutine, no `run_in_executor`/`to_thread`: `psutil.cpu_percent()` and `psutil.virtual_memory()` —
+  confirmed by grep across the whole 3757-line file, this is the ENTIRE psutil footprint; no
+  `process_iter`/`Process()`/per-pid `.io_counters()`/`.memory_info()` call exists anywhere in it. So the
+  "aggregate cost of dozens of per-process /proc reads" premise this row was filed on does not describe the
+  real code at all — there is no per-process enumeration to aggregate. Measured the two real calls anyway,
+  live, under litebox (isolated one-shot guest boot from the same `--oci-image
+  docker.io/linuxserver/webtop:debian-xfce --resume-from .wfgy/webtop_stack_seed.tar` state the live stack
+  itself resumes from, 200-iteration loop, `time.perf_counter()`, no fork involved so the tcache crash class
+  is side-stepped exactly like the prior `do_open()` measurement was): **`psutil.cpu_percent()` = 26.0us,
+  `psutil.virtual_memory()` = 48.9us, combined = 74.8us per tick** — same order of magnitude as the
+  already-measured `do_open()` ENOENT path (3.8-5.8us) and **~5-6 orders of magnitude below the ~20s
+  `keepalive_ping_timeout` window** (74.8us is ~0.0000037 of a 20s budget; even naively summed across every
+  tick in a 20s window it is ~1.5ms). **The synchronous-call sub-claim was correct (selkies really does call
+  psutil straight from the coroutine, no executor) but the blocking-cost sub-claim is refuted by direct
+  measurement** — exactly the same shape as the immediately-preceding retraction in this file, and the same
+  verdict: do not patch this call site (`sitecustomize.py`-monkeypatching it onto `asyncio.to_thread` would
+  be a correct-shaped but unmotivated change against a mechanism that isn't real; not applied). Live
+  reproduction this same session on the restored stack (killed the running instance to free litebox's
+  single-boot lock for the isolated measurement above, then relaunched identically and reconnected a real
+  browser tab) shows the desktop renders correctly and the SAME `keepalive ping timeout` disconnect/reconnect
+  cycle documented above still fires — confirming the real cause remains open and is NOT this row's psutil
+  mechanism. **The real root cause of the ACK-stall-kill is still unidentified** — the 19/19
+  `/proc/<pid>/cmdline` ENOENT-burst correlation this row was chasing needs a source that isn't psutil: next
+  candidates are `GPUtil.getGPUs()` (a `nvidia-smi`-probing library; the `_collect_gpu_stats_ws` task calls
+  it once at task start and returns immediately with no GPU present here, so it is not a repeating-tick
+  source, but its one-shot subprocess probe touching `/proc` at task start is unexamined) and — more
+  promising given the "+2 stride" pid pattern already noted — whatever spawns short-lived subprocesses on
+  a per-client-connect cadence elsewhere in `selkies.py` (`_run_detached_command`/`_run_command` and the
+  xrandr/xfconf-query paths `webtop_sitecustomize.py` already targets for a DIFFERENT reason). Not
+  investigated further this session — scope was this one row.
 Do not re-reach for the GLIBC_TUNABLES fix for either of these symptoms — it is already ruled out by direct
 evidence (zero fatal-signal lines anywhere near any of the observed kills/stalls/dual-connects), and do not
 re-open a frontend/nginx-config investigation for "dual-connect" — both are now byte/log-verified clean.
