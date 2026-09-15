@@ -1,4 +1,4 @@
-# litebox — current state (2026-09-15)
+# litebox — current state (2026-09-16)
 
 The authoritative CURRENT-STATE picture of what works, what is broken, and what to do next. Every claim
 carries a commit sha or `file:line` so the next session re-verifies instead of re-deriving; a claim
@@ -287,216 +287,73 @@ even under continuous fork-stress load — but every popup/dropdown menu (XFCE p
 pointer-grab semantics for `GtkMenu` vs. a menu-specific timing/coordinate issue). A session with working
 popup-menu input, or a guest-side `xdotool` path, should open Terminal Emulator directly and time it.
 
-**2026-09-15, later session: could NOT re-confirm the popup-menu symptom live — blocked before reaching
-it by two boot-reliability regressions, one found and fixed, one found and NOT fixed.** Architecture
-read first, no code changed on guesswork: `webtop_stack.sh`'s guest is plain `Xvfb` (`+extension XTEST`)
-+ XFCE + `selkies`, and selkies' own `input_handler.py` (`WebRTCInput.send_x11_mouse`/`send_mouse`) drives
-mouse position/clicks through `pynput.mouse.Controller`'s Xlib backend, which is `Xlib.ext.xtest.
-fake_input` under the hood — an ordinary X11 client issuing real XTest protocol requests over its own
-AF_UNIX socket to Xvfb, exactly like any other `XTestFakeMotionEvent`/`FakeButtonEvent` caller. **litebox
-implements no grab-specific or menu-specific code anywhere in this path** — `litebox_shim_linux::syscalls
-::evdev` (`/dev/input/event0`, `EV_REL`-only push model) is a DIFFERENT subsystem for a native-DRM/uinput
-desktop shape this webtop deployment never uses; the generic `Pollee`/`Observer` notifier
-(`litebox/src/event/polling.rs`) and the AF_UNIX socket implementation (`litebox_shim_linux::syscalls::
-unix`) both call `notify_observers`/`register_observer` correctly on every state transition (unlike the
-already-fixed "only wakes on the first event" bug class `evdev.rs`/`drm.rs` document), and `sys_ppoll`
-(`litebox_shim_linux::syscalls::file.rs:5671`) rebuilds a fresh `PollSet` and rescans real fd state on
-every call — level-triggered, not edge/observer-only, so it cannot exhibit a "the byte arrived but nobody
-woke up to read it" gap for a GLib/GTK poll()-based main loop. **If a real litebox defect explains the
-menu symptom, by this reading it has to be in generic syscall-emulation correctness (AF_UNIX ordering,
-timestamp/clock semantics X11 grabs validate against, or something not yet identified) — not a
-menu-specific code path, because litebox has none.** This narrows future search; it does not confirm or
-refute the symptom itself, which still needs a live re-test.
-
-Live re-test was blocked before reaching the Applications menu at all, across 15 full boot cycles of
-`--resume-from .wfgy/webtop_stack_seed.tar` this session:
-
-1. **Fixed**: `.wfgy/webtop_stack.sh`'s nginx supervisor retry block only recreates
-   `/var/lib/nginx/{tmp,logs,body,proxy,fastcgi,uwsgi,scgi}` when `/etc/nginx/sites-enabled/default` is
-   missing — but nginx's OWN first-launch `mkdir() "/var/lib/nginx/body" failed (2: No such file or
-   directory)` reproduced 22/22 times regardless (sites-enabled/default already existed from the
-   top-of-script setup, so the gated recreate never fired to paper over it), forcing every boot into the
-   supervisor's fork-heavy respawn loop (mkdir/openssl/nginx/curl×20) before Xvfb ever started — and that
-   fork storm hit the already-documented ADVISORY-001 §3N glibc safe-linked tcache/fastbin double-free
-   (`double free or corruption (out)` → `SIGABRT`/`SIGSEGV`, killing the whole guest) on 22 of 22 boots
-   this session, far above this bug's historically-documented "sporadic, once in several cycles" rate.
-   Root cause of the mkdir ENOENT itself not identified (a real candidate: a forked `mkdir` utility's
-   directory creation not yet visible to a separately-forked `nginx` process under litebox's thread-based
-   fork — worth a follow-up, not chased further this session), but the fix doesn't need that: recreating
-   those dirs unconditionally right before every nginx launch attempt (not gated on sites-enabled/default)
-   made nginx succeed on attempt=1 and skip the fork storm entirely. This is a `.wfgy/`-local repro-script
-   fix, not a litebox source change (`.wfgy/` is gitignored, confirmed via `git ls-files` — nothing to
-   commit), but it took boot success (reaching `SELKIES_LAUNCHED_LAST` with zero crashes) from 0/22 to
-   3/5 on the patched seed. Also swapped the script's `tail -F /tmp/sk.log` (retry+inotify) for `tail -f`
-   (polling): litebox has no `inotify_init`/`inotify_init1` (`unsupported syscall`, confirmed live on
-   every boot), and GNU `tail -F` silently never notices new data when that syscall is refused rather than
-   falling back to polling — this made every prior session's `[sk]`-tagged selkies log tee a silent no-op.
-2. **NOT fixed, real, and now the actual blocker**: even on a clean boot (`XVFB_UP`, `DE_UP`, no crash),
-   selkies itself never serves. `curl`'s own WebSocket-upgrade probe against `http://127.0.0.1:3000/
-   websockets` (the dashboard's real, confirmed-correct endpoint — verified via the browser's own console:
-   `WebSocket connection to 'ws://127.0.0.1:3000/websockets' failed ... 404`) returns `404` every time,
-   with ZERO `[sk]`-tagged output ever appearing even with the `tail -f` fix active, across all 3 clean
-   boots reached this session. One boot's stderr trace shows the mechanism: at t≈175s (selkies apparently
-   still initializing) a `spawn_exec_collision_child` event fires (matching this project's own documented
-   collision class — most likely selkies' `gst_app_resize`/xfconf-query DPI-set fork, already implicated
-   elsewhere in this file for a different, sporadic SIGSEGV), fork_verify logs a burst of stale
-   CODE/DATA-pointer heals in response, and selkies exits `rc=1` roughly 15s later with no logged reason —
-   the supervisor then respawns it into the same failure. `docs/webtop-debian-selkies-2026-09-06.md`
-   documents an apparently-related, 100%-reproducible prior bug (a proxied `location` deterministically
-   gets `connect() refused` — masked as a `404` by a missing `50x.html` — if and only if the ORIGINAL
-   client request arrived via the `-p`-published NAT path, never via a same-guest loopback probe); this
-   session could not distinguish "same bug, still unfixed" from "a new, DPI-fork-triggered selkies startup
-   failure" without a working internal-vs-external curl comparison (attempted once via an in-script
-   background probe subshell; it never printed even its first iteration in 300+s and was reverted rather
-   than trusted or chased further). **Whoever picks this up next should re-run that doc's exact four-boot
-   internal-vs-`-p` `curl` comparison first** — it is the fastest way to tell which of the two candidate
-   bugs (or a third one) is live today, before assuming either.
-3. Xvfb's own `XVFB_FAILED` rate was also unusually high this session (4 of the last 6 boot attempts) —
-   consistent with, but not confirmed as, the already-documented Mesa llvmpipe/`cc1` fixed-address
-   collision race (`LIBGL_ALWAYS_SOFTWARE=1`/`GALLIUM_DRIVER=softpipe` already applied); not investigated
-   further since it was not this session's blocker (the 3 clean boots reached DE_UP fine).
-
-**Net effect: the popup-menu/Terminal-Emulator symptom is UNCHANGED from the prior session's finding —
-neither newly confirmed nor refuted live this session — and no litebox source code was changed**, per
-this project's own standing discipline against forcing an unverified fix. The one real fix landed
-(nginx dir-recreate race) is in `.wfgy/webtop_stack.sh` only and measurably improves boot reliability for
-whoever runs this repro next, but does not itself touch litebox.
-
-**2026-09-16: the t≈175s `spawn_exec_collision_child` + selkies-never-binds mechanism, root-caused and
-fixed — the trigger was NOT `gst_app_resize`/xfconf-query as guessed above; it is selkies' own interpreter
-re-exec, and the real defect was an unbounded blocking wait with no fallback.** Live-reproduced
-(`.wfgy/boot_repro2.*`, `.wfgy/fix_verify_run1.log`) with `LITEBOX_LOG=warn,…fork_verify=warn`, correlating
-`path=` on every `spawn_exec_collision_child` line against the guest's own `[sk]`-tagged stdout:
-
-- The collision is `path=/lsiopy/bin/python3` — selkies' shebang (`/lsiopy/bin/selkies` → `#!/lsiopy/bin/
-  python3`) re-execs an `ET_EXEC` python3 at selkies' own launch, ~70-180s into boot, once nginx/Xvfb/dbus/
-  xfce4-session's cumulative fork/exec history has filled enough of litebox's ONE shared host address
-  space to collide with python3's fixed link address. The EARLIER, already-documented `cc1`/Mesa-llvmpipe
-  collision (`~t=76s`, harmless, resolves in ~5s) is a separate, unrelated event that just happens to
-  precede it by design (`.wfgy/webtop_stack.sh` starts nginx/Xvfb before selkies specifically to dodge that
-  one) — do not conflate the two `spawn_exec_collision_child` events in a boot's log.
-- `spawn_exec_collision_child` (`litebox/src/platform/mod.rs:1131`, impl `litebox_platform_windows_userland/
-  src/lib.rs:9972`, called from `sys_execve` at `litebox_shim_linux/src/syscalls/process.rs:6075` on
-  `Map(EEXIST)` after the point of no return) correctly avoids crashing the guest by spawning a fresh,
-  genuinely separate `litebox_runner` process to run the colliding program and adopting its exit status —
-  but it did so via a **plain blocking `cmd.status()` with no timeout**. That nested child is a completely
-  isolated OS process with no shared AF_UNIX namespace with the ORIGINAL guest's already-running Xvfb/
-  D-Bus (the same gap `docs/fork-fs-veh-2026-09-08.md:128-144` already documents for cross-process FORK
-  children, now confirmed to also apply here) — selkies inside it cannot actually reach the desktop it's
-  supposed to serve. Observed live consequences, both real, both reproduced: (a) the nested attempt can
-  exit quickly with a real but degraded-environment failure (its own gcc/collect2 sub-step, itself another
-  nested collision, returning `raw_status=1`); or (b) — the actual mechanism behind this row's original
-  "selkies never binds, 404s forever" symptom — the nested child can sit at 0% CPU forever (most likely
-  blocked on a `connect()`-then-`ppoll(timeout=-1)` against an unreachable socket path, the exact
-  `dbus-daemon --fork` hang class this project already knows), and since the calling guest thread blocks on
-  it UNCONDITIONALLY, this wedges the ENTIRE guest boot — the top-level shell's own supervisor loop never
-  sees `selkies` exit, so it never respawns, and the whole `.wfgy/webtop_stack.sh` `HOLD` loop just ticks
-  forever over a dead boot. Live-witnessed: 7+ minutes at 0.06s total CPU, `Get-Process` confirmed, until
-  manually killed.
-- **Fixed** (`litebox_platform_windows_userland/src/lib.rs`, `spawn_exec_collision_child`): replaced the
-  blocking `cmd.status()` with `cmd.spawn()` + a poll loop using the SAME "genuinely wedged, not just slow"
-  CPU-progress check `process_fork::run_external_fault_watchdog_child` already uses and this project already
-  trusts for the identical judgment call (measured on the CHILD's handle from a genuinely different
-  process, never the self-measurement that function's own doc comment already found unreliable) — a 20s
-  no-CPU-progress stall grace, and a 120s absolute cap regardless of progress. Timing out kills the child
-  and returns `None`, which is exactly the existing, already-correct spawn-failure fallback (kill this ONE
-  guest process with `SIGSEGV`; its own supervisor loop already respawns it) — changes nothing for the
-  overwhelmingly common case where the child actually exits.
-- **Live-verified the fix actually fires and recovers**, not just compiles: re-ran the identical repro on
-  the patched binary (`.wfgy/boot_repro3.*`). The SAME `/lsiopy/bin/python3` collision occurred (t=161.7s
-  this run — this class is inherently non-deterministic run to run, expected), its nested child again made
-  some CPU progress but never exited; at t=281.9s (exactly 120.1s later) the absolute cap fired —
-  `spawn_exec_collision_child: replacement process exceeded the absolute time cap … killing it` — the
-  original guest thread then took the pre-existing `killing process with SIGSEGV tid=211 path=/lsiopy/
-  bin/python3` fallback, and the boot's own supervisor loop printed `SELKIES_SUPERVISOR: attempt=… exited
-  rc=… -- respawning` and kept going instead of hanging. `Get-Process` after the fix's cap fired showed only
-  the one main runner process alive (no orphaned/zombie nested child), confirming `child.kill()`+`child.
-  wait()` clean up correctly.
-- **What this fix does NOT close**: the underlying single-shared-address-space collision itself (Track B,
-  already extensively documented, multi-session-scale infra work) is unchanged — selkies' python3 re-exec
-  can still collide, and when it does, the nested recovery attempt still cannot reach Xvfb/D-Bus, so it
-  still very likely fails or times out (now bounded at ≤120s instead of forever). A separate, pre-existing,
-  already-documented bug (ADVISORY-001 §3N glibc tcache/fastbin corruption, `[sk] Segmentation fault`
-  `rc=139`) also still fires independently on some selkies (re)launches, unrelated to this fix. **The fix's
-  scope is precisely**: convert an unbounded, unrecoverable, whole-boot hang into a bounded failure the
-  existing supervisor-respawn loop already knows how to recover from — a real, live-confirmed reliability
-  improvement, not a claim that the collision itself no longer happens.
-- Boot-reliability numbers, repeated live boots, `.wfgy/webtop_stack.sh --resume-from .wfgy/
-  webtop_stack_seed.tar`: pre-fix, one live run hit the unbounded hang directly (0/1 that run, needed a
-  manual kill after 7+ minutes with zero progress) — consistent with this row's own prior-session 3/5
-  "clean boot but selkies never binds" characterization, since an unbounded hang and a `404`-forever boot
-  are the same underlying defect, just differing in whether the specific run's nested child fully wedges or
-  merely fails slowly. Post-fix, two live runs both avoided the hang: one recovered via the bounded fallback
-  and kept cycling through the supervisor loop (never reached a fully clean `Data WebSocket Server
-  listening` state in the observation window, blocked by the separate, pre-existing tcache-corruption
-  respawn loop above); commit `HEAD` has the fix. This is a real, measured improvement (a boot that used to
-  need a manual process kill now self-recovers), not yet a claim of 100% clean-boot reliability — the
-  tcache/fastbin corruption class remains this project's next blocker for a fully clean boot, tracked
-  separately (ADVISORY-001 §3N).
+**2026-09-16**: a live re-test attempt (blocked before reaching the Applications menu; architecture read
+found no litebox grab-/menu-specific code on this input path) hit selkies never binding
+(`/websockets` 404) — now root-caused and **fixed**: `spawn_exec_collision_child`
+(`litebox/src/platform/mod.rs:1131`, impl `litebox_platform_windows_userland/src/lib.rs`) recovers from
+an exec-address collision by spawning a replacement `litebox_runner`, but awaited it with an unbounded
+blocking `cmd.status()` — a wedged replacement hung the WHOLE guest boot forever. **Fixed and
+live-verified (`42d8ced`)**: bounded poll (20s stall grace/120s cap); re-run hit the same collision, the
+cap fired, and supervisor-respawn recovered cleanly. Does not fix Track B or ADVISORY-001 §3N (above,
+both still open) — only bounds this hang. Full repro/architecture-read detail:
+`docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 ## Host-side crash machinery
 
-**A fatal host fault dumps before it dies, ungated** — the stack walk, `RECENT_FAULTS` ring
-(`litebox_platform_windows_userland/src/lib.rs:789`) and `RECOVERY_LOG` print with no env var set
-(`lib.rs:1950-1956`); a real OS minidump (`199655b`) comes only from the repeated-identical-fault
-circuit breaker, >64 faults at one rip.
+**A fatal host fault dumps before it dies, ungated**: stack walk, `RECENT_FAULTS` ring
+(`litebox_platform_windows_userland/src/lib.rs:789`), `RECOVERY_LOG` print with no env var needed
+(`lib.rs:1950-1956`); a real OS minidump (`199655b`) comes only from the repeated-identical-fault circuit
+breaker, >64 faults at one rip.
 
-**Two dump fields mislead if you trust an old reading.** `error_code` is synthesized here and `19740a3`
-made its Present bit REAL rather than hardcoded 0, so **every pre-2026-09-10 "not-present, therefore
-unmapped" inference from `error_code` is unsound**. `is_in_guest` became tri-state in `c0c1472` (before
-it, a failed TLS lookup printed identically to a confirmed `false`). Exact semantics: archive.
+**Two dump fields mislead on an old reading**: `error_code` is synthesized, and `19740a3` made its
+Present bit REAL rather than hardcoded 0 (every pre-2026-09-10 "not-present" inference is unsound);
+`is_in_guest` became tri-state in `c0c1472`. Exact semantics: archive.
 
-**An unexplained `0xC0000005` with no further detail may be something that panicked** — litebox no longer
-sees Rust panics as panics. The handler used to carry every exception code, panic code `0xE06D7363`
-included, through a stack swap into a handler with no interest in it, overflowing the stack; it now
-enters only for the four codes it triages (`78dda05`) and registers FIRST in the chain (`5870ab0`).
-Per-depth frames are sized from disassembly, not guessed (`5cacf7f`, `0473cc3`); `dc108fb` stopped the
-watchdog killing a successfully-recovered run. Narrative: `docs/veh-exception-handler-design.md`.
+**An unexplained `0xC0000005` may be a panic** — litebox no longer treats Rust panics as panics; the
+handler now enters only for the four codes it triages (`78dda05`), registers FIRST in the chain
+(`5870ab0`), sizes per-depth frames from disassembly not guesswork (`5cacf7f`, `0473cc3`), and `dc108fb`
+stopped the watchdog killing a recovered run. Narrative: `docs/veh-exception-handler-design.md`.
 
-**Cross-process synchronization on Windows is a hard platform constraint** (measured, memory
-`mem-b709a7d784b98110-1430`): every native address/TID-based wait is process-local — `WaitOnAddress`,
-keyed events, `NtAlertThreadByThreadId` (ACCESS_DENIED). The only cross-process wake is a shared kernel
-object; NAMED auto-reset Events work cross-process with no `DuplicateHandle`. The primitive exists and is
-live-verified (`litebox_platform_windows_userland/src/xproc_sync.rs`, `b2166c4`); wiring it into
-`RawMutex` is open (PRD row `wire-xproc-sync-crossprocessmutex-into-litebox-platform-rawmutex`).
+**Cross-process sync on Windows is a hard platform constraint** (memory `mem-b709a7d784b98110-1430`):
+every native address/TID-based wait is process-local (`WaitOnAddress`, keyed events,
+`NtAlertThreadByThreadId`=ACCESS_DENIED); only a shared kernel object crosses processes — NAMED
+auto-reset Events, no `DuplicateHandle` needed. Live-verified primitive:
+`litebox_platform_windows_userland/src/xproc_sync.rs` (`b2166c4`); wiring it into `RawMutex` is open (PRD
+`wire-xproc-sync-crossprocessmutex-into-litebox-platform-rawmutex`).
 
 ## Closed — do not re-attempt without a genuinely new approach
 
-**There is no open host crash.** The `RtlpUnwindPrologue` crash earlier notes called "the one genuinely
-open" one was `VEH_FRAME_STRIDE`, closed by `0473cc3` on 2026-09-08 (`271cbb5`) — a 4096-byte per-level
-slice 168 bytes short of the two frames it must cover, nested to `veh_depth=2` by `fork_verify`'s own
-AV-heal storm (not a `fork_verify` bug itself). Bisected live: `66bd640`/`b0fe210` 10/10 fatal, `0473cc3`
-0/10, `5683a4e` 0/57. Mechanism and diagnostic pitfall: memory `mem-c62454fedb1baef8-2714`. Still
-unguarded, not a live defect: nothing detects a too-small stride (PRD
-`veh-frame-stride-has-no-overflow-guard`).
+**There is no open host crash** — the `RtlpUnwindPrologue` crash earlier notes called "the one genuinely
+open" one was `VEH_FRAME_STRIDE`, closed by `0473cc3` (`271cbb5`): a 4096-byte per-level slice 168 bytes
+short of the two frames it must cover, nested to `veh_depth=2` by `fork_verify`'s own AV-heal storm.
+Bisected live: `66bd640`/`b0fe210` 10/10 fatal, `0473cc3` 0/10, `5683a4e` 0/57 (mechanism: memory
+`mem-c62454fedb1baef8-2714`). Unguarded, not a live defect: PRD `veh-frame-stride-has-no-overflow-guard`.
 
-**Windows CoW-mmap performance.** Zero practical effect on real tar-packed execs: `MapViewOfFile3` needs
-64KiB file-offset alignment and real ELF `PT_LOAD` segments are only page-aligned, no exploitable slack.
-**`LITEBOX_COW_MMAP` default-off is load-bearing**: the shipped flank restoration (`329174b`) recommits
-orphaned flanks as anonymous **zero-fill**, while the fault it fixed was `ld.so` **reading** that flank's
-`.gnu.hash`/`.dynsym` — opting in trades a loud SIGSEGV for silently zeroed symbol tables. Detail:
-`docs/cow-mmap-fixed-address-design.md`, memory `mem-3e13872ce1ffe95e-2814`.
+**Windows CoW-mmap performance**: zero practical effect on tar-packed execs (`MapViewOfFile3` needs 64KiB
+file-offset alignment; ELF `PT_LOAD` segments are only page-aligned, no exploitable slack).
+**`LITEBOX_COW_MMAP` default-off is load-bearing** — the shipped flank fix (`329174b`) recommits orphaned
+flanks as zero-fill, while the bug it fixed was `ld.so` reading that flank's `.gnu.hash`/`.dynsym`;
+opting in trades a loud SIGSEGV for silently zeroed symbol tables (`docs/cow-mmap-fixed-address-design.md`,
+memory `mem-3e13872ce1ffe95e-2814`).
 
-**Input latency.** Three real bugs fixed and verified live: sub-pixel mouse remainders truncated by
-float-to-i32, now accumulated losslessly; each move delivered as TWO evdev reports instead of one, now a
-single `SYN_REPORT` (`59e4ca0`, live-counted witness in `5683a4e`); the window locked to guest virtual
-resolution, now resizable with scaled deltas. Present mode is **Mailbox-preferred with Fifo fallback**
-(`presentation.rs:1064-1080`) — any note calling it Fifo-only is stale. Genuinely open: deltas come from
-differencing winit `CursorMoved` absolutes rather than `DeviceEvent::MouseMotion` (PRD
-`mouse-motion-devicevent-needs-pixel-calibration`); the linux/macos presenters still emit two reports per
-move (`linux-macos-userland-presentation-still-emits-two-syn-reports-per-move`); no framerate baseline
-exists since an idle compositor legitimately produces zero page flips.
+**Input latency**: three real bugs fixed and verified live (sub-pixel remainders now accumulated
+losslessly; two evdev reports per move now one `SYN_REPORT`, `59e4ca0`/`5683a4e`; window now resizable
+with scaled deltas). Present mode is Mailbox-preferred with Fifo fallback (`presentation.rs:1064-1080`) —
+any note calling it Fifo-only is stale. Open: PRD `mouse-motion-devicevent-needs-pixel-calibration`,
+`linux-macos-userland-presentation-still-emits-two-syn-reports-per-move`; no framerate baseline exists
+since an idle compositor legitimately produces zero page flips.
 
 **The GUI protocol decision is settled**: DRM/KMS + wgpu, proven live with guest page-flip pixels in a
 real host window (memory `mem-3c4a9980a884604b-1031`). Not an open X11-vs-Wayland-vs-DRM question.
 
 ## Docs and tooling map
 
-- **Archives** — `docs/AGENTS_ARCHIVE_2026-09-15.md` (two drain passes today: the 30KB-threshold
-  recompile, then the ACK-stall-kill investigation detail) and `docs/AGENTS_ARCHIVE_2026-09-10.md` (fork
-  fd boundary/eligibility verbatim, per-fork cost history, 2026-09-08 defect set, OCI cache internals,
-  s6-boot gaps, browser-desktop config, crash-dump/VEH constants, CoW flank fix, working practices).
-  Older: `docs/AGENTS_ARCHIVE_2026-09-03.md`, `_2026-09-05.md`.
+- **Archives** — `docs/AGENTS_ARCHIVE_2026-09-16.md` (popup-menu re-test,
+  `spawn_exec_collision_child` fix detail), `docs/AGENTS_ARCHIVE_2026-09-15.md` (30KB recompile + the
+  ACK-stall-kill detail), and `docs/AGENTS_ARCHIVE_2026-09-10.md` (fork fd boundary/eligibility, per-fork
+  cost history, 2026-09-08 defect set, OCI cache internals, s6-boot gaps, browser-desktop config,
+  crash-dump/VEH constants, CoW flank fix, working practices). Older: `docs/AGENTS_ARCHIVE_2026-09-03.md`,
+  `_2026-09-05.md`.
 - Fork: `docs/track-b-fork-fix-progress.md`, `advisor/ADVISORY-002-d-zero-fork.md`,
   `advisor/ADVISORY-001-fundamentals.md` (§3N tcache analysis, Appendix D presenter case).
 - `docs/veh-exception-handler-design.md` — canonical VEH narrative; read before touching the handler,
