@@ -1978,6 +1978,60 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if !state.trampoline_mapped {
             let tramp_addr = state.trampoline_addr;
 
+            // Size the initial allocation from a cheap upper bound on how many `syscall`
+            // (`0F 05`) byte pairs this segment can possibly contain, rather than a flat
+            // `PAGE_SIZE` guess. A real container-image binary (e.g. GNU bash, vs. the
+            // busybox this was originally sized against) routinely needs far more than one
+            // page of stubs: undersizing here used to fall through to the `trampoline_mapped_len`
+            // "extend" path below, which only ever tries ONE fixed, exactly-adjacent address via
+            // `MAP_FIXED_NOREPLACE` with no fallback -- unlike this initial allocation's own
+            // try-fixed-then-let-the-VM-choose fallback a few lines down. Any unrelated mapping
+            // already occupying that single adjacent address (common; nothing reserves it) made
+            // the extend fail outright, which nukes EVERY syscall in the whole segment to an
+            // `ICEBP;HLT` crash trap (`apply_trap_fallback`) -- including the ones that were
+            // otherwise perfectly patchable -- so the guest died on the first syscall it ever
+            // executed after load (confirmed live: `docker.io/edgelevel/alpine-xfce-vnc`'s `/bin/sh`
+            // == bash, SIGILL within 3s of exec, 480 syscalls trap-poisoned by one failed 4KiB
+            // extension). Counting the byte pairs is the same sound-upper-bound technique
+            // `litebox_syscall_rewriter::patch_code_segment`'s own fast-reject scan already relies
+            // on: a real `syscall` is always exactly `0F 05` with no prefix that changes those
+            // bytes, so this can only OVER-count (data or another instruction's encoding
+            // containing that pair), never under-count, and sizing off an over-count is safe.
+            let syscall_upper_bound = mapped_addr
+                .to_owned_slice::<Platform>(len)
+                .map(|owned| {
+                    let buf = owned.into_vec();
+                    buf.windows(2)
+                        .filter(|w| w[0] == 0x0F && w[1] == 0x05)
+                        .count()
+                })
+                .unwrap_or(0);
+            // Per-syscall stub upper bound: the fixed lea+jmp+jmp-back sequence
+            // (`hook_syscalls_in_section`) is 18 bytes, plus up to `SYSCALL_CONTEXT_INSTRUCTIONS`
+            // (8) re-encoded instructions of at most 15 bytes (x86-64's own max instruction
+            // length) each on the richer pre/post-syscall paths -- 128 comfortably covers that
+            // with headroom, and only pads address space (never committed memory) if it
+            // overshoots.
+            const MAX_STUB_BYTES_PER_SYSCALL: usize = 128;
+            const TRAMPOLINE_ENTRY_BYTES: usize = 8;
+            // Capped: `syscall_upper_bound` counts raw `0F 05` byte pairs anywhere in the
+            // mapping, including non-code data (rodata sharing the segment, or an unrelated
+            // byte pair inside another instruction's encoding) -- real code never approaches
+            // this density, so a huge count here means the segment is huge and mostly NOT
+            // syscalls, not that it genuinely needs gigabytes of trampoline. 4 MiB covers over
+            // 32,000 real syscall sites (every real-world binary seen so far needs under 1,000)
+            // while bounding the one-time address-space/commit cost for a large, data-heavy
+            // mapping. A segment that legitimately needs more than this still has the existing
+            // `trampoline_mapped_len`-extension path as a backstop, unchanged.
+            const MAX_INITIAL_TRAMPOLINE_SIZE: usize = 4 * 1024 * 1024;
+            let initial_tramp_size = align_up(
+                TRAMPOLINE_ENTRY_BYTES
+                    + syscall_upper_bound.saturating_mul(MAX_STUB_BYTES_PER_SYSCALL),
+                PAGE_SIZE,
+            )
+            .max(PAGE_SIZE)
+            .min(MAX_INITIAL_TRAMPOLINE_SIZE);
+
             // Try MAP_FIXED_NOREPLACE first — works when the preferred
             // trampoline address is available. If that fails, let the VM
             // manager choose a free address and validate that it is still
@@ -1985,14 +2039,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let actual_addr = self
                 .do_mmap_anonymous(
                     Some(tramp_addr),
-                    PAGE_SIZE,
+                    initial_tramp_size,
                     ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
                     MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
                 )
                 .or_else(|_| {
                     self.do_mmap_anonymous(
                         None,
-                        PAGE_SIZE,
+                        initial_tramp_size,
                         ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
                         MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
                     )
@@ -2015,7 +2069,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     distance:? = distance;
                     "trampoline too far from code segment, skipping patching"
                 );
-                let _ = self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), PAGE_SIZE);
+                let _ = self.sys_munmap_raw(
+                    UserPtrMut::<u8>::from_usize(actual_addr),
+                    initial_tramp_size,
+                );
                 self.apply_trap_fallback(mapped_addr, len, false);
                 return true;
             }
@@ -2029,13 +2086,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .is_none()
             {
                 litebox_util_log::warn!("failed to write syscall entry point to trampoline");
-                let _ = self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), PAGE_SIZE);
+                let _ = self.sys_munmap_raw(
+                    UserPtrMut::<u8>::from_usize(actual_addr),
+                    initial_tramp_size,
+                );
                 self.apply_trap_fallback(mapped_addr, len, false);
                 return true;
             }
             state.trampoline_cursor = 8; // stubs start after the 8-byte entry
             state.trampoline_mapped = true;
-            state.trampoline_mapped_len = PAGE_SIZE;
+            state.trampoline_mapped_len = initial_tramp_size;
         }
 
         // Performance guard: skip if this exact range was already patched.
