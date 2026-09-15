@@ -266,6 +266,79 @@ cross-process fork gives zero AVs but Xvfb is unreachable from its clients (`/tm
 shared object); one host-side transport shared by every process of a guest would put the whole desktop
 on the already-crash-free path (`docs/fork-fs-veh-2026-09-08.md:128-144`).
 
+**The documented `--env GLIBC_TUNABLES=...` boot flag is required literally as written — a bare shell
+prefix does not work.** `GLIBC_TUNABLES=... ./litebox_runner....exe ...` (env var set on the host shell
+before the exe, no `--env`/`--forward-env`) does NOT reach the guest: confirmed live, that shape
+reproduces the pre-workaround crash 1/1 (`comm=sh`, pid=1, SIGSEGV, ~7.5s in, right after
+NGINX_SELFTEST — byte-for-byte the same fixed point `7f84dc3` describes). `--env
+GLIBC_TUNABLES=glibc.malloc.tcache_count=0:glibc.malloc.mxfast=0` (an actual runner flag) is required;
+`.wfgy/webtop_stack.sh` now also exports it near the top as defense in depth for every child process it
+execs, but that does NOT cover the top-level shell itself (see the comment there).
+
+**"Streams 1-2s then stops, needs a refresh" is NOT the glibc/tcache crash, and NOT literally a second
+browser tab.** Live-captured evidence (2026-09-15, single Chrome tab, zero devtools interference during
+the control pass): the desktop streams and renders correctly (clock advancing, `SUCCESS: Capture started
+for 'primary'`), then within single-digit seconds `sk.log` logs `Client stall for 'primary': No ACK in
+N.Ns. Forcing backpressure.` followed by `Data WS closed with error ...: sent 1011 (internal error)
+keepalive ping timeout; no close frame received` — selkies' OWN stall-detector concludes the client is
+dead and kills the data-channel connection, tearing down capture (`Last client disconnected. All
+pipelines should have been stopped`). The browser's own frontend JS (console-verified) confirms it
+starts `Started sending backpressure ACKs every 50ms` right after connecting, so the client believes it
+is acking; the runner log has ZERO fatal-signal lines anywhere near these kills across multiple observed
+cycles, ruling the tcache/fastbin crash class out for this symptom specifically. A related but distinct
+finding from the SAME capture: the very first-ever connection in a fresh tab can 404 on
+`ws://.../websockets` (console: `WebSocket connection ... failed: Unexpected response code: 404`), which
+trips the frontend's OWN `WebSocket disconnected, reloading page to reconnect.` auto-reload — a second,
+independent way to land on "it just stopped," separate from the ACK-stall kill above. Neither is fixed
+here: the ACK-stall kill fires even on a single idle, non-interactive, freshly-reloaded client with
+nothing else connected (ruling out a real second client racing in on THAT run), so one contributing
+mechanism is a transport- or scheduling-level gap in delivering the client's low-latency 50ms heartbeat
+back through litebox's inbound `--publish` path or the guest's own asyncio loop under litebox's
+syscall-emulation overhead — not proven to instruction level, and NOT the same code path as the
+already-fixed one-shot HTTP shutdown/close race in `litebox_platform_windows_userland/src/net.rs`
+(long-lived bidirectional WS traffic, not request/response). CDP corroboration from the SAME capture:
+`Runtime.evaluate` and `Accessibility.getFullAXTree` both timed out against the live streaming tab
+(while `Page.captureScreenshot` and raw input kept working), consistent with the tab's own JS main
+thread (canvas + WebCodecs H264 decode) being busy enough, at times, to miss its own 50ms ACK-send
+timer — a client-side contributor to the same symptom, not just a server- or transport-side one.
+
+**The single most reproducible mechanism, found after the above: a real page load opens TWO
+`data_websocket` "Legacy client...Role: controller" registrations, not one — observed 5/5 times this
+session (fresh tab loads and in-place reloads alike), each time with no second real browser tab and no
+devtools interference in flight.** Sequence every time: two `Legacy client (10.0.0.2, <port>) connected`
+lines land within the same fraction of a second to ~tens of seconds of each other, then either (a) the
+second one is treated as a genuine new primary and the first is explicitly killed
+(`Killing old client for 'primary' ... Reason: a new primary client connected connection killed`,
+visible client-side as the frozen `Connection Terminated: a new primary client connected connection
+killed` screen that does NOT auto-recover — this is likely the literal, most common mechanism behind
+"needs a full page refresh to resume", independent of any actual second tab/session), or (b) neither
+data-channel ever reaches `SUCCESS: Capture started`/`Registering new client for display` at all and the
+page sits on `Waiting for stream...` indefinitely (observed live, this same capture, final attempt).
+Root cause not yet isolated to instruction level (dashboard JS is a minified bundle inside the image,
+not vendored in this repo, so it could not be read directly this session) — plausible candidates: the
+frontend's own `/websockets` (plural) 404-then-auto-reload path racing a legitimate connection attempt
+(console-verified: `WebSocket connection to 'ws://.../websockets' failed: ... 404` immediately followed
+by `WebSocket disconnected, reloading page to reconnect.` on a fresh tab's first-ever load), or the
+dashboard opening a probe/legacy connection alongside its real one. PRD row
+`selkies-dual-connect-per-pageload-pending-frontend-trace` covers isolating this (needs the unminified
+dashboard JS or a guest-side packet trace, both beyond this session's reach) and PRD row
+`selkies-ack-stall-kill-pending-transport-trace` covers the separate ACK-stall-kill mechanism above. Do
+not re-reach for the GLIBC_TUNABLES fix for either of these symptoms — it is already ruled out by direct
+evidence (zero fatal-signal lines anywhere near any of the observed kills/stalls/dual-connects).
+
+**The glibc/tcache crash class (candidate 1 from the original bug report) is real and DOES still hit
+selkies, just sporadically, separately from the two mechanisms above.** Live-captured this session, once
+in several boot cycles: `fatal signal ... signal=Signal(11) ... comm=python3` during
+`gst_app_resize`'s `xfconf-query` DPI-set fork on a client's 5th rapid reconnect, immediately followed by
+selkies' own `Segmentation fault` / `double free or corruption (out)` / `SIGABRT comm=sh` and
+`SELKIES_SUPERVISOR: attempt=1 exited rc=139 -- respawning` — this is genuinely ADVISORY-001 section 3N,
+confirming the prior session's own prediction ("Selkies still takes a sporadic §3N death on its own
+xfconf-query DPI fork when a new client connects"). It happened despite `--env GLIBC_TUNABLES=...` being
+correctly passed to the runner, which is why `.wfgy/webtop_stack.sh` now also exports it directly (see
+top of file) as defense in depth for every child selkies itself forks — not yet re-verified crash-free
+over many cycles post-change, since the dual-connect and ACK-stall mechanisms above dominate the
+symptom in practice and made a long enough crash-free observation window hard to reach this session.
+
 ## Host-side crash machinery
 
 **A fatal host fault dumps before it dies, ungated** — the stack walk, `RECENT_FAULTS` ring
