@@ -472,6 +472,54 @@ dashboard source (`advisor/probes/dashboard/src/selkies-core.js`, `.../index.htm
   *successful* exec (unlike GPUtil's cheap failed one) — untimed against this specific guest and uncorrelated
   against whether any of them fire repeatedly within one connection's lifetime rather than once at
   connect/reconfigure. That correlation is the next lead, not GPUtil.
+- **`pixelflux-capture-encode-hot-path`, RESOLVED 2026-09-15: refuted by source-level architecture, same fate
+  as psutil/GPUtil — and refuted by design, not just by absence of contrary evidence.** Read the pinned
+  `selkies.py`'s own capture call site (`_start_capture_for_display`, `selkies.py:3091-3200`):
+  `capture_module.start_capture` is invoked exactly ONCE per display, via
+  `await self.capture_loop.run_in_executor(None, capture_module.start_capture, queue_data_for_display,
+  settings)` — a single executor dispatch to kick the whole capture session off, not a per-frame call on the
+  coroutine, and never a tight loop on the event loop. `pixelflux` (`selkies-project/pixelflux`) is a PyO3
+  0.29.2 Rust extension, confirmed from its real upstream source (`pixelflux/src/lib.rs`, fetched live via
+  `gh api`/raw.githubusercontent.com, not assumed) to have an explicit three-thread architecture — Capture/
+  Compositor, Encode, and a dedicated Delivery thread that owns the Python callback. Grepping the 8381-line
+  source: zero `allow_threads`/`with_gil` (PyO3's pre-0.29 GIL API) but 20+ `py.detach()`/`Python::attach()`
+  calls (PyO3 0.29's renamed release/acquire-GIL API) wrapping capture and encode work, and the callback
+  invocation itself (`cb.call1(py, (f,))`, `lib.rs:2316`/`6832`) is the ONLY place the GIL gets reacquired on
+  that path — inside `Python::attach(|py| { ... })` on the delivery thread specifically. The source's own
+  comments state the design intent directly: "the Python frame callback runs on a dedicated delivery thread
+  so its GIL never stalls calloop input / control dispatch" (`lib.rs:4345-4346`) and "one GIL acquisition per
+  frame with all stripes batched" (`lib.rs:6710`) — i.e. capture (X11/MIT-SHM) and x264 encode run GIL-free
+  on their own threads, and the main/event-loop thread is blocked, at most, for the duration of one Python
+  callback per frame. That callback (`queue_data_for_display`, `selkies.py:3140-3162`) does only a
+  `memoryview` wrap, a small dict literal, and `self.capture_loop.call_soon_threadsafe(do_put)` — no encode
+  or capture work happens inside the GIL-held window at all, the same cheap-arithmetic shape already cleared
+  for `_run_frame_backpressure_logic`. Also relevant: the one documented server-side marker for the real bug
+  (19/19 `keepalive ping timeout` closes preceded by a `/proc/<pid>/cmdline` ENOENT burst) is structurally
+  impossible to attribute to pixelflux — X11 MIT-SHM capture and libx264 encode never touch `/proc`. **Live
+  corroboration**: reused the already-running stack (PID 18292, port 3000, no second runner started),
+  connected a real Chrome tab via chrome-devtools MCP, and observed continuous rendering (desktop clock
+  advancing across multiple checks, live cursor-hover tooltip redraw proving active capture+encode+decode,
+  zero console disconnect/reload messages) for a multi-minute window before a keepalive-ping-timeout-style
+  disconnect eventually fired **spontaneously, while the desktop was idle** (a Thunar window sitting open,
+  mouse motion only, no heavy pixel-diff/encode load) — the opposite correlation a genuine encode-hot-path
+  cause would predict. **Do not patch `_start_capture_for_display`/`run_in_executor`** — there is no
+  synchronous or GIL-blocking encode call on the event loop to offload; a `sitecustomize.py` patch here
+  would be unmotivated against a mechanism this session confirmed, from pixelflux's own source, was built
+  specifically not to exist. **The real root cause remains unidentified** — sixth hypothesis refuted, same
+  standard of evidence as the prior five.
+- **New lead surfaced mid-session, NOT reproduced or refuted — flagged for the next agent.** A live disconnect
+  observed during this session's own browser reconnection coincided with an open Thunar (file manager)
+  window on the guest desktop, prompting the hypothesis that a window-manager event (close/unmap → xfwm4/
+  xfdesktop re-layout) triggers one of the still-untested real subprocess spawns named in the paragraph above
+  (`resize_display`/`_run_command`/`_run_detached_command`, xrandr/xfconf-query). Attempted direct
+  reproduction: dispatched synthetic `PointerEvent`/`MouseEvent` (`pointerdown`/`mousedown`/`pointerup`/
+  `mouseup`/`click`) at the Thunar close-button's canvas coordinates via chrome-devtools MCP's
+  `evaluate_script` — the events did not register with the frontend's real input-forwarding path (window
+  stayed open, no server-side effect), and `claude-in-chrome`'s coordinate-based `computer` tool (which
+  *can* drive a trusted-feeling click) was not connected in this session's browser. **This specific trigger
+  is untested, not confirmed and not refuted.** Next agent: get a working coordinate-click path (connect the
+  claude-in-chrome extension first), open/close a real window, and time-correlate against `sk.log`'s
+  `_run_command`/`_run_detached_command`/xrandr/xfconf-query call sites while it happens.
 Do not re-reach for the GLIBC_TUNABLES fix for either of these symptoms — it is already ruled out by direct
 evidence (zero fatal-signal lines anywhere near any of the observed kills/stalls/dual-connects), and do not
 re-open a frontend/nginx-config investigation for "dual-connect" — both are now byte/log-verified clean.
