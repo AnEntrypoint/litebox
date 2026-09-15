@@ -348,9 +348,44 @@ dashboard source (`advisor/probes/dashboard/src/selkies-core.js`, `.../index.htm
   reload does not reclaim the slot") — real `docker run` deployments show the identical old+new pairing on
   every reload; what's deployment-specific here is only that the keepalive/ACK-stall fires every reload
   cycle instead of never, forcing that ordinary transient pairing to repeat forever instead of settling.
-  There is no independent "dual-connect" bug to fix — fixing the ACK-stall-kill's real transport/scheduling
-  gap (still open, still not root-caused to instruction level — see the paragraph above) removes this
-  symptom too, since nothing would trigger the repeated reload-and-reconnect that produces it.
+  There is no independent "dual-connect" bug to fix — fixing the ACK-stall-kill's real cause (see the next
+  paragraph, which narrows and partly corrects this row's original framing) removes this symptom too, since
+  nothing would trigger the repeated reload-and-reconnect that produces it.
+- **`selkies-ack-stall-kill-pending-transport-trace`, narrowed 2026-09-15: proven server/guest-side, NOT a
+  client (browser JS/decode) problem, and not a raw network/transport delivery gap either — the original
+  "transport/scheduling gap in delivering the client's heartbeat" framing is half right (scheduling) and
+  half wrong (transport).** Two live experiments against the SAME running stack (`.wfgy/webtop_stack.sh`,
+  port 3000), same session:
+  1. **Client-side exonerated by a clean control.** A minimal, protocol-only WS client (raw `socket`, no JS,
+     no canvas, no WebCodecs decode — hand-rolled RFC6455 framing that reflects every incoming `PING` as an
+     immediate `PONG`, `reflect_latency_ms=0.00` every time) connected directly to `ws://127.0.0.1:3000/websocket`
+     and stayed open cleanly for the full 150s test window, cleanly surviving 7 consecutive 20s ping cycles
+     with zero disconnects — while real Chrome tabs connected to the identical endpoint at the identical time
+     were dying with `keepalive ping timeout` on their usual ~20-60s cycle. A client that is physically
+     incapable of "a busy JS main thread missing its ACK timer" survives fine; real browsers do not. This
+     retires the client-JS-thread hypothesis this row previously carried forward unproven.
+  2. **Every single server-side timeout in the live log is preceded by the same signature.** All 19/19
+     `keepalive ping timeout` closes in one 100+min session's `sk.log` (`.wfgy/streamfix_boot3.log`) have a
+     burst (1-8 lines, mode=8) of litebox's own `[diag-proc-sys-open-miss] unregistered path opened:
+     /proc/<pid>/cmdline errno=2` diagnostic (`litebox_shim_linux/src/syscalls/file.rs:62`,
+     `diag_raw_print_proc_sys_open_miss`) landing in the handful of lines immediately before it — 100%
+     correlation, zero exceptions, across the whole log (`grep -n "keepalive ping timeout"` cross-checked
+     against the preceding 10 lines of each occurrence). The pids climb in a tight `+2` stride each burst
+     (e.g. `6746,6748,...,6760`), consistent with `psutil`-driven bookkeeping (already confirmed active in
+     this same log via its `virtual_memory()` `RuntimeWarning` and the 5s-cadence `system_stats`/
+     `network_stats` WS messages) walking a list of previously-spawned/already-reaped worker pids on
+     selkies' own single asyncio event loop — the SAME loop that has to notice the client's already-arrived
+     `PONG` in time. This project's own separate efficiency investigation
+     (`exec-reads-whole-binary-in-4kb-chunks`) already measured litebox's per-syscall path as carrying real,
+     non-trivial wall-clock overhead; a routine burst of ordinary, correct `/proc` liveness checks that would
+     be sub-millisecond on bare metal is enough, repeated across the 20s ping window, to starve that
+     connection's own read task past `ping_timeout` often enough to explain the observed cycle length.
+  **Not yet fixed**: the exact call site inside selkies issuing these `/proc/<pid>/cmdline` checks, and
+  litebox's own precise per-open-syscall cost on this path, were not pinned to an instruction/line this
+  session — this needs either a timed wrapper around `diag_raw_print_proc_sys_open_miss`'s call sites or a
+  vendored-selkies `sitecustomize.py` hook (pattern: `advisor/probes/webtop_sitecustomize.py`) timing the
+  bookkeeping call directly. Do not re-attempt a client-side (browser/JS/WebCodecs) fix for this row — that
+  path is closed by experiment 1 above.
 Do not re-reach for the GLIBC_TUNABLES fix for either of these symptoms — it is already ruled out by direct
 evidence (zero fatal-signal lines anywhere near any of the observed kills/stalls/dual-connects), and do not
 re-open a frontend/nginx-config investigation for "dual-connect" — both are now byte/log-verified clean.
