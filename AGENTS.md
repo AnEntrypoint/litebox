@@ -507,6 +507,68 @@ dashboard source (`advisor/probes/dashboard/src/selkies-core.js`, `.../index.htm
   would be unmotivated against a mechanism this session confirmed, from pixelflux's own source, was built
   specifically not to exist. **The real root cause remains unidentified** — sixth hypothesis refuted, same
   standard of evidence as the prior five.
+- **`litebox-net-gateway-fullduplex-starvation`, RESOLVED 2026-09-15 (seventh candidate): refuted by architecture
+  read of litebox's own inbound-forwarding code, not by a targeted timing measurement — couldn't safely rebuild
+  and restart the only healthy live stack this session (host free memory ~1.8-2.1GB throughout; see below), and
+  this session's synthetic-input path (chrome-devtools MCP `click`/`type_text` against the canvas) never
+  registered with the guest's real input-forwarding path, so genuine heavy sustained video-encode load could
+  not be driven live either.** Hypothesis was: litebox's own userspace NAT gateway
+  (`litebox_platform_windows_userland/src/net.rs`, the code behind `--publish`/`LITEBOX_PUBLISH`) might couple
+  reads and writes on a published-port TCP flow such that heavy OUTBOUND video traffic (guest -> browser)
+  starves the small, latency-sensitive INBOUND pong (browser -> guest) on the same connection — unlike a real
+  OS-level NAT, where full-duplex sockets never block each other. **Full read of the gateway (`net.rs`, all
+  1068 lines) finds no such coupling:**
+  - The whole gateway (outbound NAT AND every `--publish` flow) runs on ONE dedicated thread
+    (`litebox-nat-gateway`, `net.rs:902-915`) in a fixed loop: `drive()` then `sleep(5ms)` (`net.rs:912`) — not
+    event-driven, but deterministic and fast, five orders of magnitude below a 20s window regardless.
+  - For a `--publish` flow, `TcpFlow.real` (`net.rs:186-209`) is the host-accepted browser socket and `socket`
+    is the gateway's own `smoltcp` connection to the guest. `pump_tcp_flows` (`net.rs:507-665`) processes
+    guest->real (video out, `net.rs:526-563`) THEN real->guest (pong in, `net.rs:564-602`) for each flow, but
+    **every operation on both sides is nonblocking** — `real` is set `set_nonblocking(true)` the moment it's
+    accepted (`net.rs:820`), and every `smoltcp` buffer op (`can_recv`/`recv_slice`/`can_send`/`send_slice`) is
+    non-blocking by construction. A `WouldBlock` on either side breaks that side's loop immediately
+    (`net.rs:537`, `555-557`, `596`) rather than stalling the thread, so a full smoltcp receive buffer
+    (256KB, `SOCKET_BUFFER_SIZE`, `net.rs:76`) of queued video cannot force the thread to sit blocked on
+    `real.write()` — at most it costs a bounded number of cheap nonblocking syscalls (256KB / 4096B chunks =
+    <=64 write() calls) before the same function reaches the real->guest block for that identical flow, all
+    within one 5ms tick. The real `connect()` for an OUTBOUND flow runs on its own background thread
+    (`net.rs:480-492`), never blocking the gateway thread either. **Worst-case added latency for delivering an
+    inbound pong under this architecture is one ~5ms gateway tick plus a handful of sub-millisecond nonblocking
+    syscalls — not the seconds-to-tens-of-seconds this symptom needs.**
+  - One real but UNCONFIRMED-causal inefficiency noted for the record, not fixed: `LoopbackQueue`
+    (`net.rs:112-117`, the `to_gateway`/`to_guest` `VecDeque`s) has no size cap, and
+    `ensure_listeners_for_queued_packets` (`net.rs:391-417`) clones the ENTIRE pending `to_gateway` backlog
+    every single 5ms tick to scan for new destination ports — O(n) `Vec<u8>` clones repeated every cycle. This
+    is pure in-memory overhead (no syscalls), not a blocking-read-behind-write coupling, and was not measured
+    as a contributor to the keepalive-timeout symptom; flagged as a legitimate cleanup opportunity (bound the
+    queue, or only re-scan packets newly appended since the last tick) for whoever next touches this file, not
+    as this investigation's root cause.
+  - **Live corroboration, on the already-running stack (PID 18292, port 3000, no second runner started, per
+    this project's single-runner memory constraint):** connected via chrome-devtools MCP to the real Chrome tab
+    already mid-stream and observed 3+ continuous minutes (clock 18:07 -> 18:10, screenshots both ends) with
+    **zero** new console lines (56 messages, stable, across three checks spaced across the window) — no
+    `keepalive ping timeout`, no `Client stall`, no reload, no second `Legacy client` registration. This is
+    passive/idle-level load only (this session's synthetic input never reached the canvas), so it does not
+    directly exercise the "heavy asymmetric load" condition the hypothesis needs, but it is consistent with the
+    architecture finding above: nothing about this code produces a disconnect on a fixed cadence regardless of
+    load, which is what a real full-duplex-starvation bug would look like.
+  - **Do not re-attempt a fix here** — same verdict as GPUtil/psutil/pixelflux: a correct-shaped change (e.g.
+    per-flow direction fairness, splitting the pump across two threads) against a mechanism this session's code
+    read found no evidence is real. **The real root cause remains unidentified after seven investigations, all
+    seven now refuted** (client JS, nginx config, dual-connect, `/proc` cmdline ENOENT cost, psutil tick,
+    `GPUtil.getGPUs()`, pixelflux capture/encode, and now litebox's own NAT/publish layer). **What a follow-up
+    session needs that none of the seven had**: a real packet capture at the host TCP layer (Wireshark/pktmon
+    on `127.0.0.1:3000`) with wall-clock timestamps, correlated against a guest-side timing instrument on
+    selkies' own pong-receive path (same `sitecustomize.py`-style hook prior agents used for psutil/GPUtil,
+    applied to the `websockets` library's own ping/pong handling this time) — bytes-on-the-wire timing vs.
+    guest-received timing is the one comparison that would show a genuine transport-layer gap directly instead
+    of ruling out one more candidate mechanism by architecture or by absence. That capture needs a working
+    trusted-input path into the canvas to reliably drive heavy load on demand (this session's chrome-devtools
+    MCP `click`/`type_text` calls against the dashboard's a11y-tree buttons did not register — `claude-in-chrome`
+    extension, flagged as untested by the immediately-preceding session too, is the next thing to try) and a
+    rebuild-and-restart window, which a session starting with more than ~1.8-2GB free host memory would be
+    much safer attempting than this one was.
+
 - **New lead surfaced mid-session, NOT reproduced or refuted — flagged for the next agent.** A live disconnect
   observed during this session's own browser reconnection coincided with an open Thunar (file manager)
   window on the guest desktop, prompting the hypothesis that a window-manager event (close/unmap → xfwm4/
