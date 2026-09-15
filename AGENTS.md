@@ -314,17 +314,46 @@ killed` screen that does NOT auto-recover — this is likely the literal, most c
 "needs a full page refresh to resume", independent of any actual second tab/session), or (b) neither
 data-channel ever reaches `SUCCESS: Capture started`/`Registering new client for display` at all and the
 page sits on `Waiting for stream...` indefinitely (observed live, this same capture, final attempt).
-Root cause not yet isolated to instruction level (dashboard JS is a minified bundle inside the image,
-not vendored in this repo, so it could not be read directly this session) — plausible candidates: the
-frontend's own `/websockets` (plural) 404-then-auto-reload path racing a legitimate connection attempt
-(console-verified: `WebSocket connection to 'ws://.../websockets' failed: ... 404` immediately followed
-by `WebSocket disconnected, reloading page to reconnect.` on a fresh tab's first-ever load), or the
-dashboard opening a probe/legacy connection alongside its real one. PRD row
-`selkies-dual-connect-per-pageload-pending-frontend-trace` covers isolating this (needs the unminified
-dashboard JS or a guest-side packet trace, both beyond this session's reach) and PRD row
-`selkies-ack-stall-kill-pending-transport-trace` covers the separate ACK-stall-kill mechanism above. Do
-not re-reach for the GLIBC_TUNABLES fix for either of these symptoms — it is already ruled out by direct
-evidence (zero fatal-signal lines anywhere near any of the observed kills/stalls/dual-connects).
+**RETRACTED, this session: "dual-connect" is not a selkies frontend bug, and PRD row
+`selkies-dual-connect-per-pageload-pending-frontend-trace` was mis-framed.** The user's own correction was
+right ("selkies works fine elsewhere so it should work here") and pointed at the actual place to look:
+this deployment, not selkies' JS. This session had what the prior one didn't — the unpacked, non-minified
+dashboard source (`advisor/probes/dashboard/src/selkies-core.js`, `.../index.html`) already vendored under
+`advisor/probes/dashboard/` — and traced with real evidence instead:
+- **nginx config: byte-verified correct.** Reproduced `.wfgy/webtop_stack.sh`'s exact `sed` pipeline
+  (CPORT=3000, CWS=8081, SFOLDER=/) against the stock `/defaults/default.conf` template
+  (`.wfgy/webtop-debian/extracted/default.conf`) and diffed the result: `location /websocket` resolves
+  correctly and, being a plain 10-char prefix location with no competing regex, is nginx's
+  longest-prefix-wins match for a `/websockets` (plural) request too — the trailing `s` some client code
+  paths use does NOT 404 by itself. Live `curl` against the running instance confirms it: both
+  `ws://127.0.0.1:3000/websocket` and `.../websockets` complete a real `101 Switching Protocols` handshake
+  and stream real `MODE websockets` / `server_settings` payload from selkies. No config bug found.
+- **The frontend is the stock, unmodified selkies dashboard.** Instrumented it live (injected a
+  `window.WebSocket` wrapper via `navigate_page`'s `initScript`, one real fresh page load, chrome-devtools
+  MCP) and read its own console output plus a live `tail` of the guest's `sk.log`
+  (`.wfgy/streamfix_boot3.log`, an instance that had then been running 90+ minutes with **zero**
+  `SELKIES_SUPERVISOR: attempt=` respawn lines in the whole log — selkies itself never crashed once). The
+  dashboard opens exactly ONE `data_websocket` per page load, same as any stock selkies deployment; there
+  is no dual-connect logic in it.
+- **The real, still-live mechanism: this session's own capture reproduces the ACK-stall-kill
+  (`selkies-ack-stall-kill-pending-transport-trace`) as the sole driver.** `sk.log` shows a continuous,
+  ongoing cycle — with selkies never once crashing — of `Legacy client (10.0.0.2, <port>) connected` then,
+  ~tens of seconds later with no exception, `Data WS closed with error ...: sent 1011 (internal error)
+  keepalive ping timeout; no close frame received`. The dashboard's OWN reload-on-disconnect logic (see
+  above section) then reloads the page and reconnects, and because a page navigation never sends the
+  outgoing socket a clean WS close frame, the pre-reload socket lingers server-side until the fresh one
+  either preempts it (`Killing old client for 'primary' ... reason: a new primary client connected`) or it
+  times out on its own — which is the entire "two `Legacy client` registrations per reload" pattern. That
+  pairing is the *expected*, by-design behavior of any selkies reconnect (see "Open here" above: "a page
+  reload does not reclaim the slot") — real `docker run` deployments show the identical old+new pairing on
+  every reload; what's deployment-specific here is only that the keepalive/ACK-stall fires every reload
+  cycle instead of never, forcing that ordinary transient pairing to repeat forever instead of settling.
+  There is no independent "dual-connect" bug to fix — fixing the ACK-stall-kill's real transport/scheduling
+  gap (still open, still not root-caused to instruction level — see the paragraph above) removes this
+  symptom too, since nothing would trigger the repeated reload-and-reconnect that produces it.
+Do not re-reach for the GLIBC_TUNABLES fix for either of these symptoms — it is already ruled out by direct
+evidence (zero fatal-signal lines anywhere near any of the observed kills/stalls/dual-connects), and do not
+re-open a frontend/nginx-config investigation for "dual-connect" — both are now byte/log-verified clean.
 
 **The glibc/tcache crash class (candidate 1 from the original bug report) is real and DOES still hit
 selkies, just sporadically, separately from the two mechanisms above.** Live-captured this session, once
