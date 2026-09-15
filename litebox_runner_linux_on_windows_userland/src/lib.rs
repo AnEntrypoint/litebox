@@ -599,6 +599,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         std::env::var_os("LITEBOX_DRM_TRACE").is_some(),
     );
 
+    litebox_shim_linux::syscalls::set_input_trace(
+        std::env::var_os("LITEBOX_INPUT_TRACE").is_some(),
+    );
+
     // Same `no_std` reason as `set_drm_trace` above: the shim cannot read the environment, so
     // translate `LITEBOX_NO_DIRTYFB=1` here. Note the sense -- the flag DISABLES DIRTYFB
     // presentation, so an unset environment leaves it ENABLED, which is the intended behaviour.

@@ -1341,6 +1341,12 @@ impl ApplicationHandler<PresenterCommand> for PresenterApp {
                 let Some(consumer) = &self.input_consumer else {
                     return;
                 };
+                if std::env::var_os("LITEBOX_INPUT_TRACE").is_some() {
+                    litebox_util_log::debug!(
+                        x:% = position.x, y:% = position.y;
+                        "input-trace: pointer-motion handler invoked"
+                    );
+                }
                 // Real evdev `EV_REL` motion is a signed DELTA since the last event, not an
                 // absolute position (that's `EV_ABS`, not emitted by this pass -- see the module
                 // doc comment). `winit`'s own `CursorMoved` reports the new absolute position, so
@@ -1387,6 +1393,12 @@ impl ApplicationHandler<PresenterCommand> for PresenterApp {
                     // A zero delta on an axis is omitted by the receiver, and an all-zero move
                     // queues nothing at all.
                     if dx != 0 || dy != 0 {
+                        if std::env::var_os("LITEBOX_INPUT_TRACE").is_some() {
+                            litebox_util_log::debug!(
+                                dx:% = dx, dy:% = dy;
+                                "input-trace: pointer-motion handler emitting grouped RelMotion"
+                            );
+                        }
                         consumer(InputSignal::RelMotion(dx, dy));
                     }
                     // Advance the reference by the whole GUEST pixels ACTUALLY SENT (already

@@ -39,6 +39,24 @@ use zerocopy::IntoBytes;
 
 use crate::ShimPlatform;
 
+/// Whether per-`SYN_REPORT` input tracing is enabled (set from `LITEBOX_INPUT_TRACE=1` by
+/// the runner, since this `no_std` crate cannot read the environment itself).
+///
+/// Off by default, same reasoning as `drm::drm_trace_enabled`: mouse motion arrives at
+/// pointer-sample rate, so an ungated log floods a real session. Turn it on to answer "how many
+/// `SYN_REPORT`s does one physical mouse move actually produce" -- the question
+/// `evdev-emits-two-syn-reports-per-mouse-move` needed a live, counted answer to.
+pub(crate) fn input_trace_enabled() -> bool {
+    INPUT_TRACE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set once by the runner to turn evdev `SYN_REPORT` tracing on.
+pub fn set_input_trace(enabled: bool) {
+    INPUT_TRACE.store(enabled, core::sync::atomic::Ordering::Relaxed);
+}
+
+static INPUT_TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Bound on how many not-yet-`read()` events this device holds before the oldest is dropped --
 /// a real evdev device's kernel-side ring buffer is similarly bounded (`EVDEV_BUFFER_SIZE`,
 /// currently 64 in the real kernel); this exists so a guest that never reads input (e.g. a
@@ -102,6 +120,12 @@ impl<Platform: ShimPlatform> EvdevSubsystem<Platform> {
     fn push_batch(&self, batch: &[InputEvent]) {
         if batch.is_empty() {
             return;
+        }
+        if input_trace_enabled() {
+            litebox_util_log::debug!(
+                batch_len:% = batch.len();
+                "evdev-input-trace: push_batch emitting one SYN_REPORT"
+            );
         }
         let mut events = self.pending_events.lock();
         for event in batch {
