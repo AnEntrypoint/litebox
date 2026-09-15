@@ -148,10 +148,8 @@ for the next cost question. Three correctness bugs that work exposed are all fix
 cross-process registry), `d5cc744` (a redundant claim release deleted a coalesced `CLAIMED_RANGES` slot);
 mechanisms, repros and the cost-measurement history: archive.
 
-**Reading a cross-process log**: on an identity fork, `fork_verify` emits "stale CODE pointer detected,
-translating and resuming" with `translated_rip == rip` — 84,319 of ~90,400 lines in one run, zero real
-translations, bounded per child by `MAX_IDENTITY_VERIFICATION_STEPS = 4096`. Wasteful, not corrupting;
-without knowing this you will chase it.
+**Reading a cross-process log** — the `fork_verify` "stale CODE pointer" noise-vs-signal read is archived:
+`docs/AGENTS_ARCHIVE_2026-09-15.md`.
 
 **Still open**: nginx's own SSL-cert generation fails on its first real startup attempt — the original
 symptom this investigation began from, genuinely not root-caused
@@ -380,12 +378,29 @@ dashboard source (`advisor/probes/dashboard/src/selkies-core.js`, `.../index.htm
      non-trivial wall-clock overhead; a routine burst of ordinary, correct `/proc` liveness checks that would
      be sub-millisecond on bare metal is enough, repeated across the 20s ping window, to starve that
      connection's own read task past `ping_timeout` often enough to explain the observed cycle length.
-  **Not yet fixed**: the exact call site inside selkies issuing these `/proc/<pid>/cmdline` checks, and
-  litebox's own precise per-open-syscall cost on this path, were not pinned to an instruction/line this
-  session — this needs either a timed wrapper around `diag_raw_print_proc_sys_open_miss`'s call sites or a
-  vendored-selkies `sitecustomize.py` hook (pattern: `advisor/probes/webtop_sitecustomize.py`) timing the
-  bookkeeping call directly. Do not re-attempt a client-side (browser/JS/WebCodecs) fix for this row — that
-  path is closed by experiment 1 above.
+  **RETRACTED, 2026-09-15: the syscall-cost hypothesis in the paragraph above is refuted by direct
+  measurement, not confirmed.** PRD row `ack-stall-pin-proc-enum-callsite-and-syscall-cost` asked to pin
+  litebox's real per-open-syscall cost on this exact path — done, via a temporary `litebox::platform::Instant`
+  timing wrapper around `do_open_resolved`'s `do_open()` call and `diag_raw_print_proc_sys_open_miss`
+  (`litebox_shim_linux/src/syscalls/file.rs:790-798`, reverted after measuring — `git diff` clean), rebuilt
+  (`cargo build --release -p litebox_runner_linux_on_windows_userland`), and measured against an isolated
+  repro (bash `exec 3<path` builtin against 20 nonexistent `/proc/<pid>/cmdline` paths — no `fork()`, so it
+  side-steps the unrelated tcache crash class entirely). **Real numbers**: `do_open()`'s own ENOENT
+  resolution costs 3800-5800ns; `diag_raw_print_proc_sys_open_miss`'s `WriteFile`+mutex stderr write costs
+  1200-4200ns. ~5-10us total per occurrence, ~40-80us for a full 8-line burst (the documented mode=8 burst
+  size) — **5-6 orders of magnitude below the ~20s `keepalive_ping_timeout` window**, so this syscall path
+  cannot be what starves selkies' event loop past its own ping deadline. Code-read explains why it's cheap:
+  `Procfs::walk_directories` (`litebox/src/fs/procfs.rs:344-365`) rejects an unrecognized first path
+  component (a numeric pid) via a linear scan over a fixed 7-entry `ProcfsEntry::ALL` array — no
+  process-table walk, no lock, no host syscall, immediate `ENOENT`. The 19/19 log correlation is real but is
+  a **marker, not the cause**: selkies' psutil tick almost certainly spends its real cost on the SUCCESSFUL
+  `/proc/<pid>/{stat,status,io,maps}` reads against every genuinely-live process in the guest (dozens on a
+  full desktop) — invisible in this log, since only misses get the diag print, and never measured. Follow-up
+  filed as PRD row `ack-stall-kill-rootcause-not-proc-syscall-cost`: measure the aggregate cost of one full
+  psutil tick (vendored `sitecustomize.py` timing hook, or `LITEBOX_STRACE_SUMMARY=1` — an existing,
+  already-built instrument at `litebox_shim_linux/src/diag.rs:86` / `lib.rs:1550-1620`, not previously used
+  for this row — correlated against `sk.log` timestamps). **Do not re-attempt a fix aimed at the open-miss
+  or diag-print path** — closed by the measurement above, not just unconfirmed.
 Do not re-reach for the GLIBC_TUNABLES fix for either of these symptoms — it is already ruled out by direct
 evidence (zero fatal-signal lines anywhere near any of the observed kills/stalls/dual-connects), and do not
 re-open a frontend/nginx-config investigation for "dual-connect" — both are now byte/log-verified clean.

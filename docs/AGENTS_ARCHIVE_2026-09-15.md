@@ -9,6 +9,12 @@ deleted outright in that pass rather than archived here — keeping a refuted cl
 Everything below carries its proving commit sha or `file:line`. Earlier drains:
 `docs/AGENTS_ARCHIVE_2026-09-10.md`, `_2026-09-05.md`, `_2026-09-03.md`.
 
+## Reading a cross-process fork log
+
+On an identity fork, `fork_verify` emits "stale CODE pointer detected, translating and resuming" with
+`translated_rip == rip` — 84,319 of ~90,400 lines in one run, zero real translations, bounded per child by
+`MAX_IDENTITY_VERIFICATION_STEPS = 4096`. Wasteful, not corrupting; without knowing this you will chase it.
+
 ## Trampoline-extension poisoning: the blow-by-blow (`6311f74`)
 
 `AGENTS.md` keeps the mechanism and the fix in one paragraph; this is the live evidence behind it.
