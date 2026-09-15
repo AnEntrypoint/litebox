@@ -287,6 +287,81 @@ even under continuous fork-stress load — but every popup/dropdown menu (XFCE p
 pointer-grab semantics for `GtkMenu` vs. a menu-specific timing/coordinate issue). A session with working
 popup-menu input, or a guest-side `xdotool` path, should open Terminal Emulator directly and time it.
 
+**2026-09-15, later session: could NOT re-confirm the popup-menu symptom live — blocked before reaching
+it by two boot-reliability regressions, one found and fixed, one found and NOT fixed.** Architecture
+read first, no code changed on guesswork: `webtop_stack.sh`'s guest is plain `Xvfb` (`+extension XTEST`)
++ XFCE + `selkies`, and selkies' own `input_handler.py` (`WebRTCInput.send_x11_mouse`/`send_mouse`) drives
+mouse position/clicks through `pynput.mouse.Controller`'s Xlib backend, which is `Xlib.ext.xtest.
+fake_input` under the hood — an ordinary X11 client issuing real XTest protocol requests over its own
+AF_UNIX socket to Xvfb, exactly like any other `XTestFakeMotionEvent`/`FakeButtonEvent` caller. **litebox
+implements no grab-specific or menu-specific code anywhere in this path** — `litebox_shim_linux::syscalls
+::evdev` (`/dev/input/event0`, `EV_REL`-only push model) is a DIFFERENT subsystem for a native-DRM/uinput
+desktop shape this webtop deployment never uses; the generic `Pollee`/`Observer` notifier
+(`litebox/src/event/polling.rs`) and the AF_UNIX socket implementation (`litebox_shim_linux::syscalls::
+unix`) both call `notify_observers`/`register_observer` correctly on every state transition (unlike the
+already-fixed "only wakes on the first event" bug class `evdev.rs`/`drm.rs` document), and `sys_ppoll`
+(`litebox_shim_linux::syscalls::file.rs:5671`) rebuilds a fresh `PollSet` and rescans real fd state on
+every call — level-triggered, not edge/observer-only, so it cannot exhibit a "the byte arrived but nobody
+woke up to read it" gap for a GLib/GTK poll()-based main loop. **If a real litebox defect explains the
+menu symptom, by this reading it has to be in generic syscall-emulation correctness (AF_UNIX ordering,
+timestamp/clock semantics X11 grabs validate against, or something not yet identified) — not a
+menu-specific code path, because litebox has none.** This narrows future search; it does not confirm or
+refute the symptom itself, which still needs a live re-test.
+
+Live re-test was blocked before reaching the Applications menu at all, across 15 full boot cycles of
+`--resume-from .wfgy/webtop_stack_seed.tar` this session:
+
+1. **Fixed**: `.wfgy/webtop_stack.sh`'s nginx supervisor retry block only recreates
+   `/var/lib/nginx/{tmp,logs,body,proxy,fastcgi,uwsgi,scgi}` when `/etc/nginx/sites-enabled/default` is
+   missing — but nginx's OWN first-launch `mkdir() "/var/lib/nginx/body" failed (2: No such file or
+   directory)` reproduced 22/22 times regardless (sites-enabled/default already existed from the
+   top-of-script setup, so the gated recreate never fired to paper over it), forcing every boot into the
+   supervisor's fork-heavy respawn loop (mkdir/openssl/nginx/curl×20) before Xvfb ever started — and that
+   fork storm hit the already-documented ADVISORY-001 §3N glibc safe-linked tcache/fastbin double-free
+   (`double free or corruption (out)` → `SIGABRT`/`SIGSEGV`, killing the whole guest) on 22 of 22 boots
+   this session, far above this bug's historically-documented "sporadic, once in several cycles" rate.
+   Root cause of the mkdir ENOENT itself not identified (a real candidate: a forked `mkdir` utility's
+   directory creation not yet visible to a separately-forked `nginx` process under litebox's thread-based
+   fork — worth a follow-up, not chased further this session), but the fix doesn't need that: recreating
+   those dirs unconditionally right before every nginx launch attempt (not gated on sites-enabled/default)
+   made nginx succeed on attempt=1 and skip the fork storm entirely. This is a `.wfgy/`-local repro-script
+   fix, not a litebox source change (`.wfgy/` is gitignored, confirmed via `git ls-files` — nothing to
+   commit), but it took boot success (reaching `SELKIES_LAUNCHED_LAST` with zero crashes) from 0/22 to
+   3/5 on the patched seed. Also swapped the script's `tail -F /tmp/sk.log` (retry+inotify) for `tail -f`
+   (polling): litebox has no `inotify_init`/`inotify_init1` (`unsupported syscall`, confirmed live on
+   every boot), and GNU `tail -F` silently never notices new data when that syscall is refused rather than
+   falling back to polling — this made every prior session's `[sk]`-tagged selkies log tee a silent no-op.
+2. **NOT fixed, real, and now the actual blocker**: even on a clean boot (`XVFB_UP`, `DE_UP`, no crash),
+   selkies itself never serves. `curl`'s own WebSocket-upgrade probe against `http://127.0.0.1:3000/
+   websockets` (the dashboard's real, confirmed-correct endpoint — verified via the browser's own console:
+   `WebSocket connection to 'ws://127.0.0.1:3000/websockets' failed ... 404`) returns `404` every time,
+   with ZERO `[sk]`-tagged output ever appearing even with the `tail -f` fix active, across all 3 clean
+   boots reached this session. One boot's stderr trace shows the mechanism: at t≈175s (selkies apparently
+   still initializing) a `spawn_exec_collision_child` event fires (matching this project's own documented
+   collision class — most likely selkies' `gst_app_resize`/xfconf-query DPI-set fork, already implicated
+   elsewhere in this file for a different, sporadic SIGSEGV), fork_verify logs a burst of stale
+   CODE/DATA-pointer heals in response, and selkies exits `rc=1` roughly 15s later with no logged reason —
+   the supervisor then respawns it into the same failure. `docs/webtop-debian-selkies-2026-09-06.md`
+   documents an apparently-related, 100%-reproducible prior bug (a proxied `location` deterministically
+   gets `connect() refused` — masked as a `404` by a missing `50x.html` — if and only if the ORIGINAL
+   client request arrived via the `-p`-published NAT path, never via a same-guest loopback probe); this
+   session could not distinguish "same bug, still unfixed" from "a new, DPI-fork-triggered selkies startup
+   failure" without a working internal-vs-external curl comparison (attempted once via an in-script
+   background probe subshell; it never printed even its first iteration in 300+s and was reverted rather
+   than trusted or chased further). **Whoever picks this up next should re-run that doc's exact four-boot
+   internal-vs-`-p` `curl` comparison first** — it is the fastest way to tell which of the two candidate
+   bugs (or a third one) is live today, before assuming either.
+3. Xvfb's own `XVFB_FAILED` rate was also unusually high this session (4 of the last 6 boot attempts) —
+   consistent with, but not confirmed as, the already-documented Mesa llvmpipe/`cc1` fixed-address
+   collision race (`LIBGL_ALWAYS_SOFTWARE=1`/`GALLIUM_DRIVER=softpipe` already applied); not investigated
+   further since it was not this session's blocker (the 3 clean boots reached DE_UP fine).
+
+**Net effect: the popup-menu/Terminal-Emulator symptom is UNCHANGED from the prior session's finding —
+neither newly confirmed nor refuted live this session — and no litebox source code was changed**, per
+this project's own standing discipline against forcing an unverified fix. The one real fix landed
+(nginx dir-recreate race) is in `.wfgy/webtop_stack.sh` only and measurably improves boot reliability for
+whoever runs this repro next, but does not itself touch litebox.
+
 ## Host-side crash machinery
 
 **A fatal host fault dumps before it dies, ungated** — the stack walk, `RECENT_FAULTS` ring
