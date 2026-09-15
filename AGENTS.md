@@ -439,6 +439,39 @@ dashboard source (`advisor/probes/dashboard/src/selkies-core.js`, `.../index.htm
   a per-client-connect cadence elsewhere in `selkies.py` (`_run_detached_command`/`_run_command` and the
   xrandr/xfconf-query paths `webtop_sitecustomize.py` already targets for a DIFFERENT reason). Not
   investigated further this session — scope was this one row.
+- **`GPUtil.getGPUs()`, RESOLVED 2026-09-15: refuted by direct measurement, same fate as psutil.** Pinned
+  source (`/lsiopy/lib/python3.13/site-packages/GPUtil/__init__.py`) confirms the call at `selkies.py:1701`
+  (`if GPUtil.getGPUs():`) is genuinely synchronous on the event loop, no executor, and fires exactly once
+  per client (re)connect — matching the "client-connect cadence" this row was chasing — plus once more at
+  `_collect_gpu_stats_ws` task start (`selkies.py:3300`), which then returns immediately since `gpus` is
+  empty (not a repeating tick, confirming the earlier note). **`nvidia-smi` is NOT absent from this guest as
+  assumed** — `GPUtil`'s own `Popen(["nvidia-smi", ...])` (synchronous, blocking `.communicate()`) really
+  forks and attempts to exec `/usr/bin/nvidia-smi` every call; a direct top-level exec of that exact path
+  confirms it does not exist as a file at all (`OpenError(Errno(2 = ENOENT))`), so every call is a genuine
+  fork()+failed-exec()+cleanup cycle, not a no-op. Measured live in an isolated one-shot boot against the
+  same `--oci-image docker.io/linuxserver/webtop:debian-xfce` this guest uses (`--resume-from` a minimal
+  seed tar carrying only the timing probe, `/lsiopy/bin/python3` as the top-level program — PowerShell, not
+  Git Bash, which mangles the absolute guest path into `C:/Program Files/Git/...`): **first call 0.975ms,
+  N=20 timing loop: avg=0.644ms, median=0.608ms, min=0.588ms, max=0.852ms** — confirmed by litebox's own
+  guest process-tree dump showing exactly 21 real `/usr/bin/nvidia-smi` fork attempts (1 first call + 20
+  loop iterations, matching call count exactly). Higher than the already-refuted `psutil` tick (74.8us,
+  ~8-14x) because a real fork() is involved rather than a bare syscall, but still ~4-5 orders of magnitude
+  below the 20s `ping_timeout` window even summed across every occurrence in a session. **Do not patch this
+  call site** — same verdict as the psutil row: a correct-shaped disable/offload against a mechanism that
+  isn't real. Also confirmed while here: the `keepalive ping timeout` message itself comes from the
+  `websockets` library's own protocol-level keepalive (`ws_async.serve(..., ping_interval=20,
+  ping_timeout=20)`, `selkies.py:2708-2709` — both are the library DEFAULT, not a selkies customization), and
+  `_run_frame_backpressure_logic` (the `Client stall for 'primary': No ACK in N.Ns` warning's source,
+  `backpressure_check_interval_s=0.5`, `selkies.py:1204`) is pure arithmetic on frame-id/timestamp state with
+  **zero subprocess calls** — confirmed innocent, a downstream symptom detector, not a cause. **The real root
+  cause is still unidentified.** Not yet measured: the OTHER named candidate, real (non-GPUtil) subprocess
+  spawns via `asyncio.create_subprocess_exec/shell` (`resize_display`/`generate_xrandr_gtf_modeline`/
+  `_run_command`/`_run_detached_command`) — these are async-created (not the classic synchronous-blocking
+  shape `psutil`/`GPUtil` are), so only their fork()+exec() startup syscall, not their full runtime, could
+  block the loop, but that startup cost on this platform is independently documented at tens of ms for a
+  *successful* exec (unlike GPUtil's cheap failed one) — untimed against this specific guest and uncorrelated
+  against whether any of them fire repeatedly within one connection's lifetime rather than once at
+  connect/reconfigure. That correlation is the next lead, not GPUtil.
 Do not re-reach for the GLIBC_TUNABLES fix for either of these symptoms — it is already ruled out by direct
 evidence (zero fatal-signal lines anywhere near any of the observed kills/stalls/dual-connects), and do not
 re-open a frontend/nginx-config investigation for "dual-connect" — both are now byte/log-verified clean.
