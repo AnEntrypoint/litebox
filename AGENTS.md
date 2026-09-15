@@ -298,6 +298,66 @@ cap fired, and supervisor-respawn recovered cleanly. Does not fix Track B or ADV
 both still open) — only bounds this hang. Full repro/architecture-read detail:
 `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
+**2026-09-16, later same day: `42d8ced` re-confirmed live twice more; Terminal Emulator app and the
+Applications-menu popup both proven healthy in isolation; the live menu-click test itself is still
+blocked by the pre-existing `-p` NAT websocket bug.** 13 boot attempts of `.wfgy/webtop_stack.sh
+--resume-from .wfgy/webtop_stack_seed.tar` this session. Two live firings of the `42d8ced` bound, both
+the same `/lsiopy/bin/python3` collision, both hit the 120s cap and recovered without hanging the guest:
+once the guest kept serving the dashboard throughout (curl `200` on `/`); once the fallback SIGSEGV
+happened to land on the selkies-supervisor subshell itself (`comm=sh`, not the colliding child), which
+permanently lost selkies for that boot (no more respawns) but still did **not** hang the whole
+guest — a related but distinct failure mode from the originally-fixed hang, worth a future look but not
+a defect in the fix itself.
+
+Could not reach a live, browser-rendered desktop to click-test the Applications menu: every external
+(`-p`-published) request to `/websockets` returned `404` (masked `502`) deterministically, even on a
+clean boot with selkies confirmed listening (`INFO:data_websocket:Data WebSocket Server listening on
+port 8081`) — the same already-documented bug (`docs/webtop-debian-selkies-2026-09-06.md`), unchanged
+since 2026-09-06. Tried one new workaround: routed nginx's `proxy_pass` to the guest's own routable
+interface address (`10.0.0.2:8081`) instead of `127.0.0.1:8081`, rebinding selkies to `0.0.0.0` —
+sed-verified the generated config actually used the new target (`grep proxy_pass` on the live
+`/etc/nginx/sites-available/default`), but the `404` reproduced identically. This rules OUT the
+loopback-vs-interface-address choice as the variable, consistent with the 2026-09-07 finding that
+`net.rs` and the guest's own `net/mod.rs` share no state or code path — the real cause is still
+unidentified.
+
+With the browser path blocked, tested the menu bug a different way: drove the guest DIRECTLY (no
+selkies/browser/click in the loop) via a script step after `DE_UP`. Two clean findings, each reproduced
+twice across independent boots:
+
+- **`xfce4-terminal` itself is completely healthy under litebox.** `DISPLAY=:1 xfce4-terminal
+  --title=DIAGTERM -e ...` opens a correctly-sized real window (`818x485`) within 3 seconds every time,
+  no crash, only a benign `SESSION_MANAGER` warning. Rules OUT an app-level exec/fork crash (hypothesis
+  (c)/(d) from the prior investigation) as the cause of "Terminal Emulator never opens."
+- **The Applications-menu popup mechanism itself also works.** `xfce4-popup-applicationsmenu` (the exact
+  helper the panel button execs) reliably creates a real `166x305` menu window both times tried — input
+  reaching the button and the popup rendering are NOT the broken link.
+- **Inconclusive, not yet resolved**: driving the OPEN menu with `xdotool` (type-ahead search "Terminal
+  Emulator" + Return, once; arrow-key Down/Right exploration, attempted twice more) did not visibly
+  launch anything in the one run that completed the step, but both later arrow-key attempts were
+  preempted by this session's own elevated crash rate before completing (one full guest death, `pid=2
+  comm=sh SIGSEGV`, mid-boot before reaching the diagnostic; one run where the runner's own RSS grew past
+  5GB with stalled stdout progress, killed rather than risk host OOM). Whether the open menu genuinely
+  fails to dispatch activation, or the test itself has a gap (type-ahead search may not traverse a nested
+  category from the root level), is NOT yet distinguished. Next session: retry the arrow-key-only variant
+  (script already written, `.wfgy/webtop_stack_menudiag3.sh`) on a quieter boot — if keyboard nav also
+  produces nothing, that is strong evidence of a real dispatch-level defect in this popup instance (a
+  structurally different code path from mouse clicks, further narrowing away from mouse-only
+  grab-semantics theories if it reproduces).
+
+This session's boot reliability was noticeably worse than the 3/5 baseline the nginx-race fix
+established: 3 of 13 attempts hit `XVFB_FAILED`, at least 2 hit a full-guest `pid=2 SIGSEGV` (the
+standing ADVISORY-001 §3N tcache class, not a new defect), and one run's RSS grew to 5GB+ with no
+forward stdout progress before being killed — not root-caused, plausibly the same tcache class
+manifesting as a slow spin rather than an immediate abort, plausibly amplified by this session's own
+extra forking (`xfce4-terminal`, `xfce4-popup-applicationsmenu`, `xdotool`) adding more exec/collision
+surface on top of the normal boot sequence. Flagging, not chasing further this session.
+
+No litebox source change was made or warranted for the Terminal Emulator/menu investigation this
+session — both the app-exec path and the menu-popup path are now independently proven healthy, and
+forcing a change without isolating a further-specific defect would violate this project's own standing
+discipline against unverified fixes.
+
 ## Host-side crash machinery
 
 **A fatal host fault dumps before it dies, ungated**: stack walk, `RECENT_FAULTS` ring
