@@ -183,6 +183,28 @@ bug. `tar_ro.rs`'s multi-layer index is built ONCE at mount (`litebox/src/fs/tar
 per read — that build was O(entries²) and starting one process against the 2.5GB webtop rootfs went
 17.3s → 0.35s (`90c010a`). Cache internals and the four fixed OOM bugs: archive.
 
+**Trampoline-extension failure used to poison a whole segment's syscalls, not just the
+overflowing ones** (`6311f747b3`). The runtime patcher's initial trampoline allocation
+was a flat one-page guess; a segment needing more stub space (a few hundred `syscall` sites —
+ordinary for a real binary, not just busybox) then tried to *extend* the region at exactly one
+fixed adjacent address (`MAP_FIXED_NOREPLACE`, no fallback — unlike the initial allocation's own
+try-fixed-then-let-the-VM-choose path a few lines up). Any unrelated mapping already occupying
+that one address made the extension fail, and `apply_trap_fallback` then poisoned **every**
+syscall in the whole segment with `ICEBP;HLT`, regardless of how many were otherwise patchable —
+so the guest died on the first syscall it executed after load. Confirmed live pulling+booting
+`docker.io/edgelevel/alpine-xfce-vnc:latest` fresh via `--oci-image` (no packager step): busybox
+`/bin/sh` SIGILL within 3s of exec (`[diag-ud-entry] raw_code=0xc0000096`, 480 sites poisoned by
+one failed 4KiB extension). Fixed by sizing the initial allocation from a cheap `0F 05` byte-pair
+count (sound upper bound — same technique the rewriter's own fast-reject scan already relies on),
+capped at 4MiB; re-run clean, zero fatal signals. Generalizes beyond this one image: any real
+binary whose patchable-syscall count exceeds one page of stubs was exposed.
+
+**`edgelevel/alpine-xfce-vnc` verified against its canonical registry layer**: Alpine 3.16.0,
+ships `Xvfb`/`x11vnc`/`novnc_server` plus the full `xfce4-session`/`xfwm4` set — a noVNC-over-
+browser pipeline, same X-server category (Xvfb, not Xorg/DRM) as the already-verified
+`alpine-mate` selkies boot above, so there is no DRM/KMS+wgpu path for this image to misalign
+with; it lands squarely in the already-settled Xvfb/browser pipeline, not the `--gui` one.
+
 **Tags, verified live, never from the name**: `linuxserver/webtop:alpine-mate` ships MATE, not XFCE;
 `alpine-xfce` does not exist (404); `debian-xfce`/`ubuntu-xfce` DO ship a real XFCE stack (`34da133`,
 `c65ab93`, `1ea5203`; XFCE ships only on the debian/ubuntu/fedora/arch bases, `8c07f51`). The `alpine-*`
