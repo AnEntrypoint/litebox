@@ -176,91 +176,69 @@ corruption signature under heavy fork load** (`double free or corruption (out)` 
 territory, not a tunable-coverage gap** — do not re-attempt a `GLIBC_TUNABLES`/env fix without evidence
 of a THIRD mechanism. Full evidence: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
-### The ACK-stall-kill — root cause found and fix committed 2026-09-16, live-verification still pending
+### The ACK-stall-kill and port-8081 watchdog — backpressure CLOSED, watchdog fix applied but unverified (2026-09-16)
 
-Streams fine, then selkies' stall-detector kills the data channel and the dashboard auto-reloads.
-Eight candidates investigated, seven refuted live; a real livelock-protection gap was found and
-fixed (`b6ddf43`) along the way. **Ninth candidate, write-side backpressure — root cause found and
-FIXED**: `_video_chunk_sender`'s `'primary'` branch sent via `websockets.broadcast()` (docstring:
-applies **no backpressure at all**) and computed each viewer's `backpressure_enabled` flag but
-never gated the send on it, unlike the parallel `'secondary'` branch — a falling-behind client's
-backlog could grow unbounded, queuing the next keepalive ping past `ping_timeout`. **Fixed**: gate
-the primary broadcast on `backpressure_enabled` plus a `transport.get_write_buffer_size()` check
-dropping frames past a 256KiB backlog (`SELKIES_VIDEO_BACKLOG_LIMIT_BYTES`-tunable). Canonical
-patch: `advisor/patches/selkies_primary_backpressure_patch.py` (committed); `.wfgy/webtop_stack.sh`
-applies an inline copy after `DBUS_UP`. **Partially live-verified 2026-09-16 (see "Backpressure fix
-partially verified" below): triggers/lifts correctly, `keepalive ping timeout` disconnect still
-happens anyway** — not fully closed. History: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
+Eight ACK-stall-kill candidates investigated earlier, seven refuted, one livelock gap fixed
+(`b6ddf43`); ninth candidate (write-side backpressure) below. Two `RESOLVED` facts from earlier this
+day, both still load-bearing: the python3/ET_EXEC address-collision fix
+(`litebox_platform_windows_userland/src/lib.rs`, `0x600000`→`0x1000000`, 9/9 clean vs 10/10 collisions
+pre-fix) and the video-never-arrives readiness-gate race fix (real browser client, full `sk.log`
+pipeline, Applications-menu → Terminal Emulator opens in 1-2s). Detail: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
-**RESOLVED 2026-09-16: the python3 collision was a litebox host-side bug — fixed, live-verified,
-selkies now genuinely binds.** `WindowsUserland::new`'s startup `VirtualAlloc` reservation band was
-~999KiB short of real `python3.13`'s RW/BSS `PT_LOAD` ceiling; widened `0x600000`→`0x1000000`
-(`litebox_platform_windows_userland/src/lib.rs`). 9/9 clean repros post-fix vs. 10/10 collisions
-pre-fix. Arithmetic: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
+**Backpressure fix (`478e640`) — RESOLVED, live-verified.** The real blocker was never the send-gating
+logic itself: the guest-side patcher (`advisor/patches/selkies_primary_backpressure_patch.py`, inlined
+in `.wfgy/webtop_stack.sh`) crashed on EVERY prior boot with an uncaught `OSError: [Errno 38] Function
+not implemented` from `shutil.copy2()`'s `copystat()` → `os.listxattr()` (litebox's Linux shim has no
+`listxattr`) — `selkies.py` was **never actually patched** in any session that believed it was; every
+earlier "trigger/lift work correctly, ping timeout still happens" read was against unpatched code (the
+pre-existing, unrelated `_run_frame_backpressure_logic` stall detector, not this patch's send gate).
+Fixed via `shutil.copyfile()` (data-only, no xattr needed for a source backup). Also found and fixed a
+real logic gap in the gate itself: the per-frame backlog check compared the CURRENT backlog to the
+drop threshold, not what it would become after the new frame — one oversized keyframe could sail
+through while backlog was still under the cap and push it far past it in one write. Fixed: check
+`backlog_bytes + len(data_chunk) > threshold`; default cap also lowered 256KiB→128KiB. **Live-verified
+with the real fix applied**: a genuinely-foregrounded `chrome-devtools` tab
+(`visibilityState`/`hasFocus()` confirmed throughout) through a clean, download-only asymmetric
+throttle (userspace TCP proxy, 20KB/s down / unthrottled up — the clean isolation the investigation
+always needed and never had) survived 60+s with zero `keepalive ping timeout`, vs. dying at ~19s
+pre-fix under the identical throttle. This closes the whole multi-session ACK-stall-kill/backpressure
+thread (Wake Lock refutation, `Slow 3G` bidirectional-throttle confound, etc. — history in the archive).
 
-**RESOLVED 2026-09-16: video-never-arrives did NOT recur once the readiness-gate race fix was live —
-root cause was the race, not a separate capture bug.** Real browser client connected clean, full
-expected `sk.log` pipeline, genuinely live interactive XFCE desktop (Applications menu → Terminal
-Emulator opened within ~1-2s of a real remote click). **Terminal Emulator/Applications-menu click path
-independently confirmed healthy.**
+**Port-8081 double-bind bug — watchdog fix code-verified correct and its instrumentation confirmed
+live; the double-bind condition itself did NOT recur under this session's testing, so a fire+recover
+cycle is still unwitnessed.** Root cause and fix unchanged from prior passes: `kill -0 "$pid"` was the
+sole gate on the stall counter and silently reset it every tick under litebox's non-standard process
+model; fix drops that pre-check and adds a per-tick `SELKIES_BIND_WATCHDOG_TICK` trace line. **This
+session (13 boot cycles, real `chrome-devtools`/`claude-in-chrome` browser client against
+`http://127.0.0.1:3000/`, `--resume-from .wfgy/webtop_stack_seed_fixed.tar` confirmed byte-identical to
+the live `.wfgy/webtop_stack.sh` before every boot):**
+- 4/13 boots died to the already-known, unrelated `/bin/sh` `Signal(11)` non-determinism class before
+  selkies bound; two of those specifically killed the watchdog's OWN shell (`comm=sh`, the pid printed
+  by `SELKIES_BIND_WATCHDOG_STARTED`) seconds after it started — an aggravating environmental factor
+  this session hit repeatedly, not a defect in the fix.
+- On every boot where the watchdog shell survived, `SELKIES_BIND_WATCHDOG_TICK` fired correctly on
+  cadence with accurate `count`/`last_count`/`stall` fields (confirmed across 4 separate boots) —
+  **the instrumentation gap this fix targeted is closed and live-confirmed.**
+- Threw substantial, varied reconnect pressure at the real bound selkies process without reproducing
+  `OSError starting Data WS`: staggered real-browser reload bursts (up to 40 genuine
+  `Legacy client ... connected` events and 16 server-side `reconnecting too quickly` rejections in one
+  boot) and, separately, genuinely concurrent same-tick `new WebSocket(...)` floods (up to 40 at once,
+  via in-page JS against `ws://127.0.0.1:3000/websockets`) producing real `close code 4029` rejections.
+  `count` stayed `0` throughout every one of these — the specific overlap window (two "start Data WS"
+  attempts landing on the exact same reconfiguration moment) is narrower than any of this session's
+  triggers reached, consistent with the very sparse historical hit rate (one clean live capture across
+  many prior sessions). **Not a refutation of the fix** — merely means the fire+kill+respawn+recover
+  path is still unexercised live; next session should keep the same technique (concurrent in-page
+  `WebSocket` floods are more effective than sequential reloads: they generated 3-4x the
+  `reconnecting too quickly` rejections per attempt) and extend the window if host RAM allows.
 
-**Backpressure fix (`478e640`) partially verified — throttle works, targeted disconnect still happens
-anyway.** Live, unthrottled (organic desync): `Backpressure TRIGGERED for 'primary'. S:722, C:0
-(EffDesync:706.4f > Allowed:68.0f)` → `Backpressure LIFTED for 'primary'. S:722, C:722` — trigger/
-catch-up/lift all work. Seconds later, same client still dropped: `Data WS closed with error ...: sent
-1011 (internal error) keepalive ping timeout; no close frame received` — the exact failure mode
-`478e640` targeted, still reachable.
-
-**Retested 2026-09-16 (later session) with a genuinely foregrounded tab (`chrome-devtools`, not
-`claude-in-chrome`) — the Wake Lock candidate is REFUTED, but the disconnect still reproduces from a
-THIRD, distinct cause.** Live-confirmed the tab stayed real: `document.visibilityState` stayed
-`"visible"`, `document.hasFocus()` stayed `true`, zero `visibilitychange`/`blur` events fired for the
-whole session, and the console logged `Screen Wake Lock is active` with **no** `Could not acquire Wake
-Lock` error anywhere — the exact opposite of the prior session's capture, confirming that session's
-background-tab throttling was a real, now-controlled-out variable. Despite this, throttling the
-connection (`Slow 3G`, both directions) for the SAME client still produced the identical `keepalive
-ping timeout` disconnect — but with **no preceding `Backpressure TRIGGERED` line at all**, meaning
-`478e640`'s own mechanism (server video-queue backlog starving the ping) was never even engaged this
-time. Most likely cause: `Slow 3G` throttles bidirectionally, so the CLIENT's own 50ms ACK/keepalive
-traffic (upload direction) couldn't reach the server in time either — a network degraded enough to
-threaten tiny control-plane packets, not a video-backlog problem `478e640` was ever meant to cover.
-**Net read**: the original multi-session disconnect is very likely NOT the backgrounded-tab theory
-(refuted this pass) and is NOT proven to be `478e640`'s own residual gap either (this specific
-reproduction bypassed that code path) — a cleanly-isolated "throttle below encoder output but still
-comfortably above keepalive-packet size" repro is still needed to test `478e640` on its own terms; not
-completed this pass (time-boxed). Full methodology (the chrome-devtools coordinate-click technique
-used to drive the canvas with trusted input, since synthetic JS events are silently ignored by
-selkies' input path): `docs/AGENTS_ARCHIVE_2026-09-16.md`.
-
-**Port-8081-reconnect-forever bug: root-caused live, litebox's own socket lifecycle is CLEARED,
-mitigation applied but not fully closed.** `sk.log`: `OSError starting Data WS on port 8081: ...
-address already in use. Retrying in 5s...` looping forever after a disconnect, permanently wedging the
-session (no PRD needed — root-caused this pass). **litebox's own port-release-on-process-exit is
-proven correct**, not the cause: three separate live repros (`.wfgy/port_release_repro.sh`), each
-matching selkies' real crash shape (a foreground `cmd; rc=$?`-reaped process that dies without ever
-calling `close()`), including one holding a real ESTABLISHED accepted connection at the moment of
-death — every one let a brand-new process rebind the exact same port immediately, no delay. **Real
-cause, live-caught via the genuinely-foregrounded retest above**: this occurrence was NOT a crashed-
-then-respawned process at all (no `SELKIES_SUPERVISOR: attempt=N exited` line preceded it) — it was
-the SAME still-alive selkies process, whose original listening socket from early boot was still open
-and still accepting connections, while its own "full display reconfiguration" logic (triggered by a
-reloading/reconnecting client) tried to bind a SECOND Data WS server on the SAME port from the SAME
-process — an ordinary, correct `EADDRINUSE` (a process can't double-bind its own port), a **selkies
-application bug, not a litebox one**. **Fix applied** (`.wfgy/webtop_stack.sh`, gitignored):
-`selkies_supervisor.sh` now backgrounds selkies and publishes its pid to
-`/tmp/selkies_current_pid` (`wait "$pid"` afterward preserves identical `rc` semantics — zero added
-forks), and a new `selkies_bind_watchdog.sh` companion (launched the same forkless-exec way as the
-other supervisors) kills a process that is alive but shows a growing count of `OSError starting Data
-WS` lines in `sk.log` (3 ticks at 15s = ~45s) so the existing respawn logic gets a clean attempt — a
-curl-liveness first version was tried and **live-caught NOT firing** (the still-open original listener
-fooled a plain "does anything answer on the port" check), replaced with this direct log-symptom check.
-**Not fully closed**: the improved version's live end-to-end firing was not re-verified before this
-session's time budget ran out — treat as a real, reasoned mitigation, not a confirmed-closed bug.
-Transcript and the exact chrome-devtools trusted-input technique: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
-
-RAM: plateaued 2.0-2.9GB free through the sessions' combined 20+ min of use, never neared the 1.6GB
-floor, killed manually each time, recovered to 7.8-8.2GB free within seconds — consistent with "steep
-but bounded".
+RAM this session ran tighter than prior documented baselines (~4-8GB free pre-boot vs. the ~7-8GB
+norm, due to concurrent unrelated host load — multiple Firefox/Chrome processes, not litebox's own
+footprint) — most boots crossed the 1.5-2GB safety floor within 30-90s of selkies binding under
+reconnect-storm testing and were killed immediately on catching it. **Every one of the 13 cycles fully
+recovered host RAM within seconds of `Stop-Process`** (settling 5.4-8.2GB free each time) — zero host
+leaks, zero unrecovered processes. Normal single-client use without reconnect-storm testing still
+plateaus in the previously-documented 2.0-2.9GB range.
 
 ## Host-side crash machinery
 
