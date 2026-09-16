@@ -233,62 +233,27 @@ mechanism. Full evidence: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 ### The ACK-stall-kill — root cause still unidentified after ten investigations, the one genuinely open bug in this project
 
-**Symptom**: streams fine, then `sk.log`'s `Client stall for 'primary'... Forcing backpressure` →
-`Data WS closed ...: sent 1011 ... keepalive ping timeout` — selkies' own stall-detector kills the data
-channel, and the dashboard's frontend auto-reloads. A distinct second way to land there: a fresh tab's
-first connection sometimes 404s on `/websockets`, tripping the same auto-reload.
+**Symptom**: streams fine, then selkies' own stall-detector kills the data channel and the
+dashboard auto-reloads (or a fresh tab 404s on `/websockets`, same auto-reload). Eight candidates
+investigated, seven refuted live; the eighth (`fork_verify` thread-based healing starving
+selkies' event loop) is neither confirmed nor cleanly refuted — a real livelock-protection gap
+was found and fixed (`b6ddf43`) along the way, but no unfixed-vs-fixed A/B was possible. **Do not
+re-reach for `GLIBC_TUNABLES` here; do not re-open the frontend/nginx angle** — both already
+byte/log-verified clean. Separately, the Terminal Emulator/Applications-menu popup mechanism is
+itself independently healthy when driven directly; its own click-path retest is blocked because
+selkies has not bound its data socket in 7/7 recent launch attempts (same crash class below, not
+a popup bug). Full candidate-by-candidate history, the unconfirmed Thunar-relayout lead, and the
+Terminal Emulator retest detail: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
-**Eight candidates investigated; seven refuted by live measurement or architecture read** (client JS/
-transport, nginx config/frontend dual-connect, `/proc/<pid>/cmdline` ENOENT cost, selkies' psutil tick,
-`GPUtil.getGPUs()`, pixelflux capture/encode, litebox's own NAT/`--publish` gateway). **One, fork_verify
-thread-based healing starving selkies' event loop, is NOT confirmed, NOT cleanly refuted** — a real
-livelock-protection gap in `on_single_step` case (1) WAS found and fixed (`b6ddf43`), stress-tested clean
-11+ minutes with heals firing continuously, but no unfixed-vs-fixed A/B was possible and a disconnect has
-never once co-occurred with active fork-heal traffic in ten sessions. **Do not re-reach for GLIBC_TUNABLES
-here; do not re-open the frontend/nginx angle** (both byte/log-verified clean). Per-candidate evidence:
-`docs/AGENTS_ARCHIVE_2026-09-15.md`.
-
-**New, unconfirmed lead**: a live disconnect coincided with an open Thunar window closing, suggesting an
-xfwm4/xfdesktop re-layout event might trigger one of `selkies.py`'s untested subprocess spawns
-(`resize_display`/xrandr/xfconf-query) — untested, not ruled out.
-
-**A follow-up needs**: a real host-TCP packet capture (Wireshark/pktmon on `127.0.0.1:3000`) correlated
-against a guest-side timing instrument on selkies' `websockets`-library pong-receive path, plus a working
-trusted-input path into the canvas and >1.8-2GB free memory for a rebuild-and-restart window.
-
-**Separate open complaint, distinct from the ACK-stall-kill: Terminal Emulator/Applications-menu popup.**
-Architecture read found no litebox grab-/menu-specific code on this path; driving the guest DIRECTLY
-(bypassing selkies/browser) proved **both `xfce4-terminal` and the `xfce4-popup-applicationsmenu` popup
-mechanism are independently healthy** (open correctly twice each, no crash). `net.rs` is fully cleared
-(live-proven twice); the masked-502/404 bug was a startup race (fixed) plus the crash class below hitting
-selkies moments after bind (still open). `spawn_exec_collision_child`'s hang is fixed and reconfirmed
-(`42d8ced`, 20s/120s bounded). **2026-09-16: the click-path retest is STILL blocked, now for a precisely
-diagnosed reason, not RAM** — 2 boots, ~26 min combined, RAM healthy 4-9GB free throughout, selkies reached
-`Data WebSocket Server listening` **0 times in 7 launch attempts**; a live `chrome-devtools` probe got a
-real `502` (`ws://localhost:3000/websockets` refused to selkies' own port), confirming no stream was ever
-up to click into. Full detail: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
-
-**Track A fork-without-exec audit (ADVISORY-002 §6): crash-frequency measured, root-caused to
-`spawn_exec_collision_child`'s own 120s absolute cap firing on selkies' python3 collision — confirmed not
-a bug, not a watchdog regression.** All four Track A daemons (dbus-daemon/nginx/xfsettingsd/Thunar)
-cleared; selkies itself: 0/7 binds, `SIGSEGV`/`rc=139` on 6/7 at a ~120s cadence — a direct causal log
-line (not correlation) proves the nested recovery child makes real CPU progress yet structurally cannot
-succeed (no shared AF_UNIX/D-Bus namespace to the original guest). Raising the cap only prolongs an
-already-guaranteed failure; real fix stays Track B. Full mechanism: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
-
-**2026-09-16, later still: ET_EXEC directly confirmed (not assumed) — real Debian `python3.13`, no PIE
-swap-in exists, boot-reorder mitigation tried and insufficient.** Live `readelf -h` on the guest's actual
-interpreter (`/lsiopy/bin/python3` → `/usr/bin/python3` → `python3.13`) shows `Type: EXEC`, entry
-`0x67b0d0` — genuinely non-PIE, and the stock dpkg `python3.13 3.13.5-2+deb13u4` package, not a custom
-lsiopy build as previously assumed. No alternate PIE python3 exists anywhere in the image to swap in, and
-patching `ET_EXEC`→`ET_DYN` in place isn't viable without a full source rebuild — both ruled out live, not
-assumed. Moved selkies' launch earlier in `.wfgy/webtop_stack.sh` (before startwm.sh) two ways; both
-insufficient — **new finding: concurrent fork PRESSURE from another active subsystem (not just cumulative
-history) drives the collision rate** (launch-only made it WORSE, 6/6 respawns collided once it raced
-xfce4-session's own fork tree; gating on selkies binding first, 260s bounded, still didn't get a clean
-bind in the one Xvfb-up boot obtained). Net 0/2 XVFB-up boots reached `Data WebSocket Server listening`
-this pass; Terminal Emulator retest still blocked. **Confirms Track B is the only real fix at this
-layer.** Reorder kept (harmless) but not claimed as a fix. Full detail: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
+**Track A fork-without-exec audit (ADVISORY-002 §6) and the ET_EXEC finding**: all four Track A
+daemons (dbus-daemon/nginx/xfsettingsd/Thunar) are cleared — crash-frequency on the remaining one
+(selkies itself, 0/7 binds) is root-caused to `spawn_exec_collision_child`'s own 120s cap firing
+on a real, structurally-unwinnable recovery attempt (no shared AF_UNIX/D-Bus namespace), not a
+watchdog bug. The guest's actual Python (`python3.13`, stock dpkg, confirmed via `readelf -h`) is
+genuinely `ET_EXEC` with no alternate PIE build to swap in; a boot-reorder mitigation was tried
+and was insufficient — concurrent fork pressure from another subsystem, not just cumulative
+history, drives the collision rate. **Confirms Track B is the only real fix at this layer.** Full
+mechanism and both boot logs: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 ## Host-side crash machinery
 
@@ -308,10 +273,82 @@ stopped the watchdog killing a recovered run. Narrative: `docs/veh-exception-han
 
 **Cross-process sync on Windows is a hard platform constraint** (memory `mem-b709a7d784b98110-1430`):
 every native address/TID-based wait is process-local (`WaitOnAddress`, keyed events,
-`NtAlertThreadByThreadId`=ACCESS_DENIED); only a shared kernel object crosses processes — NAMED
-auto-reset Events, no `DuplicateHandle` needed. Live-verified primitive:
-`litebox_platform_windows_userland/src/xproc_sync.rs` (`b2166c4`); wiring it into `RawMutex` is open (PRD
-`wire-xproc-sync-crossprocessmutex-into-litebox-platform-rawmutex`).
+`NtAlertThreadByThreadId`=ACCESS_DENIED); only a shared kernel object crosses processes.
+`litebox_platform_windows_userland/src/xproc_sync.rs` (`b2166c4`) is a live-verified NAMED-event
+mutex primitive, still unwired (see its own doc comment: it wants Track B step 3's fixed-base
+shared section first, to key its side-table by section offset rather than address). `RawMutex`
+itself (the trait every shim subsystem's synchronization bottoms out in) is rewired as of this
+pass -- see "Cross-process-capable `RawMutex`" below, a different mechanism from `xproc_sync.rs`.
+
+## Cross-process-capable `RawMutex` (Track B step 2, ADVISORY-002 §3.2) -- done this pass
+
+`litebox_platform_windows_userland/src/lib.rs`'s `RawMutex` (~5905-6300) no longer calls
+`WaitOnAddress`/`WakeByAddressSingle` (process-local by MSDN's own contract, per the "hard
+platform constraint" note above). Same trait, same `underlying_atomic()`/`INIT` contract, no
+caller changed. Internals: a manual wait queue (`waiters: Mutex<Vec<WaiterRecord>>` per
+`RawMutex` instance) plus one auto-reset kernel `Event` per OS THREAD, not per mutex
+(`thread_waiter_event`, a new `thread_local!`, cached for that thread's whole lifetime). Register
+(push into the queue) and check (`underlying_atomic() != val`) happen under the same lock
+`wake_many` takes to pop, closing the lost-wakeup window the same way `xproc_sync.rs`'s swap-based
+protocol does. A timeout race (wait times out just as `wake_many` pops the same waiter) is
+resolved by re-acquiring that lock: still-queued means genuinely timed out (remove self); already
+popped means `wake_many` already committed to `SetEvent`, so the recovery path does one more
+bounded wait to consume it rather than leaving a stray signal on a per-thread event this thread
+will reuse later. `wake_many` now returns the real count of waiters it popped and signaled
+(previously always `0` -- Windows genuinely couldn't observe it via `WakeByAddress*`; the trait
+contract allows either, and callers, e.g. `sync/mutex.rs`/`sync/rwlock.rs`, are already written to
+be correct under the old always-`0` behaviour, so this is a pure improvement, not a behaviour
+requirement).
+
+**The cross-process half is real code, not a stub, but genuinely untaken today.** Every
+`WaiterRecord` carries the waiter's owning pid alongside its event handle
+(`resolve_waiter_event`, `lib.rs:6033`): same-pid (always true today, since `RawMutex` instances
+still live in ordinary per-process heap -- Track B step 3 hasn't landed) uses the handle directly;
+a different pid would `OpenProcess(PROCESS_DUP_HANDLE)` + `DuplicateHandle` (the same mechanism
+`advisor/probes/dup_probe.c`/`control_server.rs` already prove works cross-process, non-admin),
+caching the result per-mutex in `remote_waiter_handles` (closed by `RawMutex`'s new `Drop` impl).
+This is deliberately a DIFFERENT design from `xproc_sync.rs`'s single named-per-mutex event
+(that one avoids ever needing `DuplicateHandle` at all, at the cost of needing to know a section
+offset to key its side-table by -- see that file's own integration-sketch comment). `RawMutex`
+needed a design that works BEFORE Track B step 3 exists, since it is reachable from ordinary
+single-process synchronization today; the per-waiter-event/duplicate-on-demand shape is what
+ADVISORY-002 §3.2 itself specifies for exactly this reason.
+
+`dev_tests/src/ratchet.rs`'s bare-static count for this crate bumped 18->19 for the one new
+`thread_local!` (`THREAD_WAITER_EVENT`); a plain `thread_local!` rather than a `TlsState` field
+(unlike `codewatch`/`ctxwatch`, which deliberately avoid this ratchet) because `RawMutex` is
+reachable from host-only threads that never call `install_tls`.
+
+**Live-verified** (release build, default thread-based fork, no test files): `yes hello | head -c
+5000000 | wc -c` inside a `debian:stable-slim` guest -- exact byte count `5000000`, proving
+correct blocking-pipe reads/writes (both directions) through the new queue with no lost data.
+`seq 1 3000000 | sort --parallel=4 -n | tail -3` (env `GLIBC_TUNABLES=glibc.malloc.tcache_count=
+0:glibc.malloc.mxfast=0` -- works around the UNRELATED, pre-existing ADVISORY-001 §3N
+fork-without-exec tcache bug so it doesn't confound this specific read; not a RawMutex fix) --
+exact correct output `2999998`/`2999999`/`3000000`, proving `sort`'s own real multi-threaded
+pthread mutex/condvar contention (glibc futex calls, which this trait backs) completes correctly
+under genuine contention: no hang, no deadlock, no missed wakeup, no corrupted merge. Host RAM
+identical before/after (~8.43GB free of ~16GB), no leaked processes.
+
+**One separate, unrelated finding surfaced while testing, not investigated further (out of this
+pass's scope)**: a 3-stage pipeline (`seq | sort --parallel=4 | tail`) under
+`LITEBOX_PROCESS_FORK=1` spun two of the three cross-process children at high sustained CPU with
+no progress for 5+ minutes (killed, not root-caused). Cross-process fork rebuilds pipeline fds
+over REAL inherited Windows pipe handles (`[process_fork_diag] task-resume-probe (child): guest fd
+N rebuilt over inherited Windows pipe handle ...`), a different code path from the emulated-pipe
+subsystem `RawMutex` backs in the default (thread-based) fork configuration this pass's tests
+otherwise used -- likely a pre-existing gap in multi-stage-pipeline fd inheritance under
+`LITEBOX_PROCESS_FORK=1` specifically, not a `RawMutex` regression (nothing in this pass touched
+`process_fork.rs`), but not yet isolated. Worth a `prd-add`-shaped follow-up before relying on
+`LITEBOX_PROCESS_FORK=1` for anything pipe-heavy.
+
+**What remains before Track B step 3 (fixed-base shared kernel heap)**: `RawMutex.waiters`/
+`remote_waiter_handles` are ordinary process-local `std::sync::Mutex`es because `RawMutex`
+instances themselves still live in per-process heap. Once step 3 places `RawMutex` in a
+cross-process shared section, those two fields need to become POD/cross-process-safe in their own
+right (e.g. a fixed-size slot array guarded by `xproc_sync::CrossProcessMutex` instead of a
+`Vec` guarded by `std::sync::Mutex`) -- this pass deliberately did not build that yet, since it
+depends on step 3's allocator seam existing first, matching ADVISORY-002's own step ordering.
 
 ## Closed — do not re-attempt without a genuinely new approach
 
@@ -356,51 +393,19 @@ real pre-existing `E0277` `flip_callbacks`'s own doc comment already names). `li
 diag::set_strace_summary_enabled` added (the real runtime toggle -- `init_strace_summary` is a
 one-shot latch despite its own doc comment's "idempotent" phrasing suggesting otherwise).
 
-**Live-verified this session** (release build, real named pipe, no test files): `advisor/probes/
-dup_probe.c` reconfirmed live (mingw gcc) -- `DuplicateHandle` into a same-user non-admin sibling
-still works, matches ADVISORY-001 §5's 2026-09-03 finding. Headless (no `--gui`, local tar,
-`bin/sleep`): `presenter?`→`ok none`, `strace query`→`ok off`, `frames on/off`→`ok`, `scanout`→
-`err bad_state` (no fb attached), `key`/`rel`→`ok`, `abs`→`err unsupported` -- all live over the
-real pipe via a PowerShell `NamedPipeClientStream` script (design doc §3's own suggested
-debug-tooling shape). This is scenario 2 AND 6 from §6's plan. `--gui=hidden`: `litebox-presenter.exe`
-spawns (confirmed via `Get-Process`, several runs). `show` with no drawing guest: blocks ~5.08s
-then `err io_error presenter did not start` -- exactly §5 risk 3's 5s contract, live-timed.
-Presenter cleanup: found live that a panic on a non-main Rust thread only kills that thread, not
-the process -- an orphaned zombie `litebox-presenter.exe` resulted when its scanout-retry thread
-hit "runner closed the connection" while the main thread's winit loop kept running. Fixed with a
-process-wide panic hook (`litebox_presenter/src/main.rs`) that exits after the default hook
-prints; reconfirmed live afterward -- presenter now exits the instant the runner's pipe breaks.
-
-**Live-verified in a follow-up session (2026-09-16, real flip-producing guest, full narrative in
-`docs/AGENTS_ARCHIVE_2026-09-16.md`)**: built `drmgui_multiflip.hooked` per
-`docs/dump-frames-writer-verify-probe/README.md`'s exact recipe and ran all three previously-open
-scenarios against it. **Scenario 1**: `LITEBOX_DUMP_FRAMES=1`, 21 flips -> 21 `.bmp` files,
-`non_black_pixels=2073600`, `0 dropped` -- byte-identical to the 2026-09-05 baseline. **Scenario
-3/4**: `--gui=hidden` + `show` against a real flip-producing guest -- presenter registers, `show`
-replies `ok`, presenter survives, `presenter?`->`ok visible`, `EnumWindows` finds a real visible
-`"litebox virtual display"` window, `PrintWindow` capture shows real rendered content (not blank).
-**Scenario 5**: killed the presenter mid-display -- guest/`screenshot` unaffected
-(`non_black_pixels=2073600` throughout), a follow-up `show` spawned a fresh presenter that got its
-own real visible window with current content within ~370ms -- true respawn-and-resume.
-
-**Real bug found and fixed this pass**: the first-ever live `show` against a REAL content-producing
-guest (every earlier session's `show` test used a guest with no drawn framebuffer, hitting only
-the timeout path) made `litebox-presenter.exe` silently `exit(0)` moments after `show`, no panic.
-Root cause in `litebox_presenter_protocol::pipe` (shared client+server named-pipe I/O): every
-handle had `FILE_FLAG_OVERLAPPED` set but every `ReadFile`/`WriteFile` passed a NULL `OVERLAPPED`
-pointer -- unsound once more than one thread has I/O in flight on the same pipe object at once,
-which is exactly this module's own `show`/`hide` design (one thread blocked reading a presenter's
-connection while a different thread writes `show`/`hide` through a `duplicate_into_current_process`
-duplicate of the same handle). Live effect: the pending read spuriously saw `ERROR_BROKEN_PIPE`
-right after the concurrent write succeeded. Fix: `litebox_presenter_protocol::pipe::overlapped_call`,
-a private per-call `OVERLAPPED` + manual-reset event for every `ReadFile`/`WriteFile`/
-`ConnectNamedPipe` (new `Win32_System_Threading` feature on that crate's `windows-sys` dep), which
-is what `FILE_FLAG_OVERLAPPED` is actually for -- applied to both server and client (client's
-`CreateFileW` also gained `FILE_FLAG_OVERLAPPED`, closing the same latent hazard for future
-input-forwarding writes). Simply removing `FILE_FLAG_OVERLAPPED` instead (tried first) "fixes" the
-crash but deadlocks the write forever behind the permanently-pending read -- do not retry that
-half-fix; see the archive for why. Live-reconfirmed: `show` now replies in ~300ms, presenter
-survives indefinitely.
+**Live-verified across two sessions** (release build, real named pipe, no test files): every
+control-pipe command works headless and `--gui=hidden`; a real flip-producing guest confirmed
+`LITEBOX_DUMP_FRAMES`, `show`/`presenter?`/`EnumWindows`-visible-window, and kill-mid-display
+respawn-and-resume all byte/pixel-correct. **One real bug found and fixed**: the first-ever live
+`show` against a REAL content-producing guest made `litebox-presenter.exe` silently `exit(0)`.
+Root cause in `litebox_presenter_protocol::pipe`: every handle had `FILE_FLAG_OVERLAPPED` set but
+every `ReadFile`/`WriteFile` passed a NULL `OVERLAPPED` pointer -- unsound once more than one
+thread has I/O in flight on the same pipe object (exactly this module's `show`/`hide` design).
+Fixed by `litebox_presenter_protocol::pipe::overlapped_call`, a private per-call `OVERLAPPED` +
+manual-reset event for every I/O call. **Do not "fix" this by simply removing
+`FILE_FLAG_OVERLAPPED`** -- that was tried first, stops the crash, but deadlocks the write forever
+behind the permanently-pending read instead. Full verification narrative, scenario-by-scenario
+logs, and the deadlock half-fix's own kernel-level explanation: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 **Still open / pre-existing, not fixed this pass** (unrelated to the crash above, small and
 disclosed):
