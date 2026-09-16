@@ -1400,3 +1400,289 @@ session closes out.
 `.wfgy/pyfix_fullboot1.log` (full boot, gitignored, not committed); python3.13 binary and its
 `readelf -h`/`readelf -l` output obtained via `snapshot.debian.org` (not committed to the repo,
 scratch-only).
+
+## Sustained-verification session (2026-09-16, later pass): backpressure/Terminal-Emulator retest blocked by a NEW video-never-starts bug; readiness-gate race found and fixed; RAM characterized as steep-but-bounded
+
+Follow-up to the python3-collision fix above (`548f8fe`). Goal was to live-verify the backpressure
+fix under real throttled load, retest the Terminal Emulator click path, and do a sustained
+non-throttled usability check. None of the three were reached -- but real, new, disclosed findings
+came out of trying.
+
+**Boot 1** (`.wfgy/sustained1_run1.combined.log`): normal boot, reached `XVFB_UP`/`DBUS_UP` cleanly
+(the known-harmless `cc1` collision fired once, as documented). Host free RAM held flat ~6.1-6.3GB
+through the nginx/Xvfb/dbus phase, then fell from 6.17GB to 1.5GB in ~127s (~37MB/s) starting the
+moment `SELKIES_LAUNCHED_LAST`/`DE_LAUNCHED` fired together -- this session's own safety monitor
+force-killed the runner at the pre-agreed 1.6GB floor. In that window: a REAL browser client (not
+curl) connected via `claude-in-chrome` to `http://127.0.0.1:3000/`, and selkies logged `Legacy
+client ('10.0.0.2', 65305) connected... Data WebSocket connected` -- the first time this entire
+multi-session investigation reached a genuine non-curl client connect. The desktop itself failed:
+`DE_VIA_STARTWM=no` then `DE_FAILED` (xfce4-session's own fallback never reached
+`_NET_SUPPORTING_WM_CHECK` in its 30s+35s windows) -- `de2.log` showed only benign ConsoleKit/EWMH
+warnings, no crash, meaning it was simply still starting up when the RAM-critical kill landed.
+
+**Root cause of the DE_FAILED/RAM-race found and fixed** (`.wfgy/webtop_stack.sh`, gitignored,
+local-only): the "gate the desktop launch on selkies actually binding first" mitigation that
+AGENTS.md and the script's own comments claimed was already in place was NOT actually wired that
+way. A `si=0; while curl ...; do ...; done` loop (the "PREDE" loop) ran up to 260s BEFORE selkies
+was even launched, polling a port nothing could possibly be listening on yet on a cold boot -- a
+100%-guaranteed no-op that wasted up to 260s and ~260 forks per boot for zero effect. The REAL
+readiness gate (the one that actually confirms `SELKIES_PORT_UP`) ran AFTER `DE_LAUNCHED`, i.e.
+too late to prevent xfce4-session's fork tree and selkies' own python3 startup from racing for
+CPU/host address space concurrently -- exactly the race witnessed producing `DE_FAILED` in boot 1.
+**Fix**: removed the dead PREDE loop; moved the real `SELKIES_PORT_UP` readiness gate to run
+immediately after `SELKIES_LAUNCHED_LAST`, before the desktop-launch section, so `startwm.sh` does
+not fire until selkies has bound (or the gate's own bounded timeout elapses). Full before/after
+text is in `.wfgy/webtop_stack.sh`'s own comments at both edit sites.
+
+**Gotcha that cost real time diagnosing**: `--resume-from .wfgy/webtop_stack_seed_fixed.tar`
+embeds its OWN frozen copy of `config/webtop_stack.sh` inside the tar (confirmed via `tar -tvf`:
+`config/webtop_stack.sh`, timestamped from when the tar was built). Editing the host-side
+`.wfgy/webtop_stack.sh` alone has ZERO effect on the next `--resume-from` boot -- boot 2 (below)
+ran with the fix already applied on disk and reproduced boot 1's exact PREDE-loop behavior
+byte-for-byte (`SELKIES_PORT_PREDE_TIMEOUT after 260s`), proving the live guest was still running
+the OLD frozen script. Fixed by extracting the tar, overwriting `config/webtop_stack.sh` with the
+current host copy, and re-tarring it. **Any future edit to `.wfgy/webtop_stack.sh` must be
+followed by regenerating every `--resume-from` seed tar that embeds it, or the edit is silently
+inert.**
+
+**Boot 2** (`.wfgy/sustained1_run2.combined.log`, still on the OLD frozen script, i.e. a second
+independent data point for the pre-fix behavior): same PREDE-loop/442s-to-`DE_LAUNCHED` pattern as
+boot 1, RAM fell 6.18GB->1.7-1.9GB over the same ~130s window (~35-40MB/s, consistent with boot 1).
+This time `DE_UP via direct xfce4-session` succeeded (nondeterministic outcome vs. boot 1's
+`DE_FAILED` -- same race, different timing luck) and RAM **plateaued** at ~1.82-1.9GB free for a
+genuine 3+ minute stable window (not a fluke: dozens of consecutive samples, no further decline) --
+this is the key RAM-growth finding: **the growth is steep but BOUNDED, not an unbounded leak** --
+it tracks the concurrent desktop+selkies fork storm and stops once that settles into steady state
+(the script's own `HOLD` loop). The danger is that the bounded ceiling lands very close to (this
+session, within ~200-250MB of) whatever safety floor is in force, not that it grows forever.
+
+**New bug found this session, real and distinct from everything above**: in boot 2's stable
+window, a REAL browser client connected cleanly (`[websockets] Connection opened!`, settings sent,
+backpressure ACKs sending every 50ms, zero client or server errors), `DE_UP` had already fired, yet
+**no video frame ever arrived** -- the client sat on "Waiting for stream..." for 3+ minutes straight
+(confirmed via repeated `claude-in-chrome` screenshots), reconnecting itself twice
+(`Pre-flight checks passed` re-logged at `1:52:50 PM` after the `1:51:21 PM` initial connect) with
+still zero frames. `sk.log` shows client registration and DPI/cursor xfconf-query setup but **zero**
+capture/encode-related log lines (`grep -i 'capture|pixelflux|damage|encode|h264|gstreamer' sk.log`
+= no matches) and zero errors. This blocked BOTH the backpressure-throttle test (nothing to
+throttle) and any visual Terminal Emulator retest (nothing renders to click into) -- it is the
+actual reason neither of this session's two top-priority items could be reached, not a regression
+of the collision fix (`548f8fe`) or the backpressure patch (`478e640`), both of which remain
+believed-good but still not directly exercised end-to-end. Root cause not yet investigated (no
+time left in this pass); prime suspects for a follow-up: pixelflux/GPUtil capture thread failing
+to start silently, or DPI/cursor xfconf-query setup (itself several guest-side forks) stalling
+ahead of the capture loop.
+
+**Boot 3** (`.wfgy/sustained1.combined.log`, this time on the REPACKED seed tar with the gate fix
+actually live): confirmed the fix works as intended. Log shows
+`SELKIES_BACKPRESSURE_PATCH_STAGE_DONE` -> `SELKIES_LAUNCHED_LAST` -> `SELKIES_PORT_UP curl_exit=28
+(after 7s)` -> `SK_TAIL_BEGIN` -> `DE_LAUNCHED`, zero PREDE-loop messages, selkies bound in 7s this
+time (desktop not yet competing for CPU), and total elapsed from boot start to `DE_LAUNCHED` fell
+from 442s (boots 1 and 2) to 109s -- a ~4x speedup, and the concurrent-fork-pressure race
+structurally eliminated (selkies now always binds, or times out, before xfce4-session's fork tree
+starts). Deliberately killed immediately after confirming this ordering (RAM was already falling
+into the same danger zone) rather than riding it to the RAM floor a third time, to conserve host
+RAM/session time. **Not yet confirmed**: whether this reordering actually prevents `DE_FAILED` or
+raises the RAM plateau's safety margin over a full boot to `DE_UP`+video -- follow-up session should
+verify with the now-repacked `.wfgy/webtop_stack_seed_fixed.tar`.
+
+**Session RAM discipline**: only one runner process at a time throughout (confirmed via
+`Get-Process` before each boot); an automated monitor force-killed at a 1.6GB-free floor on boots 1
+and 2; boot 3 was killed manually once its diagnostic goal was met. Host free RAM fully recovered
+to ~7.7-7.8GB within seconds after every kill, both times confirmed via `Get-Process` returning zero
+matches -- no leaked host processes or handles across any of the three boots.
+
+**Status for the next session**: backpressure-under-throttle (`478e640`) and the Terminal
+Emulator/Applications-menu click path are STILL not live-verified -- both are now blocked
+specifically on the video-never-starts bug above, not on selkies binding (which is fixed and
+reliable) or the desktop coming up (now faster and race-free per boot 3, outcome not yet
+re-confirmed). Fix the video-start gap first; the other two should then be reachable in the same
+pass. Evidence: `.wfgy/sustained1_run1.combined.log`, `.wfgy/sustained1_run2.combined.log`,
+`.wfgy/sustained1.combined.log` (boot 3), `.wfgy/webtop_stack.sh` (both edit sites carry inline
+before/after comments).
+
+## Retest session (2026-09-16, later still): video-never-arrives did not recur with the race fix live; Terminal Emulator confirmed; backpressure partially verified; new port-8081 reconnect bug found
+
+Follow-up to the boot-3 race fix above. Goal per the prior session's own "Status for the next
+session": confirm the race fix alone resolves video-never-arrives, then work down the priority list
+(backpressure-under-throttle, Terminal Emulator, general usability).
+
+**Pre-flight check**: confirmed no stray `litebox_runner_linux_on_windows_userland`/
+`litebox-presenter` processes running (`Get-Process`, zero matches), host free RAM baseline 8.16-8.18GB
+of 15.99GB total. Confirmed `.wfgy/webtop_stack_seed_fixed.tar` (mtime 13:55) was repacked AFTER the
+current `.wfgy/webtop_stack.sh` (mtime 13:42) by extracting `config/webtop_stack.sh` from the tar and
+`diff`-ing it byte-for-byte against the host copy -- identical, so no repack was needed this session
+(the prior session's own gotcha about stale embedded scripts did not recur).
+
+**Boot** (`.wfgy/videoretest1.out.log`/`.log`, same launch shape as `watchdogcheck_launch2.ps1`:
+`--env GLIBC_TUNABLES=...`, `--oci-image docker.io/linuxserver/webtop:debian-xfce --resume-from
+.wfgy/webtop_stack_seed_fixed.tar --publish 3000:3000`). **Gotcha hit and worked around**: PowerShell's
+`>`/`2>` redirects write UTF-16LE, not UTF-8 -- plain `grep`/`cat` on the raw log file matches nothing
+even when the content is there (every character appears space-separated to a byte-oriented tool).
+Fix: `iconv -f UTF-16LE -t UTF-8` before grepping. Cost real time diagnosing an apparently-empty log
+during an otherwise-successful boot; worth a standing note for any future session redirecting this
+runner's output from PowerShell and reading it from Git Bash.
+
+**Race fix reconfirmed working**: boot sequence was `GUESTSTART` -> `XVFB_UP` -> `DBUS_UP` ->
+`SELKIES_BACKPRESSURE_PATCH_STAGE_DONE` -> `SELKIES_LAUNCHED_LAST supervisor_pid=114` ->
+`SELKIES_PORT_UP curl_exit=28 (after 7s)` -> `SK_TAIL_BEGIN` -> `DE_LAUNCHED (image startwm.sh)` ->
+`DE_VIA_STARTWM=no` -> `DE_UP via direct xfce4-session` -- zero PREDE-loop lines, selkies bound in 7s,
+matching boot 3's fast/race-free pattern exactly. Desktop then held stable (`[s] HOLD t=Ns` ticking
+every 20s) for 12+ minutes of active testing with no crash.
+
+**Video-never-arrives did NOT recur.** A real browser client was driven via `claude-in-chrome`
+(navigate to `http://127.0.0.1:3000/`, no curl). `sk.log` (tailed into the guest's own stdout via the
+script's existing `[sk]` prefix) showed the full expected pipeline this time: `Registering new client
+for display: primary` -> `Preparing to start capture for display='primary': Res=1280x800, Offset=0x0`
+-> `[x11] Configuring Output: 1280x800 @ 34.00 FPS (Encode Node: -1)` -> `SUCCESS: Capture started for
+'primary'` -> `[x11] No GPU Encoder available -> Using CPU Software Encoding` -> `[x11] Stream settings
+active -> Res: 1280x800 | FPS: 34.0 | Encoder: CPU | Mode: H264 | CRF: 43 | Colorspace: I420 (Limited
+Range) | Damage Thresh: 10f | Damage Dur: 20f`. Screenshots via `claude-in-chrome` confirmed genuinely
+live, interactive rendering, not a frozen/black frame: the XFCE desktop (panel, Home/File System
+icons) rendered correctly; clicking "Applications" opened a real dropdown menu reflecting the click
+live; clicking "Terminal Emulator" opened a real terminal window (visible title bar, menu bar, blinking
+cursor) within ~1-2s. **Conclusion: the race fix alone was sufficient -- root cause of video-never-
+arrives was the same readiness-gate race documented in boot 3 above (desktop fork storm competing with
+selkies' own capture-thread/DPI-xfconf startup for CPU/address space), not a separate capture-thread or
+X11-attach bug.** None of the candidate root causes from the prior session's priority list (b), (c), (d)
+needed investigating -- the race fix alone closed the gap.
+
+**Terminal Emulator/Applications-menu click path: independently confirmed healthy.** Real click,
+real terminal, within a few seconds, exactly as the priority list asked to verify. No menu/launch bug
+exists.
+
+**Backpressure fix (`478e640`): partially verified, one real gap found.** Not under a deliberate
+bandwidth throttle (ran out of session time to add one before the client-side issue below intervened)
+but a real, organic desync occurred from ordinary interactive use (menu clicks, window open) -- the
+mechanism fired exactly as designed: `Backpressure TRIGGERED for 'primary'. S:722, C:0
+(EffDesync:706.4f > Allowed:68.0f)` immediately followed by `Backpressure LIFTED for 'primary'. S:722,
+C:722 (EffDesync:-11.5f <= Allowed:68.0f)` -- trigger, throttle, catch-up, lift, all correct. **But
+seconds after the LIFT, the same client was still dropped**: `Data WS closed with error from
+('10.0.0.2', 55251): sent 1011 (internal error) keepalive ping timeout; no close frame received` --
+this is the EXACT failure mode `478e640` was written to eliminate, still reachable even with the fix
+live and the backpressure logic itself working correctly. A second, larger desync event followed
+minutes later (`Backpressure TRIGGERED for 'primary'. S:1934, C:756 (EffDesync:1167.8f > Allowed:68.0f)`)
+without a matching LIFT ever appearing in the log before the client went unresponsive. **New
+candidate cause, not yet confirmed**: the browser console logged repeated `Could not acquire Wake
+Lock: NotAllowedError, Failed to execute 'request' on 'WakeLock': The requesting page is not visible`
+in the same time window -- Chrome throttles background-tab JS timers, and the frontend runs a 50ms
+backpressure-ACK-sender interval (`[websockets] Started sending backpressure ACKs every 50ms`, logged
+at connect) plus the ping/pong keepalive itself; if `claude-in-chrome`'s own tab-switching during this
+session backgrounded the tab even briefly, that alone could stall the ACK stream client-side, cause
+server-side desync, and lead to exactly this trigger/keepalive-timeout sequence. Not proven -- the next
+session should retest with the tab kept strictly foregrounded throughout (no other tool calls that
+might defocus it) to isolate whether this is a genuine server-side gap or a client-instrumentation
+artifact. Either way, the disconnect itself is real and reproducible, so `478e640` is not yet a full
+fix for the ACK-stall-kill class, only a confirmed-correct throttle mechanism.
+
+**New bug found: reload/reconnect after a disconnect hangs forever, root cause identified live.**
+After the keepalive-timeout disconnect, both a fresh page load and a `navigate` to the same URL got
+stuck indefinitely on the frontend's own "WebSocket disconnected. Attempting to reconnect..." banner
+(waited 8s, then another 8s, no change). `sk.log` explained why: a new client connect was accepted
+(`Legacy client ('10.0.0.2', 52352) connected`) and briefly registered, then almost immediately
+`Client for 'primary' disconnected. Removing and triggering full display reconfiguration` ->
+`WARNING:data_websocket:No display clients connected. Video pipelines remain stopped.` -- and every
+subsequent reconnect attempt hit `ERROR:data_websocket:OSError starting Data WS on port 8081: [Errno
+98] error while attempting to bind on address ('0.0.0.0', 8081): [errno 98] address already in use.
+Retrying in 5s...`, repeating every 5s with no recovery for the rest of the boot (multiple minutes,
+until manually killed). This means once a client disconnects and a reconnect/reconfiguration cycle
+starts, something is left holding port 8081 (either the original process never actually released the
+listening socket, or a stale handler/task did not get cleaned up before a new bind was attempted) --
+a real, reproducible, previously-undocumented bug distinct from both the ACK-stall-kill and the
+python3-collision class. Not root-caused this session (no time remaining); no PRD filed yet -- next
+session should add one and investigate `selkies`' own Data WS server lifecycle (does it call
+`server.close()`/await the close before the next bind attempt, or race a new `start_server()` against
+the old one still tearing down). This is now the practical blocker for a multi-minute "general
+usability" pass (open/close several apps, move windows) since a single disconnect mid-session (which
+the ACK-stall-kill above shows can happen organically) currently ends the session with no working path
+back in.
+
+**RAM discipline**: single runner process confirmed via `Get-Process` before boot. Free RAM: 8.18GB
+baseline -> fell steeply (consistent with prior sessions' ~35-40MB/s fork-storm rate) during
+`DBUS_UP`->`DE_UP`, plateaued ~2.7-2.9GB free through the first several minutes of HOLD/interactive
+testing, then drifted down further to a second, lower plateau of ~2.0-2.15GB free during the
+reconnect-churn portion of testing (repeated display reconfiguration/teardown-rebuild cycles from the
+disconnect/reconnect attempts above) -- never approached the 1.6GB safety floor at any point. Killed
+manually (`Stop-Process -Force`) once the port-8081 bug was confirmed reproducing, not by the safety
+monitor. Free RAM recovered to 8.17GB within ~3 seconds of the kill, `Get-Process` confirmed zero
+`litebox_runner_linux_on_windows_userland`/`litebox-presenter` matches, and no stray launcher
+`powershell.exe` processes remained. This is a genuine second data point for "steep but bounded, not
+an unbounded leak" -- the lower second plateau tracks additional real work (repeated display
+reconfiguration) rather than continued unbounded growth at idle.
+
+**Status for the next session**: video-never-arrives and the Terminal Emulator click path are now
+CLOSED (both confirmed working with the race fix live). Remaining open items, in priority order: (1)
+root-cause the port-8081 reconnect bind collision (blocks any multi-client-lifecycle or sustained-
+usability test that survives a single disconnect); (2) re-verify backpressure under a genuine
+deliberate bandwidth throttle with the test tab kept strictly foregrounded throughout, to separate the
+Wake-Lock/background-tab-throttling hypothesis from a real server-side gap; (3) once (1) is fixed, run
+the originally-planned general usability pass (open/close several apps, move windows, sustained
+multi-minute session). Evidence: `.wfgy/videoretest1.out.log`, `.wfgy/videoretest1.log` (both
+UTF-16LE -- convert before reading), `.wfgy/videoretest_launch1.ps1`.
+
+## Track B step 3 detail drained from AGENTS.md (2026-09-16, later session, size compaction)
+
+Full pointer-rich state inventory, preserved verbatim from AGENTS.md before compaction:
+
+**Track B step 3 (fixed-base shared kernel heap) -- NOT started, needed next.** Immediate
+consequence for `RawMutex` itself: `waiters`/`remote_waiter_handles` are ordinary process-local
+`std::sync::Mutex`es only because `RawMutex` instances still live in per-process heap; once step 3
+lands they need to become POD/cross-process-safe (e.g. a fixed-size slot array under
+`xproc_sync::CrossProcessMutex`, not a `Vec` under `std::sync::Mutex`) -- deliberately not built
+yet, since it depends on step 3's allocator seam existing first. Concrete pointer-rich state that
+must move into the fixed-base shared section (`advisor/ADVISORY-002-d-zero-fork.md` §3.3, read
+before starting): two heap singletons behind a build-time bare-static ratchet --
+`LiteBoxX { platform, descriptors }` (`litebox/src/litebox.rs:112`, the fd table) and
+`GlobalState`'s 22 fields (`litebox_shim_linux/src/lib.rs:2243-2347` -- futex manager, pipes,
+network, pid/tid allocator, AF_UNIX address table, flock/pty/memfd registries, DRM, evdev, id
+counters), plus outside `GlobalState`: `DefaultFS`, the `shared_pending` signal queue, per-process
+fd tables. Two constraints the older design notes don't flag: (1) **trait-object vtables** --
+`DescriptorEntry`'s `Box<dyn FdEnabledSubsystemEntry>` vtable pointer is only valid cross-process
+if the runner loads at the SAME base; the runner has no `/DYNAMICBASE:NO`/`/FIXED` today (a
+`CreateProcess`-based clone would need one added -- cheap, `build.rs:28` already emits a similar
+link-arg), while `RtlCloneUserProcess` sidesteps this entirely (same image, same base, by
+construction -- an argument for clone over `CreateProcess`, independent of CoW/`MAP_SHARED`); (2)
+**reserve size/placement** -- no documented max reserved-section size or guaranteed
+collision-free high-VA band; place high in 64-bit space and verify at runtime, don't assume.
+Ordering after this per ADVISORY-002 §7: (iv) fd/HANDLE indirection, then relaxing the
+`beyond_stdio` fork-eligibility gate.
+
+## Presenter-process split full section, drained from AGENTS.md (2026-09-16, later session, size compaction)
+
+Preserved verbatim before compaction (status: done, fully verified live end-to-end, 2026-09-16):
+
+Built and committed: `litebox_presenter_protocol` crate (newline-delimited scanout/screenshot/
+show/hide/presenter?/key/rel/abs/ps/strace/frames grammar + named-pipe transport), runner-side
+`ControlServer` (`DuplicateHandle`-based zero-copy scanout handoff via a polling thread, not a
+flip-callback, so headless-with-no-observers stays as cheap as before), and
+`litebox-presenter.exe` (new crate, links only `litebox_platform_windows_userland::presentation`
++ the protocol crate, zero shim/kernel dependency). `--gui` is now `Option<GuiMode>`
+(`--gui`/`--gui=hidden`; old `--gui-hidden` kept as a deprecated alias). `DrmSubsystem` gained
+`frame_seq` and `scanout_snapshot()` (a plain generic query, not a boxed flip callback -- can't
+carry `Platform::SharedMemoryHandle` across a trait object); `set_strace_summary_enabled` added.
+
+Verified live, across two sessions (release build, real named pipe, no test files): every
+control-pipe command headless and under `--gui=hidden`; `litebox-presenter.exe` spawn/respawn; a
+panic on a non-main thread no longer orphans a zombie presenter (process-wide panic hook added);
+scenario-1 byte-identical `LITEBOX_DUMP_FRAMES` regression against a real flip-producing guest
+(21 flips -> 21 `.bmp`, matching the 2026-09-05 baseline exactly); `show`/`hide`/`presenter?`
+against that same real-content guest, with a real visible `EnumWindows`-found window;
+kill-mid-display -> `screenshot` unaffected -> a follow-up `show` spawns a fresh presenter with
+its own visible window and current content within ~370ms (true respawn-and-resume).
+
+One real bug found and fixed: the first-ever `show` against a REAL content-producing guest made
+`litebox-presenter.exe` silently `exit(0)` -- every handle in `litebox_presenter_protocol::pipe` had
+`FILE_FLAG_OVERLAPPED` set but every `ReadFile`/`WriteFile` passed a NULL `OVERLAPPED`, unsound once
+more than one thread has I/O in flight on the same pipe object (exactly this module's `show`/`hide`
+design). Fixed via `pipe::overlapped_call` (a private per-call `OVERLAPPED` + manual-reset event for
+every I/O call). Do not "fix" this by removing `FILE_FLAG_OVERLAPPED` -- tried first, stops the
+crash, but deadlocks the write forever behind the permanently-pending read instead.
+
+Still open / pre-existing, not fixed this pass (small, disclosed, unrelated to the crash above):
+`frames on <dir>` ignores the directory arg (ON/OFF toggle works, redirect doesn't); `ps` returns
+`ok 0` with a live guest process (`diag::PROCESS_TREE` gap, pre-existing, not caused by the split);
+`PrintWindow` capture of the presenter window is a partial-shape artifact (known DXGI-flip-model
+issue, not a regression -- the same-moment `screenshot` read the correct full-frame pixel count;
+don't chase via `PrintWindow`); disclosed deviation: `dump_frame_diagnostic`/`encode_bmp`/
+`count_pixel_stats` stay in `litebox_platform_windows_userland::presentation` rather than the
+runner crate per design §1.1 (zero wgpu dependency, headless-never-touches-a-window already held).

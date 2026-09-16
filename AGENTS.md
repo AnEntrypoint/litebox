@@ -178,56 +178,89 @@ of a THIRD mechanism. Full evidence: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 ### The ACK-stall-kill — root cause found and fix committed 2026-09-16, live-verification still pending
 
-**History (superseded by the fix below, kept for context)**: streams fine, then selkies'
-stall-detector kills the data channel and the dashboard auto-reloads (or a fresh tab 404s on
-`/websockets`, same auto-reload). Eight candidates investigated, seven refuted live; the eighth
-(`fork_verify` thread-based healing starving selkies' event loop) was never cleanly refuted — a
-real livelock-protection gap was found and fixed (`b6ddf43`) along the way, but no A/B was
-possible. Separately, the Terminal Emulator/Applications-menu popup mechanism is independently
-healthy when driven directly; its own click-path retest is blocked because selkies hasn't bound
-its data socket in 7/7 recent launch attempts (same crash class below, not a popup bug). Full
-candidate-by-candidate history, the unconfirmed Thunar-relayout lead, and the Terminal Emulator
-retest detail: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
+Streams fine, then selkies' stall-detector kills the data channel and the dashboard auto-reloads.
+Eight candidates investigated, seven refuted live; a real livelock-protection gap was found and
+fixed (`b6ddf43`) along the way. **Ninth candidate, write-side backpressure — root cause found and
+FIXED**: `_video_chunk_sender`'s `'primary'` branch sent via `websockets.broadcast()` (docstring:
+applies **no backpressure at all**) and computed each viewer's `backpressure_enabled` flag but
+never gated the send on it, unlike the parallel `'secondary'` branch — a falling-behind client's
+backlog could grow unbounded, queuing the next keepalive ping past `ping_timeout`. **Fixed**: gate
+the primary broadcast on `backpressure_enabled` plus a `transport.get_write_buffer_size()` check
+dropping frames past a 256KiB backlog (`SELKIES_VIDEO_BACKLOG_LIMIT_BYTES`-tunable). Canonical
+patch: `advisor/patches/selkies_primary_backpressure_patch.py` (committed); `.wfgy/webtop_stack.sh`
+applies an inline copy after `DBUS_UP`. **Partially live-verified 2026-09-16 (see "Backpressure fix
+partially verified" below): triggers/lifts correctly, `keepalive ping timeout` disconnect still
+happens anyway** — not fully closed. History: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
-**Ninth candidate, write-side backpressure -- sharper root cause found and FIXED this pass** (not
-yet live-verified, selkies' 0/7 binds blocked any boot). `_video_chunk_sender`'s `'primary'`
-branch (the only display mode a single-client webtop ever uses) sends via
-`websockets.broadcast()`, whose own docstring says it applies **no backpressure at all** -- and
-that branch computed each viewer's `backpressure_enabled` flag but never gated the send on it,
-unlike the parallel `'secondary'` branch which does. A falling-behind primary client's backlog
-could thus grow unbounded (up to the full 120-frame queue), queuing the next keepalive ping's
-bytes behind it past `ping_timeout`. **Fixed**: gate the primary broadcast on
-`backpressure_enabled` (closes the actual bug) plus a `transport.get_write_buffer_size()` check
-dropping frames past a 256KiB backlog (`SELKIES_VIDEO_BACKLOG_LIMIT_BYTES`-tunable) as a
-faster-reacting safety net. Canonical patch: `advisor/patches/selkies_primary_backpressure_patch.py`
-(committed); `.wfgy/webtop_stack.sh` applies an inline copy right after `DBUS_UP`, before selkies
-first launches -- idempotent, refuses to touch the file if it has drifted from the pinned block.
-**Verify once boots stabilize**: throttle host->browser bandwidth below encoder output for >20s
-(force an IDR mid-throttle); pre-fix `sk.log` shows `keepalive ping timeout` inside that window,
-post-fix watch for `Backpressure TRIGGERED for 'primary'` with no ping timeout while throttled.
-Full mechanism and citations: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
+**RESOLVED 2026-09-16: the python3 collision was a litebox host-side bug — fixed, live-verified,
+selkies now genuinely binds.** `WindowsUserland::new`'s startup `VirtualAlloc` reservation band was
+~999KiB short of real `python3.13`'s RW/BSS `PT_LOAD` ceiling; widened `0x600000`→`0x1000000`
+(`litebox_platform_windows_userland/src/lib.rs`). 9/9 clean repros post-fix vs. 10/10 collisions
+pre-fix. Arithmetic: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
-**RESOLVED 2026-09-16: the python3 collision was a litebox host-side bug, not Track B-only — fixed,
-live-verified, selkies now genuinely binds.** Track A cleared all four fork-without-exec daemons;
-four boot-reorder variants (up to n=10, 100% collision, "Absolute-first" with zero other guest
-forks) narrowed the collision partner to "the HOST RUNNER's own static layout at `0x67b0d0`" but
-didn't identify it. **Root cause**: `WindowsUserland::new`'s startup `VirtualAlloc(0x400000,
-MEM_RESERVE)` band (keeps a real Windows thread stack from squatting where non-PIE ELFs load) was
-sized `0x600000` (6MiB, tuned only to `gcc`'s ~`0x618000` need) — but real `python3.13` (`readelf -l`
-on the exact stock Debian `python3.13_3.13.5-2+deb13u4` binary, fetched and inspected directly, not
-the guest) has an RW/BSS `PT_LOAD` ending at `0x9eedb8+0x104f90=0xaf3d48`, ~999KiB *above* the old
-`0xa00000` ceiling — a real thread stack was free to land in that gap, and did, every time.
-**Fixed**: widened to `0x1000000` (16MiB, `0x400000..0x1400000`),
-`litebox_platform_windows_userland/src/lib.rs`. **Verified**: 9/9 clean runs of the absolute-first
-`/bin/sh -c 'exec /lsiopy/bin/python3 -c pass'` repro (0/9 collision vs. pre-fix 10/10), then a full
-`debian-xfce` webtop boot ran 380+s with zero python3 collisions (only the pre-existing, unrelated,
-already-harmless `gcc`/`cc1`/`/usr/bin/gcc` collisions fired, both resolved normally) and selkies
-genuinely bound and served a real client: `[sk] INFO:data_websocket:Data WebSocket connected from
-('10.0.0.2', ...)`, handled, cleaned up — the first live client connection this whole investigation
-has reached. **Not reached**: a real-browser retest of the backpressure fix
-(`advisor/patches/selkies_primary_backpressure_patch.py`) under throttled bandwidth, or the Terminal
-Emulator/menu click path — killed for RAM safety (7GB→2.6GB free) right after the connection proof.
-Evidence: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
+**RESOLVED 2026-09-16: video-never-arrives did NOT recur once the readiness-gate race fix was live —
+root cause was the race, not a separate capture bug.** Real browser client connected clean, full
+expected `sk.log` pipeline, genuinely live interactive XFCE desktop (Applications menu → Terminal
+Emulator opened within ~1-2s of a real remote click). **Terminal Emulator/Applications-menu click path
+independently confirmed healthy.**
+
+**Backpressure fix (`478e640`) partially verified — throttle works, targeted disconnect still happens
+anyway.** Live, unthrottled (organic desync): `Backpressure TRIGGERED for 'primary'. S:722, C:0
+(EffDesync:706.4f > Allowed:68.0f)` → `Backpressure LIFTED for 'primary'. S:722, C:722` — trigger/
+catch-up/lift all work. Seconds later, same client still dropped: `Data WS closed with error ...: sent
+1011 (internal error) keepalive ping timeout; no close frame received` — the exact failure mode
+`478e640` targeted, still reachable.
+
+**Retested 2026-09-16 (later session) with a genuinely foregrounded tab (`chrome-devtools`, not
+`claude-in-chrome`) — the Wake Lock candidate is REFUTED, but the disconnect still reproduces from a
+THIRD, distinct cause.** Live-confirmed the tab stayed real: `document.visibilityState` stayed
+`"visible"`, `document.hasFocus()` stayed `true`, zero `visibilitychange`/`blur` events fired for the
+whole session, and the console logged `Screen Wake Lock is active` with **no** `Could not acquire Wake
+Lock` error anywhere — the exact opposite of the prior session's capture, confirming that session's
+background-tab throttling was a real, now-controlled-out variable. Despite this, throttling the
+connection (`Slow 3G`, both directions) for the SAME client still produced the identical `keepalive
+ping timeout` disconnect — but with **no preceding `Backpressure TRIGGERED` line at all**, meaning
+`478e640`'s own mechanism (server video-queue backlog starving the ping) was never even engaged this
+time. Most likely cause: `Slow 3G` throttles bidirectionally, so the CLIENT's own 50ms ACK/keepalive
+traffic (upload direction) couldn't reach the server in time either — a network degraded enough to
+threaten tiny control-plane packets, not a video-backlog problem `478e640` was ever meant to cover.
+**Net read**: the original multi-session disconnect is very likely NOT the backgrounded-tab theory
+(refuted this pass) and is NOT proven to be `478e640`'s own residual gap either (this specific
+reproduction bypassed that code path) — a cleanly-isolated "throttle below encoder output but still
+comfortably above keepalive-packet size" repro is still needed to test `478e640` on its own terms; not
+completed this pass (time-boxed). Full methodology (the chrome-devtools coordinate-click technique
+used to drive the canvas with trusted input, since synthetic JS events are silently ignored by
+selkies' input path): `docs/AGENTS_ARCHIVE_2026-09-16.md`.
+
+**Port-8081-reconnect-forever bug: root-caused live, litebox's own socket lifecycle is CLEARED,
+mitigation applied but not fully closed.** `sk.log`: `OSError starting Data WS on port 8081: ...
+address already in use. Retrying in 5s...` looping forever after a disconnect, permanently wedging the
+session (no PRD needed — root-caused this pass). **litebox's own port-release-on-process-exit is
+proven correct**, not the cause: three separate live repros (`.wfgy/port_release_repro.sh`), each
+matching selkies' real crash shape (a foreground `cmd; rc=$?`-reaped process that dies without ever
+calling `close()`), including one holding a real ESTABLISHED accepted connection at the moment of
+death — every one let a brand-new process rebind the exact same port immediately, no delay. **Real
+cause, live-caught via the genuinely-foregrounded retest above**: this occurrence was NOT a crashed-
+then-respawned process at all (no `SELKIES_SUPERVISOR: attempt=N exited` line preceded it) — it was
+the SAME still-alive selkies process, whose original listening socket from early boot was still open
+and still accepting connections, while its own "full display reconfiguration" logic (triggered by a
+reloading/reconnecting client) tried to bind a SECOND Data WS server on the SAME port from the SAME
+process — an ordinary, correct `EADDRINUSE` (a process can't double-bind its own port), a **selkies
+application bug, not a litebox one**. **Fix applied** (`.wfgy/webtop_stack.sh`, gitignored):
+`selkies_supervisor.sh` now backgrounds selkies and publishes its pid to
+`/tmp/selkies_current_pid` (`wait "$pid"` afterward preserves identical `rc` semantics — zero added
+forks), and a new `selkies_bind_watchdog.sh` companion (launched the same forkless-exec way as the
+other supervisors) kills a process that is alive but shows a growing count of `OSError starting Data
+WS` lines in `sk.log` (3 ticks at 15s = ~45s) so the existing respawn logic gets a clean attempt — a
+curl-liveness first version was tried and **live-caught NOT firing** (the still-open original listener
+fooled a plain "does anything answer on the port" check), replaced with this direct log-symptom check.
+**Not fully closed**: the improved version's live end-to-end firing was not re-verified before this
+session's time budget ran out — treat as a real, reasoned mitigation, not a confirmed-closed bug.
+Transcript and the exact chrome-devtools trusted-input technique: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
+
+RAM: plateaued 2.0-2.9GB free through the sessions' combined 20+ min of use, never neared the 1.6GB
+floor, killed manually each time, recovered to 7.8-8.2GB free within seconds — consistent with "steep
+but bounded".
 
 ## Host-side crash machinery
 
@@ -279,28 +312,13 @@ merge. Host RAM identical before/after, no leaked processes.
 two children at high CPU with no progress for 5+ minutes, killed not root-caused -- follow-up needed
 before relying on `LITEBOX_PROCESS_FORK=1` for anything pipe-heavy.
 
-**Track B step 3 (fixed-base shared kernel heap) -- NOT started, needed next.** Immediate
-consequence for `RawMutex` itself: `waiters`/`remote_waiter_handles` are ordinary process-local
-`std::sync::Mutex`es only because `RawMutex` instances still live in per-process heap; once step 3
-lands they need to become POD/cross-process-safe (e.g. a fixed-size slot array under
-`xproc_sync::CrossProcessMutex`, not a `Vec` under `std::sync::Mutex`) -- deliberately not built
-yet, since it depends on step 3's allocator seam existing first. Concrete pointer-rich state that
-must move into the fixed-base shared section (`advisor/ADVISORY-002-d-zero-fork.md` §3.3, read
-before starting): two heap singletons behind a build-time bare-static ratchet --
-`LiteBoxX { platform, descriptors }` (`litebox/src/litebox.rs:112`, the fd table) and
-`GlobalState`'s 22 fields (`litebox_shim_linux/src/lib.rs:2243-2347` -- futex manager, pipes,
-network, pid/tid allocator, AF_UNIX address table, flock/pty/memfd registries, DRM, evdev, id
-counters), plus outside `GlobalState`: `DefaultFS`, the `shared_pending` signal queue, per-process
-fd tables. Two constraints the older design notes don't flag: (1) **trait-object vtables** --
-`DescriptorEntry`'s `Box<dyn FdEnabledSubsystemEntry>` vtable pointer is only valid cross-process
-if the runner loads at the SAME base; the runner has no `/DYNAMICBASE:NO`/`/FIXED` today (a
-`CreateProcess`-based clone would need one added -- cheap, `build.rs:28` already emits a similar
-link-arg), while `RtlCloneUserProcess` sidesteps this entirely (same image, same base, by
-construction -- an argument for clone over `CreateProcess`, independent of CoW/`MAP_SHARED`); (2)
-**reserve size/placement** -- no documented max reserved-section size or guaranteed
-collision-free high-VA band; place high in 64-bit space and verify at runtime, don't assume.
-Ordering after this per ADVISORY-002 §7: (iv) fd/HANDLE indirection, then relaxing the
-`beyond_stdio` fork-eligibility gate.
+**Track B step 3 (fixed-base shared kernel heap) -- NOT started, needed next.** `RawMutex`'s
+`waiters`/`remote_waiter_handles` stay ordinary process-local `std::sync::Mutex`es until this lands
+(then need to become POD/cross-process-safe, e.g. a fixed slot array, not a `Vec`) -- deliberately
+not built yet, pending step 3's allocator seam. Full pointer-rich state inventory (the two heap
+singletons that must move, the trait-object-vtable and reserve-placement constraints):
+`docs/AGENTS_ARCHIVE_2026-09-16.md`. Ordering after this per ADVISORY-002 §7: (iv) fd/HANDLE
+indirection, then relaxing the `beyond_stdio` fork-eligibility gate.
 
 ## Closed — do not re-attempt without a genuinely new approach
 
@@ -328,43 +346,14 @@ real host window. Not an open X11-vs-Wayland-vs-DRM question.
 
 ## Presenter-process split (`docs/presenter-process-design.md`) -- done, fully verified live end-to-end, 2026-09-16
 
-Built and committed: `litebox_presenter_protocol` crate (newline-delimited scanout/screenshot/
-show/hide/presenter?/key/rel/abs/ps/strace/frames grammar + named-pipe transport), runner-side
-`ControlServer` (`DuplicateHandle`-based zero-copy scanout handoff via a polling thread, not a
-flip-callback, so headless-with-no-observers stays as cheap as before), and
-`litebox-presenter.exe` (new crate, links only `litebox_platform_windows_userland::presentation`
-+ the protocol crate, zero shim/kernel dependency). `--gui` is now `Option<GuiMode>`
-(`--gui`/`--gui=hidden`; old `--gui-hidden` kept as a deprecated alias). `DrmSubsystem` gained
-`frame_seq` and `scanout_snapshot()` (a plain generic query, not a boxed flip callback -- can't
-carry `Platform::SharedMemoryHandle` across a trait object); `set_strace_summary_enabled` added.
-
-**Verified live, across two sessions** (release build, real named pipe, no test files): every
-control-pipe command headless and under `--gui=hidden`; `litebox-presenter.exe` spawn/respawn; a
-panic on a non-main thread no longer orphans a zombie presenter (process-wide panic hook added);
-scenario-1 byte-identical `LITEBOX_DUMP_FRAMES` regression against a real flip-producing guest
-(21 flips -> 21 `.bmp`, matching the 2026-09-05 baseline exactly); `show`/`hide`/`presenter?`
-against that same real-content guest, with a real visible `EnumWindows`-found window;
-kill-mid-display -> `screenshot` unaffected -> a follow-up `show` spawns a fresh presenter with
-its own visible window and current content within ~370ms (true respawn-and-resume).
-
-**One real bug found and fixed**: the first-ever `show` against a REAL content-producing guest made
-`litebox-presenter.exe` silently `exit(0)` -- every handle in `litebox_presenter_protocol::pipe` had
-`FILE_FLAG_OVERLAPPED` set but every `ReadFile`/`WriteFile` passed a NULL `OVERLAPPED`, unsound once
-more than one thread has I/O in flight on the same pipe object (exactly this module's `show`/`hide`
-design). Fixed via `pipe::overlapped_call` (a private per-call `OVERLAPPED` + manual-reset event for
-every I/O call). **Do not "fix" this by removing `FILE_FLAG_OVERLAPPED`** -- tried first, stops the
-crash, but deadlocks the write forever behind the permanently-pending read instead. Full
-verification/bisection narrative: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
-
-**Still open / pre-existing, not fixed this pass** (small, disclosed, unrelated to the crash above;
-full detail archived): `frames on <dir>` ignores the directory arg (ON/OFF toggle works, redirect
-doesn't); `ps` returns `ok 0` with a live guest process (`diag::PROCESS_TREE` gap, pre-existing, not
-caused by the split); `PrintWindow` capture of the presenter window is a partial-shape artifact
-(known DXGI-flip-model issue, not a regression -- the same-moment `screenshot` read the correct
-full-frame pixel count; don't chase via `PrintWindow`); disclosed deviation:
-`dump_frame_diagnostic`/`encode_bmp`/`count_pixel_stats` stay in
-`litebox_platform_windows_userland::presentation` rather than the runner crate per design §1.1
-(zero wgpu dependency, headless-never-touches-a-window already held).
+`litebox_presenter_protocol` crate + runner-side `ControlServer` (zero-copy scanout handoff) +
+`litebox-presenter.exe` (new crate, zero shim/kernel dependency); `--gui` is now `Option<GuiMode>`.
+Verified live across two sessions: every control-pipe command headless/`--gui=hidden`, spawn/respawn,
+byte-identical `LITEBOX_DUMP_FRAMES` regression, kill-mid-display respawn-and-resume within ~370ms.
+One real bug found and fixed: missing per-call `OVERLAPPED` made the first real `show` silently
+`exit(0)` (fixed via `pipe::overlapped_call`; do NOT fix by removing `FILE_FLAG_OVERLAPPED` — tried,
+deadlocks instead). Small disclosed pre-existing gaps unrelated to the crash (`frames on <dir>`,
+`ps` PROCESS_TREE, `PrintWindow` partial-shape). Full narrative: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 ## Docs and tooling map
 
