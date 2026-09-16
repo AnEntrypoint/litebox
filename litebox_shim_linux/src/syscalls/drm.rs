@@ -202,6 +202,21 @@ struct DumbBuffer<Platform: ShimPlatform> {
     map_offset: Option<u64>,
 }
 
+/// Returned by [`DrmSubsystem::scanout_snapshot`] -- the current front buffer's identity, for a
+/// host-side control channel (`docs/presenter-process-design.md` section 2) to duplicate the
+/// handle into an external presenter process. `pub`, not `pub(crate)`, so it can be re-exported
+/// at this crate's root and named by a runner crate outside `litebox_shim_linux`.
+pub struct ScanoutSnapshot<Platform: ShimPlatform> {
+    pub handle: Platform::SharedMemoryHandle,
+    pub size: usize,
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+    pub pixel_format: u32,
+    pub offset: u64,
+    pub seq: u64,
+}
+
 /// A framebuffer object: an attached (buffer handle, format, geometry) tuple, referenced by
 /// `fb_id` from `DRM_IOCTL_MODE_SETCRTC`/`PAGE_FLIP`.
 struct Framebuffer {
@@ -307,6 +322,16 @@ pub(crate) struct DrmSubsystem<Platform: ShimPlatform> {
         Platform,
         alloc::vec::Vec<alloc::boxed::Box<dyn Fn(&[u8], u32, u32, u32, u32) + Send + Sync>>,
     >,
+    /// Bumped on every successful [`Self::notify_flip_callback`] call (i.e. every `SETCRTC`,
+    /// `PAGE_FLIP`, and `DIRTYFB`), unconditionally -- registered no matter whether any
+    /// `flip_callbacks` observer exists, per `docs/presenter-process-design.md` section 2.2's
+    /// `ScanoutDescriptor::frame_seq` and section 4.3/4.4 ("something must always maintain it for
+    /// `screenshot`/`scanout` to have current data regardless of whether a presenter is
+    /// attached"). A plain incrementing counter, not a real vblank timestamp -- a presenter or
+    /// control-channel caller ([`Self::scanout_snapshot`]) polls this to know a new frame exists,
+    /// exactly like [`Self::next_vblank_sequence`] but host-readable outside this crate (mirrored
+    /// into a shared section by the runner, see the design doc's section 2.4).
+    frame_seq: core::sync::atomic::AtomicU64,
 }
 
 impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
@@ -328,7 +353,40 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             next_vblank_sequence: AtomicU32::new(0),
             is_master: core::sync::atomic::AtomicBool::new(false),
             flip_callbacks: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
+            frame_seq: core::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// A snapshot of the current front buffer's identity for a host-side control channel to hand
+    /// off to an external presenter process (`docs/presenter-process-design.md` section 2.2/2.3).
+    /// Reads the exact same `crtc_fb`/`framebuffers`/`buffers` bookkeeping
+    /// [`Self::notify_flip_callback`] already consults, but returns the platform's own
+    /// [`ShimPlatform::SharedMemoryHandle`] itself rather than mapping it and handing out bytes --
+    /// unlike [`Self::flip_callbacks`] (a `Box<dyn Fn>` that cannot carry this associated type
+    /// across a trait object, see that field's own doc comment), a plain generic method call from
+    /// a caller that already knows the concrete `Platform` type (the runner) has no such
+    /// limitation. `None` until the guest has attached a framebuffer to the CRTC at least once.
+    pub(crate) fn scanout_snapshot(&self) -> Option<ScanoutSnapshot<Platform>> {
+        let fb_id = (*self.crtc_fb.lock())?;
+        let framebuffers = self.framebuffers.lock();
+        let fb = framebuffers.get(&fb_id)?;
+        let buffers = self.buffers.lock();
+        let buffer = buffers.get(&fb.handle)?;
+        Some(ScanoutSnapshot {
+            handle: buffer.handle,
+            size: buffer.size,
+            width: fb.width,
+            height: fb.height,
+            pitch: buffer.pitch,
+            pixel_format: fb.pixel_format,
+            // Single-buffer dumb-buffer allocation: the whole section backs one buffer starting
+            // at byte 0 (see `create_dumb`). A future double-buffered upgrade (design doc section
+            // 2.2's own noted future step) is the only case that would ever make this non-zero.
+            offset: 0,
+            seq: self
+                .frame_seq
+                .load(core::sync::atomic::Ordering::Acquire),
+        })
     }
 
     /// Append a host-side frame observer -- see [`Self::flip_callbacks`]'s doc
@@ -619,6 +677,10 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     /// vanish, indistinguishable from "no presents happened" (see this fn's own fix history for
     /// the LYING INSTRUMENTS writeup this corrects).
     fn notify_flip_callback(&self, platform: &Platform, fb_id: u32) {
+        // Unconditional: see this field's own doc comment for why this must not be gated behind
+        // `callback_count == 0` the way the rest of this function is.
+        self.frame_seq
+            .fetch_add(1, core::sync::atomic::Ordering::Release);
         let callback_count = self.flip_callbacks.lock().len();
         litebox_util_log::debug!(callback_count:? = callback_count; "drm-diag: notify_flip_callback called");
         if callback_count == 0 && !drm_trace_enabled() {

@@ -53,6 +53,12 @@ pub mod syscalls;
 pub mod transport;
 mod wait;
 
+// `syscalls::drm` is `pub(crate)` (its ioctl surface is not meant to be called directly from
+// outside this crate), but `ScanoutSnapshot` -- the one type a runner's control channel needs --
+// is re-exported here at the crate root so it is nameable without exposing the rest of that
+// module. See `LinuxShim::drm_scanout_snapshot`.
+pub use syscalls::drm::ScanoutSnapshot;
+
 use crate::syscalls::file::get_file_descriptor_flags;
 
 pub type DefaultFS<Platform> = LinuxFS<Platform>;
@@ -557,6 +563,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         callback: impl Fn(&[u8], u32, u32, u32, u32) + Send + Sync + 'static,
     ) {
         self.0.drm.add_flip_callback(callback);
+    }
+
+    /// The current front buffer's identity (platform shared-memory handle plus geometry and
+    /// frame sequence number), for a host-side `ControlServer` to hand off to an external
+    /// presenter process -- see [`syscalls::drm::ScanoutSnapshot`] and
+    /// `docs/presenter-process-design.md` section 2.2/2.3. Unlike
+    /// [`Self::add_drm_flip_callback`], this is a plain on-demand query, not a per-flip observer:
+    /// a control channel calls it once when handling a `scanout` command, and again whenever it
+    /// wants to check whether the buffer identity changed (a mode change/reallocation) after
+    /// observing `seq` advance. `None` until the guest has attached a framebuffer to the CRTC at
+    /// least once.
+    pub fn drm_scanout_snapshot(&self) -> Option<syscalls::drm::ScanoutSnapshot<Platform>> {
+        self.0.drm.scanout_snapshot()
     }
 
     /// Push a real keyboard/mouse-button transition into the shim's `/dev/input/event0` queue --

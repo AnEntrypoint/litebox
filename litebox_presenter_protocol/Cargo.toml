@@ -1,0 +1,17 @@
+[package]
+name = "litebox_presenter_protocol"
+version = "0.1.0"
+edition = "2024"
+description = "Newline-delimited command/reply wire grammar and named-pipe transport shared by litebox_runner_linux_on_windows_userland (ControlServer) and litebox-presenter.exe, per docs/presenter-process-design.md section 3."
+
+[dependencies]
+windows-sys = { version = "0.60.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Pipes",
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+] }
+
+[lints]
+workspace = true
