@@ -317,6 +317,39 @@ One real bug found and fixed: missing per-call `OVERLAPPED` made the first real 
 deadlocks instead). Small disclosed pre-existing gaps unrelated to the crash (`frames on <dir>`,
 `ps` PROCESS_TREE, `PrintWindow` partial-shape). Full narrative: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
+## Five cheap-wins PRD rows closed, 2026-09-16 (all cargo build/fmt-verified, no boot needed)
+
+- `litebox-mm-unsafe-op-in-unsafe-fn-breaks-dwarnings`: `litebox/src/mm/mod.rs:1429-1524`'s 5
+  `make_pages_*` wrappers now call `change_page_permissions` inside explicit `unsafe{}` with SAFETY
+  comments. `RUSTFLAGS=-Dwarnings cargo build -p litebox` clean. Commit `d336d94`.
+- `litebox-common-linux-not-rustfmt-clean`: ran `cargo fmt -p litebox_common_linux` (5 pre-existing
+  diffs: `src/lib.rs:2276,4378,4896`, `src/mm.rs:67,188`). `-- --check` now clean. Commit `30a3392`.
+- `litebox-shim-linux-cfg-test-build-broken`: `Task::pid/ppid/tid`'s move to `Cell<i32>` was never
+  propagated into `#[cfg(test)]` call sites in `syscalls/process.rs`, `syscalls/epoll.rs`, `lib.rs`'s
+  `clone_as_forked_child_for_test` (21 errors: missing `.get()`, one moved-out non-`Copy` `Cell`, one
+  `Arc::downgrade(self.process())` needing `&`). Fixed; `cargo build --tests -p litebox_shim_linux`
+  now compiles clean, unblocking this crate's whole regression-test suite. Commit `8e70c81`.
+- `repo-hygiene-violations-contradict-the-standing-lesson`: `target/` was never actually tracked
+  (the original claim didn't reproduce), but `git ls-files` found 10 real violations -- probe frame
+  dumps/debug logs (`advisor/probes/baseline_xorg_pid1_black.bmp`, `endpoint2-painted-pixels/
+  frame{03,05,09}_*.bmp`, `xorg-fork-segv/{X5-fork-segv,x1-pid1-control}.log`) plus root scratch
+  files (`scratch2.txt`, `scratch_window.txt`, `scratchpad_labwc_{final,xkbfix}.png`). Untracked via
+  `git rm --cached` (kept on disk, two are cited as evidence in `advisor/probes/README-x-client-test.md`
+  and `dirtyfb/DESIGN.md`); `.gitignore` widened (`advisor/probes/**/*.bmp`, `**/*.log`, `/scratch*`).
+  Also deleted 3 stray untracked `*.stackdump` droppings. Commits `a4d4759`, `a37773d` (a shared-worktree
+  `git add -A` race with a concurrent session transiently re-added these files in `30a3392` between
+  the two commits; `a4d4759` corrected it without a history rewrite -- verified via `git ls-files`:
+  zero matches for any of the 10 paths at current HEAD).
+- `windows-reserve-and-commit-64kib-granularity-noaccess-flanks`: `reserve_and_commit`
+  (`litebox_platform_windows_userland/src/lib.rs`) leaves up to ~60KiB reserved-but-uncommitted on
+  each side of a caller's unrounded range inside a 64KiB granule. Both proposed fixes are unsafe/
+  impossible: committing the flanks would break the documented neighbour-sharing invariant CoW flank
+  restoration relies on; shrinking the reservation can't work since Windows requires a granularity-
+  aligned `MEM_RESERVE` base. Live-verified via a standalone VirtualAlloc/VirtualQuery probe
+  (replicating the exact reserve/commit shape) that the flank is already the wanted guard: State stays
+  `MEM_RESERVE` and touching it raises an uncatchable access violation, not silent/zero-filled access.
+  No behavior change; documented as intentional in the function's own doc comment. Commit `936714f`.
+
 ## Docs and tooling map
 
 - **Archives** — `docs/AGENTS_ARCHIVE_2026-09-16.md` (popup-menu re-test, `spawn_exec_collision_child`
