@@ -231,18 +231,13 @@ despite the `--env` flag being passed correctly — genuinely ADVISORY-001 §3N 
 `webtop_stack.sh` now also exports the tunables directly for every child selkies forks; **not yet
 re-verified crash-free over many cycles** (the ACK-stall-kill below dominates the symptom in practice).
 
-**2026-09-16: `GLIBC_TUNABLES` propagation through `spawn_exec_collision_child` has NO gap — live-proven
-via a new permanent diagnostic (`lib.rs`'s `glibc_tunables_forwarded` warn line) — and the recurring
-crash class is a genuinely SECOND, different corruption signature under heavy fork load (`double free or
-corruption (out)` → SIGABRT, not §3N's original `REVEAL_PTR` XOR SIGSEGV), not a propagation regression
-from `42d8ced`.** Confirmed forwarded `true` on every collision including the critical
-`path=/lsiopy/bin/python3` selkies case, then watched the crash happen anyway ~2 minutes later on the
-SELKIES_SUPERVISOR subshell. Conclusion: the tunables do their documented job and reach every process
-correctly; the new signature hits the unsorted/small/large-bin paths they deliberately leave enabled,
-meaning litebox's own pointer-relocation fork-healing doesn't reliably heal every plain `fd`/`bk` pointer
-either under this much concurrent fork pressure. **This is Track B territory (`ADVISORY-002-d-zero-fork.md`),
-not a tunable-coverage gap** — do not re-attempt a `GLIBC_TUNABLES`/env fix here without new evidence of a
-THIRD mechanism. Full evidence: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
+**2026-09-16: `GLIBC_TUNABLES` propagation through `spawn_exec_collision_child` has NO gap** (live-proven
+via `lib.rs`'s `glibc_tunables_forwarded` diagnostic — `true` on every collision including
+`path=/lsiopy/bin/python3`) — **the recurring crash is a SECOND, different corruption signature under
+heavy fork load** (`double free or corruption (out)` SIGABRT, not §3N's `REVEAL_PTR` XOR SIGSEGV), hitting
+the unsorted/small/large-bin paths the tunables deliberately leave enabled. **Track B territory, not a
+tunable-coverage gap** — do not re-attempt a `GLIBC_TUNABLES`/env fix without evidence of a THIRD
+mechanism. Full evidence: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 ### The ACK-stall-kill — root cause still unidentified after ten investigations, the one genuinely open bug in this project
 
@@ -281,18 +276,27 @@ diagnosed reason, not RAM** — 2 boots, ~26 min combined, RAM healthy 4-9GB fre
 real `502` (`ws://localhost:3000/websockets` refused to selkies' own port), confirming no stream was ever
 up to click into. Full detail: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
-**Track A fork-without-exec audit (ADVISORY-002 §6): crash-frequency measured, root-caused to the watchdog's
-own cap, confirmed not a bug.** Supervisor subshells fixed; dbus-daemon/nginx/xfsettingsd/Thunar cleared —
-all four Track A daemons closed. But selkies crashed `SIGSEGV`/`rc=139` on 6/7 attempts at a consistent
-**~120s** interval, 0/7 binds. **2026-09-16 later: direct causal log line (not timing correlation), live
-twice** — `spawn_exec_collision_child`'s 120s absolute cap fires on selkies' python3 collision, its
-existing fallback SIGSEGVs the guest thread 0.13s later, exactly the guest's own `SELKIES_SUPERVISOR:
-attempt=N exited rc=139`. **Not the fix misdiagnosing a slow-but-live recovery**: the cap firing (not the
-20s stall-grace) proves the nested child WAS making periodic CPU progress, yet structurally cannot succeed
-— a separate OS process with no shared AF_UNIX/loopback namespace to the original guest's Xvfb/D-Bus
-(`lib.rs:10100-10128`; same gap as `fork-fs-veh-2026-09-08.md:128-144`). Raising the cap only prolongs an
-already-guaranteed failure. **No code change made, none warranted** — real fix stays Track B. Evidence:
-`docs/AGENTS_ARCHIVE_2026-09-16.md`.
+**Track A fork-without-exec audit (ADVISORY-002 §6): crash-frequency measured, root-caused to
+`spawn_exec_collision_child`'s own 120s absolute cap firing on selkies' python3 collision — confirmed not
+a bug, not a watchdog regression.** All four Track A daemons (dbus-daemon/nginx/xfsettingsd/Thunar)
+cleared; selkies itself: 0/7 binds, `SIGSEGV`/`rc=139` on 6/7 at a ~120s cadence — a direct causal log
+line (not correlation) proves the nested recovery child makes real CPU progress yet structurally cannot
+succeed (no shared AF_UNIX/D-Bus namespace to the original guest). Raising the cap only prolongs an
+already-guaranteed failure; real fix stays Track B. Full mechanism: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
+
+**2026-09-16, later still: ET_EXEC directly confirmed (not assumed) — real Debian `python3.13`, no PIE
+swap-in exists, boot-reorder mitigation tried and insufficient.** Live `readelf -h` on the guest's actual
+interpreter (`/lsiopy/bin/python3` → `/usr/bin/python3` → `python3.13`) shows `Type: EXEC`, entry
+`0x67b0d0` — genuinely non-PIE, and the stock dpkg `python3.13 3.13.5-2+deb13u4` package, not a custom
+lsiopy build as previously assumed. No alternate PIE python3 exists anywhere in the image to swap in, and
+patching `ET_EXEC`→`ET_DYN` in place isn't viable without a full source rebuild — both ruled out live, not
+assumed. Moved selkies' launch earlier in `.wfgy/webtop_stack.sh` (before startwm.sh) two ways; both
+insufficient — **new finding: concurrent fork PRESSURE from another active subsystem (not just cumulative
+history) drives the collision rate** (launch-only made it WORSE, 6/6 respawns collided once it raced
+xfce4-session's own fork tree; gating on selkies binding first, 260s bounded, still didn't get a clean
+bind in the one Xvfb-up boot obtained). Net 0/2 XVFB-up boots reached `Data WebSocket Server listening`
+this pass; Terminal Emulator retest still blocked. **Confirms Track B is the only real fix at this
+layer.** Reorder kept (harmless) but not claimed as a fix. Full detail: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 ## Host-side crash machinery
 
