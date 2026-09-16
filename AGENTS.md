@@ -268,13 +268,31 @@ cause with the open `fork-verify-av-path-stale-rip-bypasses-single-step-heal` ro
 `process-fork-pipe-relay-sigpipe-above-4kb` resolved (redirected); don't rely on
 `LITEBOX_PROCESS_FORK=1` for heavy-iteration guests. Methodology: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
-**Track B step 3 (fixed-base shared kernel heap) -- NOT started, needed next.** `RawMutex`'s
-`waiters`/`remote_waiter_handles` stay ordinary process-local `std::sync::Mutex`es until this lands
-(then need to become POD/cross-process-safe, e.g. a fixed slot array, not a `Vec`) -- deliberately
-not built yet, pending step 3's allocator seam. Full pointer-rich state inventory (the two heap
-singletons that must move, the trait-object-vtable and reserve-placement constraints):
-`docs/AGENTS_ARCHIVE_2026-09-16.md`. Ordering after this per ADVISORY-002 §7: (iv) fd/HANDLE
-indirection, then relaxing the `beyond_stdio` fork-eligibility gate.
+## Fixed-base shared kernel heap (Track B step 3, ADVISORY-002 §3.3) -- LANDED, single-process-verified
+
+`SLAB_ALLOC` (`#[global_allocator]`) now backs EVERY host-heap allocation with one 8 GiB
+pagefile-backed section mapped at a fixed address (`SHARED_KERNEL_HEAP_BASE = 0x7FF8_0000_0000`,
+32 GiB above `HOST_ALLOCATOR_REGION_MIN`, left unchanged as the guest `Vmem` boundary);
+`WindowsUserland::alloc` bump-allocates sub-ranges of that one mapping. This moves `LiteBoxX`/
+`GlobalState`/`DefaultFS`/per-process fd tables (already ordinary `Box`/`Arc`-backed global-allocator
+values) into the shared section for free, no per-field rewrite, no nightly `allocator_api` needed.
+Two real bugs found+fixed live (a panic-in-allocator livelock; `MapViewOfFile3`+
+`MEM_ADDRESS_REQUIREMENTS` = invalid combo, `ERROR_INVALID_PARAMETER`): mechanism, repro/fix, and
+3-tier verification (cheap repro, heavy stress repro, full `webtop_stack.sh` to `DE_UP` holding
+580+s, zero crashes, ~8.6GB private mem) in `docs/AGENTS_ARCHIVE_2026-09-16.md`.
+
+**Not re-triggered this session** (disclosed, not guessed): the browser-reported terminal-emulator
+`/bin/sh` SIGABRT needs driving the live desktop via selkies' canvas stream; not attempted this pass
+(low-reliability for the effort). Expected: step 3 alone doesn't change which fork path a shell
+takes -- that's step 4 (`beyond_stdio` gate).
+
+**Remaining before step 4** (detail: archive): `RawMutex`'s `waiters`/`remote_waiter_handles` still
+process-local `Vec`s, need POD/fixed-slot; `DescriptorEntry`'s `Box<dyn FdEnabledSubsystemEntry>`
+vtable is cross-process-invalid without same-base loading, deliberately deferred (no
+`/DYNAMICBASE:NO` added) per the advisory's own step ordering; no second process has actually
+mapped the shared section yet (this pass is single-process only); fd/HANDLE indirection and
+`beyond_stdio` itself both unstarted (§7 items iv, v). Host memory fully recovered after every kill
+this session, no leaked processes at session end.
 
 ## Closed — do not re-attempt without a genuinely new approach
 

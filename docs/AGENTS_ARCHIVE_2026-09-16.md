@@ -2118,3 +2118,158 @@ zero matches afterward). The 10.9GB `.dump /ma` full-memory dump (`.wfgy/xorg_fr
 scratch) was deleted after extracting the register/disassembly evidence above; host disk was at 41GB free of
 1.9TB (98% used) at delete time, host RAM 7.1GB free of 15.6GB total at session end -- worth flagging to a
 future session as a standing low-disk-headroom condition, not something this session caused.
+
+## Fixed-base shared kernel heap (Track B step 3, ADVISORY-002 §3.3): full mechanism, both bugs, full verification (2026-09-16, later session)
+
+Compacted out of the main AGENTS.md entry for space; that entry keeps the LANDED/verified summary
+and the step-4 remaining-work list, this is the internals and repro/fix detail a maintainer needs.
+
+**Design decision and why it was made.** The advisory frames this step as migrating `LiteBoxX`,
+`GlobalState`'s 22 fields, `DefaultFS`, `shared_pending`, and per-process fd tables into a
+fixed-base shared section, and calls it "likely the largest, most mechanical part of the work --
+go field by field." That framing implicitly assumes a SECOND, narrower allocator instance that
+only those specific types opt into -- which on stable Rust requires `Box::new_in`/`Vec::new_in`/
+`BTreeMap::new_in` and the nightly-only `allocator_api` feature (confirmed: `rust-toolchain.toml`
+pins `channel = "stable"`, and a repo-wide grep found zero `#![feature(...)]` anywhere). Since
+every one of those types (`LiteBoxX`, `GlobalState`, `LinuxFS` aka `DefaultFS`, the per-process fd
+`Descriptors` table, `shared_pending`'s `Arc<Mutex<...>>`) is ALREADY an ordinary heap value
+allocated via the process's one `#[global_allocator]` like literally everything else in the
+process, the simpler and stable-Rust-compatible move is to make THAT ONE ALLOCATOR's backing
+store the fixed shared section -- which is exactly what the advisory's own "seam exists and is
+the right one: `#[global_allocator] static SLAB_ALLOC`" sentence points at. This gets every one of
+those structs into the shared section with zero type-level changes, at the cost of the ENTIRE
+process heap (not just kernel state) now living in one 8 GiB reservation -- judged an acceptable
+tradeoff given the section is pagefile-backed (lazy commit) and 8 GiB is far above this process's
+observed real usage (see the webtop boot's ~8.6 GB private / ~5.2 GB resident figures below, which
+already include a full XFCE desktop).
+
+**The seam.** `litebox/src/mm/allocator.rs`'s `SafeZoneAllocator<ORDER, M: MemoryProvider>` calls
+`M::alloc(&layout)` only when its buddy/slab allocators are out of memory (a rescue callback), and
+`M::free` is never called anywhere in that file (confirmed by grep) -- freed pages return to
+`LockedHeapWithRescue`'s own internal free list, never back to the host. `WindowsUserland`'s
+`MemoryProvider` impl (`litebox_platform_windows_userland/src/lib.rs`, the `SLAB_ALLOC`'s `M`)
+previously called `VirtualAlloc2` fresh on every such rescue, constrained only to
+`LowestStartingAddress: HOST_ALLOCATOR_REGION_MIN` (`0x7FF0_0000_0000`) with no upper bound -- i.e.
+a FLOATING region, OS-placed within that lower bound, different in principle across processes.
+
+**The new mechanism.** `SHARED_KERNEL_HEAP_BASE = 0x7FF8_0000_0000` (32 GiB above
+`HOST_ALLOCATOR_REGION_MIN`, chosen for headroom, not proven collision-free -- verified at runtime
+instead, see below) and `SHARED_KERNEL_HEAP_SIZE = 8 GiB`. `init_shared_kernel_heap()` runs once,
+lazily, on the process's first-ever host allocation (guarded by a raw 3-state atomic --
+`_UNINIT`/`_INITIALIZING`/`_READY` -- CAS loop, no `OnceLock`/`Mutex`, matching the file's existing
+`DIAG_ALLOC_ENABLED_CACHE` precedent for the same "can run before any allocating primitive is
+safe" constraint): `CreateFileMappingW(INVALID_HANDLE_VALUE, ..., PAGE_READWRITE, size=8GiB)`
+creates a pagefile-backed section (no real file; only commits pagefile lazily on first touch), then
+`MapViewOfFile3(section, GetCurrentProcess(), SHARED_KERNEL_HEAP_BASE, 0, 8GiB, 0, PAGE_READWRITE,
+null, 0)` maps the WHOLE reservation in one call. `WindowsUserland::alloc` (now, for every
+subsequent call) just bump-allocates: an `AtomicUsize` cursor starting at
+`SHARED_KERNEL_HEAP_BASE`, advanced by `compare_exchange_weak` per call, returning `None`
+(ordinary allocator OOM) if the cursor would exceed the reservation. `free` is a documented no-op
+(matches its already-dead status -- see above -- and would be unsound to implement as a real
+per-range release regardless, since only `UnmapViewOfFileEx` of the WHOLE view is valid, not an
+arbitrary sub-range of it).
+
+**Bug 1: panic-in-allocator livelock (found and fixed live, this session).** The first
+implementation used `assert!(cond, "...{}...", GetLastError())` on the `CreateFileMappingW`/
+`MapViewOfFile3` failure paths. This is unsafe specifically on this code path: `SLAB_ALLOC` is
+`#[global_allocator]`, so a panic's message FORMATTING (needed because the message interpolates
+`GetLastError()`) can recurse into this very allocator to allocate the formatted string --
+exactly the hazard `diag_alloc_enabled`'s own doc comment already documents for `eprintln!`/
+`format!` on this same code path. Because `SHARED_KERNEL_HEAP_STATE` is still `_INITIALIZING` (not
+yet `_READY`) at the moment of failure, that reentrant `alloc()` call takes the
+`if state != READY { init_shared_kernel_heap() }` branch AGAIN on the SAME thread, hits
+`compare_exchange(UNINIT, INITIALIZING)` which now fails with `Err(_INITIALIZING)` (not `UNINIT`,
+since the outer call already claimed it), and falls into the `spin_loop()` retry branch --
+forever, since the ONE thread that could ever advance the state to `_READY` is the one now stuck
+spinning on its own reentrant call. Symptom, live-observed before the fix: the cheap
+`debian:stable-slim` repro (normally ~2s) hung 30+s with ZERO output on stdout/stderr, host CPU
+climbing steadily (325s -> 697s of accumulated CPU time over ~10 minutes wall-clock, consistent
+with a tight spin) while `WorkingSet64` stayed flat at ~5.9 MB (consistent with the process never
+getting past its very first allocation). **Fix**: replaced both `assert!`s with the file's own
+established allocation-free-diagnostic pattern -- `diag_raw_print` (fixed-size stack buffers, raw
+`WriteFile` to stderr, already used elsewhere in this file for VEH/crash diagnostics) followed by
+`std::process::abort()` (does not go through Rust's panic/unwind machinery at all, so it cannot
+invoke a panic hook or format anything -- confirmed non-recursing by construction, not just by
+testing).
+
+**Bug 2: `MapViewOfFile3` + `MEM_ADDRESS_REQUIREMENTS` = `ERROR_INVALID_PARAMETER` (found and
+fixed live, this session, immediately after fixing bug 1 surfaced a real diagnostic instead of a
+hang).** The first implementation copied `copy_one_group`'s (`process_fork.rs`) `VirtualAlloc2`
+pattern verbatim: an exact-fit `MEM_ADDRESS_REQUIREMENTS` window
+(`LowestStartingAddress`==`SHARED_KERNEL_HEAP_BASE`, `HighestEndingAddress`==`base+size-1`) passed
+as an extended parameter ALONGSIDE an explicit non-null `BaseAddress` argument to `MapViewOfFile3`.
+Live result once bug 1's fix let the real error surface: `win32_err=0x57`
+(`ERROR_INVALID_PARAMETER`) on every attempt, `landed=0x0`. Root cause: `MapViewOfFile3` (unlike
+`VirtualAlloc2`) does not accept a non-null `BaseAddress` combined with a `MEM_ADDRESS_REQUIREMENTS`
+extended parameter -- confirmed by re-reading this file's OWN already-working `map_shared_memory`/
+`try_allocate_cow_pages` functions, whose shared `try_map` closure pattern only ever attaches
+`MEM_ADDRESS_REQUIREMENTS` on the branch where `base_addr` is NULL (letting the OS choose within a
+bounded range); the branch with an explicit non-null hint address passes NO extended parameters at
+all. **Fix**: pass `SHARED_KERNEL_HEAP_BASE` directly as `MapViewOfFile3`'s `BaseAddress` with
+`pParameters: null, ParameterCount: 0` -- a non-null explicit `BaseAddress` already gives the
+"lands exactly there or fails" guarantee needed, no extended parameter required. After this fix,
+`init_shared_kernel_heap` succeeded on every subsequent boot attempt this session (cheap repro,
+stress repro, full webtop boot).
+
+**Verification, in order, same session, release build (`cargo build --release --bin
+litebox_runner_linux_on_windows_userland`, clean except pre-existing unrelated warnings):**
+
+1. `cargo check -p litebox_platform_windows_userland --target x86_64-pc-windows-msvc` -- clean.
+2. Cheap repro (`--oci-image docker.io/library/debian:stable-slim -- /bin/bash -c 'echo
+   HELLO_FROM_GUEST; ls /; echo DONE'`, run via PowerShell `& ... *> log`, NOT Git Bash -- see
+   AGENTS.md's own standing PowerShell-vs-Git-Bash path-mangling gotcha, hit once this session
+   too, `ENOENT` on `bash` before switching): exit 0, `HELLO_FROM_GUEST`/`ls`/`DONE` all present.
+3. Heavy multi-threaded stress repro, the exact one Track B step 2's `RawMutex` verification used
+   (`--env GLIBC_TUNABLES=... -- /bin/bash -c 'seq 1 3000000 | sort --parallel=4 -n | tail -3'`):
+   exit 0, exact correct output `2999998`/`2999999`/`3000000` -- proves the new bump allocator (an
+   `AtomicUsize` CAS loop under real concurrent multi-threaded alloc/dealloc pressure from `sort`'s
+   own pthread mutex/condvar contention) has no correctness gap the old per-call `VirtualAlloc2`
+   design didn't also not have.
+4. **Full real `webtop_stack.sh` boot**, exact command: `& .\target\release\litebox_runner_linux_on_windows_userland.exe
+   -Z --env GLIBC_TUNABLES=glibc.malloc.tcache_count=0:glibc.malloc.mxfast=0 --oci-image
+   docker.io/linuxserver/webtop:debian-xfce --resume-from .wfgy\webtop_stack_seed_fixed.tar
+   --publish 3000:3000 -- /bin/sh -c "echo GUESTSTART; /bin/sh /config/webtop_stack.sh" *>
+   .wfgy\sharedheap_boot2.combined.log`, run via PowerShell in the background, polled via a Bash
+   `until`-style loop reading the log file. Reached, in order, exactly the milestones a known-good
+   boot reaches: `NGINX_CONFIGURED`/`NGINX_STARTED`/`NGINX_SELFTEST http_code=200`, `XVFB_UP`,
+   `DBUS_UP`, `SELKIES_BACKPRESSURE_PATCH_STAGE_DONE`/`PATCH_MARKER_CHECK count=2`,
+   `SELKIES_LAUNCHED_LAST`, `SELKIES_BIND_WATCHDOG_STARTED`, `SELKIES_PORT_UP`, `DE_LAUNCHED (image
+   startwm.sh)`, `DE_UP via startwm.sh`, then held stable through `HOLD t=20s` .. `HOLD t=580s`
+   with **zero** occurrences anywhere in the log of `panic`, `SIGABRT`, `SIGSEGV`, `double free`, or
+   `corruption`. `Get-Process` on the real guest-hosting pid (distinct from a small ~6MB wrapper
+   pid) showed `PrivateMemorySize64 = 8,653,471,744` (~8.06 GiB -- consistent with real allocation
+   through the new 8 GiB shared heap, plus other private-but-not-global-allocator memory such as
+   the guest's own `Vmem`-backed pages and thread stacks) and `WorkingSet64 = 5,241,225,216` (~4.88
+   GiB resident), `TotalProcessorTime` climbing across `{6012, 4464, 12240, 17272, ...}` (many real
+   threads) -- a genuinely heavy, long-running, multi-gigabyte, many-thread desktop workload
+   handled correctly end to end by the new allocator. Killed cleanly via `Stop-Process -Force`
+   once this evidence was gathered (rather than let it run indefinitely); `Get-Process` confirmed
+   zero litebox processes remained after the kill. Host `FreePhysicalMemory` was 2.49 GB of 15.6 GB
+   total mid-boot (expected for a full XFCE desktop on this host) and recovered fully after the kill.
+
+**Not attempted this session, disclosed honestly**: re-triggering the specific browser-reported
+"Terminal Emulator opens blank, `/bin/sh` SIGABRTs with `double free or corruption (out)`"
+symptom. This needs either driving the live desktop through selkies' canvas video stream
+(Applications menu -> Terminal Emulator -- a real click-through against a streamed/encoded canvas,
+which this session judged unreliable-to-calibrate blind relative to the value it would add for
+THIS dispatch) or finding some other live-interactive-equivalent repro; no way was found to inject
+a follow-on command into an already-booted `webtop_stack.sh` session, since that script's own tail
+is an unconditional `HOLD`/wait loop that never returns control to a chained shell command. Per
+this dispatch's own explicit framing, this is expected and not a failure of step 3: the specific
+shell spawn still goes through the SAME thread-based relocating fork today regardless of the new
+allocator, because nothing routes it through the cross-process fork path until step 4 (relaxing
+`beyond_stdio`) lands -- any real guest process holding so much as one fd past stdio (which a
+terminal-emulator-spawned interactive shell inside a PTY certainly does) falls through that gate
+exactly as it did before this session's change.
+
+**Concrete next-session pickup points, in order**: (1) start real cross-process plumbing --
+duplicate the shared section's `HANDLE` into `spawn_cross_process_fork_child`'s target process
+(the presenter-split/`RawMutex` sessions already proved cross-process `DuplicateHandle`/section
+sharing work on this host), map it at the SAME `SHARED_KERNEL_HEAP_BASE` there, and verify
+byte-identical contents from both sides (the `xproc_mutex_probe.c` cross-process-read pattern is
+the template). (2) Make `RawMutex`'s `waiters`/`remote_waiter_handles` POD/fixed-slot so a
+`RawMutex` instance living IN the shared section (not just backed by shared-section memory, which
+it already is transitively via the allocator, but genuinely usable cross-process) works. (3)
+Decide and implement the trait-object-vtable answer for real (either the `/DYNAMICBASE:NO` link
+arg, or defer fully to `RtlCloneUserProcess`). (4) Only then does relaxing `beyond_stdio` become
+meaningful, per ADVISORY-002 §7's own ordering.
