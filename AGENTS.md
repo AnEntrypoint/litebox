@@ -277,13 +277,19 @@ output, proving `sort`'s real multi-threaded pthread mutex/condvar contention (g
 which this trait backs) completes correctly: no hang, no deadlock, no missed wakeup, no corrupted
 merge. Host RAM identical before/after, no leaked processes.
 
-**3-stage-pipeline finding: re-investigated 2026-09-16, NOT reproduced under a clean invocation.**
-`echo hello | cat | wc -c` under `LITEBOX_PROCESS_FORK=1` (PowerShell `&`/`*>`, never
-`Start-Process`/`Start-Job`): all 3 stages cross-process, exited clean, correct output in ~5.4s.
-`spawn_fork_child_pipe_pump`'s Source-bridge `owners()` wait audited and found sound. One
-`Start-Job`-launched attempt DID hang (shaped differently from the original report) but is an
-environment artifact, not reproduced correctly-invoked. Heavier `seq | sort -n | tail -3` is
-UNTESTED (runner busy) -- retest before closing. Trace: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
+**3-stage-pipeline finding: root-caused further 2026-09-16 -- real, size-dependent bug, likely the
+SAME gap the original "spins at high CPU" report hit.** `echo hello | cat | wc -c` (6 bytes) under
+`LITEBOX_PROCESS_FORK=1` completes cleanly. `seq 1 200000 | sort -n | tail -3` (~1.2MB) does NOT:
+`seq` is `SIGPIPE`-killed after exactly one 4096-byte relay chunk. Evidence: the child-side relay
+pump (`litebox_runner_linux_on_windows_userland/src/lib.rs` ~1669-1711, distinct from the platform
+crate's parent-side `spawn_fork_child_pipe_pump`) logs `pipe pump (child, fd N): stream ended
+(n=4096)` -- `write_all_to_inherited_handle` FAILED (not `n==0`), meaning the parent's real OS pipe
+read handle for that hop was already gone. Exact mechanism NOT nailed down (a 4-hop relay per fd:
+child's local pipe -> real OS pipe -> parent `Sink` pump -> in-process buffer -> parent `Source`
+pump -> another real OS pipe -> next child -- too many candidate closure points to patch blindly);
+no speculative fix applied. PRD `process-fork-3stage-pipeline-heavier-shape-retest`. Do not rely on
+`LITEBOX_PROCESS_FORK=1` for a pipeline carrying >~4KB through a middle stage until fixed. Trace:
+`docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 **Track B step 3 (fixed-base shared kernel heap) -- NOT started, needed next.** `RawMutex`'s
 `waiters`/`remote_waiter_handles` stay ordinary process-local `std::sync::Mutex`es until this lands
