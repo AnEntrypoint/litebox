@@ -243,15 +243,16 @@ output, proving `sort`'s real multi-threaded pthread mutex/condvar contention (g
 which this trait backs) completes correctly: no hang, no deadlock, no missed wakeup, no corrupted
 merge. Host RAM identical before/after, no leaked processes.
 
-**3-stage-pipeline finding: root-caused further 2026-09-16 -- real, size-dependent SIGPIPE, likely the
-SAME gap the original "spins at high CPU" report hit.** `echo hello | cat | wc -c` (6 bytes) completes
-cleanly under `LITEBOX_PROCESS_FORK=1`; `seq 1 200000 | sort -n | tail -3` (~1.2MB) does not -- `seq`
-is SIGPIPE-killed after exactly one 4096-byte relay chunk (`write_all_to_inherited_handle` FAILED, not
-`n==0`: the parent's real OS pipe read handle for that hop was already gone). Exact mechanism not
-nailed down (a 4-hop relay per fd, too many candidate closure points to patch blindly); no speculative
-fix applied. PRD `process-fork-3stage-pipeline-heavier-shape-retest`. Do not rely on
-`LITEBOX_PROCESS_FORK=1` for a pipeline carrying >~4KB through a middle stage until fixed. Trace:
-`docs/AGENTS_ARCHIVE_2026-09-16.md`.
+**3-stage-pipeline SIGPIPE: relay EXONERATED 2026-09-16; fault is upstream in guest execution
+correctness, not the relay.** `seq 1 200000 | sort -n | tail -3` under `LITEBOX_PROCESS_FORK=1`
+needed the `VEH_FRAME_STRIDE` fix below just to reach this repro. Every `CloseHandle` site in both
+pumps, instrumented across ~9 live runs, showed `total_read == total_written` every time -- the relay
+never misbehaves. `seq` stops early instead: once a real `SIGPIPE` (the original report), other times
+a silent clean exit with truncated output (`13300/13301/13302`, not `199998/199999/200000`). Only the
+5000-line repro completes correctly (4/4); 200000-line never has, 9/9 attempts. Likely shares root
+cause with the open `fork-verify-av-path-stale-rip-bypasses-single-step-heal` row. PRD
+`process-fork-pipe-relay-sigpipe-above-4kb` resolved (redirected); don't rely on
+`LITEBOX_PROCESS_FORK=1` for heavy-iteration guests. Methodology: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 **Track B step 3 (fixed-base shared kernel heap) -- NOT started, needed next.** `RawMutex`'s
 `waiters`/`remote_waiter_handles` stay ordinary process-local `std::sync::Mutex`es until this lands
@@ -270,7 +271,11 @@ after (two follow-up commits; mechanism: archive). **`veh-frame-stride-has-no-ov
 2026-09-16**: `VehFrameCanaryGuard` (`litebox_platform_windows_userland/src/lib.rs`, right above
 `vectored_exception_handler`) stamps a canary above the next nesting level's slice floor and checks it
 on `Drop`, `RaiseFailFastException`ing on mismatch instead of silent corruption. `cargo build --release
--p litebox_platform_windows_userland` clean; live boot+fork re-verification still wanted.
+-p litebox_platform_windows_userland` clean. **Live-reverified same day**: its first real
+cross-process-fork workout (pipe-relay-sigpipe investigation) hit it immediately, 3/3 children --
+guard worked (no silent corruption) but 8 KiB/cap-3 was too small for this workload. Fixed:
+`VEH_FRAME_STRIDE` 8->16 KiB, `VEH_DEPTH_CAP` 3->1 (same 32 KiB total, redistributed -- depth never
+exceeded 1 across 20,000+ single-step exceptions on 3 processes). 0/9 recurrences since.
 
 **`dev_bench`/`litebox_runner_snp` Windows build failures — CLOSED 2026-09-16, root cause was NOT
 libc/seccomp.** `dev_bench`'s new `reap_children` called `libc::wait4`/`rusage`/`WIFEXITED`/
@@ -290,18 +295,11 @@ zero-fill; opting in trades a loud SIGSEGV for silently zeroed symbol tables
 losslessly; two evdev reports per move now one `SYN_REPORT`; window now resizable with scaled deltas).
 Present mode is Mailbox-preferred with Fifo fallback — any note calling it Fifo-only is stale.
 
-**Presenter-split reintroduced the duplicate-`SYN_REPORT` bug, fixed 2026-09-16.** `CursorMoved`
-still emits one coalesced `InputSignal::RelMotion`, but `litebox_presenter/src/main.rs` (new
-today) forwarded it as TWO `rel` wire lines, and `control_server.rs` called `push_input_rel` once
-per line -- two `SYN_REPORT`s/move. Fixed: `Request::RelMotion{dx,dy}` (`relmotion <i32> <i32>`)
-added to `litebox_presenter_protocol`, wired to `push_input_rel_motion`. **Live-verified**
-(`--gui=hidden`, `LITEBOX_INPUT_TRACE=1`, control pipe driven directly): one `relmotion 5 3` ->
-exactly one `push_batch emitting one SYN_REPORT batch_len=2` line; two separate `rel` lines (the
-pre-fix shape) -> two `batch_len=1` lines, confirming both the bug and the fix live. Open PRD,
-both DIFFERENT/untouched: `mouse-motion-devicevent-needs-pixel-calibration` (DeviceEvent pixel
-scale, not sync count), `linux-macos-userland-presentation-still-emits-two-syn-reports-per-move`
-(Linux/macOS platform crates' own handlers, pre-existing). No framerate baseline exists (idle
-compositor legitimately produces zero page flips).
+**Presenter-split reintroduced the duplicate-`SYN_REPORT` bug, fixed and live-verified 2026-09-16**
+(`Request::RelMotion{dx,dy}` added to `litebox_presenter_protocol`; one `relmotion 5 3` now produces
+exactly one `SYN_REPORT`). Open PRD, both DIFFERENT/untouched: `mouse-motion-devicevent-needs-pixel-
+calibration`, `linux-macos-userland-presentation-still-emits-two-syn-reports-per-move`. Full repro:
+`docs/AGENTS_ARCHIVE_2026-09-16.md`. No framerate baseline exists (idle compositor = zero flips).
 
 **The GUI protocol decision is settled**: DRM/KMS + wgpu, proven live with guest page-flip pixels in a
 real host window. Not an open X11-vs-Wayland-vs-DRM question.

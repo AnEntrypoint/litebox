@@ -1891,3 +1891,123 @@ pixel-calibration` (a DeviceEvent pixel-scale calibration question, not a sync-c
 `linux-macos-userland-presentation-still-emits-two-syn-reports-per-move` (the Linux/macOS platform
 crates' own CursorMoved handlers still have the pre-existing two-`Rel`-call shape, not reachable for
 live GUI validation from this Windows host).
+
+## Pipe-relay SIGPIPE investigation: VEH_FRAME_STRIDE cross-process-fork gap found+fixed; relay
+machinery exonerated; real fault redirected upstream (2026-09-16, later session)
+
+Picked up `process-fork-pipe-relay-sigpipe-above-4kb` where the prior session left it: `seq 1 200000 |
+sort -n | tail -3` under `LITEBOX_PROCESS_FORK=1` was documented as reliably `SIGPIPE`-killing `seq`
+after exactly one 4096-byte relay chunk, with the exact closing handle not pinned down (too many
+candidate closure points across the 4-hop relay to patch blindly).
+
+**Blocker found before the target bug could even be reached**: the very first live attempt hit
+`[diag-veh-frame-stride-overflow]` (the `VehFrameCanaryGuard` fail-fast added earlier the same day,
+commit c8cb263, itself never live-verified against a real fork workload -- its own AGENTS.md entry
+said so explicitly). 3/3 forked children (`seq`/`sort`/`tail`), 100% reproducible, every single run.
+Added temporary instrumentation (`[diag-veh-canary-new]`, printing `depth`/`host_sp`/`addr` at every
+`VehFrameCanaryGuard::new()` call) and captured full data across two builds: `veh_depth` was `0x1` on
+every one of 7144+12291+... (tens of thousands total) single-step-driven guard constructions across
+3 independent processes -- NEVER once reaching depth 2, let alone the cap of 3. `corrupted_value`
+was identically `0x40` on every hit regardless of process/address, consistent with the SAME
+deterministic code path (`fork_verify::on_single_step`'s cross-process/identity-relocation branch,
+exercised on every newly-encountered guest instruction address until each code page is healed once --
+far more frequent than the thread-based-fork path's translation pattern) overflowing into the SAME
+relative stack offset every time, not random garbage.
+
+**Fix**: `VEH_FRAME_STRIDE` 8192 -> 16384, `VEH_DEPTH_CAP` 3 -> 1 (`litebox_platform_windows_userland/
+src/lib.rs`). Keeps `(CAP+1)*STRIDE` unchanged at the existing, previously-established-safe 32 KiB
+ceiling below `host_sp` (raising the total was explicitly avoided per that ceiling's own prior
+reasoning: the frames already reach further than the thread's typically-committed real stack, so
+reaching deeper trades one hazard for another) -- just redistributes it from an unused-in-practice
+third nesting level to the one depth this workload actually needs more of. Live-verified: 0/9
+recurrences across every subsequent `LITEBOX_PROCESS_FORK=1` repro this session (both the 5000-line
+and 200000-line scale), where the pre-fix build hit it 3/3 times, every time, at any scale tried.
+
+**With that unblocked, direct live tracing of the pipe relay itself, per the task's own request**:
+instrumented every `CloseHandle` site in both pump implementations --
+`spawn_fork_child_pipe_pump`'s `Sink`/`Source` arms and `close_unused_pipe_ends`
+(`litebox_platform_windows_userland/src/lib.rs`), `close_child_side`/`close_inherited_handle`
+(`litebox_platform_windows_userland/src/process_fork.rs`), and the runner's own child-side pump
+(`litebox_runner_linux_on_windows_userland/src/lib.rs`) -- with running byte/chunk totals on both
+sides of the `seq`->`sort` hop and the real Win32 `GetLastError()` on every `ReadFile` failure.
+
+Ran the exact repro live ~9 times post-VEH-fix (`seq 1 200000 | sort -n | tail -3`, plus a faster
+5000-line variant for iteration speed, plus one 50000-line variant). Findings, all consistent across
+every capture:
+- The relay's own bookkeeping is correct. Every single `[diag-sink-pump]`/child-pump total showed
+  `total_read == total_written` exactly -- not one byte was ever silently dropped or duplicated by
+  the relay itself, at any scale.
+- Every close of a parent-side `local` read handle followed a genuine, legitimate zero-byte
+  `ReadFile` with `GetLastError=109` (`ERROR_BROKEN_PIPE`) -- meaning Windows itself had already seen
+  every writer-side handle closed. This is NOT a stale/reused/double-closed handle value (that would
+  show `ERROR_INVALID_HANDLE`) and NOT a premature close issued by any of the 5 instrumented close
+  sites ahead of a legitimate EOF signal -- none of them fired early in any capture.
+- No `close_unused_pipe_ends`/error-path close ever ran concurrently with a live pump in any capture
+  (these only fire on a DIFFERENT fork call's own setup failure, never observed this session).
+- The `Some(0) | None => break` branch in the `Sink` arm's inner write loop (flagged as a candidate
+  latent data-loss bug during static review -- discarding a partially-written chunk's remaining
+  bytes without retry) never fired in any capture. Confirmed by reading `WriteEnd::try_write`
+  (`litebox/src/pipes.rs`): a non-empty buffer can only return `Err(TryAgain)` internally, which
+  `Pollee::wait`'s blocking-mode retry loop absorbs -- `Ok(0)` for a non-empty write is structurally
+  unreachable through this API, so this branch is dead code for the current implementation, not an
+  active bug.
+
+**What actually happens instead, ~8 of 9 large-scale runs (even post-VEH-fix)**: `seq` itself stops
+producing output early, before writing its full expected 1,288,895 bytes (200000 lines). Two distinct
+observed shapes:
+1. A genuine `SIGPIPE`: one capture showed `fatal signal: terminating task signal=Signal(13) ...
+   comm=seq`, matching the originally-reported symptom exactly, with the relay's own diagnostics
+   confirming its `write_all_to_inherited_handle` failure was a real, correctly-reported downstream
+   consequence (its own local guest pipe's read end really had been dropped, because the CHILD's own
+   relay pump legitimately gave up after ITS OWN write to the real OS pipe failed for the same
+   reason) -- i.e. real, cascading EPIPE, not a relay bug.
+2. A silent, clean early exit: one capture (`chunks=67`, `total_read=total_written=68706` bytes on
+   both sides of the relay, matching exactly) produced output `13300/13301/13302` instead of
+   `199998/199999/200000` -- `seq`'s own encoded exit status was `0xc0de0000`, IDENTICAL to a normal
+   successful exit, with NO fatal-signal line anywhere in the log. `seq` believed it finished
+   normally having only counted to roughly 13302, not 200000.
+
+Both shapes are consistent with the SAME upstream trigger (something perturbing `seq`'s own guest
+execution state during sustained, heavy single-step-based `fork_verify` healing at this iteration
+count), manifesting differently depending on exactly when/how it hits `seq`'s own write-path/loop
+state -- not with a bug in the relay's handle lifecycle, which behaved correctly in every single
+capture. The already-open, separately-tracked PRD row
+`fork-verify-av-path-stale-rip-bypasses-single-step-heal` describes precisely this class of gap: a
+stale/corrupted `rip` can reach a genuinely unmapped page and raise a raw AV that bypasses
+`fork_verify::on_single_step`'s healing entirely (only the `EXCEPTION_SINGLE_STEP` path is healed,
+not this AV path) -- a plausible, not yet confirmed, common root cause for both observed shapes here.
+
+**Scale data**: the 5000-line repro (`seq 1 5000 | sort -n | tail -3`) completed correctly 4/4 times,
+every time, in ~15-20s each. The 50000-line repro completed the `seq`->`sort` relay hop cleanly 3/3
+times but never finished the overall pipeline within a 90s window (`sort`'s own processing time under
+heavy tracing, not a relay issue -- confirmed via `total_read==total_written` matching before the
+timeout). The 200000-line repro never once produced correct output across 9 attempts post-VEH-fix:
+1 real `SIGPIPE`, 1 silent truncation, 1 empty-stdout completion, 6 timeouts (60-300s) without
+finishing. Wall-clock cost alone (90-300+s per large-scale attempt, only ~9 possible in this
+session's remaining budget) precludes pinning the exact upstream mechanism further in this pass --
+would need either a live debugger (still absent on this host, per this project's own long-standing
+gap) or a dedicated session building targeted `fork_verify`-healing instrumentation on top of the
+`fork-verify-av-path-stale-rip-bypasses-single-step-heal` row's own already-identified gap.
+
+**Disposition**: `process-fork-pipe-relay-sigpipe-above-4kb` resolved with this evidence -- the
+row's own hypothesis (a premature handle close somewhere in the 4-hop relay) is refuted by direct,
+exhaustive live tracing of every close site; the real defect lives upstream, in cross-process-fork
+guest execution correctness under sustained single-step tracing, and is very likely the SAME
+mechanism as the already-open `fork-verify-av-path-stale-rip-bypasses-single-step-heal` row. The one
+concrete, shippable fix from this pass (`VEH_FRAME_STRIDE`/`VEH_DEPTH_CAP`) is real, live-verified,
+and unblocks cross-process-fork entirely for any heavy-single-step workload, not just this one --
+without it, EVERY such workload fail-fast crashes before doing anything useful. `LITEBOX_PROCESS_FORK=1`
+remains unsafe for a heavy-iteration guest workload (tens of thousands of single-stepped
+instructions), pipes or not, until the upstream `fork_verify` gap is closed.
+
+**Process hygiene**: every run singly, `Get-Process` confirmed clear before each launch, every boot
+observed to completion or killed via `timeout`/explicit `Stop-Process` on its own -- no leaked
+`litebox_runner`/`litebox-presenter` processes at session end (confirmed via `Get-Process` returning
+no matches). Host RAM: ~3.9GB free of 15.25GB total at session end, consistent with this host's
+normal idle range, no leak signature. Temporary diagnostic logging (`[diag-veh-canary-new]`,
+`[diag-close-site]`, `[diag-sink-pump]`) added and used live, then fully removed once each specific
+question it was answering was settled -- except the runner child-side pump's `chunk_num`/
+`total_relayed` counters on its terminal-failure `eprintln!`, kept as a permanent, low-volume (fires
+once per pipe lifetime, only on the failure path) trace point in the same style as this project's
+other `[process_fork_diag]` lines, since this investigation itself needed exactly this data live and
+a future session chasing the same class of bug will too.

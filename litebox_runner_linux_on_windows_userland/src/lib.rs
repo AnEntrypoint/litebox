@@ -1674,13 +1674,26 @@ fn diag_process_fork_task_resume_probe(
                     // the far side its EOF. `detached_pipe_read` blocks in the guest pipe's own
                     // wait machinery and returns 0 once the guest has closed every writer.
                     pf::ChildPipeEnd::ChildWrites => {
+                        // `chunk_num`/`total_relayed` (added during the pipe-relay-sigpipe
+                        // investigation, 2026-09-16): kept as a permanent, low-volume trace point
+                        // -- this only prints once, on the terminal chunk of this pipe's lifetime,
+                        // not per-chunk. When a relay hop fails partway, knowing exactly how many
+                        // bytes/chunks it had already relayed cleanly narrows "which side closed
+                        // and when" far faster than `n` alone, as this investigation itself needed
+                        // live to distinguish a genuine early failure from the ordinary EOF shape.
+                        let mut total_relayed = 0u64;
+                        let mut chunk_num = 0u64;
                         while let Some(n) = pump_shim.detached_pipe_read(&host_end, &mut buf) {
-                            if n == 0 || !pf::write_all_to_inherited_handle(handle, &buf[..n]) {
+                            chunk_num += 1;
+                            let write_ok =
+                                n != 0 && pf::write_all_to_inherited_handle(handle, &buf[..n]);
+                            if !write_ok {
                                 eprintln!(
-                                    "[process_fork_diag] pipe pump (child, fd {fd}): stream ended (n={n}), closing the inherited handle to deliver EOF upstream"
+                                    "[process_fork_diag] pipe pump (child, fd {fd}, handle={handle:#x}): stream ended (n={n}), chunk={chunk_num} total_relayed_before_this_chunk={total_relayed}, closing the inherited handle to deliver EOF upstream"
                                 );
                                 break;
                             }
+                            total_relayed += n as u64;
                         }
                     }
                     // Fill the guest's pipe from the inherited handle. Dropping `host_end` at the

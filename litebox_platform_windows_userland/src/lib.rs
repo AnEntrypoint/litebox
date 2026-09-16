@@ -3628,7 +3628,26 @@ const EXCEPTION_RECORD_RESERVE: usize = 65536;
 /// own doc comment records ~16 KiB as the measured figure), so buying headroom by reaching deeper
 /// would trade one hazard for another. The space comes from the exception-record slots instead,
 /// which were provisioned for 204 levels against a cap of 7.
-const VEH_FRAME_STRIDE: u32 = 8192;
+///
+/// RAISED AGAIN to 16 KiB (from 8 KiB, alongside lowering [`VEH_DEPTH_CAP`] from 3 to 1, keeping
+/// `(CAP + 1) * STRIDE` unchanged at 32 KiB -- the same "don't reach deeper below `host_sp`" limit
+/// this constant's own history already established) after live-reproducing the pipe-relay-SIGPIPE
+/// investigation's blocking crash: a real `LITEBOX_PROCESS_FORK=1` cross-process fork child
+/// (`seq`/`sort`/`tail` from `seq 1 200000 | sort -n | tail -3`) hit `[diag-veh-frame-stride-
+/// overflow]` on its VERY FIRST pipeline run, 100% reproducible, on all three forked children
+/// independently. Temporary instrumentation (`[diag-veh-canary-new]`, since removed) showed the
+/// nesting depth was uniformly 1 across all three processes and over 20,000 single-step
+/// exceptions -- `veh_depth` never once reached 2, let alone the old cap of 3 -- so the extra
+/// levels bought no real headroom for this workload, while `fork_verify::on_single_step`'s
+/// cross-process/identity-relocation code path (exercised on every guest instruction fetch until
+/// each code page is healed once, unlike the thread-based fork path's sparser translation pattern)
+/// reliably needed more than the roughly 5.6 KiB of headroom 8 KiB left after the two measured
+/// frame prologues -- reproducibly overflowing into the SAME relative stack offset each time
+/// (hence the identical `corrupted_value=0x40` on every hit, not a random garbage read).
+/// Redistributing the same 32 KiB ceiling from an unused-in-practice third nesting level to the
+/// one depth this workload actually uses fixes the crash without increasing how far this
+/// mechanism reaches below `host_sp`.
+const VEH_FRAME_STRIDE: u32 = 16384;
 
 /// Maximum nesting depth `vectored_exception_handler_entry`'s per-depth frame (see
 /// `VEH_FRAME_STRIDE`) will use before giving up on the host-stack swap and bailing out via
@@ -3656,7 +3675,18 @@ const VEH_FRAME_STRIDE: u32 = 8192;
 /// nesting in practice is 1-2; a cap of 3 covers that with a level in hand, and a fault nesting
 /// deeper than that is the separate, still-unexplained condition this constant's original comment
 /// already describes, where `.Lsearch` is the honest answer.
-const VEH_DEPTH_CAP: u32 = 3;
+///
+/// LOWERED AGAIN to 1 (from 3), alongside doubling [`VEH_FRAME_STRIDE`], per that constant's own
+/// doc comment: a live cross-process-fork repro (`seq 1 200000 | sort -n | tail -3` under
+/// `LITEBOX_PROCESS_FORK=1`) recorded `veh_depth` over 20,000 times across three independent
+/// forked children and never once saw depth 2, so the "1-2" estimate above was optimistic for this
+/// workload -- real nesting is 1, reliably, and every one of those depth-1 invocations needs more
+/// of the shared 32 KiB budget than a cap of 3 could spare it. A fault that genuinely nests to
+/// depth 2 now takes `.Lsearch` immediately instead of getting its own slice, which is a narrower
+/// safety net than before -- but the prior net still could not survive the depth-1 case this
+/// workload actually exercises, so this is a strictly better trade until real reentrant nesting is
+/// independently observed and budgeted for.
+const VEH_DEPTH_CAP: u32 = 1;
 
 /// Diagnostic-only: how many times `vectored_exception_handler_entry`'s `.Lsearch` path has
 /// returned `EXCEPTION_CONTINUE_SEARCH` straight from the naked-asm trampoline, without ever
