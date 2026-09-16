@@ -43,7 +43,7 @@ warns per single-stepped instruction). Do **not** add `LITEBOX_LOG=error` by ref
   needing a power-cycle.
 - **Never run two full-stack verifications concurrently**, peer sessions included — starves both, and
   the failure looks exactly like a real hang. Kill every `litebox_runner` between runs; watch
-  `FreePhysicalMemory` live and kill on a falling trend, not a fixed RSS number.
+  `FreePhysicalMemory` and kill on a falling trend, not a fixed RSS number.
 - **`LITEBOX_DUMP_FRAMES=1` is the only trustworthy `--gui` visual check**, never
   `PrintWindow`/`CopyFromScreen`. A pixel count alone never identifies WHO painted a frame — decode
   frame structure (`advisor/probes/decode_frame.py`) and correlate against `DIAG_TIMELINE execve`'s
@@ -114,12 +114,11 @@ produces a bootable flat tar in one command (x86-64/Apple Silicon hosts only) �
 OCI-pull Python scripts this project once hand-rolled, retired, do not recreate.
 
 **Runtime in-memory loading** — `--oci-image <ref>` pulls, merges and rewrites every layer in memory; no
-host directory is ever created for the rootfs (extracting to a real one hit three independent
-Windows-path bugs). Rewritten layers are cached under `.litebox-cache/`, keyed so a rewriter change
-self-invalidates. Large images (multi-GB, 100K+ entries) pack fine now; residual risk is host-memory
-contention from unrelated processes, not a litebox bug. `tar_ro.rs`'s multi-layer index is built ONCE at
-mount, not per read — that build was O(entries²) (17.3s → 0.35s fixed). Cache internals and the four
-fixed OOM bugs: archive.
+host directory is ever created for the rootfs (a real one hit three independent Windows-path bugs).
+Rewritten layers are cached under `.litebox-cache/`, keyed so a rewriter change self-invalidates. Large
+images (multi-GB, 100K+ entries) pack fine now; residual risk is host-memory contention, not a litebox
+bug. `tar_ro.rs`'s multi-layer index is built ONCE at mount, not per read (was O(entries²), 17.3s →
+0.35s fixed). Cache internals and the four fixed OOM bugs: archive.
 
 **A trampoline-extension failure used to poison a whole segment's syscalls, now fixed** — sized from a
 byte-pair count instead of a one-page guess, capped 4MiB (full detail archived). **Tags, verified live,
@@ -129,19 +128,19 @@ Alpine 3.16.0.
 
 **X server choice**: for the DRM/wgpu on-screen (`--gui`) path use `Xorg` with `modesetting` — litebox's
 virtual DRM device is legacy-KMS + dumb-buffer + XRGB8888 only, no atomic modeset/GBM/EGL, so a GBM-first
-compositor lands on its least-tested software fallback, and `Xvfb` never touches DRM/KMS at all (zero
-page-flips, indistinguishable from "never drew"). For browser/selkies, `Xvfb` IS correct and verified —
-its `-shmem` framebuffer works now that SysV shared memory exists.
+compositor lands on its least-tested fallback, and `Xvfb` never touches DRM/KMS at all (zero page-flips,
+indistinguishable from "never drew"). For browser/selkies, `Xvfb` IS correct and verified — its
+`-shmem` framebuffer works now that SysV shared memory exists.
 
-**Durable artifacts**: `C:\dev\litebox-webtop\webtop_seatd.tar` (stock MATE webtop); the hand-assembled
-weston+XFCE tar under `.wfgy/xfce-build/` is superseded by the stock-image path.
+**Durable artifacts**: `C:\dev\litebox-webtop\webtop_seatd.tar` (stock MATE webtop); the
+`.wfgy/xfce-build/` hand-assembled weston+XFCE tar is superseded by the stock-image path.
 
 ## A real desktop renders in a browser
 
 **XFCE renders in a real host browser, and MATE too** — full pipeline (Xvfb, selkies/pixelflux x264,
 MIT-SHM) inside litebox, only the reverse proxy host-side. Working config: selkies `--addr=0.0.0.0`
-port **8081**, dashboard over `--publish`, `/websockets` tunnelled to 8081. Fourteen independent
-litebox defects got here, all landed (archive).
+port **8081**, dashboard over `--publish`, `/websockets` tunnelled to 8081. Fourteen litebox defects
+got here, all landed (archive).
 
 **A stock s6-overlay image boots with no flags/stubs**: `/init` runs 16 cross-process children with
 zero uncarriable fds into supervision — retires three "fundamental blocker" claims older notes
@@ -257,11 +256,11 @@ step 3 exists, per ADVISORY-002 §3.2.
 
 **Live-verified** (release build, default thread-based fork, no test files): `yes hello | head -c
 5000000 | wc -c` -- exact `5000000`, proving correct blocking-pipe reads/writes both directions
-through the new queue with no lost data. `seq 1 3000000 | sort --parallel=4 -n | tail -3` (with the
-pre-existing, unrelated ADVISORY-001 §3N tcache workaround env so it doesn't confound this read) --
-exact correct output, proving `sort`'s real multi-threaded pthread mutex/condvar contention
-(glibc futex calls, which this trait backs) completes correctly: no hang, no deadlock, no missed
-wakeup, no corrupted merge. Host RAM identical before/after, no leaked processes.
+through the new queue with no lost data. `seq 1 3000000 | sort --parallel=4 -n | tail -3` (with an
+unrelated ADVISORY-001 §3N tcache workaround env so it doesn't confound this read) -- exact correct
+output, proving `sort`'s real multi-threaded pthread mutex/condvar contention (glibc futex calls,
+which this trait backs) completes correctly: no hang, no deadlock, no missed wakeup, no corrupted
+merge. Host RAM identical before/after, no leaked processes.
 
 **Separate, unrelated finding, not investigated**: a 3-stage pipeline under `LITEBOX_PROCESS_FORK=1`
 (its real inherited-pipe-handle fd path, not the emulated-pipe path `RawMutex` backs by default) spun
@@ -295,8 +294,8 @@ Ordering after this per ADVISORY-002 §7: (iv) fd/HANDLE indirection, then relax
 
 **There is no open host crash** — the `RtlpUnwindPrologue` crash earlier notes called "the one genuinely
 open" one was `VEH_FRAME_STRIDE`: a 4096-byte per-level slice 168 bytes short of the two frames it must
-cover, nested by `fork_verify`'s own AV-heal storm. Bisected live: 10/10 fatal before the fix, then 0/10
-and 0/57 across two follow-up commits (mechanism: archive). Unguarded, not a live defect: PRD
+cover, nested by `fork_verify`'s own AV-heal storm. Bisected live: 10/10 fatal before, 0/10 then 0/57
+after (two follow-up commits; mechanism: archive). Unguarded, not a live defect: PRD
 `veh-frame-stride-has-no-overflow-guard`.
 
 **Windows CoW-mmap performance**: zero practical effect on tar-packed execs (`MapViewOfFile3` needs 64KiB
@@ -307,10 +306,10 @@ zero-fill; opting in trades a loud SIGSEGV for silently zeroed symbol tables
 
 **Input latency**: three real bugs fixed and verified live (sub-pixel remainders now accumulated
 losslessly; two evdev reports per move now one `SYN_REPORT`; window now resizable with scaled deltas).
-Present mode is Mailbox-preferred with Fifo fallback — any note calling it Fifo-only is stale. Open:
-PRD `mouse-motion-devicevent-needs-pixel-calibration`,
+Present mode is Mailbox-preferred with Fifo fallback — any note calling it Fifo-only is stale. Open PRD:
+`mouse-motion-devicevent-needs-pixel-calibration`,
 `linux-macos-userland-presentation-still-emits-two-syn-reports-per-move`; no framerate baseline exists
-since an idle compositor legitimately produces zero page flips.
+(idle compositor legitimately produces zero page flips).
 
 **The GUI protocol decision is settled**: DRM/KMS + wgpu, proven live with guest page-flip pixels in a
 real host window. Not an open X11-vs-Wayland-vs-DRM question.
@@ -319,14 +318,13 @@ real host window. Not an open X11-vs-Wayland-vs-DRM question.
 
 Built and committed: `litebox_presenter_protocol` crate (newline-delimited scanout/screenshot/
 show/hide/presenter?/key/rel/abs/ps/strace/frames grammar + named-pipe transport), runner-side
-`ControlServer` (`control_server.rs` -- `DuplicateHandle`-based zero-copy scanout handoff via a
-polling thread, not a flip-callback, so headless-with-no-observers stays as cheap as before), and
+`ControlServer` (`DuplicateHandle`-based zero-copy scanout handoff via a polling thread, not a
+flip-callback, so headless-with-no-observers stays as cheap as before), and
 `litebox-presenter.exe` (new crate, links only `litebox_platform_windows_userland::presentation`
 + the protocol crate, zero shim/kernel dependency). `--gui` is now `Option<GuiMode>`
 (`--gui`/`--gui=hidden`; old `--gui-hidden` kept as a deprecated alias). `DrmSubsystem` gained
 `frame_seq` and `scanout_snapshot()` (a plain generic query, not a boxed flip callback -- can't
-carry `Platform::SharedMemoryHandle` across a trait object); `set_strace_summary_enabled` added
-(the real runtime toggle).
+carry `Platform::SharedMemoryHandle` across a trait object); `set_strace_summary_enabled` added.
 
 **Verified live, across two sessions** (release build, real named pipe, no test files): every
 control-pipe command headless and under `--gui=hidden`; `litebox-presenter.exe` spawn/respawn; a
@@ -337,29 +335,26 @@ against that same real-content guest, with a real visible `EnumWindows`-found wi
 kill-mid-display -> `screenshot` unaffected -> a follow-up `show` spawns a fresh presenter with
 its own visible window and current content within ~370ms (true respawn-and-resume).
 
-**One real bug found and fixed**: the first-ever `show` against a REAL content-producing guest
-made `litebox-presenter.exe` silently `exit(0)` -- every handle in
-`litebox_presenter_protocol::pipe` had `FILE_FLAG_OVERLAPPED` set but every `ReadFile`/`WriteFile`
-passed a NULL `OVERLAPPED`, unsound once more than one thread has I/O in flight on the same pipe
-object (exactly this module's `show`/`hide` design). Fixed via
-`litebox_presenter_protocol::pipe::overlapped_call` (a private per-call `OVERLAPPED` + manual-reset
-event for every I/O call). **Do not "fix" this by removing `FILE_FLAG_OVERLAPPED`** -- that was
-tried first, stops the crash, but deadlocks the write forever behind the permanently-pending read
-instead. Full verification/bisection narrative, scenario-by-scenario logs, and the deadlock
-half-fix's own kernel-level explanation: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
+**One real bug found and fixed**: the first-ever `show` against a REAL content-producing guest made
+`litebox-presenter.exe` silently `exit(0)` -- every handle in `litebox_presenter_protocol::pipe` had
+`FILE_FLAG_OVERLAPPED` set but every `ReadFile`/`WriteFile` passed a NULL `OVERLAPPED`, unsound once
+more than one thread has I/O in flight on the same pipe object (exactly this module's `show`/`hide`
+design). Fixed via `pipe::overlapped_call` (a private per-call `OVERLAPPED` + manual-reset event for
+every I/O call). **Do not "fix" this by removing `FILE_FLAG_OVERLAPPED`** -- tried first, stops the
+crash, but deadlocks the write forever behind the permanently-pending read instead. Full
+verification/bisection narrative: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 **Still open / pre-existing, not fixed this pass** (small, disclosed, unrelated to the crash
 above):
 1. `frames on <dir>` stores the directory but `dump_frame_diagnostic` ignores it, always using
    `LITEBOX_DUMP_FRAMES_PATH`/its own default naming -- ON/OFF toggle works, directory redirect
    does not yet.
-2. `ps` returns `ok 0` with a live guest process running -- `diag::PROCESS_TREE` has exactly one
-   populating call site and stays empty for a plain top-level exec with no fork/clone; a
-   pre-existing gap the split surfaces, not one it caused.
+2. `ps` returns `ok 0` with a live guest process running -- `diag::PROCESS_TREE` stays empty for a
+   plain top-level exec with no fork/clone; a pre-existing gap the split surfaces, not causes.
 3. `PrintWindow` capture of the live presenter window rendered a partial shape, not a full
-   rectangle -- a known `PrintWindow`-vs-DXGI-flip-model capture artifact, not a rendering
-   regression (the same-moment `screenshot` command, reading the scanout section directly,
-   reported the correct full-frame pixel count). Don't chase this via `PrintWindow`.
+   rectangle -- a known `PrintWindow`-vs-DXGI-flip-model artifact, not a rendering regression (the
+   same-moment `screenshot` command, reading the scanout section directly, reported the correct
+   full-frame pixel count). Don't chase this via `PrintWindow`.
 4. **Disclosed deviation**: `dump_frame_diagnostic`/`encode_bmp`/`count_pixel_stats` stay in
    `litebox_platform_windows_userland::presentation` rather than moving into the runner crate per
    design §1.1 -- zero window/wgpu dependency, so headless-never-touches-a-window already held.
@@ -371,14 +366,13 @@ above):
   `_2026-09-10.md` (fork fd eligibility, cost history, OCI cache, s6-boot, browser config, crash-dump/
   VEH, CoW, working practices). Older: `_2026-09-03.md`, `_2026-09-05.md`.
 - Fork: `docs/track-b-fork-fix-progress.md`, `advisor/ADVISORY-002-d-zero-fork.md`,
-  `advisor/ADVISORY-001-fundamentals.md` (§3N tcache analysis, Appendix D presenter case).
-  `docs/veh-exception-handler-design.md` — canonical VEH narrative, read before touching the handler,
-  trampoline or frame sizing.
+  `advisor/ADVISORY-001-fundamentals.md` (§3N tcache, Appendix D presenter case).
+  `docs/veh-exception-handler-design.md` — canonical VEH narrative, read before touching the handler.
 - Desktop logs: `docs/webtop-debian-selkies-2026-09-06.md`, `webtop-alpine-mate-2026-09-07.md`,
   `webtop-debian-xfce-2026-09-08.md`, `webtop-xfce-code-vs-data-2026-09-08.md`, `fork-fs-veh-2026-09-08.md`.
 - Consult before deriving: `docs/premade-library-research.md`, `docs/drm-dumb-buffer-ioctl-reference.md`
-  (kernel UAPI for DRM syscalls), `docs/diag-timeline-field-semantics.md` (before any hypothesis on
-  `DIAG_TIMELINE`'s `comm` field — two investigations mis-traced it).
+  (kernel UAPI for DRM syscalls), `docs/diag-timeline-field-semantics.md` (before any `DIAG_TIMELINE`
+  `comm`-field hypothesis — two investigations mis-traced it).
 - `docs/macos.md` — port state; the Apple Silicon guest-execution context switch is a stub, stays
   deferred (PRD `macos-aarch64-guest-execution-context-switch-is-not-implemented`,
   `gui-macos-presentation-runner-and-guest-entry-blocked`). Probe crates: `docs/wayland-drm-backend-probe/`,
@@ -388,8 +382,8 @@ above):
   (`litebox_termemu`'s VT100-emulator slice IS implemented; the daemon/IPC layer is not),
   `docs/fork-region-grouping-design.md` (still a diagnostic probe).
 - `advisor/probes/` — diagnostics (`decode_frame.py`, `symbolize_litebox_crash.py`, `dup_probe.c`,
-  `cross_process_fork_wait_hang_probe.sh`, `drm_flip_probe.c`, `clone_probe.c`) plus
-  `MEASUREMENT-PITFALLS.md`, `DISK-HYGIENE.md`. OCI-pull Python scripts there are retired.
+  `drm_flip_probe.c`, `clone_probe.c`) plus `MEASUREMENT-PITFALLS.md`, `DISK-HYGIENE.md`. OCI-pull
+  Python scripts there are retired.
 - `.gm/memories/`: `mem-c62454fedb1baef8-2714` (RtlpUnwindPrologue), `mem-e5107049137fcf43-1303`
   (browser witness), `mem-7cb09e839ca086f2-4223` (XFCE/MATE/weston), `mem-6c4697ac568ea7be-4487`
   (packager OOM), `mem-136ae2ce29bc28a4-3133` (image tags), `mem-b709a7d784b98110-1430` (cross-process

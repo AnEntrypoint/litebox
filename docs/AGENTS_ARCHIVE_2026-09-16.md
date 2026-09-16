@@ -1143,3 +1143,43 @@ timeout` in `sk.log` inside that window. Post-fix, expect to see `Backpressure T
 `SELKIES_VIDEO_BACKLOG_LIMIT_BYTES`-driven frame drops, with NO ping timeout while the throttle
 holds -- frame drops and a visibly stalled/frozen video during the throttle window are expected
 and correct in that state, not a regression.
+
+## Cross-process-capable `RawMutex`: full mechanism internals (Track B step 2, 2026-09-16)
+
+Compacted out of the main `AGENTS.md` entry for space; that entry keeps the done/verified summary
+and the Track B step 3 pointer, this is the internals a maintainer needs before touching the code.
+
+`litebox_platform_windows_userland/src/lib.rs`'s `RawMutex` (~5905-6300) replaced
+`WaitOnAddress`/`WakeByAddressSingle` (process-local per MSDN) with a manual wait queue
+(`waiters: Mutex<Vec<WaiterRecord>>` per `RawMutex` instance) plus one auto-reset kernel `Event`
+per OS THREAD, not per mutex (`thread_waiter_event`, a new `thread_local!`, cached for that
+thread's whole lifetime -- so a thread that waits on many different mutexes over its life reuses
+one event rather than allocating a fresh kernel object per wait). Same trait, same
+`underlying_atomic()`/`INIT` contract; no caller changed.
+
+**Lock-ordering / lost-wakeup avoidance**: register (push into the queue) and check
+(`underlying_atomic() != val`) happen under the SAME lock `wake_many` takes to pop waiters --
+closing the lost-wakeup window the same way `xproc_sync.rs`'s swap-based protocol does (a waiter
+can never miss a wake that happens between its check and its registration, because both steps and
+the wake are serialized through one lock).
+
+**Timeout-race resolution**: a wait that times out just as `wake_many` pops that same waiter is
+resolved by re-acquiring the queue lock: still-queued means genuinely timed out (remove self, no
+signal was ever sent); already popped means `wake_many` already committed to `SetEvent` on this
+waiter's event, so the recovery path does one more bounded wait to consume that pending signal
+rather than leaving a stray `SetEvent` on a per-thread event this thread will reuse on its next
+wait (a leaked signal there would cause the NEXT unrelated wait on this thread to return
+immediately with a false "woken" result).
+
+**`wake_many` return value**: now returns the real count of waiters it popped and signaled
+(previously always `0` -- Windows genuinely couldn't observe this via `WakeByAddress*`, which has
+no return value). The trait contract allows either 0-or-real-count, and every existing caller
+(`sync/mutex.rs`, `sync/rwlock.rs`) was already written to be correct under the old always-`0`
+behaviour, so returning the real count is a pure improvement, not a behaviour requirement change
+-- no caller needed updating.
+
+**Ratchet**: `dev_tests/src/ratchet.rs`'s bare-static count for this crate bumped 18->19 for the
+one new `thread_local!` (`THREAD_WAITER_EVENT`). Deliberately a plain `thread_local!` rather than a
+`TlsState` field (unlike `codewatch`/`ctxwatch`, which deliberately avoid adding to this ratchet)
+because `RawMutex` is reachable from host-only threads that never call `install_tls`, so a
+`TlsState`-backed field would be unreachable/panic on exactly the threads this code needs to run on.
