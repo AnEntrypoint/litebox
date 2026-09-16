@@ -479,3 +479,100 @@ Applications-menu click path (task step 4) — no boot held a stable serving win
 same RAM reason above. Track B architectural work (cross-process `RawMutex`, presenter-process split,
 etc.) was explicitly out of scope for this dispatch and was not started, per ADVISORY-002 §6's own
 recommendation that it is multi-session-scale work.
+
+## Track A crash-frequency finally measured with an adequate sample: selkies itself crashes on ~100% of launch attempts, ~120s MTBF, unchanged by the fix; xfsettingsd/Thunar cleared (2026-09-16, later session)
+
+**Task**: the follow-up this file's own prior section called for — re-run `webtop_stack_seed_fixed.tar`
+past the historical crash window with real host RAM headroom (this session's host recovered to 6-9GB free,
+unlike the ~1.7GB reading at session start, which never recurred once boots were underway — likely a
+transient dip from unrelated host activity, not a real constraint), and independently re-verify
+`xfsettingsd`/Thunar's own fork behavior.
+
+**Boot 1** (`.wfgy/crashval1.*`, `LITEBOX_LOG=warn,…fork_verify=error`, `--resume-from
+webtop_stack_seed_fixed.tar`, i.e. the Track A forkless-supervisor fix in effect): ran **1215s (~20.25
+min) live**, killed manually only after the finding below was unambiguous — never RAM-forced (free RAM
+stayed 6.3-9.1GB throughout, confirmed by continuous polling; peak runner RSS ~3.1GB). Every one of 17
+`spawn_exec_collision_child` events logged `glibc_tunables_forwarded=true` (0 false) — the propagation
+finding from this file's earlier "no gap" section reconfirms on a second, much longer-running boot.
+
+**The result is a clean, real answer, not another inconclusive RAM-limited sample**: the `SELKIES_SUPERVISOR`
+(the Track A forkless-fix subprocess itself) survived all 6 of its own respawns over the full 20 minutes
+without ever dying — direct, positive confirmation that the fix does exactly what it was designed to do
+(a fresh `/bin/sh` exec discards whatever corrupted heap state the parent script's shell carried). But
+**selkies itself — the process the supervisor launches — segfaulted (`rc=139`, `[sk] Segmentation fault`,
+`SIGSEGV`) on attempts 1 through 6, one per launch, at a strikingly consistent **~120-second** interval
+measured from the script's own `HOLD t=Ns` ticks (attempt=3 at HOLD~140s, attempt=4 at HOLD~260s,
+attempt=5 at HOLD~380s, attempt=6 at HOLD~500s — four consecutive 120s±5s gaps). This period is not a
+script artifact: `selkies_supervisor.sh`'s body (`.wfgy/webtop_stack.sh:387-410`) has no delay besides
+`sleep 1` between attempts, so ~120s is genuinely how long selkies' own process takes, every single time,
+to reach whatever internal operation collides/corrupts and kills it — consistent with (not yet proven to
+be) a periodic internal timer of selkies' own (a resize/DPI-recheck candidate, matching this file's
+existing "unconfirmed lead" about xfwm4/xfdesktop re-layout events, still not isolated). **In 1215s and 7
+total launch attempts, selkies never once logged reaching `Data WebSocket Server listening` — 0/7 successful
+binds.** Attempt 7 (launched after attempt 6's crash) did not crash again within the remaining ~700s of
+this boot, but also never bound: a live `chrome-devtools` browser check against `http://localhost:3000`
+mid-attempt-7 got the dashboard shell (nginx serving fine) but its own console logged `WebSocket connection
+to 'ws://localhost:3000/websockets' failed: … Unexpected response code: 502` — the exact
+already-documented `connect() failed (111: Connection refused)` to `127.0.0.1:8081` signature, confirming
+selkies was simply not listening at that moment either, ~200-300s into its own run. This is a **third**
+distinct outcome for a launch attempt (crash / never-crash-but-never-bind), not previously distinguished
+from each other in this file's own earlier, RAM-truncated samples.
+
+**Boot 2** (`.wfgy/crashval2_xfdiag.*`, same fixed tar and `--env`, `LITEBOX_LOG` additionally carrying
+`litebox_shim_linux::syscalls::process=debug` to get `DIAG_TIMELINE` visibility): independently reproduced
+the identical crash signature — `SELKIES_SUPERVISOR: attempt=1 exited rc=139` — on its very first launch,
+confirming boot 1's finding is not a one-boot fluke. This boot reached the desktop via the REAL
+`startwm.sh` path (`DE_UP via startwm.sh`, not boot 1's fallback), and hit only the already-documented,
+already-benign fatal signals along the way: `SIGKILL`→`dbus-daemon` ×2 (ordinary transient-bus teardown)
+and one `SIGSEGV`→`gpg-agent` (byte-for-byte the same known, accepted `fork_verify` livelock
+single-task-sacrifice this file's own "1 control run" paragraph already recorded) — no new fatal-signal
+class. Killed deliberately at 349s (RAM stayed a healthy ~4-4.5GB free throughout; not a RAM kill) once its
+two jobs were done, because `syscalls::process=debug` measurably slows guest wall-clock progress (far more
+`DIAG_TIMELINE`/`resolve_shebang` lines than a normal boot) and continuing it further was low value once
+xfsettingsd/Thunar were answered.
+
+**`xfsettingsd`/Thunar, independently re-verified live for the first time this week (ADVISORY-002 §6's one
+open item, closed)**: `DIAG_TIMELINE` in boot 2 shows both launched by ordinary, safe fork+exec —
+`comm=xfce4-session` execve'ing `argv0=/usr/bin/xfsettingsd` (pid=146, t=114.8s guest-time, after the
+expected `ENOENT`-then-succeed `PATH` search through `/lsiopy/bin`, `/usr/local/sbin`, `/usr/local/bin`,
+`/usr/sbin`), and `comm=xfce4-session` execve'ing `argv0=/usr/bin/Thunar` (a wrapper script) which itself
+then execs `argv0=/usr/bin/thunar-real` from a `bash` comm — both ordinary parent-forks-child-execs-once
+chains, exactly the safe shape ADVISORY-002 §6 already assumes for images that don't self-daemonize these
+binaries. **No fatal signal was ever attributed to xfsettingsd's or Thunar's pids in this boot.** The only
+`pid=146` "exit" events seen afterward were `comm=pool-9`-style GLib thread-pool worker threads exiting
+cleanly (`status=0`) — ordinary intra-process thread churn, not the process dying and not a
+fork-without-exec self-daemonization event. **Conclusion: xfsettingsd and Thunar do NOT need their own
+forkless-daemon fix — this closes the one item ADVISORY-002 §6's Track A audit left unverified last
+session.** All four daemons named by Track A (dbus-daemon, nginx, xfsettingsd, Thunar) are now confirmed
+either already fixed or never at risk in this image.
+
+**What this means for the dispatch's core question ("did the forkless-daemon fix reduce crash frequency,
+eliminate it, or make no difference")**: **no difference to selkies' own crash rate.** The fix's scope was
+always precisely the supervisor script's own heap (confirmed working, 6/6 respawns survived, 2 boots, 0
+regressions) — it was never going to touch selkies' own process-internal corruption, and it doesn't.
+Selkies' crash rate in this environment right now is effectively **100% per launch attempt** (7 attempts
+across 2 independent boots, 7 failures — 6 outright `SIGSEGV` crashes plus 1 silent no-bind hang), a
+materially WORSE measured rate than this project's older "sporadic, once in several cycles" characterization
+— though that older figure predates today's heavier concurrent-fork-pressure conditions (nested
+`gcc`/`collect2`/`cc1` exec collisions, the exec-collision recovery path itself, and the supervisor
+fix's own extra fork+exec) and the two are not measured under identical conditions, so this is not
+claimed as a regression, only as the first real measurement under current conditions.
+
+**Terminal Emulator/Applications-menu browser click-path retest: still not reached, but for a newly and
+precisely diagnosed reason.** It is no longer "every boot lost to RAM before a clean window opened" — host
+RAM was healthy (4-9GB free) for the full ~26 minutes of combined boot time this session. The actual and
+only blocker is that **selkies (the streaming layer) did not reach a stable bound-and-serving state even
+once, in 7 attempts across 2 boots** — there was no browser-visible desktop stream to click into at any
+point. This is a stronger, more decisive negative result than any prior session reached (all of which were
+cut off by RAM before this clarity was possible). The real fix remains Track B
+(`ADVISORY-002-d-zero-fork.md`'s cross-process `D==0` fork, removing thread-based relocating fork as
+selkies' own execution mechanism) — no new workaround was attempted or warranted here.
+
+**Not reached this session**: the ACK-stall-kill investigation (task step 5) — explicitly lower priority
+per this dispatch, and its relevance is superseded for now: selkies never reached a connected state to
+stall FROM in either boot this session, so there was nothing live to correlate against a packet capture.
+
+**Host RAM, final state**: both runners killed cleanly and manually (never by the RAM-safety threshold);
+free RAM recovered to ~9.3GB within 2s of each kill, confirming the runner process itself was the only
+consumer and the host has no other leak. `Get-Process litebox_runner_linux_on_windows_userland` returns
+zero matches at the end of this session.

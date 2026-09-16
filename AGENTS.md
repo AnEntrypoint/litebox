@@ -272,35 +272,27 @@ trusted-input path into the canvas and >1.8-2GB free memory for a rebuild-and-re
 **Separate open complaint, distinct from the ACK-stall-kill: Terminal Emulator/Applications-menu popup.**
 Architecture read found no litebox grab-/menu-specific code on this path; driving the guest DIRECTLY
 (bypassing selkies/browser) proved **both `xfce4-terminal` and the `xfce4-popup-applicationsmenu` popup
-mechanism are independently healthy** (open correctly twice each, no crash) — ruling out an app-exec-crash
-cause and click/render. `xdotool` on the OPEN menu (arrow-keys/type-ahead) didn't
-visibly launch anything once, inconclusive (test gap vs. real defect not yet distinguished) — retry
-`.wfgy/webtop_stack_menudiag3.sh`'s arrow-key variant on a quieter boot. The live browser click-path retest
-remains blocked — every session this week lost its clean-enough boot to ADVISORY-001 §3N (or, 2026-09-16,
-host RAM exhaustion, below) first. `net.rs` is fully cleared (live-proven twice, both guest-internal and
-`-p`-external probes); the masked-502/404 bug was a startup race (fixed: `SELKIES_PORT_UP` gate + a missing
-`50x.html`) plus §3N hitting selkies moments after bind (still open). `spawn_exec_collision_child`'s own
-unbounded-wait hang is fixed and live-reconfirmed (`42d8ced`, 20s/120s bounded). No litebox source change
-was made or warranted here — both paths are proven healthy; forcing a change without a further-specific
-defect would violate this project's standing discipline. Full blow-by-blow: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
+mechanism are independently healthy** (open correctly twice each, no crash). `net.rs` is fully cleared
+(live-proven twice); the masked-502/404 bug was a startup race (fixed) plus the crash class below hitting
+selkies moments after bind (still open). `spawn_exec_collision_child`'s hang is fixed and reconfirmed
+(`42d8ced`, 20s/120s bounded). **2026-09-16: the click-path retest is STILL blocked, now for a precisely
+diagnosed reason, not RAM** — 2 boots, ~26 min combined, RAM healthy 4-9GB free throughout, selkies reached
+`Data WebSocket Server listening` **0 times in 7 launch attempts**; a live `chrome-devtools` probe got a
+real `502` (`ws://localhost:3000/websockets` refused to selkies' own port), confirming no stream was ever
+up to click into. Full detail: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
-**2026-09-16, Track A fork-without-exec audit (ADVISORY-002 §6): `.wfgy/webtop_stack.sh`'s own supervisor
-subshells were themselves a live-matching instance of the crash class — fixed, but crash-frequency
-evidence is inconclusive (host RAM exhaustion), not yet statistically confident.** dbus-daemon (`--nofork`)
-and nginx (`daemon off; master_process off;`) already avoid self-daemonizing (pre-existing). But the
-script's own nginx/selkies
-supervisor loops ran as bare `( ... ) &` subshells — fork() with no exec(), the same unsafe shape as
-`dbus-daemon --fork` — and the archive's own `spawn_exec_collision_child` investigation already
-live-caught exactly this `SELKIES_SUPERVISOR` subshell SIGABRT-ing on `double free or corruption (out)`.
-**Fixed**: both loops extracted to files launched via `/bin/sh file &` (real fork+exec, discards any
-inherited corrupted heap per ADVISORY-002 §1.5). Six boots this session (1 control, 5 fixed): every one
-not killed early reached at least `DE_UP`/`DE_FALLBACK_LAUNCHED` cleanly, **zero occurrences of the target
-tcache/double-free crash in either arm** — but every boot (both arms) had to be killed for RAM safety at
-`DE_UP`/`SELKIES_LAUNCHED_LAST`, before the archive's own examples of that crash need several more
-`HOLD`-minutes of fork pressure to appear. No regression across 5 fixed attempts; real crash-frequency
-effect needs a re-run with more free RAM. Browser Terminal Emulator/menu retest not reached, same reason.
-`xfsettingsd`/Thunar's own fork behavior not independently re-verified — unchanged from ADVISORY-002.
-Boot-by-boot log: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
+**Track A fork-without-exec audit (ADVISORY-002 §6), crash-frequency now actually measured.**
+`.wfgy/webtop_stack.sh`'s own nginx/selkies supervisor subshells (bare `( ... ) &`, fork-no-exec) were
+**fixed** (real fork+exec via `/bin/sh file &`); dbus-daemon/nginx already avoided self-daemonizing.
+**`xfsettingsd`/Thunar re-verified live and cleared**: `DIAG_TIMELINE` shows both launched by
+`xfce4-session` via ordinary safe fork+exec, no fatal signal, no self-daemonization — all four Track A
+daemons now fixed or confirmed never at risk. **The supervisor fix works exactly as scoped, no further**:
+over 2 boots (~26 min, RAM healthy, never RAM-killed) `SELKIES_SUPERVISOR` itself survived all 6 respawns,
+but selkies crashed `SIGSEGV`/`rc=139` on 6 of 7 attempts at a consistent **~120s** interval (not a script
+artifact — no such delay exists in the script), plus one hang that never bound. **0/7 successful binds;
+the fix has no measurable effect on selkies' own crash rate** (never its intended scope). `GLIBC_TUNABLES`
+forwarding reconfirmed 100% (17/17) over a 20-min boot. Real fix remains Track B (below). Boot log:
+`docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 ## Host-side crash machinery
 
