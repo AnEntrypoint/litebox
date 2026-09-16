@@ -5901,17 +5901,190 @@ impl litebox::platform::RawMutexProvider for WindowsUserland {
     }
 }
 
-// A skeleton of a raw mutex for Windows.
+/// Identifies one thread blocked in [`RawMutex::block_or_maybe_timeout`]: the process it lives
+/// in, and the raw value of the auto-reset [`Win32_Foundation::HANDLE`] backing its per-thread
+/// wait event within that process.
+///
+/// Stored as a plain `isize` bit pattern rather than `HANDLE` so this type stays a trivial
+/// `Copy`/`Send`/`Sync` value with no `unsafe impl` needed -- the bit pattern is only ever
+/// reinterpreted back into a `HANDLE` at the point of use, in [`RawMutex::resolve_waiter_event`].
+///
+/// # Why `pid` is here even though every waiter today lives in this same process
+///
+/// `ADVISORY-002` §3.2 requires this design to generalize to a real cross-process waiter once
+/// Track B step 3 places `RawMutex` instances in memory shared across a process boundary: a
+/// waiter's raw event handle is only a meaningful value inside the process that created it, so a
+/// waker resolving one owned by a *different* process must go through
+/// [`RawMutex::resolve_waiter_event`]'s `DuplicateHandle` path rather than ever calling
+/// `SetEvent` directly on a foreign handle number. That path is real and complete below, not a
+/// stub -- it is simply never exercised yet, because `pid` is always the current process's own
+/// id until a genuine multi-process guest exists.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct WaiterRecord {
+    pid: u32,
+    event: isize,
+}
+
+struct ThreadWaiterEvent(Win32_Foundation::HANDLE);
+
+impl Drop for ThreadWaiterEvent {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is a valid, owned event handle, not used after this point. No other
+        // thread can be blocked on it: it is this thread's own per-thread event, and a thread
+        // cannot simultaneously be running this destructor (on itself, at thread-exit) and
+        // blocked inside `RawMutex::block_or_maybe_timeout` (also on itself).
+        unsafe {
+            Win32_Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+thread_local! {
+    /// This OS thread's own auto-reset wait event, created lazily on first use and reused for
+    /// every [`RawMutex`] this thread ever blocks on, for its whole lifetime -- replacing
+    /// `WaitOnAddress`/`WakeByAddressSingle` (MSDN: wakeable only by "another thread in the same
+    /// process"; `ADVISORY-002` §3.2) with the one primitive that generalizes across a process
+    /// boundary: a kernel `Event` object. One event per THREAD rather than one per `RawMutex`
+    /// keeps this independent of how many locks a thread ever contends on, and keeps `RawMutex`
+    /// itself `const`-constructible ([`litebox::platform::RawMutex::INIT`]), since opening a
+    /// kernel object is not a `const` operation.
+    static THREAD_WAITER_EVENT: RefCell<Option<ThreadWaiterEvent>> = const { RefCell::new(None) };
+}
+
+/// Returns this thread's own cached waiter event, creating it on first call.
+///
+/// The event is deliberately unnamed: it is signaled either directly by another thread in this
+/// same process (the common case today) or via a `DuplicateHandle`'d copy held by a thread in
+/// another process ([`RawMutex::resolve_waiter_event`], once one exists) -- neither needs the
+/// object to be findable by name.
+fn thread_waiter_event() -> Win32_Foundation::HANDLE {
+    THREAD_WAITER_EVENT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some(existing) = slot.as_ref() {
+            return existing.0;
+        }
+        // SAFETY: a null name requests an unnamed event; bManualReset=FALSE (auto-reset) and
+        // bInitialState=FALSE (not signaled) are required -- see this function's doc comment and
+        // `RawMutex::block_or_maybe_timeout`'s lost-wakeup argument, both of which depend on
+        // auto-reset semantics.
+        let handle =
+            unsafe { Win32_Threading::CreateEventW(core::ptr::null(), 0, 0, core::ptr::null()) };
+        assert!(
+            !handle.is_null(),
+            "CreateEventW for thread waiter event failed: {}",
+            unsafe { GetLastError() }
+        );
+        *slot = Some(ThreadWaiterEvent(handle));
+        handle
+    })
+}
+
+/// A raw mutex/futex for Windows.
+///
+/// Blocking is implemented with a manual wait queue plus a per-waiter kernel `Event`
+/// ([`thread_waiter_event`]) rather than `WaitOnAddress`/`WakeByAddressSingle`, because the
+/// latter pair is process-local by construction (`ADVISORY-002` §3.2) and this primitive must be
+/// ready to cross a process boundary once Track B's fixed-base shared kernel heap (step 3)
+/// lands. `inner` -- the value exposed as [`litebox::platform::RawMutex::underlying_atomic`] --
+/// is unchanged: it remains the uncontended fast-path CAS target for every caller, exactly as
+/// before this change.
 pub struct RawMutex {
     // The `inner` is the value shown to the outside world as an underlying atomic.
     inner: AtomicU32,
+    /// Threads currently blocked in [`Self::block_or_maybe_timeout`] on this specific `RawMutex`.
+    /// Guarded by an ordinary process-local `Mutex` because `RawMutex` instances themselves still
+    /// live in per-process heap memory today (Track B step 3 has not landed); see
+    /// [`WaiterRecord`]'s doc comment for what changes once it does.
+    waiters: Mutex<Vec<WaiterRecord>>,
+    /// Cache of cross-process handle duplications this mutex's wake path has ever needed, keyed
+    /// by the [`WaiterRecord`] it was resolved for. Populated only by
+    /// [`Self::resolve_waiter_event`]'s cross-process branch, which nothing reaches today -- see
+    /// that method's doc comment.
+    remote_waiter_handles: Mutex<Vec<(WaiterRecord, isize)>>,
 }
 
 impl RawMutex {
     const fn new() -> Self {
         Self {
             inner: AtomicU32::new(0),
+            waiters: Mutex::new(Vec::new()),
+            remote_waiter_handles: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Returns a `HANDLE` this process can legally call `SetEvent` on for `record`.
+    ///
+    /// # The two cases
+    ///
+    /// - `record.pid` is this process's own id (true for every waiter that exists today): the
+    ///   raw `record.event` value is already directly usable, because a `HANDLE` is valid for any
+    ///   thread within its owning process, not just the thread that created it.
+    /// - `record.pid` names a *different* process (unreachable until a real multi-process guest
+    ///   exists, per [`WaiterRecord`]'s doc comment): `record.event`'s bit pattern is meaningless
+    ///   in this process's own handle table, so it must be imported via `OpenProcess` +
+    ///   `DuplicateHandle` -- the same mechanism `advisor/probes/dup_probe.c` and
+    ///   `control_server.rs` already prove works for a same-user, non-admin sibling process. The
+    ///   result is cached in `self.remote_waiter_handles` so a mutex with a steady set of
+    ///   cross-process waiters pays the duplication cost once, not on every wake.
+    ///
+    /// This is a real, complete implementation of the second case, not a stub -- it is simply
+    /// untaken today, because every `record.pid` is this process's own until Track B step 3
+    /// places a `RawMutex` in memory genuinely shared across a process boundary.
+    fn resolve_waiter_event(&self, record: WaiterRecord) -> Win32_Foundation::HANDLE {
+        // SAFETY: reading the calling thread's own process id; no preconditions.
+        let self_pid = unsafe { Win32_Threading::GetCurrentProcessId() };
+        if record.pid == self_pid {
+            return record.event as Win32_Foundation::HANDLE;
+        }
+
+        let mut cache = self.remote_waiter_handles.lock().unwrap();
+        if let Some((_, local)) = cache.iter().find(|(r, _)| *r == record) {
+            return *local as Win32_Foundation::HANDLE;
+        }
+
+        // SAFETY: `record.pid` was read from a `WaiterRecord` this same mutex's own
+        // `block_or_maybe_timeout` pushed while that waiter was live; `PROCESS_DUP_HANDLE` is the
+        // minimum access the `DuplicateHandle` call below needs.
+        let owner = unsafe {
+            Win32_Threading::OpenProcess(Win32_Threading::PROCESS_DUP_HANDLE, 0, record.pid)
+        };
+        assert!(
+            !owner.is_null(),
+            "OpenProcess(PROCESS_DUP_HANDLE) on waiter process {} failed: {}",
+            record.pid,
+            unsafe { GetLastError() }
+        );
+
+        let mut local: Win32_Foundation::HANDLE = core::ptr::null_mut();
+        // SAFETY: `owner` was just opened with `PROCESS_DUP_HANDLE` above; `record.event` is a
+        // live event handle in that process (its owning thread cannot have closed it while
+        // registered as a waiter, for the same reason `wake_many`'s `SetEvent` call is safe --
+        // see that method's doc comment); `local` is a valid out-pointer into this process's own
+        // handle table.
+        let ok = unsafe {
+            Win32_Foundation::DuplicateHandle(
+                owner,
+                record.event as Win32_Foundation::HANDLE,
+                GetCurrentProcess(),
+                &mut local,
+                0,
+                0,
+                Win32_Foundation::DUPLICATE_SAME_ACCESS,
+            )
+        };
+        // SAFETY: `owner` is a valid, owned handle not used again after this point.
+        unsafe {
+            Win32_Foundation::CloseHandle(owner);
+        }
+        assert!(
+            ok != 0,
+            "DuplicateHandle(waiter event) from pid {} failed: {}",
+            record.pid,
+            unsafe { GetLastError() }
+        );
+
+        cache.push((record, local as isize));
+        local
     }
 
     #[expect(clippy::unnecessary_wraps)]
@@ -5920,6 +6093,40 @@ impl RawMutex {
         val: u32,
         timeout: Option<Duration>,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
+        // `LITEBOX_DIAG_WAIT_DUR=1`: log requested-vs-actual duration for every wait whose
+        // actual elapsed time is itself suspiciously long (>=1s), regardless of whether it timed
+        // out or was woken. This is the decisive measurement for the "missed wakeup, rescued
+        // only by a timeout" theory (AGENTS.md, "Rendering/scanout blocker": stalls recur in
+        // precise 60.000s-period blocks) -- a genuine missed-wakeup shows requested==actual
+        // (always times out, never woken early), whereas a real wake arriving late but before
+        // the timeout shows actual<requested. Gated and gap-filtered to avoid flooding on the
+        // (extremely common) fast/normal wait case.
+        let diag = diag_wait_dur_enabled();
+        let start = diag.then(std::time::Instant::now);
+
+        let event = thread_waiter_event();
+        // SAFETY: reading the calling thread's own process id; no preconditions.
+        let pid = unsafe { Win32_Threading::GetCurrentProcessId() };
+        let record = WaiterRecord {
+            pid,
+            event: event as isize,
+        };
+
+        // Register-then-check under the SAME lock `wake_many` takes to check-then-pop: this is
+        // the lost-wakeup argument. Whichever of (this check) / (a concurrent release's value
+        // change followed by its `wake_many` call) happens second, while holding this lock,
+        // observes the other's effect -- there is no window in which this thread has "decided to
+        // wait" without yet being visible to a waker, because registering and checking are one
+        // critical section.
+        {
+            let mut waiters = self.waiters.lock().unwrap();
+            if self.inner.load(Ordering::SeqCst) != val {
+                drop(waiters);
+                return Ok(UnblockedOrTimedOut::Unblocked);
+            }
+            waiters.push(record);
+        }
+
         // Compute timeout in ms
         let timeout_ms = match timeout {
             None => Win32_Threading::INFINITE, // no timeout
@@ -5929,36 +6136,51 @@ impl RawMutex {
             }
         };
 
-        // `LITEBOX_DIAG_WAIT_DUR=1`: log requested-vs-actual duration for every
-        // `WaitOnAddress` call whose actual elapsed time is itself suspiciously long (>=1s),
-        // regardless of whether it timed out or was woken. This is the decisive measurement
-        // for the "missed wakeup, rescued only by a timeout" theory (AGENTS.md,
-        // "Rendering/scanout blocker": stalls recur in precise 60.000s-period blocks) -- a
-        // genuine missed-wakeup shows requested==actual (always times out, never woken
-        // early), whereas a real wake arriving late but before the timeout shows
-        // actual<requested. Gated and gap-filtered to avoid flooding on the (extremely
-        // common) fast/normal wait case.
-        let diag = diag_wait_dur_enabled();
-        let start = diag.then(std::time::Instant::now);
+        // SAFETY: `event` is this thread's own valid, owned-for-its-lifetime event handle.
+        let rc = unsafe { Win32_Threading::WaitForSingleObject(event, timeout_ms) };
 
-        let ok = unsafe {
-            Win32_Threading::WaitOnAddress(
-                (&raw const self.inner).cast::<c_void>(),
-                (&raw const val).cast::<c_void>(),
-                std::mem::size_of::<u32>(),
-                timeout_ms,
-            ) != 0
-        };
-
-        let result = if ok {
-            Ok(UnblockedOrTimedOut::Unblocked)
-        } else {
-            // Check why WaitOnAddress failed
-            let err = unsafe { GetLastError() };
-            match err {
-                Win32_Foundation::ERROR_TIMEOUT => Ok(UnblockedOrTimedOut::TimedOut),
-                e => panic!("Unexpected error={e} for WaitOnAddress"),
+        let result = match rc {
+            Win32_Foundation::WAIT_OBJECT_0 => Ok(UnblockedOrTimedOut::Unblocked),
+            Win32_Foundation::WAIT_TIMEOUT => {
+                // Race with a concurrent `wake_many`: it may have already popped `record` (and
+                // therefore committed to signaling `event`) in the gap between the wait timing
+                // out internally and this thread reacquiring `self.waiters`. Resolve it under
+                // the same lock, so the two operations are mutually exclusive.
+                let still_queued = {
+                    let mut waiters = self.waiters.lock().unwrap();
+                    if let Some(pos) = waiters.iter().position(|w| *w == record) {
+                        waiters.remove(pos);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if still_queued {
+                    Ok(UnblockedOrTimedOut::TimedOut)
+                } else {
+                    // `wake_many` already removed us from the queue, which under its own
+                    // implementation happens only as part of unconditionally signaling `event`
+                    // (see its doc comment) -- so this wait cannot race that signal, only
+                    // possibly precede its delivery. Consuming it here, rather than leaving it
+                    // pending on a per-thread event this thread will reuse for an unrelated
+                    // future wait, is what makes that reuse across calls safe.
+                    // SAFETY: `event` is this thread's own valid, owned event handle.
+                    let rc2 = unsafe {
+                        Win32_Threading::WaitForSingleObject(event, Win32_Threading::INFINITE)
+                    };
+                    assert_eq!(
+                        rc2,
+                        Win32_Foundation::WAIT_OBJECT_0,
+                        "waiter event not signaled after wake_many committed to signaling it"
+                    );
+                    Ok(UnblockedOrTimedOut::Unblocked)
+                }
             }
+            Win32_Foundation::WAIT_FAILED => {
+                let err = unsafe { GetLastError() };
+                panic!("Unexpected error={err} for WaitForSingleObject")
+            }
+            other => panic!("Unexpected WaitForSingleObject return {other:#x}"),
         };
 
         if let Some(start) = start {
@@ -5971,12 +6193,27 @@ impl RawMutex {
                     requested:? = timeout,
                     elapsed_ms:% = elapsed.as_millis(),
                     result:? = result;
-                    "[diag-wait-dur] WaitOnAddress"
+                    "[diag-wait-dur] wait_for_single_object"
                 );
             }
         }
 
         result
+    }
+}
+
+impl Drop for RawMutex {
+    fn drop(&mut self) {
+        // Close any cross-process handle duplications this mutex ever cached. Never reached
+        // today (see `resolve_waiter_event`'s doc comment), but a `RawMutex` that did accumulate
+        // any must not leak them.
+        for (_, handle) in self.remote_waiter_handles.lock().unwrap().drain(..) {
+            // SAFETY: `handle` was returned by a `DuplicateHandle` call this same mutex made into
+            // this process's own handle table, and is used nowhere else.
+            unsafe {
+                Win32_Foundation::CloseHandle(handle as Win32_Foundation::HANDLE);
+            }
+        }
     }
 }
 
@@ -6036,25 +6273,37 @@ impl litebox::platform::RawMutex for RawMutex {
 
     fn wake_many(&self, n: usize) -> usize {
         assert!(n > 0, "wake_many should be called with n > 0");
-        let n: u32 = n.try_into().unwrap();
 
-        let mutex = core::ptr::from_ref(self.underlying_atomic()).cast::<c_void>();
-        unsafe {
-            if n == 1 {
-                Win32_Threading::WakeByAddressSingle(mutex);
-            } else if n >= i32::MAX as u32 {
-                Win32_Threading::WakeByAddressAll(mutex);
-            } else {
-                // Wake up `n` threads iteratively
-                for _ in 0..n {
-                    Win32_Threading::WakeByAddressSingle(mutex);
-                }
+        // Pop up to `n` waiters under `self.waiters`' lock -- the same lock
+        // `block_or_maybe_timeout` re-checks on a timeout race -- so a popped record is always
+        // exactly the set this call commits to signaling below; nothing else can also claim it.
+        let popped: Vec<WaiterRecord> = {
+            let mut waiters = self.waiters.lock().unwrap();
+            let k = n.min(waiters.len());
+            waiters.drain(0..k).collect()
+        };
+
+        let woken = popped.len();
+        for record in popped {
+            let handle = self.resolve_waiter_event(record);
+            // SAFETY: `handle` is a valid, live auto-reset event handle -- either this thread's
+            // direct view of the waiter's own handle (same process, the only case reachable
+            // today) or a handle `resolve_waiter_event` duplicated (or had already cached) from
+            // the waiter's own process. Either way the waiter registered `record` in
+            // `self.waiters` before blocking on it and cannot have closed it since: a blocked
+            // thread does not run concurrently with the wake that unblocks it, and the drain
+            // above already removed `record` under the same lock `block_or_maybe_timeout`'s
+            // timeout-race path re-checks, so no other caller can also signal or reclaim it.
+            unsafe {
+                Win32_Threading::SetEvent(handle);
             }
         }
 
-        // For windows, the OS kernel does not tell us how many threads were actually woken up,
-        // so we return zero to indicate that the count is unknown.
-        0
+        // Unlike `WakeByAddressSingle`/`WakeByAddressAll`, this manual queue DOES know exactly
+        // how many waiters it just signaled, so it reports the real count rather than the
+        // conservative `0` the OS primitive forced before this change. Trait contract
+        // (`litebox::platform::RawMutex::wake_many`) explicitly allows either.
+        woken
     }
 
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
