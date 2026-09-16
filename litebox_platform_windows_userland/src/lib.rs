@@ -6944,6 +6944,27 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         //
         // To ensure future MEM_COMMIT calls on sub-ranges succeed, we always reserve the entire aligned range
         // (i.e., MEM_RESERVE size is also made aligned to system allocation granularity).
+        //
+        // This deliberately leaves up to `dwAllocationGranularity - 1` bytes on each side of the
+        // caller's unrounded `r` reserved but never committed (PRD
+        // `windows-reserve-and-commit-64kib-granularity-noaccess-flanks`). Do NOT "fix" this by
+        // widening MEM_COMMIT to the full aligned span or by shrinking MEM_RESERVE to `r`: the
+        // former would commit real memory into a granule another, unrelated allocation may later
+        // legitimately claim (see the flank-restoration note below and `allocate_pages`'s
+        // whole-view CoW reservation, both of which rely on neighbours sharing a granule), and
+        // the latter is not achievable at all -- Windows rejects a MEM_RESERVE base that is not
+        // itself granularity-aligned. The asymmetry is already the intended guard, not a gap:
+        // reserved-but-uncommitted memory is unbacked, so any guest access landing in a flank
+        // faults exactly like a real out-of-bounds access would, before ever reaching
+        // `change_page_permissions`'s tracked range. Live-verified with a standalone
+        // VirtualAlloc/VirtualQuery probe replicating this exact shape (reserve a 3-granule span
+        // at PAGE_NOACCESS, commit only a deliberately unaligned inner sub-range): both flanks
+        // report State=MEM_RESERVE while the sub-range reports MEM_COMMIT/PAGE_READWRITE, and
+        // reading one byte from a flank raises an uncatchable native access violation (not a
+        // recoverable managed exception), confirming the flank is a hard fault boundary, not
+        // silently-readable memory. The only real cost is a few KiB of otherwise-unusable
+        // reserved (never committed, never charged) address space per allocation, negligible on
+        // a 64-bit process's address space.
         // `floor` raises `MEM_ADDRESS_REQUIREMENTS::LowestStartingAddress` for the
         // OS-picks-the-address (`r.start == 0`) path. Windows satisfies an unconstrained
         // request BOTTOM-UP from the lowest free address, so a caller that had a perfectly
