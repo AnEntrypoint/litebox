@@ -7,6 +7,7 @@
 
 extern crate alloc;
 
+pub mod control_server;
 pub mod session_cli;
 
 /// The standard Linux executable search path, prepended to a forwarded `PATH` in `main` below.
@@ -45,6 +46,16 @@ use clap::Parser;
 use litebox_platform_windows_userland::WindowsUserland as Platform;
 use memmap2::Mmap;
 use std::path::{Path, PathBuf};
+
+/// `--gui`'s value, per `docs/presenter-process-design.md` section 4.1.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuiMode {
+    /// `--gui` (no value, via `default_missing_value`) or `--gui=shown`: spawn the presenter and
+    /// show its window immediately.
+    Shown,
+    /// `--gui=hidden`: spawn the presenter at startup but leave its window not visible.
+    Hidden,
+}
 
 /// Run Linux programs with LiteBox on unmodified Windows.
 ///
@@ -118,23 +129,36 @@ pub struct CliArgs {
     #[arg(long = "pty-mode")]
     pub pty_mode: bool,
 
-    /// Open a real host window and display the guest's `/dev/dri/card0` DRM output in it (see
-    /// `litebox_shim_linux::syscalls::drm::DrmSubsystem` and
-    /// `litebox_platform_windows_userland::presentation`) -- opt-in, since most invocations
-    /// (scripted CLI usage, the common case this runner otherwise serves) have no GUI content to
-    /// show and should never have a window pop up unexpectedly.
-    #[arg(long = "gui")]
-    pub gui: bool,
-
-    /// Run the GUI presenter with its window HIDDEN at startup. Implies `--gui`: the whole
-    /// display pipeline (window, wgpu surface, input wiring, frame capture) is created and
-    /// running, there is simply nothing on screen until it is shown.
+    /// Spawn `litebox-presenter.exe` (a separate process -- see
+    /// `docs/presenter-process-design.md`) and open a real host window displaying the guest's
+    /// `/dev/dri/card0` DRM output in it. Opt-in, since most invocations (scripted CLI usage, the
+    /// common case this runner otherwise serves) have no GUI content to show and should never
+    /// have a window pop up unexpectedly.
     ///
-    /// This exists because a guest's GUI must not depend on a window existing. A desktop session
-    /// can boot, render, and be captured (`LITEBOX_DUMP_FRAMES`) headlessly, then be revealed
-    /// later -- headless and headed become the same running system observed differently, rather
-    /// than two modes chosen before the guest starts.
-    #[arg(long = "gui-hidden")]
+    /// Bare `--gui` shows the window immediately at startup (`GuiMode::Shown`, the
+    /// `default_missing_value` below). `--gui=hidden` spawns the presenter process (so a LATER
+    /// `show` control-channel call is fast, no cold-start wgpu/window-creation cost) but leaves
+    /// its window not visible -- matching `docs/presenter-process-design.md` section 4.1 exactly.
+    /// This exists because a guest's GUI must not depend on a window existing: a desktop session
+    /// can boot, render, and be captured (`LITEBOX_DUMP_FRAMES`, or a `screenshot` control-channel
+    /// call) headlessly, then be revealed later -- headless and headed become the same running
+    /// system observed differently, rather than two modes chosen before the guest starts.
+    ///
+    /// No `--gui` at all is headless exactly as today: `litebox-presenter.exe` is never spawned,
+    /// though the control channel still starts and answers `screenshot`/`ps`/`strace`/`frames`/
+    /// `key`/`rel` with no window -- only an explicit `show` (from a caller, or this flag) ever
+    /// spawns one.
+    #[arg(
+        long = "gui",
+        value_enum,
+        num_args = 0..=1,
+        default_missing_value = "shown"
+    )]
+    pub gui: Option<GuiMode>,
+
+    /// Deprecated spelling of `--gui=hidden`, kept so existing scripts using this flag keep
+    /// working unchanged. Prefer `--gui=hidden`.
+    #[arg(long = "gui-hidden", hide = true)]
     pub gui_hidden: bool,
 
     /// Publish a port from the guest to the host, `host_port:guest_port` (mirrors `docker run
@@ -797,178 +821,34 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     let shim = shim_builder.build();
 
-    // `--gui`: open a real host window and wire the guest's DRM page-flips into it. The
-    // `Presenter`'s own event loop (`Presenter::run`) blocks its calling thread for the window's
-    // entire lifetime -- see `presentation.rs`'s module doc comment for why that thread must NOT
-    // be this one (which goes on to call `run_thread` directly to execute the guest) -- so it gets
-    // its own dedicated OS thread, matching the `net_worker` pattern just below. Frames are pushed
-    // into it from `DrmSubsystem::page_flip` (inside the guest-execution thread, whichever thread
-    // that ends up being for a given guest process) via the `FrameSender` handle, never by the
-    // presenter thread reaching back into guest state itself.
-    //
-    // The `JoinHandle` is kept (not detached) so this function can wait for the WINDOW's own
-    // lifetime, not just the guest's: a real GUI stays on screen after the program that drew into
-    // it exits (exactly like a real X11 client disconnecting doesn't close the X server) -- without
-    // this, `std::process::exit` below tears the presenter thread down the instant the guest
-    // process finishes, which reliably raced the presenter's own async `resumed()`/first-frame
-    // setup and produced a window that never actually appeared, confirmed live.
-    // `--gui-hidden` implies `--gui`: it selects the window's INITIAL visibility, not whether the
-    // presenter exists.
-    let gui_requested = cli_args.gui || cli_args.gui_hidden;
-    let gui_start_hidden = cli_args.gui_hidden;
-    let gui_presenter_thread = gui_requested.then(|| {
-        // `winit::EventLoop` (inside `Presenter`) is genuinely not `Send` on Windows -- it must be
-        // BOTH created and run on the same OS thread, per winit's own platform requirement -- so
-        // `Presenter::new()` happens INSIDE the spawned closure, not before it. The `FrameSender`
-        // handle (which IS `Send`+`Clone`, see its own doc comment) crosses the thread boundary
-        // the other way, via a one-shot channel, so `add_drm_flip_callback` below can be wired up
-        // on the main thread without blocking on the presenter thread's own startup.
-        let (sender_tx, sender_rx) = std::sync::mpsc::channel();
-        let input_shim = shim.clone();
-        // Default `std::thread::spawn` stack (1 MiB on Windows) is not enough headroom for this
-        // thread's real work: `Presenter::new()`/`resumed()` create a real Win32 window plus a
-        // wgpu `Instance`/`Adapter`/`Device`/`Surface`, and `Presenter::run` then drives winit's
-        // event loop for the window's whole lifetime -- confirmed live as the actual overflowing
-        // thread (a genuine SEH stack-overflow crash reproduced with a real guest DRM client,
-        // `docs/wayland-drm-backend-probe/`, only with `--gui` set; the guest-execution thread
-        // itself was ruled out first by reproducing successfully with `--gui` OMITTED). This is a
-        // debug-build-specific cost (wgpu/winit's own deep, heavily-monomorphized generic call
-        // chains are dramatically more stack-hungry unoptimized -- confirmed live: a `--release`
-        // build never overflows even at 8 MiB, run repeatedly; a `dev` build still intermittently
-        // overflowed at 64 MiB before this larger budget), not an unbounded-growth bug -- 256 MiB
-        // is a deliberately generous fixed ceiling for a single always-present background thread,
-        // not a per-guest or per-frame cost that could ever compound.
-        const PRESENTER_THREAD_STACK_SIZE: usize = 256 * 1024 * 1024;
-        let handle = std::thread::Builder::new()
-            .name("litebox-gui-presenter".to_owned())
-            .stack_size(PRESENTER_THREAD_STACK_SIZE)
-            .spawn(move || {
-            let mut presenter =
-                match litebox_platform_windows_userland::presentation::Presenter::new() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        litebox_util_log::warn!(error:? = e; "failed to create GUI presenter");
-                        return;
-                    }
-                };
-            if gui_start_hidden {
-                presenter = presenter.hidden_at_startup();
-            }
-            // Forward real keyboard/mouse events captured by winit into the guest's
-            // `/dev/input/event0` queue, exactly mirroring how DRM page-flips are forwarded the
-            // other way (guest -> host) via `add_drm_flip_callback` below. This is what makes a
-            // `--gui` guest genuinely interactive rather than render-only.
-            presenter.set_input_consumer(move |signal| match signal {
-                litebox_platform_windows_userland::presentation::InputSignal::Key(code, value) => {
-                    input_shim.push_input_key(code, value);
-                }
-                litebox_platform_windows_userland::presentation::InputSignal::Rel(code, value) => {
-                    input_shim.push_input_rel(code, value);
-                }
-                litebox_platform_windows_userland::presentation::InputSignal::RelMotion(dx, dy) => {
-                    input_shim.push_input_rel_motion(dx, dy);
-                }
-            });
-            let _ = sender_tx.send(presenter.sender());
-            if let Err(e) = presenter.run() {
-                litebox_util_log::warn!(error:? = e; "GUI presenter event loop exited with an error");
-            }
-        })
-            .expect("failed to spawn GUI presenter thread");
-        if let Ok(sender) = sender_rx.recv() {
-            // `LITEBOX_GUI_VISIBILITY_FILE`: a one-byte control file polled on a background
-            // thread, letting the window be hidden and shown WHILE THE GUEST RUNS, from outside
-            // the process (`echo 0 > file` hides, `echo 1 > file` shows).
-            //
-            // A control file rather than a keyboard shortcut or a signal: a shortcut cannot reach
-            // a window that is currently hidden (the case that most needs it), and this runner
-            // has no guest-facing control channel to overload. Polling rather than a filesystem
-            // watch keeps it dependency-free and is trivially cheap at this interval; the file's
-            // CONTENT is the desired state, not a toggle, so a repeated write is idempotent and a
-            // caller never has to know the current state.
-            if let Some(path) = std::env::var_os("LITEBOX_GUI_VISIBILITY_FILE") {
-                let sender = sender.clone();
-                std::thread::Builder::new()
-                    .name("litebox-gui-visibility".to_owned())
-                    .spawn(move || {
-                        let mut last: Option<bool> = None;
-                        loop {
-                            if let Ok(text) = std::fs::read_to_string(&path) {
-                                let want = match text.trim() {
-                                    "0" | "hide" | "hidden" => Some(false),
-                                    "1" | "show" | "visible" => Some(true),
-                                    // Anything else (including a partially-written file caught
-                                    // mid-write) is ignored rather than guessed at.
-                                    _ => None,
-                                };
-                                if let Some(want) = want
-                                    && last != Some(want)
-                                {
-                                    litebox_util_log::warn!(visible:? = want; "gui: visibility change requested");
-                                    sender.set_visible(want);
-                                    last = Some(want);
-                                }
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(200));
-                        }
-                    })
-                    .expect("failed to spawn GUI visibility watcher thread");
-            }
-            // Presentation ONLY. Frame capture is a separate observer registered below, not an
-            // inline step here: when the flip slot held a single callback, capture had to be
-            // smuggled into this closure (running before `sender.send` took ownership) so that a
-            // stuck presenter could not starve it. Observers are additive now, so capture is
-            // genuinely independent -- it no longer depends on this closure running at all, and
-            // duplicating it here would write every frame twice.
-            shim.add_drm_flip_callback(move |bytes, width, height, pitch, _pixel_format| {
-                // The dumb buffer this slice points into is host-visible shared memory the guest
-                // can `mmap` and keep writing to, and `DrmSubsystem::notify_flip_callback` (see
-                // its own SAFETY note) unmaps it the instant every registered callback -- this one
-                // included -- returns. `sender.send` only QUEUES the frame for later, async
-                // presentation on a different thread, well after this callback (and the mapping
-                // backing `bytes`) is gone -- so a copy out of `bytes` is genuinely required here,
-                // not an incidental cost to shave off. What IS avoidable is a FRESH heap
-                // allocation for that copy on every single flip: `take_free_buffer` reclaims the
-                // `Vec` a previous, already-superseded frame no longer needs (see `FrameSender`'s
-                // own doc comment for the free-list this comes from), so steady-state flipping at
-                // a fixed resolution allocates only once, not per frame.
-                let mut owned = sender.take_free_buffer();
-                owned.clear();
-                owned.extend_from_slice(bytes);
-                let frame = litebox_platform_windows_userland::presentation::Frame {
-                    width,
-                    height,
-                    pitch,
-                    bytes: owned,
-                };
-                sender.send(frame);
-            });
-        }
-        handle
-    });
-    // `LITEBOX_DUMP_FRAMES` verification path, registered INDEPENDENTLY of `--gui`:
-    // frame capture must not require a working host window/wgpu presenter at all -- the presenter
-    // thread is a genuinely separate, independently flaky subsystem (real Win32 window + wgpu
-    // device/surface setup racing guest DRM startup, see the `--gui` doc comments above), and
-    // tying frame verification to it means a presenter hang silently blocks every other
-    // diagnostic too.
-    //
-    // This deliberately no longer excludes the `--gui` case. Flip observers are ADDITIVE (see
-    // `add_drm_flip_callback`), so a windowed run can capture the very same frames it displays.
-    // Previously the single-callback slot meant registering this one REPLACED the presenter's,
-    // so the two had to be gated against each other -- which disabled capture in exactly the
-    // situation it is most useful: proving what the on-screen window is actually showing, and
-    // telling "the guest never drew" apart from "the guest drew and presentation lost it".
-    if std::env::var_os("LITEBOX_DUMP_FRAMES").is_some() {
-        shim.add_drm_flip_callback(move |bytes, width, height, pitch, _pixel_format| {
-            let frame = litebox_platform_windows_userland::presentation::Frame {
-                width,
-                height,
-                pitch,
-                bytes: bytes.to_vec(),
-            };
-            litebox_platform_windows_userland::presentation::dump_frame_diagnostic(&frame);
-        });
+    // `ControlServer`: named-pipe listener answering `docs/presenter-process-design.md` section 3's
+    // command grammar (scanout/screenshot/show/hide/presenter?/key/rel/abs/ps/strace/frames).
+    // Started UNCONDITIONALLY -- headless or `--gui`/`--gui=hidden` -- per section 4.3: a caller
+    // can `screenshot`/`ps`/`strace`/`frames`/`key`/`rel` with no window regardless, and nothing
+    // about starting this listener touches a window, wgpu, or COM (see `control_server.rs`'s own
+    // module doc comment). This replaces the old `gui_presenter_thread` closure entirely: the
+    // window/wgpu/winit code that used to run on a thread INSIDE this process now lives in a
+    // separate `litebox-presenter.exe` process (section 1.2), connected to over this same pipe.
+    let presenter_exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|dir| dir.join("litebox-presenter.exe")))
+        .unwrap_or_else(|| PathBuf::from("litebox-presenter.exe"));
+    let control = control_server::start(shim.clone(), presenter_exe)
+        .expect("failed to start ControlServer (named-pipe listener)");
+
+    // `--gui-hidden` is a deprecated alias for `--gui=hidden` (kept for existing scripts, see the
+    // field's own doc comment); merge the two into the one `GuiMode` section 4.1 actually
+    // specifies. `--gui-hidden` wins if somehow both are given, since it is the more conservative
+    // (non-visible) choice.
+    let gui_mode = if cli_args.gui_hidden {
+        Some(GuiMode::Hidden)
+    } else {
+        cli_args.gui
+    };
+    if let Some(mode) = gui_mode
+        && let Err(e) = control_server::spawn_and_maybe_show(&control, mode)
+    {
+        litebox_util_log::warn!(error:? = e; "failed to start GUI presenter");
     }
 
     // Spawn a background worker that drives real network I/O (via the in-process userspace NAT
@@ -1251,15 +1131,19 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // `shutdown` frequently even while otherwise idle; the join below returns promptly.
     let _ = net_worker.join();
 
-    // `--gui`: keep the process (and its window) alive until the user closes it, matching real
-    // desktop application behavior -- the guest program that drew the window's content has
-    // already exited by this point (this line only runs after `program.process.wait()` above),
-    // exactly like a real X11/Wayland client disconnecting from the display server does not close
-    // the server or its windows. `Presenter::run`'s event loop only returns once
-    // `WindowEvent::CloseRequested` fires (the user clicked the window's close button), so this
-    // join is exactly the wait needed -- no polling, no arbitrary timeout.
-    if let Some(handle) = gui_presenter_thread {
-        let _ = handle.join();
+    // `--gui`/`--gui=hidden`: keep the process (and the presenter's window, if shown) alive until
+    // the user closes it, matching real desktop application behavior -- the guest program that
+    // drew the window's content has already exited by this point (this line only runs after
+    // `program.process.wait()` above), exactly like a real X11/Wayland client disconnecting from
+    // the display server does not close the server or its windows. `litebox-presenter.exe` is now
+    // a genuinely separate process, not a thread here, so there is no `JoinHandle` to wait on;
+    // instead poll for its control-channel connection to end (it closes its own connection right
+    // before exiting on `WindowEvent::CloseRequested`), which is the cross-process equivalent of
+    // the old thread join.
+    if gui_mode.is_some() {
+        while control_server::is_presenter_connected(&control) {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
     }
 
     // Loud, not silent: disclose any `LITEBOX_DUMP_FRAMES` frames dropped due to background-

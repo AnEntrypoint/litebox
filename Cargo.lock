@@ -2292,12 +2292,14 @@ dependencies = [
  "litebox_common_linux",
  "litebox_packager",
  "litebox_platform_windows_userland",
+ "litebox_presenter_protocol",
  "litebox_session_daemon",
  "litebox_shim_linux",
  "litebox_util_log",
  "memmap2",
  "tar",
  "tracing-subscriber",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

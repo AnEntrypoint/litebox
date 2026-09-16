@@ -59,6 +59,20 @@ impl PipeHandle {
     pub fn raw(&self) -> HANDLE {
         self.0
     }
+
+    /// Wraps an already-open pipe `HANDLE` this call takes ownership of (it will be closed on
+    /// drop). Used when a second, independent handle VALUE for the same underlying pipe instance
+    /// has already been produced (e.g. via `DuplicateHandle` within one process), so it can be
+    /// stored and closed independently of the original.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be a valid, currently-open handle that nothing else will close or continue
+    /// to use after this call.
+    #[must_use]
+    pub unsafe fn from_raw(handle: HANDLE) -> Self {
+        Self(handle)
+    }
 }
 
 /// Creates one named-pipe server instance and blocks until a client connects to it. One instance

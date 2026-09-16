@@ -104,9 +104,29 @@ fn dump_frames_writer_channel() -> &'static std::sync::mpsc::SyncSender<QueuedDu
 /// this diagnostic's original synchronous implementation) -- runs only on the background writer
 /// thread, never on the guest's flip path.
 fn write_dump_frame_bmp(queued: &QueuedDumpFrame) {
-    let width = queued.width;
-    let height = queued.height;
-    let pitch = queued.pitch;
+    let out = encode_bmp(queued.width, queued.height, queued.pitch, &queued.bytes);
+    if let Err(e) = std::fs::write(&queued.out_path, &out) {
+        eprintln!(
+            "[LITEBOX_DUMP_FRAMES] failed to write {} (frame {}): {e}",
+            queued.out_path, queued.frame_number
+        );
+    } else {
+        eprintln!(
+            "[LITEBOX_DUMP_FRAMES] wrote {} ({} bytes, frame {})",
+            queued.out_path,
+            out.len(),
+            queued.frame_number
+        );
+    }
+}
+
+/// Encodes `width`x`height` `BGRA8`/`XRGB8888` pixel bytes (row `pitch` applied, bottom-to-top
+/// BMP row order) as a complete `.bmp` file. Extracted out of [`write_dump_frame_bmp`] (unchanged
+/// byte layout) so `litebox_runner_linux_on_windows_userland`'s `screenshot` control-channel
+/// command (`docs/presenter-process-design.md` section 3.2) can reuse the exact same encoder
+/// against a live-read scanout section, rather than duplicating this format.
+#[must_use]
+pub fn encode_bmp(width: usize, height: usize, pitch: usize, bytes: &[u8]) -> Vec<u8> {
     let row_bytes = width * 4;
     let pixel_data_size = row_bytes * height;
     let file_header_size = 14;
@@ -137,23 +157,40 @@ fn write_dump_frame_bmp(queued: &QueuedDumpFrame) {
     for row in (0..height).rev() {
         let row_start = row * pitch;
         let row_end = row_start + row_bytes;
-        if let Some(row_bytes_slice) = queued.bytes.get(row_start..row_end) {
+        if let Some(row_bytes_slice) = bytes.get(row_start..row_end) {
             out.extend_from_slice(row_bytes_slice);
         } else {
             out.extend(std::iter::repeat_n(0u8, row_bytes));
         }
     }
-    if let Err(e) = std::fs::write(&queued.out_path, &out) {
-        eprintln!(
-            "[LITEBOX_DUMP_FRAMES] failed to write {} (frame {}): {e}",
-            queued.out_path, queued.frame_number
-        );
-    } else {
-        eprintln!(
-            "[LITEBOX_DUMP_FRAMES] wrote {} ({file_size} bytes, frame {})",
-            queued.out_path, queued.frame_number
-        );
+    out
+}
+
+/// Counts non-black pixels (any nonzero RGB channel, alpha ignored -- see
+/// [`dump_frame_diagnostic`]'s own doc comment for why) and distinct colors (capped at 64) over a
+/// `width`x`height` region with row `pitch`. Extracted out of [`dump_frame_diagnostic`] so
+/// `screenshot`'s `<non_black_pixels> <distinct_colors_capped64>` reply tokens
+/// (`docs/presenter-process-design.md` section 3.2) reuse the exact same counting logic.
+#[must_use]
+pub fn count_pixel_stats(width: usize, height: usize, pitch: usize, bytes: &[u8]) -> (usize, usize) {
+    let mut non_black_pixels = 0usize;
+    let mut distinct_colors = std::collections::HashSet::new();
+    for row in 0..height {
+        let row_start = row * pitch;
+        for col in 0..width {
+            let px_start = row_start + col * 4;
+            let Some(px) = bytes.get(px_start..px_start + 4) else {
+                continue;
+            };
+            if px[0] != 0 || px[1] != 0 || px[2] != 0 {
+                non_black_pixels += 1;
+            }
+            if distinct_colors.len() < 64 {
+                distinct_colors.insert([px[0], px[1], px[2], px[3]]);
+            }
+        }
     }
+    (non_black_pixels, distinct_colors.len())
 }
 
 /// Debugging aid, gated behind `LITEBOX_DUMP_FRAMES`: called from the guest's DRM `PAGE_FLIP`
@@ -210,38 +247,17 @@ pub fn dump_frame_diagnostic(frame: &Frame) {
         return;
     }
 
-    let mut non_black_pixels = 0usize;
-    let mut distinct_colors = std::collections::HashSet::new();
-    for row in 0..height {
-        let row_start = row * pitch;
-        for col in 0..width {
-            let px_start = row_start + col * 4;
-            let Some(px) = frame.bytes.get(px_start..px_start + 4) else {
-                continue;
-            };
-            // "Black" means the RGB channels alone, regardless of alpha -- confirmed live
-            // (advisor-db cross-session review) that the previous exact-match check against only
-            // `[0, 0, 0, 0]` and `[0, 0, 0, 255]` produced a false-positive whole-frame
-            // `non_black_pixels` count on a real capture whose actual bytes were `[0, 0, 0, 1]`
-            // (visually indistinguishable from black, just an off-by-one alpha value neither
-            // exact match caught) -- a scanout framebuffer's alpha byte carries no visual meaning
-            // for this diagnostic's own purpose (spotting real drawn RGB content), so it should
-            // never be part of the "is this black" test at all.
-            if px[0] != 0 || px[1] != 0 || px[2] != 0 {
-                non_black_pixels += 1;
-            }
-            if distinct_colors.len() < 64 {
-                distinct_colors.insert([px[0], px[1], px[2], px[3]]);
-            }
-        }
-    }
+    // "Black" means the RGB channels alone, regardless of alpha -- confirmed live (advisor-db
+    // cross-session review) that an earlier exact-match check against only `[0, 0, 0, 0]` and
+    // `[0, 0, 0, 255]` produced a false-positive whole-frame `non_black_pixels` count on a real
+    // capture whose actual bytes were `[0, 0, 0, 1]` (visually indistinguishable from black, just
+    // an off-by-one alpha value neither exact match caught) -- a scanout framebuffer's alpha byte
+    // carries no visual meaning for this diagnostic's own purpose (spotting real drawn RGB
+    // content), so it should never be part of the "is this black" test at all. See
+    // `count_pixel_stats` (shared with the `screenshot` control-channel command).
+    let (non_black_pixels, distinct_colors) = count_pixel_stats(width, height, pitch, &frame.bytes);
     eprintln!(
-        "[LITEBOX_DUMP_FRAMES] frame {}x{} pitch={} non_black_pixels={} distinct_colors_capped64={}",
-        width,
-        height,
-        pitch,
-        non_black_pixels,
-        distinct_colors.len()
+        "[LITEBOX_DUMP_FRAMES] frame {width}x{height} pitch={pitch} non_black_pixels={non_black_pixels} distinct_colors_capped64={distinct_colors}"
     );
 
     if std::env::var_os("LITEBOX_DUMP_FRAMES_METADATA_ONLY").is_some() {

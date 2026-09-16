@@ -10,11 +10,17 @@ litebox = { version = "0.1.0", path = "../litebox" }
 litebox_common_linux = { version = "0.1.0", path = "../litebox_common_linux" }
 litebox_packager = { version = "0.1.0", path = "../litebox_packager" }
 litebox_platform_windows_userland = { version = "0.1.0", path = "../litebox_platform_windows_userland" }
+litebox_presenter_protocol = { version = "0.1.0", path = "../litebox_presenter_protocol" }
 litebox_session_daemon = { version = "0.1.0", path = "../litebox_session_daemon" }
 litebox_shim_linux = { version = "0.1.0", path = "../litebox_shim_linux", default-features = false }
 litebox_util_log = { version = "0.1.0", path = "../litebox_util_log", features = ["backend_tracing"] }
 memmap2 = "0.9.8"
 tar = "0.4.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+windows-sys = { version = "0.60.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }
 [lints]
 workspace = true

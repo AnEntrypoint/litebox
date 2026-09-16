@@ -81,6 +81,18 @@ pub fn strace_summary_enabled() -> bool {
     STRACE_ENABLED.load(Ordering::Acquire)
 }
 
+/// Unconditionally sets the live enabled state, unlike [`init_strace_summary`] -- that function
+/// is a one-shot latch (a second call is a no-op by design, see its own doc comment), so it
+/// cannot serve a genuine runtime `strace on`/`strace off` control-channel command
+/// (`docs/presenter-process-design.md` section 3.2). This is that missing setter: cheap (one
+/// store), safe to call from any thread at any time, and idempotent in the sense that matters for
+/// a toggle (setting the same value twice is harmless), not in `init_strace_summary`'s
+/// call-once-only sense.
+pub fn set_strace_summary_enabled(enabled: bool) {
+    STRACE_ENABLED.store(enabled, Ordering::Release);
+    STRACE_INIT.store(true, Ordering::Release);
+}
+
 /// Record one completed syscall dispatch. `duration_ns` is the wall time spent in
 /// `do_syscall`. `err_debug` is `Some(format!("{err:?}"))` on an `Err` result.
 pub fn record_syscall(syscall_number: usize, duration_ns: u64, err_debug: Option<String>) {
