@@ -107,6 +107,20 @@ the perf work exposed are all fixed; mechanisms/repros/cost history: archive.
 symptom this investigation began from, genuinely not root-caused (`docs/track-b-fork-fix-progress.md:
 146-152`). Do not cite the separate curl-self-test stall as live open work: that one is fixed.
 
+**Fork-after-Xorg PERMANENT freeze — reproduced, narrowed, NOT fixed (2026-09-16).** Forking any new
+process (e.g. `xfconfd`) shortly after a real `Xorg :0 -novtswitch -sharevts` starts on litebox's
+virtual DRM device permanently hangs the guest (CPU flat ~11s, RSS ~1.35GB, never recovers — distinct
+from the older transient stall class). A full invasive `cdb -p <pid>` attach (not `-pv`) read all 11
+threads cleanly: 10 are ordinary idle waits (epoll/RawMutex/named-pipe/sleep, none pathological, and
+none touching the new cross-process `RawMutex` work from `6c09213`); one thread alone burned the
+process's entire lifetime CPU and is pinned mid-instruction in ordinary rewritten guest syscall-return
+code (not a stale/unmapped pointer, not a lock wait) — pointing at `fork_verify.rs`'s single-step
+healing state machine / `vectored_exception_handler` interaction for that one thread as the real
+mechanism, never fully proven to converge-or-not from a single post-mortem snapshot. Full repro script,
+thread-by-thread dump, disassembly and next-step plan (attach BEFORE the freeze, check EFLAGS.TF across
+repros): `docs/AGENTS_ARCHIVE_2026-09-16.md`. `cdb.exe`/`WinDbgX.exe` are already installed on this host
+(Windows Kits + the WinDbg Store app) — no ProcDump download needed for this class of investigation.
+
 ## Container images and OCI loading
 
 **`litebox_packager --oci-image <ref> --output <tar>`** pulls, whiteout-merges, rewrites every ELF and
@@ -317,36 +331,14 @@ deadlocks instead). Small disclosed pre-existing gaps unrelated to the crash (`f
 
 ## Five cheap-wins PRD rows closed, 2026-09-16 (all cargo build/fmt-verified, no boot needed)
 
-- `litebox-mm-unsafe-op-in-unsafe-fn-breaks-dwarnings`: `litebox/src/mm/mod.rs:1429-1524`'s 5
-  `make_pages_*` wrappers now call `change_page_permissions` inside explicit `unsafe{}` with SAFETY
-  comments. `RUSTFLAGS=-Dwarnings cargo build -p litebox` clean. Commit `d336d94`.
-- `litebox-common-linux-not-rustfmt-clean`: ran `cargo fmt -p litebox_common_linux` (5 pre-existing
-  diffs: `src/lib.rs:2276,4378,4896`, `src/mm.rs:67,188`). `-- --check` now clean. Commit `30a3392`.
-- `litebox-shim-linux-cfg-test-build-broken`: `Task::pid/ppid/tid`'s move to `Cell<i32>` was never
-  propagated into `#[cfg(test)]` call sites in `syscalls/process.rs`, `syscalls/epoll.rs`, `lib.rs`'s
-  `clone_as_forked_child_for_test` (21 errors: missing `.get()`, one moved-out non-`Copy` `Cell`, one
-  `Arc::downgrade(self.process())` needing `&`). Fixed; `cargo build --tests -p litebox_shim_linux`
-  now compiles clean, unblocking this crate's whole regression-test suite. Commit `8e70c81`.
-- `repo-hygiene-violations-contradict-the-standing-lesson`: `target/` was never actually tracked
-  (the original claim didn't reproduce), but `git ls-files` found 10 real violations -- probe frame
-  dumps/debug logs (`advisor/probes/baseline_xorg_pid1_black.bmp`, `endpoint2-painted-pixels/
-  frame{03,05,09}_*.bmp`, `xorg-fork-segv/{X5-fork-segv,x1-pid1-control}.log`) plus root scratch
-  files (`scratch2.txt`, `scratch_window.txt`, `scratchpad_labwc_{final,xkbfix}.png`). Untracked via
-  `git rm --cached` (kept on disk, two are cited as evidence in `advisor/probes/README-x-client-test.md`
-  and `dirtyfb/DESIGN.md`); `.gitignore` widened (`advisor/probes/**/*.bmp`, `**/*.log`, `/scratch*`).
-  Also deleted 3 stray untracked `*.stackdump` droppings. Commits `a4d4759`, `a37773d` (a shared-worktree
-  `git add -A` race with a concurrent session transiently re-added these files in `30a3392` between
-  the two commits; `a4d4759` corrected it without a history rewrite -- verified via `git ls-files`:
-  zero matches for any of the 10 paths at current HEAD).
-- `windows-reserve-and-commit-64kib-granularity-noaccess-flanks`: `reserve_and_commit`
-  (`litebox_platform_windows_userland/src/lib.rs`) leaves up to ~60KiB reserved-but-uncommitted on
-  each side of a caller's unrounded range inside a 64KiB granule. Both proposed fixes are unsafe/
-  impossible: committing the flanks would break the documented neighbour-sharing invariant CoW flank
-  restoration relies on; shrinking the reservation can't work since Windows requires a granularity-
-  aligned `MEM_RESERVE` base. Live-verified via a standalone VirtualAlloc/VirtualQuery probe
-  (replicating the exact reserve/commit shape) that the flank is already the wanted guard: State stays
-  `MEM_RESERVE` and touching it raises an uncatchable access violation, not silent/zero-filled access.
-  No behavior change; documented as intentional in the function's own doc comment. Commit `936714f`.
+`litebox-mm-unsafe-op-in-unsafe-fn-breaks-dwarnings` (explicit `unsafe{}`+SAFETY comments around
+`change_page_permissions` in `litebox/src/mm/mod.rs`, commit `d336d94`); `litebox-common-linux-not-
+rustfmt-clean` (`cargo fmt -p litebox_common_linux`, commit `30a3392`); `litebox-shim-linux-cfg-test-
+build-broken` (`Cell<i32>` drift in `#[cfg(test)]` call sites, 21 errors fixed, commit `8e70c81`);
+`repo-hygiene-violations-contradict-the-standing-lesson` (10 tracked probe-artifact/scratch-file
+violations `git rm --cached`, `.gitignore` widened, commits `a4d4759`/`a37773d`); `windows-reserve-
+and-commit-64kib-granularity-noaccess-flanks` (documented the ~60KiB reserved-but-uncommitted flank as
+an intentional CoW guard, no code change, commit `936714f`). Full detail: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 ## Docs and tooling map
 

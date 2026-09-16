@@ -2011,3 +2011,110 @@ question it was answering was settled -- except the runner child-side pump's `ch
 once per pipe lifetime, only on the failure path) trace point in the same style as this project's
 other `[process_fork_diag]` lines, since this investigation itself needed exactly this data live and
 a future session chasing the same class of bug will too.
+
+## Fork-after-Xorg permanent freeze -- REPRODUCED, full 11-thread invasive dump, real mechanism narrowed (2026-09-16, session xorg-fork-freeze-7f3a9c)
+
+Continuation of `mut-1789-fork-after-xorg-drm-permanent-freeze` / `prd-1789-fork-after-xorg-permanent-freeze`
+/ `mut-1788426841641`. Prior session's `cdb -pv` (non-invasive) attach read only 4 of ~24 threads and
+could not re-attach a second time (`Win32 error 0n87`). This session used a genuinely INVASIVE `cdb -p <pid>`
+attach (no `-pv`), which suspends every thread and reads all of them -- the exact fix the prior session's
+own next-step note asked for, since ProcDump was not installed on this host but `cdb.exe`/`WinDbgX.exe`
+already are (`C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe`; `Microsoft.WinDbg` Store app at
+`C:\Program Files\WindowsApps\Microsoft.WinDbg_1.2606.22001.0_x64__8wekyb3d8bbwe`, `WinDbgX.exe`/`cdbX64.exe`
+stubs under `%LOCALAPPDATA%\Microsoft\WindowsApps\Microsoft.WinDbg_8wekyb3d8bbwe\`) -- no download needed.
+
+**Repro (deterministic, reproduced this session on a MINIMAL script, no full XFCE needed):** `linuxserver/webtop:debian-xfce`
+via cached `.wfgy/webtop-dxfce/webtop-debian-xfce.tar`, `--gui=hidden`, `--env GLIBC_TUNABLES=glibc.malloc.tcache_count=0:glibc.malloc.mxfast=0`
+(needed to dodge the UNRELATED ADVISORY-001 3N tcache-corruption/"stack smashing detected" class, which this
+image's fork-heavy boot hits independently and which otherwise kills the launcher shell before the target bug
+is even reached -- confirmed twice by disabling the workaround). Script: `dbus-daemon --nofork` (bus wait),
+`seatd` (single spawn, single `sleep`, NOT a `sleep 0.5`-per-iteration busybox loop -- that loop pattern is
+ALSO a separate, real, already-documented bug: repeated `fork()+sleep` from a poll loop reliably
+`*** stack smashing detected ***`-aborts the LAUNCHER SHELL ITSELF, reproduced twice more this session even
+at `sleep 2` granularity, apparently triggered by Xorg's own concurrent fork/allocate_pages load rather than
+poll-loop frequency alone -- a single blocking `sleep N` per stage avoids it entirely and is what actually
+worked), then `XKB_CONFIG_ROOT=/usr/share/X11/xkb Xorg :0 -nolisten tcp -noreset -novtswitch -sharevts`, then
+background `/usr/lib/xfce4/xfconf/xfconfd`. Freeze onset matches the archived signature almost exactly:
+CPU pinned flat thereafter (this run: ~11.03s cumulative, vs. archived "~11s total"), RSS ~1.35GB steady
+(vs. archived "~1.36GB steady") -- strong confirmation this is the same bug, not a new one.
+
+**Full thread inventory (11 real host threads total in this minimal repro, all 11 read cleanly via invasive
+attach -- the full-XFCE run's ~24 threads were mostly additional guest worker threads not needed to trigger
+this):**
+
+- Thread 0 (main): idle periodic `sleep` inside `litebox_runner_linux_on_windows_userland::run`'s main loop.
+- Thread 1: `fault_terminate_watchdog_thread_body`, idle periodic `sleep`.
+- Thread 2: `control_server::spawn_header_publisher`, idle periodic `sleep`.
+- Thread 3: `control_server::start` accept loop, blocked on `GetOverlappedResult`/`WaitForSingleObject`
+  waiting for `litebox-presenter.exe` to connect (ordinary, presenter connects later).
+- Thread 4: `NatGateway::new`-related idle thread, periodic `sleep`.
+- Thread 5: `control_server::handle_connection` -> `LineReader::read_line` -> `GetOverlappedResult`, blocked
+  reading the next control-pipe command from the connected presenter (ordinary idle).
+- Threads 6, 7, 9: guest worker threads blocked in `litebox::platform::RawMutex::block` ->
+  `WaitForSingleObject`, reached via `litebox::event::wait::WaitContext::wait_until` ->
+  `EpollFile`/`PollSet::wait` -> `pty_ioctl` -> `sys_epoll_pwait` -- i.e. genuinely idle guest threads
+  correctly blocked in `epoll_pwait`, nothing pathological about the wait itself (this is the SAME
+  `RawMutex` the day's cross-process rewrite (commit `6c09213`) touched, but every instance of it here is a
+  completely ordinary same-process wait with no missing wake evident -- `6c09213`'s cross-process branch is
+  provably NOT implicated in this freeze).
+- Thread 10: `ntdll!DbgBreakPoint`/`DbgUiRemoteBreakin` -- cdb's own injected breakin thread, not part of the
+  guest.
+- **Thread 8 (host tid `0x3448`) is the ONE outlier and the real finding.** `!runaway` showed it alone
+  carrying 5.515s of the process's ~11s total lifetime CPU -- every other thread combined used well under
+  1s. It is NOT blocked on any Windows synchronization primitive at all: `rip=0x00007fefedf84668`, inside a
+  `PAGE_EXECUTE_READ`/`MEM_PRIVATE` region (`0x7fefedf1d000`-`0x7fefee080000`, the rewritten guest-code band
+  this project's own recall notes already call out as "source guest mappings live in the 0x7fef_xxxx_xxxx
+  band"). Disassembly at and around `rip` (`u @rip-30 L10` / `u @rip L20`) is ordinary, straight-line
+  musl/glibc syscall-return glue -- no visible loop, no backward branch: `mov edx,[rbx+0x308]` (reading a
+  field off a per-thread structure), `pop rcx; pop rsi; cmp rax,-4; je +0x28; pop rbx; ret`, immediately
+  preceded by `call 0x7fefedf8f9c0` (a call into litebox's own syscall trampoline) -- i.e. thread 8 is
+  captured right after a guest syscall returned, checking/handling its result. `rbx=0x10000b00`, so the
+  read targets `0x10000e08`, which resolves (`!address`) to a real, correctly `PAGE_READWRITE`-mapped,
+  `MEM_COMMIT` 12KB region at `0x10000000`-`0x10003000` (musl's per-thread TCB/TLS area for this thread) --
+  the debugger read `*0x10000e08 == 0` live off the dump, so this is NOT a stale-pointer access violation in
+  the already-open `fork-verify-av-path-stale-rip-bypasses-single-step-heal` sense (that row's mechanism is
+  an AV on a genuinely UNMAPPED page; this page is mapped and readable).
+
+**What this rules out and what it leaves open.** The freeze is NOT: a RawMutex/epoll missed-wakeup (every
+`RawMutex` waiter in the dump is an ordinary, explicable idle wait), NOT the day's new cross-process
+`RawMutex` work (`6c09213` -- never exercised cross-process here, every instance is same-process), NOT the
+`ALLOCATE_PAGES_FIXED_ADDR_LOCK`/`VIRTUAL_PROTECT_LOCK` contention already refuted for the transient-stall
+class (no thread in this dump is waiting to acquire it, and none show `diag-lockhold` log lines in this
+run's `LITEBOX_LOG=...windows_userland=debug` capture -- confirmed absent, closing that half of the prior
+session's own follow-up question), and NOT a simple stale/unmapped-pointer AV (the exact page thread 8 reads
+is live, mapped, correct). What it IS, most likely, given thread 8 alone burned the overwhelming majority of
+the process's entire lifetime CPU before all forward progress stopped process-wide: thread 8 is (or very
+recently was) the thread actively undergoing `fork_verify`'s single-step healing for the newly-forked
+`xfconfd` child (or a sibling fork very close in time) -- consistent with `mut-1788426841641`'s own
+independent observation of "a burst of small `mprotect(PROT_READ)` calls...consistent with a dlopen()-
+triggered one-time-init lock" immediately preceding its hang, and with this run's own captured
+`allocate_pages`/`DIAG region state` log burst for `GuestPid(22)` right before the freeze. The single static
+snapshot available from ONE invasive attach cannot by itself distinguish "genuinely wedged inside the VEH's
+single-step re-entry handling for this exact instruction forever" from "finished its burst and is idle
+between syscalls, with something else (an APC, a re-arm, a wake) that should schedule it onward never
+arriving" -- both point at `fork_verify.rs`'s single-step healing state machine and its interaction with
+`vectored_exception_handler` for THIS thread, specifically, not at any lock held by another thread (no other
+thread in the dump holds anything thread 8 could be waiting on). A second invasive attach to get a
+before/after RIP comparison failed with the SAME `Win32 error 0n87` the prior session hit on a second `-pv`
+attach -- confirmed this is not `-pv`-specific, it is a general "cdb cannot re-attach to a process it very
+recently detached from" limitation; the workaround is `cdb -z <dumpfile>` against the `.dump /ma` full-memory
+dump taken on the FIRST attach (this is how the register/disassembly/`!address` follow-up queries above were
+actually obtained, offline, with zero risk of disturbing the live process further).
+
+**Not fixed this session** -- the exact non-convergence mechanism inside `fork_verify`'s single-step handling
+for this thread needs either a live single-step trace with breakpoints INSIDE `fork_verify::on_single_step`/
+`vectored_exception_handler` (risky against a process this hard to re-attach to) or careful manual code
+reading of that handler's re-entry/TF-clearing logic under this exact interleaving, neither done this
+session. Next session: set a breakpoint at `fork_verify::begin`/`on_single_step` BEFORE reproducing (i.e.
+launch already attached, e.g. `cdb -o` on the runner's own child-process creation, or attach immediately
+after the `xfconfd` fork's PID is known) rather than attaching after the freeze already happened, so the
+transition INTO the stuck state is observed rather than only the aftermath; check whether EFLAGS.TF
+(trap flag, bit 0x100) is set or clear at the exact freeze point across several fresh repros (this session's
+one snapshot showed `efl=00000246`, TF clear, at the moment of attach -- inconclusive alone).
+
+Cleanup: runner (`litebox_runner_linux_on_windows_userland.exe`, 2 pids) and `litebox-presenter.exe` exited
+on their own shortly after the second `cdb -z`/`qd` cycle (no explicit kill needed -- `Get-Process` returned
+zero matches afterward). The 10.9GB `.dump /ma` full-memory dump (`.wfgy/xorg_freeze_full.dmp`, gitignored
+scratch) was deleted after extracting the register/disassembly evidence above; host disk was at 41GB free of
+1.9TB (98% used) at delete time, host RAM 7.1GB free of 15.6GB total at session end -- worth flagging to a
+future session as a standing low-disk-headroom condition, not something this session caused.
