@@ -337,12 +337,14 @@ Present mode is Mailbox-preferred with Fifo fallback — any note calling it Fif
 still emits one coalesced `InputSignal::RelMotion`, but `litebox_presenter/src/main.rs` (new
 today) forwarded it as TWO `rel` wire lines, and `control_server.rs` called `push_input_rel` once
 per line -- two `SYN_REPORT`s/move. Fixed: `Request::RelMotion{dx,dy}` (`relmotion <i32> <i32>`)
-added to `litebox_presenter_protocol`, wired to `push_input_rel_motion`. Code-verified (one
-`push_batch` call, batch_len=2); live `LITEBOX_INPUT_TRACE=1` confirmation still wanted (runner
-busy this pass). Open PRD, both DIFFERENT/untouched: `mouse-motion-devicevent-needs-pixel-
-calibration` (DeviceEvent pixel scale, not sync count), `linux-macos-userland-presentation-still-
-emits-two-syn-reports-per-move` (Linux/macOS platform crates' own handlers, pre-existing). No
-framerate baseline exists (idle compositor legitimately produces zero page flips).
+added to `litebox_presenter_protocol`, wired to `push_input_rel_motion`. **Live-verified**
+(`--gui=hidden`, `LITEBOX_INPUT_TRACE=1`, control pipe driven directly): one `relmotion 5 3` ->
+exactly one `push_batch emitting one SYN_REPORT batch_len=2` line; two separate `rel` lines (the
+pre-fix shape) -> two `batch_len=1` lines, confirming both the bug and the fix live. Open PRD,
+both DIFFERENT/untouched: `mouse-motion-devicevent-needs-pixel-calibration` (DeviceEvent pixel
+scale, not sync count), `linux-macos-userland-presentation-still-emits-two-syn-reports-per-move`
+(Linux/macOS platform crates' own handlers, pre-existing). No framerate baseline exists (idle
+compositor legitimately produces zero page flips).
 
 **The GUI protocol decision is settled**: DRM/KMS + wgpu, proven live with guest page-flip pixels in a
 real host window. Not an open X11-vs-Wayland-vs-DRM question.
