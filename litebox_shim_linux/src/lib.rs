@@ -2989,7 +2989,7 @@ mod test_utils {
                 pid,
                 Arc::new(PageManager::new(&self.global.litebox)),
                 false,
-                Some(Arc::downgrade(self.process())),
+                Some(Arc::downgrade(&self.process())),
                 shared_pending.clone(),
                 Some(litebox_common_linux::signal::Signal::SIGCHLD.as_i32()),
             );

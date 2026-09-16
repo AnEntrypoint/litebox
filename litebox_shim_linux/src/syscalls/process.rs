@@ -6781,7 +6781,10 @@ mod tests {
             "a forked child must be a genuinely different process"
         );
 
-        assert_eq!(task.sys_kill(child.pid, Signal::SIGTERM.as_i32()), Ok(0));
+        assert_eq!(
+            task.sys_kill(child.pid.get(), Signal::SIGTERM.as_i32()),
+            Ok(0)
+        );
 
         assert!(
             child.pending_signal_set().contains(Signal::SIGTERM),
@@ -6810,8 +6813,8 @@ mod tests {
             let futex_addr = (&raw mut futex_word) as usize;
 
             let child_task = task.clone_as_forked_child_for_test();
-            let child_pid = child_task.pid;
-            assert_ne!(child_pid, task.pid);
+            let child_pid = child_task.pid.get();
+            assert_ne!(child_pid, task.pid.get());
 
             let bg = std::thread::spawn(move || {
                 <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
@@ -6858,8 +6861,8 @@ mod tests {
         let child = task.clone_as_forked_child_for_test();
 
         // Move the child into the parent's own process group.
-        child.sys_setpgid(0, task.pid).unwrap();
-        assert_eq!(child.sys_getpgid(0).unwrap(), task.pid);
+        child.sys_setpgid(0, task.pid.get()).unwrap();
+        assert_eq!(child.sys_getpgid(0).unwrap(), task.pid.get());
 
         assert_eq!(task.sys_kill(0, Signal::SIGTERM.as_i32()), Ok(0));
 
@@ -6933,19 +6936,19 @@ mod tests {
         let child = task.clone_as_forked_child_for_test();
 
         // A freshly forked child defaults to being its own group leader.
-        assert_eq!(task.sys_getpgid(child.pid).unwrap(), child.pid);
+        assert_eq!(task.sys_getpgid(child.pid.get()).unwrap(), child.pid.get());
 
         // Move the child into an explicit new group (as a shell would for a pipeline).
-        assert_eq!(task.sys_setpgid(child.pid, 4242), Ok(()));
-        assert_eq!(task.sys_getpgid(child.pid).unwrap(), 4242);
+        assert_eq!(task.sys_setpgid(child.pid.get(), 4242), Ok(()));
+        assert_eq!(task.sys_getpgid(child.pid.get()).unwrap(), 4242);
         // The child's own view of its pgid must agree.
         assert_eq!(child.sys_getpgid(0).unwrap(), 4242);
         // Self must be untouched.
-        assert_eq!(task.sys_getpgid(0).unwrap(), task.pid);
+        assert_eq!(task.sys_getpgid(0).unwrap(), task.pid.get());
 
         // pgid == 0 means "use the target pid's own pid", not the caller's.
-        assert_eq!(task.sys_setpgid(child.pid, 0), Ok(()));
-        assert_eq!(task.sys_getpgid(child.pid).unwrap(), child.pid);
+        assert_eq!(task.sys_setpgid(child.pid.get(), 0), Ok(()));
+        assert_eq!(task.sys_getpgid(child.pid.get()).unwrap(), child.pid.get());
     }
 
     #[test]
@@ -7194,7 +7197,7 @@ mod tests {
             .expect("block SIGUSR1 failed");
 
             assert_eq!(task.sys_alarm(1).unwrap(), 0);
-            task.sys_tkill(task.tid, Signal::SIGUSR1.as_i32())
+            task.sys_tkill(task.tid.get(), Signal::SIGUSR1.as_i32())
                 .expect("tkill failed");
             assert!(!task.has_pending_signals(), "blocked SIGUSR1 should not be deliverable");
 
@@ -7465,7 +7468,7 @@ mod tests {
                     // this thread as owner, with the waiters bit set since the main thread is
                     // about to block on it.
                     #[expect(clippy::cast_sign_loss, reason = "tid is always non-negative")]
-                    let owner_word = (bg_task.tid as u32) | super::FUTEX_WAITERS;
+                    let owner_word = (bg_task.tid.get() as u32) | super::FUTEX_WAITERS;
                     let futex_atomic = unsafe { &*(futex_addr as *const AtomicU32) };
                     futex_atomic.store(owner_word, Ordering::SeqCst);
 

@@ -1082,7 +1082,7 @@ mod test {
                 &task.global,
                 &WaitState::new(platform()).context(),
                 1024,
-                task.tid,
+                task.tid.get(),
                 0,
             )
             .unwrap();
@@ -1191,7 +1191,7 @@ mod test {
                 &task.global,
                 &WaitState::new(platform()).context(),
                 1024,
-                task.tid,
+                task.tid.get(),
                 0,
             )
             .unwrap();
@@ -1236,7 +1236,7 @@ mod test {
                     .context()
                     .with_timeout(core::time::Duration::from_secs(2)),
                 1024,
-                task.tid,
+                task.tid.get(),
                 0,
             )
             .unwrap();
@@ -1372,7 +1372,7 @@ mod test {
                 &task.global,
                 &WaitState::new(platform()).context(),
                 1024,
-                task.tid,
+                task.tid.get(),
                 0,
             )
             .unwrap();
@@ -1419,7 +1419,7 @@ mod test {
                     .context()
                     .with_timeout(core::time::Duration::from_secs(2)),
                 1024,
-                task.tid,
+                task.tid.get(),
                 0,
             )
             .unwrap();
@@ -1674,7 +1674,7 @@ mod test {
                 &task.global,
                 &WaitState::new(platform()).context(),
                 1024,
-                task.tid,
+                task.tid.get(),
                 0,
             )
             .unwrap();
