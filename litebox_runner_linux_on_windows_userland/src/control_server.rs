@@ -299,8 +299,22 @@ fn spawn_header_publisher<FS: ShimFS>(shared: Arc<Shared<FS>>) {
 }
 
 fn spawn_presenter_process(shared: &Shared<impl ShimFS>) -> std::io::Result<()> {
+    // Explicit `Stdio::null()`, not the default inherited stdio: the presenter is an independent
+    // background process (its whole point, per section 1.2, is that it shares no address space
+    // or lifetime coupling with the runner) -- inheriting the runner's own stdout/stderr handles
+    // means, if those happen to be redirected (a log file, a pipe to another tool), the presenter
+    // keeps that redirection's write end open for as long as IT runs, which can stall the
+    // runner-side redirection from ever seeing EOF/closing cleanly even after the runner itself
+    // exits (confirmed live during this change's own verification: a `--gui=hidden` run under
+    // `-RedirectStandardOutput`/`-RedirectStandardError` produced truncated runner output because
+    // the still-running presenter held the same pipe open). Matches
+    // `litebox_session_daemon::client::connect_or_spawn`'s identical `Stdio::null()` choice for
+    // its own auto-spawned, independent daemon process.
     std::process::Command::new(&shared.presenter_exe)
         .arg(&shared.pipe_name)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()?;
     Ok(())
 }

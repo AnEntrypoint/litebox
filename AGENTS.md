@@ -161,20 +161,12 @@ bug. `tar_ro.rs`'s multi-layer index is built ONCE at mount (`litebox/src/fs/tar
 per read — that build was O(entries²) and starting one process against the 2.5GB webtop rootfs went
 17.3s → 0.35s (`90c010a`). Cache internals and the four fixed OOM bugs: archive.
 
-**A trampoline-extension failure used to poison a whole segment's syscalls, now fixed** (`6311f74`). A
-one-page initial allocation guess meant a segment needing more stub space (ordinary for a real binary)
-extended at one fixed adjacent address with no fallback; any unrelated mapping there made
-`apply_trap_fallback` poison **every** syscall in the segment with `ICEBP;HLT` on first use. Now sized
-from a cheap `0F 05` byte-pair count (sound upper bound), capped at 4MiB. Witnessed live: `edgelevel/
-alpine-xfce-vnc:latest` SIGILL'd within 3s before, zero fatal signals after. Blow-by-blow: archive.
+**A trampoline-extension failure used to poison a whole segment's syscalls, now fixed** (`6311f74`,
+sized from a `0F 05` byte-pair count instead of a one-page guess, capped 4MiB) — full detail archived.
 
-**Tags, verified live, never from the name**: `linuxserver/webtop:alpine-mate` ships MATE, not XFCE;
-`alpine-xfce` does not exist (404); `debian-xfce`/`ubuntu-xfce` DO ship real XFCE (`34da133`, `c65ab93`,
-`1ea5203`; only the debian/ubuntu/fedora/arch bases carry it, `8c07f51`). `alpine-*` flavors share one
-~519MB base layer (`9c7ea2b`); `debian-xfce` is a 17-layer Debian 13 image sharing nothing with them.
-`edgelevel/alpine-xfce-vnc` is Alpine 3.16.0, Xvfb/browser pipeline (archive). `ubuntu-xfce` packs fine
-but its rust-coreutils aborted in rustix auxv handling (`sleep`/`tail`/DE launch) — `bb46f1a` has since
-implemented `/proc/self/auxv`/`AT_EXECFN`, so that's a re-test, not a fresh investigation.
+**Tags, verified live, never from the name** (full detail archived): `linuxserver/webtop:alpine-mate`
+ships MATE not XFCE; `alpine-xfce` doesn't exist; `debian-xfce`/`ubuntu-xfce` ship real XFCE
+(`34da133`, `c65ab93`, `1ea5203`, `8c07f51`); `edgelevel/alpine-xfce-vnc` is Alpine 3.16.0.
 
 **X server choice**: for the DRM/wgpu on-screen (`--gui`) path use `Xorg` with `modesetting` — litebox's
 virtual DRM device is legacy-KMS + dumb-buffer + XRGB8888 only, no atomic modeset/GBM/EGL, so a GBM-first
@@ -346,6 +338,79 @@ since an idle compositor legitimately produces zero page flips.
 **The GUI protocol decision is settled**: DRM/KMS + wgpu, proven live with guest page-flip pixels in a
 real host window (memory `mem-3c4a9980a884604b-1031`). Not an open X11-vs-Wayland-vs-DRM question.
 
+## Presenter-process split (`docs/presenter-process-design.md`) -- implemented, partially verified, 2026-09-16
+
+Built and committed: `litebox_presenter_protocol` crate (newline-delimited scanout/screenshot/
+show/hide/presenter?/key/rel/abs/ps/strace/frames grammar + named-pipe transport), runner-side
+`ControlServer` (`litebox_runner_linux_on_windows_userland/src/control_server.rs` --
+`DuplicateHandle`-based zero-copy scanout handoff; a header-section polling thread, NOT a
+`DrmSubsystem` flip-callback, keeps headless-with-no-observers exactly as cheap as before per
+section 4.4, since that callback mechanism unconditionally maps the whole pixel buffer once ANY
+observer exists), and `litebox-presenter.exe` (new crate `litebox_presenter`, links only
+`litebox_platform_windows_userland::presentation` verbatim + the protocol crate, zero shim/kernel
+dependency). `--gui` is now `Option<GuiMode>` (`--gui`/`--gui=hidden`); old `--gui-hidden` kept as
+a deprecated alias. `DrmSubsystem` gained `frame_seq` (bumped unconditionally, covers
+SETCRTC/PAGE_FLIP/DIRTYFB alike) and `scanout_snapshot()` (a plain generic query, not a boxed flip
+callback -- that mechanism can't carry `Platform::SharedMemoryHandle` across a trait object, the
+real pre-existing `E0277` `flip_callbacks`'s own doc comment already names). `litebox_shim_linux::
+diag::set_strace_summary_enabled` added (the real runtime toggle -- `init_strace_summary` is a
+one-shot latch despite its own doc comment's "idempotent" phrasing suggesting otherwise).
+
+**Live-verified this session** (release build, real named pipe, no test files): `advisor/probes/
+dup_probe.c` reconfirmed live (mingw gcc) -- `DuplicateHandle` into a same-user non-admin sibling
+still works, matches ADVISORY-001 §5's 2026-09-03 finding. Headless (no `--gui`, local tar,
+`bin/sleep`): `presenter?`→`ok none`, `strace query`→`ok off`, `frames on/off`→`ok`, `scanout`→
+`err bad_state` (no fb attached), `key`/`rel`→`ok`, `abs`→`err unsupported` -- all live over the
+real pipe via a PowerShell `NamedPipeClientStream` script (design doc §3's own suggested
+debug-tooling shape). This is scenario 2 AND 6 from §6's plan. `--gui=hidden`: `litebox-presenter.exe`
+spawns (confirmed via `Get-Process`, several runs). `show` with no drawing guest: blocks ~5.08s
+then `err io_error presenter did not start` -- exactly §5 risk 3's 5s contract, live-timed.
+Presenter cleanup: found live that a panic on a non-main Rust thread only kills that thread, not
+the process -- an orphaned zombie `litebox-presenter.exe` resulted when its scanout-retry thread
+hit "runner closed the connection" while the main thread's winit loop kept running. Fixed with a
+process-wide panic hook (`litebox_presenter/src/main.rs`) that exits after the default hook
+prints; reconfirmed live afterward -- presenter now exits the instant the runner's pipe breaks.
+
+**Not live-verified this session, for a follow-up** (ran out of session time fighting host/tooling
+friction, not code issues):
+1. §6 scenario 1 (headless + `LITEBOX_DUMP_FRAMES=1`, byte-identical `.bmp`/pixel-count output vs.
+   pre-change baseline) -- ran clean but with no real DRM flips (a `sleep` guest never touches
+   `/dev/dri`), so only "doesn't crash" is confirmed, not byte-identical dump output. Needs a real
+   flip-producing guest; `advisor/probes/drm_flip_probe.c` (prebuilt binary present) is the
+   intended one but no session has ever preserved its literal working CLI (checked exhaustively --
+   `fda3787`'s commit message narrates results, not the command). Nearest fully-preserved recipe:
+   `docs/dump-frames-writer-verify-probe/README.md` (`drmgui_multiflip.c` + zig cc +
+   `litebox_syscall_rewriter` + `rootfs.tar`) -- add `--gui`/`--gui=hidden` to it and start there.
+2. Scenario 4's SUCCESS path (`show` reveals a real window, `screenshot` counts change while a
+   drawing guest renders) and scenario 5 (kill presenter, `show` respawns and resumes) both need
+   that same real drawing guest -- only `show`'s TIMEOUT path (no drawing guest) is confirmed.
+3. Win32 window-visibility introspection (`Process.MainWindowHandle`/`IsWindowVisible`) is
+   UNRELIABLE for this binary on this host -- live-observed `IsWindowVisible=True` for a
+   `--gui=hidden` presenter that should be hidden (almost certainly finding the console window,
+   not the winit one). Confirms the standing rule below (`LITEBOX_DUMP_FRAMES`/`screenshot`
+   pixel counts only) applies here too -- do not re-attempt Win32 visibility introspection.
+4. `frames on <dir>` stores the directory but `dump_frame_diagnostic` (deliberately left in
+   `litebox_platform_windows_userland::presentation`, see below) ignores it, always using
+   `LITEBOX_DUMP_FRAMES_PATH`/its own default naming -- the runtime ON/OFF toggle works, the
+   runtime directory redirect does not yet. Small, disclosed gap.
+5. `ps` returns `ok 0` even with a live guest process running -- `diag::PROCESS_TREE` has exactly
+   one populating call site (`process.rs:5964`) and stays empty for a plain top-level exec with no
+   fork/clone. Proxying `print_process_tree` faithfully (as designed) surfaces this pre-existing
+   gap; not something this task should fix.
+6. `--initial-files alpine-fresh-test.tar -- bin/sleep <n>` was FLAKY this session -- sometimes
+   fine, sometimes the runner exited in well under `<n>` seconds with zero captured output despite
+   several redirection strategies (PowerShell `-RedirectStandardOutput`, a `.bat` wrapper, Bash
+   `>`). Root cause not identified. `--oci-image docker.io/library/debian:stable-slim` was more
+   reliable once its own unrelated manifest-fetch network flakiness (Docker Hub-side, nothing to
+   do with litebox) was worked around by retrying.
+
+**Disclosed deviation, not an oversight**: `dump_frame_diagnostic`/`encode_bmp`/`count_pixel_stats`
+stay in `litebox_platform_windows_userland::presentation` rather than moving into the runner crate
+verbatim as design §1.1 literally describes -- they have zero window/wgpu dependency (confirmed by
+reading), so the actual requirement (headless never touches a window) already held before this
+change; moving already-correct code for no functional gain was skipped in favor of the runtime
+`frames on/off` flag work §3.2 actually needs.
+
 ## Docs and tooling map
 
 - **Archives** — `docs/AGENTS_ARCHIVE_2026-09-16.md` (popup-menu re-test, `spawn_exec_collision_child`
@@ -370,7 +435,9 @@ real host window (memory `mem-3c4a9980a884604b-1031`). Not an open X11-vs-Waylan
   virtual connector; surfaced `DRM_IOCTL_MODE_OBJ_GETPROPERTIES`/`GETPROPERTY`, a debug-build `--gui`
   stack overflow, nested epoll — `1e1da7c`); `docs/linux-native-drm-gui-probe/` (Linux-native DRM → wgpu
   control case for a Windows-only claim).
-- Designs not implemented: `docs/presenter-process-design.md`, `docs/session-daemon-design.md`
+- `docs/presenter-process-design.md` -- IMPLEMENTED 2026-09-16, partially verified live; see this
+  file's own "Presenter-process split" section above for what's confirmed vs. still open.
+- Designs not implemented: `docs/session-daemon-design.md`
   (`litebox_termemu`, its VT100-emulator slice, IS implemented; the daemon/IPC layer is not),
   `docs/fork-region-grouping-design.md` (shipped state is still a diagnostic probe).
 - `advisor/probes/` — diagnostics (`decode_frame.py`, `symbolize_litebox_crash.py`,

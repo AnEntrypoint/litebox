@@ -70,17 +70,54 @@ fn map_readonly(handle: HANDLE, offset: u64, size: usize) -> MappedSection {
     MappedSection { ptr: view.Value }
 }
 
-fn read_scanout_reply(pipe: &PipeHandle, reader: &mut LineReader) -> ScanoutReply {
-    let line = reader
-        .read_line(pipe)
-        .expect("pipe I/O error reading scanout reply")
-        .expect("runner closed the connection before replying to scanout");
-    match Reply::parse_header(&line).expect("malformed scanout reply line") {
-        ReplyHeader::Ok { tokens } => {
-            ScanoutReply::parse(&tokens).expect("malformed scanout reply tokens")
+/// Sends `scanout` and returns the parsed reply, retrying every 250ms on `err bad_state` (the
+/// guest has not attached a framebuffer yet -- an entirely normal state for a presenter that
+/// connected before the guest got around to any `SETCRTC`/`PAGE_FLIP`/`ADDFB2` call, e.g.
+/// `--gui`/`--gui=hidden` at startup racing the guest's own boot) up to `retry_budget`. The
+/// runner's own `show` handler applies a 5s timeout waiting for this process's `ready` line
+/// (section 5 risk 3), so in the common "guest never draws anything" case THAT timeout fires
+/// first and reports a clean `err` back to whoever asked for `show` -- this loop's own longer
+/// budget exists only so a presenter started well before a slow-booting guest (e.g.
+/// `--gui=hidden` at process launch) does not need to be told to retry from outside.
+///
+/// # Panics
+///
+/// Panics on any other `err` code (a real, non-transient failure) or if `retry_budget` elapses.
+fn scanout_with_retry(
+    pipe: &PipeHandle,
+    write_lock: &Mutex<()>,
+    reader: &mut LineReader,
+    retry_budget: Duration,
+) -> ScanoutReply {
+    let deadline = std::time::Instant::now() + retry_budget;
+    loop {
+        {
+            let _guard = write_lock.lock().expect("pipe write lock poisoned");
+            pipe::write_line(pipe, "scanout").expect("failed to write scanout request");
         }
-        ReplyHeader::Err { code, detail } => {
-            panic!("scanout request failed: {code} {detail}");
+        let line = reader
+            .read_line(pipe)
+            .expect("pipe I/O error reading scanout reply")
+            .expect("runner closed the connection before replying to scanout");
+        match Reply::parse_header(&line).expect("malformed scanout reply line") {
+            ReplyHeader::Ok { tokens } => {
+                return ScanoutReply::parse(&tokens).expect("malformed scanout reply tokens");
+            }
+            ReplyHeader::Err {
+                code: litebox_presenter_protocol::reply::ErrorCode::BadState,
+                ..
+            } => {
+                if std::time::Instant::now() >= deadline {
+                    panic!(
+                        "no framebuffer attached after {retry_budget:?} of retrying scanout -- \
+                         giving up"
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            ReplyHeader::Err { code, detail } => {
+                panic!("scanout request failed: {code} {detail}");
+            }
         }
     }
 }
@@ -159,6 +196,24 @@ fn poll_scanout_and_feed(
 const PRESENTER_THREAD_STACK_SIZE: usize = 256 * 1024 * 1024;
 
 fn main() {
+    // This binary spawns several worker threads (the connection reader/scanout-handshake thread,
+    // the scanout-poll-and-feed thread) whose failure means the whole process has nothing further
+    // to usefully do -- Rust's default behavior for a panic on a NON-main thread is to unwind and
+    // terminate only that one thread, silently leaving every other thread (including the winit
+    // event loop on the thread spawned just below) running with no one left driving the
+    // connection. Confirmed live: this exact silent-half-death was produced during this feature's
+    // own verification -- a `--gui=hidden` run whose guest exited before ever drawing anything
+    // left `litebox-presenter.exe` running forever as an orphaned zombie process after the runner
+    // exited, because `scanout_with_retry`'s "runner closed the connection" panic only killed its
+    // own spawned thread, not the process. Installing a process-wide panic hook that exits after
+    // the default hook prints is the standard fix for "a panic on any thread should end this
+    // program", matching how a single-threaded program's panic already behaves.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        std::process::exit(1);
+    }));
+
     let handle = std::thread::Builder::new()
         .name("litebox-presenter-main".to_owned())
         .stack_size(PRESENTER_THREAD_STACK_SIZE)
@@ -180,22 +235,14 @@ fn run() {
         pipe::connect_client(&pipe_name, Duration::from_secs(10))
             .expect("failed to connect to runner control pipe"),
     );
-    let mut reader = LineReader::new();
 
-    pipe::write_line(&pipe, "scanout").expect("failed to write scanout request");
-    let scanout = read_scanout_reply(&pipe, &mut reader);
-
-    let header = map_readonly(
-        scanout.header_section_handle as HANDLE,
-        0,
-        4096,
-    );
-    let pixel = map_readonly(
-        scanout.pixel_section_handle as HANDLE,
-        scanout.offset,
-        (scanout.pitch as usize) * (scanout.height as usize),
-    );
-
+    // Event-loop/window construction happens FIRST, before scanout even succeeds once --
+    // `--gui=hidden`'s whole point (section 4.1) is "the process and its window exist... so a
+    // LATER show is fast, no cold-start wgpu/window-creation cost", which requires the window to
+    // exist even while the guest has not yet attached any framebuffer (a presenter spawned at
+    // process launch will usually race a slow-booting guest). Blocking window creation on the
+    // first successful `scanout` -- this function's original shape -- would have left NO window
+    // at all during that race, silently defeating that guarantee.
     let mut presenter = Presenter::new().expect("failed to create presenter window/event loop");
     // Start hidden: the runner's `show`/`hide` control-channel commands (pushed over this same
     // connection, see the reader thread below) are the sole source of truth for visibility now --
@@ -233,12 +280,59 @@ fn run() {
     // caller issuing them to the runner needs the ALREADY-CONNECTED presenter's window toggled,
     // not a new connection). See this crate's module doc comment for why a bare `show`/`hide`
     // line is unambiguous against an `ok`/`err ...` reply to something this process itself sent.
+    //
+    // This SAME thread also performs the initial `scanout` handshake (with retry, see
+    // `scanout_with_retry`'s doc comment) before falling into the forever show/hide watch loop --
+    // both are reads on this one connection, and a Windows named pipe has no way to distinguish
+    // "a reply to what I just sent" from "an unprompted push from the peer" at the transport
+    // level (see this crate's own module doc comment), so exactly one thread must own every read
+    // on this connection for its whole lifetime, never two racing readers.
     let watch_pipe = pipe.clone();
     let watch_sender = sender.clone();
+    let watch_write_lock = write_lock.clone();
     std::thread::Builder::new()
         .name("litebox-presenter-pipe-reader".to_owned())
         .spawn(move || {
             let mut reader = LineReader::new();
+
+            // 60s: generous relative to the runner's own 5s `show` timeout (see
+            // `scanout_with_retry`'s doc comment) -- this budget only matters for a presenter
+            // spawned well before the guest draws anything at all, e.g. `--gui=hidden` at process
+            // launch racing a slow boot.
+            let scanout = scanout_with_retry(
+                &watch_pipe,
+                &watch_write_lock,
+                &mut reader,
+                Duration::from_secs(60),
+            );
+            let header = map_readonly(scanout.header_section_handle as HANDLE, 0, 4096);
+            let pixel = map_readonly(
+                scanout.pixel_section_handle as HANDLE,
+                scanout.offset,
+                (scanout.pitch as usize) * (scanout.height as usize),
+            );
+            // Feeds `watch_sender` from the mapped scanout section on its own thread -- this
+            // never touches the pipe (it only reads the mapped section and calls
+            // `FrameSender::send`, an in-process channel), so it cannot race this thread's own
+            // pipe reads below.
+            let feed_sender = watch_sender.clone();
+            std::thread::Builder::new()
+                .name("litebox-presenter-scanout-poll".to_owned())
+                .spawn(move || poll_scanout_and_feed(header, pixel, feed_sender))
+                .expect("failed to spawn litebox-presenter-scanout-poll thread");
+
+            // Readiness signal (section 5 risk 3): first successful `scanout` (just above) plus
+            // event-loop/window construction (`Presenter::new()`, before this thread was spawned)
+            // are both done by this point -- the real Win32 `Window` itself is created lazily
+            // inside `resumed()` on the first tick of `presenter.run()`, which by now has already
+            // been running on the main presenter thread for as long as `scanout_with_retry` took,
+            // so this is a close (not lagging-by-long) approximation of "window created" rather
+            // than a signal plumbed out of `resumed()` itself.
+            {
+                let _guard = watch_write_lock.lock().expect("pipe write lock poisoned");
+                pipe::write_line(&watch_pipe, "ready").expect("failed to send ready to runner");
+            }
+
             loop {
                 match reader.read_line(&watch_pipe) {
                     Ok(Some(line)) => match line.trim() {
@@ -256,22 +350,6 @@ fn run() {
             }
         })
         .expect("failed to spawn litebox-presenter-pipe-reader thread");
-
-    // Background thread: feeds `sender` from the mapped scanout section.
-    std::thread::Builder::new()
-        .name("litebox-presenter-scanout-poll".to_owned())
-        .spawn(move || poll_scanout_and_feed(header, pixel, sender))
-        .expect("failed to spawn litebox-presenter-scanout-poll thread");
-
-    // Readiness signal (section 5 risk 3): first successful `scanout` (above) plus event-loop/
-    // window construction (`Presenter::new()`, above) are both done by this point -- the real
-    // Win32 `Window` itself is created lazily inside `resumed()` on the first tick of
-    // `presenter.run()` below, moments from now, so this is a close (not lagging-by-long)
-    // approximation of "window created" rather than a signal plumbed out of `resumed()` itself.
-    {
-        let _guard = write_lock.lock().expect("pipe write lock poisoned");
-        pipe::write_line(&pipe, "ready").expect("failed to send ready to runner");
-    }
 
     if let Err(e) = presenter.run() {
         eprintln!("[litebox-presenter] event loop exited with an error: {e}");

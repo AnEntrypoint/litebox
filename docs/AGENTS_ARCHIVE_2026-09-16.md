@@ -691,3 +691,20 @@ Terminal Emulator/Applications-menu click-path retest: still blocked, for the sa
 Evidence: `.wfgy/elfcheck3.out.log` (readelf), `.wfgy/elfcheck4.out.log` (dpkg/symlink listing), `.wfgy/reorder_boot1.out.log` through `reorder_boot5.err.log`, `.wfgy/webtop_stack.sh` (current, reordered) and `.wfgy/webtop_stack.sh.bak-preselkiesreorder` (pre-change copy).
 
 **Host RAM, final state this pass**: all `litebox_runner_linux_on_windows_userland` processes killed manually after boot 5; free RAM recovered to ~8.1GB (of ~15.6GB total) within seconds, `Get-Process` confirms zero matches.
+
+## Trimmed from AGENTS.md 2026-09-16 (presenter-process-split session, kept full detail here)
+
+**A trampoline-extension failure used to poison a whole segment's syscalls, now fixed** (`6311f74`). A
+one-page initial allocation guess meant a segment needing more stub space (ordinary for a real binary)
+extended at one fixed adjacent address with no fallback; any unrelated mapping there made
+`apply_trap_fallback` poison **every** syscall in the segment with `ICEBP;HLT` on first use. Now sized
+from a cheap `0F 05` byte-pair count (sound upper bound), capped at 4MiB. Witnessed live: `edgelevel/
+alpine-xfce-vnc:latest` SIGILL'd within 3s before, zero fatal signals after.
+
+**Tags, verified live, never from the name**: `linuxserver/webtop:alpine-mate` ships MATE, not XFCE;
+`alpine-xfce` does not exist (404); `debian-xfce`/`ubuntu-xfce` DO ship real XFCE (`34da133`, `c65ab93`,
+`1ea5203`; only the debian/ubuntu/fedora/arch bases carry it, `8c07f51`). `alpine-*` flavors share one
+~519MB base layer (`9c7ea2b`); `debian-xfce` is a 17-layer Debian 13 image sharing nothing with them.
+`edgelevel/alpine-xfce-vnc` is Alpine 3.16.0, Xvfb/browser pipeline. `ubuntu-xfce` packs fine
+but its rust-coreutils aborted in rustix auxv handling (`sleep`/`tail`/DE launch) — `bb46f1a` has since
+implemented `/proc/self/auxv`/`AT_EXECFN`, so that's a re-test, not a fresh investigation.
