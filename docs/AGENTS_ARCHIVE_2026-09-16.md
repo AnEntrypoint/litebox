@@ -945,3 +945,201 @@ crash but deadlocks the write forever behind the permanently-pending read -- do 
 half-fix; the earlier "First fix attempt" paragraph above (this same file, ~180 lines up) has the
 full kernel-level reasoning for why. Live-reconfirmed: `show` now replies in ~300ms, presenter
 survives indefinitely.
+
+## Ninth ACK-stall-kill candidate: write-side backpressure through the video pipeline (2026-09-16)
+
+No boot attempted this pass -- selkies' 0/7 recent data-socket binds (ET_EXEC finding above)
+already made a live repro unlikely before starting, so this was a pure code-level audit of all
+three write-path layers between pixelflux's encoder output and the browser: litebox's `--publish`
+NAT gateway, pixelflux's delivery thread, and selkies' own websocket send path. Sources for the
+latter two aren't vendored in this repo -- fetched live: `selkies.py` from
+`selkies-project/selkies@348bc4f61da66198573e7e57db9a266aca1991d5` (`src/selkies/selkies.py`, the
+exact pin `docker-baseimage-selkies` uses, confirmed by the 3757-line count matching the
+2026-09-15 investigation's own count), `lib.rs` from `linuxserver/pixelflux` (`pixelflux/src/
+lib.rs`, master), and `connection.py` from `python-websockets/websockets` (`src/websockets/
+asyncio/connection.py`, main -- the real library selkies imports, confirmed via `selkies.py:61`'s
+`import websockets.asyncio.server as ws_async`).
+
+**All three layers are individually correct; none blocks an event loop or a hot capture/encode
+path on network state.**
+
+- **`net.rs`'s write side** (`litebox_platform_windows_userland/src/net.rs`): `pump_tcp_flows`
+  (`:526-602`) buffers at most one ~4096B chunk in `pending_to_real`/`pending_to_guest` on
+  `WouldBlock` (real sockets are nonblocking on both the outbound-connect path, `:488`, and the
+  inbound-accept path, `:820`) and retries it on the next 5ms tick -- and critically STOPS calling
+  `socket.recv_slice()` on the guest-facing smoltcp socket while that pending buffer is nonempty
+  (`:541`), so the smoltcp socket's own 256KB RX ring fills and its advertised TCP window correctly
+  shrinks toward zero, propagating real backpressure all the way to the guest's own kernel TCP
+  stack -- exactly the "does it apply real backpressure or drop/corrupt" question this investigation
+  needed answered, and the answer is real backpressure, correctly. `LoopbackQueue` (`:112-117`,
+  flagged in an earlier pass as "unbounded and cloned in full every 5ms tick") is structurally an
+  uncapped `VecDeque`, but nothing pushes into it without first passing through a bounded (256KB)
+  smoltcp socket buffer above it, so its practical growth is bounded by that, not itself a leak or
+  backpressure hazard -- the earlier "flagged but not proven causal" note is now resolved: not
+  causal, and not effectively unbounded either.
+- **pixelflux's delivery thread** (`lib.rs`, fetched from upstream `master`, 4232 lines --
+  smaller than the 2026-09-15 session's "8381-line" count, consistent with upstream having moved
+  on since; mechanism below unaffected by the size difference): the X11 capture path's
+  `on_frame` closure does a REAL blocking `deliver_tx.send()` into a 1-slot `sync_channel`
+  (`:3691,3723-3727`) -- but this can only block the dedicated pixelflux capture OS thread, never
+  selkies' Python/asyncio thread, because the delivery thread's own `cb.call1(py, (f,))` invokes
+  `queue_data_for_display` (`selkies.py:3130-3149`), which does only a `memoryview` wrap and
+  `self.capture_loop.call_soon_threadsafe(do_put)` -- a fixed-cost, always-immediate,
+  network-state-independent handoff (the actual `asyncio.Queue.put_nowait`/`QueueFull` check
+  happens later, inside `do_put`, scheduled to run ON the event loop, not inside this call). The
+  GPU/Wayland encode path (`:2784-2807`) is even more conservative and explicitly comments on
+  exactly this hazard: it never blocks the calloop thread at all, using `try_send` and parking one
+  pending frame (dropping no encoded data, since an encoded frame is part of the H.264 reference
+  chain) rather than risk freezing input/Wayland dispatch on a stalled Python consumer.
+- **selkies' own websocket send path**: both `send()` and the keepalive `ping()` route through
+  the real `websockets.asyncio` library's `send_context()` (`connection.py:860-927`), which does
+  `self.send_data(); await self.drain()` (`:914-915`) -- genuine per-connection flow-control-aware
+  backpressure (`pause_writing`/`resume_writing`/high-water-mark, `:1049-1078`), never a raw
+  blocking socket call. Critically, `keepalive()` (`:803-849`) only starts the `ping_timeout`
+  countdown AFTER `await self.ping()` returns (`:822-828`) -- and `ping()` itself goes through the
+  same drain-aware `send_context()` -- so a momentarily-full send buffer at the moment a ping is
+  due does NOT by itself cause a spurious "keepalive ping timeout": the ping-send call absorbs
+  whatever backpressure exists first, and only then does the 20s pong-wait clock start. Selkies
+  also has its own application-level defense independent of all of this: a bounded
+  `asyncio.Queue(maxsize=120)` per display (`BACKPRESSURE_QUEUE_SIZE`, `selkies.py:3176-3177`)
+  between the capture callback and `_video_chunk_sender`, with `QueueFull` silently dropping the
+  new frame (`:3143-3147`) rather than ever blocking anything upstream.
+
+**The real, remaining, evidence-backed mechanism -- ruled IN as plausible, not confirmed live.**
+Ping and video-frame bytes share ONE ordered per-connection TCP byte stream and ONE asyncio
+transport buffer; WebSocket has no separate control-frame channel at the transport level.
+`send_data()` (`connection.py:914`) writes an ENTIRE frame's bytes into that buffer unconditionally
+BEFORE the drain/high-water check that follows it on the next line -- so a single oversized
+`await websocket.send(data_chunk)` call for one IDR/keyframe (explicitly triggerable on demand via
+`request_idr_frame()`, `selkies.py:3113`, e.g. on reconnect or a display resize) can push the
+transport buffer far past its flow-control threshold in one shot, before any drain-based pushback
+has a chance to apply. If the real, achievable throughput from server to browser stays low enough
+for long enough afterward -- for any reason: this same day's own independently-documented host
+memory-pressure instability (AGENTS.md's "watch `FreePhysicalMemory` live... less stable than that
+baseline implies"), a throttled/backgrounded browser tab, or genuine network/loopback contention --
+that the backlog cannot physically drain within the 20s `ping_timeout` window, then the ping's own
+on-wire delivery, and therefore the pong's return, genuinely cannot make the deadline. This is not
+a bug in litebox, pixelflux, or `websockets` individually; it is an emergent property of a single
+shared-stream WebSocket connection's keepalive under SUSTAINED backpressure, and it precisely fits
+the symptom's own "20-60s", not-exactly-periodic timing (load-dependent delay stacked on the fixed
+20s interval, rather than a fixed-interval bug).
+
+**Precise repro condition for when the stack is next bootable, not yet attempted**: throttle
+host->browser bandwidth (Windows QoS policy, or read the client side of the websocket slowly/
+pause reads to simulate a slow consumer) to below pixelflux's realistic encoder output rate,
+sustained for >20s, ideally while forcing an IDR (resize or reconnect) partway through the
+throttle window to inject one oversized single-frame write -- watch for `keepalive ping timeout`
+appearing well inside that window rather than only at a `ping_interval` boundary. Do not re-chase
+this by reading `net.rs` or `pixelflux` again without new evidence -- both are now confirmed
+correct for backpressure specifically (not just "nonblocking," which was the prior pass's scope);
+the open question is purely about ACHIEVABLE THROUGHPUT under real load, not a code defect in any
+of the three audited layers.
+
+## Ping-starvation: sharper root cause found and fixed (2026-09-16, follow-up session)
+
+Re-fetched the same pinned sources (`selkies.py`@`348bc4f61da66198573e7e57db9a266aca1991d5`,
+3757 lines, matching count; `connection.py` from `python-websockets/websockets@main`) to build a
+concrete fix rather than only characterize the gap. Found a cleaner, upstream-documented mechanism
+that supersedes the prior pass's "one oversized IDR frame beats drain to the punch" framing -- same
+bug CLASS (video-frame backlog can starve the ping), but a sharper, more directly fixable cause.
+
+**`_video_chunk_sender`'s `'primary'` branch never actually respected backpressure, by any layer.**
+`selkies.py:3063` (pinned commit) sends via `websockets.broadcast(primary_viewers, data_chunk)`.
+`websockets.asyncio.connection.broadcast()`'s own docstring (`connection.py:1172-1178`) is explicit:
+"pushes the message synchronously to all connections even if their write buffers are overflowing.
+There's no backpressure. If you broadcast messages faster than a connection can handle them,
+messages will pile up in its write buffer until the connection times out." Confirmed in the
+implementation (`connection.py:1235-1239`): `getattr(connection.protocol, send_method)(message);
+connection.send_data()` -- no `await self.drain()`, ever, for a broadcast. This is a deliberate
+library tradeoff for many-viewers-at-once efficiency, not a bug in `websockets` -- but selkies calls
+it for `'primary'`, the ONLY display mode a single-client webtop deployment like this one ever
+actually uses (confirmed against `webtop_stack.sh`'s single-Xvfb-display setup and AGENTS.md's
+"one client per selkies instance" note), so it is the actual production send path, not an edge
+case.
+
+**Worse: selkies' OWN app-level backpressure system is silently disconnected from that path.**
+`_run_frame_backpressure_logic` (`selkies.py:1196-1267`) is a real, working, fast-reacting detector
+-- `BACKPRESSURE_CHECK_INTERVAL_S = 0.5` (`:9`), `STALLED_CLIENT_TIMEOUT_SECONDS = 4.0` (`:14`) --
+that computes frame desync from client-ACKed vs server-sent frame IDs (RTT-adjusted) and sets
+`display_clients[id]['backpressure_enabled'] = False` on either a >4s ACK stall or an
+allowed-desync breach, logging `"Backpressure TRIGGERED for '{display_id}'"` /
+`"Client stall ... Forcing backpressure"`. The **secondary**-display branch of
+`_video_chunk_sender` (`selkies.py:3069-3072`) correctly gates its send on this flag: `if not
+client_info or ... or not client_info.get('backpressure_enabled', True): continue`. The
+**primary** branch (`:3053-3061`, a few lines above the broadcast call) reads the exact same flag
+per viewer -- but only to decide whether to update `sent_timestamps`/`last_sent_frame_id`
+bookkeeping, never to skip the send. The broadcast call two lines later
+(`websockets.broadcast(primary_viewers, data_chunk)`) unconditionally includes every viewer in
+`primary_viewers` regardless of their `backpressure_enabled` state. This reads as a copy-paste/
+refactor asymmetry (the primary branch clearly USED to intend the same gating, given it computes
+the identical flag) rather than an intentional design difference -- and it means the one
+production-relevant display mode had a real backpressure system whose signal was computed but
+never consumed by the send path, while the actually-executed path (`broadcast()`) additionally has
+zero library-level backpressure of its own. Two independent safety nets, both absent for the path
+that matters.
+
+**Consequence, precisely**: a primary client that falls behind (stalled ACKs, or growing frame
+desync) keeps receiving every dequeued frame from the bounded `asyncio.Queue(maxsize=120)`
+(`BACKPRESSURE_QUEUE_SIZE`, `selkies.py:3176-3177`) via `broadcast()`, each one written directly
+into that connection's transport buffer with no drain wait -- so the backlog can grow to the full
+120-frame queue depth (potentially several MB of H.264 data at typical webtop bitrates) before the
+upstream queue's own `QueueFull`-drop even engages. A ping due during that window queues its own
+tiny frame behind that backlog on the SAME ordered TCP byte stream (WebSocket has no separate
+control-frame channel), and if the backlog can't drain within `ping_timeout` (20s), the pong
+genuinely can't return in time -- killing an otherwise-healthy connection. This is a strictly
+worse (larger, more directly forced) version of the prior pass's "one big frame" mechanism, now
+tied to a concrete, provable code asymmetry instead of a timing coincidence.
+
+**The fix** (two changes, both confined to `_video_chunk_sender`'s `'primary'` branch, applied via
+`advisor/patches/selkies_primary_backpressure_patch.py`, committed to this repo; see that file's
+own docstring for the full text-level diff):
+
+1. Actually gate the `broadcast()` call on `backpressure_enabled`, matching the secondary branch's
+   existing correct behavior. This alone lets the already-working 0.5s/4s-reacting ACK-desync
+   detector stop feeding a falling-behind client before its backlog can grow unbounded -- for the
+   documented "sustained backpressure for >20s" symptom, this detector fires within 0.5-4s, an
+   order of magnitude before `ping_timeout` could ever be threatened.
+2. Defense in depth for the 0.5-4s gap before that detector reacts: check each viewer's real
+   `transport.get_write_buffer_size()` (a live `asyncio.Transport` method --
+   `Connection.transport` is a genuine `asyncio.Transport` per `connection_made()`,
+   `connection.py:1013`) and skip that one frame for that one client if already backlogged past
+   `VIDEO_BACKLOG_DROP_THRESHOLD_BYTES` (default 256KiB, env-tunable via
+   `SELKIES_VIDEO_BACKLOG_LIMIT_BYTES`). 256KiB was chosen, not measured live: it drains in ~2s at
+   a modest 1Mbps and ~16s even at a barely-functional 128kbps -- comfortably inside `ping_timeout`
+   for any connection that isn't already effectively dead, while staying well above a typical
+   1280x800 H.264 keyframe so ordinary IDR frames aren't spuriously dropped under merely transient
+   jitter. Neither change touches `websockets`' own `send_data()`/`drain()`/`ping()`/`keepalive()`
+   code (third-party, pinned, correct on its own terms) -- only selkies' own choice of which bytes
+   to hand it.
+
+**Applied**, not yet live-verified: selkies' 0/7 recent data-socket binds (the unrelated ET_EXEC
+finding above) made a live repro unlikely before starting, so this was built and verified
+offline against the real fetched source: the exact `OLD_BLOCK`/`CONST_ANCHOR` text match was
+confirmed unique (`grep -c` on the distinguishing `websockets.broadcast(primary_viewers,
+data_chunk)` line = 1) against the pinned `selkies.py`, the substitution was applied and the
+result round-tripped through `ast.parse()` successfully, and a diff of the patched file against
+the original showed exactly the intended, minimal change (two hunks: one new module constant,
+one rewritten branch body) with no incidental drift elsewhere in the 3757-line file. The patch
+script's own guest-side file-location step (`import selkies.selkies as m; m.__file__`) could not
+be fully exercised on this Windows host (selkies' real dependency chain -- `pixelflux`, `pcmflux`,
+`GPUtil`, `aiohttp`, `PIL`, etc. -- isn't installed here), but that step is a standard, low-risk
+Python idiom; the load-bearing correctness claim (the text transform itself) was verified directly
+against the real file.
+
+**Wiring**: `.wfgy/webtop_stack.sh` (gitignored, local-only) embeds an inline copy of this exact
+patch and runs it right after `DBUS_UP`/the `dbus-launch` shim, before the selkies supervisor loop
+first launches `selkies` -- i.e. before the target file is ever imported by a running process. The
+patcher is idempotent (a `PING-STARVATION FIX (2026-09-16)` marker short-circuits a re-run) and
+refuses to touch the file at all if the exact pinned block isn't found verbatim (reports
+`SELKIES_PATCH_SKIPPED reason=source_mismatch` rather than risk corrupting a drifted version).
+
+**Verification once a stable boot exists again** (see the ET_EXEC/Track-B blocker above for why
+none was attempted this pass): throttle host->browser bandwidth below pixelflux's realistic
+encoder output rate (Windows QoS policy, or read the client side of the websocket slowly to
+simulate a stalled consumer), sustained for >20s, ideally forcing an IDR (resize or reconnect)
+partway through to inject one oversized single-frame write. Pre-fix, expect `keepalive ping
+timeout` in `sk.log` inside that window. Post-fix, expect to see `Backpressure TRIGGERED for
+'primary'` (now load-bearing on the actual send, not just a log line) and/or
+`SELKIES_VIDEO_BACKLOG_LIMIT_BYTES`-driven frame drops, with NO ping timeout while the throttle
+holds -- frame drops and a visibly stalled/frozen video during the throttle window are expected
+and correct in that state, not a regression.
