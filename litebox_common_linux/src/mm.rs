@@ -67,10 +67,20 @@ pub fn do_mmap<
     // SIGSEGV on at the first byte it wrote. See
     // `PageManager::create_pages_with_permissions`'s own doc comment.
     let mut permissions = MemoryRegionPermissions::empty();
-    permissions.set(MemoryRegionPermissions::READ, prot.contains(ProtFlags::PROT_READ));
-    permissions.set(MemoryRegionPermissions::WRITE, prot.contains(ProtFlags::PROT_WRITE));
-    permissions.set(MemoryRegionPermissions::EXEC, prot.contains(ProtFlags::PROT_EXEC));
-    let result = unsafe { pm.create_pages_with_permissions(suggested_addr, length, flags, permissions, op) };
+    permissions.set(
+        MemoryRegionPermissions::READ,
+        prot.contains(ProtFlags::PROT_READ),
+    );
+    permissions.set(
+        MemoryRegionPermissions::WRITE,
+        prot.contains(ProtFlags::PROT_WRITE),
+    );
+    permissions.set(
+        MemoryRegionPermissions::EXEC,
+        prot.contains(ProtFlags::PROT_EXEC),
+    );
+    let result =
+        unsafe { pm.create_pages_with_permissions(suggested_addr, length, flags, permissions, op) };
     // AGENTS.md pass 212: a `MAP_FIXED`/`MAP_FIXED_NOREPLACE` request must place the mapping at
     // EXACTLY the requested address or fail -- that is real Linux `mmap(2)`'s contract, and
     // every caller (the ELF loader chief among them) computes all subsequent addresses from the
@@ -188,7 +198,8 @@ pub fn sys_mprotect<
         }
         permissions
     };
-    unsafe { pm.change_page_permissions(addr, len, permissions, "guest_mprotect") }.map_err(Errno::from)
+    unsafe { pm.change_page_permissions(addr, len, permissions, "guest_mprotect") }
+        .map_err(Errno::from)
 }
 
 /// Handle syscall `mremap`

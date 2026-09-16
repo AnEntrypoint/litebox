@@ -2316,7 +2316,9 @@ cfg_if::cfg_if! {
 }
 
 /// timespec from [Linux](https://elixir.bootlin.com/linux/v5.19.17/source/include/uapi/linux/time_types.h#L7)
-#[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, FromBytes, IntoBytes, Default, Immutable)]
+#[derive(
+    Debug, Clone, Copy, PartialOrd, PartialEq, Eq, FromBytes, IntoBytes, Default, Immutable,
+)]
 #[repr(C)]
 pub struct Timespec {
     /// Seconds.
@@ -4418,9 +4420,7 @@ impl SyscallRequest {
                         DRM_IOCTL_MODE_SETPLANE => IoctlArg::DrmModeSetPlane(ctx.sys_req_ptr(2)),
                         DRM_IOCTL_VERSION => IoctlArg::DrmVersion(ctx.sys_req_ptr(2)),
                         DRM_IOCTL_GET_CAP => IoctlArg::DrmGetCap(ctx.sys_req_ptr(2)),
-                        DRM_IOCTL_SET_CLIENT_CAP => {
-                            IoctlArg::DrmSetClientCap(ctx.sys_req_ptr(2))
-                        }
+                        DRM_IOCTL_SET_CLIENT_CAP => IoctlArg::DrmSetClientCap(ctx.sys_req_ptr(2)),
                         DRM_IOCTL_SET_MASTER => IoctlArg::DrmSetMaster,
                         DRM_IOCTL_DROP_MASTER => IoctlArg::DrmDropMaster,
                         DRM_IOCTL_GET_MAGIC => IoctlArg::DrmGetMagic(ctx.sys_req_ptr(2)),
@@ -4939,7 +4939,12 @@ impl SyscallRequest {
                 }
             }
             Sysno::ftruncate => sys_req!(Ftruncate { fd, length }),
-            Sysno::fallocate => sys_req!(Fallocate { fd, mode, offset, len }),
+            Sysno::fallocate => sys_req!(Fallocate {
+                fd,
+                mode,
+                offset,
+                len
+            }),
             #[cfg(target_arch = "x86_64")]
             Sysno::newfstatat => sys_req!(Newfstatat { dirfd,pathname:*,buf:*,flags }),
             #[cfg(target_arch = "aarch64")]
