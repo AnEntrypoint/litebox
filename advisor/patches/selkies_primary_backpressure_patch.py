@@ -68,6 +68,53 @@ selkies boot-rate blocker, unrelated to this fix):
     watch for `Backpressure TRIGGERED for 'primary'` (now load-bearing on the
     actual send, not just a log line) and confirm no ping timeout fires while
     the throttle holds; frame drops are expected and correct in that state.
+
+V2 FIX (2026-09-16, live-verified this still dropped under a CLEAN,
+download-only asymmetric throttle -- a userspace TCP proxy capping only
+server->client bytes to 20000 B/s while leaving client->server unthrottled, so
+pings/ACKs could always leave promptly; tab confirmed genuinely foregrounded
+throughout, `document.visibilityState==="visible"` and `hasFocus()===true`).
+Real, reproducible failure: `Backpressure TRIGGERED for 'primary'` fired
+(EffDesync up to 65484.7f), never followed by a matching LIFTED, and the
+connection still died with the exact `keepalive ping timeout` symptom this
+patch targets, ~19s later -- inside the same 20s `ping_timeout` budget.
+
+ROOT CAUSE OF THE RESIDUAL GAP: the v1 drop check compared the backlog
+BEFORE this frame against the threshold (`backlog_bytes >
+VIDEO_BACKLOG_DROP_THRESHOLD_BYTES`), not the backlog this frame's own bytes
+would produce. A single large write (a real H.264 keyframe, which can be
+several hundred KiB at 1280x800) sent while backlog was still comfortably
+under the cap sails straight through the check and lands in the transport
+buffer whole -- one such write can by itself push backlog well past the
+"safe" threshold and take far longer than the remaining ping_timeout budget
+to drain at a genuinely low download rate (262144 B / 20000 B/s = 13.1s
+already consumes most of a 20s budget on its own, before accounting for the
+ping frame having to queue and traverse behind it). This is why EffDesync
+spiked to 65484.7f in one step instead of climbing gradually.
+
+FIX: check what the backlog WOULD BE after this frame, not just what it is
+now (`backlog_bytes + len(data_chunk) > VIDEO_BACKLOG_DROP_THRESHOLD_BYTES`),
+so no single send can ever push the transport past the safe cap. Also
+lowered the default cap 256 KiB -> 128 KiB (still env-tunable via
+`SELKIES_VIDEO_BACKLOG_LIMIT_BYTES`) for a larger safety margin under
+sustained low-bandwidth conditions -- 128 KiB drains in comfortably under
+half of a 20s ping_timeout even at the 20 KB/s rate that reproduced the
+residual gap live, leaving headroom for the ping/pong round trip and any
+buffering below the asyncio Transport layer (OS socket send buffer) that
+this check cannot see directly.
+
+EVEN MORE FUNDAMENTAL FIX, SAME PASS: while instrumenting the boot script to
+prove the v2 change above actually took effect, discovered this patcher had
+NEVER successfully applied on ANY boot, ever -- `main()`'s own
+`shutil.copy2(path, backup)` backup step raises an uncaught
+`OSError: [Errno 38] Function not implemented` (ENOSYS) because litebox's
+Linux shim has no `listxattr` syscall, which `copy2`'s `copystat()` calls to
+preserve extended attributes. The exception aborted the script before the
+patched file was ever written, on every prior session that believed this fix
+was live. Fixed by using `shutil.copyfile()` (data only, no metadata/xattr
+preservation needed for a source backup) instead of `copy2()`. This was the
+real, sole blocker -- the v1/v2 send-gating logic above was never actually
+exercised in a live guest until this fix.
 """
 
 import ast
@@ -117,7 +164,7 @@ NEW_BLOCK = """\
                         queue.task_done()
                         continue
                     now = time.monotonic()
-                    # PING-STARVATION FIX (2026-09-16): websockets.broadcast() applies NO
+                    # PING-STARVATION FIX (2026-09-16, v2): websockets.broadcast() applies NO
                     # backpressure by its own documentation. This branch used to compute
                     # 'backpressure_enabled' per viewer but never acted on it before
                     # broadcasting -- unlike the secondary-display branch below, which
@@ -125,7 +172,12 @@ NEW_BLOCK = """\
                     # add a direct transport-write-buffer check as a faster-reacting safety
                     # net for the gap between backpressure_check_interval_s polls, so a
                     # falling-behind client's backlog can never grow unbounded and starve
-                    # its own keepalive ping past ping_timeout.
+                    # its own keepalive ping past ping_timeout. v2: check what the backlog
+                    # WOULD BE after this frame (backlog_bytes + len(data_chunk)), not just
+                    # what it is now -- the v1 pre-send-only check let one oversized keyframe
+                    # sail through while backlog was still under the cap and push it far past
+                    # the cap in a single write, live-caught still causing a ping timeout
+                    # under a clean low-bandwidth repro (see module docstring "V2 FIX").
                     sendable_viewers = set()
                     for client_ws in primary_viewers:
                         primary_client_info = None
@@ -141,7 +193,7 @@ NEW_BLOCK = """\
                                 backlog_bytes = transport.get_write_buffer_size()
                             except Exception:
                                 backlog_bytes = 0
-                            if backlog_bytes > VIDEO_BACKLOG_DROP_THRESHOLD_BYTES:
+                            if backlog_bytes + len(data_chunk) > VIDEO_BACKLOG_DROP_THRESHOLD_BYTES:
                                 continue
                         primary_client_info['sent_timestamps'][frame_id] = now
                         primary_client_info['last_sent_frame_id'] = frame_id
@@ -160,13 +212,13 @@ NEW_BLOCK = """\
 CONST_ANCHOR = "SENT_FRAME_TIMESTAMP_HISTORY_SIZE = 1000\n"
 CONST_INSERT = (
     "SENT_FRAME_TIMESTAMP_HISTORY_SIZE = 1000\n"
-    "# PING-STARVATION FIX (2026-09-16): see selkies_primary_backpressure_patch.py.\n"
+    "# PING-STARVATION FIX (2026-09-16, v2): see selkies_primary_backpressure_patch.py.\n"
     "VIDEO_BACKLOG_DROP_THRESHOLD_BYTES = int(\n"
-    "    os.environ.get(\"SELKIES_VIDEO_BACKLOG_LIMIT_BYTES\", 262144)\n"
+    "    os.environ.get(\"SELKIES_VIDEO_BACKLOG_LIMIT_BYTES\", 131072)\n"
     ")\n"
 )
 
-MARKER = "PING-STARVATION FIX (2026-09-16)"
+MARKER = "PING-STARVATION FIX (2026-09-16, v2)"
 
 
 def find_selkies_file():
@@ -209,7 +261,16 @@ def main():
 
     backup = path + ".pre-backpressure-patch.bak"
     if not os.path.exists(backup):
-        shutil.copy2(path, backup)
+        # shutil.copy2() -- NOT copyfile() -- preserves metadata via copystat(),
+        # which calls os.listxattr() to carry extended attributes. litebox's
+        # Linux shim has no listxattr implementation and raises OSError errno
+        # 38 (ENOSYS, "Function not implemented"), an UNCAUGHT exception that
+        # crashed this whole patcher before it ever wrote the patched file --
+        # live-caught 2026-09-16: every prior "patch applied" belief was wrong,
+        # selkies.py was never actually patched on any boot. A plain-text
+        # source backup needs no metadata/xattrs, so copyfile() is correct,
+        # not merely a workaround.
+        shutil.copyfile(path, backup)
 
     tmp = path + ".tmp-backpressure-patch"
     with open(tmp, "w", encoding="utf-8") as f:
