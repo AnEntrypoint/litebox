@@ -23,7 +23,10 @@ matters: coreutils `touch` issues the `utimensat(fd, NULL, …)`/futimens form b
 
 - **PowerShell, never Git Bash** — Git Bash rewrites `/absolute/guest/paths` into
   `C:/Program Files/Git/...` before the runner sees them, giving a misleading `ENOENT` on the program
-  path.
+  path. **`Start-Process -RedirectStandardOutput/-RedirectStandardError` makes the runner exit almost
+  instantly with zero guest output** (no crash dump, no event-log entry — its console-handle expectations,
+  ADVISORY-002 §3.1, aren't met by that redirection shape); use `& .\runner.exe ... *> combined.log`
+  instead, confirmed live to run normally.
 - **Single quotes only inside `-c`** — embedded double quotes are corrupted crossing into the child's
   Win32 command line. This masqueraded as deep fork/stack-pointer corruption for a whole sub-session.
 
@@ -46,7 +49,9 @@ fork heal is the subject.
 - **Never run two full-stack verifications concurrently**, peer sessions included — they starve each
   other, and the failure (log truncated mid-line, no crash, no exit) is indistinguishable from a real
   hang. Each runner under an OCI desktop image holds 650MB-1GB+ resident against ~800MB free on this
-  host; kill every `litebox_runner` between runs.
+  host; kill every `litebox_runner` between runs. **Free RAM has been less stable than that baseline
+  implies** (2026-09-16: one `debian-xfce`+selkies boot's RSS passed 4.5GB by `DE_UP` alone, host starting
+  at ~6GB free) — watch `FreePhysicalMemory` live and kill on a falling trend, not a fixed RSS number.
 - **`LITEBOX_DUMP_FRAMES=1` is the only trustworthy `--gui` visual check** (numbered `.bmp` +
   non-black-pixel count to stderr), never `PrintWindow`/`CopyFromScreen`.
 - **A pixel count never identifies WHO painted a frame** — decode frame structure
@@ -85,9 +90,9 @@ fork heal is the subject.
   preferring mature libraries over hand-rolled code for known problem classes.
 - **Never record a test count you did not just watch run to completion, and never leave a suite red for
   an environmental reason.** No counts are recorded here on purpose — a suite is not evidence of anything.
-- **Repo hygiene** — packed layer tars, frame dumps and debug logs never go in git; keep them in `.wfgy/`
-  (gitignored) or an untracked sibling like `../litebox-webtop/`. Root-level scratch (`probe_*.tar`,
-  `*.bmp`, `*.log`) is gitignored; if `git add -A` sweeps one in, untrack it.
+- **Repo hygiene** — packed layer tars, frame dumps and debug logs never go in git; keep in `.wfgy/`
+  (gitignored) or an untracked sibling. Root-level scratch (`probe_*.tar`, `*.bmp`, `*.log`) is
+  gitignored; if `git add -A` sweeps one in, untrack it.
 
 ## Guest-reachable code returns an errno, never a panic
 
@@ -171,7 +176,7 @@ alpine-xfce-vnc:latest` SIGILL'd within 3s before, zero fatal signals after. Blo
 but its rust-coreutils aborted in rustix auxv handling (`sleep`/`tail`/DE launch) — `bb46f1a` has since
 implemented `/proc/self/auxv`/`AT_EXECFN`, so that's a re-test, not a fresh investigation.
 
-**Which X server**: for the DRM/wgpu on-screen (`--gui`) path use `Xorg` with `modesetting` — litebox's
+**X server choice**: for the DRM/wgpu on-screen (`--gui`) path use `Xorg` with `modesetting` — litebox's
 virtual DRM device is legacy-KMS + dumb-buffer + XRGB8888 only, no atomic modeset/GBM/EGL, so a GBM-first
 compositor lands on its least-tested software fallback, and `Xvfb` never touches DRM/KMS at all (zero
 page-flips, indistinguishable from "never drew"). For browser/selkies, `Xvfb` IS correct and verified:
@@ -243,139 +248,59 @@ THIRD mechanism. Full evidence: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 **Symptom**: streams fine, then `sk.log`'s `Client stall for 'primary'... Forcing backpressure` →
 `Data WS closed ...: sent 1011 ... keepalive ping timeout` — selkies' own stall-detector kills the data
-channel, and the dashboard's frontend auto-reloads, presenting as "needs a refresh." A distinct second
-way to land there: a fresh tab's first connection sometimes 404s on `/websockets`, tripping the same
-auto-reload.
+channel, and the dashboard's frontend auto-reloads. A distinct second way to land there: a fresh tab's
+first connection sometimes 404s on `/websockets`, tripping the same auto-reload.
 
-**Eight candidates investigated; seven refuted by live measurement or architecture read, one still open**
-(full evidence for each: `docs/AGENTS_ARCHIVE_2026-09-15.md`):
-
-- Client JS/transport — refuted (protocol-only WS client survived 150s clean; real browsers died on the
-  same endpoint at the same time).
-- nginx config / frontend "dual-connect" — refuted, byte- and log-verified; the "two `Legacy client`
-  registrations per reload" is selkies' own by-design reconnect pairing, not a bug (it only *repeats
-  forever* here because the ACK-stall-kill fires every cycle).
-- `/proc/<pid>/cmdline` ENOENT cost (the original 19/19-correlated marker) — refuted, measured 5-10us/
-  occurrence, 5-6 orders of magnitude below the 20s timeout window. A correlated marker, not a cause.
-- selkies' own psutil tick — refuted, measured 74.8us/tick combined (pinned deployed source has no
-  per-process enumeration at all).
-- `GPUtil.getGPUs()` — refuted, measured 0.6-0.85ms/call (fork+failed-exec, `nvidia-smi` absent).
-- pixelflux capture/encode — refuted by the library's own upstream source: dedicated delivery thread, one
-  GIL acquisition per frame, nothing on the event-loop thread. Corroborated live: a disconnect fired while
-  the desktop was idle, the opposite of what an encode-load cause predicts.
-- litebox's own NAT/`--publish` gateway (`net.rs`) — refuted by full 1068-line read: one thread, fixed
-  5ms tick, fully nonblocking both directions. (Unrelated cleanup flagged, not the cause: `LoopbackQueue`
-  has no size cap and clones its whole backlog every tick.)
-- **fork_verify thread-based healing starving selkies' event loop — NOT confirmed, NOT cleanly refuted.**
-  No priority/affinity/global-suspend mechanism found anywhere in the crate. A real litebox-only defect
-  WAS found and fixed here: `on_single_step` case (1) had no livelock protection (unlike its AV-path
-  siblings), so an unhealed repeat address cost a fresh ~600us trap every iteration (measured: 357
-  consecutive traps, 216ms). **Fixed `b6ddf43`**: case (1) now gets the same livelock counter and deeper
-  GOT/PLT healers the AV path already has. Stress-tested same day: 0.3s-interval concurrent fork load for
-  11+ minutes of disconnect-free streaming with the fix active and heals firing continuously (124k+ warn
-  lines) — real evidence the fixed defect isn't THE cause *by itself*, but no unfixed-vs-fixed A/B was
-  possible (single-runner host). Across all ten sessions, a disconnect and active fork-heal traffic have
-  never once co-occurred in the same observation window, either direction.
-
-**Do not re-reach for GLIBC_TUNABLES here** (zero fatal-signal lines near any kill/stall/reload). **Do
-not re-open the frontend/nginx angle** (byte/log-verified clean). **Do not re-attempt the thread-priority/
-global-lock/suspension angles** under the fork_verify candidate (checked clean above).
+**Eight candidates investigated; seven refuted by live measurement or architecture read** (client JS/
+transport, nginx config/frontend dual-connect, `/proc/<pid>/cmdline` ENOENT cost, selkies' psutil tick,
+`GPUtil.getGPUs()`, pixelflux capture/encode, litebox's own NAT/`--publish` gateway). **One, fork_verify
+thread-based healing starving selkies' event loop, is NOT confirmed, NOT cleanly refuted** — a real
+livelock-protection gap in `on_single_step` case (1) WAS found and fixed (`b6ddf43`), stress-tested clean
+11+ minutes with heals firing continuously, but no unfixed-vs-fixed A/B was possible and a disconnect has
+never once co-occurred with active fork-heal traffic in ten sessions. **Do not re-reach for GLIBC_TUNABLES
+here; do not re-open the frontend/nginx angle** (both byte/log-verified clean). Per-candidate evidence:
+`docs/AGENTS_ARCHIVE_2026-09-15.md`.
 
 **New, unconfirmed lead**: a live disconnect coincided with an open Thunar window closing, suggesting an
 xfwm4/xfdesktop re-layout event might trigger one of `selkies.py`'s untested subprocess spawns
-(`resize_display`/xrandr/xfconf-query). Synthetic pointer events via chrome-devtools don't register with
-the guest's real input path, so this is untested, not ruled out.
+(`resize_display`/xrandr/xfconf-query) — untested, not ruled out.
 
-**What a follow-up needs that none of the ten had**: a real host-TCP packet capture (Wireshark/pktmon on
-`127.0.0.1:3000`) correlated against a guest-side timing instrument on selkies' `websockets`-library
-pong-receive path — direct wire-vs-guest timing, not one more candidate ruled out by absence. Needs a
-working trusted-input path into the canvas (`claude-in-chrome`'s coordinate `computer` tool, untested
-across multiple sessions) to drive load on demand, and a host with >1.8-2GB free memory for a
-rebuild-and-restart window.
+**A follow-up needs**: a real host-TCP packet capture (Wireshark/pktmon on `127.0.0.1:3000`) correlated
+against a guest-side timing instrument on selkies' `websockets`-library pong-receive path, plus a working
+trusted-input path into the canvas and >1.8-2GB free memory for a rebuild-and-restart window.
 
-**Separate open complaint, distinct from the ACK-stall-kill**: Terminal Emulator reportedly never opens
-in the streamed desktop. Not a general hang — native coordinate-precise clicks open Thunar in seconds
-even under continuous fork-stress load — but every popup/dropdown menu (XFCE panel "Applications", Thunar
-"File") fails to open via the same clicks that work everywhere else, not yet root-caused (X11
-pointer-grab semantics for `GtkMenu` vs. a menu-specific timing/coordinate issue). A session with working
-popup-menu input, or a guest-side `xdotool` path, should open Terminal Emulator directly and time it.
+**Separate open complaint, distinct from the ACK-stall-kill: Terminal Emulator/Applications-menu popup.**
+Architecture read found no litebox grab-/menu-specific code on this path; driving the guest DIRECTLY
+(bypassing selkies/browser) proved **both `xfce4-terminal` and the `xfce4-popup-applicationsmenu` popup
+mechanism are independently healthy** (open correctly twice each, no crash) — ruling out an app-exec-crash
+cause and click/render. `xdotool` on the OPEN menu (arrow-keys/type-ahead) didn't
+visibly launch anything once, inconclusive (test gap vs. real defect not yet distinguished) — retry
+`.wfgy/webtop_stack_menudiag3.sh`'s arrow-key variant on a quieter boot. The live browser click-path retest
+remains blocked — every session this week lost its clean-enough boot to ADVISORY-001 §3N (or, 2026-09-16,
+host RAM exhaustion, below) first. `net.rs` is fully cleared (live-proven twice, both guest-internal and
+`-p`-external probes); the masked-502/404 bug was a startup race (fixed: `SELKIES_PORT_UP` gate + a missing
+`50x.html`) plus §3N hitting selkies moments after bind (still open). `spawn_exec_collision_child`'s own
+unbounded-wait hang is fixed and live-reconfirmed (`42d8ced`, 20s/120s bounded). No litebox source change
+was made or warranted here — both paths are proven healthy; forcing a change without a further-specific
+defect would violate this project's standing discipline. Full blow-by-blow: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
-**2026-09-16**: a live re-test attempt (blocked before reaching the Applications menu; architecture read
-found no litebox grab-/menu-specific code on this input path) hit selkies never binding
-(`/websockets` 404) — now root-caused and **fixed**: `spawn_exec_collision_child`
-(`litebox/src/platform/mod.rs:1131`, impl `litebox_platform_windows_userland/src/lib.rs`) recovers from
-an exec-address collision by spawning a replacement `litebox_runner`, but awaited it with an unbounded
-blocking `cmd.status()` — a wedged replacement hung the WHOLE guest boot forever. **Fixed and
-live-verified (`42d8ced`)**: bounded poll (20s stall grace/120s cap); re-run hit the same collision, the
-cap fired, and supervisor-respawn recovered cleanly. Does not fix Track B or ADVISORY-001 §3N (above,
-both still open) — only bounds this hang. Full repro/architecture-read detail:
-`docs/AGENTS_ARCHIVE_2026-09-16.md`.
-
-**2026-09-16, later same day: `42d8ced` re-confirmed live twice more (13 boot attempts,
-`.wfgy/webtop_stack.sh --resume-from .wfgy/webtop_stack_seed.tar`); Terminal Emulator app and the
-Applications-menu popup both proven healthy in isolation; the live menu-click test itself is still
-blocked by the pre-existing `-p` NAT websocket bug.** Both firings hit the same `/lsiopy/bin/python3`
-collision, both hit the 120s cap and recovered without hanging the guest — once serving the dashboard
-throughout, once with the fallback SIGSEGV landing on the selkies-supervisor subshell itself instead of
-the colliding child (permanently lost selkies that boot, but did not hang the guest — a related, distinct,
-not-yet-chased failure mode, not a defect in the fix).
-
-Could not reach a live, browser-rendered desktop to click-test the Applications menu that session: every
-external (`-p`-published) request to `/websockets` returned `404` (masked `502`) deterministically, even
-on a clean boot with selkies confirmed listening — the same bug `docs/webtop-debian-selkies-2026-09-06.md`
-first captured. A same-day interface-address workaround (proxy_pass to `10.0.0.2:8081` instead of
-`127.0.0.1:8081`) reproduced the `404` identically, ruling out loopback-vs-interface-address as the
-variable.
-
-**Root-caused live later the same day — `net.rs` cleared for good, this thread closed.** Tailed nginx's own
-`error_log` live for the first time and caught the real error on two boots: a genuine
-`connect() failed (111: Connection refused)` to `127.0.0.1:8081`, from BOTH a guest-internal probe
-(`client: 10.0.0.2`) and a real `-p` external probe (`client: 10.0.0.1`) — proving live what `net.rs`'s
-code already implied (its loopback fast-path bypasses the NAT gateway entirely for `127.0.0.0/8`), so this
-was never a `-p`-vs-loopback bug. The refusal is (a) a plain startup race (selkies' real bind latency is
-~100-140s; anything proxied earlier gets a genuine ECONNREFUSED) and/or (b) the standing ADVISORY-001 §3N
-tcache class killing selkies moments after it DOES bind (live-witnessed: bound, logged "listening on port
-8081", then still 502'd on a probe shortly after — and this session's own crash dump caught a NEW instance
-of this class hitting the boot script's own `pid=2`, not just selkies/nginx). Two `.wfgy/webtop_stack.sh`
-fixes landed (gitignored, no litebox source change): a missing `50x.html` meant every real 502 was itself
-404ing — fixed, so a genuine backend failure now surfaces honestly; and a `SELKIES_PORT_UP` gate (curl exit
-code, not `%{http_code}`, which can't tell "nobody home" from "connected, no HTTP reply" against a raw WS
-server) closes the first-bind race before anything downstream treats the boot as ready. (b) remains open,
-unchanged, under ADVISORY-001 §3N. Evidence trail: `docs/AGENTS_ARCHIVE_2026-09-16.md`. Browser Terminal
-Emulator re-test still not reached — both boots run to gather this evidence were themselves lost to §3N
-before a long-enough clean window opened.
-
-With the browser path blocked, tested the menu bug a different way: drove the guest DIRECTLY (no
-selkies/browser/click in the loop) via a script step after `DE_UP`. Two clean findings, each reproduced
-twice across independent boots:
-
-- **`xfce4-terminal` itself is completely healthy under litebox.** `DISPLAY=:1 xfce4-terminal
-  --title=DIAGTERM -e ...` opens a correctly-sized real window (`818x485`) within 3 seconds every time,
-  no crash, only a benign `SESSION_MANAGER` warning. Rules OUT an app-level exec/fork crash (hypothesis
-  (c)/(d) from the prior investigation) as the cause of "Terminal Emulator never opens."
-- **The Applications-menu popup mechanism itself also works.** `xfce4-popup-applicationsmenu` (the exact
-  helper the panel button execs) reliably creates a real `166x305` menu window both times tried — input
-  reaching the button and the popup rendering are NOT the broken link.
-- **Inconclusive, not yet resolved**: driving the OPEN menu with `xdotool` (type-ahead search, once;
-  arrow-key exploration, twice more) did not visibly launch anything in the one completed run; both later
-  arrow-key attempts were preempted by this session's own elevated §3N crash rate before completing.
-  Whether the open menu genuinely fails to dispatch activation, or the test itself has a gap, is NOT yet
-  distinguished. Next session: retry the arrow-key-only variant (`.wfgy/webtop_stack_menudiag3.sh`) on a
-  quieter boot — keyboard nav also producing nothing would be strong evidence of a real dispatch-level
-  defect, distinct from mouse-only grab-semantics theories.
-
-This session's boot reliability was noticeably worse than the 3/5 baseline the nginx-race fix
-established: 3 of 13 attempts hit `XVFB_FAILED`, at least 2 hit a full-guest `pid=2 SIGSEGV` (the
-standing ADVISORY-001 §3N tcache class, not a new defect), and one run's RSS grew to 5GB+ with no
-forward stdout progress before being killed — not root-caused, plausibly the same tcache class
-manifesting as a slow spin rather than an immediate abort, plausibly amplified by this session's own
-extra forking (`xfce4-terminal`, `xfce4-popup-applicationsmenu`, `xdotool`) adding more exec/collision
-surface on top of the normal boot sequence. Flagging, not chasing further this session.
-
-No litebox source change was made or warranted for the Terminal Emulator/menu investigation this
-session — both the app-exec path and the menu-popup path are now independently proven healthy, and
-forcing a change without isolating a further-specific defect would violate this project's own standing
-discipline against unverified fixes.
+**2026-09-16, Track A fork-without-exec audit (ADVISORY-002 §6): `.wfgy/webtop_stack.sh`'s own supervisor
+subshells were themselves a live-matching instance of the crash class — fixed, but crash-frequency
+evidence is inconclusive (host RAM exhaustion), not yet statistically confident.** dbus-daemon (`--nofork`)
+and nginx (`daemon off; master_process off;`) already avoid self-daemonizing (pre-existing). But the
+script's own nginx/selkies
+supervisor loops ran as bare `( ... ) &` subshells — fork() with no exec(), the same unsafe shape as
+`dbus-daemon --fork` — and the archive's own `spawn_exec_collision_child` investigation already
+live-caught exactly this `SELKIES_SUPERVISOR` subshell SIGABRT-ing on `double free or corruption (out)`.
+**Fixed**: both loops extracted to files launched via `/bin/sh file &` (real fork+exec, discards any
+inherited corrupted heap per ADVISORY-002 §1.5). Six boots this session (1 control, 5 fixed): every one
+not killed early reached at least `DE_UP`/`DE_FALLBACK_LAUNCHED` cleanly, **zero occurrences of the target
+tcache/double-free crash in either arm** — but every boot (both arms) had to be killed for RAM safety at
+`DE_UP`/`SELKIES_LAUNCHED_LAST`, before the archive's own examples of that crash need several more
+`HOLD`-minutes of fork pressure to appear. No regression across 5 fixed attempts; real crash-frequency
+effect needs a re-run with more free RAM. Browser Terminal Emulator/menu retest not reached, same reason.
+`xfsettingsd`/Thunar's own fork behavior not independently re-verified — unchanged from ADVISORY-002.
+Boot-by-boot log: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 ## Host-side crash machinery
 
@@ -427,12 +352,10 @@ real host window (memory `mem-3c4a9980a884604b-1031`). Not an open X11-vs-Waylan
 
 ## Docs and tooling map
 
-- **Archives** — `docs/AGENTS_ARCHIVE_2026-09-16.md` (popup-menu re-test,
-  `spawn_exec_collision_child` fix detail), `docs/AGENTS_ARCHIVE_2026-09-15.md` (30KB recompile + the
-  ACK-stall-kill detail), and `docs/AGENTS_ARCHIVE_2026-09-10.md` (fork fd boundary/eligibility, per-fork
-  cost history, 2026-09-08 defect set, OCI cache internals, s6-boot gaps, browser-desktop config,
-  crash-dump/VEH constants, CoW flank fix, working practices). Older: `docs/AGENTS_ARCHIVE_2026-09-03.md`,
-  `_2026-09-05.md`.
+- **Archives** — `docs/AGENTS_ARCHIVE_2026-09-16.md` (popup-menu re-test, `spawn_exec_collision_child`
+  fix, Track A audit boot logs), `docs/AGENTS_ARCHIVE_2026-09-15.md` (ACK-stall-kill detail), and
+  `docs/AGENTS_ARCHIVE_2026-09-10.md` (fork fd eligibility, cost history, OCI cache, s6-boot, browser
+  config, crash-dump/VEH, CoW, working practices). Older: `_2026-09-03.md`, `_2026-09-05.md`.
 - Fork: `docs/track-b-fork-fix-progress.md`, `advisor/ADVISORY-002-d-zero-fork.md`,
   `advisor/ADVISORY-001-fundamentals.md` (§3N tcache analysis, Appendix D presenter case).
 - `docs/veh-exception-handler-design.md` — canonical VEH narrative; read before touching the handler,

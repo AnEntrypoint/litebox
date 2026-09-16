@@ -348,3 +348,134 @@ session, per this project's own "never run two full-stack verifications concurre
 live boot run was fully consumed by the tunable-propagation/RAM investigation above and ended in the same
 standing crash class before a clean window opened — unchanged from every other session's experience this
 week. This remains blocked on the same standing ADVISORY-001 §3N / Track B blocker, not on anything new.
+
+## Track A fork-without-exec audit: dbus-daemon/nginx already fixed, boot script's own supervisor subshells found and fixed, evidence inconclusive on host RAM exhaustion (2026-09-16, later session)
+
+**Task**: `advisor/ADVISORY-002-d-zero-fork.md` §6 Track A recommends avoiding fork-without-exec entirely
+for XFCE session daemons (`dbus-daemon --fork`, `xfsettingsd`, `Thunar --daemon`) and nginx's own
+master/worker model, without touching litebox's architecture, as the fastest route to real desktop
+stability. This session audited `.wfgy/webtop_stack.sh` (the gitignored local boot script) against that
+recommendation, daemon by daemon.
+
+**Per-daemon findings**:
+- **dbus-daemon**: already fixed, predates this session. `webtop_stack.sh` starts the session bus with
+  `dbus-daemon --session --nofork --print-address` directly (a foreground, non-self-daemonizing
+  invocation) and shims `dbus-launch` to `exec` its argument against the already-running bus rather than
+  letting the image's own `startwm.sh` invoke real `dbus-launch` (which internally forks and previously
+  SIGSEGV'd, see `AGENTS.md`'s "fork carries pipes... but NOT sockets" lesson). No change needed.
+- **nginx**: already fixed, predates this session. Started with `-g 'master_process off; daemon off;'`,
+  removing both nginx's own daemonizing self-fork AND its worker-process fork (which the script's own
+  comment already documents as unreliable under litebox's thread-based relocating fork: "the worker
+  crashed silently... while the master itself kept running"). No change needed.
+- **xfsettingsd, Thunar**: launched inside `xfce4-session`'s own client-launch chain (via
+  `/defaults/startwm.sh`), not directly invoked by `webtop_stack.sh`. `xfce4-session` forks+execs each
+  session client once (safe, ordinary fork+exec) — the open question ADVISORY-002 raises is whether these
+  binaries THEMSELVES call fork() again after being exec'd (genuine self-daemonization), which needs an
+  interactive guest shell (`xfsettingsd --help`/`Thunar --help`, or a live `ps` tree check for
+  reparenting) to verify empirically. **Not independently re-verified this session** — every boot attempt
+  was killed for RAM safety before a stable interactive guest shell was reached (see below). Status
+  unchanged from ADVISORY-002's own claim that these fork-without-exec by design; if a real substitute
+  foreground flag exists for either, it was not found or tested this session.
+- **selkies**: not a boot-script daemon-invocation question (no separate fork-avoidance flag applies to
+  selkies' own process model) — its relevant fork risk is its `xclip`-polling clipboard monitor, already
+  disabled via `--clipboard-enabled=false` (pre-existing fix, predates this session).
+
+**New finding, not anticipated by the daemon-by-daemon framing: the boot script's OWN supervisor loops
+were themselves an uninvestigated instance of the exact crash class.** Both the nginx and selkies
+supervisor loops were implemented as `( ... ) &` bash subshells — reproducing s6-supervise's respawn
+behavior, added in an earlier session specifically because a bare `&` with no restart let a crashed nginx/
+selkies silently vanish. But a `(...)&` subshell is fork() with NO exec() after it: bash forks a child
+that keeps running the SAME interpreter image (running the while-loop, `$n` arithmetic, string
+substitutions for path construction, `case`/`if` evaluation) for the rest of the boot, allocating heap
+memory as it goes — structurally identical in shape to `dbus-daemon --fork`'s self-daemonizing fork the
+advisory names as unsafe, just spelled as a shell construct instead of a C `fork()` call. This was not
+hypothetical: re-reading this same archive's own "GLIBC_TUNABLES propagation" section above shows the
+mechanism already caught red-handed — the `SELKIES_SUPERVISOR` subshell (`supervisor_pid=170` from
+`SELKIES_LAUNCHED_LAST`) SIGABRT'd on a bare `double free or corruption (out)` line ~2 minutes after a
+python3 exec-collision event, while it was still alive as exactly this kind of long-lived
+forked-without-exec bash process.
+
+**Fix applied** (`.wfgy/webtop_stack.sh`, gitignored, no litebox source change): both the nginx and
+selkies supervisor loop bodies were extracted verbatim into standalone scripts (`/tmp/nginx_supervisor.sh`,
+`/tmp/selkies_supervisor.sh`, written via a quoted heredoc so nothing is expanded early) and launched via
+`/bin/sh /tmp/<name>.sh &` instead of a bare `( ... ) &` subshell. This is an ordinary fork()+execve() of a
+fresh `/bin/sh` image — per ADVISORY-002 §1.5's own mechanism ("a child that execs promptly discards the
+whole inherited heap... before allocating again"), the new supervisor process starts with a clean heap
+regardless of what corruption state the parent script's own heap was in at that moment, exactly mirroring
+what the pre-existing `dbus-daemon --nofork`/`nginx daemon off` fixes already do for THEIR processes.
+nginx's supervisor needed five previously-local (non-exported) shell variables (`NGINX_CONFIG`, `CPORT`,
+`CWS`, `SFOLDER`, `FILE_MANAGER_PATH`) exported before the new script is launched, since a freshly-exec'd
+process only inherits the environment, not the parent shell's local variables; selkies' supervisor needed
+no such export (no external variable references in its body).
+
+**Evidence gathered — six live boots this session** (`docker.io/linuxserver/webtop:debian-xfce`,
+`--env GLIBC_TUNABLES=glibc.malloc.tcache_count=0:glibc.malloc.mxfast=0`, `--publish 3000:3000`, log level
+`warn,litebox_platform_windows_userland::fork_verify=error`):
+
+- **Launch-mechanism gotcha found and fixed first**: `Start-Process -RedirectStandardOutput/
+  -RedirectStandardError` made the runner exit almost instantly (`HasExited=True` within 3-10s) with a
+  peak working set of only ~50MB and ZERO guest-side output — not even the script's own leading `echo
+  GUESTSTART`, no crash dump, no Windows Application-Error event, no low-virtual-memory event. Confirmed
+  reproducible with BOTH the fixed script's tar AND the known-good original `webtop_stack_seed.tar`
+  (ruling out the tar/script content as the cause) and confirmed NOT a resource issue (working set never
+  grew, no `Get-WinEvent` crash/OOM record at the matching timestamp). Switching to the call operator with
+  `*>` file redirection (`& .\runner.exe ... *> combined.log`) made the exact same invocation run
+  normally end to end. Root cause not fully instrumented, but consistent with ADVISORY-002 §3.1's own
+  documented risk notes about the runner's console-handle assumptions (`SetConsoleCtrlHandler`, a
+  `ConsoleStdinReader` thread) not being satisfied by `Start-Process`'s redirected-pipe handles. This
+  gotcha would have produced a false "the fix broke booting entirely" conclusion if not caught early by
+  testing the SAME redirection method against the known-good original script first.
+- **1 control run** (unmodified original `webtop_stack.sh`/`webtop_stack_seed.tar`): reached
+  `NGINX_STARTED`→`NGINX_SELFTEST 200`→`XVFB_UP`→`DBUS_UP`→`DE_LAUNCHED`→`DE_VIA_STARTWM=no`→
+  `DE_FALLBACK_LAUNCHED`→`DE_UP via direct xfce4-session`→`SELKIES_LAUNCHED_LAST`→`SK_TAIL_BEGIN`→
+  `HOLD t=20s` — a full clean boot. One `fork_verify` AV-path stale-CODE-pointer livelock (8 repeats at
+  the same rip, matching the already-documented, already-bounded `b6ddf43` livelock-counter behavior)
+  triggered the existing sacrifice-one-task fallback: `fatal signal ... Signal(11) pid=143 comm=gpg-agent`
+  — a single, known, non-fatal-to-the-boot task kill, NOT the whole-guest tcache/double-free class (the
+  boot's own log continued normally for many more seconds afterward with no further disruption). RSS
+  climbed to ~5GB+ by `HOLD t=20s`, forcing a manual kill for RAM safety (free RAM had fallen to
+  ~1.07GB); RAM recovered to ~7GB within 2s of the kill, confirming the runner process itself (not a
+  leak elsewhere on the host) was the consumer.
+- **5 fixed-script attempts**, `webtop_stack_seed_fixed.tar` (a freshly-built tar, same `ustar` header
+  structure verified byte-identical to the known-good original via `xxd`, embedding only the updated
+  script at `config/webtop_stack.sh`):
+  - Attempts 1-2: killed prematurely by this session's own misreading of the script's BY-DESIGN quiet
+    60-second Xvfb-socket poll loop (`while [ $i -lt 60 ]; do [ -S "$XSOCK" ] && break; ...; sleep 1;
+    done` — pure shell builtins, deliberately forks nothing while waiting, per the script's own comment)
+    as an unresponsive stall. Both showed `NGINX_STARTED`/`NGINX_SELFTEST 200` (i.e., the fixed nginx
+    supervisor worked identically to the original) before being killed with no crash signature observed
+    in either. Inconclusive as boot-completion data points, but corroborate that the fix introduces no
+    immediately-visible regression in the part of the boot both attempts covered.
+  - Attempt 3: killed mid-transition (right as `XVFB_FAILED`→`DBUS_UP`→`DE_LAUNCHED` were written,
+    likely already buffered before the kill took effect) after the same premature-stall misreading — no
+    crash signature.
+  - Attempt 4: full clean run, patient this time — `NGINX_STARTED`→`NGINX_SELFTEST 200`→`XVFB_UP`→
+    `DBUS_UP`→`DE_LAUNCHED`→`DE_VIA_STARTWM=no`→`DE_FALLBACK_LAUNCHED`→`DE_UP via direct xfce4-session`,
+    zero crash signature, killed for RAM safety (free RAM ~2.25GB and falling) right at/after `DE_UP`.
+  - Attempt 5: `NGINX_STARTED`→`NGINX_SELFTEST 200`→`XVFB_UP`→`DBUS_UP`→`DE_LAUNCHED`→`DE_VIA_STARTWM=no`→
+    `DE_FALLBACK_LAUNCHED`, zero crash signature, killed for RAM safety (free RAM ~2GB) before the DE
+    fallback verdict resolved.
+
+**Conclusion, stated honestly in both directions**: the fix is mechanistically sound and directly
+addresses a live-documented crash instance (the exact `SELKIES_SUPERVISOR` SIGABRT this same archive
+already recorded), and caused no observed regression across five attempts — every fixed-script boot
+progressed at least as far as the unmodified control run, on the same milestones, at comparable timing.
+**But this session cannot claim a measured reduction in crash frequency for the target tcache/double-free
+class**, because that class did not occur in EITHER arm (control or fixed) within the boot-age this
+session's host RAM allowed — every single boot, six for six, had to be manually killed for RAM safety
+between `DE_UP` and `SELKIES_LAUNCHED_LAST`, consistently 130-170s into the boot. The archive's own prior
+examples of the target crash class (the `SELKIES_SUPERVISOR` SIGABRT this fix targets, the pid=2 SIGSEGV
+elsewhere in this file) occurred several minutes further into the boot's `HOLD`-loop steady state, under
+sustained concurrent fork pressure this session never reached before RAM forced a kill. This host's free
+RAM was materially more constrained today than the archive's own earlier "~800MB free" baseline assumes —
+starting each boot with only ~5.8-6.2GB free (of 15.6GB total) and watching it fall below 1-2GB within
+150s of a single `debian-xfce`+selkies boot, well above the documented 650MB-1GB steady-state RSS this
+project's own standing lesson names. A re-run on a host with more sustained free RAM (or a lighter guest
+image) is needed to actually measure the fix's effect on crash frequency; this session's result is
+honest negative evidence (no regression, no confirmed improvement) rather than a positive confirmation.
+
+**Not reached this session**: a live browser-verified stable connection to retest the Terminal Emulator/
+Applications-menu click path (task step 4) — no boot held a stable serving window long enough, for the
+same RAM reason above. Track B architectural work (cross-process `RawMutex`, presenter-process split,
+etc.) was explicitly out of scope for this dispatch and was not started, per ADVISORY-002 §6's own
+recommendation that it is multi-session-scale work.
