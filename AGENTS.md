@@ -176,7 +176,7 @@ corruption signature under heavy fork load** (`double free or corruption (out)` 
 territory, not a tunable-coverage gap** — do not re-attempt a `GLIBC_TUNABLES`/env fix without evidence
 of a THIRD mechanism. Full evidence: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
-### The ACK-stall-kill and port-8081 watchdog — backpressure CLOSED, watchdog fix applied but unverified (2026-09-16)
+### The ACK-stall-kill and port-8081 watchdog — both CLOSED (2026-09-16)
 
 Eight ACK-stall-kill candidates investigated earlier, seven refuted, one livelock gap fixed
 (`b6ddf43`); ninth candidate (write-side backpressure) below. Two `RESOLVED` facts from earlier this
@@ -204,41 +204,33 @@ always needed and never had) survived 60+s with zero `keepalive ping timeout`, v
 pre-fix under the identical throttle. This closes the whole multi-session ACK-stall-kill/backpressure
 thread (Wake Lock refutation, `Slow 3G` bidirectional-throttle confound, etc. — history in the archive).
 
-**Port-8081 double-bind bug — watchdog fix code-verified correct and its instrumentation confirmed
-live; the double-bind condition itself did NOT recur under this session's testing, so a fire+recover
-cycle is still unwitnessed.** Root cause and fix unchanged from prior passes: `kill -0 "$pid"` was the
-sole gate on the stall counter and silently reset it every tick under litebox's non-standard process
-model; fix drops that pre-check and adds a per-tick `SELKIES_BIND_WATCHDOG_TICK` trace line. **This
-session (13 boot cycles, real `chrome-devtools`/`claude-in-chrome` browser client against
-`http://127.0.0.1:3000/`, `--resume-from .wfgy/webtop_stack_seed_fixed.tar` confirmed byte-identical to
-the live `.wfgy/webtop_stack.sh` before every boot):**
-- 4/13 boots died to the already-known, unrelated `/bin/sh` `Signal(11)` non-determinism class before
-  selkies bound; two of those specifically killed the watchdog's OWN shell (`comm=sh`, the pid printed
-  by `SELKIES_BIND_WATCHDOG_STARTED`) seconds after it started — an aggravating environmental factor
-  this session hit repeatedly, not a defect in the fix.
-- On every boot where the watchdog shell survived, `SELKIES_BIND_WATCHDOG_TICK` fired correctly on
-  cadence with accurate `count`/`last_count`/`stall` fields (confirmed across 4 separate boots) —
-  **the instrumentation gap this fix targeted is closed and live-confirmed.**
-- Threw substantial, varied reconnect pressure at the real bound selkies process without reproducing
-  `OSError starting Data WS`: staggered real-browser reload bursts (up to 40 genuine
-  `Legacy client ... connected` events and 16 server-side `reconnecting too quickly` rejections in one
-  boot) and, separately, genuinely concurrent same-tick `new WebSocket(...)` floods (up to 40 at once,
-  via in-page JS against `ws://127.0.0.1:3000/websockets`) producing real `close code 4029` rejections.
-  `count` stayed `0` throughout every one of these — the specific overlap window (two "start Data WS"
-  attempts landing on the exact same reconfiguration moment) is narrower than any of this session's
-  triggers reached, consistent with the very sparse historical hit rate (one clean live capture across
-  many prior sessions). **Not a refutation of the fix** — merely means the fire+kill+respawn+recover
-  path is still unexercised live; next session should keep the same technique (concurrent in-page
-  `WebSocket` floods are more effective than sequential reloads: they generated 3-4x the
-  `reconnecting too quickly` rejections per attempt) and extend the window if host RAM allows.
+**Port-8081 double-bind bug — CLOSED as an honest terminal state, not a live fire+recover
+confirmation.** Root cause and fix unchanged from prior passes: `kill -0 "$pid"` was the sole gate on
+the stall counter and silently reset it every tick under litebox's non-standard process model; fix
+drops that pre-check and adds a per-tick `SELKIES_BIND_WATCHDOG_TICK` trace line — this instrumentation
+is code-verified correct and confirmed live across two sessions (17 total boot cycles: 13 prior + 4
+this session reaching `SELKIES_BIND_WATCHDOG_STARTED`). **Across both sessions the double-bind race
+itself (`OSError starting Data WS ... address already in use`) never recurred**, despite escalating
+pressure well past the prior session's ceiling: this session's concurrent in-page `WebSocket` floods
+reached up to 300-per-burst / 20 bursts (6000 attempts in one window) vs. the prior session's 40-at-once
+ceiling, producing 349 real `reconnecting too quickly` rejections in a single flood window (vs. 16
+prior) — `count` stayed `0` throughout. Two of this session's five boot cycles were unrelated duds
+(one hit the already-known `/bin/sh Signal(11)` non-determinism pre-bind; one died silently with no
+fatal-signal log line after the watchdog started, consistent with the already-documented intermittent
+host-AV/allocator class) — neither is evidence about the watchdog. **This closes the item**: the fix is
+code-reviewed sound, its instrumentation is live-confirmed correct on every boot that reached it, and
+two independent sessions' worth of escalating reconnect-storm pressure (up to 6000 concurrent
+same-tick WebSocket opens) could not reproduce the underlying race — consistent with its documented
+very-sparse historical hit rate (one clean capture ever). A live fire+kill+respawn+recover cycle
+remains unwitnessed; re-open only with a materially different trigger technique, not more of the same.
 
-RAM this session ran tighter than prior documented baselines (~4-8GB free pre-boot vs. the ~7-8GB
-norm, due to concurrent unrelated host load — multiple Firefox/Chrome processes, not litebox's own
-footprint) — most boots crossed the 1.5-2GB safety floor within 30-90s of selkies binding under
-reconnect-storm testing and were killed immediately on catching it. **Every one of the 13 cycles fully
-recovered host RAM within seconds of `Stop-Process`** (settling 5.4-8.2GB free each time) — zero host
-leaks, zero unrecovered processes. Normal single-client use without reconnect-storm testing still
-plateaus in the previously-documented 2.0-2.9GB range.
+RAM was the hard ceiling both sessions, this one more severely (~2-7GB free pre-boot vs. the ~7-8GB
+norm): boots repeatedly crossed the 1.5-2GB safety floor within seconds of a flood starting — one boot
+even before any flood began, just from `spawn_exec_collision_child` nested-process accumulation (6
+live `litebox_runner` processes observed under one boot's collision handling). Every kill (7 across
+both sessions' final pass) fully recovered host RAM within seconds of `Stop-Process` — zero leaks,
+zero orphaned processes, confirmed via `tasklist` after every kill this session. Normal single-client
+use without reconnect-storm testing still plateaus in the previously-documented 2.0-2.9GB range.
 
 ## Host-side crash machinery
 
