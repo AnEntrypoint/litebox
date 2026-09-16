@@ -147,7 +147,30 @@ fn poll_scanout_and_feed(
     }
 }
 
+/// `litebox_runner_linux_on_windows_userland`'s own doc comments (`PRESENTER_THREAD_STACK_SIZE`,
+/// now-deleted from that crate) record a confirmed-live `STATUS_STACK_OVERFLOW` in a debug build
+/// running `Presenter::new()`/`resumed()`/`Presenter::run()` on a default 1 MiB stack -- wgpu/
+/// winit's own deep, heavily-monomorphized call chains are dramatically more stack-hungry
+/// unoptimized. That code ran on a SPAWNED thread it could size explicitly; this binary's `main()`
+/// is a process's own primary thread, whose stack size is fixed at link time (1 MiB by default on
+/// Windows) rather than adjustable via `std::thread::Builder`. Running the same wgpu/winit work
+/// here needs the identical mitigation: do the real work on a spawned thread sized the same as
+/// before, and let `main()` itself be a thin launcher.
+const PRESENTER_THREAD_STACK_SIZE: usize = 256 * 1024 * 1024;
+
 fn main() {
+    let handle = std::thread::Builder::new()
+        .name("litebox-presenter-main".to_owned())
+        .stack_size(PRESENTER_THREAD_STACK_SIZE)
+        .spawn(run)
+        .expect("failed to spawn litebox-presenter-main thread");
+    match handle.join() {
+        Ok(()) => {}
+        Err(e) => std::panic::resume_unwind(e),
+    }
+}
+
+fn run() {
     let pipe_name = std::env::args().nth(1).unwrap_or_else(|| {
         eprintln!("usage: litebox-presenter.exe <pipe-name>");
         std::process::exit(2);
