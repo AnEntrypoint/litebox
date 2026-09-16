@@ -226,6 +226,19 @@ despite the `--env` flag being passed correctly — genuinely ADVISORY-001 §3N 
 `webtop_stack.sh` now also exports the tunables directly for every child selkies forks; **not yet
 re-verified crash-free over many cycles** (the ACK-stall-kill below dominates the symptom in practice).
 
+**2026-09-16: `GLIBC_TUNABLES` propagation through `spawn_exec_collision_child` has NO gap — live-proven
+via a new permanent diagnostic (`lib.rs`'s `glibc_tunables_forwarded` warn line) — and the recurring
+crash class is a genuinely SECOND, different corruption signature under heavy fork load (`double free or
+corruption (out)` → SIGABRT, not §3N's original `REVEAL_PTR` XOR SIGSEGV), not a propagation regression
+from `42d8ced`.** Confirmed forwarded `true` on every collision including the critical
+`path=/lsiopy/bin/python3` selkies case, then watched the crash happen anyway ~2 minutes later on the
+SELKIES_SUPERVISOR subshell. Conclusion: the tunables do their documented job and reach every process
+correctly; the new signature hits the unsorted/small/large-bin paths they deliberately leave enabled,
+meaning litebox's own pointer-relocation fork-healing doesn't reliably heal every plain `fd`/`bk` pointer
+either under this much concurrent fork pressure. **This is Track B territory (`ADVISORY-002-d-zero-fork.md`),
+not a tunable-coverage gap** — do not re-attempt a `GLIBC_TUNABLES`/env fix here without new evidence of a
+THIRD mechanism. Full evidence: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
+
 ### The ACK-stall-kill — root cause still unidentified after ten investigations, the one genuinely open bug in this project
 
 **Symptom**: streams fine, then `sk.log`'s `Client stall for 'primary'... Forcing backpressure` →
@@ -298,16 +311,14 @@ cap fired, and supervisor-respawn recovered cleanly. Does not fix Track B or ADV
 both still open) — only bounds this hang. Full repro/architecture-read detail:
 `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
-**2026-09-16, later same day: `42d8ced` re-confirmed live twice more; Terminal Emulator app and the
+**2026-09-16, later same day: `42d8ced` re-confirmed live twice more (13 boot attempts,
+`.wfgy/webtop_stack.sh --resume-from .wfgy/webtop_stack_seed.tar`); Terminal Emulator app and the
 Applications-menu popup both proven healthy in isolation; the live menu-click test itself is still
-blocked by the pre-existing `-p` NAT websocket bug.** 13 boot attempts of `.wfgy/webtop_stack.sh
---resume-from .wfgy/webtop_stack_seed.tar` this session. Two live firings of the `42d8ced` bound, both
-the same `/lsiopy/bin/python3` collision, both hit the 120s cap and recovered without hanging the guest:
-once the guest kept serving the dashboard throughout (curl `200` on `/`); once the fallback SIGSEGV
-happened to land on the selkies-supervisor subshell itself (`comm=sh`, not the colliding child), which
-permanently lost selkies for that boot (no more respawns) but still did **not** hang the whole
-guest — a related but distinct failure mode from the originally-fixed hang, worth a future look but not
-a defect in the fix itself.
+blocked by the pre-existing `-p` NAT websocket bug.** Both firings hit the same `/lsiopy/bin/python3`
+collision, both hit the 120s cap and recovered without hanging the guest — once serving the dashboard
+throughout, once with the fallback SIGSEGV landing on the selkies-supervisor subshell itself instead of
+the colliding child (permanently lost selkies that boot, but did not hang the guest — a related, distinct,
+not-yet-chased failure mode, not a defect in the fix).
 
 Could not reach a live, browser-rendered desktop to click-test the Applications menu that session: every
 external (`-p`-published) request to `/websockets` returned `404` (masked `502`) deterministically, even
@@ -345,18 +356,13 @@ twice across independent boots:
 - **The Applications-menu popup mechanism itself also works.** `xfce4-popup-applicationsmenu` (the exact
   helper the panel button execs) reliably creates a real `166x305` menu window both times tried — input
   reaching the button and the popup rendering are NOT the broken link.
-- **Inconclusive, not yet resolved**: driving the OPEN menu with `xdotool` (type-ahead search "Terminal
-  Emulator" + Return, once; arrow-key Down/Right exploration, attempted twice more) did not visibly
-  launch anything in the one run that completed the step, but both later arrow-key attempts were
-  preempted by this session's own elevated crash rate before completing (one full guest death, `pid=2
-  comm=sh SIGSEGV`, mid-boot before reaching the diagnostic; one run where the runner's own RSS grew past
-  5GB with stalled stdout progress, killed rather than risk host OOM). Whether the open menu genuinely
-  fails to dispatch activation, or the test itself has a gap (type-ahead search may not traverse a nested
-  category from the root level), is NOT yet distinguished. Next session: retry the arrow-key-only variant
-  (script already written, `.wfgy/webtop_stack_menudiag3.sh`) on a quieter boot — if keyboard nav also
-  produces nothing, that is strong evidence of a real dispatch-level defect in this popup instance (a
-  structurally different code path from mouse clicks, further narrowing away from mouse-only
-  grab-semantics theories if it reproduces).
+- **Inconclusive, not yet resolved**: driving the OPEN menu with `xdotool` (type-ahead search, once;
+  arrow-key exploration, twice more) did not visibly launch anything in the one completed run; both later
+  arrow-key attempts were preempted by this session's own elevated §3N crash rate before completing.
+  Whether the open menu genuinely fails to dispatch activation, or the test itself has a gap, is NOT yet
+  distinguished. Next session: retry the arrow-key-only variant (`.wfgy/webtop_stack_menudiag3.sh`) on a
+  quieter boot — keyboard nav also producing nothing would be strong evidence of a real dispatch-level
+  defect, distinct from mouse-only grab-semantics theories.
 
 This session's boot reliability was noticeably worse than the 3/5 baseline the nginx-race fix
 established: 3 of 13 attempts hit `XVFB_FAILED`, at least 2 hit a full-guest `pid=2 SIGSEGV` (the

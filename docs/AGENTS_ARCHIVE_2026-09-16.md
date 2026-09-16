@@ -244,3 +244,107 @@ selkies crash from the standing ADVISORY-001 §3N tcache/fastbin class. Fixing (
 B's cross-process kernel-state infrastructure (already the standing recommendation for the unrelated vfork
 row) or a from-scratch investigation of why `GLIBC_TUNABLES=glibc.malloc.tcache_count=0:glibc.malloc.mxfast=0`
 is an incomplete workaround under this much concurrent fork load — not a masked-502 question anymore.
+
+## `GLIBC_TUNABLES` propagation through `spawn_exec_collision_child`: no gap, live-verified; the recurring crash is a second corruption signature (2026-09-16, later session)
+
+**Task**: the from-scratch investigation the previous section above named as needed. Specifically: does
+`42d8ced`'s new nested-litebox_runner collision-recovery path (added the same day as the tunable
+workaround was first believed sufficient) silently drop `GLIBC_TUNABLES` somewhere in its fork/exec
+chain — a very plausible regression vector, since it spawns a genuinely separate host OS process — or
+does the workaround reach every process correctly and the crash class is simply not fully closed by it?
+
+**Code-level read first, before touching anything live**: `sys_execve`
+(`litebox_shim_linux/src/syscalls/process.rs:6058-6059`) clones `argv_vec`/`envp_vec` into
+`argv_for_collision_retry`/`envp_for_collision_retry` BEFORE `load_program` consumes the originals, purely
+for this hand-off — this clone is *the exact envp the failing `execve()` call itself carried*, not some
+separately-reconstructed or ambient-host-env substitute. `spawn_exec_collision_child`
+(`litebox_platform_windows_userland/src/lib.rs:9972` impl) then loops over every `envp` entry and adds it
+as a `--env KEY=VALUE` flag to the nested `litebox_runner` invocation (`lib.rs:10035-10047`), with an
+explicit doc comment already distinguishing this from the HOST process's own ambient environment (which
+`Command` inherits by default, unconditionally, unrelated to this loop). Structurally, there is no gap: if
+`GLIBC_TUNABLES` was present in the colliding process's own envp (which normal guest-level fork/exec
+inheritance from `webtop_stack.sh`'s `export` on line 45 should guarantee, since that part is ordinary
+Unix env inheritance, not exec-collision machinery), it reaches the nested child.
+
+**Added a permanent diagnostic to convert this from a code-reading argument into a live fact on every
+occurrence** (`litebox_platform_windows_userland/src/lib.rs`, `spawn_exec_collision_child`): a
+`glibc_tunables_forwarded: Option<bool>` tracked across the `--env` loop, logged via one `warn!` per
+collision (`path=`, `glibc_tunables_forwarded=true|false`). Rebuilt release (`cargo build --release -p
+litebox_runner_linux_on_windows_userland`, 27.7s incremental).
+
+**Live boot** (`.wfgy/envcheck_launch.ps1`, `--resume-from .wfgy/webtop_stack_seed_natdiag3.tar`,
+`--env GLIBC_TUNABLES=glibc.malloc.tcache_count=0:glibc.malloc.mxfast=0`, `--publish 3000:3000`):
+`.wfgy/envcheck_run1.log` recorded FOUR collision events, checked live via `Get-CimInstance Win32_Process`
+parent/child confirmation (a real nested `litebox_runner.exe` child process, PID 16908, parented to the
+main runner PID 14744) plus the new diagnostic line, for every one:
+
+```
+path=/usr/libexec/gcc/x86_64-linux-gnu/14/collect2  glibc_tunables_forwarded=true   (t=3.07s, nested clock)
+path=/usr/bin/gcc                                    glibc_tunables_forwarded=true   (t=4.58s, nested clock)
+path=/usr/libexec/gcc/x86_64-linux-gnu/14/cc1        glibc_tunables_forwarded=true   (t=76.27s)
+path=/lsiopy/bin/python3                             glibc_tunables_forwarded=true   (t=116.20s)  <- selkies' own shebang re-exec, the exact case this investigation targeted
+```
+
+**Every single collision forwarded the tunable correctly, including the critical selkies case.** This
+closes the "does `42d8ced` leak the workaround" question definitively: it does not. No fix was needed or
+applied to the propagation path itself.
+
+**The crash still happened anyway, same boot, ~2 minutes after the confirmed-forwarded python3
+collision** — and this is the real finding. Sequence from `.wfgy/envcheck_run1.log`/`.out.log`:
+
+1. `t=116.20s`: `/lsiopy/bin/python3` collision, nested child spawned (PID 16908 confirmed via
+   `Win32_Process`), `glibc_tunables_forwarded=true`.
+2. The nested child sat at ~0.05s total CPU (confirmed via `Get-Process -Id 16908`, unchanged across
+   repeated checks) — the same "wedged, no shared AF_UNIX namespace with Xvfb/D-Bus" pattern `42d8ced`
+   already documents.
+3. `t=236.30s` (elapsed=120.0935317s after the collision, matching `42d8ced`'s absolute cap to the
+   millisecond-scale): `spawn_exec_collision_child: replacement process exceeded the absolute time cap …
+   killing it` — the `42d8ced` fix firing exactly as designed.
+4. `t=236.41s`: the guest thread's existing fallback — `killing process with SIGSEGV tid=172
+   path=/lsiopy/bin/python3` — fired correctly, matching `EEXIST`/point-of-no-return handling.
+5. Immediately after: a bare `double free or corruption (out)` line (glibc's `malloc_printerr` message,
+   unprefixed since it comes from the guest's own stdout/stderr, not a litebox log line), followed by
+   `t=237.52s ERROR … fatal signal: terminating task signal=Signal(6) pid=170 tid=170 comm=[the raw byte
+   sequence for "sh"]` — i.e. **the SELKIES_SUPERVISOR subshell itself (`supervisor_pid=170` from
+   `SELKIES_LAUNCHED_LAST` in the stdout log) aborted via SIGABRT**, not SIGSEGV.
+
+**This is NOT the same fault signature ADVISORY-001 §3N originally symbolized.** §3N's own
+symbolization (`advisor/ADVISORY-001-fundamentals.md` section 3N) is specific:
+`__libc_malloc+0x76`'s `xor (%rax),%rsi` — `tcache_get`'s `REVEAL_PTR` of a safe-linked `next` pointer,
+raising **SIGSEGV** because the revealed "address" is a XOR-masked non-pointer, not a dereferenceable
+address. `tcache_count=0`/`mxfast=0` exist specifically to take this exact instruction out of the picture
+by forcing every free/alloc through bins that don't safe-link. `double free or corruption (out)` is a
+categorically different glibc code path: it is `malloc_printerr`'s own message, raised by `_int_free`'s
+(or `malloc_consolidate`'s) explicit consistency checks on a chunk's size/prev-size fields or a detected
+duplicate free — a **SIGABRT**, not a page-fault SIGSEGV, and one that fires on the unsorted/small/large
+bins specifically (the ones `tcache_count=0`/`mxfast=0` deliberately leave active, per §3N's own original
+reasoning that those use "ordinary unmangled `fd`/`bk` pointers, which DO land in a source range and
+which the existing relocation healing handles").
+
+**Conclusion, evidence-based, not forced**: the `GLIBC_TUNABLES` workaround has no propagation gap
+anywhere, including through `42d8ced`'s new nested-spawn recovery path, and is doing exactly the job it
+was designed for (eliminating the specific safe-linked-pointer SIGSEGV). The crash class recurring today
+is real, but it is a SECOND, related mechanism: under this much concurrent fork/exec pressure (nginx +
+Xvfb/D-Bus + nested gcc/collect2/cc1 collisions + the selkies-supervisor retry loop, several of these
+forking near-simultaneously), litebox's own thread-based relocating fork-healing does not reliably heal
+every plain (non-safe-linked) heap pointer either — the exact "structurally unhealable... known,
+documented, architecturally-understood gap" this dispatch's own brief named, just now confirmed to extend
+beyond the safe-linked-pointer case specifically. There is no additional `GLIBC_TUNABLES` setting to reach
+for (disabling the unsorted/small/large bins too is not an available tunable, and would defeat malloc's
+own free-list reuse broadly, likely trading one failure mode for a worse one). **This is Track B territory
+(`ADVISORY-002-d-zero-fork.md`'s cross-process `D==0` fork)** — the real fix is removing thread-based
+relocating fork as the mechanism, not a bigger or different memory-allocator workaround. No unverified fix
+was forced onto this; the diagnostic (`glibc_tunables_forwarded`) is left in place as a permanent,
+near-zero-cost live check for the next session that touches this class.
+
+**Host RAM note**: this boot's process tree (main runner ~1.9GB RSS + repeated nested collision children)
+took host free RAM from ~7.3GB to ~1.5GB over roughly 4 minutes before being killed — consistent with this
+project's other standing RAM-pressure warnings for this exact scenario (heavy concurrent fork/collision
+load). All `litebox_runner_linux_on_windows_userland` processes were force-killed immediately upon
+observing this; host free RAM recovered to ~6.8GB within seconds of the kill. Only one boot was run this
+session, per this project's own "never run two full-stack verifications concurrently" rule.
+
+**Not reached this session**: the Terminal Emulator/Applications-menu browser click-path retest. The one
+live boot run was fully consumed by the tunable-propagation/RAM investigation above and ended in the same
+standing crash class before a clean window opened — unchanged from every other session's experience this
+week. This remains blocked on the same standing ADVISORY-001 §3N / Track B blocker, not on anything new.

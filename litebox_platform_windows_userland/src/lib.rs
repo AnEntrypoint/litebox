@@ -10036,6 +10036,18 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         // (`execve`'s own `envp` argument), entirely separate from this HOST process's
         // environment (which the child inherits unconditionally via `Command`'s own default,
         // unrelated to this loop).
+        //
+        // `glibc_tunables_forwarded` is a targeted diagnostic for the ADVISORY-001 §3N
+        // tcache/fastbin workaround specifically: that workaround's whole premise is that
+        // `GLIBC_TUNABLES` reaches every guest process's OWN libc startup, and this collision-
+        // recovery path is a genuinely separate host process spawn (`docs/AGENTS_ARCHIVE_
+        // 2026-09-16.md`) where "does the caller's ambient env carry it" is not a valid
+        // assumption -- only this entry's `envp`, forwarded above, does. Logging whether it was
+        // actually present in that envp turns "the tunable might be getting dropped somewhere in
+        // this fork/exec chain" from a re-derived guess into a one-line live fact on every
+        // collision, at effectively zero cost (this path already logs on every occurrence, and
+        // occurrences are rare relative to a boot's overall syscall volume).
+        let mut glibc_tunables_forwarded: Option<bool> = None;
         for entry in envp {
             let Ok(entry) = entry.to_str() else {
                 litebox_util_log::warn!(
@@ -10043,8 +10055,16 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
                 );
                 continue;
             };
+            if entry.starts_with("GLIBC_TUNABLES=") {
+                glibc_tunables_forwarded = Some(true);
+            }
             cmd.arg("--env").arg(entry);
         }
+        litebox_util_log::warn!(
+            path:% = path, glibc_tunables_forwarded:% = glibc_tunables_forwarded.unwrap_or(false);
+            "spawn_exec_collision_child: GLIBC_TUNABLES presence in the envp forwarded to the \
+             replacement process -- ADVISORY-001 §3N diagnostic"
+        );
 
         // The new program's own path, then every argv entry EXCEPT argv[0] -- `program_and_
         // arguments`'s own doc comment: the path is given separately, and litebox supplies its
