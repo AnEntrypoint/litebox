@@ -178,59 +178,25 @@ of a THIRD mechanism. Full evidence: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 ### The ACK-stall-kill and port-8081 watchdog — both CLOSED (2026-09-16)
 
-Eight ACK-stall-kill candidates investigated earlier, seven refuted, one livelock gap fixed
-(`b6ddf43`); ninth candidate (write-side backpressure) below. Two `RESOLVED` facts from earlier this
-day, both still load-bearing: the python3/ET_EXEC address-collision fix
-(`litebox_platform_windows_userland/src/lib.rs`, `0x600000`→`0x1000000`, 9/9 clean vs 10/10 collisions
-pre-fix) and the video-never-arrives readiness-gate race fix (real browser client, full `sk.log`
-pipeline, Applications-menu → Terminal Emulator opens in 1-2s). Detail: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
-
-**Backpressure fix (`478e640`) — RESOLVED, live-verified.** The real blocker was never the send-gating
-logic itself: the guest-side patcher (`advisor/patches/selkies_primary_backpressure_patch.py`, inlined
-in `.wfgy/webtop_stack.sh`) crashed on EVERY prior boot with an uncaught `OSError: [Errno 38] Function
-not implemented` from `shutil.copy2()`'s `copystat()` → `os.listxattr()` (litebox's Linux shim has no
-`listxattr`) — `selkies.py` was **never actually patched** in any session that believed it was; every
-earlier "trigger/lift work correctly, ping timeout still happens" read was against unpatched code (the
-pre-existing, unrelated `_run_frame_backpressure_logic` stall detector, not this patch's send gate).
-Fixed via `shutil.copyfile()` (data-only, no xattr needed for a source backup). Also found and fixed a
-real logic gap in the gate itself: the per-frame backlog check compared the CURRENT backlog to the
-drop threshold, not what it would become after the new frame — one oversized keyframe could sail
-through while backlog was still under the cap and push it far past it in one write. Fixed: check
-`backlog_bytes + len(data_chunk) > threshold`; default cap also lowered 256KiB→128KiB. **Live-verified
-with the real fix applied**: a genuinely-foregrounded `chrome-devtools` tab
-(`visibilityState`/`hasFocus()` confirmed throughout) through a clean, download-only asymmetric
-throttle (userspace TCP proxy, 20KB/s down / unthrottled up — the clean isolation the investigation
-always needed and never had) survived 60+s with zero `keepalive ping timeout`, vs. dying at ~19s
-pre-fix under the identical throttle. This closes the whole multi-session ACK-stall-kill/backpressure
-thread (Wake Lock refutation, `Slow 3G` bidirectional-throttle confound, etc. — history in the archive).
-
-**Port-8081 double-bind bug — CLOSED as an honest terminal state, not a live fire+recover
-confirmation.** Root cause and fix unchanged from prior passes: `kill -0 "$pid"` was the sole gate on
-the stall counter and silently reset it every tick under litebox's non-standard process model; fix
-drops that pre-check and adds a per-tick `SELKIES_BIND_WATCHDOG_TICK` trace line — this instrumentation
-is code-verified correct and confirmed live across two sessions (17 total boot cycles: 13 prior + 4
-this session reaching `SELKIES_BIND_WATCHDOG_STARTED`). **Across both sessions the double-bind race
-itself (`OSError starting Data WS ... address already in use`) never recurred**, despite escalating
-pressure well past the prior session's ceiling: this session's concurrent in-page `WebSocket` floods
-reached up to 300-per-burst / 20 bursts (6000 attempts in one window) vs. the prior session's 40-at-once
-ceiling, producing 349 real `reconnecting too quickly` rejections in a single flood window (vs. 16
-prior) — `count` stayed `0` throughout. Two of this session's five boot cycles were unrelated duds
-(one hit the already-known `/bin/sh Signal(11)` non-determinism pre-bind; one died silently with no
-fatal-signal log line after the watchdog started, consistent with the already-documented intermittent
-host-AV/allocator class) — neither is evidence about the watchdog. **This closes the item**: the fix is
-code-reviewed sound, its instrumentation is live-confirmed correct on every boot that reached it, and
-two independent sessions' worth of escalating reconnect-storm pressure (up to 6000 concurrent
-same-tick WebSocket opens) could not reproduce the underlying race — consistent with its documented
-very-sparse historical hit rate (one clean capture ever). A live fire+kill+respawn+recover cycle
-remains unwitnessed; re-open only with a materially different trigger technique, not more of the same.
-
-RAM was the hard ceiling both sessions, this one more severely (~2-7GB free pre-boot vs. the ~7-8GB
-norm): boots repeatedly crossed the 1.5-2GB safety floor within seconds of a flood starting — one boot
-even before any flood began, just from `spawn_exec_collision_child` nested-process accumulation (6
-live `litebox_runner` processes observed under one boot's collision handling). Every kill (7 across
-both sessions' final pass) fully recovered host RAM within seconds of `Stop-Process` — zero leaks,
-zero orphaned processes, confirmed via `tasklist` after every kill this session. Normal single-client
-use without reconnect-storm testing still plateaus in the previously-documented 2.0-2.9GB range.
+Nine ACK-stall-kill candidates investigated total, all refuted or fixed: a livelock gap (`b6ddf43`),
+the python3/ET_EXEC collision (`0x600000`→`0x1000000`, 9/9 clean vs 10/10 pre-fix), the
+video-never-arrives readiness-gate race (real browser client, Applications-menu → Terminal Emulator
+opens in 1-2s), and the backpressure gate itself. **Backpressure fix (`478e640`) — RESOLVED,
+live-verified.** Real blocker was the guest-side patcher silently crashing on `shutil.copy2()`'s
+`copystat()`→`os.listxattr()` (litebox's Linux shim has no `listxattr`) before ever patching
+`selkies.py` — every earlier "trigger/lift works, timeout still happens" read was against unpatched
+code. Fixed via `shutil.copyfile()`; also fixed a real backlog-check gap (compared backlog before the
+new frame, not after: now `backlog_bytes + len(data_chunk) > threshold`, cap 256KiB→128KiB).
+Live-verified: 60+s with zero `keepalive ping timeout` under a clean download-only throttle, vs ~19s
+pre-fix. **Port-8081 double-bind — CLOSED as an honest terminal state, not a live fire+recover
+confirmation.** Fix (drop the `kill -0` stall-counter pre-check, add `SELKIES_BIND_WATCHDOG_TICK`
+tracing) is code-verified correct and instrumentation-confirmed live across two sessions (17 boot
+cycles). The underlying double-bind race itself did not recur even under an escalated reconnect-storm
+stress test (up to 6000 WebSocket opens/window vs. the prior session's 40) — consistent with its
+documented very-sparse historical hit rate. A live fire+kill+recover cycle remains unwitnessed;
+re-open only with a materially different trigger. RAM was the hard ceiling both sessions; every kill
+fully recovered host RAM within seconds, zero leaks/orphans. Full session detail (boot-cycle/RAM
+accounting, stress-test numbers, Wake Lock/`Slow 3G` refutation history): `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 ## Host-side crash machinery
 
@@ -277,17 +243,13 @@ output, proving `sort`'s real multi-threaded pthread mutex/condvar contention (g
 which this trait backs) completes correctly: no hang, no deadlock, no missed wakeup, no corrupted
 merge. Host RAM identical before/after, no leaked processes.
 
-**3-stage-pipeline finding: root-caused further 2026-09-16 -- real, size-dependent bug, likely the
-SAME gap the original "spins at high CPU" report hit.** `echo hello | cat | wc -c` (6 bytes) under
-`LITEBOX_PROCESS_FORK=1` completes cleanly. `seq 1 200000 | sort -n | tail -3` (~1.2MB) does NOT:
-`seq` is `SIGPIPE`-killed after exactly one 4096-byte relay chunk. Evidence: the child-side relay
-pump (`litebox_runner_linux_on_windows_userland/src/lib.rs` ~1669-1711, distinct from the platform
-crate's parent-side `spawn_fork_child_pipe_pump`) logs `pipe pump (child, fd N): stream ended
-(n=4096)` -- `write_all_to_inherited_handle` FAILED (not `n==0`), meaning the parent's real OS pipe
-read handle for that hop was already gone. Exact mechanism NOT nailed down (a 4-hop relay per fd:
-child's local pipe -> real OS pipe -> parent `Sink` pump -> in-process buffer -> parent `Source`
-pump -> another real OS pipe -> next child -- too many candidate closure points to patch blindly);
-no speculative fix applied. PRD `process-fork-3stage-pipeline-heavier-shape-retest`. Do not rely on
+**3-stage-pipeline finding: root-caused further 2026-09-16 -- real, size-dependent SIGPIPE, likely the
+SAME gap the original "spins at high CPU" report hit.** `echo hello | cat | wc -c` (6 bytes) completes
+cleanly under `LITEBOX_PROCESS_FORK=1`; `seq 1 200000 | sort -n | tail -3` (~1.2MB) does not -- `seq`
+is SIGPIPE-killed after exactly one 4096-byte relay chunk (`write_all_to_inherited_handle` FAILED, not
+`n==0`: the parent's real OS pipe read handle for that hop was already gone). Exact mechanism not
+nailed down (a 4-hop relay per fd, too many candidate closure points to patch blindly); no speculative
+fix applied. PRD `process-fork-3stage-pipeline-heavier-shape-retest`. Do not rely on
 `LITEBOX_PROCESS_FORK=1` for a pipeline carrying >~4KB through a middle stage until fixed. Trace:
 `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
@@ -306,22 +268,17 @@ open" one was `VEH_FRAME_STRIDE`: a 4096-byte per-level slice 168 bytes short of
 cover, nested by `fork_verify`'s own AV-heal storm. Bisected live: 10/10 fatal before, 0/10 then 0/57
 after (two follow-up commits; mechanism: archive). **`veh-frame-stride-has-no-overflow-guard` — CLOSED
 2026-09-16**: `VehFrameCanaryGuard` (`litebox_platform_windows_userland/src/lib.rs`, right above
-`vectored_exception_handler`) stamps a canary 64 bytes above the next nesting level's slice floor and
-checks it on `Drop` (covers all of that function's return sites), `RaiseFailFastException`ing on
-mismatch instead of silent corruption — the exact design this row itself proposed. `cargo build
---release -p litebox_platform_windows_userland` clean; live boot+fork re-verification still wanted
-next session (runner was busy with a parallel session this pass).
+`vectored_exception_handler`) stamps a canary above the next nesting level's slice floor and checks it
+on `Drop`, `RaiseFailFastException`ing on mismatch instead of silent corruption. `cargo build --release
+-p litebox_platform_windows_userland` clean; live boot+fork re-verification still wanted.
 
 **`dev_bench`/`litebox_runner_snp` Windows build failures — CLOSED 2026-09-16, root cause was NOT
-libc/seccomp.** `dev_bench`: the new `reap_children` (backing `run_rewritten_hello_static_concurrent`)
-called `libc::wait4`/`rusage`/`WIFEXITED`/`WEXITSTATUS` unconditionally — genuinely absent from the
-`libc` crate on `windows-msvc`; fixed via `#[cfg(unix)]`/`#[cfg(not(unix))]` split (`dev_bench/src/
-main.rs`). `litebox_runner_snp`: already correctly excluded from `default-members` and every
-workspace-wide `clippy`/`build`/`doc` line in `ci.yml` — it's a `#![no_std]` SNP-guest kernel image
-needing its own custom target (`target.json`) + pinned nightly (`rust-toolchain.toml`) +
-`-Zbuild-std`, real error is "unwinding panics are not supported without std", nothing to do with
-Windows vs Linux symbols; root `Cargo.toml` now documents this next to the `litebox_runner_lvbs`
-precedent so it isn't re-diagnosed.
+libc/seccomp.** `dev_bench`'s new `reap_children` called `libc::wait4`/`rusage`/`WIFEXITED`/
+`WEXITSTATUS` unconditionally — absent from `libc` on `windows-msvc`; fixed via `#[cfg(unix)]`/
+`#[cfg(not(unix))]` split. `litebox_runner_snp` was already correctly excluded from the default Windows
+build path (`#![no_std]` SNP-guest kernel image, own custom target + pinned nightly + `-Zbuild-std`,
+real error is "unwinding panics are not supported without std") — root `Cargo.toml` now documents why,
+next to the `litebox_runner_lvbs` precedent, so it isn't re-diagnosed.
 
 **Windows CoW-mmap performance**: zero practical effect on tar-packed execs (`MapViewOfFile3` needs 64KiB
 file-offset alignment; ELF `PT_LOAD` segments are only page-aligned, no exploitable slack).

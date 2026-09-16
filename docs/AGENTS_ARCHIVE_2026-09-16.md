@@ -1686,3 +1686,208 @@ issue, not a regression -- the same-moment `screenshot` read the correct full-fr
 don't chase via `PrintWindow`); disclosed deviation: `dump_frame_diagnostic`/`encode_bmp`/
 `count_pixel_stats` stay in `litebox_platform_windows_userland::presentation` rather than the
 runner crate per design §1.1 (zero wgpu dependency, headless-never-touches-a-window already held).
+
+## Final verification session (2026-09-16, latest): backpressure fix's real blocker found and fixed
+## (patcher was crashing silently, never applied); watchdog non-firing root-caused and fixed, not
+## yet re-confirmed to fire
+
+Task: verify the port-8081 watchdog fires end-to-end, and cleanly isolate the backpressure fix with
+an asymmetric (download-only) throttle test per the prior session's own stated next steps.
+
+**Setup**: `.wfgy/webtop_stack_seed_fixed.tar` reconfirmed fresh (byte-identical embedded
+`config/webtop_stack.sh` vs the host copy) before first boot. A userspace Node.js TCP proxy
+(`dl_throttle_proxy.js`, scratchpad) was written to give the clean asymmetric throttle the prior
+session said it never had: listens on 127.0.0.1:13000, forwards to 127.0.0.1:3000, relays
+client->server bytes immediately/unthrottled, rate-limits server->client bytes via a 100ms-tick token
+bucket (tested at 20000 B/s). `chrome-devtools`'s own `emulate` tool was tried first and confirmed to
+reject any field beyond its five named presets (`Slow 3G` etc.), all of which are throttle profiles
+unsuited to "very low download, ~unlimited upload" -- hence the proxy.
+
+**Backpressure retest, first pass (pre-fix code, unknowingly)**: connected through the proxy, held
+20+s, watched `Backpressure TRIGGERED for 'primary'. S:3000, C:3019 (EffDesync:65484.7f >
+Allowed:120.0f)` fire with no matching LIFTED, then `Data WS closed with error ...: sent 1011
+(internal error) keepalive ping timeout; no close frame received` ~19s later (16:00:22.641 ->
+16:00:41.488 wall clock) -- the exact pre-`478e640` failure mode, under a clean, foreground-confirmed,
+asymmetric throttle this time. Read as "478e640 still has a real gap" and two candidate fixes were
+drafted (frame-size-aware backlog check, lower default threshold) -- **but before re-testing, a
+`SELKIES_PATCH_APPLIED`/`SELKIES_PATCH_SKIPPED` log line was never actually observed in ANY boot's
+log**, which prompted checking whether the patch had applied at all.
+
+**Root cause of the real blocker**: instrumented `.wfgy/webtop_stack.sh` to capture the patcher's
+stdout via command substitution (`PATCH_OUT=$(python3 .../patch.py 2>&1)`) instead of the original
+`python3 ... | while IFS= read -r line; do echo "[s] $line"; done` pipe, which was silently producing
+ZERO captured output on every boot (root cause of the pipe itself never diagnosed further -- moot once
+the real crash was found). The captured output showed an uncaught Python traceback:
+```
+OSError: [Errno 38] Function not implemented: '/lsiopy/lib/python3.13/site-packages/selkies/selkies.py'
+```
+from `shutil.copy2(path, backup)` -> `copystat()` -> `os.listxattr()`. litebox's shim has no
+`listxattr` (matches the already-known `unsupported syscall flistxattr/llistxattr` warnings visible in
+every boot's stderr). The patcher crashed on this line on EVERY prior boot, before ever writing the
+patched file -- meaning `selkies.py` was never modified in any session, ever, and every earlier
+"`Backpressure TRIGGERED`/`LIFTED` work correctly" observation was watching the PRE-EXISTING, unrelated
+`_run_frame_backpressure_logic` stall detector (present before `478e640`), never the patch's own send
+gate. Fixed: `shutil.copy2` -> `shutil.copyfile` (data-only copy, no xattr preservation needed for a
+plain source backup) in both `advisor/patches/selkies_primary_backpressure_patch.py` and the inline
+copy in `.wfgy/webtop_stack.sh`. A `PATCH_MARKER_CHECK ... count=N` diagnostic (`grep -c` on the live
+`selkies.py` for the patch's marker string) was added right after, confirmed `count=0` pre-fix and
+`count=2` post-fix on the next boot, with `[patch] SELKIES_PATCH_APPLIED path=... backup=... rc=0` now
+present -- and the traceback's own line number in later boots (1722 vs the original 1718) is itself
+independent confirmation the file was actually rewritten.
+
+**Second, real gap found and fixed in the send-gating logic itself** (found by reasoning about why a
+20000 B/s throttle -- well below even the patch's own docstring's "bad case" of 256 kbps/32000 B/s --
+could still overrun a 256KiB cap): the v1 check was `if backlog_bytes > THRESHOLD: continue`, i.e. it
+only inspected the backlog BEFORE this frame, not what it would become after adding the frame about to
+be sent. A single large H.264 keyframe arriving while backlog was still under the cap sails through
+whole and can by itself push far past the "safe" threshold in one write -- consistent with the
+one-step 65484.7f EffDesync spike observed pre-fix. Fixed: `if backlog_bytes + len(data_chunk) >
+THRESHOLD: continue`. Default `VIDEO_BACKLOG_DROP_THRESHOLD_BYTES` also lowered 262144 -> 131072 for
+a larger safety margin (drains in ~6.5s at the tested 20000 B/s rate, comfortably inside a 20s
+`ping_timeout`). Both changes landed in `advisor/patches/selkies_primary_backpressure_patch.py` and
+the `.wfgy/webtop_stack.sh` inline copy, kept in sync.
+
+**Re-verification with the real fix live**: fresh boot, `PATCH_MARKER_CHECK count=2` and
+`SELKIES_PATCH_APPLIED rc=0` confirmed, reconnected through the same 20000 B/s download-only proxy,
+tab genuinely foregrounded (`chrome-devtools`, `visibilityState`/`hasFocus()` polled throughout),
+forced interaction (canvas click + `Alt+F2`) to spike content. `Backpressure TRIGGERED` /
+`Backpressure LIFTED` cycled cleanly and repeatedly with SMALL, bounded S/C numbers (`S:19,C:19`,
+`EffDesync:-9.5f`) instead of the prior single 65484.7f spike. Held 60+ seconds total under the
+identical throttle (well over the requested ">20s"); log-wide `grep -c "ping timeout"` returned 1 for
+the WHOLE session, and that one hit was an unrelated orphaned/duplicate connection object from an
+earlier navigation attempt (`Display ID: None`, never registered as `'primary'`), not the active
+client. The active client never disconnected. This closes the backpressure investigation.
+
+**Port-8081 watchdog test**: with RAM still healthy (~2.6-3.5GB free through most of this), rapid
+`about:blank` <-> `http://localhost:3000` navigation cycles (bypassing the throttle, unrelated to
+bandwidth) were used to force the double-bind race. First clean reproduction: `SELKIES_SUPERVISOR:
+attempt=1 exited rc=139 -- respawning` followed immediately by the respawned process's own
+`OSError starting Data WS on port 8081: ... address already in use. Retrying in 5s...`, repeating
+every 5s. Watched for 36 consecutive growing occurrences over 2+ minutes (16:21:35.285 first-observed
+checkpoint to well past 16:23:35) with ZERO `SELKIES_BIND_WATCHDOG:` fires and RAM holding steady
+(~2.6GB, not the cause of stopping this attempt) -- the watchdog, as shipped, definitively does not
+fire against a real, sustained occurrence of the exact bug it exists to catch. Root-caused from
+reading the script: `kill -0 "$pid" 2>/dev/null || { stall=0; last_count=0; continue; }` was the ONLY
+gate on the stall counter ever incrementing -- any false "not found" from `kill -0` (plausible under
+litebox's own documented non-standard process/PID model, thread-based fork by default per this file's
+own "Cross-process fork" section) silently and permanently prevents firing with no diagnostic anywhere.
+Fixed: dropped the `kill -0` pre-check entirely (a `kill -9` on an already-dead pid is a harmless
+no-op -- returns nonzero, already suppressed via `2>/dev/null`, so removing the pre-check costs
+nothing) and added a `SELKIES_BIND_WATCHDOG_TICK pid=$pid count=$count last_count=$last_count
+stall=$stall` trace line every 15s tick so a future non-firing is diagnosable from the log alone. Also
+fixed the log message's `$CWS` interpolation (empty every time -- never exported into the heredoc'd
+watchdog script's own subshell) by hardcoding the known port 8081.
+
+**Fix not yet confirmed to fire live**: RAM safety intervened once (a burst of ~40 rapid reload cycles
+in one boot depleted free RAM from 8GB to 1.0GB within about 4 minutes -- far faster than any
+previously-documented pattern, likely the cumulative cost of many consecutive full display
+reconfiguration cycles rather than a leak; killed immediately per the 1.6GB floor rule) before the
+post-fix watchdog got a full 45s window against a reproduced occurrence. Two subsequent boots hit an
+unrelated, already-known litebox host non-determinism class instead (`fatal signal: terminating task
+signal=Signal(11) pid=2 tid=2 comm=/bin/sh` -- a SIGSEGV in the guest's own root shell process very
+early in boot, before `XVFB_UP`, on two separate attempts) that killed the whole runner before a
+repro could even be attempted -- not caused by anything changed this session, consistent with the
+already-documented "intermittent host AV" / crash-class non-determinism noted elsewhere in this file.
+A final, careful attempt (minimal reload-cycle footprint, RAM polled between every 2-4 cycles) ran 18
+reconnect cycles without reproducing the underlying `rc=139` crash again before RAM again approached
+the 1.6GB floor (1.73GB) and was killed proactively -- the crash class itself is genuinely
+probabilistic (address-space-collision-dependent, matching this file's own "ET_EXEC" characterization
+elsewhere), not reliably on-demand. **Status for the next session**: the fix is real, well-reasoned,
+and costs nothing if wrong; confirming it actually fires just needs ONE more clean reproduction with a
+patient 45s+ hold afterward -- reproduce via rapid `about:blank`<->`http://localhost:3000` cycles
+against unthrottled port 3000 (no proxy needed), then stop touching the page and just watch the log for
+`SELKIES_BIND_WATCHDOG:` within 45s of the first `OSError`.
+
+**Process hygiene**: nine boots total this pass, singly, one at a time, `Get-Process` confirmed zero
+matches before each launch; every boot killed via `Stop-Process -Force` (seven manually on task
+completion/RAM threshold, two crashed on their own from the unrelated `/bin/sh` SIGSEGV before any
+kill was needed); RAM recovered to 7.6-8.3GB within seconds of every kill, no leaked
+`litebox_runner`/`litebox-presenter`/proxy processes at session end.
+
+## Third drain pass, same day -- port-8081 watchdog closure session, AGENTS.md crossed 30KB again (2026-09-16, latest sessions)
+
+Follow-on from the "Final verification session" above: the watchdog fix (drop the `kill -0`
+stall-counter pre-check, add `SELKIES_BIND_WATCHDOG_TICK` tracing) needed one more clean reproduction
+with a patient 45s+ hold. This drains the full closure detail that AGENTS.md's "both CLOSED" section
+now only summarizes.
+
+**Watchdog fix verification session**: instrumentation confirmed live -- `SELKIES_BIND_WATCHDOG_TICK
+pid=$pid count=$count last_count=$last_count stall=$stall` fired every 15s tick as designed, and
+`SELKIES_BIND_WATCHDOG_STARTED` was reached across 4 boots this session (13 prior + 4 = 17 total boot
+cycles reaching that line across both sessions). The double-bind race itself (`OSError starting Data
+WS ... address already in use`) did not recur in this session's reproduction attempts.
+
+**Closure session (escalated stress test)**: concurrent in-page `WebSocket` floods were pushed well
+past the prior session's 40-at-once ceiling -- up to 300-per-burst / 20 bursts (6000 attempts in one
+window), producing 349 real `reconnecting too quickly` rejections in a single flood window (vs. 16
+prior). `count` (the watchdog's own stall counter) stayed `0` throughout -- consistent with the race
+genuinely not occurring, not with the watchdog silently failing to see it (the tick-trace instrumentation
+proves the watchdog was live and observing). Two of this session's five boot cycles were unrelated duds:
+one hit the already-known `/bin/sh Signal(11)` non-determinism pre-bind; one died silently with no
+fatal-signal log line after the watchdog started, consistent with the already-documented intermittent
+host-AV/allocator class -- neither is evidence about the watchdog either way.
+
+**Verdict**: the fix is code-reviewed sound, its instrumentation is live-confirmed correct on every
+boot that reached it, and two independent sessions' worth of escalating reconnect-storm pressure (up to
+6000 concurrent same-tick WebSocket opens) could not reproduce the underlying race -- consistent with
+its documented very-sparse historical hit rate (one clean capture ever, back in the session that first
+found the bug). Closed as an honest terminal state, not a live fire+kill+respawn+recover confirmation;
+re-open only with a materially different trigger technique, not more of the same escalation.
+
+**RAM**: the hard ceiling across both sessions, this one more severely (~2-7GB free pre-boot vs. the
+~7-8GB norm) -- boots repeatedly crossed the 1.5-2GB safety floor within seconds of a flood starting,
+one boot even before any flood began, just from `spawn_exec_collision_child` nested-process
+accumulation (6 live `litebox_runner` processes observed under one boot's collision handling). Every
+kill (7 across both sessions' final pass) fully recovered host RAM within seconds of `Stop-Process` --
+zero leaks, zero orphaned processes, confirmed via `tasklist` after every kill. Normal single-client use
+without reconnect-storm testing still plateaus in the previously-documented 2.0-2.9GB range.
+
+## 3-stage `LITEBOX_PROCESS_FORK=1` pipeline hang: precise root cause found (2026-09-16, latest session)
+
+Follow-on from the "spins at high CPU, not root-caused" note in the RawMutex section: re-audited with a
+smaller, cheaper repro ladder. `echo hello | cat | wc -c` (6 bytes) under `LITEBOX_PROCESS_FORK=1`
+completes cleanly. `seq 1 200000 | sort -n | tail -3` (~1.2MB through the middle stage) does NOT: `seq`
+is `SIGPIPE`-killed after relaying exactly one 4096-byte chunk.
+
+**Evidence**: the child-side relay pump (`litebox_runner_linux_on_windows_userland/src/lib.rs`
+~1669-1711 -- distinct from the platform crate's parent-side `spawn_fork_child_pipe_pump`) logs `pipe
+pump (child, fd N): stream ended (n=4096)`. Critically this is `write_all_to_inherited_handle` FAILING
+partway (not the ordinary `n==0` EOF shape), meaning the parent's real OS pipe read handle for that hop
+was already gone by the time the child tried to relay past the first chunk.
+
+**Why not root-caused further this pass**: the pipeline is a 4-hop relay per fd (child's local pipe ->
+real OS pipe -> parent `Sink` pump -> in-process buffer -> parent `Source` pump -> another real OS pipe
+-> next child) with too many candidate closure points to patch blindly from one data point. No
+speculative fix was applied. This is likely the SAME underlying gap the original "spins at high CPU
+with no progress for 5+ minutes" report hit, now given a much cheaper, deterministic small-vs-large
+repro pair instead of a multi-minute hang to iterate against.
+
+**Status**: PRD `process-fork-3stage-pipeline-heavier-shape-retest` tracks the follow-up. Do not rely on
+`LITEBOX_PROCESS_FORK=1` for a pipeline carrying more than ~4KB through a middle stage until this is
+fixed.
+
+## Presenter-split duplicate-SYN_REPORT re-fix: live-verified via direct control-pipe injection (2026-09-16, latest session)
+
+Follow-on from the presenter-process-split section: that split reintroduced the exact duplicate-
+`SYN_REPORT` bug already fixed once on the monolithic path. `CursorMoved` still emits one coalesced
+`InputSignal::RelMotion`, but `litebox_presenter/src/main.rs` (new that session) forwarded it as TWO
+`rel` wire lines, and `control_server.rs` called `push_input_rel` once per line -- two `SYN_REPORT`s per
+physical mouse move instead of one.
+
+**Fix**: added `Request::RelMotion{dx,dy}` (wire form `relmotion <i32> <i32>`) to
+`litebox_presenter_protocol`, wired straight through to `push_input_rel_motion` (the same batching path
+the original evdev fix used), replacing the two-`rel`-line encoding.
+
+**Live verification method**: rather than a full `--gui` boot with real mouse hardware, drove the
+control pipe directly (`--gui=hidden`, `LITEBOX_INPUT_TRACE=1`) to get a byte-exact, deterministic
+signal. Sending one `relmotion 5 3` line produced exactly one `evdev-input-trace: push_batch emitting
+one SYN_REPORT batch_len=2` line. Sending the pre-fix shape instead -- two separate `rel 5 0` / `rel 0
+3` lines -- produced two separate `batch_len=1` lines. This confirms both the bug's mechanism (one
+extra `push_batch` call per axis) and the fix (one call carrying both axes) with a live, repeatable,
+zero-hardware-dependent signal.
+
+**Scope note**: two OPEN, unrelated PRD rows are untouched by this fix: `mouse-motion-devicevent-needs-
+pixel-calibration` (a DeviceEvent pixel-scale calibration question, not a sync-count bug) and
+`linux-macos-userland-presentation-still-emits-two-syn-reports-per-move` (the Linux/macOS platform
+crates' own CursorMoved handlers still have the pre-existing two-`Rel`-call shape, not reachable for
+live GUI validation from this Windows host).
