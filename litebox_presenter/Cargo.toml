@@ -1,0 +1,21 @@
+[package]
+name = "litebox_presenter"
+version = "0.1.0"
+edition = "2024"
+description = "litebox-presenter.exe: the presenter process for docs/presenter-process-design.md -- owns the Win32 window and wgpu/winit presentation code, connects to the runner's named pipe, and reads the guest's scanout buffer via a zero-copy duplicated section handle. Links against litebox_platform_windows_userland::presentation (kept verbatim there) and litebox_shim_linux/DrmSubsystem-free -- a presenter crash cannot touch guest state."
+
+[[bin]]
+name = "litebox-presenter"
+path = "src/main.rs"
+
+[dependencies]
+litebox_common_linux = { version = "0.1.0", path = "../litebox_common_linux" }
+litebox_platform_windows_userland = { version = "0.1.0", path = "../litebox_platform_windows_userland" }
+litebox_presenter_protocol = { version = "0.1.0", path = "../litebox_presenter_protocol" }
+windows-sys = { version = "0.60.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+] }
+
+[lints]
+workspace = true

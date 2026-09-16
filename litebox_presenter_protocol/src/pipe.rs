@@ -53,6 +53,15 @@ impl Drop for PipeHandle {
 // ReadFile/WriteFile/CloseHandle are all valid from any thread (matches
 // `litebox_session_daemon`'s identical `PipeHandle`/`SendableHandle` reasoning).
 unsafe impl Send for PipeHandle {}
+// SAFETY: sharing a `&PipeHandle` across threads (e.g. behind an `Arc`, as
+// `litebox_presenter` does to let one thread read while others write) is sound because the
+// underlying Win32 calls have no thread affinity; callers are responsible for their own
+// serialization between concurrent writers (a `Mutex` guarding the write path) exactly as they
+// would be with any other raw OS handle shared this way -- `Sync` here asserts no ADDITIONAL
+// unsafety beyond what `&HANDLE` sharing already implies, not that concurrent unsynchronized
+// writes are safe (they are not, for the same reason two threads calling `write()` on the same
+// fd with no coordination would interleave).
+unsafe impl Sync for PipeHandle {}
 
 impl PipeHandle {
     #[must_use]
