@@ -285,10 +285,13 @@ output, proving `sort`'s real multi-threaded pthread mutex/condvar contention (g
 which this trait backs) completes correctly: no hang, no deadlock, no missed wakeup, no corrupted
 merge. Host RAM identical before/after, no leaked processes.
 
-**Separate, unrelated finding, not investigated**: a 3-stage pipeline under `LITEBOX_PROCESS_FORK=1`
-(its real inherited-pipe-handle fd path, not the emulated-pipe path `RawMutex` backs by default) spun
-two children at high CPU with no progress for 5+ minutes, killed not root-caused -- follow-up needed
-before relying on `LITEBOX_PROCESS_FORK=1` for anything pipe-heavy.
+**3-stage-pipeline finding: re-investigated 2026-09-16, NOT reproduced under a clean invocation.**
+`echo hello | cat | wc -c` under `LITEBOX_PROCESS_FORK=1` (PowerShell `&`/`*>`, never
+`Start-Process`/`Start-Job`): all 3 stages cross-process, exited clean, correct output in ~5.4s.
+`spawn_fork_child_pipe_pump`'s Source-bridge `owners()` wait audited and found sound. One
+`Start-Job`-launched attempt DID hang (shaped differently from the original report) but is an
+environment artifact, not reproduced correctly-invoked. Heavier `seq | sort -n | tail -3` is
+UNTESTED (runner busy) -- retest before closing. Trace: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 **Track B step 3 (fixed-base shared kernel heap) -- NOT started, needed next.** `RawMutex`'s
 `waiters`/`remote_waiter_handles` stay ordinary process-local `std::sync::Mutex`es until this lands
@@ -330,10 +333,18 @@ zero-fill; opting in trades a loud SIGSEGV for silently zeroed symbol tables
 
 **Input latency**: three real bugs fixed and verified live (sub-pixel remainders now accumulated
 losslessly; two evdev reports per move now one `SYN_REPORT`; window now resizable with scaled deltas).
-Present mode is Mailbox-preferred with Fifo fallback — any note calling it Fifo-only is stale. Open PRD:
-`mouse-motion-devicevent-needs-pixel-calibration`,
-`linux-macos-userland-presentation-still-emits-two-syn-reports-per-move`; no framerate baseline exists
-(idle compositor legitimately produces zero page flips).
+Present mode is Mailbox-preferred with Fifo fallback — any note calling it Fifo-only is stale.
+
+**Presenter-split reintroduced the duplicate-`SYN_REPORT` bug, fixed 2026-09-16.** `CursorMoved`
+still emits one coalesced `InputSignal::RelMotion`, but `litebox_presenter/src/main.rs` (new
+today) forwarded it as TWO `rel` wire lines, and `control_server.rs` called `push_input_rel` once
+per line -- two `SYN_REPORT`s/move. Fixed: `Request::RelMotion{dx,dy}` (`relmotion <i32> <i32>`)
+added to `litebox_presenter_protocol`, wired to `push_input_rel_motion`. Code-verified (one
+`push_batch` call, batch_len=2); live `LITEBOX_INPUT_TRACE=1` confirmation still wanted (runner
+busy this pass). Open PRD, both DIFFERENT/untouched: `mouse-motion-devicevent-needs-pixel-
+calibration` (DeviceEvent pixel scale, not sync count), `linux-macos-userland-presentation-still-
+emits-two-syn-reports-per-move` (Linux/macOS platform crates' own handlers, pre-existing). No
+framerate baseline exists (idle compositor legitimately produces zero page flips).
 
 **The GUI protocol decision is settled**: DRM/KMS + wgpu, proven live with guest page-flip pixels in a
 real host window. Not an open X11-vs-Wayland-vs-DRM question.

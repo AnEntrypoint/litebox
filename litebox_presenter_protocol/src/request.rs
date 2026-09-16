@@ -20,6 +20,15 @@ pub enum Request {
     Key { code: u16, value: u8 },
     /// `rel <evdev_code> <i32>` (motion/wheel, REL_X/REL_Y/REL_WHEEL).
     Rel { code: u16, value: i32 },
+    /// `relmotion <dx:i32> <dy:i32>` -- one 2D cursor movement as a SINGLE evdev report
+    /// (`REL_X`, `REL_Y`, one `SYN_REPORT`), matching what real hardware emits for one physical
+    /// motion. A presenter MUST send this instead of two `Rel` requests for cursor movement: two
+    /// separate `rel` lines each get their own `SYN_REPORT` on the runner side (`push_input_rel`
+    /// is called once per line), making a client process the same motion twice -- exactly the
+    /// duplicate-`SYN_REPORT` bug class already fixed once for the in-process presentation path
+    /// (`litebox_shim_linux::push_input_rel_motion`'s own doc comment) and reintroduced by the
+    /// presenter/runner process split until this variant existed.
+    RelMotion { dx: i32, dy: i32 },
     /// `abs <evdev_code> <i32>` -- reserved, always replies `err unsupported` today.
     Abs { code: u16, value: i32 },
     /// List guest processes.
@@ -81,6 +90,11 @@ impl Request {
                 let value = parse_tok(tokens.next(), "rel: missing value")?;
                 Ok(Self::Rel { code, value })
             }
+            "relmotion" => {
+                let dx = parse_tok(tokens.next(), "relmotion: missing dx")?;
+                let dy = parse_tok(tokens.next(), "relmotion: missing dy")?;
+                Ok(Self::RelMotion { dx, dy })
+            }
             "abs" => {
                 let code = parse_tok(tokens.next(), "abs: missing code")?;
                 let value = parse_tok(tokens.next(), "abs: missing value")?;
@@ -119,6 +133,7 @@ impl Request {
             Self::PresenterQuery => "presenter?".to_owned(),
             Self::Key { code, value } => format!("key {code} {value}"),
             Self::Rel { code, value } => format!("rel {code} {value}"),
+            Self::RelMotion { dx, dy } => format!("relmotion {dx} {dy}"),
             Self::Abs { code, value } => format!("abs {code} {value}"),
             Self::Ps => "ps".to_owned(),
             Self::StraceOn => "strace on".to_owned(),

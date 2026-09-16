@@ -560,6 +560,10 @@ fn dispatch<FS: ShimFS>(
             shared.shim.push_input_rel(code, value);
             Reply::Ok
         }
+        Request::RelMotion { dx, dy } => {
+            shared.shim.push_input_rel_motion(dx, dy);
+            Reply::Ok
+        }
         Request::Abs { .. } => Reply::err(ErrorCode::Unsupported, "abs is reserved, not yet implemented"),
         Request::Ps => handle_ps(),
         Request::StraceOn | Request::StraceOff | Request::StraceQuery | Request::StraceDump => {

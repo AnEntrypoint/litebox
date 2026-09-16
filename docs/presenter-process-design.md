@@ -330,6 +330,19 @@ the SAME runner-side `key`/`rel` handler that calls
 `push_input_key`/`push_input_rel`, so scripted input injection for
 automated testing needs no window to exist.
 
+**`relmotion <dx:i32> <dy:i32>`** -- one 2D cursor movement as a SINGLE
+evdev report (`REL_X`, `REL_Y`, one `SYN_REPORT`), the wire counterpart of
+`LinuxShim::push_input_rel_motion`. The presenter's `CursorMoved` handler
+already coalesces one physical mouse move into one `InputSignal::RelMotion`
+(`presentation.rs`'s own doc comment: "ONE report for one physical
+movement, not two"); sending that as two separate `rel` lines instead
+would give each its own `SYN_REPORT` on the runner side (`rel`'s handler
+calls `push_input_rel` once per line), making a client process the same
+motion twice -- found live during the presenter/runner process split
+(2026-09-16): the split initially DID send two `rel` lines here, silently
+reintroducing the exact duplicate-`SYN_REPORT` bug already fixed once for
+the in-process path. Request: `relmotion <i32> <i32>`. Reply: `ok`.
+
 **`ps`** -- list guest processes.
 Request: `ps`.
 Reply: `ok <n>` followed by `n` lines `<pid> <ppid> <comm>`, proxying

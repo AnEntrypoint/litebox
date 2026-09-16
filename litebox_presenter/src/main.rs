@@ -258,15 +258,12 @@ fn run() {
         let line = match signal {
             InputSignal::Key(code, value) => format!("key {code} {value}"),
             InputSignal::Rel(code, value) => format!("rel {code} {value}"),
-            // No dedicated wire command for a single 2D motion report (section 3.2 only defines
-            // `rel` for one evdev code/value pair at a time) -- send it as the two `rel` lines the
-            // wire format actually supports; the runner's own `push_input_rel` calls funnel into
-            // the same evdev queue either way.
+            // `relmotion` is the dedicated wire command for one 2D motion report (protocol
+            // `Request::RelMotion`) -- sending it as two separate `rel` lines instead would give
+            // each its own `SYN_REPORT` on the runner side (`push_input_rel` is per-line), making
+            // a client process the same motion twice. See `Request::RelMotion`'s own doc comment.
             InputSignal::RelMotion(dx, dy) => {
-                let _guard = input_write_lock.lock().expect("pipe write lock poisoned");
-                let _ = pipe::write_line(&input_pipe, &format!("rel {} {dx}", litebox_common_linux::REL_X));
-                let _ = pipe::write_line(&input_pipe, &format!("rel {} {dy}", litebox_common_linux::REL_Y));
-                return;
+                format!("relmotion {dx} {dy}")
             }
         };
         let _guard = input_write_lock.lock().expect("pipe write lock poisoned");
