@@ -238,3 +238,9 @@ litebox_runner_linux_on_windows_userland/tests/test-bins/*.hooked
 /probe_*.tar
 /*.bmp
 /*.log
+/scratch*
+
+### Probe-captured frame dumps and debug logs -- never go in git per the standing repo-hygiene
+### lesson (AGENTS.md), regardless of which subdirectory a probe happens to write them into
+advisor/probes/**/*.bmp
+advisor/probes/**/*.log
