@@ -309,17 +309,30 @@ permanently lost selkies for that boot (no more respawns) but still did **not** 
 guest — a related but distinct failure mode from the originally-fixed hang, worth a future look but not
 a defect in the fix itself.
 
-Could not reach a live, browser-rendered desktop to click-test the Applications menu: every external
-(`-p`-published) request to `/websockets` returned `404` (masked `502`) deterministically, even on a
-clean boot with selkies confirmed listening (`INFO:data_websocket:Data WebSocket Server listening on
-port 8081`) — the same already-documented bug (`docs/webtop-debian-selkies-2026-09-06.md`), unchanged
-since 2026-09-06. Tried one new workaround: routed nginx's `proxy_pass` to the guest's own routable
-interface address (`10.0.0.2:8081`) instead of `127.0.0.1:8081`, rebinding selkies to `0.0.0.0` —
-sed-verified the generated config actually used the new target (`grep proxy_pass` on the live
-`/etc/nginx/sites-available/default`), but the `404` reproduced identically. This rules OUT the
-loopback-vs-interface-address choice as the variable, consistent with the 2026-09-07 finding that
-`net.rs` and the guest's own `net/mod.rs` share no state or code path — the real cause is still
-unidentified.
+Could not reach a live, browser-rendered desktop to click-test the Applications menu that session: every
+external (`-p`-published) request to `/websockets` returned `404` (masked `502`) deterministically, even
+on a clean boot with selkies confirmed listening — the same bug `docs/webtop-debian-selkies-2026-09-06.md`
+first captured. A same-day interface-address workaround (proxy_pass to `10.0.0.2:8081` instead of
+`127.0.0.1:8081`) reproduced the `404` identically, ruling out loopback-vs-interface-address as the
+variable.
+
+**Root-caused live later the same day — `net.rs` cleared for good, this thread closed.** Tailed nginx's own
+`error_log` live for the first time and caught the real error on two boots: a genuine
+`connect() failed (111: Connection refused)` to `127.0.0.1:8081`, from BOTH a guest-internal probe
+(`client: 10.0.0.2`) and a real `-p` external probe (`client: 10.0.0.1`) — proving live what `net.rs`'s
+code already implied (its loopback fast-path bypasses the NAT gateway entirely for `127.0.0.0/8`), so this
+was never a `-p`-vs-loopback bug. The refusal is (a) a plain startup race (selkies' real bind latency is
+~100-140s; anything proxied earlier gets a genuine ECONNREFUSED) and/or (b) the standing ADVISORY-001 §3N
+tcache class killing selkies moments after it DOES bind (live-witnessed: bound, logged "listening on port
+8081", then still 502'd on a probe shortly after — and this session's own crash dump caught a NEW instance
+of this class hitting the boot script's own `pid=2`, not just selkies/nginx). Two `.wfgy/webtop_stack.sh`
+fixes landed (gitignored, no litebox source change): a missing `50x.html` meant every real 502 was itself
+404ing — fixed, so a genuine backend failure now surfaces honestly; and a `SELKIES_PORT_UP` gate (curl exit
+code, not `%{http_code}`, which can't tell "nobody home" from "connected, no HTTP reply" against a raw WS
+server) closes the first-bind race before anything downstream treats the boot as ready. (b) remains open,
+unchanged, under ADVISORY-001 §3N. Evidence trail: `docs/AGENTS_ARCHIVE_2026-09-16.md`. Browser Terminal
+Emulator re-test still not reached — both boots run to gather this evidence were themselves lost to §3N
+before a long-enough clean window opened.
 
 With the browser path blocked, tested the menu bug a different way: drove the guest DIRECTLY (no
 selkies/browser/click in the loop) via a script step after `DE_UP`. Two clean findings, each reproduced

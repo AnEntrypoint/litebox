@@ -163,3 +163,84 @@ against the guest's own `[sk]`-tagged stdout:
   to need a manual process kill now self-recovers), not yet a claim of 100% clean-boot reliability — the
   tcache/fastbin corruption class remains this project's next blocker for a fully clean boot, tracked
   separately (ADVISORY-001 §3N).
+
+## Masked-502/404 root-caused live: a startup race + ADVISORY-001 §3N, NOT a NAT/net.rs bug (2026-09-16, later session)
+
+**Task**: get the REAL error under the masked `404` on `/websockets` (previously only inferred from a
+2026-09-06 capture, unconfirmed since), correlate its timing, and determine litebox-vs-script-vs-other.
+Re-read `litebox_platform_windows_userland/src/net.rs` in full (1068 lines, still structurally clean, matches
+the 2026-09-07 finding) before touching anything live.
+
+**Live capture, this session (`.wfgy/webtop_stack_natdiag.sh` variants — nginx `error_log` tailed live,
+never done before): a genuine, real `connect() failed (111: Connection refused)` to `127.0.0.1:8081`,
+captured twice, on two independent boots, from BOTH a guest-internal probe (`client: 10.0.0.2`) and a real
+`-p`-published external probe (`client: 10.0.0.1`, matching `net.rs`'s documented gateway-side ephemeral
+endpoint).** This is decisive: `net.rs`'s own `send_ip_packet` loops any `127.0.0.0/8`-destined packet
+straight back into the guest's receive queue, bypassing the NAT gateway/real-socket-bridge code entirely —
+confirmed by this exact line (`litebox_platform_windows_userland/src/net.rs:1028-1037`) and now independently
+proven live: the identical `ECONNREFUSED` occurred via a path (guest-internal curl) that never touches the
+gateway at all. The `-p`-vs-loopback framing every prior session (2026-09-06 through today) carried is
+**retired** — there is no NAT-path-dependent bug, and there never was; `net.rs` is cleared for the third
+time, now with live proof instead of code-reading alone.
+
+**What the ECONNREFUSED actually is**: a plain startup race, plus the already-tracked ADVISORY-001 §3N crash
+class hitting selkies itself:
+- Boot 1: probed `/websockets` within ~seconds of `SELKIES_LAUNCHED_LAST` (before selkies' own Python
+  interpreter/import cost could possibly have reached `bind()`/`listen()`) — genuine refusal, both internal
+  and external.
+- Boot 2: selkies logged its own `INFO:data_websocket:Data WebSocket Server listening on port 8081` at
+  guest t≈130-140s, i.e. selkies genuinely bound — and an external `-p` probe issued shortly after still got
+  a real `502` (nginx's error log showed the identical `connect() failed (111: Connection refused)`,
+  `client: 10.0.0.1`). Selkies bound, then died, before that specific request landed. This is the SAME
+  fork-corruption class already tracked project-wide (ADVISORY-001 §3N; the same class that killed the
+  Selkies-supervisor subshell and the boot's own top-level `sh` pid 2 elsewhere this session — see below),
+  not a new mechanism.
+- A live process-table dump captured mid-boot2 (this session's own crash-time snapshot) confirmed
+  `pid=184 ppid=164 comm=/lsiopy/bin/selkies` genuinely alive at that moment, and separately confirmed a
+  `fatal signal: terminating task signal=Signal(11) pid=2` (the top-level guest shell) at t≈208s — a NEW
+  witness of the standing tcache-corruption class hitting the boot script's own pid 2, not just selkies/
+  nginx as previously documented.
+
+**Real fixes landed, both `.wfgy/webtop_stack.sh`-only (gitignored; no litebox source change, nothing to
+commit for these two)**:
+1. **The masking itself, fixed**: `error_page 500 502 503 504 /50x.html` was firing correctly on every real
+   upstream failure, but `/usr/share/selkies/web/50x.html` never existed in this script's setup (flagged as
+   a "cosmetic, lower priority" fix back on 2026-09-06, never actually done until now) — so the real 502's
+   own error page 404'd, and THAT was the status code every session since 2026-09-06 was chasing as if it
+   were the primary symptom. Added a `printf`-written placeholder at setup time (no external fork). Live
+   effect, confirmed this session: the exact same underlying `ECONNREFUSED` now surfaces as an honest
+   `curl`-visible `502`, not a `404` — verified directly (`external_http_code=502`, not `404`, after the
+   fix; `open() ".../50x.html" failed` no longer appears in nginx's error log after the fix, where it did
+   before). This alone resolves the "confusing 404" framing that drove ten-plus sessions' worth of
+   `-p`-path suspicion.
+2. **A `SELKIES_PORT_UP` gate** after `SELKIES_LAUNCHED_LAST`: polls selkies' own port directly (bypassing
+   nginx and the 50x.html masking) via `curl`'s EXIT CODE (7 = couldn't connect; anything else means
+   something is genuinely listening) rather than `%{http_code}` — the first version of this gate used
+   `http_code` and looped all the way to its cap every time even after selkies was confirmed listening,
+   because selkies' raw WebSocket server does not necessarily answer a plain HTTP GET with a
+   curl-parseable response before timeout, so `%{http_code}` reads "000" for BOTH "nobody home" and
+   "connected fine, no HTTP reply" — a real, self-inflicted diagnostic bug, caught live (the `http_code`
+   version ran all 60 iterations, ~150s, ~120 extra forks, and that specific extra fork pressure is
+   plausibly what pushed the boot into the pid=2 SIGSEGV above — measure-changed-the-outcome, this file's
+   own recurring lesson, striking its own diagnostic this time). Fixed to the exit-code check; cap raised to
+   170s to match the real, live-measured ~100-140s selkies bind latency (a 20s cap, tried first, elapsed
+   every time before selkies ever bound). **Scope, stated plainly in the script's own comment**: this gate
+   closes the FIRST-bind race only. It cannot and does not close the separate ADVISORY-001 §3N crash class
+   that can kill selkies (or nginx, or the script's own shell) moments after a successful bind — that
+   remains this project's open, multi-session architectural blocker, unchanged by this session.
+
+**Not reached this session**: a browser-verified stable connection long enough to retest the Terminal
+Emulator/Applications-menu click path. Both live boots run to gather the above evidence were themselves
+eventually lost to the ADVISORY-001 §3N class (one killed manually on a 5GB+-RSS/stalled-stdout pattern
+matching this file's own already-documented bad sign; one ended in the pid=2 SIGSEGV above) before a
+sufficiently long clean window opened for a real `claude-in-chrome`/`chrome-devtools` browser session. The
+Terminal Emulator re-test via the real browser click path remains blocked on the SAME standing blocker
+(ADVISORY-001 §3N boot reliability), not on the masked-502/404 investigation this session closes out.
+
+**Bottom line for the next session**: stop treating `/websockets` 404s/502s as a networking investigation —
+`net.rs` is cleared for good, live-proven twice more. Every remaining instance of this symptom is either (a)
+a request that landed before selkies bound (now mitigated, not eliminated, by `SELKIES_PORT_UP`), or (b) a
+selkies crash from the standing ADVISORY-001 §3N tcache/fastbin class. Fixing (b) at the root needs Track
+B's cross-process kernel-state infrastructure (already the standing recommendation for the unrelated vfork
+row) or a from-scratch investigation of why `GLIBC_TUNABLES=glibc.malloc.tcache_count=0:glibc.malloc.mxfast=0`
+is an incomplete workaround under this much concurrent fork load — not a masked-502 question anymore.
