@@ -338,7 +338,7 @@ since an idle compositor legitimately produces zero page flips.
 **The GUI protocol decision is settled**: DRM/KMS + wgpu, proven live with guest page-flip pixels in a
 real host window (memory `mem-3c4a9980a884604b-1031`). Not an open X11-vs-Wayland-vs-DRM question.
 
-## Presenter-process split (`docs/presenter-process-design.md`) -- implemented, partially verified, 2026-09-16
+## Presenter-process split (`docs/presenter-process-design.md`) -- implemented, live-verified end-to-end, 2026-09-16
 
 Built and committed: `litebox_presenter_protocol` crate (newline-delimited scanout/screenshot/
 show/hide/presenter?/key/rel/abs/ps/strace/frames grammar + named-pipe transport), runner-side
@@ -371,38 +371,55 @@ hit "runner closed the connection" while the main thread's winit loop kept runni
 process-wide panic hook (`litebox_presenter/src/main.rs`) that exits after the default hook
 prints; reconfirmed live afterward -- presenter now exits the instant the runner's pipe breaks.
 
-**Not live-verified this session, for a follow-up** (ran out of session time fighting host/tooling
-friction, not code issues):
-1. §6 scenario 1 (headless + `LITEBOX_DUMP_FRAMES=1`, byte-identical `.bmp`/pixel-count output vs.
-   pre-change baseline) -- ran clean but with no real DRM flips (a `sleep` guest never touches
-   `/dev/dri`), so only "doesn't crash" is confirmed, not byte-identical dump output. Needs a real
-   flip-producing guest; `advisor/probes/drm_flip_probe.c` (prebuilt binary present) is the
-   intended one but no session has ever preserved its literal working CLI (checked exhaustively --
-   `fda3787`'s commit message narrates results, not the command). Nearest fully-preserved recipe:
-   `docs/dump-frames-writer-verify-probe/README.md` (`drmgui_multiflip.c` + zig cc +
-   `litebox_syscall_rewriter` + `rootfs.tar`) -- add `--gui`/`--gui=hidden` to it and start there.
-2. Scenario 4's SUCCESS path (`show` reveals a real window, `screenshot` counts change while a
-   drawing guest renders) and scenario 5 (kill presenter, `show` respawns and resumes) both need
-   that same real drawing guest -- only `show`'s TIMEOUT path (no drawing guest) is confirmed.
-3. Win32 window-visibility introspection (`Process.MainWindowHandle`/`IsWindowVisible`) is
-   UNRELIABLE for this binary on this host -- live-observed `IsWindowVisible=True` for a
-   `--gui=hidden` presenter that should be hidden (almost certainly finding the console window,
-   not the winit one). Confirms the standing rule below (`LITEBOX_DUMP_FRAMES`/`screenshot`
-   pixel counts only) applies here too -- do not re-attempt Win32 visibility introspection.
-4. `frames on <dir>` stores the directory but `dump_frame_diagnostic` (deliberately left in
-   `litebox_platform_windows_userland::presentation`, see below) ignores it, always using
+**Live-verified in a follow-up session (2026-09-16, real flip-producing guest, full narrative in
+`docs/AGENTS_ARCHIVE_2026-09-16.md`)**: built `drmgui_multiflip.hooked` per
+`docs/dump-frames-writer-verify-probe/README.md`'s exact recipe and ran all three previously-open
+scenarios against it. **Scenario 1**: `LITEBOX_DUMP_FRAMES=1`, 21 flips -> 21 `.bmp` files,
+`non_black_pixels=2073600`, `0 dropped` -- byte-identical to the 2026-09-05 baseline. **Scenario
+3/4**: `--gui=hidden` + `show` against a real flip-producing guest -- presenter registers, `show`
+replies `ok`, presenter survives, `presenter?`->`ok visible`, `EnumWindows` finds a real visible
+`"litebox virtual display"` window, `PrintWindow` capture shows real rendered content (not blank).
+**Scenario 5**: killed the presenter mid-display -- guest/`screenshot` unaffected
+(`non_black_pixels=2073600` throughout), a follow-up `show` spawned a fresh presenter that got its
+own real visible window with current content within ~370ms -- true respawn-and-resume.
+
+**Real bug found and fixed this pass**: the first-ever live `show` against a REAL content-producing
+guest (every earlier session's `show` test used a guest with no drawn framebuffer, hitting only
+the timeout path) made `litebox-presenter.exe` silently `exit(0)` moments after `show`, no panic.
+Root cause in `litebox_presenter_protocol::pipe` (shared client+server named-pipe I/O): every
+handle had `FILE_FLAG_OVERLAPPED` set but every `ReadFile`/`WriteFile` passed a NULL `OVERLAPPED`
+pointer -- unsound once more than one thread has I/O in flight on the same pipe object at once,
+which is exactly this module's own `show`/`hide` design (one thread blocked reading a presenter's
+connection while a different thread writes `show`/`hide` through a `duplicate_into_current_process`
+duplicate of the same handle). Live effect: the pending read spuriously saw `ERROR_BROKEN_PIPE`
+right after the concurrent write succeeded. Fix: `litebox_presenter_protocol::pipe::overlapped_call`,
+a private per-call `OVERLAPPED` + manual-reset event for every `ReadFile`/`WriteFile`/
+`ConnectNamedPipe` (new `Win32_System_Threading` feature on that crate's `windows-sys` dep), which
+is what `FILE_FLAG_OVERLAPPED` is actually for -- applied to both server and client (client's
+`CreateFileW` also gained `FILE_FLAG_OVERLAPPED`, closing the same latent hazard for future
+input-forwarding writes). Simply removing `FILE_FLAG_OVERLAPPED` instead (tried first) "fixes" the
+crash but deadlocks the write forever behind the permanently-pending read -- do not retry that
+half-fix; see the archive for why. Live-reconfirmed: `show` now replies in ~300ms, presenter
+survives indefinitely.
+
+**Still open / pre-existing, not fixed this pass** (unrelated to the crash above, small and
+disclosed):
+1. `frames on <dir>` stores the directory but `dump_frame_diagnostic` (deliberately left in
+   `litebox_platform_windows_userland::presentation`) ignores it, always using
    `LITEBOX_DUMP_FRAMES_PATH`/its own default naming -- the runtime ON/OFF toggle works, the
-   runtime directory redirect does not yet. Small, disclosed gap.
-5. `ps` returns `ok 0` even with a live guest process running -- `diag::PROCESS_TREE` has exactly
+   runtime directory redirect does not yet.
+2. `ps` returns `ok 0` even with a live guest process running -- `diag::PROCESS_TREE` has exactly
    one populating call site (`process.rs:5964`) and stays empty for a plain top-level exec with no
    fork/clone. Proxying `print_process_tree` faithfully (as designed) surfaces this pre-existing
-   gap; not something this task should fix.
-6. `--initial-files alpine-fresh-test.tar -- bin/sleep <n>` was FLAKY this session -- sometimes
-   fine, sometimes the runner exited in well under `<n>` seconds with zero captured output despite
-   several redirection strategies (PowerShell `-RedirectStandardOutput`, a `.bat` wrapper, Bash
-   `>`). Root cause not identified. `--oci-image docker.io/library/debian:stable-slim` was more
-   reliable once its own unrelated manifest-fetch network flakiness (Docker Hub-side, nothing to
-   do with litebox) was worked around by retrying.
+   gap; out of scope for the presenter-split feature itself.
+3. `PrintWindow`-based capture of the live presenter window (used this pass only as extra visual
+   confirmation, not the primary evidence) rendered the guest's solid-fill frame as a partial
+   triangle rather than a full rectangle -- a known `PrintWindow`-vs-DXGI-flip-model capture
+   artifact, not a rendering regression (the SAME moment's `screenshot` control-pipe command,
+   which reads the scanout section directly rather than compositing the live window, reported the
+   correct full-frame `non_black_pixels=2073600`). Do not chase this further via `PrintWindow`; the
+   project's standing pixel-count-based verification (`screenshot`/`LITEBOX_DUMP_FRAMES`) remains
+   the reliable signal, not Win32 window-capture APIs.
 
 **Disclosed deviation, not an oversight**: `dump_frame_diagnostic`/`encode_bmp`/`count_pixel_stats`
 stay in `litebox_platform_windows_userland::presentation` rather than moving into the runner crate

@@ -15,16 +15,90 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
-    INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE,
+    GetLastError, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_OVERLAPPED, FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
+use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE,
     PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
 };
+use windows_sys::Win32::System::Threading::CreateEventW;
+
+/// Issues one overlapped Win32 I/O call (`ReadFile`/`WriteFile`/`ConnectNamedPipe`, all of which
+/// share the `(HANDLE, ..., *mut OVERLAPPED) -> BOOL` shape) through a FRESH, PRIVATE `OVERLAPPED`
+/// structure with its own manual-reset event, and blocks until that specific operation completes
+/// via `GetOverlappedResult`.
+///
+/// # Why this exists (do not go back to a null `OVERLAPPED` on this handle)
+///
+/// Every pipe handle here is created with `FILE_FLAG_OVERLAPPED`, but an earlier version of this
+/// module still passed a NULL `OVERLAPPED` pointer to every `ReadFile`/`WriteFile` call, believing
+/// that made them "ordinary blocking I/O" (a belief `litebox_session_daemon`'s own pipe code
+/// states too). That is only true when at most one I/O operation is ever in flight on a given
+/// pipe INSTANCE at a time. This module's own `show`/`hide` design is exactly the case where it
+/// is not: `litebox_runner_linux_on_windows_userland::control_server` keeps one thread blocked in
+/// `ReadFile` on a presenter's connection (waiting for rare `key`/`rel` pushes FROM the presenter)
+/// indefinitely, while a SEPARATE thread calls `WriteFile` through
+/// `duplicate_into_current_process`'s duplicated handle (to push `show`/`hide` TO the presenter)
+/// -- two duplicate handles of the SAME underlying pipe object, used concurrently from different
+/// threads. Live verification during the presenter-process-split feature (2026-09-16) found two
+/// distinct failure modes from this, in order: (1) with `FILE_FLAG_OVERLAPPED` set but a null
+/// `OVERLAPPED` on every call, the pending read spuriously observed `ERROR_BROKEN_PIPE` right
+/// after the concurrent write succeeded, even though neither side had actually closed anything;
+/// (2) after removing `FILE_FLAG_OVERLAPPED` entirely (to make the handle genuinely synchronous),
+/// the concurrent write instead hung FOREVER, queued behind the permanently-pending read at the
+/// file-object level (a pending synchronous read on a duplicate handle can starve a synchronous
+/// write on another duplicate of the same object -- there is no user-visible primitive to avoid
+/// that once queued). A private `OVERLAPPED`/event PER CALL is the actual fix: real overlapped
+/// I/O explicitly supports multiple simultaneously-pending operations on one pipe object (that is
+/// the feature's whole purpose), so the pending read and the concurrent write no longer contend
+/// for anything at all.
+fn overlapped_call(handle: HANDLE, issue: impl FnOnce(*mut OVERLAPPED) -> i32) -> io::Result<u32> {
+    // SAFETY: no name, no security attributes, manual-reset, initially-unset -- all plain values
+    // with no aliasing/lifetime requirements.
+    let event = unsafe { CreateEventW(core::ptr::null(), 1, 0, core::ptr::null()) };
+    if event.is_null() {
+        // SAFETY: `GetLastError` has no preconditions.
+        return Err(io::Error::from_raw_os_error(unsafe {
+            GetLastError().cast_signed()
+        }));
+    }
+    let mut overlapped: OVERLAPPED = unsafe { core::mem::zeroed() };
+    overlapped.hEvent = event;
+    // SAFETY: `overlapped` is valid and outlives the I/O it issues -- this function does not
+    // return until `GetOverlappedResult` below reports that operation complete.
+    let immediate = issue(&raw mut overlapped);
+    let result = (|| -> io::Result<u32> {
+        if immediate == 0 {
+            // SAFETY: `GetLastError` has no preconditions.
+            let err = unsafe { GetLastError() };
+            if err != ERROR_IO_PENDING {
+                return Err(io::Error::from_raw_os_error(err.cast_signed()));
+            }
+        }
+        let mut transferred = 0u32;
+        // SAFETY: `handle` is the same handle passed into `issue`; `overlapped` is the exact
+        // structure just passed to it; a nonzero `bWait` blocks until this operation (and no
+        // other) completes, per this structure's own private event.
+        let ok = unsafe { GetOverlappedResult(handle, &overlapped, &raw mut transferred, 1) };
+        if ok == 0 {
+            // SAFETY: `GetLastError` has no preconditions.
+            return Err(io::Error::from_raw_os_error(unsafe {
+                GetLastError().cast_signed()
+            }));
+        }
+        Ok(transferred)
+    })();
+    // SAFETY: `event` was created fresh above; nothing else references it.
+    unsafe {
+        CloseHandle(event);
+    }
+    result
+}
 
 /// `\\.\pipe\litebox-<runner-pid>`, exactly `docs/presenter-process-design.md` section 3.1's
 /// name (matches Appendix D2's own choice).
@@ -114,22 +188,18 @@ pub fn create_and_accept_one_instance(name: &str) -> io::Result<PipeHandle> {
             GetLastError().cast_signed()
         }));
     }
-    // Synchronous (blocking) `ReadFile`/`WriteFile` per connection despite `FILE_FLAG_OVERLAPPED`
-    // on the handle, exactly matching `litebox_session_daemon`'s identical reasoning: the flag is
-    // set only so `ConnectNamedPipe` can be interrupted/observed in a future revision; a null
-    // `OVERLAPPED` pointer on every `ReadFile`/`WriteFile` call below makes those calls ordinary
-    // blocking I/O.
-    // SAFETY: `handle` was just created above and is a valid pipe server instance handle.
-    let ok = unsafe { ConnectNamedPipe(handle, core::ptr::null_mut()) };
-    if ok == 0 {
-        // SAFETY: `GetLastError` has no preconditions.
-        let err = unsafe { GetLastError() };
-        if err != ERROR_PIPE_CONNECTED {
+    // See `overlapped_call`'s own doc comment for why every I/O call on this handle (including
+    // this one) goes through it rather than passing a null `OVERLAPPED` pointer. A client that
+    // connected between `CreateNamedPipeW` and this call (`ERROR_PIPE_CONNECTED`) is the one
+    // "error" that means success here, exactly as the non-overlapped version of this code treated
+    // it.
+    if let Err(e) = overlapped_call(handle, |ov| unsafe { ConnectNamedPipe(handle, ov) }) {
+        if e.raw_os_error() != Some(ERROR_PIPE_CONNECTED as i32) {
             // SAFETY: `handle` is a valid, still-owned handle not yet given to a `PipeHandle`.
             unsafe {
                 CloseHandle(handle);
             }
-            return Err(io::Error::from_raw_os_error(err.cast_signed()));
+            return Err(e);
         }
     }
     Ok(PipeHandle(handle))
@@ -174,7 +244,7 @@ pub fn connect_client(name: &str, timeout: Duration) -> io::Result<PipeHandle> {
                 FILE_SHARE_NONE,
                 core::ptr::null(),
                 OPEN_EXISTING,
-                0,
+                FILE_FLAG_OVERLAPPED,
                 core::ptr::null_mut(),
             )
         };
@@ -241,27 +311,37 @@ impl LineReader {
                 self.start = 0;
             }
             let mut chunk = [0u8; 4096];
-            let mut n_read = 0u32;
-            // SAFETY: `handle.raw()` is a valid, open pipe handle; `chunk` is a valid writable
-            // buffer for the duration of this call.
-            let ok = unsafe {
-                ReadFile(
-                    handle.raw(),
-                    chunk.as_mut_ptr(),
-                    chunk.len() as u32,
-                    &raw mut n_read,
-                    core::ptr::null_mut(),
-                )
-            };
-            if ok == 0 {
-                // SAFETY: `GetLastError` has no preconditions.
-                let err = unsafe { GetLastError() };
-                if self.buf.is_empty() && err == windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE
-                {
-                    return Ok(None);
+            // See `overlapped_call`'s own doc comment for why this goes through it rather than
+            // passing a null `OVERLAPPED` pointer: this read is often left pending for a long time
+            // (waiting for a rare `key`/`rel` push from a presenter, or for `show`/`hide` on the
+            // client side) while another thread writes through a duplicate of this same handle,
+            // and only a private per-call `OVERLAPPED`/event lets both proceed independently.
+            let read_result = overlapped_call(handle.raw(), |ov| {
+                // SAFETY: `handle.raw()` is a valid, open pipe handle; `chunk` is a valid writable
+                // buffer for the duration of this call, which `overlapped_call` blocks until
+                // that call's own `GetOverlappedResult` reports complete.
+                unsafe {
+                    ReadFile(
+                        handle.raw(),
+                        chunk.as_mut_ptr(),
+                        chunk.len() as u32,
+                        core::ptr::null_mut(),
+                        ov,
+                    )
                 }
-                return Err(io::Error::from_raw_os_error(err.cast_signed()));
-            }
+            });
+            let n_read = match read_result {
+                Ok(n) => n,
+                Err(e) => {
+                    if self.buf.is_empty()
+                        && e.raw_os_error()
+                            == Some(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE as i32)
+                    {
+                        return Ok(None);
+                    }
+                    return Err(e);
+                }
+            };
             if n_read == 0 {
                 if self.buf.is_empty() {
                     return Ok(None);
@@ -293,24 +373,24 @@ pub fn write_line(handle: &PipeHandle, line: &str) -> io::Result<()> {
     buf.push(b'\n');
     let mut remaining: &[u8] = &buf;
     while !remaining.is_empty() {
-        let mut n_written = 0u32;
-        // SAFETY: `handle.raw()` is a valid, open pipe handle; `remaining` is a valid readable
-        // slice for the duration of this call.
-        let ok = unsafe {
-            WriteFile(
-                handle.raw(),
-                remaining.as_ptr(),
-                remaining.len() as u32,
-                &raw mut n_written,
-                core::ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            // SAFETY: `GetLastError` has no preconditions.
-            return Err(io::Error::from_raw_os_error(unsafe {
-                GetLastError().cast_signed()
-            }));
-        }
+        // See `overlapped_call`'s own doc comment: this write may run concurrently with a long-
+        // pending read on a duplicate of this same handle (`show`/`hide` pushed to a presenter
+        // while that connection's own reader thread is blocked waiting for a rare `key`/`rel`),
+        // so it must go through a private per-call `OVERLAPPED`/event rather than a null pointer.
+        let n_written = overlapped_call(handle.raw(), |ov| {
+            // SAFETY: `handle.raw()` is a valid, open pipe handle; `remaining` is a valid readable
+            // slice for the duration of this call, which `overlapped_call` blocks until that
+            // call's own `GetOverlappedResult` reports complete.
+            unsafe {
+                WriteFile(
+                    handle.raw(),
+                    remaining.as_ptr(),
+                    remaining.len() as u32,
+                    core::ptr::null_mut(),
+                    ov,
+                )
+            }
+        })?;
         remaining = &remaining[n_written as usize..];
     }
     Ok(())

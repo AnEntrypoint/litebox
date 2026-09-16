@@ -708,3 +708,109 @@ alpine-xfce-vnc:latest` SIGILL'd within 3s before, zero fatal signals after.
 `edgelevel/alpine-xfce-vnc` is Alpine 3.16.0, Xvfb/browser pipeline. `ubuntu-xfce` packs fine
 but its rust-coreutils aborted in rustix auxv handling (`sleep`/`tail`/DE launch) — `bb46f1a` has since
 implemented `/proc/self/auxv`/`AT_EXECFN`, so that's a re-test, not a fresh investigation.
+
+## Presenter-process split: full live-verification narrative (2026-09-16 follow-up session)
+
+Prior session's build (commits `4e848d9`, `1ca3da0`, `831a35d`, `71c76b9`, `1e55830`) had verified
+scenarios 2 and 6 from `docs/presenter-process-design.md` section 6 plus the `show` TIMEOUT path,
+but explicitly left scenario 1's byte-identical dump check, scenario 4's SUCCESS path, and
+scenario 5's crash-recovery-with-content unverified for lack of a real DRM-flip-producing guest.
+This follow-up built one and closed all three.
+
+**Recipe used**: `docs/dump-frames-writer-verify-probe/README.md`'s exact steps -- a Python-hosted
+zig (`pip install ziglang`, `python -m ziglang` via a tiny shell shim on `PATH`) cross-compiled
+`drmgui_multiflip.c` for `x86_64-linux-musl`, `litebox_syscall_rewriter` hooked its syscalls, and
+the result was appended (`tar -rf`, staged under a local `tmp/` first) into a working copy of
+`alpine-rootfs.tar`. Two additional environment knobs beyond the README's own baseline recipe:
+`DRMGUI_FLIP_COUNT`/`DRMGUI_FLIP_DELAY_MS` set high (`600`/`1000`) to keep a guest alive and
+flipping for several minutes so `show`/`hide`/kill/respawn could all be exercised interactively
+against ONE long-lived run, forwarded via the runner's existing `--forward-env`.
+
+**Scenario 1 (byte-identical regression)**: `LITEBOX_DUMP_FRAMES=1`, `DRMGUI_FLIP_COUNT=20`, no
+`--gui` -> 21 `.bmp` files, `non_black_pixels=2073600`/`distinct_colors_capped64=1` every frame
+(the guest fills the whole 1920x1080 buffer with one solid color per flip), end-of-run
+`21 frames enqueued for writing, 0 dropped due to writer backpressure`. Matches the pre-existing
+2026-09-05 baseline in `docs/dump-frames-writer-verify-probe/README.md`'s own "Results" section
+(`21 flips, 21 .bmp files, exactly matching historical every-frame behavior`) exactly.
+
+**Scenarios 3/4/5 tooling**: a small PowerShell `NamedPipeClientStream` script
+(`pipe_client.ps1`, scratch) sent one command per invocation and printed the raw reply line --
+same shape the prior session used. The runner spawns TWO OS processes for one guest run (only one
+hosts the `ControlServer`'s named pipe; the other is an internal helper) -- when locating the live
+pipe, try both candidate `litebox-<pid>` names and use whichever one's `presenter?` actually
+replies, don't assume the first-listed `Get-Process` result is the right PID.
+
+**The crash and its diagnosis** (full blow-by-blow, compacted out of the main AGENTS.md entry):
+issuing `show` against a presenter that had a real guest actively flipping caused
+`litebox-presenter.exe` to disappear within a few seconds, every time, reproduced 3+ times
+independently of whether the presenter was auto-spawned by `--gui=hidden` or manually run in the
+foreground for visibility into its own stderr. Bisection process: (1) added a diagnostic print to
+`litebox_presenter/src/main.rs`'s pipe-reader thread's `Ok(None)|Err(_)` exit arm -- confirmed it
+was hitting a clean `Ok(None)` (broken pipe), not a panic, not the process's main-thread event
+loop legitimately returning. (2) added matching diagnostics to
+`litebox_runner_linux_on_windows_userland::control_server`'s own `handle_connection`/
+`push_to_presenter` -- confirmed the SERVER's own read on the presenter's connection independently
+saw the identical `Ok(None)` at the same moment `push_to_presenter`'s `WriteFile` (through the
+`duplicate_into_current_process`-duplicated handle) had JUST reported success. (3) Traced this to
+`litebox_presenter_protocol::pipe`'s `CreateNamedPipeW`/`CreateFileW` calls: `FILE_FLAG_OVERLAPPED`
+set on every handle, but every single `ReadFile`/`WriteFile` call (both client and server sides)
+passed a NULL `OVERLAPPED` pointer -- a documented-unsound combination once more than one thread
+has I/O in flight on handles referring to the same pipe object at once, which is exactly this
+module's own `show`/`hide` design (one thread blocked reading a presenter's connection waiting for
+rare `key`/`rel`, a different thread writing `show`/`hide` through a duplicate handle of the same
+object). First fix attempt: removed `FILE_FLAG_OVERLAPPED` entirely (reasoning: if truly
+synchronous I/O was intended, make the handle actually synchronous). This "fixed" the crash but
+introduced a WORSE, previously-latent bug: the write then hung forever (confirmed via a targeted
+`eprintln` bracketing the raw `WriteFile` call, which printed "starting" but never "returned") --
+a pending synchronous read on one duplicate handle can starve a synchronous write on another
+duplicate of the same file object at the kernel level, with no way to avoid it once queued. This
+explains why NO prior session had ever seen this: the ORIGINAL bug (corruption/crash) always fired
+before a session could stay connected long enough to trip the SECOND, deadlock bug hiding behind
+it. The real fix: keep `FILE_FLAG_OVERLAPPED`, and give EVERY `ReadFile`/`WriteFile`/
+`ConnectNamedPipe` call its own fresh, private `OVERLAPPED` structure with its own manual-reset
+event (`litebox_presenter_protocol::pipe::overlapped_call`, `windows-sys`'s
+`Win32_System_Threading` feature newly enabled in that crate's `Cargo.toml` for `CreateEventW`),
+waited on via `GetOverlappedResult(..., bWait=TRUE)`. This is the intended, standard way to allow
+multiple simultaneously-pending I/O operations on one named pipe object -- concurrent pending
+read+write across duplicate handles is explicitly what `FILE_FLAG_OVERLAPPED` exists to support,
+and per-call private synchronization objects mean the two operations never share any completion
+state to race over. Applied uniformly to both the server's `create_and_accept_one_instance`/
+`handle_connection` path and the client's `connect_client` path (which gained
+`FILE_FLAG_OVERLAPPED` on its own `CreateFileW` too, closing the same latent hazard for its own
+future input-forwarding key/rel writes racing its blocked reader thread, even though that path
+wasn't exercised this session since no real keyboard/mouse input was injected).
+
+**Post-fix confirmation, timed**: `show` on an already-connected, ready presenter now replies in
+~300-370ms (previously: either silent crash within ~1-3s, or -- during the deadlock half-fix --
+no reply ever). The presenter survives indefinitely afterward; `presenter?` correctly transitions
+`ok hidden` -> `ok visible`; `EnumWindows`/`GetWindowThreadProcessId`/`IsWindowVisible` (run from
+a PowerShell process in the SAME desktop session, `SessionId` matched against the presenter's own)
+finds a real, visible top-level window titled `"litebox virtual display"` for the presenter's own
+PID -- this is the FIRST session in this feature's history where that Win32 introspection produced
+a real, correct positive result, because it's the first session where the presenter survived long
+enough for there to be anything real to find. A `PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT)`
+capture of that live window was saved and visually inspected: it shows the guest's solid fill
+color as a large diagonal-edged shape rather than a clean full rectangle -- a known
+`PrintWindow`-vs-hardware-accelerated-DXGI-flip-model capture artifact (PrintWindow is well known
+to render DirectComposition/DXGI swapchain content incompletely/incorrectly on many hosts), NOT a
+litebox rendering regression: the control-pipe `screenshot` command, which reads the scanout
+SECTION directly rather than compositing the on-screen window, reported the correct
+`non_black_pixels=2073600` (the full 1920x1080 frame) at the same moment. Do not use `PrintWindow`
+captures as a correctness signal for this feature going forward -- `screenshot`'s own pixel counts
+already are, and remain, the project's standing reliable verification method (matches the
+already-standing rule against trusting `IsWindowVisible` alone).
+
+**Scenario 5, timed**: `Stop-Process -Id <presenter-pid> -Force` while the presenter was
+displaying live content -> `presenter?` immediately reported `ok none`, `screenshot` kept
+returning `non_black_pixels=2073600` with no interruption (guest/runner never touched). A
+follow-up `show` spawned a brand-new `litebox-presenter.exe` (new PID, confirmed via
+`Get-Process`/`StartTime`), which reconnected, registered, and had its own real visible
+`"litebox virtual display"` window within ~370ms, with `screenshot` immediately reflecting current
+scanout content -- true respawn-and-resume, matching the design's own claim, not merely "a new
+process now exists" as the prior session could only partially argue from the timeout path.
+
+**Cleanup**: all `litebox_runner_linux_on_windows_userland.exe`/`litebox-presenter.exe` processes
+started during this verification pass were killed (`taskkill /F`) before the session ended; none
+were left running. Scratch build artifacts (`drmgui_multiflip`/`.hooked`, the working rootfs copy,
+`run-*` test directories) were deleted from `.wfgy/` afterward; the pre-existing large `.wfgy/`
+accumulation from earlier, unrelated sessions was left untouched (out of scope for this pass).
