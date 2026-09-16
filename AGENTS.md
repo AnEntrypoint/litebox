@@ -207,15 +207,27 @@ first launches -- idempotent, refuses to touch the file if it has drifted from t
 post-fix watch for `Backpressure TRIGGERED for 'primary'` with no ping timeout while throttled.
 Full mechanism and citations: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
-**Track A fork-without-exec audit (ADVISORY-002 §6) and the ET_EXEC finding**: all four Track A
-daemons (dbus-daemon/nginx/xfsettingsd/Thunar) are cleared — crash-frequency on the remaining one
-(selkies itself, 0/7 binds) is root-caused to `spawn_exec_collision_child`'s own 120s cap firing on
-a real, structurally-unwinnable recovery attempt (no shared AF_UNIX/D-Bus namespace), not a
-watchdog bug. The guest's actual Python (`python3.13`, stock dpkg, confirmed via `readelf -h`) is
-genuinely `ET_EXEC` with no alternate PIE build to swap in; a boot-reorder mitigation was tried and
-was insufficient — concurrent fork pressure from another subsystem drives the collision rate.
-**Confirms Track B is the only real fix at this layer.** Full mechanism and boot logs:
-`docs/AGENTS_ARCHIVE_2026-09-16.md`.
+**RESOLVED 2026-09-16: the python3 collision was a litebox host-side bug, not Track B-only — fixed,
+live-verified, selkies now genuinely binds.** Track A cleared all four fork-without-exec daemons;
+four boot-reorder variants (up to n=10, 100% collision, "Absolute-first" with zero other guest
+forks) narrowed the collision partner to "the HOST RUNNER's own static layout at `0x67b0d0`" but
+didn't identify it. **Root cause**: `WindowsUserland::new`'s startup `VirtualAlloc(0x400000,
+MEM_RESERVE)` band (keeps a real Windows thread stack from squatting where non-PIE ELFs load) was
+sized `0x600000` (6MiB, tuned only to `gcc`'s ~`0x618000` need) — but real `python3.13` (`readelf -l`
+on the exact stock Debian `python3.13_3.13.5-2+deb13u4` binary, fetched and inspected directly, not
+the guest) has an RW/BSS `PT_LOAD` ending at `0x9eedb8+0x104f90=0xaf3d48`, ~999KiB *above* the old
+`0xa00000` ceiling — a real thread stack was free to land in that gap, and did, every time.
+**Fixed**: widened to `0x1000000` (16MiB, `0x400000..0x1400000`),
+`litebox_platform_windows_userland/src/lib.rs`. **Verified**: 9/9 clean runs of the absolute-first
+`/bin/sh -c 'exec /lsiopy/bin/python3 -c pass'` repro (0/9 collision vs. pre-fix 10/10), then a full
+`debian-xfce` webtop boot ran 380+s with zero python3 collisions (only the pre-existing, unrelated,
+already-harmless `gcc`/`cc1`/`/usr/bin/gcc` collisions fired, both resolved normally) and selkies
+genuinely bound and served a real client: `[sk] INFO:data_websocket:Data WebSocket connected from
+('10.0.0.2', ...)`, handled, cleaned up — the first live client connection this whole investigation
+has reached. **Not reached**: a real-browser retest of the backpressure fix
+(`advisor/patches/selkies_primary_backpressure_patch.py`) under throttled bandwidth, or the Terminal
+Emulator/menu click path — killed for RAM safety (7GB→2.6GB free) right after the connection proof.
+Evidence: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 ## Host-side crash machinery
 
@@ -344,20 +356,15 @@ every I/O call). **Do not "fix" this by removing `FILE_FLAG_OVERLAPPED`** -- tri
 crash, but deadlocks the write forever behind the permanently-pending read instead. Full
 verification/bisection narrative: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
-**Still open / pre-existing, not fixed this pass** (small, disclosed, unrelated to the crash
-above):
-1. `frames on <dir>` stores the directory but `dump_frame_diagnostic` ignores it, always using
-   `LITEBOX_DUMP_FRAMES_PATH`/its own default naming -- ON/OFF toggle works, directory redirect
-   does not yet.
-2. `ps` returns `ok 0` with a live guest process running -- `diag::PROCESS_TREE` stays empty for a
-   plain top-level exec with no fork/clone; a pre-existing gap the split surfaces, not causes.
-3. `PrintWindow` capture of the live presenter window rendered a partial shape, not a full
-   rectangle -- a known `PrintWindow`-vs-DXGI-flip-model artifact, not a rendering regression (the
-   same-moment `screenshot` command, reading the scanout section directly, reported the correct
-   full-frame pixel count). Don't chase this via `PrintWindow`.
-4. **Disclosed deviation**: `dump_frame_diagnostic`/`encode_bmp`/`count_pixel_stats` stay in
-   `litebox_platform_windows_userland::presentation` rather than moving into the runner crate per
-   design §1.1 -- zero window/wgpu dependency, so headless-never-touches-a-window already held.
+**Still open / pre-existing, not fixed this pass** (small, disclosed, unrelated to the crash above;
+full detail archived): `frames on <dir>` ignores the directory arg (ON/OFF toggle works, redirect
+doesn't); `ps` returns `ok 0` with a live guest process (`diag::PROCESS_TREE` gap, pre-existing, not
+caused by the split); `PrintWindow` capture of the presenter window is a partial-shape artifact
+(known DXGI-flip-model issue, not a regression -- the same-moment `screenshot` read the correct
+full-frame pixel count; don't chase via `PrintWindow`); disclosed deviation:
+`dump_frame_diagnostic`/`encode_bmp`/`count_pixel_stats` stay in
+`litebox_platform_windows_userland::presentation` rather than the runner crate per design §1.1
+(zero wgpu dependency, headless-never-touches-a-window already held).
 
 ## Docs and tooling map
 

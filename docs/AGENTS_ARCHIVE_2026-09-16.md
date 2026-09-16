@@ -1183,3 +1183,220 @@ one new `thread_local!` (`THREAD_WAITER_EVENT`). Deliberately a plain `thread_lo
 `TlsState` field (unlike `codewatch`/`ctxwatch`, which deliberately avoid adding to this ratchet)
 because `RawMutex` is reachable from host-only threads that never call `install_tls`, so a
 `TlsState`-backed field would be unreachable/panic on exactly the threads this code needs to run on.
+
+## Absolute-first boot-reorder variant, real n=10 sample -- collision rate unchanged, mechanism reframed (2026-09-16, later still)
+
+Task: the prior boot-reorder session (see "ET_EXEC confirmed live... boot-reorder mitigation tried
+and found insufficient" above) tried two variants -- moved earlier concurrent with startwm.sh (6/6
+collided) and moved earlier gated on selkies binding first (only 1 usable Xvfb-up boot, n=1, not a
+real sample) -- and concluded collision rate is driven by concurrent fork pressure, not cumulative
+fork history. This session tested a third variant to check that with a real sample: launch
+selkies' python3 as literally the first fork/exec in the whole guest -- before nginx config writes,
+before XDG_RUNTIME_DIR setup, before Xvfb, before dbus-daemon -- so if address-space "virginity"
+matters at all, this is the cleanest test of it, fully decoupled from the concurrent-pressure
+confound.
+
+Method: new guest script `.wfgy/webtop_stack_selkies_absolute_first.sh` (test-only, not the
+production `.wfgy/webtop_stack.sh`) -- only bash-builtin exports, then `: > /tmp/empty` and a
+`printf` (builtin, no fork) writing a one-shot selkies-supervisor wrapper, then `/bin/sh
+/tmp/selkies_abs_first.sh &`. The ONLY guest fork before selkies' own shebang re-exec of python3 is
+that `/bin/sh` wrapper fork -- identical unavoidable scaffolding cost present in every variant
+already tried. No cat/mkdir/chmod, no Xvfb, no dbus, no nginx precede it. A builtin sleep-loop
+(200s, zero forks) holds afterward, then one final grep (200s after launch, well past the ~120s
+absolute-cap ceiling, so this fork cannot itself confound the attempt-1 measurement) checks
+/tmp/sk.log for "Data WebSocket Server listening". Packaged as
+`.wfgy/webtop_stack_seed_selkies_first.tar` (config/webtop_stack.sh), launched via --resume-from,
+LITEBOX_LOG=warn,litebox_platform_windows_userland::fork_verify=error,
+--oci-image docker.io/linuxserver/webtop:debian-xfce, no --publish (nginx never starts in this
+variant). Each trial ran as a PowerShell Start-Job with a 240-260s Wait-Job timeout, then an
+explicit Stop-Process -Force sweep of any litebox_runner_linux_on_windows_userland process
+regardless of job state, per this project's standing "kill between runs" rule.
+
+Cache note: the OCI layer cache (.litebox-cache/) was NOT actually warm for
+docker.io/linuxserver/webtop:debian-xfce at session start despite files present from other
+images/sessions -- the first validation attempt spent its entire 260s budget on [cache] MISS layer
+pulls (through layer 16/17) and never reached the guest script at all. Fixed with one dedicated
+cache-warming boot (--oci-image only, trivial guest command, 540s budget) before sampling; all 10
+real trials below ran against a fully warm cache ([cache] HIT on all 17 layers). Not warming the
+cache first would have silently produced false "no collision" data points (timeout before python3
+ever executed) -- worth flagging for any future session reusing this image after a
+.litebox-cache/ prune.
+
+Results, real n=10, all 10 trials reached GUESTSTART (guest booted) and TRIAL_DONE:
+
+- 10/10 (100%) collided on the guest's very FIRST-ever exec attempt (path=/lsiopy/bin/python3 in
+  the host-side spawn_exec_collision_child log, correlated per-trial).
+- 9/10 hit the exact 42d8ced absolute-time-cap failure signature: nested collision-recovery child
+  spawned, ran, then "spawn_exec_collision_child: replacement process exceeded the absolute time
+  cap even while making CPU progress -- killing it", SELKIES_ABS_FIRST_ATTEMPT1_DONE rc=139
+  (SIGSEGV) -- collision-to-cap elapsed time consistent with the previously-documented ~120s figure
+  in every one of the 9.
+- 1/10 (run 7) hit the OTHER previously-documented failure mode instead: rc=1 (no absolute-cap
+  line, no SIGSEGV) -- the "nested gcc/collect2 sub-step, itself another nested collision,
+  returning raw_status=1" case named in the earlier boot-reorder session, now confirmed to occur
+  even on a genuinely first-ever guest exec, not just under concurrent load.
+- 0/10 bound (Data WebSocket Server listening never appeared in any trial's sk.log).
+- Every trial showed multiple sub-second-apart spawn_exec_collision_child log lines with DIFFERENT
+  per-line elapsed-time bases (each nested recovery child resets its own clock at init_logging(),
+  per this file's own standing pitfall) before the final absolute-cap or raw_status=1 outcome --
+  the recovery path nests/retries multiple times per attempt, consistent with prior sessions.
+
+Three-way comparison, real numbers:
+- baseline (selkies after full desktop), archived/informal sample: "roughly one collision per
+  whole boot" (lower than per-attempt); some binds (what 42d8ced's recovery-loop fix targets).
+- moved earlier, concurrent with startwm.sh: 6 respawn attempts in 1 boot, 6/6 = 100% collided,
+  0/6 bound.
+- moved earlier, gated on bind: n=1 usable boot (2/3 hit unrelated XVFB_FAILED), 4/4 attempts in
+  that boot collided, 0/1 boot bound.
+- absolute-first (this session): n=10 independent boots, 10/10 = 100% collided, 0/10 bound.
+
+Conclusion -- collision rate is statistically indistinguishable between "zero guest history" and
+"concurrent guest fork pressure"; both measure 100% on real samples. This REFUTES, with a real
+sample where the earlier n=1 attempt could not, the hypothesis that reducing accumulated guest-side
+fork/exec history by itself lowers the odds of python3's fixed-address collision. Since nothing
+else had forked or exec'd anywhere in the guest before this session's attempt-1 measurements, the
+address python3 (entry 0x67b0d0) collided with cannot belong to another guest process's mapping --
+by elimination it must already be occupied by the litebox RUNNER PROCESS's OWN address space layout
+(its image, heap, thread stacks, wgpu/host allocations, or similar host-side state that exists from
+process start, before any guest code runs at all). This means no ordering of any guest operations,
+at any granularity, can avoid this collision, because the collision partner is not guest-
+controlled. Sharpens this file's standing conclusion that Track B
+(advisor/ADVISORY-002-d-zero-fork.md) -- fixing the address space model itself, not guest boot
+ordering -- is the only real fix. No further boot-reorder variant is worth attempting without new
+evidence contradicting this session's n=10 read.
+
+Streaming verification, backpressure fix, Terminal Emulator retest: still blocked. 0/10 binds this
+session (same as every recent session) means the ninth-candidate backpressure fix
+(advisor/patches/selkies_primary_backpressure_patch.py, AGENTS.md "Ninth candidate") remains
+committed but NOT live-verified, and the Terminal Emulator/Applications-menu click-path retest
+remains blocked for the same reason as every prior session -- no live stream to click into. This
+session did not attempt the production .wfgy/webtop_stack.sh end-to-end boot (nginx/Xvfb/
+startwm.sh) since the absolute-first variant's own result (100% collision, identical to the
+existing production script's own "moved earlier, gated on bind" state) gives no reason to expect a
+different outcome; the production script's ordering is UNCHANGED by this session's finding.
+
+Host RAM: stable ~7-8GB free (of ~15.6GB total) throughout all 10 trials and the cache-warming run;
+Get-Process litebox_runner_linux_on_windows_userland / Get-Job both empty at session end (an
+explicit Stop-Process -Force ran after every single trial -- no trial was left running into the
+next).
+
+Evidence: `.wfgy/webtop_stack_selkies_absolute_first.sh`, `.wfgy/webtop_stack_seed_selkies_first.tar`
+(gitignored, both test-only, not the production stack), `.wfgy/absfirst_validate2.combined.log`
+through `.wfgy/absfirst_run10.combined.log` (10 trial logs), `.wfgy/absfirst_double.ps1` (batch
+driver), `.wfgy/cache_warmup.combined.log`.
+
+## RESOLVED: python3 ET_EXEC collision root-caused to an undersized host reservation, fixed and live-verified (2026-09-16, later still)
+
+**Task**: the "Absolute-first" n=10 session above reframed the collision partner as "the HOST
+RUNNER's own static layout" but did not identify WHAT occupies python3's fixed load address. This
+session finds the exact occupant and fixes it.
+
+**Mechanism traced via code read, no boot needed for this part**: every `execve()` (including a
+guest's very first program load, not just subsequent ones) goes through
+`litebox_shim_linux::load_program_with_pty` (`litebox_shim_linux/src/lib.rs:660`), which
+constructs a BRAND-NEW `PageManager`/`Vmem` for the new image via `linux::Vmem::new(platform)`
+(`litebox/src/mm/linux.rs:751`). `Vmem::new` seeds its `vmas` map by calling
+`platform.reserved_pages()` and inserting every returned range as an empty-flags placeholder
+"already taken" entry. On Windows, `reserved_pages()` (`litebox_platform_windows_userland/src/lib.rs:7799`)
+just returns a cached `Vec` computed ONCE, at process startup, by `read_memory_maps` -- a full
+`VirtualQuery` walk of the host process's ENTIRE address space at that moment
+(`litebox_platform_windows_userland/src/lib.rs:3045-3094`) -- and `refresh_reserved_pages()` is a
+no-op on Windows (unlike Linux), so this snapshot is NEVER updated for the life of the process. Any
+python `PT_LOAD` segment whose fixed address falls inside one of these frozen placeholder ranges
+hits `insert_mapping`'s `FixedAddressBehavior::NoReplace`/`Replace` overlap check
+(`litebox/src/mm/linux.rs:1145-1240`) and fails with `AllocationError::AddressInUse`/
+`AddressPartiallyInUse`, surfacing as `LoadError(Map(Errno(EEXIST)))` -- exactly the error
+`sys_execve` (`litebox_shim_linux/src/syscalls/process.rs:6070-6074`) matches to invoke
+`spawn_exec_collision_child`.
+
+An EXISTING mitigation already addressed part of this: right after taking the `read_memory_maps`
+snapshot, `WindowsUserland::new` (`litebox_platform_windows_userland/src/lib.rs:2853-2875`) calls
+`VirtualAlloc(0x400000, 0x600000, MEM_RESERVE, PAGE_NOACCESS)` -- deliberately AFTER the snapshot
+(so it stays invisible to `reserved_pages()`, letting a genuine `MAP_FIXED` guest load reclaim it
+via `Replace`-mode decommit-then-recommit) -- purely to stop Windows' own thread-stack-placement
+algorithm from putting a NEW real OS thread's stack in the low address band where non-PIE `ET_EXEC`
+binaries conventionally load. Sized `0x600000` (6MiB, `0x400000..0xa00000`), tuned to `gcc`'s own
+documented need ("its colliding segment needs up to roughly `0x618000`").
+
+**The actual occupant, found by getting python3.13's REAL program headers** (fetched the exact
+stock Debian 13 binary directly from `snapshot.debian.org` -- `python3.13-minimal`
+`3.13.5-2+deb13u4` amd64, hash `74e55d896b26f35fffd8863b6c23d5c47491f2a5`, `/usr/bin/python3.13`,
+6,812,336 bytes, matching the guest's own 6,812,368-byte listing to within a few bytes of build
+metadata -- then `readelf -l` on it locally, no boot required): its `PT_LOAD` segments span
+`0x400000` (first LOAD) through the RW/BSS segment `VirtAddr=0x9eedb8, FileSiz=0x90970,
+MemSiz=0x104f90` -> real end `0x9eedb8+0x104f90=0xaf3d48` (page-rounded `0xaf4000`). That is
+**~999KiB (998,728 bytes) above the existing reservation's `0xa00000` ceiling** -- completely
+unprotected. A real Windows OS thread stack (or any other host allocation) was free to land
+anywhere in that `0xa00000..0xaf4000` gap, and -- given the project's own 100%-reproducible n=10
+finding -- evidently did, every single time, for whatever the runner's own thread-creation sequence
+consistently produces at that point. This is the exact, concrete, previously-unidentified occupant
+the dispatch asked for: not the runner's own randomly-ASLR'd PE/DLL image, not guest-tracked memory
+from a prior process, but a plain host-side region inside litebox's own frozen `reserved_pages`
+placeholder set, one whose lower edge (`0xa00000`) the existing anti-collision mitigation drew in
+the wrong place for this specific binary.
+
+**Fix** (`litebox_platform_windows_userland/src/lib.rs:2853-2882`): widened the `VirtualAlloc` size
+from `0x0060_0000` to `0x0100_0000` (6MiB -> 16MiB, new band `0x400000..0x1400000`), comfortably
+clearing python3.13's real `0xaf4000` ceiling with ~5.5MiB of margin for other non-PIE binaries.
+Comment updated with the exact `readelf -l` arithmetic above so a future session never has to
+re-derive it. No change to `reserved_pages()`/`Vmem::new`/`insert_mapping` themselves -- this is a
+one-line size widen on an already-correct mechanism, not a new subsystem.
+
+**Live-verified, two independent ways, same rebuilt release binary** (`cargo build --release -p
+litebox_runner_linux_on_windows_userland`, clean build, pre-existing warnings only):
+
+1. **Cheap absolute-first repro, n=9** (one trial burned on a shell-quoting mistake, not a real
+   attempt): `litebox_runner_linux_on_windows_userland.exe -Z --env GLIBC_TUNABLES=... --oci-image
+   docker.io/linuxserver/webtop:debian-xfce -- /bin/sh -c 'exec /lsiopy/bin/python3 -c pass'` --
+   **9/9 clean exits (`EXIT=0`), 0/9 collision markers, 0/9 SIGSEGV, process tree confirms `pid=1
+   comm=/lsiopy/bin/python3` every time** (`.wfgy/pydiag_verify_run2.combined.log` through
+   `run10.combined.log`) -- a complete flip from the pre-fix baseline's 10/10 (100%) collision rate
+   on the identical "absolute-first, zero other guest forks" methodology.
+2. **Full real webtop boot** (`--resume-from .wfgy/webtop_stack_seed_fixed.tar --publish 3000:3000
+   -- /bin/sh -c "echo GUESTSTART; /bin/sh /config/webtop_stack.sh"`,
+   `.wfgy/pyfix_fullboot1.out.log`/`.log`): ran 380+ seconds. The ONLY `spawn_exec_collision_child`
+   events across the whole log were the pre-existing, unrelated, already-known-harmless `cc1`
+   (t=80s, `raw_status=0`) and `/usr/bin/gcc` (t=436-443s, `raw_status=1`) collisions -- **zero
+   `path=/lsiopy/bin/python3` collision lines, zero `rc=139`, zero `SIGSEGV`/`Segmentation fault`
+   anywhere in the boot**. Selkies genuinely bound and served a REAL client connection: `[sk]
+   INFO:data_websocket:Legacy client ('10.0.0.2', 65305) connected... Data WebSocket connected from
+   ('10.0.0.2', 65305)`, sent cursor data, attempted PulseAudio, then `Cleaning up Data WS handler...
+   finished all cleanup` -- a full, clean connect/serve/disconnect cycle, live-triggered by this
+   session's own `curl` websocket-upgrade probe against the `--publish`-mapped dashboard on
+   `127.0.0.1:3000/websockets` (NAT-gatewayed to the guest as `10.0.0.2`, matching this project's own
+   documented NAT addressing). **This is the first live client connection this project's entire
+   `spawn_exec_collision_child`/selkies-boot-hang investigation (spanning many sessions since
+   `42d8ced`) has ever reached.**
+
+**Host RAM discipline honored**: the verifying boot was killed manually (`Stop-Process -Force`)
+once free RAM fell from ~7GB to ~2.6GB with RSS still climbing (~5.25GB), per this project's own
+standing "watch `FreePhysicalMemory` and kill on a falling trend" rule -- RAM recovered to ~7.8GB
+within seconds, `Get-Process litebox_runner_linux_on_windows_userland` confirmed zero matches
+afterward.
+
+**What this changes for the standing "Track B is the only real fix" framing**: **retracted for
+THIS specific collision.** The prior session's own conclusion ("no guest-side reorder can fix
+this... Confirms Track B is the only real fix") was correct that no BOOT-SCRIPT-side reorder could
+fix it, but incorrectly generalized that to "no litebox-side fix exists at all" -- the real fix was
+a one-line host-side reservation-size bug, discoverable by reading the exact binary's own program
+headers rather than only its entry point. Track B (`ADVISORY-002-d-zero-fork.md`) remains the right
+fix for the SEPARATE, still-open architectural gaps this project has independently and correctly
+attributed to it (no shared AF_UNIX/D-Bus namespace across a cross-process fork/collision boundary,
+the ADVISORY-001 §3N/double-free tcache corruption class under heavy concurrent fork load) -- this
+session's fix does not touch either of those, and neither should be assumed closed by it.
+
+**Not reached this session, and why**: a sustained real-browser (`chrome-devtools`/
+`claude-in-chrome`) session long enough to retest the backpressure fix
+(`advisor/patches/selkies_primary_backpressure_patch.py`) under deliberately throttled bandwidth, or
+the Terminal Emulator/Applications-menu click path -- the verifying boot was deliberately killed
+right after the connection-proof milestone, per the RAM discipline above, rather than pushed further
+into a climbing-RSS regime for a secondary verification. Both remain open, now genuinely blocked
+only on "run a longer live session with a real browser," not on the standing crash class this
+session closes out.
+
+**Evidence**: `litebox_platform_windows_userland/src/lib.rs:2853-2882` (the fix, committed);
+`.wfgy/pydiag_verify_launch.ps1`, `.wfgy/pydiag_verify_run2.combined.log` through `run10.combined.log`
+(cheap-repro n=9); `.wfgy/pyfix_fullboot_launch1.ps1`, `.wfgy/pyfix_fullboot1.out.log`,
+`.wfgy/pyfix_fullboot1.log` (full boot, gitignored, not committed); python3.13 binary and its
+`readelf -h`/`readelf -l` output obtained via `snapshot.debian.org` (not committed to the repo,
+scratch-only).

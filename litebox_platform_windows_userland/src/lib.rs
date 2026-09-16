@@ -2850,9 +2850,9 @@ impl WindowsUserland {
 
         let reserved_pages = Self::read_memory_maps::<4096>();
 
-        // Pre-reserve the well-known low address band where common Alpine/musl `ET_EXEC` (non-
-        // PIE) binaries conventionally load (`gcc`'s own fixed base is `0x400000`; confirmed live
-        // via `DIAG sys_mmap: entry` evidence that its colliding segment needs up to roughly
+        // Pre-reserve the well-known low address band where common Alpine/musl/Debian `ET_EXEC`
+        // (non-PIE) binaries conventionally load (`gcc`'s own fixed base is `0x400000`; confirmed
+        // live via `DIAG sys_mmap: entry` evidence that its colliding segment needs up to roughly
         // `0x618000`) -- BEFORE any guest OS thread gets spawned, so Windows' own default
         // thread-stack-placement algorithm is forced to choose a different, non-colliding address
         // for every guest thread stack from the very first one. Deliberately reserved AFTER
@@ -2865,10 +2865,25 @@ impl WindowsUserland {
         // ever needs to keep a REAL OS thread's stack from landing here first; it is never
         // committed, and a subsequent guest `MAP_FIXED` `Replace`-mode `mmap` simply reclaims it
         // like any other free-but-reserved region.
+        //
+        // Widened from `0x600000` to `0x1000000` (6MiB -> 16MiB band, `0x400000..0x1400000`,
+        // 2026-09-16): the original 6MiB size was tuned only to `gcc`'s own ~`0x618000` need and
+        // left a real, live-confirmed gap for anything bigger. `readelf -l` on the guest's real
+        // colliding binary (Debian 13's stock `python3.13` 3.13.5-2+deb13u4, selkies' own shebang
+        // interpreter, entry `0x67b0d0`) shows its `PT_LOAD` segments span `0x400000` (first LOAD)
+        // through its RW/BSS segment's real end, `0x9eedb8 + MemSiz(0x104f90) = 0xaf3d48`
+        // (page-rounded `0xaf4000`) -- ~999KiB *above* the old `0xa00000` reservation ceiling, i.e.
+        // completely unprotected. This is the `spawn_exec_collision_child`/
+        // `AllocationError::AddressInUse` (`Errno(EEXIST)`) collision this project chased across
+        // many sessions (`docs/AGENTS_ARCHIVE_2026-09-16.md`): a real Windows OS thread stack (or
+        // other host allocation) is free to land in that unreserved `0xa00000..0xaf4000` gap, and
+        // when it does, python3's own fixed-address `PT_LOAD` later collides with it. `0x1000000`
+        // clears python3.13's real `0xaf4000` ceiling with ~5.5MiB of margin for other non-PIE
+        // binaries this or a future image may exec at this same conventional base.
         unsafe {
             windows_sys::Win32::System::Memory::VirtualAlloc(
                 0x0040_0000 as *const core::ffi::c_void,
-                0x0060_0000,
+                0x0100_0000,
                 Win32_Memory::MEM_RESERVE,
                 Win32_Memory::PAGE_NOACCESS,
             );
