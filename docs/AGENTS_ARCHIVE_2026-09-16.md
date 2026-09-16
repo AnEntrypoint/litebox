@@ -576,3 +576,79 @@ stall FROM in either boot this session, so there was nothing live to correlate a
 free RAM recovered to ~9.3GB within 2s of each kill, confirming the runner process itself was the only
 consumer and the host has no other leak. `Get-Process litebox_runner_linux_on_windows_userland` returns
 zero matches at the end of this session.
+
+## The ~120s selkies-crash cadence is `spawn_exec_collision_child`'s own absolute cap, direct causal proof, not a watchdog regression (2026-09-16, later session)
+
+**Task**: the previous section's own `SIGSEGV`/`rc=139` ~120s cadence was measured via the script's `HOLD`
+ticks, never directly correlated against `spawn_exec_collision_child`'s internal log lines in the SAME
+boot — this dispatch's hypothesis was that `42d8ced`'s own 120s absolute cap might be killing a
+legitimately-still-progressing (not genuinely wedged) nested recovery, i.e. a real defect in yesterday's
+fix, not a coincidence of timing.
+
+**Code read first** (`litebox_platform_windows_userland/src/lib.rs:10156-10213`): the poll loop checks
+`elapsed >= EXEC_COLLISION_ABSOLUTE_CAP` (120s) UNCONDITIONALLY, before the progress check each iteration
+— it kills and returns `Err` regardless of whether the child is making CPU progress, per its own log text
+("exceeded the absolute time cap even while making CPU progress"). The 20s stall-grace is a SEPARATE,
+earlier-firing branch that only trips on zero measurable CPU delta for a full 20s. Structurally: reaching
+the 120s branch at all is only possible if the child's CPU delta cleared `MEANINGFUL_CPU_DELTA_100NS` at
+least once every <20s throughout — i.e. the absolute cap firing is itself proof the child was NOT flatlined
+the whole time (contrast the earlier "GLIBC_TUNABLES propagation" section's own instance, which measured
+~0.05s CPU pinned via `Get-Process` polling and still only hit the SAME 120s branch — see below for how
+both are reconciled).
+
+**Live boot 1** (`.wfgy/watchdogcheck_launch1.ps1`, `--resume-from webtop_stack_seed_fixed.tar`, `LITEBOX_LOG=
+warn,…fork_verify=error`): died at t=105.9s to the standing, already-documented, UNRELATED tcache/
+double-free class hitting the top-level guest shell directly (`fatal signal: …Signal(11) pid=2 comm=sh`,
+`Segmentation fault`) — before ever reaching selkies or triggering `spawn_exec_collision_child` even once.
+Independent, additional live confirmation that this second corruption class is real and can fire on
+ordinary fork/exec churn (this run's own `mkdir`/`cp`/`which` calls for the xfce4-session fallback path),
+with zero relationship to the watchdog under investigation.
+
+**Live boot 2** (`.wfgy/watchdogcheck_launch2.ps1`, identical config): reached `SELKIES_LAUNCHED_LAST` and
+produced the DIRECT causal chain this dispatch needed, verbatim from `.wfgy/watchdogcheck2.log`/`.out.log`:
+
+```
+119.721726900s WARN spawn_exec_collision_child: GLIBC_TUNABLES … glibc_tunables_forwarded=true
+119.722260600s WARN spawn_exec_collision_child: this process's own address space cannot load this image …
+  [path=/lsiopy/bin/python3 -- selkies' shebang re-exec, confirmed by the error= line below]
+239.817279400s WARN spawn_exec_collision_child: replacement process exceeded the absolute time cap … killing it
+239.946159400s WARN spawn_exec_collision_child: the replacement process did not exit normally …
+  path=/lsiopy/bin/python3 error=spawn_exec_collision_child: absolute time cap exceeded
+  killing process with SIGSEGV tid=160 path=/lsiopy/bin/python3 error=LoadError(Map(Errno(17 = EEXIST)))
+```
+…and in the SAME boot's guest-side stdout, immediately: `[s] SELKIES_SUPERVISOR: attempt=1 exited rc=139
+-- respawning`. Elapsed collision-to-cap: 120.095s — matching the earlier "GLIBC_TUNABLES propagation"
+section's own 120.0935317s/120.1s measurements to the same decimal precision, on a DIFFERENT boot, DIFFERENT
+day-session, confirming this is deterministic mechanism behavior, not noise. This repeated 3x total in this
+one boot (`cap`-line count 6, `rc=139` count 3) before the run was killed for RAM safety (free RAM fell
+9.1GB→2.8GB over the run; recovered to 8.8GB within 3s of `Stop-Process`).
+
+**Verdict, both directions honestly stated**:
+- **The absolute cap IS the direct, proven cause of the ~120s SIGSEGV cadence** — not an independent tcache
+  coincidence landing on a similar timescale. This closes the timing-correlation-vs-causation gap the prior
+  section's own measurement left open.
+- **This is NOT the hypothesized defect** ("the fix kills a slow-but-otherwise-fine recovery"). Two lines of
+  evidence: (1) reaching the 120s branch at all requires periodic CPU progress (see code-read above) — this
+  boot's nested child was not idle; (2) regardless, the nested recovery is a genuinely separate OS process
+  with no shared AF_UNIX/loopback namespace to the ORIGINAL guest's already-running Xvfb/D-Bus
+  (`lib.rs:10100-10128`'s own doc comment, and `docs/fork-fs-veh-2026-09-08.md:128-144`'s identical gap for
+  the sibling cross-process FORK case) — selkies inside that nested child cannot reach the desktop it needs
+  to serve NO MATTER HOW LONG it runs. An uncapped/longer-cap re-run was deliberately NOT attempted: it would
+  only reproduce the pre-`42d8ced` unbounded whole-boot hang (already proven, at cost, in that commit's own
+  investigation) for zero new information, since the blocker is structural, not a timing threshold.
+- **No code change made to `spawn_exec_collision_child`, and none is warranted** — raising the cap would
+  strictly worsen effective boot behavior (longer hangs before an already-guaranteed-failed attempt gets
+  respawned), with no corresponding chance of success. The fix remains correctly scoped exactly as `42d8ced`
+  and the "selkies-boot-hang root cause and fix" section above already concluded.
+- **The real, still-open blocker is Track B** (`ADVISORY-002-d-zero-fork.md`'s cross-process `D==0` fork,
+  extended to cover `spawn_exec_collision_child`'s own nested children too): giving cross-process children a
+  shared AF_UNIX/loopback namespace with the parent guest is the only change that could let selkies' own
+  collision-recovery attempt actually succeed instead of deterministically timing out every ~120s.
+
+**Not reached this session**: a successful `Data WebSocket Server listening` bind (0/2 this session, 0/9
+combined with the prior section's 0/7) and, consequently, the Terminal Emulator/Applications-menu browser
+click-path retest — still blocked on the same standing Track B blocker, unchanged.
+
+**Host RAM, final state**: both boots killed manually (boot 1 for an unrelated crash, boot 2 for RAM safety
+at 2.8GB free); free RAM recovered to 8.8GB within 3s of the final kill. `Get-Process
+litebox_runner_linux_on_windows_userland` returns zero matches at the end of this session.

@@ -281,17 +281,17 @@ diagnosed reason, not RAM** — 2 boots, ~26 min combined, RAM healthy 4-9GB fre
 real `502` (`ws://localhost:3000/websockets` refused to selkies' own port), confirming no stream was ever
 up to click into. Full detail: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
-**Track A fork-without-exec audit (ADVISORY-002 §6), crash-frequency now actually measured.**
-`.wfgy/webtop_stack.sh`'s own nginx/selkies supervisor subshells (bare `( ... ) &`, fork-no-exec) were
-**fixed** (real fork+exec via `/bin/sh file &`); dbus-daemon/nginx already avoided self-daemonizing.
-**`xfsettingsd`/Thunar re-verified live and cleared**: `DIAG_TIMELINE` shows both launched by
-`xfce4-session` via ordinary safe fork+exec, no fatal signal, no self-daemonization — all four Track A
-daemons now fixed or confirmed never at risk. **The supervisor fix works exactly as scoped, no further**:
-over 2 boots (~26 min, RAM healthy, never RAM-killed) `SELKIES_SUPERVISOR` itself survived all 6 respawns,
-but selkies crashed `SIGSEGV`/`rc=139` on 6 of 7 attempts at a consistent **~120s** interval (not a script
-artifact — no such delay exists in the script), plus one hang that never bound. **0/7 successful binds;
-the fix has no measurable effect on selkies' own crash rate** (never its intended scope). `GLIBC_TUNABLES`
-forwarding reconfirmed 100% (17/17) over a 20-min boot. Real fix remains Track B (below). Boot log:
+**Track A fork-without-exec audit (ADVISORY-002 §6): crash-frequency measured, root-caused to the watchdog's
+own cap, confirmed not a bug.** Supervisor subshells fixed; dbus-daemon/nginx/xfsettingsd/Thunar cleared —
+all four Track A daemons closed. But selkies crashed `SIGSEGV`/`rc=139` on 6/7 attempts at a consistent
+**~120s** interval, 0/7 binds. **2026-09-16 later: direct causal log line (not timing correlation), live
+twice** — `spawn_exec_collision_child`'s 120s absolute cap fires on selkies' python3 collision, its
+existing fallback SIGSEGVs the guest thread 0.13s later, exactly the guest's own `SELKIES_SUPERVISOR:
+attempt=N exited rc=139`. **Not the fix misdiagnosing a slow-but-live recovery**: the cap firing (not the
+20s stall-grace) proves the nested child WAS making periodic CPU progress, yet structurally cannot succeed
+— a separate OS process with no shared AF_UNIX/loopback namespace to the original guest's Xvfb/D-Bus
+(`lib.rs:10100-10128`; same gap as `fork-fs-veh-2026-09-08.md:128-144`). Raising the cap only prolongs an
+already-guaranteed failure. **No code change made, none warranted** — real fix stays Track B. Evidence:
 `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 ## Host-side crash machinery
