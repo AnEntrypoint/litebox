@@ -736,6 +736,108 @@ fn faulting_instruction_has_fs_override(rip: usize) -> bool {
     buf[..n].contains(&0x64)
 }
 
+/// PRD `veh-frame-stride-has-no-overflow-guard`: `VEH_FRAME_STRIDE` (see that constant's own doc
+/// comment) has been silently too small twice before -- 64 bytes, then 4096 bytes -- and both
+/// times the symptom was cross-frame stack corruption found only by a multi-session live crash
+/// hunt, because nothing in the tree actually detects a too-small stride: the const assertions
+/// near `exception_record_ptr` only prove the per-depth frames and the exception-record slots
+/// don't collide with EACH OTHER, never that any one frame's actual peak stack usage fits inside
+/// its own `VEH_FRAME_STRIDE`-sized slice.
+///
+/// Stamps a fixed canary value 64 bytes above the FLOOR of the *next* nesting level's own slice --
+/// the same 64 bytes that level's own trampoline entry unconditionally reserves for its shadow
+/// space and its three saved registers, see `vectored_exception_handler_entry`'s `.Lswap` comment
+/// -- at construction, then re-reads it on `Drop`, i.e. after every possible return path out of
+/// `vectored_exception_handler` (this function has over a dozen distinct `return` sites, so a
+/// single check at the bottom would miss most of them). A live overflow -- this invocation's own
+/// stack usage, or anything it calls transitively (`fork_verify::on_single_step`, the AV-path
+/// stale-pointer healers, `eprintln!` formatting, iced-x86 decoding) -- reaching past this
+/// invocation's `VEH_FRAME_STRIDE` budget corrupts the canary irreversibly: the write already
+/// happened, so popping the stack pointer back up on return does not undo it, which is exactly why
+/// checking at `Drop` time (long after the deepest actual stack depth was reached) still reliably
+/// catches it.
+///
+/// Deliberately does NOT write the canary from the naked-asm trampoline itself, where the
+/// historical bug lived: that address sits up to one whole `VEH_FRAME_STRIDE` (8 KiB, two pages)
+/// below the trampoline's own `rsp` at that point, and a single write that far past the last
+/// touched page risks the exact guard-page-skip hazard `exception_record_ptr`'s own write already
+/// had to solve via an explicit `VirtualAlloc(MEM_COMMIT)` (see that call site's doc comment) --
+/// reusing that same proven technique here, from ordinary (non-naked) Rust code that already has a
+/// ordinary stack frame of its own, is safer than hand-rolling the same fix a second time in
+/// fragile trampoline asm on the fault-recovery path itself.
+struct VehFrameCanaryGuard {
+    addr: *mut u64,
+}
+
+/// Arbitrary but recognizable in a hex dump: "VEHCANAR" read as big-endian ASCII bytes.
+const VEH_FRAME_CANARY: u64 = 0x5645_4843_414e_4152;
+
+impl VehFrameCanaryGuard {
+    /// `host_sp`/`depth` must be this invocation's own `TlsState::host_sp`/post-increment
+    /// `TlsState::veh_depth` (i.e. exactly what `vectored_exception_handler_entry`'s trampoline
+    /// just used to place this invocation's own slice) -- this invocation's own floor is
+    /// `host_sp - depth * VEH_FRAME_STRIDE`, so the next level's floor, and the canary 64 bytes
+    /// above it, is one more `VEH_FRAME_STRIDE` further down. Returns `None` for `depth == 0`
+    /// (should never happen on the depth-tracked swap path, but stays defensive rather than
+    /// computing a nonsense address on an unexpected value) so callers can skip the guard entirely
+    /// on the narrow `.Lcall_here_startup` fallback, which never went through the depth-tracked
+    /// slice scheme in the first place.
+    fn new(host_sp: *mut u128, depth: u32) -> Option<Self> {
+        if depth == 0 {
+            return None;
+        }
+        let next_floor = (host_sp as usize)
+            .wrapping_sub((depth as usize + 1).wrapping_mul(VEH_FRAME_STRIDE as usize));
+        let addr = next_floor.wrapping_add(64) as *mut u64;
+        // SAFETY: mirrors `exception_record_ptr`'s own explicit-commit write exactly (same file,
+        // same reasoning) -- commits precisely the one page this write needs before touching it,
+        // rather than relying on a single far jump to trigger ordinary sequential guard-page
+        // growth.
+        unsafe {
+            let commit_page = (addr as *mut u8).map_addr(|a| a & !0xFFF);
+            let _ = Win32_Memory::VirtualAlloc(
+                commit_page.cast(),
+                4096,
+                Win32_Memory::MEM_COMMIT,
+                Win32_Memory::PAGE_READWRITE,
+            );
+            addr.write_volatile(VEH_FRAME_CANARY);
+        }
+        Some(Self { addr })
+    }
+}
+
+impl Drop for VehFrameCanaryGuard {
+    fn drop(&mut self) {
+        // SAFETY: `addr` was committed and written by `new` above; `Drop` runs on the same thread,
+        // strictly after that write, on every exit path.
+        let value = unsafe { self.addr.read_volatile() };
+        if value != VEH_FRAME_CANARY {
+            diag_raw_print(
+                b"[diag-veh-frame-stride-overflow] addr=0x",
+                self.addr as usize,
+                b" corrupted_value=0x",
+                value as usize,
+            );
+            // Same reasoning as the unrecovered-AV circuit breaker just below in this file: a
+            // stack slice known to have been overrun risks silent corruption of a neighboring
+            // nesting level's still-live frame -- exactly the historical VEH_FRAME_STRIDE bug this
+            // guard exists to catch. Fail fast rather than let the trampoline unwind back into a
+            // possibly-corrupted outer frame. `RaiseFailFastException` accepts null record/context
+            // pointers per its own contract; there is no single exception record that describes
+            // "a canary write detected stack corruption", unlike the real AV/AV-recovery call
+            // sites elsewhere in this file that pass the genuine faulting record.
+            unsafe {
+                windows_sys::Win32::System::Diagnostics::Debug::RaiseFailFastException(
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    0,
+                );
+            }
+        }
+    }
+}
+
 unsafe extern "system" fn vectored_exception_handler(
     exception_info: *mut EXCEPTION_POINTERS,
 ) -> i32 {
@@ -760,6 +862,17 @@ unsafe extern "system" fn vectored_exception_handler(
     // unconditionally, this early, before anything in this handler (including `get_tls_ptr`'s own
     // `TlsGetValue` call, which depends on a working TEB) risks running with it wrong.
     WindowsUserland::restore_thread_gs_base_if_cleared();
+
+    // Overflow guard for this invocation's own `VEH_FRAME_STRIDE` slice (PRD
+    // `veh-frame-stride-has-no-overflow-guard`, see `VehFrameCanaryGuard`'s own doc comment for
+    // the full reasoning). Placed as early as practical -- right after the GS_BASE repair, which
+    // must run first since it backs this function's own TLS access -- so the guard's lifetime
+    // covers essentially the whole function body, including every deep call this handler makes.
+    // `None` on the narrow no-TLS/no-swap fallback paths, which have no dedicated slice to guard.
+    let _veh_frame_canary_guard = get_tls_ptr().and_then(|p| {
+        let tls = unsafe { &*p };
+        VehFrameCanaryGuard::new(tls.host_sp.get(), tls.veh_depth.get())
+    });
 
     // DIAG (LITEBOX_DIAG_ALLOC_VEC=1 investigation continuation): unconditional (no gate other
     // than a call-count cap), allocation-free entry counter -- answers "is VEH even being

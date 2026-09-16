@@ -303,8 +303,24 @@ indirection, then relaxing the `beyond_stdio` fork-eligibility gate.
 **There is no open host crash** — the `RtlpUnwindPrologue` crash earlier notes called "the one genuinely
 open" one was `VEH_FRAME_STRIDE`: a 4096-byte per-level slice 168 bytes short of the two frames it must
 cover, nested by `fork_verify`'s own AV-heal storm. Bisected live: 10/10 fatal before, 0/10 then 0/57
-after (two follow-up commits; mechanism: archive). Unguarded, not a live defect: PRD
-`veh-frame-stride-has-no-overflow-guard`.
+after (two follow-up commits; mechanism: archive). **`veh-frame-stride-has-no-overflow-guard` — CLOSED
+2026-09-16**: `VehFrameCanaryGuard` (`litebox_platform_windows_userland/src/lib.rs`, right above
+`vectored_exception_handler`) stamps a canary 64 bytes above the next nesting level's slice floor and
+checks it on `Drop` (covers all of that function's return sites), `RaiseFailFastException`ing on
+mismatch instead of silent corruption — the exact design this row itself proposed. `cargo build
+--release -p litebox_platform_windows_userland` clean; live boot+fork re-verification still wanted
+next session (runner was busy with a parallel session this pass).
+
+**`dev_bench`/`litebox_runner_snp` Windows build failures — CLOSED 2026-09-16, root cause was NOT
+libc/seccomp.** `dev_bench`: the new `reap_children` (backing `run_rewritten_hello_static_concurrent`)
+called `libc::wait4`/`rusage`/`WIFEXITED`/`WEXITSTATUS` unconditionally — genuinely absent from the
+`libc` crate on `windows-msvc`; fixed via `#[cfg(unix)]`/`#[cfg(not(unix))]` split (`dev_bench/src/
+main.rs`). `litebox_runner_snp`: already correctly excluded from `default-members` and every
+workspace-wide `clippy`/`build`/`doc` line in `ci.yml` — it's a `#![no_std]` SNP-guest kernel image
+needing its own custom target (`target.json`) + pinned nightly (`rust-toolchain.toml`) +
+`-Zbuild-std`, real error is "unwinding panics are not supported without std", nothing to do with
+Windows vs Linux symbols; root `Cargo.toml` now documents this next to the `litebox_runner_lvbs`
+precedent so it isn't re-diagnosed.
 
 **Windows CoW-mmap performance**: zero practical effect on tar-packed execs (`MapViewOfFile3` needs 64KiB
 file-offset alignment; ELF `PT_LOAD` segments are only page-aligned, no exploitable slack).

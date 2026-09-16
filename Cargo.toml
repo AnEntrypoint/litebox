@@ -59,6 +59,22 @@ default-members = [
 ]
 # We exclude `litebox_runner_lvbs` from `default-members` because it requires
 # a custom target and `-Z build-std`, which requires a nightly toolchain.
+#
+# `litebox_runner_snp` is excluded from `default-members` for the identical reason: it is a
+# `#![no_std]`/`#![no_main]` freestanding SNP (AMD SEV-SNP confidential-VM guest) kernel image
+# with its own custom target (`litebox_runner_snp/target.json`, `os: "none"`) and its own pinned
+# nightly toolchain (`litebox_runner_snp/rust-toolchain.toml`) -- it is not, and was never meant
+# to be, buildable via a plain `cargo build -p litebox_runner_snp` on the workspace's ordinary
+# stable toolchain/host target, on Windows or on Linux alike. A bare `-p litebox_runner_snp`
+# invocation fails with "unwinding panics are not supported without std", NOT because of any
+# missing Linux-only libc/seccomp symbol (a plausible-looking but incorrect prior diagnosis) --
+# `no_std` + `panic-strategy: "abort"` requires `-Z build-std`, which requires nightly. See CI's
+# dedicated `build_and_test_snp` job (`.github/workflows/ci.yml`) for the correct invocation:
+# `cargo build -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem
+# --manifest-path=litebox_runner_snp/Cargo.toml --target litebox_runner_snp/target.json`, under
+# the toolchain named in `litebox_runner_snp/rust-toolchain.toml`. Also excluded from every
+# workspace-wide `cargo build`/`clippy`/`doc` invocation in `ci.yml` for the same reason
+# `litebox_runner_lvbs` is.
 
 # Introduce all the pedantic clippy lints and remove ones I (jayb) think are
 # pushing it too far; this way we get something even further than default clippy

@@ -470,6 +470,14 @@ const CONCURRENT_SESSION_COUNT: usize = 16;
 /// multi-benchmark `dev_bench` process. Returns the summed `ru_maxrss` (peak
 /// RSS, in KB on Linux) if every child exited cleanly, otherwise the first
 /// error encountered -- after every child has still been reaped.
+///
+/// Unix-only (`wait4`/`rusage`/`WIFEXITED`/`WEXITSTATUS` do not exist in the
+/// `libc` crate for non-Unix targets): this mirrors every other benchmark in
+/// this file that spawns `litebox_runner_linux_userland` (a Linux ELF), which
+/// only ever runs on a Unix host regardless -- see the `#[cfg(not(unix))]`
+/// stub below for the non-Unix build, which exists purely so `dev_bench` (a
+/// `default-members` crate, built on every host) still compiles on Windows.
+#[cfg(unix)]
 fn reap_children(children: Vec<std::process::Child>) -> Result<i64> {
     let mut total_max_rss_kb: i64 = 0;
     let mut first_err: Option<anyhow::Error> = None;
@@ -506,6 +514,26 @@ fn reap_children(children: Vec<std::process::Child>) -> Result<i64> {
         Some(e) => Err(e),
         None => Ok(total_max_rss_kb),
     }
+}
+
+/// Non-Unix stub: see the real implementation's doc comment above. Still reaps every
+/// child via the portable `Child::wait` (so this never leaves zombies even on a host
+/// that reaches this path), but cannot report `rusage`/peak RSS, which is a genuinely
+/// Unix-only concept -- always reports an error, matching this benchmark's own
+/// existing reality on non-Unix hosts (it spawns `litebox_runner_linux_userland`, a
+/// Linux ELF, which cannot run here at all).
+#[cfg(not(unix))]
+fn reap_children(children: Vec<std::process::Child>) -> Result<i64> {
+    let mut first_err: Option<anyhow::Error> = None;
+    for mut child in children {
+        let pid = child.id();
+        if let Err(e) = child.wait() {
+            first_err.get_or_insert_with(|| anyhow!("wait failed for concurrent session pid {pid}: {e}"));
+        }
+    }
+    Err(first_err.unwrap_or_else(|| {
+        anyhow!("peak-RSS reporting via wait4/rusage is Unix-only; unsupported on this host")
+    }))
 }
 
 /// Spawns [`CONCURRENT_SESSION_COUNT`] `litebox_runner_linux_userland` sessions
