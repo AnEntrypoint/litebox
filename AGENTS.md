@@ -106,18 +106,22 @@ symptom this investigation began from, genuinely not root-caused (`docs/track-b-
 146-152`). The TOP-LEVEL parent's curl-self-test stall (`sys_wait4(pid=-1)` not checking
 `cross_process_children`) is fixed (`6e86a40`) — do not cite that one as open.
 
-**NEW, found live 2026-09-17, full `.wfgy/webtop_stack.sh` boot under `LITEBOX_PROCESS_FORK=1` (a
-new best: reliably reaches `NGINX_STARTED`, past the shared-kernel-heap commit-exhaustion wall
-which is now separately fixed), NOT fixed: a nested variant of the already-fixed curl-self-test
-stall.** Top-level pid 1 blocks reading the `$(curl ...)` self-test's pipe forever; the writer (a
-cross-process-fork child that already finished its own script-visible work) is itself stuck one
-level deeper, inside its own `prepare_for_exit()` reaping ITS OWN (thread-based-forked) child,
-blocked in `RawMutex::block` forever. `6e86a40`'s fix only covers the TOP-LEVEL parent's own
-`wait4`; this is a cross-process child's OWN nested wait4, a locus that fix never touched. Not
-root-caused (two live candidate leads, undistinguished); `XVFB_UP`/`DBUS_UP`/`DE_UP`/browser were
-NOT reached this session as a direct result. Full mechanism, cdb evidence, and a process-hygiene
-lesson (`cdb -p <pid>` alone is INVASIVE — a bare `q` KILLS the debuggee; always use `-pv`/`qd`):
-archive.
+**Still reliably reaches `NGINX_STARTED` under `LITEBOX_PROCESS_FORK=1` (past the
+shared-kernel-heap commit-exhaustion wall, separately fixed), then wedges in the nginx
+self-test retry loop — NOT fixed, and the mechanism first written down here (a nested
+`prepare_for_exit`/`wait4` reap) is RETRACTED, unconfirmed on re-investigation.** A later
+2026-09-17 pass re-ran the identical repro and, using `cdb`'s `-pv`/`qd` non-invasive attach
+correctly, found the actual block site is `RawMutex::block` inside `curl`'s own
+`LinuxShim::perform_network_interaction()` call (contending for the cross-process-shared
+`net_lock`), not `wait4` — the earlier "prepare_for_exit" attribution traced to this optimized
+binary's LTO-driven symbol merging (the same generic `RawMutex::block` call site resolved to
+several different, unrelated-looking enclosing symbols across threads in one dump). Leading
+unconfirmed candidate: `SpinEnabledRawMutex` has no fairness, and each cross-process-fork
+child's own hot-looping `net_worker` thread can win every re-lock race against a freshly-woken
+waiter, starving it indefinitely — not yet confirmed via a direct memory read of `net_lock`'s
+`holder_pid`/`inner`, so no fix was attempted. `XVFB_UP`/`DBUS_UP`/`DE_UP`/browser were NOT
+reached. Full mechanism, both passes' cdb evidence, and the process-hygiene lesson (`cdb -p
+<pid>` alone is INVASIVE — a bare `q` KILLS the debuggee; always use `-pv`/`qd`): archive.
 
 **Fork-after-Xorg PERMANENT freeze — did NOT reproduce 2026-09-17; thread-based-fork-only.** Under
 `LITEBOX_PROCESS_FORK=1` the identical script completed cleanly 2/2 — zero freeze, zero double-free.

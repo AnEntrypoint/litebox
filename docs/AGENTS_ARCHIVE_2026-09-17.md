@@ -1686,3 +1686,99 @@ Host memory: recovered cleanly to ~4.5GB free / 15.6GB total after killing all `
 processes at the end of this investigation (`Stop-Process -Force`, not `cdb`) -- no leaked
 processes, no lingering commit pressure, consistent with every prior session's same cleanup
 discipline.
+
+## Re-investigated 2026-09-17 (later pass): the "nested wait4" read above does NOT hold up --
+## real block site is `net_lock` contention inside `perform_network_interaction`, not `wait4`
+
+Re-ran the identical repro (`.wfgy/webtop_stack.sh`, `LITEBOX_PROCESS_FORK=1`, same flags as
+above) fresh. **Reconfirmed live**: reaches `NGINX_STARTED` reliably (this run: ~120s wall,
+8049 log lines), then wedges permanently in the self-test retry loop -- zero log growth over a
+sustained 50s+ window, and the hung processes were still frozen at the SAME log line many minutes
+later when this investigation ended. Fix D (`4e417d7`) still holds: no lock-orphaning symptom
+recurred (the earlier `net_lock`-left-locked-by-a-killed-process shape this pass's own `cdb`
+evidence would have shown as a *confirmably-dead* `holder_pid`, which is not what was found).
+
+**Live process inventory at hang time** (`Get-Process litebox_runner_linux_on_windows_userland`):
+four survivors. Two are `run_external_fault_watchdog_child` sleep-loop watchdogs (harmless, one
+per real guest-hosting process). The two real ones: the top-level (bootstrap `pid 1`, largest
+working set) and one cross-process-fork child that the log's own `[process_fork_diag]
+task-resume-probe (child, winpid=...)`/`sys_execve ... path=/usr/bin/curl` lines identify
+unambiguously as the nginx self-test's own `curl` invocation.
+
+**cdb evidence, `-pv`/`qd` throughout (both processes confirmed alive and undisturbed
+afterward)**:
+- Top-level: its guest-execution thread is in `Pipes::read` -> `run_on_raw_fd`/`sys_read` ->
+  `litebox::event::polling::wait_on_events` -> `RawMutex::block`, i.e. still genuinely waiting
+  on the self-test's `$(curl ...)` pipe for EOF -- matches the EARLIER pass's own point 1 above.
+  A separate top-level thread (`spawn_fork_child_pipe_pump`) is blocked in a raw `NtReadFile` on
+  the OS-pipe bridge for that same fd, consistent with "waiting on the child to actually close
+  its end."
+- The `curl` cross-process child: its OWN guest-execution thread -- the one running curl's
+  actual `execve`'d image, confirmed by `DIAG_TIMELINE execve ... argv0=/usr/bin/curl` in the
+  log just before the freeze -- is blocked in `RawMutex::block`, reached via
+  `Mutex<SpinEnabledRawMutex>::lock_contended` from **`LinuxShim::perform_network_interaction`**
+  (called synchronously as part of handling curl's own network syscall), NOT from
+  `Process::prepare_for_exit`/`sys_wait4` at all. `perform_network_interaction`'s only lock is
+  `GlobalStateHandle::net_lock()` -- the SAME genuinely-cross-process-shared lock Fix D (instance
+  12) already made owner-death-recoverable.
+
+**This directly contradicts the EARLIER read in this same file** ("stuck inside
+`prepare_for_exit()` -> a `sys_wait4()`-equivalent reap"). Re-examining that evidence: this
+pass's OWN dumps caught the exact same generic `RawMutex::block` call site (used by dozens of
+unrelated call paths -- `wait4`'s blocking loop, `Pipes::read`, `perform_network_interaction`,
+`do_clone`'s `elf_patch_cache` wait, etc.) resolving to wildly different, unrelated-looking
+*enclosing* symbols across different threads in the SAME dump (`ThreadHandle::interrupt+0x194c`,
+`+0x2307`, and even `pty_ioctl+0x7028` all appeared as the return-address frame immediately
+above an identical `RawMutex::block` call in three different, confirmed-unrelated threads this
+pass). This LTO/inlining-driven symbol merging in the release binary is apparently severe enough
+that a frame name a few levels up from `RawMutex::block` is not reliable evidence of which
+logical call site actually blocked -- only a frame that names a real inlined call directly
+(`perform_network_interaction`, `Pipes::read`, `detached_pipe_read`, all confirmed present
+verbatim as their own frames this pass) should be trusted. The earlier pass's "prepare_for_exit"
+attribution was most likely this same artifact, not a real distinct call site; **this file's own
+earlier "13th defect" mechanism description (nested `wait4` reaping a thread-based grandchild)
+is retracted, unconfirmed by this pass's more careful reading** -- there is no live evidence for
+it now, on the identical repro. `arm_cross_process_exit_notifier`/`register_cross_process_child`
+were separately audited this pass (`litebox_shim_linux/src/syscalls/process.rs`): both call sites
+in `do_clone` fire unconditionally whenever `spawn_cross_process_fork_child` succeeds, regardless
+of whether the CALLING process is itself a cross-process-fork child or the true top-level, and
+`ThreadRemote::handle` (the interrupt path `prepare_for_exit`'s SIGCHLD delivery depends on) is
+populated by `EnterShim::init`/`handle_init_request`, which a cross-process child's own resume
+path (`run_thread_with_fork_verification` -> `run_thread_inner` -> ... -> `EnterShim::init`) DOES
+call, same as the ordinary thread-based path -- both mechanisms this pass suspected as the "14th
+defect" turned out to be correctly wired already.
+
+**New, NOT YET root-caused candidate for the real mechanism**: `net_lock` is a plain
+`SpinEnabledRawMutex` (`litebox/src/sync/mutex.rs`) with no fairness/FIFO ordering. Every
+cross-process-fork child (including this `curl` child) ALSO spawns its OWN `net_worker`
+background thread (`litebox_runner_linux_on_windows_userland/src/lib.rs:~1884`, mirroring
+`run()`'s own copy at `~862`) that calls `perform_network_interaction()` in a tight loop,
+breaking only for a sub-millisecond `wait_on_tun` when the platform reports nothing more to do
+immediately (`CallAgainImmediately` vs `WaitOnDeviceOrSocketInteraction`). `unlock()`
+(`SpinEnabledRawMutex::unlock`) calls `wake_one()` on a contended release but does NOT hand the
+lock off atomically -- the very next `try_lock()`/`lock_contended()` fast-path CAS from ANY
+thread (including the SAME hot-looping `net_worker` that just released it) can win the race back
+to "locked" before the just-woken waiter's OS thread is scheduled, with no starvation bound. This
+is a self-consistent, plausible explanation for curl's guest thread being starved indefinitely by
+its OWN process's net_worker thread (a same-process race, not even requiring the cross-process
+`resolve_waiter_event`/`DuplicateHandle` path to be involved) -- but it was **not directly
+confirmed** this pass: doing so needs a live memory read of `net_lock`'s `holder_pid`/`inner`
+fields at hang time (their address is computable from the fixed-base shared kernel arena's own
+base plus `GlobalState.net`'s known offset, not attempted this pass -- out of session budget) to
+distinguish "still legitimately re-locked every microsecond by net_worker" from "already
+unlocked, a wake was actually lost." **No fix was shipped this pass** -- the mechanism is
+plausible but unconfirmed, and this lock's fairness semantics are exactly the kind of change
+(`AGENTS.md`'s own graceful-shutdown-fix-that-was-wrong precedent) that must not be guessed at
+without first pinning down which of the two shapes above is real.
+
+`XVFB_UP`/`DBUS_UP`/`DE_UP`/browser/terminal/apps were NOT reached this pass either, for the same
+reason as the earlier one (this exact hang, whichever its real mechanism, still blocks the boot
+at the identical point). Host memory recovered cleanly to ~4.4GB free / 15.6GB total after
+`Stop-Process -Force` on all four survivors; no leaks.
+
+**Pickup for next session**: attach `cdb -pv -p <curl-child-pid>` BEFORE it exits (e.g. right
+after its `sys_execve` log line, well before the hang would normally set in) or immediately after
+the hang, and read `GlobalState.net`'s embedded `RawMutex` bytes directly (`inner: AtomicU32` at
+offset 0, `holder_pid: AtomicU32` near the end of the struct -- see
+`litebox_platform_windows_userland/src/lib.rs`'s `RawMutex` definition for the exact layout) to
+settle starvation-vs-lost-wake conclusively before attempting any fix.
