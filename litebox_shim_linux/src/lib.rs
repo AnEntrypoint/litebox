@@ -2831,6 +2831,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
         guard.rebind_per_process_fields(&self.litebox);
         guard
     }
+
+    /// Rebind the shared `Pipes`'s `litebox` handle to THIS process's own, always-locally-valid
+    /// state before handing out access -- same "rebind a stale-in-shared-memory pointer field
+    /// before every use" shape as [`Self::net_lock`], for `litebox::pipes::Pipes` instead of
+    /// `litebox::net::Network`. See [`litebox::pipes::Pipes`]'s own doc comment for the live crash
+    /// evidence (`STATUS_ACCESS_VIOLATION` inside a per-process descriptor table's own `Drop`,
+    /// reached while tearing down an inherited stdio pipe). Every call site that used to reach
+    /// `GlobalState.pipes` directly must go through this instead.
+    pub(crate) fn pipes(&self) -> &litebox::pipes::Pipes<Platform> {
+        self.pipes.rebind_per_process_fields(&self.litebox);
+        &self.pipes
+    }
 }
 
 struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {

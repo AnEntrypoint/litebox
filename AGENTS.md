@@ -203,8 +203,9 @@ live-verified NAMED-event mutex primitive, still unwired (its own doc comment: i
 
 `RawMutex` no longer calls `WaitOnAddress`/`WakeByAddressSingle` (process-local per MSDN) --
 replaced with a manual wait queue plus one auto-reset kernel `Event` per OS thread; cross-process
-half is real code (`DuplicateHandle`-based) but genuinely untaken today (same-pid always true so
-far). Live-verified: `yes hello | head -c 5000000 | wc -c`, `sort --parallel=4` multithreaded
+half is real code (`DuplicateHandle`-based), now genuinely live and fixed once (see "RawMutex
+lost-wakeup" below -- the wait-queue storage itself had to become pointer-free once cross-process
+contention became real). Live-verified: `yes hello | head -c 5000000 | wc -c`, `sort --parallel=4` multithreaded
 contention, both exact/correct, no hang/deadlock. `process-fork-pipe-relay-sigpipe-above-4kb`
 (3-stage pipeline SIGPIPE) resolved 2026-09-16, don't rely on `LITEBOX_PROCESS_FORK=1` for
 heavy-iteration guests. Full internals: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
@@ -260,121 +261,66 @@ Decisive live proof: parent registers one key immediately before `spawn_cross_pr
 a second strictly after; child observes both right after its own `build()` -- proves genuine live
 sharing, not a snapshot.
 
-## Cross-process-fork stack-overflow class -- ROOT-CAUSED AND FIXED 2026-09-17
+## Cross-process fork: eight registry/pointer fixes converging on one root pattern, 2026-09-17
 
-The pre-existing, load-scaling `thread '<unknown>' has overflowed its stack` crash above (122
-occurrences by `XVFB_FAILED`) is **NOT** stack-size, `fork_verify` single-stepping, or memory
-pressure -- every cross-process fork child after the family's first died chasing
-`GlobalStateHandle`'s `litebox: LiteBox<Platform>` field: `LiteBox<Platform>` is
-`Platform::Handle<LiteBoxX<Platform>>` (an `Arc` pointer), and `GlobalState.litebox` placed that
-pointer's literal bytes inline in the cross-process-shared arena at CREATE time -- an ATTACHing
-child read back the FIRST creator's pointer VALUE, meaningless in its own address space, and
-chasing its garbage `RwLock` internals is what consumed the stack. **This is THE pattern reused
-for every fix below**: `GlobalState` loses the field entirely; `GlobalStateHandle` carries its own
-copy instead, populated from THIS process's own per-process source on every path (attach or
-create) -- Rust's field resolution tries the receiver's own concrete type before auto-`Deref`ing,
-so this SHADOWS the removed `GlobalState` field transparently; no external call site needs to
-change beyond widening its parameter type from `&GlobalState<..>` to `&GlobalStateHandle<..>`.
-Also fixed same-session, same pattern: `proc_self_info`/`pts_registry` (a second,
-doc-comment-predicted instance -- `default_fs` mounts `/proc/self`+`/dev/pts` with
-`LinuxShimBuilder`'s own per-process copies before `build()`'s attach-or-create decision).
+All eight are the SAME defect class -- a raw `Arc`/`Box` pointer captured once by whichever process
+constructs `GlobalState` first, frozen into cross-process-shared bytes, meaningless (or dangling) in
+every other attaching process -- found and fixed one layer deeper each time, isolated with a minimal
+`-Z --oci-image debian:stable-slim -- /bin/bash -c 'mkdir ...'` repro under `LITEBOX_PROCESS_FORK=1`.
+The fix pattern throughout: either shadow the field on `GlobalStateHandle` with a fresh per-process
+copy (correct when the state genuinely doesn't need cross-process visibility), or rebind it in place
+via a locking accessor (`net_lock`/`pipes()`) when it does. In order found: **1-2** `litebox: LiteBox
+<Platform>` (root-caused the load-scaling `overflowed its stack` crash, 122+ occurrences) and
+`proc_self_info`/`pts_registry` -- shadowed on `GlobalStateHandle`. **3-5** `elf_patch_cache`/
+`exec_ranges_cache`/`segment_scan_cache` (`BTreeMap`s, real panics/hangs in ELF-load) -- shadowed,
+same pattern; plus an unrelated same-session fix, trampoline placement (`maybe_patch_exec_segment`'s
+`MAP_FIXED_NOREPLACE` fallback could land a trampoline outside JMP rel32 range; fixed via
+`Task::probe_nearby_trampoline_slot`). **6-7** `Network.litebox`/`Network.device` (real WER
+`0xc0000005` faults, `Descriptors::iter_mut`/`receive_ip_packet`) -- `Network` itself is genuinely
+shared, so these two fields are REBOUND via `Network::rebind_per_process_fields`, called from
+`GlobalStateHandle::net_lock`. **8** (this session) `RawMutex.waiters`/`Pipes.litebox` -- see below.
+Does NOT close `XVFB_FAILED`/`DBUS_FAILED`; `pty_registry`/`flock_registry`/etc. remain real,
+still-open follow-on work. Full panic signatures, bisection transcripts and WER/symbolizer evidence
+per fix: archive.
 
-**Live-verified fixed**: two independent full `.wfgy/webtop_stack.sh` boots under
-`LITEBOX_PROCESS_FORK=1`, zero `overflowed its stack` occurrences in either (previously 122+ by
-`XVFB_FAILED` alone). Full bisection transcript: archive.
+## RawMutex lost-wakeup and Pipes stale-pointer -- BOTH FIXED 2026-09-17; FutexManager sharing gap found, NOT fixed
 
-## Four more registries/subsystems fixed the SAME session, 2026-09-17 (`34129ed`, `33bc57f`)
+**A. `RawMutex::resolve_waiter_event` cross-process branch -- FIXED.** Was: `RawMutex.waiters:
+Mutex<Vec<WaiterRecord>>`'s `Vec` buffer is process-private-heap, so a `RawMutex` embedded in
+cross-process-shared memory (any `litebox::sync::Mutex`/`RwLock` field of `GlobalState`) let an
+attaching process's `wake_many` read a bogus pid and PANIC on `OpenProcess` failure -- the real
+waiter (blocked in `RawMutex::block` via `do_clone`/`with_fork_duplicate_claim_owner`, confirmed live
+via `cdb -p`) was never signaled. Ninth instance of the nested-collection-on-private-heap class. Fix:
+`waiters` is now `WaiterQueue`, a fixed-32-slot pointer-free array guarded by a pure spin-CAS lock
+(no nested OS-backed lock); `resolve_waiter_event` returns `Option<HANDLE>` and logs+skips instead of
+panicking; the handle-dedup cache moved to a process-local `static` keyed by mutex address. Live-
+verified reachable and non-fatal (the "queue full" fallback engaged live, zero panics). Full mechanism
+and live evidence: archive.
 
-With the stack overflow gone, boots progressed further and hit the SAME root cause one field at a
-time -- each isolated with a minimal `-Z --oci-image debian:stable-slim -- /bin/bash -c 'mkdir -p
-...'` repro under `LITEBOX_PROCESS_FORK=1` (much cheaper than a full webtop boot per iteration),
-fixed with the SAME `GlobalStateHandle`-shadow-field pattern as `litebox`/`proc_self_info`/
-`pts_registry`, rebuilt, re-verified live after each. Full panic signatures and mechanism per fix:
-archive. Summary:
+**B. `Pipes` stale-`litebox`-pointer -- FIXED.** Tenth instance, found live while verifying A: a
+`mkdir` fork child was silently `Killed`, WER showed a real `0xc0000005`, `llvm-symbolizer` resolved
+it to `Vec<Option<IndividualEntry<WindowsUserland>>>::drop` -- `litebox::pipes::Pipes`'s `litebox`
+field, captured once at construction (same defect `Network::rebind_per_process_fields` already fixed
+twice), was stale/dangling when a killed process's inherited stdio pipe tore down. Fix: `Pipes.litebox`
+is now interior-mutable (`litebox::sync::Mutex`-wrapped); `GlobalStateHandle::pipes()` rebinds before
+every access, same shape as `net_lock`. Live-verified: the same repro's `d1` now exits cleanly
+(`exiting with encoded status 0xc0de0000`) instead of crashing. Full mechanism: archive.
 
-- **`elf_patch_cache`** (`BTreeMap<(pid,fd), ElfPatchState>`): real panic in `.entry().or_insert()`.
-  Keyed by `(pid, fd)` already, holds absolute per-process addresses -- per-process storage is
-  CORRECT, not just safe.
-- **`exec_ranges_cache`** (`BTreeMap<(dev,ino), Arc<Vec<Range<u64>>>>`): same panic signature, next
-  field down. Values are a pure function of a file's own ELF headers -- only cache reuse is lost.
-- **`segment_scan_cache`** (`BTreeMap<SegmentScanKey, Arc<SegmentScanTemplate>>`): with the above
-  two fixed, stopped panicking but HUNG instead (corrupted `BTreeMap` walking a cyclic chain). Same
-  fix.
-- **Trampoline placement** (not a registry -- found right after the three caches above stopped
-  blocking ELF loading): `maybe_patch_exec_segment`'s `MAP_FIXED_NOREPLACE` fallback discarded its
-  proximity hint entirely on failure, landing a trampoline up to ~127 TiB away (`distance >
-  0x7FFF_0000`, past JMP rel32 range) and poisoning the segment's syscalls. Fixed by
-  `Task::probe_nearby_trampoline_slot` (`litebox_shim_linux/src/syscalls/mm.rs`): a local, bounded
-  probe at exponentially-increasing offsets, capped at 24 rounds. Zero recurrence over 5 iterations
-  (was 100%).
+**C. `FutexManager` cross-process sharing -- CONFIRMED live via `cdb -p`, NOT fixed, real design
+work needed.** With A and B both fixed, the identical repro still hangs one step later:
+`FutexManager::wake` -> `LoanList::extract_if` -> `RawMutex::block`, permanently blocked (second
+thread blocked the same way as A, via `do_clone`). Eleventh instance at the outer level
+(`FutexManager.table: Box<[LoanList<...>; N]>` is process-private-heap), but `LoanList` itself is
+structurally deeper: entries are "allocated once by the caller, potentially on the stack" (its own
+doc comment) -- a `FutexEntry` a guest thread registers is commonly stack-allocated, which has NO
+"move it to the shared arena" fix (unlike every prior instance this session). Genuine cross-process
+futex sharing likely needs a different wait-registration mechanism entirely (a flat, fixed-slot,
+copy-not-borrow registry, or scoping cross-process futex support to `FUTEX_PRIVATE_FLAG`-only and
+falling back to thread-based fork otherwise) -- not attempted, needs its own investigation. Full
+mechanism and live evidence: archive.
 
-**Does NOT close `XVFB_FAILED`/`DBUS_FAILED`.** The intermittent silent-kill/hang shape above is now
-diagnosed with real evidence (WER events, `llvm-symbolizer`, live `cdb -p` attach). The "six
-remaining registries" hypothesis this file previously carried was WRONG for the silent-kill case and
-UNCONFIRMED for the hang -- real root causes below. `pty_registry`/`flock_registry`/etc. remain
-real, still-open follow-on work but were NOT what plain `mkdir` was hitting.
-
-## Silent-kill mechanism -- ROOT-CAUSED AND FIXED 2026-09-17 (seventh and eighth instances of the SAME defect class)
-
-`Get-WinEvent -LogName Application -Id 1000` showed real `0xc0000005` host faults at the exact
-moments a guest `mkdir` fork was reported `Killed` with zero litebox diagnostic (no `diag-unrecov-av`
-lines anywhere -- VEH did not intervene; not investigated further). `llvm-symbolizer
---relative-address` against the WER `Fault offset` (matching on-disk binary+pdb) resolved two real
-symbols: `Descriptors::iter_mut::<Network<WindowsUserland>>`'s closure (via
-`Network::close_pending_sockets`) and `litebox_platform_windows_userland::net::receive_ip_packet`
-(via `phy::Device::receive`). Root cause: **seventh and eighth instances of the identical
-cross-process-stale-pointer defect** fixed six times already (`litebox`/`proc_self_info`/
-`pts_registry`/`elf_patch_cache`/`exec_ranges_cache`/`segment_scan_cache`), found one level deeper --
-inside `litebox::net::Network`, which IS itself genuinely, correctly shared (one virtual NIC for the
-whole guest) via `GlobalState.net: Mutex<Network<Platform>>`, but whose OWN `litebox: LiteBox<Platform>`
-(captured once at `Network::new`, used to reach the PER-PROCESS `descriptor_table()`) and `device:
-phy::Device<Platform>` (holds `platform: &'static Platform`) fields are raw pointers an attaching
-cross-process-fork child inherits verbatim from the first creator.
-
-Fix: `Network::rebind_per_process_fields(&mut self, litebox: &LiteBox<Platform>)`
-(`litebox/src/net/mod.rs`) resets both to the calling process's own valid state (`device` rebuilt
-wholesale via `phy::Device::new` -- cheap, no state worth preserving across a rebind).
-`GlobalStateHandle::net_lock(&self)` (`litebox_shim_linux/src/lib.rs`) locks `GlobalState.net` and
-calls this before returning the guard; all ~34 call sites that used `GlobalState.net.lock()`
-directly now go through `net_lock()` (one test-only site in `syscalls/tests.rs` deliberately left
-alone). `Network`'s OTHER fields (`socket_set`, `interface`) remain genuinely shared -- do NOT reset
-them, they hold the guest's actual live connections. Live-verified: the same repro that hit both
-crash sites no longer hits either after the fix -- the failure surface moved two layers deeper, to
-the two mechanisms below. Full investigation trail, including a `cargo build`/`tail`-pipe exit-code
-pitfall hit while verifying: archive.
-
-## Two deeper, CONFIRMED, NOT-YET-FIXED mechanisms found immediately behind the fix above (2026-09-17)
-
-Both found via the SAME 10-sequential-`mkdir` repro against the fixed binary; both are separate from
-each other and from every fix above. Neither was fixed this session -- both need real design work,
-not a quick shadow-field patch, and guessing wrong here risks a silent correctness bug rather than a
-crash (this file's own standing caution). Get an exact mechanism before touching either.
-
-**A. `RawMutex::resolve_waiter_event` cross-process branch is broken -- causes a genuine lost-wakeup
-hang (LOW/FLAT host CPU).** Real panic, `litebox_platform_windows_userland/src/lib.rs:6209`:
-`OpenProcess(PROCESS_DUP_HANDLE) on waiter process 8 failed: 87` -- PID 8 is not a real litebox
-process. This is the "Cross-process-capable `RawMutex`" work's own cross-process branch, documented
-as untaken until real multi-process contention exists -- it now does, and this is its first live
-exercise. Plausibly a ninth instance of the nested-collection stale-pointer class
-(`RawMutex.waiters: Mutex<Vec<WaiterRecord>>` is private-heap-backed like the others), but NOT
-confirmed to that precision (the read didn't crash, which a wild pointer normally would). Confirmed
-IMPACT via live `cdb -p`: a separate thread genuinely blocked in `RawMutex::block` via
-`ThreadProvider::with_fork_duplicate_claim_owner` -> `do_clones` (real fork sync code), never woken
--- the panicking thread was almost certainly the one that would have delivered that wakeup.
-
-**B. A separate host allocator livelock (CLIMBING CPU), confirmed via live `cdb -p` on a different
-hung fork child.** Two threads stuck inside `SafeZoneAllocator::alloc` (`#[global_allocator]`,
-`SpinMutex<ZoneAllocator>`-backed, private per-process heap). One reached it from INSIDE
-`slabmalloc::ZoneAllocator::deallocate`'s own panic-formatting path (a real `panic!()` fired during
-`deallocate`, and formatting that message re-enters the same allocator). Leading, UNCONFIRMED
-hypothesis: the fork snapshot (`PageManager::duplicate`/`copy_one_group`) can capture the parent's
-heap while its allocator `SpinMutex` is HELD by a thread whose call stack isn't part of what the
-child resumes -- the child inherits a permanently-locked spinlock nothing will ever unlock.
-
-Neither fixed this session -- both need real design work (fork-time allocator quiescence or a
-different snapshot strategy for B; the same flat, pointer-free redesign as
-`SharedUnixAddrPresenceTable` for A), not a shadow-field patch. Full stacks, reasoning and a
-concrete next-session repro/verification plan: archive.
+Previously-recorded allocator livelock (`SafeZoneAllocator::alloc`, `SpinMutex<ZoneAllocator>`,
+CLIMBING CPU) not re-investigated this pass -- still open, full detail: archive.
 
 ## Closed — do not re-attempt without a genuinely new approach
 

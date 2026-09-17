@@ -1337,3 +1337,107 @@ without elevation). Windows Defender was checked as a possible silent-kill culpr
 and showed ONLY routine health-report events (ids 1150/1151), no detection/action events -- this
 rules OUT a Defender quarantine/kill action for these specific crashes (the REAL mechanism was the
 host AV `0xc0000005` faults above, confirmed via `Application Error` id 1000, not Defender).
+
+## RawMutex cross-process lost-wakeup -- ROOT-CAUSED AND FIXED (attribution: lanmower)
+
+Confirmed mechanism (session continuing from "Two deeper, CONFIRMED, NOT-YET-FIXED mechanisms"
+above): `RawMutex.waiters` was `Mutex<Vec<WaiterRecord>>` (`litebox_platform_windows_userland/src/
+lib.rs`). `RawMutex` instances are now genuinely embedded in cross-process-shared memory (any
+`litebox::sync::Mutex<Platform, T>`/`RwLock` field of `GlobalState` -- `net`, `sysv_shm`,
+`unix_addr_table` -- places its inline `RawMutex` bytes in the fixed-base shared kernel arena via
+`SharedArc`). `Vec`'s backing buffer is ordinary process-private-heap-allocated by whichever process
+calls `push`, so an attaching process's `wake_many` read a pointer meaningful only in the first
+process's address space -- decoded a bogus small `pid` (`8`), and `resolve_waiter_event`'s
+`assert!`-based `OpenProcess` failure handling PANICKED on the waker's own thread, so the real
+waiter (blocked in `RawMutex::block` via `do_clone`/`with_fork_duplicate_claim_owner`, confirmed
+live via `cdb -p`) was never signaled -- a genuine, permanent lost wakeup. Ninth confirmed instance
+of this session's nested-collection-on-private-heap defect class.
+
+Fix: `RawMutex.waiters` is now `WaiterQueue`, a fixed-32-slot, pointer-free array of atomics guarded
+by a pure spin-CAS lock (no nested OS-backed lock, which would reintroduce the same process-local-
+primitive defect one layer down) -- `push_locked`/`remove_locked`/`drain_locked` replace
+`Vec::push`/`position`+`remove`/`drain`. `resolve_waiter_event` now returns `Option<HANDLE>` and
+logs+skips (never panics) when `OpenProcess`/`DuplicateHandle` fails -- both because a panic on this
+guest-reachable path violates the project's own standing "guest-reachable code returns an errno,
+never a panic" rule, and because even with the storage bug fixed, a waiter's process can legitimately
+exit between registering and being woken. The former `remote_waiter_handles: Mutex<Vec<(WaiterRecord,
+isize)>>` field (a second instance of the SAME bug, one level down: a duplicated `HANDLE` is only
+valid in the process that made it, so caching it inline in shared bytes let one process read
+another's fabricated handle value) is now `REMOTE_WAITER_HANDLES`, a process-local `static` keyed by
+`(self: *const RawMutex as usize, WaiterRecord)`. `block_or_maybe_timeout` falls back to a bounded,
+correct-by-construction polling loop (`poll_until_value_changes`, 200us interval) if all 32 waiter
+slots are ever full, rather than panicking or dropping the registration.
+
+Live-verified reachable and non-fatal: `LITEBOX_PROCESS_FORK=1`, `-Z --oci-image debian:stable-slim
+-- /bin/bash -c` ten sequential `/bin/mkdir` calls (external-binary forks, not the shell builtin) hit
+`RawMutex::block_or_maybe_timeout: waiter queue full, falling back to polling` live, at 0.17s into a
+child's run -- zero panics, zero `OpenProcess`-failure aborts, execution continued past the point the
+OLD code would have panicked. (Whether 32 concurrent waiters on one `RawMutex` this early reflects
+expected contention or a slower-draining path worth widening is unconfirmed; not chased further this
+session -- the fallback engaging correctly, with no hang and no panic, is the load-bearing fact.)
+
+## Pipes cross-process stale-litebox-pointer -- ROOT-CAUSED AND FIXED (attribution: lanmower)
+
+Tenth confirmed instance of the SAME defect class, found live while verifying the RawMutex fix
+above: the ten-sequential-mkdir repro's first child (d1) was silently Killed by the guest's own
+shell -- WER (`Get-WinEvent -LogName Application -Id 1000`) showed a real 0xc0000005 at the exact
+moment, with NO litebox VEH diagnostic at all (matches this file's earlier-documented "seventh/eighth
+instance" silent-kill shape exactly). `llvm-symbolizer --relative-address --obj=<matching .exe>
+<fault-offset>` (binary snapshotted at crash time, per this repo's own symbolizer-tool warning)
+resolved the fault to `Vec<Option<litebox::fd::IndividualEntry<WindowsUserland>>>::drop` -- i.e. a
+per-process `Descriptors` table's own teardown, during the killed process's exit.
+
+Root cause: `litebox::pipes::Pipes<Platform>` (a `GlobalState` field, genuinely shared like `Network`)
+held a plain `litebox: LiteBox<Platform>` captured ONCE at construction -- the exact same "raw Arc
+pointer frozen into shared bytes by whichever process constructs `GlobalState` first" defect already
+found and fixed twice for `Network` (`litebox`/`device` fields, see `Network::
+rebind_per_process_fields`'s own doc comment) -- just never yet applied to `Pipes`. Tearing down an
+inherited stdio pipe end during process exit dereferences this stale/dangling pointer.
+
+Fix, same shape as `net_lock`: `Pipes.litebox` is now `litebox::sync::Mutex<Platform,
+LiteBox<Platform>>` (interior-mutable so it can be corrected via `&self`); `Pipes::
+rebind_per_process_fields(&self, litebox: &LiteBox<Platform>)` overwrites it;
+`GlobalStateHandle::pipes(&self) -> &Pipes<Platform>` (`litebox_shim_linux/src/lib.rs`) rebinds
+before returning access -- every one of the 9 `Pipes` methods that touched `self.litebox` now binds
+a fresh local clone off the (now-correct) `Mutex`-guarded field first. All call sites across
+`syscalls/{file,pipe,epoll}.rs` (~15) changed from `.pipes.` (direct field) to `.pipes()` (rebinding
+accessor) -- mechanical, `.pipes()` is an inherent method on `GlobalStateHandle` found before Rust's
+method-resolution auto-derefs to the `GlobalState` field of the same name, so no ambiguity.
+
+Live-verified: re-running the identical repro against the rebuilt binary, d1 no longer crashes --
+`task-resume-probe (child): exiting with encoded status 0xc0de0000` (clean exit) where the previous
+run showed Killed with a WER 0xc0000005 at the same point. Zero new WER events across this run.
+
+## FutexManager cross-process sharing -- CONFIRMED live, NOT fixed, real design work needed (attribution: lanmower)
+
+Found live immediately after the Pipes fix above unblocked d1's exit: d2 (or a later child) still
+hangs -- `cdb -p` attach (twice, ~20s apart, identical stacks both times) shows the SAME persistent
+pattern as the original RawMutex finding, but now reached via a DIFFERENT call chain: one thread
+permanently blocked in `RawMutex::block`, reached via `litebox::sync::futex::FutexManager::wake` ->
+`LoanList::extract_if`'s closure; a second thread permanently blocked in `RawMutex::block` via
+`do_clone`/`with_fork_duplicate_claim_owner` (the same frame as the original finding). Host CPU on
+the process climbs slowly and steadily (not the earlier livelock's fast climb), consistent with
+`RawMutex`'s new `poll_until_value_changes` fallback engaging for ONE contended lock while a SECOND,
+different lock (or the same one from a second angle) is never released -- i.e. this is NOT the same
+bug the RawMutex/Pipes fixes above addressed; it reproduces identically with both already applied.
+
+Root cause, NOT yet fixed (confirmed via code reading, `litebox/src/sync/futex.rs` +
+`litebox/src/utilities/loan_list.rs`): `FutexManager<Platform>` (`GlobalState` field, genuinely
+cross-process-shared like `Network`/`Pipes`/`net`) stores `table: alloc::boxed::Box<[LoanList
+<Platform, FutexEntry<Platform>>; HASH_TABLE_ENTRIES]>` -- an eleventh instance of the
+nested-collection-on-private-heap defect at the OUTER level (the `Box`'s allocation is
+process-private, same as `elf_patch_cache`/`RawMutex.waiters`/etc. before their fixes). But
+`LoanList<Platform, T>` itself (`Mutex<Platform, LinkedList<EntryData<Platform, T>>>`) is a much
+deeper structural problem, NOT just a container-needs-flattening one: its own doc comment states
+entries are "allocated once by the caller, potentially on the stack" and inserted via a pinned,
+intrusive `LoanListEntry` -- i.e. a `FutexEntry` a guest thread registers while waiting is commonly
+allocated on THAT THREAD'S OWN STACK, which is Windows-process-private by construction, with no
+"place it in the shared arena" fix available at all (unlike every other instance this session, where
+the fix was moving/flattening a heap allocation). Genuine cross-process futex sharing (real Linux's
+non-FUTEX_PRIVATE_FLAG semantics) is very likely NOT representable by `LoanList`'s current design at
+all -- this needs a different wait-registration mechanism (candidates: a
+`SharedUnixAddrPresenceTable`-style flat, fixed-slot, copy-not-borrow registry storing FutexEntry
+VALUES inline rather than pinning caller-owned memory, or explicitly scoping cross-process futex
+support out via FUTEX_PRIVATE_FLAG-only semantics and falling back to thread-based fork for anything
+that needs more) -- real design work, not a shadow-field patch, and guessing wrong here risks silent
+futex mis-wakes rather than a crash. Not attempted this session; needs its own investigation.

@@ -32,8 +32,33 @@ use crate::{
 };
 
 /// Support for unidirectional communication channels
+///
+/// # Why `litebox` is a `Mutex`, not a plain field
+///
+/// `Pipes` is a `GlobalState` field (`litebox_shim_linux`), so in a cross-process-fork guest its
+/// bytes -- this `litebox` field included -- are placed inline in the fixed-base shared kernel
+/// arena, genuinely readable/writable by every process in the fork family at the same address. A
+/// plain `litebox: LiteBox<Platform>` captured once at construction (the earlier design) is exactly
+/// the defect class already found and fixed twice this same investigation, one/two levels deeper
+/// inside `litebox::net::Network` (`Network::rebind_per_process_fields`'s own doc comment has the
+/// full mechanism and live crash evidence: `LiteBox<Platform>` is `Platform::Handle<LiteBoxX<...>>`,
+/// effectively an `Arc` pointer, so the FIRST process to construct `GlobalState` freezes its own
+/// pointer value into shared bytes forever -- every OTHER process, including one attaching after
+/// the first has since exited, inherits a meaningless or genuinely dangling pointer). Live-caught
+/// here too: `STATUS_ACCESS_VIOLATION` (0xc0000005) inside `Vec<Option<litebox::fd::IndividualEntry
+/// <WindowsUserland>>>::drop` on a plain `mkdir` cross-process-fork child with only its inherited
+/// stdio pipes, zero sockets -- `Descriptors` itself is genuinely per-process (see
+/// `Network::rebind_per_process_fields`'s doc comment), but tearing down a pipe's `WriteEnd` during
+/// that per-process table's own `Drop` reaches back into `Pipes::close`-equivalent logic through
+/// this same stale `litebox` pointer.
+///
+/// The fix: `litebox` is wrapped so it can be corrected in place via `&self`
+/// ([`Self::rebind_per_process_fields`]) rather than only readable -- `GlobalStateHandle::pipes`
+/// (`litebox_shim_linux`) rebinds it to THIS process's own, always-locally-valid `LiteBox` before
+/// every access, the same "lock and rebind before handing out access" shape as
+/// `GlobalStateHandle::net_lock`.
 pub struct Pipes<Platform: RawSyncPrimitivesProvider + TimeProvider> {
-    litebox: LiteBox<Platform>,
+    litebox: Mutex<Platform, LiteBox<Platform>>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
@@ -43,8 +68,17 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     /// and the created `Pipes` handle is expected to be shared across all usage over the system.
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
         Self {
-            litebox: litebox.clone(),
+            litebox: Mutex::new(litebox.clone()),
         }
+    }
+
+    /// Rebinds this `Pipes`'s `litebox` handle to the CALLING process's own, always-correct
+    /// `LiteBox`. See this struct's doc comment for why a value captured once at construction goes
+    /// stale (or dangling) in every other process of a cross-process-fork family. Every real call
+    /// site goes through `GlobalStateHandle::pipes` (`litebox_shim_linux`), which calls this before
+    /// returning access -- never call the 9 methods below through a path that skips it.
+    pub fn rebind_per_process_fields(&self, litebox: &LiteBox<Platform>) {
+        *self.litebox.lock() = litebox.clone();
     }
 
     /// Create a unidirectional communication channel for sending messages of (slices of) bytes.
@@ -70,7 +104,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
             new_pipe::<Platform, u8>(capacity, OFlags::from(flags), atomic_slice_guarantee_size);
         let sender = PipeEnd::Sender(sender);
         let receiver = PipeEnd::Receiver(receiver);
-        let mut dt = self.litebox.descriptor_table_mut();
+        let litebox = self.litebox.lock().clone();
+        let mut dt = litebox.descriptor_table_mut();
         let sender = dt.insert(sender);
         let receiver = dt.insert(receiver);
         (sender, receiver)
@@ -80,7 +115,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     ///
     /// Future operations on the `fd` will start to return `ClosedFd` errors.
     pub fn close(&self, fd: &PipeFd<Platform>) -> Result<(), errors::CloseError> {
-        let removed = self.litebox.descriptor_table_mut().remove(fd);
+        let litebox = self.litebox.lock().clone();
+        let removed = litebox.descriptor_table_mut().remove(fd);
         // `unique` is the invariant that decides whether the guest on the other end gets EOF:
         // only a unique entry is actually dropped here, and only that drop runs `WriteEnd::drop`.
         // A `false` on what should be the last close means some other descriptor-table duplicate
@@ -103,7 +139,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         fd: &PipeFd<Platform>,
         buf: &mut [u8],
     ) -> Result<usize, errors::ReadError> {
-        let dt = self.litebox.descriptor_table();
+        let litebox = self.litebox.lock().clone();
+        let dt = litebox.descriptor_table();
         let p = match &dt.get_entry(fd).ok_or(errors::ReadError::ClosedFd)?.entry {
             PipeEnd::Receiver(p) => Arc::clone(p),
             PipeEnd::Sender(_) => return Err(errors::ReadError::NotForReading),
@@ -121,7 +158,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         fd: &PipeFd<Platform>,
         buf: &[u8],
     ) -> Result<usize, errors::WriteError> {
-        let dt = self.litebox.descriptor_table();
+        let litebox = self.litebox.lock().clone();
+        let dt = litebox.descriptor_table();
         let p = match &dt.get_entry(fd).ok_or(errors::WriteError::ClosedFd)?.entry {
             PipeEnd::Sender(p) => Arc::clone(p),
             PipeEnd::Receiver(_) => return Err(errors::WriteError::NotForWriting),
@@ -150,7 +188,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         &self,
         fd: &PipeFd<Platform>,
     ) -> Result<DetachedPipeEnd<Platform>, errors::ClosedError> {
-        let dt = self.litebox.descriptor_table();
+        let litebox = self.litebox.lock().clone();
+        let dt = litebox.descriptor_table();
         let end = match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
             PipeEnd::Receiver(p) => PipeEnd::Receiver(Arc::clone(p)),
             PipeEnd::Sender(p) => PipeEnd::Sender(Arc::clone(p)),
@@ -163,7 +202,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         &self,
         fd: &PipeFd<Platform>,
     ) -> Result<HalfPipeType, errors::ClosedError> {
-        let dt = self.litebox.descriptor_table();
+        let litebox = self.litebox.lock().clone();
+        let dt = litebox.descriptor_table();
         match dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
             PipeEnd::Sender(_) => Ok(HalfPipeType::SenderHalf),
             PipeEnd::Receiver(_) => Ok(HalfPipeType::ReceiverHalf),
@@ -172,7 +212,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
 
     /// Get the flags set on the pipe at `fd`.
     pub fn get_flags(&self, fd: &PipeFd<Platform>) -> Result<Flags, errors::ClosedError> {
-        let dt = self.litebox.descriptor_table();
+        let litebox = self.litebox.lock().clone();
+        let dt = litebox.descriptor_table();
         let oflags = match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
             PipeEnd::Receiver(p) => p.get_status(),
             PipeEnd::Sender(p) => p.get_status(),
@@ -189,7 +230,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         mask: Flags,
         on: bool,
     ) -> Result<(), errors::ClosedError> {
-        let dt = self.litebox.descriptor_table();
+        let litebox = self.litebox.lock().clone();
+        let dt = litebox.descriptor_table();
         match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
             PipeEnd::Receiver(p) => p.set_status(OFlags::from(mask), on),
             PipeEnd::Sender(p) => p.set_status(OFlags::from(mask), on),
@@ -203,7 +245,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         fd: &PipeFd<Platform>,
         f: impl FnOnce(&dyn IOPollable) -> R,
     ) -> Result<R, errors::ClosedError> {
-        let dt = self.litebox.descriptor_table();
+        let litebox = self.litebox.lock().clone();
+        let dt = litebox.descriptor_table();
         match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
             PipeEnd::Receiver(p) => Ok(f(p)),
             PipeEnd::Sender(p) => Ok(f(p)),

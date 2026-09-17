@@ -1641,7 +1641,7 @@ mod test {
         let (task, epoll) = setup_epoll();
         let (producer, consumer) =
             task.global
-                .pipes
+                .pipes()
                 .create_pipe(2, litebox::pipes::Flags::empty(), None);
         let consumer = Arc::new(consumer);
         let reader = super::EpollDescriptor::Pipe(Arc::clone(&consumer));
@@ -1663,7 +1663,7 @@ mod test {
             std::thread::sleep(core::time::Duration::from_millis(100));
             assert_eq!(
                 global
-                    .pipes
+                    .pipes()
                     .write(&WaitState::new(platform()).context(), &producer, &[1, 2])
                     .unwrap(),
                 2
@@ -1680,7 +1680,7 @@ mod test {
             .unwrap();
         let mut buf = [0; 2];
         task.global
-            .pipes
+            .pipes()
             .read(&WaitState::new(platform()).context(), &consumer, &mut buf)
             .unwrap();
         assert_eq!(buf, [1, 2]);

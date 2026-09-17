@@ -4720,7 +4720,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         },
                         |fd| {
                             self.global
-                                .pipes
+                                .pipes()
                                 .update_flags(fd, litebox::pipes::Flags::NON_BLOCKING, val != 0)
                                 .map_err(Errno::from)
                         },
@@ -6035,12 +6035,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         target_fd: i32,
     ) -> Option<litebox::pipes::DetachedPipeEnd<Platform>> {
         let ends = self.global.create_linux_pipe(OFlags::empty()).ok()?;
-        let reader_handle = self.global.pipes.detach_end(&ends.reader).ok()?;
+        let reader_handle = self.global.pipes().detach_end(&ends.reader).ok()?;
         let temp_fd = {
             let files = self.files.borrow();
             let wr = files.insert_raw_fd(ends.writer).ok()?;
             // The reader half is never inserted: the HOST owns it, via `reader_handle` above.
-            let _ = self.global.pipes.close(&ends.reader);
+            let _ = self.global.pipes().close(&ends.reader);
             wr
         };
         let temp_fd = i32::try_from(temp_fd).ok()?;
@@ -6063,12 +6063,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         target_fd: i32,
     ) -> Option<litebox::pipes::DetachedPipeEnd<Platform>> {
         let ends = self.global.create_linux_pipe(OFlags::empty()).ok()?;
-        let writer_handle = self.global.pipes.detach_end(&ends.writer).ok()?;
+        let writer_handle = self.global.pipes().detach_end(&ends.writer).ok()?;
         let temp_fd = {
             let files = self.files.borrow();
             let rd = files.insert_raw_fd(ends.reader).ok()?;
             // The writer half is never inserted: the HOST owns it, via `writer_handle` above.
-            let _ = self.global.pipes.close(&ends.writer);
+            let _ = self.global.pipes().close(&ends.writer);
             rd
         };
         let temp_fd = i32::try_from(temp_fd).ok()?;
@@ -6285,8 +6285,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_| None,
                 |_| None,
                 |pipe_fd| {
-                    let half = self.global.pipes.half_pipe_type(pipe_fd).ok()?;
-                    let end = self.global.pipes.detach_end(pipe_fd).ok()?;
+                    let half = self.global.pipes().half_pipe_type(pipe_fd).ok()?;
+                    let end = self.global.pipes().detach_end(pipe_fd).ok()?;
                     Some((end, half))
                 },
                 |_| None,
