@@ -2136,3 +2136,80 @@ real flock() must contend across the whole process tree); (3) push past DE_LAUNC
 real browser/terminal/apps witness now that RAM is healthy again and both known crash classes are
 characterized -- host RAM recovers cleanly to ~4.7GB+ free after killing all litebox_runner/
 orphaned fork-child processes, confirmed this pass.
+
+## Sixth pass (2026-09-17, browser-witness attempt) -- full evidence, attribution: lanmower
+
+Goal: pick up item (3) from the fifth pass's own pickup list -- push past `DE_LAUNCHED` to a real
+browser/terminal/apps witness. Host RAM at launch: ~3.09GB free, already below the 4GB target and
+oscillating hard throughout this session (confirmed unrelated to litebox: several large `python`
+host processes, ~1GB working set each, pre-existed and kept fluctuating independently -- verified
+directly by re-checking free RAM while zero `litebox_runner*` processes existed, still swinging
+1.3-4.7GB). Do not misread this session's RAM swings as a litebox leak; they are host noise.
+
+Launch: `target/release/litebox_runner_linux_on_windows_userland.exe --gui=hidden -p 8080:3000
+--env GLIBC_TUNABLES=glibc.malloc.tcache_count=0:glibc.malloc.mxfast=0 --oci-image
+docker.io/linuxserver/webtop:debian-xfce --resume-from .wfgy/webtop_seed.tar -- /bin/bash
+/webtop_stack.sh`, `LITEBOX_PROCESS_FORK=1`/`LITEBOX_LOG=warn,...fork_verify=error` as real host
+env vars, `-p 8080:3000` chosen over the fifth pass's `-p 8081:8081` because `8081:8081` only
+publishes selkies' own websocket port while selkies itself binds `--addr=localhost` (loopback-only
+inside the guest) -- the actual browser-facing port per every prior working-browser session
+(`webtop-debian-selkies-2026-09-06.md` etc.) and per `webtop_stack.sh`'s own nginx config is guest
+port 3000 (nginx, which itself proxies `/websockets` to 8081 over the guest's OWN loopback). Process
+launched correctly this time via the harness's native background-task mechanism (a `Start-Job`
+inside one PowerShell tool call was tried first and silently lost its child process across tool-call
+boundaries -- confirmed via `tasklist` showing zero litebox processes and a dead job object one call
+later; not a litebox bug, a harness/tooling lesson for next time: never `Start-Job` a long-lived
+litebox boot across separate tool invocations, use the run-in-background primitive directly).
+
+Milestones (`[s]` lines): `NGINX_CONFIGURED` -> `NGINX_STARTED` -> (repeat native-thread stack
+overflows, same non-fatal class as every prior pass) -> `NGINX_SELFTEST_FAILED` -> `XVFB_FAILED` ->
+`DBUS_FAILED` -> `PATCH_OUTPUT_BEGIN >>><<< PATCH_OUTPUT_END rc=137` (the backpressure-patch python3
+was killed before printing anything -- same thread-based-fork corruption class hitting python3's
+non-PIE fixed load address again) -> `SELKIES_BACKPRESSURE_PATCH_STAGE_DONE` ->
+`PATCH_MARKER_CHECK path=UNRESOLVED count=0` (patch did not apply this run) ->
+`SELKIES_LAUNCHED_LAST supervisor_pid=178` -> `SELKIES_SUPERVISOR: attempt=1 exited rc=2 --
+respawning` -> `SELKIES_BIND_WATCHDOG_STARTED pid=183` -> **nothing further, ever** -- confirmed via
+two independent condition-poll waits (never a blind sleep), 120s then another 120s, both showing
+literal zero byte/line growth in the boot log (`wc -l` identical: 16562, both times) while the
+process count kept climbing (17 -> 21 real `litebox_runner_linux_on_windows_userland.exe` Windows
+processes alive simultaneously, confirmed via `tasklist`, each a genuine separate cross-process-fork
+child per the architecture, not a leak of the SAME process). The `SELKIES_PORT_UP` readiness gate
+(170s-bounded curl loop) should have concluded with SOME `[s]` line (success or
+`SELKIES_PORT_SELFTEST_FAILED`) well before 240s of silence; it did not -- a genuine stall, not a
+slow-but-progressing loop.
+
+New evidence, the LAST lines actually written to the log (the final fork child spawned before the
+stall set in): `[process_fork_diag] globalstate-probe (child): could not adopt the parent's writable
+layer from C:\...\litebox-container-fs-20160.tar: failed to open ...: The system cannot find the
+file specified. (os error 2)`, immediately followed by `[process_fork_diag] task-resume-probe
+(child): could not reopen /webtop_stack.sh at guest fd 255, it will be missing`, and then the child
+STILL logged `entering real guest execution` regardless of both failures. This is a NEW failure
+mode, distinct from every registry/pointer bug fixed earlier today: the writable-layer tar a fork
+child adopts from is apparently deleted (or renamed/moved) out from under a LATER sibling that still
+expects to find it at the same path -- plausibly the same class of parent-export/child-import
+lifecycle race as the already-fixed pipe-handle-inheritance leak, one level higher (a whole exported
+filesystem layer instead of a single pipe handle), but NOT confirmed causal to the stall this pass --
+a child missing its own resumed script (fd 255) would plausibly hang or silently do nothing forever
+rather than crash, which is at least consistent with the observed symptom, but no direct stack/wait
+evidence (no `cdb` attach was done this pass) ties the two together yet. Real next step: `cdb -pv -p
+<pid> -c "~*k;qd"` on the STALLED process the next time this reproduces, before killing it, to get
+the actual blocked call stack rather than inferring from the log's last lines alone.
+
+Stopped cleanly: `taskkill /F /IM litebox_runner_linux_on_windows_userland.exe /T` (21/21 processes
+terminated, confirmed zero remaining via `tasklist` immediately after), `litebox-presenter.exe` was
+never spawned (`--gui=hidden`, expected). Host RAM after teardown: recovered to the same volatile
+2-4GB range as before the boot ever started (not a clean high-RAM recovery like the fifth pass's
+~4.7GB+, because the OTHER host processes never went away -- this session's low starting RAM was
+never litebox's to fix). Browser/terminal/apps: NOT reached this pass -- the pickup item (3) from
+the fifth pass remains open, now blocked on this NEW stall rather than (or possibly in addition to)
+the already-characterized `socket_set` gap, since the run never got far enough past
+`SELKIES_BIND_WATCHDOG_STARTED` to reach the `socket_set`-relevant nginx<->selkies loopback
+connection at all this time.
+
+Pickup for a future pass: (1) reproduce this exact stall again with `RUST_BACKTRACE=1` and be ready
+to `cdb -pv` attach to the stalled process the moment log growth stops, rather than only reading the
+log after the fact; (2) check whether the writable-layer-tar-missing failure is itself new (never
+logged in any prior pass's archived evidence) or was previously masked/silent; (3) the
+`socket_set`/`interface` shared-arena-native redesign (AGENTS.md, still not attempted) and the
+browser/terminal/apps witness both remain the real end goals, both still blocked -- now by two
+potentially-separate issues (this stall, then `socket_set` if the boot gets past it).

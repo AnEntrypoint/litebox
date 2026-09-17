@@ -203,6 +203,10 @@ Glibc-only workaround, not a fix (PRD `glibc-tunables-workaround-pending-zero-fo
 below closes. Selkies also needs `--clipboard-enabled=false` (its clipboard monitor re-triggers the
 same corruption every tick).
 
+**Sixth pass (2026-09-17) — did NOT reach `DE_LAUNCHED`, new stall past
+`SELKIES_BIND_WATCHDOG_STARTED`** (writable-layer-adoption race on a late fork child); browser
+never reached, killed clean, no RAM-leak evidence. Archive (newest entry).
+
 **Open here.** One client per selkies instance, no slot reclaim on reload. An intermittent host AV ends
 some runs (host-allocator region fault) — separate non-determinism from the ACK-stall-kill below.
 Architectural gap: **guest processes share no AF_UNIX/loopback/FIFO namespace**, so a cross-process fork
