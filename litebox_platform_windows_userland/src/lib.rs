@@ -11197,6 +11197,24 @@ impl litebox::platform::SharedKernelStateProvider for WindowsUserland {
         // identical binary.
         Some(unsafe { SharedArc::<T>::attach(offset) })
     }
+
+    /// Real (non-default) implementation: hands back a raw pointer into the SAME fixed-base
+    /// [`shared_kernel_arena_alloc`] arena `create_shared_kernel_state`/`SharedArc` themselves
+    /// use. The address this returns is, by that arena's own fixed-base design (see
+    /// [`SHARED_KERNEL_HEAP_ACTUAL_BASE`]'s doc comment), the SAME valid pointer value in every
+    /// process that reached the inherited-section success path -- unlike `SharedArc<T>`, no
+    /// offset/attach round-trip is needed for the CALLER to reuse this pointer later, because the
+    /// caller embeds the pointer/slice itself directly into an already-shared struct (e.g.
+    /// `litebox::net::Network::socket_set`, itself a field of the `SharedArc`-placed
+    /// `litebox_shim_linux::GlobalState`) at construction time, and that struct's own bytes are
+    /// what actually crosses to attaching processes.
+    fn shared_kernel_arena_alloc_bytes(
+        &self,
+        layout: core::alloc::Layout,
+    ) -> Option<core::ptr::NonNull<u8>> {
+        let (addr, _size) = shared_kernel_arena_alloc(&layout)?;
+        core::ptr::NonNull::new(addr as *mut u8)
+    }
 }
 
 /// Isolated test payload for the live cross-process [`SharedArc<T>`] proof

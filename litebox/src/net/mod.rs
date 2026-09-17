@@ -45,6 +45,52 @@ pub const SOCKET_BUFFER_SIZE: usize = 65536 * 4;
 /// Limits maximum number of packets in a buffer
 const MAX_PACKET_COUNT: usize = 32;
 
+/// Fixed capacity of [`Network::socket_set`]'s slot table.
+///
+/// `Network` is embedded by value inside `litebox_shim_linux::GlobalState`, which on a platform
+/// with genuine cross-process shared kernel state (`SharedKernelStateProvider`) is placed once
+/// into a shared arena and then ATTACHED to (never reconstructed) by every other process in a
+/// cross-process-fork family (see that trait's own doc comment). `socket_set` itself, however,
+/// used to be `smoltcp::iface::SocketSet::new(vec![])` -- an ordinary growable `Vec`, whose
+/// HEADER (ptr/len/cap) lives inline in that shared struct (so it copies over fine) but whose
+/// BACKING BYTES are an ordinary heap allocation on whichever process's PRIVATE heap first grew
+/// it. Every process other than the one that ran `Network::new` therefore held a `Vec` pointer
+/// meaningless (or dangling) in its own address space -- the confirmed root cause of a live
+/// `tcp::Socket::dispatch` panic (`self.tuple.unwrap()` on `None`, `smoltcp-0.12.0/src/socket/
+/// tcp.rs:2126`) recorded in [`Network::rebind_per_process_fields`]'s own doc comment.
+///
+/// The fix: back `socket_set` with a FIXED-CAPACITY slice allocated once (by whichever process
+/// first constructs `Network`, i.e. exactly once per fork family) via
+/// [`platform::SharedKernelStateProvider::shared_kernel_arena_alloc_bytes`], on a platform where
+/// that reaches genuinely cross-process-shared memory at a fixed base address (see that method's
+/// own doc comment) -- so the resulting `&'static mut [SocketStorage<'static>]`'s raw pointer
+/// value is the SAME valid address in every attaching process, unlike a private-heap `Vec`
+/// pointer. `smoltcp::iface::SocketSet`/`RingBuffer`/`PacketBuffer` are all backed by
+/// `managed::ManagedSlice<'a, T>`, which supports exactly this "caller-supplied fixed slice"
+/// shape via `SocketSet::new`/`RingBuffer::new`/`PacketBuffer::new`'s generic `Into<ManagedSlice>`
+/// bound -- confirmed by reading smoltcp 0.12.0's own vendored source rather than assumed.
+///
+/// This fixes cross-process visibility of every INLINE field smoltcp stores per socket (protocol
+/// state machine, sequence numbers, the `tuple` field from the panic above, `Meta`, ...), because
+/// those now live directly in the shared bytes this slice points at. It does **not** yet fix
+/// cross-process visibility of each socket's OWN rx/tx ring/packet buffer PAYLOAD bytes --
+/// `tcp::Socket`/`udp::Socket` still construct those via `RingBuffer::new(vec![...])`/
+/// `PacketBuffer::new(vec![...], vec![...])` (see [`Network::socket`]), so a socket's actual
+/// data bytes remain private-heap-backed and only safely readable/writable from the process that
+/// created that particular socket. Making the per-slot BUFFERS arena-native too is real,
+/// separately-scoped follow-up work (needs a fixed-capacity buffer POOL indexed alongside
+/// `socket_set`'s own slots and reused across a slot's socket lifecycle, since the arena
+/// allocator underlying `shared_kernel_arena_alloc_bytes` is a bump allocator with no free list
+/// and cannot absorb one allocation per ephemeral TCP connection) -- see
+/// `docs/AGENTS_ARCHIVE_2026-09-17.md`.
+///
+/// `smoltcp::iface::SocketSet::add` PANICS if a `Borrowed` (fixed) `ManagedSlice` is full (see
+/// smoltcp's own `socket_set.rs`), unlike the old unbounded `Vec`, so [`Network::socket`] checks
+/// remaining capacity itself first and returns [`errors::SocketError::TooManySockets`] instead of
+/// ever hitting that panic. 256 matches this codebase's other established fixed-slot caps
+/// (`SharedUnixAddrPresenceTable`'s 256, `RawMutex::WaiterQueue`'s 32).
+pub(crate) const MAX_SOCKETS: usize = 256;
+
 /// TCP connection timeout.
 const TCP_CONNECT_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(75);
 
@@ -60,7 +106,7 @@ const TCP_CONNECT_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::fr
 pub struct Network<Platform>
 where
     Platform:
-        platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider,
+        platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider + platform::SharedKernelStateProvider,
 {
     litebox: LiteBox<Platform>,
     /// The set of sockets
@@ -85,7 +131,7 @@ where
 impl<Platform> Network<Platform>
 where
     Platform:
-        platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider,
+        platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider + platform::SharedKernelStateProvider,
 {
     /// Construct a new `Network` instance
     ///
@@ -131,7 +177,9 @@ where
         }
         Self {
             litebox: litebox.clone(),
-            socket_set: smoltcp::iface::SocketSet::new(vec![]),
+            socket_set: smoltcp::iface::SocketSet::new(alloc_shared_socket_storage(
+                litebox.x.platform,
+            )),
             device,
             interface,
             zero_time: litebox.x.platform.now(),
@@ -141,6 +189,54 @@ where
             closing_in_background: vec![],
         }
     }
+}
+
+/// Allocates [`MAX_SOCKETS`] worth of [`smoltcp::iface::SocketStorage`] slots via
+/// [`platform::SharedKernelStateProvider::shared_kernel_arena_alloc_bytes`] and returns a
+/// `'static` slice over them, all initialized to [`smoltcp::iface::SocketStorage::EMPTY`] --
+/// see [`MAX_SOCKETS`]'s own doc comment for why this replaces the old `vec![]` (private-heap,
+/// not genuinely cross-process-shared) backing for [`Network::socket_set`].
+///
+/// Called exactly once, from [`Network::new`] (itself expected to run exactly once per fork
+/// family -- see that function's own doc comment), so there is no reuse/attach concern here:
+/// unlike [`platform::SharedKernelStateProvider::create_shared_kernel_state`]/
+/// `attach_shared_kernel_state`'s create-or-attach protocol, every OTHER process in the fork
+/// family never calls this function at all -- it instead inherits the already-initialized
+/// `Network` (this slice's raw pointer included) as part of attaching to the shared
+/// `litebox_shim_linux::GlobalState` singleton that embeds it.
+fn alloc_shared_socket_storage<Platform>(
+    platform: &Platform,
+) -> &'static mut [smoltcp::iface::SocketStorage<'static>]
+where
+    Platform: platform::SharedKernelStateProvider,
+{
+    let layout = core::alloc::Layout::array::<smoltcp::iface::SocketStorage<'static>>(MAX_SOCKETS)
+        .expect("MAX_SOCKETS layout computation cannot overflow");
+    let ptr = platform
+        .shared_kernel_arena_alloc_bytes(layout)
+        .expect("shared_kernel_arena_alloc_bytes failed for Network::socket_set (arena exhausted)")
+        .cast::<smoltcp::iface::SocketStorage<'static>>();
+    for i in 0..MAX_SOCKETS {
+        // SAFETY: `ptr` names a freshly allocated, exclusively-owned (nothing else has a
+        // reference to this allocation yet) region of at least `MAX_SOCKETS` uninitialized
+        // `SocketStorage` slots, per `layout` above -- `ptr.add(i)` stays within that region for
+        // every `i < MAX_SOCKETS`, and writing an `EMPTY` value into uninitialized memory (rather
+        // than dropping any prior value) is exactly what a raw `write` is for.
+        unsafe {
+            ptr.add(i).write(smoltcp::iface::SocketStorage::EMPTY);
+        }
+    }
+    // SAFETY: `ptr` is non-null and points to `MAX_SOCKETS` contiguous, now fully-initialized
+    // `SocketStorage` values (the loop above), validly aligned per `layout`. The `'static`
+    // lifetime is sound because this allocation is placed in the shared kernel arena (on a
+    // platform where `shared_kernel_arena_alloc_bytes` reaches one) or the process's own leaked
+    // global-allocator memory (the default implementation) -- either way, per
+    // `SharedKernelStateProvider::shared_kernel_arena_alloc_bytes`'s own doc comment, this
+    // allocation is NEVER reclaimed, exactly matching every other `'static` promotion this
+    // codebase already performs over such arena memory (e.g. `phy::Device`'s own `&'static
+    // Platform`). No other code holds a reference to this memory (it was just allocated), so
+    // handing out an exclusive `&'static mut` is sound.
+    unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr(), MAX_SOCKETS) }
 }
 
 /// [`SocketHandle`] stores all relevant information for a specific [`SocketFd`], for easy access
@@ -266,6 +362,14 @@ impl TcpServerSpecific {
     fn refill_to_backlog(&mut self, socket_set: &mut smoltcp::iface::SocketSet) {
         let backlog = self.backlog.unwrap();
         for _ in self.socket_set_handles.len()..backlog.into() {
+            // `socket_set` is fixed-capacity now (see `MAX_SOCKETS`'s own doc comment): stop
+            // refilling the backlog early rather than let `SocketSet::add` panic when the whole
+            // table happens to be full -- a smaller-than-requested accept backlog under real
+            // resource pressure, not a crash, matches ordinary OS behavior under fd/socket
+            // exhaustion.
+            if socket_set.iter().count() >= MAX_SOCKETS {
+                break;
+            }
             let mut listening_socket = tcp::Socket::new(
                 smoltcp::storage::RingBuffer::new(vec![0u8; SOCKET_BUFFER_SIZE]),
                 smoltcp::storage::RingBuffer::new(vec![0u8; SOCKET_BUFFER_SIZE]),
@@ -434,7 +538,7 @@ impl PlatformInteractionReinvocationAdvice {
 impl<Platform> Network<Platform>
 where
     Platform:
-        platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider,
+        platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider + platform::SharedKernelStateProvider,
 {
     /// Rebind every field of this `Network` that holds a raw, process-relative pointer captured at
     /// construction time to the CALLING process's own, always-correct equivalent.
@@ -792,7 +896,7 @@ where
 impl<Platform> Network<Platform>
 where
     Platform:
-        platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider,
+        platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider + platform::SharedKernelStateProvider,
 {
     /// Explicitly private-only function that returns the current (smoltcp) Instant, relative to the
     /// initialized arbitrary 0-point in time.
@@ -817,6 +921,13 @@ where
     /// By default, the created socket has no associated proxy; to set a proxy, use
     /// [`set_socket_proxy`](Self::set_socket_proxy).
     pub fn socket(&mut self, protocol: Protocol) -> Result<SocketFd<Platform>, SocketError> {
+        // `socket_set` is now a fixed-capacity (`MAX_SOCKETS`) arena-backed slice (see
+        // `MAX_SOCKETS`'s own doc comment) -- `smoltcp::iface::SocketSet::add` PANICS on a full
+        // fixed-capacity table rather than growing, unlike the old `Vec`-backed one, so check
+        // capacity ourselves first and return an ordinary error instead.
+        if self.socket_set.iter().count() >= MAX_SOCKETS {
+            return Err(SocketError::TooManySockets);
+        }
         let handle = match protocol {
             Protocol::Tcp => self.socket_set.add(tcp::Socket::new(
                 smoltcp::storage::RingBuffer::new(vec![0u8; SOCKET_BUFFER_SIZE]),
@@ -1927,7 +2038,7 @@ pub enum CloseBehavior {
 }
 
 crate::fd::enable_fds_for_subsystem! {
-    @Platform: { platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider };
+    @Platform: { platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider + platform::SharedKernelStateProvider };
     Network<Platform>;
     @Platform: { platform::TimeProvider + sync::RawSyncPrimitivesProvider };
     SocketHandle<Platform>;

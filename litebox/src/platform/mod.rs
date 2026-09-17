@@ -444,6 +444,37 @@ pub trait SharedKernelStateProvider {
     ) -> Option<Self::Handle<T>> {
         None
     }
+
+    /// Allocates `layout`-sized raw bytes in the same potentially-cross-process-shared arena
+    /// [`Self::create_shared_kernel_state`] itself uses, for FIXED-CAPACITY, pointer-free
+    /// "slot array" storage that must live at a fixed, cross-process-valid address but cannot be
+    /// expressed as an owned `T` handed to [`Self::create_shared_kernel_state`] -- the caller
+    /// wants a `'static`-lifetime slice/reference INTO the allocation (e.g. smoltcp's own
+    /// `SocketSet::new(&'static mut [SocketStorage<'static>])`, a self-referential shape no
+    /// owning handle can express), not an owning handle to it.
+    ///
+    /// Never reclaimed, matching every other [`Self::create_shared_kernel_state`] allocation on
+    /// a platform that actually shares this arena cross-process (bump allocator, no free list --
+    /// see `litebox_platform_windows_userland::SharedArc`'s own doc comment for why that is
+    /// deliberate, not an oversight, for kernel-singleton-shaped state: this call is meant for
+    /// FIXED, session-lifetime-sized allocations decided once up front, e.g.
+    /// [`litebox::net::Network`]'s own bounded socket-slot table, never for per-connection or
+    /// otherwise unboundedly-repeated allocation, which would exhaust a bounded shared pool).
+    ///
+    /// Returns `None` on allocation failure (arena exhaustion on a platform with a bounded
+    /// shared pool). The default implementation uses the ordinary global allocator -- correct on
+    /// every platform without genuine cross-process shared memory, exactly like
+    /// [`Self::create_shared_kernel_state`]'s own `Arc::new` default.
+    fn shared_kernel_arena_alloc_bytes(
+        &self,
+        layout: core::alloc::Layout,
+    ) -> Option<core::ptr::NonNull<u8>> {
+        // SAFETY: `layout` is caller-provided and required (by this function's own contract) to
+        // be non-zero-sized -- every real caller allocates a fixed array of at least one
+        // element.
+        let ptr = unsafe { alloc::alloc::alloc(layout) };
+        core::ptr::NonNull::new(ptr)
+    }
 }
 
 /// A zero-sized struct indicating that the block was immediately unblocked (due to non-matching

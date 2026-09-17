@@ -111,18 +111,49 @@ cause: broad `bInheritHandles=TRUE` leaked a sibling fork child's inheritable br
 into unrelated children racing the same window. Fix: `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` explicit
 per-call handle allow-list (`process_fork.rs`, `spawn_suspended_impl`). Live-verified. Archive.
 
-**That BTreeMap panic — IDENTIFIED, NOT one of the six registries (fifth pass).** The live panic
-is `litebox::net::Network`'s `socket_set`/`interface`/`queued_for_closure`/`closing_in_background`
-(`litebox/src/net/mod.rs`), still `Vec`-backed and NOT cross-process-safe — only `litebox`/
-`device`, two of Network's nine fields, are rebound. Reproduces as
-`smoltcp-0.12.0/src/socket/tcp.rs:2126:46` `self.tuple.unwrap()` on `None`. **Not a hard
-blocker**: the crashing child dies, s6 respawns it, boot reaches `DE_LAUNCHED` anyway.
-**Deliberately not fixed**: `Network` can't be per-process-shadowed like the other six registries
-— nginx/selkies are separate fork children that must see the SAME `socket_set` for smoltcp's
-virtual loopback `127.0.0.1:8081` routing; the fix is a shared-arena-native redesign (fixed
-socket-count cap, arena-backed rx/tx buffers via smoltcp's `Managed<'a, [u8]>`), real separate
-follow-on work, **confirmed still the actual blocker to a browser witness** by direct 2026-09-17
-evidence below ("Track B step 4"). Archive.
+**`Network::socket_set` made shared-arena-native — landed, partially live-verified, browser
+witness still NOT reached (eighth pass, 2026-09-17).** The `tuple.unwrap()` panic's root cause
+(`socket_set: smoltcp::iface::SocketSet::new(vec![])` — an ordinary `Vec`, private-heap-backed
+even though `Network` itself is embedded in the shared `GlobalState` arena) is fixed:
+`smoltcp::iface::SocketSet`/`RingBuffer`/`PacketBuffer` are all backed by `managed::ManagedSlice`,
+which supports a caller-supplied FIXED `&'static mut [T]` slice as well as `Vec` (confirmed by
+reading vendored smoltcp 0.12.0 source, not assumed) — so `socket_set` now gets a 256-slot
+(`litebox::net::MAX_SOCKETS`) array allocated once, at `Network::new` time, via a new
+`SharedKernelStateProvider::shared_kernel_arena_alloc_bytes` trait method (default: ordinary
+global alloc; real impl on `WindowsUserland`, reusing `shared_kernel_arena_alloc`). Because the
+arena is fixed-base, the resulting pointer is the SAME valid address in every attaching process —
+no per-process rebind needed, unlike `litebox`/`device`. This makes every INLINE per-socket field
+(state machine, sequence numbers, the `tuple` field from the panic, `Meta`) correctly shared.
+**Does NOT yet cover each socket's own rx/tx ring/packet-buffer PAYLOAD bytes** (`tcp::Socket`/
+`udp::Socket` still build those via `RingBuffer::new(vec![...])`) — real, separately-scoped
+follow-on work, needs a fixed buffer POOL reused across a slot's lifecycle (a naive per-socket
+arena allocation would exhaust the bump-allocated, never-freed arena under real connection churn).
+`queued_for_closure`/`closing_in_background` also remain `Vec`-backed (smaller, self-contained
+follow-ons; the former also touches the shared `DescriptorTable::drain_entries_full_covered_by`
+API). `litebox/src/net/mod.rs`'s own `MAX_SOCKETS` doc comment has the full design and rationale.
+
+**Verification**: `cargo check`/`build --release` clean across `litebox`, `litebox_platform_
+windows_userland`, `litebox_shim_linux`, `litebox_runner_linux_on_windows_userland`; all 25
+`litebox` net unit tests pass unchanged (incl. full bidirectional-TCP flow through `Network::new`/
+`socket`/`connect`/`accept`/close). Live boot (`webtop_stack.sh`, `LITEBOX_PROCESS_FORK=1`,
+release binary): reached `NGINX_STARTED` (matching prior best), **zero occurrences of the
+`tuple.unwrap()` panic across the whole run** (previously reproduced routinely), and a direct
+`curl`/`Invoke-WebRequest` to the published port now shows a genuinely different, more-advanced
+signature than before — TCP connects and the HTTP request is sent and held open, timing out
+waiting for a response, vs. the previously-documented `http_code=000`/"accepted then torn down"
+— consistent with (not proof of) the socket-state-sharing fix actually taking effect. The run then
+stalled with no further `[s]` markers and no log growth; a non-invasive `cdb -pv -p <pid> -c
+"~*k;qd"` sample of the longest-lived nginx-tree process found every visible thread blocked in
+`WaitForSingleObjectEx`, not spinning. **Not diagnosed further this pass** — this is very likely
+the SAME pre-existing, not-yet-root-caused nginx self-test/Xvfb stall this file already tracks
+below ("Still open: nginx's own SSL-cert generation fails..." / the prior pass's "wedges
+permanently" curl-retry finding), not a new defect from this fix, but that is not yet PROVEN
+(no repro was run on the pre-fix binary in the same sitting for a controlled A/B). **Next
+pickup step: re-run the identical repro on the pre-fix commit to confirm the stall itself is
+unchanged, then root-cause the stall itself** (likely inside nginx's self-test loop or the
+Xvfb/dbus thread-fork path, per the existing open items below) — the browser/terminal/apps
+milestone is still not reached. Full transcript and command line: this pass's own session (no
+separate archive entry needed — the design/verification above is complete and self-contained).
 
 **`XVFB_FAILED`/`DBUS_FAILED` — characterized, NOT primarily RAM pressure (fifth pass, healthy
 ~3.6GB-free start).** Direct log evidence: `webtop_stack.sh: line 280: 147 Killed xset q >
@@ -152,37 +183,34 @@ to work, because even a successfully-forked Xvfb would be unreachable from sibli
 while `Network`'s `socket_set` stays unshared (previous section). The fd-count gate itself is
 already mostly relaxed (pipes/files/eventfds carry, cloexec drops harmlessly); only
 `socket`/`unix-socket`/`pty`/`epoll`/`netlink` remain uncarriable. **The `Network` shared-arena
-redesign, not a gate tweak, is the real next unlock** — confirmed again live this pass (`curl
-127.0.0.1:8080` got `http_code=000` both before and after this pass's fix, TCP accepted then
-torn down, no HTTP — direct confirmation nginx/selkies still can't resolve their loopback route
-across separate fork children); still correctly out of safe single-pass scope.
+redesign, not a gate tweak, was the real next unlock** — confirmed live this pass (`curl
+127.0.0.1:8080` got `http_code=000`, TCP accepted then torn down, no HTTP). **`socket_set`'s own
+half of that redesign has since landed (this file's own "made shared-arena-native" entry above)**
+— a same-day re-test after the fix saw a materially different signature (TCP connects, request
+sent, times out waiting for a response, no more instant teardown) but still no working HTTP
+response; see that entry for what's proven vs. still open.
 
-**Two fresh boots, evidence refining prior hypotheses (full detail: archive)**: Xvfb is
-genuinely signal-killed, not just the `xset` probe (refines the fifth-pass "false negative"
-read). `DBUS_FAILED`'s real cause in both runs was `/tmp/empty: No such file or directory` — a
-writable-layer cross-child-visibility gap, distinct from the already-fixed adoption race
-(`cc2ec83`), not root-caused. **New panic class**: `litebox/src/event/wait.rs:224`
-`ThreadHandle::interrupt`'s `unreachable!()` fires on garbage state (e.g. `UNKNOWN(994464581)`),
-dozens per boot, same stale-cross-process-pointer shape as everywhere else today but NOT
-debugger-confirmed, and there's already a separate unrelated open candidate
-(`SafeZoneAllocator::alloc` livelock) — do not patch blind, root-cause first. Both boots reached
-`DE_LAUNCHED` 2/2, matching the seventh pass.
+**Two fresh boots, evidence refining prior hypotheses (full detail: archive)**: Xvfb genuinely
+signal-killed, not just the `xset` probe. `DBUS_FAILED`'s real cause: `/tmp/empty: No such file
+or directory`, a writable-layer cross-child-visibility gap, not root-caused. **New panic class**:
+`litebox/src/event/wait.rs:224` `ThreadHandle::interrupt`'s `unreachable!()` on garbage state
+(e.g. `UNKNOWN(994464581)`), dozens per boot, NOT debugger-confirmed — do not patch blind,
+root-cause first. Both boots reached `DE_LAUNCHED` 2/2.
 
 **One real bug found and FIXED**: `spawn_cross_process_fork_child`'s `inherited_eventfds` param
-(since pass 116) was received but never forwarded — `FORK_CHILD_EVENTFDS_ENV_VAR` was fully
-documented and the child-side consumer already worked, but nothing set the env var, so every
-fork accepted as eligible for carrying only eventfd(s) resumed its child with that fd silently
-missing. Fixed in `spawn_process_fork_child` (`litebox_platform_windows_userland/src/
-process_fork.rs` + its one call site in `lib.rs`), same encode shape as `inherited_files`.
-Builds clean; 2/2 post-fix boots still reach `DE_LAUNCHED` (no regression). Not yet observed
-exercised live (zero "recreated as an eventfd" lines in either boot) — this workload's eligible
-forks never happen to hold a non-cloexec eventfd at their `fork()` call site.
+was received but never forwarded to `spawn_process_fork_child` — fixed, same encode shape as
+`inherited_files`. Not yet observed exercised live (this workload's eligible forks never happen
+to hold a non-cloexec eventfd at their `fork()` call site).
 
 **Pickup, precise**: (1) debugger-root-cause `wait.rs:224` before touching it — highest-value,
-most frequent panic; (2) root-cause the `/tmp/empty` writable-layer-visibility gap; (3) the
-`Network` shared-arena redesign is the real unlock, large/separate; (4) after (1)-(3),
-`timerfd`/`signalfd` are the next-cheapest carriable fd kinds (same shape as eventfd) before
-attempting `socket`/`unix-socket`/`pty`/`epoll`.
+most frequent panic; (2) root-cause the `/tmp/empty` writable-layer-visibility gap; (3) root-cause
+the post-`NGINX_STARTED` stall this file's "`socket_set` made shared-arena-native" entry above
+just re-confirmed (curl connects/sends/times-out, no `[s]` marker progress, all sampled nginx-tree
+threads blocked not spinning) — likely the SAME nginx self-test/Xvfb class as (1)/(2), confirm via
+A/B against the pre-fix commit before assuming so; (4) finish the `Network` shared-arena redesign
+(`queued_for_closure`/`closing_in_background`, then per-socket buffer payload bytes — see
+`litebox/src/net/mod.rs`'s `MAX_SOCKETS` doc comment); (5) after (1)-(4), `timerfd`/`signalfd` are
+the next-cheapest carriable fd kinds before attempting `socket`/`unix-socket`/`pty`/`epoll`.
 
 ## Container images and OCI loading
 
