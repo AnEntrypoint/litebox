@@ -9230,10 +9230,20 @@ impl litebox::platform::StdioProvider for WindowsUserland {
     }
 }
 
-/// Backed by [`SHARED_KERNEL_HEAP_BASE`] via `WindowsUserland`'s `MemoryProvider` impl below --
-/// every host-heap allocation this process makes lands inside that one fixed-base, pagefile-backed
-/// mapping, which is what a future cross-process fork child mapping the same section at the same
-/// address needs (ADVISORY-002 3.3, Track B step 3).
+/// **Reverted to private per-process backing 2026-09-17** (selective-routing correction, see
+/// [`WindowsUserland::alloc`]'s own doc comment for the full story): this is now backed by the
+/// ORDINARY per-call, per-process `VirtualAlloc2` mechanism again, exactly as it was before Track B
+/// step 3 (`c08182d`). Routing EVERY host-heap allocation through the fixed-base shared kernel heap
+/// (`c08182d` through `3d661d2`) proved not viable live: an ordinary one-shot allocation (e.g. the
+/// OCI rootfs-reconstruction buffer every plain guest exec makes) is indistinguishable, at this
+/// choke point, from genuinely-must-be-shared kernel state, and the shared section is a bump
+/// allocator with no reclaim -- routing everything through it exhausted the 8 GiB reservation after
+/// 45-90 real execs under `webtop_stack.sh` (`memory allocation of 181493744 bytes failed`, live,
+/// 218 occurrences). The shared-kernel-heap machinery itself (fixed base, atomic cross-process
+/// cursor, handle export/inherit) is NOT deleted -- see [`shared_kernel_arena_alloc`] below, now a
+/// small, bounded, STANDALONE bump arena deliberately not wired to `GlobalAlloc`/this
+/// `#[global_allocator]` at all, reserved for a follow-up session's `LiteBoxX`/`GlobalState`-only
+/// migration (`AGENTS.md`, "Fixed-base shared kernel heap" section).
 #[global_allocator]
 static SLAB_ALLOC: litebox::mm::allocator::SafeZoneAllocator<'static, 34, WindowsUserland> =
     litebox::mm::allocator::SafeZoneAllocator::new();
@@ -9663,17 +9673,19 @@ fn diag_raw_regdump(
     }
 }
 
-/// Fixed base address for the cross-process shared kernel heap (`advisor/ADVISORY-002-d-zero-fork.md`
-/// section 3.3, Track B step 3). This is `SLAB_ALLOC`'s (the `#[global_allocator]`) entire backing
-/// store: every host-heap allocation the process makes -- including `LiteBoxX`
-/// (`litebox/src/litebox.rs`) and `GlobalState` (`litebox_shim_linux/src/lib.rs`), both ordinary
-/// `Box`/`Arc`-held Rust values that already allocate via the global allocator like everything
-/// else -- lands inside this one mapping, at this same address, with no per-type rewrite needed.
-/// A second process that maps the SAME pagefile-backed section at this SAME fixed address (not
-/// implemented by this step; this step is single-process-verifiable, per the advisory) would see
-/// byte-identical contents at byte-identical addresses, which is the precondition every pointer
-/// inside that state (an `Arc`'s data pointer, a `BTreeMap` node pointer, a `Vec`'s buffer
-/// pointer) needs to remain valid across the process boundary.
+/// Fixed base address for the cross-process shared kernel arena (`advisor/ADVISORY-002-d-zero-fork.md`
+/// section 3.3, Track B step 3). **NOT `SLAB_ALLOC`'s backing store as of 2026-09-17** -- see
+/// [`SLAB_ALLOC`]'s and [`WindowsUserland::alloc`]'s doc comments for why routing EVERY host-heap
+/// allocation through here was reverted (live-demonstrated shared-pool exhaustion after 45-90 real
+/// execs). This region is now reserved exclusively for [`shared_kernel_arena_alloc`], a small,
+/// standalone bump arena NOT wired to `GlobalAlloc`, intended for the specific, bounded set of
+/// genuinely-must-be-cross-process-visible kernel singletons (`LiteBoxX`, `GlobalState`) a
+/// follow-up session migrates onto it one type at a time (see that function's doc comment for the
+/// remaining `SharedArc<T>`-style wrapper work this needs before any real caller can use it for
+/// those types). A second process that maps the SAME pagefile-backed section at this SAME fixed
+/// address would see byte-identical contents at byte-identical addresses, which is the
+/// precondition every pointer inside that state (an `Arc`'s data pointer, a `BTreeMap` node
+/// pointer, a `Vec`'s buffer pointer) needs to remain valid across the process boundary.
 ///
 /// Placed a full 32 GiB above [`HOST_ALLOCATOR_REGION_MIN`] (that constant's own floating
 /// `VirtualAlloc2`-per-call region is superseded by this one -- see [`WindowsUserland::alloc`] --
@@ -9719,7 +9731,14 @@ const SHARED_KERNEL_HEAP_BASE: usize = 0x7FF8_0000_0000;
 /// reserving its own) remains deliberately deferred to step 4 -- see `SHARED_KERNEL_HEAP_BASE`'s
 /// doc comment on why cross-process vtable validity needs same-base loading first; today's fix
 /// only makes each process's OWN reservation lazy, not shared.
-const SHARED_KERNEL_HEAP_SIZE: usize = 8 * 1024 * 1024 * 1024;
+///
+/// **Shrunk from 8 GiB to 64 MiB, 2026-09-17** (selective-routing correction): this region no
+/// longer backs `SLAB_ALLOC` (every host-heap allocation) -- see [`SLAB_ALLOC`]'s doc comment --
+/// it is reserved solely for [`shared_kernel_arena_alloc`]'s small, bounded set of genuinely
+/// cross-process-visible kernel singletons (`LiteBoxX`+`GlobalState`, a handful of allocations
+/// total, each at most low-KB). 64 MiB is generous headroom for that bounded set while remaining
+/// nowhere near open-ended -- the exact failure mode this shrink exists to prevent recurring.
+const SHARED_KERNEL_HEAP_SIZE: usize = 64 * 1024 * 1024;
 
 const SHARED_KERNEL_HEAP_STATE_UNINIT: u8 = 0;
 const SHARED_KERNEL_HEAP_STATE_INITIALIZING: u8 = 1;
@@ -10330,6 +10349,95 @@ pub(crate) fn shared_kernel_heap_probe_child_read(base: usize, inherited: bool) 
     );
 }
 
+/// Standalone, bounded bump arena over the fixed-base shared kernel section -- **deliberately NOT
+/// wired to `GlobalAlloc`/`SLAB_ALLOC`** (see [`SLAB_ALLOC`]'s doc comment for why routing every
+/// host-heap allocation through here was reverted 2026-09-17). This is the machinery a follow-up
+/// session's `LiteBoxX`/`GlobalState`-only migration needs: call this directly (never via `Box`/
+/// `Arc`, which always go through `#[global_allocator]`) to get a raw pointer into the shared
+/// section, `ptr::write` the value into place, and wrap it in a manually-refcounted smart pointer
+/// with a custom `Drop` (Rust stable has no `allocator_api`/`Box::new_in`, so `Arc<T>` itself can
+/// never be told to use a non-default allocator; its `ArcInner` layout is also a private,
+/// unstable implementation detail, so `Arc::from_raw` over manually-placed bytes is unsound --
+/// only a hand-rolled wrapper type works here). **Not yet called by any real caller as of this
+/// pass** -- `LiteBoxX`/`GlobalState` still allocate via ordinary `Arc::new` on the reverted
+/// private heap; wiring them through this function requires that wrapper type, which itself needs
+/// a new trait (analogous to `RawMutexProvider`) threaded through `litebox`/`litebox_shim_linux`'s
+/// generic `Platform` bound with a no-op default for every non-Windows platform, since `LiteBox::
+/// new`/`LinuxShimBuilder::build` are shared, platform-generic code paths. Left as real,
+/// live-verifiable (see the existing `LITEBOX_DIAG_SHARED_HEAP_PROBE=1` sentinel probes, which
+/// operate on raw bytes and work unchanged against this smaller region) infrastructure rather than
+/// deleted, since the atomic cursor / fixed-base / cross-process handle-inheritance mechanism
+/// (`3e81e1d`/`3d661d2`) is correct, live-verified, and exactly what this smaller use case needs.
+pub(crate) fn shared_kernel_arena_alloc(layout: &std::alloc::Layout) -> Option<(usize, usize)> {
+    let size = core::cmp::max(
+        layout.size().next_power_of_two(),
+        core::cmp::max(layout.align(), 0x1000) << 1,
+    );
+
+    if SHARED_KERNEL_HEAP_STATE.load(Ordering::Acquire) != SHARED_KERNEL_HEAP_STATE_READY {
+        init_shared_kernel_heap();
+    }
+
+    // Bump-allocate a sub-range of the single fixed-base mapping reserved by
+    // `init_shared_kernel_heap`. `size` is always a power of two and at least 4 KiB (see above),
+    // so the cursor -- itself starting at the page-aligned actual base (see
+    // [`SHARED_KERNEL_HEAP_ACTUAL_BASE`] -- usually `SHARED_KERNEL_HEAP_BASE`, but
+    // `init_shared_kernel_heap`'s fallback may have landed elsewhere) and only ever advanced by
+    // such sizes -- stays page-aligned throughout.
+    let actual_base = SHARED_KERNEL_HEAP_ACTUAL_BASE.load(Ordering::Acquire);
+    // Cross-process-safe cursor: lives INSIDE the shared section itself (see
+    // `shared_heap_cursor`'s doc comment), not a process-local `static`, so a cross-process-fork
+    // child sharing this section via inherited handle advances the exact SAME cursor the parent
+    // (and every sibling) sees, via one atomic CAS loop -- correct regardless of which process
+    // actually performs the allocation.
+    let cursor = shared_heap_cursor();
+    let mut cur = cursor.load(Ordering::Acquire);
+    let addr = loop {
+        let next = cur.checked_add(size)?;
+        if next > actual_base + SHARED_KERNEL_HEAP_SIZE {
+            // Exhausted the reservation; surfaces as an ordinary allocator OOM.
+            return None;
+        }
+        match cursor.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => break cur,
+            Err(actual) => cur = actual,
+        }
+    };
+
+    // On-demand commit: `init_shared_kernel_heap` leaves this whole mapping reserved-not-committed
+    // (`SEC_RESERVE`), so the sub-range this call just exclusively claimed via the CAS above is
+    // reserved address space only, not yet backed by memory/pagefile. Commit exactly that range
+    // now, matching the codebase's established lazy-commit pattern for other large reservations
+    // (this file's own `was_mapped_view`/`reserve_and_commit` paths, which likewise call
+    // `VirtualAlloc2(..., MEM_COMMIT, ...)` in place over an already-reserved mapped-view range).
+    // `addr`/`size` are both page-aligned (see this function's own comment above), so no rounding
+    // is needed.
+    // SAFETY: `addr` names a page-aligned sub-range of the shared section's live view that this
+    // call just exclusively claimed via the CAS above -- no other caller can commit or touch this
+    // exact range concurrently.
+    let committed = unsafe {
+        VirtualAlloc2(
+            GetCurrentProcess(),
+            addr as *mut c_void,
+            size,
+            Win32_Memory::MEM_COMMIT,
+            Win32_Memory::PAGE_READWRITE,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+    if committed.is_null() {
+        diag_raw_print(
+            b"[shared_kernel_arena] FATAL VirtualAlloc2(MEM_COMMIT) failed win32_err=0x",
+            unsafe { GetLastError() } as usize,
+            b" addr=0x",
+            addr,
+        );
+        std::process::abort();
+    }
+    Some((addr, size))
+}
+
 impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
     fn alloc(layout: &std::alloc::Layout) -> Option<(usize, usize)> {
         let size = core::cmp::max(
@@ -10339,106 +10447,72 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
             core::cmp::max(layout.align(), 0x1000) << 1,
         );
 
-        if SHARED_KERNEL_HEAP_STATE.load(Ordering::Acquire) != SHARED_KERNEL_HEAP_STATE_READY {
-            init_shared_kernel_heap();
-        }
-
-        // Bump-allocate a sub-range of the single fixed-base mapping reserved by
-        // `init_shared_kernel_heap` -- see [`SHARED_KERNEL_HEAP_BASE`]'s doc comment for why this
-        // (rather than a fresh `VirtualAlloc2` per call, the prior behavior) is what makes every
-        // allocation this process's global allocator ever hands out live inside one shared,
-        // fixed-address-identical-across-processes region. `size` is always a power of two and
-        // at least 4 KiB (see above), so the cursor -- itself starting at the page-aligned actual
-        // base (see [`SHARED_KERNEL_HEAP_ACTUAL_BASE`] -- usually `SHARED_KERNEL_HEAP_BASE`, but
-        // `init_shared_kernel_heap`'s fallback may have landed elsewhere) and only ever advanced by
-        // such sizes -- stays page-aligned throughout, matching every real caller's alignment
-        // expectation without extra rounding.
-        let actual_base = SHARED_KERNEL_HEAP_ACTUAL_BASE.load(Ordering::Acquire);
-        // Cross-process-safe cursor: lives INSIDE the shared section itself (see
-        // `shared_heap_cursor`'s doc comment), not a process-local `static`, so a
-        // cross-process-fork child sharing this section via inherited handle advances the exact
-        // SAME cursor the parent (and every sibling) sees, via one atomic CAS loop -- correct
-        // regardless of which process actually performs the allocation.
-        let cursor = shared_heap_cursor();
-        let mut cur = cursor.load(Ordering::Acquire);
-        let addr = loop {
-            let next = cur.checked_add(size)?;
-            if next > actual_base + SHARED_KERNEL_HEAP_SIZE {
-                // Exhausted the reservation; surfaces as an ordinary allocator OOM.
-                return None;
-            }
-            match cursor.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => break cur,
-                Err(actual) => cur = actual,
-            }
+        // **Reverted to private per-process `VirtualAlloc2`, 2026-09-17** (selective-routing
+        // correction; exact pre-`c08182d` mechanism -- see [`SLAB_ALLOC`]'s doc comment for the
+        // full story of why routing every host-heap allocation through the fixed-base shared
+        // kernel section, tried 2026-09-16/17, is not viable: it exhausted that section's bump
+        // allocator, which has no reclaim, after 45-90 real execs under real desktop load). Every
+        // ORDINARY allocation this process's global allocator ever hands out -- including
+        // one-shot buffers like OCI rootfs-reconstruction data during `exec` -- goes back to
+        // normal private per-process memory here, exactly as before Track B step 3. Constrain
+        // every host-allocator-backing page to `HOST_ALLOCATOR_REGION_MIN..`, strictly above the
+        // guest's own `TASK_ADDR_MAX`, so this allocator can never be handed an address the
+        // guest's `Vmem` also considers fair game. See `HOST_ALLOCATOR_REGION_MIN`'s doc comment
+        // for why an unconstrained (null-base) request was unsafe here.
+        let mut addr_req = MEM_ADDRESS_REQUIREMENTS {
+            LowestStartingAddress: HOST_ALLOCATOR_REGION_MIN as *mut c_void,
+            HighestEndingAddress: core::ptr::null_mut(),
+            Alignment: 0,
+        };
+        let mut ext_param = MEM_EXTENDED_PARAMETER {
+            Anonymous1: MEM_EXTENDED_PARAMETER_0 {
+                _bitfield: MemExtendedParameterAddressRequirements as u64,
+            },
+            Anonymous2: windows_sys::Win32::System::Memory::MEM_EXTENDED_PARAMETER_1 {
+                Pointer: (&raw mut addr_req).cast::<c_void>(),
+            },
         };
 
-        // On-demand commit: `init_shared_kernel_heap` decommits this whole mapping immediately
-        // after creating it (see that function's doc comment for why decommit-after-map, not
-        // `SEC_RESERVE`, is what actually works at this fixed address), so the sub-range this call
-        // just exclusively claimed via the CAS above is reserved address space only, not yet backed
-        // by memory/pagefile. Commit exactly that range now, matching the codebase's established
-        // lazy-commit pattern for other large reservations (this file's own
-        // `was_mapped_view`/`reserve_and_commit` paths, which likewise call
-        // `VirtualAlloc2(..., MEM_COMMIT, ...)` in place over an already-reserved mapped-view
-        // range) rather than leaving the section's full eager `SEC_COMMIT` charge held for the
-        // process's entire lifetime, which is what let N cross-process fork children multiply into
-        // real commit-limit exhaustion. `addr`/`size` are both page-aligned (see this function's
-        // own comment above), so no rounding is needed.
-        // SAFETY: `addr` names a page-aligned sub-range of `SHARED_KERNEL_HEAP_BASE`'s live view
-        // that this call just exclusively claimed via the CAS above -- no other caller can commit
-        // or touch this exact range concurrently.
-        let committed = unsafe {
+        let result = match unsafe {
             VirtualAlloc2(
                 GetCurrentProcess(),
-                addr as *mut c_void,
-                size,
-                Win32_Memory::MEM_COMMIT,
-                Win32_Memory::PAGE_READWRITE,
                 core::ptr::null_mut(),
-                0,
+                size,
+                Win32_Memory::MEM_COMMIT | Win32_Memory::MEM_RESERVE,
+                Win32_Memory::PAGE_READWRITE,
+                &raw mut ext_param,
+                1,
             )
+        } {
+            addr if addr.is_null() => None,
+            addr => Some((addr as usize, size)),
         };
-        if committed.is_null() {
-            // Same allocation-free-reporting constraint as `init_shared_kernel_heap`'s own
-            // failure paths: this can run from inside the global allocator itself, so no
-            // panic!/format! formatting machinery is safe here.
-            diag_raw_print(
-                b"[shared_kernel_heap] FATAL VirtualAlloc2(MEM_COMMIT) failed win32_err=0x",
-                unsafe { GetLastError() } as usize,
-                b" addr=0x",
-                addr,
-            );
-            std::process::abort();
-        }
 
         if diag_alloc_enabled() {
-            let n = DIAG_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
-            let offset = addr.wrapping_sub(actual_base);
-            diag_raw_print(b"[diag_alloc] n=0x", n, b" off=0x", offset);
-            diag_raw_print(
-                b"[diag_alloc]   size=0x",
-                size,
-                b" layout_size=0x",
-                layout.size(),
-            );
+            if let Some((addr, _)) = result {
+                let n = DIAG_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+                let offset = addr.wrapping_sub(HOST_ALLOCATOR_REGION_MIN);
+                diag_raw_print(b"[diag_alloc] n=0x", n, b" off=0x", offset);
+                diag_raw_print(
+                    b"[diag_alloc]   size=0x",
+                    size,
+                    b" layout_size=0x",
+                    layout.size(),
+                );
+            }
         }
-        Some((addr, size))
+        result
     }
 
     unsafe fn free(addr: usize) {
-        // Dead in practice today (confirmed: `litebox/src/mm/allocator.rs`'s `SafeZoneAllocator`
-        // never calls `MemoryProvider::free` -- freed pages return to `LockedHeapWithRescue`'s
-        // own internal free list, never back to the host), and would be unsound to implement as a
-        // real release even if it were called: `addr` now names a sub-range bump-allocated out of
-        // ONE fixed-lifetime `MapViewOfFile3` view shared by every allocation this process makes,
-        // and the only OS call that releases any of a mapped view's pages
-        // (`UnmapViewOfFileEx`/`VirtualFree(MEM_RELEASE)`) applies to the view's ENTIRE range, not
-        // an arbitrary sub-range -- unlike the prior per-call `VirtualAlloc2` design, where each
-        // `addr` really was the base of its own independently releasable region. A real per-range
-        // free would need the shared heap's own free-list/generation-counter design (out of scope
-        // for this step; see `advisor/ADVISORY-002-d-zero-fork.md` 3.3's remaining-work notes).
-        let _ = addr;
+        // `addr` is guaranteed by the `MemoryProvider` contract to be a base address
+        // previously returned by `alloc`, i.e. the base of a whole `VirtualAlloc2`
+        // RESERVE|COMMIT region. `MEM_RELEASE` requires exactly that: the original
+        // base address and a size of 0 (it always releases the entire region).
+        let ok = unsafe { VirtualFree(addr as *mut c_void, 0, Win32_Memory::MEM_RELEASE) } != 0;
+        assert!(ok, "VirtualFree(RELEASE) failed: {}", unsafe {
+            GetLastError()
+        });
     }
 }
 

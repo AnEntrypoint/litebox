@@ -259,69 +259,56 @@ cause with the open `fork-verify-av-path-stale-rip-bypasses-single-step-heal` ro
 `process-fork-pipe-relay-sigpipe-above-4kb` resolved (redirected); don't rely on
 `LITEBOX_PROCESS_FORK=1` for heavy-iteration guests. Methodology: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
-## Fixed-base shared kernel heap (Track B step 3, ADVISORY-002 §3.3) -- LANDED, lazy-commit fixed 2026-09-17
+## Shared kernel heap -- SELECTIVE-ROUTING CORRECTION LANDED 2026-09-17 (ADVISORY-002 §3.3)
 
-`SLAB_ALLOC` (`#[global_allocator]`) backs EVERY host-heap allocation with one 8 GiB pagefile-backed
-section, normally mapped at a fixed address (`SHARED_KERNEL_HEAP_BASE = 0x7FF8_0000_0000`); every
-process independently reserves+maps its own copy at the same address (heap-functional,
-address-consistent, but NOT content-shared -- see step 4 below for the mechanism that closes that).
-`SEC_RESERVE` + on-demand `VirtualAlloc2(MEM_COMMIT)` makes this lazy (was eager-full-commit,
-`ERROR_COMMITMENT_LIMIT` at 96% host commit under real fork density -- fixed). The exact fixed
-address is NOT collision-free on this host (`STATUS_CONFLICTING_ADDRESSES` 100% of the time,
-fork-mode-independent, pre-existing) -- `init_shared_kernel_heap` falls back to an OS-chosen
-address (`SHARED_KERNEL_HEAP_ACTUAL_BASE`), heap stays functional either way. **Live-verified**:
-`webtop_stack.sh` under `LITEBOX_PROCESS_FORK=1` holds 39-42% commit charge through `NGINX_STARTED`
-(vs. 96%/FATAL pre-fix), then hits the ALREADY-DOCUMENTED `XVFB_FAILED`/`DBUS_FAILED` architectural
-gap (guest processes share no AF_UNIX/loopback/FIFO namespace -- see "A real desktop renders in a
-browser"'s "Open here" note), not a new bug. Full narrative, both bugs' elimination trails, PRDs:
-`docs/AGENTS_ARCHIVE_2026-09-17.md`.
+**The "route everything through one shared section" design (Track B steps 3-5, `c08182d`..`3d661d2`)
+is REVERTED.** `SLAB_ALLOC` (`#[global_allocator]`, `lib.rs`) is back to the pre-`c08182d` private
+per-process `VirtualAlloc2` mechanism for EVERY ordinary host-heap allocation -- exactly as it was
+before Track B started. Routing everything (including one-shot buffers like the OCI
+rootfs-reconstruction allocation every plain guest exec makes) through the shared bump allocator,
+which has no reclaim, was live-proven to exhaust an 8 GiB pool after 45-90 real execs under
+`webtop_stack.sh` (`memory allocation of 181493744 bytes failed`, 218 occurrences) -- worse than not
+sharing at all. That regression is now gone: **live-verified**, the identical real
+`debian-xfce webtop_stack.sh` boot under `LITEBOX_PROCESS_FORK=1` (default flags, sharing gate left
+off) ran 200+s, many concurrent forked children, reached `NGINX_STARTED` then the
+ALREADY-DOCUMENTED `XVFB_FAILED` architectural gap (below) with **zero** `memory allocation ...
+failed` lines (was 218), zero panics/FATAL/abort, host RAM fully recovered on kill.
 
-## Real cross-process content sharing (Track B steps 4-5, ADVISORY-002 §3.3) -- cursor fixed+proven, still gated OFF: NEW capacity blocker found 2026-09-17
+The fixed-base/atomic-cursor/handle-inherit machinery (`SHARED_KERNEL_HEAP_BASE`,
+`shared_heap_cursor`, `shared_kernel_heap_export_for_fork_child`, all live-verified correct in prior
+sessions -- 71 concurrent cross-process forks, zero corruption) is NOT deleted: it now backs a small
+**64 MiB, standalone, bounded** arena (`shared_kernel_arena_alloc`, `lib.rs`) deliberately NOT wired
+to `GlobalAlloc`, reserved for a follow-up session's `LiteBoxX`/`GlobalState`-only migration. Basic
+mechanism re-verified live at the new size (parent-side init+map+commit+sentinel-write landed
+correctly at `base+64MiB-0x1000`); the opt-in `LITEBOX_DIAG_SHARED_HEAP_INHERIT=1` fork-export path
+is untouched and still gated off by default.
 
-Step 4 (handle-inheritance mechanism, sentinel proof) unchanged -- see archive. Step 5 (this pass)
-moved the bump-allocation cursor (`shared_heap_cursor`, `SHARED_KERNEL_HEAP_CURSOR_OFFSET`,
-`lib.rs`) OUT of a process-local `static` and INTO the shared section itself, advanced by one
-atomic CAS: `AtomicUsize::compare_exchange` compiles to `lock cmpxchg`, a CPU cache-coherency
-instruction correct against any physical memory two cores share, cross-process section included --
-not an OS construct like `WaitOnAddress` (which fails cross-process for a different reason, see
-"hard platform constraint" above). This closes the exact bug that used to crash the parent
-(`STATUS_ACCESS_VIOLATION`) when step 4's inherit path went unconditional.
+**Why `LiteBoxX`/`GlobalState` are NOT yet wired to `shared_kernel_arena_alloc`, precisely scoped
+for the next session**: `Arc<T>`'s layout is a private std implementation detail (`Arc::from_raw`
+over manually-placed bytes is unsound) and Rust stable has no `allocator_api`/`Box::new_in`, so
+`Arc::new` can never be told to use a non-default allocator. The only sound mechanism is a
+hand-rolled `SharedArc<T>`-style wrapper (manual refcount, `ptr::write` into raw
+`shared_kernel_arena_alloc` bytes, custom `Drop` that runs the destructor but never reclaims the
+backing bytes, matching this codebase's existing bump-allocator philosophy). `LiteBox::new`
+(`litebox/src/litebox.rs`) and `LinuxShimBuilder::build` (`litebox_shim_linux/src/lib.rs`) are
+platform-generic code shared by every runner (Linux native, macOS, optee, snp, lvbs), so that
+wrapper needs a new trait (alongside `RawMutexProvider`) with a real impl for `WindowsUserland` and
+a no-op default (ordinary `Arc::new`) for every other platform -- real, scoped, multi-file work, not
+started this pass. Separately and even after that: today's design has EVERY process (parent and
+every CreateProcess-based "fork" child alike) call `LinuxShimBuilder::new().build()` unconditionally at
+its own startup, constructing its OWN fresh `GlobalState`/`LiteBoxX` -- so merely placing those
+allocations in shared memory does not by itself give a forked child the PARENT's already-open
+pipes/futexes/AF_UNIX table; that needs a create-vs-attach protocol (first process creates, later
+ones in the family detect and attach to the existing instance at a known shared offset) that does
+not exist in this codebase in any form yet. This is the real remaining size of the "GlobalState
+cross-process visibility" goal -- track it as its own PRD, do not assume the arena alone closes it.
 
-**Live-verified correct under real concurrent pressure**: the prior sentinel write/read repro still
-passes byte-for-byte with the cursor fix in place; a NEW escalation -- 10 parallel subshells x 5
-sequential `/bin/true` forks each, 71 real cross-process forks total, all genuinely mapping the SAME
-inherited section (zero private-fallback) -- completed exit 0, all markers present, zero
-corruption/crash/colliding-offset evidence. The cursor mechanism itself is correct.
-
-**NOT flipped to the default -- live-booting the real target workload found a separate regression
-first.** Making export/inherit unconditional under `LITEBOX_PROCESS_FORK=1`, then booting
-`.wfgy/webtop_stack.sh` (`debian-xfce`, 17 layers, one alone 736 MiB), surfaced a capacity bug
-distinct from the fixed correctness bug: every plain external command the script execs (`sed`,
-`ln`, `mkdir`, ...) reconstructs its OWN full in-memory merged rootfs from the OCI layer cache
-(`globalstate-probe (child): rebuilding rootfs from OCI image ...`) -- a single ~173 MiB+ allocation
-through the SAME shared heap. Sharing off: each such process's whole 8 GiB reservation is a PRIVATE
-section Windows reclaims the instant that process exits. Sharing on: every one draws from the SAME
-ONE 8 GiB pool for as long as the eldest ancestor (this boot's PID 1) stays alive, and this bump
-allocator never frees/decommits a claimed range on any exit (`WindowsUserland::free`'s own "dead in
-practice" comment) -- so ~45-90 plain execs into a real `debian-xfce` boot the shared pool is
-permanently exhausted and every later forked command aborts (live: `memory allocation of
-181493744 bytes failed`, repeating, well before Xvfb/dbus start) -- **worse** than sharing-off,
-which reaches `NGINX_STARTED`/`NGINX_SELFTEST_FAILED` and beyond without this class. Reverted the
-gate to opt-in (`LITEBOX_DIAG_SHARED_HEAP_INHERIT=1`); confirmed byte-for-byte that plain
-`LITEBOX_PROCESS_FORK=1` is unchanged (0 inherited-section events, clean exit 0).
-
-**`XVFB_FAILED`/`DBUS_FAILED` remain genuinely untested** -- this boot died from heap exhaustion
-during the nginx-config stage, well before Xvfb ever launches, so the AF_UNIX-sharing question this
-investigation was aimed at is still open, neither confirmed nor refuted.
-
-**Next step, precisely scoped**: needs either (a) a reclaim mechanism -- decommit/return a
-process's claimed byte-range on its exit (nothing does this today, in- or cross-process), or (b)
-routing the one-shot rootfs-rebuild buffer through a private, non-shared allocation instead of this
-heap -- before unconditional sharing is safe for a real multi-exec workload. Do not re-flip the
-default without re-testing this SAME `debian-xfce webtop_stack.sh` boot, not just the lighter repros
-above. `GlobalState`'s 22 fields still are NOT migrated to live in the shared heap; trait-object
-vtables remain cross-process-invalid without same-base loading (ASLR still on) -- both separate,
-still-open blockers. Full evidence, byte accounting, both repro logs: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
+`XVFB_FAILED`/`DBUS_FAILED` (guest processes share no AF_UNIX/loopback/FIFO namespace -- see "A real
+desktop renders in a browser"'s "Open here" note) is UNCHANGED by this pass, exactly as expected:
+this fix closes the capacity/OOM regression, not the AF_UNIX-sharing gap, which needs the
+create-vs-attach protocol above, not just bytes-in-shared-memory. Full narrative, elimination
+trails, both live webtop-boot logs (broken-everything-shared vs. this session's reverted+bounded
+run): `docs/AGENTS_ARCHIVE_2026-09-17.md`.
 
 ## Closed — do not re-attempt without a genuinely new approach
 
@@ -340,8 +327,8 @@ independently reproduced (applied on inspection, a real provable defect). Repro 
 script must end in a trailing command (`OUTER_EXIT=$?`) to force a real `clone()` -- tail-exec of
 the final command never calls it. Full detail: archive.
 
-**Second bug found the same pass, since FIXED**: the fixed-base shared kernel heap's eager-full-commit
-defect -- see "Fixed-base shared kernel heap" section above for the full mechanism and fix.
+**Second bug found the same pass, since FIXED**: the shared kernel heap's eager-full-commit
+defect -- see "Shared kernel heap" section above for the full mechanism and fix.
 
 **PTY test, NOT root-caused**: `script -qec '...' /dev/null` under a real PTY hit `signal=Signal(13)`
 on `script` itself ~6s in -- a different bug; PRD `cross-process-fork-pty-sigpipe-in-script-relay`.

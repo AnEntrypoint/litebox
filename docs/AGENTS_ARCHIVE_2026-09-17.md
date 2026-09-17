@@ -3,6 +3,119 @@
 Trimmed out of `AGENTS.md` to keep it under the 30KB working-set budget. Read this for the trail;
 `AGENTS.md` keeps only the current-state pointer.
 
+## Shared-kernel-heap selective-routing correction -- session detail (attribution: lanmower)
+
+Full evidence trail for the "Shared kernel heap -- SELECTIVE-ROUTING CORRECTION LANDED 2026-09-17"
+entry in `AGENTS.md`. Starting point: Track B step 3 (`c08182d`) had routed EVERY host-heap
+allocation (`SLAB_ALLOC`, `#[global_allocator]`) through one 8 GiB fixed-base shared section,
+reasoning this carried `LiteBoxX`/`GlobalState`/`DefaultFS`/per-process fd tables into shared
+memory "for free". Live-proven not viable: a real `webtop_stack.sh` boot under
+`LITEBOX_PROCESS_FORK=1` (sharing gate on) hit `memory allocation of 181493744 bytes failed` 218
+times before Xvfb/dbus even started -- the shared bump allocator has no reclaim, and an ordinary
+one-shot allocation (the OCI rootfs-reconstruction buffer every plain exec makes) is
+indistinguishable at that choke point from genuinely-must-be-shared kernel state.
+
+**Code changes** (`litebox_platform_windows_userland/src/lib.rs`):
+1. `WindowsUserland::alloc`/`free` (the `MemoryProvider` impl backing `SLAB_ALLOC`) reverted to the
+   EXACT pre-`c08182d` mechanism: per-call `VirtualAlloc2(MEM_COMMIT|MEM_RESERVE)` constrained to
+   `HOST_ALLOCATOR_REGION_MIN..` via `MEM_ADDRESS_REQUIREMENTS`, `free` via
+   `VirtualFree(MEM_RELEASE)`. Diffed directly against `git show c08182d` to confirm byte-for-byte
+   equivalence of the restored logic (`diag_alloc` offset math, alignment doubling, everything).
+2. The old bump-allocation body of `WindowsUserland::alloc` was NOT deleted -- extracted verbatim
+   into a new standalone function `shared_kernel_arena_alloc(layout) -> Option<(usize, usize)>`,
+   deliberately never called from `GlobalAlloc`/`#[global_allocator]` context. Still uses the exact
+   same atomic cross-process cursor (`shared_heap_cursor`, `SHARED_KERNEL_HEAP_CURSOR_OFFSET`) and
+   fixed-base/fallback mapping (`init_shared_kernel_heap`) from the prior two sessions' work
+   (`3e81e1d`/`3d661d2`), unmodified.
+3. `SHARED_KERNEL_HEAP_SIZE` shrunk `8 * 1024 * 1024 * 1024` -> `64 * 1024 * 1024` (64 MiB) --
+   this region no longer needs to hold bulk process-wide allocation traffic, only a small, bounded
+   set of future kernel-singleton allocations.
+4. Doc comments on `SLAB_ALLOC`, `SHARED_KERNEL_HEAP_BASE`, `SHARED_KERNEL_HEAP_SIZE` rewritten to
+   describe the corrected design and point at this archive entry.
+
+**Why `LiteBoxX`/`GlobalState` are not wired to `shared_kernel_arena_alloc` this session** -- real,
+identified blockers, not an oversight:
+- `Arc<T>`'s `ArcInner` layout is a private std implementation detail. `Arc::from_raw` over bytes
+  manually placed by `ptr::write` into arbitrary memory is unsound -- it must originate from
+  `Arc::new`/`Arc::into_raw`. Rust stable has no `allocator_api`/`Box::new_in`/`Arc::new_in`, so
+  there is no sanctioned way to tell `Arc::new` to use a non-default allocator. The only sound
+  mechanism is a hand-rolled `SharedArc<T>`-style wrapper: `shared_kernel_arena_alloc` a raw
+  `{AtomicUsize strong; T value}` block, `ptr::write` the value in, manual `Clone`
+  (`fetch_add(1)`)/`Drop` (`fetch_sub(1)`, `ptr::drop_in_place` on last release, deliberately never
+  reclaiming the backing bytes -- matches this codebase's existing "free is dead in practice" bump
+  allocator philosophy already documented on `WindowsUserland::free`).
+- `LiteBox::new` (`litebox/src/litebox.rs:32`, constructs `Arc::new(LiteBoxX{platform,
+  descriptors})`) and `LinuxShimBuilder::build` (`litebox_shim_linux/src/lib.rs:469`, constructs
+  `Arc::new(GlobalState{...22 fields...})`) are platform-generic code, `Platform: ShimPlatform`
+  (`RawSyncPrimitivesProvider` etc.), shared verbatim by every runner: Windows, Linux native
+  (`litebox_runner_linux_userland`), macOS, optee, snp, lvbs. A `SharedArc<T>` wrapper usable there
+  needs a NEW trait (parallel to `litebox::platform::RawMutexProvider`) with a real impl only for
+  `WindowsUserland` and a default no-op (ordinary `Arc::new`) for every other platform, so this is
+  real, scoped, cross-crate work -- not attempted this pass to avoid an unverified half-migration
+  landing on stable.
+- Both `LinuxShimBuilder::new(platform)` (`LiteBox::new` call site) and `.build()` (`GlobalState`
+  call site) are invoked from `litebox_runner_linux_on_windows_userland/src/lib.rs` (~line 780-822,
+  a second call site ~line 1277) -- already Windows-specific, already depends on
+  `litebox_platform_windows_userland` directly. THIS is where a future session should wrap just
+  those two calls with a scope guard once the `SharedArc<T>` trait exists, rather than touching the
+  platform-generic crates' function signatures at all.
+- Deeper, separate blocker even after the wrapper exists: today's design has EVERY process in a
+  fork family (the original parent AND every `CreateProcess`-based "fork" child) call
+  `LinuxShimBuilder::new().build()` unconditionally at its own startup, constructing its OWN fresh
+  `GlobalState`/`LiteBoxX`. Placing that allocation in shared memory does not by itself give a
+  child the PARENT's already-open pipes/futexes/AF_UNIX table -- each process still ends up with
+  its own distinct object at its own distinct offset in the shared arena. Real content sharing of
+  the *singleton* needs a create-vs-attach protocol (first process in the family creates it at a
+  well-known shared offset; every later process in the family detects the existing instance and
+  attaches to it instead of constructing a fresh one) that does not exist anywhere in this codebase
+  yet. Recommend tracking this as its own PRD, separate from "give `shared_kernel_arena_alloc` a
+  real caller".
+
+**Live verification, in order**:
+1. `cargo build --release -p litebox_platform_windows_userland` and
+   `-p litebox_runner_linux_on_windows_userland`: both clean (only pre-existing/expected warnings:
+   `shared_heap_cursor`/`shared_kernel_arena_alloc` now genuinely unused dead code until a follow-up
+   session wires a caller -- intentional, not a bug).
+2. Cheap repro (`AGENTS.md`'s own recipe) under `LITEBOX_PROCESS_FORK=1`,
+   `docker.io/library/debian:stable-slim`, a 5-iteration bash loop ending in a trailing command to
+   force a real `clone()`: exit 0, all 5 `iter_N` lines plus `done_exit_0` present.
+3. Sentinel-style proof of the shrunk 64 MiB standalone arena, `LITEBOX_PROCESS_FORK=1` +
+   `LITEBOX_DIAG_SHARED_HEAP_INHERIT=1` + `LITEBOX_DIAG_SHARED_HEAP_PROBE=1`: parent-side
+   init+map+commit+sentinel-write succeeded at `base + 0x3FFF000` (= `base + 64MiB - 4KiB`,
+   confirming the shrink took effect correctly), value `0xc0ffee00deadec5f` written cleanly, real
+   `task-resume-probe` lines confirming a genuine cross-process fork occurred. Child-side
+   `[shared_kernel_heap] INHERITED`/`OBSERVED` lines did NOT fire this run -- expected and harmless:
+   since `WindowsUserland::alloc` no longer auto-triggers `init_shared_kernel_heap()` on a process's
+   first allocation (that trigger was the OLD everything-shared design), nothing in a child calls
+   `init_shared_kernel_heap()`/`shared_kernel_arena_alloc()` today, so the child-side half of the
+   probe is genuinely dormant until a real caller exists (see "why not wired" above) -- not a
+   regression, since the parent-side mechanics (the actual thing that changed this session) are
+   confirmed correct at the new size.
+4. **The real target test**: `.wfgy/webtop_stack.sh` (`docker.io/linuxserver/webtop:debian-xfce`,
+   17 layers, one 736 MiB), flags `--gui=hidden -p 8080:3000 --env
+   GLIBC_TUNABLES=glibc.malloc.tcache_count=0:glibc.malloc.mxfast=0 --oci-image
+   docker.io/linuxserver/webtop:debian-xfce --resume-from .wfgy/webtop_seed.tar -- /bin/bash
+   /webtop_stack.sh`, `LITEBOX_PROCESS_FORK=1` + `LITEBOX_LOG=warn,...fork_verify=error` as real
+   host env vars (sharing gate left OFF, i.e. today's actual default). Ran 200+s with 8-9 real
+   concurrent `litebox_runner_linux_on_windows_userland.exe` processes alive simultaneously
+   (confirmed via `tasklist`), reached `NGINX_CONFIGURED` -> `NGINX_STARTED` ->
+   `NGINX_SELFTEST_FAILED` (pre-existing, separately-tracked nginx issue, unrelated to this fix) ->
+   `XVFB_FAILED`. **Zero** `memory allocation of ... failed` lines across a 10,864-line combined
+   stderr log (was 218 before this fix, in the same boot script). Zero panic/FATAL/abort markers.
+   Killed cleanly via `Stop-Process -Force` on the whole process tree once the known terminal state
+   (`XVFB_FAILED`) was confirmed reached and stable (nginx supervisor retry-looping, as documented
+   pre-existing behavior); host free RAM fully recovered to the pre-boot baseline
+   (~5.8M KB free / 15.9M KB total) within seconds, zero leaked/orphaned processes.
+
+**Net result**: the capacity/OOM regression this session was scoped to fix is definitively fixed
+and live-proven fixed on the actual real-world repro that originally found it. `XVFB_FAILED` is
+reached at the SAME point as the historical sharing-off baseline (not further, not less) --
+confirming the fix restores exactly the pre-Track-B-step-3 behavior for ordinary allocations without
+reintroducing the old problem Track B was trying to solve (genuine `LiteBoxX`/`GlobalState`
+cross-process visibility), which remains open, scoped, and precisely documented above for a
+follow-up session -- this session did not attempt it, to avoid landing an unverified partial
+migration.
+
 ## Closed — do not re-attempt without a genuinely new approach (moved verbatim from AGENTS.md)
 
 **There is no open host crash** — the `RtlpUnwindPrologue` crash earlier notes called "the one genuinely
