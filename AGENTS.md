@@ -296,45 +296,30 @@ this session, no leaked processes at session end.
 
 ## Closed — do not re-attempt without a genuinely new approach
 
-**There is no open host crash** — the `RtlpUnwindPrologue` crash earlier notes called "the one genuinely
-open" one was `VEH_FRAME_STRIDE`: a 4096-byte per-level slice 168 bytes short of the two frames it must
-cover, nested by `fork_verify`'s own AV-heal storm. Bisected live: 10/10 fatal before, 0/10 then 0/57
-after (two follow-up commits; mechanism: archive). **`veh-frame-stride-has-no-overflow-guard` — CLOSED
-2026-09-16**: `VehFrameCanaryGuard` (`litebox_platform_windows_userland/src/lib.rs`, right above
-`vectored_exception_handler`) stamps a canary above the next nesting level's slice floor and checks it
-on `Drop`, `RaiseFailFastException`ing on mismatch instead of silent corruption. `cargo build --release
--p litebox_platform_windows_userland` clean. **Live-reverified same day**: its first real
-cross-process-fork workout (pipe-relay-sigpipe investigation) hit it immediately, 3/3 children --
-guard worked (no silent corruption) but 8 KiB/cap-3 was too small for this workload. Fixed:
-`VEH_FRAME_STRIDE` 8->16 KiB, `VEH_DEPTH_CAP` 3->1 (same 32 KiB total, redistributed -- depth never
-exceeded 1 across 20,000+ single-step exceptions on 3 processes). 0/9 recurrences since.
+VEH_FRAME_STRIDE canary guard, `dev_bench`/`litebox_runner_snp` Windows build failures, CoW-mmap
+performance, input-latency bugs, presenter-split duplicate-`SYN_REPORT`, and the GUI-protocol
+(DRM/KMS+wgpu) decision — all CLOSED 2026-09-16, none open. Full detail moved to
+`docs/AGENTS_ARCHIVE_2026-09-17.md` to keep this file under budget.
 
-**`dev_bench`/`litebox_runner_snp` Windows build failures — CLOSED 2026-09-16, root cause was NOT
-libc/seccomp.** `dev_bench`'s new `reap_children` called `libc::wait4`/`rusage`/`WIFEXITED`/
-`WEXITSTATUS` unconditionally — absent from `libc` on `windows-msvc`; fixed via `#[cfg(unix)]`/
-`#[cfg(not(unix))]` split. `litebox_runner_snp` was already correctly excluded from the default Windows
-build path (`#![no_std]` SNP-guest kernel image, own custom target + pinned nightly + `-Zbuild-std`,
-real error is "unwinding panics are not supported without std") — root `Cargo.toml` now documents why,
-next to the `litebox_runner_lvbs` precedent, so it isn't re-diagnosed.
+## Terminal-emulator shell crash — investigated 2026-09-17, real mechanism found, NOT fixed
 
-**Windows CoW-mmap performance**: zero practical effect on tar-packed execs (`MapViewOfFile3` needs 64KiB
-file-offset alignment; ELF `PT_LOAD` segments are only page-aligned, no exploitable slack).
-**`LITEBOX_COW_MMAP` default-off is load-bearing** — the shipped flank fix recommits orphaned flanks as
-zero-fill; opting in trades a loud SIGSEGV for silently zeroed symbol tables
-(`docs/cow-mmap-fixed-address-design.md`).
-
-**Input latency**: three real bugs fixed and verified live (sub-pixel remainders now accumulated
-losslessly; two evdev reports per move now one `SYN_REPORT`; window now resizable with scaled deltas).
-Present mode is Mailbox-preferred with Fifo fallback — any note calling it Fifo-only is stale.
-
-**Presenter-split reintroduced the duplicate-`SYN_REPORT` bug, fixed and live-verified 2026-09-16**
-(`Request::RelMotion{dx,dy}` added to `litebox_presenter_protocol`; one `relmotion 5 3` now produces
-exactly one `SYN_REPORT`). Open PRD, both DIFFERENT/untouched: `mouse-motion-devicevent-needs-pixel-
-calibration`, `linux-macos-userland-presentation-still-emits-two-syn-reports-per-move`. Full repro:
-`docs/AGENTS_ARCHIVE_2026-09-16.md`. No framerate baseline exists (idle compositor = zero flips).
-
-**The GUI protocol decision is settled**: DRM/KMS + wgpu, proven live with guest page-flip pixels in a
-real host window. Not an open X11-vs-Wayland-vs-DRM question.
+Live-tested (not assumed) whether the xfce4-terminal/shell crash is a leaked fd or just needs
+`LITEBOX_PROCESS_FORK=1`: it is neither. `LITEBOX_PROCESS_FORK=1` is confirmed NOT set in
+`.wfgy/webtop_stack.sh`'s standing boot recipe. A clean, fd-redirection-free, genuinely
+`beyond_stdio==0` fork+exec repro (no Xorg, no terminal) still crashes under BOTH fork paths: the
+default thread-based path hits the already-documented, still-unfixed "second glibc corruption
+class" (`double free or corruption (out)`, distinct from the tcache/safe-linking class
+`GLIBC_TUNABLES` covers); `LITEBOX_PROCESS_FORK=1` correctly takes the eligible cross-process path
+(`clone: cross-process fork() is eligible`, `spawned new task`, confirmed via debug log) but the
+child's own glibc then aborts with `Fatal error: glibc detected an invalid stdio handle` before
+running any guest code — a distinct, previously-uncharacterized bug in
+`spawn_cross_process_fork_child`'s stdio wiring (`litebox_platform_windows_userland/src/
+process_fork.rs`'s `spawn_suspended`), not in xfce4-terminal's fd hygiene. Neither path is
+currently safe for this shape. No code fix applied (unverified-fix risk, see archive). Full
+repro commands, debug-log evidence, and the exact suspect code (`spawn_suspended`'s two redundant
+`STARTF_USESTDHANDLES` blocks): `docs/AGENTS_ARCHIVE_2026-09-17.md`. Also note: AGENTS.md's own
+prior "5 refused forks of 34" claim for `LITEBOX_PROCESS_FORK=1` on a real debian-xfce boot has no
+corroborating evidence anywhere in the tracked repo — treat as unverified until re-demonstrated.
 
 ## Presenter-process split (`docs/presenter-process-design.md`) -- done, fully verified live end-to-end, 2026-09-16
 
@@ -360,8 +345,11 @@ an intentional CoW guard, no code change, commit `936714f`). Full detail: `docs/
 
 ## Docs and tooling map
 
-- **Archives** — `docs/AGENTS_ARCHIVE_2026-09-16.md` (popup-menu re-test, `spawn_exec_collision_child`
-  fix, Track A audit, RawMutex/presenter mechanism detail), `_2026-09-15.md` (ACK-stall-kill detail),
+- **Archives** — `docs/AGENTS_ARCHIVE_2026-09-17.md` (terminal-emulator shell-crash live investigation:
+  `LITEBOX_PROCESS_FORK=1` refuted as a one-line fix, cross-process-fork stdio-handle bug found;
+  closed-items detail moved out of AGENTS.md), `_2026-09-16.md` (popup-menu re-test,
+  `spawn_exec_collision_child` fix, Track A audit, RawMutex/presenter mechanism detail), `_2026-09-15.md`
+  (ACK-stall-kill detail),
   `_2026-09-10.md` (fork fd eligibility, cost history, OCI cache, s6-boot, browser config, crash-dump/
   VEH, CoW, working practices). Older: `_2026-09-03.md`, `_2026-09-05.md`.
 - Fork: `docs/track-b-fork-fix-progress.md`, `advisor/ADVISORY-002-d-zero-fork.md`,
