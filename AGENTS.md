@@ -106,20 +106,49 @@ symptom this investigation began from, genuinely not root-caused (`docs/track-b-
 146-152`). The TOP-LEVEL parent's curl-self-test stall (`sys_wait4(pid=-1)` not checking
 `cross_process_children`) is fixed (`6e86a40`) — do not cite that one as open.
 
-**Still reliably reaches `NGINX_STARTED` under `LITEBOX_PROCESS_FORK=1`, then wedges in the
-nginx self-test retry loop — NOT fixed.** The `SpinEnabledRawMutex`-starvation hypothesis
-recorded here previously is **REFUTED by a direct raw memory read of `net_lock`**
-(2026-09-17, third pass): its live address (base+`0x1000`(`SHARED_GLOBALSTATE_OFFSET`)+`0x228`,
-`inner`@`+0x430`, `holder_pid`@`+0x434`, all `cdb`-disassembly-derived not guessed) reads
-`inner=0, holder_pid=0` at the frozen state — unlocked, uncontended; not the blocker. Fix D's
-owner-death recovery (`4e417d7`) fired correctly twice earlier in the same run (dead
-`holder_pid=20372`, recovered at 3.8s/46s) — also not implicated. New, unconfirmed leading
-hypothesis: top-level's `Pipes::read` awaits EOF on the self-test's `$(curl)` pipe; its writer
-(winpid 20372) already exited, but a different live fork child (winpid 12956) may hold a
-stray inherited duplicate of that pipe's write handle open (over-broad Windows handle
-inheritance). Not confirmed (a `cdb !handle` scan of 12956 was killed unfinished for host
-memory pressure); `XVFB_UP`/`DBUS_UP`/`DE_UP`/browser NOT reached. Full derivation and
-evidence: archive.
+**The nginx-self-test pipe-EOF wedge (fourth pass, 2026-09-17) — CONFIRMED and FIXED.** Root
+cause: `spawn_process_fork_child`'s `CreateProcessW` calls (`process_fork.rs`) used plain
+`bInheritHandles=TRUE`, which inherits EVERY currently-inheritable handle open anywhere in the
+spawning process into the new child — not just the ones that call intended. A sibling
+cross-process-fork child's own bridge-pipe `child` end (marked inheritable in
+`create_inheritable_child_pipe`, only closed after ITS OWN spawn's `CreateProcessW` returns) is
+open and inheritable during that whole window, so any OTHER `CreateProcessW(bInheritHandles=
+TRUE)` call from the same process racing inside that window silently duplicates it too — keeping
+the pipe's underlying kernel object alive after its real writer exits, so the reader never sees
+EOF. Fix (`process_fork.rs`, `spawn_suspended_impl`): switched from broad `bInheritHandles=TRUE`
+to `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (`STARTUPINFOEXW` + `Initialize/UpdateProcThreadAttribute
+List`), an explicit per-call handle allow-list (each child's own bridge-pipe ends + the
+shared-heap section handle + its own wired stdio handles) — matches real `fork()`+`exec()`
+semantics (child gets exactly the fds it should) and is immune to whatever else is concurrently
+marked inheritable elsewhere in the process. `spawn_suspended`/`spawn_suspended_forcing_handle_
+inheritance` both thread `extra_inheritable_handles` through; `spawn_process_fork_child` builds
+the list from `child_pipe_handles` + the shared-heap handle. **Live-verified**: a real
+`.wfgy/webtop_stack.sh` boot under `LITEBOX_PROCESS_FORK=1` no longer hangs at the self-test —
+`NGINX_SELFTEST_FAILED` (a real, non-hanging result) now prints after the bounded 20s retry
+window, and the boot continues (`SELKIES_LAUNCHED_LAST`, `SELKIES_BIND_WATCHDOG_STARTED`, dozens
+more `task-resume-probe`/pipe-pump cycles completing cleanly) — previously this wedged forever,
+confirmed stuck 65s+ with zero log growth in the prior (third) pass. `XVFB_FAILED`/`DBUS_FAILED`
+this same run are plausible low-host-memory fallout (run started at only ~2.75GB free, common
+in this session) rather than a new litebox defect — not re-investigated this pass.
+
+**New blocker found immediately after (fourth pass, NOT fixed)**: a real Rust panic,
+`alloc::collections::btree::node.rs:1232: range end index 833 out of range for slice of length
+11`, in a forked child's `BTreeMap` (`is_in_guest=false` — host-side Rust code, not
+guest-emulated), crashes that thread/process and appears to be what stopped the top-level
+script's own forward progress this run (no further `[s]` milestones after
+`SELKIES_BIND_WATCHDOG_STARTED`). No backtrace was captured (`RUST_BACKTRACE=1` was not set).
+Consistent with — but not yet proven to be — the already-documented "GlobalState nested
+collections not actually shared" gap (`pty_registry`/`flock_registry`/`fifo_registry`/
+`sysv_shm`/`memfds`/`shared_files` still real, per-process-heap `BTreeMap`s under cross-process
+fork; see "`SharedArc<T>`" section below). Pickup: re-run with `RUST_BACKTRACE=1` exported into
+`child_env` (`spawn_process_fork_child`), or symbolize `rip=0x7ff630c77dd0`/`module_base=
+0x7ff630a90000`/`rva=0x1e7dd0` from this run's own log against this exact build's `.pdb`
+(`advisor/probes/symbolize_litebox_crash.py`) to identify which registry's `BTreeMap` this is
+before attempting a fix — do not guess which one. `XVFB_UP`/`DBUS_UP`/`DE_UP`/browser/terminal/
+apps NOT reached this pass. Host memory recovered cleanly (~6GB free after killing 23 orphaned
+fork-child processes the crashed top-level left behind — the top-level's own death does not tear
+down its cross-process-fork children, a separate observation, not investigated further this
+pass).
 
 **Fork-after-Xorg PERMANENT freeze — did NOT reproduce 2026-09-17; thread-based-fork-only.** Under
 `LITEBOX_PROCESS_FORK=1` the identical script completed cleanly 2/2 — zero freeze, zero double-free.
@@ -297,68 +326,19 @@ per-fix detail: archive (`docs/AGENTS_ARCHIVE_2026-09-17.md`, newest entries at 
 
 ## RawMutex lost-wakeup, Pipes stale-pointer, FutexManager sharing gap, and cross-process-fork lock-orphaning -- ALL FOUR FIXED 2026-09-17
 
-**A. `RawMutex::resolve_waiter_event` cross-process branch -- FIXED.** Was: `RawMutex.waiters:
-Mutex<Vec<WaiterRecord>>`'s `Vec` buffer is process-private-heap, so a `RawMutex` embedded in
-cross-process-shared memory (any `litebox::sync::Mutex`/`RwLock` field of `GlobalState`) let an
-attaching process's `wake_many` read a bogus pid and PANIC on `OpenProcess` failure -- the real
-waiter (blocked in `RawMutex::block` via `do_clone`/`with_fork_duplicate_claim_owner`, confirmed live
-via `cdb -p`) was never signaled. Ninth instance of the nested-collection-on-private-heap class. Fix:
-`waiters` is now `WaiterQueue`, a fixed-32-slot pointer-free array guarded by a pure spin-CAS lock
-(no nested OS-backed lock); `resolve_waiter_event` returns `Option<HANDLE>` and logs+skips instead of
-panicking; the handle-dedup cache moved to a process-local `static` keyed by mutex address. Live-
-verified reachable and non-fatal (the "queue full" fallback engaged live, zero panics). Full mechanism
-and live evidence: archive.
-
-**B. `Pipes` stale-`litebox`-pointer -- FIXED.** Tenth instance, found live while verifying A: a
-`mkdir` fork child was silently `Killed`, WER showed a real `0xc0000005`, `llvm-symbolizer` resolved
-it to `Vec<Option<IndividualEntry<WindowsUserland>>>::drop` -- `litebox::pipes::Pipes`'s `litebox`
-field, captured once at construction (same defect `Network::rebind_per_process_fields` already fixed
-twice), was stale/dangling when a killed process's inherited stdio pipe tore down. Fix: `Pipes.litebox`
-is now interior-mutable (`litebox::sync::Mutex`-wrapped); `GlobalStateHandle::pipes()` rebinds before
-every access, same shape as `net_lock`. Live-verified: the same repro's `d1` now exits cleanly
-(`exiting with encoded status 0xc0de0000`) instead of crashing. Full mechanism: archive.
-
-**C. `FutexManager` cross-process sharing -- FIXED (`30d4608`).** With A and B both fixed, the
-identical repro still hung one step later: `FutexManager::wake` -> `LoanList::extract_if` ->
-`RawMutex::block`, permanently blocked (second thread blocked the same way as A, via
-`do_clone`/`with_fork_duplicate_claim_owner`). Eleventh instance at the outer level
-(`FutexManager.table: Box<[LoanList<...>; N]>` is process-private-heap), but `LoanList` itself is
-structurally deeper: entries are "allocated once by the caller, potentially on the stack" (its own
-doc comment) -- a `FutexEntry` a guest thread registers is commonly stack-allocated, which has NO
-"move it to the shared arena" fix (unlike every prior instance this session): a stack address is
-fork-family-identical only for the ONE thread that actually called `fork()`, so any other thread's
-stack-resident entry, or lock state a non-forking thread held at fork time, is permanently
-unrecoverable garbage to every other process. Resolved the same way as `elf_patch_cache`/etc
-instead: `FutexManager`'s own pre-existing doc comment already scopes it to "private"
-(single-process) futexes only, so giving each process its own fresh `FutexManager` is the
-already-documented intended semantics, not a workaround -- `GlobalStateHandle` carries its own
-`Arc<FutexManager<Platform>>`, freshly constructed once per process in `LinuxShimBuilder::build`,
-shadowing `GlobalState`'s (now removed) field. Live-verified: 10 sequential external `/bin/mkdir`
-cross-process forks now complete cleanly (`OK1..OK10` + a final marker), across two independent
-runs -- previously hung permanently partway through the loop.
-
-**D. Cross-process-fork lock-orphaning hang -- FIXED.** Twelfth instance. Root cause, confirmed
-live: a cross-process-fork CHILD's own `net_worker` thread (`lib.rs` ~1884) had no shutdown signal
-(unlike `run()`'s own copy at ~862, despite a doc comment claiming a "verbatim" mirror) and spends a
-large fraction of its life holding the one genuinely cross-process-shared `net_lock`; this child's
-fast `ExitProcess` exit (skips `Drop` entirely, `main.rs`) can and does kill that thread mid-hold,
-orphaning the lock permanently for the rest of the fork family -- a plain `AtomicU32` has no
-OS-level "owner died" release. A graceful shutdown+join fix was tried first and was WRONG: it forces
-the exiting child to contend for the shared lock against the ever-running parent's own `net_worker`,
-which live-tested as a 4m45s stall ending in an external-watchdog `STATUS_FATAL_APP_EXIT` kill, worse
-than the original bug -- reverted, do not retry that shape of fix. Real fix: robust-mutex owner-death
-recovery on `RawMutex` itself -- new `note_locked`/`note_unlocked` trait hooks (default no-op on
-every platform but Windows) record the holder's pid; `block_or_maybe_timeout` waits in bounded 2s
-chunks and, only once a recorded holder is POSITIVELY CONFIRMED dead via `OpenProcess`+
-`GetExitCodeProcess` (never a merely-slow-but-alive one), force-recovers the lock. Live-verified: 4
-independent full 10-mkdir runs under `LITEBOX_PROCESS_FORK=1`, all exit 0 in ~7s, every run hitting
-the recovery path exactly twice. Full mechanism, the reverted attempt's evidence, and file list:
-archive.
-
-Previously-recorded allocator livelock (`SafeZoneAllocator::alloc`, `SpinMutex<ZoneAllocator>`,
-CLIMBING CPU) not re-investigated this pass -- still open, full detail: archive. Distinct from D
-above (D's snapshots show flat CPU, no thread spinning -- a lock left locked forever, not a
-livelock).
+Four fixes, all live-verified, all landed: (A) `RawMutex::resolve_waiter_event`'s cross-process
+branch panicked on a stale pid instead of signaling the real waiter -- `waiters` is now a
+fixed-32-slot pointer-free `WaiterQueue`. (B) `Pipes.litebox`'s stale pointer crashed a killed
+fork child's stdio teardown -- now interior-mutable, rebound via `GlobalStateHandle::pipes()`
+same as `net_lock`. (C) `FutexManager` cross-process sharing hung on `LoanList` entries that can
+be stack-allocated (fork-family-identical only for the forking thread) -- resolved by giving each
+process its own fresh `FutexManager`, matching its own pre-existing "private futexes only" doc
+comment. (D) A cross-process-fork child's un-shutdown `net_worker` thread could be killed mid-hold
+of the shared `net_lock`, orphaning it forever -- fixed with `RawMutex` owner-death recovery
+(`note_locked`/`note_unlocked` + `OpenProcess`/`GetExitCodeProcess`-confirmed-dead force-recovery).
+Full mechanism, live evidence, and the reverted wrong-shape fix for D: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
+Previously-recorded allocator livelock (`SafeZoneAllocator::alloc`) not re-investigated this pass
+-- still open, distinct from D (flat CPU, not spinning).
 
 ## Closed — do not re-attempt without a genuinely new approach
 

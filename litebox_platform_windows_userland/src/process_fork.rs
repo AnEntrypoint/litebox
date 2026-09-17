@@ -55,9 +55,11 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, GetExitCodeProcess, INFINITE,
-    PROCESS_INFORMATION,
-    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
+    InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
+    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 /// Windows' `STILL_ACTIVE` sentinel (`GetExitCodeProcess` returns this as the "exit code" for a
@@ -1745,14 +1747,35 @@ pub fn spawn_process_fork_child(
             exe_wide.as_ptr()
         );
     }
+    // Explicit allow-list for THIS child's `CreateProcessW` call: its own bridge-pipe ends plus
+    // (when exported) the shared-kernel-heap section handle -- never rely on ambient
+    // `bInheritHandles=TRUE` picking up whatever else happens to be marked inheritable
+    // process-wide at this moment (see `spawn_suspended_impl`'s doc comment: that ambient
+    // over-broad inheritance is the confirmed root cause of the nginx-self-test pipe-EOF hang).
+    let mut extra_inheritable_handles: std::vec::Vec<HANDLE> =
+        child_pipe_handles.iter().map(|(_, h, _)| *h).collect();
+    if let Some((section_handle, _base)) = shared_heap_export {
+        extra_inheritable_handles.push(section_handle as HANDLE);
+    }
     // Only forced when the shared-heap gate above actually exported a handle -- an unconditional
     // `bInheritHandles=TRUE` would inherit every OTHER currently-inheritable handle in this
     // process into the child too, a behavior change to the DEFAULT path this pass has no reason
     // to make when there is nothing new for the child to inherit.
     let spawn_result = if shared_heap_export.is_some() {
-        spawn_suspended_forcing_handle_inheritance(&mut exe_wide, &child_env)
+        spawn_suspended_forcing_handle_inheritance(
+            &mut exe_wide,
+            &child_env,
+            &extra_inheritable_handles,
+        )
     } else {
-        spawn_suspended(&mut exe_wide, false, false, true, &child_env)
+        spawn_suspended_with_extra_handles(
+            &mut exe_wide,
+            false,
+            false,
+            true,
+            &child_env,
+            &extra_inheritable_handles,
+        )
     };
     if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
         eprintln!(
@@ -3492,6 +3515,29 @@ fn spawn_suspended(
     inherit_stdio: bool,
     extra_env: &[(&str, String)],
 ) -> Result<SpawnSuspendedResult, String> {
+    spawn_suspended_with_extra_handles(
+        exe_wide,
+        want_stdout_pipe,
+        want_stdin_pipe,
+        inherit_stdio,
+        extra_env,
+        &[],
+    )
+}
+
+/// Same as [`spawn_suspended`], plus an explicit list of extra handles this ONE child should
+/// inherit -- see [`spawn_suspended_impl`]'s doc comment on `extra_inheritable_handles` for why
+/// this matters even outside the `force_inherit_handles` (shared-heap) path: any cross-process
+/// fork spawn that carries pipe fds into its child needs its bridge-pipe `child` ends listed here
+/// too, or they fall back to ambient (over-broad) `bInheritHandles=TRUE` inheritance.
+fn spawn_suspended_with_extra_handles(
+    exe_wide: &mut [u16],
+    want_stdout_pipe: bool,
+    want_stdin_pipe: bool,
+    inherit_stdio: bool,
+    extra_env: &[(&str, String)],
+    extra_inheritable_handles: &[HANDLE],
+) -> Result<SpawnSuspendedResult, String> {
     spawn_suspended_impl(
         exe_wide,
         want_stdout_pipe,
@@ -3499,6 +3545,7 @@ fn spawn_suspended(
         inherit_stdio,
         extra_env,
         false,
+        extra_inheritable_handles,
     )
 }
 
@@ -3511,13 +3558,50 @@ fn spawn_suspended(
 /// whose real stdio handles all happened to be invalid/non-inheritable (e.g. fully redirected to
 /// `NUL`) would silently leave `inherit_handles` at `0` and drop the shared-heap handle on the
 /// floor even though `spawn_process_fork_child` had already set it up.
+///
+/// `extra_inheritable_handles` are handles this ONE child is specifically meant to inherit
+/// (the shared-kernel-heap section handle, this child's own bridge-pipe ends) -- see
+/// [`spawn_suspended_impl`]'s doc comment for why they are threaded all the way through instead
+/// of just relying on ambient `bInheritHandles=TRUE` process-wide inheritance.
 fn spawn_suspended_forcing_handle_inheritance(
     exe_wide: &mut [u16],
     extra_env: &[(&str, String)],
+    extra_inheritable_handles: &[HANDLE],
 ) -> Result<SpawnSuspendedResult, String> {
-    spawn_suspended_impl(exe_wide, false, false, true, extra_env, true)
+    spawn_suspended_impl(
+        exe_wide,
+        false,
+        false,
+        true,
+        extra_env,
+        true,
+        extra_inheritable_handles,
+    )
 }
 
+/// `extra_inheritable_handles`: handles this call additionally wants ONE new child to inherit
+/// (e.g. `spawn_process_fork_child`'s per-fd bridge-pipe "child" ends, or the shared-kernel-heap
+/// section handle), each of which the CALLER has already marked `HANDLE_FLAG_INHERIT` on.
+///
+/// FIX (pipe-handle-leak investigation, 2026-09-17): plain `bInheritHandles=TRUE` inherits EVERY
+/// currently-inheritable handle open anywhere in THIS process into the new child -- not just the
+/// ones this call intends. That is over-broad by construction: any OTHER handle this process
+/// happens to have marked inheritable at the moment of this `CreateProcessW` call (most
+/// concretely, another concurrently-in-flight `spawn_process_fork_child` call's own per-fd bridge
+/// pipe `child` end, marked inheritable earlier in `create_inheritable_child_pipe` and not yet
+/// closed by that OTHER call's own `close_child_side`) gets silently duplicated into THIS child
+/// too, purely because Windows handle inheritance is scoped to the whole process, never to one
+/// `CreateProcessW` call. A sibling cross-process-fork child holding a stray inherited duplicate
+/// of another child's pipe write end keeps that pipe's underlying kernel object alive after its
+/// real, intended writer exits -- the reader never sees EOF, presenting as a permanent hang
+/// (root-caused live against the `webtop_stack.sh` nginx self-test hang; see
+/// `docs/AGENTS_ARCHIVE_2026-09-17.md`). `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` scopes inheritance
+/// to an explicit allow-list for exactly this ONE `CreateProcessW` call, immune to whatever else
+/// is concurrently marked inheritable elsewhere in the process -- the same mechanism Microsoft's
+/// own docs recommend over broad `bInheritHandles=TRUE` for this reason (MSDN "Constrained
+/// process handle inheritance"), and the only way to match real `fork()`+`exec()` semantics
+/// (child gets exactly the fds it should, nothing else) rather than the "inherit everything"
+/// Windows default.
 fn spawn_suspended_impl(
     exe_wide: &mut [u16],
     want_stdout_pipe: bool,
@@ -3525,6 +3609,7 @@ fn spawn_suspended_impl(
     inherit_stdio: bool,
     extra_env: &[(&str, String)],
     force_inherit_handles: bool,
+    extra_inheritable_handles: &[HANDLE],
 ) -> Result<SpawnSuspendedResult, String> {
     // Built up-front so the pointer handed to `CreateProcessW` stays valid for the whole call.
     let mut env_block = build_child_environment_block(extra_env);
@@ -3708,6 +3793,96 @@ fn spawn_suspended_impl(
     // every one of this session's dozens of test runs) flash a new terminal window on screen.
     // Mirrors the fault-watchdog spawn's own `CREATE_NO_WINDOW` use elsewhere in this file.
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    // Build the explicit inheritance allow-list this call intends: its own wired stdio handles
+    // plus whatever `extra_inheritable_handles` the caller asked for (bridge-pipe child ends,
+    // the shared-heap section handle). See `spawn_suspended_impl`'s own doc comment for why this
+    // exists instead of trusting plain `bInheritHandles=TRUE`.
+    let mut allow_list: std::vec::Vec<HANDLE> = std::vec::Vec::new();
+    for h in [
+        startup_info.hStdOutput,
+        startup_info.hStdError,
+        startup_info.hStdInput,
+    ] {
+        if !h.is_null() && !allow_list.contains(&h) {
+            allow_list.push(h);
+        }
+    }
+    for h in extra_inheritable_handles {
+        if !h.is_null() && !allow_list.contains(h) {
+            allow_list.push(*h);
+        }
+    }
+
+    // `attr_list_buf` must outlive the `CreateProcessW` call below; `DeleteProcThreadAttributeList`
+    // is called on every exit path (the `ok` branch below and both early-return failure branches),
+    // matching the paired-cleanup shape every other resource in this function already follows.
+    let mut attr_list_buf: std::vec::Vec<u8> = std::vec::Vec::new();
+    let mut startup_info_ex: STARTUPINFOEXW = unsafe { core::mem::zeroed() };
+    let mut creation_flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
+    let mut attr_list_initialized = false;
+    let use_explicit_list = inherit_handles == 1 && !allow_list.is_empty();
+    if use_explicit_list {
+        let mut size: usize = 0;
+        // Safety: first call with a null list is documented to fail with
+        // `ERROR_INSUFFICIENT_BUFFER` while still writing the required size into `size`.
+        unsafe {
+            InitializeProcThreadAttributeList(core::ptr::null_mut(), 1, 0, &raw mut size);
+        }
+        if size > 0 {
+            attr_list_buf.resize(size, 0);
+            let list_ptr = attr_list_buf.as_mut_ptr().cast::<c_void>();
+            // Safety: `attr_list_buf` is sized exactly `size` bytes per the query above and
+            // outlives every use of `list_ptr` below.
+            let init_ok =
+                unsafe { InitializeProcThreadAttributeList(list_ptr, 1, 0, &raw mut size) };
+            if init_ok != 0 {
+                attr_list_initialized = true;
+                // Safety: `allow_list` outlives the `UpdateProcThreadAttribute`/`CreateProcessW`
+                // pair below; `list_ptr` was just initialized above.
+                let update_ok = unsafe {
+                    UpdateProcThreadAttribute(
+                        list_ptr,
+                        0,
+                        PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                        allow_list.as_ptr().cast::<c_void>(),
+                        allow_list.len() * core::mem::size_of::<HANDLE>(),
+                        core::ptr::null_mut(),
+                        core::ptr::null(),
+                    )
+                };
+                if update_ok != 0 {
+                    startup_info_ex.StartupInfo = startup_info;
+                    startup_info_ex.StartupInfo.cb = u32::try_from(
+                        core::mem::size_of::<STARTUPINFOEXW>(),
+                    )
+                    .expect("STARTUPINFOEXW fits in u32");
+                    startup_info_ex.lpAttributeList = list_ptr;
+                    creation_flags |= EXTENDED_STARTUPINFO_PRESENT;
+                } else {
+                    // Setup failed -- fall back to the old ambient-inheritance behavior rather
+                    // than hard-failing the whole spawn; still strictly no worse than before this
+                    // fix. `attr_list_initialized` stays true so cleanup still runs.
+                    eprintln!(
+                        "spawn_suspended_impl: UpdateProcThreadAttribute(HANDLE_LIST) failed, GetLastError={} -- falling back to bInheritHandles=TRUE with no explicit list",
+                        unsafe { GetLastError() }
+                    );
+                }
+            } else {
+                eprintln!(
+                    "spawn_suspended_impl: InitializeProcThreadAttributeList failed, GetLastError={} -- falling back to bInheritHandles=TRUE with no explicit list",
+                    unsafe { GetLastError() }
+                );
+            }
+        }
+    }
+    let startup_info_ptr: *const STARTUPINFOW = if creation_flags & EXTENDED_STARTUPINFO_PRESENT
+        != 0
+    {
+        (&raw const startup_info_ex).cast::<STARTUPINFOW>()
+    } else {
+        &raw const startup_info
+    };
     let ok = unsafe {
         CreateProcessW(
             core::ptr::null(),
@@ -3715,13 +3890,20 @@ fn spawn_suspended_impl(
             core::ptr::null(),
             core::ptr::null(),
             inherit_handles,
-            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+            creation_flags,
             env_block.as_mut_ptr().cast(),
             core::ptr::null(),
-            &raw const startup_info,
+            startup_info_ptr,
             &raw mut process_info,
         )
     };
+    if attr_list_initialized {
+        // Safety: `list_ptr` (== `attr_list_buf.as_mut_ptr()`) was successfully initialized above
+        // and `CreateProcessW` has already returned, so the list is no longer needed.
+        unsafe {
+            DeleteProcThreadAttributeList(attr_list_buf.as_mut_ptr().cast::<c_void>());
+        }
+    }
     // The child's own inherited copy of the write/read handles keeps them open in the child; the
     // parent must close ITS copies regardless of CreateProcessW's outcome so each pipe only stays
     // open via the child's handle (needed for ERROR_BROKEN_PIPE to fire correctly once the child

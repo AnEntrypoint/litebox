@@ -1899,3 +1899,65 @@ handle list at every cross-process-fork `CreateProcess` call, not another `RawMu
 change -- this hang is unrelated to the `net_lock`/`SpinEnabledRawMutex` mechanism entirely, per
 the direct memory evidence above. `XVFB_UP`/`DBUS_UP`/`DE_UP`/browser/terminal/apps were NOT
 reached this pass either. Host memory recovered cleanly, no leaked processes.
+
+## RawMutex lost-wakeup, Pipes stale-pointer, FutexManager sharing gap, and cross-process-fork lock-orphaning -- ALL FOUR FIXED 2026-09-17 (folded from AGENTS.md, compaction pass)
+
+**A. `RawMutex::resolve_waiter_event` cross-process branch -- FIXED.** Was: `RawMutex.waiters:
+Mutex<Vec<WaiterRecord>>`'s `Vec` buffer is process-private-heap, so a `RawMutex` embedded in
+cross-process-shared memory (any `litebox::sync::Mutex`/`RwLock` field of `GlobalState`) let an
+attaching process's `wake_many` read a bogus pid and PANIC on `OpenProcess` failure -- the real
+waiter (blocked in `RawMutex::block` via `do_clone`/`with_fork_duplicate_claim_owner`, confirmed live
+via `cdb -p`) was never signaled. Ninth instance of the nested-collection-on-private-heap class. Fix:
+`waiters` is now `WaiterQueue`, a fixed-32-slot pointer-free array guarded by a pure spin-CAS lock
+(no nested OS-backed lock); `resolve_waiter_event` returns `Option<HANDLE>` and logs+skips instead of
+panicking; the handle-dedup cache moved to a process-local `static` keyed by mutex address. Live-
+verified reachable and non-fatal (the "queue full" fallback engaged live, zero panics).
+
+**B. `Pipes` stale-`litebox`-pointer -- FIXED.** Tenth instance, found live while verifying A: a
+`mkdir` fork child was silently `Killed`, WER showed a real `0xc0000005`, `llvm-symbolizer` resolved
+it to `Vec<Option<IndividualEntry<WindowsUserland>>>::drop` -- `litebox::pipes::Pipes`'s `litebox`
+field, captured once at construction (same defect `Network::rebind_per_process_fields` already fixed
+twice), was stale/dangling when a killed process's inherited stdio pipe tore down. Fix: `Pipes.litebox`
+is now interior-mutable (`litebox::sync::Mutex`-wrapped); `GlobalStateHandle::pipes()` rebinds before
+every access, same shape as `net_lock`. Live-verified: the same repro's `d1` now exits cleanly
+(`exiting with encoded status 0xc0de0000`) instead of crashing.
+
+**C. `FutexManager` cross-process sharing -- FIXED (`30d4608`).** With A and B both fixed, the
+identical repro still hung one step later: `FutexManager::wake` -> `LoanList::extract_if` ->
+`RawMutex::block`, permanently blocked (second thread blocked the same way as A, via
+`do_clone`/`with_fork_duplicate_claim_owner`). Eleventh instance at the outer level
+(`FutexManager.table: Box<[LoanList<...>; N]>` is process-private-heap), but `LoanList` itself is
+structurally deeper: entries are "allocated once by the caller, potentially on the stack" (its own
+doc comment) -- a `FutexEntry` a guest thread registers is commonly stack-allocated, which has NO
+"move it to the shared arena" fix (unlike every prior instance this session): a stack address is
+fork-family-identical only for the ONE thread that actually called `fork()`, so any other thread's
+stack-resident entry, or lock state a non-forking thread held at fork time, is permanently
+unrecoverable garbage to every other process. Resolved the same way as `elf_patch_cache`/etc
+instead: `FutexManager`'s own pre-existing doc comment already scopes it to "private"
+(single-process) futexes only, so giving each process its own fresh `FutexManager` is the
+already-documented intended semantics, not a workaround -- `GlobalStateHandle` carries its own
+`Arc<FutexManager<Platform>>`, freshly constructed once per process in `LinuxShimBuilder::build`,
+shadowing `GlobalState`'s (now removed) field. Live-verified: 10 sequential external `/bin/mkdir`
+cross-process forks now complete cleanly (`OK1..OK10` + a final marker), across two independent
+runs -- previously hung permanently partway through the loop.
+
+**D. Cross-process-fork lock-orphaning hang -- FIXED.** Twelfth instance. Root cause, confirmed
+live: a cross-process-fork CHILD's own `net_worker` thread (`lib.rs` ~1884) had no shutdown signal
+(unlike `run()`'s own copy at ~862, despite a doc comment claiming a "verbatim" mirror) and spends a
+large fraction of its life holding the one genuinely cross-process-shared `net_lock`; this child's
+fast `ExitProcess` exit (skips `Drop` entirely, `main.rs`) can and does kill that thread mid-hold,
+orphaning the lock permanently for the rest of the fork family -- a plain `AtomicU32` has no
+OS-level "owner died" release. A graceful shutdown+join fix was tried first and was WRONG: it forces
+the exiting child to contend for the shared lock against the ever-running parent's own `net_worker`,
+which live-tested as a 4m45s stall ending in an external-watchdog `STATUS_FATAL_APP_EXIT` kill, worse
+than the original bug -- reverted, do not retry that shape of fix. Real fix: robust-mutex owner-death
+recovery on `RawMutex` itself -- new `note_locked`/`note_unlocked` trait hooks (default no-op on
+every platform but Windows) record the holder's pid; `block_or_maybe_timeout` waits in bounded 2s
+chunks and, only once a recorded holder is POSITIVELY CONFIRMED dead via `OpenProcess`+
+`GetExitCodeProcess` (never a merely-slow-but-alive one), force-recovers the lock. Live-verified: 4
+independent full 10-mkdir runs under `LITEBOX_PROCESS_FORK=1`, all exit 0 in ~7s, every run hitting
+the recovery path exactly twice.
+
+Previously-recorded allocator livelock (`SafeZoneAllocator::alloc`, `SpinMutex<ZoneAllocator>`,
+CLIMBING CPU) not re-investigated this pass -- still open. Distinct from D above (D's snapshots
+show flat CPU, no thread spinning -- a lock left locked forever, not a livelock).
